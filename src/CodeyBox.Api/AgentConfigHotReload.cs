@@ -940,6 +940,19 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.ObservedFailureRetentionMinutes,
                 opts.CapRetryIntervalSeconds,
                 opts.ColdStartFitInWindow,
+                opts.DrainAggressiveness,
+                ExpectedResets = mapped.ExpectedResets
+                    .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(kv => kv.Key, kv => new
+                    {
+                        Timestamps = kv.Value.Timestamps
+                            .OrderBy(t => t)
+                            .ToArray(),
+                        CadenceSeconds = kv.Value.Cadence is { } cadence
+                            ? checked((int)cadence.TotalSeconds)
+                            : (int?)null,
+                        kv.Value.CadenceAnchor,
+                    }),
                 IntraKindRoutingPolicy = opts.IntraKindRoutingPolicy.ToString(),
             },
             JsonOpts);

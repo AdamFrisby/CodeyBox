@@ -20,6 +20,8 @@ internal static class QuotaRouterConfigMapper
         ObservedFailureRetention = TimeSpan.FromMinutes(qr.ObservedFailureRetentionMinutes),
         CapRetryRecheckInterval = TimeSpan.FromSeconds(qr.CapRetryIntervalSeconds),
         ColdStartFitInWindow = qr.ColdStartFitInWindow,
+        DrainAggressiveness = qr.DrainAggressiveness,
+        ExpectedResets = BuildExpectedResetOverrides(qr.ExpectedResets),
         IntraKindRoutingPolicy = qr.IntraKindRoutingPolicy,
     };
 
@@ -39,6 +41,8 @@ internal static class QuotaRouterConfigMapper
         dst.ObservedFailureRetention = TimeSpan.FromMinutes(src.ObservedFailureRetentionMinutes);
         dst.CapRetryRecheckInterval = TimeSpan.FromSeconds(src.CapRetryIntervalSeconds);
         dst.ColdStartFitInWindow = src.ColdStartFitInWindow;
+        dst.DrainAggressiveness = src.DrainAggressiveness;
+        dst.ExpectedResets = BuildExpectedResetOverrides(src.ExpectedResets);
         dst.IntraKindRoutingPolicy = src.IntraKindRoutingPolicy;
     }
 
@@ -94,6 +98,36 @@ internal static class QuotaRouterConfigMapper
         {
             if (kv.Value < 0) continue;
             dst[kv.Key] = kv.Value;
+        }
+        return dst;
+    }
+
+    private static Dictionary<string, ExpectedQuotaResetOptions> BuildExpectedResetOverrides(
+        IDictionary<string, QuotaRouterExpectedResetConfig>? src)
+    {
+        var dst = new Dictionary<string, ExpectedQuotaResetOptions>(StringComparer.OrdinalIgnoreCase);
+        if (src is null) return dst;
+        foreach (var kv in src)
+        {
+            if (string.IsNullOrWhiteSpace(kv.Key) || kv.Value is null) continue;
+            var timestamps = kv.Value.Timestamps
+                .Select(t => t.ToUniversalTime())
+                .Distinct()
+                .OrderBy(t => t)
+                .ToArray();
+            var cadence = kv.Value.CadenceSeconds is { } seconds && seconds > 0
+                ? TimeSpan.FromSeconds(seconds)
+                : (TimeSpan?)null;
+            var anchor = kv.Value.CadenceAnchor?.ToUniversalTime();
+            if (timestamps.Length == 0 && (cadence is null || anchor is null))
+                continue;
+
+            dst[kv.Key] = new ExpectedQuotaResetOptions
+            {
+                Timestamps = timestamps,
+                Cadence = cadence,
+                CadenceAnchor = cadence is not null ? anchor : null,
+            };
         }
         return dst;
     }

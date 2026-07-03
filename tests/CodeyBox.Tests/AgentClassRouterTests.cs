@@ -19,7 +19,8 @@ public sealed class AgentClassRouterTests
         IEnumerable<IAgentQuotaProbe> probes,
         double minQuotaPct = 10.0,
         IAgentDispatchAvailability? dispatchAvailability = null,
-        IntraKindRoutingPolicy policy = IntraKindRoutingPolicy.MostQuotaFirst)
+        IntraKindRoutingPolicy policy = IntraKindRoutingPolicy.MostQuotaFirst,
+        TimeProvider? timeProvider = null)
     {
         var opts = new QuotaRouterOptions
         {
@@ -27,20 +28,22 @@ public sealed class AgentClassRouterTests
             QuotaRecheckInterval = TimeSpan.FromMinutes(5),
             IntraKindRoutingPolicy = policy,
         };
-        return BuildRouter(catalog, probes, opts, dispatchAvailability);
+        return BuildRouter(catalog, probes, opts, dispatchAvailability, timeProvider);
     }
 
     private static AgentClassRouter BuildRouter(
         IEnumerable<AgentClass> catalog,
         IEnumerable<IAgentQuotaProbe> probes,
         QuotaRouterOptions opts,
-        IAgentDispatchAvailability? dispatchAvailability = null)
+        IAgentDispatchAvailability? dispatchAvailability = null,
+        TimeProvider? timeProvider = null)
     {
         return new AgentClassRouter(
             catalog.ToList(),
             probes,
             opts,
             NullLogger<AgentClassRouter>.Instance,
+            timeProvider: timeProvider,
             dispatchAvailability: dispatchAvailability);
     }
 
@@ -73,6 +76,17 @@ public sealed class AgentClassRouterTests
 
     private static AgentMembership Api(AgentKind kind) =>
         new() { Agent = kind, Billing = AgentBilling.PayPerApi, QualityScore = 100 };
+
+    private static AgentQuotaSnapshot Snapshot(
+        double availablePct,
+        DateTimeOffset? resetAt = null,
+        params WindowQuota[] windows) =>
+        new()
+        {
+            AvailablePct = availablePct,
+            ResetAt = resetAt,
+            Windows = windows,
+        };
 
     // ── No class configured ──────────────────────────────────────────────────
 
@@ -220,6 +234,272 @@ public sealed class AgentClassRouterTests
         var decision = await router.ResolveAsync(item, null, CancellationToken.None);
 
         Assert.Equal("claude/acct-b", decision.Chosen!.RouteKey);
+    }
+
+    [Fact]
+    public async Task DeadlineAwareDrain_RoutesToEarlierDeadlineOverHigherAbsoluteQuota()
+    {
+        var now = new DateTimeOffset(2026, 6, 1, 12, 0, 0, TimeSpan.Zero);
+        var opts = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            IntraKindRoutingPolicy = IntraKindRoutingPolicy.DeadlineAwareDrain,
+        };
+        var cls = FrontierClass(Sub(Claude), Sub(Codex));
+        var router = BuildRouter([cls],
+        [
+            new FakeProbe(Claude, Snapshot(50.0, now.AddHours(6))),
+            new FakeProbe(Codex, Snapshot(70.0, now.AddDays(5))),
+        ], opts, timeProvider: new FakeTimeProvider(now));
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(Claude, decision.Chosen!.Agent);
+    }
+
+    [Fact]
+    public async Task DeadlineAwareDrain_DeprioritisesAgentAlreadyAheadOfPerCyclePace()
+    {
+        var now = new DateTimeOffset(2026, 6, 1, 12, 0, 0, TimeSpan.Zero);
+        var reset = now.AddHours(24);
+        var rateReset = now.AddHours(6);
+        var opts = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            IntraKindRoutingPolicy = IntraKindRoutingPolicy.DeadlineAwareDrain,
+        };
+        var cls = FrontierClass(Sub(Claude), Sub(Codex));
+        var router = BuildRouter([cls],
+        [
+            new FakeProbe(Claude, Snapshot(
+                90.0,
+                reset,
+                new WindowQuota { Name = "five_hour", AvailablePct = 70.0, ResetAt = rateReset },
+                new WindowQuota { Name = "weekly", AvailablePct = 90.0, ResetAt = reset })),
+            new FakeProbe(Codex, Snapshot(
+                50.0,
+                reset,
+                new WindowQuota { Name = "5h-rolling", AvailablePct = 100.0, ResetAt = rateReset },
+                new WindowQuota { Name = "weekly", AvailablePct = 50.0, ResetAt = reset })),
+        ], opts, timeProvider: new FakeTimeProvider(now));
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(Codex, decision.Chosen!.Agent);
+    }
+
+    [Fact]
+    public async Task DeadlineAwareDrain_PreservesQualityGate()
+    {
+        var now = new DateTimeOffset(2026, 6, 1, 12, 0, 0, TimeSpan.Zero);
+        var weakUrgent = Sub(Claude) with { QualityScore = 50 };
+        var strongLessUrgent = Sub(Codex) with { QualityScore = 100 };
+        var opts = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            IntraKindRoutingPolicy = IntraKindRoutingPolicy.DeadlineAwareDrain,
+        };
+        var router = BuildRouter([FrontierClass(weakUrgent, strongLessUrgent)],
+        [
+            new FakeProbe(Claude, Snapshot(95.0, now.AddHours(1))),
+            new FakeProbe(Codex, Snapshot(40.0, now.AddDays(5))),
+        ], opts, timeProvider: new FakeTimeProvider(now));
+        var item = MakeItem("frontier") with { MinModelScore = 90 };
+
+        var decision = await router.ResolveAsync(item, null, CancellationToken.None);
+
+        Assert.Equal(Codex, decision.Chosen!.Agent);
+    }
+
+    [Fact]
+    public async Task DeadlineAwareDrain_MeterlessAgentFallsBehindReadableDeadlineSignal()
+    {
+        var now = new DateTimeOffset(2026, 6, 1, 12, 0, 0, TimeSpan.Zero);
+        var opts = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            IntraKindRoutingPolicy = IntraKindRoutingPolicy.DeadlineAwareDrain,
+        };
+        var router = BuildRouter([FrontierClass(Sub(Claude), Sub(Codex))],
+        [
+            new FakeProbe(Codex, Snapshot(30.0, now.AddHours(12))),
+        ], opts, timeProvider: new FakeTimeProvider(now));
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(Codex, decision.Chosen!.Agent);
+    }
+
+    [Fact]
+    public async Task DeadlineAwareDrain_UnknownResetFallsBackToMostQuotaFirst()
+    {
+        var opts = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            IntraKindRoutingPolicy = IntraKindRoutingPolicy.DeadlineAwareDrain,
+        };
+        var router = BuildRouter([FrontierClass(Sub(Claude), Sub(Codex))],
+        [
+            new FakeProbe(Claude, Snapshot(50.0)),
+            new FakeProbe(Codex, Snapshot(70.0)),
+        ], opts);
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(Codex, decision.Chosen!.Agent);
+    }
+
+    [Fact]
+    public async Task DeadlineAwareDrain_UnknownQuotaFallsBackSafely()
+    {
+        var opts = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            IntraKindRoutingPolicy = IntraKindRoutingPolicy.DeadlineAwareDrain,
+        };
+        var router = BuildRouter([FrontierClass(Sub(Claude), Sub(Codex))],
+        [
+            new FakeProbe(Claude, AgentQuotaSnapshot.UnknownSnapshot(QuotaUnknownReason.Transient)),
+            new FakeProbe(Codex, Snapshot(60.0)),
+        ], opts);
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(Codex, decision.Chosen!.Agent);
+    }
+
+    [Fact]
+    public async Task DeadlineAwareDrain_ExpectedResetSoonerThanProbeDeadlineDrainsFaster()
+    {
+        var now = new DateTimeOffset(2026, 6, 1, 12, 0, 0, TimeSpan.Zero);
+        var scheduledReset = now.AddDays(5);
+        var rateReset = now.AddHours(6);
+        var opts = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            IntraKindRoutingPolicy = IntraKindRoutingPolicy.DeadlineAwareDrain,
+            ExpectedResets = new(StringComparer.OrdinalIgnoreCase)
+            {
+                [Claude.Value] = new ExpectedQuotaResetOptions
+                {
+                    Timestamps = [now.AddHours(12)],
+                },
+            },
+        };
+        var router = BuildRouter([FrontierClass(Sub(Claude), Sub(Codex))],
+        [
+            new FakeProbe(Claude, Snapshot(
+                50.0,
+                scheduledReset,
+                new WindowQuota { Name = "five_hour", AvailablePct = 90.0, ResetAt = rateReset },
+                new WindowQuota { Name = "weekly", AvailablePct = 50.0, ResetAt = scheduledReset })),
+            new FakeProbe(Codex, Snapshot(
+                70.0,
+                scheduledReset,
+                new WindowQuota { Name = "5h-rolling", AvailablePct = 100.0, ResetAt = rateReset },
+                new WindowQuota { Name = "weekly", AvailablePct = 70.0, ResetAt = scheduledReset })),
+        ], opts, timeProvider: new FakeTimeProvider(now));
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(Claude, decision.Chosen!.Agent);
+    }
+
+    [Fact]
+    public async Task DeadlineAwareDrain_ExpectedResetCadenceSoonerThanProbeDeadlineDrainsFaster()
+    {
+        var now = new DateTimeOffset(2026, 6, 1, 12, 0, 0, TimeSpan.Zero);
+        var scheduledReset = now.AddDays(5);
+        var rateReset = now.AddHours(6);
+        // Anchor 12h in the past with a 24h cadence => the next recurring free
+        // reset fires at anchor + 24h == now + 12h, i.e. well before the 5-day
+        // scheduled probe reset. This drives the ResolveNextCadenceReset branch
+        // (periodsElapsed math + next-period selection), NOT the Timestamps arm.
+        var opts = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            IntraKindRoutingPolicy = IntraKindRoutingPolicy.DeadlineAwareDrain,
+            ExpectedResets = new(StringComparer.OrdinalIgnoreCase)
+            {
+                [Claude.Value] = new ExpectedQuotaResetOptions
+                {
+                    Cadence = TimeSpan.FromHours(24),
+                    CadenceAnchor = now.AddHours(-12),
+                },
+            },
+        };
+        var router = BuildRouter([FrontierClass(Sub(Claude), Sub(Codex))],
+        [
+            new FakeProbe(Claude, Snapshot(
+                50.0,
+                scheduledReset,
+                new WindowQuota { Name = "five_hour", AvailablePct = 90.0, ResetAt = rateReset },
+                new WindowQuota { Name = "weekly", AvailablePct = 50.0, ResetAt = scheduledReset })),
+            new FakeProbe(Codex, Snapshot(
+                70.0,
+                scheduledReset,
+                new WindowQuota { Name = "5h-rolling", AvailablePct = 100.0, ResetAt = rateReset },
+                new WindowQuota { Name = "weekly", AvailablePct = 70.0, ResetAt = scheduledReset })),
+        ], opts, timeProvider: new FakeTimeProvider(now));
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        // With the cadence-derived reset (12h) honoured, Claude's urgency
+        // outranks Codex's larger absolute quota pacing to the 5-day reset.
+        // If the cadence branch failed to move the deadline earlier, Claude
+        // would pace to 5 days and Codex (more absolute quota) would win.
+        Assert.Equal(Claude, decision.Chosen!.Agent);
+    }
+
+    [Fact]
+    public async Task DeadlineAwareDrain_DrainAggressivenessRaisesPerCyclePace()
+    {
+        var now = new DateTimeOffset(2026, 6, 1, 12, 0, 0, TimeSpan.Zero);
+        var reset = now.AddHours(24);
+        var rateReset = now.AddHours(6);
+
+        var defaultOpts = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            IntraKindRoutingPolicy = IntraKindRoutingPolicy.DeadlineAwareDrain,
+            DrainAggressiveness = 1.0,
+        };
+        var aggressiveOpts = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            IntraKindRoutingPolicy = IntraKindRoutingPolicy.DeadlineAwareDrain,
+            DrainAggressiveness = 3.0,
+        };
+        var cls = FrontierClass(Sub(Claude), Sub(Codex));
+        var probes = new IAgentQuotaProbe[]
+        {
+            new FakeProbe(Claude, Snapshot(
+                90.0,
+                reset,
+                new WindowQuota { Name = "five_hour", AvailablePct = 75.0, ResetAt = rateReset },
+                new WindowQuota { Name = "weekly", AvailablePct = 90.0, ResetAt = reset })),
+            new FakeProbe(Codex, Snapshot(
+                40.0,
+                reset,
+                new WindowQuota { Name = "5h-rolling", AvailablePct = 100.0, ResetAt = rateReset },
+                new WindowQuota { Name = "weekly", AvailablePct = 40.0, ResetAt = reset })),
+        };
+
+        var defaultDecision = await BuildRouter(
+                [cls],
+                probes,
+                defaultOpts,
+                timeProvider: new FakeTimeProvider(now))
+            .ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+        var aggressiveDecision = await BuildRouter(
+                [cls],
+                probes,
+                aggressiveOpts,
+                timeProvider: new FakeTimeProvider(now))
+            .ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        Assert.Equal(Codex, defaultDecision.Chosen!.Agent);
+        Assert.Equal(Claude, aggressiveDecision.Chosen!.Agent);
     }
 
     [Fact]

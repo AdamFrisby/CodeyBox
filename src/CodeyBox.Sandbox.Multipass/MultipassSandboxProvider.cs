@@ -5242,6 +5242,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private const int DetachedProcessGroupMalformedExitCode = 73;
     private const int DetachedSupervisorSetupFailedExitCode = 88;
     private const int DetachedPollFailureLimit = 5;
+    private static readonly TimeSpan DetachedAuthenticatedExitCleanupTimeout = TimeSpan.FromSeconds(5);
     private const string DetachedSupervisorDirectory = "/run/codeybox-exec";
 
     // Test seam: override the WaitForDetachedCompletionAsync poll interval.
@@ -5249,6 +5250,11 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     // wall-clock-bound (a real 2s Task.Delay can drift well past a short test
     // deadline under thread-pool starvation, making the test flaky).
     internal TimeSpan? DetachedPollIntervalOverride { get; set; }
+
+    // Test seam: override the post-authenticated-exit cleanup timeout so the
+    // timeout-driven terminate+diagnostic branches (reap and sidecar read)
+    // can be exercised without a real 5s wall-clock wait.
+    internal TimeSpan? DetachedAuthenticatedExitCleanupTimeoutOverride { get; set; }
     internal const string AgentOutputHttpSetupFailureMarker =
         "codeybox-exec: agent output HTTP ingest unavailable before launch";
     private static readonly byte[] PngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
@@ -5630,7 +5636,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
                 var detachedExit = await WaitForDetachedCompletionAsync(detachedProcessGroupMarker!, agentOutputIngest, ct)
                     .ConfigureAwait(false);
-                var detachedOutput = await ReadDetachedOutputSidecarsAsync(detachedProcessGroupMarker!, ct)
+                var detachedOutput = await ReadDetachedOutputSidecarsAfterAuthenticatedExitAsync(detachedProcessGroupMarker!)
                     .ConfigureAwait(false);
                 await agentOutputIngest.DisposeAsync().ConfigureAwait(false);
                 var detachedIngested = agentOutputIngest;
@@ -6455,7 +6461,7 @@ while True:
             {
                 if (ingest.TryGetExitCode(out var authenticatedExitCode))
                 {
-                    var reapError = await EnsureDetachedProcessGroupReapedAsync(processGroupMarker, ct).ConfigureAwait(false);
+                    var reapError = await EnsureDetachedProcessGroupReapedAfterAuthenticatedExitAsync(processGroupMarker).ConfigureAwait(false);
                     return new DetachedExitResult(authenticatedExitCode, reapError);
                 }
 
@@ -6465,7 +6471,7 @@ while True:
             {
                 if (ingest.TryGetExitCode(out var exitCode))
                 {
-                    var reapError = await EnsureDetachedProcessGroupReapedAsync(processGroupMarker, ct).ConfigureAwait(false);
+                    var reapError = await EnsureDetachedProcessGroupReapedAfterAuthenticatedExitAsync(processGroupMarker).ConfigureAwait(false);
                     return new DetachedExitResult(exitCode, reapError);
                 }
 
@@ -6479,6 +6485,21 @@ while True:
                     1,
                     $"detached exec process group {state.ProcessGroupId} exited without authenticated exit completion\n");
             }
+        }
+    }
+
+    private async Task<string?> EnsureDetachedProcessGroupReapedAfterAuthenticatedExitAsync(string processGroupMarker)
+    {
+        var cleanupTimeout = DetachedAuthenticatedExitCleanupTimeoutOverride ?? DetachedAuthenticatedExitCleanupTimeout;
+        using var reapCts = new CancellationTokenSource(cleanupTimeout);
+        try
+        {
+            return await EnsureDetachedProcessGroupReapedAsync(processGroupMarker, reapCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (reapCts.IsCancellationRequested)
+        {
+            await TryTerminateDetachedProcessGroupAsync(processGroupMarker).ConfigureAwait(false);
+            return $"detached exec process group cleanup timed out after authenticated exit ({cleanupTimeout.TotalSeconds:0.#}s)\n";
         }
     }
 
@@ -6501,6 +6522,23 @@ while True:
             stdout.Output,
             stderr.Output,
             stdout.Error + stderr.Error);
+    }
+
+    private async Task<DetachedOutputSidecars> ReadDetachedOutputSidecarsAfterAuthenticatedExitAsync(string processGroupMarker)
+    {
+        var cleanupTimeout = DetachedAuthenticatedExitCleanupTimeoutOverride ?? DetachedAuthenticatedExitCleanupTimeout;
+        using var readCts = new CancellationTokenSource(cleanupTimeout);
+        try
+        {
+            return await ReadDetachedOutputSidecarsAsync(processGroupMarker, readCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (readCts.IsCancellationRequested)
+        {
+            return new DetachedOutputSidecars(
+                "",
+                "",
+                $"detached exec output sidecar read timed out after authenticated exit ({cleanupTimeout.TotalSeconds:0.#}s)\n");
+        }
     }
 
     private async Task<DetachedOutputSidecar> ReadDetachedOutputSidecarAsync(

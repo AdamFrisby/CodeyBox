@@ -95,7 +95,10 @@ Same-kind siblings are ordered by `CodeyBox:QuotaRouter:IntraKindRoutingPolicy`.
 The default `MostQuotaFirst` probes sibling instances and spends the account
 with the most remaining quota first. `RoundRobin` rotates across usable
 siblings for even wear, and `Sticky` keeps a work item on its existing
-`AgentInstanceId` when that instance is still usable.
+`AgentInstanceId` when that instance is still usable. `DeadlineAwareDrain`
+orders quality-eligible members by quota headroom at risk before the nearest
+known or expected reset; members without a readable quota signal fall back
+behind deadline-aware candidates.
 
 For simple single-credential deployments, omit `InstanceId` and
 `AgentInstances`; the route key remains the bare kind (`claude`, `codex`, …)
@@ -534,6 +537,14 @@ Configured under `CodeyBox:QuotaRouter`:
       "QuotaCacheTtlSeconds": 60,
       "UnknownPolicy": "UseObservedFailures",
       "IntraKindRoutingPolicy": "MostQuotaFirst",
+      "DrainAggressiveness": 1.0,
+      "ExpectedResets": {
+        "codex": {
+          "Timestamps": ["2030-01-01T00:20:00Z"],
+          "CadenceSeconds": 604800,
+          "CadenceAnchor": "2030-01-01T00:20:00Z"
+        }
+      },
       "ObservedFailureWindowMinutes": 10,
       "ObservedFailureRetentionMinutes": 30,
       "ProbeMaxRetries": 2,
@@ -555,7 +566,9 @@ Configured under `CodeyBox:QuotaRouter`:
 | `QuotaRecheckIntervalSeconds` | `300` | Seconds to wait before re-probing when all Subscription members are exhausted. |
 | `QuotaCacheTtlSeconds` | `60` | Seconds to cache a probe result. Keeps the pickup loop cheap under load. |
 | `UnknownPolicy` | `UseObservedFailures` | How to handle unknown probe responses: recent quota failures block, otherwise allow. `FailCautious` blocks all unknowns; `FailOpen` is opt-in legacy behavior. |
-| `IntraKindRoutingPolicy` | `MostQuotaFirst` | How to order usable same-kind subscription instances: `MostQuotaFirst`, `RoundRobin`, or `Sticky`. Hot-reloadable. |
+| `IntraKindRoutingPolicy` | `MostQuotaFirst` | How to order quality-eligible members: `MostQuotaFirst`, `RoundRobin`, `Sticky`, or `DeadlineAwareDrain`. Hot-reloadable. |
+| `DrainAggressiveness` | `1.0` | Multiplier used by `DeadlineAwareDrain` to run ahead of even per-cycle pacing. Higher values bias toward burning the full rate-window allowance before the deadline. |
+| `ExpectedResets` | `{}` | Optional per-agent expected free/manual reset declarations. The policy uses the sooner of live probe reset and next expected reset. |
 | `ObservedFailureWindowMinutes` | `10` | Minutes a quota-shaped stderr failure blocks the same agent/model. |
 | `ObservedFailureRetentionMinutes` | `30` | Minutes observed failures are retained in `state.db`. |
 | `ProbeMaxRetries` | `2` | Additional retries on a transient probe failure (network error / timeout / 5xx) before recording the failure. Hot-reloadable; currently honoured by the Claude probe. |

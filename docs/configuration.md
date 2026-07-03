@@ -402,6 +402,14 @@ Tuning knobs for the quota probe and deferred-requeue logic.
   "QuotaCacheTtlSeconds": 60,
   "UnknownPolicy": "UseObservedFailures",
   "IntraKindRoutingPolicy": "MostQuotaFirst",
+  "DrainAggressiveness": 1.0,
+  "ExpectedResets": {
+    "codex": {
+      "Timestamps": ["2030-01-01T00:20:00Z"],
+      "CadenceSeconds": 604800,
+      "CadenceAnchor": "2030-01-01T00:20:00Z"
+    }
+  },
   "ObservedFailureWindowMinutes": 10,
   "ObservedFailureRetentionMinutes": 30,
   "ProbeMaxRetries": 2,
@@ -421,7 +429,9 @@ Tuning knobs for the quota probe and deferred-requeue logic.
 | `QuotaRecheckIntervalSeconds` | `300` | Seconds to wait before re-probing when all Subscription members are exhausted. |
 | `QuotaCacheTtlSeconds` | `60` | Seconds to cache a quota probe result (per probe instance). |
 | `UnknownPolicy` | `UseObservedFailures` | How to treat unknown probe snapshots: `UseObservedFailures`, `FailCautious`, or opt-in `FailOpen`. |
-| `IntraKindRoutingPolicy` | `MostQuotaFirst` | Same-kind instance ordering policy: `MostQuotaFirst` maximizes runway, `RoundRobin` spreads wear evenly, and `Sticky` keeps a work item on its existing instance when usable. Hot-reloadable. |
+| `IntraKindRoutingPolicy` | `MostQuotaFirst` | Routing policy for eligible class members: `MostQuotaFirst` maximizes runway within same-kind ties, `RoundRobin` spreads wear, `Sticky` keeps a work item on its existing instance, and `DeadlineAwareDrain` orders quality-eligible members by quota headroom at risk before the nearest known or expected reset. Hot-reloadable. |
+| `DrainAggressiveness` | `1.0` | Multiplier used only by `DeadlineAwareDrain`. Values above `1.0` run ahead of the even per-rate-window pace; invalid or non-positive values are treated as `1.0`. Hot-reloadable. |
+| `ExpectedResets` | `{}` | Optional per-agent expected reset declarations, keyed by agent kind. Each entry may set explicit `Timestamps` and/or a recurring `CadenceSeconds` with `CadenceAnchor`; the policy paces to the sooner of the live probe reset and the next expected reset. Hot-reloadable. |
 | `ObservedFailureWindowMinutes` | `10` | Minutes a recent quota-shaped failure blocks the same agent/model across all projects. |
 | `ObservedFailureRetentionMinutes` | `30` | Minutes observed quota failures remain in `state.db`. |
 | `ProbeMaxRetries` | `2` | Additional retries on a transient probe failure (network error / timeout / 5xx) before recording the failure. Hot-reloadable; currently honoured by the Claude probe. |

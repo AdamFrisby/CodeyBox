@@ -2253,6 +2253,63 @@ public sealed class AgentConfigHotReloadTests
     }
 
     [Fact]
+    public async Task Coordinator_OnChange_QuotaRouterDrainDeadlineInputsPropagate()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            QuotaRouter = new QuotaRouterConfig
+            {
+                MinQuotaPct = 10.0,
+                DrainAggressiveness = 1.0,
+            },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var qro = QuotaRouterConfigMapper.ToOptions(initial.QuotaRouter);
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            qro,
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            quotaRouterOptions: qro);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        var reset = new DateTimeOffset(2026, 6, 1, 0, 20, 0, TimeSpan.Zero);
+        monitor.Fire(new CodeyBoxOptions
+        {
+            QuotaRouter = new QuotaRouterConfig
+            {
+                MinQuotaPct = 10.0,
+                DrainAggressiveness = 2.5,
+                ExpectedResets = new(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["codex"] = new QuotaRouterExpectedResetConfig
+                    {
+                        Timestamps = [reset],
+                        CadenceSeconds = 3600,
+                        CadenceAnchor = reset,
+                    },
+                },
+            },
+        });
+
+        Assert.Equal(2.5, qro.DrainAggressiveness);
+        Assert.True(qro.ExpectedResets.TryGetValue("codex", out var codex));
+        Assert.Equal([reset], codex.Timestamps);
+        Assert.Equal(TimeSpan.FromHours(1), codex.Cadence);
+        Assert.Equal(reset, codex.CadenceAnchor);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task Coordinator_OnChange_QuotaRouterIntraKindRoutingPolicyPropagates()
     {
         var initial = new CodeyBoxOptions
@@ -2306,6 +2363,16 @@ public sealed class AgentConfigHotReloadTests
             },
         });
         Assert.Equal(IntraKindRoutingPolicy.Sticky, qro.IntraKindRoutingPolicy);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            QuotaRouter = new QuotaRouterConfig
+            {
+                MinQuotaPct = 10.0,
+                IntraKindRoutingPolicy = IntraKindRoutingPolicy.DeadlineAwareDrain,
+            },
+        });
+        Assert.Equal(IntraKindRoutingPolicy.DeadlineAwareDrain, qro.IntraKindRoutingPolicy);
 
         await coordinator.StopAsync(CancellationToken.None);
     }
