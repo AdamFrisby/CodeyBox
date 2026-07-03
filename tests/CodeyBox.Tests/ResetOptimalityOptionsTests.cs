@@ -24,6 +24,8 @@ public sealed class ResetOptimalityOptionsTests
         Assert.Equal(TimeSpan.FromDays(7), opts.CadencePeriod);
         Assert.Equal(1.0, opts.DustThresholdPct);
         Assert.Equal(TimeSpan.FromHours(6), opts.TimeTolerance);
+        Assert.Equal(TimeSpan.FromHours(6), opts.AnchorRefineTolerance);
+        Assert.Equal("weekly", opts.ResetTargetWindow);
         Assert.True(opts.RefineAnchorFromLogger);
     }
 
@@ -37,6 +39,8 @@ public sealed class ResetOptimalityOptionsTests
             ["Root:CadencePeriodDays"] = "7",
             ["Root:DustThresholdPct"] = "2.5",
             ["Root:TimeToleranceHours"] = "12",
+            ["Root:AnchorRefineToleranceHours"] = "3",
+            ["Root:ResetTargetWindow"] = "seven_day",
             ["Root:RefineAnchorFromLogger"] = "false",
         }));
 
@@ -45,6 +49,8 @@ public sealed class ResetOptimalityOptionsTests
         Assert.Equal(TimeSpan.FromDays(7), opts.CadencePeriod);
         Assert.Equal(2.5, opts.DustThresholdPct);
         Assert.Equal(TimeSpan.FromHours(12), opts.TimeTolerance);
+        Assert.Equal(TimeSpan.FromHours(3), opts.AnchorRefineTolerance);
+        Assert.Equal("seven_day", opts.ResetTargetWindow);
         Assert.False(opts.RefineAnchorFromLogger);
     }
 

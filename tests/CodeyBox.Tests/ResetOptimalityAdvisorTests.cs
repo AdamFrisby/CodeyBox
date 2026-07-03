@@ -148,12 +148,41 @@ public sealed class ResetOptimalityAdvisorTests : IDisposable
         probe.ResetCreditsAvailable = 1;   // and a credit is granted here
         await plugin.SampleOnceAsync(CancellationToken.None); // t+10h: reset detected
 
+        // Time passes and the fresh weekly window is spent back down. At advice
+        // time the reset-target (weekly) window is exhausted, so burn-first is
+        // satisfied and the decision reaches the re-anchor branch. (A still-fresh
+        // weekly window would correctly be burn-first territory instead.)
+        clock.Advance(TimeSpan.FromHours(1));
+        probe.WeeklyPct = 0;
+        await plugin.SampleOnceAsync(CancellationToken.None); // t+11h: weekly spent again
+
         var advice = await plugin.AdviseAsync(new ResetAdviceRequest());
 
-        // Refined anchor = T0 + 10h; next reset strictly after now (T0+10h) is
+        // Refined anchor = T0 + 10h; next reset strictly after now (T0+11h) is
         // one period later → T0 + 7d + 10h (vs T0 + 7d without refinement).
         Assert.Equal(ResetAdviceReason.NaturalResetArrivesInTime, advice.Reason);
         Assert.Equal(T0 + TimeSpan.FromDays(7) + TimeSpan.FromHours(10), advice.PredictedNaturalReset);
+    }
+
+    [Fact]
+    public async Task Advise_NoLoggedSnapshot_ReportsQuotaReadingUnavailable()
+    {
+        // Nothing sampled into the store → ReadLatestSnapshotAsync must translate
+        // the empty series into an unknown snapshot so the evaluator holds, rather
+        // than fabricating a 0% reading that would silently flip burn-first.
+        var probe = new MutableProbe(AgentKind.Codex);
+        var clock = new FakeClock(T0);
+        await using var plugin = await BuildPluginAsync([probe], clock, new()
+        {
+            ["ResetOptimality:CadenceAnchor"] = "2026-06-01T00:00:00Z",
+            ["ResetOptimality:RefineAnchorFromLogger"] = "false",
+        });
+
+        var advice = await plugin.AdviseAsync(new ResetAdviceRequest());
+
+        Assert.False(advice.ShouldSpend);
+        Assert.Equal(ResetAdviceReason.QuotaReadingUnavailable, advice.Reason);
+        Assert.Null(advice.UsableQuotaPct);
     }
 
     private async Task<StatisticsQuotaPlugin> BuildPluginAsync(

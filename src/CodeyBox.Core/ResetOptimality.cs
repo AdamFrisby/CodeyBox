@@ -63,7 +63,7 @@ public static class ResetOptimalityEvaluator
 
         var nextCreditExpiresAt = credits.NextCreditExpiresAt;
         var nextCreditIsEstimated = credits.NextCreditIsEstimated;
-        double? usableQuotaPct = quota.IsKnown ? quota.AvailablePct : null;
+        double? usableQuotaPct = quota.IsKnown ? ResolveResetTargetQuota(quota, config) : null;
 
         // Base advice carrying the transparency fields common to every branch.
         // Individual branches override ShouldSpend / Reason / Rationale / window.
@@ -152,6 +152,38 @@ public static class ResetOptimalityEvaluator
             predictedNaturalReset: predictedNaturalReset,
             decisionDeadline: decisionDeadline,
             window: new ResetSpendWindow(now, decisionDeadline));
+    }
+
+    /// <summary>
+    /// Reads the usable-quota percentage of the window a banked reset actually
+    /// re-anchors (the weekly window for Codex), NOT the cross-window minimum
+    /// <see cref="AgentQuotaSnapshot.AvailablePct"/> exposes.
+    ///
+    /// <para>Burn-first / re-anchor reasoning is about that one window: applying a
+    /// reset re-anchors it and forfeits whatever it still holds. During a heavy
+    /// burst a short 5h window routinely sits near 0% while the weekly window is
+    /// still substantial; keying on the min would read ~0%, falsely satisfy
+    /// burn-first, and advise spending a credit that wastes the live weekly
+    /// quota — exactly the loss the algorithm exists to prevent.</para>
+    ///
+    /// <para>When the snapshot carries no per-window breakdown, or the configured
+    /// target window is absent from it, this falls back to the aggregated
+    /// <see cref="AgentQuotaSnapshot.AvailablePct"/> — best-effort, since a probe
+    /// without window detail can only offer the overall number.</para>
+    /// </summary>
+    private static double ResolveResetTargetQuota(AgentQuotaSnapshot quota, ResetOptimalityConfig config)
+    {
+        if (!string.IsNullOrWhiteSpace(config.ResetTargetWindow) && quota.Windows.Count > 0)
+        {
+            foreach (var window in quota.Windows)
+            {
+                if (string.Equals(window.Name, config.ResetTargetWindow, StringComparison.OrdinalIgnoreCase)
+                    && window.AvailablePct >= 0)
+                    return window.AvailablePct;
+            }
+        }
+
+        return quota.AvailablePct;
     }
 }
 
@@ -260,6 +292,17 @@ public sealed record ResetOptimalityConfig
 
     /// <summary>Natural-reset period. Codex resets weekly; default 7 days.</summary>
     public TimeSpan CadencePeriod { get; init; } = TimeSpan.FromDays(7);
+
+    /// <summary>
+    /// Name of the cap window a banked reset re-anchors — the window burn-first
+    /// must reason over. For Codex this is the <c>weekly</c> window; a reset
+    /// re-anchors it, so the decision hinges on its remaining quota, not the
+    /// cross-window minimum <see cref="AgentQuotaSnapshot.AvailablePct"/> reports.
+    /// When null/empty, or when the snapshot has no matching window, the evaluator
+    /// falls back to the aggregated <see cref="AgentQuotaSnapshot.AvailablePct"/>.
+    /// Matched case-insensitively against <see cref="WindowQuota.Name"/>.
+    /// </summary>
+    public string? ResetTargetWindow { get; init; } = "weekly";
 
     /// <summary>
     /// Usable-quota percentage at or below which the current window counts as

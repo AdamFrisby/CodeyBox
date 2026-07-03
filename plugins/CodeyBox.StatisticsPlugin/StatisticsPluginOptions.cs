@@ -245,11 +245,29 @@ public sealed record ResetOptimalityConfigOptions
     /// <summary>Natural-reset period. Codex resets weekly; default 7 days.</summary>
     public TimeSpan CadencePeriod { get; init; } = TimeSpan.FromDays(7);
 
+    /// <summary>
+    /// Name of the cap window a banked reset re-anchors (the window burn-first
+    /// reasons over). For Codex the <c>weekly</c> window. Null/empty falls the
+    /// evaluator back to the aggregated availability. See
+    /// <see cref="ResetOptimalityConfig.ResetTargetWindow"/>.
+    /// </summary>
+    public string? ResetTargetWindow { get; init; } = "weekly";
+
     /// <summary>Usable-quota % at/below which the window counts as spent (burn-first satisfied). Default 1%.</summary>
     public double DustThresholdPct { get; init; } = 1.0;
 
     /// <summary>Slack around the deadline-vs-natural-reset comparison. Default 6 hours.</summary>
     public TimeSpan TimeTolerance { get; init; } = TimeSpan.FromHours(6);
+
+    /// <summary>
+    /// Phase-drift below which cadence-anchor self-calibration treats an observed
+    /// reset as noise and keeps the configured anchor (passed to
+    /// <see cref="NaturalResetCadence.RefineAnchor"/>). Semantically distinct from
+    /// <see cref="TimeTolerance"/> — one governs "is the natural reset close enough
+    /// to the deadline to wait for", this one governs "how far must the learned
+    /// phase drift before we re-anchor". Default 6 hours.
+    /// </summary>
+    public TimeSpan AnchorRefineTolerance { get; init; } = TimeSpan.FromHours(6);
 
     /// <summary>
     /// When true (default) the configured <see cref="CadenceAnchor"/> is
@@ -271,8 +289,10 @@ public sealed record ResetOptimalityConfigOptions
             PlanEndsAt = ReadDateTimeOffset(section, "PlanEndsAt", defaults.PlanEndsAt),
             CadenceAnchor = ReadDateTimeOffset(section, "CadenceAnchor", defaults.CadenceAnchor),
             CadencePeriod = ReadSpanDays(section, "CadencePeriodDays", defaults.CadencePeriod, TimeSpan.FromHours(1)),
+            ResetTargetWindow = ReadString(section, "ResetTargetWindow", defaults.ResetTargetWindow),
             DustThresholdPct = ReadPercent(section, "DustThresholdPct", defaults.DustThresholdPct),
             TimeTolerance = ReadSpanHours(section, "TimeToleranceHours", defaults.TimeTolerance, TimeSpan.Zero),
+            AnchorRefineTolerance = ReadSpanHours(section, "AnchorRefineToleranceHours", defaults.AnchorRefineTolerance, TimeSpan.Zero),
             RefineAnchorFromLogger = ReadBool(section, "RefineAnchorFromLogger", defaults.RefineAnchorFromLogger),
         };
     }
@@ -297,6 +317,12 @@ public sealed record ResetOptimalityConfigOptions
         var raw = section[key];
         if (string.IsNullOrWhiteSpace(raw)) return fallback;
         return bool.TryParse(raw, out var parsed) ? parsed : fallback;
+    }
+
+    private static string? ReadString(IConfigurationSection section, string key, string? fallback)
+    {
+        var raw = section[key];
+        return string.IsNullOrWhiteSpace(raw) ? fallback : raw.Trim();
     }
 
     private static DateTimeOffset? ReadDateTimeOffset(IConfigurationSection section, string key, DateTimeOffset? fallback)

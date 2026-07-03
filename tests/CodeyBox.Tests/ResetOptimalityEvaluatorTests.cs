@@ -37,6 +37,22 @@ public sealed class ResetOptimalityEvaluatorTests
     private static AgentQuotaSnapshot Quota(double availablePct)
         => new() { AvailablePct = availablePct };
 
+    /// <summary>
+    /// A multi-window snapshot mirroring Codex's two cap windows. <see cref="AgentQuotaSnapshot.AvailablePct"/>
+    /// is the cross-window MIN (as the probe aggregates it), while the per-window
+    /// readings are exposed in <see cref="AgentQuotaSnapshot.Windows"/>.
+    /// </summary>
+    private static AgentQuotaSnapshot MultiWindowQuota(double weeklyPct, double fiveHourPct)
+        => new()
+        {
+            AvailablePct = Math.Min(weeklyPct, fiveHourPct),
+            Windows = new[]
+            {
+                new WindowQuota { Name = "5h-rolling", AvailablePct = fiveHourPct },
+                new WindowQuota { Name = "weekly", AvailablePct = weeklyPct },
+            },
+        };
+
     private static AgentQuotaSnapshot UnknownQuota()
         => AgentQuotaSnapshot.UnknownSnapshot(QuotaUnknownReason.Transient);
 
@@ -96,6 +112,61 @@ public sealed class ResetOptimalityEvaluatorTests
 
         Assert.NotEqual(ResetAdviceReason.BurnFirst, advice.Reason);
         Assert.Equal(ResetAdviceReason.NaturalResetArrivesInTime, advice.Reason);
+    }
+
+    [Fact]
+    public void BurnFirst_ReadsResetTargetWindow_NotCrossWindowMin()
+    {
+        // During a burst the 5h window sits at 0% while the weekly window — the
+        // one a banked reset re-anchors — still holds 40%. AvailablePct is the
+        // cross-window MIN (0%), which would falsely satisfy burn-first and advise
+        // spending a credit that forfeits the live weekly quota. The evaluator must
+        // key on the weekly window and HOLD.
+        var advice = ResetOptimalityEvaluator.Evaluate(
+            "codex",
+            MultiWindowQuota(weeklyPct: 40.0, fiveHourPct: 0.0),
+            Credit(Now + TimeSpan.FromDays(1)),
+            Config(),
+            Now);
+
+        Assert.False(advice.ShouldSpend);
+        Assert.Equal(ResetAdviceReason.BurnFirst, advice.Reason);
+        Assert.Equal(40.0, advice.UsableQuotaPct);
+    }
+
+    [Fact]
+    public void BurnFirst_ResetTargetWindowExhausted_ProceedsEvenWhenAnotherWindowIsFull()
+    {
+        // Mirror image: the weekly (reset-target) window is spent (0%) while the
+        // 5h window is fresh (90%). The reset re-anchors the weekly window, so
+        // burn-first is satisfied on the weekly reading despite the full 5h window.
+        var advice = ResetOptimalityEvaluator.Evaluate(
+            "codex",
+            MultiWindowQuota(weeklyPct: 0.0, fiveHourPct: 90.0),
+            Credit(Now + TimeSpan.FromDays(20)),
+            Config(),
+            Now);
+
+        Assert.NotEqual(ResetAdviceReason.BurnFirst, advice.Reason);
+        Assert.Equal(0.0, advice.UsableQuotaPct);
+    }
+
+    [Fact]
+    public void ResetTargetWindowAbsent_FallsBackToAggregatePct()
+    {
+        // Snapshot carries windows but none named "weekly" → the evaluator falls
+        // back to the aggregated AvailablePct (0%), satisfying burn-first.
+        var quota = new AgentQuotaSnapshot
+        {
+            AvailablePct = 0.0,
+            Windows = new[] { new WindowQuota { Name = "5h-rolling", AvailablePct = 0.0 } },
+        };
+
+        var advice = ResetOptimalityEvaluator.Evaluate(
+            "codex", quota, Credit(Now + TimeSpan.FromDays(20)), Config(), Now);
+
+        Assert.NotEqual(ResetAdviceReason.BurnFirst, advice.Reason);
+        Assert.Equal(0.0, advice.UsableQuotaPct);
     }
 
     // ---- RE-ANCHOR: natural reset would be destroyed ----------------------
