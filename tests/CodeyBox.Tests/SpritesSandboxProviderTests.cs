@@ -138,6 +138,28 @@ public sealed class SpritesSandboxProviderTests
     }
 
     [Fact]
+    public async Task ExecAsync_WebSocketClosesBeforeExit_YieldsExecutionUnavailable()
+    {
+        // The exec WebSocket delivers session_info + stdout then closes without ever sending an
+        // "exit" JSON message or a stream-ID 3 exit frame. ReadExecUntilExitAsync leaves exitCode
+        // null, so the result must report ExecutionUnavailable with the 255 stand-in exit code — the
+        // signal the orchestrator's retry/availability logic uses to tell "never got an exit" apart
+        // from "process exited non-zero".
+        var socket = new FakeSpritesWebSocket();
+        socket.EnqueueText("""{"type":"session_info","session_id":9,"command":"bash","created":0,"cols":0,"rows":0,"is_owner":true,"tty":false}""");
+        socket.EnqueueBinary([1, (byte)'o', (byte)'u', (byte)'t']);
+        // No exit message/frame enqueued: the queue drains straight to Close.
+
+        var sandbox = NewSandbox(socket, new SandboxSpec { ImageReference = "ignored" });
+
+        var result = await sandbox.ExecAsync(new SandboxExec { Argv = ["bash", "-lc", "true"] });
+
+        Assert.True(result.ExecutionUnavailable);
+        Assert.Equal(255, result.ExitCode);
+        Assert.Equal("out", result.Stdout);
+    }
+
+    [Fact]
     public async Task CreateAsync_AllowsCredentialTmpfsPlaceholderWithoutPersistingDirectory()
     {
         var handler = SuccessfulLifecycleHandler();

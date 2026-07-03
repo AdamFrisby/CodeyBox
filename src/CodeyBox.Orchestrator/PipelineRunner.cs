@@ -16704,7 +16704,7 @@ Original merge-phase failure (JSON string, for context only):
         }
     }
 
-    private sealed class ActivityTrackingSandbox : ISandbox
+    private sealed class ActivityTrackingSandbox : ISandbox, ISandboxDecorator
     {
         private readonly ISandbox _inner;
         private readonly Action _touch;
@@ -16714,6 +16714,8 @@ Original merge-phase failure (JSON string, for context only):
             _inner = inner;
             _touch = touch;
         }
+
+        public ISandbox InnerSandbox => _inner;
 
         public string Id => _inner.Id;
 

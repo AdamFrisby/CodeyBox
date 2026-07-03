@@ -80,7 +80,7 @@ public sealed class SupervisedTurnDispatcher
 /// hand a sandbox to a session-capable runner without losing ownership of
 /// the lifecycle.
 /// </summary>
-internal sealed class NonDisposingSandbox : ISandbox
+internal sealed class NonDisposingSandbox : ISandbox, ISandboxDecorator
 {
     private readonly ISandbox _inner;
 
@@ -88,6 +88,8 @@ internal sealed class NonDisposingSandbox : ISandbox
     {
         _inner = inner ?? throw new ArgumentNullException(nameof(inner));
     }
+
+    public ISandbox InnerSandbox => _inner;
 
     public string Id => _inner.Id;
     public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
