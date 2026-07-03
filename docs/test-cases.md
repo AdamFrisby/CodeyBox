@@ -69,6 +69,40 @@ reading replay artifacts:
 `CodeyBox:MaxBulkItems` defaults to `1000` and is capped at `10_000` by the
 options validator (see `CodeyBoxOptions.MaximumMaxBulkItems`).
 
+## Emission from an approved plan
+
+When the optional planning phase is on (the `plan` knob — see
+[the planning docs](../AGENTS.md)) and a plan is **approved**, CodeyBox turns
+the plan's declared test intentions into real, queryable test cases so the
+downstream coverage / execution gates consume structured cases instead of
+prose. The plan artifact's `testStrategy` array is the source: each entry is
+one scenario the plan commits to, and each becomes one `TestCase` linked to the
+work item via `SourceWorkItemId`.
+
+`PlanTestCaseReconciler` (in `CodeyBox.Core`) drives this at the plan-approval
+transition inside `PipelineRunner`:
+
+- **`AutomationKind`** is inferred from lexical markers in each scenario
+  (`PlanTestCaseSynthesizer.ClassifyAutomationKind`): `e2e` / `end-to-end` /
+  `replay` / a browser-driver name → `E2eReplay`; `integration` → `Integration`;
+  `unit` → `Unit`; anything else → `Manual`. When more than one marker is
+  present the broader scope wins (`e2e` > `integration` > `unit`).
+- **e2e cases are emitted without a committed replay** — `AutomationKind =
+  E2eReplay` with `ExecutableArtifactJson = null`. The separate replay-authoring
+  orchestration fills the artifact in later; reconcile preserves it.
+- **Idempotent / reconciling.** The case id is deterministic in
+  `(workItemId, ordinal)`, so plan-rework updates changed scenarios in place,
+  appends new ones, and prunes the tail a shorter plan dropped — it never
+  duplicates. A re-approval of an unchanged plan is a no-op. Reconcile only
+  touches the plan-derived ids; manually-authored cases (random ids) and any
+  committed replay / conformance / `LastRun*` history an authoring or execution
+  item filled in are left untouched.
+- **Gated.** Only planned items (the `plan` knob on) ever reach this path, so
+  unplanned items are unaffected. Set `CodeyBox:EmitPlanTestCases=false` to keep
+  the planning phase without materialising test cases (captured at startup;
+  edits require a restart). Emission is best-effort: a store or parse failure is
+  logged and swallowed rather than stranding an already-approved plan.
+
 ## JobTrack mapping
 
 JobTrack (the test-management app this artifact will export to) carries a

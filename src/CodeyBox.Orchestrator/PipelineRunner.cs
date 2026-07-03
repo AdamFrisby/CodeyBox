@@ -167,6 +167,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private readonly AgentPromptPreprocessorChain _promptPreprocessors;
     private readonly IKnobRegistry? _knobRegistry;
     private readonly IPlanReviewGate _planReviewGate;
+    // Optional store for plan-derived test cases. Null in minimal compositions /
+    // tests that don't exercise the emit path; when null, plan approval simply
+    // skips test-case emission (the plan itself is still approved).
+    private readonly ITestCaseStore? _testCaseStore;
     private readonly string _disabledHostHooksPath;
     // Resumable Claude session worker. Null when not registered in DI (the
     // default for tests / minimal compositions). Composed with the global
@@ -301,7 +305,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // the registry-built path below.
         IAgentAuthRequiredHandler? authRequiredHandler = null,
         IAgentAuthRequiredAvailabilityReader? authRequiredReader = null,
-        IPlanReviewGate? planReviewGate = null)
+        IPlanReviewGate? planReviewGate = null,
+        // Optional store for plan-derived test cases. Null disables emission
+        // entirely (plans still approve). Only planned items reach the emit path,
+        // so unplanned items are never touched regardless of wiring.
+        ITestCaseStore? testCaseStore = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -378,6 +386,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _promptPreprocessors = promptPreprocessors ?? AgentPromptPreprocessorChain.Empty;
         _knobRegistry = knobRegistry;
         _planReviewGate = planReviewGate ?? new AlwaysPassPlanReviewGate();
+        _testCaseStore = testCaseStore;
         _availability = availability;
         // Prefer the DI-injected handler when supplied: keeps the registry
         // plumbing in one place (the composition root) rather than duplicated
@@ -1217,7 +1226,48 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 $"Plan review approval raced with state {latest.State}; refusing to approve an ambiguous plan.");
         }
 
+        await EmitPlanTestCasesAsync(reviewed, ct);
+
         return await _store.GetAsync(item.Id, ct) ?? reviewed;
+    }
+
+    /// <summary>
+    /// Materialises the approved plan's declared test scenarios into linked
+    /// <see cref="TestCase"/> artifacts (idempotently reconciling across
+    /// plan-rework). Best-effort: emission is a downstream convenience artifact,
+    /// so a store or parse failure is logged and swallowed rather than stranding
+    /// an already-approved plan.
+    /// </summary>
+    private async Task EmitPlanTestCasesAsync(WorkItem approved, CancellationToken ct)
+    {
+        if (_testCaseStore is null
+            || !_opts.EmitPlanTestCases
+            || string.IsNullOrWhiteSpace(approved.PlanArtifact))
+            return;
+
+        try
+        {
+            var reconciler = new PlanTestCaseReconciler(_testCaseStore);
+            var result = await reconciler.ReconcileAsync(
+                approved.Id,
+                approved.PlanArtifact!,
+                DateTimeOffset.UtcNow,
+                ct);
+            if (result.Total > 0)
+                _log.LogInformation(
+                    "Plan test-case reconcile for work item {WorkItemId}: {Created} created, {Updated} updated, {Removed} removed.",
+                    approved.Id,
+                    result.Created,
+                    result.Updated,
+                    result.Removed);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(
+                ex,
+                "Plan test-case emission failed for work item {WorkItemId}; continuing without emitted test cases.",
+                approved.Id);
+        }
     }
 
     private async Task<WorkItem> TryTransitionPlanningStateAsync(
@@ -16641,6 +16691,16 @@ public sealed record PipelineOptions
     /// Must be ≥ 1 (or 0 to disable) when non-negative.
     /// </summary>
     public int StuckThresholdMinutes { get; init; } = 10;
+
+    /// <summary>
+    /// When true (default), approving a plan emits/reconciles a
+    /// <see cref="CodeyBox.Core.TestCase"/> for each declared test scenario,
+    /// linked to the work item. Only planned items (the <c>plan</c> knob on)
+    /// ever reach the emit path, so unplanned items are unaffected regardless of
+    /// this flag; set it false to keep planning on without materialising test
+    /// cases. No effect unless an <see cref="Core.ITestCaseStore"/> is wired.
+    /// </summary>
+    public bool EmitPlanTestCases { get; init; } = true;
 
     internal TimeProvider TimeProvider { get; init; } = TimeProvider.System;
 
