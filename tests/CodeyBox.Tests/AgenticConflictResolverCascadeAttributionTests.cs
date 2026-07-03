@@ -150,6 +150,11 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
             new AvailabilityOptions(), TimeProvider.System,
             NullLogger<AgentAvailabilityRegistry>.Instance);
         var webhooks = new CapturingWebhookDispatcher();
+        // A corroborating in-VM smoke gate: the forced probe confirms the
+        // stdout-only auth evidence, so the fleet-wide bench is authorised.
+        // Without corroboration the bench fails CLOSED (covered separately).
+        var smokeGate = new AuthCorroboratingInVmSmokeGate();
+        smokeGate.AttachAuthRegistry(availability, webhooks);
         using var fix = BuildFixture(
             seed,
             [claudeAgent, codexAgent],
@@ -162,7 +167,8 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
                     {
                         MaxIterations = 2,
                         MaxAttemptsPerAgent = 1,
-                    })));
+                    })),
+            inVmSmokeGate: smokeGate);
 
         var item = NewItem(AgentKind.Claude) with { State = WorkItemState.WorkComplete };
         var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
@@ -181,12 +187,18 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
         var availabilityVerdict = availability.GetAvailability(AgentKind.Claude);
         Assert.False(availabilityVerdict.Available);
         Assert.Contains("auth required from agent output", availabilityVerdict.Reason);
+        // Phase attribution rides the availability reason (the pipeline's
+        // PublishSideEffectsAsync overwrites the auth-required reason with the
+        // phase-scoped detail after corroboration).
+        Assert.Contains("rebase-resolver", availabilityVerdict.Reason);
         Assert.True(availability.GetAvailability(AgentKind.Codex).Available);
 
+        // The corroborating in-VM probe publishes the smoke_failed webhook for
+        // the benched primary; its later pipeline-side republish is deduped
+        // because the agent is already excluded.
         var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
         var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
         Assert.Equal("claude", details.AgentKind);
-        Assert.Contains("rebase-resolver", details.Reason);
     }
 
     [Fact]
@@ -211,6 +223,12 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
             new AvailabilityOptions(), TimeProvider.System,
             NullLogger<AgentAvailabilityRegistry>.Instance);
         var webhooks = new CapturingWebhookDispatcher();
+        // Corroborating gate authorises the fleet-wide bench for each candidate
+        // (the forced probe confirms every candidate's stdout-only auth
+        // evidence). This keeps the publish-per-candidate coverage intact under
+        // the fail-closed-unless-corroborated policy.
+        var smokeGate = new AuthCorroboratingInVmSmokeGate();
+        smokeGate.AttachAuthRegistry(availability, webhooks);
         using var fix = BuildFixture(
             seed,
             [claudeAgent, codexAgent],
@@ -223,7 +241,8 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
                     {
                         MaxIterations = 4,
                         MaxAttemptsPerAgent = 1,
-                    })));
+                    })),
+            inVmSmokeGate: smokeGate);
 
         var item = NewItem(AgentKind.Claude) with { State = WorkItemState.WorkComplete };
         var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
@@ -274,6 +293,10 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
             TimeProvider.System,
             NullLogger<AgentAvailabilityRegistry>.Instance);
         var webhooks = new CapturingWebhookDispatcher();
+        // Corroborating gate authorises the fleet-wide bench for the sole
+        // candidate's stdout-only auth evidence.
+        var smokeGate = new AuthCorroboratingInVmSmokeGate();
+        smokeGate.AttachAuthRegistry(availability, webhooks);
         using var fix = BuildFixture(
             seed,
             [claudeAgent],
@@ -282,7 +305,8 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
             availability,
             new AgenticConflictResolver(
                 new AgenticConflictResolverOptionsSnapshot(
-                    new AgenticConflictResolverOptions { MaxIterations = 3 })));
+                    new AgenticConflictResolverOptions { MaxIterations = 3 })),
+            inVmSmokeGate: smokeGate);
 
         var item = NewItem(AgentKind.Claude) with { State = WorkItemState.WorkComplete };
         var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
@@ -311,7 +335,8 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
         IAuditReportStore auditReportStore,
         IWebhookDispatcher? webhooks = null,
         AgentAvailabilityRegistry? availability = null,
-        AgenticConflictResolver? agenticConflictResolver = null)
+        AgenticConflictResolver? agenticConflictResolver = null,
+        IInVmSmokeGate? inVmSmokeGate = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -385,6 +410,7 @@ public sealed class AgenticConflictResolverCascadeAttributionTests : IDisposable
             availability: availability,
             authAvailability: authAvailability,
             agenticConflictResolver: agenticConflictResolver,
+            inVmSmokeGate: inVmSmokeGate,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions);

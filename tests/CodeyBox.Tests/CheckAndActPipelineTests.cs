@@ -416,8 +416,12 @@ public sealed class CheckAndActPipelineTests : IDisposable
     }
 
     [Fact]
-    public async Task AuthPromptDuringCheck_FailsItemBenchesAgentAndAlerts()
+    public async Task AuthPromptDuringCheck_FailsItemWithoutFleetBench()
     {
+        // A stdout-only auth prompt during the check phase, with in-VM smoke
+        // unavailable (no gate wired), fails the item (AuthRequired) but must
+        // NOT globally bench the agent: the irreversible fleet-wide bench fails
+        // CLOSED on uncorroborated, model-controllable stdout evidence.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var registry = NewAvailabilityRegistry();
         var webhooks = new CapturingWebhookDispatcher();
@@ -455,11 +459,9 @@ public sealed class CheckAndActPipelineTests : IDisposable
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("check", final.LastError);
-        Assert.Contains("forced in-VM smoke corroboration unavailable", final.LastError);
-        Assert.False(registry.GetAvailability(AgentKind.Claude).Available);
-        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("claude", details.AgentKind);
+        Assert.Contains("item-level failure only, no fleet-wide bench", final.LastError);
+        Assert.True(registry.GetAvailability(AgentKind.Claude).Available);
+        Assert.DoesNotContain(webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
@@ -1093,8 +1095,11 @@ public sealed class CheckAndActPipelineTests : IDisposable
     }
 
     [Fact]
-    public async Task AuthPromptDuringPostActRecheck_FailsItemBenchesAgentAndAlerts()
+    public async Task AuthPromptDuringPostActRecheck_FailsItemWithoutFleetBench()
     {
+        // Stdout-only auth during the post-act recheck with in-VM smoke
+        // unavailable: item fails (AuthRequired) but the agent is NOT globally
+        // benched — the fleet-wide bench fails CLOSED without corroboration.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var registry = NewAvailabilityRegistry();
         var webhooks = new CapturingWebhookDispatcher();
@@ -1141,11 +1146,9 @@ public sealed class CheckAndActPipelineTests : IDisposable
         Assert.Equal(WorkItemFailureKinds.AuthRequired, finalFollowup.FailureKind);
         Assert.Contains("auth required from agent output", finalFollowup.LastError);
         Assert.Contains("post-act-recheck", finalFollowup.LastError);
-        Assert.Contains("forced in-VM smoke corroboration unavailable", finalFollowup.LastError);
-        Assert.False(registry.GetAvailability(AgentKind.Claude).Available);
-        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("claude", details.AgentKind);
+        Assert.Contains("item-level failure only, no fleet-wide bench", finalFollowup.LastError);
+        Assert.True(registry.GetAvailability(AgentKind.Claude).Available);
+        Assert.DoesNotContain(webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]

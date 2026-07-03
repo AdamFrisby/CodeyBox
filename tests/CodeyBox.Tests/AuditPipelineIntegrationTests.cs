@@ -595,7 +595,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task LlmAuditAgent_Exit0StdoutAuthPromptWithoutResult_FailsBenchesAndAlerts()
+    public async Task LlmAuditAgent_Exit0StdoutAuthPromptWithoutResult_FailsItemWithoutFleetBench()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var transcript = await File.ReadAllTextAsync(
@@ -636,13 +636,14 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("audit:security:llm-review", final.LastError);
-        Assert.Contains("forced in-VM smoke corroboration unavailable", final.LastError);
+        // In-VM smoke unavailable → stdout-only auth evidence not corroborated
+        // → item fails but the agent is NOT globally benched (fail-closed on
+        // the irreversible fleet-wide bench).
+        Assert.Contains("item-level failure only, no fleet-wide bench", final.LastError);
 
         var agentAvailability = availability.GetAvailability(AgentKind.Claude);
-        Assert.False(agentAvailability.Available, agentAvailability.Reason);
-        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("claude", details.AgentKind);
+        Assert.True(agentAvailability.Available, agentAvailability.Reason);
+        Assert.DoesNotContain(webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
@@ -699,7 +700,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task LlmAuditAgent_StdoutAuthPromptWithQuotaDiagnostic_FailsBeforeQuotaParkingAndBenches()
+    public async Task LlmAuditAgent_StdoutAuthPromptWithQuotaDiagnostic_FailsBeforeQuotaParking_WithoutFleetBench()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var agent = new ScriptedAgent([MergeStrategy.RealMerge]);
@@ -742,13 +743,15 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Null(final.QuotaRetryFrom);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("forced in-VM smoke corroboration unavailable", final.LastError);
+        // Auth (stdout) still wins over the quota diagnostic (stderr) so the
+        // item fails AuthRequired rather than quota-parking; but with in-VM
+        // smoke unavailable the stdout-only auth is uncorroborated, so no
+        // fleet-wide bench fires.
+        Assert.Contains("item-level failure only, no fleet-wide bench", final.LastError);
 
         var agentAvailability = availability.GetAvailability(AgentKind.Claude);
-        Assert.False(agentAvailability.Available, agentAvailability.Reason);
-        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("claude", details.AgentKind);
+        Assert.True(agentAvailability.Available, agentAvailability.Reason);
+        Assert.DoesNotContain(webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]

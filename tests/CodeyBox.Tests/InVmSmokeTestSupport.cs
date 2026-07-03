@@ -1,5 +1,7 @@
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
+using CodeyBox.Webhooks;
 
 namespace CodeyBox.Tests;
 
@@ -64,6 +66,95 @@ internal sealed class RecordingInVmSmokeGate : IInVmSmokeGate
 
     public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct) =>
         Task.FromResult<AgentAvailability?>(new AgentAvailability(true, null, null));
+}
+
+/// <summary>
+/// In-VM smoke gate that corroborates a stdout-only auth-required detection:
+/// its forced probe marks the agent auth-required on the attached registry
+/// (mirroring what the real <c>InVmSmokeProber</c> does when it observes an
+/// auth/login prompt in-VM), so the pipeline's corroboration check sees a
+/// positive signal and escalates to the fleet-wide bench. Passing an explicit
+/// non-auth <paramref name="forcedAvailability"/> models the non-corroborating
+/// path (transient / passing probe): the forced probe reports that availability
+/// and does NOT mark auth-required.
+/// </summary>
+internal sealed class AuthCorroboratingInVmSmokeGate : IInVmSmokeGate
+{
+    private readonly AgentAvailability _forcedAvailability;
+    private readonly bool _corroboratesAuth;
+    private IAgentAuthAvailabilityRegistry? _authAvailability;
+    private IWebhookDispatcher? _webhooks;
+
+    public AuthCorroboratingInVmSmokeGate(AgentAvailability? forcedAvailability = null)
+    {
+        _forcedAvailability = forcedAvailability
+            ?? new AgentAvailability(false, "smoke probe failed [persistent]: credential login required", null);
+        _corroboratesAuth = forcedAvailability is null;
+    }
+
+    /// <summary>
+    /// Wires the auth registry + webhook dispatcher the gate publishes through.
+    /// Called post-construction because the gate is usually built before the
+    /// registry/dispatcher exist.
+    /// </summary>
+    public void AttachAuthRegistry(
+        IAgentAuthAvailabilityRegistry authAvailability,
+        IWebhookDispatcher webhooks)
+    {
+        _authAvailability = authAvailability;
+        _webhooks = webhooks;
+    }
+
+    public int ForceProbeCalls { get; private set; }
+    public List<InVmSmokeSandboxTarget> ForceProbeTargets { get; } = [];
+    public bool Enabled => true;
+
+    public Task<AgentAvailability> EnsureAvailableAsync(
+        AgentKind kind,
+        InVmSmokeSandboxTarget target,
+        CancellationToken ct)
+        => Task.FromResult(new AgentAvailability(true, null, null));
+
+    public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+    public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) => Task.CompletedTask;
+
+    public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
+    {
+        ForceProbeCalls++;
+        MarkAuthIfNeeded(kind);
+        return Task.FromResult<AgentAvailability?>(_forcedAvailability);
+    }
+
+    public Task<AgentAvailability?> ForceProbeAsync(
+        AgentKind kind,
+        InVmSmokeSandboxTarget target,
+        CancellationToken ct)
+    {
+        ForceProbeCalls++;
+        ForceProbeTargets.Add(target);
+        MarkAuthIfNeeded(kind);
+        return Task.FromResult<AgentAvailability?>(_forcedAvailability);
+    }
+
+    private void MarkAuthIfNeeded(AgentKind kind)
+    {
+        if (!_corroboratesAuth || _authAvailability is null) return;
+        var reason = _forcedAvailability.Reason ?? "in-VM smoke detected auth/login prompt";
+        var transition = _authAvailability.MarkAuthRequired(kind, reason);
+        if (transition is { PreviouslyExcluded: false, NowExcluded: true } && _webhooks is not null)
+        {
+            _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "agent.smoke_failed",
+                Details = new AgentSmokeFailedDetails
+                {
+                    AgentKind = kind.Value,
+                    Reason = reason,
+                    Category = SmokeFailureCategory.Persistent,
+                },
+            }, CancellationToken.None).GetAwaiter().GetResult();
+        }
+    }
 }
 
 /// <summary>Baseline resolver returning a fixed ref; can be made to throw.</summary>

@@ -420,15 +420,17 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task SuccessfulNoDiffRun_WithCapturedStdoutAuthPrompt_NoInVmGate_ExcludesFailOpen()
+    public async Task SuccessfulNoDiffRun_WithCapturedStdoutAuthPrompt_NoInVmGate_FailsItemWithoutFleetBench()
     {
         // With no in-VM smoke gate wired the corroboration check returns
-        // Unavailable, which the policy currently treats as fail-open (publish
-        // side effects). The fleet bench still fires, but the reason carries
-        // the "corroboration unavailable" qualifier so operators know it was
-        // not corroborated. This is the documented trade-off — stronger
-        // protection requires an in-VM gate that can run --version inside a
-        // fresh sandbox; see PipelineRunner.TryCorroborateStdoutOnlyAuthRequiredAsync.
+        // Unavailable. The fleet-wide "operator action required" bench is an
+        // irreversible action, so it fails CLOSED: Unavailable does NOT
+        // corroborate, so only the item fails (AuthRequired) and the resolver
+        // reroutes to another class member — the agent is NOT globally benched
+        // on model-controllable stdout that could never be corroborated (in-VM
+        // smoke is disabled by the #187 stopgap). Only POSITIVELY corroborated
+        // stdout-only evidence (or a stderr-detected auth failure) benches the
+        // fleet; see PipelineRunner.TryCorroborateStdoutOnlyAuthRequiredAsync.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed);
         var transcript = await File.ReadAllTextAsync(
@@ -447,17 +449,14 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("forced in-VM smoke corroboration unavailable", final.LastError);
+        Assert.Contains("item-level failure only, no fleet-wide bench", final.LastError);
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
 
+        // Not benched: in-VM smoke could not corroborate, so the fleet-wide
+        // bench does not fire and the agent stays available for other items.
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
-        Assert.False(availability.Available);
-        Assert.Contains("auth required from agent output", availability.Reason);
-
-        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("codex", details.AgentKind);
-        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        Assert.True(availability.Available, availability.Reason);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
@@ -683,13 +682,16 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task MergePhaseDirectAgentRun_WithNonzeroAuthLoginPrompt_ExcludesAgent_AndPublishesPersistentAlert()
+    public async Task MergePhaseDirectAgentRun_WithNonzeroStdoutOnlyAuthLoginPrompt_FailsItemWithoutFleetBench()
     {
         // Distinct from the stderr/exit-0 variant above: an exit-1 merge
-        // resolver run whose login prompt is on STDOUT. The merge-resolver
+        // resolver run whose login prompt is on STDOUT only. The merge-resolver
         // auth detector must catch it before downstream quota/transient
-        // classifiers swallow the auth signal. Same conflict setup so the
-        // agentic resolver actually runs the agent.
+        // classifiers swallow the auth signal (so the item fails AuthRequired),
+        // but with in-VM smoke unavailable the stdout-only evidence is
+        // uncorroborated — the fleet-wide bench fails CLOSED, so the agent is
+        // not globally benched. Same conflict setup so the agentic resolver
+        // actually runs the agent.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed);
         var transcript = await File.ReadAllTextAsync(
@@ -720,15 +722,11 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("merge", final.LastError);
 
+        // No fleet-wide bench: in-VM smoke is unavailable, so the stdout-only
+        // resolver auth evidence is uncorroborated and the agent stays routable.
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
-        Assert.False(availability.Available);
-        Assert.Contains("auth required from agent output", availability.Reason);
-
-        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("codex", details.AgentKind);
-        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
-        Assert.Contains("merge", details.Reason);
+        Assert.True(availability.Available, availability.Reason);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
@@ -799,8 +797,12 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task StdoutOnlyAuthFragment_FromNoDiffWorkRun_ExcludesAgent()
+    public async Task StdoutOnlyAuthFragment_FromNoDiffWorkRun_FailsItemWithoutFleetBench()
     {
+        // A stdout-only auth fragment on a no-diff run fails the item
+        // (AuthRequired, distinct from the plain no-changes failure) but with
+        // in-VM smoke unavailable the uncorroborated evidence must NOT globally
+        // bench the agent.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed);
 
@@ -819,15 +821,11 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.DoesNotContain("Agent produced no changes to commit", final.LastError);
+        Assert.Contains("item-level failure only, no fleet-wide bench", final.LastError);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
-        Assert.False(availability.Available);
-        Assert.Contains("auth required from agent output", availability.Reason);
-
-        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("codex", details.AgentKind);
-        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        Assert.True(availability.Available, availability.Reason);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
@@ -952,14 +950,14 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task StdoutOnlyAuthPrompt_FromWorkRun_WithThrowingInVmCorroboration_FailsOpenAndBenches()
+    public async Task StdoutOnlyAuthPrompt_FromWorkRun_WithThrowingInVmCorroboration_FailsItemWithoutFleetBench()
     {
         // Mirrors the audit-side AuditStdoutOnlyAuthPrompt_WithThrowingInVmCorroboration
         // shape: when the forced in-VM smoke probe throws, the corroboration
-        // path catches and returns Unavailable. The policy currently treats
-        // Unavailable as fail-open — global bench fires, but the reason
-        // carries the "corroboration unavailable" qualifier so operators see
-        // that the in-VM signal was indeterminate.
+        // path catches and returns Unavailable. Unavailable fails CLOSED on the
+        // irreversible fleet-wide bench — the item fails (AuthRequired) but the
+        // agent is NOT globally benched, because the in-VM signal was
+        // indeterminate and stdout alone is model-controllable.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var gate = new ThrowingForceProbeInVmSmokeGate();
         using var fix = BuildPipeline(seed, inVmSmokeGate: gate);
@@ -983,22 +981,22 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("forced in-VM smoke corroboration unavailable", final.LastError);
+        Assert.Contains("item-level failure only, no fleet-wide bench", final.LastError);
         Assert.Equal(1, gate.ForceProbeCalls);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
-        Assert.False(availability.Available);
-        Assert.Contains("auth required from agent output", availability.Reason);
-
-        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("codex", details.AgentKind);
-        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+        Assert.True(availability.Available, availability.Reason);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
-    public async Task AuditStdoutOnlyAuthPrompt_WithoutInVmSmoke_FailsBenchesAndAlerts()
+    public async Task AuditStdoutOnlyAuthPrompt_WithoutInVmSmoke_FailsItemWithoutFleetBench()
     {
+        // Audit-side mirror of the work-phase no-gate case: with in-VM smoke
+        // unavailable the stdout-only auth evidence cannot be corroborated, so
+        // the fleet-wide bench fails CLOSED — the item fails (AuthRequired) but
+        // the agent stays available and no persistent operator-action alert
+        // fires on evidence that was never corroborated.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
@@ -1018,19 +1016,15 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("forced in-VM smoke corroboration unavailable", final.LastError);
+        Assert.Contains("item-level failure only, no fleet-wide bench", final.LastError);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
-        Assert.False(availability.Available, availability.Reason);
-        Assert.Contains("auth required from agent output", availability.Reason);
-
-        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("codex", details.AgentKind);
+        Assert.True(availability.Available, availability.Reason);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
-    public async Task AuditRawOutputOnlyAuthPrompt_WithoutInVmSmoke_FailsBenchesAndAlerts()
+    public async Task AuditRawOutputOnlyAuthPrompt_WithoutInVmSmoke_FailsItemWithoutFleetBench()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var transcript = await File.ReadAllTextAsync(
@@ -1051,15 +1045,11 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("forced in-VM smoke corroboration unavailable", final.LastError);
+        Assert.Contains("item-level failure only, no fleet-wide bench", final.LastError);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
-        Assert.False(availability.Available, availability.Reason);
-        Assert.Contains("auth required from agent output", availability.Reason);
-
-        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("codex", details.AgentKind);
+        Assert.True(availability.Available, availability.Reason);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
@@ -1100,8 +1090,12 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task AuditStdoutOnlyAuthPrompt_WithThrowingInVmCorroboration_StillBenchesAndAlerts()
+    public async Task AuditStdoutOnlyAuthPrompt_WithThrowingInVmCorroboration_FailsItemWithoutFleetBench()
     {
+        // Audit-side mirror of the work-phase throwing-probe case: a throwing
+        // forced probe yields Unavailable, which fails CLOSED on the fleet-wide
+        // bench. The item still fails (AuthRequired) but the agent is NOT
+        // globally benched and no operator-action alert fires.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var transcript = await File.ReadAllTextAsync(
             Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
@@ -1122,17 +1116,13 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("forced in-VM smoke corroboration unavailable", final.LastError);
+        Assert.Contains("item-level failure only, no fleet-wide bench", final.LastError);
         Assert.Equal(1, gate.ForceProbeCalls);
         Assert.Single(gate.ForceProbeTargets);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
-        Assert.False(availability.Available, availability.Reason);
-        Assert.Contains("auth required from agent output", availability.Reason);
-
-        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("codex", details.AgentKind);
+        Assert.True(availability.Available, availability.Reason);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]

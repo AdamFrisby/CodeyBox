@@ -749,7 +749,7 @@ public sealed class MergeConflictReworkTests : IDisposable
     }
 
     [Fact]
-    public async Task ConflictRework_AuthPrompt_BenchesAgentAndFailsAsInfrastructure()
+    public async Task ConflictRework_StdoutOnlyAuthPrompt_FailsAsInfrastructure_WithoutFleetBench()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
@@ -791,16 +791,14 @@ public sealed class MergeConflictReworkTests : IDisposable
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("conflict_rework", final.LastError);
-        Assert.False(availability.GetAvailability(AgentKind.Claude).Available);
-
-        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("claude", details.AgentKind);
-        Assert.Contains("conflict_rework", details.Reason);
+        // Stdout-only auth with in-VM smoke unavailable is uncorroborated:
+        // the item fails but the fleet-wide bench fails CLOSED.
+        Assert.True(availability.GetAvailability(AgentKind.Claude).Available);
+        Assert.DoesNotContain(webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
-    public async Task ConflictRework_SessionResumeAuthPrompt_BenchesAgentAndFailsAsInfrastructure()
+    public async Task ConflictRework_SessionResumeStdoutOnlyAuthPrompt_FailsAsInfrastructure_WithoutFleetBench()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main side\n");
@@ -844,12 +842,10 @@ public sealed class MergeConflictReworkTests : IDisposable
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("conflict_rework", final.LastError);
-        Assert.False(availability.GetAvailability(AgentKind.Claude).Available);
-
-        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("claude", details.AgentKind);
-        Assert.Contains("conflict_rework", details.Reason);
+        // Stdout-only auth with in-VM smoke unavailable is uncorroborated:
+        // the item fails but the fleet-wide bench fails CLOSED.
+        Assert.True(availability.GetAvailability(AgentKind.Claude).Available);
+        Assert.DoesNotContain(webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
