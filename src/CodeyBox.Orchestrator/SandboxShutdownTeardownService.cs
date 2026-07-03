@@ -355,7 +355,11 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
         try
         {
             await sandbox.DisposeAsync().AsTask().WaitAsync(timeoutCts.Token);
-            AuditLog.SandboxDisposedOnShutdown(workItemId, sandbox.Id);
+            var metrics = sandbox.ResourceMetrics;
+            AuditLog.SandboxDisposedOnShutdown(
+                workItemId,
+                sandbox.Id,
+                metrics);
         }
         catch (OperationCanceledException)
         {

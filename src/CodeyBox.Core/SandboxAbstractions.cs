@@ -64,6 +64,26 @@ public interface ISandboxProvider
 }
 
 /// <summary>
+/// Optional <see cref="ISandboxProvider"/> capability that reports whether the
+/// provider captures per-VM resource metrics at teardown (the multipass
+/// <c>CaptureResourceMetrics</c> toggle). When true, each work-item timing
+/// phase must be kept on its own VM so a persisted per-phase resource record is
+/// attributable to a single phase; when false (the default), a warm reusable VM
+/// is shared across phases as before, incurring no extra teardown/rebuild churn.
+/// <c>WorkSandboxContext</c> queries this so the phase-keyed VM isolation only
+/// fires when the capture feature is enabled. Providers that never capture
+/// metrics simply do not implement this interface.
+/// </summary>
+public interface IResourceMetricsCapturingProvider
+{
+    /// <summary>
+    /// True when the provider captures per-VM resource usage at teardown. Read
+    /// live so a hot-reload of the capture toggle is observed on the next call.
+    /// </summary>
+    bool CapturesResourceMetrics { get; }
+}
+
+/// <summary>
 /// Snapshot of a sandbox that exists on the host, returned by
 /// <see cref="ISandboxProvider.ListAllManagedAsync"/>.
 /// </summary>
@@ -156,7 +176,35 @@ public interface ISandbox : IAsyncDisposable
 
     Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default) =>
         Task.FromResult<string?>(null);
+
+    /// <summary>
+    /// Resource metrics captured at teardown/disposal, or null if not yet captured or not supported.
+    /// </summary>
+    SandboxResourceMetrics? ResourceMetrics => null;
 }
+
+/// <summary>
+/// Resource metrics captured at sandbox teardown for capacity planning.
+/// </summary>
+public sealed record SandboxResourceMetrics(
+    long? PeakRamBytes,
+    double? AvgCpuPercent,
+    long? NetRxBytes,
+    long? NetTxBytes,
+    double? UptimeSeconds,
+    double? LoadAvg1,
+    double? LoadAvg5,
+    double? LoadAvg15,
+    string? BaselineRef,
+    string? NetworkProfile,
+    string Phase,
+    DateTimeOffset CapturedAt)
+{
+    public long? TotalNetIoBytes => NetRxBytes.HasValue || NetTxBytes.HasValue
+        ? (NetRxBytes ?? 0) + (NetTxBytes ?? 0)
+        : null;
+}
+
 
 /// <summary>
 /// Optional sandbox capability used during graceful host shutdown. A provider

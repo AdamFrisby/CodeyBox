@@ -17,7 +17,7 @@ internal interface ISandboxAdmissionSnapshot
 /// disposed, so worker, audit, merge, smoke, and verifier call sites all share
 /// the same VM budget without each call site knowing about the policy.
 /// </summary>
-public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmissionSnapshot, IActiveSandboxProgressProvider
+public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmissionSnapshot, IActiveSandboxProgressProvider, IResourceMetricsCapturingProvider
 {
     private readonly ISandboxProvider _inner;
     private readonly SandboxAdmissionGate _gate;
@@ -108,6 +108,12 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     public int CurrentAdmittedSandboxes => _gate.CurrentAdmitted;
 
     public int MaxConcurrentSandboxes => _gate.MaxConcurrent;
+
+    // Forward the wrapped provider's resource-metrics capture capability so
+    // WorkSandboxContext (which only ever sees this decorator) can gate its
+    // per-phase VM isolation on the live toggle.
+    public bool CapturesResourceMetrics =>
+        _inner is IResourceMetricsCapturingProvider capturing && capturing.CapturesResourceMetrics;
 
     public string Name => _inner.Name;
     public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
@@ -823,6 +829,7 @@ internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox
     public string Id => _inner.Id;
     public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
     public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
+    public SandboxResourceMetrics? ResourceMetrics => _inner.ResourceMetrics;
 
     public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
         _inner.ExecAsync(exec, ct);

@@ -328,9 +328,30 @@ public static class AuditLog
                 "Agent infrastructure failure for work item {WorkItemId}: agent={Agent} sandbox={Sandbox} phase={Phase} summary={Summary} reason={Reason}",
                 workItemId.ToString(), agent.Value, sandboxName, phase, AuditSingleLine(summary), AuditSingleLine(reason));
 
-    public static void SandboxDisposed(string vmName) =>
+    public static void SandboxDisposed(
+        string vmName,
+        SandboxResourceMetrics? metrics = null) =>
         Audit("sandbox.disposed")
-            .Information("Sandbox {VmName} disposed", vmName);
+            .ForContext("PeakRamBytes", metrics?.PeakRamBytes)
+            .ForContext("AvgCpuPercent", metrics?.AvgCpuPercent)
+            .ForContext("NetRxBytes", metrics?.NetRxBytes)
+            .ForContext("NetTxBytes", metrics?.NetTxBytes)
+            .ForContext("TotalNetIoBytes", metrics?.TotalNetIoBytes)
+            .ForContext("DurationSeconds", metrics?.UptimeSeconds)
+            .ForContext("LoadAvg1", metrics?.LoadAvg1)
+            .ForContext("LoadAvg5", metrics?.LoadAvg5)
+            .ForContext("LoadAvg15", metrics?.LoadAvg15)
+            .ForContext("BaselineRef", metrics?.BaselineRef)
+            .ForContext("NetworkProfile", metrics?.NetworkProfile)
+            .ForContext("Phase", metrics?.Phase)
+            .ForContext("CapturedAt", metrics?.CapturedAt)
+            .Information(
+                "Sandbox {VmName} disposed (peakRAM={PeakRam}MB avgCPU={AvgCpu} netRX={NetRx}MB netTX={NetTx}MB)",
+                vmName,
+                metrics?.PeakRamBytes.HasValue == true ? (metrics.PeakRamBytes.Value / (1024 * 1024)).ToString() : "unknown",
+                metrics?.AvgCpuPercent.HasValue == true ? metrics.AvgCpuPercent.Value.ToString("F1") + "%" : "unknown",
+                metrics?.NetRxBytes.HasValue == true ? (metrics.NetRxBytes.Value / (1024 * 1024)).ToString() : "unknown",
+                metrics?.NetTxBytes.HasValue == true ? (metrics.NetTxBytes.Value / (1024 * 1024)).ToString() : "unknown");
 
     public static void SandboxLeakDetected(string name, double ageMinutes, long? diskMb, string? reason = null) =>
         Audit("sandbox.leak_detected")
@@ -362,10 +383,32 @@ public static class AuditLog
             .Information("Stopped sandbox {VmName} for work item {WorkItemId} on graceful shutdown",
                 vmName, workItemId.ToString());
 
-    public static void SandboxDisposedOnShutdown(WorkItemId workItemId, string vmName) =>
+    public static void SandboxDisposedOnShutdown(
+        WorkItemId workItemId,
+        string vmName,
+        SandboxResourceMetrics? metrics = null) =>
         Audit("sandbox.disposed_on_shutdown")
-            .Information("Disposed sandbox {VmName} for work item {WorkItemId} on graceful shutdown",
-                vmName, workItemId.ToString());
+            .ForContext("PeakRamBytes", metrics?.PeakRamBytes)
+            .ForContext("AvgCpuPercent", metrics?.AvgCpuPercent)
+            .ForContext("NetRxBytes", metrics?.NetRxBytes)
+            .ForContext("NetTxBytes", metrics?.NetTxBytes)
+            .ForContext("TotalNetIoBytes", metrics?.TotalNetIoBytes)
+            .ForContext("DurationSeconds", metrics?.UptimeSeconds)
+            .ForContext("LoadAvg1", metrics?.LoadAvg1)
+            .ForContext("LoadAvg5", metrics?.LoadAvg5)
+            .ForContext("LoadAvg15", metrics?.LoadAvg15)
+            .ForContext("BaselineRef", metrics?.BaselineRef)
+            .ForContext("NetworkProfile", metrics?.NetworkProfile)
+            .ForContext("Phase", metrics?.Phase)
+            .ForContext("CapturedAt", metrics?.CapturedAt)
+            .Information(
+                "Disposed sandbox {VmName} for work item {WorkItemId} on graceful shutdown (peakRAM={PeakRam}MB avgCPU={AvgCpu} netRX={NetRx}MB netTX={NetTx}MB)",
+                vmName,
+                workItemId.ToString(),
+                metrics?.PeakRamBytes.HasValue == true ? (metrics.PeakRamBytes.Value / (1024 * 1024)).ToString() : "unknown",
+                metrics?.AvgCpuPercent.HasValue == true ? metrics.AvgCpuPercent.Value.ToString("F1") + "%" : "unknown",
+                metrics?.NetRxBytes.HasValue == true ? (metrics.NetRxBytes.Value / (1024 * 1024)).ToString() : "unknown",
+                metrics?.NetTxBytes.HasValue == true ? (metrics.NetTxBytes.Value / (1024 * 1024)).ToString() : "unknown");
 
     public static void SandboxStartupReconciled(string vmName, string action) =>
         Audit("sandbox.startup_reconciled")

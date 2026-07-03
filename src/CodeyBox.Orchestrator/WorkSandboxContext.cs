@@ -21,6 +21,7 @@ public sealed class WorkSandboxContext : IAsyncDisposable
 
     private ISandbox? _activeSandbox;
     private string? _activeBaselineImageRef;
+    private string? _activeTimingPhase;
     private int _reuseCount;
     private DateTimeOffset _createdAt;
 
@@ -42,6 +43,20 @@ public sealed class WorkSandboxContext : IAsyncDisposable
             _log.LogDebug("Sandbox reuse is disabled; creating fresh sandbox.");
             return await _provider.CreateAsync(spec, ct);
         }
+
+        var requestedTimingPhase = string.IsNullOrWhiteSpace(spec.TimingPhase)
+            ? "work"
+            : spec.TimingPhase!;
+
+        // Per-phase VM isolation exists ONLY to keep each phase's teardown
+        // resource record attributable to a single phase. It is gated on the
+        // provider's resource-metrics capture toggle so that with the feature
+        // off (the default) a warm VM is still reused across work<->rework,
+        // exactly as before — no hidden VM churn for operators who never opted
+        // into capture.
+        var isolatePhasesForMetrics =
+            _provider is IResourceMetricsCapturingProvider capturing
+            && capturing.CapturesResourceMetrics;
 
         // Check pressure threshold
         if (_provider is ISandboxAdmissionSnapshot snapshot)
@@ -75,6 +90,12 @@ public sealed class WorkSandboxContext : IAsyncDisposable
                 _log.LogInformation("Active sandbox baseline image mismatch ('{Active}' != '{Request}'); recreating sandbox.", _activeBaselineImageRef, spec.BaselineImageRef);
                 await DisposeActiveSandboxAsync();
             }
+            else if (isolatePhasesForMetrics
+                && !string.Equals(_activeTimingPhase, requestedTimingPhase, StringComparison.Ordinal))
+            {
+                _log.LogInformation("Active sandbox timing phase changed ('{Active}' != '{Request}') and resource-metrics capture is on; recreating sandbox for an accurate per-phase record.", _activeTimingPhase, requestedTimingPhase);
+                await DisposeActiveSandboxAsync();
+            }
         }
 
         if (_activeSandbox == null)
@@ -82,6 +103,7 @@ public sealed class WorkSandboxContext : IAsyncDisposable
             _log.LogInformation("Creating fresh sandbox for reuse (BaselineImageRef: {Image}).", spec.BaselineImageRef);
             _activeSandbox = await _provider.CreateAsync(spec, ct);
             _activeBaselineImageRef = spec.BaselineImageRef;
+            _activeTimingPhase = requestedTimingPhase;
             _createdAt = DateTimeOffset.UtcNow;
             _reuseCount = 0;
             return Wrap(_activeSandbox, this);
@@ -104,6 +126,7 @@ public sealed class WorkSandboxContext : IAsyncDisposable
                 await DisposeActiveSandboxAsync();
                 _activeSandbox = await _provider.CreateAsync(spec, ct);
                 _activeBaselineImageRef = spec.BaselineImageRef;
+                _activeTimingPhase = requestedTimingPhase;
                 _createdAt = DateTimeOffset.UtcNow;
                 _reuseCount = 0;
                 return Wrap(_activeSandbox, this);
@@ -128,6 +151,7 @@ public sealed class WorkSandboxContext : IAsyncDisposable
             }
             _activeSandbox = null;
             _activeBaselineImageRef = null;
+            _activeTimingPhase = null;
         }
     }
 
@@ -190,6 +214,7 @@ public sealed class WorkSandboxContext : IAsyncDisposable
         public string Id => _inner.Id;
         public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
         public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
+        public SandboxResourceMetrics? ResourceMetrics => _inner.ResourceMetrics;
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {

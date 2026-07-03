@@ -428,7 +428,13 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
             new BubblewrapSandboxOptions(),
             loggerFactory.CreateLogger<BubblewrapSandboxProvider>(),
             sp.GetService<ITimingStore>()),
-        "multipass" => BuildMultipass(opts, sp, loggerFactory, startupLog, sp.GetService<ITimingStore>()),
+        "multipass" => BuildMultipass(
+            opts,
+            sp,
+            loggerFactory,
+            startupLog,
+            sp.GetService<ITimingStore>(),
+            sp.GetService<ISandboxResourceUsageStore>()),
         "multipass-remote" => BuildMultipassRemote(sp, loggerFactory),
         _ => throw new InvalidOperationException(
             $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: multipass, multipass-remote, bubblewrap, process"),
@@ -457,7 +463,13 @@ static ISandboxProvider BuildProcess(CodeyBoxOptions opts, IHostEnvironment env,
     return new ProcessSandboxProvider(loggerFactory.CreateLogger<ProcessSandboxProvider>());
 }
 
-static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServiceProvider sp, ILoggerFactory loggerFactory, ILogger startupLog, ITimingStore? timings)
+static MultipassSandboxProvider BuildMultipass(
+    CodeyBoxOptions opts,
+    IServiceProvider sp,
+    ILoggerFactory loggerFactory,
+    ILogger startupLog,
+    ITimingStore? timings,
+    ISandboxResourceUsageStore? resourceUsageStore)
 {
     // DiskGuard is resolved once at startup: it captures the state-database
     // directory (built from opts) which is itself immutable for the process
@@ -507,6 +519,10 @@ static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServicePro
                 MaxConcurrentBoots = multipassSandbox.MaxConcurrentBoots,
                 BootLaunchDelay = TimeSpan.FromMilliseconds(multipassSandbox.BootLaunchDelayMs),
                 DisableAgentOutputHttpIngest = multipassSandbox.DisableAgentOutputHttpIngest,
+                CaptureResourceMetrics = multipassSandbox.CaptureResourceMetrics,
+                ResourceMetricsCaptureTimeout = multipassSandbox.ResourceMetricsCaptureTimeoutSeconds > 0
+                    ? TimeSpan.FromSeconds(multipassSandbox.ResourceMetricsCaptureTimeoutSeconds)
+                    : MultipassSandboxOptions.DefaultResourceMetricsCaptureTimeout,
                 DiskGuard = diskGuard,
                 PackageCacheSeeds = live.MultipassPackageCacheSeeds?.Select(s => new PackageCacheSeedOptions
                 {
@@ -524,7 +540,8 @@ static MultipassSandboxProvider BuildMultipass(CodeyBoxOptions opts, IServicePro
             };
         },
         loggerFactory.CreateLogger<MultipassSandboxProvider>(),
-        timings);
+        timings,
+        resourceUsageStore);
 
     // Startup banner: log free disk for each guarded path so the operator
     // can see at a glance whether the host is close to the threshold. Mirrors
@@ -1499,6 +1516,10 @@ builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new OpencodeSmokeProbe(
         sp.GetRequiredService<ILoggerFactory>().CreateLogger<OpencodeSmokeProbe>()));
+builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
+    new AntigravitySmokeProbe(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<AntigravitySmokeProbe>()));
 
 // --- In-VM smoke probes ------------------------------------------------------
 // Registered as IEnumerable<IInVmSmokeProbe>; InVmSmokeProber resolves by Kind.
@@ -2054,6 +2075,11 @@ builder.Services.AddSingleton<ITimingStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteTimingStore(opts.StateDatabasePath);
+});
+builder.Services.AddSingleton<ISandboxResourceUsageStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteSandboxResourceUsageStore(opts.StateDatabasePath);
 });
 builder.Services.AddSingleton<IWorkItemCostStore>(sp =>
 {
@@ -3011,6 +3037,7 @@ PluginEndpoints.Map(app);
 WorkerRegistryEndpoints.Map(app);
 AgentSupervisionEndpoints.Map(app);
 SandboxEndpoints.Map(app);
+SandboxResourceUsageEndpoints.Map(app);
 BaselineEndpoints.Map(app);
 QuotaRetryStatusEndpoints.Map(app);
 QuotaHistoryEndpoints.Map(app);
@@ -3496,6 +3523,20 @@ namespace CodeyBox.Api
         /// transport drops a freshly-created sandbox's agent stdout + exit code.
         /// </summary>
         public bool DisableAgentOutputHttpIngest { get; set; }
+
+        /// <summary>
+        /// When true, multipass sandbox disposal makes one short best-effort
+        /// in-VM exec before delete/preserve teardown to capture resource
+        /// metrics for capacity planning. Default false.
+        /// </summary>
+        public bool CaptureResourceMetrics { get; set; }
+
+        /// <summary>
+        /// Timeout for the best-effort resource metrics capture exec. Values
+        /// less than or equal to zero use the provider default (5 seconds).
+        /// </summary>
+        public int ResourceMetricsCaptureTimeoutSeconds { get; set; } =
+            (int)MultipassSandboxOptions.DefaultResourceMetricsCaptureTimeout.TotalSeconds;
     }
 
     /// <summary>

@@ -1314,7 +1314,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var sw = Stopwatch.StartNew();
         var (exit, _, stderr) = await RunLocalProcessAsync(
             "/bin/bash",
-            [launchScript],
+            ["-c", "exec 3>&1\nexec \"$1\"", "codeybox-launch-with-extra-fd", launchScript],
             environmentOverrides: FakeSudoPathEnvironment());
         sw.Stop();
 
