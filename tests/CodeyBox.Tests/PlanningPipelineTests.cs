@@ -114,6 +114,50 @@ public sealed class PlanningPipelineTests : IDisposable
     }
 
     [Fact]
+    public async Task PlanOn_EmitPlanTestCasesOff_ApprovesPlanButEmitsZeroTestCases()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        // Store IS wired so emission is observable; only the flag gates it off.
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            wireTestCaseStore: true,
+            pipelineOptions: new PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                AgentAllowedHosts = [],
+                EmitPlanTestCases = false,
+            });
+        var item = NewItem("feature/plan-emit-off") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        // The plan is still approved and the item completes normally...
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.NotNull(final.PlanReviewedAt);
+        Assert.Contains("\"approach\"", final.PlanArtifact, StringComparison.Ordinal);
+
+        // ...but with the flag OFF, the fixture plan's testStrategy scenario
+        // materialises NO TestCase artifacts (guard at
+        // EmitPlanTestCasesAsync: !_opts.EmitPlanTestCases short-circuits).
+        var cases = new List<TestCase>();
+        await foreach (var tc in setup.TestCaseStore!.ListByWorkItemAsync(item.Id.ToString()))
+            cases.Add(tc);
+        Assert.Empty(cases);
+    }
+
+    [Fact]
     public async Task PlanOff_Default_DoesNotRunPlanningPhase()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
