@@ -763,6 +763,13 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             throw;
         }
 
+        if (createTask.IsCompleted)
+        {
+            linked.Dispose();
+            provisionCts.Dispose();
+            return await createTask;
+        }
+
         using var timeoutCts = new CancellationTokenSource();
         using var callerCancellationCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var timeoutTask = Task.Delay(provisionTimeout, timeoutCts.Token);
