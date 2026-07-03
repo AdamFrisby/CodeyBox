@@ -107,6 +107,14 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
     // bookkeeping is written). Resolved at teardown time so operator config
     // hot-reload takes effect on the next graceful shutdown.
     private readonly Func<SandboxTeardownMode> _teardownModeAccessor;
+    // Drives the per-VM NonSuspend teardown timeout's CancellationTokenSource
+    // timer. Defaults to TimeProvider.System in production; tests that exercise
+    // the hung-stop/hung-dispose cancellation path inject a FakeTimeProvider so
+    // the timeout fires deterministically on Advance() instead of relying on a
+    // 25ms wall-clock timer, which is flaky under scheduler contention when the
+    // full test suite runs in parallel (observed as a 12s WaitAsync timeout
+    // instead of the ~25ms the inner timer nominally promises).
+    private readonly TimeProvider _timeProvider;
 
     public SandboxShutdownTeardownService(
         ISandboxProvider provider,
@@ -118,7 +126,8 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
         TimeSpan? nonSuspendTeardownTimeout = null,
         IShutdownDispatchGate? dispatchGate = null,
         SandboxTeardownMode? teardownMode = null,
-        Func<SandboxTeardownMode>? teardownModeAccessor = null)
+        Func<SandboxTeardownMode>? teardownModeAccessor = null,
+        TimeProvider? timeProvider = null)
     {
         _provider = provider;
         _store = store;
@@ -128,6 +137,7 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
         _perGiBSuspendBudget = perGiBSuspendBudget is { } g && g > TimeSpan.Zero ? g : DefaultPerGiBSuspendBudget;
         _nonSuspendTeardownTimeout = nonSuspendTeardownTimeout is { } n && n > TimeSpan.Zero ? n : DefaultNonSuspendTeardownTimeout;
         _dispatchGate = dispatchGate;
+        _timeProvider = timeProvider ?? TimeProvider.System;
         if (teardownModeAccessor is not null)
         {
             _teardownModeAccessor = teardownModeAccessor;
@@ -295,7 +305,7 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
         }
 
         var timeout = NonSuspendTeardownTimeout;
-        using var timeoutCts = new CancellationTokenSource(timeout);
+        using var timeoutCts = new CancellationTokenSource(timeout, _timeProvider);
         try
         {
             await preemptible.StopAndPreserveAsync(timeoutCts.Token).WaitAsync(timeoutCts.Token);
@@ -351,7 +361,7 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
     {
         sandbox.MarkOwnedByShutdownHandler();
         var timeout = NonSuspendTeardownTimeout;
-        using var timeoutCts = new CancellationTokenSource(timeout);
+        using var timeoutCts = new CancellationTokenSource(timeout, _timeProvider);
         try
         {
             await sandbox.DisposeAsync().AsTask().WaitAsync(timeoutCts.Token);

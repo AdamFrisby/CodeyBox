@@ -15,6 +15,7 @@ using CodeyBox.HostProcess;
 using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox.Multipass;
 using CodeyBox.Tests.Uat.SandboxProviders;
+using ControllableTimeProvider = Microsoft.Extensions.Time.Testing.FakeTimeProvider;
 
 namespace CodeyBox.Tests;
 
@@ -37,6 +38,7 @@ namespace CodeyBox.Tests;
 ///   API listener.</item>
 /// </list>
 /// </summary>
+[Collection("Background service timing")]
 public sealed class SandboxShutdownOrderingTests : IDisposable
 {
     private readonly string _dbPath =
@@ -582,13 +584,32 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         var sandbox = new OrderingFakeSandbox("vm-stop-hung", stopTask: neverStopped.Task);
         provider.Register(item.Id, sandbox);
 
+        // Drive the per-VM timeout's CTS clock with a FakeTimeProvider. A real
+        // 25ms wall-clock timer is flaky under scheduler contention when the
+        // full suite runs in parallel — the inner timer can be delayed well
+        // past the outer WaitAsync window (observed ~12s in CI), flipping an
+        // otherwise-passing cancellation test into a spurious TimeoutException.
+        // Advancing the timer deterministically lets the test assert the
+        // cancellation semantics without racing the thread pool.
+        var fakeTime = new ControllableTimeProvider();
         var svc = new SandboxShutdownTeardownService(
             provider, _store,
             NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Stop,
-            nonSuspendTeardownTimeout: TimeSpan.FromMilliseconds(25));
+            nonSuspendTeardownTimeout: TimeSpan.FromMilliseconds(25),
+            timeProvider: fakeTime);
 
-        await svc.TeardownAllAsync().WaitAsync(TimeSpan.FromSeconds(1));
+        // Start teardown without awaiting; the worker queues Task.Run per
+        // sandbox, then awaits the never-completing StopAndPreserveAsync.
+        var teardownTask = svc.TeardownAllAsync();
+        await sandbox.StopStarted.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Advance the clock past the 25ms timeout — the FakeTimeProvider fires
+        // the CTS timer synchronously, the token cancels, the await throws
+        // OperationCanceledException, and StopOneAsync surfaces it as a warn
+        // (NOT a thrown error) so host shutdown continues.
+        fakeTime.Advance(TimeSpan.FromMilliseconds(25));
+        await teardownTask.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.True(sandbox.StopAndPreserveCalled);
         Assert.False(neverStopped.Task.IsCompleted);
@@ -701,13 +722,21 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         var sandbox = new OrderingFakeSandbox("vm-dispose-hung", disposeTask: neverDisposed.Task);
         provider.Register(item.Id, sandbox);
 
+        // See ShutdownHandler_StopMode_CancelsHungStopAtNonSuspendTimeout for
+        // why we drive the timeout clock with a FakeTimeProvider instead of a
+        // wall-clock 25ms CTS.CancelAfter timer.
+        var fakeTime = new ControllableTimeProvider();
         var svc = new SandboxShutdownTeardownService(
             provider, _store,
             NullLogger<SandboxShutdownTeardownService>.Instance,
             teardownMode: SandboxTeardownMode.Dispose,
-            nonSuspendTeardownTimeout: TimeSpan.FromMilliseconds(25));
+            nonSuspendTeardownTimeout: TimeSpan.FromMilliseconds(25),
+            timeProvider: fakeTime);
 
-        await svc.TeardownAllAsync().WaitAsync(TimeSpan.FromSeconds(1));
+        var teardownTask = svc.TeardownAllAsync();
+        await sandbox.DisposeStarted.WaitAsync(TimeSpan.FromSeconds(5));
+        fakeTime.Advance(TimeSpan.FromMilliseconds(25));
+        await teardownTask.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.True(sandbox.DisposeCalled);
         Assert.False(neverDisposed.Task.IsCompleted);
@@ -1299,6 +1328,18 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         private readonly Task? _stopTask;
         private readonly Exception? _stopException;
         private readonly Action<string>? _recordEvent;
+        // Deterministic start signals: tests that drive the hung-stop /
+        // hung-dispose cancellation path with a FakeTimeProvider need to await
+        // the EXACT moment the fake's StopAndPreserveAsync / DisposeAsync has
+        // synchronously returned (so the per-VM CTS timer is registered and the
+        // await is parked on the cancellation token) before advancing the clock.
+        // Without these, the test would race the worker Task.Run against
+        // Advance(), and the CTS timer might be registered after the test
+        // already advanced past it.
+        private readonly TaskCompletionSource _stopStarted =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _disposeStarted =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
         public OrderingFakeSandbox(
             string id,
             Func<bool>? isDispatchPaused = null,
@@ -1325,6 +1366,8 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         public int MarkOwnedOrder { get; private set; }
         public int StopAndPreserveOrder { get; private set; }
         public int DisposeOrder { get; private set; }
+        public Task StopStarted => _stopStarted.Task;
+        public Task DisposeStarted => _disposeStarted.Task;
         private int _order;
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
             => Task.FromResult(new SandboxExecResult(0, "", ""));
@@ -1332,6 +1375,7 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
         {
             DisposeCalled = true;
             DisposeOrder = ++_order;
+            _disposeStarted.TrySetResult();
             if (_disposeException is not null)
                 throw _disposeException;
             return _disposeTask is null
@@ -1349,6 +1393,7 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
             if (_isDispatchPaused?.Invoke() == true) SawDispatchPaused = true;
             StopAndPreserveCalled = true;
             StopAndPreserveOrder = ++_order;
+            _stopStarted.TrySetResult();
             _recordEvent?.Invoke("stop");
             if (_stopException is not null)
                 throw _stopException;
