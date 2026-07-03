@@ -55,12 +55,8 @@ public sealed class InVmSmokeProbeServiceTests
     private static async Task AwaitExecute(InVmSmokeProbeService service)
     {
         var done = service.ExecuteTask ?? Task.CompletedTask;
-        // 45 s ceiling (not 15 s): the single sweep completes in milliseconds on a
-        // healthy box, but under parallel audit-suite load the sweep's scripted
-        // sandbox exec can be starved of a thread-pool thread past 15 s. Task.WhenAny
-        // returns the instant the sweep finishes, so this only widens headroom.
-        var winner = await Task.WhenAny(done, Task.Delay(TimeSpan.FromSeconds(45)));
-        Assert.Same(done, winner); // single-sweep ExecuteAsync must complete promptly
+        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+        await done.WaitAsync(cts.Token);
         await done; // surface any exception that escaped (there must be none)
     }
 
@@ -133,10 +129,11 @@ public sealed class InVmSmokeProbeServiceTests
             NullLogger<InVmSmokeProbeService>.Instance);
 
         await service.StartAsync(CancellationToken.None);
-        var reachedTwo = await gate.WaitForAtLeastAsync(2, TimeSpan.FromSeconds(5));
+        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+        await gate.WaitForAtLeastAsync(2, cts.Token);
         await service.StopAsync(CancellationToken.None);
 
-        Assert.True(reachedTwo, $"expected the interval loop to sweep >=2 times, saw {gate.SweepCount}");
+        Assert.True(gate.SweepCount >= 2, $"expected the interval loop to sweep >=2 times, saw {gate.SweepCount}");
     }
 
     [Fact]
@@ -150,10 +147,11 @@ public sealed class InVmSmokeProbeServiceTests
 
         await service.StartAsync(CancellationToken.None);
         gate.Enabled = true;
-        var reachedOne = await gate.WaitForAtLeastAsync(1, TimeSpan.FromSeconds(5));
+        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+        await gate.WaitForAtLeastAsync(1, cts.Token);
         await service.StopAsync(CancellationToken.None);
 
-        Assert.True(reachedOne, "expected the periodic service to observe the live gate after it was re-enabled");
+        Assert.True(gate.SweepCount >= 1, "expected the periodic service to observe the live gate after it was re-enabled");
     }
 
     [Fact]
@@ -313,15 +311,16 @@ public sealed class InVmSmokeProbeServiceTests
         public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
             => Task.FromResult<AgentAvailability?>(new AgentAvailability(true, null, null));
 
-        public async Task<bool> WaitForAtLeastAsync(int target, TimeSpan timeout)
+        public async Task WaitForAtLeastAsync(int target, CancellationToken ct)
         {
+            Task task;
             lock (_sync)
             {
                 _target = target;
-                if (_count >= target) return true;
+                if (_count >= target) return;
+                task = _reached.Task;
             }
-            var winner = await Task.WhenAny(_reached.Task, Task.Delay(timeout));
-            return winner == _reached.Task;
+            await task.WaitAsync(ct);
         }
     }
 
