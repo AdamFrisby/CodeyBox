@@ -2224,6 +2224,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
             else if (!skipAudit)
             {
+                // Reached only when !skipAudit but auditGateConfigured is false
+                // (no auditors, no required-build gate, no mechanical fixers), so
+                // there is nothing to audit this pickup. The assignment is a
+                // defensive no-op: EnsureCurrentRealAuditPassBeforeMergeAsync
+                // returns immediately when auditGateConfigured is false and never
+                // reads currentRunAuditPass. Kept for symmetry so the "a pass was
+                // produced this pickup" flag stays true on every non-skipped path.
                 currentRunAuditPass = true;
             }
 
@@ -7968,7 +7975,24 @@ public sealed partial class PipelineRunner : IPipelineRunner
         DateTimeOffset? currentWorkAttemptStartedAt,
         CancellationToken ct)
     {
-        if (_auditProgress is null || item.State != WorkItemState.WorkComplete)
+        // Load prior audit history for the two resume states that re-enter the
+        // audit loop with the work phase skipped: WorkComplete and AuditPassed.
+        //   • WorkComplete: an interrupted mid-audit resume — the history is
+        //     used to continue the loop (or, if the latest is a passing verdict,
+        //     to purge and re-audit fresh).
+        //   • AuditPassed: a resume/requeue of an item that previously reached a
+        //     pass (WorkItemRecoveryPolicy maps AuditPassed/Merging back here).
+        //     Its latest recorded verdict is a whole prior-run pass; loading it
+        //     here is what lets RunAuditLoopAsync purge the stale prior-run rows
+        //     before the fresh iteration-1 re-audit. Without this branch the
+        //     purge never fires, stale iterations 2..N survive the same
+        //     work-attempt partition, and EnsureCurrentRealAuditPassBeforeMergeAsync
+        //     selects the stale highest-iteration record instead of this pickup's
+        //     fresh pass — either wedging a cleanly re-audited item forever (on a
+        //     stale "review agent failed to run" verdict) or shipping an
+        //     unreviewed prior-run verdict.
+        if (_auditProgress is null
+            || item.State is not (WorkItemState.WorkComplete or WorkItemState.AuditPassed))
             return [];
 
         IReadOnlyList<AuditProgressRecord> records;
