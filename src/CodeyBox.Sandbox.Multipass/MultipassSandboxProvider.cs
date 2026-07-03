@@ -5122,6 +5122,11 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     // wall-clock-bound (a real 2s Task.Delay can drift well past a short test
     // deadline under thread-pool starvation, making the test flaky).
     internal TimeSpan? DetachedPollIntervalOverride { get; set; }
+
+    // Test seam: override the post-authenticated-exit cleanup timeout so the
+    // timeout-driven terminate+diagnostic branches (reap and sidecar read)
+    // can be exercised without a real 5s wall-clock wait.
+    internal TimeSpan? DetachedAuthenticatedExitCleanupTimeoutOverride { get; set; }
     internal const string AgentOutputHttpSetupFailureMarker =
         "codeybox-exec: agent output HTTP ingest unavailable before launch";
     private static readonly byte[] PngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
@@ -6335,7 +6340,8 @@ while True:
 
     private async Task<string?> EnsureDetachedProcessGroupReapedAfterAuthenticatedExitAsync(string processGroupMarker)
     {
-        using var reapCts = new CancellationTokenSource(DetachedAuthenticatedExitCleanupTimeout);
+        var cleanupTimeout = DetachedAuthenticatedExitCleanupTimeoutOverride ?? DetachedAuthenticatedExitCleanupTimeout;
+        using var reapCts = new CancellationTokenSource(cleanupTimeout);
         try
         {
             return await EnsureDetachedProcessGroupReapedAsync(processGroupMarker, reapCts.Token).ConfigureAwait(false);
@@ -6343,7 +6349,7 @@ while True:
         catch (OperationCanceledException) when (reapCts.IsCancellationRequested)
         {
             await TryTerminateDetachedProcessGroupAsync(processGroupMarker).ConfigureAwait(false);
-            return $"detached exec process group cleanup timed out after authenticated exit ({DetachedAuthenticatedExitCleanupTimeout.TotalSeconds:0.#}s)\n";
+            return $"detached exec process group cleanup timed out after authenticated exit ({cleanupTimeout.TotalSeconds:0.#}s)\n";
         }
     }
 
@@ -6370,7 +6376,8 @@ while True:
 
     private async Task<DetachedOutputSidecars> ReadDetachedOutputSidecarsAfterAuthenticatedExitAsync(string processGroupMarker)
     {
-        using var readCts = new CancellationTokenSource(DetachedAuthenticatedExitCleanupTimeout);
+        var cleanupTimeout = DetachedAuthenticatedExitCleanupTimeoutOverride ?? DetachedAuthenticatedExitCleanupTimeout;
+        using var readCts = new CancellationTokenSource(cleanupTimeout);
         try
         {
             return await ReadDetachedOutputSidecarsAsync(processGroupMarker, readCts.Token).ConfigureAwait(false);
@@ -6380,7 +6387,7 @@ while True:
             return new DetachedOutputSidecars(
                 "",
                 "",
-                $"detached exec output sidecar read timed out after authenticated exit ({DetachedAuthenticatedExitCleanupTimeout.TotalSeconds:0.#}s)\n");
+                $"detached exec output sidecar read timed out after authenticated exit ({cleanupTimeout.TotalSeconds:0.#}s)\n");
         }
     }
 

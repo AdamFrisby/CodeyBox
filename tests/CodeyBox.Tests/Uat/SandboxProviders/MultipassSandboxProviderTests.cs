@@ -2177,6 +2177,132 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task ExecAsync_DetachedAuthenticatedExitReapTimeoutTerminatesGroupAndReturnsDiagnostic()
+    {
+        if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
+            return;
+
+        var exitPoster = new CapturingDetachedExitPoster();
+        var pollCalls = 0;
+        var killCalls = 0;
+        var runner = new RecordingMultipassRunner(async (argv, stdin, _) =>
+        {
+            if (argv is [_, "exec", _, "--", "mkdir", "-p", _])
+                return new ProcessRunResult(0, "", "");
+            if (argv is [_, "transfer", _, _])
+                return new ProcessRunResult(0, "", "");
+            if (argv is [_, "exec", _, "--", "chmod", _, _])
+                return new ProcessRunResult(0, "", "");
+            if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
+                && launchScript.Contains("/detached-", StringComparison.Ordinal))
+            {
+                AssertDetachedLaunchStdin(stdin);
+                return new ProcessRunResult(0, "", "");
+            }
+            if (IsDetachedProcessGroupPoll(argv))
+            {
+                pollCalls++;
+                if (pollCalls == 1)
+                    await exitPoster.PostExitAsync(0);
+                // The agent authenticated its exit, but the process group never
+                // reaps: every reap probe keeps reporting the group alive, so
+                // EnsureDetachedProcessGroupReapedAsync never returns and the
+                // cleanup timeout must fire.
+                return new ProcessRunResult(0, "alive 12345\n", "");
+            }
+            if (IsDetachedOutputSidecarRead(argv))
+                return new ProcessRunResult(0, "", "");
+            if (IsDetachedProcessGroupKill(argv))
+            {
+                killCalls++;
+                return new ProcessRunResult(0, "", "");
+            }
+            if (argv is [_, "exec", _, "--", "rm", "-f", ..])
+                return new ProcessRunResult(0, "", "");
+
+            return new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv));
+        });
+        var sandbox = NewLoopbackHttpIngestSandbox(runner, exitPoster.StartAsync);
+        sandbox.DetachedAuthenticatedExitCleanupTimeoutOverride = TimeSpan.FromMilliseconds(100);
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["agent-cli", "--json"],
+            AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferHttpIngest,
+            LaunchMode = SandboxExecLaunchMode.DetachedBatch,
+        });
+
+        // The authenticated exit code (0) is downgraded to a failure because the
+        // reap never completed; the timeout branch also terminates the group.
+        Assert.False(result.Success);
+        Assert.Equal(1, result.ExitCode);
+        Assert.True(killCalls >= 1);
+        Assert.Contains("cleanup timed out after authenticated exit", result.Stderr);
+    }
+
+    [Fact]
+    public async Task ExecAsync_DetachedAuthenticatedExitSidecarReadTimeoutReturnsDiagnostic()
+    {
+        if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
+            return;
+
+        var exitPoster = new CapturingDetachedExitPoster();
+        var pollCalls = 0;
+        var runner = new RecordingMultipassRunner(async (argv, stdin, ct) =>
+        {
+            if (argv is [_, "exec", _, "--", "mkdir", "-p", _])
+                return new ProcessRunResult(0, "", "");
+            if (argv is [_, "transfer", _, _])
+                return new ProcessRunResult(0, "", "");
+            if (argv is [_, "exec", _, "--", "chmod", _, _])
+                return new ProcessRunResult(0, "", "");
+            if (argv is [_, "exec", _, "--", "/bin/bash", var launchScript]
+                && launchScript.Contains("/detached-", StringComparison.Ordinal))
+            {
+                AssertDetachedLaunchStdin(stdin);
+                return new ProcessRunResult(0, "", "");
+            }
+            if (IsDetachedProcessGroupPoll(argv))
+            {
+                pollCalls++;
+                if (pollCalls == 1)
+                {
+                    await exitPoster.PostExitAsync(0);
+                    return new ProcessRunResult(0, "alive 12345\n", "");
+                }
+
+                // Reap completes cleanly so we reach the sidecar read.
+                return new ProcessRunResult(0, "exited 12345 0 gone\n", "");
+            }
+            if (IsDetachedOutputSidecarRead(argv))
+            {
+                // Hang the sidecar read until the cleanup token cancels it,
+                // driving the read-timeout diagnostic branch.
+                await Task.Delay(TimeSpan.FromSeconds(30), ct);
+                return new ProcessRunResult(0, "", "");
+            }
+            if (argv is [_, "exec", _, "--", "rm", "-f", ..])
+                return new ProcessRunResult(0, "", "");
+
+            return new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv));
+        });
+        var sandbox = NewLoopbackHttpIngestSandbox(runner, exitPoster.StartAsync);
+        sandbox.DetachedAuthenticatedExitCleanupTimeoutOverride = TimeSpan.FromMilliseconds(100);
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["agent-cli", "--json"],
+            AgentOutputTransport = SandboxAgentOutputTransportPreference.PreferHttpIngest,
+            LaunchMode = SandboxExecLaunchMode.DetachedBatch,
+        });
+
+        // The agent exit itself is clean (0); only the diagnostic surfaces the
+        // sidecar read having timed out.
+        Assert.Equal(0, result.ExitCode);
+        Assert.Contains("output sidecar read timed out after authenticated exit", result.Stderr);
+    }
+
+    [Fact]
     public async Task ExecAsync_DetachedOutputSidecarReadFailureAppendsDiagnostic()
     {
         if (MultipassAgentOutputHttpIngestSession.TryResolveBridgeAddress("lo") is null)
