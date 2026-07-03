@@ -122,6 +122,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
     // OrchestratorService.ApplyAgentConcurrencyReload (which writes through
     // the shared snapshot) is observable here on the next GetCapSafe read.
     private readonly AgentConcurrencySnapshot? _concurrencySnapshot;
+    // Per-agent concurrency-cap gate (extracted). Owns the IsAtAgentCap /
+    // GetCapSafe / GetRunningSafe cluster; PipelineRunner delegates to it.
+    private readonly AgentConcurrencyGate _concurrencyGate;
     // In-VM agentic conflict resolver. Mid-rebase / mid-merge conflicts are
     // resolved by invoking the configured agent's normal CLI inside the same
     // sandbox via IAgentRunner.RunAsync — supersedes the old text-only LLM
@@ -414,6 +417,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // "no per-agent cap state wired" — GetCapSafe returns 0 (= unlimited).
         _concurrencySnapshot = agentConcurrencySnapshot
             ?? (agentConcurrency is null ? null : new AgentConcurrencySnapshot(agentConcurrency));
+        _concurrencyGate = new AgentConcurrencyGate(_agentRunningCounters, _concurrencySnapshot);
         _preMergeVerifier = preMergeVerifier;
         _requiredBuildVerifier = requiredBuildVerifier
             ?? throw new ArgumentNullException(
@@ -3929,59 +3933,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
     /// not wired — keeping the resolver's behaviour stable for tests /
     /// embeddings that don't register concurrency.
     /// </summary>
-    private bool IsAtAgentCap(AgentKind agent)
-    {
-        var cap = GetCapSafe(agent);
-        if (cap <= 0) return false;
-        if (_agentRunningCounters is null) return false;
-        return _agentRunningCounters.GetRunning(agent) >= cap;
-    }
+    private bool IsAtAgentCap(AgentKind agent) => _concurrencyGate.IsAtAgentCap(agent);
 
-    private bool IsAtAgentCap(AgentMembership member)
-    {
-        var cap = GetCapSafe(member);
-        if (cap <= 0) return false;
-        if (_agentRunningCounters is null) return false;
-        return _agentRunningCounters.GetRunning(member) >= cap;
-    }
+    private bool IsAtAgentCap(AgentMembership member) => _concurrencyGate.IsAtAgentCap(member);
 
-    private int GetCapSafe(AgentKind agent)
-    {
-        // Bind the snapshot reference once so a concurrent ApplyConcurrencyReload
-        // can't tear the read between the existence check and the lookup.
-        // Defence-in-depth on MaxConcurrent: AgentConcurrencyOptions.ValidateAndThrow
-        // rejects values <= 0 at load, but tests can construct an options
-        // instance directly without the validator, so we keep the > 0 guard.
-        var opts = _concurrencySnapshot?.Current;
-        return opts is not null
-            && opts.Members.TryGetValue(agent.Value, out var entry)
-            && entry is { MaxConcurrent: > 0 }
-            ? entry.MaxConcurrent
-            : 0;
-    }
+    private int GetCapSafe(AgentKind agent) => _concurrencyGate.GetCapSafe(agent);
 
-    private int GetCapSafe(AgentMembership member)
-    {
-        var opts = _concurrencySnapshot?.Current;
-        if (opts is null)
-            return 0;
+    private int GetCapSafe(AgentMembership member) => _concurrencyGate.GetCapSafe(member);
 
-        if (opts.Members.TryGetValue(member.RouteKey, out var exact)
-            && exact is { MaxConcurrent: > 0 })
-            return exact.MaxConcurrent;
+    private int GetRunningSafe(AgentKind agent) => _concurrencyGate.GetRunningSafe(agent);
 
-        if (opts.Members.TryGetValue(member.Agent.Value, out var byKind)
-            && byKind is { MaxConcurrent: > 0 })
-            return byKind.MaxConcurrent;
-
-        return 0;
-    }
-
-    private int GetRunningSafe(AgentKind agent) =>
-        _agentRunningCounters?.GetRunning(agent) ?? 0;
-
-    private int GetRunningSafe(AgentMembership member) =>
-        _agentRunningCounters?.GetRunning(member) ?? 0;
+    private int GetRunningSafe(AgentMembership member) => _concurrencyGate.GetRunningSafe(member);
 
     private static async Task<bool> FetchOriginBranchAsync(ISandbox sandbox, string branch, bool required, CancellationToken ct)
     {
