@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
+using CodeyBox.Agents.Antigravity;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
 using CodeyBox.Agents.Gemini;
@@ -275,6 +276,7 @@ internal static class TestSupport
                 new ClaudeQuotaFailureDetector(),
                 new CodexQuotaFailureDetector(),
                 new GeminiQuotaFailureDetector(),
+                new AntigravityQuotaFailureDetector(),
             }),
             retryScheduler: retryScheduler,
             preMergeVerifier: preMergeVerifier,

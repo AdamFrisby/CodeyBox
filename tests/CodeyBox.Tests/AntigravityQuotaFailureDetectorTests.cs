@@ -1,3 +1,4 @@
+using CodeyBox.Agents;
 using CodeyBox.Agents.Antigravity;
 using CodeyBox.Core;
 
@@ -81,6 +82,48 @@ public sealed class AntigravityQuotaFailureDetectorTests
         Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
         Assert.NotNull(detection.ResetAt);
         Assert.InRange(detection.ResetAt!.Value, before.AddSeconds(494), after.AddSeconds(494));
+    }
+
+    [Fact]
+    public void Detect_ResourceExhaustedWithoutResetDuration_ClassifiesWithNullReset()
+    {
+        // A RESOURCE_EXHAUSTED 429 that carries NO parseable reset duration must
+        // still classify as a rate-limit — with a null ResetAt — so the router
+        // falls back to its default backoff rather than null-crashing or silently
+        // dropping the detection. (Exercises the `reset = … ?? null` fallback.)
+        var detection = _detector.Detect(
+            stderr: "RESOURCE_EXHAUSTED (code 429): Individual quota reached", stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.Null(detection.ResetAt);
+    }
+
+    [Fact]
+    public void ResetParser_RelativeDuration_ComputesFromInjectedClock()
+    {
+        // The relative reset is now + duration off an INJECTED clock, so the parked
+        // resetAt is deterministic (no wall-clock bracketing needed). "8m14s" = 494s.
+        var now = new DateTimeOffset(2026, 7, 3, 12, 0, 0, TimeSpan.Zero);
+        var reset = QuotaResetParser.TryParseResetAt(
+            new[] { "RESOURCE_EXHAUSTED (code 429): Individual quota reached (Resets in 8m14s)" },
+            utcNow: now);
+
+        Assert.Equal(now.AddSeconds(494), reset);
+    }
+
+    [Fact]
+    public void ResetParser_ZeroDurationPrefixBeforeRealDuration_DoesNotShadowRealWindow()
+    {
+        // A non-duration "resets in a moment" prefix yields an all-zero first match;
+        // scanning must continue to the real "retry after 8m" later in the SAME
+        // string instead of bailing to the coarse default backoff.
+        var now = new DateTimeOffset(2026, 7, 3, 12, 0, 0, TimeSpan.Zero);
+        var reset = QuotaResetParser.TryParseResetAt(
+            new[] { "quota resets in a moment; retry after 8m" },
+            utcNow: now);
+
+        Assert.Equal(now.AddMinutes(8), reset);
     }
 
     [Fact]

@@ -4703,6 +4703,47 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         ct: ct);
                 }
 
+                // Exit-0 terminal quota block. Some CLIs (notably agy) exit 0 and
+                // make no file changes when a consumer-tier RESOURCE_EXHAUSTED (429)
+                // stops them, writing the 429 only to an internal log. Such a run
+                // reaches here as a clean exit with an empty diff — the !Success
+                // quota routing above never saw it — and would otherwise terminal-
+                // fail as "produced no changes" and eventually dead-letter, losing
+                // legitimate work that a short quota reset would have recovered. The
+                // runner lifts the terminal error region into TerminalDiagnostic (a
+                // side-channel distinct from Stderr, so the success-path auth
+                // classifier is unaffected); classify it here so a real 429 parks the
+                // item in WaitingForQuotaReset with the parsed reset window instead of
+                // falling through to the generic no-changes terminal failure. A
+                // genuine no-op (no marker → null diagnostic → no detection) still
+                // terminal-fails below, so this adds no false quota parks. Runs BEFORE
+                // RecordNoChangesOutcomeAsync so a quota park never trips the
+                // no-changes circuit breaker.
+                if (!string.IsNullOrEmpty(agentResult.TerminalDiagnostic))
+                {
+                    var noChangeQuota = _quotaClassifier.Detect(
+                        runner.Kind, agentResult.TerminalDiagnostic, agentResult.Stdout);
+                    if (noChangeQuota is not null)
+                    {
+                        _quotaAuditEmitter.EmitAdvisoryAuditEvents(
+                            runner.Kind, agentResult.TerminalDiagnostic, agentResult.Stdout, agentPhase, sandbox.Id);
+                        await _quotaClassifier.RecordIfQuotaFailureAsync(
+                            _quotaFailures,
+                            runner.Kind,
+                            observedModelId,
+                            agentResult.Summary,
+                            agentResult.TerminalDiagnostic,
+                            agentEndedAt,
+                            _auditQuotaOptions.ObservedFailureRetention,
+                            ct,
+                            projectId: item.ProjectId,
+                            stdout: agentResult.Stdout);
+                        throw new TerminalQuotaError(noChangeQuota.Kind,
+                            $"Agent {runner.Kind} reported quota failure on clean exit with no changes: {RedactAndTruncateAgentDetail(agentResult.Summary)}",
+                            noChangeQuota.ResetAt);
+                    }
+                }
+
                 if (resumingPreempt)
                 {
                     await using (var pushScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.push_resumed_checkpoint_to_bare_repo",

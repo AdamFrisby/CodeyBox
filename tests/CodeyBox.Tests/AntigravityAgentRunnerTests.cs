@@ -451,12 +451,39 @@ public sealed class AntigravityAgentRunnerTests
             stdoutChunkCallback: stdoutChunkCallback, captureStructuredStream: false);
 
         Assert.True(result.Success);
-        // Stderr must NOT carry the recovered-transient glog lines.
+        // Stderr must NOT carry the glog lines: the success-path auth classifier
+        // reads Stderr, so a recovered-transient 401/429 there would falsely bench.
         Assert.DoesNotContain("RESOURCE_EXHAUSTED", result.Stderr ?? string.Empty);
         Assert.DoesNotContain("applyAuthResult", result.Stderr ?? string.Empty);
-        // But the stream archive still surfaces the diagnostics to operators.
+        // But the terminal region IS surfaced on the TerminalDiagnostic side-channel
+        // even on this exit-0 run — this is the un-blinding that lets the pipeline's
+        // no-changes branch classify agy's exit-0 give-up 429 and park the item in
+        // WaitingForQuotaReset instead of terminal-failing it as "produced no changes".
+        Assert.Contains("RESOURCE_EXHAUSTED (code 429): Individual quota reached (Resets in 8m14s)",
+            result.TerminalDiagnostic ?? string.Empty);
+        // And the stream archive still surfaces the diagnostics to operators.
         Assert.Contains("RESOURCE_EXHAUSTED (code 429): Individual quota reached (Resets in 8m14s)\n", streamedChunks);
         Assert.Contains("applyAuthResult: authMethod=consumer\n", streamedChunks);
+    }
+
+    [Fact]
+    public async Task RunAsync_ExitZeroNoMarker_LeavesTerminalDiagnosticNull()
+    {
+        // A genuine no-op (exit 0, no quota/auth marker anywhere in the glog) must
+        // leave TerminalDiagnostic null so the pipeline's no-changes branch finds no
+        // detection and still terminal-fails as "produced no changes" — no false park.
+        var sandbox = new AntigravityLogCapturingSandbox(
+            logFileContent: "Model resolved: gemini-3.5-flash\nread 12 files, wrote 0 files\ndone",
+            agyExitCode: 0
+        );
+        var runner = new AntigravityAgentRunner();
+
+        var result = await runner.RunAsync(
+            sandbox, "/work", "do something", credential: null,
+            stdoutChunkCallback: null, captureStructuredStream: false);
+
+        Assert.True(result.Success);
+        Assert.Null(result.TerminalDiagnostic);
     }
 
     [Fact]
