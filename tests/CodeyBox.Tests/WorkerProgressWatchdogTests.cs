@@ -1669,6 +1669,39 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         };
     }
 
+    private static async Task<WorkerProgressActivity?> WaitForActivityAsync(
+        IWorkerProgressActivitySource source,
+        WorkerRegistration worker,
+        WorkItemId itemId,
+        WorkerProgressActivityProbe probe,
+        string? requiredReason = null)
+    {
+        // Polling deadline is generous (30s) because the underlying signal
+        // for "process-cpu" relies on the busy process accumulating observable
+        // utime/stime between samples. Under the full parallel audit suite the
+        // host CPU is saturated and the .NET thread pool is starved, so both
+        // the busy process and the `await Task.Delay` continuations below are
+        // scheduled slowly; a 10s deadline was observed to race that
+        // starvation (the signal is real, it just arrives late), so we give it
+        // ample headroom. The happy path still returns on the first observation
+        // that carries the signal, so a passing run costs no extra wall-clock.
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(30);
+        WorkerProgressActivity? last = null;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            last = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
+            if (last is not null
+                && (requiredReason is null || string.Equals(last.Reason, requiredReason, StringComparison.Ordinal)))
+            {
+                return last;
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(25));
+        }
+
+        return last;
+    }
+
     private sealed class ScriptedWorkerProgressActivitySource(WorkerProgressActivity? activity) : IWorkerProgressActivitySource
     {
         public int Calls { get; private set; }
