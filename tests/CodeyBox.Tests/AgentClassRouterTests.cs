@@ -406,6 +406,52 @@ public sealed class AgentClassRouterTests
     }
 
     [Fact]
+    public async Task DeadlineAwareDrain_ExpectedResetCadenceSoonerThanProbeDeadlineDrainsFaster()
+    {
+        var now = new DateTimeOffset(2026, 6, 1, 12, 0, 0, TimeSpan.Zero);
+        var scheduledReset = now.AddDays(5);
+        var rateReset = now.AddHours(6);
+        // Anchor 12h in the past with a 24h cadence => the next recurring free
+        // reset fires at anchor + 24h == now + 12h, i.e. well before the 5-day
+        // scheduled probe reset. This drives the ResolveNextCadenceReset branch
+        // (periodsElapsed math + next-period selection), NOT the Timestamps arm.
+        var opts = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10.0,
+            IntraKindRoutingPolicy = IntraKindRoutingPolicy.DeadlineAwareDrain,
+            ExpectedResets = new(StringComparer.OrdinalIgnoreCase)
+            {
+                [Claude.Value] = new ExpectedQuotaResetOptions
+                {
+                    Cadence = TimeSpan.FromHours(24),
+                    CadenceAnchor = now.AddHours(-12),
+                },
+            },
+        };
+        var router = BuildRouter([FrontierClass(Sub(Claude), Sub(Codex))],
+        [
+            new FakeProbe(Claude, Snapshot(
+                50.0,
+                scheduledReset,
+                new WindowQuota { Name = "five_hour", AvailablePct = 90.0, ResetAt = rateReset },
+                new WindowQuota { Name = "weekly", AvailablePct = 50.0, ResetAt = scheduledReset })),
+            new FakeProbe(Codex, Snapshot(
+                70.0,
+                scheduledReset,
+                new WindowQuota { Name = "5h-rolling", AvailablePct = 100.0, ResetAt = rateReset },
+                new WindowQuota { Name = "weekly", AvailablePct = 70.0, ResetAt = scheduledReset })),
+        ], opts, timeProvider: new FakeTimeProvider(now));
+
+        var decision = await router.ResolveAsync(MakeItem("frontier"), null, CancellationToken.None);
+
+        // With the cadence-derived reset (12h) honoured, Claude's urgency
+        // outranks Codex's larger absolute quota pacing to the 5-day reset.
+        // If the cadence branch failed to move the deadline earlier, Claude
+        // would pace to 5 days and Codex (more absolute quota) would win.
+        Assert.Equal(Claude, decision.Chosen!.Agent);
+    }
+
+    [Fact]
     public async Task DeadlineAwareDrain_DrainAggressivenessRaisesPerCyclePace()
     {
         var now = new DateTimeOffset(2026, 6, 1, 12, 0, 0, TimeSpan.Zero);
