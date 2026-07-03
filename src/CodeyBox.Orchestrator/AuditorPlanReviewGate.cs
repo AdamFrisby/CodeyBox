@@ -145,9 +145,6 @@ public sealed class AuditorPlanReviewGate : IPlanReviewGate
         PlanReviewRequest request,
         CancellationToken ct)
     {
-        if (request.Agent is not { } agentKind)
-            return null;
-
         var project = await _projects.GetAsync(request.ProjectId, ct);
         if (project is null)
         {
@@ -156,6 +153,14 @@ public sealed class AuditorPlanReviewGate : IPlanReviewGate
                 request.ProjectId, request.WorkItemId);
             return null;
         }
+
+        // Default-routed items carry a null Agent and rely on the project's
+        // DefaultAgent (non-null, defaults to Claude) — the same
+        // `item.Agent ?? project.DefaultAgent` idiom every other phase uses. The
+        // project is loaded first so this fallback can never be skipped;
+        // resolving off request.Agent alone would silently no-op plan review for
+        // the common DefaultAgent-routed configuration.
+        var agentKind = request.Agent ?? project.DefaultAgent;
 
         if (!_agents.TryGet(agentKind, out var runner))
             return null;

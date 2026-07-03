@@ -97,6 +97,55 @@ public sealed class AuditorPlanReviewGateTests
     }
 
     [Fact]
+    public async Task ReviewAsync_BlocksWhenReviewerThrows()
+    {
+        // A reviewer that throws (any non-cancellation exception) must BLOCK the
+        // plan — never crash the gate or let the plan through — and the rejection
+        // reason must name the failing reviewer. This guards the core "plan MUST
+        // pass before implementation" invariant.
+        var runner = new FakeTextOnlyRunner("unused", throwMessage: "reviewer blew up");
+        var gate = BuildGate(runner, auditTypes: ["architecture"]);
+
+        var decision = await gate.ReviewAsync(Request());
+
+        Assert.False(decision.Approved);
+        Assert.Contains("plan reviewer failed", decision.RejectionReason, StringComparison.Ordinal);
+        Assert.Contains("architecture:llm-review", decision.RejectionReason, StringComparison.Ordinal);
+        Assert.Contains("reviewer blew up", decision.RejectionReason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ReviewAsync_ApprovesOnValidity_WhenTextOnlyUnavailable()
+    {
+        // When the routed agent's text-only path is unavailable (e.g. Claude with
+        // no API key), the gate degrades to approve-on-validity WITHOUT calling any
+        // reviewer — plan review is skipped, not hard-failed.
+        var runner = new FakeTextOnlyRunner("unused", unavailabilityReason: "no API key");
+        var gate = BuildGate(runner, auditTypes: ["architecture"]);
+
+        var decision = await gate.ReviewAsync(Request());
+
+        Assert.True(decision.Approved);
+        Assert.Equal(0, runner.Calls);
+    }
+
+    [Fact]
+    public async Task ReviewAsync_RunsReviewers_WhenItemHasNoAgentAndFallsBackToProjectDefault()
+    {
+        // Default-routed items carry a null Agent and rely on the project's
+        // DefaultAgent. The gate must resolve the fallback and actually run the
+        // plan reviewers — not silently approve on validity.
+        var runner = new FakeTextOnlyRunner("""{"passed": false, "findings": [{"severity":"error","title":"wrong approach","description":"d"}]}""");
+        var gate = BuildGate(runner, auditTypes: ["architecture"]);
+
+        var decision = await gate.ReviewAsync(Request(defaultRouted: true));
+
+        Assert.False(decision.Approved);
+        Assert.Equal(1, runner.Calls);
+        Assert.Contains("wrong approach", decision.RejectionReason, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task ReviewAsync_RejectsStructurallyInvalidPlan()
     {
         var runner = new FakeTextOnlyRunner("unused");
@@ -123,14 +172,16 @@ public sealed class AuditorPlanReviewGateTests
             NullLogger<AuditorPlanReviewGate>.Instance);
     }
 
-    private static PlanReviewRequest Request(string artifact = ValidPlan) => new(
+    private static PlanReviewRequest Request(string artifact = ValidPlan, bool defaultRouted = false) => new(
         WorkItemId.New(),
         new ProjectId("proj"),
         "title",
         "do the work",
         PromptRevision: 1,
         artifact,
-        AgentKind.Claude,
+        // A default-routed item carries a null Agent and relies on the project's
+        // DefaultAgent; otherwise route explicitly to Claude.
+        defaultRouted ? null : AgentKind.Claude,
         AgentInstanceId: null,
         ModelId: null,
         ReasoningMode: null);

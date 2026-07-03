@@ -204,7 +204,8 @@ internal sealed class FakeTextOnlyRunner(
     string output,
     bool success = true,
     string? unavailabilityReason = null,
-    bool requiresSandbox = false)
+    bool requiresSandbox = false,
+    string? throwMessage = null)
     : ITextOnlyAgentRunner
 {
     public AgentKind Kind => AgentKind.Claude;
@@ -224,6 +225,8 @@ internal sealed class FakeTextOnlyRunner(
     {
         Calls++;
         LastPrompt = prompt;
+        if (throwMessage is not null)
+            throw new InvalidOperationException(throwMessage);
         return Task.FromResult(new TextOnlyAgentResult(success, "done", success ? output : null, success ? null : "failed"));
     }
 
