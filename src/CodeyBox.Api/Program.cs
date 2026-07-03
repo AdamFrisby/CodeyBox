@@ -3691,7 +3691,15 @@ namespace CodeyBox.Api
         /// <summary>Whether create should wait for capacity before returning.</summary>
         public bool WaitForCapacity { get; set; }
 
-        /// <summary>URL auth setting sent on create. Sprites supports <c>sprite</c> and <c>public</c>.</summary>
+        /// <summary>
+        /// URL auth setting sent on create. Sprites supports <c>sprite</c> (default,
+        /// bearer-token-authenticated per-sprite URL) and <c>public</c>. Setting
+        /// <c>public</c> drops access control on the sprite's per-sprite HTTP endpoint
+        /// while a work item runs inside it (source tree, agent process, staged mounts),
+        /// leaving it reachable without the bearer token — a foot-gun that silently
+        /// removes network-level access control on a live work sandbox. Prefer
+        /// <c>sprite</c> unless you have an explicit reason and a separate boundary.
+        /// </summary>
         public string UrlAuth { get; set; } = "sprite";
 
         /// <summary>Safety ceiling for paged list calls during leak reaping.</summary>
@@ -3714,9 +3722,16 @@ namespace CodeyBox.Api
         public bool AllowPersistentTmpfsDowngrade { get; set; }
 
         /// <summary>
-        /// Shell commands run inside each fresh sprite after network policy is
-        /// applied and before mounts are staged. Use to install agent CLIs and
-        /// project toolchains because rc30 create has no image/baseline field.
+        /// Shell commands run inside each fresh sprite to provision it (rc30
+        /// create has no image/baseline field). They execute BEFORE the work
+        /// item's egress allow-list is applied and BEFORE mounts are staged,
+        /// so they run against OPEN egress until the default-deny policy is
+        /// posted after provisioning completes and before the agent runs. This
+        /// is deliberate: these operator-trusted commands need to reach package
+        /// registries (npm/apt/curl), and no agent code or credential material
+        /// is present yet. Use to install agent CLIs and project toolchains.
+        /// Note: with open egress, a curl-piped installer can reach arbitrary
+        /// hosts; only list commands you trust.
         /// </summary>
         public List<string> SetupCommands { get; set; } = [];
 

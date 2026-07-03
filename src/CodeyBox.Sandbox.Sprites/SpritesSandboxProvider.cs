@@ -18,8 +18,11 @@ namespace CodeyBox.Sandbox.Sprites;
 /// <summary>
 /// Sandbox provider backed by Fly.io Sprites. Sprites expose persistent
 /// Firecracker microVMs through an HTTP/WebSocket API rather than host-local
-/// bind mounts, so host mounts are staged into the sprite and writable mounts
-/// are synchronized back after execs.
+/// bind mounts, so host mounts are staged into the sprite and writable host
+/// mounts are synchronized back to the host ONCE, during sandbox disposal
+/// (teardown). Per-exec sync-back is NOT performed: ExecAsync always runs with
+/// the sync flag off, so a consumer that reads a writable host mount between
+/// execs observes stale (pre-run) content until the sandbox is disposed.
 /// </summary>
 public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IActiveSandboxProgressProvider
 {
@@ -453,7 +456,8 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
         """
         set -eu
         __codeybox_env_bytes="$1"
-        shift
+        __codeybox_wd="$2"
+        shift 2
         __codeybox_env_payload="$(dd bs=1 count="$__codeybox_env_bytes" 2>/dev/null || true)"
         while IFS= read -r __codeybox_env_line; do
           [ -n "$__codeybox_env_line" ] || continue
@@ -464,6 +468,10 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
         done <<__CODEYBOX_ENV__
         $__codeybox_env_payload
         __CODEYBOX_ENV__
+        if [ -n "$__codeybox_wd" ]; then
+          mkdir -p "$__codeybox_wd"
+          cd "$__codeybox_wd"
+        fi
         exec "$@"
         """;
 
@@ -520,8 +528,14 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
             {
                 Argv = ["bash", "-lc", command],
                 WorkingDirectory = "/",
-                MaxStdoutBytes = 1024 * 1024,
-                MaxStderrBytes = 1024 * 1024,
+                // Setup commands are the sole provisioning path for rc30 sprites (no baseline image),
+                // so apt/npm/curl installs land here — the noisiest phase. The 1 MiB hardcode that used
+                // to bound this was inconsistent with the agent exec path's DefaultMaxStreamBytes
+                // (64 MiB) and could strand provisioning when an install log exceeded 1 MiB (apt
+                // unpack progress is emitted to stderr). Reuse the same DoS ceiling the agent path
+                // uses; it is still hard-bounded and far larger than any legitimate install log.
+                MaxStdoutBytes = DefaultMaxStreamBytes,
+                MaxStderrBytes = DefaultMaxStreamBytes,
                 KillOnOutputLimit = true,
             }, syncWritableMounts: false, allowDuringDispose: false, includeSpecEnvironment: false, ct: ct).ConfigureAwait(false);
             if (!result.Success)
@@ -589,7 +603,10 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
                 "sprites.dev does not expose tmpfs credential storage; refusing to write credential file material " +
                 "to the sprite ext4 filesystem. Use non-file credential environment variables for sprites-backed sandboxes.");
         }
-        var wireExec = BuildWireExec(exec, effectiveEnvironment);
+        var effectiveWorkingDirectory = string.IsNullOrWhiteSpace(exec.WorkingDirectory)
+            ? (_spec.WorkingDirectory ?? "/")
+            : exec.WorkingDirectory;
+        var wireExec = BuildWireExec(exec, effectiveEnvironment, effectiveWorkingDirectory);
 
         int? sessionId = null;
         await using var webSocket = _webSocketFactory.Create();
@@ -793,14 +810,16 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
         if (builder.Port == 80 || builder.Port == 443)
             builder.Port = -1;
 
+        // The working directory is established by the in-sandbox bootstrap (mkdir -p <wd>; cd <wd>)
+        // before exec "$@", rather than the documented `dir` query param. rc30 sprites have no baseline
+        // image, so the spec working directory (default /work) does not exist until the bootstrap
+        // creates it; sending `dir=/work` would have the sprite chdir into a nonexistent path before
+        // any script runs (the work->audit flow's first exec is `git clone <url> /work`). The bootstrap
+        // creates the directory lazily on the same exec, so the clone lands in /work.
         var query = new List<KeyValuePair<string, string>>();
         foreach (var arg in exec.Argv)
             query.Add(new KeyValuePair<string, string>("cmd", arg));
         query.Add(new KeyValuePair<string, string>("tty", "false"));
-
-        var workingDirectory = exec.WorkingDirectory ?? _spec.WorkingDirectory;
-        if (!string.IsNullOrWhiteSpace(workingDirectory))
-            query.Add(new KeyValuePair<string, string>("dir", workingDirectory));
 
         builder.Query = string.Join('&', query.Select(q =>
             $"{Uri.EscapeDataString(q.Key)}={Uri.EscapeDataString(q.Value)}"));
@@ -809,20 +828,22 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
 
     private static SpritesWireExec BuildWireExec(
         SandboxExec exec,
-        IReadOnlyDictionary<string, string> effectiveEnvironment)
+        IReadOnlyDictionary<string, string> effectiveEnvironment,
+        string workingDirectory)
     {
         var envBlock = BuildEnvironmentBlock(effectiveEnvironment);
         var envBlockBytes = Utf8.GetByteCount(envBlock);
-        var argv = new List<string>(exec.Argv.Count + 5)
+        var argv = new List<string>(exec.Argv.Count + 6)
         {
             "sh",
             "-c",
             EnvironmentBootstrapScript,
             "_",
             envBlockBytes.ToString(CultureInfo.InvariantCulture),
+            workingDirectory,
         };
         argv.AddRange(exec.Argv);
-        return new SpritesWireExec(argv, exec.WorkingDirectory, envBlock + (exec.Stdin ?? ""));
+        return new SpritesWireExec(argv, envBlock + (exec.Stdin ?? ""));
     }
 
     private static string BuildEnvironmentBlock(IReadOnlyDictionary<string, string> environment)
@@ -876,12 +897,21 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
         return env;
     }
 
+    /// <summary>
+    /// Best-effort exec-level backstop that rejects commands writing a credential
+    /// file into <see cref="SandboxConventions.CredentialsDir"/>. It only inspects
+    /// a narrow shape (non-null Stdin + an argv element that names the credentials
+    /// directory); a credential-writing exec built from a redirect inside a shell
+    /// script, a here-doc, or an env-var-driven path would bypass it. The robust
+    /// defense is the runner-level guard (<c>RejectUnsupportedFileBackedCredentials</c>,
+    /// which walks the decorator chain to the SpritesSandbox and covers every
+    /// file-materialising runner); this exec-level check is defence-in-depth only.
+    /// </summary>
     private static bool WouldPersistCredentialFile(SandboxExec exec)
     {
         if (exec.Stdin is not null &&
             exec.Argv.Any(arg =>
                 arg.Equals(SandboxConventions.CredentialsDir, StringComparison.Ordinal) ||
-                arg.StartsWith(SandboxConventions.CredentialsDir + "/", StringComparison.Ordinal) ||
                 arg.Contains(SandboxConventions.CredentialsDir + "/", StringComparison.Ordinal)))
         {
             return true;
@@ -1197,7 +1227,6 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
 
     private readonly record struct SpritesWireExec(
         IReadOnlyList<string> Argv,
-        string? WorkingDirectory,
         string? Stdin);
 }
 
@@ -1213,6 +1242,15 @@ internal sealed class LimitedOutputCollector
     private readonly int? _limit;
     private readonly Action<string>? _callback;
     private readonly MemoryStream _buffer = new();
+    // Trailing bytes of the most recent Append that did not complete a full UTF-8 character. They are
+    // already written to _buffer (so ToString decodes the whole buffer at once), but the live per-chunk
+    // callback must NOT decode them in isolation: WebSocket binary frames (and the output-cap
+    // truncation) can split a multi-byte UTF-8 sequence across two Append calls, and decoding the
+    // partial bytes here emits U+FFFD replacement characters into the streamed callback — which for
+    // the primary agent path feeds the structured stream-json parser and can corrupt a JSON event
+    // (dropping the captured CLI session id / usage metric). They are prepended to the next chunk so
+    // the callback only ever emits complete characters.
+    private readonly List<byte> _pendingUtf8 = new();
 
     public LimitedOutputCollector(int? limit, Action<string>? callback)
     {
@@ -1244,11 +1282,59 @@ internal sealed class LimitedOutputCollector
         }
 
         _buffer.Write(bytes[..allowed]);
-        if (_callback is not null)
-            _callback(Utf8.GetString(bytes[..allowed]));
+        if (_callback is null)
+            return;
+
+        byte[] decodeBytes;
+        if (_pendingUtf8.Count > 0)
+        {
+            decodeBytes = new byte[_pendingUtf8.Count + allowed];
+            _pendingUtf8.CopyTo(decodeBytes, 0);
+            bytes[..allowed].ToArray().CopyTo(decodeBytes, _pendingUtf8.Count);
+            _pendingUtf8.Clear();
+        }
+        else
+        {
+            decodeBytes = bytes[..allowed].ToArray();
+        }
+
+        var complete = CountCompleteUtf8Bytes(decodeBytes);
+        if (complete < decodeBytes.Length)
+        {
+            _pendingUtf8.AddRange(decodeBytes.AsSpan(complete));
+            if (complete == 0)
+                return;
+            decodeBytes = decodeBytes[..complete];
+        }
+
+        _callback(Utf8.GetString(decodeBytes));
     }
 
     public override string ToString() => Utf8.GetString(_buffer.ToArray());
+
+    // Returns the length of the longest valid UTF-8 prefix of <paramref name="bytes"/>; any trailing
+    // bytes that start (but do not complete) a multi-byte sequence are left for the next Append.
+    private static int CountCompleteUtf8Bytes(byte[] bytes)
+    {
+        var i = 0;
+        while (i < bytes.Length)
+        {
+            var b = bytes[i];
+            int seqLen;
+            if (b < 0x80) seqLen = 1;
+            else if ((b & 0xE0) == 0xC0) seqLen = 2;
+            else if ((b & 0xF0) == 0xE0) seqLen = 3;
+            else if ((b & 0xF8) == 0xF0) seqLen = 4;
+            else return i; // invalid lead byte (stray continuation byte or 0xF8+); stop before it
+            if (i + seqLen > bytes.Length) return i;
+            for (var j = 1; j < seqLen; j++)
+            {
+                if ((bytes[i + j] & 0xC0) != 0x80) return i;
+            }
+            i += seqLen;
+        }
+        return i;
+    }
 }
 
 internal sealed class SpritesApiClient

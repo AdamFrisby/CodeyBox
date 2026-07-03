@@ -122,19 +122,66 @@ public sealed class SpritesSandboxProviderTests
 
         Assert.NotNull(socket.ConnectedUri);
         var query = ParseQuery(socket.ConnectedUri!);
-        AssertWrappedCommand(query, ["bash", "-lc", "cat"]);
-        Assert.Equal(["/work"], query["dir"]);
         Assert.Equal(["false"], query["tty"]);
         Assert.False(query.ContainsKey("env"));
         Assert.DoesNotContain("env-value", socket.ConnectedUri!.ToString(), StringComparison.Ordinal);
         Assert.DoesNotContain(query.Keys, k => k.Equals("stdin", StringComparison.OrdinalIgnoreCase));
 
         Assert.Equal("sprite-token", socket.BearerToken);
+        AssertWrappedCommand(query, ["bash", "-lc", "cat"], "/work");
+        // The working directory is established by the in-sandbox bootstrap (mkdir+cd) rather than
+        // the documented `dir` query param, so the sprite never chdir's into a not-yet-created
+        // directory. dir must be absent from the URL; the workdir travels as a bootstrap argv element.
+        Assert.False(query.ContainsKey("dir"), "dir query param must not be sent; the bootstrap handles cwd");
         Assert.Contains(socket.SentFrames, frame =>
             frame.Length > 1 &&
             frame[0] == 0 &&
             Encoding.UTF8.GetString(frame[1..]).EndsWith("hello", StringComparison.Ordinal));
         Assert.Contains(socket.SentFrames, frame => frame.SequenceEqual(new byte[] { 4 }));
+    }
+
+    [Fact]
+    public async Task ExecAsync_BootstrapCreatesSpecWorkingDirectory_BeforeRunningTheCommand()
+    {
+        // The first exec the orchestrator issues is `git clone <url> /work` with NO SandboxExec.WorkingDirectory
+        // set, so the sprite is asked to chdir into the spec working directory (/work) — which rc30 sprites
+        // do not create (no baseline image). The bootstrap must therefore mkdir -p <wd> and cd into it before
+        // exec "$@", and the exec must NOT send a `dir` query param that would have the sprite chdir into a
+        // not-yet-created directory before the script runs. Assert both: the workdir travels as a bootstrap
+        // argv element and dir is absent from the URL.
+        var socket = new FakeSpritesWebSocket();
+        socket.EnqueueText("""{"type":"session_info","session_id":1,"command":"git","created":0,"cols":0,"rows":0,"is_owner":true,"tty":false}""");
+        socket.EnqueueText("""{"type":"exit","exit_code":0}""");
+        // Spec carries no /work mount and WorkingDirectory defaults to /work — so nothing else creates /work.
+        var sandbox = NewSandbox(socket, new SandboxSpec { ImageReference = "ignored" });
+
+        var result = await sandbox.ExecAsync(new SandboxExec { Argv = ["git", "clone", "https://example.test/repo", "/work"] });
+
+        Assert.True(result.Success);
+        var query = ParseQuery(socket.ConnectedUri!);
+        Assert.False(query.ContainsKey("dir"), "dir must not be sent — the bootstrap creates and cd's into the workdir");
+        AssertWrappedCommand(query, ["git", "clone", "https://example.test/repo", "/work"], "/work");
+    }
+
+    [Fact]
+    public async Task LimitedOutputCollector_DoesNotSplitUtf8AcrossFrames()
+    {
+        // WebSocket binary frames (and output-cap truncation) can split a multi-byte UTF-8 sequence
+        // across two Append calls. The live per-chunk callback feeds the structured stream-json
+        // parser, so decoding the partial bytes in isolation would emit U+FFFD and corrupt a JSON
+        // event. The collector must buffer trailing partial bytes across Append calls and only emit
+        // complete characters to the callback.
+        var collected = new StringBuilder();
+        var collector = new LimitedOutputCollector(null, s => collected.Append(s));
+
+        // "中" is U+4E2D = 0xE4 0xB8 0xAD (3 bytes). Split after the second byte across two frames,
+        // then continue with an ASCII char in the second frame.
+        collector.Append([(byte)0xE4, (byte)0xB8]);
+        Assert.Equal("", collected.ToString()); // incomplete character held, nothing emitted yet
+        collector.Append([(byte)0xAD, (byte)'x']);
+
+        Assert.Equal("中x", collected.ToString()); // callback saw the whole character, not U+FFFD
+        Assert.Equal("中x", collector.ToString()); // full buffer decodes at the end
     }
 
     [Fact]
@@ -578,6 +625,87 @@ public sealed class SpritesSandboxProviderTests
             provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" }));
 
         Assert.Contains(expectedMessage, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(nameof(SpritesSandboxOptions.MaxSyncArchiveBase64Bytes))]
+    [InlineData(nameof(SpritesSandboxOptions.MaxSyncArchiveBytes))]
+    [InlineData(nameof(SpritesSandboxOptions.MaxSyncArchiveExpandedBytes))]
+    [InlineData(nameof(SpritesSandboxOptions.MaxSyncArchiveEntries))]
+    [InlineData(nameof(SpritesSandboxOptions.MaxFileSyncBase64Bytes))]
+    [InlineData(nameof(SpritesSandboxOptions.MaxFileSyncBytes))]
+    public async Task ReadValidatedOptions_RejectsZeroSyncSizeLimit(string limitName)
+    {
+        // The MaxSync*/MaxFileSync* ceilings are the memory-exhaustion / DoS backstops for the
+        // sync-back path. An inverted comparison or dropped clause in any one of them would silently
+        // disable that backstop, so each must be independently rejected when <= 0.
+        var options = new SpritesSandboxOptions { Token = "sprite-token" };
+        switch (limitName)
+        {
+            case nameof(SpritesSandboxOptions.MaxSyncArchiveBase64Bytes):
+                options = options with { MaxSyncArchiveBase64Bytes = 0 };
+                break;
+            case nameof(SpritesSandboxOptions.MaxSyncArchiveBytes):
+                options = options with { MaxSyncArchiveBytes = 0 };
+                break;
+            case nameof(SpritesSandboxOptions.MaxSyncArchiveExpandedBytes):
+                options = options with { MaxSyncArchiveExpandedBytes = 0 };
+                break;
+            case nameof(SpritesSandboxOptions.MaxSyncArchiveEntries):
+                options = options with { MaxSyncArchiveEntries = 0 };
+                break;
+            case nameof(SpritesSandboxOptions.MaxFileSyncBase64Bytes):
+                options = options with { MaxFileSyncBase64Bytes = 0 };
+                break;
+            case nameof(SpritesSandboxOptions.MaxFileSyncBytes):
+                options = options with { MaxFileSyncBytes = 0 };
+                break;
+        }
+        var provider = NewProvider(
+            new RecordingHttpHandler(_ => throw new InvalidOperationException("HTTP should not be called")),
+            new EmptySpritesWebSocketFactory(),
+            options);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" }));
+
+        Assert.Contains("sync size limits must all be greater than zero", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public async Task ReadValidatedOptions_RejectsNonPositiveMaxListPages(int maxListPages)
+    {
+        var provider = NewProvider(
+            new RecordingHttpHandler(_ => throw new InvalidOperationException("HTTP should not be called")),
+            new EmptySpritesWebSocketFactory(),
+            new SpritesSandboxOptions { Token = "sprite-token", MaxListPages = maxListPages });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" }));
+
+        Assert.Contains("MaxListPages must be greater than zero", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("sprites")]
+    [InlineData("codeybox")]
+    [InlineData("codeybox2")]
+    public async Task ReadValidatedOptions_RejectsNamePrefixMissingCodeyboxSuffix(string namePrefix)
+    {
+        // Each of these passes the charset rule (lowercase letters/digits) but does NOT start with the
+        // full "codeybox-" prefix, so it must hit the distinct 'must start with codeybox-' rejection
+        // rather than the earlier charset rule that the theory's "bad_prefix" row exercises.
+        var provider = NewProvider(
+            new RecordingHttpHandler(_ => throw new InvalidOperationException("HTTP should not be called")),
+            new EmptySpritesWebSocketFactory(),
+            new SpritesSandboxOptions { Token = "sprite-token", NamePrefix = namePrefix });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" }));
+
+        Assert.Contains("must start with 'codeybox-'", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1266,17 +1394,20 @@ public sealed class SpritesSandboxProviderTests
         return result;
     }
 
-    private static void AssertWrappedCommand(Dictionary<string, List<string>> query, IReadOnlyList<string> expectedOriginalArgv)
+    private static void AssertWrappedCommand(Dictionary<string, List<string>> query, IReadOnlyList<string> expectedOriginalArgv, string expectedWorkingDirectory = "/")
     {
         var cmd = query["cmd"];
-        Assert.True(cmd.Count >= expectedOriginalArgv.Count + 5, $"wrapped command had too few argv entries: {string.Join(" ", cmd)}");
+        Assert.True(cmd.Count >= expectedOriginalArgv.Count + 6, $"wrapped command had too few argv entries: {string.Join(" ", cmd)}");
         Assert.Equal("sh", cmd[0]);
         Assert.Equal("-c", cmd[1]);
         Assert.Contains("exec \"$@\"", cmd[2], StringComparison.Ordinal);
+        Assert.Contains("mkdir -p", cmd[2], StringComparison.Ordinal);
+        Assert.Contains("cd \"$__codeybox_wd\"", cmd[2], StringComparison.Ordinal);
         Assert.Equal("_", cmd[3]);
         Assert.True(int.TryParse(cmd[4], NumberStyles.None, CultureInfo.InvariantCulture, out var envBytes), "env byte count should be numeric");
         Assert.True(envBytes > 0);
-        Assert.Equal(expectedOriginalArgv, cmd.Skip(5).ToArray());
+        Assert.Equal(expectedWorkingDirectory, cmd[5]);
+        Assert.Equal(expectedOriginalArgv, cmd.Skip(6).ToArray());
     }
 
     private sealed class RecordingHttpHandler : HttpMessageHandler
