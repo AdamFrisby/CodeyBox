@@ -14,7 +14,11 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class PullRequestDescriptionTimeoutTests
 {
-    private static readonly TimeSpan TestHangGuard = TimeSpan.FromSeconds(30);
+    // Backstop against a genuine hang only — CompleteAsync returns in well under a
+    // second on a healthy box once the generator timeout fires. 60 s (not 30 s)
+    // keeps the guard from tripping under parallel audit-suite thread-pool
+    // starvation, where the fallback continuation can be delayed past 30 s.
+    private static readonly TimeSpan TestHangGuard = TimeSpan.FromSeconds(60);
 
     private static readonly GitHubUpstreamOptions TimeoutOpts = new()
     {

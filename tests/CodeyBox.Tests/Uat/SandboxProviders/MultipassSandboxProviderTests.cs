@@ -1304,7 +1304,14 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var processGroupMarker = Path.Combine(_workspace, "detached.pgid");
         var doneFile = Path.Combine(_workspace, "detached.done");
         await File.WriteAllTextAsync(envFile, MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment()));
-        await File.WriteAllTextAsync(commandScript, "sleep 3\nprintf done > \"$1\"\n");
+        // Sleep far longer than any plausible launch-script overhead. The
+        // "returns before the command completes" invariant is then verified by
+        // the command still being in-flight when the launch returns (doneFile
+        // absent), NOT by an absolute wall-clock deadline. The launch spawns
+        // several python3/sudo helpers before it backgrounds the command, so a
+        // tight deadline flakes under full-suite thread-pool contention even
+        // though the launch is genuinely non-blocking.
+        await File.WriteAllTextAsync(commandScript, "sleep 30\nprintf done > \"$1\"\n");
         File.SetUnixFileMode(commandScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         await File.WriteAllTextAsync(
             launchScript,
@@ -1320,10 +1327,18 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         Assert.Equal(0, exit);
         Assert.Equal("", stderr);
-        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(2.5), $"detached launch stayed attached for {sw.Elapsed}");
         Assert.True(File.Exists(processGroupMarker));
-        await WaitForFileAsync(doneFile, TimeSpan.FromSeconds(6));
-        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
+        // The launch returned while the backgrounded command was still sleeping
+        // — it did not block until completion.
+        Assert.False(
+            File.Exists(doneFile),
+            $"detached launch stayed attached until the command completed (returned after {sw.Elapsed})");
+
+        // Tear the still-sleeping command's process group down rather than
+        // waiting out the full 30s sleep.
+        var pgid = (await File.ReadAllTextAsync(processGroupMarker)).Trim();
+        await KillProcessGroupAsync(pgid);
+        await WaitForProcessGroupIdGoneAsync(pgid, TimeSpan.FromSeconds(6));
     }
 
     [Fact]

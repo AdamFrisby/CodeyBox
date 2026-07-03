@@ -8,6 +8,9 @@ public sealed class QuotaResetParserTests
     [InlineData("reset after 21h41m24s", 21, 41, 24)]
     [InlineData("will reset after 5m17s", 0, 5, 17)]
     [InlineData("reset in 30m", 0, 30, 0)]
+    // agy's consumer-quota 429 phrasing: "Individual quota reached (Resets in 8m14s)".
+    [InlineData("Resets in 8m14s", 0, 8, 14)]
+    [InlineData("Individual quota reached (Resets in 8m14s)", 0, 8, 14)]
     [InlineData("retry after 1h", 1, 0, 0)]
     [InlineData("try again after 2h30m", 2, 30, 0)]
     [InlineData("available in 13m", 0, 13, 0)]

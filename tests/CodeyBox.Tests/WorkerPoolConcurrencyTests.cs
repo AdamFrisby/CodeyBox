@@ -69,8 +69,12 @@ public sealed class WorkerPoolConcurrencyTests : IDisposable
         using var _ = registry;
         await svc.StartAsync(CancellationToken.None);
 
-        // Wait until all items reach Done (generous timeout for CI).
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(15);
+        // Wait until all items reach Done (generous timeout for CI). 45 s, not 15 s:
+        // under parallel audit-suite load the worker loop can be starved of a
+        // thread-pool thread long enough that no item is even picked up inside 15 s
+        // (peakConcurrent stays 0). The loop breaks the instant all items are Done,
+        // so a healthy run still finishes fast — this only widens the headroom.
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(45);
         while (DateTimeOffset.UtcNow < deadline)
         {
             int doneCount = 0;

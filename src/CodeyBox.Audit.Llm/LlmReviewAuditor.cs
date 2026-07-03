@@ -150,7 +150,10 @@ public sealed class LlmReviewAuditor : IAuditor, IRequiresPassedBuildTestGate
                 RawOutput: rawOutput,
                 AgentStderr: agentResult.Stderr,
                 AgentSummary: agentResult.Summary,
-                AgentStdout: agentResult.Stdout);
+                AgentStdout: agentResult.Stdout)
+            {
+                AgentTerminalDiagnostic = agentResult.TerminalDiagnostic,
+            };
         }
 
         // Read the JSON result file from the sandbox.
@@ -175,7 +178,13 @@ public sealed class LlmReviewAuditor : IAuditor, IRequiresPassedBuildTestGate
                 RawOutput: rawOutput,
                 AgentStderr: agentResult.Stderr,
                 AgentSummary: agentResult.Summary,
-                AgentStdout: agentResult.Stdout);
+                AgentStdout: agentResult.Stdout)
+            {
+                // The exit-0 give-up (agy 429 with no result.json) lands here; carry
+                // the runner-lifted terminal region so the audit-phase quota routing
+                // can park instead of reading zero findings as a clean audit.
+                AgentTerminalDiagnostic = agentResult.TerminalDiagnostic,
+            };
         }
 
         try

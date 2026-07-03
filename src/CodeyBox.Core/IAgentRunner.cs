@@ -196,7 +196,25 @@ public interface ICliSessionResumableAgentRunner : IAgentRunner
     string? TryExtractSessionId(string? stdout);
 }
 
-public sealed record AgentResult(bool Success, string Summary, string? Stdout, string? Stderr);
+public sealed record AgentResult(bool Success, string Summary, string? Stdout, string? Stderr)
+{
+    /// <summary>
+    /// The runner-extracted TERMINAL error region (e.g. a CLI's final
+    /// <c>RESOURCE_EXHAUSTED</c> / quota line) when the agent surfaces its cause
+    /// in a side-channel that its process exit code and stderr do not reflect.
+    ///
+    /// <para>Some CLIs (notably <c>agy</c>) exit <b>0</b> and make no file changes
+    /// when they give up on a consumer-tier quota block, writing the 429 only to
+    /// an internal log. Such a run reaches the pipeline as a "success" with an
+    /// empty diff and would otherwise terminal-fail as "produced no changes",
+    /// losing legitimate work that a short quota reset would have recovered. The
+    /// runner lifts that terminal region into this field — separate from
+    /// <see cref="Stderr"/> so the success-path auth classifier is unaffected —
+    /// so the no-changes branch can classify it and park the item in
+    /// <c>WaitingForQuotaReset</c> instead of dead-lettering it.</para>
+    /// </summary>
+    public string? TerminalDiagnostic { get; init; }
+}
 
 /// <summary>Maps agent kinds to runners. Loose coupling: register new runners without recompiling consumers.</summary>
 public interface IAgentRegistry
