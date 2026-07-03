@@ -2126,7 +2126,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // agent to run the mechanical (shell) auditors itself before
             // committing, pre-empting iter-1 rework cycles for trivial
             // findings (format, lint, build-WaE).
-            var auditors = _auditorComposer.Compose(project, agentRunner);
+            //
+            // Filter to Code-target auditors so the code-audit phase mirrors the
+            // plan-review phase's target filtering (which composes Plan-target
+            // auditors). Every built-in preset is CodeOnly or PlanAndCode today,
+            // so this is currently a no-op for the shipped set — but it keeps the
+            // Targets seam symmetric so a Plan-only auditor never runs its
+            // code-diff RunAsync during the code audit.
+            var auditors = _auditorComposer.ComposeForTarget(project, agentRunner, AuditTarget.Code);
             AuditLog.AuditProfileSelected(project.Audit.Profile, auditors.Select(a => a.Name).ToArray());
             // currentRunAuditPass gates the merge on "an audit pass was produced
             // in THIS pickup". Two resume paths seed it true without running a

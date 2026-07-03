@@ -96,12 +96,33 @@ public sealed class AuditorPlanReviewGate : IPlanReviewGate
                 continue;
             }
 
+            var errorFindingCount = 0;
             foreach (var finding in result.Findings)
             {
                 if (finding.Severity == AuditSeverity.Error)
+                {
                     blocking.Add(finding);
+                    errorFindingCount++;
+                }
                 else
+                {
                     advisory++;
+                }
+            }
+
+            // Honour the reviewer's explicit reject verdict even when it emitted
+            // no error-severity finding (e.g. passed=false with only warnings, or
+            // an empty findings list). This mirrors the code-audit convention
+            // (`!result.Passed || Findings.Any(error)` is blocking) so the "plan
+            // MUST pass before implementation" invariant cannot be bypassed by an
+            // inconsistent-but-plausible model verdict that discards the boolean.
+            if (!result.Passed && errorFindingCount == 0)
+            {
+                blocking.Add(new AuditFinding(
+                    ((IAuditor)reviewer).Name,
+                    AuditSeverity.Error,
+                    "plan rejected by reviewer",
+                    "The plan reviewer returned an explicit reject verdict (passed=false) without an error-severity finding."));
             }
         }
 
@@ -142,6 +163,23 @@ public sealed class AuditorPlanReviewGate : IPlanReviewGate
         {
             _log.LogInformation(
                 "Agent {Agent} has no text-only path; plan review is skipped for work item {WorkItemId}.",
+                agentKind, request.WorkItemId);
+            return null;
+        }
+
+        // Subscription CLIs (Cursor / Opencode) execute their text-only path
+        // inside the work-item sandbox, which the host-only plan-review gate has
+        // no way to supply. Their credential probe reports "available" whenever
+        // the auth bundle is present, so without this check the gate would issue
+        // a call guaranteed to fail and misclassify that infrastructure
+        // condition as a blocking plan rejection — failing the work item after
+        // MaxPlanReviewIterations. Degrade-and-skip instead (approve on
+        // validity), exactly like the Claude-without-API-key path below.
+        if (textRunner.TextOnlyRequiresSandbox)
+        {
+            _log.LogInformation(
+                "Agent {Agent} requires a sandbox for text-only review, which the plan-review gate cannot provide; " +
+                "skipping plan review for work item {WorkItemId} and approving on validity.",
                 agentKind, request.WorkItemId);
             return null;
         }

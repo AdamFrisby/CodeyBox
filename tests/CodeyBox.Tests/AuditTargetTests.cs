@@ -115,6 +115,71 @@ public sealed class AuditTargetTests
         Assert.Contains(result.Findings, f => f.Severity == AuditSeverity.Error);
     }
 
+    [Fact]
+    public async Task LlmReviewAuditor_PlanReview_AgentFailure_IsBlocking()
+    {
+        // The text-only runner reporting failure is an agent/infra error, not a
+        // passing review — it must surface a blocking Error finding so a failed
+        // reviewer never silently approves the plan.
+        var auditor = PlanAuditor();
+        var runner = new FakeTextOnlyRunner("ignored", success: false);
+        var ctx = PlanContext();
+
+        var result = await ((IPlanTextReviewer)auditor).ReviewPlanAsync(ctx, runner, credential: null);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("plan review agent failed to run", finding.Title, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task LlmReviewAuditor_PlanReview_EmptyVerdict_IsBlocking()
+    {
+        // A successful call that returns no text has no verdict to trust.
+        var auditor = PlanAuditor();
+        var runner = new FakeTextOnlyRunner("   ");
+        var ctx = PlanContext();
+
+        var result = await ((IPlanTextReviewer)auditor).ReviewPlanAsync(ctx, runner, credential: null);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("produced no verdict", finding.Title, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task LlmReviewAuditor_PlanReview_InvalidJson_IsBlocking()
+    {
+        // A chatty/malformed model response that isn't parseable JSON must be a
+        // blocking Error, not swallowed into a passing verdict.
+        var auditor = PlanAuditor();
+        var runner = new FakeTextOnlyRunner("I could not decide, sorry — no JSON here.");
+        var ctx = PlanContext();
+
+        var result = await ((IPlanTextReviewer)auditor).ReviewPlanAsync(ctx, runner, credential: null);
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("produced invalid JSON", finding.Title, StringComparison.Ordinal);
+    }
+
+    private static LlmReviewAuditor PlanAuditor() => new(new LlmReviewAuditorOptions
+    {
+        Name = "architecture:llm-review",
+        Agent = new NoopAgent(),
+        ReviewFocus = "- Layering violations",
+        FrameTemplate = "{{reviewFocus}} {{resultFile}}",
+        Targets = AuditTargets.PlanAndCode,
+    });
+
+    private static AuditContext PlanContext() => new(
+        WorkItemId.New(), "work", "main", 1, "task",
+        Target: AuditTarget.Plan,
+        PlanArtifact: """{"approach":"a","files":["f"],"testStrategy":["t"],"risks":["r"],"satisfiesTask":"s"}""");
+
     private sealed class BareCodeAuditor : IAuditor
     {
         public string Name => "bare";
@@ -135,12 +200,17 @@ public sealed class AuditTargetTests
     }
 }
 
-internal sealed class FakeTextOnlyRunner(string output, bool success = true, string? unavailabilityReason = null)
+internal sealed class FakeTextOnlyRunner(
+    string output,
+    bool success = true,
+    string? unavailabilityReason = null,
+    bool requiresSandbox = false)
     : ITextOnlyAgentRunner
 {
     public AgentKind Kind => AgentKind.Claude;
     public string LastPrompt { get; private set; } = string.Empty;
     public int Calls { get; private set; }
+    public bool TextOnlyRequiresSandbox => requiresSandbox;
 
     public Task<AgentResult> RunAsync(
         ISandbox sandbox, string workingDirectory, string prompt, AgentCredential? credential,

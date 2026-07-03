@@ -53,6 +53,50 @@ public sealed class AuditorPlanReviewGateTests
     }
 
     [Fact]
+    public async Task ReviewAsync_RejectsWhenReviewerVerdictIsPassedFalseWithoutErrorFinding()
+    {
+        // An explicit reject verdict (passed=false) with only advisory findings
+        // must still block — the boolean cannot be discarded.
+        var runner = new FakeTextOnlyRunner(
+            """{"passed": false, "findings": [{"severity":"warning","title":"iffy approach","description":"maybe"}]}""");
+        var gate = BuildGate(runner, auditTypes: ["architecture"]);
+
+        var decision = await gate.ReviewAsync(Request());
+
+        Assert.False(decision.Approved);
+        Assert.Contains("plan rejected by reviewer", decision.RejectionReason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ReviewAsync_ApprovesWhenAgentRequiresSandbox()
+    {
+        // Subscription CLIs (Cursor/Opencode) need a sandbox the host-only gate
+        // can't provide; the gate degrades-and-skips instead of hard-failing.
+        var runner = new FakeTextOnlyRunner("unused", requiresSandbox: true);
+        var gate = BuildGate(runner, auditTypes: ["architecture"]);
+
+        var decision = await gate.ReviewAsync(Request());
+
+        Assert.True(decision.Approved);
+        Assert.Equal(0, runner.Calls);
+    }
+
+    [Fact]
+    public async Task ReviewAsync_ApprovesWithAdvisoryNotes_WhenOnlyNonErrorFindings()
+    {
+        // passed=true with warning/info findings → approved, but the advisory
+        // count is surfaced in the summary.
+        var runner = new FakeTextOnlyRunner(
+            """{"passed": true, "findings": [{"severity":"warning","title":"nit","description":"n"},{"severity":"info","title":"fyi","description":"i"}]}""");
+        var gate = BuildGate(runner, auditTypes: ["architecture"]);
+
+        var decision = await gate.ReviewAsync(Request());
+
+        Assert.True(decision.Approved);
+        Assert.Contains("advisory", decision.Summary, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task ReviewAsync_RejectsStructurallyInvalidPlan()
     {
         var runner = new FakeTextOnlyRunner("unused");
