@@ -39,6 +39,66 @@ public sealed class AntigravityQuotaFailureDetectorTests
     }
 
     [Fact]
+    public void Detect_ConsumerQuota429_ParsesRelativeResetToPreciseWindow()
+    {
+        // agy's consumer-tier 429 reports its rolling-window reset as a RELATIVE
+        // duration ("Resets in 8m14s"), not an absolute ISO timestamp. The item
+        // must park in WaitingForQuotaReset with resetAt ≈ now + 494s so it
+        // retries right after the window clears — not on a coarse default backoff.
+        var before = DateTimeOffset.UtcNow;
+        var stderr = "RESOURCE_EXHAUSTED (code 429): Individual quota reached (Resets in 8m14s)";
+
+        var detection = _detector.Detect(stderr, stdout: null);
+        var after = DateTimeOffset.UtcNow;
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.NotNull(detection.ResetAt);
+        // 8m14s = 494s. Bracket by the wall-clock reads to stay flake-free.
+        Assert.InRange(
+            detection.ResetAt!.Value,
+            before.AddSeconds(494),
+            after.AddSeconds(494));
+    }
+
+    [Fact]
+    public void Detect_CapturedTerminalRegionWithRelativeReset_ParksWithPreciseReset()
+    {
+        // End-to-end over the shape the runner folds into Stderr on a terminal
+        // agy 429: ExtractTerminalErrorRegion slices the glog tail, then Detect
+        // classifies it and parses the relative reset off the same terminal line.
+        var glog = "Model resolved: gemini-3.5-flash\n"
+            + "applyAuthResult: authMethod=consumer\n"
+            + "RESOURCE_EXHAUSTED (code 429): Individual quota reached (Resets in 8m14s)";
+        var region = AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(glog);
+        Assert.NotNull(region);
+
+        var before = DateTimeOffset.UtcNow;
+        var detection = _detector.Detect(stderr: region, stdout: null);
+        var after = DateTimeOffset.UtcNow;
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.NotNull(detection.ResetAt);
+        Assert.InRange(detection.ResetAt!.Value, before.AddSeconds(494), after.AddSeconds(494));
+    }
+
+    [Fact]
+    public void Detect_CleanNoOpRunWithoutQuotaMarker_ReturnsNoDetection()
+    {
+        // A genuine no-op — agy ran, emitted its ordinary diagnostics, and made no
+        // file changes with NO 429 anywhere — must NOT be misread as a quota park.
+        // It has to fall through to the "produced no changes" terminal failure.
+        var glog = "Model resolved: gemini-3.5-flash\n"
+            + "applyAuthResult: authMethod=consumer\n"
+            + "read 12 files, wrote 0 files\n"
+            + "done";
+
+        Assert.Null(AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(glog));
+        Assert.Null(_detector.Detect(stderr: glog, stdout: null));
+    }
+
+    [Fact]
     public void Detect_AbsoluteLockoutInPlainText_StillExtractsReset()
     {
         var when = DateTimeOffset.UtcNow.AddHours(48);
