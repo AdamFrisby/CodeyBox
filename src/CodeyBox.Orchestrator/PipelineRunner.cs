@@ -6798,7 +6798,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (stdoutOnlyEvidence && requireStdoutOnlyCorroboration)
         {
             var corroboration = await TryCorroborateStdoutOnlyAuthRequiredAsync(item, project, agent, phase, ct);
-            publishSideEffects = corroboration != StdoutOnlyAuthCorroboration.NotCorroborated;
+            // Fail-CLOSED on the irreversible fleet-wide "operator action
+            // required" bench: only POSITIVELY corroborated stdout-only
+            // evidence escalates to a global bench. Both NotCorroborated and
+            // Unavailable (e.g. in-VM smoke disabled) degrade to item-level
+            // handling — the resolver reroutes to another class member —
+            // rather than benching a possibly-authenticated agent fleet-wide
+            // on model-controllable stdout that was never corroborated.
+            publishSideEffects = corroboration == StdoutOnlyAuthCorroboration.Corroborated;
             stdoutOnlyNote = corroboration switch
             {
                 StdoutOnlyAuthCorroboration.Corroborated =>
@@ -6806,7 +6813,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 StdoutOnlyAuthCorroboration.NotCorroborated =>
                     "stdout accepted for item failure only; forced in-VM smoke probe did not corroborate auth",
                 _ =>
-                    "stdout auth evidence accepted for global benching; forced in-VM smoke corroboration unavailable",
+                    "stdout auth evidence NOT corroborated (forced in-VM smoke unavailable); item-level failure only, no fleet-wide bench",
             };
         }
 

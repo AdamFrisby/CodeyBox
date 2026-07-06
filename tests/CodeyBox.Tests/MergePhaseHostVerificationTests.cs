@@ -449,7 +449,7 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
     }
 
     [Fact]
-    public async Task AdvisoryAgentAuthPrompt_RaisesAuthRequiredBenchesAndAlerts()
+    public async Task AdvisoryAgentAuthPrompt_RaisesAuthRequired_WithoutFleetBench()
     {
         var (gitHost, repoId) = await CreateConflictingRepoAsync();
         var preMergeMain = await gitHost.ResolveCommitAsync(repoId, "main");
@@ -516,17 +516,18 @@ public sealed class SecurityReviewIsAdvisoryOnlyTest : IDisposable
                 conflictsResolvedByConstrainedResolver: true));
 
         Assert.Contains("merge-security-review", ex.Message);
-        Assert.Contains("forced in-VM smoke corroboration unavailable", ex.Message);
+        // In-VM smoke is unavailable here, so the stdout-only auth evidence is
+        // NOT corroborated: the item-level AgentAuthRequiredException is raised
+        // (so the merge does not proceed) but the fleet-wide bench fails CLOSED.
+        Assert.Contains("item-level failure only, no fleet-wide bench", ex.Message);
         // ex.Agent and ex.Phase are load-bearing for downstream catch sites that
         // attribute benching/webhook publishing — pin them so a regression that
         // stamps the fallback runner or a wrong phase string surfaces here.
         Assert.Equal(AgentKind.Claude, ex.Agent);
         Assert.Equal("merge-security-review", ex.Phase);
         var current = availability.GetAvailability(AgentKind.Claude);
-        Assert.False(current.Available, current.Reason);
-        var failed = Assert.Single(webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("claude", details.AgentKind);
+        Assert.True(current.Available, current.Reason);
+        Assert.DoesNotContain(webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     private async Task<(LocalGitHost GitHost, string RepoId)> CreateConflictingRepoAsync()
