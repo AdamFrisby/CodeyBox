@@ -3853,7 +3853,7 @@ test "$work" = present && test "$exec_wrapper" = present
         set -eux
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
-        apt-get install -y --no-install-recommends xvfb x11vnc xfce4 xfce4-terminal dbus-x11 xdotool scrot ffmpeg x11-utils socat
+        apt-get install -y --no-install-recommends xvfb x11vnc xfce4 xfce4-terminal dbus-x11 xdotool scrot ffmpeg x11-utils socat tesseract-ocr tesseract-ocr-eng at-spi2-core python3-pyatspi
         systemctl daemon-reload
         systemctl enable codeybox-xvfb.service codeybox-xfce.service codeybox-vnc.service
         systemctl restart codeybox-xvfb.service codeybox-xfce.service codeybox-vnc.service
@@ -5240,6 +5240,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     internal const int MaxScreenshotStderrBytes = 64 * 1024;
     internal const int ResourceMetricsCaptureMaxStdoutBytes = 4096;
     internal const int ResourceMetricsCaptureMaxStderrBytes = 4096;
+    internal const int MaxAccessibilityJsonStdoutBytes = 2 * 1024 * 1024;
+    internal const int MaxAccessibilityStderrBytes = 64 * 1024;
     internal const int AgentOutputHttpSetupFailedExitCode = 86;
     private const int DetachedProcessGroupMalformedExitCode = 73;
     private const int DetachedSupervisorSetupFailedExitCode = 88;
@@ -5260,6 +5262,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     internal const string AgentOutputHttpSetupFailureMarker =
         "codeybox-exec: agent output HTTP ingest unavailable before launch";
     private static readonly byte[] PngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
+    private static readonly JsonSerializerOptions AccessibilityJsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+    };
 
     internal delegate Task<MultipassAgentOutputHttpIngestSession?> AgentOutputHttpIngestSessionStarter(
         System.Net.IPAddress bindAddress,
@@ -5729,6 +5735,79 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         => bytes.Length >= PngSignature.Length
             && bytes.AsSpan(0, PngSignature.Length).SequenceEqual(PngSignature);
 
+    public async Task<SandboxAccessibilitySnapshot?> GetAccessibilityAtPointAsync(int x, int y, CancellationToken ct = default)
+    {
+        EnsureGraphical();
+        var result = await ExecRunAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "bash", "-lc",
+                "DISPLAY=:0 python3 - <<'PY'\n" + MultipassAccessibilityAtPointPython + "\nPY\n",
+            ],
+            ExtraEnvironment = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["CODEYBOX_AX_X"] = x.ToString(CultureInfo.InvariantCulture),
+                ["CODEYBOX_AX_Y"] = y.ToString(CultureInfo.InvariantCulture),
+            },
+            WorkingDirectory = _spec.WorkingDirectory,
+        }, ct, maxStdoutBytes: MaxAccessibilityJsonStdoutBytes, maxStderrBytes: MaxAccessibilityStderrBytes);
+
+        if (!result.Success
+            || result.StdoutLimitExceeded
+            || result.StderrLimitExceeded
+            || string.IsNullOrWhiteSpace(result.Stdout))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(result.Stdout);
+            if (doc.RootElement.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+                return null;
+            return JsonSerializer.Deserialize<SandboxAccessibilitySnapshot?>(result.Stdout, AccessibilityJsonOptions);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    public async Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default)
+    {
+        EnsureGraphical();
+        var result = await ExecRunAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "bash", "-lc",
+                "DISPLAY=:0 python3 - <<'PY'\n" + MultipassAccessibilityTreePython + "\nPY\n",
+            ],
+            WorkingDirectory = _spec.WorkingDirectory,
+        }, ct, maxStdoutBytes: MaxAccessibilityJsonStdoutBytes, maxStderrBytes: MaxAccessibilityStderrBytes);
+
+        if (!result.Success
+            || result.StdoutLimitExceeded
+            || result.StderrLimitExceeded
+            || string.IsNullOrWhiteSpace(result.Stdout))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(result.Stdout);
+            if (doc.RootElement.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+                return null;
+            return result.Stdout;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
     public async Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
     {
         EnsureGraphical();
@@ -5791,6 +5870,182 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 throw new ArgumentOutOfRangeException(nameof(inputEvent), inputEvent.Type, "Unknown input event type.");
         }
     }
+
+    private const string MultipassAccessibilityAtPointPython =
+        """
+        import os
+        import json
+        import sys
+
+        try:
+            import pyatspi
+        except Exception:
+            print("null")
+            sys.exit(0)
+
+        target_x = int(os.environ.get("CODEYBOX_AX_X", "0"))
+        target_y = int(os.environ.get("CODEYBOX_AX_Y", "0"))
+        MAX_NODES = 2000
+        MAX_DEPTH = 64
+        count = 0
+        limit_hit = False
+
+        def safe(call, default=None):
+            try:
+                return call()
+            except Exception:
+                return default
+
+        def text_of(acc):
+            text = safe(lambda: acc.queryText())
+            if text is None:
+                return None
+            count = safe(lambda: text.characterCount, 0) or 0
+            if count <= 0:
+                return None
+            value = safe(lambda: text.getText(0, min(count, 512)), None)
+            return value if value else None
+
+        def bounds_of(acc):
+            component = safe(lambda: acc.queryComponent())
+            if component is None:
+                return None
+            extents = safe(lambda: component.getExtents(pyatspi.DESKTOP_COORDS))
+            if extents is None:
+                return None
+            x, y, width, height = int(extents.x), int(extents.y), int(extents.width), int(extents.height)
+            if width <= 0 or height <= 0:
+                return None
+            return {"x": x, "y": y, "width": width, "height": height}
+
+        def contains(bounds):
+            return (bounds is not None
+                    and target_x >= bounds["x"]
+                    and target_y >= bounds["y"]
+                    and target_x < bounds["x"] + bounds["width"]
+                    and target_y < bounds["y"] + bounds["height"])
+
+        def snapshot(acc):
+            role = safe(lambda: acc.getRoleName())
+            name = safe(lambda: acc.name)
+            return {
+                "role": role,
+                "name": name,
+                "text": text_of(acc),
+                "elementType": role,
+            }
+
+        def walk(acc, best=None, depth=0):
+            global count, limit_hit
+            if acc is None or limit_hit:
+                return best
+            if depth > MAX_DEPTH:
+                limit_hit = True
+                return best
+            count += 1
+            if count > MAX_NODES:
+                limit_hit = True
+                return best
+            bounds = bounds_of(acc)
+            if contains(bounds):
+                best = acc
+            if bounds is None or contains(bounds):
+                child_count = safe(lambda: acc.childCount, 0) or 0
+                for index in range(child_count):
+                    if limit_hit:
+                        break
+                    child = safe(lambda i=index: acc.getChildAtIndex(i))
+                    if child is not None:
+                        best = walk(child, best, depth + 1)
+            return best
+
+        desktop = safe(lambda: pyatspi.Registry.getDesktop(0))
+        if desktop is None:
+            print("null")
+            sys.exit(0)
+
+        hit = walk(desktop)
+        print(json.dumps(snapshot(hit) if hit is not None and not limit_hit else None, separators=(",", ":")))
+        """;
+
+    private const string MultipassAccessibilityTreePython =
+        """
+        import json
+        import sys
+
+        try:
+            import pyatspi
+        except Exception:
+            print("null")
+            sys.exit(0)
+
+        MAX_NODES = 2000
+        count = 0
+
+        def safe(call, default=None):
+            try:
+                return call()
+            except Exception:
+                return default
+
+        def text_of(acc):
+            text = safe(lambda: acc.queryText())
+            if text is None:
+                return None
+            char_count = safe(lambda: text.characterCount, 0) or 0
+            if char_count <= 0:
+                return None
+            value = safe(lambda: text.getText(0, min(char_count, 512)), None)
+            return value if value else None
+
+        def bounds_of(acc):
+            component = safe(lambda: acc.queryComponent())
+            if component is None:
+                return None
+            extents = safe(lambda: component.getExtents(pyatspi.DESKTOP_COORDS))
+            if extents is None:
+                return None
+            x, y, width, height = int(extents.x), int(extents.y), int(extents.width), int(extents.height)
+            if width <= 0 or height <= 0:
+                return None
+            return {"x": x, "y": y, "width": width, "height": height}
+
+        def node(acc):
+            global count
+            count += 1
+            role = safe(lambda: acc.getRoleName())
+            item = {
+                "role": role,
+                "name": safe(lambda: acc.name),
+                "text": text_of(acc),
+                "elementType": role,
+            }
+            bounds = bounds_of(acc)
+            if bounds is not None:
+                item["bounds"] = bounds
+            state = safe(lambda: acc.getState())
+            if state is not None and safe(lambda: state.contains(pyatspi.STATE_FOCUSED), False):
+                item["focused"] = True
+
+            children = []
+            child_count = safe(lambda: acc.childCount, 0) or 0
+            for index in range(child_count):
+                if count >= MAX_NODES:
+                    break
+                child = safe(lambda i=index: acc.getChildAtIndex(i))
+                if child is not None:
+                    children.append(node(child))
+            if children:
+                item["children"] = children
+            return item
+
+        desktop = safe(lambda: pyatspi.Registry.getDesktop(0))
+        if desktop is None:
+            print("null")
+            sys.exit(0)
+
+        print(json.dumps({"children": [node(desktop)]}, separators=(",", ":")))
+        """;
 
     private static IReadOnlyList<string> BuildScrollArgv(List<string> argv, SandboxInputEvent inputEvent)
     {
@@ -6107,6 +6362,15 @@ while True:
         sb.AppendLine("codeybox_release_lock() {");
         sb.AppendLine("    codeybox_root_sh 'rmdir \"$1\" 2>/dev/null || true' \"$codeybox_lock_dir\" || true");
         sb.AppendLine("}");
+        sb.AppendLine("codeybox_child_script=");
+        sb.AppendLine("codeybox_child_status_file=");
+        sb.AppendLine("codeybox_child_pgid_file=");
+        sb.AppendLine("codeybox_cleanup_launcher() {");
+        sb.AppendLine("    codeybox_release_lock");
+        sb.AppendLine("    if [ -n \"$codeybox_child_script\" ]; then rm -f \"$codeybox_child_script\" 2>/dev/null || true; fi");
+        sb.AppendLine("    if [ -n \"$codeybox_child_status_file\" ]; then rm -f \"$codeybox_child_status_file\" 2>/dev/null || true; fi");
+        sb.AppendLine("    if [ -n \"$codeybox_child_pgid_file\" ]; then rm -f \"$codeybox_child_pgid_file\" 2>/dev/null || true; fi");
+        sb.AppendLine("}");
         sb.AppendLine("codeybox_drain_stdin() {");
         sb.AppendLine("    cat >/dev/null 2>/dev/null || true");
         sb.AppendLine("}");
@@ -6128,7 +6392,7 @@ while True:
         sb.AppendLine("    sleep 0.1");
         sb.AppendLine("    codeybox_lock_i=$((codeybox_lock_i + 1))");
         sb.AppendLine("done");
-        sb.AppendLine("trap codeybox_release_lock EXIT");
+        sb.AppendLine("trap codeybox_cleanup_launcher EXIT");
         sb.AppendLine("if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then codeybox_drain_stdin; exit 0; fi");
         sb.AppendLine("codeybox_root_sh 'rm -f \"$1.tmp\" \"$1.exit.tmp\" \"$1.exit-token.tmp\" \"$1.stdin\" \"$1.stdin.tmp\"' \"$codeybox_pgid_marker\" || true");
         sb.AppendLine("if [ -n \"$codeybox_exit_token_file\" ]; then");
@@ -6211,7 +6475,40 @@ while True:
             .AppendLine(" >&2");
         sb.AppendLine($"    exit {AgentOutputHttpSetupFailedExitCode}");
         sb.AppendLine("fi");
-        sb.AppendLine("codeybox_child_script=$(mktemp \"${TMPDIR:-/tmp}/codeybox-detached-child.XXXXXX\")");
+        sb.AppendLine("codeybox_report_child_status_if_present() {");
+        sb.AppendLine("    if [ ! -s \"$codeybox_child_status_file\" ]; then");
+        sb.AppendLine("        return 1");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    local codeybox_child_status");
+        sb.AppendLine("    IFS= read -r codeybox_child_status < \"$codeybox_child_status_file\" || codeybox_child_status=");
+        sb.AppendLine("    case \"$codeybox_child_status\" in");
+        sb.AppendLine("        ''|*[!0-9]*) codeybox_child_status=88 ;;");
+        sb.AppendLine("    esac");
+        sb.AppendLine("    if [ -n \"${codeybox_detached_pid:-}\" ]; then");
+        sb.AppendLine("        wait \"$codeybox_detached_pid\" 2>/dev/null || true");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    echo \"codeybox-detached: detached child exited before publishing process group marker (exit $codeybox_child_status)\" >&2");
+        sb.AppendLine("    exit \"$codeybox_child_status\"");
+        sb.AppendLine("}");
+        sb.AppendLine("codeybox_read_child_pgid() {");
+        sb.AppendLine("    local codeybox_child_pgid");
+        sb.AppendLine("    if [ -s \"$codeybox_child_pgid_file\" ]; then");
+        sb.AppendLine("        IFS= read -r codeybox_child_pgid < \"$codeybox_child_pgid_file\" || codeybox_child_pgid=");
+        sb.AppendLine("        case \"$codeybox_child_pgid\" in");
+        sb.AppendLine("            ''|*[!0-9]*) ;;");
+        sb.AppendLine("            *) printf '%s\\n' \"$codeybox_child_pgid\"; return 0 ;;");
+        sb.AppendLine("        esac");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    printf '%s\\n' \"$codeybox_detached_pid\"");
+        sb.AppendLine("}");
+        sb.AppendLine("codeybox_child_group_alive() {");
+        sb.AppendLine("    local codeybox_child_pgid");
+        sb.AppendLine("    codeybox_child_pgid=$(codeybox_read_child_pgid)");
+        sb.AppendLine("    kill -0 \"-$codeybox_child_pgid\" 2>/dev/null");
+        sb.AppendLine("}");
+        sb.AppendLine("codeybox_child_script=$(mktemp \"${TMPDIR:-/tmp}/codeybox-detached-child.XXXXXX\") || exit 88");
+        sb.AppendLine("codeybox_child_status_file=$(mktemp \"${TMPDIR:-/tmp}/codeybox-detached-status.XXXXXX\") || exit 88");
+        sb.AppendLine("codeybox_child_pgid_file=$(mktemp \"${TMPDIR:-/tmp}/codeybox-detached-pgid.XXXXXX\") || exit 88");
         sb.AppendLine("cat > \"$codeybox_child_script\" <<'CODEYBOX_DETACHED_CHILD'");
         sb.AppendLine("#!/bin/bash");
         sb.AppendLine("set +e");
@@ -6229,9 +6526,13 @@ while True:
         sb.AppendLine("    done");
         sb.AppendLine("}");
         sb.AppendLine("codeybox_pgid_marker=$1");
-        sb.AppendLine("codeybox_stdin_file=$2");
-        sb.AppendLine("codeybox_env_file=$3");
-        sb.AppendLine("codeybox_exit_token_file=$4");
+        sb.AppendLine("codeybox_child_status_file=$2");
+        sb.AppendLine("codeybox_child_pgid_file=$3");
+        sb.AppendLine("codeybox_stdin_file=$4");
+        sb.AppendLine("codeybox_env_file=$5");
+        sb.AppendLine("codeybox_exit_token_file=$6");
+        sb.AppendLine("shift");
+        sb.AppendLine("shift");
         sb.AppendLine("shift");
         sb.AppendLine("shift");
         sb.AppendLine("shift");
@@ -6241,6 +6542,10 @@ while True:
         sb.AppendLine("    shift");
         sb.AppendLine("    sudo -n sh -c \"$codeybox_script\" codeybox-root-sh \"$@\"");
         sb.AppendLine("}");
+        sb.AppendLine("codeybox_publish_child_status() {");
+        sb.AppendLine("    printf '%s\\n' \"$1\" > \"$codeybox_child_status_file\" 2>/dev/null || true");
+        sb.AppendLine("}");
+        sb.AppendLine("printf '%s\\n' \"$$\" > \"$codeybox_child_pgid_file\" 2>/dev/null || true");
         sb.AppendLine("codeybox_output_url=");
         sb.AppendLine("codeybox_output_run_id=");
         sb.AppendLine("codeybox_output_exit_token=");
@@ -6275,6 +6580,7 @@ while True:
         sb.AppendLine("}");
         sb.AppendLine("codeybox_pgid=$$");
         sb.AppendLine("if ! codeybox_root_sh 'marker=$1; pgid=$2; tmp=\"${marker}.tmp\"; umask 077; printf \"%s\\n\" \"$pgid\" > \"$tmp\" && mv -f \"$tmp\" \"$marker\" && { chown root:root \"$marker\" 2>/dev/null || true; } && chmod 0600 \"$marker\"' \"$codeybox_pgid_marker\" \"$codeybox_pgid\"; then");
+        sb.AppendLine($"    codeybox_publish_child_status {DetachedSupervisorSetupFailedExitCode}");
         sb.AppendLine($"    exit {DetachedSupervisorSetupFailedExitCode}");
         sb.AppendLine("fi");
         sb.AppendLine("codeybox_close_inherited_stream_fds");
@@ -6334,7 +6640,7 @@ while True:
         sb.AppendLine("chmod 0700 \"$codeybox_child_script\"");
         sb.AppendLine("(");
         sb.AppendLine("    exec </dev/null >/dev/null 2>/dev/null");
-        sb.Append("    exec setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_stdin_file\" \"$codeybox_env_file\" \"$codeybox_exit_token_file\"");
+        sb.Append("    exec setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_child_status_file\" \"$codeybox_child_pgid_file\" \"$codeybox_stdin_file\" \"$codeybox_env_file\" \"$codeybox_exit_token_file\"");
         foreach (var arg in command)
             sb.Append(' ').Append(MultipassSandboxProvider.ShellSingleQuote(arg));
         sb.AppendLine();
@@ -6345,18 +6651,22 @@ while True:
         sb.AppendLine("    if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
         sb.AppendLine("        break");
         sb.AppendLine("    fi");
+        sb.AppendLine("    if codeybox_report_child_status_if_present; then");
+        sb.AppendLine("        :");
+        sb.AppendLine("    fi");
         sb.AppendLine("    if [ \"$SECONDS\" -ge \"$codeybox_marker_deadline\" ]; then");
         sb.AppendLine("        if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
         sb.AppendLine("            break");
         sb.AppendLine("        fi");
-        sb.AppendLine("        kill -TERM \"-$codeybox_detached_pid\" 2>/dev/null || true");
+        sb.AppendLine("        codeybox_detached_pgid=$(codeybox_read_child_pgid)");
+        sb.AppendLine("        kill -TERM \"-$codeybox_detached_pgid\" 2>/dev/null || true");
         sb.AppendLine("        codeybox_term_i=0");
-        sb.AppendLine("        while kill -0 \"-$codeybox_detached_pid\" 2>/dev/null && [ \"$codeybox_term_i\" -lt 20 ]; do");
+        sb.AppendLine("        while kill -0 \"-$codeybox_detached_pgid\" 2>/dev/null && [ \"$codeybox_term_i\" -lt 20 ]; do");
         sb.AppendLine("            sleep 0.05");
         sb.AppendLine("            codeybox_term_i=$((codeybox_term_i + 1))");
         sb.AppendLine("        done");
-        sb.AppendLine("        if kill -0 \"-$codeybox_detached_pid\" 2>/dev/null; then");
-        sb.AppendLine("            kill -KILL \"-$codeybox_detached_pid\" 2>/dev/null || true");
+        sb.AppendLine("        if kill -0 \"-$codeybox_detached_pgid\" 2>/dev/null; then");
+        sb.AppendLine("            kill -KILL \"-$codeybox_detached_pgid\" 2>/dev/null || true");
         sb.AppendLine("        fi");
         sb.AppendLine("        set +e");
         sb.AppendLine("        wait \"$codeybox_detached_pid\" 2>/dev/null");
@@ -6371,10 +6681,39 @@ while True:
         sb.AppendLine("        if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
         sb.AppendLine("            break");
         sb.AppendLine("        fi");
+        sb.AppendLine("        if [ ! -s \"$codeybox_child_pgid_file\" ] && [ \"$SECONDS\" -lt \"$codeybox_marker_deadline\" ]; then");
+        sb.AppendLine("            sleep 0.1");
+        sb.AppendLine("            continue");
+        sb.AppendLine("        fi");
+        sb.AppendLine("        if codeybox_child_group_alive; then");
+        sb.AppendLine("            sleep 0.1");
+        sb.AppendLine("            continue");
+        sb.AppendLine("        fi");
+        sb.AppendLine("        if codeybox_report_child_status_if_present; then");
+        sb.AppendLine("            :");
+        sb.AppendLine("        fi");
         sb.AppendLine("        set +e");
-        sb.AppendLine("        wait \"$codeybox_detached_pid\"");
-        sb.AppendLine("        codeybox_child_rc=$?");
+        sb.AppendLine("        codeybox_wait_stderr_file=$(mktemp \"${TMPDIR:-/tmp}/codeybox-detached-wait.XXXXXX\" 2>/dev/null || true)");
+        sb.AppendLine("        if [ -n \"$codeybox_wait_stderr_file\" ]; then");
+        sb.AppendLine("            wait \"$codeybox_detached_pid\" 2>\"$codeybox_wait_stderr_file\"");
+        sb.AppendLine("            codeybox_child_rc=$?");
+        sb.AppendLine("        else");
+        sb.AppendLine("            wait \"$codeybox_detached_pid\"");
+        sb.AppendLine("            codeybox_child_rc=$?");
+        sb.AppendLine("        fi");
         sb.AppendLine("        set -e");
+        sb.AppendLine("        if [ \"$codeybox_child_rc\" -eq 127 ] && [ -n \"$codeybox_wait_stderr_file\" ] && [ -s \"$codeybox_wait_stderr_file\" ]; then");
+        sb.AppendLine("            rm -f \"$codeybox_wait_stderr_file\"");
+        sb.AppendLine("            if codeybox_report_child_status_if_present; then");
+        sb.AppendLine("                :");
+        sb.AppendLine("            fi");
+        sb.AppendLine("            sleep 0.1");
+        sb.AppendLine("            continue");
+        sb.AppendLine("        fi");
+        sb.AppendLine("        if [ -n \"$codeybox_wait_stderr_file\" ]; then");
+        sb.AppendLine("            cat \"$codeybox_wait_stderr_file\" >&2");
+        sb.AppendLine("            rm -f \"$codeybox_wait_stderr_file\"");
+        sb.AppendLine("        fi");
         sb.AppendLine("        echo \"codeybox-detached: detached child exited before publishing process group marker (exit $codeybox_child_rc)\" >&2");
         sb.AppendLine("        exit \"$codeybox_child_rc\"");
         sb.AppendLine("    fi");

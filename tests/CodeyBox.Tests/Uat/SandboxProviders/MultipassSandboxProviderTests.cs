@@ -33,6 +33,16 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             Directory.Delete(_workspace, recursive: true);
     }
 
+    public static IEnumerable<object[]> AccessibilityProbeNullResults()
+    {
+        yield return [new ProcessRunResult(1, "", "pyatspi failed")];
+        yield return [new ProcessRunResult(0, "{\"role\":\"button\"}", "", StdoutLimitExceeded: true)];
+        yield return [new ProcessRunResult(0, "{\"role\":\"button\"}", "stderr", StderrLimitExceeded: true)];
+        yield return [new ProcessRunResult(0, "", "")];
+        yield return [new ProcessRunResult(0, "not-json", "")];
+        yield return [new ProcessRunResult(0, "null", "")];
+    }
+
     [Fact]
     public void CloudInit_InstallsExecWrapperAndRouteServiceWithoutGuestFirewallRules()
     {
@@ -290,6 +300,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("xvfb x11vnc xfce4", cloudInit);
         Assert.Contains("xdotool scrot ffmpeg", cloudInit);
         Assert.Contains("x11-utils socat", cloudInit);
+        Assert.Contains("tesseract-ocr tesseract-ocr-eng", cloudInit);
         Assert.Contains($"-rfbport {SandboxConventions.GraphicalVncPort}", cloudInit);
         Assert.Contains("-listen \"$listen_addr\"", cloudInit);
         Assert.Contains("-allow \"$host_addr\"", cloudInit);
@@ -312,6 +323,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.DoesNotContain("xvfb x11vnc xfce4", headlessCloudInit);
         Assert.DoesNotContain("xdotool scrot ffmpeg", headlessCloudInit);
         Assert.DoesNotContain("x11-utils socat", headlessCloudInit);
+        Assert.DoesNotContain("tesseract-ocr", headlessCloudInit);
+        // Accessibility probes are a graphical-only capability; they must not
+        // leak into the headless install line (regression guard for the
+        // graphical-flavor at-spi2-core / python3-pyatspi packages).
+        Assert.DoesNotContain("at-spi2-core", headlessCloudInit);
+        Assert.DoesNotContain("python3-pyatspi", headlessCloudInit);
     }
 
     [Fact]
@@ -324,6 +341,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         Assert.Contains("xvfb x11vnc xfce4", cloudInit);
         Assert.Contains("xdotool scrot ffmpeg", cloudInit);
+        Assert.Contains("tesseract-ocr tesseract-ocr-eng", cloudInit);
+        Assert.Contains("at-spi2-core python3-pyatspi", cloudInit);
         Assert.True(
             cloudInit.IndexOf("systemctl enable --now codeybox-route.service", StringComparison.Ordinal)
             < cloudInit.IndexOf("apt-get update", StringComparison.Ordinal),
@@ -407,8 +426,90 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             Task.FromResult(new ProcessRunResult(0, "", "")));
 
         await Assert.ThrowsAsync<NotSupportedException>(() => sandbox.GetScreenshotAsync());
+        await Assert.ThrowsAsync<NotSupportedException>(() => sandbox.GetAccessibilityAtPointAsync(10, 20));
+        await Assert.ThrowsAsync<NotSupportedException>(() => sandbox.GetAccessibilityTreeJsonAsync());
         await Assert.ThrowsAsync<NotSupportedException>(() =>
             sandbox.SynthesizeInputAsync([new SandboxInputEvent { Type = SandboxInputEventType.Click }]));
+    }
+
+    [Fact]
+    public async Task GetAccessibilityAtPointAsync_GraphicalSandboxRunsPyAtSpiProbe()
+    {
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new ProcessRunResult(
+                0,
+                "{\"role\":\"push button\",\"name\":\"Save\",\"text\":\"Save\",\"elementType\":\"push button\"}",
+                "")));
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, runner);
+
+        var snapshot = await sandbox.GetAccessibilityAtPointAsync(12, 34);
+
+        Assert.NotNull(snapshot);
+        Assert.Equal("push button", snapshot.Role);
+        Assert.Equal("Save", snapshot.Name);
+        Assert.Equal("Save", snapshot.Text);
+        var call = Assert.Single(runner.Calls);
+        Assert.Equal(MultipassSandbox.MaxAccessibilityJsonStdoutBytes, call.MaxStdoutBytes);
+        Assert.Equal(MultipassSandbox.MaxAccessibilityStderrBytes, call.MaxStderrBytes);
+        Assert.Contains($"DISPLAY={SandboxConventions.GraphicalDisplay}", call.Argv);
+        Assert.Contains("CODEYBOX_AX_X=12", call.Argv);
+        Assert.Contains("CODEYBOX_AX_Y=34", call.Argv);
+        var command = string.Join("\n", call.Argv);
+        Assert.Contains("python3", command);
+        Assert.Contains("pyatspi", command);
+        Assert.Contains("MAX_NODES", command);
+        Assert.Contains("bounds is None or contains(bounds)", command);
+    }
+
+    [Theory]
+    [MemberData(nameof(AccessibilityProbeNullResults))]
+    public async Task GetAccessibilityAtPointAsync_ReturnsNullForProbeFailures(ProcessRunResult probeResult)
+    {
+        var runner = new RecordingMultipassRunner((_, _, _) => Task.FromResult(probeResult));
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, runner);
+
+        var snapshot = await sandbox.GetAccessibilityAtPointAsync(12, 34);
+
+        Assert.Null(snapshot);
+        var call = Assert.Single(runner.Calls);
+        Assert.Equal(MultipassSandbox.MaxAccessibilityJsonStdoutBytes, call.MaxStdoutBytes);
+        Assert.Equal(MultipassSandbox.MaxAccessibilityStderrBytes, call.MaxStderrBytes);
+    }
+
+    [Fact]
+    public async Task GetAccessibilityTreeJsonAsync_GraphicalSandboxRunsPyAtSpiProbe()
+    {
+        const string treeJson = "{\"children\":[{\"role\":\"frame\",\"name\":\"JobTrack\",\"text\":null,\"elementType\":\"frame\"}]}";
+        var runner = new RecordingMultipassRunner((_, _, _) =>
+            Task.FromResult(new ProcessRunResult(0, treeJson, "")));
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, runner);
+
+        var tree = await sandbox.GetAccessibilityTreeJsonAsync();
+
+        Assert.Equal(treeJson, tree);
+        var call = Assert.Single(runner.Calls);
+        Assert.Equal(MultipassSandbox.MaxAccessibilityJsonStdoutBytes, call.MaxStdoutBytes);
+        Assert.Equal(MultipassSandbox.MaxAccessibilityStderrBytes, call.MaxStderrBytes);
+        Assert.Contains($"DISPLAY={SandboxConventions.GraphicalDisplay}", call.Argv);
+        var command = string.Join("\n", call.Argv);
+        Assert.Contains("python3", command);
+        Assert.Contains("pyatspi", command);
+        Assert.Contains("STATE_FOCUSED", command);
+    }
+
+    [Theory]
+    [MemberData(nameof(AccessibilityProbeNullResults))]
+    public async Task GetAccessibilityTreeJsonAsync_ReturnsNullForProbeFailures(ProcessRunResult probeResult)
+    {
+        var runner = new RecordingMultipassRunner((_, _, _) => Task.FromResult(probeResult));
+        var sandbox = NewMultipassSandbox(SandboxProfileFlavor.Graphical, runner);
+
+        var tree = await sandbox.GetAccessibilityTreeJsonAsync();
+
+        Assert.Null(tree);
+        var call = Assert.Single(runner.Calls);
+        Assert.Equal(MultipassSandbox.MaxAccessibilityJsonStdoutBytes, call.MaxStdoutBytes);
+        Assert.Equal(MultipassSandbox.MaxAccessibilityStderrBytes, call.MaxStderrBytes);
     }
 
     [Fact]
@@ -788,7 +889,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.NotNull(transferredLaunchScript);
         Assert.Contains("codeybox_stdin_file='/run/codeybox-exec/detached-", transferredLaunchScript);
         Assert.Contains("codeybox-detached: failed to publish stdin sidecar", transferredLaunchScript);
-        Assert.Contains("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_stdin_file\" \"$codeybox_env_file\" \"$codeybox_exit_token_file\" '/bin/sh'", transferredLaunchScript);
+        Assert.Contains("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_child_status_file\" \"$codeybox_child_pgid_file\" \"$codeybox_stdin_file\" \"$codeybox_env_file\" \"$codeybox_exit_token_file\" '/bin/sh'", transferredLaunchScript);
         Assert.DoesNotContain("codeybox_exit_marker", transferredLaunchScript);
         Assert.DoesNotContain(runner.Calls, IsCodeyboxExecCall);
 
@@ -1146,20 +1247,26 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("while ! codeybox_root_sh 'mkdir \"$1\" 2>/dev/null' \"$codeybox_lock_dir\"", script);
         Assert.Contains("codeybox_drain_stdin", script);
         Assert.Contains("if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then codeybox_drain_stdin; exit 0; fi", script);
-        Assert.Contains("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_stdin_file\" \"$codeybox_env_file\" \"$codeybox_exit_token_file\" '/bin/sh' '/home/ubuntu/.codeybox-exec/command script.sh'", script);
+        Assert.Contains("setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_child_status_file\" \"$codeybox_child_pgid_file\" \"$codeybox_stdin_file\" \"$codeybox_env_file\" \"$codeybox_exit_token_file\" '/bin/sh' '/home/ubuntu/.codeybox-exec/command script.sh'", script);
         Assert.Contains("codeybox_detached_pid=$!", script);
+        Assert.Contains("codeybox_child_status_file=$(mktemp", script);
+        Assert.Contains("codeybox_child_pgid_file=$(mktemp", script);
+        Assert.Contains("codeybox_report_child_status_if_present", script);
+        Assert.Contains("codeybox_child_group_alive", script);
         Assert.Contains("codeybox_pgid=$$", script);
         Assert.Contains("printf \"%s\\n\" \"$pgid\" > \"$tmp\" && mv -f \"$tmp\" \"$marker\"", script);
+        Assert.Contains("printf '%s\\n' \"$$\" > \"$codeybox_child_pgid_file\"", script);
         Assert.Contains("mv -f \"$exit_tmp\" \"${marker}.exit\"", script);
         Assert.Contains("mv -f \"$stdout_tmp\" \"${marker}.stdout\"", script);
         Assert.Contains("mv -f \"$stderr_tmp\" \"${marker}.stderr\"", script);
-        Assert.Contains("kill -TERM \"-$codeybox_detached_pid\"", script);
-        Assert.Contains("while kill -0 \"-$codeybox_detached_pid\"", script);
-        Assert.Contains("kill -KILL \"-$codeybox_detached_pid\"", script);
+        Assert.Contains("codeybox_detached_pgid=$(codeybox_read_child_pgid)", script);
+        Assert.Contains("kill -TERM \"-$codeybox_detached_pgid\"", script);
+        Assert.Contains("while kill -0 \"-$codeybox_detached_pgid\"", script);
+        Assert.Contains("kill -KILL \"-$codeybox_detached_pgid\"", script);
         Assert.Contains("wait \"$codeybox_detached_pid\" 2>/dev/null", script);
-        var termIndex = script.IndexOf("kill -TERM \"-$codeybox_detached_pid\"", StringComparison.Ordinal);
+        var termIndex = script.IndexOf("kill -TERM \"-$codeybox_detached_pgid\"", StringComparison.Ordinal);
         var sleepIndex = script.IndexOf("sleep 0.05", termIndex, StringComparison.Ordinal);
-        var killIndex = script.IndexOf("kill -KILL \"-$codeybox_detached_pid\"", termIndex, StringComparison.Ordinal);
+        var killIndex = script.IndexOf("kill -KILL \"-$codeybox_detached_pgid\"", termIndex, StringComparison.Ordinal);
         var waitIndex = script.IndexOf("wait \"$codeybox_detached_pid\" 2>/dev/null", termIndex, StringComparison.Ordinal);
         var timeoutExitIndex = script.IndexOf(
             "exit 88",
@@ -1593,12 +1700,18 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             [launchScript],
             environmentOverrides: FakeSudoPathEnvironment());
         await WaitForFileAsync(countFile, TimeSpan.FromSeconds(3));
+        // The first invocation's parent exits once the marker is written, but the
+        // detached child keeps running: it posts the authenticated exit code and
+        // then writes the stdout/stderr/exit sidecars into the same workspace dir.
+        // Wait for the child's process group to fully exit before launching the
+        // second invocation so its supervisor-dir prep and marker re-check never
+        // race the trailing sidecar writes.
+        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
         var second = await RunLocalProcessAsync(
             "/bin/bash",
             [launchScript],
             environmentOverrides: FakeSudoPathEnvironment(),
             stdin: "retry-token-line-that-must-be-drained\n" + new string('x', 1024 * 1024));
-        await Task.Delay(200);
 
         Assert.True(
             first.Exit == 0,
@@ -1982,6 +2095,99 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal("", stdout);
         Assert.Contains("codeybox-detached: timed out waiting for process group marker", stderr, StringComparison.Ordinal);
         Assert.False(File.Exists(processGroupMarker));
+    }
+
+    [Fact]
+    public async Task BuildDetachedLaunchScript_MarkerTimeoutUsesPublishedPgidWhenSetsidLauncherExitsEarly()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        const string realSetsid = "/usr/bin/setsid";
+        if (!File.Exists(realSetsid))
+            return;
+
+        await using var session = await MultipassAgentOutputHttpIngestSession.TryStartAsync(
+            System.Net.IPAddress.Loopback,
+            "marker-timeout-launcher-exits",
+            NullLogger.Instance,
+            stdoutChunkCallback: null,
+            stderrChunkCallback: null,
+            CancellationToken.None);
+        if (session is null)
+            return;
+
+        var envFile = Path.Combine(_workspace, "detached-marker-timeout-launcher-exits.env");
+        var launchScript = Path.Combine(_workspace, "detached-marker-timeout-launcher-exits.sh");
+        var processGroupMarker = Path.Combine(_workspace, "detached-marker-timeout-launcher-exits.pgid");
+        var sudoProcessGroupFile = Path.Combine(_workspace, "detached-marker-timeout-launcher-exits.sudo-pgid");
+        await File.WriteAllTextAsync(envFile, MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment()));
+        await File.WriteAllTextAsync(
+            launchScript,
+            MultipassSandbox.BuildDetachedLaunchScript(
+                envFile,
+                processGroupMarker,
+                null,
+                ["/bin/sh", "-c", "printf should-not-run"],
+                markerWaitSeconds: 5));
+        File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        var fakeBin = CreateFakeSudoBin($$"""
+            #!/bin/sh
+            if [ "$1" = "-n" ]; then shift; fi
+            if [ "$1" = "sh" ] && [ "$2" = "-c" ]; then
+                case "$3" in *'pgid=$2'*)
+                    pgid=$(ps -o pgid= -p "$$" | tr -d ' ')
+                    printf '%s\n' "$pgid" > {{MultipassSandboxProvider.ShellSingleQuote(sudoProcessGroupFile)}}
+                    trap '' TERM
+                    while :; do sleep 1; done
+                    ;;
+                esac
+            fi
+            exec "$@"
+            """);
+        var fakeSetsid = Path.Combine(fakeBin, "setsid");
+        await File.WriteAllTextAsync(
+            fakeSetsid,
+            $$"""
+            #!/bin/sh
+            {{MultipassSandboxProvider.ShellSingleQuote(realSetsid)}} "$@" &
+            exit 88
+            """);
+        File.SetUnixFileMode(fakeSetsid, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            var (exit, stdout, stderr) = await RunLocalProcessAsync(
+                "/bin/bash",
+                [launchScript],
+                timeout.Token,
+                environmentOverrides: new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["PATH"] = fakeBin + Path.PathSeparator + (Environment.GetEnvironmentVariable("PATH") ?? ""),
+                });
+
+            Assert.Equal(88, exit);
+            Assert.Equal("", stdout);
+            Assert.Contains("codeybox-detached: timed out waiting for process group marker", stderr, StringComparison.Ordinal);
+            Assert.False(File.Exists(processGroupMarker));
+
+            await WaitForFileAsync(sudoProcessGroupFile, TimeSpan.FromSeconds(1));
+            var pgid = (await File.ReadAllTextAsync(sudoProcessGroupFile)).Trim();
+            await WaitForProcessGroupIdGoneAsync(pgid, TimeSpan.FromSeconds(3));
+        }
+        finally
+        {
+            for (var i = 0; i < 20 && !File.Exists(sudoProcessGroupFile); i++)
+                await Task.Delay(50);
+
+            if (File.Exists(sudoProcessGroupFile))
+            {
+                var pgid = (await File.ReadAllTextAsync(sudoProcessGroupFile)).Trim();
+                await KillProcessGroupAsync(pgid);
+            }
+        }
     }
 
     [Fact]
@@ -4669,7 +4875,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.DoesNotContain("apt-get install -y --no-install-recommends xvfb", baselineCloudInitText);
         Assert.Contains(installCommands, cmd =>
             cmd.Contains("xvfb x11vnc xfce4", StringComparison.Ordinal)
-            && cmd.Contains("xdotool scrot ffmpeg", StringComparison.Ordinal));
+            && cmd.Contains("xdotool scrot ffmpeg", StringComparison.Ordinal)
+            && cmd.Contains("tesseract-ocr tesseract-ocr-eng", StringComparison.Ordinal));
         Assert.Contains(installCommands, cmd =>
             cmd.Contains("touch /opt/codeybox-project-tools", StringComparison.Ordinal));
     }

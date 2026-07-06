@@ -2573,7 +2573,7 @@ public sealed class AcpBridgeUnitTests
             Directory.CreateDirectory(workDir);
 
             var markerPath = Path.Combine(tmpDir, "sigterm-trapped.marker");
-            var armedPath = Path.Combine(tmpDir, "trap-armed.marker");
+            var armedPath = Path.Combine(tmpDir, "sigterm-trap-armed.marker");
             var stubPath = Path.Combine(tmpDir, "claude-sigterm-stub.sh");
 
             // Bash stub: trap SIGTERM → write marker → exit 0. The `sleep &
@@ -2581,8 +2581,8 @@ public sealed class AcpBridgeUnitTests
             // BETWEEN commands by default; backgrounding the sleep and
             // wait-ing on it lets the trap deliver mid-sleep. argv[1] ==
             // "--ide" (the flag Bridge always prepends), argv[2] == the
-            // marker path the trap writes, argv[3] == the "armed" path the
-            // stub touches AFTER installing the trap.
+            // marker path the trap writes, argv[3] == the "trap armed"
+            // marker the stub touches AFTER installing the trap.
             //
             // The armed-file handshake closes a test-only race: Bridge emits
             // `ready` from WriteLockfile() BEFORE SpawnClaude() starts this
@@ -2599,7 +2599,7 @@ public sealed class AcpBridgeUnitTests
                 "MARKER=\"$2\"\n" +
                 "ARMED=\"$3\"\n" +
                 "trap 'echo \"got-sigterm\" > \"$MARKER\"; exit 0' SIGTERM\n" +
-                "echo armed > \"$ARMED\"\n" +
+                "echo \"armed\" > \"$ARMED\"\n" +
                 "sleep 60 &\n" +
                 "wait $!\n");
             File.SetUnixFileMode(stubPath,
@@ -2607,14 +2607,14 @@ public sealed class AcpBridgeUnitTests
 
             await using var ctx = new BridgeRunHandle();
             var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
-                + "\",\"claudeArgs\":[\"" + markerPath + "\",\"" + armedPath
+                + "\",\"claudeArgs\":[\"" + markerPath
+                + "\",\"" + armedPath
                 + "\"],\"workingDirectory\":\"" + workDir
                 + "\",\"lockDir\":\"" + lockDir
                 + "\",\"turnTimeoutSeconds\":30}";
             await ctx.WriteStdinLineAsync(hello);
 
             await ctx.WaitForEnvelopeAsync("ready");
-
             // Wait until the stub has installed its SIGTERM trap (it touches
             // the armed file immediately after `trap`). Only then is it safe
             // to trigger shutdown — otherwise SIGTERM could race ahead of the
@@ -2670,20 +2670,23 @@ public sealed class AcpBridgeUnitTests
 
             var pidPath = Path.Combine(tmpDir, "claude.pid");
             var markerPath = Path.Combine(tmpDir, "sigterm-observed.marker");
+            var armedPath = Path.Combine(tmpDir, "sigterm-trap-armed.marker");
             var stubPath = Path.Combine(tmpDir, "claude-ignore-sigterm-stub.sh");
 
-            // Install the SIGTERM trap BEFORE writing the pidfile or emitting
-            // the stdout readiness line, so observing either signal guarantees
-            // the trap is already armed. The reverse order leaves a window
-            // where SIGTERM could land before the trap install,
-            // default-terminating the child and spuriously failing the marker
-            // assertion under capped full-suite load (same race class as the
-            // SIGTERM-first fixture above).
+            // Install the SIGTERM trap BEFORE writing either readiness marker,
+            // so observing the pidfile and armed file guarantees the trap is
+            // already live. The reverse order leaves a window where SIGTERM
+            // could land before the trap install, default-terminating the
+            // child and spuriously failing the marker assertion under capped
+            // full-suite load (same race class as the SIGTERM-first fixture
+            // above).
             File.WriteAllText(stubPath,
                 "#!/bin/bash\n" +
                 "PIDFILE=\"$2\"\n" +
                 "MARKER=\"$3\"\n" +
+                "ARMED=\"$4\"\n" +
                 "trap 'echo \"got-sigterm-but-staying-alive\" > \"$MARKER\"' SIGTERM\n" +
+                "echo \"armed\" > \"$ARMED\"\n" +
                 "echo $$ > \"$PIDFILE\"\n" +
                 "echo \"pid-ready:$$\"\n" +
                 "while true; do sleep 60 & wait $!; done\n");
@@ -2693,6 +2696,7 @@ public sealed class AcpBridgeUnitTests
             await using var ctx = new BridgeRunHandle();
             var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
                 + "\",\"claudeArgs\":[\"" + pidPath + "\",\"" + markerPath
+                + "\",\"" + armedPath
                 + "\"],\"workingDirectory\":\"" + workDir
                 + "\",\"lockDir\":\"" + lockDir
                 + "\",\"turnTimeoutSeconds\":30}";
@@ -2702,6 +2706,9 @@ public sealed class AcpBridgeUnitTests
             var pidReady = await ctx.WaitForEnvelopeAsync("claude_stdout", TimeSpan.FromSeconds(15));
             Assert.Contains("pid-ready:", pidReady.GetProperty("text").GetString(), StringComparison.Ordinal);
             Assert.True(File.Exists(pidPath), "SIGKILL fallback fixture did not record a child pid.");
+            for (int i = 0; i < 50 && !File.Exists(armedPath); i++)
+                await Task.Delay(50);
+            Assert.True(File.Exists(armedPath), "SIGKILL fallback fixture did not arm its SIGTERM trap before shutdown.");
             var childPid = int.Parse(File.ReadAllText(pidPath).Trim(), CultureInfo.InvariantCulture);
 
             await ctx.WriteStdinLineAsync("{\"type\":\"shutdown\"}");

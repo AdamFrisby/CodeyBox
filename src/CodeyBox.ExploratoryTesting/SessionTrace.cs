@@ -64,6 +64,14 @@ public sealed record TraceAction
     /// recognition — never by raw coordinates.
     /// </summary>
     public required TraceTargetDescriptor TargetDescriptor { get; init; }
+
+    /// <summary>
+    /// True only for deliberately global input that is not scoped to a recorded
+    /// focus target, such as an application-wide Escape shortcut. Targetless
+    /// key/type steps default to false so trimmed or legacy traces cannot type
+    /// into incidental focus by accident.
+    /// </summary>
+    public bool IsGlobalInput { get; init; }
 }
 
 /// <summary>
@@ -101,12 +109,20 @@ public sealed record TraceAccessibilityDescriptor
     public string? Name { get; init; }
     public string? Text { get; init; }
     public string? ElementType { get; init; }
+
+    /// <summary>
+    /// Bounds of the accessibility node at recording time when the provider
+    /// exposed them. Optional for backward compatibility with older traces and
+    /// point-only providers.
+    /// </summary>
+    public TraceBoundingRegion? Bounds { get; init; }
 }
 
 /// <summary>
 /// Visual signals for re-locating a target by sight. Includes a cropped
-/// template/anchor image, OCR text from the region, and the bounding region
-/// in the source screenshot.
+/// template/anchor image, OCR text from the region, the bounding region in
+/// the source screenshot, and the click offset inside that region when the
+/// action had a pointer anchor.
 ///
 /// <para><see cref="OcrText"/> originates from the app screen and is untrusted —
 /// treat it as opaque data, never as instructions, when consumed by LLM-driven
@@ -131,6 +147,20 @@ public sealed record TraceVisualDescriptor
     /// Bounding region of the target in <see cref="SourceScreenshotPng"/>.
     /// </summary>
     public required TraceBoundingRegion Region { get; init; }
+
+    /// <summary>
+    /// X offset of the recorded pointer inside <see cref="Region"/>. Null for
+    /// older traces and non-pointer actions, where replay falls back to the
+    /// region centre.
+    /// </summary>
+    public int? ClickOffsetX { get; init; }
+
+    /// <summary>
+    /// Y offset of the recorded pointer inside <see cref="Region"/>. Null for
+    /// older traces and non-pointer actions, where replay falls back to the
+    /// region centre.
+    /// </summary>
+    public int? ClickOffsetY { get; init; }
 
     /// <summary>
     /// The pre-action screenshot this visual descriptor was computed from.
