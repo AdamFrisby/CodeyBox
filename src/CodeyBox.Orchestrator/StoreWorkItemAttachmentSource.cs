@@ -49,6 +49,11 @@ public sealed class StoreWorkItemAttachmentSource : IWorkItemAttachmentSource
             {
                 deliveryName = $"{row.Id}-{fileName}";
                 seenNames.Add(deliveryName);
+                // Reflect the disambiguated name in both the FileName field
+                // and the InVmPath basename so the manifest does not show a
+                // bold FileName that disagrees with the trailing code-span
+                // path (which would tempt the agent to open the bare name).
+                fileName = deliveryName;
             }
             result.Add(new WorkItemAttachment(
                 InVmPath: $"{SandboxStagingDirectory}/{deliveryName}",

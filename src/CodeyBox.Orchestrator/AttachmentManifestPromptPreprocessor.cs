@@ -19,6 +19,14 @@ namespace CodeyBox.Orchestrator;
 public sealed class AttachmentManifestPromptPreprocessor : IAgentPromptPreprocessor
 {
     private const int MaxAttachmentsListed = 200;
+    /// <summary>
+    /// Defensive truncation cap for captions rendered into the prompt.
+    /// Intentionally SMALLER than <see cref="CodeyBox.Api.WorkItemAttachmentEndpoints"/>'s
+    /// upload-side <c>MaxCaptionChars</c> (2000) so pre-existing rows whose
+    /// captions predate the upload cap still get truncated rather than
+    /// blowing out the prompt. The two constants share a name but live in
+    /// different files; edit them together.
+    /// </summary>
     private const int MaxCaptionChars = 500;
 
     private readonly IWorkItemAttachmentSource? _source;

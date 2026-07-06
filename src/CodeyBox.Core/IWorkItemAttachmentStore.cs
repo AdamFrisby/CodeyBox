@@ -26,11 +26,17 @@ public interface IWorkItemAttachmentStore
 
     /// <summary>
     /// Deletes the metadata row by id and returns the deleted record (or null
-    /// if it did not exist). Caller is responsible for reference-counting the
-    /// underlying blob via <see cref="CountReferencesAsync"/> before deleting
-    /// it from disk.
+    /// if it did not exist, or if <paramref name="scopeByWorkItemId"/> was
+    /// supplied and the row belongs to a different work item). The caller does
+    /// NOT reference-count the underlying blob here: physical blob deletion is
+    /// deferred to the orphan-sweep grace window so a concurrent upload that
+    /// has staged the same hash but not yet written its metadata row cannot be
+    /// orphaned by an out-of-band delete.
     /// </summary>
-    Task<WorkItemAttachmentRecord?> DeleteAsync(string id, CancellationToken ct = default);
+    Task<WorkItemAttachmentRecord?> DeleteAsync(
+        string id,
+        WorkItemId? scopeByWorkItemId = null,
+        CancellationToken ct = default);
 
     /// <summary>
     /// Number of metadata rows still pointing at the given blob hash. Callers
@@ -58,5 +64,25 @@ public interface IWorkItemAttachmentStore
     /// <summary>Deletes every attachment row for a work item and returns their previous records.</summary>
     Task<IReadOnlyList<WorkItemAttachmentRecord>> DeleteAllForWorkItemAsync(
         WorkItemId workItemId,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Atomically inserts every record in <paramref name="records"/> under the
+    /// store's write gate, but only if doing so would not exceed
+    /// <paramref name="maxCount"/> attachments or <paramref name="maxTotalBytes"/>
+    /// total bytes for the affected work item. Returns true when the batch was
+    /// committed, false when a cap would be crossed (in which case no row is
+    /// inserted and the caller is responsible for leaving any staged blobs on
+    /// disk for the orphan sweep to reclaim). The atomic check-and-insert
+    /// closes the check-then-act race that two concurrent uploads to the same
+    /// work item would otherwise exploit to blow past the per-item caps.
+    /// </summary>
+    /// <remarks>
+    /// All records must share the same <see cref="WorkItemAttachmentRecord.WorkItemId"/>.
+    /// </remarks>
+    Task<bool> CreateBatchIfUnderCapAsync(
+        IReadOnlyList<WorkItemAttachmentRecord> records,
+        int maxCount,
+        long maxTotalBytes,
         CancellationToken ct = default);
 }

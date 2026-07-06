@@ -54,8 +54,14 @@ public static class FileNameSanitizer
             }
         }
         var sanitized = buf.ToString().Trim().Trim('.');
-        if (sanitized.Length == 0) return null;
+        if (string.IsNullOrWhiteSpace(sanitized)) return null;
         if (sanitized is "." or "..") return null;
+        // Defend against argv-flag confusion in downstream tooling (tar/grep/
+        // git add/Claude's file-read): a name whose first character is '-' can
+        // be parsed as a flag rather than a positional. Prefix with '_' so the
+        // visible glyph stays stable while the leading dash is neutralised.
+        if (sanitized[0] == '-')
+            sanitized = "_" + sanitized;
         return sanitized;
     }
 }

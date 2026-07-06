@@ -11,10 +11,15 @@ namespace CodeyBox.Orchestrator;
 /// streamed to a temp file with hashing, size-checked on the fly, then
 /// atomically promoted into their final path. Repeated uploads of the same
 /// bytes (same hash) are deduplicated — only one on-disk copy exists per
-/// distinct blob.
+/// distinct blob. On dedup the existing blob's last-write time is touched so
+/// the orphan-sweep grace window protects a freshly-referenced blob whose
+/// metadata row has not landed yet.
 /// </summary>
-public sealed class HostWorkItemAttachmentBlobStore : IWorkItemAttachmentAdminBlobStore
+public sealed class HostWorkItemAttachmentBlobStore : IWorkItemAttachmentBlobStoreAdmin
 {
+    private const int StreamBufferSize = 81920; // .NET default FileStream buffer; rent/write/read all share it.
+    private const string TempDirName = ".tmp";
+
     private readonly Func<string> _rootResolver;
     private readonly ILogger<HostWorkItemAttachmentBlobStore>? _log;
 
@@ -25,8 +30,6 @@ public sealed class HostWorkItemAttachmentBlobStore : IWorkItemAttachmentAdminBl
         _rootResolver = rootResolver ?? throw new ArgumentNullException(nameof(rootResolver));
         _log = log;
     }
-
-    public string CurrentRoot => Resolve();
 
     public async Task<AttachmentBlobStageResult> StageAsync(
         Stream source,
@@ -39,13 +42,13 @@ public sealed class HostWorkItemAttachmentBlobStore : IWorkItemAttachmentAdminBl
 
         var root = Resolve();
         Directory.CreateDirectory(root);
-        var tempDir = Path.Combine(root, ".tmp");
+        var tempDir = Path.Combine(root, TempDirName);
         Directory.CreateDirectory(tempDir);
 
         var tempPath = Path.Combine(tempDir, Guid.NewGuid().ToString("N"));
         long total = 0;
         byte[]? finalHash = null;
-        var buffer = ArrayPool<byte>.Shared.Rent(81920);
+        var buffer = ArrayPool<byte>.Shared.Rent(StreamBufferSize);
         try
         {
             using (var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
@@ -54,7 +57,7 @@ public sealed class HostWorkItemAttachmentBlobStore : IWorkItemAttachmentAdminBl
                 FileMode.CreateNew,
                 FileAccess.Write,
                 FileShare.None,
-                bufferSize: 81920,
+                bufferSize: StreamBufferSize,
                 useAsync: true))
             {
                 while (true)
@@ -82,6 +85,11 @@ public sealed class HostWorkItemAttachmentBlobStore : IWorkItemAttachmentAdminBl
             if (File.Exists(finalPath))
             {
                 TryDeleteTemp(tempPath);
+                // Touch the existing blob's last-write time so a concurrent
+                // upload's metadata write (which lands after this dedup) is
+                // protected by the orphan-sweep grace window: the blob reads
+                // as freshly staged, not as the original creation time.
+                TouchLastWrite(finalPath);
                 return new AttachmentBlobStageResult(hashHex, total, WasDeduplicated: true);
             }
 
@@ -94,6 +102,7 @@ public sealed class HostWorkItemAttachmentBlobStore : IWorkItemAttachmentAdminBl
                 // Raced with another upload of the same bytes — the existing
                 // file is already canonical, drop the temp.
                 TryDeleteTemp(tempPath);
+                TouchLastWrite(finalPath);
                 return new AttachmentBlobStageResult(hashHex, total, WasDeduplicated: true);
             }
 
@@ -120,7 +129,7 @@ public sealed class HostWorkItemAttachmentBlobStore : IWorkItemAttachmentAdminBl
             FileMode.Open,
             FileAccess.Read,
             FileShare.Read,
-            bufferSize: 81920,
+            bufferSize: StreamBufferSize,
             useAsync: true);
     }
 
@@ -147,6 +156,27 @@ public sealed class HostWorkItemAttachmentBlobStore : IWorkItemAttachmentAdminBl
         }
     }
 
+    public DateTimeOffset? GetBlobLastWriteTimeUtc(string sha256)
+    {
+        if (!IsValidHash(sha256)) return null;
+        var path = PathFor(Resolve(), sha256);
+        if (!File.Exists(path)) return null;
+        try
+        {
+            var info = new FileInfo(path);
+            // LastWriteTimeUtc is reliably maintained on every common Linux
+            // filesystem (unlike CreationTimeUtc/birthtime which is missing on
+            // stock ext4 and silently returns a sentinel). Every stage / dedup
+            // touch refreshes it, so the orphan-sweep grace window is portable.
+            return new DateTimeOffset(info.LastWriteTimeUtc, TimeSpan.Zero);
+        }
+        catch (Exception ex)
+        {
+            _log?.LogDebug(ex, "Failed to stat attachment blob {Sha256} at {Path}", sha256, path);
+            return null;
+        }
+    }
+
     public IReadOnlyCollection<string> EnumerateHashes()
     {
         var root = Resolve();
@@ -168,6 +198,32 @@ public sealed class HostWorkItemAttachmentBlobStore : IWorkItemAttachmentAdminBl
             }
         }
         return result;
+    }
+
+    public int SweepTempFiles(TimeSpan grace)
+    {
+        var root = Resolve();
+        var tempDir = Path.Combine(root, TempDirName);
+        if (!Directory.Exists(tempDir)) return 0;
+
+        var cutoff = DateTimeOffset.UtcNow - grace;
+        var deleted = 0;
+        foreach (var file in Directory.EnumerateFiles(tempDir))
+        {
+            try
+            {
+                var info = new FileInfo(file);
+                if (!info.Exists) continue;
+                if (new DateTimeOffset(info.LastWriteTimeUtc, TimeSpan.Zero) > cutoff) continue;
+                File.Delete(file);
+                deleted++;
+            }
+            catch (Exception ex)
+            {
+                _log?.LogDebug(ex, "Failed to sweep temp attachment file {Path}", file);
+            }
+        }
+        return deleted;
     }
 
     private string Resolve()
@@ -204,20 +260,15 @@ public sealed class HostWorkItemAttachmentBlobStore : IWorkItemAttachmentAdminBl
         return true;
     }
 
+    private static void TouchLastWrite(string path)
+    {
+        try { File.SetLastWriteTimeUtc(path, DateTime.UtcNow); }
+        catch (Exception) { /* best-effort; grace window still bounds the sweep */ }
+    }
+
     private void TryDeleteTemp(string path)
     {
         try { if (File.Exists(path)) File.Delete(path); }
         catch (Exception ex) { _log?.LogDebug(ex, "Failed to delete temp attachment file {Path}", path); }
     }
-}
-
-/// <summary>
-/// Internal extension of <see cref="IWorkItemAttachmentBlobStore"/> for the
-/// composition root: exposes the live resolved root so admin endpoints and the
-/// orphan sweep can reason about it. Kept separate from the consumer-facing
-/// interface so business code can't poke at filesystem paths directly.
-/// </summary>
-public interface IWorkItemAttachmentAdminBlobStore : IWorkItemAttachmentBlobStore
-{
-    string CurrentRoot { get; }
 }

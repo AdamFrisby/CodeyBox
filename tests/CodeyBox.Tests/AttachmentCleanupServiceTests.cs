@@ -136,9 +136,19 @@ public sealed class AttachmentCleanupServiceTests : IDisposable
 
         Assert.Equal(1, deletedCount);
 
-        // Metadata for WI 1 should be gone
+        // Metadata for WI 1 should be gone (terminal cleanup deletes rows).
         Assert.Null(await _store.GetAsync(rec1.Id));
-        // Blob 1 should be deleted from disk
+        // Blob 1 is NOT deleted by terminal cleanup — blob deletion is
+        // deferred to the orphan sweep so a concurrent upload of the same
+        // bytes cannot be orphaned. Verify it lingers, then reclaim it via
+        // the orphan sweep with a zero grace window.
+        Assert.True(_blobs.Exists(blob1.Sha256));
+        var reclaimOpts = new AttachmentsOptions
+        {
+            RootDirectory = _rootDir,
+            OrphanGracePeriod = TimeSpan.Zero,
+        };
+        await service.RunOrphanSweepAsync(reclaimOpts, CancellationToken.None);
         Assert.False(_blobs.Exists(blob1.Sha256));
 
         // Metadata and blobs for WI 2 and WI 3 should be preserved
@@ -177,17 +187,19 @@ public sealed class AttachmentCleanupServiceTests : IDisposable
         };
         await _store.CreateAsync(rec);
 
-        // 2. Orphan blob 1: young (created just now) -> should NOT be deleted
+        // 2. Orphan blob 1: young (written just now) -> should NOT be deleted
         using var s2 = new MemoryStream(Encoding.UTF8.GetBytes("young-orphan"));
         var blob2 = await _blobs.StageAsync(s2, 100);
         var path2 = Path.Combine(_rootDir, blob2.Sha256[..2], blob2.Sha256);
-        File.SetCreationTimeUtc(path2, now.UtcDateTime);
+        File.SetLastWriteTimeUtc(path2, now.UtcDateTime);
 
-        // 3. Orphan blob 2: old (created 1 hour ago) -> should be deleted
+        // 3. Orphan blob 2: old (written 1 hour ago) -> should be deleted.
+        // The sweep reads LastWriteTimeUtc (not CreationTimeUtc, which is
+        // missing on stock ext4) so we backdate the write time here.
         using var s3 = new MemoryStream(Encoding.UTF8.GetBytes("old-orphan"));
         var blob3 = await _blobs.StageAsync(s3, 100);
         var path3 = Path.Combine(_rootDir, blob3.Sha256[..2], blob3.Sha256);
-        File.SetCreationTimeUtc(path3, now.AddHours(-1).UtcDateTime);
+        File.SetLastWriteTimeUtc(path3, now.AddHours(-1).UtcDateTime);
 
         // Run the sweep
         var deletedCount = await service.RunOrphanSweepAsync(_options, CancellationToken.None);

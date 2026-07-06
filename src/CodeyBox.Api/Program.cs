@@ -2428,15 +2428,19 @@ builder.Services.AddSingleton<HostWorkItemAttachmentBlobStore>(sp =>
 });
 builder.Services.AddSingleton<IWorkItemAttachmentBlobStore>(sp =>
     sp.GetRequiredService<HostWorkItemAttachmentBlobStore>());
-builder.Services.AddSingleton<IWorkItemAttachmentAdminBlobStore>(sp =>
+builder.Services.AddSingleton<IWorkItemAttachmentBlobStoreAdmin>(sp =>
     sp.GetRequiredService<HostWorkItemAttachmentBlobStore>());
-// Adapter that lets the prompt-preprocessor chain pick up operator-uploaded
-// attachments at pickup time.
-builder.Services.AddSingleton<IWorkItemAttachmentSource>(sp =>
-    new StoreWorkItemAttachmentSource(sp.GetRequiredService<IWorkItemAttachmentStore>()));
+// NOTE: IWorkItemAttachmentSource (StoreWorkItemAttachmentSource) is intentionally
+// NOT registered here. It fabricates InVmPath values like
+// /work/.codeybox/attachments/<name> that no code in this foundation ticket
+// actually stages into the sandbox — in-VM blob delivery is a dependent task.
+// Registering it now would make AttachmentManifestPromptPreprocessor inject a
+// manifest pointing at paths the agent cannot open, wasting turns and
+// confusing the agent. The registration lands with the delivery ticket, which
+// is also when the blobs are actually written to SandboxStagingDirectory.
 builder.Services.AddHostedService(sp => new AttachmentCleanupService(
     sp.GetRequiredService<IWorkItemAttachmentStore>(),
-    sp.GetRequiredService<IWorkItemAttachmentAdminBlobStore>(),
+    sp.GetRequiredService<IWorkItemAttachmentBlobStoreAdmin>(),
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Attachments,
     sp.GetRequiredService<ILogger<AttachmentCleanupService>>()));
 builder.Services.AddSingleton<IWorkItemQuestionStore>(sp =>

@@ -57,18 +57,4 @@ public interface IWorkItemAttachmentBlobStore
 
     /// <summary>True if a blob with the given hash exists on disk.</summary>
     bool Exists(string sha256);
-
-    /// <summary>
-    /// Deletes the blob from disk if present. Returns true when a blob was
-    /// removed, false when no blob with that hash was on disk. Callers must
-    /// ensure the blob has no remaining metadata references before calling.
-    /// </summary>
-    bool TryDelete(string sha256);
-
-    /// <summary>
-    /// Returns the lowercase-hex SHA-256 of every blob currently on disk in
-    /// the content-addressed root (used by the orphan sweep to compute
-    /// on-disk MINUS referenced).
-    /// </summary>
-    IReadOnlyCollection<string> EnumerateHashes();
 }
