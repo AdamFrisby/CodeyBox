@@ -75,6 +75,8 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".codex/sessions", ".codex/history.jsonl"];
 
+    protected override IReadOnlyList<string> FileBackedCredentialEnvironmentVariables => ["CODEX_AUTH_JSON"];
+
     protected override string PreemptProcessPattern => Binary;
 
     /// <summary>

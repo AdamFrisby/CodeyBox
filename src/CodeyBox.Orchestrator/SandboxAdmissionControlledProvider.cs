@@ -794,7 +794,7 @@ internal sealed class SandboxAdmissionLease : IDisposable
     }
 }
 
-internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox
+internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox, ISandboxDecorator
 {
     private readonly ISandbox _inner;
     private readonly IPreserveOnDisposeSandbox? _preserveOnDispose;
@@ -827,6 +827,7 @@ internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox
     }
 
     public string Id => _inner.Id;
+    public ISandbox InnerSandbox => _inner;
     public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
     public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
     public SandboxResourceMetrics? ResourceMetrics => _inner.ResourceMetrics;

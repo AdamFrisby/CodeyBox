@@ -28,6 +28,7 @@ using CodeyBox.Sandbox.Bubblewrap;
 using CodeyBox.Sandbox.Multipass;
 using CodeyBox.Sandbox.MultipassRemote;
 using CodeyBox.Sandbox.Process;
+using CodeyBox.Sandbox.Sprites;
 using CodeyBox.HostProcess;
 using CodeyBox.Webhooks;
 using CodeyBox.Notifications;
@@ -352,6 +353,8 @@ ApiKeyAuth.Configure(builder);
 //   multipass   — Real Ubuntu VMs via Canonical's snap. Separate guest
 //                 kernel. Single 'snap install multipass' on Ubuntu, no
 //                 podman / OCI runtime / /etc edits. ~10-30s VM launch.
+//   sprites     — Fly.io hosted Firecracker microVMs via sprites.dev. Requires
+//                 SPRITES_TOKEN (or configured token env var).
 builder.Services.AddSingleton<ISandboxProvider>(SelectSandboxProvider);
 
 // B1: register the baseline-image resolver capability as a derived view of
@@ -416,7 +419,7 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         {
             throw new InvalidOperationException(
                 "CodeyBox:SandboxProvider must be set in non-Development environments. " +
-                "Choose one of: multipass, multipass-remote, bubblewrap, process " +
+                "Choose one of: multipass, multipass-remote, sprites, bubblewrap, process " +
                 "(see docs/sandbox-providers.md for trade-offs).");
         }
     }
@@ -436,8 +439,9 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
             sp.GetService<ITimingStore>(),
             sp.GetService<ISandboxResourceUsageStore>()),
         "multipass-remote" => BuildMultipassRemote(sp, loggerFactory),
+        "sprites" => BuildSprites(sp, loggerFactory, startupLog),
         _ => throw new InvalidOperationException(
-            $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: multipass, multipass-remote, bubblewrap, process"),
+            $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: multipass, multipass-remote, sprites, bubblewrap, process"),
     };
     var orchestratorOptions = sp.GetRequiredService<OrchestratorOptions>();
     startupLog.LogInformation(
@@ -597,6 +601,67 @@ static MultipassRemoteSandboxProvider BuildMultipassRemote(IServiceProvider sp, 
             VmStateCheckInterval = cfg.VmStateCheckInterval ?? fromDefaults.VmStateCheckInterval,
             VmNamePrefix = !string.IsNullOrWhiteSpace(cfg.VmNamePrefix) ? cfg.VmNamePrefix! : fromDefaults.VmNamePrefix,
         };
+    }
+}
+
+static SpritesSandboxProvider BuildSprites(IServiceProvider sp, ILoggerFactory loggerFactory, ILogger startupLog)
+{
+    startupLog.LogInformation(
+        "Using sprites.dev sandbox provider; host mounts are staged through the Sprites API.");
+    return new SpritesSandboxProvider(
+        () =>
+        {
+            var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
+            var cfg = live.Sprites ?? new SpritesSandboxConfig();
+            var defaults = new SpritesSandboxOptions();
+            return new SpritesSandboxOptions
+            {
+                ApiBaseUrl = !string.IsNullOrWhiteSpace(cfg.ApiBaseUrl) ? cfg.ApiBaseUrl : defaults.ApiBaseUrl,
+                TokenEnvironmentVariable = !string.IsNullOrWhiteSpace(cfg.TokenEnvironmentVariable)
+                    ? cfg.TokenEnvironmentVariable
+                    : defaults.TokenEnvironmentVariable,
+                NamePrefix = !string.IsNullOrWhiteSpace(cfg.NamePrefix) ? cfg.NamePrefix : defaults.NamePrefix,
+                WaitForCapacity = cfg.WaitForCapacity,
+                UrlAuth = !string.IsNullOrWhiteSpace(cfg.UrlAuth) ? cfg.UrlAuth : defaults.UrlAuth,
+                MaxListPages = cfg.MaxListPages > 0 ? cfg.MaxListPages : defaults.MaxListPages,
+                AllowUnsafeHttp = cfg.AllowUnsafeHttp,
+                AllowPersistentTmpfsDowngrade = cfg.AllowPersistentTmpfsDowngrade,
+                SetupCommands = cfg.SetupCommands ?? defaults.SetupCommands,
+                NetworkProfiles = CopySpritesNetworkProfiles(cfg.NetworkProfiles),
+                MaxSyncArchiveBase64Bytes = cfg.MaxSyncArchiveBase64Bytes > 0
+                    ? cfg.MaxSyncArchiveBase64Bytes
+                    : defaults.MaxSyncArchiveBase64Bytes,
+                MaxSyncArchiveBytes = cfg.MaxSyncArchiveBytes > 0
+                    ? cfg.MaxSyncArchiveBytes
+                    : defaults.MaxSyncArchiveBytes,
+                MaxSyncArchiveExpandedBytes = cfg.MaxSyncArchiveExpandedBytes > 0
+                    ? cfg.MaxSyncArchiveExpandedBytes
+                    : defaults.MaxSyncArchiveExpandedBytes,
+                MaxSyncArchiveEntries = cfg.MaxSyncArchiveEntries > 0
+                    ? cfg.MaxSyncArchiveEntries
+                    : defaults.MaxSyncArchiveEntries,
+                MaxFileSyncBase64Bytes = cfg.MaxFileSyncBase64Bytes > 0
+                    ? cfg.MaxFileSyncBase64Bytes
+                    : defaults.MaxFileSyncBase64Bytes,
+                MaxFileSyncBytes = cfg.MaxFileSyncBytes > 0
+                    ? cfg.MaxFileSyncBytes
+                    : defaults.MaxFileSyncBytes,
+                DefaultCpuCount = cfg.DefaultCpuCount,
+                DefaultMemoryBytes = cfg.DefaultMemoryBytes,
+                Region = cfg.Region,
+            };
+        },
+        loggerFactory.CreateLogger<SpritesSandboxProvider>());
+
+    static Dictionary<string, List<string>> CopySpritesNetworkProfiles(Dictionary<string, List<string>>? source)
+    {
+        var result = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        if (source is null)
+            return result;
+
+        foreach (var (name, hosts) in source)
+            result[name] = hosts?.ToList() ?? [];
+        return result;
     }
 }
 
@@ -3608,6 +3673,100 @@ namespace CodeyBox.Api
     }
 
     /// <summary>
+    /// Configuration for <c>CodeyBox:SandboxProvider=sprites</c>. The Sprites
+    /// rc30 create API accepts only name, capacity wait, and URL auth settings;
+    /// CPU/RAM/region values are retained as explicit no-op operator hints.
+    /// </summary>
+    public sealed class SpritesSandboxConfig
+    {
+        /// <summary>Sprites REST/WebSocket API base URL. Default <c>https://api.sprites.dev</c>.</summary>
+        public string ApiBaseUrl { get; set; } = "https://api.sprites.dev";
+
+        /// <summary>Environment variable read for the bearer token. Default <c>SPRITES_TOKEN</c>.</summary>
+        public string TokenEnvironmentVariable { get; set; } = "SPRITES_TOKEN";
+
+        /// <summary>Managed sprite name prefix. Must remain <c>codeybox-</c>-compatible for leak reaping.</summary>
+        public string NamePrefix { get; set; } = SpritesSandboxProvider.DefaultNamePrefix;
+
+        /// <summary>Whether create should wait for capacity before returning.</summary>
+        public bool WaitForCapacity { get; set; }
+
+        /// <summary>
+        /// URL auth setting sent on create. Sprites supports <c>sprite</c> (default,
+        /// bearer-token-authenticated per-sprite URL) and <c>public</c>. Setting
+        /// <c>public</c> drops access control on the sprite's per-sprite HTTP endpoint
+        /// while a work item runs inside it (source tree, agent process, staged mounts),
+        /// leaving it reachable without the bearer token — a foot-gun that silently
+        /// removes network-level access control on a live work sandbox. Prefer
+        /// <c>sprite</c> unless you have an explicit reason and a separate boundary.
+        /// </summary>
+        public string UrlAuth { get; set; } = "sprite";
+
+        /// <summary>Safety ceiling for paged list calls during leak reaping.</summary>
+        public int MaxListPages { get; set; } = 100;
+
+        /// <summary>
+        /// Test-only escape hatch for local mock servers. Production Sprites
+        /// traffic carries bearer tokens and exec environment variables, so
+        /// the provider rejects <c>http://</c> unless this is explicitly true.
+        /// </summary>
+        public bool AllowUnsafeHttp { get; set; }
+
+        /// <summary>
+        /// Explicit downgrade for non-secret tmpfs mounts. Sprites has no
+        /// tmpfs API, so the default is to reject <c>SandboxMount.Tmpfs</c>.
+        /// When true, non-credential tmpfs paths are created as ordinary
+        /// sprite directories and remain subject to sprite persistence until
+        /// teardown succeeds.
+        /// </summary>
+        public bool AllowPersistentTmpfsDowngrade { get; set; }
+
+        /// <summary>
+        /// Shell commands run inside each fresh sprite to provision it (rc30
+        /// create has no image/baseline field). They execute BEFORE the work
+        /// item's egress allow-list is applied and BEFORE mounts are staged,
+        /// so they run against OPEN egress until the default-deny policy is
+        /// posted after provisioning completes and before the agent runs. This
+        /// is deliberate: these operator-trusted commands need to reach package
+        /// registries (npm/apt/curl), and no agent code or credential material
+        /// is present yet. Use to install agent CLIs and project toolchains.
+        /// Note: with open egress, a curl-piped installer can reach arbitrary
+        /// hosts; only list commands you trust.
+        /// </summary>
+        public List<string> SetupCommands { get; set; } = [];
+
+        /// <summary>Sprites egress allow-list domains keyed by CodeyBox network profile name.</summary>
+        public Dictionary<string, List<string>> NetworkProfiles { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Maximum base64 stdout bytes accepted for directory sync-back.</summary>
+        public int MaxSyncArchiveBase64Bytes { get; set; } = 128 * 1024 * 1024;
+
+        /// <summary>Maximum compressed gzip/tar bytes accepted for directory sync-back.</summary>
+        public int MaxSyncArchiveBytes { get; set; } = 96 * 1024 * 1024;
+
+        /// <summary>Maximum summed regular-file bytes accepted for directory sync-back.</summary>
+        public long MaxSyncArchiveExpandedBytes { get; set; } = 512L * 1024 * 1024;
+
+        /// <summary>Maximum tar entries accepted for directory sync-back.</summary>
+        public int MaxSyncArchiveEntries { get; set; } = 200_000;
+
+        /// <summary>Maximum base64 stdout bytes accepted for single-file sync-back.</summary>
+        public int MaxFileSyncBase64Bytes { get; set; } = 64 * 1024 * 1024;
+
+        /// <summary>Maximum decoded bytes accepted for single-file sync-back.</summary>
+        public long MaxFileSyncBytes { get; set; } = 48L * 1024 * 1024;
+
+        /// <summary>Operator hint only; Sprites rc30 has no create-time CPU field.</summary>
+        public int? DefaultCpuCount { get; set; }
+
+        /// <summary>Operator hint only; Sprites rc30 has no create-time RAM field.</summary>
+        public long? DefaultMemoryBytes { get; set; }
+
+        /// <summary>Operator hint only; Sprites rc30 has no create-time region field.</summary>
+        public string? Region { get; set; }
+    }
+
+    /// <summary>
     /// Top-level options bag bound from the <c>CodeyBox</c> configuration
     /// section. See <c>docs/configuration.md</c> for the full hot-reload
     /// contract per field. Summary of the rule of thumb consumers should
@@ -3805,7 +3964,8 @@ namespace CodeyBox.Api
 
         /// <summary>
         /// Which sandbox provider to use. One of: <c>multipass</c>,
-        /// <c>bubblewrap</c>, <c>process</c>.
+        /// <c>multipass-remote</c>, <c>sprites</c>, <c>bubblewrap</c>,
+        /// <c>process</c>.
         /// Default is empty — startup defaults to 'process' in Development
         /// and refuses to start in other environments.
         /// </summary>
@@ -3835,6 +3995,12 @@ namespace CodeyBox.Api
         /// only consumed when that provider is selected.
         /// </summary>
         public MultipassRemoteSandboxConfig? MultipassRemoteSandbox { get; set; }
+
+        /// <summary>
+        /// Configuration for <c>SandboxProvider=sprites</c>. Optional; provider
+        /// defaults to the public sprites.dev API and <c>SPRITES_TOKEN</c>.
+        /// </summary>
+        public SpritesSandboxConfig? Sprites { get; set; }
 
         /// <summary>
         /// Maps logical network-profile names → host bridge names. Operators

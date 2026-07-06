@@ -79,6 +79,7 @@
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Graphical\CodeyBox.Sandbox.Graphical.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Multipass\CodeyBox.Sandbox.Multipass.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.MultipassRemote\CodeyBox.Sandbox.MultipassRemote.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Sprites\CodeyBox.Sandbox.Sprites.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.ExploratoryTesting\CodeyBox.ExploratoryTesting.csproj" />
     <ProjectReference Include="..\..\tools\CodeyBox.Harness\CodeyBox.Harness.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Webhooks\CodeyBox.Webhooks.csproj" />

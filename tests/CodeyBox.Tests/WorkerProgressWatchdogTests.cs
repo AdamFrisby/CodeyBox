@@ -600,42 +600,47 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
             return;
 
         var itemId = WorkItemId.New();
-        using var process = StartBusyProcess(itemId);
-        try
-        {
-            var source = new DefaultWorkerProgressActivitySource();
-            var probe = new WorkerProgressActivityProbe(
-                ProcessCpuProgressSignalEnabled: true,
-                ActiveSandboxProgressSignalEnabled: false);
-            var worker = new WorkerRegistration
-            {
-                WorkerId = "cpu-test",
-                HostName = Environment.MachineName,
-                ProcessId = Environment.ProcessId,
-                StartedAt = DateTimeOffset.UtcNow,
-                LastHeartbeatAt = DateTimeOffset.UtcNow,
-                CurrentWorkItemId = itemId.ToString(),
-            };
+        // One stable tagged process set whose CPU ticks strictly increase across
+        // samples, exercising the pure "accrued utime/stime counts as progress"
+        // branch (TryConfirmImmediateCpuProgress on first observe, then the
+        // steady-state CpuTicks > previous.CpuTicks delta). HasActiveProcessState
+        // is false throughout so the R-state shortcut is bypassed and the delta
+        // path is the only thing under test. Scripting the samples removes the
+        // dependency on a real `yes` process winning a /proc CPU tick between two
+        // reads, which starved under suite-wide CPU saturation and null-failed
+        // the first Assert.NotNull (the previous source of flakiness).
+        var cpuReader = ScriptedCpuSamples(
+            new DefaultWorkerProgressActivitySource.ProcessCpuSample(
+                CpuTicks: 100,
+                ProcessSetSignature: "cpu-delta-process",
+                HasActiveProcessState: false,
+                HasConfirmedProgress: false),
+            new DefaultWorkerProgressActivitySource.ProcessCpuSample(
+                CpuTicks: 200,
+                ProcessSetSignature: "cpu-delta-process",
+                HasActiveProcessState: false,
+                HasConfirmedProgress: false),
+            new DefaultWorkerProgressActivitySource.ProcessCpuSample(
+                CpuTicks: 300,
+                ProcessSetSignature: "cpu-delta-process",
+                HasActiveProcessState: false,
+                HasConfirmedProgress: false));
+        var source = new DefaultWorkerProgressActivitySource(
+            activeSandboxProvider: null,
+            processCpuSampleReader: cpuReader,
+            initialCpuSampleAttempts: 1);
+        var probe = new WorkerProgressActivityProbe(
+            ProcessCpuProgressSignalEnabled: true,
+            ActiveSandboxProgressSignalEnabled: false);
+        var worker = WorkerForItem("cpu-test", itemId);
 
-            var first = await WaitForActivityAsync(source, worker, itemId, probe);
-            Assert.NotNull(first);
+        var first = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
+        Assert.NotNull(first);
+        Assert.Equal("process-cpu", first!.Reason);
 
-            await Task.Delay(TimeSpan.FromMilliseconds(150));
-
-            var second = await WaitForActivityAsync(source, worker, itemId, probe);
-            Assert.NotNull(second);
-            Assert.Equal("process-cpu", second!.Reason);
-        }
-        finally
-        {
-            try
-            {
-                if (!process.HasExited)
-                    process.Kill(entireProcessTree: true);
-                process.WaitForExit(1000);
-            }
-            catch { }
-        }
+        var second = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
+        Assert.NotNull(second);
+        Assert.Equal("process-cpu", second!.Reason);
     }
 
     [Fact]
@@ -1662,35 +1667,6 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
             sample = queue.Dequeue();
             return true;
         };
-    }
-
-    private static async Task<WorkerProgressActivity?> WaitForActivityAsync(
-        IWorkerProgressActivitySource source,
-        WorkerRegistration worker,
-        WorkItemId itemId,
-        WorkerProgressActivityProbe probe,
-        string? requiredReason = null)
-    {
-        // Polling deadline is generous (10s) because the underlying signal
-        // for "process-cpu" relies on the replacement process accumulating
-        // observable utime/stime between samples; under loaded CI the
-        // nice-19 busy process can be starved long enough that a 2-second
-        // deadline races the scheduler.
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
-        WorkerProgressActivity? last = null;
-        while (DateTimeOffset.UtcNow < deadline)
-        {
-            last = await source.ObserveAsync(worker, itemId, probe, CancellationToken.None);
-            if (last is not null
-                && (requiredReason is null || string.Equals(last.Reason, requiredReason, StringComparison.Ordinal)))
-            {
-                return last;
-            }
-
-            await Task.Delay(TimeSpan.FromMilliseconds(25));
-        }
-
-        return last;
     }
 
     private sealed class ScriptedWorkerProgressActivitySource(WorkerProgressActivity? activity) : IWorkerProgressActivitySource

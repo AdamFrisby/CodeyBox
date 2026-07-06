@@ -69,6 +69,14 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     protected virtual IReadOnlyList<string> ScratchpadHomeDirectories => [];
 
     /// <summary>
+    /// Credential environment variables that this runner materialises as files
+    /// inside the sandbox before invoking the CLI. Sandboxes that reject
+    /// file-backed credentials use this list to fail before secrets are written
+    /// to persistent storage.
+    /// </summary>
+    protected virtual IReadOnlyList<string> FileBackedCredentialEnvironmentVariables => [];
+
+    /// <summary>
     /// Pattern used to ask the running CLI to stop before scratchpad capture.
     /// </summary>
     protected virtual string PreemptProcessPattern => Kind.Value;
@@ -129,6 +137,9 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         // The credential env is set on the container at boot via SandboxSpec.Environment
         // so secrets don't land on per-exec argv. We deliberately do NOT merge
         // credential.EnvironmentVariables into the per-exec ExtraEnvironment.
+        if (RejectUnsupportedFileBackedCredentials(sandbox, credential) is { } unsupported)
+            return unsupported;
+
         var preparation = await PrepareSandboxAsync(sandbox, workingDirectory, credential, resume: null, ct);
         if (preparation is not null)
             return preparation;
@@ -186,6 +197,9 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         Action<string>? stdoutChunkCallback,
         bool captureStructuredStream)
     {
+        if (RejectUnsupportedFileBackedCredentials(sandbox, credential) is { } unsupported)
+            return unsupported;
+
         await RestoreScratchpadAsync(sandbox, workingDirectory, resume, ct);
 
         var preparation = await PrepareSandboxAsync(sandbox, workingDirectory, credential, resume, ct);
@@ -738,6 +752,9 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         string? reasoningMode,
         CancellationToken ct)
     {
+        if (RejectUnsupportedFileBackedCredentials(sandbox, credential) is { } unsupported)
+            return new TextOnlyAgentResult(false, unsupported.Summary, unsupported.Stdout, unsupported.Stderr);
+
         var preparation = await PrepareSandboxAsync(sandbox, workingDirectory, credential, resume: null, ct);
         if (preparation is not null)
             return new TextOnlyAgentResult(false, preparation.Summary, preparation.Stdout, preparation.Stderr);
@@ -787,6 +804,47 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             return -1;
         var tail = summary[prefix.Length..];
         return int.TryParse(tail, out var code) ? code : -1;
+    }
+
+    private AgentResult? RejectUnsupportedFileBackedCredentials(ISandbox sandbox, AgentCredential? credential)
+    {
+        // In production the sandbox is wrapped by admission-control / reusable decorators that cannot
+        // conditionally re-implement the IRejectsFileBackedAgentCredentials marker, so probe the whole
+        // decorator chain rather than only the outermost wrapper.
+        if (ResolveFileBackedCredentialPolicy(sandbox) is not { } policy)
+            return null;
+        if (credential?.EnvironmentVariables is not { Count: > 0 } env)
+            return null;
+        if (FileBackedCredentialEnvironmentVariables.Count == 0)
+            return null;
+
+        foreach (var key in FileBackedCredentialEnvironmentVariables)
+        {
+            if (!env.TryGetValue(key, out var value) || string.IsNullOrEmpty(value))
+                continue;
+
+            var summary =
+                $"{Kind.Value} file-backed credentials are not supported by sandbox {sandbox.Id}: " +
+                policy.FileBackedAgentCredentialsUnsupportedReason;
+            return new AgentResult(
+                Success: false,
+                Summary: summary,
+                Stdout: null,
+                Stderr: summary);
+        }
+
+        return null;
+    }
+
+    private static IRejectsFileBackedAgentCredentials? ResolveFileBackedCredentialPolicy(ISandbox sandbox)
+    {
+        for (ISandbox? current = sandbox; current is not null; current = (current as ISandboxDecorator)?.InnerSandbox)
+        {
+            if (current is IRejectsFileBackedAgentCredentials policy)
+                return policy;
+        }
+
+        return null;
     }
 
     public virtual async Task RequestPreemptAsync(ISandbox sandbox, string workingDirectory, CancellationToken ct = default)
