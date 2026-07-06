@@ -559,10 +559,36 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         };
         for (var i = 1; i < sshArgv.Count; i++) psi.ArgumentList.Add(sshArgv[i]);
         var p = new System.Diagnostics.Process { StartInfo = psi };
-        if (!p.Start())
+        if (!StartWithTextBusyRetry(p))
             throw new RemoteSshTransportException(
                 $"Failed to start OpenSSH client at '{opts.SshBinary}'.");
         return p;
+    }
+
+    // Linux errno for ETXTBSY ("Text file busy"). Process.Start forks and execs;
+    // when the orchestrator spawns many processes concurrently (hundreds of VMs
+    // fanned across hosts), a sibling fork can transiently inherit an open
+    // write fd to the target executable, making exec fail with ETXTBSY even
+    // though the binary is complete. It clears in milliseconds once the writer
+    // closes, so a brief bounded retry is the correct handling rather than
+    // surfacing a spurious start failure.
+    private const int ETXTBSY = 26;
+
+    private static bool StartWithTextBusyRetry(System.Diagnostics.Process p)
+    {
+        const int maxAttempts = 20;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return p.Start();
+            }
+            catch (System.ComponentModel.Win32Exception ex)
+                when (ex.NativeErrorCode == ETXTBSY && attempt < maxAttempts)
+            {
+                System.Threading.Thread.Sleep(10);
+            }
+        }
     }
 
     private static async Task<ProcessRunResult> RunSshWithBinaryStdinAsync(
@@ -582,7 +608,7 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         };
         for (var i = 1; i < sshArgv.Count; i++) psi.ArgumentList.Add(sshArgv[i]);
         using var p = new System.Diagnostics.Process { StartInfo = psi };
-        if (!p.Start())
+        if (!StartWithTextBusyRetry(p))
             return new ProcessRunResult(1, "", "", StartFailed: true);
 
         var stderrTask = p.StandardError.ReadToEndAsync(ct);
