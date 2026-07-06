@@ -250,13 +250,46 @@ public sealed class E2eReplayArtifactEmitterTests
             plan));
     }
 
-    [Fact]
-    public void CheapModelCuaAuthor_rejects_frontier_model_ids()
+    [Theory]
+    [InlineData("claude-opus-4-7")]   // frontier denylist fragment ("opus")
+    [InlineData("gpt-5.5")]           // frontier denylist fragment ("gpt-5")
+    [InlineData("composer-2.5")]      // frontier denylist fragment ("composer")
+    public void CheapModelCuaAuthor_rejects_frontier_model_ids(string modelId)
     {
         Assert.Throws<ArgumentException>(() => new CheapModelCuaAuthor(new CheapModelCuaAuthorOptions
         {
-            ModelId = "claude-opus-4-7",
+            ModelId = modelId,
         }));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void CheapModelAllowlist_rejects_missing_model_id(string? modelId)
+    {
+        // Path 1: null/whitespace model id.
+        Assert.Throws<ArgumentException>(() => CheapModelAllowlist.EnsureCheap(modelId));
+    }
+
+    [Theory]
+    [InlineData("gpt-4o")]                 // unknown, not frontier-denylisted, no haiku/flash
+    [InlineData("some-unknown-model")]     // arbitrary id that must not slip through
+    [InlineData("gemini-3-pro-preview")]   // capable Gemini id without the "flash" cheap marker
+    public void CheapModelAllowlist_rejects_unknown_non_cheap_model_id(string modelId)
+    {
+        // Path 3: the catch-all reject — neither allow-listed nor haiku/flash.
+        Assert.Throws<ArgumentException>(() => CheapModelAllowlist.EnsureCheap(modelId));
+    }
+
+    [Theory]
+    [InlineData("claude-haiku-4-5-20251001")]  // explicit allowlist entry
+    [InlineData("gemini-3-flash-preview")]      // explicit allowlist entry
+    [InlineData("some-future-haiku-mini")]      // accepted via the "haiku" cheap marker
+    [InlineData("vendor-flash-lite")]           // accepted via the "flash" cheap marker
+    public void CheapModelAllowlist_accepts_cheap_model_ids(string modelId)
+    {
+        CheapModelAllowlist.EnsureCheap(modelId);
     }
 
     [Fact]

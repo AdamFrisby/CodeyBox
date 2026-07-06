@@ -145,7 +145,11 @@ public sealed class DemoLoginCuaSandbox : ISandbox
 
 /// <summary>
 /// Replay sandbox that runs the real <see cref="CodeyBox.Orchestrator.E2eReplayRuntime"/>
-/// embedded driver against a Playwright stub backed by <see cref="DemoLoginPageModel"/>.
+/// embedded driver against a Playwright stub whose DOM answers (title, initial
+/// hidden state, element text, post-login show/hide transition and accepted
+/// credentials) are parsed from the real committed HTML fixture
+/// (<c>Fixtures/demo-login-app/index.html</c>). The stub never fabricates DOM
+/// state the fixture does not itself produce, so a wrong assertion cannot pass.
 /// Firewall install scripts are executed for real (not silently short-circuited).
 /// </summary>
 public sealed class DemoLoginReplaySandbox : ISandbox
@@ -258,6 +262,15 @@ public sealed class DemoLoginReplaySandbox : ISandbox
 
     private static string BuildPlaywrightStub()
     {
+        // This stub is deliberately driven by the *real* committed HTML fixture
+        // (Fixtures/demo-login-app/index.html): title, initial `hidden` state,
+        // element text, the post-login show/hide transition and the accepted
+        // credentials are all parsed from that markup rather than hardcoded.
+        // That keeps replay-green honest — if the fixture's title, selectors,
+        // hidden attributes or submit-handler logic drift, the stub's answers
+        // drift with them, so a wrong assertion cannot silently pass. It never
+        // fabricates DOM state (no phantom "Demo Dashboard" title or /dashboard
+        // navigation) that the fixture does not itself produce.
         return """
             const fs = require('fs');
             let pageState = { email: '', password: '', loggedIn: false };
@@ -267,27 +280,62 @@ public sealed class DemoLoginReplaySandbox : ISandbox
               if (seeded) pageState = JSON.parse(seeded);
             } catch {}
 
-            const htmlFixture = process.env.DEMO_LOGIN_HTML;
-            if (htmlFixture && fs.existsSync(htmlFixture)) {
-              fs.readFileSync(htmlFixture, 'utf8');
+            function parseFixture(html) {
+              const title = (html.match(/<title>([^<]*)<\/title>/i) || [, ''])[1].trim();
+              const els = [];
+              const tagRe = /<([a-zA-Z][\w-]*)\b([^>]*?)\/?>/g;
+              let m;
+              while ((m = tagRe.exec(html)) !== null) {
+                const attrs = m[2] || '';
+                const id = (attrs.match(/\bid\s*=\s*"([^"]*)"/) || [])[1];
+                const testid = (attrs.match(/\bdata-testid\s*=\s*"([^"]*)"/) || [])[1];
+                if (!id && !testid) continue;
+                const selectors = [];
+                if (id) selectors.push('#' + id);
+                if (testid) selectors.push('[data-testid="' + testid + '"]');
+                const el = { id, selectors, hidden: /\bhidden\b/.test(attrs), text: '' };
+                if (id) {
+                  const inner = html.match(new RegExp('id\\s*=\\s*"' + id + '"[^>]*>([\\s\\S]*?)<\\/', 'i'));
+                  if (inner) el.text = inner[1].replace(/<[^>]*>/g, '').trim();
+                }
+                els.push(el);
+              }
+              // The post-login transition and accepted credentials come straight
+              // from the fixture's own inline submit handler.
+              const expectEmail = (html.match(/email\s*===\s*'([^']*)'/) || [])[1] || '';
+              const expectPassword = (html.match(/password\s*===\s*'([^']*)'/) || [])[1] || '';
+              const show = [...html.matchAll(/getElementById\('([^']+)'\)\.hidden\s*=\s*false/g)].map(x => x[1]);
+              const hide = [...html.matchAll(/getElementById\('([^']+)'\)\.hidden\s*=\s*true/g)].map(x => x[1]);
+              return { title, els, expectEmail, expectPassword, show, hide };
             }
 
-            const knownSelectors = new Set([
-              '#welcome', '[data-testid="welcome-banner"]', '#hidden',
-              '#email', '#password', '#login-btn', '[data-testid="login-form"]', '#ready'
-            ]);
+            const htmlFixture = process.env.DEMO_LOGIN_HTML;
+            if (!htmlFixture || !fs.existsSync(htmlFixture)) {
+              throw new Error('demo login HTML fixture not found: ' + htmlFixture);
+            }
+            const fixture = parseFixture(fs.readFileSync(htmlFixture, 'utf8'));
+
+            function resolve(selector) {
+              return fixture.els.find(el => el.selectors.includes(selector));
+            }
+
+            function currentHidden(el) {
+              let hidden = el.hidden;
+              if (pageState.loggedIn && el.id) {
+                if (fixture.show.includes(el.id)) hidden = false;
+                if (fixture.hide.includes(el.id)) hidden = true;
+              }
+              return hidden;
+            }
 
             function isVisible(selector) {
-              if (selector === '#welcome' || selector === '[data-testid="welcome-banner"]') return pageState.loggedIn;
-              if (selector === '#hidden') return false;
-              if (selector === '#email' || selector === '#password' || selector === '#login-btn') return !pageState.loggedIn;
-              if (selector === '#ready') return true;
-              return knownSelectors.has(selector);
+              const el = resolve(selector);
+              return el ? !currentHidden(el) : false;
             }
 
             function textContent(selector) {
-              if (selector === '#welcome' || selector === '[data-testid="welcome-banner"]') return 'Welcome, alice@example.com';
-              return '';
+              const el = resolve(selector);
+              return el ? el.text : '';
             }
 
             function makeLocator(selector) {
@@ -296,8 +344,10 @@ public sealed class DemoLoginReplaySandbox : ISandbox
                 async isVisible() { return isVisible(selector); },
                 async textContent() { return textContent(selector); },
                 async click() {
-                  if (selector === '#login-btn') {
-                    if (pageState.email.trim() === 'alice@example.com' && pageState.password === 'secret') {
+                  const el = resolve(selector);
+                  const submits = el && (selector === '#login-btn' || (el.id && el.id === 'login-btn'));
+                  if (submits) {
+                    if (pageState.email.trim() === fixture.expectEmail && pageState.password === fixture.expectPassword) {
                       pageState.loggedIn = true;
                       console.log(JSON.stringify({ loggedIn: true }));
                     }
@@ -322,8 +372,8 @@ public sealed class DemoLoginReplaySandbox : ISandbox
                 currentUrl: 'http://app.local/',
                 locator: makeLocator,
                 async goto(url) { this.currentUrl = url; },
-                url() { return pageState.loggedIn ? 'http://app.local/dashboard' : this.currentUrl; },
-                async title() { return pageState.loggedIn ? 'Demo Dashboard' : 'Demo Login'; },
+                url() { return this.currentUrl; },
+                async title() { return fixture.title; },
                 async waitForTimeout() {}
               };
             }
@@ -394,9 +444,9 @@ public static class DemoLoginExploration
             },
             new E2eReplayAssertion
             {
-                Kind = "titleContains",
-                Value = "Dashboard",
-                Description = "page title reflects post-login dashboard",
+                Kind = "selectorHidden",
+                Selector = "#login-form",
+                Description = "login form hidden after successful login",
             },
         ],
         EmitOptions = new E2eReplayEmitOptions

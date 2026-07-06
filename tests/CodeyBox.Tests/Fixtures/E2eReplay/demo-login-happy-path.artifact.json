@@ -55,7 +55,7 @@
       "action": "fill",
       "selector": "#password",
       "target": null,
-      "value": "<redacted-password>",
+      "value": "\u003Credacted-password\u003E",
       "argv": [],
       "stdin": null,
       "workingDirectory": null,
@@ -98,15 +98,15 @@
       "description": "welcome banner shows the signed-in email"
     },
     {
-      "kind": "titleContains",
-      "selector": null,
+      "kind": "selectorHidden",
+      "selector": "#login-form",
       "target": null,
-      "value": "Dashboard",
+      "value": null,
       "argv": [],
       "expectExitCode": 0,
       "expectStdoutContains": null,
       "expectStdoutNotContains": null,
-      "description": "page title reflects post-login dashboard"
+      "description": "login form hidden after successful login"
     }
   ]
 }
