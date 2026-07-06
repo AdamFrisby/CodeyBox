@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Demo Login</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; }
+    label { display: block; margin-top: 1rem; }
+    input { width: 16rem; padding: 0.4rem; }
+    button { margin-top: 1rem; padding: 0.5rem 1rem; }
+    #welcome { margin-top: 1.5rem; color: #0a5; font-weight: 600; }
+    #welcome[hidden] { display: none; }
+  </style>
+</head>
+<body>
+  <h1 id="page-title">Demo Login</h1>
+  <form id="login-form" data-testid="login-form">
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" data-testid="email-input" autocomplete="username" />
+
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" data-testid="password-input" autocomplete="current-password" />
+
+    <button id="login-btn" type="submit" data-testid="login-button">Log in</button>
+  </form>
+  <div id="welcome" data-testid="welcome-banner" hidden>Welcome, alice@example.com</div>
+  <script>
+    document.getElementById('login-form').addEventListener('submit', function (event) {
+      event.preventDefault();
+      var email = document.getElementById('email').value.trim();
+      var password = document.getElementById('password').value;
+      if (email === 'alice@example.com' && password === 'secret') {
+        document.getElementById('welcome').hidden = false;
+        document.getElementById('login-form').hidden = true;
+      }
+    });
+  </script>
+</body>
+</html>

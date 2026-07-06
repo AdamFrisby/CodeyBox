@@ -1,0 +1,112 @@
+{
+  "name": "demo-login-happy-path",
+  "readiness": {
+    "url": "http://app.local/healthz",
+    "argv": [],
+    "maxAttempts": 10,
+    "delayMs": 100
+  },
+  "steps": [
+    {
+      "action": "navigate",
+      "selector": null,
+      "target": "http://app.local/",
+      "value": null,
+      "argv": [],
+      "stdin": null,
+      "workingDirectory": null,
+      "failOnNonZeroExit": true,
+      "delayAfterMs": 50
+    },
+    {
+      "action": "click",
+      "selector": "#email",
+      "target": null,
+      "value": null,
+      "argv": [],
+      "stdin": null,
+      "workingDirectory": null,
+      "failOnNonZeroExit": true,
+      "delayAfterMs": 50
+    },
+    {
+      "action": "fill",
+      "selector": "#email",
+      "target": null,
+      "value": "alice@example.com",
+      "argv": [],
+      "stdin": null,
+      "workingDirectory": null,
+      "failOnNonZeroExit": true,
+      "delayAfterMs": 50
+    },
+    {
+      "action": "click",
+      "selector": "#password",
+      "target": null,
+      "value": null,
+      "argv": [],
+      "stdin": null,
+      "workingDirectory": null,
+      "failOnNonZeroExit": true,
+      "delayAfterMs": 50
+    },
+    {
+      "action": "fill",
+      "selector": "#password",
+      "target": null,
+      "value": "secret",
+      "argv": [],
+      "stdin": null,
+      "workingDirectory": null,
+      "failOnNonZeroExit": true,
+      "delayAfterMs": 50
+    },
+    {
+      "action": "click",
+      "selector": "#login-btn",
+      "target": null,
+      "value": null,
+      "argv": [],
+      "stdin": null,
+      "workingDirectory": null,
+      "failOnNonZeroExit": true,
+      "delayAfterMs": 50
+    }
+  ],
+  "assertions": [
+    {
+      "kind": "selectorVisible",
+      "selector": "#welcome",
+      "target": null,
+      "value": null,
+      "argv": [],
+      "expectExitCode": 0,
+      "expectStdoutContains": null,
+      "expectStdoutNotContains": null,
+      "description": "welcome banner visible after login"
+    },
+    {
+      "kind": "selectorTextContains",
+      "selector": "#welcome",
+      "target": null,
+      "value": "alice@example.com",
+      "argv": [],
+      "expectExitCode": 0,
+      "expectStdoutContains": null,
+      "expectStdoutNotContains": null,
+      "description": "welcome banner shows the signed-in email"
+    },
+    {
+      "kind": "titleContains",
+      "selector": null,
+      "target": null,
+      "value": "Dashboard",
+      "argv": [],
+      "expectExitCode": 0,
+      "expectStdoutContains": null,
+      "expectStdoutNotContains": null,
+      "description": "page title reflects post-login dashboard"
+    }
+  ]
+}

@@ -35,6 +35,8 @@
     <Content Include="Fixtures\**\*.json" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="Fixtures\**\*.jsonl" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="Fixtures\**\*.txt" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Fixtures\**\*.html" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Fixtures\demo-login-app\healthz" CopyToOutputDirectory="PreserveNewest" />
     <Compile Remove="Fixtures\**\*.cs" />
   </ItemGroup>
 
