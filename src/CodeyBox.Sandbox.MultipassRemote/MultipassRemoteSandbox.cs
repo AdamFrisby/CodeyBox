@@ -65,7 +65,20 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
 
     public string Id { get; }
     public string HostId { get; }
-    internal bool IsTrackedActive => Volatile.Read(ref _disposed) == 0;
+
+    // Reaper-exemption gate. This MUST track "cleanup not yet complete", NOT
+    // "dispose not yet started" (_disposed). DisposeAsync sets _disposed=1 up
+    // front (to reject further ExecAsync) but then performs the fallible
+    // sync-back at line 275; if that throws SandboxProvisioningDeferredException
+    // the VM + staged writable mounts (holding the agent's committed work) are
+    // deliberately retained for a retry and _onDispose is NOT called, so the
+    // sandbox stays in _active. Were IsTrackedActive keyed on _disposed, that
+    // retained-for-retry sandbox would report as a leak and the
+    // SandboxLeakReaper would purge the un-synced work before the retry runs.
+    // Keying on _cleanupComplete keeps a mid-dispose / pending-sync-back
+    // sandbox reaper-exempt until cleanup genuinely finishes (at which point
+    // _onDispose removes it from _active and it no longer appears at all).
+    internal bool IsTrackedActive => Volatile.Read(ref _cleanupComplete) == 0;
     internal MultipassRemoteSandboxOptions HostOptions => _opts;
     internal IRemoteHostTransport Transport => _transport;
 

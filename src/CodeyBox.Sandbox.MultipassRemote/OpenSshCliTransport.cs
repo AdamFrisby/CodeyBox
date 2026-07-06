@@ -574,19 +574,38 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
     // surfacing a spurious start failure.
     private const int ETXTBSY = 26;
 
+    // Retry budget for the ETXTBSY window. The condition clears within a few
+    // milliseconds of the concurrent writer closing its fd, so the poll is
+    // deliberately tight: up to 20 attempts spaced 10ms apart caps the added
+    // start latency at ~200ms before we stop retrying and surface the failure.
+    // Kept small on purpose — a genuine (non-transient) start failure must not
+    // be masked by a long spin.
+    private const int TextBusyMaxAttempts = 20;
+    private const int TextBusyRetryDelayMs = 10;
+
     private static bool StartWithTextBusyRetry(System.Diagnostics.Process p)
+        => StartWithTextBusyRetry(
+            p.Start,
+            static _ => System.Threading.Thread.Sleep(TextBusyRetryDelayMs));
+
+    // Test seam: the retry policy is driven through this overload with an
+    // injected start delegate and a no-op / recording sleep so all three
+    // branches (retry-then-succeed, exhaustion after TextBusyMaxAttempts, and
+    // immediate propagation of a non-ETXTBSY Win32Exception) can be exercised
+    // without depending on real fork/exec timing. Production callers use the
+    // Process overload above, which forwards Process.Start here.
+    internal static bool StartWithTextBusyRetry(Func<bool> start, Action<int> onBusyRetry)
     {
-        const int maxAttempts = 20;
         for (var attempt = 1; ; attempt++)
         {
             try
             {
-                return p.Start();
+                return start();
             }
             catch (System.ComponentModel.Win32Exception ex)
-                when (ex.NativeErrorCode == ETXTBSY && attempt < maxAttempts)
+                when (ex.NativeErrorCode == ETXTBSY && attempt < TextBusyMaxAttempts)
             {
-                System.Threading.Thread.Sleep(10);
+                onBusyRetry(attempt);
             }
         }
     }
