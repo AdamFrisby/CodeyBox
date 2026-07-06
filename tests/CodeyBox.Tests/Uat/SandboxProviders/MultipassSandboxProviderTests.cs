@@ -2200,6 +2200,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 processGroupMarker,
                 null,
                 ["/bin/sh", "-c", "printf should-not-run"],
+                launchLockAttempts: 10,
                 markerWaitSeconds: 5,
                 virtualElapsedSecondsFile: virtualTime.ElapsedSecondsFile));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
@@ -2404,6 +2405,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 processGroupMarker,
                 null,
                 ["/bin/sh", "-c", "printf should-not-run"],
+                launchLockAttempts: 10,
                 markerWaitSeconds: 5,
                 virtualElapsedSecondsFile: virtualTime.ElapsedSecondsFile));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
