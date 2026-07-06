@@ -2393,6 +2393,52 @@ public sealed class E2eExecutionTests : IDisposable
         Assert.Equal(3, hostSumBinds.MaxConcurrent); // min(10, 3)
     }
 
+    [Fact]
+    public async Task MultiHostPool_uses_explicit_image_and_denies_network_when_profile_unset()
+    {
+        // The production remote-ssh pool's BuildSpec must honour an explicit
+        // SandboxImageReference over the global fallback AND default the network
+        // to Denied when no profile is set — the same contract the dev-only
+        // LocalPool is tested for. A swapped image precedence or a forgotten
+        // Denied default (open egress for replays) must fail here.
+        var host = new CountingSandboxProvider();
+        var monitor = new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions
+        {
+            MaxConcurrent = 1,
+            SandboxImageReference = "e2e-image",
+        });
+        var pool = new MultiHostE2eExecutionPool(
+            [new E2eExecutionHost("remote-a", host, 1)],
+            monitor,
+            NullLogger<MultiHostE2eExecutionPool>.Instance,
+            fallbackImageReference: () => "global-image");
+
+        await using var slot = await pool.LeaseAsync();
+
+        var spec = Assert.Single(host.Specs);
+        Assert.Equal("e2e-image", spec.ImageReference);
+        Assert.Equal(SandboxNetworkPolicy.Denied, spec.Network);
+    }
+
+    [Fact]
+    public void MultiHostPool_resizes_global_gate_when_options_monitor_fires_change()
+    {
+        // MaxConcurrent is documented as hot-reloadable on the production pool.
+        // Keep the host sum (5) above the global cap so MaxConcurrent reflects
+        // the global gate both before and after the reload; a handler that
+        // resizes the wrong gate (or ignores the change) fails this assertion.
+        var monitor = new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions { MaxConcurrent = 1 });
+        var pool = new MultiHostE2eExecutionPool(
+            [new E2eExecutionHost("a", new CountingSandboxProvider(), 5)],
+            monitor,
+            NullLogger<MultiHostE2eExecutionPool>.Instance);
+        Assert.Equal(1, pool.MaxConcurrent); // min(1, 5)
+
+        monitor.Set(new E2eExecutionOptions { MaxConcurrent = 3 });
+
+        Assert.Equal(3, pool.MaxConcurrent); // min(3, 5) -> the resized global gate binds
+    }
+
     // --------------------------------------------------------------------
     // Helpers
     // --------------------------------------------------------------------
