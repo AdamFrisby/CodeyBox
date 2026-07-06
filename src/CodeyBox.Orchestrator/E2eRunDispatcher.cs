@@ -370,12 +370,15 @@ public sealed class E2eRunDispatcher : BackgroundService
             AssertionResults = Array.Empty<E2eAssertionResult>(),
         };
 
-    private static bool IsInfrastructureFailure(string? failureKind) =>
+    // Internal (not private) so the classification map can be pinned by a
+    // data-driven test — this single predicate decides whether a non-passing
+    // replay records as Error (infrastructure) vs Failed (deterministic), so a
+    // silently-dropped kind must be caught by a test, not code review.
+    internal static bool IsInfrastructureFailure(string? failureKind) =>
         string.Equals(failureKind, "ReadinessProbe", StringComparison.Ordinal)
         || string.Equals(failureKind, "ReadinessUrlRejected", StringComparison.Ordinal)
         || string.Equals(failureKind, "NavigationUrlRejected", StringComparison.Ordinal)
         || string.Equals(failureKind, "ExecException", StringComparison.Ordinal)
-        || string.Equals(failureKind, "AssertionException", StringComparison.Ordinal)
         || string.Equals(failureKind, "ReplayDriverFailed", StringComparison.Ordinal)
         || string.Equals(failureKind, "ReplayDriverProtocolError", StringComparison.Ordinal)
         || string.Equals(failureKind, "ReplayDriverUnavailable", StringComparison.Ordinal)

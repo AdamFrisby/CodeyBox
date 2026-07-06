@@ -988,6 +988,128 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.Contains(scenario, result.FailureMessage);
     }
 
+    // ----- Enabled remote-ssh E2E: BaselineImageRef + fail-closed DNS -----
+
+    [Fact]
+    public void Validate_AcceptsFullyValidEnabledRemoteE2eConfig()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.MultipassRemoteSandbox = null;
+        options.E2eMultipassRemoteSandbox = new MultipassRemoteSandboxConfig { SshTarget = "e2e@198.51.100.10" };
+        options.E2eExecution.Enabled = true;
+        options.E2eExecution.PoolKind = "remote-ssh";
+        options.E2eExecution.BaselineImageRef = "cb-e2e";
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.False(result.Failed, result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsEnabledRemoteE2eWhenBaselineImageRefIsBlank()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.MultipassRemoteSandbox = null;
+        options.E2eMultipassRemoteSandbox = new MultipassRemoteSandboxConfig { SshTarget = "e2e@198.51.100.10" };
+        options.E2eExecution.Enabled = true;
+        options.E2eExecution.PoolKind = "remote-ssh";
+        options.E2eExecution.BaselineImageRef = "   "; // nothing to clone per run
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("BaselineImageRef is required", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsEnabledRemoteE2eWhenSshTargetHostIsUnresolvable()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.MultipassRemoteSandbox = null;
+        options.E2eMultipassRemoteSandbox = new MultipassRemoteSandboxConfig { SshTarget = "e2e@codeybox-e2e-nonexistent.invalid" };
+        options.E2eExecution.Enabled = true;
+        options.E2eExecution.PoolKind = "remote-ssh";
+        options.E2eExecution.BaselineImageRef = "cb-e2e";
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("dedicated resolvable remote SSH host", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsConfiguredRemoteE2eWhenCodingHostIsUnresolvable()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.MultipassRemoteSandbox = new MultipassRemoteSandboxConfig { SshTarget = "coding@codeybox-coding-nonexistent.invalid" };
+        options.E2eMultipassRemoteSandbox = new MultipassRemoteSandboxConfig { SshTarget = "e2e@198.51.100.10" };
+        options.E2eExecution.Enabled = false; // lifecycle-isolation check runs even when disabled
+        options.E2eExecution.PoolKind = "remote-ssh";
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("must be resolvable to verify fleet isolation", result.FailureMessage);
+    }
+
+    // ----- OpenSshConfigResolver.TryResolveHostName branch coverage -----
+
+    [Fact]
+    public void OpenSshConfigResolver_returns_false_for_blank_ssh_target()
+    {
+        var resolver = new OpenSshConfigResolver(new RecordingProcessRunner(new ProcessRunResult(0, "hostname h\n", string.Empty)));
+
+        Assert.False(resolver.TryResolveHostName(new MultipassRemoteSandboxConfig { SshTarget = "   " }, out var host));
+        Assert.Null(host);
+    }
+
+    [Fact]
+    public void OpenSshConfigResolver_returns_false_when_ssh_exits_nonzero()
+    {
+        var resolver = new OpenSshConfigResolver(new RecordingProcessRunner(new ProcessRunResult(255, "hostname h\n", "boom")));
+
+        Assert.False(resolver.TryResolveHostName(new MultipassRemoteSandboxConfig { SshTarget = "e2e@host" }, out var host));
+        Assert.Null(host);
+    }
+
+    [Fact]
+    public void OpenSshConfigResolver_returns_false_when_stdout_limit_exceeded()
+    {
+        var resolver = new OpenSshConfigResolver(
+            new RecordingProcessRunner(new ProcessRunResult(0, "hostname h\n", string.Empty, StdoutLimitExceeded: true)));
+
+        Assert.False(resolver.TryResolveHostName(new MultipassRemoteSandboxConfig { SshTarget = "e2e@host" }, out var host));
+        Assert.Null(host);
+    }
+
+    [Fact]
+    public void OpenSshConfigResolver_returns_false_when_runner_throws()
+    {
+        var resolver = new OpenSshConfigResolver(new ThrowingProcessRunner());
+
+        Assert.False(resolver.TryResolveHostName(new MultipassRemoteSandboxConfig { SshTarget = "e2e@host" }, out var host));
+        Assert.Null(host);
+    }
+
+    [Fact]
+    public void OpenSshConfigResolver_returns_false_when_no_hostname_line_present()
+    {
+        var resolver = new OpenSshConfigResolver(new RecordingProcessRunner(new ProcessRunResult(0, "user e2e\nport 22\n", string.Empty)));
+
+        Assert.False(resolver.TryResolveHostName(new MultipassRemoteSandboxConfig { SshTarget = "e2e@host" }, out var host));
+        Assert.Null(host);
+    }
+
+    [Fact]
+    public void OpenSshConfigResolver_parses_hostname_line_on_success()
+    {
+        var resolver = new OpenSshConfigResolver(
+            new RecordingProcessRunner(new ProcessRunResult(0, "user e2e\nhostname resolved.example\nport 22\n", string.Empty)));
+
+        Assert.True(resolver.TryResolveHostName(new MultipassRemoteSandboxConfig { SshTarget = "e2e@alias" }, out var host));
+        Assert.Equal("resolved.example", host);
+    }
+
     private static CodeyBoxOptions ValidCodeyBoxOptions()
         => new() { AuditLog = ValidAuditLogOptions() };
 
@@ -1073,4 +1195,19 @@ public sealed class CodeyBoxOptionsValidatorTests
         string? Stdin,
         int? MaxStdoutBytes,
         int? MaxStderrBytes);
+
+    private sealed class ThrowingProcessRunner : IProcessRunner
+    {
+        public Task<ProcessRunResult> RunAsync(
+            IReadOnlyList<string> argv,
+            string? stdin,
+            CancellationToken ct,
+            Action<string>? stdoutChunkCallback = null,
+            Action<string>? stderrChunkCallback = null,
+            int? maxStdoutBytes = null,
+            int? maxStderrBytes = null,
+            IReadOnlyDictionary<string, string>? environment = null,
+            bool killOnOutputLimit = true)
+            => Task.FromException<ProcessRunResult>(new InvalidOperationException("ssh -G launch failed"));
+    }
 }

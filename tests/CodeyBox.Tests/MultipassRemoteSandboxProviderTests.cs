@@ -452,6 +452,34 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
+    public async Task ListAllManagedAsync_returns_empty_without_a_transport_call_when_SshTarget_is_blank()
+    {
+        // An unconfigured (blank SshTarget) E2E provider must NOT enumerate a
+        // fleet it is not attached to — otherwise the leak reaper could sweep
+        // another fleet's VMs. The guard returns [] before touching the transport.
+        var opts = new MultipassRemoteSandboxOptions
+        {
+            SshTarget = "   ",
+            SshBinary = "ssh",
+            RemoteMultipassPath = "/snap/bin/multipass",
+            RemoteStagingRoot = "/home/codeybox/snap/multipass/common/codeybox-remote-staging",
+            VmNamePrefix = "codeybox-r-",
+        };
+        var transport = new FakeRemoteHostTransport
+        {
+            OnRun = (_, _) => throw new InvalidOperationException("transport must not be reached when SshTarget is blank"),
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var managed = await provider.ListAllManagedAsync(CancellationToken.None);
+
+        Assert.Empty(managed);
+        Assert.Empty(transport.RecordedCalls);
+    }
+
+    [Fact]
     public async Task DisposeAsync_attempts_stop_then_delete_and_syncback_for_writable_mounts()
     {
         var opts = DefaultOptions();

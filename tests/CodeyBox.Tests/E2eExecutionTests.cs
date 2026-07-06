@@ -2086,6 +2086,314 @@ public sealed class E2eExecutionTests : IDisposable
     }
 
     // --------------------------------------------------------------------
+    // Infrastructure-vs-deterministic failure classification map
+    // --------------------------------------------------------------------
+
+    [Theory]
+    // Every infrastructure kind the runtime/driver can emit -> Error.
+    [InlineData("ReadinessProbe", true)]
+    [InlineData("ReadinessUrlRejected", true)]
+    [InlineData("NavigationUrlRejected", true)]
+    [InlineData("ExecException", true)]
+    [InlineData("ReplayDriverFailed", true)]
+    [InlineData("ReplayDriverProtocolError", true)]
+    [InlineData("ReplayDriverUnavailable", true)]
+    [InlineData("ReplayEgressFirewallUnavailable", true)]
+    [InlineData("ReplayEgressOriginRejected", true)]
+    [InlineData("ReplayEgressResolutionFailed", true)]
+    [InlineData("OutputLimitExceeded", true)]
+    // Deterministic test failures the driver emits -> Failed (NOT infrastructure).
+    [InlineData("StepFailed", false)]
+    [InlineData("AssertionFailed", false)]
+    // Unclassified / absent -> Failed.
+    [InlineData("", false)]
+    [InlineData(null, false)]
+    // "AssertionException" was never emitted anywhere; it must NOT be treated as
+    // infrastructure (else genuine assertion failures would be mislabeled Error).
+    [InlineData("AssertionException", false)]
+    public void IsInfrastructureFailure_classifies_every_known_failure_kind(string? failureKind, bool expected)
+    {
+        Assert.Equal(expected, E2eRunDispatcher.IsInfrastructureFailure(failureKind));
+    }
+
+    // --------------------------------------------------------------------
+    // PersistResultAsync no-rows outcomes (throw vs canceled-race skip)
+    // --------------------------------------------------------------------
+
+    [Fact]
+    public async Task Dispatcher_throws_affected_no_rows_when_persist_updates_nothing_and_run_not_canceled()
+    {
+        var tcId = await SeedE2eTestCaseAsync(MakeTrivialPassArtifact());
+        var runId = Guid.NewGuid().ToString("N");
+        var store = new ClaimFailureRunStore
+        {
+            Queued = true,
+            ClaimedRun = new E2eRun { Id = runId, TestCaseId = tcId, Status = E2eRunStatus.Running },
+            UpdateStatusResult = false, // update affects no rows...
+            GetRun = null,              // ...and the run is NOT Canceled -> safety throw must fire
+        };
+        var monitor = new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions { Enabled = true, MaxConcurrent = 1 });
+        var pool = new LocalE2eExecutionPool(new CountingSandboxProvider(), monitor, NullLogger<LocalE2eExecutionPool>.Instance);
+        var logger = new CapturingLogger<E2eRunDispatcher>();
+        var dispatcher = new E2eRunDispatcher(
+            store,
+            pool,
+            new CountingReplayRuntime(),
+            _testCases,
+            monitor,
+            new E2eRunCancellationRegistry(),
+            Admission(monitor),
+            logger);
+
+        Assert.True(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
+
+        var crashed = await logger.WaitForEntryAsync(
+            e => e.Exception is InvalidOperationException && e.Exception.Message.Contains("affected no rows"),
+            TimeSpan.FromSeconds(5));
+        Assert.NotNull(crashed.Exception);
+        Assert.NotNull(store.UpdatedStatus); // a persist WAS attempted before the throw
+        var testCase = await _testCases.GetAsync(tcId);
+        Assert.NotNull(testCase);
+        Assert.Null(testCase.LastRunAt); // no last-run stamp when the persist reports no rows
+    }
+
+    [Fact]
+    public async Task Dispatcher_canceled_race_on_persist_skips_last_run_stamp()
+    {
+        var tcId = await SeedE2eTestCaseAsync(MakeTrivialPassArtifact());
+        var runId = Guid.NewGuid().ToString("N");
+        var store = new ClaimFailureRunStore
+        {
+            Queued = true,
+            ClaimedRun = new E2eRun { Id = runId, TestCaseId = tcId, Status = E2eRunStatus.Running },
+            UpdateStatusResult = false, // update affects no rows because...
+            GetRun = new E2eRun { Id = runId, TestCaseId = tcId, Status = E2eRunStatus.Canceled }, // ...it was canceled
+        };
+        var monitor = new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions { Enabled = true, MaxConcurrent = 1 });
+        var provider = new CountingSandboxProvider();
+        var pool = new LocalE2eExecutionPool(provider, monitor, NullLogger<LocalE2eExecutionPool>.Instance);
+        var runtime = new CountingReplayRuntime();
+        var dispatcher = new E2eRunDispatcher(
+            store,
+            pool,
+            runtime,
+            _testCases,
+            monitor,
+            new E2eRunCancellationRegistry(),
+            Admission(monitor),
+            NullLogger<E2eRunDispatcher>.Instance);
+
+        Assert.True(await dispatcher.TryDispatchOneAsync(CancellationToken.None));
+        await WaitForDispatcherIdleAsync(dispatcher);
+
+        Assert.Equal(1, runtime.ExecuteCount);                  // the replay actually ran
+        Assert.Equal(E2eRunStatus.Passed, store.UpdatedStatus); // persist attempted with the real status
+        Assert.Equal(0, pool.InFlight);
+        Assert.True(provider.AllSandboxesDisposed);
+        var testCase = await _testCases.GetAsync(tcId);
+        Assert.NotNull(testCase);
+        Assert.Null(testCase.LastRunAt); // canceled race -> last-run NOT stamped
+    }
+
+    // --------------------------------------------------------------------
+    // Secret redaction of the persisted driver result
+    // --------------------------------------------------------------------
+
+    [Fact]
+    public async Task Replay_redacts_secret_shaped_strings_in_persisted_driver_result()
+    {
+        const string secret = "sk-ant-SECRETTOKEN0123456789";
+        var driverResult = new E2eRunResult
+        {
+            Passed = false,
+            FailureKind = "StepFailed",
+            Summary = $"driver failed leaking {secret} token",
+            FailedStepIndex = 0,
+            StepResults =
+            [
+                new E2eStepResult { ExitCode = 1, Passed = false, StdoutTail = $"out {secret}", StderrTail = $"err {secret}" },
+            ],
+            AssertionResults =
+            [
+                new E2eAssertionResult { Passed = false, Detail = $"detail {secret}" },
+            ],
+        };
+        var sandbox = new FakeSandbox();
+        sandbox.Programs["getent"] = _ => new SandboxExecResult(0, "203.0.113.10 STREAM app.local\n", string.Empty);
+        sandbox.Programs["node"] = _ => DriverResult(driverResult, exitCode: 1);
+        var artifact = new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "navigate", Target = "http://app.local/" }] };
+        var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
+
+        var result = await runtime.ExecuteAsync(artifact, sandbox);
+
+        Assert.False(result.Passed);
+        Assert.DoesNotContain(secret, result.Summary);
+        Assert.Contains("***", result.Summary);
+        Assert.DoesNotContain(secret, result.StepResults[0].StdoutTail);
+        Assert.DoesNotContain(secret, result.StepResults[0].StderrTail);
+        Assert.DoesNotContain(secret, result.AssertionResults[0].Detail);
+    }
+
+    // --------------------------------------------------------------------
+    // Metadata-address (SSRF) blocking — IPv4 and the IPv6 branch
+    // --------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("169.254.169.254", true)]
+    [InlineData("fd00:ec2::254", true)]        // GCP link-local IPv6
+    [InlineData("fe80::a9fe:a9fe", true)]      // link-local metadata alias
+    [InlineData("::ffff:169.254.169.254", true)] // IPv4-mapped
+    [InlineData("::169.254.169.254", true)]    // IPv4-compatible
+    [InlineData("2001:db8::1", false)]
+    [InlineData("fd00:ec2::255", false)]
+    [InlineData("203.0.113.10", false)]
+    public void IsBlockedMetadataIp_flags_ipv4_and_ipv6_metadata_forms(string address, bool expected)
+    {
+        var ip = System.Net.IPAddress.Parse(address);
+        Assert.Equal(expected, E2eReplayOriginPolicy.IsBlockedMetadataIp(ip));
+    }
+
+    // --------------------------------------------------------------------
+    // IPv6 egress endpoint resolution + ip6tables emission
+    // --------------------------------------------------------------------
+
+    [Fact]
+    public async Task Replay_emits_ip6tables_rules_for_ipv6_allowed_origin()
+    {
+        var sandbox = new FakeSandbox();
+        sandbox.Programs["getent"] = _ => new SandboxExecResult(0, "2001:db8::1 STREAM app.local\n", string.Empty);
+        sandbox.Programs["node"] = _ => DriverResult(PassedDriverResult(1, 0));
+        var artifact = new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "navigate", Target = "http://app.local/" }] };
+        var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
+
+        var result = await runtime.ExecuteAsync(artifact, sandbox);
+
+        Assert.True(result.Passed, result.Summary);
+        var install = sandbox.ExecRequests.Single(exec =>
+            exec.Argv.SequenceEqual(["sh", "-s"]) && exec.Stdin!.Contains("iptables -I OUTPUT", StringComparison.Ordinal));
+        // family '6' endpoint lines drive the ip6tables RETURN rules.
+        Assert.Contains("6 2001:db8::1 80", install.Stdin, StringComparison.Ordinal);
+        Assert.Contains("6 2001:db8::1 443", install.Stdin, StringComparison.Ordinal);
+        Assert.Contains("ip6tables", install.Stdin, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Replay_normalizes_ipv4_mapped_origin_address_to_ipv4_firewall_rule()
+    {
+        var sandbox = new FakeSandbox();
+        sandbox.Programs["getent"] = _ => new SandboxExecResult(0, "::ffff:203.0.113.10 STREAM app.local\n", string.Empty);
+        sandbox.Programs["node"] = _ => DriverResult(PassedDriverResult(1, 0));
+        var artifact = new E2eReplayArtifact { Steps = [new E2eReplayStep { Action = "navigate", Target = "http://app.local/" }] };
+        var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
+
+        var result = await runtime.ExecuteAsync(artifact, sandbox);
+
+        Assert.True(result.Passed, result.Summary);
+        var install = sandbox.ExecRequests.Single(exec =>
+            exec.Argv.SequenceEqual(["sh", "-s"]) && exec.Stdin!.Contains("iptables -I OUTPUT", StringComparison.Ordinal));
+        // The IPv4-mapped address is unwrapped to a plain IPv4 (family '4') rule.
+        Assert.Contains("4 203.0.113.10 80", install.Stdin, StringComparison.Ordinal);
+        Assert.DoesNotContain("::ffff:203.0.113.10", install.Stdin, StringComparison.Ordinal);
+    }
+
+    // --------------------------------------------------------------------
+    // SqliteE2eRunStore queue predicates against the real store
+    // --------------------------------------------------------------------
+
+    [Fact]
+    public async Task HasQueuedAsync_reflects_queued_rows_in_the_real_store()
+    {
+        var tcId = await SeedE2eTestCaseAsync(MakeTrivialPassArtifact());
+        Assert.False(await _runs.HasQueuedAsync());
+
+        var runId = Guid.NewGuid().ToString("N");
+        await _runs.CreateAsync(new E2eRun { Id = runId, TestCaseId = tcId, Status = E2eRunStatus.Queued });
+        Assert.True(await _runs.HasQueuedAsync());
+
+        var claimed = await _runs.ClaimNextQueuedAsync(sandboxId: null);
+        Assert.NotNull(claimed);
+        Assert.False(await _runs.HasQueuedAsync()); // only a Running row remains
+    }
+
+    [Fact]
+    public async Task ClaimNextQueuedAsync_claims_each_queued_run_at_most_once_under_concurrency()
+    {
+        var tcId = await SeedE2eTestCaseAsync(MakeTrivialPassArtifact());
+        const int queued = 5;
+        for (var i = 0; i < queued; i++)
+            await _runs.CreateAsync(new E2eRun { Id = Guid.NewGuid().ToString("N"), TestCaseId = tcId, Status = E2eRunStatus.Queued });
+
+        // More claimers than queued rows: the surplus must lose the race and get null,
+        // and no run may be handed to two claimers.
+        var claims = await Task.WhenAll(Enumerable.Range(0, queued + 3)
+            .Select(_ => Task.Run(() => _runs.ClaimNextQueuedAsync(sandboxId: null))));
+
+        var claimedIds = claims.Where(r => r is not null).Select(r => r!.Id).ToArray();
+        Assert.Equal(queued, claimedIds.Length);
+        Assert.Equal(queued, claimedIds.Distinct(StringComparer.Ordinal).Count()); // no double-claim
+        Assert.Equal(3, claims.Count(r => r is null));
+        Assert.False(await _runs.HasQueuedAsync());
+    }
+
+    // --------------------------------------------------------------------
+    // Pool MaxConcurrent clamping and the multi-host min() crossover
+    // --------------------------------------------------------------------
+
+    [Theory]
+    [InlineData(0, E2eExecutionOptions.MinimumMaxConcurrent)]
+    [InlineData(-5, E2eExecutionOptions.MinimumMaxConcurrent)]
+    [InlineData(E2eExecutionOptions.MaximumMaxConcurrent + 1, E2eExecutionOptions.MaximumMaxConcurrent)]
+    public void LocalPool_clamps_MaxConcurrent_into_configured_bounds(int configured, int expected)
+    {
+        var monitor = new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions { MaxConcurrent = configured });
+        var pool = new LocalE2eExecutionPool(new CountingSandboxProvider(), monitor, NullLogger<LocalE2eExecutionPool>.Instance);
+        Assert.Equal(expected, pool.MaxConcurrent);
+    }
+
+    [Fact]
+    public void MultiHostPool_clamps_out_of_range_host_and_global_caps_up_to_the_floor()
+    {
+        // Host cap 0 must clamp UP to the floor (1), not leave the gate at 0
+        // (which would deadlock). Global is high so the host cap is what shows.
+        var hostFloor = new MultiHostE2eExecutionPool(
+            [new E2eExecutionHost("a", new CountingSandboxProvider(), 0)],
+            new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions { MaxConcurrent = 5 }),
+            NullLogger<MultiHostE2eExecutionPool>.Instance);
+        Assert.Equal(E2eExecutionOptions.MinimumMaxConcurrent, hostFloor.MaxConcurrent); // min(5, clamp(0)=1)
+
+        // Global cap 0 must clamp UP to the floor (1); host sum is higher.
+        var globalFloor = new MultiHostE2eExecutionPool(
+            [new E2eExecutionHost("a", new CountingSandboxProvider(), 3)],
+            new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions { MaxConcurrent = 0 }),
+            NullLogger<MultiHostE2eExecutionPool>.Instance);
+        Assert.Equal(E2eExecutionOptions.MinimumMaxConcurrent, globalFloor.MaxConcurrent); // min(clamp(0)=1, 3)
+    }
+
+    [Fact]
+    public void MultiHostPool_MaxConcurrent_is_min_of_global_cap_and_host_sum()
+    {
+        // Global cap BELOW the host sum -> the global cap binds.
+        var globalBinds = new MultiHostE2eExecutionPool(
+            [
+                new E2eExecutionHost("a", new CountingSandboxProvider(), 4),
+                new E2eExecutionHost("b", new CountingSandboxProvider(), 4),
+            ],
+            new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions { MaxConcurrent = 2 }),
+            NullLogger<MultiHostE2eExecutionPool>.Instance);
+        Assert.Equal(2, globalBinds.MaxConcurrent); // min(2, 8)
+
+        // Host sum BELOW the global cap -> the host sum binds.
+        var hostSumBinds = new MultiHostE2eExecutionPool(
+            [
+                new E2eExecutionHost("a", new CountingSandboxProvider(), 1),
+                new E2eExecutionHost("b", new CountingSandboxProvider(), 2),
+            ],
+            new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions { MaxConcurrent = 10 }),
+            NullLogger<MultiHostE2eExecutionPool>.Instance);
+        Assert.Equal(3, hostSumBinds.MaxConcurrent); // min(10, 3)
+    }
+
+    // --------------------------------------------------------------------
     // Helpers
     // --------------------------------------------------------------------
 
@@ -2529,6 +2837,7 @@ public sealed class E2eExecutionTests : IDisposable
         public bool ThrowOnClaim { get; set; }
         public bool ReturnNullClaim { get; set; }
         public bool AssignSandboxResult { get; set; } = true;
+        public bool UpdateStatusResult { get; set; } = true;
         public E2eRun? ClaimedRun { get; set; }
         public E2eRun? GetRun { get; set; }
         public E2eRunStatus? UpdatedStatus { get; private set; }
@@ -2581,7 +2890,7 @@ public sealed class E2eExecutionTests : IDisposable
         {
             UpdatedStatus = status;
             UpdatedResult = result;
-            return Task.FromResult(true);
+            return Task.FromResult(UpdateStatusResult);
         }
 
         public Task<bool> CancelAsync(string id, CancellationToken ct = default) => Task.FromResult(true);
