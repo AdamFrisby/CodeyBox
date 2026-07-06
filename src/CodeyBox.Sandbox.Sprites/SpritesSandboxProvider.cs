@@ -929,7 +929,11 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
             [
                 "sh",
                 "-c",
-                "set -eu; rm -rf \"$1\"; mkdir -p \"$1\"; base64 -d | tar -xzf - -C \"$1\"",
+                // No pipe: `base64 -d | tar -xzf -` would let a failed base64
+                // decode (truncated/corrupt payload) be masked by tar's exit, so
+                // a bad upload could still extract a partial tree. Decode to a temp
+                // file first so a base64 failure aborts before tar touches "$1".
+                "set -eu; rm -rf \"$1\"; mkdir -p \"$1\"; tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; base64 -d > \"$tmp\"; tar -xzf \"$tmp\" -C \"$1\"",
                 "_",
                 sandboxPath,
             ],
@@ -986,7 +990,12 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
             [
                 "sh",
                 "-c",
-                "set -eu; test -d \"$1\"; tar -czf - -C \"$1\" . | base64 -w0",
+                // No pipe: POSIX sh (dash) lacks `pipefail` and `set -e` only
+                // inspects the LAST pipe stage, so `tar ... | base64` would mask
+                // a mid-stream tar read/permission failure behind base64's exit 0
+                // and hand a truncated/empty archive to the host-overwrite path.
+                // Stage tar to a temp file first so a tar failure aborts the sync.
+                "set -eu; test -d \"$1\"; tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; tar -czf \"$tmp\" -C \"$1\" .; base64 -w0 \"$tmp\"",
                 "_",
                 sandboxPath,
             ],
