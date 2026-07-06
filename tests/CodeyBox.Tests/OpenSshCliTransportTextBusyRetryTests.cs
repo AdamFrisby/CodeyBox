@@ -75,11 +75,17 @@ public sealed class OpenSshCliTransportTextBusyRetryTests
                 onBusyRetry: attempt => sleeps.Add(attempt)));
 
         Assert.Equal(ETXTBSY, ex.NativeErrorCode);
-        // The final (cap-th) attempt throws out of the loop, so there is exactly
-        // one fewer backoff than there were start attempts.
-        Assert.Equal(attempts - 1, sleeps.Count);
-        // Bounded: the cap keeps the spin tight (documented ~200ms budget).
-        Assert.InRange(attempts, 2, 64);
+        // Pin the documented cap exactly: TextBusyMaxAttempts is 20, so the loop
+        // makes exactly 20 start attempts (retrying while attempt < 20) and the
+        // 20th throws out of the loop. Backoffs fire only on attempts 1..19, so
+        // there are exactly 19. Hard-coding these (rather than self-relative
+        // attempts-1) means changing the production cap to 5/19/21/30 — which
+        // moves the documented ~200ms (19 x 10ms) retry budget — fails this test.
+        Assert.Equal(20, attempts);
+        Assert.Equal(19, sleeps.Count);
+        // The callback receives the 1-based attempt index for each of the 19
+        // retried attempts, in order.
+        Assert.Equal(Enumerable.Range(1, 19).ToArray(), sleeps);
     }
 
     [Fact]
