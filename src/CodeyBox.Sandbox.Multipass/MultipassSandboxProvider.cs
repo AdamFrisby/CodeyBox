@@ -6506,15 +6506,12 @@ while True:
         // regardless of host load, so tests assert exit 86 off that internal
         // deadline, not a host-scheduling race.
         sb.AppendLine("codeybox_http_ready() {");
+        sb.AppendLine("timeout 3 env \\");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_URL=\"$codeybox_output_url\" \\");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_TOKEN=\"$codeybox_output_token\" \\");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_RUN_ID=\"$codeybox_output_run_id\" \\");
         sb.AppendLine("python3 - <<'PY'");
-        sb.AppendLine("import os, signal, sys, urllib.error, urllib.parse, urllib.request");
-        sb.AppendLine("def codeybox_timeout(_signum, _frame):");
-        sb.AppendLine("    raise TimeoutError('ready probe timed out')");
-        sb.AppendLine("signal.signal(signal.SIGALRM, codeybox_timeout)");
-        sb.AppendLine("signal.alarm(2)");
+        sb.AppendLine("import os, sys, urllib.error, urllib.parse, urllib.request");
         sb.AppendLine("base = os.environ.get('CODEYBOX_AGENT_OUTPUT_URL', '').rstrip('/')");
         sb.AppendLine("run_id = os.environ.get('CODEYBOX_AGENT_OUTPUT_RUN_ID', '')");
         sb.AppendLine("token = os.environ.get('CODEYBOX_AGENT_OUTPUT_TOKEN', '')");
