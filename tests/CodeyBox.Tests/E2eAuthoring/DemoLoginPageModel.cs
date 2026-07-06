@@ -16,7 +16,7 @@ public sealed class DemoLoginPageModel
 
     public bool TryLogin()
     {
-        if (Email.Trim() == "alice@example.com" && Password == "secret")
+        if (Email.Trim() == "alice@example.com" && ResolvePassword(Password) == "secret")
         {
             LoggedIn = true;
             return true;
@@ -25,27 +25,8 @@ public sealed class DemoLoginPageModel
         return false;
     }
 
-    public string CurrentUrl(string baseUrl)
-        => LoggedIn ? $"{baseUrl.TrimEnd('/')}/dashboard" : $"{baseUrl.TrimEnd('/')}/";
-
-    public string Title => LoggedIn ? "Demo Dashboard" : "Demo Login";
-
-    public bool IsVisible(string selector)
-        => selector switch
-        {
-            "#welcome" or "[data-testid=\"welcome-banner\"]" => LoggedIn,
-            "#hidden" => false,
-            "#email" or "#password" or "#login-btn" or "[data-testid=\"login-form\"]" => !LoggedIn,
-            "#ready" => true,
-            _ => !selector.Contains("hidden", StringComparison.OrdinalIgnoreCase),
-        };
-
-    public string TextContent(string selector)
-        => selector is "#welcome" or "[data-testid=\"welcome-banner\"]"
-            ? "Welcome, alice@example.com"
-            : selector is "#message"
-                ? $"Welcome {Email}"
-                : string.Empty;
+    public static string ResolvePassword(string value)
+        => value == E2eReplaySensitiveValueRedaction.PasswordPlaceholder ? "secret" : value;
 
     public string AccessibilityTreeJson()
     {

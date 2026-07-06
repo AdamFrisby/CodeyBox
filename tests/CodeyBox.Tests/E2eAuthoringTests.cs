@@ -99,6 +99,11 @@ public sealed class E2eAuthoringTests
     Assert.Equal("fill", artifact.Steps[2].Action);
     Assert.Equal("#email", artifact.Steps[2].Selector);
     Assert.Equal("alice@example.com", artifact.Steps[2].Value);
+    Assert.NotNull(artifact.Readiness);
+    Assert.Equal("http://app.local/healthz", artifact.Readiness!.Url);
+    Assert.Single(artifact.Assertions);
+    Assert.Equal("selectorVisible", artifact.Assertions[0].Kind);
+    Assert.Equal("#welcome", artifact.Assertions[0].Selector);
   }
 
   [Fact]
@@ -107,19 +112,20 @@ public sealed class E2eAuthoringTests
     await using var cuaSandbox = new E2eAuthoring.DemoLoginCuaSandbox();
     await using var session = E2eAuthoring.DemoLoginExploration.CreateSession(cuaSandbox);
 
-    var author = new CheapModelCuaAuthor(new CheapModelCuaAuthorOptions
-    {
-      ModelId = "claude-haiku-4-5-20251001",
-    });
-    var explorer = new ScriptedE2eCuaExplorer();
+    var modelId = "claude-haiku-4-5-20251001";
+    var plan = E2eAuthoring.DemoLoginExploration.Plan();
+    var modelClient = new E2eAuthoring.ScriptedComputerUseModelClient(plan.Actions);
+    var explorer = new AnthropicCheapModelCuaExplorer(modelClient, modelId);
+    var author = new CheapModelCuaAuthor(new CheapModelCuaAuthorOptions { ModelId = modelId });
 
-    var result = await author.ExploreAndEmitAsync(session, explorer, E2eAuthoring.DemoLoginExploration.Plan());
+    var result = await author.ExploreAndEmitAsync(session, plan, explorer);
 
-    Assert.Equal("claude-haiku-4-5-20251001", result.AuthorModelId);
+    Assert.Equal(modelId, result.AuthorModelId);
     Assert.False(string.IsNullOrWhiteSpace(result.Artifact.Name));
     Assert.Equal(6, result.Artifact.Steps.Count);
     Assert.Contains(result.Artifact.Steps, s => s.Action == "fill" && s.Selector == "#email");
-    Assert.Contains(result.Artifact.Steps, s => s.Action == "fill" && s.Selector == "#password");
+    Assert.Contains(result.Artifact.Steps, s => s.Action == "fill" && s.Selector == "#password"
+      && s.Value == E2eReplaySensitiveValueRedaction.PasswordPlaceholder);
     Assert.Contains(result.Artifact.Steps, s => s.Action == "click" && s.Selector == "#login-btn");
     Assert.Equal(3, result.Artifact.Assertions.Count);
     Assert.True(E2eReplayArtifactValidation.TryValidate(result.Artifact, out _, out var detail), detail);
@@ -133,12 +139,14 @@ public sealed class E2eAuthoringTests
     Assert.Equal(6, replay.StepResults.Count);
     Assert.Equal(3, replay.AssertionResults.Count);
     Assert.All(replay.AssertionResults, assertion => Assert.True(assertion.Passed, assertion.Detail));
+    Assert.NotEmpty(replaySandbox.FirewallExecs);
+    Assert.Contains(replaySandbox.FirewallExecs, exec => exec.Stdin!.Contains("iptables -I OUTPUT", StringComparison.Ordinal));
 
     if (string.Equals(Environment.GetEnvironmentVariable("WRITE_E2E_FIXTURES"), "1", StringComparison.Ordinal))
-      await WriteCommittedFixturesAsync(result);
+      await WriteCommittedFixturesAsync(result, plan);
   }
 
-  private static async Task WriteCommittedFixturesAsync(E2eAuthoringResult result)
+  private static async Task WriteCommittedFixturesAsync(E2eAuthoringResult result, E2eExplorationPlan plan)
   {
     var fixtureDir = Path.GetFullPath(Path.Combine(
       AppContext.BaseDirectory,
@@ -156,8 +164,8 @@ public sealed class E2eAuthoringTests
       "Cheap-model CUA explores the demo login fixture and emits a deterministic replay artifact.",
       E2eAuthoring.DemoLoginExploration.WorkItemId,
       result.Trace,
-      E2eAuthoring.DemoLoginExploration.Plan().Assertions,
-      E2eAuthoring.DemoLoginExploration.Plan().EmitOptions,
+      plan.Assertions,
+      plan.EmitOptions,
       """{"capability":"demo-login","mustPassOn":"main"}""",
       "demo-login");
     var testcaseJson = JsonSerializer.Serialize(new
@@ -216,5 +224,11 @@ public sealed class E2eAuthoringTests
     Assert.Equal(E2eAuthoring.DemoLoginExploration.TestCaseId, root.GetProperty("id").GetString());
     Assert.False(string.IsNullOrWhiteSpace(root.GetProperty("executableArtifactJson").GetString()));
     Assert.False(string.IsNullOrWhiteSpace(root.GetProperty("conformanceJson").GetString()));
+
+    var embeddedArtifact = JsonSerializer.Deserialize<E2eReplayArtifact>(
+      root.GetProperty("executableArtifactJson").GetString()!,
+      JsonOptions);
+    Assert.NotNull(embeddedArtifact);
+    Assert.True(E2eReplayArtifactValidation.TryValidate(embeddedArtifact, out _, out var embeddedDetail), embeddedDetail);
   }
 }

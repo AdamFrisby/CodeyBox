@@ -1,8 +1,7 @@
-using CodeyBox.Core;
+namespace CodeyBox.Core;
 
-namespace CodeyBox.Orchestrator;
-
-internal static class E2eReplayArtifactValidation
+/// <summary>Shared schema validation for <see cref="E2eReplayArtifact"/> payloads.</summary>
+public static class E2eReplayArtifactValidation
 {
     public const int MaxArtifactJsonBytes = 256 * 1024;
     public const int MaxSteps = 500;

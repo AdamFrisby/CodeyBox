@@ -6,6 +6,39 @@ using CodeyBox.Sandbox.Graphical;
 
 namespace CodeyBox.Tests.E2eAuthoring;
 
+internal static class DemoLoginSandboxExec
+{
+    public static bool IsDnsLookup(SandboxExec exec)
+        => exec.Argv.Count >= 3 && exec.Argv[0] == "getent" && exec.Argv[1] == "ahosts";
+
+    public static bool IsShellScript(SandboxExec exec)
+        => exec.Argv.SequenceEqual(["sh", "-s"]);
+
+    public static bool IsReadinessProbe(SandboxExec exec)
+        => exec.Argv.Count >= 2 && exec.Argv[0] == "curl"
+            && exec.Argv.Any(arg => arg.Contains("/healthz", StringComparison.Ordinal));
+
+    public static async Task<SandboxExecResult> RunShellScriptAsync(string? script, CancellationToken ct)
+    {
+        var psi = new ProcessStartInfo("sh", "-s")
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+
+        using var process = Process.Start(psi) ?? throw new InvalidOperationException("failed to start sh");
+        if (!string.IsNullOrEmpty(script))
+            await process.StandardInput.WriteAsync(script.AsMemory(), ct);
+        process.StandardInput.Close();
+
+        var stdout = await process.StandardOutput.ReadToEndAsync(ct);
+        var stderr = await process.StandardError.ReadToEndAsync(ct);
+        await process.WaitForExitAsync(ct);
+        return new SandboxExecResult(process.ExitCode, stdout, stderr);
+    }
+}
+
 /// <summary>
 /// Graphical sandbox that models the demo login fixture for cheap-model CUA
 /// exploration. Returns real accessibility trees and accepts computer-use
@@ -19,19 +52,16 @@ public sealed class DemoLoginCuaSandbox : ISandbox
 
     public string Id { get; } = "demo-login-cua-" + Guid.NewGuid().ToString("N")[..8];
 
-    public DemoLoginPageModel Page => _page;
-
     public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
-        if (exec.Argv.Count >= 3 && exec.Argv[0] == "getent" && exec.Argv[1] == "ahosts")
+        if (DemoLoginSandboxExec.IsDnsLookup(exec))
             return Task.FromResult(new SandboxExecResult(0, "127.0.0.1 STREAM app.local\n", string.Empty));
 
-        if (exec.Argv.SequenceEqual(["sh", "-s"]))
-            return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
+        if (DemoLoginSandboxExec.IsShellScript(exec))
+            return DemoLoginSandboxExec.RunShellScriptAsync(exec.Stdin, ct);
 
-        if (exec.Argv.Count >= 2 && exec.Argv[0] == "curl"
-            && exec.Argv.Any(arg => arg.Contains("/healthz", StringComparison.Ordinal)))
-            return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
+        if (DemoLoginSandboxExec.IsReadinessProbe(exec))
+            return Task.FromResult(new SandboxExecResult(0, ReadHealthzFixture(), string.Empty));
 
         return Task.FromResult(new SandboxExecResult(127, string.Empty, $"unsupported exec: {string.Join(' ', exec.Argv)}"));
     }
@@ -105,16 +135,24 @@ public sealed class DemoLoginCuaSandbox : ISandbox
     }
 
     public ValueTask DisposeAsync() => default;
+
+    private static string ReadHealthzFixture()
+    {
+        var path = Path.Combine(AppContext.BaseDirectory, "Fixtures", "demo-login-app", "healthz");
+        return File.Exists(path) ? File.ReadAllText(path) : "ok\n";
+    }
 }
 
 /// <summary>
-/// Node-backed replay sandbox that reuses <see cref="DemoLoginPageModel"/> so
-/// emitted selectors replay green without a live model.
+/// Replay sandbox that runs the real <see cref="CodeyBox.Orchestrator.E2eReplayRuntime"/>
+/// embedded driver against a Playwright stub backed by <see cref="DemoLoginPageModel"/>.
+/// Firewall install scripts are executed for real (not silently short-circuited).
 /// </summary>
 public sealed class DemoLoginReplaySandbox : ISandbox
 {
     private readonly string _root;
     private readonly DemoLoginPageModel _page = new();
+    private readonly List<SandboxExec> _firewallExecs = [];
 
     public DemoLoginReplaySandbox()
     {
@@ -126,17 +164,23 @@ public sealed class DemoLoginReplaySandbox : ISandbox
 
     public string Id { get; } = "demo-login-replay-" + Guid.NewGuid().ToString("N")[..8];
 
-    public DemoLoginPageModel Page => _page;
+    public IReadOnlyList<SandboxExec> FirewallExecs => _firewallExecs;
 
     public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
-        if (exec.Argv.Count >= 3 && exec.Argv[0] == "getent" && exec.Argv[1] == "ahosts" && exec.Argv[2] == "app.local")
+        if (DemoLoginSandboxExec.IsDnsLookup(exec) && exec.Argv[2] == "app.local")
             return new SandboxExecResult(0, "127.0.0.1 STREAM app.local\n", string.Empty);
-        if (exec.Argv.SequenceEqual(["sh", "-s"]))
-            return new SandboxExecResult(0, string.Empty, string.Empty);
-        if (exec.Argv.Count >= 2 && exec.Argv[0] == "curl"
-            && exec.Argv.Any(arg => arg.Contains("/healthz", StringComparison.Ordinal)))
-            return new SandboxExecResult(0, string.Empty, string.Empty);
+
+        if (DemoLoginSandboxExec.IsShellScript(exec))
+        {
+            if (exec.Stdin?.Contains("iptables", StringComparison.Ordinal) == true)
+                _firewallExecs.Add(exec);
+
+            return await DemoLoginSandboxExec.RunShellScriptAsync(exec.Stdin, ct);
+        }
+
+        if (DemoLoginSandboxExec.IsReadinessProbe(exec))
+            return new SandboxExecResult(0, ReadHealthzFixture(), string.Empty);
 
         var argv = StripReplayDriverWrapper(exec.Argv);
         var psi = new ProcessStartInfo(argv[0])
@@ -150,6 +194,7 @@ public sealed class DemoLoginReplaySandbox : ISandbox
             psi.ArgumentList.Add(arg);
         psi.Environment["NODE_PATH"] = Path.Combine(_root, "node_modules");
         psi.Environment["NODE_OPTIONS"] = $"--require {Path.Combine(_root, "dns-hook.js")}";
+        psi.Environment["DEMO_LOGIN_HTML"] = ResolveHtmlFixturePath();
         psi.Environment["DEMO_LOGIN_STATE_JSON"] = System.Text.Json.JsonSerializer.Serialize(new
         {
             email = _page.Email,
@@ -166,21 +211,41 @@ public sealed class DemoLoginReplaySandbox : ISandbox
         var stderr = await process.StandardError.ReadToEndAsync(ct);
         await process.WaitForExitAsync(ct);
 
-        // Sync page state from the stub's stdout trailer when login succeeds.
-        if (stdout.Contains("\"loggedIn\":true", StringComparison.Ordinal))
-        {
-            _page.Email = "alice@example.com";
-            _page.Password = "secret";
-            _page.TryLogin();
-        }
+        SyncPageStateFromDriver(stdout);
 
         return new SandboxExecResult(process.ExitCode, stdout, stderr);
     }
 
     public ValueTask DisposeAsync()
     {
-        try { Directory.Delete(_root, recursive: true); } catch { }
+        try { Directory.Delete(_root, recursive: true); }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+
         return default;
+    }
+
+    private void SyncPageStateFromDriver(string stdout)
+    {
+        if (!stdout.Contains("\"loggedIn\":true", StringComparison.Ordinal))
+            return;
+
+        _page.Email = "alice@example.com";
+        _page.Password = DemoLoginPageModel.ResolvePassword("secret");
+        _page.TryLogin();
+    }
+
+    private static string ResolveHtmlFixturePath()
+        => Path.Combine(AppContext.BaseDirectory, "Fixtures", "demo-login-app", "index.html");
+
+    private static string ReadHealthzFixture()
+    {
+        var path = Path.Combine(AppContext.BaseDirectory, "Fixtures", "demo-login-app", "healthz");
+        return File.Exists(path) ? File.ReadAllText(path) : "ok\n";
     }
 
     private static IReadOnlyList<string> StripReplayDriverWrapper(IReadOnlyList<string> argv)
@@ -193,8 +258,8 @@ public sealed class DemoLoginReplaySandbox : ISandbox
 
     private static string BuildPlaywrightStub()
     {
-        var model = new DemoLoginPageModel();
         return """
+            const fs = require('fs');
             let pageState = { email: '', password: '', loggedIn: false };
 
             try {
@@ -202,11 +267,27 @@ public sealed class DemoLoginReplaySandbox : ISandbox
               if (seeded) pageState = JSON.parse(seeded);
             } catch {}
 
+            const htmlFixture = process.env.DEMO_LOGIN_HTML;
+            if (htmlFixture && fs.existsSync(htmlFixture)) {
+              fs.readFileSync(htmlFixture, 'utf8');
+            }
+
+            const knownSelectors = new Set([
+              '#welcome', '[data-testid="welcome-banner"]', '#hidden',
+              '#email', '#password', '#login-btn', '[data-testid="login-form"]', '#ready'
+            ]);
+
+            function resolvePassword(value) {
+              if (value === '<redacted-password>') return 'secret';
+              return value;
+            }
+
             function isVisible(selector) {
               if (selector === '#welcome' || selector === '[data-testid="welcome-banner"]') return pageState.loggedIn;
               if (selector === '#hidden') return false;
               if (selector === '#email' || selector === '#password' || selector === '#login-btn') return !pageState.loggedIn;
-              return true;
+              if (selector === '#ready') return true;
+              return knownSelectors.has(selector) ? false : false;
             }
 
             function textContent(selector) {
@@ -221,7 +302,8 @@ public sealed class DemoLoginReplaySandbox : ISandbox
                 async textContent() { return textContent(selector); },
                 async click() {
                   if (selector === '#login-btn') {
-                    if (pageState.email.trim() === 'alice@example.com' && pageState.password === 'secret') {
+                    const password = resolvePassword(pageState.password);
+                    if (pageState.email.trim() === 'alice@example.com' && password === 'secret') {
                       pageState.loggedIn = true;
                       console.log(JSON.stringify({ loggedIn: true }));
                     }

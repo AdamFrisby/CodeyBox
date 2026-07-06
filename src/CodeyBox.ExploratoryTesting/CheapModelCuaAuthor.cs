@@ -16,45 +16,43 @@ public sealed record CheapModelCuaAuthorOptions
 
 /// <summary>
 /// Orchestrates a cheap-model computer-use exploration session and emits a
-/// deterministic <see cref="E2eReplayArtifact"/>. The explorer implementation
-/// is injected so tests can substitute a scripted driver that does not call a
-/// live model API.
+/// deterministic <see cref="E2eReplayArtifact"/>.
 /// </summary>
 public sealed class CheapModelCuaAuthor
 {
     private readonly CheapModelCuaAuthorOptions _options;
     private readonly TimeProvider _timeProvider;
+    private readonly IComputerUseModelClient? _defaultModelClient;
+    private readonly IE2eReauthoringHook _reauthoringHook;
 
     public CheapModelCuaAuthor(
         CheapModelCuaAuthorOptions? options = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        IComputerUseModelClient? defaultModelClient = null,
+        IE2eReauthoringHook? reauthoringHook = null)
     {
         _options = options ?? new CheapModelCuaAuthorOptions();
+        CheapModelAllowlist.EnsureCheap(_options.ModelId);
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _defaultModelClient = defaultModelClient;
+        _reauthoringHook = reauthoringHook ?? NullE2eReauthoringHook.Instance;
     }
 
     public string ModelId => _options.ModelId;
 
+    public IE2eReauthoringHook ReauthoringHook => _reauthoringHook;
+
     public async Task<E2eAuthoringResult> ExploreAndEmitAsync(
         AppUnderTestSession session,
-        IE2eCuaExplorer explorer,
         E2eExplorationPlan plan,
+        IE2eCuaExplorer? explorer = null,
         CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(session);
-        ArgumentNullException.ThrowIfNull(explorer);
         ArgumentNullException.ThrowIfNull(plan);
 
-        var recorder = new RecordingComputerUseBridge(
-            session.ComputerUse,
-            _timeProvider,
-            new RecordingComputerUseBridgeOptions { Modality = plan.Modality });
-
-        recorder.SetMetadata(
-            targetName: plan.TargetName,
-            entryUrl: plan.EntryUrl ?? session.EntryUrl,
-            readinessScreenshotPng: session.ReadinessScreenshotPng);
-
+        explorer ??= CreateDefaultExplorer();
+        var recorder = CreateRecorder(session, plan);
         await explorer.ExploreAsync(session.Sandbox, recorder, plan, ct).ConfigureAwait(false);
         recorder.EndTrace();
 
@@ -64,6 +62,35 @@ public sealed class CheapModelCuaAuthor
             plan.EmitOptions);
 
         return new E2eAuthoringResult(recorder.Trace, artifact, _options.ModelId);
+    }
+
+    public Task<bool> TryReauthorAfterReplayFailureAsync(
+        AppUnderTestSession session,
+        E2eExplorationPlan plan,
+        E2eRunResult failedReplay,
+        CancellationToken ct = default)
+        => _reauthoringHook.TryReauthorAsync(session, plan, failedReplay, ct);
+
+    private RecordingComputerUseBridge CreateRecorder(AppUnderTestSession session, E2eExplorationPlan plan)
+    {
+        var recorder = new RecordingComputerUseBridge(
+            session.ComputerUse,
+            _timeProvider,
+            new RecordingComputerUseBridgeOptions { Modality = plan.Modality });
+
+        recorder.SetMetadata(
+            targetName: plan.TargetName,
+            entryUrl: plan.EntryUrl ?? session.EntryUrl,
+            readinessScreenshotPng: session.ReadinessScreenshotPng);
+        return recorder;
+    }
+
+    private IE2eCuaExplorer CreateDefaultExplorer()
+    {
+        if (_defaultModelClient is null)
+            throw new InvalidOperationException("No IE2eCuaExplorer was supplied and no default IComputerUseModelClient is configured.");
+
+        return new AnthropicCheapModelCuaExplorer(_defaultModelClient, _options.ModelId);
     }
 }
 
@@ -96,41 +123,7 @@ public interface IE2eCuaExplorer
 {
     Task ExploreAsync(
         ISandbox sandbox,
-        RecordingComputerUseBridge recorder,
+        IComputerUseExplorationTarget target,
         E2eExplorationPlan plan,
         CancellationToken ct = default);
-}
-
-/// <summary>
-/// Deterministic stand-in for a cheap-model computer-use agent. Drives the
-/// real computer-use bridge with scripted actions so authoring tests never
-/// burn frontier coding quota.
-/// </summary>
-public sealed class ScriptedE2eCuaExplorer : IE2eCuaExplorer
-{
-    public async Task ExploreAsync(
-        ISandbox sandbox,
-        RecordingComputerUseBridge recorder,
-        E2eExplorationPlan plan,
-        CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(sandbox);
-        ArgumentNullException.ThrowIfNull(recorder);
-        ArgumentNullException.ThrowIfNull(plan);
-
-        foreach (var action in plan.Actions)
-        {
-            ct.ThrowIfCancellationRequested();
-            var request = action.Kind switch
-            {
-                "click" => new ComputerUseRequest { Action = "click", X = action.X ?? 0, Y = action.Y ?? 0 },
-                "type" => new ComputerUseRequest { Action = "type", Text = action.Text ?? string.Empty },
-                "key" => new ComputerUseRequest { Action = "key", Key = action.Key ?? action.Text },
-                "screenshot" => new ComputerUseRequest { Action = "screenshot" },
-                _ => throw new NotSupportedException($"Unsupported exploration action '{action.Kind}'."),
-            };
-
-            await recorder.ExecuteAsync(sandbox, request, ct).ConfigureAwait(false);
-        }
-    }
 }

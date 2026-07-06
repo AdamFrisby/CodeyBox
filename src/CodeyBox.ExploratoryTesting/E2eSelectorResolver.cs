@@ -29,7 +29,12 @@ public static class E2eSelectorResolver
             return descriptor.ElementType["css:".Length..];
 
         if (!string.IsNullOrWhiteSpace(descriptor.Name) && !string.IsNullOrWhiteSpace(descriptor.Role))
-            return $"{descriptor.Role}[name=\"{EscapeCssValue(descriptor.Name)}\"]";
+        {
+            if (!IsKnownAriaRole(descriptor.Role))
+                return null;
+
+            return $"role={descriptor.Role}[name=\"{EscapeCssValue(descriptor.Name)}\"]";
+        }
 
         return null;
     }
@@ -72,7 +77,27 @@ public static class E2eSelectorResolver
         => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
     private static string EscapeCssValue(string value)
-        => value.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal);
+    {
+        var escaped = value.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal);
+        return System.Text.RegularExpressions.Regex.Replace(
+            escaped,
+            @"[\x00-\x1f\x7f]",
+            static m => $"\\{Convert.ToInt32(m.Value[0]):X2}");
+    }
+
+    private static bool IsKnownAriaRole(string role)
+    {
+        var normalized = Normalize(role);
+        return normalized is not null && KnownAriaRoles.Contains(normalized);
+    }
+
+    private static readonly HashSet<string> KnownAriaRoles = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "alert", "button", "checkbox", "combobox", "dialog", "gridcell", "link", "log",
+        "menuitem", "menuitemcheckbox", "menuitemradio", "option", "progressbar", "radio",
+        "scrollbar", "searchbox", "slider", "spinbutton", "status", "switch", "tab",
+        "tabpanel", "textbox", "tooltip", "treeitem",
+    };
 
     private static IReadOnlyList<AccessibilityNode> ParseNodes(string? accessibilityTreeJson)
     {

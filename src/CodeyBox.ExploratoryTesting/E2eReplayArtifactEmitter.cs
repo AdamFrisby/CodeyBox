@@ -55,7 +55,9 @@ public static class E2eReplayArtifactEmitter
                         Selector = selector,
                         DelayAfterMs = options.StepDelayAfterMs,
                     });
-                    focusedSelector = selector;
+                    focusedSelector = IsTextInputSelector(entry.Action.TargetDescriptor.Accessibility)
+                        ? selector
+                        : null;
                     break;
 
                 case "type":
@@ -70,7 +72,7 @@ public static class E2eReplayArtifactEmitter
                     {
                         Action = "fill",
                         Selector = focusedSelector,
-                        Value = typedValue ?? string.Empty,
+                        Value = RedactSensitiveValue(focusedSelector, entry.Action.TargetDescriptor.Accessibility, typedValue),
                         DelayAfterMs = options.StepDelayAfterMs,
                     });
                     break;
@@ -88,10 +90,21 @@ public static class E2eReplayArtifactEmitter
                     });
                     break;
 
+                case "double_click":
+                    if (string.IsNullOrWhiteSpace(selector))
+                        throw new InvalidOperationException($"Could not resolve selector for double_click at sequence {entry.Sequence}.");
+                    steps.Add(new E2eReplayStep
+                    {
+                        Action = "doubleClick",
+                        Selector = selector,
+                        DelayAfterMs = options.StepDelayAfterMs,
+                    });
+                    focusedSelector = null;
+                    break;
+
                 case "screenshot":
                 case "move":
                 case "scroll":
-                case "double_click":
                     break;
 
                 default:
@@ -99,13 +112,50 @@ public static class E2eReplayArtifactEmitter
             }
         }
 
-        return new E2eReplayArtifact
+        var artifact = new E2eReplayArtifact
         {
             Name = options.Name ?? trace.TargetName,
             Readiness = options.Readiness ?? BuildDefaultReadiness(trace.EntryUrl),
             Steps = steps,
             Assertions = assertions,
         };
+
+        if (!E2eReplayArtifactValidation.TryValidate(artifact, out var failureKind, out var detail))
+            throw new InvalidOperationException($"Emitted artifact failed validation ({failureKind}): {detail}");
+
+        return artifact;
+    }
+
+    private static bool IsTextInputSelector(TraceAccessibilityDescriptor? descriptor)
+    {
+        if (descriptor is null)
+            return false;
+
+        if (string.Equals(descriptor.Role, "textbox", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var elementType = descriptor.ElementType ?? string.Empty;
+        return elementType.Contains("password", StringComparison.OrdinalIgnoreCase)
+            || elementType.Contains("#email", StringComparison.Ordinal)
+            || elementType.Contains("#password", StringComparison.Ordinal);
+    }
+
+    private static string RedactSensitiveValue(string? selector, TraceAccessibilityDescriptor? descriptor, string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return value ?? string.Empty;
+
+        if (selector?.Contains("password", StringComparison.OrdinalIgnoreCase) == true)
+            return E2eReplaySensitiveValueRedaction.PasswordPlaceholder;
+
+        if (descriptor is null)
+            return value;
+
+        var elementType = descriptor.ElementType ?? string.Empty;
+        if (elementType.Contains("password", StringComparison.OrdinalIgnoreCase))
+            return E2eReplaySensitiveValueRedaction.PasswordPlaceholder;
+
+        return value;
     }
 
     public static string EmitJson(
@@ -143,21 +193,31 @@ public static class E2eReplayArtifactEmitter
         };
     }
 
+    private const int DefaultReadinessMaxAttempts = 30;
+    private const int DefaultReadinessDelayMs = 250;
+
     private static E2eReadinessProbe? BuildDefaultReadiness(string? entryUrl)
     {
         if (string.IsNullOrWhiteSpace(entryUrl))
             return null;
 
-        var baseUrl = entryUrl.TrimEnd('/');
-        var slash = baseUrl.LastIndexOf('/');
-        var origin = slash > 0 ? baseUrl[..slash] : baseUrl;
+        if (!Uri.TryCreate(entryUrl, UriKind.Absolute, out var uri))
+            return null;
+
+        var origin = uri.GetLeftPart(UriPartial.Authority);
         return new E2eReadinessProbe
         {
             Url = $"{origin}/healthz",
-            MaxAttempts = 30,
-            DelayMs = 250,
+            MaxAttempts = DefaultReadinessMaxAttempts,
+            DelayMs = DefaultReadinessDelayMs,
         };
     }
+}
+
+/// <summary>Placeholder substituted for password fields in emitted replay artifacts.</summary>
+public static class E2eReplaySensitiveValueRedaction
+{
+    public const string PasswordPlaceholder = "<redacted-password>";
 }
 
 public sealed record E2eReplayEmitOptions

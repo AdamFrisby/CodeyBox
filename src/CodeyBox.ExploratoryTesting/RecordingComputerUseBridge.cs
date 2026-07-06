@@ -51,7 +51,7 @@ public sealed record RecordingComputerUseMetadata
 /// without external synchronisation; concurrent reading during
 /// <see cref="ExecuteAsync"/> requires caller-supplied serialisation.</para>
 /// </summary>
-public sealed class RecordingComputerUseBridge
+public sealed class RecordingComputerUseBridge : IComputerUseExplorationTarget
 {
     private readonly ComputerUseBridge _inner;
     private readonly TimeProvider _timeProvider;
