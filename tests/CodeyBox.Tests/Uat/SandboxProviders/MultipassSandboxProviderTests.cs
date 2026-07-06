@@ -324,6 +324,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.DoesNotContain("xdotool scrot ffmpeg", headlessCloudInit);
         Assert.DoesNotContain("x11-utils socat", headlessCloudInit);
         Assert.DoesNotContain("tesseract-ocr", headlessCloudInit);
+        // Accessibility probes are a graphical-only capability; they must not
+        // leak into the headless install line (regression guard for the
+        // graphical-flavor at-spi2-core / python3-pyatspi packages).
+        Assert.DoesNotContain("at-spi2-core", headlessCloudInit);
+        Assert.DoesNotContain("python3-pyatspi", headlessCloudInit);
     }
 
     [Fact]

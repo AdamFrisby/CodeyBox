@@ -30,6 +30,42 @@ public interface IReachabilityChecker
         TraceTargetDescriptor descriptor,
         ReplayOptions options,
         CancellationToken ct);
+
+    /// <summary>
+    /// Recovery for the case where the locator found NOTHING for a visual-only
+    /// descriptor whose recorded click point is off-viewport: scroll toward the
+    /// recorded region like a human, then re-locate. This is the same scroll
+    /// orchestrator as <see cref="EnsureReachableAsync"/>'s off-viewport loop —
+    /// it lives behind this seam (not in the engine) so there is ONE owner of
+    /// scroll-and-relocate. Returns <see cref="VisualMissScrollOutcome.Skipped"/>
+    /// when the descriptor doesn't qualify (has an accessibility signal, no
+    /// visual signal, or its recorded point is already on screen), a
+    /// <see cref="VisualMissScrollOutcome.Found"/> with the re-located target,
+    /// or a <see cref="VisualMissScrollOutcome.Failed"/> categorical failure.
+    /// </summary>
+    Task<VisualMissScrollOutcome> TryScrollOffscreenVisualMissIntoViewAsync(
+        ISandbox sandbox,
+        TraceTargetDescriptor descriptor,
+        ReplayOptions options,
+        CancellationToken ct);
+}
+
+/// <summary>
+/// Outcome of <see cref="IReachabilityChecker.TryScrollOffscreenVisualMissIntoViewAsync"/>.
+/// Exactly one of the three shapes: skipped (descriptor didn't qualify),
+/// found (re-located after scrolling), or failed (categorical failure the
+/// engine surfaces verbatim).
+/// </summary>
+public sealed record VisualMissScrollOutcome
+{
+    public LocatedTarget? Target { get; init; }
+    public ReplayFailureKind? FailureKind { get; init; }
+    public string? Diagnostic { get; init; }
+
+    public static VisualMissScrollOutcome Skipped { get; } = new();
+    public static VisualMissScrollOutcome Found(LocatedTarget target) => new() { Target = target };
+    public static VisualMissScrollOutcome Failed(ReplayFailureKind kind, string diagnostic)
+        => new() { FailureKind = kind, Diagnostic = diagnostic };
 }
 
 /// <summary>

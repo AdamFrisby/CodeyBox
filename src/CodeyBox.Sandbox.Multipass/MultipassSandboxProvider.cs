@@ -5238,7 +5238,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
     internal const int MaxScreenshotBase64StdoutBytes = ((MaxScreenshotPngBytes + 2) / 3 * 4) + 4096;
     internal const int MaxScreenshotStderrBytes = 64 * 1024;
-internal const int ResourceMetricsCaptureMaxStdoutBytes = 4096;
+    internal const int ResourceMetricsCaptureMaxStdoutBytes = 4096;
     internal const int ResourceMetricsCaptureMaxStderrBytes = 4096;
     internal const int MaxAccessibilityJsonStdoutBytes = 2 * 1024 * 1024;
     internal const int MaxAccessibilityStderrBytes = 64 * 1024;

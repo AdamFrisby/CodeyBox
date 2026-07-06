@@ -4052,6 +4052,35 @@ public sealed class ReplayEngineTests
     }
 
     [Fact]
+    public void DiagnosticText_ReplacesControlCharacters_WithReplacementChar()
+    {
+        // The whole point of Sanitize is log-forging defence (OWASP A09): CR /
+        // LF / TAB and other C0/C1 control chars must be replaced with U+FFFD
+        // so an attacker-supplied accessibility name cannot split a log line.
+        // Inverting or dropping the char.IsControl guard fails this test.
+        const char Repl = '�';
+        var sanitized = DiagnosticText.Sanitize("a\r\nb\tc de");
+
+        Assert.DoesNotContain('\r', sanitized);
+        Assert.DoesNotContain('\n', sanitized);
+        Assert.DoesNotContain('\t', sanitized);
+        // Each control char maps to exactly one U+FFFD (no collapsing / no
+        // dropping); the ordinary space (0x20) is NOT a control char and is
+        // preserved verbatim.
+        Assert.Equal($"a{Repl}{Repl}b{Repl}c de", sanitized);
+    }
+
+    [Fact]
+    public void DiagnosticText_PreservesPrintableUnicode_AndEmptyInput()
+    {
+        Assert.Equal("", DiagnosticText.Sanitize(null));
+        Assert.Equal("", DiagnosticText.Sanitize(""));
+        // Printable non-ASCII (accented, CJK, emoji) is not a control char and
+        // must survive untouched.
+        Assert.Equal("café 日本 🚀", DiagnosticText.Sanitize("café 日本 🚀"));
+    }
+
+    [Fact]
     public async Task Replay_NamedRecordingVisualMatch_FallsBackToVerifierResolution()
     {
         // Named-recording visual-match: assertion.Detail set => engine's
@@ -5690,7 +5719,7 @@ public sealed class ReplayEngineTests
             _heal = heal;
             _updatedDescriptor = updatedDescriptor;
         }
-        public Task<LocatorHealResult?> HealAsync(ISandbox sandbox, TraceEntry entry, ReplayOptions options, CancellationToken ct)
+        public Task<LocatorHealResult?> HealAsync(ISandbox sandbox, TraceTargetDescriptor descriptor, int sequence, ReplayOptions options, CancellationToken ct)
         {
             Calls++;
             return Task.FromResult<LocatorHealResult?>(new LocatorHealResult
@@ -5905,6 +5934,10 @@ public sealed class ReplayEngineTests
             ISandbox sandbox, LocatedTarget target, TraceTargetDescriptor descriptor,
             ReplayOptions options, CancellationToken ct)
             => throw _toThrow;
+
+        public Task<VisualMissScrollOutcome> TryScrollOffscreenVisualMissIntoViewAsync(
+            ISandbox sandbox, TraceTargetDescriptor descriptor, ReplayOptions options, CancellationToken ct)
+            => Task.FromResult(VisualMissScrollOutcome.Skipped);
     }
 
     private sealed class AlwaysReachable : IReachabilityChecker
@@ -5922,6 +5955,10 @@ public sealed class ReplayEngineTests
                 Status = ReachabilityStatus.Reachable,
                 Target = target,
             });
+
+        public Task<VisualMissScrollOutcome> TryScrollOffscreenVisualMissIntoViewAsync(
+            ISandbox sandbox, TraceTargetDescriptor descriptor, ReplayOptions options, CancellationToken ct)
+            => Task.FromResult(VisualMissScrollOutcome.Skipped);
     }
 
     private sealed class AlwaysMatchScreenshotComparer : IScreenshotComparer
@@ -6014,7 +6051,7 @@ public sealed class ReplayEngineTests
     private sealed class NullHealer : ILocatorHealer
     {
         public int Calls { get; private set; }
-        public Task<LocatorHealResult?> HealAsync(ISandbox sandbox, TraceEntry entry, ReplayOptions options, CancellationToken ct)
+        public Task<LocatorHealResult?> HealAsync(ISandbox sandbox, TraceTargetDescriptor descriptor, int sequence, ReplayOptions options, CancellationToken ct)
         {
             Calls++;
             return Task.FromResult<LocatorHealResult?>(null);

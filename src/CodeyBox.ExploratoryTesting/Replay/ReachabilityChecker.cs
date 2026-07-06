@@ -74,7 +74,7 @@ public sealed class ReachabilityChecker : IReachabilityChecker
         var consecutiveRelocateMisses = 0;
         for (var attempt = 0; attempt <= options.MaxScrollAttempts; attempt++)
         {
-            if (InViewport(current, options))
+            if (ViewportGeometry.PointInViewport(current.CenterX, current.CenterY, options))
                 break;
 
             if (attempt == options.MaxScrollAttempts)
@@ -87,7 +87,7 @@ public sealed class ReachabilityChecker : IReachabilityChecker
                 };
             }
 
-            var (dx, dy) = ResolveScrollDelta(current, options);
+            var (dx, dy) = ViewportGeometry.ResolveScrollDelta(current.CenterX, current.CenterY, options);
             // The bridge validator rejects two-axis scroll events, and X/Y on
             // a scroll request resolve as fallback for ScrollX/Y — so we pass
             // the scroll magnitude on a single dedicated axis and leave X/Y
@@ -292,25 +292,101 @@ public sealed class ReachabilityChecker : IReachabilityChecker
         return _visualVerifier.Verify(screenshot, descriptor.Visual, current);
     }
 
-    private static bool InViewport(LocatedTarget t, ReplayOptions o) =>
-        t.CenterX >= 0 && t.CenterX < o.ScreenWidth && t.CenterY >= 0 && t.CenterY < o.ScreenHeight;
-
-    private static (int Dx, int Dy) ResolveScrollDelta(LocatedTarget t, ReplayOptions o)
+    public async Task<VisualMissScrollOutcome> TryScrollOffscreenVisualMissIntoViewAsync(
+        ISandbox sandbox,
+        TraceTargetDescriptor descriptor,
+        ReplayOptions options,
+        CancellationToken ct)
     {
-        // Pick the axis that's actually off-screen. Vertical takes priority when
-        // both axes are out — most layouts scroll vertically far more often than
-        // horizontally, and the recorder rarely emits two-axis scrolls.
-        if (t.CenterY < 0) return (0, -o.ScrollStep);
-        if (t.CenterY >= o.ScreenHeight) return (0, o.ScrollStep);
-        if (t.CenterX < 0) return (-o.ScrollStep, 0);
-        if (t.CenterX >= o.ScreenWidth) return (o.ScrollStep, 0);
-        // The caller gates this call on !InViewport, so a both-axes-in-bounds
-        // target is a logic error. Throw rather than emit a (0, 0) scroll —
-        // the bridge would reject it with "Scroll events require a non-zero
-        // X or Y amount" and that diagnostic would be reported against the
-        // wrong layer.
-        throw new InvalidOperationException(
-            $"ResolveScrollDelta invoked for in-viewport target ({t.CenterX},{t.CenterY}).");
+        ArgumentNullException.ThrowIfNull(sandbox);
+        ArgumentNullException.ThrowIfNull(descriptor);
+        ArgumentNullException.ThrowIfNull(options);
+
+        if (!ShouldScrollSearchAfterVisualMiss(descriptor, options, out var cx, out var cy))
+            return VisualMissScrollOutcome.Skipped;
+
+        if (options.MaxScrollAttempts <= 0)
+        {
+            return VisualMissScrollOutcome.Failed(
+                ReplayFailureKind.OffScreen,
+                $"visual target's recorded click point ({cx},{cy}) is outside viewport ({options.ScreenWidth}x{options.ScreenHeight}) and no scroll attempts are allowed");
+        }
+
+        for (var attempt = 1; attempt <= options.MaxScrollAttempts; attempt++)
+        {
+            var (dx, dy) = ViewportGeometry.ResolveScrollDelta(cx, cy, options);
+            var scrollRequest = dx != 0
+                ? new ComputerUseRequest { Action = "scroll", ScrollX = dx }
+                : new ComputerUseRequest { Action = "scroll", ScrollY = dy };
+
+            try
+            {
+                await _bridge.ExecuteAsync(sandbox, scrollRequest, ct).ConfigureAwait(false);
+                var settled = await _visualWait.WaitAsync(sandbox, predicate: null, options, ct)
+                    .ConfigureAwait(false);
+                if (settled is null)
+                {
+                    return VisualMissScrollOutcome.Failed(
+                        ReplayFailureKind.OffScreen,
+                        $"screen did not settle after scrolling toward off-screen visual target ({cx},{cy}) within {options.VisualWaitTimeout}");
+                }
+
+                var relocated = await _locator.LocateAsync(sandbox, descriptor, options, ct)
+                    .ConfigureAwait(false);
+                if (relocated is not null)
+                    return VisualMissScrollOutcome.Found(relocated);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                return VisualMissScrollOutcome.Failed(
+                    ReplayFailureKind.ActionFailed,
+                    $"scroll search for off-screen visual target failed: {DiagnosticText.Sanitize(ex.Message)}");
+            }
+        }
+
+        return VisualMissScrollOutcome.Failed(
+            ReplayFailureKind.OffScreen,
+            $"visual target's recorded click point ({cx},{cy}) is outside viewport ({options.ScreenWidth}x{options.ScreenHeight}); target not found after {options.MaxScrollAttempts} scroll attempts");
+    }
+
+    private bool ShouldScrollSearchAfterVisualMiss(
+        TraceTargetDescriptor descriptor,
+        ReplayOptions options,
+        out int cx,
+        out int cy)
+    {
+        var visual = descriptor.Visual;
+        var region = visual.Region;
+        cx = 0;
+        cy = 0;
+
+        if (descriptor.Accessibility is { } accessibility
+            && _matcher.HasAnyAccessibilitySignal(accessibility))
+        {
+            return false;
+        }
+
+        if (region.Width <= 0 || region.Height <= 0)
+            return false;
+
+        if (visual.TemplatePng is not { Length: > 0 }
+            && visual.SourceScreenshotPng is not { Length: > 0 }
+            && string.IsNullOrWhiteSpace(visual.OcrText))
+        {
+            return false;
+        }
+
+        cx = visual.ClickOffsetX is int offsetX && offsetX >= 0 && offsetX < region.Width
+            ? region.X + offsetX
+            : region.X + region.Width / 2;
+        cy = visual.ClickOffsetY is int offsetY && offsetY >= 0 && offsetY < region.Height
+            ? region.Y + offsetY
+            : region.Y + region.Height / 2;
+        return !ViewportGeometry.PointInViewport(cx, cy, options);
     }
 
     private static string Describe(SandboxAccessibilitySnapshot s) =>

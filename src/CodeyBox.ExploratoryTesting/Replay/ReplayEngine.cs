@@ -222,7 +222,7 @@ public sealed class ReplayEngine
 
             if (located is null && _healer is not null)
             {
-                var healed = await _healer.HealAsync(sandbox, entry, options, ct).ConfigureAwait(false);
+                var healed = await _healer.HealAsync(sandbox, effectiveDescriptor, entry.Sequence, options, ct).ConfigureAwait(false);
                 if (healed is not null)
                 {
                     located = healed.Target;
@@ -232,9 +232,12 @@ public sealed class ReplayEngine
 
             if (located is null)
             {
-                var scrollSearch = await TryLocateVisualMissByScrollingAsync(
+                // Visual-only target the locator couldn't see: delegate the
+                // scroll-and-relocate recovery to the reachability checker so
+                // there is ONE scroll orchestrator, not a preemptive engine
+                // loop overlapping the checker's canonical off-viewport loop.
+                var scrollSearch = await reachability.TryScrollOffscreenVisualMissIntoViewAsync(
                     sandbox,
-                    bridge,
                     effectiveDescriptor,
                     options,
                     ct).ConfigureAwait(false);
@@ -370,64 +373,6 @@ public sealed class ReplayEngine
             Passed = true,
             LocatedTarget = located,
         };
-    }
-
-    private async Task<VisualMissScrollSearchResult> TryLocateVisualMissByScrollingAsync(
-        ISandbox sandbox,
-        ComputerUseBridge bridge,
-        TraceTargetDescriptor descriptor,
-        ReplayOptions options,
-        CancellationToken ct)
-    {
-        if (!ShouldScrollSearchAfterVisualMiss(descriptor, options, out var cx, out var cy))
-            return VisualMissScrollSearchResult.Skipped;
-
-        if (options.MaxScrollAttempts <= 0)
-        {
-            return VisualMissScrollSearchResult.Failed(
-                ReplayFailureKind.OffScreen,
-                $"visual target's recorded click point ({cx},{cy}) is outside viewport ({options.ScreenWidth}x{options.ScreenHeight}) and no scroll attempts are allowed");
-        }
-
-        for (var attempt = 1; attempt <= options.MaxScrollAttempts; attempt++)
-        {
-            var (dx, dy) = ResolveScrollDelta(cx, cy, options);
-            var scrollRequest = dx != 0
-                ? new ComputerUseRequest { Action = "scroll", ScrollX = dx }
-                : new ComputerUseRequest { Action = "scroll", ScrollY = dy };
-
-            try
-            {
-                await bridge.ExecuteAsync(sandbox, scrollRequest, ct).ConfigureAwait(false);
-                var settled = await _visualWait.WaitAsync(sandbox, predicate: null, options, ct)
-                    .ConfigureAwait(false);
-                if (settled is null)
-                {
-                    return VisualMissScrollSearchResult.Failed(
-                        ReplayFailureKind.OffScreen,
-                        $"screen did not settle after scrolling toward off-screen visual target ({cx},{cy}) within {options.VisualWaitTimeout}");
-                }
-
-                var relocated = await _locator.LocateAsync(sandbox, descriptor, options, ct)
-                    .ConfigureAwait(false);
-                if (relocated is not null)
-                    return VisualMissScrollSearchResult.Found(relocated);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                return VisualMissScrollSearchResult.Failed(
-                    ReplayFailureKind.ActionFailed,
-                    $"scroll search for off-screen visual target failed: {DiagnosticText.Sanitize(ex.Message)}");
-            }
-        }
-
-        return VisualMissScrollSearchResult.Failed(
-            ReplayFailureKind.OffScreen,
-            $"visual target's recorded click point ({cx},{cy}) is outside viewport ({options.ScreenWidth}x{options.ScreenHeight}); target not found after {options.MaxScrollAttempts} scroll attempts");
     }
 
     private async Task<ReplayStepResult> RunScreenshotStepAsync(
@@ -629,258 +574,8 @@ public sealed class ReplayEngine
         LocatedTarget? located,
         CancellationToken ct)
     {
-        var request = BuildRequestForReplay(action, located);
+        var request = ReplayRequestBuilder.BuildRequestForReplay(action, located);
         await bridge.ExecuteAsync(sandbox, request, ct).ConfigureAwait(false);
-    }
-
-    private static ComputerUseRequest BuildRequestForReplay(TraceAction action, LocatedTarget? located)
-    {
-        return action.Kind switch
-        {
-            "click" => new ComputerUseRequest
-            {
-                Action = "click",
-                X = located!.CenterX,
-                Y = located.CenterY,
-            },
-            "double_click" => new ComputerUseRequest
-            {
-                Action = "double_click",
-                X = located!.CenterX,
-                Y = located.CenterY,
-            },
-            "move" => new ComputerUseRequest
-            {
-                Action = "move",
-                X = located!.CenterX,
-                Y = located.CenterY,
-            },
-            "scroll" => BuildScrollRequest(action, located),
-            "key" => BuildTargetedKeyRequest(action, located),
-            "type" => BuildTargetedTypeRequest(action, located),
-            "events" => new ComputerUseRequest
-            {
-                Action = "events",
-                Events = RelocateEvents(action.InputEvents, located, action),
-            },
-            _ => throw new NotSupportedException($"Unsupported replay action kind '{action.Kind}'."),
-        };
-    }
-
-    private static ComputerUseRequest BuildTargetedKeyRequest(TraceAction action, LocatedTarget? located)
-    {
-        var key = FirstKey(action.InputEvents);
-        if (located is not null)
-        {
-            return new ComputerUseRequest
-            {
-                Action = "events",
-                Events =
-                [
-                    new SandboxInputEvent
-                    {
-                        Type = SandboxInputEventType.Click,
-                        X = located.CenterX,
-                        Y = located.CenterY,
-                    },
-                    new SandboxInputEvent
-                    {
-                        Type = SandboxInputEventType.Key,
-                        Key = key,
-                    },
-                ],
-            };
-        }
-
-        return new ComputerUseRequest
-        {
-            Action = "key",
-            Key = key,
-        };
-    }
-
-    private static ComputerUseRequest BuildTargetedTypeRequest(TraceAction action, LocatedTarget? located)
-    {
-        var text = FirstText(action.InputEvents);
-        if (located is not null)
-        {
-            return new ComputerUseRequest
-            {
-                Action = "events",
-                Events =
-                [
-                    new SandboxInputEvent
-                    {
-                        Type = SandboxInputEventType.Click,
-                        X = located.CenterX,
-                        Y = located.CenterY,
-                    },
-                    new SandboxInputEvent
-                    {
-                        Type = SandboxInputEventType.Type,
-                        Text = text,
-                    },
-                ],
-            };
-        }
-
-        return new ComputerUseRequest
-        {
-            Action = "type",
-            Text = text,
-        };
-    }
-
-    private static ComputerUseRequest BuildScrollRequest(TraceAction action, LocatedTarget? located)
-    {
-        // The bridge resolves the scroll event from (ScrollX ?? X, ScrollY ?? Y)
-        // and the validator rejects events with both axes non-zero. We:
-        //   - pull the magnitude from the first SandboxInputEvent of Type=Scroll,
-        //     not action.InputEvents[0] verbatim (a malformed recording whose
-        //     first event is a Click could push pixel coords as scroll units);
-        //   - zero the smaller axis when the recording emits a two-axis scroll,
-        //     so the validator never rejects a real recording for shape.
-        SandboxInputEvent? scrollEvent = null;
-        foreach (var e in action.InputEvents)
-        {
-            if (e.Type == SandboxInputEventType.Scroll)
-            {
-                scrollEvent = e;
-                break;
-            }
-        }
-        if (scrollEvent is null)
-        {
-            // Recorder bug: a scroll action with no Scroll-typed event in its
-            // InputEvents. Surface as a categorical recording-shape failure
-            // upfront so operators see "recording has no Scroll event" instead
-            // of the bridge validator's generic "Scroll events require a
-            // non-zero X or Y amount" once it tries to dispatch null axes.
-            throw new MalformedTraceException(
-                "scroll action carries no SandboxInputEvent of Type=Scroll (recorder bug)");
-        }
-        var sx = scrollEvent.X ?? 0;
-        var sy = scrollEvent.Y ?? 0;
-        if (sx == 0 && sy == 0)
-        {
-            // Recorder bug: a Scroll event with zero magnitude on both axes
-            // would dispatch as a no-op the validator rejects.
-            throw new MalformedTraceException(
-                "scroll action's Scroll event has zero magnitude on both axes (recorder bug)");
-        }
-        if (sx != 0 && sy != 0)
-        {
-            // Drop the smaller-magnitude axis — vertical wins on ties.
-            if (Math.Abs(sx) > Math.Abs(sy)) sy = 0;
-            else sx = 0;
-        }
-        if (located is not null)
-        {
-            return new ComputerUseRequest
-            {
-                Action = "events",
-                Events =
-                [
-                    new SandboxInputEvent
-                    {
-                        Type = SandboxInputEventType.Move,
-                        X = located.CenterX,
-                        Y = located.CenterY,
-                    },
-                    new SandboxInputEvent
-                    {
-                        Type = SandboxInputEventType.Scroll,
-                        X = sx == 0 ? null : sx,
-                        Y = sy == 0 ? null : sy,
-                    },
-                ],
-            };
-        }
-
-        return new ComputerUseRequest
-        {
-            Action = "scroll",
-            ScrollX = sx == 0 ? null : sx,
-            ScrollY = sy == 0 ? null : sy,
-        };
-    }
-
-    private static IReadOnlyList<SandboxInputEvent> RelocateEvents(
-        IReadOnlyList<SandboxInputEvent> events,
-        LocatedTarget? located,
-        TraceAction action)
-    {
-        if (located is null) return events;
-        // Anchor relative offsets at the recorded centre so a drag (or any
-        // multi-event sequence with internal motion) preserves its geometry
-        // when the target moved on screen: each event's recorded (X, Y) is
-        // translated by the delta from the recorded anchor to the located
-        // anchor. If the action has no recorded coordinates to anchor on, the
-        // first Click/Move position acts as the anchor.
-        var anchor = FindAnchor(events);
-        if (anchor is null)
-        {
-            return CollapseToCentre(events, located);
-        }
-        var deltaX = located.CenterX - anchor.Value.X;
-        var deltaY = located.CenterY - anchor.Value.Y;
-        var result = new List<SandboxInputEvent>(events.Count);
-        foreach (var evt in events)
-        {
-            result.Add(evt.Type switch
-            {
-                SandboxInputEventType.Click or SandboxInputEventType.Move when evt.X is not null && evt.Y is not null =>
-                    evt with { X = evt.X + deltaX, Y = evt.Y + deltaY },
-                SandboxInputEventType.Click or SandboxInputEventType.Move =>
-                    evt with { X = located.CenterX, Y = located.CenterY },
-                _ => evt,
-            });
-        }
-        return result;
-    }
-
-    private static (int X, int Y)? FindAnchor(IReadOnlyList<SandboxInputEvent> events)
-    {
-        foreach (var evt in events)
-        {
-            if (evt.X is int x && evt.Y is int y &&
-                (evt.Type == SandboxInputEventType.Click || evt.Type == SandboxInputEventType.Move))
-            {
-                return (x, y);
-            }
-        }
-        return null;
-    }
-
-    private static IReadOnlyList<SandboxInputEvent> CollapseToCentre(
-        IReadOnlyList<SandboxInputEvent> events,
-        LocatedTarget located)
-    {
-        var result = new List<SandboxInputEvent>(events.Count);
-        foreach (var evt in events)
-        {
-            result.Add(evt.Type switch
-            {
-                SandboxInputEventType.Click or SandboxInputEventType.Move =>
-                    evt with { X = located.CenterX, Y = located.CenterY },
-                _ => evt,
-            });
-        }
-        return result;
-    }
-
-    private static string? FirstKey(IReadOnlyList<SandboxInputEvent> events)
-    {
-        foreach (var e in events)
-            if (e.Type == SandboxInputEventType.Key) return e.Key;
-        return null;
-    }
-
-    private static string? FirstText(IReadOnlyList<SandboxInputEvent> events)
-    {
-        foreach (var e in events)
-            if (e.Type == SandboxInputEventType.Type) return e.Text;
-        return null;
     }
 
     private static bool NeedsLocator(TraceAction action) =>
@@ -909,55 +604,6 @@ public sealed class ReplayEngine
     private static bool IsTargetlessScrollAction(TraceAction action) =>
         action.Kind == "scroll"
         && !HasUsableTargetSignal(action.TargetDescriptor);
-
-    private bool ShouldScrollSearchAfterVisualMiss(
-        TraceTargetDescriptor descriptor,
-        ReplayOptions options,
-        out int cx,
-        out int cy)
-    {
-        var visual = descriptor.Visual;
-        var region = visual.Region;
-        cx = 0;
-        cy = 0;
-
-        if (descriptor.Accessibility is { } accessibility
-            && _accessibilityMatcher.HasAnyAccessibilitySignal(accessibility))
-        {
-            return false;
-        }
-
-        if (region.Width <= 0 || region.Height <= 0)
-            return false;
-
-        if (visual.TemplatePng is not { Length: > 0 }
-            && visual.SourceScreenshotPng is not { Length: > 0 }
-            && string.IsNullOrWhiteSpace(visual.OcrText))
-        {
-            return false;
-        }
-
-        cx = visual.ClickOffsetX is int offsetX && offsetX >= 0 && offsetX < region.Width
-            ? region.X + offsetX
-            : region.X + region.Width / 2;
-        cy = visual.ClickOffsetY is int offsetY && offsetY >= 0 && offsetY < region.Height
-            ? region.Y + offsetY
-            : region.Y + region.Height / 2;
-        return !PointInViewport(cx, cy, options);
-    }
-
-    private static bool PointInViewport(int x, int y, ReplayOptions options)
-        => x >= 0 && x < options.ScreenWidth && y >= 0 && y < options.ScreenHeight;
-
-    private static (int Dx, int Dy) ResolveScrollDelta(int x, int y, ReplayOptions options)
-    {
-        if (y < 0) return (0, -options.ScrollStep);
-        if (y >= options.ScreenHeight) return (0, options.ScrollStep);
-        if (x < 0) return (-options.ScrollStep, 0);
-        if (x >= options.ScreenWidth) return (options.ScrollStep, 0);
-        throw new InvalidOperationException(
-            $"ResolveScrollDelta invoked for in-viewport point ({x},{y}).");
-    }
 
     private static bool HasUsableTargetSignal(TraceTargetDescriptor descriptor)
     {
@@ -1039,16 +685,6 @@ public sealed class ReplayEngine
             // diagnostics when this returns null.
             return null;
         }
-    }
-
-    private sealed record VisualMissScrollSearchResult(
-        LocatedTarget? Target,
-        ReplayFailureKind? FailureKind,
-        string? Diagnostic)
-    {
-        public static VisualMissScrollSearchResult Skipped { get; } = new(null, null, null);
-        public static VisualMissScrollSearchResult Found(LocatedTarget target) => new(target, null, null);
-        public static VisualMissScrollSearchResult Failed(ReplayFailureKind kind, string diagnostic) => new(null, kind, diagnostic);
     }
 
     private static string DescribeDescriptor(TraceTargetDescriptor descriptor)

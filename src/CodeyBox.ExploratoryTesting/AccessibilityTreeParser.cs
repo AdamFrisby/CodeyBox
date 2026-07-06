@@ -67,23 +67,35 @@ internal static class AccessibilityTreeParser
             return false;
         }
 
-        ParsedAccessibilityNode? firstContaining = null;
+        // Prefer the deepest (smallest-area) containing node — Search emits
+        // parents before children, so the FIRST containing node is the
+        // shallowest ancestor (typically a document / desktop root), not the
+        // control the user actually clicked. Tracking the smallest containing
+        // bounds gives the innermost leaf regardless of DFS ordering.
+        ParsedAccessibilityNode? innermostContaining = null;
+        long innermostArea = long.MaxValue;
         foreach (var candidate in nodes)
         {
             if (candidate.Bounds is not { } bounds || !Contains(bounds, x, y))
                 continue;
 
-            firstContaining ??= candidate;
             if (topMost is not null && SnapshotEquivalent(candidate.Snapshot, topMost))
             {
                 node = candidate;
                 return true;
             }
+
+            var area = (long)bounds.Width * bounds.Height;
+            if (area < innermostArea)
+            {
+                innermostArea = area;
+                innermostContaining = candidate;
+            }
         }
 
-        if (topMost is null && firstContaining is not null)
+        if (topMost is null && innermostContaining is not null)
         {
-            node = firstContaining;
+            node = innermostContaining;
             return true;
         }
 
@@ -296,10 +308,27 @@ internal static class AccessibilityTreeParser
             && y < region.Y + region.Height;
 
     private static bool SnapshotEquivalent(SandboxAccessibilitySnapshot candidate, SandboxAccessibilitySnapshot topMost)
-        => Same(candidate.Role, topMost.Role)
+    {
+        // Fail closed on an all-null / all-empty top-most snapshot: a probe
+        // that returned no identifying signal must NOT match the first
+        // containing node (the Same helper below treats an empty field as
+        // "matches anything", so without this guard an all-null topMost would
+        // rubber-stamp any candidate). This mirrors the IAccessibilityMatcher
+        // contract's "fail-closed on an all-null expected descriptor" rule so
+        // the two identity policies in the codebase agree.
+        if (string.IsNullOrEmpty(topMost.Role)
+            && string.IsNullOrEmpty(topMost.Name)
+            && string.IsNullOrEmpty(topMost.Text)
+            && string.IsNullOrEmpty(topMost.ElementType))
+        {
+            return false;
+        }
+
+        return Same(candidate.Role, topMost.Role)
             && Same(candidate.Name, topMost.Name)
             && Same(candidate.Text, topMost.Text)
             && Same(candidate.ElementType, topMost.ElementType);
+    }
 
     private static bool Same(string? left, string? right)
         => string.IsNullOrEmpty(right) || string.Equals(left ?? "", right, StringComparison.Ordinal);

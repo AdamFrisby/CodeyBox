@@ -23,10 +23,18 @@ public interface ILocatorHealer
     /// locator was able to use. Return null when no heal is possible - the
     /// engine will surface the original
     /// <see cref="ReplayFailureKind.NotFound"/>.
+    ///
+    /// <para>The healer receives only the recorded target
+    /// <paramref name="descriptor"/> (what it needs to re-locate) and the step
+    /// <paramref name="sequence"/> (for logging) — not the whole
+    /// <see cref="TraceEntry"/>. Keeping the surface narrow prevents a healer
+    /// from silently coupling its result to unrelated entry state (post-action
+    /// screenshots, assertions, timestamps).</para>
     /// </summary>
     Task<LocatorHealResult?> HealAsync(
         ISandbox sandbox,
-        TraceEntry entry,
+        TraceTargetDescriptor descriptor,
+        int sequence,
         ReplayOptions options,
         CancellationToken ct);
 }

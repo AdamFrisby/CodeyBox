@@ -78,10 +78,14 @@ public sealed class TesseractOcrTextLocator : IOcrTextLocator
         return TryLocateFromTsv(result.Stdout, expected, visual);
     }
 
-    public static LocatedTarget? TryLocateFromTsv(string tsv, string expectedText)
+    // Internal — TSV parsing is an implementation detail of the Tesseract
+    // locator, not part of the IOcrTextLocator seam. Kept accessible to the
+    // test assembly via InternalsVisibleTo so callers cannot bind to the CLI's
+    // TSV column shape through the public surface.
+    internal static LocatedTarget? TryLocateFromTsv(string tsv, string expectedText)
         => TryLocateFromTsv(tsv, expectedText, visual: null);
 
-    public static LocatedTarget? TryLocateFromTsv(string tsv, string expectedText, TraceVisualDescriptor? visual)
+    internal static LocatedTarget? TryLocateFromTsv(string tsv, string expectedText, TraceVisualDescriptor? visual)
     {
         var rows = ParseRows(tsv);
         if (rows.Count == 0) return null;
