@@ -238,6 +238,39 @@ public sealed class MetricsEmissionTests
     }
 
     [Fact]
+    public async Task CoordinatorSqliteWriteGateWait_EmitsCanceledAndRethrowsWhenSaturated()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"cb-metrics-{Guid.NewGuid():N}.db");
+        var (listener, measurements) = CreateLongListener(
+            "CodeyBox.Coordinator",
+            "codeybox.coordinator.sqlite.write_gate.wait_ms",
+            "outcome");
+        using (listener)
+        using (var gate1 = SqliteDatabaseWriteGate.ForPath(path))
+        using (var gate2 = SqliteDatabaseWriteGate.ForPath(path))
+        {
+            // Saturate the single-writer gate so the second waiter blocks.
+            gate1.Wait();
+            using var cts = new CancellationTokenSource();
+            var waiter = Task.Run(() => gate2.WaitAsync(cts.Token));
+
+            // The waiter is parked on the semaphore; cancel it while saturated.
+            await Task.Delay(25);
+            Assert.False(waiter.IsCompleted);
+            cts.Cancel();
+
+            // The cancellation must be rethrown (the writer never proceeds
+            // without the lock), and the "canceled" outcome must be emitted.
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => waiter);
+
+            AssertEventuallyContains(measurements, measurement =>
+                measurement.TagValue == "canceled");
+
+            gate1.Release();
+        }
+    }
+
+    [Fact]
     public async Task CoordinatorAgentStreamCaptureDuration_EmitsFromCaptureDispose()
     {
         var dir = Path.Combine(Path.GetTempPath(), $"cb-stream-metrics-{Guid.NewGuid():N}");
