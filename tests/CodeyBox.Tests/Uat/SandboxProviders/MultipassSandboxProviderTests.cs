@@ -1409,6 +1409,112 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task BuildDetachedLaunchScript_HttpPreflightBypassesProxyEnvironment()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        using var serverCts = new CancellationTokenSource();
+        using var target = new TcpListener(IPAddress.Loopback, 0);
+        using var proxy = new TcpListener(IPAddress.Loopback, 0);
+        target.Start();
+        proxy.Start();
+        var targetRequests = 0;
+        var proxyRequests = 0;
+        var targetTask = Task.Run(async () =>
+        {
+            try
+            {
+                using var client = await target.AcceptTcpClientAsync(serverCts.Token);
+                Interlocked.Increment(ref targetRequests);
+                var stream = client.GetStream();
+                var response = System.Text.Encoding.ASCII.GetBytes(
+                    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                await stream.WriteAsync(response.AsMemory(), serverCts.Token);
+                await stream.FlushAsync(serverCts.Token);
+            }
+            catch (Exception ex) when (serverCts.IsCancellationRequested
+                && ex is OperationCanceledException or ObjectDisposedException or SocketException)
+            {
+            }
+        });
+        var proxyTask = Task.Run(async () =>
+        {
+            try
+            {
+                using var client = await proxy.AcceptTcpClientAsync(serverCts.Token);
+                Interlocked.Increment(ref proxyRequests);
+                var stream = client.GetStream();
+                var response = System.Text.Encoding.ASCII.GetBytes(
+                    "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                await stream.WriteAsync(response.AsMemory(), serverCts.Token);
+                await stream.FlushAsync(serverCts.Token);
+            }
+            catch (Exception ex) when (serverCts.IsCancellationRequested
+                && ex is OperationCanceledException or ObjectDisposedException or SocketException)
+            {
+            }
+        });
+
+        var targetPort = ((IPEndPoint)target.LocalEndpoint).Port;
+        var proxyPort = ((IPEndPoint)proxy.LocalEndpoint).Port;
+        var envFile = Path.Combine(_workspace, "detached-proxy-ready.env");
+        var commandScript = Path.Combine(_workspace, "detached-proxy-ready-command.sh");
+        var launchScript = Path.Combine(_workspace, "detached-proxy-ready-launch.sh");
+        var processGroupMarker = Path.Combine(_workspace, "detached-proxy-ready.pgid");
+        var doneFile = Path.Combine(_workspace, "detached-proxy-ready.done");
+        await File.WriteAllTextAsync(
+            envFile,
+            MultipassSandboxProvider.BuildEnvironmentFileContent(new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [MultipassAgentOutputHttpIngestSession.UrlEnvironmentVariable] =
+                    $"http://127.0.0.1:{targetPort}/codeybox-agent-output",
+                [MultipassAgentOutputHttpIngestSession.TokenEnvironmentVariable] = "stream-token",
+                [MultipassAgentOutputHttpIngestSession.RunIdEnvironmentVariable] = "proxy-ready",
+            }));
+        await File.WriteAllTextAsync(commandScript, "printf done > \"$1\"\n");
+        File.SetUnixFileMode(commandScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        await File.WriteAllTextAsync(
+            launchScript,
+            MultipassSandbox.BuildDetachedLaunchScript(envFile, processGroupMarker, null, ["/bin/sh", commandScript, doneFile]));
+        File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var (exit, _, stderr) = await RunLocalProcessAsync(
+                "/bin/bash",
+                [launchScript],
+                timeout.Token,
+                environmentOverrides: MergeEnvironment(
+                    FakeSudoPathEnvironment(),
+                    new Dictionary<string, string>(StringComparer.Ordinal)
+                    {
+                        ["http_proxy"] = $"http://127.0.0.1:{proxyPort}",
+                        ["HTTP_PROXY"] = $"http://127.0.0.1:{proxyPort}",
+                        ["https_proxy"] = $"http://127.0.0.1:{proxyPort}",
+                        ["HTTPS_PROXY"] = $"http://127.0.0.1:{proxyPort}",
+                        ["no_proxy"] = "",
+                        ["NO_PROXY"] = "",
+                    }));
+
+            Assert.Equal(0, exit);
+            Assert.Equal("", stderr);
+            Assert.Equal(1, Volatile.Read(ref targetRequests));
+            Assert.Equal(0, Volatile.Read(ref proxyRequests));
+            await WaitForFileAsync(doneFile, TimeSpan.FromSeconds(6));
+            await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
+        }
+        finally
+        {
+            serverCts.Cancel();
+            target.Stop();
+            proxy.Stop();
+            await Task.WhenAll(targetTask, proxyTask);
+        }
+    }
+
+    [Fact]
     public async Task BuildDetachedLaunchScript_PreflightRejectsMalformedHttpIngestUrlBeforeLaunch()
     {
         if (OperatingSystem.IsWindows())

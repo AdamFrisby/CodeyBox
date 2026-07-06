@@ -10,11 +10,13 @@ namespace CodeyBox.Orchestrator.Knobs;
 /// pre-knob output when the knob is unset or set to the default.
 ///
 /// <para>
-/// Wiring scope (intentional): this knob only adjusts the WORK-PHASE prompt.
-/// Audit-side enforcement (e.g. an auditor that flags out-of-scope edits
-/// when <c>surgical</c>) and merge-friendliness gating are tracked as
-/// separate dependent items so the prompt change can ship and be evaluated
-/// in isolation.
+/// Wiring scope: this knob shapes the WORK-phase prompt (instructs the
+/// agent), the AUDIT-phase prompt (instructs every LLM auditor how to
+/// weigh blast radius), and the MERGE phase (telemetry tagging on merge
+/// timing/log events; the agentic conflict resolver carries the value as
+/// context). The merge-phase scheduling bias for refactor pile-ups in hot
+/// files is provided today by <see cref="JobType.Refactor"/>'s
+/// project-exclusive dispatcher gate, not by this knob.
 /// </para>
 /// </summary>
 public sealed class ChangeScopeKnob : IKnob
@@ -63,4 +65,30 @@ public sealed class ChangeScopeKnob : IKnob
         // contributes nothing" per the framework contract.
         return null;
     }
+
+    public string? GetAuditPromptFragment(string value)
+    {
+        if (string.Equals(value, ValueSurgical, StringComparison.OrdinalIgnoreCase))
+        {
+            return
+                "Change scope: SURGICAL. This work item was scoped to the smallest possible change. " +
+                "Minimise blast radius: flag any out-of-scope refactor, adjacent rewrites, broadened renames, " +
+                "reformatting of unrelated files, or restructuring that goes beyond the strictly-required code as a finding. " +
+                "Scope inflation IS a defect for this item — surface it even when the new code is otherwise correct. " +
+                "A tight diff that is easy to merge cleanly is preferred over a tidy diff that touches more files than necessary.";
+        }
+
+        if (string.Equals(value, ValueRefactor, StringComparison.OrdinalIgnoreCase))
+        {
+            return
+                "Change scope: REFACTOR. This work item was permitted to restructure or re-architect the affected area. " +
+                "Do NOT penalise breadth, adjacent rewrites, renames, module splits/consolidations, or a larger and " +
+                "harder-to-merge diff per se — those are explicitly in scope. An architecture-focused auditor may even " +
+                "expect material structural improvement here. Focus on whether the restructuring is principled and correct, " +
+                "not on whether the diff could have been smaller.";
+        }
+
+        return null;
+    }
+
 }

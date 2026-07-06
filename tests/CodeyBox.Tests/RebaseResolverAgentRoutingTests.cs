@@ -2,10 +2,12 @@ using CodeyBox.Agents;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
+using CodeyBox.Orchestrator.Knobs;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
 using CodeyBox.Webhooks;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Serilog;
 using Serilog.Events;
@@ -137,6 +139,64 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
         Assert.Empty(gemini.AgenticConflictInvocations);
         Assert.Empty(claude.AgenticConflictInvocations);
         Assert.Empty(codex.AgenticConflictInvocations);
+    }
+
+    [Fact]
+    public async Task PickupRebaseConflictPassesItemChangeScopeToResolver()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var claude = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Claude };
+        claude.ConflictResolutionPlan.Enqueue(files =>
+        {
+            var file = Assert.Single(files);
+            Assert.Equal("README.md", file.Path);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["README.md"] = "main branch change\nwork branch change\n",
+            };
+        });
+        var resolverLog = new CapturingLogger<AgenticConflictResolver>();
+        var resolver = new AgenticConflictResolver(log: resolverLog);
+
+        using var fix = BuildRoutingFixture(
+            seed,
+            [claude],
+            agenticConflictResolver: resolver,
+            mergeScopeResolver: NewMergeScopeResolver(),
+            projectKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical,
+            });
+
+        var item = NewItem(AgentKind.Claude) with
+        {
+            State = WorkItemState.WorkComplete,
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueRefactor,
+            },
+        };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(
+            barePath,
+            item.WorkBranch!,
+            "README.md",
+            "work branch change\n",
+            "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        var startLog = Assert.Single(
+            resolverLog.Entries,
+            e => e.Level == LogLevel.Information
+                 && e.Message.Contains("Agentic conflict resolver: starting", StringComparison.Ordinal));
+        Assert.Equal(ChangeScopeKnob.ValueRefactor, startLog.Properties["ChangeScope"]);
+        Assert.Equal(AgenticConflictResolverOperation.Rebase, startLog.Properties["Operation"]);
     }
 
     [Fact]
@@ -612,7 +672,10 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
         IAgentRunningCounters? runningCounters = null,
         AgentConcurrencyOptions? agentConcurrency = null,
         AgentKind? auditAgent = null,
-        Dictionary<AgentKind, double>? quotas = null)
+        Dictionary<AgentKind, double>? quotas = null,
+        AgenticConflictResolver? agenticConflictResolver = null,
+        IMergeScopeResolver? mergeScopeResolver = null,
+        IReadOnlyDictionary<string, string>? projectKnobs = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -658,6 +721,7 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
             DefaultAgent = agents[0].Kind,
             DefaultAgentClass = "frontier",
             Audit = new ProjectAudit { MaxIterations = 1, AuditAgent = auditAgent },
+            Knobs = projectKnobs ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
         };
         var projects = new InMemoryProjectRepository(project);
         var webhooks = new NullWebhookDispatcher();
@@ -681,12 +745,17 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
             classRouter: router,
             agentRunningCounters: runningCounters,
             agentConcurrency: agentConcurrency,
+            agenticConflictResolver: agenticConflictResolver,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,
-            terminalRevisionBuilder: terminalTransitions);
+            terminalRevisionBuilder: terminalTransitions,
+            mergeScopeResolver: mergeScopeResolver);
 
         return new RoutingFixture(pipeline, store, gitHost);
     }
+
+    private static ChangeScopeMergeScopeResolver NewMergeScopeResolver() =>
+        new(new KnobRegistry([new ChangeScopeKnob()]));
 
     private static WorkItem NewItem(AgentKind agent)
     {

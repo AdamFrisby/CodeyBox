@@ -70,24 +70,24 @@ public readonly record struct KnobNormalizationResult(
 /// per work item or per project to nudge the agent's behaviour. The framework
 /// is intentionally minimalist: a knob is identified by its <see cref="Key"/>,
 /// constrained by its typed value parser, and contributes its behaviour via
-/// optional framework-level hooks such as <see cref="GetWorkPromptFragment"/>
-/// and <see cref="GetPipelineLifecycle"/>.
+/// optional framework-level hooks such as <see cref="GetWorkPromptFragment"/>,
+/// <see cref="GetAuditPromptFragment"/>, and <see cref="GetPipelineLifecycle"/>.
 ///
 /// <para>
 /// Adding a new knob is a localised change: implement
 /// <see cref="IKnob"/>, register it as a DI singleton, and that knob is
 /// immediately visible to the API (set/validate), persisted on work items,
-/// and consulted by the work-prompt assembly seam — no edit to the pipeline
+/// and consulted by the prompt-assembly seam — no edit to the pipeline
 /// core required.
 /// </para>
 ///
 /// <para>
 /// Knobs remain operator-facing dials, not arbitrary plug-in handlers. Runtime
 /// effects are limited to the explicit framework hooks on this interface, such
-/// as prompt fragments and pipeline lifecycle requests. Future seams (audit
-/// prompt fragments, merge strategy hints, post-merge behaviour, ...) plug in
-/// here by adding optional methods with default implementations that contribute
-/// nothing — existing knobs need no edits.
+/// as per-phase prompt fragments (work + audit) and pipeline lifecycle
+/// requests. Future seams (merge strategy hints, post-merge behaviour, ...)
+/// plug in here by adding optional methods with default implementations that
+/// contribute nothing — existing knobs need no edits.
 /// </para>
 /// </summary>
 public interface IKnob
@@ -150,9 +150,21 @@ public interface IKnob
     KnobPipelineLifecycle GetPipelineLifecycle(string value) => KnobPipelineLifecycle.None;
 
     /// <summary>
+    /// Optional fragment appended to every audit-phase prompt for the given
+    /// effective <paramref name="value"/>. Lets a knob shape what the
+    /// auditors weigh blast-radius / breadth / scope-creep as on this item
+    /// without editing the auditor's own focus list. Return <c>null</c> or
+    /// whitespace when this value contributes nothing — same contract as
+    /// <see cref="GetWorkPromptFragment"/>. Default implementation returns
+    /// <c>null</c> so existing knobs need no edits.
+    /// </summary>
+    string? GetAuditPromptFragment(string value) => null;
+
+    /// <summary>
     /// Free-form values can be operator/user controlled. Leave this false
-    /// unless <see cref="GetWorkPromptFragment"/> either never emits the raw
-    /// free-form value or explicitly delimits/encodes it as untrusted data.
+    /// unless <see cref="GetWorkPromptFragment"/> and
+    /// <see cref="GetAuditPromptFragment"/> either never emit the raw
+    /// free-form value or explicitly delimit/encode it as untrusted data.
     /// The prompt preprocessor enforces this when a free-form descriptor
     /// contributes a fragment.
     /// </summary>

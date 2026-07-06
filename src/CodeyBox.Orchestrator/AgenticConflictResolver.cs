@@ -85,6 +85,14 @@ public sealed record AgenticConflictResolverContext(
     AgenticConflictResolverOperation Operation)
 {
     public ProjectId? ProjectId { get; init; }
+
+    /// <summary>
+    /// Merge-scope metadata supplied by the pipeline. The resolver treats it
+    /// only as neutral telemetry context: <see cref="MergeScopeHint.Value"/> is
+    /// logged, while <see cref="MergeScopeHint.HighlightInResolverLog"/>
+    /// decides whether the start-of-resolve log should be emitted.
+    /// </summary>
+    public MergeScopeHint? MergeScope { get; init; }
 }
 
 public enum AgenticConflictResolverOperation
@@ -254,6 +262,16 @@ public sealed class AgenticConflictResolver
 
         foreach (var file in conflictFiles)
             MergeConflictPathInspector.ValidateRelativeWorkPath(file);
+
+        // Gate the start-of-resolve log on the pipeline-supplied hint. The
+        // resolver is generic conflict machinery; it should not know which
+        // knob values are default or operationally interesting.
+        if (context.MergeScope is { HighlightInResolverLog: true } mergeScope)
+        {
+            _log.LogInformation(
+                "Agentic conflict resolver: starting for {WorkItemId} on {Operation} (changeScope={ChangeScope}, conflictFiles={Count})",
+                workItemId, context.Operation, mergeScope.Value, conflictFiles.Count);
+        }
 
         var options = _options.Current;
         var maxIterations = Math.Max(1, options.MaxIterations);
@@ -889,4 +907,5 @@ public sealed class AgenticConflictResolver
         {
             RequiresStructuredStreamForSessionId: true,
         };
+
 }

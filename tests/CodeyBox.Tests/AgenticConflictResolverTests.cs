@@ -1,4 +1,5 @@
 using System.Text;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -1760,6 +1761,125 @@ public sealed class AgenticConflictResolverTests
             CompletedInjections.Add(injection);
             return Task.CompletedTask;
         }
+    }
+
+    [Fact]
+    public async Task ResolveAsync_EmitsStartingLogWithMergeScopeHint_WhenHighlighted()
+    {
+        // The resolver tags its start-of-resolve log line with the effective
+        // merge scope so operators can correlate refactor-scoped items with
+        // merge-conflict-prone behaviour. Pin the actual log emission, not
+        // just the record-field plumbing.
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+        var logger = new CapturingLogger<AgenticConflictResolver>();
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }),
+            log: logger);
+        var runner = new FakeAgentResolverRunner(sb =>
+        {
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "claimed", null, null);
+        });
+        var workItemId = WorkItemId.New();
+
+        _ = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            workItemId,
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Merge)
+            {
+                MergeScope = new MergeScopeHint("refactor", HighlightInResolverLog: true),
+            },
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        var startLog = Assert.Single(
+            logger.Entries,
+            e =>
+                e.Level == LogLevel.Information &&
+                e.Message.Contains("Agentic conflict resolver: starting", StringComparison.Ordinal));
+        Assert.True(startLog.Properties.TryGetValue("ChangeScope", out var scopeProp));
+        Assert.Equal("refactor", scopeProp);
+        Assert.True(startLog.Properties.TryGetValue("WorkItemId", out var idProp));
+        Assert.Equal(workItemId, idProp);
+        Assert.True(startLog.Properties.TryGetValue("Operation", out var opProp));
+        Assert.Equal(AgenticConflictResolverOperation.Merge, opProp);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_DoesNotEmitStartingLog_WhenMergeScopeUnset()
+    {
+        // Guards against the inverted-condition bug class: when the context
+        // carries no merge-scope hint (e.g. older callers that did not thread
+        // the metadata through), the resolver must NOT emit the start
+        // log — otherwise the log would carry an empty/null tag every time.
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+        var logger = new CapturingLogger<AgenticConflictResolver>();
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }),
+            log: logger);
+        var runner = new FakeAgentResolverRunner(sb =>
+        {
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "claimed", null, null);
+        });
+
+        _ = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Merge),
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        Assert.DoesNotContain(
+            logger.Entries,
+            e => e.Message.Contains("Agentic conflict resolver: starting", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("surgical", true, true)]
+    [InlineData("refactor", true, true)]
+    [InlineData("moderate", false, false)]
+    [InlineData("moderate", true, true)]
+    [InlineData("refactor", false, false)]
+    public async Task ResolveAsync_StartingLogHonorsSuppliedMergeScopeHint(
+        string mergeScopeValue,
+        bool highlight,
+        bool expectLogEmitted)
+    {
+        // The resolver must not import concrete knob semantics. Pipeline code
+        // supplies both the label and the highlight bit; this test proves the
+        // resolver honors that neutral metadata instead of interpreting values.
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+        var logger = new CapturingLogger<AgenticConflictResolver>();
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }),
+            log: logger);
+        var runner = new FakeAgentResolverRunner(sb =>
+        {
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "claimed", null, null);
+        });
+
+        _ = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Merge)
+            {
+                MergeScope = new MergeScopeHint(mergeScopeValue, highlight),
+            },
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None);
+
+        var emitted = logger.Entries.Any(
+            e => e.Level == LogLevel.Information &&
+                 e.Message.Contains("Agentic conflict resolver: starting", StringComparison.Ordinal));
+        Assert.Equal(expectLogEmitted, emitted);
     }
 
     private sealed class NoopPreprocessor : IAgentPromptPreprocessor

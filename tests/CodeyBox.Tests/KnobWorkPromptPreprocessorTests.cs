@@ -113,8 +113,11 @@ public sealed class KnobWorkPromptPreprocessorTests
     }
 
     [Fact]
-    public async Task NonWorkPhases_AreSkipped_PromptUnchanged()
+    public async Task NonAuditNonWorkPhases_AreSkipped_PromptUnchanged()
     {
+        // Merge, CheckAndAct, and Rework are intentionally untouched by the
+        // knob preprocessor today. Adding more phase seams is a per-phase
+        // opt-in via new IKnob methods.
         var registry = new KnobRegistry([new ChangeScopeKnob()]);
         var store = new SingleItemStore(NewItem(knobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -122,11 +125,259 @@ public sealed class KnobWorkPromptPreprocessorTests
         }));
         var preprocessor = new KnobWorkPromptPreprocessor(registry, store);
 
-        foreach (var phase in new[] { AgentPromptPhase.Audit, AgentPromptPhase.Merge, AgentPromptPhase.CheckAndAct })
+        foreach (var phase in new[] { AgentPromptPhase.Merge, AgentPromptPhase.CheckAndAct })
         {
             var result = await preprocessor.ProcessAsync(NewContext(store.Item.Id, phase), "carried");
             Assert.Equal("carried", result);
         }
+    }
+
+    [Fact]
+    public async Task ChangeScopeSurgical_AppendsBlastRadiusFragmentToAuditPhase()
+    {
+        // Acceptance: a surgical item's audit prompt carries a "penalise
+        // out-of-scope breadth" instruction that a refactor item's does not.
+        var registry = new KnobRegistry([new ChangeScopeKnob()]);
+        var store = new SingleItemStore(NewItem(knobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical,
+        }));
+        var preprocessor = new KnobWorkPromptPreprocessor(registry, store);
+
+        var result = await preprocessor.ProcessAsync(NewContext(store.Item.Id, AgentPromptPhase.Audit), "audit task");
+
+        Assert.Contains("Per-item directives (knobs)", result);
+        Assert.Contains("changeScope=surgical", result);
+        Assert.Contains("SURGICAL", result);
+        Assert.Contains("blast radius", result, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("scope inflation", result, StringComparison.OrdinalIgnoreCase);
+        Assert.StartsWith("audit task", result);
+    }
+
+    [Fact]
+    public async Task ChangeScopeRefactor_AppendsDoNotPenaliseBreadthFragmentToAuditPhase()
+    {
+        var registry = new KnobRegistry([new ChangeScopeKnob()]);
+        var store = new SingleItemStore(NewItem(knobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueRefactor,
+        }));
+        var preprocessor = new KnobWorkPromptPreprocessor(registry, store);
+
+        var result = await preprocessor.ProcessAsync(NewContext(store.Item.Id, AgentPromptPhase.Audit), "audit task");
+
+        Assert.Contains("REFACTOR", result);
+        Assert.Contains("changeScope=refactor", result);
+        Assert.Contains("Do NOT penalise", result, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("blast radius", result, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("scope inflation", result, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ChangeScopeModerate_AuditPhase_ContributesNothing_PromptUnchanged()
+    {
+        var registry = new KnobRegistry([new ChangeScopeKnob()]);
+        var store = new SingleItemStore(NewItem(knobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueModerate,
+        }));
+        var preprocessor = new KnobWorkPromptPreprocessor(registry, store);
+
+        var result = await preprocessor.ProcessAsync(NewContext(store.Item.Id, AgentPromptPhase.Audit), "stable audit prompt");
+
+        Assert.Equal("stable audit prompt", result);
+    }
+
+    [Fact]
+    public async Task AuditPhase_ProjectDefaultIsApplied_WhenItemHasNoOverride()
+    {
+        var registry = new KnobRegistry([new ChangeScopeKnob()]);
+        var store = new SingleItemStore(NewItem(knobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)));
+        var project = NewProject(projectKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical,
+        });
+        var preprocessor = new KnobWorkPromptPreprocessor(registry, store);
+
+        var result = await preprocessor.ProcessAsync(
+            NewContext(store.Item.Id, AgentPromptPhase.Audit, project),
+            "audit task");
+
+        Assert.Contains("changeScope=surgical", result);
+        Assert.Contains("SURGICAL", result);
+        Assert.Contains("blast radius", result, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task AuditPhase_ItemOverrideWinsOverProjectDefault()
+    {
+        var registry = new KnobRegistry([new ChangeScopeKnob()]);
+        var store = new SingleItemStore(NewItem(knobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueRefactor,
+        }));
+        var project = NewProject(projectKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical,
+        });
+        var preprocessor = new KnobWorkPromptPreprocessor(registry, store);
+
+        var result = await preprocessor.ProcessAsync(
+            NewContext(store.Item.Id, AgentPromptPhase.Audit, project),
+            "audit task");
+
+        Assert.Contains("changeScope=refactor", result);
+        Assert.Contains("REFACTOR", result);
+        Assert.DoesNotContain("scope inflation", result, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task SurgicalVsRefactor_AuditFragmentsDiffer_OnlySurgicalPenalisesBreadth()
+    {
+        // Acceptance pin: side-by-side test that proves the surgical audit
+        // fragment flags out-of-scope breadth where the refactor one does
+        // not. Without this, a future edit could neutralise the
+        // surgical-side language and the per-fragment tests above would
+        // still pass even though the directional contract was lost.
+        var knob = new ChangeScopeKnob();
+        var surgical = knob.GetAuditPromptFragment(ChangeScopeKnob.ValueSurgical);
+        var refactor = knob.GetAuditPromptFragment(ChangeScopeKnob.ValueRefactor);
+        Assert.NotNull(surgical);
+        Assert.NotNull(refactor);
+        Assert.Contains("blast radius", surgical, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("scope inflation", surgical, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("blast radius", refactor, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("scope inflation", refactor, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Do NOT penalise", refactor, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ChangeScopeKnob_GetAuditPromptFragment_ModerateAndUnknownValues_ReturnNull()
+    {
+        var knob = new ChangeScopeKnob();
+        Assert.Null(knob.GetAuditPromptFragment(ChangeScopeKnob.ValueModerate));
+        Assert.Null(knob.GetAuditPromptFragment("yolo"));
+        Assert.Null(knob.GetAuditPromptFragment(""));
+    }
+
+    [Fact]
+    public void MergeScopeResolver_HonoursItemOverProjectOverDefault()
+    {
+        var resolver = NewMergeScopeResolver();
+
+        // Item override wins.
+        Assert.Equal(ChangeScopeKnob.ValueRefactor, resolver.Resolve(
+            itemKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueRefactor,
+            },
+            projectKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical,
+            }).Value);
+
+        // Project default applies when item is silent.
+        Assert.Equal(ChangeScopeKnob.ValueSurgical, resolver.Resolve(
+            itemKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+            projectKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical,
+            }).Value);
+
+        // Falls back to the knob's documented default when neither side speaks.
+        Assert.Equal(ChangeScopeKnob.ValueModerate, resolver.Resolve(
+            itemKnobs: null,
+            projectKnobs: null).Value);
+    }
+
+    [Fact]
+    public void MergeScopeResolver_CanonicalisesCasingAndTrimsWhitespace()
+    {
+        var resolver = NewMergeScopeResolver();
+
+        // Defense-in-depth: a non-canonical value (mixed casing, whitespace)
+        // is normalised to the AllowedValues entry rather than leaking onto
+        // telemetry tags. The registry-driven prompt path does the same
+        // canonicalisation, so the two paths agree on the effective value.
+        Assert.Equal(ChangeScopeKnob.ValueRefactor, resolver.Resolve(
+            itemKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = "  REFACTOR  ",
+            },
+            projectKnobs: null).Value);
+
+        Assert.Equal(ChangeScopeKnob.ValueSurgical, resolver.Resolve(
+            itemKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = "Surgical",
+            },
+            projectKnobs: null).Value);
+    }
+
+    [Fact]
+    public void MergeScopeResolver_InvalidValueFallsThroughToNextTier()
+    {
+        var resolver = NewMergeScopeResolver();
+
+        // An obsolete / tampered item value must NOT leak onto telemetry —
+        // it falls through to the project tier, then to the default. Mirrors
+        // KnobRegistry.Resolve, which rejects-and-falls-through via ParseValue.
+        Assert.Equal(ChangeScopeKnob.ValueSurgical, resolver.Resolve(
+            itemKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = "yolo",
+            },
+            projectKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical,
+            }).Value);
+
+        Assert.Equal(ChangeScopeKnob.ValueModerate, resolver.Resolve(
+            itemKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = "yolo",
+            },
+            projectKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = "also-yolo",
+            }).Value);
+    }
+
+    [Fact]
+    public void MergeScopeResolver_WhitespaceItemValueFallsThroughToProject()
+    {
+        var resolver = NewMergeScopeResolver();
+
+        // The fallthrough guard must also catch whitespace-only stored values
+        // (a non-defense-in-depth helper would treat them as "set" and leak
+        // an empty tag onto telemetry).
+        Assert.Equal(ChangeScopeKnob.ValueRefactor, resolver.Resolve(
+            itemKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = "   ",
+            },
+            projectKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueRefactor,
+            }).Value);
+    }
+
+    [Fact]
+    public void MergeScopeResolver_CaseSensitiveCallerMapStillHitsKey()
+    {
+        var resolver = NewMergeScopeResolver();
+
+        // The IReadOnlyDictionary interface carries no comparer guarantee. A
+        // caller-supplied map with the default (Ordinal) comparer must still
+        // find the key — otherwise telemetry would silently fall through to
+        // the default while the registry's case-insensitive lookup would
+        // have found it.
+        Assert.Equal(ChangeScopeKnob.ValueRefactor, resolver.Resolve(
+            itemKnobs: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["ChangeScope"] = ChangeScopeKnob.ValueRefactor,
+            },
+            projectKnobs: null).Value);
     }
 
     [Fact]
@@ -229,6 +480,55 @@ public sealed class KnobWorkPromptPreprocessorTests
     }
 
     [Fact]
+    public async Task MissingWorkItem_AuditPhase_ReturnsPromptUnchanged_NoThrow()
+    {
+        // Release deep audits (ReleaseService.RunDeepAuditIterationAsync) wrap
+        // the auditor's runner with a SYNTHETIC WorkItemId built from the
+        // release id. That id never matches a row in IWorkItemStore — releases
+        // are stored separately — so a null return here is the expected shape
+        // for the release-level deep-audit path. The preprocessor MUST NOT
+        // throw on that path: throwing here regressed every LLM-based deep
+        // auditor (LlmReviewAuditor, OwaspAsvsDeepAuditor, …) to zero findings
+        // because ReleaseService swallows the exception as a LogWarning and
+        // the iteration completes with no findings recorded.
+        //
+        // Pin the tolerant behaviour: when the Audit-phase preprocessor is
+        // called with a WorkItemId that the store can't see, fall through
+        // with the prompt unchanged. Mirrors the existing unknown-key
+        // tolerance: the preprocessor never fails the pipeline when the
+        // per-item knob context is unavailable on the audit phase.
+        var registry = new KnobRegistry([new ChangeScopeKnob()]);
+        var store = new SingleItemStore(NewItem());
+        var preprocessor = new KnobWorkPromptPreprocessor(registry, store);
+
+        var unknownId = WorkItemId.New();
+        var result = await preprocessor.ProcessAsync(
+            NewContext(unknownId, AgentPromptPhase.Audit),
+            "deep-audit prompt body");
+
+        Assert.Equal("deep-audit prompt body", result);
+    }
+
+    [Fact]
+    public async Task MissingWorkItem_AuditPhase_AppliesProjectDefaults()
+    {
+        var registry = new KnobRegistry([new ChangeScopeKnob()]);
+        var store = new SingleItemStore(NewItem());
+        var project = NewProject(projectKnobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [ChangeScopeKnob.KeyName] = ChangeScopeKnob.ValueSurgical,
+        });
+        var preprocessor = new KnobWorkPromptPreprocessor(registry, store);
+
+        var result = await preprocessor.ProcessAsync(
+            NewContext(WorkItemId.New(), AgentPromptPhase.Audit, project),
+            "deep-audit prompt body");
+
+        Assert.Contains("changeScope=surgical", result);
+        Assert.Contains("blast radius", result, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task FreeFormPromptFragment_WithoutSafetyOptIn_Throws()
     {
         var registry = new KnobRegistry([new UnsafeFreeFormKnob()]);
@@ -242,6 +542,39 @@ public sealed class KnobWorkPromptPreprocessorTests
             () => preprocessor.ProcessAsync(NewContext(store.Item.Id, AgentPromptPhase.Work), "prompt"));
 
         Assert.Contains("must declare finite AllowedValues", ex.Message);
+    }
+
+    [Fact]
+    public async Task AuditFreeFormPromptFragment_WithoutSafetyOptIn_Throws()
+    {
+        var registry = new KnobRegistry([new UnsafeFreeFormKnob()]);
+        var store = new SingleItemStore(NewItem(knobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [UnsafeFreeFormKnob.KeyName] = "operator text",
+        }));
+        var preprocessor = new KnobWorkPromptPreprocessor(registry, store);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => preprocessor.ProcessAsync(NewContext(store.Item.Id, AgentPromptPhase.Audit), "prompt"));
+
+        Assert.Contains("must declare finite AllowedValues", ex.Message);
+    }
+
+    [Fact]
+    public async Task AuditPhase_WorkOnlyKnobDefaultHook_LeavesPromptUnchanged()
+    {
+        var registry = new KnobRegistry([new WorkOnlyKnob()]);
+        var store = new SingleItemStore(NewItem(knobs: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [WorkOnlyKnob.KeyName] = "on",
+        }));
+        var preprocessor = new KnobWorkPromptPreprocessor(registry, store);
+
+        var result = await preprocessor.ProcessAsync(
+            NewContext(store.Item.Id, AgentPromptPhase.Audit),
+            "audit prompt");
+
+        Assert.Equal("audit prompt", result);
     }
 
     [Fact]
@@ -320,6 +653,9 @@ public sealed class KnobWorkPromptPreprocessorTests
         Knobs = projectKnobs ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
     };
 
+    private static ChangeScopeMergeScopeResolver NewMergeScopeResolver() =>
+        new(new KnobRegistry([new ChangeScopeKnob()]));
+
     private static PromptContext NewContext(
         WorkItemId itemId,
         AgentPromptPhase phase,
@@ -355,6 +691,7 @@ public sealed class KnobWorkPromptPreprocessorTests
         public IReadOnlyList<string> AllowedValues => [];
         public string DefaultValue => "default";
         public string? GetWorkPromptFragment(string value) => $"raw value: {value}";
+        public string? GetAuditPromptFragment(string value) => $"raw audit value: {value}";
     }
 
     private sealed class SafeFreeFormKnob : IKnob
@@ -367,6 +704,20 @@ public sealed class KnobWorkPromptPreprocessorTests
         public string DefaultValue => "default";
         public bool AllowsFreeFormPromptFragments => true;
         public string? GetWorkPromptFragment(string value) => "safe free-form value accepted";
+    }
+
+    private sealed class WorkOnlyKnob : IKnob
+    {
+        public const string KeyName = "workOnly";
+
+        public string Key => KeyName;
+        public string Description => "work-only test knob";
+        public IReadOnlyList<string> AllowedValues { get; } = ["off", "on"];
+        public string DefaultValue => "off";
+        public string? GetWorkPromptFragment(string value) =>
+            string.Equals(value, "on", StringComparison.OrdinalIgnoreCase)
+                ? "work-only fragment"
+                : null;
     }
 
     private sealed class NoopSandbox : ISandbox

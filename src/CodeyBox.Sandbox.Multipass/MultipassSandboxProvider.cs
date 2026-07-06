@@ -3460,6 +3460,7 @@ test "$work" = present && test "$exec_wrapper" = present
         stream = sys.argv[1]
         seq = sys.argv[2]
         data = sys.stdin.buffer.read()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         url = base + "/" + urllib.parse.quote(run_id, safe="") + "/" + urllib.parse.quote(stream, safe="") + "/" + str(seq)
         deadline = time.monotonic() + 300.0
         attempt = 0
@@ -3470,7 +3471,7 @@ test "$work" = present && test "$exec_wrapper" = present
                 method="POST",
                 headers={"Authorization": "Bearer " + token, "Content-Type": "application/octet-stream"})
             try:
-                with urllib.request.urlopen(req, timeout=10.0) as resp:
+                with opener.open(req, timeout=10.0) as resp:
                     code = resp.getcode()
                     if 200 <= code < 300:
                         sys.exit(0)
@@ -3502,6 +3503,7 @@ test "$work" = present && test "$exec_wrapper" = present
         max_chunk = 65536
         deadline_seconds = 300.0
         buf = bytearray()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
         def post(data):
             global seq
@@ -3516,7 +3518,7 @@ test "$work" = present && test "$exec_wrapper" = present
                     method="POST",
                     headers={"Authorization": "Bearer " + token, "Content-Type": "application/octet-stream"})
                 try:
-                    with urllib.request.urlopen(req, timeout=10.0) as resp:
+                    with opener.open(req, timeout=10.0) as resp:
                         code = resp.getcode()
                         if 200 <= code < 300:
                             seq += 1
@@ -6058,6 +6060,7 @@ token = sys.stdin.buffer.readline().decode('utf-8').rstrip('\n')
 data = sys.stdin.buffer.read()
 if not base or not run_id or not token or not data:
     sys.exit(0)
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 url = base + '/' + urllib.parse.quote(run_id, safe='') + '/exit/0'
 deadline = time.monotonic() + 300.0
 attempt = 0
@@ -6068,7 +6071,7 @@ while True:
         method='POST',
         headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'text/plain; charset=utf-8'})
     try:
-        with urllib.request.urlopen(req, timeout=10.0) as resp:
+        with opener.open(req, timeout=10.0) as resp:
             code = resp.getcode()
             if 200 <= code < 300:
                 sys.exit(0)
@@ -6107,6 +6110,7 @@ while True:
         sb.AppendLine("codeybox_drain_stdin() {");
         sb.AppendLine("    cat >/dev/null 2>/dev/null || true");
         sb.AppendLine("}");
+        sb.AppendLine("if [ -f \"$codeybox_pgid_marker\" ]; then codeybox_drain_stdin; exit 0; fi");
         sb.AppendLine("if ! codeybox_root_sh 'mkdir -p \"$1\" && { chown root:root \"$1\" 2>/dev/null || true; } && chmod 0700 \"$1\"' \"$codeybox_supervisor_dir\"; then");
         sb.AppendLine("    echo \"codeybox-detached: failed to prepare supervisor directory\" >&2");
         sb.AppendLine("    codeybox_drain_stdin");
@@ -6177,6 +6181,7 @@ while True:
         sb.AppendLine("token = os.environ.get('CODEYBOX_AGENT_OUTPUT_TOKEN', '')");
         sb.AppendLine("if not base or not run_id or not token:");
         sb.AppendLine("    sys.exit(1)");
+        sb.AppendLine("opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))");
         sb.AppendLine("url = base + '/' + urllib.parse.quote(run_id, safe='') + '/ready/0'");
         sb.AppendLine("req = urllib.request.Request(");
         sb.AppendLine("    url,");
