@@ -91,6 +91,13 @@ public sealed record TraceTargetDescriptor
     public TraceAccessibilityDescriptor? Accessibility { get; init; }
 
     /// <summary>
+    /// Full accessibility-tree snapshot captured immediately before the action
+    /// executed. Used by the replay emitter to resolve stable selectors against
+    /// the pre-action DOM.
+    /// </summary>
+    public string? AccessibilitySnapshotJson { get; init; }
+
+    /// <summary>
     /// Visual descriptor — always captured so untagged / canvas / 3D targets
     /// remain re-locatable by sight.
     /// </summary>

@@ -72,6 +72,15 @@ public sealed class E2eExecutionOptions
     ];
 
     /// <summary>
+    /// Runtime-only map from emitted fill placeholders (for example
+    /// <see cref="E2eReplaySensitiveValueRedaction.PasswordPlaceholder"/>)
+    /// to real values. Never committed in artifacts — supplied by the operator
+    /// when the replay runtime executes a case.
+    /// </summary>
+    public IReadOnlyDictionary<string, string> FillSecrets { get; set; } =
+        new Dictionary<string, string>(StringComparer.Ordinal);
+
+    /// <summary>
     /// How often the dispatcher polls for queued runs when the pool is idle.
     /// Defaults to 1 second; raise to reduce DB churn on deployments with low
     /// enqueue cadence. Hot-reloadable.

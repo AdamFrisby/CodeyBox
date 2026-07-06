@@ -162,9 +162,13 @@ public sealed class RecordingComputerUseBridge : IComputerUseExplorationTarget
         (int? cx, int? cy) = ResolveActionCentre(canonicalAction, events);
         TraceAccessibilityDescriptor? preAccessibility = null;
         string? preAccessibilityJson = null;
-        if (cx.HasValue && cy.HasValue)
+        if (!isScreenshot)
         {
             preAccessibilityJson = await CaptureAccessibilityTreeBestEffortAsync(sandbox, ct).ConfigureAwait(false);
+        }
+
+        if (cx.HasValue && cy.HasValue)
+        {
             preAccessibility = await CaptureAccessibilityBestEffortAsync(
                 sandbox,
                 cx.Value,
@@ -190,7 +194,7 @@ public sealed class RecordingComputerUseBridge : IComputerUseExplorationTarget
         var isGlobalInput = ShouldRecordGlobalInput(metadata, canonicalAction, events);
         var targetDescriptor = isGlobalInput
             ? BuildEmptyTargetDescriptor(preScreenshot)
-            : BuildTargetDescriptor(canonicalAction, events, preScreenshot, preAccessibility);
+            : BuildTargetDescriptor(canonicalAction, events, preScreenshot, preAccessibility, preAccessibilityJson);
         UpdateRememberedFocusTarget(canonicalAction, events, targetDescriptor, postAccessibilityJson, postScreenshot);
 
         var entry = new TraceEntry
@@ -307,7 +311,8 @@ public sealed class RecordingComputerUseBridge : IComputerUseExplorationTarget
         string action,
         SandboxInputEvent[] events,
         byte[]? preScreenshot,
-        TraceAccessibilityDescriptor? preAccessibility)
+        TraceAccessibilityDescriptor? preAccessibility,
+        string? preAccessibilityJson)
     {
         var (cx, cy) = ResolveActionCentre(action, events);
 
@@ -362,6 +367,7 @@ public sealed class RecordingComputerUseBridge : IComputerUseExplorationTarget
         return new TraceTargetDescriptor
         {
             Accessibility = preAccessibility,
+            AccessibilitySnapshotJson = preAccessibilityJson,
             Visual = new TraceVisualDescriptor
             {
                 Region = region,

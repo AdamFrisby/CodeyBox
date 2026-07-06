@@ -235,7 +235,7 @@ public sealed class DemoLoginReplaySandbox : ISandbox
             return;
 
         _page.Email = "alice@example.com";
-        _page.Password = DemoLoginPageModel.ResolvePassword("secret");
+        _page.Password = "secret";
         _page.TryLogin();
     }
 
@@ -277,17 +277,12 @@ public sealed class DemoLoginReplaySandbox : ISandbox
               '#email', '#password', '#login-btn', '[data-testid="login-form"]', '#ready'
             ]);
 
-            function resolvePassword(value) {
-              if (value === '<redacted-password>') return 'secret';
-              return value;
-            }
-
             function isVisible(selector) {
               if (selector === '#welcome' || selector === '[data-testid="welcome-banner"]') return pageState.loggedIn;
               if (selector === '#hidden') return false;
               if (selector === '#email' || selector === '#password' || selector === '#login-btn') return !pageState.loggedIn;
               if (selector === '#ready') return true;
-              return knownSelectors.has(selector) ? false : false;
+              return knownSelectors.has(selector);
             }
 
             function textContent(selector) {
@@ -302,8 +297,7 @@ public sealed class DemoLoginReplaySandbox : ISandbox
                 async textContent() { return textContent(selector); },
                 async click() {
                   if (selector === '#login-btn') {
-                    const password = resolvePassword(pageState.password);
-                    if (pageState.email.trim() === 'alice@example.com' && password === 'secret') {
+                    if (pageState.email.trim() === 'alice@example.com' && pageState.password === 'secret') {
                       pageState.loggedIn = true;
                       console.log(JSON.stringify({ loggedIn: true }));
                     }

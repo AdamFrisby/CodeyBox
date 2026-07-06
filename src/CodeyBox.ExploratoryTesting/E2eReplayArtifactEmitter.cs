@@ -42,7 +42,8 @@ public static class E2eReplayArtifactEmitter
             var action = entry.Action.Kind;
             var selector = E2eSelectorResolver.Resolve(
                 entry.Action.TargetDescriptor.Accessibility,
-                entry.Observation.AccessibilitySnapshotJson);
+                entry.Action.TargetDescriptor.AccessibilitySnapshotJson
+                ?? entry.Observation.AccessibilitySnapshotJson);
 
             switch (action)
             {
@@ -146,14 +147,14 @@ public static class E2eReplayArtifactEmitter
             return value ?? string.Empty;
 
         if (selector?.Contains("password", StringComparison.OrdinalIgnoreCase) == true)
-            return E2eReplaySensitiveValueRedaction.PasswordPlaceholder;
+            return Core.E2eReplaySensitiveValueRedaction.PasswordPlaceholder;
 
         if (descriptor is null)
             return value;
 
         var elementType = descriptor.ElementType ?? string.Empty;
         if (elementType.Contains("password", StringComparison.OrdinalIgnoreCase))
-            return E2eReplaySensitiveValueRedaction.PasswordPlaceholder;
+            return Core.E2eReplaySensitiveValueRedaction.PasswordPlaceholder;
 
         return value;
     }
@@ -212,12 +213,6 @@ public static class E2eReplayArtifactEmitter
             DelayMs = DefaultReadinessDelayMs,
         };
     }
-}
-
-/// <summary>Placeholder substituted for password fields in emitted replay artifacts.</summary>
-public static class E2eReplaySensitiveValueRedaction
-{
-    public const string PasswordPlaceholder = "<redacted-password>";
 }
 
 public sealed record E2eReplayEmitOptions

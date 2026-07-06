@@ -1,8 +1,10 @@
+using System.Net;
 using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.ExploratoryTesting;
 using CodeyBox.Orchestrator;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Tests;
 
@@ -17,6 +19,18 @@ public sealed class E2eAuthoringTests
   {
     WriteIndented = true,
   };
+
+  private static E2eReplayRuntime CreateDemoReplayRuntime()
+  {
+    var options = new SimpleOptionsMonitor<E2eExecutionOptions>(new E2eExecutionOptions
+    {
+      FillSecrets = new Dictionary<string, string>(StringComparer.Ordinal)
+      {
+        [E2eReplaySensitiveValueRedaction.PasswordPlaceholder] = "secret",
+      },
+    });
+    return new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance, options);
+  }
 
   [Fact]
   public void SelectorResolver_prefers_explicit_selector_from_accessibility_tree()
@@ -131,7 +145,7 @@ public sealed class E2eAuthoringTests
     Assert.True(E2eReplayArtifactValidation.TryValidate(result.Artifact, out _, out var detail), detail);
 
     await using var replaySandbox = new E2eAuthoring.DemoLoginReplaySandbox();
-    var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
+    var runtime = CreateDemoReplayRuntime();
     var replay = await runtime.ExecuteAsync(result.Artifact, replaySandbox);
 
     Assert.True(replay.Passed, replay.Summary);
@@ -198,8 +212,12 @@ public sealed class E2eAuthoringTests
 
     Assert.True(E2eReplayArtifactValidation.TryValidate(artifact, out _, out var detail), detail);
 
+    var passwordStep = artifact.Steps.FirstOrDefault(s => s.Action == "fill" && s.Selector == "#password");
+    Assert.NotNull(passwordStep);
+    Assert.Equal(E2eReplaySensitiveValueRedaction.PasswordPlaceholder, passwordStep!.Value);
+
     await using var replaySandbox = new E2eAuthoring.DemoLoginReplaySandbox();
-    var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
+    var runtime = CreateDemoReplayRuntime();
     var replay = await runtime.ExecuteAsync(artifact, replaySandbox);
 
     Assert.True(replay.Passed, replay.Summary);
@@ -230,5 +248,172 @@ public sealed class E2eAuthoringTests
       JsonOptions);
     Assert.NotNull(embeddedArtifact);
     Assert.True(E2eReplayArtifactValidation.TryValidate(embeddedArtifact, out _, out var embeddedDetail), embeddedDetail);
+    var embeddedPassword = embeddedArtifact!.Steps.FirstOrDefault(s => s.Action == "fill" && s.Selector == "#password");
+    Assert.NotNull(embeddedPassword);
+    Assert.Equal(E2eReplaySensitiveValueRedaction.PasswordPlaceholder, embeddedPassword!.Value);
+  }
+
+  [Fact]
+  public async Task NullE2eReauthoringHook_returns_false()
+  {
+    await using var sandbox = new E2eAuthoring.DemoLoginCuaSandbox();
+    await using var session = E2eAuthoring.DemoLoginExploration.CreateSession(sandbox);
+    var author = new CheapModelCuaAuthor();
+    var plan = E2eAuthoring.DemoLoginExploration.Plan();
+    var failed = new E2eRunResult { Passed = false, FailedStepIndex = 2 };
+
+    var reauthored = await author.TryReauthorAfterReplayFailureAsync(session, plan, failed);
+
+    Assert.False(reauthored);
+  }
+
+  [Fact]
+  public async Task TryReauthorAfterReplayFailureAsync_delegates_to_injected_hook()
+  {
+    await using var sandbox = new E2eAuthoring.DemoLoginCuaSandbox();
+    await using var session = E2eAuthoring.DemoLoginExploration.CreateSession(sandbox);
+    var plan = E2eAuthoring.DemoLoginExploration.Plan();
+    var failed = new E2eRunResult { Passed = false, FailedStepIndex = 1, Summary = "selector missing" };
+    var hook = new RecordingE2eReauthoringHook();
+    var author = new CheapModelCuaAuthor(reauthoringHook: hook);
+
+    var reauthored = await author.TryReauthorAfterReplayFailureAsync(session, plan, failed);
+
+    Assert.True(reauthored);
+    Assert.Same(session, hook.LastSession);
+    Assert.Same(plan, hook.LastPlan);
+    Assert.Same(failed, hook.LastFailedReplay);
+  }
+
+  [Fact]
+  public async Task CheapModelCuaAuthor_throws_when_no_explorer_or_default_client()
+  {
+    await using var sandbox = new E2eAuthoring.DemoLoginCuaSandbox();
+    await using var session = E2eAuthoring.DemoLoginExploration.CreateSession(sandbox);
+    var author = new CheapModelCuaAuthor();
+    var plan = E2eAuthoring.DemoLoginExploration.Plan();
+
+    var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+      author.ExploreAndEmitAsync(session, plan));
+
+    Assert.Contains("No IE2eCuaExplorer was supplied", ex.Message);
+  }
+
+  [Fact]
+  public async Task AnthropicComputerUseModelClient_PlanNextActionsAsync_sends_headers_and_parses_response()
+  {
+    string? capturedBody = null;
+    HttpRequestMessage? captured = null;
+    var handler = new CapturingHttpHandler(async (request, _) =>
+    {
+      captured = request;
+      capturedBody = request.Content is null
+        ? null
+        : await request.Content.ReadAsStringAsync();
+      return new HttpResponseMessage(HttpStatusCode.OK)
+      {
+        Content = new StringContent("""
+          {
+            "content": [
+              { "type": "tool_use", "input": { "action": "left_click", "coordinate": [5, 6] } }
+            ]
+          }
+          """),
+      };
+    });
+    using var http = new HttpClient(handler) { BaseAddress = new Uri("https://api.anthropic.com/") };
+    var client = new AnthropicComputerUseModelClient(http, () => "test-api-key");
+    var plan = E2eAuthoring.DemoLoginExploration.Plan();
+    var context = new ComputerUseModelTurnContext
+    {
+      ModelId = "claude-haiku-4-5-20251001",
+      Plan = plan,
+      TurnIndex = 0,
+      ScreenshotPng = [0x89, 0x50, 0x4E, 0x47],
+    };
+
+    var actions = await client.PlanNextActionsAsync(context);
+
+    Assert.NotNull(captured);
+    Assert.Equal("test-api-key", captured!.Headers.GetValues("x-api-key").Single());
+    Assert.Equal("2023-06-01", captured.Headers.GetValues("anthropic-version").Single());
+    Assert.Contains("computer-use-2025-01-24", captured.Headers.GetValues("anthropic-beta").Single());
+    Assert.Contains("claude-haiku-4-5-20251001", capturedBody);
+    Assert.Contains("computer-use-2025-01-24", capturedBody);
+    Assert.Single(actions);
+    Assert.Equal("click", actions[0].Action);
+    Assert.Equal(5, actions[0].X);
+    Assert.Equal(6, actions[0].Y);
+  }
+
+  [Fact]
+  public async Task AnthropicComputerUseModelClient_PlanNextActionsAsync_throws_when_api_key_missing()
+  {
+    using var http = new HttpClient(new CapturingHttpHandler((_, _) =>
+      Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("{}") })));
+    var client = new AnthropicComputerUseModelClient(http, () => null);
+    var context = new ComputerUseModelTurnContext
+    {
+      ModelId = "claude-haiku-4-5-20251001",
+      Plan = E2eAuthoring.DemoLoginExploration.Plan(),
+      TurnIndex = 0,
+    };
+
+    var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => client.PlanNextActionsAsync(context));
+    Assert.Contains("ANTHROPIC_API_KEY", ex.Message);
+  }
+
+  [Fact]
+  public async Task AnthropicComputerUseModelClient_PlanNextActionsAsync_throws_on_non_success_status()
+  {
+    using var http = new HttpClient(new CapturingHttpHandler((_, _) =>
+      Task.FromResult(new HttpResponseMessage(HttpStatusCode.Unauthorized)
+      {
+        Content = new StringContent("invalid api key"),
+      })));
+    var client = new AnthropicComputerUseModelClient(http, () => "bad-key");
+    var context = new ComputerUseModelTurnContext
+    {
+      ModelId = "claude-haiku-4-5-20251001",
+      Plan = E2eAuthoring.DemoLoginExploration.Plan(),
+      TurnIndex = 0,
+    };
+
+    var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => client.PlanNextActionsAsync(context));
+    Assert.Contains("401", ex.Message);
+    Assert.Contains("invalid api key", ex.Message);
+  }
+
+  private sealed class RecordingE2eReauthoringHook : IE2eReauthoringHook
+  {
+    public AppUnderTestSession? LastSession { get; private set; }
+    public E2eExplorationPlan? LastPlan { get; private set; }
+    public E2eRunResult? LastFailedReplay { get; private set; }
+
+    public Task<bool> TryReauthorAsync(
+      AppUnderTestSession session,
+      E2eExplorationPlan plan,
+      E2eRunResult failedReplay,
+      CancellationToken ct = default)
+    {
+      LastSession = session;
+      LastPlan = plan;
+      LastFailedReplay = failedReplay;
+      return Task.FromResult(true);
+    }
+  }
+
+  private sealed class CapturingHttpHandler(Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> handler)
+    : HttpMessageHandler
+  {
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+      => handler(request, cancellationToken);
+  }
+
+  private sealed class SimpleOptionsMonitor<T>(T value) : IOptionsMonitor<T> where T : class
+  {
+    public T CurrentValue => value;
+    public T Get(string? name) => value;
+    public IDisposable? OnChange(Action<T, string?> listener) => null;
   }
 }

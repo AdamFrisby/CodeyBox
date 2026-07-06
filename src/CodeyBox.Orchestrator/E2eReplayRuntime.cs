@@ -579,6 +579,8 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
     private ReplayDriverInput ToReplayDriverInput(E2eReplayArtifact artifact, ReplayEgressPolicy egressPolicy)
     {
         var allowed = CurrentAllowedOrigins();
+        var fillSecrets = _options?.CurrentValue.FillSecrets
+            ?? new Dictionary<string, string>(StringComparer.Ordinal);
         return new ReplayDriverInput(
             artifact.Name,
             artifact.Readiness,
@@ -589,7 +591,8 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
                 .Select(static origin => E2eReplayOriginPolicy.NormalizeOrigin(new Uri(origin)))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray(),
-            egressPolicy.HostResolverRules);
+            egressPolicy.HostResolverRules,
+            fillSecrets);
     }
 
     private static string NormalizeHost(string host)
@@ -687,7 +690,8 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
         [property: JsonPropertyName("steps")] IReadOnlyList<E2eReplayStep> Steps,
         [property: JsonPropertyName("assertions")] IReadOnlyList<E2eReplayAssertion> Assertions,
         [property: JsonPropertyName("__codeyboxAllowedOrigins")] IReadOnlyList<string> AllowedOrigins,
-        [property: JsonPropertyName("__codeyboxHostResolverRules")] IReadOnlyList<ReplayHostResolverRule> HostResolverRules);
+        [property: JsonPropertyName("__codeyboxHostResolverRules")] IReadOnlyList<ReplayHostResolverRule> HostResolverRules,
+        [property: JsonPropertyName("__codeyboxFillSecrets")] IReadOnlyDictionary<string, string> FillSecrets);
 
     private sealed record ReplayEgressPolicy(
         IReadOnlyList<ReplayAllowedEndpoint> Endpoints,
@@ -757,6 +761,14 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
           return new Set(origins.map(normalizeOrigin));
         }
 
+        function resolveFillValue(value, artifact) {
+          const raw = String(value || '');
+          const secrets = artifact.__codeyboxFillSecrets;
+          if (!secrets || typeof secrets !== 'object') return raw;
+          if (Object.prototype.hasOwnProperty.call(secrets, raw)) return String(secrets[raw]);
+          return raw;
+        }
+
         function ensureAllowedUrl(raw, allowedOrigins, label) {
           const origin = normalizeOrigin(raw);
           if (!allowedOrigins.has(origin)) throw new Error(`${label} origin ${origin} is not allowed`);
@@ -817,7 +829,7 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
           return rules.length > 0 ? rules.join(',') : null;
         }
 
-        async function performStep(page, step, allowedOrigins) {
+        async function performStep(page, step, allowedOrigins, artifact) {
           const action = String(step.action || '').toLowerCase();
           if (action === 'navigate') {
             ensureAllowedUrl(step.target, allowedOrigins, 'navigate target');
@@ -826,7 +838,7 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
           }
           else if (action === 'click') await page.locator(step.selector).click();
           else if (action === 'doubleclick') await page.locator(step.selector).dblclick();
-          else if (action === 'fill') await page.locator(step.selector).fill(step.value || '');
+          else if (action === 'fill') await page.locator(step.selector).fill(resolveFillValue(step.value, artifact) || '');
           else if (action === 'press') await page.locator(step.selector).press(step.value || '');
           else if (action === 'select') await page.locator(step.selector).selectOption(step.value || '');
           else if (action === 'check') await page.locator(step.selector).check();
@@ -915,7 +927,7 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
             const page = await context.newPage();
             for (let i = 0; i < (artifact.steps || []).length; i++) {
               try {
-                await performStep(page, artifact.steps[i], allowedOrigins);
+                await performStep(page, artifact.steps[i], allowedOrigins, artifact);
                 stepResults.push(okStep());
               } catch (error) {
                 stepResults.push(failStep(error));

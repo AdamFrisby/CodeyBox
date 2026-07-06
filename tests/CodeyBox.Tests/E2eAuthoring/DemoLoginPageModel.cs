@@ -1,4 +1,5 @@
 using System.Text.Json;
+using CodeyBox.Core;
 using CodeyBox.ExploratoryTesting;
 
 namespace CodeyBox.Tests.E2eAuthoring;

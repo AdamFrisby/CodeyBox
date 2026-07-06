@@ -55,7 +55,7 @@
       "action": "fill",
       "selector": "#password",
       "target": null,
-      "value": "secret",
+      "value": "<redacted-password>",
       "argv": [],
       "stdin": null,
       "workingDirectory": null,
