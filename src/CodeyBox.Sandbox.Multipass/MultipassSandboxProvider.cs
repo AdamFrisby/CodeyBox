@@ -5445,6 +5445,14 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private const int DetachedProcessGroupMalformedExitCode = 73;
     private const int DetachedSupervisorSetupFailedExitCode = 88;
     private const int DetachedPollFailureLimit = 5;
+    // Once the process group is observed gone without a captured authenticated
+    // exit, re-check the ingest listener this many times before declaring the
+    // completion lost. The wrapper posts its authenticated exit as its final
+    // act (after stdout has already streamed), so a gone-PG almost always means
+    // the exit POST is in flight or the liveness probe raced the still-draining
+    // wrapper under host load — a bounded grace closes that window without
+    // masking a genuine crash.
+    private const int DetachedAuthenticatedExitGraceAttempts = 25;
     private static readonly TimeSpan DetachedAuthenticatedExitCleanupTimeout = TimeSpan.FromSeconds(5);
     private const string DetachedSupervisorDirectory = "/run/codeybox-exec";
     internal const string DetachedProcessGroupPollCommand = """
@@ -7255,15 +7263,49 @@ while True:
                 if (state.ProcessGroupAlive)
                     continue;
 
-                // PG is gone but the wrapper never delivered the host-authenticated
-                // completion. The wrapper crashed, was killed, or could not reach
-                // the ingest listener — surface a diagnostic rather than guessing.
+                // PG reported gone but the authenticated exit is not yet visible.
+                // The wrapper posts that exit as its last act before the group
+                // dies, and stdout has already streamed over the same channel, so
+                // this is almost always an in-flight exit POST (or a liveness
+                // probe that raced the still-draining wrapper under host load).
+                // Give the authenticated completion a bounded grace to land
+                // before concluding the wrapper crashed without delivering it.
+                if (await WaitForAuthenticatedExitAfterProcessGroupGoneAsync(ingest, ct).ConfigureAwait(false)
+                    is { } gracedExitCode)
+                {
+                    var reapError = await EnsureDetachedProcessGroupReapedAfterAuthenticatedExitAsync(processGroupMarker).ConfigureAwait(false);
+                    return new DetachedExitResult(gracedExitCode, reapError);
+                }
+
+                // Grace elapsed with still no authenticated completion. The
+                // wrapper crashed, was killed, or could not reach the ingest
+                // listener — surface a diagnostic rather than guessing.
                 return new DetachedExitResult(
                     1,
                     "agent output transport produced nothing / detached run reported no exit: " +
                     $"detached exec process group {state.ProcessGroupId} exited without authenticated exit completion\n");
             }
         }
+    }
+
+    // Re-check the ingest listener for the authenticated exit after the process
+    // group is observed gone, giving an in-flight exit POST (or a raced liveness
+    // probe) a bounded window to resolve. Returns the exit code once captured,
+    // or null if the grace elapses with no authenticated completion.
+    private async Task<int?> WaitForAuthenticatedExitAfterProcessGroupGoneAsync(
+        MultipassAgentOutputHttpIngestSession ingest,
+        CancellationToken ct)
+    {
+        var graceInterval = DetachedPollIntervalOverride ?? TimeSpan.FromMilliseconds(200);
+        for (var attempt = 0; attempt < DetachedAuthenticatedExitGraceAttempts; attempt++)
+        {
+            if (ingest.TryGetExitCode(out var exitCode))
+                return exitCode;
+            ct.ThrowIfCancellationRequested();
+            await Task.Delay(graceInterval, ct).ConfigureAwait(false);
+        }
+
+        return ingest.TryGetExitCode(out var finalExitCode) ? finalExitCode : null;
     }
 
     private async Task<string?> EnsureDetachedProcessGroupReapedAfterAuthenticatedExitAsync(string processGroupMarker)
@@ -7681,9 +7723,13 @@ while True:
         {
             _log.LogWarning(ex, "Failed to delete multipass VM {Name}", _name);
             ReleaseActiveTracking();
-            if (_ownedByShutdownHandler)
-                throw;
-            return;
+            // The purge did not prove the VM gone. Re-arm the dispose guards so a
+            // later DisposeAsync (explicit retry) or the leak reaper can re-attempt
+            // deletion instead of silently orphaning the VM, and surface the failure
+            // so the caller learns the sandbox is still retryable rather than gone.
+            Volatile.Write(ref _disposed, 0);
+            Volatile.Write(ref _disposeStarted, 0);
+            throw;
         }
         ReleaseActiveTracking();
         _onDisposed?.Invoke(_name);
