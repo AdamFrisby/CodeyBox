@@ -19,6 +19,8 @@ public sealed class PngBitmapTests
 {
     private const int None = 0;
     private const int Sub = 1;
+    private const int Up = 2;
+    private const int Average = 3;
     private const int Paeth = 4;
 
     [Fact]
@@ -81,6 +83,57 @@ public sealed class PngBitmapTests
         AssertPixelAt(bitmap, 20, 20, 20, 1, 0);
         AssertPixelAt(bitmap, 30, 30, 30, 0, 1);
         AssertPixelAt(bitmap, 40, 40, 40, 1, 1);
+    }
+
+    [Fact]
+    public void TryDecode_DecodesGrayscale_WithUpAndAverageFilters()
+    {
+        // 2x3 grayscale gradient exercising the Up (2) and Average (3) filter
+        // predictors, which no other fixture covers. Filtered bytes are computed
+        // by hand from the PNG filter definitions so a wrong Up or Average
+        // reconstruction produces the wrong pixels.
+        //  row0 None:    [10, 20]           -> 10, 20
+        //  row1 Up:      [20, 20]           -> 10+20=30, 20+20=40
+        //  row2 Average: [35, 15]           -> (0+30)/2=15 => 50 ; (50+40)/2=45 => 60
+        var scan = new byte[]
+        {
+            None, 10, 20,
+            Up, 20, 20,
+            Average, 35, 15,
+        };
+        var png = AssemblePng(2, 3, colorType: 0, idat: Deflate(scan), palette: null);
+
+        Assert.True(PngBitmap.TryDecode(png, out var bitmap));
+        AssertPixelAt(bitmap, 10, 10, 10, 0, 0);
+        AssertPixelAt(bitmap, 20, 20, 20, 1, 0);
+        AssertPixelAt(bitmap, 30, 30, 30, 0, 1);
+        AssertPixelAt(bitmap, 40, 40, 40, 1, 1);
+        AssertPixelAt(bitmap, 50, 50, 50, 0, 2);
+        AssertPixelAt(bitmap, 60, 60, 60, 1, 2);
+    }
+
+    [Fact]
+    public void TryDecode_DecodesTruecolorAlpha_IgnoringAlphaChannel()
+    {
+        // Color type 6 (RGBA, bytesPerPixel=4) is the shape the sandbox commonly
+        // emits. The decoder must read R/G/B and skip the alpha byte; distinct
+        // alpha values here would corrupt the located pixel if the stride or
+        // channel indexing were wrong.
+        var scan = new byte[]
+        {
+            None, 10, 0, 0, 255,  20, 0, 0, 128,
+            None, 0, 30, 0, 64,   0, 0, 40, 200,
+        };
+        var png = AssemblePng(2, 2, colorType: 6, idat: Deflate(scan), palette: null);
+
+        Assert.True(PngBitmap.TryDecode(png, out var bitmap));
+        Assert.Equal(2, bitmap.Width);
+        Assert.Equal(2, bitmap.Height);
+
+        AssertPixelAt(bitmap, 10, 0, 0, 0, 0);
+        AssertPixelAt(bitmap, 20, 0, 0, 1, 0);
+        AssertPixelAt(bitmap, 0, 30, 0, 0, 1);
+        AssertPixelAt(bitmap, 0, 0, 40, 1, 1);
     }
 
     [Fact]
