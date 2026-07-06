@@ -1481,7 +1481,14 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         try
         {
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            // Match the other real detached-launch tests (e.g. line ~1324): the
+            // launch script waits up to its internal 30s marker deadline for the
+            // forked child to publish the process-group marker, and under heavy
+            // parallel test load that child (bash fork + several `sudo -n sh -c`
+            // calls + a python3 preflight) can take longer than 10s to appear. A
+            // 10s cap here cancels `WaitForExitAsync` mid-launch and flakes with
+            // TaskCanceledException even though nothing is actually wrong.
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
             var (exit, _, stderr) = await RunLocalProcessAsync(
                 "/bin/bash",
                 [launchScript],
