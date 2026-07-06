@@ -2269,6 +2269,60 @@ public sealed class MultipassRemoteSandboxProviderTests
         }
     }
 
+    [Fact]
+    public void OpenSshCliTransport_BuildLocalForwardArgv_emits_correct_forward_spec_and_flags()
+    {
+        // This is the real host-routable Expose path for the remote substrate.
+        // The -L spec field order is load-bearing: it MUST be
+        // localHost:localPort:remoteHost:remotePort, and the forward MUST use
+        // ExitOnForwardFailure=yes (so ssh exits rather than forwarding to the
+        // wrong target) and -N (no remote command — this is a pure tunnel).
+        var opts = DefaultOptions();
+        var argv = OpenSshCliTransport.BuildLocalForwardArgv(
+            opts, "127.0.0.1", 54321, "10.55.0.9", 8080);
+
+        // -L spec: exact field order, no transposition.
+        var lIndex = argv.ToList().IndexOf("-L");
+        Assert.True(lIndex >= 0, "argv must contain -L");
+        Assert.Equal("127.0.0.1:54321:10.55.0.9:8080", argv[lIndex + 1]);
+
+        // ExitOnForwardFailure=yes must be present as an -o option value.
+        Assert.Contains("ExitOnForwardFailure=yes", argv);
+
+        // -N (no remote command) must be present.
+        Assert.Contains("-N", argv);
+
+        // The SSH target is the final positional argument.
+        Assert.Equal(opts.SshTarget, argv[^1]);
+
+        // The ssh binary leads the argv.
+        Assert.Equal(opts.SshBinary, argv[0]);
+    }
+
+    [Theory]
+    [InlineData("", "10.55.0.9")]
+    [InlineData("   ", "10.55.0.9")]
+    [InlineData("127.0.0.1", "")]
+    [InlineData("127.0.0.1", "   ")]
+    public void OpenSshCliTransport_BuildLocalForwardArgv_rejects_blank_hosts(string localHost, string remoteHost)
+    {
+        var opts = DefaultOptions();
+        Assert.Throws<ArgumentException>(() =>
+            OpenSshCliTransport.BuildLocalForwardArgv(opts, localHost, 54321, remoteHost, 8080));
+    }
+
+    [Theory]
+    [InlineData(0, 8080)]
+    [InlineData(70000, 8080)]
+    [InlineData(54321, 0)]
+    [InlineData(54321, 70000)]
+    public void OpenSshCliTransport_BuildLocalForwardArgv_rejects_out_of_range_ports(int localPort, int remotePort)
+    {
+        var opts = DefaultOptions();
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            OpenSshCliTransport.BuildLocalForwardArgv(opts, "127.0.0.1", localPort, "10.55.0.9", remotePort));
+    }
+
     // ----- helpers ---------------------------------------------------
 
     private static bool Contains(IReadOnlyList<string> argv, string token)
