@@ -3,37 +3,14 @@ using System.Text;
 namespace CodeyBox.Core;
 
 /// <summary>
-/// Builds and starts isolated execution sandboxes. Implementations include a
-/// plain-process dev runner (UNSAFE; for local testing only), bubblewrap
-/// (namespace isolation, shared kernel), and Multipass (KVM-backed VMs with
-/// a separate guest kernel — recommended for production). The orchestrator
-/// picks one provider per deployment.
+/// Lists and disposes managed sandboxes without implying the ability to create
+/// new work sandboxes. Lifecycle sweepers and operator endpoints depend on this
+/// narrower contract so composite lifecycle views do not masquerade as providers.
 /// </summary>
-public interface ISandboxProvider
+public interface IManagedSandboxLifecycle
 {
     /// <summary>Stable identifier for diagnostics ("process", "bubblewrap", "multipass").</summary>
     string Name { get; }
-
-    /// <summary>
-    /// Agent-output data plane this provider can offer for long-running CLI
-    /// invocations. Providers that do not override this keep stdout/stderr on
-    /// the normal <see cref="ISandbox.ExecAsync"/> pipe.
-    /// </summary>
-    SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.ExecPipe;
-
-    /// <summary>
-    /// Preferred launch mode for one-shot batch agent invocations. Providers
-    /// that can safely supervise a detached process may advertise detached
-    /// launch independently from their output transport.
-    /// </summary>
-    SandboxBatchLaunchMode BatchLaunchMode => SandboxBatchLaunchMode.Attached;
-
-    /// <summary>
-    /// Provisions a sandbox according to the given spec. The returned handle
-    /// holds the running sandbox until disposed; disposal must tear it down
-    /// regardless of state.
-    /// </summary>
-    Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default);
 
     /// <summary>
     /// Returns all sandboxes on the host that belong to this provider
@@ -61,6 +38,46 @@ public interface ISandboxProvider
     /// must wrap invocations in try/catch and log the exception.</para>
     /// </summary>
     Task DisposeLeakedAsync(string name, CancellationToken ct);
+
+    /// <summary>
+    /// Best-effort dispose of the exact sandbox snapshot returned by
+    /// <see cref="ListAllManagedAsync"/>. Composite lifecycle views use the
+    /// snapshot metadata to route disposal back to the lifecycle that reported
+    /// the sandbox instead of broadcasting a name across every provider.
+    /// </summary>
+    Task DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
+        => DisposeLeakedAsync(sandbox.Name, ct);
+}
+
+/// <summary>
+/// Builds and starts isolated execution sandboxes. Implementations include a
+/// plain-process dev runner (UNSAFE; for local testing only), bubblewrap
+/// (namespace isolation, shared kernel), and Multipass (KVM-backed VMs with
+/// a separate guest kernel — recommended for production). The orchestrator
+/// picks one provider per deployment.
+/// </summary>
+public interface ISandboxProvider : IManagedSandboxLifecycle
+{
+    /// <summary>
+    /// Agent-output data plane this provider can offer for long-running CLI
+    /// invocations. Providers that do not override this keep stdout/stderr on
+    /// the normal <see cref="ISandbox.ExecAsync"/> pipe.
+    /// </summary>
+    SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.ExecPipe;
+
+    /// <summary>
+    /// Preferred launch mode for one-shot batch agent invocations. Providers
+    /// that can safely supervise a detached process may advertise detached
+    /// launch independently from their output transport.
+    /// </summary>
+    SandboxBatchLaunchMode BatchLaunchMode => SandboxBatchLaunchMode.Attached;
+
+    /// <summary>
+    /// Provisions a sandbox according to the given spec. The returned handle
+    /// holds the running sandbox until disposed; disposal must tear it down
+    /// regardless of state.
+    /// </summary>
+    Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default);
 }
 
 /// <summary>
@@ -114,13 +131,19 @@ public interface IResourceMetricsCapturingProvider
 /// depending on any backend's CLI state strings. Always false for providers that
 /// do not model a persistent suspend lifecycle.
 /// </param>
+/// <param name="LifecycleProviderId">
+/// Optional opaque identifier for the lifecycle provider that reported this
+/// snapshot. Plain providers leave this null; composite lifecycle views fill it
+/// so later cleanup can target the reporting provider only.
+/// </param>
 public sealed record ManagedSandboxInfo(
     string Name,
     DateTimeOffset? CreatedAt,
     long? DiskBytes,
     bool IsTrackedActive,
     bool HasPreemptMarker = false,
-    bool IsSuspendLifecycleOrFrozen = false);
+    bool IsSuspendLifecycleOrFrozen = false,
+    string? LifecycleProviderId = null);
 
 /// <summary>A live sandbox. Disposing destroys it.</summary>
 public interface ISandbox : IAsyncDisposable

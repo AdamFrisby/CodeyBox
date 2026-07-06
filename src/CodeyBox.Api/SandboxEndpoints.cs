@@ -49,7 +49,7 @@ internal static class SandboxEndpoints
     /// </summary>
     private static async Task<IResult> DisposeLeakedAsync(
         string name,
-        ISandboxProvider provider,
+        IManagedSandboxLifecycle provider,
         SandboxLeakReaper reaper,
         IWebhookDispatcher webhooks,
         ILogger<Program> log,
@@ -74,10 +74,10 @@ internal static class SandboxEndpoints
         var diskMb = leak.DiskBytes.HasValue ? leak.DiskBytes.Value / (1024 * 1024) : (long?)null;
         try
         {
-            await provider.DisposeLeakedAsync(name, cts.Token);
+            await provider.DisposeLeakedAsync(ToManagedSandboxInfo(leak), cts.Token);
             // Remove from the in-memory list immediately so a repeated call returns 404
             // instead of attempting a redundant multipass delete and returning 500.
-            reaper.RemoveFromLatestLeaks(name);
+            reaper.RemoveFromLatestLeaks(leak);
             var disposedAt = DateTimeOffset.UtcNow;
             AuditLog.SandboxLeakDisposed(name,
                 ageMinutes: leak.Age.TotalMinutes,
@@ -152,4 +152,12 @@ internal static class SandboxEndpoints
         diskMb = l.DiskBytes.HasValue ? l.DiskBytes.Value / (1024 * 1024) : (long?)null,
         reason = l.Reason,
     };
+
+    private static ManagedSandboxInfo ToManagedSandboxInfo(LeakedSandboxInfo leak)
+        => new(
+            leak.Name,
+            leak.CreatedAt,
+            leak.DiskBytes,
+            IsTrackedActive: false,
+            LifecycleProviderId: leak.LifecycleProviderId);
 }

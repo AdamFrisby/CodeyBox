@@ -26,6 +26,12 @@ public interface ITestCaseStore
     Task<bool> UpdateAsync(TestCase testCase, CancellationToken ct = default);
 
     /// <summary>
+    /// Updates only the last-run fields for an existing test case. This avoids
+    /// clobbering unrelated operator edits made while a long-running replay is active.
+    /// </summary>
+    Task<bool> UpdateLastRunAsync(string id, bool passed, DateTimeOffset ranAt, string result, CancellationToken ct = default);
+
+    /// <summary>
     /// Retrieves a test case by its unique ID.
     /// </summary>
     Task<TestCase?> GetAsync(string id, CancellationToken ct = default);

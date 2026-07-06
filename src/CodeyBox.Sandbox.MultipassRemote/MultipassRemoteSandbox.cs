@@ -26,6 +26,7 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
     private readonly IReadOnlyList<StagedBindMount> _stagedMounts;
     private readonly string _remoteSandboxRoot;
     private readonly IRemoteHostTransport _transport;
+    private readonly Func<IReadOnlyList<string>, CancellationToken, Task<ProcessRunResultLike>> _runRemoteMaybeGated;
     private readonly Func<MultipassRemoteSandboxOptions> _opts;
     private readonly ILogger _log;
     private readonly Action<string> _onDispose;
@@ -38,6 +39,7 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
         IReadOnlyList<StagedBindMount> stagedMounts,
         string remoteSandboxRoot,
         IRemoteHostTransport transport,
+        Func<IReadOnlyList<string>, CancellationToken, Task<ProcessRunResultLike>> runRemoteMaybeGated,
         Func<MultipassRemoteSandboxOptions> optsAccessor,
         ILogger log,
         Action<string> onDispose)
@@ -47,6 +49,7 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
         _stagedMounts = stagedMounts;
         _remoteSandboxRoot = remoteSandboxRoot;
         _transport = transport;
+        _runRemoteMaybeGated = runRemoteMaybeGated;
         _opts = optsAccessor;
         _log = log;
         _onDispose = onDispose;
@@ -196,10 +199,17 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
         // 1) Try to cleanly stop the VM so background processes flush.
         try
         {
-            await _transport.RunAsync(
+            var stop = await _runRemoteMaybeGated(
                 [opts.RemoteMultipassPath, "stop", "--time", "0", vmName],
-                stdin: null,
-                ct: CancellationToken.None).ConfigureAwait(false);
+                CancellationToken.None).ConfigureAwait(false);
+            if (stop.ExitCode != 0)
+            {
+                _log.LogWarning(
+                    "Remote VM {Vm} stop exited {ExitCode} during dispose: {Detail}",
+                    vmName,
+                    stop.ExitCode,
+                    stop.Stderr);
+            }
         }
         catch (RemoteSshTransportException ex)
         {
@@ -239,10 +249,17 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
         // 3) Delete VM + staging dir.
         try
         {
-            await _transport.RunAsync(
+            var delete = await _runRemoteMaybeGated(
                 [opts.RemoteMultipassPath, "delete", "--purge", vmName],
-                stdin: null,
-                ct: CancellationToken.None).ConfigureAwait(false);
+                CancellationToken.None).ConfigureAwait(false);
+            if (delete.ExitCode != 0)
+            {
+                _log.LogWarning(
+                    "Remote VM {Vm} delete exited {ExitCode} during dispose: {Detail}",
+                    vmName,
+                    delete.ExitCode,
+                    delete.Stderr);
+            }
         }
         catch (Exception ex)
         {

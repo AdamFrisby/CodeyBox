@@ -1,0 +1,509 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
+using CodeyBox.Core;
+
+namespace CodeyBox.Orchestrator;
+
+/// <summary>
+/// SQLite-backed store for E2E replay runs. Shares the orchestrator state
+/// database with <see cref="SqliteWorkItemStore"/> and
+/// <see cref="SqliteTestCaseStore"/>; the e2e_runs table is created via an
+/// additive migration on construction.
+///
+/// <para>The <c>FOREIGN KEY ... ON DELETE CASCADE</c> on test_cases.id keeps the
+/// run history's lifetime tied to its test case: archiving a work item
+/// cascades through test_cases → e2e_runs without orphans.</para>
+/// </summary>
+public sealed class SqliteE2eRunStore : IE2eRunStore, IDisposable
+{
+    private readonly SqliteConnection _conn;
+    private readonly SqliteDatabaseWriteGate _writeLock;
+    private int _disposed;
+
+    public SqliteE2eRunStore(string path)
+    {
+        var dir = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+        _conn = new SqliteConnection($"Data Source={path}");
+        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock.Wait();
+        try
+        {
+            _conn.Open();
+
+            using (var walCmd = _conn.CreateCommand())
+            {
+                walCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON;";
+                walCmd.ExecuteNonQuery();
+            }
+
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                CREATE TABLE IF NOT EXISTS e2e_runs (
+                    id            TEXT PRIMARY KEY,
+                    test_case_id  TEXT NOT NULL REFERENCES test_cases(id) ON DELETE CASCADE,
+                    status        TEXT NOT NULL,
+                    created_at    TEXT NOT NULL,
+                    started_at    TEXT,
+                    finished_at   TEXT,
+                    result        TEXT,
+                    sandbox_id    TEXT,
+                    batch_id      TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_e2e_runs_test_case ON e2e_runs(test_case_id);
+                CREATE INDEX IF NOT EXISTS idx_e2e_runs_batch ON e2e_runs(batch_id) WHERE batch_id IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_e2e_runs_status ON e2e_runs(status);
+                CREATE INDEX IF NOT EXISTS idx_e2e_runs_queue ON e2e_runs(status, created_at);
+                """;
+            cmd.ExecuteNonQuery();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task CreateAsync(E2eRun run, CancellationToken ct = default)
+        => await BulkCreateAsync([run], ct);
+
+    public async Task BulkCreateAsync(IReadOnlyList<E2eRun> runs, CancellationToken ct = default)
+    {
+        if (runs.Count == 0)
+            return;
+
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var tx = _conn.BeginTransaction();
+            try
+            {
+                foreach (var run in runs)
+                {
+                    using var cmd = _conn.CreateCommand();
+                    cmd.Transaction = tx;
+                    cmd.CommandText = """
+                        INSERT INTO e2e_runs (id, test_case_id, status, created_at, started_at, finished_at, result, sandbox_id, batch_id)
+                        VALUES ($id, $tc, $st, $ca, $sa, $fa, $res, $sb, $bt);
+                        """;
+                    Bind(cmd, run);
+                    await cmd.ExecuteNonQueryAsync(ct);
+                }
+
+                await tx.CommitAsync(ct);
+            }
+            catch
+            {
+                await tx.RollbackAsync(CancellationToken.None);
+                throw;
+            }
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<E2eRun?> GetAsync(string id, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT * FROM e2e_runs WHERE id = $id;";
+            cmd.Parameters.AddWithValue("$id", id);
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            return await reader.ReadAsync(ct) ? Read(reader) : null;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async IAsyncEnumerable<E2eRun> ListAsync(
+        int offset = 0,
+        int limit = E2eExecutionOptions.DefaultListPageSize,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var rows = new List<E2eRun>();
+        var page = NormalizePage(offset, limit);
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT * FROM e2e_runs ORDER BY created_at DESC LIMIT $limit OFFSET $offset;";
+            cmd.Parameters.AddWithValue("$limit", page.Limit);
+            cmd.Parameters.AddWithValue("$offset", page.Offset);
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                rows.Add(Read(reader));
+            }
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+        foreach (var row in rows) yield return row;
+    }
+
+    public async IAsyncEnumerable<E2eRun> ListByTestCaseAsync(
+        string testCaseId,
+        int offset = 0,
+        int limit = E2eExecutionOptions.DefaultListPageSize,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var rows = new List<E2eRun>();
+        var page = NormalizePage(offset, limit);
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT * FROM e2e_runs WHERE test_case_id = $tc ORDER BY created_at DESC LIMIT $limit OFFSET $offset;";
+            cmd.Parameters.AddWithValue("$tc", testCaseId);
+            cmd.Parameters.AddWithValue("$limit", page.Limit);
+            cmd.Parameters.AddWithValue("$offset", page.Offset);
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                rows.Add(Read(reader));
+            }
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+        foreach (var row in rows) yield return row;
+    }
+
+    public async IAsyncEnumerable<E2eRun> ListByBatchAsync(
+        string batchId,
+        int offset = 0,
+        int limit = E2eExecutionOptions.DefaultListPageSize,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var rows = new List<E2eRun>();
+        var page = NormalizePage(offset, limit);
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT * FROM e2e_runs WHERE batch_id = $bt ORDER BY created_at ASC LIMIT $limit OFFSET $offset;";
+            cmd.Parameters.AddWithValue("$bt", batchId);
+            cmd.Parameters.AddWithValue("$limit", page.Limit);
+            cmd.Parameters.AddWithValue("$offset", page.Offset);
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                rows.Add(Read(reader));
+            }
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+        foreach (var row in rows) yield return row;
+    }
+
+    public async Task<E2eRunBatchCounts?> GetBatchCountsAsync(string batchId, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT status, COUNT(*)
+                FROM e2e_runs
+                WHERE batch_id = $bt
+                GROUP BY status;
+                """;
+            cmd.Parameters.AddWithValue("$bt", batchId);
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+
+            var total = 0;
+            var queued = 0;
+            var running = 0;
+            var passed = 0;
+            var failed = 0;
+            var error = 0;
+            var canceled = 0;
+            while (await reader.ReadAsync(ct))
+            {
+                var status = reader.GetString(0);
+                var count = reader.GetInt32(1);
+                total += count;
+                if (string.Equals(status, nameof(E2eRunStatus.Queued), StringComparison.OrdinalIgnoreCase)) queued = count;
+                else if (string.Equals(status, nameof(E2eRunStatus.Running), StringComparison.OrdinalIgnoreCase)) running = count;
+                else if (string.Equals(status, nameof(E2eRunStatus.Passed), StringComparison.OrdinalIgnoreCase)) passed = count;
+                else if (string.Equals(status, nameof(E2eRunStatus.Failed), StringComparison.OrdinalIgnoreCase)) failed = count;
+                else if (string.Equals(status, nameof(E2eRunStatus.Error), StringComparison.OrdinalIgnoreCase)) error = count;
+                else if (string.Equals(status, nameof(E2eRunStatus.Canceled), StringComparison.OrdinalIgnoreCase)) canceled = count;
+            }
+
+            return total == 0
+                ? null
+                : new E2eRunBatchCounts(batchId, total, queued, running, passed, failed, error, canceled);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<bool> HasQueuedAsync(CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT 1 FROM e2e_runs WHERE status = 'Queued' LIMIT 1;";
+            var value = await cmd.ExecuteScalarAsync(ct);
+            return value is not null && value is not DBNull;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<E2eRun?> ClaimNextQueuedAsync(string? sandboxId, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var tx = _conn.BeginTransaction();
+            try
+            {
+                string? claimedId = null;
+                using (var sel = _conn.CreateCommand())
+                {
+                    sel.Transaction = tx;
+                    sel.CommandText = """
+                        SELECT id FROM e2e_runs
+                        WHERE status = 'Queued'
+                        ORDER BY created_at ASC
+                        LIMIT 1;
+                        """;
+                    using var reader = await sel.ExecuteReaderAsync(ct);
+                    if (await reader.ReadAsync(ct))
+                    {
+                        claimedId = reader.GetString(0);
+                    }
+                }
+
+                if (claimedId is null)
+                {
+                    await tx.CommitAsync(ct);
+                    return null;
+                }
+
+                var startedAt = DateTimeOffset.UtcNow;
+                using (var upd = _conn.CreateCommand())
+                {
+                    upd.Transaction = tx;
+                    upd.CommandText = """
+                        UPDATE e2e_runs
+                        SET status = 'Running', started_at = $sa, sandbox_id = $sb
+                        WHERE id = $id AND status = 'Queued';
+                        """;
+                    upd.Parameters.AddWithValue("$sa", startedAt.ToString("O"));
+                    upd.Parameters.AddWithValue("$sb", (object?)sandboxId ?? DBNull.Value);
+                    upd.Parameters.AddWithValue("$id", claimedId);
+                    var rows = await upd.ExecuteNonQueryAsync(ct);
+                    if (rows == 0)
+                    {
+                        // Lost the race to another dispatcher; commit empty and retry.
+                        await tx.CommitAsync(ct);
+                        return null;
+                    }
+                }
+
+                E2eRun? claimed = null;
+                using (var refetch = _conn.CreateCommand())
+                {
+                    refetch.Transaction = tx;
+                    refetch.CommandText = "SELECT * FROM e2e_runs WHERE id = $id;";
+                    refetch.Parameters.AddWithValue("$id", claimedId);
+                    using var reader = await refetch.ExecuteReaderAsync(ct);
+                    if (await reader.ReadAsync(ct))
+                    {
+                        claimed = Read(reader);
+                    }
+                }
+
+                await tx.CommitAsync(ct);
+                return claimed;
+            }
+            catch
+            {
+                await tx.RollbackAsync(ct);
+                throw;
+            }
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<bool> AssignSandboxAsync(string id, string sandboxId, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE e2e_runs
+                SET sandbox_id = $sb
+                WHERE id = $id AND status = 'Running';
+                """;
+            cmd.Parameters.AddWithValue("$sb", sandboxId);
+            cmd.Parameters.AddWithValue("$id", id);
+            var rows = await cmd.ExecuteNonQueryAsync(ct);
+            return rows > 0;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<int> RequeueRunningAsync(DateTimeOffset startedBefore, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE e2e_runs
+                SET status = 'Queued',
+                    started_at = NULL,
+                    sandbox_id = NULL
+                WHERE status = 'Running'
+                  AND (started_at IS NULL OR started_at <= $cutoff);
+                """;
+            cmd.Parameters.AddWithValue("$cutoff", startedBefore.ToString("O"));
+            return await cmd.ExecuteNonQueryAsync(ct);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<bool> UpdateStatusAsync(string id, E2eRunStatus status, DateTimeOffset? startedAt, DateTimeOffset? finishedAt, string? result, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE e2e_runs
+                SET status = $st,
+                    started_at = COALESCE($sa, started_at),
+                    finished_at = COALESCE($fa, finished_at),
+                    result = COALESCE($res, result)
+                WHERE id = $id
+                  AND status NOT IN ('Passed', 'Failed', 'Error', 'Canceled');
+                """;
+            cmd.Parameters.AddWithValue("$st", status.ToString());
+            cmd.Parameters.AddWithValue("$sa", (object?)startedAt?.ToString("O") ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$fa", (object?)finishedAt?.ToString("O") ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$res", (object?)result ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$id", id);
+            var rows = await cmd.ExecuteNonQueryAsync(ct);
+            return rows > 0;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<bool> CancelAsync(string id, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE e2e_runs
+                SET status = 'Canceled', finished_at = $fa
+                WHERE id = $id AND status IN ('Queued', 'Running');
+                """;
+            cmd.Parameters.AddWithValue("$fa", DateTimeOffset.UtcNow.ToString("O"));
+            cmd.Parameters.AddWithValue("$id", id);
+            var rows = await cmd.ExecuteNonQueryAsync(ct);
+            return rows > 0;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
+        try
+        {
+            SqliteConnectionDisposal.DisposeTolerantOfTeardownRace(_conn);
+        }
+        finally
+        {
+            _writeLock.Dispose();
+        }
+    }
+
+    private static void Bind(SqliteCommand cmd, E2eRun r)
+    {
+        cmd.Parameters.AddWithValue("$id", r.Id);
+        cmd.Parameters.AddWithValue("$tc", r.TestCaseId);
+        cmd.Parameters.AddWithValue("$st", r.Status.ToString());
+        cmd.Parameters.AddWithValue("$ca", r.CreatedAt.ToString("O"));
+        cmd.Parameters.AddWithValue("$sa", (object?)r.StartedAt?.ToString("O") ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$fa", (object?)r.FinishedAt?.ToString("O") ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$res", (object?)r.Result ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$sb", (object?)r.SandboxId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$bt", (object?)r.BatchId ?? DBNull.Value);
+    }
+
+    private static E2eRun Read(SqliteDataReader r)
+    {
+        E2eRunStatus status = E2eRunStatus.Queued;
+        var statusStr = r.GetString(r.GetOrdinal("status"));
+        // TryParse — forward/backward compatible for read paths. Unknown
+        // persisted strings surface as Queued in DTOs, but queue claim SQL
+        // still filters on the raw 'Queued' value and will not dispatch them.
+        Enum.TryParse(statusStr, ignoreCase: true, out status);
+
+        return new E2eRun
+        {
+            Id = r.GetString(r.GetOrdinal("id")),
+            TestCaseId = r.GetString(r.GetOrdinal("test_case_id")),
+            Status = status,
+            CreatedAt = DateTimeOffset.Parse(r.GetString(r.GetOrdinal("created_at")), System.Globalization.CultureInfo.InvariantCulture),
+            StartedAt = r.IsDBNull(r.GetOrdinal("started_at")) ? null : DateTimeOffset.Parse(r.GetString(r.GetOrdinal("started_at")), System.Globalization.CultureInfo.InvariantCulture),
+            FinishedAt = r.IsDBNull(r.GetOrdinal("finished_at")) ? null : DateTimeOffset.Parse(r.GetString(r.GetOrdinal("finished_at")), System.Globalization.CultureInfo.InvariantCulture),
+            Result = r.IsDBNull(r.GetOrdinal("result")) ? null : r.GetString(r.GetOrdinal("result")),
+            SandboxId = r.IsDBNull(r.GetOrdinal("sandbox_id")) ? null : r.GetString(r.GetOrdinal("sandbox_id")),
+            BatchId = r.IsDBNull(r.GetOrdinal("batch_id")) ? null : r.GetString(r.GetOrdinal("batch_id")),
+        };
+    }
+
+    private static (int Offset, int Limit) NormalizePage(int offset, int limit)
+    {
+        if (offset < 0) offset = 0;
+        if (limit < 1) limit = E2eExecutionOptions.DefaultListPageSize;
+        if (limit > E2eExecutionOptions.MaximumListPageSize) limit = E2eExecutionOptions.MaximumListPageSize;
+        return (offset, limit);
+    }
+}

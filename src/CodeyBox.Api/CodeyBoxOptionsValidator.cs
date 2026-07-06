@@ -6,6 +6,18 @@ namespace CodeyBox.Api;
 
 public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
 {
+    private readonly E2eRemotePoolConfigValidation _e2eRemotePoolConfigValidation;
+
+    public CodeyBoxOptionsValidator()
+        : this(E2eRemotePoolConfigValidation.Default)
+    {
+    }
+
+    internal CodeyBoxOptionsValidator(E2eRemotePoolConfigValidation e2eRemotePoolConfigValidation)
+    {
+        _e2eRemotePoolConfigValidation = e2eRemotePoolConfigValidation;
+    }
+
     public ValidateOptionsResult Validate(string? name, CodeyBoxOptions options)
     {
         var failures = new List<string>();
@@ -27,6 +39,65 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         {
             failures.Add(
                 $"CodeyBox:MaxBulkItems must be between 1 and {CodeyBoxOptions.MaximumMaxBulkItems}");
+        }
+
+        var e2e = options.E2eExecution;
+        if (e2e is not null)
+        {
+            if (e2e.MaxConcurrent is < E2eExecutionOptions.MinimumMaxConcurrent
+                or > E2eExecutionOptions.MaximumMaxConcurrent)
+            {
+                failures.Add(
+                    $"CodeyBox:E2eExecution:MaxConcurrent must be between {E2eExecutionOptions.MinimumMaxConcurrent} and {E2eExecutionOptions.MaximumMaxConcurrent}");
+            }
+            if (e2e.PollInterval < TimeSpan.Zero)
+            {
+                failures.Add("CodeyBox:E2eExecution:PollInterval must be non-negative");
+            }
+            if (e2e.PerRunTimeout <= TimeSpan.Zero)
+            {
+                failures.Add("CodeyBox:E2eExecution:PerRunTimeout must be positive");
+            }
+            if (!string.Equals(e2e.PoolKind, "local", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(e2e.PoolKind, "remote-ssh", StringComparison.OrdinalIgnoreCase))
+            {
+                failures.Add("CodeyBox:E2eExecution:PoolKind must be 'local' or 'remote-ssh'");
+            }
+            var remoteE2e = string.Equals(e2e.PoolKind, "remote-ssh", StringComparison.OrdinalIgnoreCase);
+            if (e2e.Enabled && remoteE2e)
+            {
+                failures.AddRange(_e2eRemotePoolConfigValidation.ValidateEnabledRemoteE2eConfig(e2e, options));
+            }
+            else if (remoteE2e)
+            {
+                failures.AddRange(_e2eRemotePoolConfigValidation.ValidateConfiguredRemoteLifecycleIsolation(options));
+            }
+            foreach (var (host, index) in GetE2eRemoteHostConfigs(options).Select((host, index) => (host, index)))
+            {
+                if (host.MaxConcurrent is < E2eExecutionOptions.MinimumMaxConcurrent or > E2eExecutionOptions.MaximumMaxConcurrent)
+                {
+                    failures.Add(
+                        $"CodeyBox:E2eMultipassRemoteSandboxes:{index}:MaxConcurrent must be between {E2eExecutionOptions.MinimumMaxConcurrent} and {E2eExecutionOptions.MaximumMaxConcurrent}");
+                }
+            }
+            if (e2e.AllowedReadinessOrigins is null || e2e.AllowedReadinessOrigins.Count == 0)
+            {
+                failures.Add("CodeyBox:E2eExecution:AllowedReadinessOrigins must contain at least one origin");
+            }
+            foreach (var origin in e2e.AllowedReadinessOrigins ?? [])
+            {
+                if (string.IsNullOrWhiteSpace(origin)
+                    || !Uri.TryCreate(origin, UriKind.Absolute, out var uri)
+                    || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
+                    || !string.IsNullOrEmpty(uri.AbsolutePath.Trim('/'))
+                    || !string.IsNullOrEmpty(uri.Query)
+                    || !string.IsNullOrEmpty(uri.Fragment)
+                    || !string.IsNullOrEmpty(uri.UserInfo))
+                {
+                    failures.Add("CodeyBox:E2eExecution:AllowedReadinessOrigins entries must be http(s) origins without path, query, fragment, or userinfo");
+                    break;
+                }
+            }
         }
 
         foreach (var (agent, tolerance) in options.AgentNetworkTolerance)
@@ -172,5 +243,14 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         return failures.Count == 0
             ? ValidateOptionsResult.Success
             : ValidateOptionsResult.Fail(failures);
+    }
+
+    private static IReadOnlyList<E2eMultipassRemoteHostConfig> GetE2eRemoteHostConfigs(CodeyBoxOptions options)
+    {
+        if (options.E2eMultipassRemoteSandboxes is { Count: > 0 } hosts)
+            return hosts;
+        return options.E2eMultipassRemoteSandbox is null
+            ? []
+            : [options.E2eMultipassRemoteSandbox];
     }
 }

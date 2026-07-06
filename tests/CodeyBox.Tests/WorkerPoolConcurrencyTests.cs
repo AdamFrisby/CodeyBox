@@ -9,6 +9,10 @@ namespace CodeyBox.Tests;
 /// Verifies that OrchestratorService never exceeds MaxConcurrentWorkers
 /// simultaneous in-flight items regardless of queue depth.
 /// </summary>
+// Serialised with other BackgroundService timing-sensitive tests: the test gives
+// the orchestrator 15s to dispatch and complete N items, which can miss under
+// parallel CPU contention from other suites running alongside.
+[Collection("Background service timing")]
 public sealed class WorkerPoolConcurrencyTests : IDisposable
 {
     private readonly string _dbPath =

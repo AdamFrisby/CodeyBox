@@ -32,7 +32,7 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class SandboxLeakReaper : BackgroundService
 {
-    private readonly ISandboxProvider _provider;
+    private readonly IManagedSandboxLifecycle _provider;
     private readonly IWebhookDispatcher _webhooks;
     private readonly Func<SandboxLeakOptions> _optsAccessor;
     private readonly ILogger<SandboxLeakReaper> _log;
@@ -63,21 +63,21 @@ public sealed class SandboxLeakReaper : BackgroundService
     private SandboxLeakOptions _opts => _optsAccessor();
 
     public SandboxLeakReaper(
-        ISandboxProvider provider,
+        IManagedSandboxLifecycle provider,
         IWebhookDispatcher webhooks,
         SandboxLeakOptions opts,
         ILogger<SandboxLeakReaper> log)
         : this(provider, webhooks, () => opts, log, store: null) { }
 
     public SandboxLeakReaper(
-        ISandboxProvider provider,
+        IManagedSandboxLifecycle provider,
         IWebhookDispatcher webhooks,
         Func<SandboxLeakOptions> optionsAccessor,
         ILogger<SandboxLeakReaper> log)
         : this(provider, webhooks, optionsAccessor, log, store: null) { }
 
     public SandboxLeakReaper(
-        ISandboxProvider provider,
+        IManagedSandboxLifecycle provider,
         IWebhookDispatcher webhooks,
         Func<SandboxLeakOptions> optionsAccessor,
         ILogger<SandboxLeakReaper> log,
@@ -108,6 +108,13 @@ public sealed class SandboxLeakReaper : BackgroundService
     public void RemoveFromLatestLeaks(string name)
     {
         _latestLeaks = _latestLeaks.Where(l => l.Name != name).ToList();
+    }
+
+    public void RemoveFromLatestLeaks(LeakedSandboxInfo leak)
+    {
+        _latestLeaks = _latestLeaks
+            .Where(candidate => !SameLeak(candidate, leak))
+            .ToList();
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -150,6 +157,11 @@ public sealed class SandboxLeakReaper : BackgroundService
             var allManaged = await _provider.ListAllManagedAsync(ct);
             var now = _clock();
             var observedSuspendOrphans = new HashSet<string>();
+            var duplicateNamesWithActiveSnapshot = allManaged
+                .GroupBy(static info => info.Name, StringComparer.Ordinal)
+                .Where(static group => group.Count() > 1 && group.Any(static info => info.IsTrackedActive))
+                .Select(static group => group.Key)
+                .ToHashSet(StringComparer.Ordinal);
 
             // R8-core: any VM named in a work item's SuspendedVmName is being
             // held across an orchestrator restart and MUST NOT be reaped — the
@@ -163,6 +175,9 @@ public sealed class SandboxLeakReaper : BackgroundService
             foreach (var info in allManaged)
             {
                 if (info.IsTrackedActive)
+                    continue;
+
+                if (duplicateNamesWithActiveSnapshot.Contains(info.Name))
                     continue;
 
                 if (suspendedNames.Contains(info.Name))
@@ -220,7 +235,7 @@ public sealed class SandboxLeakReaper : BackgroundService
                         : (info.HasPreemptMarker
                             ? SandboxLeakReasons.ExpiredPreemptRetention
                             : SandboxLeakReasons.UntrackedSandbox));
-                leaks.Add(new LeakedSandboxInfo(info.Name, createdAt, age, info.DiskBytes, reason));
+                leaks.Add(new LeakedSandboxInfo(info.Name, createdAt, age, info.DiskBytes, reason, info.LifecycleProviderId));
                 AuditLog.SandboxLeakDetected(info.Name, age.TotalMinutes, diskMb, reason);
                 _ = _webhooks.PublishAsync(new WebhookEvent
                 {
@@ -264,19 +279,19 @@ public sealed class SandboxLeakReaper : BackgroundService
 
             // Dispose leaks with bounded host-side pressure; each sandbox still
             // gets its independent timeout and one failure never blocks the batch.
-            var failedNames = new ConcurrentBag<string>();
+            var failedLeaks = new ConcurrentBag<LeakedSandboxInfo>();
             await Parallel.ForEachAsync(leaks, new ParallelOptions
             {
                 CancellationToken = ct,
                 MaxDegreeOfParallelism = maxConcurrentDisposes,
             }, async (leak, token) =>
             {
-                var failedName = await DisposeSingleAsync(leak, token);
-                if (failedName is not null)
-                    failedNames.Add(failedName);
+                var failedLeak = await DisposeSingleAsync(leak, token);
+                if (failedLeak is not null)
+                    failedLeaks.Add(failedLeak);
             });
-            var failedNameSet = failedNames.ToHashSet(StringComparer.Ordinal);
-            _latestLeaks = leaks.Where(leak => failedNameSet.Contains(leak.Name)).ToList();
+            var failed = failedLeaks.ToArray();
+            _latestLeaks = leaks.Where(leak => failed.Any(candidate => SameLeak(candidate, leak))).ToList();
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
@@ -313,7 +328,7 @@ public sealed class SandboxLeakReaper : BackgroundService
         return set;
     }
 
-    private async Task<string?> DisposeSingleAsync(LeakedSandboxInfo leak, CancellationToken stoppingToken)
+    private async Task<LeakedSandboxInfo?> DisposeSingleAsync(LeakedSandboxInfo leak, CancellationToken stoppingToken)
     {
         using var timeoutCts = new CancellationTokenSource(_opts.DisposeTimeout);
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, timeoutCts.Token);
@@ -321,7 +336,7 @@ public sealed class SandboxLeakReaper : BackgroundService
         var diskMb = leak.DiskBytes.HasValue ? leak.DiskBytes.Value / (1024 * 1024) : (long?)null;
         try
         {
-            await _provider.DisposeLeakedAsync(leak.Name, linkedCts.Token);
+            await _provider.DisposeLeakedAsync(ToManagedSandboxInfo(leak), linkedCts.Token);
             var disposedAt = DateTimeOffset.UtcNow;
             AuditLog.SandboxLeakDisposed(leak.Name, leak.Age.TotalMinutes, diskMb, disposedAt, leak.Reason);
             _ = _webhooks.PublishAsync(new WebhookEvent
@@ -367,7 +382,7 @@ public sealed class SandboxLeakReaper : BackgroundService
                 },
             }, stoppingToken);
             _log.LogWarning("SandboxLeakReaper: timed out disposing leaked sandbox {Name}", leak.Name);
-            return leak.Name;
+            return leak;
         }
         catch (Exception ex)
         {
@@ -385,9 +400,21 @@ public sealed class SandboxLeakReaper : BackgroundService
                 },
             }, stoppingToken);
             _log.LogWarning(ex, "SandboxLeakReaper: failed to dispose leaked sandbox {Name}", leak.Name);
-            return leak.Name;
+            return leak;
         }
     }
+
+    private static bool SameLeak(LeakedSandboxInfo left, LeakedSandboxInfo right) =>
+        string.Equals(left.Name, right.Name, StringComparison.Ordinal)
+        && string.Equals(left.LifecycleProviderId, right.LifecycleProviderId, StringComparison.Ordinal);
+
+    private static ManagedSandboxInfo ToManagedSandboxInfo(LeakedSandboxInfo leak)
+        => new(
+            leak.Name,
+            leak.CreatedAt,
+            leak.DiskBytes,
+            IsTrackedActive: false,
+            LifecycleProviderId: leak.LifecycleProviderId);
 }
 
 /// <summary>

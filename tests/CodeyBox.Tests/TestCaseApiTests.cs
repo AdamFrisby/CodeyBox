@@ -226,10 +226,7 @@ public sealed class TestCaseApiTests : IDisposable
             SourceWorkItemId: wid,
             AutomationKind: AutomationKind.Unit,
             Label: "new-label",
-            IsArchived: true,
-            LastRunPassed: false,
-            LastRunAt: DateTimeOffset.UtcNow,
-            LastRunResult: "Some error"
+            IsArchived: true
         );
 
         var resp = await _client.PutAsJsonAsync("/testcases/tc-up-1", req);
@@ -242,8 +239,61 @@ public sealed class TestCaseApiTests : IDisposable
         Assert.Equal(AutomationKind.Unit, loaded.AutomationKind);
         Assert.Equal("new-label", loaded.Label);
         Assert.True(loaded.IsArchived);
+        Assert.Null(loaded.LastRunPassed);
+        Assert.Null(loaded.LastRunAt);
+        Assert.Null(loaded.LastRunResult);
+    }
+
+    [Fact]
+    public async Task CreateAndUpdateIgnoreClientSuppliedLastRunFields()
+    {
+        var wid = await SeedWorkItemAsync();
+        var create = new
+        {
+            id = "tc-last-run-forge",
+            name = "Forge attempt",
+            description = "client supplied last-run fields",
+            sourceWorkItemId = wid,
+            lastRunPassed = true,
+            lastRunAt = DateTimeOffset.UtcNow,
+            lastRunResult = "forged-pass",
+        };
+
+        var created = await _client.PostAsJsonAsync("/testcases", create);
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+
+        var loaded = await _factory.TestCaseStore.GetAsync("tc-last-run-forge");
+        Assert.NotNull(loaded);
+        Assert.Null(loaded.LastRunPassed);
+        Assert.Null(loaded.LastRunAt);
+        Assert.Null(loaded.LastRunResult);
+
+        var serverStampedAt = DateTimeOffset.UtcNow;
+        Assert.True(await _factory.TestCaseStore.UpdateLastRunAsync(
+            "tc-last-run-forge",
+            passed: false,
+            ranAt: serverStampedAt,
+            result: "real failure"));
+
+        var update = new
+        {
+            name = "Renamed",
+            description = "still cannot forge",
+            sourceWorkItemId = wid,
+            lastRunPassed = true,
+            lastRunAt = DateTimeOffset.UtcNow.AddDays(1),
+            lastRunResult = "forged-pass",
+        };
+
+        var updated = await _client.PutAsJsonAsync("/testcases/tc-last-run-forge", update);
+        Assert.Equal(HttpStatusCode.OK, updated.StatusCode);
+
+        loaded = await _factory.TestCaseStore.GetAsync("tc-last-run-forge");
+        Assert.NotNull(loaded);
+        Assert.Equal("Renamed", loaded.Name);
         Assert.False(loaded.LastRunPassed);
-        Assert.Equal("Some error", loaded.LastRunResult);
+        Assert.Equal(serverStampedAt, loaded.LastRunAt);
+        Assert.Equal("real failure", loaded.LastRunResult);
     }
 
     [Fact]
@@ -520,12 +570,14 @@ internal sealed class TestCaseApiFactory : WebApplicationFactory<Program>
         Path.GetTempPath(), $"codeybox-testcaseshttp-{Guid.NewGuid():N}.db");
 
     public SqliteTestCaseStore TestCaseStore { get; }
+    public SqliteE2eRunStore E2eRunStore { get; }
     public SqliteWorkItemStore WorkItemStore { get; }
 
     public TestCaseApiFactory()
     {
         WorkItemStore = new SqliteWorkItemStore(_dbPath);
         TestCaseStore = new SqliteTestCaseStore(_dbPath);
+        E2eRunStore = new SqliteE2eRunStore(_dbPath);
     }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -553,6 +605,9 @@ internal sealed class TestCaseApiFactory : WebApplicationFactory<Program>
             services.RemoveAll<ITestCaseStore>();
             services.AddSingleton<ITestCaseStore>(TestCaseStore);
 
+            services.RemoveAll<IE2eRunStore>();
+            services.AddSingleton<IE2eRunStore>(E2eRunStore);
+
             services.RemoveAll<IProjectRepository>();
             services.AddSingleton<IProjectRepository>(new InMemoryProjectRepository(
                 new Project
@@ -571,6 +626,7 @@ internal sealed class TestCaseApiFactory : WebApplicationFactory<Program>
         if (disposing)
         {
             TestCaseStore.Dispose();
+            E2eRunStore.Dispose();
             WorkItemStore.Dispose();
             try { File.Delete(_dbPath); } catch { /* best-effort */ }
         }

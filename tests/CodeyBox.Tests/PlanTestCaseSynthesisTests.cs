@@ -300,6 +300,20 @@ internal sealed class InMemoryTestCaseStore : ITestCaseStore
         return Task.FromResult(true);
     }
 
+    public Task<bool> UpdateLastRunAsync(string id, bool passed, DateTimeOffset ranAt, string result, CancellationToken ct = default)
+    {
+        if (!_byId.TryGetValue(id, out var existing))
+            return Task.FromResult(false);
+        _byId[id] = existing with
+        {
+            UpdatedAt = ranAt,
+            LastRunPassed = passed,
+            LastRunAt = ranAt,
+            LastRunResult = result,
+        };
+        return Task.FromResult(true);
+    }
+
     public Task<TestCase?> GetAsync(string id, CancellationToken ct = default)
         => Task.FromResult(_byId.TryGetValue(id, out var tc) ? tc : null);
 

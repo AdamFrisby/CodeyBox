@@ -105,6 +105,7 @@ internal sealed class SandboxProviderApiFactory : WebApplicationFactory<Program>
     private readonly string _environment;
     private readonly Dictionary<string, string?> _configuration;
     private readonly ISandboxProvider? _sandboxProvider;
+    private readonly IManagedSandboxLifecycle? _managedLifecycle;
     private readonly SandboxLeakReaper? _reaper;
     private readonly IWebhookDispatcher? _webhooks;
     private readonly string _dbPath = Path.Combine(
@@ -114,12 +115,14 @@ internal sealed class SandboxProviderApiFactory : WebApplicationFactory<Program>
         string environment = "Development",
         Dictionary<string, string?>? configuration = null,
         ISandboxProvider? sandboxProvider = null,
+        IManagedSandboxLifecycle? managedLifecycle = null,
         SandboxLeakReaper? reaper = null,
         IWebhookDispatcher? webhooks = null)
     {
         _environment = environment;
         _configuration = configuration ?? [];
         _sandboxProvider = sandboxProvider;
+        _managedLifecycle = managedLifecycle;
         _reaper = reaper;
         _webhooks = webhooks;
     }
@@ -163,6 +166,19 @@ internal sealed class SandboxProviderApiFactory : WebApplicationFactory<Program>
             {
                 services.RemoveAll<ISandboxProvider>();
                 services.AddSingleton(_sandboxProvider);
+            }
+
+            if (_managedLifecycle is not null)
+            {
+                services.RemoveAll<IManagedSandboxLifecycle>();
+                services.RemoveAll<CompositeManagedSandboxProvider>();
+                services.AddSingleton(_managedLifecycle);
+            }
+            else if (_sandboxProvider is IManagedSandboxLifecycle lifecycle)
+            {
+                services.RemoveAll<IManagedSandboxLifecycle>();
+                services.RemoveAll<CompositeManagedSandboxProvider>();
+                services.AddSingleton(lifecycle);
             }
 
             if (_reaper is not null)

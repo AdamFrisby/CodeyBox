@@ -1,0 +1,50 @@
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace CodeyBox.Core;
+
+/// <summary>
+/// Durable store of <see cref="E2eRun"/> records. Implementations persist runs
+/// alongside the other orchestrator state (a SQLite table sharing the work-item
+/// database in production).
+/// </summary>
+public interface IE2eRunStore
+{
+    Task CreateAsync(E2eRun run, CancellationToken ct = default);
+
+    Task BulkCreateAsync(IReadOnlyList<E2eRun> runs, CancellationToken ct = default);
+
+    Task<E2eRun?> GetAsync(string id, CancellationToken ct = default);
+
+    /// <summary>Lists runs newest-first using a bounded page.</summary>
+    IAsyncEnumerable<E2eRun> ListAsync(int offset = 0, int limit = E2eExecutionOptions.DefaultListPageSize, CancellationToken ct = default);
+
+    IAsyncEnumerable<E2eRun> ListByTestCaseAsync(string testCaseId, int offset = 0, int limit = E2eExecutionOptions.DefaultListPageSize, CancellationToken ct = default);
+
+    IAsyncEnumerable<E2eRun> ListByBatchAsync(string batchId, int offset = 0, int limit = E2eExecutionOptions.DefaultListPageSize, CancellationToken ct = default);
+
+    Task<E2eRunBatchCounts?> GetBatchCountsAsync(string batchId, CancellationToken ct = default);
+
+    /// <summary>Returns true when at least one queued run is available to claim.</summary>
+    Task<bool> HasQueuedAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// Atomically claims the oldest queued run; returns null when the queue is
+    /// empty. <paramref name="sandboxId"/> may be null when the dispatcher needs
+    /// to validate the artifact before leasing a VM.
+    /// </summary>
+    Task<E2eRun?> ClaimNextQueuedAsync(string? sandboxId, CancellationToken ct = default);
+
+    /// <summary>Attaches the leased sandbox id to a claimed running run.</summary>
+    Task<bool> AssignSandboxAsync(string id, string sandboxId, CancellationToken ct = default);
+
+    /// <summary>Moves running rows older than the cutoff back to queued after a process restart.</summary>
+    Task<int> RequeueRunningAsync(DateTimeOffset startedBefore, CancellationToken ct = default);
+
+    /// <summary>Updates the status and terminal fields of a run.</summary>
+    Task<bool> UpdateStatusAsync(string id, E2eRunStatus status, DateTimeOffset? startedAt, DateTimeOffset? finishedAt, string? result, CancellationToken ct = default);
+
+    /// <summary>Marks a queued or running run as Canceled; returns false when the run is already terminal.</summary>
+    Task<bool> CancelAsync(string id, CancellationToken ct = default);
+}

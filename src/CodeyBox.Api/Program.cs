@@ -271,6 +271,15 @@ builder.Services.AddOptions<CodeyBoxOptions>()
     .PostConfigure(opts => AgentClassesOverrideResolver.ApplyTo(opts, builder.Configuration));
 builder.Services.Configure<BuildScriptAuditorOptions>(builder.Configuration.GetSection("CodeyBox:BuildScriptAudit"));
 builder.Services.Configure<NotificationsOptions>(builder.Configuration.GetSection("CodeyBox:Notifications"));
+// E2eExecutionOptions binds as a standalone section so the pool / dispatcher can
+// take IOptionsMonitor<E2eExecutionOptions> directly without dragging the whole
+// CodeyBoxOptions graph. The same section is also a property on CodeyBoxOptions
+// (for the unbound-key validator's walk and operator visibility); the standalone
+// binding is what gets hot-reloaded into the pool's MaxConcurrent.
+builder.Services.AddOptions<E2eExecutionOptions>()
+    .Bind(builder.Configuration.GetSection("CodeyBox:E2eExecution"))
+    .Validate(static opts => IsValidE2eExecutionOptions(opts), "CodeyBox:E2eExecution is invalid")
+    .Validate(opts => IsValidE2eExecutionOptionsForConfig(opts, builder.Configuration), "CodeyBox:E2eExecution remote pool prerequisites are invalid");
 // Register ProjectsOptions through AddOptions so IOptionsMonitor<ProjectsOptions>
 // is wired into the framework's reload pipeline. PostConfigure layers our custom
 // map-shaped binding (audit-type / language overrides / profile inheritance) on
@@ -305,10 +314,15 @@ builder.Services.AddSingleton<IOptionsMonitorCache<CodeyBoxOptions>>(
     sp => new RetainingOptionsMonitorCache<CodeyBoxOptions>(
         sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value,
         opts => AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(opts.TransientNetworkFailurePatterns)));
+builder.Services.TryAddSingleton<IProcessRunner, DefaultProcessRunner>();
+builder.Services.TryAddSingleton<IOpenSshConfigResolver, OpenSshConfigResolver>();
+builder.Services.TryAddSingleton<E2eRemoteHostValidation>();
+builder.Services.TryAddSingleton<E2eRemotePoolConfigValidation>();
 builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>>(
     sp => new ImmutableCodeyBoxOptionsValidator(
         sp.GetRequiredService<CodeyBoxOptionsStartupSnapshot>().Value));
-builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>, CodeyBoxOptionsValidator>();
+builder.Services.AddSingleton<IValidateOptions<CodeyBoxOptions>>(
+    sp => new CodeyBoxOptionsValidator(sp.GetRequiredService<E2eRemotePoolConfigValidation>()));
 
 // Unbound-key startup check. Walks the CodeyBox:* configuration sub-tree
 // and surfaces any key that does not bind to a property on the typed
@@ -424,7 +438,27 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         }
     }
 
-    var inner = kind switch
+    var inner = BuildSandboxProviderInner(sp, opts, environment, startupLog, loggerFactory, kind);
+    var orchestratorOptions = sp.GetRequiredService<OrchestratorOptions>();
+    startupLog.LogInformation(
+        "Sandbox admission control: provider={Provider}, MaxConcurrentSandboxes={MaxConcurrentSandboxes}",
+        inner.Name,
+        orchestratorOptions.MaxConcurrentSandboxes);
+    return SandboxAdmissionControlledProvider.Wrap(
+        inner,
+        orchestratorOptions.MaxConcurrentSandboxes,
+        loggerFactory.CreateLogger<SandboxAdmissionControlledProvider>());
+}
+
+static ISandboxProvider BuildSandboxProviderInner(
+    IServiceProvider sp,
+    CodeyBoxOptions opts,
+    IHostEnvironment environment,
+    ILogger startupLog,
+    ILoggerFactory loggerFactory,
+    string kind)
+{
+    return kind switch
     {
         "process" => BuildProcess(opts, environment, startupLog, loggerFactory),
         "bubblewrap" => new BubblewrapSandboxProvider(
@@ -443,15 +477,188 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         _ => throw new InvalidOperationException(
             $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: multipass, multipass-remote, sprites, bubblewrap, process"),
     };
-    var orchestratorOptions = sp.GetRequiredService<OrchestratorOptions>();
-    startupLog.LogInformation(
-        "Sandbox admission control: provider={Provider}, MaxConcurrentSandboxes={MaxConcurrentSandboxes}",
-        inner.Name,
-        orchestratorOptions.MaxConcurrentSandboxes);
-    return SandboxAdmissionControlledProvider.Wrap(
-        inner,
-        orchestratorOptions.MaxConcurrentSandboxes,
-        loggerFactory.CreateLogger<SandboxAdmissionControlledProvider>());
+}
+
+static IE2eExecutionPool BuildE2eExecutionPool(IServiceProvider sp)
+{
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var e2eOptions = sp.GetRequiredService<IOptionsMonitor<E2eExecutionOptions>>();
+    var poolKind = (e2eOptions.CurrentValue.PoolKind ?? "remote-ssh").Trim().ToLowerInvariant();
+    var environment = sp.GetRequiredService<IHostEnvironment>();
+    var startupOptions = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
+    if (poolKind == "local" && !environment.IsDevelopment())
+    {
+        throw new InvalidOperationException(
+            "CodeyBox:E2eExecution:PoolKind=local is development-only. Use remote-ssh for production E2E replay execution.");
+    }
+
+    if (poolKind == "remote-ssh" && e2eOptions.CurrentValue.Enabled)
+    {
+        ValidateEnabledRemoteE2eConfig(
+            e2eOptions.CurrentValue,
+            startupOptions,
+            sp.GetRequiredService<E2eRemotePoolConfigValidation>());
+    }
+
+    if (poolKind == "remote-ssh")
+    {
+        return BuildRemoteE2eExecutionPool(sp, loggerFactory, e2eOptions);
+    }
+
+    ISandboxProvider provider = poolKind switch
+    {
+        "local" => BuildE2eLocalSandboxProvider(sp, loggerFactory),
+        _ => throw new InvalidOperationException(
+            $"Unknown CodeyBox:E2eExecution:PoolKind '{e2eOptions.CurrentValue.PoolKind}'. Valid: local, remote-ssh"),
+    };
+
+    return new LocalE2eExecutionPool(
+        provider,
+        e2eOptions,
+        loggerFactory.CreateLogger<LocalE2eExecutionPool>(),
+        fallbackImageReference: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SandboxImageReference,
+        name: poolKind);
+}
+
+static IE2eExecutionPool BuildRemoteE2eExecutionPool(
+    IServiceProvider sp,
+    ILoggerFactory loggerFactory,
+    IOptionsMonitor<E2eExecutionOptions> e2eOptions)
+{
+    var currentOptions = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
+    var hostConfigs = GetE2eRemoteHostConfigs(currentOptions);
+    if (hostConfigs.Count == 0)
+    {
+        var provider = BuildE2eMultipassRemote(sp, loggerFactory, hostIndex: 0);
+        return new LocalE2eExecutionPool(
+            provider,
+            e2eOptions,
+            loggerFactory.CreateLogger<LocalE2eExecutionPool>(),
+            fallbackImageReference: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SandboxImageReference,
+            name: "remote-ssh");
+    }
+
+    var hosts = hostConfigs
+        .Select((cfg, index) => new E2eExecutionHost(
+            string.IsNullOrWhiteSpace(cfg.RemoteSandbox.SshTarget) ? $"remote-ssh:{index}" : cfg.RemoteSandbox.SshTarget!,
+            BuildE2eMultipassRemote(sp, loggerFactory, index),
+            cfg.MaxConcurrent ?? 1))
+        .ToArray();
+
+    return new MultiHostE2eExecutionPool(
+        hosts,
+        e2eOptions,
+        loggerFactory.CreateLogger<MultiHostE2eExecutionPool>(),
+        fallbackImageReference: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SandboxImageReference);
+}
+
+static CompositeManagedSandboxProvider BuildManagedSandboxLifecycleProvider(IServiceProvider sp)
+{
+    var providers = new List<IManagedSandboxLifecycle> { sp.GetRequiredService<ISandboxProvider>() };
+    if (sp.GetRequiredService<IE2eExecutionPool>() is IManagedSandboxProviderSource source)
+    {
+        providers.AddRange(source.ManagedSandboxProviders);
+    }
+    return new CompositeManagedSandboxProvider(providers);
+}
+
+static bool IsValidE2eExecutionOptions(E2eExecutionOptions opts)
+{
+    if (opts.MaxConcurrent is < E2eExecutionOptions.MinimumMaxConcurrent or > E2eExecutionOptions.MaximumMaxConcurrent)
+        return false;
+    if (opts.PollInterval < TimeSpan.Zero || opts.PerRunTimeout <= TimeSpan.Zero)
+        return false;
+    if (!string.Equals(opts.PoolKind, "local", StringComparison.OrdinalIgnoreCase)
+        && !string.Equals(opts.PoolKind, "remote-ssh", StringComparison.OrdinalIgnoreCase))
+        return false;
+    if (opts.AllowedReadinessOrigins.Count == 0)
+        return false;
+    foreach (var origin in opts.AllowedReadinessOrigins)
+    {
+        if (string.IsNullOrWhiteSpace(origin)
+            || !Uri.TryCreate(origin, UriKind.Absolute, out var uri)
+            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
+            || !string.IsNullOrEmpty(uri.AbsolutePath.Trim('/'))
+            || !string.IsNullOrEmpty(uri.Query)
+            || !string.IsNullOrEmpty(uri.Fragment)
+            || !string.IsNullOrEmpty(uri.UserInfo))
+            return false;
+    }
+
+    return true;
+}
+
+static bool IsValidE2eExecutionOptionsForConfig(E2eExecutionOptions opts, IConfiguration config)
+{
+    if (!opts.Enabled || !string.Equals(opts.PoolKind, "remote-ssh", StringComparison.OrdinalIgnoreCase))
+        return true;
+
+    var cb = config.GetSection("CodeyBox").Get<CodeyBoxOptions>() ?? new CodeyBoxOptions();
+    return TryValidateEnabledRemoteE2eConfig(opts, cb, out _);
+}
+
+static void ValidateEnabledRemoteE2eConfig(
+    E2eExecutionOptions e2e,
+    CodeyBoxOptions options,
+    E2eRemotePoolConfigValidation? validator = null)
+{
+    if (!TryValidateEnabledRemoteE2eConfig(e2e, options, out var message, validator))
+        throw new InvalidOperationException(message);
+}
+
+static bool TryValidateEnabledRemoteE2eConfig(
+    E2eExecutionOptions e2e,
+    CodeyBoxOptions options,
+    out string message,
+    E2eRemotePoolConfigValidation? validator = null)
+{
+    var failures = (validator ?? E2eRemotePoolConfigValidation.Default).ValidateEnabledRemoteE2eConfig(e2e, options);
+    if (failures.Count > 0)
+    {
+        message = string.Join("; ", failures);
+        return false;
+    }
+    message = string.Empty;
+    return true;
+}
+
+static IReadOnlyList<E2eMultipassRemoteHostConfig> GetE2eRemoteHostConfigs(CodeyBoxOptions options)
+{
+    if (options.E2eMultipassRemoteSandboxes is { Count: > 0 } hosts)
+        return hosts;
+    return options.E2eMultipassRemoteSandbox is null
+        ? []
+        : [options.E2eMultipassRemoteSandbox];
+}
+
+static ISandboxProvider BuildE2eLocalSandboxProvider(IServiceProvider sp, ILoggerFactory loggerFactory)
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var environment = sp.GetRequiredService<IHostEnvironment>();
+    var startupLog = loggerFactory.CreateLogger("CodeyBox.E2eSandbox");
+    if (!environment.IsDevelopment())
+    {
+        throw new InvalidOperationException(
+            "CodeyBox:E2eExecution:PoolKind=local is only available in Development.");
+    }
+
+    var kind = (opts.SandboxProvider ?? "").Trim().ToLowerInvariant();
+    if (string.IsNullOrEmpty(kind))
+    {
+        if (environment.IsDevelopment())
+        {
+            startupLog.LogWarning(
+                "CodeyBox:E2eExecution:PoolKind=local with CodeyBox:SandboxProvider unset; defaulting E2E provider to 'process' because environment is Development.");
+            kind = "process";
+        }
+        else
+        {
+            throw new InvalidOperationException(
+                "CodeyBox:SandboxProvider must be set when CodeyBox:E2eExecution:PoolKind=local in non-Development environments.");
+        }
+    }
+
+    return BuildSandboxProviderInner(sp, opts, environment, startupLog, loggerFactory, kind);
 }
 
 static ISandboxProvider BuildProcess(CodeyBoxOptions opts, IHostEnvironment env, ILogger startupLog, ILoggerFactory loggerFactory)
@@ -560,6 +767,25 @@ static MultipassSandboxProvider BuildMultipass(
 }
 
 static MultipassRemoteSandboxProvider BuildMultipassRemote(IServiceProvider sp, ILoggerFactory loggerFactory)
+    => BuildMultipassRemoteFromConfig(
+        sp,
+        loggerFactory,
+        live => live.MultipassRemoteSandbox);
+
+static MultipassRemoteSandboxProvider BuildE2eMultipassRemote(IServiceProvider sp, ILoggerFactory loggerFactory, int hostIndex)
+    => BuildMultipassRemoteFromConfig(
+        sp,
+        loggerFactory,
+        live =>
+        {
+            var hosts = GetE2eRemoteHostConfigs(live);
+            return hostIndex >= 0 && hostIndex < hosts.Count ? hosts[hostIndex].RemoteSandbox : null;
+        });
+
+static MultipassRemoteSandboxProvider BuildMultipassRemoteFromConfig(
+    IServiceProvider sp,
+    ILoggerFactory loggerFactory,
+    Func<CodeyBoxOptions, MultipassRemoteSandboxConfig?> configSelector)
 {
     // All options resolved through IOptionsMonitor so SSH endpoint, key path,
     // staging dir, and timeouts hot-reload on the next CreateAsync without an
@@ -568,18 +794,20 @@ static MultipassRemoteSandboxProvider BuildMultipassRemote(IServiceProvider sp, 
     var transportLogger = loggerFactory.CreateLogger<OpenSshCliTransport>();
     var runner = sp.GetService<IProcessRunner>() ?? new DefaultProcessRunner();
     var transport = new OpenSshCliTransport(
-        () => ReadRemoteOpts(sp),
+        () => ReadRemoteOpts(sp, configSelector),
         runner,
         transportLogger);
     return new MultipassRemoteSandboxProvider(
-        () => ReadRemoteOpts(sp),
+        () => ReadRemoteOpts(sp, configSelector),
         transport,
         loggerFactory.CreateLogger<MultipassRemoteSandboxProvider>());
 
-    static MultipassRemoteSandboxOptions ReadRemoteOpts(IServiceProvider sp)
+    static MultipassRemoteSandboxOptions ReadRemoteOpts(
+        IServiceProvider sp,
+        Func<CodeyBoxOptions, MultipassRemoteSandboxConfig?> configSelector)
     {
         var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
-        var cfg = live.MultipassRemoteSandbox ?? new MultipassRemoteSandboxConfig();
+        var cfg = configSelector(live) ?? new MultipassRemoteSandboxConfig();
         var fromDefaults = new MultipassRemoteSandboxOptions();
         return new MultipassRemoteSandboxOptions
         {
@@ -2132,6 +2360,20 @@ builder.Services.AddSingleton<ITestCaseStore>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteTestCaseStore(opts.StateDatabasePath);
 });
+builder.Services.AddSingleton<IE2eRunStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteE2eRunStore(opts.StateDatabasePath);
+});
+builder.Services.AddSingleton<IE2eReplayRuntime, E2eReplayRuntime>();
+builder.Services.AddSingleton<E2eReplayArtifactAdmissionValidator>();
+builder.Services.AddSingleton<E2eRunCancellationRegistry>();
+// E2E pool selection is deliberately independent of the coding pipeline's
+// admitted ISandboxProvider. PoolKind=remote-ssh builds the existing
+// multipass-over-SSH provider; PoolKind=local builds an unwrapped provider
+// for development only.
+builder.Services.AddSingleton<IE2eExecutionPool>(BuildE2eExecutionPool);
+builder.Services.AddHostedService<E2eRunDispatcher>();
 builder.Services.AddSingleton<IAuditReportStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -2972,6 +3214,8 @@ builder.Services.AddHostedService(sp => new BudgetAlertService(
     sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.BudgetAlerts,
     sp.GetRequiredService<ILogger<BudgetAlertService>>()));
 
+builder.Services.AddSingleton<CompositeManagedSandboxProvider>(BuildManagedSandboxLifecycleProvider);
+builder.Services.AddSingleton<IManagedSandboxLifecycle>(sp => sp.GetRequiredService<CompositeManagedSandboxProvider>());
 builder.Services.AddSingleton<SandboxLeakReaper>(sp =>
 {
     // Live accessor: thresholds and policy fields (LeakAgeThreshold, AutoDispose,
@@ -2981,7 +3225,7 @@ builder.Services.AddSingleton<SandboxLeakReaper>(sp =>
     // fields themselves.
     var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
     return new SandboxLeakReaper(
-        sp.GetRequiredService<ISandboxProvider>(),
+        sp.GetRequiredService<IManagedSandboxLifecycle>(),
         sp.GetRequiredService<IWebhookDispatcher>(),
         () => monitor.CurrentValue.SandboxLeak,
         sp.GetRequiredService<ILogger<SandboxLeakReaper>>(),
@@ -3090,6 +3334,7 @@ IdempotencyMiddleware.Use(app);
 
 WorkItemEndpoints.Map(app);
 TestCaseEndpoints.Map(app);
+E2eRunEndpoints.Map(app);
 TaskTemplateEndpoints.Map(app);
 WorkItemTimingsEndpoints.Map(app);
 WorkItemCostsEndpoints.Map(app);
@@ -3675,6 +3920,44 @@ namespace CodeyBox.Api
     }
 
     /// <summary>
+    /// Per-host configuration for the E2E replay pool. Capacity belongs here,
+    /// not on <see cref="MultipassRemoteSandboxConfig"/>, so the normal coding
+    /// fleet's remote provider config remains focused on SSH/provider settings.
+    /// </summary>
+    public sealed class E2eMultipassRemoteHostConfig
+    {
+        /// <summary>Remote Multipass provider settings for this E2E host.</summary>
+        public MultipassRemoteSandboxConfig RemoteSandbox { get; set; } = new();
+
+        /// <summary>
+        /// Per-host lease cap. Null defaults to one replay per host; the global
+        /// <c>E2eExecution:MaxConcurrent</c> still caps aggregate pool pressure.
+        /// </summary>
+        public int? MaxConcurrent { get; set; }
+
+        public string? SshTarget { get => RemoteSandbox.SshTarget; set => RemoteSandbox.SshTarget = value; }
+        public string? SshBinary { get => RemoteSandbox.SshBinary; set => RemoteSandbox.SshBinary = value; }
+        public int? SshPort { get => RemoteSandbox.SshPort; set => RemoteSandbox.SshPort = value; }
+        public string? SshKeyPath { get => RemoteSandbox.SshKeyPath; set => RemoteSandbox.SshKeyPath = value; }
+        public IList<string>? ExtraSshOptions { get => RemoteSandbox.ExtraSshOptions; set => RemoteSandbox.ExtraSshOptions = value; }
+        public bool AcceptUnknownHostKeys { get => RemoteSandbox.AcceptUnknownHostKeys; set => RemoteSandbox.AcceptUnknownHostKeys = value; }
+        public int? ServerAliveIntervalSeconds { get => RemoteSandbox.ServerAliveIntervalSeconds; set => RemoteSandbox.ServerAliveIntervalSeconds = value; }
+        public int? ServerAliveCountMax { get => RemoteSandbox.ServerAliveCountMax; set => RemoteSandbox.ServerAliveCountMax = value; }
+        public int? ConnectTimeoutSeconds { get => RemoteSandbox.ConnectTimeoutSeconds; set => RemoteSandbox.ConnectTimeoutSeconds = value; }
+        public string? LocalTarBinary { get => RemoteSandbox.LocalTarBinary; set => RemoteSandbox.LocalTarBinary = value; }
+        public string? RemoteMultipassPath { get => RemoteSandbox.RemoteMultipassPath; set => RemoteSandbox.RemoteMultipassPath = value; }
+        public string? RemoteStagingRoot { get => RemoteSandbox.RemoteStagingRoot; set => RemoteSandbox.RemoteStagingRoot = value; }
+        public string? DefaultImage { get => RemoteSandbox.DefaultImage; set => RemoteSandbox.DefaultImage = value; }
+        public TimeSpan? VmStartTimeout { get => RemoteSandbox.VmStartTimeout; set => RemoteSandbox.VmStartTimeout = value; }
+        public TimeSpan? VmStopTimeout { get => RemoteSandbox.VmStopTimeout; set => RemoteSandbox.VmStopTimeout = value; }
+        public TimeSpan? VmStateCheckInterval { get => RemoteSandbox.VmStateCheckInterval; set => RemoteSandbox.VmStateCheckInterval = value; }
+        public string? VmNamePrefix { get => RemoteSandbox.VmNamePrefix; set => RemoteSandbox.VmNamePrefix = value; }
+
+        public static implicit operator E2eMultipassRemoteHostConfig(MultipassRemoteSandboxConfig config)
+            => new() { RemoteSandbox = config };
+    }
+
+    /// <summary>
     /// Configuration for <c>CodeyBox:SandboxProvider=sprites</c>. The Sprites
     /// rc30 create API accepts only name, capacity wait, and URL auth settings;
     /// CPU/RAM/region values are retained as explicit no-op operator hints.
@@ -4005,6 +4288,22 @@ namespace CodeyBox.Api
         public SpritesSandboxConfig? Sprites { get; set; }
 
         /// <summary>
+        /// Dedicated remote Multipass configuration for the E2E replay pool.
+        /// This intentionally does not fall back to
+        /// <see cref="MultipassRemoteSandbox"/> when E2E execution is enabled:
+        /// replay load must target a separately sized cheap CPU pool rather
+        /// than the coding-agent remote fleet.
+        /// </summary>
+        public E2eMultipassRemoteHostConfig? E2eMultipassRemoteSandbox { get; set; }
+
+        /// <summary>
+        /// Multi-host E2E replay fleet. When populated, this list supersedes
+        /// <see cref="E2eMultipassRemoteSandbox"/> and the E2E pool distributes
+        /// clone-per-test leases across the configured cheap CPU hosts.
+        /// </summary>
+        public List<E2eMultipassRemoteHostConfig> E2eMultipassRemoteSandboxes { get; set; } = [];
+
+        /// <summary>
         /// Maps logical network-profile names → host bridge names. Operators
         /// configure these bridges once via scripts/setup-host-networks.sh;
         /// the orchestrator then attaches each VM to the matching bridge,
@@ -4256,6 +4555,16 @@ namespace CodeyBox.Api
         /// behaviour.
         /// </summary>
         public ClaudeSessionOptions ClaudeSession { get; set; } = new();
+
+        /// <summary>
+        /// End-to-end replay execution pool configuration. Bound from
+        /// <c>CodeyBox:E2eExecution</c>. Sizes the cheap CPU-only VM pool that
+        /// runs committed e2e-replay artifacts; intentionally separate from the
+        /// orchestrator's coding-worker fleet so E2E load never competes for
+        /// agent-dispatch slots. Disabled by default — operators opt in per
+        /// deployment.
+        /// </summary>
+        public E2eExecutionOptions E2eExecution { get; set; } = new();
     }
 
     /// <summary>
