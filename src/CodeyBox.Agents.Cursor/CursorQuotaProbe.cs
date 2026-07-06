@@ -173,11 +173,48 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe
         return ApplyMemberGate(snapshot, member, token);
     }
 
+    /// <summary>
+    /// When the configured <see cref="AgentMembership.ModelId"/> is not present
+    /// in the parsed response's per-model buckets, fall back to the overall
+    /// reading (when usable) before degrading to unknown. Cursor's per-model
+    /// dict is populated only from the auto-bucket models list; a configured
+    /// model that isn't in the auto bucket still rides the overall plan quota,
+    /// so the overall reading is the correct fallback rather than Unknown. The
+    /// resolved model id is added to <see cref="AgentQuotaSnapshot.PerModel"/>
+    /// so <see cref="QuotaGatePolicy.ResolveMemberQuota"/> finds it and the
+    /// floor is enforced on a KNOWN reading. Only degrade to Unknown when the
+    /// snapshot carries no usable overall reading.
+    /// </summary>
     private AgentQuotaSnapshot ApplyMemberGate(AgentQuotaSnapshot snapshot, AgentMembership member, string token)
     {
         if (snapshot.AvailablePct < 0) return snapshot;
         if (string.IsNullOrWhiteSpace(member.ModelId)) return snapshot;
         if (snapshot.PerModel.ContainsKey(member.ModelId)) return snapshot;
+
+        // Fall back to the overall reading. The snapshot is known (checked
+        // above), so this is always available when we reach here.
+        if (snapshot.IsKnown)
+        {
+            var resolved = new ModelQuota
+            {
+                AvailablePct = snapshot.AvailablePct,
+                ResetAt = snapshot.ResetAt,
+                Window = "overall (model-specific bucket unavailable)",
+            };
+            var perModel = new Dictionary<string, ModelQuota>(snapshot.PerModel, StringComparer.OrdinalIgnoreCase)
+            {
+                [member.ModelId] = resolved,
+            };
+            _log.LogDebug(
+                "Cursor quota probe: configured model {ModelId} not in auto bucket; resolved to overall reading",
+                member.ModelId);
+            return new AgentQuotaSnapshot
+            {
+                AvailablePct = snapshot.AvailablePct,
+                ResetAt = snapshot.ResetAt,
+                PerModel = perModel,
+            };
+        }
 
         var modelList = snapshot.PerModel.Count == 0
             ? "(none)"
