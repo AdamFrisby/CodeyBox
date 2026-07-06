@@ -53,7 +53,7 @@ public sealed class DeploymentManagerTests
     }
 
     [Fact]
-    public async Task DisposeFailure_KeepsDeploymentHandleAliveForRetry()
+    public async Task DisposeFailure_KeepsHandleRetryable_ButUntracksSoReaperCanReclaim()
     {
         var provider = new FakeDeploymentSandboxProvider();
         var driver = new LibraryDeploymentDriver();
@@ -80,8 +80,13 @@ public sealed class DeploymentManagerTests
 
         await Assert.ThrowsAsync<InvalidOperationException>(async () => await handle.DisposeAsync());
 
+        // The handle stays alive so the caller can retry teardown against it...
         Assert.True(handle.IsAlive);
-        Assert.Single(manager.GetActive());
+        // ...but the deployment is dropped from the manager's active set so its
+        // orphaned substrate no longer masks itself from the DeploymentLeakReaper
+        // (GetActive() feeds the reaper's activeSubstrateIds guard). A teardown
+        // failure that left it tracked would blind the reaper permanently.
+        Assert.Empty(manager.GetActive());
 
         provider.SandboxDisposeThrowsFor.Remove(handle.SubstrateId!);
         await handle.DisposeAsync();

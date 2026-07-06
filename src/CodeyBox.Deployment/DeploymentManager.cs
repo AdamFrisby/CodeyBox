@@ -114,7 +114,26 @@ public sealed class DeploymentManager : IDeploymentManager
             {
                 if (Volatile.Read(ref _disposed) != 0)
                     return;
-                await Inner.DisposeAsync().ConfigureAwait(false);
+                try
+                {
+                    await Inner.DisposeAsync().ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Teardown failed. Leave _disposed=0 so the caller can still
+                    // retry DisposeAsync against this handle (Inner keeps itself
+                    // retryable the same way), but drop the deployment from the
+                    // manager's active set. Otherwise GetActive() keeps reporting
+                    // the orphaned substrate id and the DeploymentLeakReaper's
+                    // activeSubstrateIds guard treats it as still-owned, so the
+                    // reaper can never reclaim it. Untracking here re-arms that
+                    // safety net and matches the provider-side ReleaseActiveTracking()
+                    // that SandboxDeploymentSubstrate.DisposeAsync already performs on
+                    // failure. Untrack is idempotent, so a later successful retry
+                    // (which calls it again) is harmless.
+                    owner.Untrack(Id);
+                    throw;
+                }
                 Volatile.Write(ref _disposed, 1);
                 owner.Untrack(Id);
             }
