@@ -6060,9 +6060,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var dir = Path.Combine(_workspace, "fake-sudo-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         var sudo = Path.Combine(dir, "sudo");
-        File.WriteAllText(sudo, script);
+        var sudoTmp = sudo + ".tmp";
+        File.WriteAllText(sudoTmp, script);
         if (!OperatingSystem.IsWindows())
-            File.SetUnixFileMode(sudo, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            File.SetUnixFileMode(sudoTmp, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        File.Move(sudoTmp, sudo);
         return dir;
     }
 
