@@ -1919,6 +1919,103 @@ public sealed class QuotaAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public async Task Scheduler_QuotaProbeRecoverySignal_RequeuesWaitingForQuotaResetItem()
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        var store = new SqliteWorkItemStore(stateDb);
+        using var _ = store;
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var projectId = new ProjectId("test-project");
+        var project = new Project
+        {
+            Id = projectId,
+            DisplayName = "Test",
+            RepositoryUrl = "http://fake",
+            DefaultAgentClass = "probe-signal-class",
+        };
+        var projects = new InMemoryProjectRepository(project);
+        var routerOptions = new QuotaRouterOptions { MinQuotaPct = 10 };
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Codex,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+        var innerProbe = new MutableProbe(AgentKind.Codex, availablePct: 0);
+        var signalingProbe = new SignalingQuotaProbe(
+            innerProbe,
+            quotaSignal,
+            new QuotaGatePolicy(routerOptions),
+            _time);
+        var router = new AgentClassRouter(
+            [
+                new AgentClass
+                {
+                    Id = "probe-signal-class",
+                    DisplayName = "Probe Signal",
+                    Members = [member],
+                },
+            ],
+            [signalingProbe],
+            routerOptions,
+            NullLogger<AgentClassRouter>.Instance,
+            _time,
+            quotaAvailabilityPublisher: quotaSignal);
+        using var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = TimeSpan.FromHours(6),
+                    MaxAutoRetriesPerWorkItem = 3,
+                },
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            projects,
+            null,
+            null,
+            _time,
+            quotaAvailabilitySignal: quotaSignal);
+
+        var parked = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = "parked",
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            QuotaRetryAttempts = 0,
+            AgentClassId = "probe-signal-class",
+            NextQuotaRetryAt = _time.Now.AddDays(7),
+        };
+        await store.CreateAsync(parked);
+
+        await signalingProbe.MarkExhaustedAsync(member, TimeSpan.FromDays(7), _time.Now.AddDays(7));
+        await signalingProbe.GetAvailabilityAsync(member, CancellationToken.None);
+        await Task.Delay(100);
+        var stillParked = await store.GetAsync(parked.Id);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, stillParked!.State);
+        Assert.Equal(0, stillParked.QuotaRetryAttempts);
+
+        innerProbe.AvailablePct = 80;
+        await signalingProbe.GetAvailabilityAsync(member, CancellationToken.None);
+
+        var retried = await WaitForAttemptsAsync(store, parked.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));
+        Assert.Equal(WorkItemState.Queued, retried.State);
+        Assert.Equal(1, retried.QuotaRetryAttempts);
+    }
+
+    [Fact]
     public async Task Router_QuotaRetryAdmissionIsConsumedWhenDispatchProbeDenies()
     {
         var failuresDb = Path.Combine(_workspace, "quota-failures-" + Guid.NewGuid().ToString("N")[..8] + ".db");

@@ -54,6 +54,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     private readonly AgentConcurrencySnapshot? _concurrencySnapshot;
     private readonly InVmSmokeSandboxTarget? _configuredSmokeTarget;
     private readonly IAgentDispatchAvailability? _dispatchAvailability;
+    private readonly IAgentQuotaAvailabilityPublisher? _quotaAvailabilityPublisher;
     // Default fit when no historical samples exist (spec: "fits 2 concurrent
     // burns" so the queue does not stall on cold start). Exposed as a constant
     // so /concurrency surface and tests reference the same value.
@@ -111,7 +112,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         IAgentBudgetProvider? budgetProvider = null,
         AgentConcurrencySnapshot? concurrencySnapshot = null,
         InVmSmokeSandboxTarget? configuredSmokeTarget = null,
-        IAgentDispatchAvailability? dispatchAvailability = null)
+        IAgentDispatchAvailability? dispatchAvailability = null,
+        IAgentQuotaAvailabilityPublisher? quotaAvailabilityPublisher = null)
     {
         _routingConfig = new RoutingConfig(
             catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase),
@@ -135,6 +137,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         _concurrencySnapshot = concurrencySnapshot;
         _configuredSmokeTarget = configuredSmokeTarget;
         _dispatchAvailability = dispatchAvailability;
+        _quotaAvailabilityPublisher = quotaAvailabilityPublisher;
     }
 
     /// <summary>
@@ -612,7 +615,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             if (commitDispatchSideEffects)
                 RecordAvailabilityAndMaybeNotify(member, quota, gate);
             else
+            {
                 RecordObservedAvailability(member, quota);
+                _quotaAvailabilityPublisher?.RecordQuotaUsability(member, gate.Allow);
+            }
             if (gate.Allow)
             {
                 // Per-agent concurrency cap: spill to the next eligible member
@@ -1192,6 +1198,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             RecordObservedAvailability(member, quota);
 
             var gate = await EvaluateGateAsync(member, item.ProjectId, quota, nowUtc, ct);
+            _quotaAvailabilityPublisher?.RecordQuotaUsability(member, gate.Allow);
             if (gate.Allow)
                 result.Add(member);
         }
@@ -1290,6 +1297,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             existing.ExpiresAt <= nowUtc || next.ExpiresAt < existing.ExpiresAt
                 ? next
                 : existing);
+        RecordQuotaUsableTransition(key, isUsable: false);
+        _quotaAvailabilityPublisher?.RecordQuotaUsability(member, isUsable: false);
     }
 
     public bool IsExhausted(AgentMembership member, DateTimeOffset nowUtc)
@@ -1921,6 +1930,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         QuotaGateDecision gate)
     {
         var key = RecordObservedAvailability(member, quota);
+        _quotaAvailabilityPublisher?.RecordQuotaUsability(member, gate.Allow);
         if (RecordQuotaUsableTransition(key, gate.Allow))
             NotifyQuotaUsableThresholdCrossed();
     }

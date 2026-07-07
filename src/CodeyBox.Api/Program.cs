@@ -1419,6 +1419,9 @@ builder.Services.AddSingleton<IQuotaFailureStore>(sp =>
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteQuotaFailureStore(cbOpts.StateDatabasePath);
 });
+builder.Services.AddSingleton<AgentQuotaAvailabilityBroadcaster>();
+builder.Services.AddSingleton<IAgentQuotaAvailabilityPublisher>(sp =>
+    sp.GetRequiredService<AgentQuotaAvailabilityBroadcaster>());
 builder.Services.AddSingleton<IAgentFallbackHistoryStore>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -1466,13 +1469,18 @@ static IAgentQuotaProbe WrapLastKnownGood(IAgentQuotaProbe inner, IServiceProvid
 {
     var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
     var lf = sp.GetRequiredService<ILoggerFactory>();
-    return new LastKnownGoodQuotaProbe(
+    var retained = new LastKnownGoodQuotaProbe(
         inner,
         () => new LastKnownGoodQuotaOptions
         {
             MaxStaleness = TimeSpan.FromSeconds(monitor.CurrentValue.QuotaRouter.ProbeMaxStalenessSeconds),
         },
         lf.CreateLogger<LastKnownGoodQuotaProbe>());
+    return new SignalingQuotaProbe(
+        retained,
+        sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>(),
+        sp.GetRequiredService<QuotaGatePolicy>(),
+        sp.GetService<TimeProvider>());
 }
 
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
@@ -1648,7 +1656,8 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         sp.GetService<IAgentBudgetProvider>(),
         sp.GetService<AgentConcurrencySnapshot>(),
         configuredSmokeTarget,
-        sp.GetService<IAgentDispatchAvailability>());
+        sp.GetService<IAgentDispatchAvailability>(),
+        sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>());
 });
 
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------
@@ -1773,7 +1782,7 @@ builder.Services.AddSingleton<IWorkerPoolOccupancy>(sp =>
 builder.Services.AddSingleton<IAgentQuotaAvailabilitySnapshot>(sp =>
     sp.GetRequiredService<AgentClassRouter>());
 builder.Services.AddSingleton<IAgentQuotaAvailabilitySignal>(sp =>
-    sp.GetRequiredService<AgentClassRouter>());
+    sp.GetRequiredService<AgentQuotaAvailabilityBroadcaster>());
 builder.Services.AddSingleton<IQuotaRetryRouter>(sp =>
     sp.GetRequiredService<AgentClassRouter>());
 builder.Services.AddSingleton<IQuotaRetryAdmissionRouter>(sp =>
