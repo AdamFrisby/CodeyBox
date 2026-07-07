@@ -348,7 +348,7 @@ public sealed class ErrorOutputTests
     [Fact]
     public async Task Error_EmptyApiBaseUrlFlag_IsReportedAsMalformedWithoutFallingThrough()
     {
-        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+        var tempDir = NewTempDirExcluding("5998", "5999");
         WriteConfigFile(tempDir, "http://127.0.0.1:5998", "test-key");
         Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", tempDir);
         Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", "http://127.0.0.1:5999");
@@ -383,7 +383,7 @@ public sealed class ErrorOutputTests
     [Fact]
     public async Task Error_EmptyApiBaseUrlEnvironmentVariable_IsReportedAsMalformedWithoutFallingThrough()
     {
-        var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+        var tempDir = NewTempDirExcluding("5998");
         WriteConfigFile(tempDir, "http://127.0.0.1:5998", "test-key");
         Environment.SetEnvironmentVariable("CODEYBOX_CLI_CONFIG_DIR", tempDir);
         Environment.SetEnvironmentVariable("CODEYBOX_CLI_API_URL", "");
@@ -969,6 +969,18 @@ public sealed class ErrorOutputTests
         var config = new CliConfig { ApiBaseUrl = url, ApiKey = key };
         var json = JsonSerializer.Serialize(config, CliJsonContext.Default.CliConfig);
         File.WriteAllText(Path.Combine(tempDir, "config.json"), json);
+    }
+
+    private static string NewTempDirExcluding(params string[] forbidden)
+    {
+        for (var i = 0; i < 100; i++)
+        {
+            var path = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+            if (!Array.Exists(forbidden, value => path.Contains(value, StringComparison.Ordinal)))
+                return path;
+        }
+
+        throw new InvalidOperationException("Could not create a temp path without forbidden diagnostic sentinels.");
     }
 
     private sealed class CancelledHttpMessageHandler : HttpMessageHandler
