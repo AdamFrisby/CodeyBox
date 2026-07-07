@@ -168,13 +168,15 @@ multi-valued `IAuditor.Targets` set (default `{ Code }`); the composer selects
 `{ Plan }`-target reviewers for this phase (respecting the same
 config-driven active set as code audit) and evaluates the PLAN artifact.
 Blocking findings send the plan back for a plan-rework turn (the planning agent
-revises the plan with the review feedback) and re-review, up to
+revises the plan with bounded structured review feedback) and re-review, up to
 `PipelineOptions.MaxPlanReviewIterations`; the plan must pass before
-`PlanApproved` flows into implementation. Which gate runs is
-`CodeyBox:PlanReview:UseAuditors` (default: the always-pass placeholder;
-`true`: the auditor-driven `AuditorPlanReviewGate`). Moving subjective /
-architectural review to the cheap PLAN artifact lets the code-stage audit stay
-objective and low-cycle.
+`PlanApproved` flows into implementation. `CodeyBox:PlanReview:UseAuditors`
+is compatibility-only and ignored; Plan-target auditors are always composed by
+the pipeline, and the registered `IPlanReviewGate` remains a structural
+compatibility hook after those auditors approve. Plan-target LLM reviewers run
+through the text-only `IPlanTextReviewer` path, not through sandboxed
+tool-bearing audit agents. Moving subjective / architectural review to the
+cheap PLAN artifact lets the code-stage audit stay objective and low-cycle.
 
 `*` Before each `Auditing` run, configured mechanical fixers may run in a
 credential-free sandbox and commit deterministic normalizations. This is a

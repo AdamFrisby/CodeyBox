@@ -585,6 +585,7 @@ public sealed record CustomAuditorDescriptor
     public IReadOnlyList<string> Argv { get; init; } = [];
     public string? ReviewFocus { get; init; }
     public IReadOnlyList<DiffPatternDescriptor> Patterns { get; init; } = [];
+    public IReadOnlyList<string> Targets { get; init; } = [];
     public string? Role { get; init; }
     public string? GateEvidence { get; init; }
 }

@@ -1,11 +1,13 @@
 namespace CodeyBox.Core;
 
 /// <summary>
-/// An audit pass run against the work-phase output before merge. Auditors
-/// can be tool-driven (linters, SAST, custom shell scripts) or LLM-driven
-/// (a review-style agent prompt). The pipeline runs all registered auditors,
-/// collects findings, and either proceeds to merge or hands findings back
-/// to the agent for rework.
+/// A target-specific review pass. The code-audit target runs against the
+/// work-phase output before merge; the plan-review target runs against the
+/// structured PLAN artifact before implementation. Auditors can be tool-driven
+/// (linters, SAST, custom shell scripts) or LLM-driven (a review-style prompt).
+/// The pipeline composes auditors by <see cref="Targets"/>, collects findings,
+/// and either proceeds to the next phase or sends the relevant artifact back
+/// for rework.
 ///
 /// Auditors declare their <see cref="Required"/> capabilities so the
 /// pipeline can group them into separate sandboxes — a tool auditor that
@@ -75,7 +77,11 @@ public interface IAuditor
     BuildTestGateEvidence BuildTestGateEvidence => BuildTestGateEvidence.None;
 
     /// <summary>
-    /// Runs the auditor against the working tree at <paramref name="workingDirectory"/>.
+    /// Runs the auditor for the target described by <paramref name="context"/>.
+    /// Code-target auditors inspect the working tree at
+    /// <paramref name="workingDirectory"/>. Plan-target auditors that require a
+    /// text-only host call implement <see cref="IPlanTextReviewer"/> and are
+    /// invoked through that seam instead of this sandbox method.
     /// </summary>
     Task<AuditResult> RunAsync(
         ISandbox sandbox,

@@ -1,5 +1,4 @@
 using CodeyBox.Core;
-using CodeyBox.Projects;
 using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Orchestrator;
@@ -17,17 +16,8 @@ public sealed class AuditorPlanReviewGate : IPlanReviewGate
 {
     private readonly ILogger<AuditorPlanReviewGate> _log;
 
-    public AuditorPlanReviewGate(
-        ProjectAuditorComposer composer,
-        IProjectRepository projects,
-        IAgentRegistry agents,
-        ICredentialProvider credentials,
-        ILogger<AuditorPlanReviewGate> log)
+    public AuditorPlanReviewGate(ILogger<AuditorPlanReviewGate> log)
     {
-        _ = composer;
-        _ = projects;
-        _ = agents;
-        _ = credentials;
         _log = log;
     }
 

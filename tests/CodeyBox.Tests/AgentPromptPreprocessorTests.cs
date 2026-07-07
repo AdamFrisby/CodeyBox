@@ -275,6 +275,22 @@ public sealed class AgentPromptPreprocessorTests
     }
 
     [Fact]
+    public void PromptPreprocessingAgentRunner_ForwardsTextOnlyRequiresSandbox()
+    {
+        var chain = new AgentPromptPreprocessorChain([new RecordingPreprocessor()]);
+        var wrapper = PromptPreprocessingAgentRunner.Wrap(
+            new RecordingTextOnlyRunner { TextOnlyRequiresSandbox = true },
+            chain,
+            WorkItemId.New(),
+            AgentPromptPhase.Audit,
+            1,
+            NewProject());
+
+        var textOnly = Assert.IsAssignableFrom<ITextOnlyAgentRunner>(wrapper);
+        Assert.True(textOnly.TextOnlyRequiresSandbox);
+    }
+
+    [Fact]
     public void PromptPreprocessingAgentRunner_DoesNotImplementTextOnlyWhenInnerIsPlain()
     {
         // The wrapper used to unconditionally implement ITextOnlyAgentRunner and
@@ -633,6 +649,8 @@ public sealed class AgentPromptPreprocessorTests
         public List<string> TextOnlyPrompts { get; } = [];
 
         public AgentKind Kind => AgentKind.Codex;
+
+        public bool TextOnlyRequiresSandbox { get; init; }
 
         public Task<AgentResult> RunAsync(
             ISandbox sandbox,

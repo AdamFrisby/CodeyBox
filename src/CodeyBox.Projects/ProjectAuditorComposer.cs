@@ -264,6 +264,7 @@ public sealed class ProjectAuditorComposer
 
         var role = ParseCustomAuditorRole(c);
         var gateEvidence = ParseCustomGateEvidence(c, role);
+        var targets = ParseCustomAuditorTargets(c);
 
         return c.Kind.ToLowerInvariant() switch
         {
@@ -271,6 +272,7 @@ public sealed class ProjectAuditorComposer
             {
                 Name = c.Name,
                 Argv = c.Argv.Count > 0 ? c.Argv : throw new InvalidOperationException($"shell auditor '{c.Name}' needs Argv"),
+                Targets = targets,
                 Role = role,
                 BuildTestGateEvidence = gateEvidence,
             }),
@@ -283,6 +285,7 @@ public sealed class ProjectAuditorComposer
                     Description = p.Description,
                     Severity = AuditSeverityParser.Parse(p.Severity),
                 }).ToList(),
+                Targets = targets,
             }),
             "llm" => new LlmReviewAuditor(new LlmReviewAuditorOptions
             {
@@ -290,9 +293,27 @@ public sealed class ProjectAuditorComposer
                 Agent = ctx.Agent,
                 ReviewFocus = c.ReviewFocus ?? throw new InvalidOperationException($"llm auditor '{c.Name}' needs ReviewFocus"),
                 FrameTemplate = frameTemplate,
+                Targets = targets,
             }),
             _ => throw new InvalidOperationException($"Unknown custom auditor kind '{c.Kind}' for '{c.Name}' (expected: shell | diff-pattern | llm)"),
         };
+    }
+
+    private static IReadOnlySet<AuditTarget> ParseCustomAuditorTargets(CustomAuditorDescriptor descriptor)
+    {
+        if (descriptor.Targets.Count == 0)
+            return AuditTargets.CodeOnly;
+
+        var targets = new List<AuditTarget>(descriptor.Targets.Count);
+        foreach (var raw in descriptor.Targets)
+        {
+            var value = raw.Trim();
+            if (string.IsNullOrWhiteSpace(value))
+                throw new InvalidOperationException($"Custom auditor '{descriptor.Name}' has an empty target value");
+            targets.Add(new AuditTarget(value.ToLowerInvariant()));
+        }
+
+        return AuditTargets.Of(targets.ToArray());
     }
 
     private static bool HasCustomGateMetadata(CustomAuditorDescriptor descriptor)

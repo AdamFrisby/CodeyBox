@@ -925,6 +925,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             PluginId = c.PluginId,
             Argv = c.Argv ?? [],
             ReviewFocus = c.ReviewFocus,
+            Targets = c.Targets ?? [],
             Role = c.Role,
             GateEvidence = c.GateEvidence,
             Patterns = (c.Patterns ?? []).Select(p => new DiffPatternDescriptor

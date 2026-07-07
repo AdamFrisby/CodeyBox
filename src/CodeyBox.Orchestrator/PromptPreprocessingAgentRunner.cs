@@ -175,6 +175,9 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
         public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential) =>
             GetInnerTextOnlyUnavailabilityReason(credential);
 
+        public bool TextOnlyRequiresSandbox =>
+            ((ITextOnlyAgentRunner)Inner).TextOnlyRequiresSandbox;
+
         public Task<TextOnlyAgentResult> RunTextOnlyAsync(
             string prompt,
             AgentCredential? credential,
@@ -202,6 +205,9 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
 
         public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential) =>
             GetInnerTextOnlyUnavailabilityReason(credential);
+
+        public bool TextOnlyRequiresSandbox =>
+            ((ITextOnlyAgentRunner)Inner).TextOnlyRequiresSandbox;
 
         public Task<TextOnlyAgentResult> RunTextOnlyAsync(
             string prompt,

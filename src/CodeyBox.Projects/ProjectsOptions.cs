@@ -363,6 +363,7 @@ public sealed class CustomAuditorConfig
     public List<string>? Argv { get; set; }
     public string? ReviewFocus { get; set; }
     public List<DiffPatternConfig>? Patterns { get; set; }
+    public List<string>? Targets { get; set; }
     public string? Role { get; set; }
     public string? GateEvidence { get; set; }
 }

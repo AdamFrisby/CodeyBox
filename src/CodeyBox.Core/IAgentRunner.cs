@@ -100,9 +100,9 @@ public interface ITextOnlyAgentRunner : IAgentRunner
     /// Claude, Gemini, Codex) leave it <c>false</c>.
     ///
     /// <para>The default is <c>false</c>. Callers that have no sandbox to offer
-    /// (e.g. the host-only plan-review gate) consult this to degrade-and-skip
-    /// rather than issue a call that is guaranteed to fail — an
-    /// <em>infrastructure</em> condition, not a substantive review rejection.
+    /// (e.g. the host-only plan-review path) consult this to surface an explicit
+    /// infrastructure failure rather than issue a call that is guaranteed to fail
+    /// or accidentally hand plan-review text to a tool-capable sandbox.
     /// This is distinct from <see cref="GetTextOnlyUnavailabilityReason"/>, which
     /// is a credential-only probe and returns <c>null</c> for these CLIs whenever
     /// the auth bundle is present.</para>

@@ -128,6 +128,29 @@ public sealed class ProjectAuditorComposerPresetTests
     }
 
     [Fact]
+    public void ComposeForTarget_CustomLlmAuditorCanOptIntoPlanTarget()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = ProjectWithCustom(new CustomAuditorDescriptor
+        {
+            Name = "custom:plan-review",
+            Kind = "llm",
+            ReviewFocus = "review the plan shape",
+            Targets = ["plan"],
+        });
+
+        var codeTargets = composer.ComposeForTarget(project, new CapturingAgent(), AuditTarget.Code)
+            .Select(a => a.Name)
+            .ToArray();
+        var planTargets = composer.ComposeForTarget(project, new CapturingAgent(), AuditTarget.Plan)
+            .Select(a => a.Name)
+            .ToArray();
+
+        Assert.DoesNotContain("custom:plan-review", codeTargets);
+        Assert.Contains("custom:plan-review", planTargets);
+    }
+
+    [Fact]
     public async Task Compose_AppliesProjectAuditTypeFocusAndFrame()
     {
         var runner = new CapturingAgent();

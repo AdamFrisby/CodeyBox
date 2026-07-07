@@ -34,6 +34,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
     public string Name => _opts.Name;
     public string Kind => "shell";
     public AuditCapabilities Required => _opts.Required;
+    public IReadOnlySet<AuditTarget> Targets => _opts.Targets;
     public bool CanShortCircuitOnBlockingFinding => _opts.CanShortCircuitOnBlockingFinding;
 
     public string? SelfReviewGuidance
@@ -179,6 +180,7 @@ public sealed record ShellCommandAuditorOptions
     public IAuditResultClassifier? ResultClassifier { get; init; }
     public AuditCapabilities Required { get; init; } = AuditCapabilities.None;
     public AuditSeverity? MissingToolSeverity { get; init; }
+    public IReadOnlySet<AuditTarget> Targets { get; init; } = AuditTargets.CodeOnly;
     public bool CanShortCircuitOnBlockingFinding { get; init; }
     public AuditorRole Role { get; init; } = AuditorRole.None;
     public BuildTestGateEvidence BuildTestGateEvidence { get; init; } = BuildTestGateEvidence.None;

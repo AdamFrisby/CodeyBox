@@ -28,6 +28,7 @@ public sealed partial class DiffPatternAuditor : IAuditor
     public string Name => _opts.Name;
     public string Kind => "diff-pattern";
     public AuditCapabilities Required => AuditCapabilities.None;
+    public IReadOnlySet<AuditTarget> Targets => _opts.Targets;
 
     public IReadOnlyList<DiffPattern> Patterns => _opts.Patterns;
 
@@ -125,6 +126,7 @@ public sealed record DiffPatternAuditorOptions
 {
     public required string Name { get; init; }
     public required IReadOnlyList<DiffPattern> Patterns { get; init; }
+    public IReadOnlySet<AuditTarget> Targets { get; init; } = AuditTargets.CodeOnly;
 }
 
 public sealed record DiffPattern

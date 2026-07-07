@@ -130,7 +130,7 @@ public sealed class AuditTargetTests
         Assert.False(result.Passed);
         var finding = Assert.Single(result.Findings);
         Assert.Equal(AuditSeverity.Error, finding.Severity);
-        Assert.Contains("plan review agent failed to run", finding.Title, StringComparison.Ordinal);
+        Assert.Contains("review agent failed to run", finding.Title, StringComparison.Ordinal);
     }
 
     [Fact]

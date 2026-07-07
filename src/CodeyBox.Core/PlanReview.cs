@@ -27,7 +27,25 @@ public sealed record PlanReviewRequest(
 public sealed record PlanReviewDecision(
     bool Approved,
     string Summary,
-    string? RejectionReason = null);
+    string? RejectionReason = null,
+    PlanReviewFeedback? ReworkFeedback = null);
+
+/// <summary>
+/// Structured, bounded feedback that may be shown to a later planning-agent turn.
+/// Free-form reviewer prose stays on <see cref="PlanReviewDecision.RejectionReason"/>
+/// for operator diagnostics; the planner receives this allowlisted shape instead.
+/// </summary>
+public sealed record PlanReviewFeedback(
+    int BlockingIssueCount,
+    IReadOnlyList<PlanReviewFeedbackIssue> Issues);
+
+public sealed record PlanReviewFeedbackIssue(
+    string Auditor,
+    string Severity,
+    string Category,
+    string Summary,
+    string Evidence,
+    string FindingId);
 
 public sealed record PlanArtifactDocument(
     string Approach,

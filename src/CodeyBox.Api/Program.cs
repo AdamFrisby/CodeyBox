@@ -2805,14 +2805,8 @@ builder.Services.AddSingleton<IWorkItemTerminalRevisionBuilder>(sp =>
     sp.GetRequiredService<WorkItemTerminalTransition>());
 // Plan-review gate. The pipeline always composes and runs AuditTarget.Plan
 // auditors before implementation; this registered gate is retained as the
-// compatibility structural-review hook and as the DI marker for the
-// auditor-backed default.
-builder.Services.AddSingleton<IPlanReviewGate>(sp => new AuditorPlanReviewGate(
-    sp.GetRequiredService<ProjectAuditorComposer>(),
-    sp.GetRequiredService<IProjectRepository>(),
-    sp.GetRequiredService<IAgentRegistry>(),
-    sp.GetRequiredService<ICredentialProvider>(),
-    sp.GetRequiredService<ILogger<AuditorPlanReviewGate>>()));
+// compatibility structural-review hook.
+builder.Services.AddSingleton<IPlanReviewGate, AuditorPlanReviewGate>();
 
 builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<ISandboxProvider>(),
@@ -4309,8 +4303,9 @@ namespace CodeyBox.Api
         public bool EmitPlanTestCases { get; set; } = true;
 
         /// <summary>
-        /// Maximum PLAN-review attempts for a single generated plan artifact
-        /// before a still-blocked item fails. Captured once at startup into
+        /// Maximum PLAN-review attempts for one planning lifecycle, including
+        /// revised plan artifacts produced by plan-rework turns, before a
+        /// still-blocked item fails. Captured once at startup into
         /// <see cref="PipelineOptions.MaxPlanReviewIterations"/>; edits
         /// require restart.
         /// </summary>

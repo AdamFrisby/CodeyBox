@@ -1,8 +1,5 @@
-using CodeyBox.Agents;
-using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
-using CodeyBox.Projects;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
@@ -34,20 +31,7 @@ public sealed class AuditorPlanReviewGateTests
     }
 
     private static AuditorPlanReviewGate BuildGate()
-    {
-        var project = new Project
-        {
-            Id = new ProjectId("proj"),
-            DisplayName = "Proj",
-            RepositoryUrl = "https://example.com/r.git",
-        };
-        return new AuditorPlanReviewGate(
-            new ProjectAuditorComposer(new PresetCatalog()),
-            new InMemoryProjectRepository(project),
-            new AgentRegistry([]),
-            new StaticCredentialProvider(),
-            NullLogger<AuditorPlanReviewGate>.Instance);
-    }
+        => new(NullLogger<AuditorPlanReviewGate>.Instance);
 
     private static PlanReviewRequest Request(string artifact = ValidPlan) => new(
         WorkItemId.New(),
