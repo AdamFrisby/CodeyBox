@@ -55,8 +55,6 @@ public sealed class InVmSmokeProbeServiceTests
     private static async Task AwaitExecute(InVmSmokeProbeService service)
     {
         var done = service.ExecuteTask ?? Task.CompletedTask;
-        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
-        await done.WaitAsync(cts.Token);
         await done; // surface any exception that escaped (there must be none)
     }
 

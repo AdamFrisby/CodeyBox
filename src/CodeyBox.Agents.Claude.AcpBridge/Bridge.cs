@@ -754,31 +754,38 @@ internal sealed class Bridge : IAsyncDisposable
         if (Interlocked.Exchange(ref _shutdownState, 1) != 0) return;
         _exitCode = code;
         try { _turnDeadline?.Dispose(); } catch { }
+
+        try
+        {
+            if (_claudeProcess is { } p)
+            {
+                // Emit claude_exit BEFORE cancelling _cts so it lands deterministically
+                // before the test's emitter scope is disposed.
+                EmitClaudeExitOnce(p);
+            }
+        }
+        catch { }
+
+        // CRITICAL: Delete the lockfile first to prevent any leak if we get terminated early.
+        try { if (_lockPath is not null) File.Delete(_lockPath); } catch { }
+
+        // Clean up connections and streams to immediately unblock the main thread's stdin read
+        WebSocketConnection? peerToClose;
+        lock (_pendingLock) peerToClose = _peer;
+        try { peerToClose?.Close(); } catch { }
+        try { _listener?.Stop(); } catch { }
+        try { _cts.Cancel(); } catch { }
+        try { _stdinStream?.Dispose(); } catch { }
+
+        // Finally, clean up the Claude child process.
         try
         {
             if (_claudeProcess is { } p)
             {
                 if (!HasProcessExited(p)) TerminateClaudeProcess(p);
-                // Emit claude_exit BEFORE cancelling _cts. The monitor task
-                // also calls this on its WaitForExitAsync completion, but
-                // emitting it here while we're still on the cleanup path
-                // means a host-side observer sees claude_exit before
-                // peer_closed / process teardown, and it lands deterministic-
-                // ally before the test's emitter scope can be disposed (the
-                // monitor task may not have a chance to wake up before the
-                // CTS cancel propagates). EmitClaudeExitOnce is single-fire,
-                // so the monitor task's later call is a no-op.
-                EmitClaudeExitOnce(p);
             }
         }
         catch { }
-        WebSocketConnection? peerToClose;
-        lock (_pendingLock) peerToClose = _peer;
-        try { peerToClose?.Close(); } catch { }
-        try { _listener?.Stop(); } catch { }
-        try { if (_lockPath is not null) File.Delete(_lockPath); } catch { }
-        try { _cts.Cancel(); } catch { }
-        try { _stdinStream?.Dispose(); } catch { }
     }
 
     private static bool HasProcessExited(Process proc)
@@ -870,7 +877,7 @@ internal sealed class Bridge : IAsyncDisposable
     {
         _ = Task.Run(async () =>
         {
-            try { await Task.Delay(1500).ConfigureAwait(false); }
+            try { await Task.Delay(2500).ConfigureAwait(false); }
             catch { }
             try { _forceExit(_exitCode); }
             catch { }
