@@ -1306,6 +1306,27 @@ public sealed class LlmAuditorAntiBiasOnLowQualityDiffTests
     private const string CiAlreadyRanMarker = LlmReviewAuditor.CiAlreadyRanMarker;
     private const string DoNotRunBuildOrTestsMarker = LlmReviewAuditor.DoNotRunBuildOrTestsMarker;
 
+    // The frame is a YAML literal block scalar, so line-wrapping the note is a
+    // non-semantic change. Marker presence is checked on whitespace-normalized text
+    // so a re-wrap cannot false-fail these assertions (which is exactly what a naive
+    // substring check does, and what a re-wrap of the frame previously triggered).
+    private static void AssertGuidancePresentIgnoringWrapping(string text, string marker)
+        => Assert.Contains(NormalizeWs(marker), NormalizeWs(text), StringComparison.Ordinal);
+
+    private static string NormalizeWs(string s)
+    {
+        var sb = new System.Text.StringBuilder(s.Length);
+        var inWhitespace = false;
+        foreach (var ch in s)
+        {
+            if (char.IsWhiteSpace(ch)) { inWhitespace = true; continue; }
+            if (inWhitespace && sb.Length > 0) sb.Append(' ');
+            inWhitespace = false;
+            sb.Append(ch);
+        }
+        return sb.ToString();
+    }
+
     [Fact]
     public async Task FrameTemplate_AntiBiasDisclaimer_SurvivesPromptRendering_AndFindingsSurface()
     {
@@ -1315,9 +1336,9 @@ public sealed class LlmAuditorAntiBiasOnLowQualityDiffTests
         // fail this test rather than silently un-gating the bias or letting
         // panel auditors re-run the deterministic suite.
         var frameTemplate = new PresetCatalog().LlmPromptFrameTemplate;
-        Assert.Contains(CiAlreadyRanMarker, frameTemplate, StringComparison.Ordinal);
-        Assert.Contains(DoNotRunBuildOrTestsMarker, frameTemplate, StringComparison.Ordinal);
-        Assert.Contains(AntiBiasMarker, frameTemplate, StringComparison.Ordinal);
+        AssertGuidancePresentIgnoringWrapping(frameTemplate, CiAlreadyRanMarker);
+        AssertGuidancePresentIgnoringWrapping(frameTemplate, DoNotRunBuildOrTestsMarker);
+        AssertGuidancePresentIgnoringWrapping(frameTemplate, AntiBiasMarker);
 
         var runner = new LowQualityDiffReviewRunner();
         var auditor = new LlmReviewAuditor(new LlmReviewAuditorOptions
@@ -1340,9 +1361,9 @@ public sealed class LlmAuditorAntiBiasOnLowQualityDiffTests
 
         // The CI note, the anti-rerun directive, and the anti-bias disclaimer
         // all reached the agent prompt.
-        Assert.Contains(CiAlreadyRanMarker, runner.ObservedPrompt, StringComparison.Ordinal);
-        Assert.Contains(DoNotRunBuildOrTestsMarker, runner.ObservedPrompt, StringComparison.Ordinal);
-        Assert.Contains(AntiBiasMarker, runner.ObservedPrompt, StringComparison.Ordinal);
+        AssertGuidancePresentIgnoringWrapping(runner.ObservedPrompt, CiAlreadyRanMarker);
+        AssertGuidancePresentIgnoringWrapping(runner.ObservedPrompt, DoNotRunBuildOrTestsMarker);
+        AssertGuidancePresentIgnoringWrapping(runner.ObservedPrompt, AntiBiasMarker);
 
         // The deterministic reviewer inspects the low-quality diff exposed by
         // the sandbox. The anti-bias sentence alone is not enough to make it

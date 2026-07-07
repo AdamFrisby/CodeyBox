@@ -33,3 +33,6 @@ obj/
 # Runtime console/audit log output written by CodeyBox.Api when run from source
 # (local-only dev artifact; can grow to GBs; never commit).
 src/CodeyBox.Api/logs/
+
+# Local rubric annotation workspace (operator notes on audit prompts; not source of truth)
+rubric-annotations/

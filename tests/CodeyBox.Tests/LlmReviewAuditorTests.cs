@@ -346,6 +346,116 @@ public sealed class LlmReviewAuditorTests
         Assert.DoesNotContain(result.Findings, f => f.Title.Contains("add more E2E coverage", StringComparison.OrdinalIgnoreCase));
     }
 
+    // ── Build/test-note guidance: present EXACTLY ONCE, wrap-invariant ──────────
+    // These pin the real intent — the CI / anti-rerun / anti-bias guidance reaches
+    // the agent exactly once — instead of the incidental fact that a marker substring
+    // appears somewhere, which the fallback prepend makes trivially true even when the
+    // frame itself lost the note or a re-wrap split a marker across lines.
+
+    [Fact]
+    public async Task ShippedFrame_RendersBuildTestGuidance_ExactlyOnce()
+    {
+        var frame = new PresetCatalog().LlmPromptFrameTemplate;
+        var observed = await RenderPromptWithFrameAsync(frame, "quality:llm-review");
+
+        // The shipped frame already carries the guidance, so the auditor must NOT
+        // prepend a duplicate copy: each marker appears exactly once in the prompt.
+        Assert.Equal(1, CountNormalized(observed, LlmReviewAuditor.CiAlreadyRanMarker));
+        Assert.Equal(1, CountNormalized(observed, LlmReviewAuditor.DoNotRunBuildOrTestsMarker));
+        Assert.Equal(1, CountNormalized(observed, LlmReviewAuditor.AntiBiasMarker));
+    }
+
+    [Fact]
+    public async Task ReWrappedFrameCiNote_IsStillDetected_NoDuplicatePrepend()
+    {
+        // Reflow the whole frame: replace every run of whitespace with a single
+        // newline. No words change, but every marker phrase is now split across
+        // lines — a naive ordinal Contains would miss the markers and wrongly
+        // prepend a second full copy of the note. Detection must survive this;
+        // the guidance must still appear exactly once. (This is the exact class of
+        // regression a pure re-wrap of the frame introduced.)
+        var frame = new PresetCatalog().LlmPromptFrameTemplate;
+        var reWrapped = ReflowEveryWhitespaceRunToNewline(frame);
+        var observed = await RenderPromptWithFrameAsync(reWrapped, "quality:llm-review");
+
+        Assert.Equal(1, CountNormalized(observed, LlmReviewAuditor.DoNotRunBuildOrTestsMarker));
+        Assert.Equal(1, CountNormalized(observed, LlmReviewAuditor.AntiBiasMarker));
+    }
+
+    [Fact]
+    public async Task FrameGenuinelyMissingCiNote_PrependsGuidanceExactlyOnce()
+    {
+        var observed = await RenderPromptWithFrameAsync(
+            "custom frame\n{{reviewFocus}}\n{{originalPrompt}}\n{{resultFile}}",
+            "security:llm-review");
+
+        // Genuinely absent → prepend fires, but exactly once (not zero, not twice).
+        Assert.Equal(1, CountNormalized(observed, LlmReviewAuditor.CiAlreadyRanMarker));
+        Assert.Equal(1, CountNormalized(observed, LlmReviewAuditor.DoNotRunBuildOrTestsMarker));
+        Assert.Equal(1, CountNormalized(observed, LlmReviewAuditor.AntiBiasMarker));
+        Assert.Contains("custom frame", observed, StringComparison.Ordinal);
+    }
+
+    private static async Task<string> RenderPromptWithFrameAsync(string frameTemplate, string auditorName)
+    {
+        var runner = new PromptCapturingRunner();
+        var auditor = new LlmReviewAuditor(new LlmReviewAuditorOptions
+        {
+            Name = auditorName,
+            Agent = runner,
+            ReviewFocus = "- verify",
+            FrameTemplate = frameTemplate,
+        });
+        var ctx = new AuditContext(
+            WorkItemId.New(),
+            WorkBranch: "codeybox/test",
+            BaseBranch: "main",
+            Iteration: 1,
+            OriginalPrompt: "do work",
+            AuditRunner: runner);
+        await auditor.RunAsync(new ResultFileSandbox(), "/work", ctx);
+        return runner.ObservedPrompt;
+    }
+
+    private static string NormalizeWs(string s)
+    {
+        var sb = new System.Text.StringBuilder(s.Length);
+        var inWhitespace = false;
+        foreach (var ch in s)
+        {
+            if (char.IsWhiteSpace(ch)) { inWhitespace = true; continue; }
+            if (inWhitespace && sb.Length > 0) sb.Append(' ');
+            inWhitespace = false;
+            sb.Append(ch);
+        }
+        return sb.ToString();
+    }
+
+    private static int CountNormalized(string haystack, string needle)
+    {
+        var h = NormalizeWs(haystack);
+        var n = NormalizeWs(needle);
+        if (n.Length == 0) return 0;
+        var count = 0;
+        for (var idx = h.IndexOf(n, StringComparison.Ordinal); idx >= 0; idx = h.IndexOf(n, idx + n.Length, StringComparison.Ordinal))
+            count++;
+        return count;
+    }
+
+    private static string ReflowEveryWhitespaceRunToNewline(string s)
+    {
+        var sb = new System.Text.StringBuilder(s.Length);
+        var inWhitespace = false;
+        foreach (var ch in s)
+        {
+            if (char.IsWhiteSpace(ch)) { inWhitespace = true; continue; }
+            if (inWhitespace && sb.Length > 0) sb.Append('\n');
+            inWhitespace = false;
+            sb.Append(ch);
+        }
+        return sb.ToString();
+    }
+
     private sealed class PromptCapturingRunner : IAgentRunner
     {
         public AgentKind Kind => AgentKind.Codex;

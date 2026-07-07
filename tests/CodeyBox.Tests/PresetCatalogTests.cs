@@ -423,25 +423,21 @@ public sealed class PresetCatalogTests
         var catalog = new PresetCatalog();
 
         Assert.StartsWith("You are performing a security code review aligned to OWASP ASVS 5.0,", catalog.GetAuditTypeReviewFocus("security"), StringComparison.Ordinal);
-        Assert.Equal("""
-            - TODO / FIXME / XXX markers added in this change
-            - New functionality without corresponding tests
-            - Half-finished implementations (functions that return early, swallowed branches)
-            - Public functions whose docstrings/comments describe behaviour the code doesn't implement
-            - Test files that were renamed or deleted instead of fixed
-            Tests which cannot be run in this environment are not part of the scoring or auditing criteria.
-            """.Replace("\r\n", "\n", StringComparison.Ordinal), catalog.GetAuditTypeReviewFocus("completeness"));
-        Assert.Equal("""
-            Compare the diff against the original task. Look for shortcuts the agent took rather than fully solving the problem:
-            - Stubbed or trivially-faked implementations (NotImplementedException, hardcoded returns where logic was requested)
-            - Disabled compiler/linter/type-checker warnings instead of fixing the underlying issue
-            - Overly broad exception catches that swallow errors
-            - Skipped or removed failing tests rather than fixing them
-            - Commented-out code that should be active
-            - 'Mock' or 'temporary' implementations marked as such
-            - Functions that return success without actually doing the work
-            Any of these should be flagged as Error.
-            """.Replace("\r\n", "\n", StringComparison.Ordinal), catalog.GetAuditTypeReviewFocus("cheating"));
+
+        // completeness / cheating carry a detection catalog followed by a per-dimension
+        // SEVERITY RUBRIC block. Assert on the stable leading catalog lines (the rubric
+        // body is intentionally long and lives in the audit-type YAML) plus the presence
+        // of the rubric section, rather than pinning the full text.
+        var completeness = catalog.GetAuditTypeReviewFocus("completeness");
+        Assert.StartsWith("You are reviewing COMPLETENESS", completeness, StringComparison.Ordinal);
+        Assert.Contains("- TODO / FIXME / XXX markers added in this change", completeness, StringComparison.Ordinal);
+        Assert.Contains("SEVERITY RUBRIC — COMPLETENESS", completeness, StringComparison.Ordinal);
+        Assert.Contains("Tests which cannot be run in this environment are not part of the scoring or auditing criteria.", completeness, StringComparison.Ordinal);
+
+        var cheating = catalog.GetAuditTypeReviewFocus("cheating");
+        Assert.StartsWith("Compare the diff against the original task. Look for shortcuts the agent took rather than fully solving the problem:", cheating, StringComparison.Ordinal);
+        Assert.Contains("- Stubbed or trivially-faked implementations (NotImplementedException, hardcoded returns where logic was requested)", cheating, StringComparison.Ordinal);
+        Assert.Contains("SEVERITY RUBRIC — CHEATING", cheating, StringComparison.Ordinal);
     }
 
     [Fact]
