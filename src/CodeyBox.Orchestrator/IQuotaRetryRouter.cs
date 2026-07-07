@@ -20,6 +20,11 @@ public interface IQuotaRetryRouter
         Project? project,
         CancellationToken ct,
         string? requiredCapability = null);
+
+    IReadOnlySet<QuotaRetryAdmissionPoolKey> GetQuotaRetryAdmissionPool(
+        WorkItem item,
+        Project? project,
+        string? requiredCapability = null);
 }
 
 public sealed record QuotaRetryRoutingDecision(
@@ -27,3 +32,27 @@ public sealed record QuotaRetryRoutingDecision(
     bool NoEligibleMembers,
     string? Reason,
     bool WaitingForPausedAgent = false);
+
+public readonly record struct QuotaRetryAdmissionPoolKey(
+    string RouteKey,
+    AgentKind Agent,
+    string ModelId)
+{
+    public static QuotaRetryAdmissionPoolKey FromMembership(AgentMembership member) =>
+        new(
+            NormalizeRouteKey(member.RouteKey),
+            member.Agent,
+            member.ModelId ?? string.Empty);
+
+    public static QuotaRetryAdmissionPoolKey FromDirectAgent(
+        AgentKind agent,
+        string routeKey,
+        string? modelId) =>
+        new(
+            NormalizeRouteKey(routeKey),
+            agent,
+            modelId ?? string.Empty);
+
+    private static string NormalizeRouteKey(string routeKey) =>
+        routeKey.Trim().ToLowerInvariant();
+}

@@ -564,6 +564,163 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
     }
 
     [Fact]
+    public async Task Pickup_BlockedQuotaPromotionAllowsQueuedWorkWithDifferentRoutablePool()
+    {
+        var queue = new ObservedTaskQueue();
+        var pipeline = new ReleaseControlledPipeline(_store);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        var now = DateTimeOffset.UtcNow;
+
+        var waitingAuditHighPriority = MakeQuotaWaitingItem(now, priority: 200) with
+        {
+            AgentClassId = "mixed-class",
+            QuotaRetryPhase = "audit",
+        };
+        var queuedLowPriority = MakeItem(createdAt: now.AddMilliseconds(1)) with
+        {
+            Priority = -1000,
+            AgentClassId = "mixed-class",
+        };
+
+        await _store.CreateAsync(waitingAuditHighPriority);
+        await _store.CreateAsync(queuedLowPriority);
+
+        var router = new AgentClassRouter(
+            [
+                new AgentClass
+                {
+                    Id = "mixed-class",
+                    DisplayName = "Mixed Class",
+                    Members =
+                    [
+                        new AgentMembership
+                        {
+                            Agent = AgentKind.Codex,
+                            Billing = AgentBilling.Subscription,
+                            QualityScore = 100,
+                            Capabilities = [WellKnownCapabilities.Audit],
+                        },
+                        new AgentMembership
+                        {
+                            Agent = AgentKind.Cursor,
+                            Billing = AgentBilling.Subscription,
+                            QualityScore = 90,
+                        },
+                    ],
+                },
+            ],
+            [new FakeProbe(AgentKind.Codex, 0.0), new FakeProbe(AgentKind.Cursor, 100.0)],
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        var promoter = new RecordingQuotaRetryDispatchPromoter(
+            new QuotaRetryDispatchPromotionResult(
+                Promoted: false,
+                Outcome: "skipped:quota-still-gated",
+                Disposition: QuotaRetryDispatchDisposition.Blocked));
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            router: router,
+            projects: new InMemoryProjectRepository(QuotaProject() with { DefaultAgentClass = "mixed-class" }),
+            quotaRetryDispatchPromoter: promoter);
+
+        var picked = await svc.PickNextEligibleForTestAsync(CancellationToken.None);
+
+        Assert.Equal(queuedLowPriority.Id, picked);
+        Assert.Equal(1, promoter.CallCount);
+    }
+
+    [Fact]
+    public async Task Pickup_BlockedDirectDefaultAgentBlocksQueuedWorkAcrossProjects()
+    {
+        var queue = new ObservedTaskQueue();
+        var pipeline = new ReleaseControlledPipeline(_store);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        var now = DateTimeOffset.UtcNow;
+        var highProject = new ProjectId("high");
+        var lowProject = new ProjectId("low");
+
+        var waitingHighPriority = MakeQuotaWaitingItem(now, priority: 200) with
+        {
+            ProjectId = highProject,
+            AgentClassId = null,
+        };
+        var queuedLowPriority = MakeItem(createdAt: now.AddMilliseconds(1)) with
+        {
+            ProjectId = lowProject,
+            Priority = -1000,
+            AgentClassId = null,
+            Agent = null,
+        };
+
+        await _store.CreateAsync(waitingHighPriority);
+        await _store.CreateAsync(queuedLowPriority);
+
+        var promoter = new RecordingQuotaRetryDispatchPromoter(
+            new QuotaRetryDispatchPromotionResult(
+                Promoted: false,
+                Outcome: "skipped:quota-still-gated",
+                Disposition: QuotaRetryDispatchDisposition.Blocked));
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            projects: new InMemoryProjectRepository(
+                QuotaProject() with { Id = highProject, DefaultAgentClass = null, DefaultAgent = AgentKind.Codex },
+                QuotaProject() with { Id = lowProject, DefaultAgentClass = null, DefaultAgent = AgentKind.Codex }),
+            quotaRetryDispatchPromoter: promoter);
+
+        var picked = await svc.PickNextEligibleForTestAsync(CancellationToken.None);
+
+        Assert.Null(picked);
+        Assert.Equal(1, promoter.CallCount);
+    }
+
+    [Fact]
+    public async Task Pickup_UnifiedScanLooksPastFirstPageOfIneligibleCandidates()
+    {
+        var queue = new ObservedTaskQueue();
+        var pipeline = new ReleaseControlledPipeline(_store);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        var now = DateTimeOffset.UtcNow;
+        var failedDependency = MakeItem(now.AddMilliseconds(-1)) with
+        {
+            State = WorkItemState.Failed,
+        };
+        await _store.CreateAsync(failedDependency);
+
+        for (var i = 0; i < 300; i++)
+        {
+            await _store.CreateAsync(MakeItem(now.AddMilliseconds(i)) with
+            {
+                Priority = 1000 - i,
+                DependsOn = [failedDependency.Id],
+            });
+        }
+
+        var runnable = MakeItem(now.AddSeconds(1)) with
+        {
+            Priority = -1000,
+        };
+        await _store.CreateAsync(runnable);
+
+        var promoter = new RecordingQuotaRetryDispatchPromoter(
+            new QuotaRetryDispatchPromotionResult(false, "unexpected"));
+        using var svc = new OrchestratorService(
+            queue, _store, pipeline, registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            projects: new InMemoryProjectRepository(QuotaProject()),
+            quotaRetryDispatchPromoter: promoter);
+
+        var picked = await svc.PickNextEligibleForTestAsync(CancellationToken.None);
+
+        Assert.Equal(runnable.Id, picked);
+        Assert.Equal(0, promoter.CallCount);
+    }
+
+    [Fact]
     public async Task Pickup_NonBlockingQuotaPromotionOutcomeAllowsQueuedWork()
     {
         var queue = new ObservedTaskQueue();
@@ -661,6 +818,24 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         }
     }
 
+    [Theory]
+    [InlineData("skipped:quota-still-gated", null, QuotaRetryDispatchDisposition.Blocked)]
+    [InlineData("skipped:max-retries", null, QuotaRetryDispatchDisposition.RestartSelection)]
+    [InlineData("moved:waiting-for-agent-resume", null, QuotaRetryDispatchDisposition.RestartSelection)]
+    [InlineData("retry-failed", "work item state changed concurrently; retry aborted", QuotaRetryDispatchDisposition.RestartSelection)]
+    [InlineData("retry-failed", "bare repo missing", QuotaRetryDispatchDisposition.Continue)]
+    [InlineData("skipped:no-eligible-members", null, QuotaRetryDispatchDisposition.Continue)]
+    public void QuotaRetryDispatchPromoter_MapsRealRetryOutcomesToDispatchDispositions(
+        string outcome,
+        string? reason,
+        QuotaRetryDispatchDisposition expected)
+    {
+        var disposition = QuotaRetryScheduler.DispatchDispositionForOutcome(
+            new QuotaRetryScheduler.QuotaRetryAttemptResult(outcome, reason));
+
+        Assert.Equal(expected, disposition);
+    }
+
     [Fact]
     public async Task UnifiedPickupQuery_OrdersDueQuotaRetryRowsByResumePhase()
     {
@@ -702,10 +877,91 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             ordered.Add(item.Id);
         }
 
+        Assert.Contains(mergeLowPriority.Id, ordered);
+        Assert.Contains(upstreamLowPriority.Id, ordered);
+        Assert.Contains(queuedHighPriority.Id, ordered);
+        Assert.Contains(auditLowPriority.Id, ordered);
+        Assert.Contains(conflictLowPriority.Id, ordered);
+
         Assert.True(ordered.IndexOf(mergeLowPriority.Id) < ordered.IndexOf(queuedHighPriority.Id));
         Assert.True(ordered.IndexOf(upstreamLowPriority.Id) < ordered.IndexOf(queuedHighPriority.Id));
         Assert.True(ordered.IndexOf(queuedHighPriority.Id) < ordered.IndexOf(auditLowPriority.Id));
         Assert.True(ordered.IndexOf(queuedHighPriority.Id) < ordered.IndexOf(conflictLowPriority.Id));
+    }
+
+    [Fact]
+    public async Task UnifiedPickupQuery_IncludesDueQuotaRetryRowsWithNullRetryTimestamp()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var waiting = MakeQuotaWaitingItem(now, priority: 200) with
+        {
+            NextQuotaRetryAt = null,
+        };
+        var queued = MakeItem(now.AddMilliseconds(1)) with { Priority = -1000 };
+
+        await _store.CreateAsync(waiting);
+        await _store.CreateAsync(queued);
+
+        var ordered = new List<WorkItemId>();
+        await foreach (var item in _store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
+            new HashSet<WorkItemId>(),
+            now,
+            limit: 10))
+        {
+            ordered.Add(item.Id);
+        }
+
+        Assert.Contains(waiting.Id, ordered);
+        Assert.True(ordered.IndexOf(waiting.Id) < ordered.IndexOf(queued.Id));
+    }
+
+    [Fact]
+    public async Task UnifiedPickupQuery_ComparesQuotaRetryTimestampsByInstant()
+    {
+        var now = new DateTimeOffset(2026, 7, 7, 15, 0, 0, TimeSpan.Zero);
+        var dueWithOffset = MakeQuotaWaitingItem(now, priority: 200) with
+        {
+            NextQuotaRetryAt = new DateTimeOffset(2026, 7, 8, 0, 0, 0, TimeSpan.FromHours(10)),
+        };
+        var queued = MakeItem(now.AddMilliseconds(1)) with { Priority = -1000 };
+
+        await _store.CreateAsync(dueWithOffset);
+        await _store.CreateAsync(queued);
+
+        var ordered = new List<WorkItemId>();
+        await foreach (var item in _store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
+            new HashSet<WorkItemId>(),
+            now,
+            limit: 10))
+        {
+            ordered.Add(item.Id);
+        }
+
+        Assert.Contains(dueWithOffset.Id, ordered);
+        Assert.True(ordered.IndexOf(dueWithOffset.Id) < ordered.IndexOf(queued.Id));
+    }
+
+    [Fact]
+    public async Task UnifiedPickupQuery_AppliesSkipIdsToDueQuotaRetryRows()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var skippedWaiting = MakeQuotaWaitingItem(now, priority: 200);
+        var queued = MakeItem(now.AddMilliseconds(1)) with { Priority = -1000 };
+
+        await _store.CreateAsync(skippedWaiting);
+        await _store.CreateAsync(queued);
+
+        var ordered = new List<WorkItemId>();
+        await foreach (var item in _store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
+            new HashSet<WorkItemId> { skippedWaiting.Id },
+            now,
+            limit: 10))
+        {
+            ordered.Add(item.Id);
+        }
+
+        Assert.DoesNotContain(skippedWaiting.Id, ordered);
+        Assert.Contains(queued.Id, ordered);
     }
 
     [Fact]
@@ -1558,6 +1814,12 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             CancellationToken ct,
             string? requiredCapability = null) =>
             Task.FromResult<DateTimeOffset?>(null);
+
+        public IReadOnlySet<QuotaRetryAdmissionPoolKey> GetQuotaRetryAdmissionPool(
+            WorkItem item,
+            Project? project,
+            string? requiredCapability = null) =>
+            throw new InvalidOperationException("quota retry router failed");
     }
 
     private sealed class RecordingQuotaRetryDispatchPromoter : IQuotaRetryDispatchPromoter

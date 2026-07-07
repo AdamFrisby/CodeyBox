@@ -1038,6 +1038,17 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
             CancellationToken ct,
             string? requiredCapability = null)
             => Task.FromResult<DateTimeOffset?>(null);
+
+        public IReadOnlySet<QuotaRetryAdmissionPoolKey> GetQuotaRetryAdmissionPool(
+            WorkItem item,
+            Project? project,
+            string? requiredCapability = null)
+        {
+            if (item.Id == _throwFor)
+                throw new InvalidOperationException("startup router failed");
+
+            return new HashSet<QuotaRetryAdmissionPoolKey>();
+        }
     }
 
     private sealed class RecordingQuotaRetryRouter : IQuotaRetryRouter
@@ -1071,6 +1082,12 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
                 ? AuditResetAt
                 : GenericResetAt);
         }
+
+        public IReadOnlySet<QuotaRetryAdmissionPoolKey> GetQuotaRetryAdmissionPool(
+            WorkItem item,
+            Project? project,
+            string? requiredCapability = null) =>
+            new HashSet<QuotaRetryAdmissionPoolKey>();
     }
 
     private sealed class ThrowingWebhookDispatcher : IWebhookDispatcher

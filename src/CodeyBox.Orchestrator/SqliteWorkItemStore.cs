@@ -1434,7 +1434,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                             1 AS dispatch_source_order
                         FROM work_items wi
                         WHERE wi.state = {(int)WorkItemState.WaitingForQuotaReset}
-                          AND (wi.next_quota_retry_at IS NULL OR wi.next_quota_retry_at <= $now)
+                          AND (wi.next_quota_retry_at IS NULL OR julianday(wi.next_quota_retry_at) <= julianday($now))
                         {skipFilter}
                     )
                     ORDER BY

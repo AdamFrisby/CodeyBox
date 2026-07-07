@@ -43,7 +43,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
 
     // Active timers for targeted wakeups. Key = WorkItemId.
     private readonly ConcurrentDictionary<WorkItemId, ITimer> _targetedTimers = new();
-    private readonly record struct QuotaRetryAttemptResult(string Outcome, string? Reason = null);
+    internal readonly record struct QuotaRetryAttemptResult(string Outcome, string? Reason = null);
     private AutoRetryOnQuotaFailureOptions CurrentRetryOptions
     {
         get
@@ -457,7 +457,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         }
     }
 
-    private static QuotaRetryDispatchDisposition DispatchDispositionForOutcome(
+    internal static QuotaRetryDispatchDisposition DispatchDispositionForOutcome(
         QuotaRetryAttemptResult outcome)
     {
         if (outcome.Outcome == "retry-failed"

@@ -110,18 +110,13 @@ internal sealed class Bridge : IAsyncDisposable
         // process once the grace window expires. RunAsync still gets a chance
         // to return cooperatively first; the watchdog is the backstop.
         //
-        // Reset the dispositions to SIG_DFL first. .NET's PosixSignalRegistration
-        // deliberately preserves an inherited SIG_IGN (POSIX "parent ignored it,
-        // keep ignoring" / nohup semantics): if any ancestor launched the bridge
-        // with SIGHUP (or SIGTERM/SIGINT) masked to SIG_IGN, the runtime records
-        // that and never installs a catchable handler, so kill(SIGHUP) is silently
-        // discarded and the ~/.claude/ide/<port>.lock file plus the claude --ide
-        // subtree leak on tear-down. A shutdown daemon must catch its term signals
-        // regardless of the disposition it inherited, so we clear SIG_IGN back to
-        // SIG_DFL before registering; the runtime then installs its handler and our
-        // Shutdown(0) runs. The reset→register window is a few instructions wide and
-        // any signal landing inside it takes the default terminate — the same
-        // outcome we want for an un-serviced term signal during startup.
+        // Reset inherited SIGHUP SIG_IGN to SIG_DFL first. .NET's
+        // PosixSignalRegistration deliberately preserves an inherited SIG_IGN
+        // (POSIX "parent ignored it, keep ignoring" / nohup semantics), so a
+        // bridge launched under an ancestor that ignores SIGHUP would otherwise
+        // discard kill(SIGHUP) silently and leak the lockfile/subtree. SIGTERM
+        // and SIGINT are left to the runtime's startup handlers; see
+        // ResetSignalDispositionsToDefault for the narrow reset rationale.
         ResetSignalDispositionsToDefault();
         _sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
         _sigint = PosixSignalRegistration.Create(PosixSignal.SIGINT, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
@@ -860,17 +855,6 @@ internal sealed class Bridge : IAsyncDisposable
     }
 
     /// <summary>
-    /// Belt-and-braces watchdog the SIGTERM/SIGINT/SIGHUP handlers schedule
-    /// after running <see cref="Shutdown(int)"/>. Cooperative exit (RunAsync
-    /// returning normally after <c>_cts.Cancel()</c> unblocks the stdin read)
-    /// is preferred and happens first when the read does unblock; the
-    /// watchdog only fires if the read stayed parked past the grace window —
-    /// the regression mode this guards against. By the time this delay
-    /// elapses Shutdown has already deleted the lockfile, SIGTERM'd claude,
-    /// stopped the TCP listener and cancelled the CTS, so force-exit is
-    /// safe — the process simply leaves no half-cleaned state behind.
-    /// </summary>
-    /// <summary>
     /// Clears an inherited SIG_IGN disposition on SIGHUP, restoring SIG_DFL so
     /// that the subsequent <see cref="PosixSignalRegistration.Create"/> call
     /// installs a catchable handler. Without this, a bridge launched under an
@@ -899,6 +883,11 @@ internal sealed class Bridge : IAsyncDisposable
         try { NativeMethods.Signal(NativeMethods.SIGHUP, IntPtr.Zero); } catch { }
     }
 
+    /// <summary>
+    /// Belt-and-braces watchdog the SIGTERM/SIGINT/SIGHUP handlers schedule
+    /// after running <see cref="Shutdown(int)"/>. Cooperative exit is preferred;
+    /// this only fires if stdin stays parked past the grace window.
+    /// </summary>
     private void ScheduleForceExitAfterSignal()
     {
         _ = Task.Run(async () =>

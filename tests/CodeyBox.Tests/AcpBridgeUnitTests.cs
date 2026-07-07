@@ -2759,6 +2759,19 @@ public sealed class AcpBridgeUnitTests
     [InlineData(2, "SIGINT")]  // Ctrl+C
     [InlineData(1, "SIGHUP")]  // controlling-terminal hangup
     public async Task Bridge_PosixSignalHandlers_TriggerCleanShutdownAndLockfileCleanup(int signo, string signalName)
+        => await AssertBridgeSignalTriggersCleanShutdownAsync(signo, signalName);
+
+    [Fact]
+    public async Task Bridge_SighupHandler_ResetsInheritedIgnoredDisposition()
+        => await AssertBridgeSignalTriggersCleanShutdownAsync(
+            1,
+            "SIGHUP-inherited-ignore",
+            inheritIgnoredSighup: true);
+
+    private static async Task AssertBridgeSignalTriggersCleanShutdownAsync(
+        int signo,
+        string signalName,
+        bool inheritIgnoredSighup = false)
     {
         if (!File.Exists("/bin/bash"))
             return; // honour Skippable shape without taking the dependency
@@ -2782,7 +2795,7 @@ public sealed class AcpBridgeUnitTests
             File.SetUnixFileMode(stubPath,
                 UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
-            var psi = new ProcessStartInfo("dotnet")
+            var psi = new ProcessStartInfo(inheritIgnoredSighup ? "/bin/bash" : "dotnet")
             {
                 RedirectStandardInput = true,
                 RedirectStandardOutput = true,
@@ -2791,8 +2804,20 @@ public sealed class AcpBridgeUnitTests
                 CreateNoWindow = true,
                 WorkingDirectory = tmpDir,
             };
-            psi.ArgumentList.Add("exec");
-            psi.ArgumentList.Add(bridgeDllPath);
+            if (inheritIgnoredSighup)
+            {
+                psi.ArgumentList.Add("-c");
+                psi.ArgumentList.Add("trap '' HUP; exec \"$@\"");
+                psi.ArgumentList.Add("cb-acp-bridge");
+                psi.ArgumentList.Add("dotnet");
+                psi.ArgumentList.Add("exec");
+                psi.ArgumentList.Add(bridgeDllPath);
+            }
+            else
+            {
+                psi.ArgumentList.Add("exec");
+                psi.ArgumentList.Add(bridgeDllPath);
+            }
 
             using var proc = Process.Start(psi)
                 ?? throw new InvalidOperationException("Process.Start returned null for dotnet exec.");

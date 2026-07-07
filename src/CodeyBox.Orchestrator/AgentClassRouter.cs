@@ -1327,6 +1327,36 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         return IsEligibleMemberForItem(member, item, effectiveCapabilities, capability);
     }
 
+    public IReadOnlySet<QuotaRetryAdmissionPoolKey> GetQuotaRetryAdmissionPool(
+        WorkItem item,
+        Project? project,
+        string? requiredCapability = null)
+    {
+        var classId = item.AgentClassId ?? project?.DefaultAgentClass;
+        if (string.IsNullOrEmpty(classId))
+            return new HashSet<QuotaRetryAdmissionPoolKey>();
+
+        var cfg = Volatile.Read(ref _routingConfig);
+        if (!cfg.Catalog.TryGetValue(classId, out var agentClass))
+            return new HashSet<QuotaRetryAdmissionPoolKey>();
+
+        var effectiveCapabilities = BuildEffectiveCapabilities(agentClass);
+        var requiredCapabilityPoolActive = !string.IsNullOrWhiteSpace(requiredCapability)
+            && agentClass.Members.Any(member => MemberHasCapability(
+                member,
+                requiredCapability!,
+                effectiveCapabilities));
+
+        return agentClass.Members
+            .Where(member => IsEligibleMemberForItem(
+                member,
+                item,
+                effectiveCapabilities,
+                requiredCapabilityPoolActive ? requiredCapability : null))
+            .Select(QuotaRetryAdmissionPoolKey.FromMembership)
+            .ToHashSet();
+    }
+
     /// <summary>
     /// Counts class members that <see cref="OrderedFallbackCandidatesAsync"/>
     /// would have considered for <paramref name="item"/> — i.e. they pass the
