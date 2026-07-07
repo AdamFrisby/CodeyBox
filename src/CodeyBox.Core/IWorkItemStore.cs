@@ -319,11 +319,11 @@ public interface IWorkItemStore
             if (skipIds.Contains(item.Id) || !IsDueQuotaRetryCandidate(item, now))
                 continue;
 
-            rows.Add((item, OrderingStateForQuotaRetryCandidate(item), sequence++));
+            rows.Add((item, QuotaRetryPhasePolicy.OrderingStateForQuotaRetryCandidate(item), sequence++));
         }
 
         foreach (var row in rows
-            .OrderBy(static row => DispatchPhaseBucket(row.OrderingState))
+            .OrderBy(static row => QuotaRetryPhasePolicy.DispatchPhaseBucket(row.OrderingState))
             .ThenByDescending(static row => row.Item.Priority)
             .ThenBy(static row => row.Item.CreatedAt)
             .ThenBy(static row => row.Sequence)
@@ -335,50 +335,6 @@ public interface IWorkItemStore
 
     private static bool IsDueQuotaRetryCandidate(WorkItem item, DateTimeOffset now) =>
         item.NextQuotaRetryAt is null || item.NextQuotaRetryAt <= now;
-
-    private static WorkItemState OrderingStateForQuotaRetryCandidate(WorkItem item)
-    {
-        var retryFrom = !string.IsNullOrWhiteSpace(item.QuotaRetryPhase)
-            ? RetryFromForQuotaPhase(item.QuotaRetryPhase)
-            : NormalizeRetryFrom(item.QuotaRetryFrom);
-
-        return retryFrom switch
-        {
-            "audit" => WorkItemState.WorkComplete,
-            "conflict_rework" => WorkItemState.ReworkingForConflict,
-            "merge" => WorkItemState.AuditPassed,
-            "upstream" => WorkItemState.Merged,
-            _ => WorkItemState.Queued,
-        };
-    }
-
-    private static string RetryFromForQuotaPhase(string? phase) =>
-        phase?.Trim().ToLowerInvariant() switch
-        {
-            "audit" => "audit",
-            "rework" => "audit",
-            "merge" => "merge",
-            "upstream" => "upstream",
-            _ => "work",
-        };
-
-    private static string NormalizeRetryFrom(string? retryFrom) =>
-        retryFrom?.Trim().ToLowerInvariant() switch
-        {
-            "audit" => "audit",
-            "conflict_rework" => "conflict_rework",
-            "merge" => "merge",
-            "upstream" => "upstream",
-            _ => "work",
-        };
-
-    private static int DispatchPhaseBucket(WorkItemState state) =>
-        state is WorkItemState.AuditPassed
-            or WorkItemState.Merging
-            or WorkItemState.Merged
-            or WorkItemState.UpstreamPushing
-            ? 0
-            : 1;
 
     /// <summary>
     /// Count of work items for <paramref name="projectId"/> whose

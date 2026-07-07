@@ -39,6 +39,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         try
         {
             _conn.Open();
+            RegisterQuotaRetryPhaseFunctions(_conn);
 
             // WAL mode allows concurrent readers; SqliteDatabaseWriteGate serializes writers in-process.
             // busy_timeout is per-connection and gives external lock holders a retry window.
@@ -389,6 +390,14 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         {
             _writeLock.Release();
         }
+    }
+
+    private static void RegisterQuotaRetryPhaseFunctions(SqliteConnection conn)
+    {
+        conn.CreateFunction<string?, string?, int>(
+            "codeybox_quota_retry_dispatch_ordering_state",
+            QuotaRetryPhasePolicy.OrderingStateForQuotaRetryCandidate,
+            isDeterministic: true);
     }
 
     private void RunMigration(string sql)
@@ -1414,23 +1423,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
 
                         SELECT
                             wi.*,
-                            CASE
-                                WHEN LOWER(TRIM(COALESCE(NULLIF(wi.quota_retry_phase, ''), ''))) IN ('audit', 'rework')
-                                    THEN {(int)WorkItemState.WorkComplete}
-                                WHEN LOWER(TRIM(COALESCE(NULLIF(wi.quota_retry_phase, ''), ''))) = 'merge'
-                                    THEN {(int)WorkItemState.AuditPassed}
-                                WHEN LOWER(TRIM(COALESCE(NULLIF(wi.quota_retry_phase, ''), ''))) = 'upstream'
-                                    THEN {(int)WorkItemState.Merged}
-                                WHEN LOWER(TRIM(COALESCE(NULLIF(wi.quota_retry_from, ''), ''))) = 'audit'
-                                    THEN {(int)WorkItemState.WorkComplete}
-                                WHEN LOWER(TRIM(COALESCE(NULLIF(wi.quota_retry_from, ''), ''))) = 'conflict_rework'
-                                    THEN {(int)WorkItemState.ReworkingForConflict}
-                                WHEN LOWER(TRIM(COALESCE(NULLIF(wi.quota_retry_from, ''), ''))) = 'merge'
-                                    THEN {(int)WorkItemState.AuditPassed}
-                                WHEN LOWER(TRIM(COALESCE(NULLIF(wi.quota_retry_from, ''), ''))) = 'upstream'
-                                    THEN {(int)WorkItemState.Merged}
-                                ELSE {(int)WorkItemState.Queued}
-                            END AS dispatch_ordering_state,
+                            codeybox_quota_retry_dispatch_ordering_state(
+                                wi.quota_retry_phase,
+                                wi.quota_retry_from
+                            ) AS dispatch_ordering_state,
                             1 AS dispatch_source_order
                         FROM work_items wi
                         WHERE wi.state = {(int)WorkItemState.WaitingForQuotaReset}

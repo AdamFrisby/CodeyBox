@@ -43,7 +43,10 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
 
     // Active timers for targeted wakeups. Key = WorkItemId.
     private readonly ConcurrentDictionary<WorkItemId, ITimer> _targetedTimers = new();
-    internal readonly record struct QuotaRetryAttemptResult(string Outcome, string? Reason = null);
+    internal readonly record struct QuotaRetryAttemptResult(
+        string Outcome,
+        string? Reason = null,
+        WorkItemRetryFailureKind FailureKind = WorkItemRetryFailureKind.None);
     private AutoRetryOnQuotaFailureOptions CurrentRetryOptions
     {
         get
@@ -339,7 +342,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             item,
             project,
             ct,
-            RequiredCapabilityForRetry(item));
+            QuotaRetryPhasePolicy.RequiredCapabilityForQuotaRetryCandidate(item));
         _log.LogDebug(
             "Quota retry startup preflight for work item {Id}: shouldWait={ShouldWait} noEligible={NoEligible} reason={Reason}",
             item.Id,
@@ -461,7 +464,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         QuotaRetryAttemptResult outcome)
     {
         if (outcome.Outcome == "retry-failed"
-            && outcome.Reason?.Contains("state changed concurrently", StringComparison.OrdinalIgnoreCase) == true)
+            && outcome.FailureKind == WorkItemRetryFailureKind.StateChangedConcurrently)
             return QuotaRetryDispatchDisposition.RestartSelection;
 
         return outcome.Outcome switch
@@ -681,7 +684,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             item,
             project,
             ct,
-            RequiredCapabilityForRetry(item));
+            QuotaRetryPhasePolicy.RequiredCapabilityForQuotaRetryCandidate(item));
         if (decision.ShouldWait)
         {
             if (decision.WaitingForPausedAgent)
@@ -748,7 +751,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             project,
             pausedAgent: null,
             ct,
-            retryFrom: NormalizeRetryFrom(item.QuotaRetryFrom));
+            retryFrom: QuotaRetryPhasePolicy.NormalizeRetryFrom(item.QuotaRetryFrom));
         if (!result.Updated)
         {
             return new QuotaRetryAttemptResult("skipped:state-changed", result.Reason);
@@ -816,22 +819,22 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         string trigger,
         CancellationToken ct)
     {
-        var retryFrom = NormalizeRetryFrom(item.QuotaRetryFrom);
+        var retryFrom = QuotaRetryPhasePolicy.NormalizeRetryFrom(item.QuotaRetryFrom);
         _log.LogInformation("Triggering quota auto-retry ({Trigger}) for work item {Id} (attempt {Attempt})",
             trigger, item.Id, item.QuotaRetryAttempts + 1);
 
         // Re-use logic from shared WorkItemRetrier to ensure identical side effects,
         // audit logs, and conditional state updates (prevents race conditions).
-        var (success, error, _, actualFrom, _) = await _retrier.RetryQuotaAutoAsync(
+        var retry = await _retrier.RetryQuotaAutoAsync(
             item,
             from: retryFrom,
             trigger: trigger,
             ct: ct);
 
-        if (!success)
+        if (!retry.Success)
         {
-            _log.LogWarning("Failed to trigger quota auto-retry for work item {Id}: {Error}", item.Id, error);
-            return new QuotaRetryAttemptResult("retry-failed", error);
+            _log.LogWarning("Failed to trigger quota auto-retry for work item {Id}: {Error}", item.Id, retry.Error);
+            return new QuotaRetryAttemptResult("retry-failed", retry.Error, retry.FailureKind);
         }
 
         if (_webhooks is not null)
@@ -852,7 +855,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                         attemptNumber = (updated?.QuotaRetryAttempts ?? item.QuotaRetryAttempts + 1),
                         triggeredBy = trigger,
                         from = retryFrom,
-                        actualFrom
+                        actualFrom = retry.ActualFrom
                     }
                 }, CancellationToken.None);
             }
@@ -865,33 +868,10 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             }
         }
 
-        return new QuotaRetryAttemptResult("retried", actualFrom == retryFrom ? $"from={retryFrom}" : $"from={retryFrom}; actualFrom={actualFrom}");
+        return new QuotaRetryAttemptResult(
+            "retried",
+            retry.ActualFrom == retryFrom ? $"from={retryFrom}" : $"from={retryFrom}; actualFrom={retry.ActualFrom}");
     }
-
-    private static string NormalizeRetryFrom(string? retryFrom) => retryFrom?.Trim().ToLowerInvariant() switch
-    {
-        "planning" => "planning",
-        "audit" => "audit",
-        "conflict_rework" => "conflict_rework",
-        "merge" => "merge",
-        "upstream" => "upstream",
-        _ => "work",
-    };
-
-    private static string? RequiredCapabilityForRetry(WorkItem item)
-    {
-        if (!string.IsNullOrWhiteSpace(item.QuotaRetryPhase))
-            return RequiredCapabilityForPhase(item.QuotaRetryPhase);
-
-        return NormalizeRetryFrom(item.QuotaRetryFrom) == "audit"
-            ? WellKnownCapabilities.Audit
-            : null;
-    }
-
-    private static string? RequiredCapabilityForPhase(string? phase) =>
-        string.Equals(phase?.Trim(), "audit", StringComparison.OrdinalIgnoreCase)
-            ? WellKnownCapabilities.Audit
-            : null;
 
     /// <summary>
     /// Notifies the scheduler that a work item has failed with a quota error,
@@ -919,7 +899,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                     item,
                     project,
                     ct,
-                    RequiredCapabilityForRetry(item));
+                    QuotaRetryPhasePolicy.RequiredCapabilityForQuotaRetryCandidate(item));
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {

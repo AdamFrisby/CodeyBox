@@ -3,6 +3,35 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
 
+public enum WorkItemRetryFailureKind
+{
+    None,
+    StateChangedConcurrently,
+}
+
+public readonly record struct WorkItemRetryResult(
+    bool Success,
+    string? Error,
+    WorkItemState? ResumeState,
+    string? ActualFrom,
+    IReadOnlyList<string>? OpenQuestions,
+    WorkItemRetryFailureKind FailureKind = WorkItemRetryFailureKind.None)
+{
+    public void Deconstruct(
+        out bool success,
+        out string? error,
+        out WorkItemState? resumeState,
+        out string? actualFrom,
+        out IReadOnlyList<string>? openQuestions)
+    {
+        success = Success;
+        error = Error;
+        resumeState = ResumeState;
+        actualFrom = ActualFrom;
+        openQuestions = OpenQuestions;
+    }
+}
+
 /// <summary>
 /// Consolidates retry logic for terminal and operator-parked work items,
 /// ensuring consistent state transitions, audit logs, and side effects (e.g.
@@ -51,28 +80,28 @@ public sealed class WorkItemRetrier
         _log = log;
     }
 
-    public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryAsync(
+    public async Task<WorkItemRetryResult> RetryAsync(
         WorkItem item,
         string? from = null,
         string trigger = "manual",
         CancellationToken ct = default)
         => await RetryCoreAsync(item, from, trigger, RetryAccounting.None, ct);
 
-    public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryQuotaAutoAsync(
+    public async Task<WorkItemRetryResult> RetryQuotaAutoAsync(
         WorkItem item,
         string? from,
         string trigger,
         CancellationToken ct = default)
         => await RetryCoreAsync(item, from, trigger, RetryAccounting.QuotaAutoRetry, ct);
 
-    public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryTransientAutoAsync(
+    public async Task<WorkItemRetryResult> RetryTransientAutoAsync(
         WorkItem item,
         string? from,
         string trigger,
         CancellationToken ct = default)
         => await RetryCoreAsync(item, from, trigger, RetryAccounting.TransientAutoRetry, ct);
 
-    private async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryCoreAsync(
+    private async Task<WorkItemRetryResult> RetryCoreAsync(
         WorkItem item,
         string? from,
         string trigger,
@@ -88,7 +117,7 @@ public sealed class WorkItemRetrier
                 .ToArray();
             if (openQuestions.Length > 0)
             {
-                return (
+                return new WorkItemRetryResult(
                     false,
                     "cannot retry item while operator questions are open; answer or dismiss them first",
                     null,
@@ -111,7 +140,12 @@ public sealed class WorkItemRetrier
             catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
             {
                 _log.LogWarning(ex, "Failed to auto-pick retry phase for work item {Id}; retry aborted", item.Id);
-                return (false, $"cannot auto-pick retry phase for work item {item.Id}: {ex.Message}", null, null, null);
+                return new WorkItemRetryResult(
+                    false,
+                    $"cannot auto-pick retry phase for work item {item.Id}: {ex.Message}",
+                    null,
+                    null,
+                    null);
             }
         }
 
@@ -131,20 +165,34 @@ public sealed class WorkItemRetrier
         };
 
         if (resumeState is null)
-            return (false, $"invalid 'from' value '{from}'", null, null, null);
+        {
+            return new WorkItemRetryResult(
+                false,
+                $"invalid 'from' value '{from}'",
+                null,
+                null,
+                null);
+        }
 
         var actualFrom = requestedFrom;
         var retryingBeforeWork = resumeState.Value is WorkItemState.PlanReview or WorkItemState.PlanApproved;
 
         if (ValidatePlanningResumeBoundary(item, requestedFrom) is { } planningBoundaryError)
-            return (false, planningBoundaryError, null, null, null);
+            return new WorkItemRetryResult(false, planningBoundaryError, null, null, null);
 
         // For from != "work", the pipeline expects the bare repo to still be present.
         if (resumeState != WorkItemState.Queued && !retryingBeforeWork)
         {
             var present = await _gitHost.RepositoryExistsAsync(item.Id, ct);
             if (!present)
-                return (false, $"cannot retry from '{from}': bare repo for work item {item.Id} no longer exists", null, null, null);
+            {
+                return new WorkItemRetryResult(
+                    false,
+                    $"cannot retry from '{from}': bare repo for work item {item.Id} no longer exists",
+                    null,
+                    null,
+                    null);
+            }
 
             // The work branch must also exist — earlier work-phase failures can
             // leave the item in Failed without ever producing a commit, in which
@@ -214,7 +262,13 @@ public sealed class WorkItemRetrier
             : await _store.TryUpdateIfStateAsync(resumed, item.State, ct);
         if (!updated)
         {
-            return (false, "work item state changed concurrently; retry aborted", null, null, null);
+            return new WorkItemRetryResult(
+                false,
+                "work item state changed concurrently; retry aborted",
+                null,
+                null,
+                null,
+                WorkItemRetryFailureKind.StateChangedConcurrently);
         }
 
         if (_streamSummaries is not null)
@@ -251,17 +305,27 @@ public sealed class WorkItemRetrier
                 _log.LogWarning(ex,
                     "Retry of work item {Id} updated state to {State} but queue kick failed; rolled back to {PreviousState}",
                     item.Id, resumeState.Value, item.State);
-                return (false, $"queue enqueue failed after state update; rolled back to {item.State}: {ex.Message}", null, actualFrom, null);
+                return new WorkItemRetryResult(
+                    false,
+                    $"queue enqueue failed after state update; rolled back to {item.State}: {ex.Message}",
+                    null,
+                    actualFrom,
+                    null);
             }
 
             _log.LogError(ex,
                 "Retry of work item {Id} updated state to {State} but queue kick failed and rollback did not apply",
                 item.Id, resumeState.Value);
-            return (false, $"queue enqueue failed after state update and rollback did not apply: {ex.Message}", null, actualFrom, null);
+            return new WorkItemRetryResult(
+                false,
+                $"queue enqueue failed after state update and rollback did not apply: {ex.Message}",
+                null,
+                actualFrom,
+                null);
         }
 
         AuditLog.WorkItemRetried(item.Id, trigger == "manual" ? auditFrom : $"{auditFrom} (auto-retry: {trigger})");
-        return (true, null, resumeState, actualFrom, null);
+        return new WorkItemRetryResult(true, null, resumeState, actualFrom, null);
     }
 
     /// <summary>

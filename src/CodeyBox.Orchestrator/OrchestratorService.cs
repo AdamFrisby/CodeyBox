@@ -15,6 +15,12 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser, IWorkerPoolOccupancy, IInfrastructureDeferralScheduler, IRefactorProjectGateStatusProvider, IRefactorProjectDispatchGate
 {
+    private const int DispatchPickupCandidatePageSize = 128;
+    // A promotion can lose a state race to another worker or operator action.
+    // Restart a small number of times so the picker observes the fresh row state
+    // without spinning indefinitely on a hot item.
+    private const int MaxQuotaPromotionRaceSelectionRestarts = 3;
+
     // Flipped by PauseDispatch() — the SandboxShutdownTeardownService calls it
     // from its IHostedLifecycleService.StoppingAsync BEFORE it begins freezing
     // VMs, so the dispatch loop stops picking up new items and creating new
@@ -1440,15 +1446,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         Dictionary<WorkItemId, WorkItemState>? statesById = null;
         var pendingRefactorProjects = (await CollectActiveRefactorDrainClaimsAsync(stoppingToken))
             .ToDictionary(c => c.ProjectId.Value, c => c.RefactorWorkItemId, StringComparer.Ordinal);
-        var quotaAdmissionPoolsByItemId = new Dictionary<WorkItemId, IReadOnlySet<QuotaRetryAdmissionPoolKey>>();
-        var projectsByItemId = new Dictionary<WorkItemId, Project?>();
+        var quotaAdmission = new QuotaRetryAdmissionPolicy(_router, _projects, _log);
 
-        for (var selectionAttempt = 0; selectionAttempt < 3; selectionAttempt++)
+        for (var selectionAttempt = 0; selectionAttempt < MaxQuotaPromotionRaceSelectionRestarts; selectionAttempt++)
         {
             var quotaRetryBlockers = new List<WorkItem>();
             var restartSelection = false;
-            var candidates = await ListPickupCandidatesByPriorityAsync(skipIds, stoppingToken);
-            foreach (var candidate in candidates)
+            await foreach (var candidate in EnumeratePickupCandidatesByPriorityAsync(skipIds, stoppingToken))
             {
                 if (!await DependenciesSatisfiedForPickupAsync(candidate, stoppingToken))
                     continue;
@@ -1474,8 +1478,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 if (await IsBlockedByHigherPriorityQuotaRetryCandidateAsync(
                         candidate,
                         quotaRetryBlockers,
-                        quotaAdmissionPoolsByItemId,
-                        projectsByItemId,
+                        quotaAdmission,
                         stoppingToken))
                 {
                     _log.LogDebug(
@@ -1599,8 +1602,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         async Task<bool> IsBlockedByHigherPriorityQuotaRetryCandidateAsync(
             WorkItem candidate,
             IReadOnlyList<WorkItem> blockers,
-            Dictionary<WorkItemId, IReadOnlySet<QuotaRetryAdmissionPoolKey>> poolCache,
-            Dictionary<WorkItemId, Project?> projectCache,
+            QuotaRetryAdmissionPolicy admission,
             CancellationToken ct)
         {
             if (blockers.Count == 0)
@@ -1608,7 +1610,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
             foreach (var blocker in blockers)
             {
-                if (await SharesQuotaRetryAdmissionPoolAsync(blocker, candidate, poolCache, projectCache, ct))
+                if (await admission.BlocksLowerPriorityCandidateAsync(blocker, candidate, ct))
                     return true;
             }
 
@@ -1616,27 +1618,35 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         }
     }
 
-    private async Task<List<WorkItem>> ListPickupCandidatesByPriorityAsync(
+    private async IAsyncEnumerable<WorkItem> EnumeratePickupCandidatesByPriorityAsync(
         IReadOnlySet<WorkItemId> skipIds,
-        CancellationToken ct)
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
-        var candidates = new List<WorkItem>();
         if (_quotaRetryDispatchPromoter is null)
         {
             await foreach (var item in _store.ListDispatchEligibleByPriorityAsync(skipIds, ct))
-                candidates.Add(item);
-            return candidates;
+                yield return item;
+            yield break;
         }
 
-        await foreach (var item in _store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
-            skipIds,
-            _time.GetUtcNow(),
-            int.MaxValue,
-            ct))
+        var pageSkipIds = new HashSet<WorkItemId>(skipIds);
+        while (true)
         {
-            candidates.Add(item);
+            var pageCount = 0;
+            await foreach (var item in _store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
+                pageSkipIds,
+                _time.GetUtcNow(),
+                DispatchPickupCandidatePageSize,
+                ct))
+            {
+                pageCount++;
+                pageSkipIds.Add(item.Id);
+                yield return item;
+            }
+
+            if (pageCount < DispatchPickupCandidatePageSize)
+                yield break;
         }
-        return candidates;
     }
 
     private async Task<QuotaRetryDispatchPromotionResult> TryPromoteQuotaRetryCandidateForDispatchAsync(
@@ -1669,121 +1679,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             result.Reason);
         return result;
     }
-
-    private async Task<bool> SharesQuotaRetryAdmissionPoolAsync(
-        WorkItem blocker,
-        WorkItem candidate,
-        Dictionary<WorkItemId, IReadOnlySet<QuotaRetryAdmissionPoolKey>> poolCache,
-        Dictionary<WorkItemId, Project?> projectCache,
-        CancellationToken ct)
-    {
-        var blockerPool = await ResolveQuotaRetryAdmissionPoolAsync(blocker, poolCache, projectCache, ct);
-        if (blockerPool.Count == 0)
-            return false;
-
-        var candidatePool = await ResolveQuotaRetryAdmissionPoolAsync(candidate, poolCache, projectCache, ct);
-        if (candidatePool.Count == 0)
-            return false;
-
-        return candidatePool.All(blockerPool.Contains);
-    }
-
-    private async Task<IReadOnlySet<QuotaRetryAdmissionPoolKey>> ResolveQuotaRetryAdmissionPoolAsync(
-        WorkItem item,
-        Dictionary<WorkItemId, IReadOnlySet<QuotaRetryAdmissionPoolKey>> poolCache,
-        Dictionary<WorkItemId, Project?> projectCache,
-        CancellationToken ct)
-    {
-        if (poolCache.TryGetValue(item.Id, out var cached))
-            return cached;
-
-        var project = await ResolveProjectForAdmissionPoolAsync(item, projectCache, ct);
-        var requiredCapability = RequiredCapabilityForQuotaAdmissionPool(item);
-        if (_router is not null)
-        {
-            var routerPool = _router.GetQuotaRetryAdmissionPool(item, project, requiredCapability);
-            if (routerPool.Count > 0)
-            {
-                poolCache[item.Id] = routerPool;
-                return routerPool;
-            }
-        }
-
-        var directAgent = item.Agent ?? project?.DefaultAgent;
-        IReadOnlySet<QuotaRetryAdmissionPoolKey> resolved = directAgent is { } agent
-            ? new HashSet<QuotaRetryAdmissionPoolKey>
-            {
-                QuotaRetryAdmissionPoolKey.FromDirectAgent(
-                    agent,
-                    ResolveDirectRouteKey(agent, item.AgentInstanceId),
-                    item.ModelId),
-            }
-            : new HashSet<QuotaRetryAdmissionPoolKey>();
-
-        poolCache[item.Id] = resolved;
-        return resolved;
-    }
-
-    private async Task<Project?> ResolveProjectForAdmissionPoolAsync(
-        WorkItem item,
-        Dictionary<WorkItemId, Project?> projectCache,
-        CancellationToken ct)
-    {
-        if (projectCache.TryGetValue(item.Id, out var cached))
-            return cached;
-
-        Project? resolved = null;
-        if (_projects is not null)
-        {
-            try
-            {
-                resolved = await _projects.GetAsync(item.ProjectId, ct);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _log.LogDebug(
-                    ex,
-                    "Could not resolve project for work item {Id}; falling back to item-local quota pool comparison",
-                    item.Id);
-            }
-        }
-
-        projectCache[item.Id] = resolved;
-        return resolved;
-    }
-
-    private static string? RequiredCapabilityForQuotaAdmissionPool(WorkItem item)
-    {
-        if (item.State == WorkItemState.WaitingForQuotaReset)
-        {
-            if (!string.IsNullOrWhiteSpace(item.QuotaRetryPhase))
-                return RequiredCapabilityForQuotaRetryPhase(item.QuotaRetryPhase);
-
-            return NormalizeQuotaRetryFrom(item.QuotaRetryFrom) == "audit"
-                ? WellKnownCapabilities.Audit
-                : null;
-        }
-
-        return item.State == WorkItemState.WorkComplete
-            ? WellKnownCapabilities.Audit
-            : null;
-    }
-
-    private static string? RequiredCapabilityForQuotaRetryPhase(string? phase) =>
-        string.Equals(phase?.Trim(), "audit", StringComparison.OrdinalIgnoreCase)
-            ? WellKnownCapabilities.Audit
-            : null;
-
-    private static string NormalizeQuotaRetryFrom(string? retryFrom) =>
-        retryFrom?.Trim().ToLowerInvariant() switch
-        {
-            "audit" => "audit",
-            _ => "work",
-        };
 
     private async Task<bool> TryDeferForProjectPauseAtPickupAsync(WorkItem candidate, CancellationToken stoppingToken)
     {
@@ -3058,20 +2953,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         DispatchPhaseBucket(item.State);
 
     private static int DispatchPhaseBucket(WorkItemState state) =>
-        state is WorkItemState.AuditPassed
-            or WorkItemState.Merging
-            or WorkItemState.Merged
-            or WorkItemState.UpstreamPushing
-            ? 0
-            : 1;
+        QuotaRetryPhasePolicy.DispatchPhaseBucket(state);
 
     private static int DispatchPhaseBucket(RefactorDispatchCandidate item) =>
-        item.State is WorkItemState.AuditPassed
-            or WorkItemState.Merging
-            or WorkItemState.Merged
-            or WorkItemState.UpstreamPushing
-            ? 0
-            : 1;
+        QuotaRetryPhasePolicy.DispatchPhaseBucket(item.State);
 
     /// <summary>
     /// Mirrors the SQL ordering of <see cref="IWorkItemStore.ListDispatchEligibleByPriorityAsync"/>:
