@@ -22,7 +22,6 @@ internal sealed class Bridge : IAsyncDisposable
     private const int SigHup = 1;
     private const int SigInt = 2;
     private const int SigTerm = 15;
-    internal const string SignalBootstrapReexecEnv = "CODEYBOX_ACPBRIDGE_SIGNAL_BOOTSTRAP_REEXECED";
 
     private readonly CancellationTokenSource _cts = new();
     private readonly Func<TcpListener> _listenerFactory;
@@ -120,19 +119,19 @@ internal sealed class Bridge : IAsyncDisposable
         // CoreCLR remembered an ignored startup disposition before RunAsync
         // got control, re-exec once before publishing stdout envelopes so the
         // runtime starts from the now-default dispositions.
-        var sigtermBefore = ReadSignalHandlerOrNull(SigTerm);
-        var sigintBefore = ReadSignalHandlerOrNull(SigInt);
-        var sighupBefore = ReadSignalHandlerOrNull(SigHup);
+        var sigtermBefore = SignalBootstrap.ReadSignalHandlerOrNull(SigTerm);
+        var sigintBefore = SignalBootstrap.ReadSignalHandlerOrNull(SigInt);
+        var sighupBefore = SignalBootstrap.ReadSignalHandlerOrNull(SigHup);
 
-        ResetInheritedIgnoredSignalToDefault(SigTerm);
+        SignalBootstrap.ResetInheritedIgnoredSignalToDefault(SigTerm);
         _sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
-        ResetInheritedIgnoredSignalToDefault(SigInt);
+        SignalBootstrap.ResetInheritedIgnoredSignalToDefault(SigInt);
         _sigint = PosixSignalRegistration.Create(PosixSignal.SIGINT, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
-        ResetInheritedIgnoredSignalToDefault(SigHup);
+        SignalBootstrap.ResetInheritedIgnoredSignalToDefault(SigHup);
         _sighup = PosixSignalRegistration.Create(PosixSignal.SIGHUP, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
         if (_stdinOverride is null)
-            _ = ReexecOnceIfSignalRegistrationUnavailable(sigtermBefore, sigintBefore, sighupBefore);
-        SetSignalBootstrapGuard(null);
+            _ = SignalBootstrap.ReexecOnceIfSignalRegistrationUnavailable(sigtermBefore, sigintBefore, sighupBefore);
+        SignalBootstrap.SetSignalBootstrapGuard(null);
         AppDomain.CurrentDomain.ProcessExit += (_, _) => Shutdown(0);
 
         Emitter.Emit("bridge_started", w => w.WriteNumber("pid", Environment.ProcessId));
@@ -890,137 +889,6 @@ internal sealed class Bridge : IAsyncDisposable
         });
     }
 
-    internal static void ResetInheritedIgnoredSignalToDefault(int signalNumber)
-    {
-        if (!OperatingSystem.IsLinux())
-            return;
-
-        // Detached launchers can inherit SIG_IGN for SIGHUP/SIGINT/SIGTERM.
-        // PosixSignalRegistration honours inherited ignores and will not make
-        // such a signal catchable, so reset only that disposition before
-        // registering the bridge's shutdown handler.
-        if (!NativeMethods.TryReadSignalHandler(signalNumber, out var handler)
-            || handler != NativeMethods.SigIgn)
-        {
-            return;
-        }
-
-        try { _ = NativeMethods.Signal(signalNumber, NativeMethods.SigDfl); }
-        catch { }
-    }
-
-    internal static IntPtr? ReadSignalHandlerOrNull(int signalNumber)
-    {
-        if (!OperatingSystem.IsLinux())
-            return null;
-
-        return NativeMethods.TryReadSignalHandler(signalNumber, out var handler)
-            ? handler
-            : null;
-    }
-
-    internal static bool ReexecOnceIfSignalRegistrationUnavailable(
-        IntPtr? sigtermBefore,
-        IntPtr? sigintBefore,
-        IntPtr? sighupBefore)
-    {
-        return TryRunSignalBootstrap(
-            isLinux: OperatingSystem.IsLinux(),
-            guardValue: Environment.GetEnvironmentVariable(SignalBootstrapReexecEnv),
-            needsBootstrap: () =>
-                NeedsSignalBootstrapReexec(SigTerm, sigtermBefore)
-                || NeedsSignalBootstrapReexec(SigInt, sigintBefore)
-                || NeedsSignalBootstrapReexec(SigHup, sighupBefore),
-            readArgv: TryReadCurrentArgv,
-            setGuard: SetSignalBootstrapGuard,
-            exec: NativeMethods.ExecVp);
-    }
-
-    private static void SetSignalBootstrapGuard(string? value)
-    {
-        Environment.SetEnvironmentVariable(SignalBootstrapReexecEnv, value);
-        if (OperatingSystem.IsLinux())
-            NativeMethods.SetEnvironmentVariable(SignalBootstrapReexecEnv, value);
-    }
-
-    internal static bool TryRunSignalBootstrap(
-        bool isLinux,
-        string? guardValue,
-        Func<bool> needsBootstrap,
-        Func<string[]?> readArgv,
-        Action<string?> setGuard,
-        Action<string[]> exec)
-    {
-        ArgumentNullException.ThrowIfNull(needsBootstrap);
-        ArgumentNullException.ThrowIfNull(readArgv);
-        ArgumentNullException.ThrowIfNull(setGuard);
-        ArgumentNullException.ThrowIfNull(exec);
-
-        if (!isLinux
-            || string.Equals(guardValue, "1", StringComparison.Ordinal)
-            || !needsBootstrap())
-        {
-            return false;
-        }
-
-        var argv = readArgv();
-        if (argv is null || argv.Length == 0)
-            return false;
-
-        // CoreCLR can remember a startup-ignored SIGINT before Bridge.RunAsync
-        // gets control; after the reset above, the first runtime may still
-        // decline to install a catchable SIGINT handler. Re-exec once before
-        // publishing any stdout envelopes so the runtime starts from the
-        // now-default dispositions. exec preserves pid and stdio fds, so the
-        // host's process and pipe tracking remain valid.
-        setGuard("1");
-        exec(argv);
-        return true;
-    }
-
-    private static bool NeedsSignalBootstrapReexec(int signalNumber, IntPtr? handlerBeforeRegistration)
-    {
-        if (handlerBeforeRegistration is not { } before
-            || (before != NativeMethods.SigDfl && before != NativeMethods.SigIgn)
-            || !NativeMethods.TryReadSignalHandler(signalNumber, out var after))
-        {
-            return false;
-        }
-
-        return after == NativeMethods.SigDfl || after == NativeMethods.SigIgn;
-    }
-
-    internal static string[]? ParseProcCmdlineArgv(byte[] bytes)
-    {
-        var args = new List<string>();
-        var start = 0;
-        for (var i = 0; i < bytes.Length; i++)
-        {
-            if (bytes[i] != 0)
-                continue;
-
-            args.Add(Encoding.UTF8.GetString(bytes, start, i - start));
-            start = i + 1;
-        }
-
-        if (start < bytes.Length)
-            args.Add(Encoding.UTF8.GetString(bytes, start, bytes.Length - start));
-
-        return args.Count == 0 ? null : args.ToArray();
-    }
-
-    internal static string[]? TryReadCurrentArgv()
-    {
-        try
-        {
-            return ParseProcCmdlineArgv(File.ReadAllBytes("/proc/self/cmdline"));
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
     private static class PeerProcessAuthorizer
     {
         public static bool IsTrustedClaudePeer(TcpClient client, Process? claudeProcess)
@@ -1180,13 +1048,6 @@ internal sealed class Bridge : IAsyncDisposable
 
     private static class NativeMethods
     {
-        internal static readonly IntPtr SigDfl = IntPtr.Zero;
-        internal static readonly IntPtr SigIgn = new(1);
-
-        // glibc and musl sigaction are 152 bytes on linux-x64; keep headroom
-        // because we only need to read the leading handler pointer.
-        private const int SigActionBufferBytes = 256;
-
         // DllImport with primitive int marshalling is fully NativeAOT-safe
         // (no codegen required at runtime) and avoids the AllowUnsafeBlocks
         // requirement LibraryImport's source generator imposes. The bridge
@@ -1206,107 +1067,6 @@ internal sealed class Bridge : IAsyncDisposable
         // are passed to the linker as file paths rather than -l names.
         [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "kill", SetLastError = true)]
         internal static extern int Kill(int pid, int sig);
-
-        [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "sigaction", SetLastError = true)]
-        private static extern int SigAction(int sig, IntPtr act, IntPtr oldact);
-
-        [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "signal", SetLastError = true)]
-        internal static extern IntPtr Signal(int sig, IntPtr handler);
-
-        [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "execvp", SetLastError = true)]
-        private static extern int ExecVp(IntPtr file, IntPtr argv);
-
-        [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "setenv", SetLastError = true)]
-        private static extern int SetEnv(IntPtr name, IntPtr value, int overwrite);
-
-        [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "unsetenv", SetLastError = true)]
-        private static extern int UnsetEnv(IntPtr name);
-
-        internal static bool TryReadSignalHandler(int signalNumber, out IntPtr handler)
-        {
-            handler = IntPtr.Zero;
-            var oldAction = Marshal.AllocHGlobal(SigActionBufferBytes);
-            try
-            {
-                if (SigAction(signalNumber, IntPtr.Zero, oldAction) != 0)
-                    return false;
-
-                handler = Marshal.ReadIntPtr(oldAction);
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(oldAction);
-            }
-        }
-
-        internal static void SetEnvironmentVariable(string name, string? value)
-        {
-            var namePtr = IntPtr.Zero;
-            var valuePtr = IntPtr.Zero;
-            try
-            {
-                namePtr = Marshal.StringToHGlobalAnsi(name);
-                if (value is null)
-                {
-                    _ = UnsetEnv(namePtr);
-                    return;
-                }
-
-                valuePtr = Marshal.StringToHGlobalAnsi(value);
-                _ = SetEnv(namePtr, valuePtr, overwrite: 1);
-            }
-            catch
-            {
-                // Managed Environment.SetEnvironmentVariable already updated
-                // this process. If libc env mutation fails, continue without
-                // turning bridge startup into a hard failure.
-            }
-            finally
-            {
-                if (valuePtr != IntPtr.Zero)
-                    Marshal.FreeHGlobal(valuePtr);
-                if (namePtr != IntPtr.Zero)
-                    Marshal.FreeHGlobal(namePtr);
-            }
-        }
-
-        internal static void ExecVp(string[] argv)
-        {
-            var argPointers = new IntPtr[argv.Length];
-            var argvBlock = IntPtr.Zero;
-            try
-            {
-                for (var i = 0; i < argv.Length; i++)
-                    argPointers[i] = Marshal.StringToHGlobalAnsi(argv[i]);
-
-                argvBlock = Marshal.AllocHGlobal(IntPtr.Size * (argv.Length + 1));
-                for (var i = 0; i < argPointers.Length; i++)
-                    Marshal.WriteIntPtr(argvBlock, i * IntPtr.Size, argPointers[i]);
-                Marshal.WriteIntPtr(argvBlock, argPointers.Length * IntPtr.Size, IntPtr.Zero);
-
-                _ = ExecVp(argPointers[0], argvBlock);
-            }
-            catch
-            {
-                // If the bootstrap exec cannot be prepared, continue on the
-                // already-registered path rather than failing bridge startup.
-            }
-            finally
-            {
-                if (argvBlock != IntPtr.Zero)
-                    Marshal.FreeHGlobal(argvBlock);
-                foreach (var argPointer in argPointers)
-                {
-                    if (argPointer != IntPtr.Zero)
-                        Marshal.FreeHGlobal(argPointer);
-                }
-            }
-        }
     }
 
     private async Task WaitForBackgroundTasksAsync()

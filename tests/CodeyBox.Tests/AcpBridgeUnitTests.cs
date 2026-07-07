@@ -2755,14 +2755,14 @@ public sealed class AcpBridgeUnitTests
     // failure modes this fixture catches.
 
     [Fact]
-    public void Bridge_SignalBootstrap_ReexecsOnceAndSetsGuardWhenNeeded()
+    public void SignalBootstrap_ReexecsOnceAndSetsGuardWhenNeeded()
     {
         var needsCalled = 0;
         string? guardValue = null;
         string[]? execArgv = null;
         var argv = new[] { "dotnet", "exec", "/tmp/bridge.dll" };
 
-        var ran = Bridge.TryRunSignalBootstrap(
+        var ran = SignalBootstrap.TryRunSignalBootstrap(
             isLinux: true,
             guardValue: null,
             needsBootstrap: () =>
@@ -2789,7 +2789,7 @@ public sealed class AcpBridgeUnitTests
     [InlineData("readArgv")]
     [InlineData("setGuard")]
     [InlineData("exec")]
-    public void Bridge_SignalBootstrap_NullDelegatesThrowArgumentNullException(string paramName)
+    public void SignalBootstrap_NullDelegatesThrowArgumentNullException(string paramName)
     {
         Func<bool> needsBootstrap = () => true;
         Func<string[]?> readArgv = () => ["dotnet", "exec", "/tmp/bridge.dll"];
@@ -2805,7 +2805,7 @@ public sealed class AcpBridgeUnitTests
         if (paramName == "exec")
             exec = null!;
 
-        var ex = Assert.Throws<ArgumentNullException>(() => Bridge.TryRunSignalBootstrap(
+        var ex = Assert.Throws<ArgumentNullException>(() => SignalBootstrap.TryRunSignalBootstrap(
             isLinux: true,
             guardValue: null,
             needsBootstrap: needsBootstrap,
@@ -2817,9 +2817,9 @@ public sealed class AcpBridgeUnitTests
     }
 
     [Fact]
-    public void Bridge_SignalBootstrap_OneShotGuardSkipsNeedCheckArgvReadAndExec()
+    public void SignalBootstrap_OneShotGuardSkipsNeedCheckArgvReadAndExec()
     {
-        var ran = Bridge.TryRunSignalBootstrap(
+        var ran = SignalBootstrap.TryRunSignalBootstrap(
             isLinux: true,
             guardValue: "1",
             needsBootstrap: () => throw new InvalidOperationException("guard should skip needs check"),
@@ -2831,9 +2831,9 @@ public sealed class AcpBridgeUnitTests
     }
 
     [Fact]
-    public void Bridge_SignalBootstrap_NonLinuxSkipsNeedCheckArgvReadAndExec()
+    public void SignalBootstrap_NonLinuxSkipsNeedCheckArgvReadAndExec()
     {
-        var ran = Bridge.TryRunSignalBootstrap(
+        var ran = SignalBootstrap.TryRunSignalBootstrap(
             isLinux: false,
             guardValue: null,
             needsBootstrap: () => throw new InvalidOperationException("non-Linux should skip needs check"),
@@ -2845,11 +2845,11 @@ public sealed class AcpBridgeUnitTests
     }
 
     [Fact]
-    public void Bridge_SignalBootstrap_NoBootstrapNeededDoesNotReadArgvSetGuardOrExec()
+    public void SignalBootstrap_NoBootstrapNeededDoesNotReadArgvSetGuardOrExec()
     {
         var needsCalled = 0;
 
-        var ran = Bridge.TryRunSignalBootstrap(
+        var ran = SignalBootstrap.TryRunSignalBootstrap(
             isLinux: true,
             guardValue: null,
             needsBootstrap: () =>
@@ -2866,7 +2866,7 @@ public sealed class AcpBridgeUnitTests
     }
 
     [Fact]
-    public void Bridge_SignalBootstrap_NoArgvFallbackDoesNotSetGuardOrExec()
+    public void SignalBootstrap_NoArgvFallbackDoesNotSetGuardOrExec()
     {
         AssertNoArgvFallback(null);
         AssertNoArgvFallback(Array.Empty<string>());
@@ -2876,7 +2876,7 @@ public sealed class AcpBridgeUnitTests
             var guardWasSet = false;
             var execWasCalled = false;
 
-            var ran = Bridge.TryRunSignalBootstrap(
+            var ran = SignalBootstrap.TryRunSignalBootstrap(
                 isLinux: true,
                 guardValue: null,
                 needsBootstrap: () => true,
@@ -2891,20 +2891,20 @@ public sealed class AcpBridgeUnitTests
     }
 
     [Fact]
-    public void Bridge_SignalBootstrap_ProcCmdlineParserHandlesNullDelimitedArgv()
+    public void SignalBootstrap_ProcCmdlineParserHandlesNullDelimitedArgv()
     {
         Assert.Equal(
             new[] { "dotnet", "exec", "/tmp/bridge.dll" },
-            Bridge.ParseProcCmdlineArgv(Encoding.UTF8.GetBytes("dotnet\0exec\0/tmp/bridge.dll\0")));
+            SignalBootstrap.ParseProcCmdlineArgv(Encoding.UTF8.GetBytes("dotnet\0exec\0/tmp/bridge.dll\0")));
         Assert.Equal(
             new[] { "dotnet", "exec" },
-            Bridge.ParseProcCmdlineArgv(Encoding.UTF8.GetBytes("dotnet\0exec")));
+            SignalBootstrap.ParseProcCmdlineArgv(Encoding.UTF8.GetBytes("dotnet\0exec")));
         Assert.Equal(
             new[] { "dotnet", "", "/tmp/bridge.dll" },
-            Bridge.ParseProcCmdlineArgv(Encoding.UTF8.GetBytes("dotnet\0\0/tmp/bridge.dll\0")));
-        Assert.Null(Bridge.ParseProcCmdlineArgv(Array.Empty<byte>()));
-        Assert.Equal(new[] { "" }, Bridge.ParseProcCmdlineArgv(new byte[] { 0 }));
-        Assert.Equal(new[] { "", "" }, Bridge.ParseProcCmdlineArgv(new byte[] { 0, 0 }));
+            SignalBootstrap.ParseProcCmdlineArgv(Encoding.UTF8.GetBytes("dotnet\0\0/tmp/bridge.dll\0")));
+        Assert.Null(SignalBootstrap.ParseProcCmdlineArgv(Array.Empty<byte>()));
+        Assert.Equal(new[] { "" }, SignalBootstrap.ParseProcCmdlineArgv(new byte[] { 0 }));
+        Assert.Equal(new[] { "", "" }, SignalBootstrap.ParseProcCmdlineArgv(new byte[] { 0, 0 }));
     }
 
     [Fact]
@@ -2948,12 +2948,12 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 using CodeyBox.Agents.Claude.AcpBridge;
 
-var reexeced = Environment.GetEnvironmentVariable(Bridge.SignalBootstrapReexecEnv) == "1";
+var reexeced = Environment.GetEnvironmentVariable(SignalBootstrap.SignalBootstrapReexecEnv) == "1";
 Console.WriteLine(JsonSerializer.Serialize(new
 {
     phase = reexeced ? "after" : "before",
     pid = Environment.ProcessId,
-    guard = Environment.GetEnvironmentVariable(Bridge.SignalBootstrapReexecEnv),
+    guard = Environment.GetEnvironmentVariable(SignalBootstrap.SignalBootstrapReexecEnv),
     args = Environment.GetCommandLineArgs()
 }));
 Console.Out.Flush();
@@ -2962,7 +2962,7 @@ if (reexeced)
     return 0;
 
 _ = Libc.Signal(15, IntPtr.Zero);
-var ran = Bridge.ReexecOnceIfSignalRegistrationUnavailable(IntPtr.Zero, null, null);
+var ran = SignalBootstrap.ReexecOnceIfSignalRegistrationUnavailable(IntPtr.Zero, null, null);
 Console.WriteLine(JsonSerializer.Serialize(new
 {
     phase = "returned",
@@ -2982,7 +2982,7 @@ internal static partial class Libc
             {
                 ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1",
                 ["DOTNET_NOLOGO"] = "1",
-                [Bridge.SignalBootstrapReexecEnv] = null,
+                [SignalBootstrap.SignalBootstrapReexecEnv] = null,
             };
             var build = await RunProcessAsync(
                 "dotnet",
@@ -3037,11 +3037,11 @@ internal static partial class Libc
     }
 
     [Fact]
-    public void Bridge_ResetInheritedIgnoredSignalToDefault_PreservesExistingCatchableHandler()
+    public void SignalBootstrap_ResetInheritedIgnoredSignalToDefault_PreservesExistingCatchableHandler()
     {
         const int sighup = 1;
         var sigIgn = new IntPtr(1);
-        var original = Bridge.ReadSignalHandlerOrNull(sighup);
+        var original = SignalBootstrap.ReadSignalHandlerOrNull(sighup);
         var restoreOriginal = original is { } originalValue
             && (originalValue == IntPtr.Zero || originalValue == sigIgn);
 
@@ -3053,14 +3053,14 @@ internal static partial class Libc
             using var registration = PosixSignalRegistration.Create(
                 PosixSignal.SIGHUP,
                 ctx => ctx.Cancel = true);
-            var before = Bridge.ReadSignalHandlerOrNull(sighup);
+            var before = SignalBootstrap.ReadSignalHandlerOrNull(sighup);
             Assert.NotNull(before);
             Assert.NotEqual(IntPtr.Zero, before.Value);
             Assert.NotEqual(sigIgn, before.Value);
 
-            Bridge.ResetInheritedIgnoredSignalToDefault(sighup);
+            SignalBootstrap.ResetInheritedIgnoredSignalToDefault(sighup);
 
-            var after = Bridge.ReadSignalHandlerOrNull(sighup);
+            var after = SignalBootstrap.ReadSignalHandlerOrNull(sighup);
             Assert.Equal(before, after);
         }
         finally
@@ -3068,6 +3068,35 @@ internal static partial class Libc
             if (restoreOriginal)
                 _ = LibcSignal(sighup, original!.Value);
         }
+    }
+
+    [Fact]
+    public void SignalBootstrap_ResetInheritedIgnoredSignalToDefault_ThrowsOnInvalidSignal()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        Assert.Throws<InvalidOperationException>(() =>
+            SignalBootstrap.ResetInheritedIgnoredSignalToDefault(-999));
+    }
+
+    [Fact]
+    public void SignalBootstrap_TryRunSignalBootstrap_ThrowsWhenExecThrows()
+    {
+        var argv = new[] { "dotnet", "exec", "/tmp/bridge.dll" };
+        string? guardValue = null;
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            SignalBootstrap.TryRunSignalBootstrap(
+                isLinux: true,
+                guardValue: null,
+                needsBootstrap: () => true,
+                readArgv: () => argv,
+                setGuard: value => guardValue = value,
+                exec: _ => throw new InvalidOperationException("Simulated execvp failure")));
+
+        Assert.Contains("Failed to re-exec signal bootstrap", ex.Message);
+        Assert.Null(guardValue);
     }
 
     [Theory]
@@ -3150,6 +3179,7 @@ internal static partial class Libc
                 // before `ready` fires, but PosixSignalRegistration.Create
                 // happens at the top of RunAsync which runs first).
                 string? lockPath = null;
+                var envelopes = new List<JsonDocument>();
                 var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
                 while (DateTime.UtcNow < deadline)
                 {
@@ -3157,15 +3187,36 @@ internal static partial class Libc
                         TimeSpan.FromSeconds(5));
                     if (line is null) break;
                     if (string.IsNullOrEmpty(line)) continue;
-                    using var doc = JsonDocument.Parse(line);
-                    if (!doc.RootElement.TryGetProperty("type", out var typeEl)) continue;
-                    if (typeEl.GetString() == "ready")
+                    var doc = JsonDocument.Parse(line);
+                    envelopes.Add(doc);
+                    if (doc.RootElement.TryGetProperty("type", out var typeEl) && typeEl.GetString() == "ready")
                     {
                         lockPath = doc.RootElement.GetProperty("lockPath").GetString();
                         break;
                     }
                 }
-                Assert.NotNull(lockPath);
+
+                try
+                {
+                    Assert.NotNull(lockPath);
+                    Assert.True(envelopes.Count >= 2, "Expected at least 2 envelopes (bridge_started and ready)");
+                    
+                    var firstEnvelope = envelopes[0].RootElement;
+                    Assert.True(firstEnvelope.TryGetProperty("type", out var firstType) && firstType.GetString() == "bridge_started",
+                        $"First envelope must be 'bridge_started', but got '{firstEnvelope.GetRawText()}'");
+                    
+                    var secondEnvelope = envelopes[1].RootElement;
+                    Assert.True(secondEnvelope.TryGetProperty("type", out var secondType) && secondType.GetString() == "ready",
+                        $"Second envelope must be 'ready', but got '{secondEnvelope.GetRawText()}'");
+                }
+                finally
+                {
+                    foreach (var doc in envelopes)
+                    {
+                        doc.Dispose();
+                    }
+                }
+
                 Assert.True(File.Exists(lockPath),
                     "Lockfile must exist after `ready` envelope — pre-signal state.");
                 for (int i = 0; i < 100 && (!File.Exists(rootPidPath) || !File.Exists(childPidPath)); i++)
