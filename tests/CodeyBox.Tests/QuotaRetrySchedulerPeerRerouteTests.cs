@@ -101,6 +101,54 @@ public sealed class QuotaRetrySchedulerPeerRerouteTests : IDisposable
     }
 
     /// <summary>
+    /// Acceptance: the real quota-probe transition path wakes parked items.
+    /// A known below-floor probe records "unusable"; the next above-floor
+    /// reading publishes through <see cref="AgentQuotaAvailabilityBroadcaster"/>
+    /// and the scheduler reuses its wake-up sweep without waiting for the
+    /// periodic interval or the stale NextQuotaRetryAt.
+    /// </summary>
+    [Fact]
+    public async Task SignalingQuotaProbe_ExhaustedToAvailable_RequeuesPromptly()
+    {
+        var probes = new MutablePeerProbes(claude: 0.0, codex: 0.0);
+        var quotaPolicy = new QuotaGatePolicy(new QuotaRouterOptions { MinQuotaPct = 10 });
+        var quotaBroadcaster = new AgentQuotaAvailabilityBroadcaster();
+        var signalingProbes = probes.AsProbes()
+            .Select(p => new SignalingQuotaProbe(p, quotaBroadcaster, quotaPolicy))
+            .Cast<IAgentQuotaProbe>()
+            .ToArray();
+        var codexMember = new AgentMembership
+        {
+            Agent = AgentKind.Codex,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 90,
+        };
+
+        // Seed the broadcaster with the known exhausted state. First readings
+        // are only recorded, so this prevents the later healthy probe from
+        // being mistaken for a first observation.
+        await signalingProbes.Single(p => p.Kind == AgentKind.Codex)
+            .GetAvailabilityAsync(codexMember, CancellationToken.None);
+
+        using var fixture = BuildSchedulerWithPeers(probes, quotaSignal: quotaBroadcaster, probeOverride: signalingProbes);
+        var item = ParkedItem() with
+        {
+            NextQuotaRetryAt = DateTimeOffset.UtcNow.AddDays(5),
+        };
+        await fixture.Store.CreateAsync(item);
+
+        probes.UpdateCodex(100.0);
+        await signalingProbes.Single(p => p.Kind == AgentKind.Codex)
+            .GetAvailabilityAsync(codexMember, CancellationToken.None);
+        await WaitForWakeUpSweepAsync(fixture.Scheduler);
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.Queued, stored!.State);
+        Assert.Equal(1, stored.QuotaRetryAttempts);
+    }
+
+    /// <summary>
     /// Acceptance: a WaitingForQuotaReset item never has a null forward retry
     /// trigger. When neither the router nor the failing-agent reset can
     /// produce a wake time, the scheduler falls back to the periodic-check
@@ -140,7 +188,8 @@ public sealed class QuotaRetrySchedulerPeerRerouteTests : IDisposable
         MutablePeerProbes probes,
         TimeProvider? timeProvider = null,
         IAgentPauseSignal? pauseSignal = null,
-        IAgentQuotaAvailabilitySignal? quotaSignal = null)
+        IAgentQuotaAvailabilitySignal? quotaSignal = null,
+        IEnumerable<IAgentQuotaProbe>? probeOverride = null)
     {
         var router = new AgentClassRouter(
             [
@@ -165,7 +214,7 @@ public sealed class QuotaRetrySchedulerPeerRerouteTests : IDisposable
                     ],
                 },
             ],
-            probes.AsProbes(),
+            probeOverride ?? probes.AsProbes(),
             new QuotaRouterOptions { MinQuotaPct = 10 },
             NullLogger<AgentClassRouter>.Instance);
         return BuildScheduler(router, timeProvider, pauseSignal, quotaSignal);
