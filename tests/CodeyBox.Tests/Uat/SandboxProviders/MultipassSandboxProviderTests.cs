@@ -1429,22 +1429,53 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         // a clean failure instead of an indefinite hang (the gated command
         // never completes until this test releases it).
         using var launchCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-        var (exit, _, stderr) = await RunLocalProcessAsync(
-            "/bin/bash",
-            ["-c", "exec 3>&1\nexec \"$1\"", "codeybox-launch-with-extra-fd", launchScript],
-            ct: launchCts.Token,
-            environmentOverrides: FakeSudoPathEnvironment());
+        try
+        {
+            var (exit, _, stderr) = await RunLocalProcessAsync(
+                "/bin/bash",
+                ["-c", "exec 3>&1\nexec \"$1\"", "codeybox-launch-with-extra-fd", launchScript],
+                ct: launchCts.Token,
+                environmentOverrides: FakeSudoPathEnvironment());
 
-        Assert.Equal(0, exit);
-        Assert.Equal("", stderr);
-        // The command cannot finish until we create the release file below, so
-        // its absence here proves the launch detached the command rather than
-        // running it inline.
-        Assert.False(File.Exists(doneFile), "detached launch returned only after the command completed");
-        Assert.True(File.Exists(processGroupMarker));
-        await File.WriteAllTextAsync(releaseFile, "go");
-        await WaitForFileAsync(doneFile, TimeSpan.FromSeconds(6));
-        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
+            Assert.Equal(0, exit);
+            Assert.Equal("", stderr);
+            // The command cannot finish until we create the release file below, so
+            // its absence here proves the launch detached the command rather than
+            // running it inline.
+            Assert.False(File.Exists(doneFile), "detached launch returned only after the command completed");
+            Assert.True(File.Exists(processGroupMarker));
+            await File.WriteAllTextAsync(releaseFile, "go");
+            await WaitForFileAsync(doneFile, TimeSpan.FromSeconds(6));
+            await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
+        }
+        finally
+        {
+            // Always release the gated command AND reap its process group, even
+            // if an assertion above fails or the launch times out. Otherwise the
+            // detached command blocks forever on the (never-written) release file
+            // and the leaked process keeps `dotnet test` from exiting — hanging
+            // the whole runner (and any agent that runs the suite) for ~78min
+            // until a stale-watchdog kills it, instead of failing cleanly/fast.
+            // Best-effort; must never throw and mask the real assertion failure.
+            try
+            {
+                if (!File.Exists(releaseFile))
+                    await File.WriteAllTextAsync(releaseFile, "go");
+            }
+            catch { /* best-effort release */ }
+            try
+            {
+                if (File.Exists(processGroupMarker))
+                {
+                    var pgid = (await File.ReadAllTextAsync(processGroupMarker)).Trim();
+                    if (!string.IsNullOrEmpty(pgid))
+                        await RunLocalProcessAsync(
+                            "/bin/sh",
+                            ["-c", "kill -9 \"-$1\" 2>/dev/null || true", "codeybox-detached-cleanup", pgid]);
+                }
+            }
+            catch { /* best-effort reap */ }
+        }
     }
 
     [Fact]
