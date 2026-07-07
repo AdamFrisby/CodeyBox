@@ -889,6 +889,7 @@ public sealed class PlanningPipelineTests : IDisposable
         // Initial plan + one rework turn = 2 planning calls (== max iterations),
         // then the still-blocked plan fails before any implementation.
         Assert.Equal(2, agent.PlanningCalls);
+        Assert.Equal(2, final.PlanReviewAttempts);
         Assert.Equal(0, agent.WorkCalls);
         Assert.Contains("did not approve the planning artifact after 2 plan-review iteration", final.LastError, StringComparison.Ordinal);
     }

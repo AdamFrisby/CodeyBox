@@ -1184,7 +1184,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
             PlanGeneratedAt = updatedAt,
             PlanReviewedAt = null,
             PlanReviewSummary = null,
-            PlanReviewAttempts = 0,
             UpdatedAt = updatedAt,
         };
         var persisted = false;
