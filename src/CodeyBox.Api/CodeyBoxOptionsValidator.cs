@@ -41,6 +41,11 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
                 $"CodeyBox:MaxBulkItems must be between 1 and {CodeyBoxOptions.MaximumMaxBulkItems}");
         }
 
+        if (options.MaxPlanReviewIterations < 1)
+        {
+            failures.Add("CodeyBox:MaxPlanReviewIterations must be >= 1");
+        }
+
         var e2e = options.E2eExecution;
         if (e2e is not null)
         {

@@ -123,6 +123,46 @@ public sealed class PipelineOptionsWiringTests
     }
 
     [Fact]
+    public void ProgramMapsConfiguredMaxPlanReviewIterationsIntoPipelineOptions()
+    {
+        using var factory = new PipelineOptionsWiringFactory(new Dictionary<string, string?>
+        {
+            ["CodeyBox:MaxPlanReviewIterations"] = "7",
+        });
+
+        var options = factory.Services.GetRequiredService<PipelineOptions>();
+
+        Assert.Equal(7, options.MaxPlanReviewIterations);
+    }
+
+    [Fact]
+    public void ProgramRejectsInvalidMaxPlanReviewIterations()
+    {
+        using var factory = new PipelineOptionsWiringFactory(new Dictionary<string, string?>
+        {
+            ["CodeyBox:MaxPlanReviewIterations"] = "0",
+        });
+
+        var ex = Assert.Throws<OptionsValidationException>(() =>
+            _ = factory.Services.GetRequiredService<IOptions<CodeyBoxOptions>>().Value);
+
+        Assert.Contains("MaxPlanReviewIterations", ex.Message);
+    }
+
+    [Fact]
+    public void ProgramBindsDeprecatedPlanReviewUseAuditorsKey()
+    {
+        using var factory = new PipelineOptionsWiringFactory(new Dictionary<string, string?>
+        {
+            ["CodeyBox:PlanReview:UseAuditors"] = "false",
+        });
+
+        var options = factory.Services.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+
+        Assert.False(options.PlanReview.UseAuditors);
+    }
+
+    [Fact]
     public void ProgramMapsPreemptiveSelfReviewConfigIntoSessionDispatchOptions()
     {
         using var factory = new PipelineOptionsWiringFactory(new Dictionary<string, string?>

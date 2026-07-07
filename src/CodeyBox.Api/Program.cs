@@ -2765,6 +2765,7 @@ builder.Services.AddSingleton<PipelineOptions>(sp =>
         PhaseAbsoluteTimeoutMultiplier = opts.PhaseAbsoluteTimeoutMultiplier,
         RequiredBuildVerificationTimeout = TimeSpan.FromSeconds(Math.Max(60, opts.RequiredBuildVerificationTimeoutSeconds)),
         EmitPlanTestCases = opts.EmitPlanTestCases,
+        MaxPlanReviewIterations = opts.MaxPlanReviewIterations,
         HostGitIdentity = hostIdentity,
     };
 });
@@ -2802,23 +2803,16 @@ builder.Services.AddSingleton<IWorkItemTerminalTransition>(sp =>
     sp.GetRequiredService<WorkItemTerminalTransition>());
 builder.Services.AddSingleton<IWorkItemTerminalRevisionBuilder>(sp =>
     sp.GetRequiredService<WorkItemTerminalTransition>());
-// Plan-review gate. Default is the always-pass placeholder; operators opt into
-// the auditor-driven gate (which composes AuditTarget.Plan reviewers and blocks
-// on their findings, driving the pipeline's plan-rework loop) with
-// CodeyBox:PlanReview:UseAuditors=true.
-if (builder.Configuration.GetValue("CodeyBox:PlanReview:UseAuditors", false))
-{
-    builder.Services.AddSingleton<IPlanReviewGate>(sp => new AuditorPlanReviewGate(
-        sp.GetRequiredService<ProjectAuditorComposer>(),
-        sp.GetRequiredService<IProjectRepository>(),
-        sp.GetRequiredService<IAgentRegistry>(),
-        sp.GetRequiredService<ICredentialProvider>(),
-        sp.GetRequiredService<ILogger<AuditorPlanReviewGate>>()));
-}
-else
-{
-    builder.Services.AddSingleton<IPlanReviewGate, AlwaysPassPlanReviewGate>();
-}
+// Plan-review gate. The pipeline always composes and runs AuditTarget.Plan
+// auditors before implementation; this registered gate is retained as the
+// compatibility structural-review hook and as the DI marker for the
+// auditor-backed default.
+builder.Services.AddSingleton<IPlanReviewGate>(sp => new AuditorPlanReviewGate(
+    sp.GetRequiredService<ProjectAuditorComposer>(),
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetRequiredService<IAgentRegistry>(),
+    sp.GetRequiredService<ICredentialProvider>(),
+    sp.GetRequiredService<ILogger<AuditorPlanReviewGate>>()));
 
 builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<ISandboxProvider>(),
@@ -4256,6 +4250,14 @@ namespace CodeyBox.Api
         /// <summary>Graceful shutdown drain and preemption timing.</summary>
         public ShutdownOptions Shutdown { get; set; } = new();
 
+        /// <summary>
+        /// Deprecated compatibility section for older configs that set
+        /// <c>CodeyBox:PlanReview:UseAuditors</c>. Auditor-backed plan review
+        /// is always enabled by the pipeline; this option is accepted only so
+        /// strict unbound-key validation does not reject existing deployments.
+        /// </summary>
+        public PlanReviewOptions PlanReview { get; set; } = new();
+
         /// <summary>Heartbeat and dead-worker reaper configuration.</summary>
         public DeadWorkerOptions DeadWorker { get; set; } = new();
 
@@ -4305,6 +4307,14 @@ namespace CodeyBox.Api
         /// <see cref="PipelineOptions.EmitPlanTestCases"/>; edits require restart.
         /// </summary>
         public bool EmitPlanTestCases { get; set; } = true;
+
+        /// <summary>
+        /// Maximum PLAN-review attempts for a single generated plan artifact
+        /// before a still-blocked item fails. Captured once at startup into
+        /// <see cref="PipelineOptions.MaxPlanReviewIterations"/>; edits
+        /// require restart.
+        /// </summary>
+        public int MaxPlanReviewIterations { get; set; } = 3;
 
         /// <summary>
         /// Maximum concurrent release deep-audit phases across all releases.
@@ -4644,6 +4654,15 @@ namespace CodeyBox.Api
         /// deployment.
         /// </summary>
         public E2eExecutionOptions E2eExecution { get; set; } = new();
+    }
+
+    /// <summary>
+    /// Deprecated compatibility plan-review options. The review loop is always
+    /// auditor-backed; <see cref="UseAuditors"/> is ignored.
+    /// </summary>
+    public sealed class PlanReviewOptions
+    {
+        public bool UseAuditors { get; set; } = true;
     }
 
     /// <summary>

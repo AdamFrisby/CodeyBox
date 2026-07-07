@@ -1,3 +1,5 @@
+using System.Collections.Frozen;
+
 namespace CodeyBox.Core;
 
 /// <summary>
@@ -31,15 +33,15 @@ public static class AuditTargets
 {
     /// <summary>The default: an auditor reviews code only.</summary>
     public static IReadOnlySet<AuditTarget> CodeOnly { get; } =
-        new HashSet<AuditTarget> { AuditTarget.Code };
+        FrozenSet.ToFrozenSet([AuditTarget.Code]);
 
     /// <summary>An auditor that reviews plans only.</summary>
     public static IReadOnlySet<AuditTarget> PlanOnly { get; } =
-        new HashSet<AuditTarget> { AuditTarget.Plan };
+        FrozenSet.ToFrozenSet([AuditTarget.Plan]);
 
     /// <summary>An auditor that reviews both plans and code.</summary>
     public static IReadOnlySet<AuditTarget> PlanAndCode { get; } =
-        new HashSet<AuditTarget> { AuditTarget.Plan, AuditTarget.Code };
+        FrozenSet.ToFrozenSet([AuditTarget.Plan, AuditTarget.Code]);
 
     /// <summary>
     /// Builds an immutable target set from the supplied targets. Empty input is
@@ -49,6 +51,6 @@ public static class AuditTargets
     {
         if (targets is null || targets.Length == 0)
             throw new ArgumentException("An auditor must declare at least one target.", nameof(targets));
-        return new HashSet<AuditTarget>(targets);
+        return targets.ToFrozenSet();
     }
 }

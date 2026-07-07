@@ -8,6 +8,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Tests;
 
@@ -15,13 +16,28 @@ namespace CodeyBox.Tests;
 public sealed class PlanReviewGateProgramWiringTests
 {
     [Fact]
-    public void Program_RegistersAlwaysPassPlanReviewGateAsIPlanReviewGate()
+    public void Program_RegistersAuditorPlanReviewGateAsIPlanReviewGateByDefault()
     {
         using var factory = new PlanReviewGateWiringFactory();
 
         var gate = factory.Services.GetRequiredService<IPlanReviewGate>();
 
-        Assert.IsType<AlwaysPassPlanReviewGate>(gate);
+        Assert.IsType<AuditorPlanReviewGate>(gate);
+    }
+
+    [Fact]
+    public void Program_IgnoresDeprecatedUseAuditorsFlagButStillBindsIt()
+    {
+        using var factory = new PlanReviewGateWiringFactory(new Dictionary<string, string?>
+        {
+            ["CodeyBox:PlanReview:UseAuditors"] = "false",
+        });
+
+        var gate = factory.Services.GetRequiredService<IPlanReviewGate>();
+        var options = factory.Services.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+
+        Assert.IsType<AuditorPlanReviewGate>(gate);
+        Assert.False(options.PlanReview.UseAuditors);
     }
 
     [Fact]
@@ -37,8 +53,14 @@ public sealed class PlanReviewGateProgramWiringTests
 
     private sealed class PlanReviewGateWiringFactory : WebApplicationFactory<Program>
     {
+        private readonly Dictionary<string, string?> _extraConfig;
         private readonly string _dbPath = Path.Combine(
             Path.GetTempPath(), $"codeybox-planreviewgate-wiring-{Guid.NewGuid():N}.db");
+
+        public PlanReviewGateWiringFactory(Dictionary<string, string?>? extraConfig = null)
+        {
+            _extraConfig = extraConfig ?? new Dictionary<string, string?>();
+        }
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
@@ -46,7 +68,7 @@ public sealed class PlanReviewGateProgramWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 var tmp = Path.GetTempPath();
-                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                var baseConfig = new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
@@ -54,7 +76,10 @@ public sealed class PlanReviewGateProgramWiringTests
                     ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
                     ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
                     ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
-                });
+                };
+                foreach (var kvp in _extraConfig)
+                    baseConfig[kvp.Key] = kvp.Value;
+                cfg.AddInMemoryCollection(baseConfig);
             });
             builder.ConfigureTestServices(services =>
             {

@@ -103,6 +103,31 @@ public sealed class ProjectAuditorComposerPresetTests
     }
 
     [Fact]
+    public void ComposeForTarget_PlanIncludesBuiltInArchitectureCompletenessAndQuality()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.com/repo.git",
+            Audit = new ProjectAudit
+            {
+                AuditTypes = ["architecture", "completeness", "quality", "security"],
+            },
+        };
+
+        var planTargets = composer.ComposeForTarget(project, new CapturingAgent(), AuditTarget.Plan)
+            .Select(a => a.Name)
+            .ToArray();
+
+        Assert.Contains("architecture:llm-review", planTargets);
+        Assert.Contains("completeness:llm-review", planTargets);
+        Assert.Contains("quality:llm-review", planTargets);
+        Assert.DoesNotContain("security:llm-review", planTargets);
+    }
+
+    [Fact]
     public async Task Compose_AppliesProjectAuditTypeFocusAndFrame()
     {
         var runner = new CapturingAgent();

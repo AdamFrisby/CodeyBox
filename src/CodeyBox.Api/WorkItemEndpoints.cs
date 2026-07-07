@@ -1370,6 +1370,7 @@ internal static class WorkItemEndpoints
         PlanGeneratedAt = null,
         PlanReviewedAt = null,
         PlanReviewSummary = null,
+        PlanReviewAttempts = 0,
     };
 
     /// <summary>

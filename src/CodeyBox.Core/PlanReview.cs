@@ -21,7 +21,8 @@ public sealed record PlanReviewRequest(
     AgentKind? Agent,
     string? AgentInstanceId,
     string? ModelId,
-    string? ReasoningMode);
+    string? ReasoningMode,
+    string? AuditorProfile = null);
 
 public sealed record PlanReviewDecision(
     bool Approved,

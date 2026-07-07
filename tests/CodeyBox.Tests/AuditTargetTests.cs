@@ -166,6 +166,27 @@ public sealed class AuditTargetTests
         Assert.Contains("produced invalid JSON", finding.Title, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task LlmReviewAuditor_PlanReview_ParsesFencedJsonVerdict()
+    {
+        var auditor = PlanAuditor();
+        var runner = new FakeTextOnlyRunner("""
+            The plan is acceptable.
+
+            ```json
+            {"passed":true,"findings":[{"severity":"warning","title":"minor risk","description":"watch rollout"}]}
+            ```
+            """);
+        var ctx = PlanContext();
+
+        var result = await ((IPlanTextReviewer)auditor).ReviewPlanAsync(ctx, runner, credential: null);
+
+        Assert.True(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Warning, finding.Severity);
+        Assert.Equal("minor risk", finding.Title);
+    }
+
     private static LlmReviewAuditor PlanAuditor() => new(new LlmReviewAuditorOptions
     {
         Name = "architecture:llm-review",

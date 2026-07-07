@@ -377,6 +377,14 @@ public sealed class OpencodeAgentRunnerTests
     }
 
     [Fact]
+    public void TextOnlyRequiresSandbox_IsTrue()
+    {
+        ITextOnlyAgentRunner runner = new OpencodeAgentRunner();
+
+        Assert.True(runner.TextOnlyRequiresSandbox);
+    }
+
+    [Fact]
     public async Task RunTextOnlyAsync_InvokesOpencodeRunWithModelAndStdin()
     {
         const string prompt = "resolve this conflict";

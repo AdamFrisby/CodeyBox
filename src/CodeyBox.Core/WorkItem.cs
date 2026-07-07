@@ -264,6 +264,14 @@ public sealed record WorkItem
     public int ConflictReworkAttempts { get; init; }
 
     /// <summary>
+    /// Number of plan-review passes attempted for the currently stored
+    /// <see cref="PlanArtifact"/>. Reset whenever a new plan artifact is
+    /// generated or the plan fields are cleared. Persisted so the
+    /// max-plan-review-iterations cap survives orchestrator restarts.
+    /// </summary>
+    public int PlanReviewAttempts { get; init; }
+
+    /// <summary>
     /// Number of times the failure-class recovery service has auto-retried
     /// this work item after classifying its terminal failure as
     /// <see cref="TerminalFailureClass.Transient"/>. Distinct from
