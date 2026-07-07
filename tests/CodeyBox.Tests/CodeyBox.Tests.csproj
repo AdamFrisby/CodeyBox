@@ -37,6 +37,7 @@
     <Content Include="Fixtures\**\*.txt" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="Fixtures\**\*.html" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="Fixtures\demo-login-app\healthz" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Fixtures\vendor\linkedom-bundle.cjs" CopyToOutputDirectory="PreserveNewest" />
     <Compile Remove="Fixtures\**\*.cs" />
   </ItemGroup>
 

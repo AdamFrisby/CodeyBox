@@ -224,6 +224,43 @@ public sealed class E2eAuthoringTests
   }
 
   [Fact]
+  public async Task Demo_login_replay_fails_when_assertion_does_not_match_fixture()
+  {
+    var artifactPath = Path.Combine(
+      AppContext.BaseDirectory,
+      "Fixtures",
+      "E2eReplay",
+      "demo-login-happy-path.artifact.json");
+    var json = await File.ReadAllTextAsync(artifactPath);
+    var artifact = JsonSerializer.Deserialize<E2eReplayArtifact>(json, JsonOptions)
+      ?? throw new InvalidOperationException("fixture artifact did not deserialize");
+
+    // The committed fixture title is "Demo Login" and never changes — a dashboard
+    // title assertion must fail against the real markup-backed replay stub.
+    var broken = artifact with
+    {
+      Assertions =
+      [
+        ..artifact.Assertions,
+        new E2eReplayAssertion
+        {
+          Kind = "titleContains",
+          Value = "Dashboard",
+          Description = "deliberately wrong post-login title for negative coverage",
+        },
+      ],
+    };
+
+    await using var replaySandbox = new E2eAuthoring.DemoLoginReplaySandbox();
+    var runtime = CreateDemoReplayRuntime();
+    var replay = await runtime.ExecuteAsync(broken, replaySandbox);
+
+    Assert.False(replay.Passed);
+    Assert.NotNull(replay.FailedStepIndex);
+    Assert.Contains(replay.AssertionResults, r => !r.Passed && r.Detail.Contains("Dashboard", StringComparison.Ordinal));
+  }
+
+  [Fact]
   public void Committed_test_case_fixture_links_to_source_work_item()
   {
     var fixturePath = Path.Combine(

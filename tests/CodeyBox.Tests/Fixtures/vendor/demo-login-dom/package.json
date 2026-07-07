@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "description": "Regenerate ../linkedom-bundle.cjs: npm install && npx esbuild node_modules/linkedom/cjs/index.js --bundle --platform=node --format=cjs --outfile=../linkedom-bundle.cjs",
+  "dependencies": {
+    "linkedom": "0.18.5"
+  }
+}

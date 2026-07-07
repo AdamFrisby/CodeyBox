@@ -319,6 +319,87 @@ public sealed class E2eReplayArtifactEmitterTests
         Assert.Equal("hello", actions[1].Text);
     }
 
+    [Fact]
+    public void AnthropicComputerUseModelClient_parses_screenshot_key_and_click_alias_actions()
+    {
+        const string response = """
+            {
+              "content": [
+                { "type": "tool_use", "input": { "action": "screenshot" } },
+                { "type": "tool_use", "input": { "action": "click", "coordinate": [3, 4] } },
+                { "type": "tool_use", "input": { "action": "key", "text": "Enter" } },
+                { "type": "tool_use", "input": { "action": "left_click" } }
+              ]
+            }
+            """;
+
+        var actions = AnthropicComputerUseModelClient.ParseToolUses(response);
+        Assert.Equal(4, actions.Count);
+        Assert.Equal("screenshot", actions[0].Action);
+        Assert.Equal("click", actions[1].Action);
+        Assert.Equal(3, actions[1].X);
+        Assert.Equal(4, actions[1].Y);
+        Assert.Equal("key", actions[2].Action);
+        Assert.Equal("Enter", actions[2].Key);
+        Assert.Equal("click", actions[3].Action);
+        Assert.Equal(0, actions[3].X);
+        Assert.Equal(0, actions[3].Y);
+    }
+
+    [Fact]
+    public void EmitFromTrace_redacts_password_key_press_values()
+    {
+        var trace = new SessionTrace
+        {
+            TraceFormatVersion = SessionTrace.CurrentVersion,
+            Modality = "web-graphical",
+            StartedAt = DateTimeOffset.UtcNow,
+            Entries =
+            [
+                new TraceEntry
+                {
+                    Sequence = 1,
+                    Timestamp = DateTimeOffset.UtcNow,
+                    Action = new TraceAction
+                    {
+                        Kind = "click",
+                        InputEvents = [new SandboxInputEvent { Type = SandboxInputEventType.Click, X = 1, Y = 1 }],
+                        TargetDescriptor = new TraceTargetDescriptor
+                        {
+                            Accessibility = new TraceAccessibilityDescriptor { Role = "textbox", Name = "Password", ElementType = "css:#password" },
+                            Visual = new TraceVisualDescriptor { Region = new TraceBoundingRegion { X = 0, Y = 0, Width = 1, Height = 1 } },
+                        },
+                    },
+                    Observation = new TraceObservation
+                    {
+                        AccessibilitySnapshotJson = """{"nodes":[{"role":"textbox","name":"Password","selector":"#password"}]}""",
+                        CapturedAt = DateTimeOffset.UtcNow,
+                    },
+                },
+                new TraceEntry
+                {
+                    Sequence = 2,
+                    Timestamp = DateTimeOffset.UtcNow,
+                    Action = new TraceAction
+                    {
+                        Kind = "key",
+                        InputEvents = [new SandboxInputEvent { Type = SandboxInputEventType.Key, Key = "secret" }],
+                        TargetDescriptor = new TraceTargetDescriptor
+                        {
+                            Accessibility = new TraceAccessibilityDescriptor { Role = "textbox", Name = "Password", ElementType = "css:#password" },
+                            Visual = new TraceVisualDescriptor { Region = new TraceBoundingRegion { X = 0, Y = 0, Width = 1, Height = 1 } },
+                        },
+                    },
+                    Observation = new TraceObservation { CapturedAt = DateTimeOffset.UtcNow },
+                },
+            ],
+        };
+
+        var artifact = E2eReplayArtifactEmitter.EmitFromTrace(trace, []);
+        var press = Assert.Single(artifact.Steps, step => step.Action == "press");
+        Assert.Equal(E2eReplaySensitiveValueRedaction.PasswordPlaceholder, press.Value);
+    }
+
     private static SessionTrace BuildTraceWithAction(
         string kind,
         bool includeSelector = true,

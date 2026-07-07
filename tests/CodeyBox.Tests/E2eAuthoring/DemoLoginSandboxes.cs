@@ -145,17 +145,15 @@ public sealed class DemoLoginCuaSandbox : ISandbox
 
 /// <summary>
 /// Replay sandbox that runs the real <see cref="CodeyBox.Orchestrator.E2eReplayRuntime"/>
-/// embedded driver against a Playwright stub whose DOM answers (title, initial
-/// hidden state, element text, post-login show/hide transition and accepted
-/// credentials) are parsed from the real committed HTML fixture
-/// (<c>Fixtures/demo-login-app/index.html</c>). The stub never fabricates DOM
-/// state the fixture does not itself produce, so a wrong assertion cannot pass.
+/// embedded driver against a Playwright stub backed by linkedom loading the committed
+/// <c>Fixtures/demo-login-app/index.html</c> fixture (including its inline script).
+/// DOM queries and the post-login show/hide transition come from the real markup, so
+/// replay-green cannot pass on fabricated state the fixture does not produce.
 /// Firewall install scripts are executed for real (not silently short-circuited).
 /// </summary>
 public sealed class DemoLoginReplaySandbox : ISandbox
 {
     private readonly string _root;
-    private readonly DemoLoginPageModel _page = new();
     private readonly List<SandboxExec> _firewallExecs = [];
 
     public DemoLoginReplaySandbox()
@@ -164,6 +162,7 @@ public sealed class DemoLoginReplaySandbox : ISandbox
         Directory.CreateDirectory(Path.Combine(_root, "node_modules", "playwright"));
         File.WriteAllText(Path.Combine(_root, "node_modules", "playwright", "index.js"), BuildPlaywrightStub());
         File.WriteAllText(Path.Combine(_root, "dns-hook.js"), DnsHook);
+        CopyLinkedomBundle();
     }
 
     public string Id { get; } = "demo-login-replay-" + Guid.NewGuid().ToString("N")[..8];
@@ -199,12 +198,6 @@ public sealed class DemoLoginReplaySandbox : ISandbox
         psi.Environment["NODE_PATH"] = Path.Combine(_root, "node_modules");
         psi.Environment["NODE_OPTIONS"] = $"--require {Path.Combine(_root, "dns-hook.js")}";
         psi.Environment["DEMO_LOGIN_HTML"] = ResolveHtmlFixturePath();
-        psi.Environment["DEMO_LOGIN_STATE_JSON"] = System.Text.Json.JsonSerializer.Serialize(new
-        {
-            email = _page.Email,
-            password = _page.Password,
-            loggedIn = _page.LoggedIn,
-        });
 
         using var process = Process.Start(psi) ?? throw new InvalidOperationException("failed to start node");
         if (exec.Stdin is not null)
@@ -214,8 +207,6 @@ public sealed class DemoLoginReplaySandbox : ISandbox
         var stdout = await process.StandardOutput.ReadToEndAsync(ct);
         var stderr = await process.StandardError.ReadToEndAsync(ct);
         await process.WaitForExitAsync(ct);
-
-        SyncPageStateFromDriver(stdout);
 
         return new SandboxExecResult(process.ExitCode, stdout, stderr);
     }
@@ -233,14 +224,13 @@ public sealed class DemoLoginReplaySandbox : ISandbox
         return default;
     }
 
-    private void SyncPageStateFromDriver(string stdout)
+    private void CopyLinkedomBundle()
     {
-        if (!stdout.Contains("\"loggedIn\":true", StringComparison.Ordinal))
-            return;
+        var source = Path.Combine(AppContext.BaseDirectory, "Fixtures", "vendor", "linkedom-bundle.cjs");
+        if (!File.Exists(source))
+            throw new FileNotFoundException("linkedom bundle missing from test output; rebuild CodeyBox.Tests.", source);
 
-        _page.Email = "alice@example.com";
-        _page.Password = "secret";
-        _page.TryLogin();
+        File.Copy(source, Path.Combine(_root, "linkedom-bundle.cjs"), overwrite: true);
     }
 
     private static string ResolveHtmlFixturePath()
@@ -262,80 +252,38 @@ public sealed class DemoLoginReplaySandbox : ISandbox
 
     private static string BuildPlaywrightStub()
     {
-        // This stub is deliberately driven by the *real* committed HTML fixture
-        // (Fixtures/demo-login-app/index.html): title, initial `hidden` state,
-        // element text, the post-login show/hide transition and the accepted
-        // credentials are all parsed from that markup rather than hardcoded.
-        // That keeps replay-green honest — if the fixture's title, selectors,
-        // hidden attributes or submit-handler logic drift, the stub's answers
-        // drift with them, so a wrong assertion cannot silently pass. It never
-        // fabricates DOM state (no phantom "Demo Dashboard" title or /dashboard
-        // navigation) that the fixture does not itself produce.
         return """
             const fs = require('fs');
-            let pageState = { email: '', password: '', loggedIn: false };
+            const path = require('path');
+            const { parseHTML } = require(path.join(__dirname, '..', '..', 'linkedom-bundle.cjs'));
 
-            try {
-              const seeded = process.env.DEMO_LOGIN_STATE_JSON;
-              if (seeded) pageState = JSON.parse(seeded);
-            } catch {}
-
-            function parseFixture(html) {
-              const title = (html.match(/<title>([^<]*)<\/title>/i) || [, ''])[1].trim();
-              const els = [];
-              const tagRe = /<([a-zA-Z][\w-]*)\b([^>]*?)\/?>/g;
-              let m;
-              while ((m = tagRe.exec(html)) !== null) {
-                const attrs = m[2] || '';
-                const id = (attrs.match(/\bid\s*=\s*"([^"]*)"/) || [])[1];
-                const testid = (attrs.match(/\bdata-testid\s*=\s*"([^"]*)"/) || [])[1];
-                if (!id && !testid) continue;
-                const selectors = [];
-                if (id) selectors.push('#' + id);
-                if (testid) selectors.push('[data-testid="' + testid + '"]');
-                const el = { id, selectors, hidden: /\bhidden\b/.test(attrs), text: '' };
-                if (id) {
-                  const inner = html.match(new RegExp('id\\s*=\\s*"' + id + '"[^>]*>([\\s\\S]*?)<\\/', 'i'));
-                  if (inner) el.text = inner[1].replace(/<[^>]*>/g, '').trim();
-                }
-                els.push(el);
+            function loadFixtureDom() {
+              const htmlFixture = process.env.DEMO_LOGIN_HTML;
+              if (!htmlFixture || !fs.existsSync(htmlFixture)) {
+                throw new Error('demo login HTML fixture not found: ' + htmlFixture);
               }
-              // The post-login transition and accepted credentials come straight
-              // from the fixture's own inline submit handler.
-              const expectEmail = (html.match(/email\s*===\s*'([^']*)'/) || [])[1] || '';
-              const expectPassword = (html.match(/password\s*===\s*'([^']*)'/) || [])[1] || '';
-              const show = [...html.matchAll(/getElementById\('([^']+)'\)\.hidden\s*=\s*false/g)].map(x => x[1]);
-              const hide = [...html.matchAll(/getElementById\('([^']+)'\)\.hidden\s*=\s*true/g)].map(x => x[1]);
-              return { title, els, expectEmail, expectPassword, show, hide };
-            }
-
-            const htmlFixture = process.env.DEMO_LOGIN_HTML;
-            if (!htmlFixture || !fs.existsSync(htmlFixture)) {
-              throw new Error('demo login HTML fixture not found: ' + htmlFixture);
-            }
-            const fixture = parseFixture(fs.readFileSync(htmlFixture, 'utf8'));
-
-            function resolve(selector) {
-              return fixture.els.find(el => el.selectors.includes(selector));
-            }
-
-            function currentHidden(el) {
-              let hidden = el.hidden;
-              if (pageState.loggedIn && el.id) {
-                if (fixture.show.includes(el.id)) hidden = false;
-                if (fixture.hide.includes(el.id)) hidden = true;
+              const html = fs.readFileSync(htmlFixture, 'utf8');
+              const { document, window } = parseHTML(html);
+              const inline = html.match(/<script>([\s\S]*?)<\/script>/i);
+              if (inline) {
+                // Run the fixture's own submit handler so show/hide transitions
+                // match the committed markup.
+                new Function('document', 'window', inline[1])(document, window);
               }
-              return hidden;
+              return { document, window };
             }
+
+            const { document, window } = loadFixtureDom();
 
             function isVisible(selector) {
-              const el = resolve(selector);
-              return el ? !currentHidden(el) : false;
+              const el = document.querySelector(selector);
+              if (!el) return false;
+              return !el.hidden;
             }
 
             function textContent(selector) {
-              const el = resolve(selector);
-              return el ? el.text : '';
+              const el = document.querySelector(selector);
+              return el ? (el.textContent || '').trim() : '';
             }
 
             function makeLocator(selector) {
@@ -344,18 +292,20 @@ public sealed class DemoLoginReplaySandbox : ISandbox
                 async isVisible() { return isVisible(selector); },
                 async textContent() { return textContent(selector); },
                 async click() {
-                  const el = resolve(selector);
-                  const submits = el && (selector === '#login-btn' || (el.id && el.id === 'login-btn'));
-                  if (submits) {
-                    if (pageState.email.trim() === fixture.expectEmail && pageState.password === fixture.expectPassword) {
-                      pageState.loggedIn = true;
-                      console.log(JSON.stringify({ loggedIn: true }));
+                  const el = document.querySelector(selector);
+                  if (!el) return;
+                  if (selector === '#login-btn' || el.id === 'login-btn') {
+                    const form = document.getElementById('login-form');
+                    if (form) {
+                      form.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
                     }
+                  } else {
+                    el.click();
                   }
                 },
                 async fill(value) {
-                  if (selector === '#email') pageState.email = value;
-                  if (selector === '#password') pageState.password = value;
+                  const el = document.querySelector(selector);
+                  if (el) el.value = value;
                 },
                 async dblclick() {},
                 async press() {},
@@ -373,7 +323,7 @@ public sealed class DemoLoginReplaySandbox : ISandbox
                 locator: makeLocator,
                 async goto(url) { this.currentUrl = url; },
                 url() { return this.currentUrl; },
-                async title() { return fixture.title; },
+                async title() { return document.title; },
                 async waitForTimeout() {}
               };
             }

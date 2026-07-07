@@ -5,6 +5,22 @@ using CodeyBox.Sandbox.Graphical;
 namespace CodeyBox.Tests.E2eAuthoring;
 
 /// <summary>
+/// Maps scripted exploration actions to computer-use requests for test stand-ins.
+/// </summary>
+internal static class E2eExplorationActionMapper
+{
+    public static ComputerUseRequest ToComputerUseRequest(E2eExplorationAction action)
+        => action.Kind switch
+        {
+            "click" => new ComputerUseRequest { Action = "click", X = action.X ?? 0, Y = action.Y ?? 0 },
+            "type" => new ComputerUseRequest { Action = "type", Text = action.Text ?? string.Empty },
+            "key" => new ComputerUseRequest { Action = "key", Key = action.Key ?? action.Text },
+            "screenshot" => new ComputerUseRequest { Action = "screenshot" },
+            _ => throw new NotSupportedException($"Unsupported exploration action '{action.Kind}'."),
+        };
+}
+
+/// <summary>
 /// Deterministic stand-in for a cheap-model computer-use agent. Drives the
 /// real computer-use bridge with scripted actions so authoring tests never
 /// burn frontier coding quota.
@@ -24,16 +40,7 @@ public sealed class ScriptedE2eCuaExplorer : IE2eCuaExplorer
         foreach (var action in plan.Actions)
         {
             ct.ThrowIfCancellationRequested();
-            var request = action.Kind switch
-            {
-                "click" => new ComputerUseRequest { Action = "click", X = action.X ?? 0, Y = action.Y ?? 0 },
-                "type" => new ComputerUseRequest { Action = "type", Text = action.Text ?? string.Empty },
-                "key" => new ComputerUseRequest { Action = "key", Key = action.Key ?? action.Text },
-                "screenshot" => new ComputerUseRequest { Action = "screenshot" },
-                _ => throw new NotSupportedException($"Unsupported exploration action '{action.Kind}'."),
-            };
-
-            await target.ExecuteAsync(sandbox, request, ct).ConfigureAwait(false);
+            await target.ExecuteAsync(sandbox, E2eExplorationActionMapper.ToComputerUseRequest(action), ct).ConfigureAwait(false);
         }
     }
 }
@@ -60,15 +67,7 @@ public sealed class ScriptedComputerUseModelClient : IComputerUseModelClient
             return Task.FromResult<IReadOnlyList<ComputerUseRequest>>([]);
 
         var action = _actions[_index++];
-        ComputerUseRequest request = action.Kind switch
-        {
-            "click" => new ComputerUseRequest { Action = "click", X = action.X ?? 0, Y = action.Y ?? 0 },
-            "type" => new ComputerUseRequest { Action = "type", Text = action.Text ?? string.Empty },
-            "key" => new ComputerUseRequest { Action = "key", Key = action.Key ?? action.Text },
-            "screenshot" => new ComputerUseRequest { Action = "screenshot" },
-            _ => throw new NotSupportedException($"Unsupported exploration action '{action.Kind}'."),
-        };
-
-        return Task.FromResult<IReadOnlyList<ComputerUseRequest>>([request]);
+        return Task.FromResult<IReadOnlyList<ComputerUseRequest>>(
+            [E2eExplorationActionMapper.ToComputerUseRequest(action)]);
     }
 }

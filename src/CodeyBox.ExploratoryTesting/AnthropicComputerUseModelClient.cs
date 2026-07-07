@@ -90,7 +90,11 @@ public sealed class AnthropicComputerUseModelClient : IComputerUseModelClient
         using var response = await _httpClient.SendAsync(request, ct).ConfigureAwait(false);
         var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
-            throw new InvalidOperationException($"Anthropic computer-use call failed ({(int)response.StatusCode}): {body}");
+        {
+            var tail = body.Length <= 240 ? body : body[^240..];
+            throw new InvalidOperationException(
+                $"Anthropic computer-use call failed ({(int)response.StatusCode}): {tail}");
+        }
 
         return ParseToolUses(body);
     }

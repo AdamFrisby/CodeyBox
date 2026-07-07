@@ -105,7 +105,8 @@ public sealed record E2eExplorationPlan
     public required string TargetName { get; init; }
     public string? EntryUrl { get; init; }
     public string Modality { get; init; } = "web-graphical";
-    public required IReadOnlyList<E2eExplorationAction> Actions { get; init; }
+    /// <summary>Scripted actions for test explorers only; production explorers plan turns via the model client.</summary>
+    public IReadOnlyList<E2eExplorationAction> Actions { get; init; } = [];
     public required IReadOnlyList<E2eReplayAssertion> Assertions { get; init; }
     public E2eReplayEmitOptions? EmitOptions { get; init; }
 }

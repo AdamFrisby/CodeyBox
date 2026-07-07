@@ -162,7 +162,7 @@ public sealed class RecordingComputerUseBridge : IComputerUseExplorationTarget
         (int? cx, int? cy) = ResolveActionCentre(canonicalAction, events);
         TraceAccessibilityDescriptor? preAccessibility = null;
         string? preAccessibilityJson = null;
-        if (!isScreenshot)
+        if (canonicalAction is "click" or "type" or "double_click")
         {
             preAccessibilityJson = await CaptureAccessibilityTreeBestEffortAsync(sandbox, ct).ConfigureAwait(false);
         }

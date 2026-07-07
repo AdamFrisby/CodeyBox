@@ -86,7 +86,7 @@ public static class E2eReplayArtifactEmitter
                     {
                         Action = "press",
                         Selector = focusedSelector,
-                        Value = key ?? string.Empty,
+                        Value = RedactSensitiveValue(focusedSelector, entry.Action.TargetDescriptor.Accessibility, key),
                         DelayAfterMs = options.StepDelayAfterMs,
                     });
                     break;
@@ -132,13 +132,8 @@ public static class E2eReplayArtifactEmitter
         if (descriptor is null)
             return false;
 
-        if (string.Equals(descriptor.Role, "textbox", StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        var elementType = descriptor.ElementType ?? string.Empty;
-        return elementType.Contains("password", StringComparison.OrdinalIgnoreCase)
-            || elementType.Contains("#email", StringComparison.Ordinal)
-            || elementType.Contains("#password", StringComparison.Ordinal);
+        return string.Equals(descriptor.Role, "textbox", StringComparison.OrdinalIgnoreCase)
+            || IsSensitiveInput(descriptor, null);
     }
 
     private static string RedactSensitiveValue(string? selector, TraceAccessibilityDescriptor? descriptor, string? value)
@@ -146,17 +141,29 @@ public static class E2eReplayArtifactEmitter
         if (string.IsNullOrEmpty(value))
             return value ?? string.Empty;
 
-        if (selector?.Contains("password", StringComparison.OrdinalIgnoreCase) == true)
-            return Core.E2eReplaySensitiveValueRedaction.PasswordPlaceholder;
-
-        if (descriptor is null)
-            return value;
-
-        var elementType = descriptor.ElementType ?? string.Empty;
-        if (elementType.Contains("password", StringComparison.OrdinalIgnoreCase))
+        if (IsSensitiveInput(descriptor, selector))
             return Core.E2eReplaySensitiveValueRedaction.PasswordPlaceholder;
 
         return value;
+    }
+
+    private static bool IsSensitiveInput(TraceAccessibilityDescriptor? descriptor, string? selector)
+    {
+        if (selector?.Contains("password", StringComparison.OrdinalIgnoreCase) == true)
+            return true;
+
+        if (descriptor is null)
+            return false;
+
+        var elementType = descriptor.ElementType ?? string.Empty;
+        if (elementType.Contains("password", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (string.Equals(descriptor.Role, "textbox", StringComparison.OrdinalIgnoreCase)
+            && descriptor.Name?.Contains("password", StringComparison.OrdinalIgnoreCase) == true)
+            return true;
+
+        return false;
     }
 
     public static string EmitJson(
