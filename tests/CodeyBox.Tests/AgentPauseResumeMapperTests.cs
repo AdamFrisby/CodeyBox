@@ -10,6 +10,7 @@ public sealed class AgentPauseResumeMapperTests
     [InlineData("plan_review", "plan_review")]
     [InlineData("plan_approved", "plan_approved")]
     [InlineData("audit", "audit")]
+    [InlineData("rework", "rework")]
     [InlineData("conflict_rework", "conflict_rework")]
     [InlineData("merge", "merge")]
     [InlineData("upstream", "upstream")]
@@ -47,7 +48,6 @@ public sealed class AgentPauseResumeMapperTests
     [InlineData("plan")]
     [InlineData("planning_review")]
     [InlineData("planreview")]
-    [InlineData("rework")]
     public void NormalizeRetryFrom_DefaultsToWork_ForUnknownOrEmptyValues(string? input)
     {
         Assert.Equal("work", AgentPauseResumeMapper.NormalizeRetryFrom(input));
@@ -58,6 +58,7 @@ public sealed class AgentPauseResumeMapperTests
     [InlineData("plan_review", WorkItemState.PlanReview)]
     [InlineData("plan_approved", WorkItemState.PlanApproved)]
     [InlineData("audit", WorkItemState.WorkComplete)]
+    [InlineData("rework", WorkItemState.WorkComplete)]
     [InlineData("conflict_rework", WorkItemState.ReworkingForConflict)]
     [InlineData("merge", WorkItemState.AuditPassed)]
     [InlineData("upstream", WorkItemState.Merged)]

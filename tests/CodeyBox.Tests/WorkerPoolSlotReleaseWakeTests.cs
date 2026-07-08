@@ -1027,21 +1027,21 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
     }
 
     [Theory]
-    [InlineData("skipped:quota-still-gated", null, WorkItemRetryFailureKind.None, QuotaRetryDispatchDisposition.Blocked)]
-    [InlineData("skipped:max-retries", null, WorkItemRetryFailureKind.None, QuotaRetryDispatchDisposition.RestartSelection)]
-    [InlineData("moved:waiting-for-agent-resume", null, WorkItemRetryFailureKind.None, QuotaRetryDispatchDisposition.RestartSelection)]
-    [InlineData("retry-failed", "retry aborted", WorkItemRetryFailureKind.StateChangedConcurrently, QuotaRetryDispatchDisposition.RestartSelection)]
-    [InlineData("retry-failed", "work item state changed concurrently; retry aborted", WorkItemRetryFailureKind.None, QuotaRetryDispatchDisposition.Continue)]
-    [InlineData("retry-failed", "bare repo missing", WorkItemRetryFailureKind.None, QuotaRetryDispatchDisposition.Continue)]
-    [InlineData("skipped:no-eligible-members", null, WorkItemRetryFailureKind.None, QuotaRetryDispatchDisposition.Continue)]
+    [InlineData("skipped:quota-still-gated", null, (int)WorkItemRetryFailureKind.None, QuotaRetryDispatchDisposition.Blocked)]
+    [InlineData("skipped:max-retries", null, (int)WorkItemRetryFailureKind.None, QuotaRetryDispatchDisposition.RestartSelection)]
+    [InlineData("moved:waiting-for-agent-resume", null, (int)WorkItemRetryFailureKind.None, QuotaRetryDispatchDisposition.RestartSelection)]
+    [InlineData("retry-failed", "retry aborted", (int)WorkItemRetryFailureKind.StateChangedConcurrently, QuotaRetryDispatchDisposition.RestartSelection)]
+    [InlineData("retry-failed", "work item state changed concurrently; retry aborted", (int)WorkItemRetryFailureKind.None, QuotaRetryDispatchDisposition.Continue)]
+    [InlineData("retry-failed", "bare repo missing", (int)WorkItemRetryFailureKind.None, QuotaRetryDispatchDisposition.Continue)]
+    [InlineData("skipped:no-eligible-members", null, (int)WorkItemRetryFailureKind.None, QuotaRetryDispatchDisposition.Continue)]
     public void QuotaRetryDispatchPromoter_MapsRealRetryOutcomesToDispatchDispositions(
         string outcome,
         string? reason,
-        WorkItemRetryFailureKind failureKind,
+        int failureKind,
         QuotaRetryDispatchDisposition expected)
     {
         var disposition = QuotaRetryScheduler.DispatchDispositionForOutcome(
-            new QuotaRetryScheduler.QuotaRetryAttemptResult(outcome, reason, failureKind));
+            new QuotaRetryScheduler.QuotaRetryAttemptResult(outcome, reason, (WorkItemRetryFailureKind)failureKind));
 
         Assert.Equal(expected, disposition);
     }
@@ -1177,6 +1177,33 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
 
         Assert.DoesNotContain(skippedWaiting.Id, ordered);
         Assert.Contains(queued.Id, ordered);
+    }
+
+    [Fact]
+    public async Task UnifiedPickupQuery_AppliesLargeSkipSetWithoutExpandingSqlParameters()
+    {
+        const int largeSkipSetSize = 33_000;
+        var now = DateTimeOffset.UtcNow;
+        var skippedWaiting = MakeQuotaWaitingItem(now, priority: 200);
+        var queued = MakeItem(now.AddMilliseconds(1)) with { Priority = -1000 };
+        var skipIds = new HashSet<WorkItemId> { skippedWaiting.Id };
+        for (var i = 1; i <= largeSkipSetSize; i++)
+            skipIds.Add(new WorkItemId(Guid.Parse($"00000000-0000-0000-0000-{i:D12}")));
+
+        await _store.CreateAsync(skippedWaiting);
+        await _store.CreateAsync(queued);
+
+        var ordered = new List<WorkItemId>();
+        await foreach (var item in _store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
+            skipIds,
+            now,
+            limit: 10))
+        {
+            ordered.Add(item.Id);
+        }
+
+        Assert.DoesNotContain(skippedWaiting.Id, ordered);
+        Assert.Equal([queued.Id], ordered);
     }
 
     [Fact]

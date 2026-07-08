@@ -3,13 +3,13 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
 
-public enum WorkItemRetryFailureKind
+internal enum WorkItemRetryFailureKind
 {
     None,
     StateChangedConcurrently,
 }
 
-public readonly record struct WorkItemRetryResult(
+internal readonly record struct WorkItemRetryResult(
     bool Success,
     string? Error,
     WorkItemState? ResumeState,
@@ -80,26 +80,42 @@ public sealed class WorkItemRetrier
         _log = log;
     }
 
-    public async Task<WorkItemRetryResult> RetryAsync(
+    public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryAsync(
         WorkItem item,
         string? from = null,
         string trigger = "manual",
         CancellationToken ct = default)
-        => await RetryCoreAsync(item, from, trigger, RetryAccounting.None, ct);
+        => ToPublicResult(await RetryCoreAsync(item, from, trigger, RetryAccounting.None, ct));
 
-    public async Task<WorkItemRetryResult> RetryQuotaAutoAsync(
+    public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryQuotaAutoAsync(
+        WorkItem item,
+        string? from,
+        string trigger,
+        CancellationToken ct = default)
+        => ToPublicResult(await RetryCoreAsync(item, from, trigger, RetryAccounting.QuotaAutoRetry, ct));
+
+    public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryTransientAutoAsync(
+        WorkItem item,
+        string? from,
+        string trigger,
+        CancellationToken ct = default)
+        => ToPublicResult(await RetryCoreAsync(item, from, trigger, RetryAccounting.TransientAutoRetry, ct));
+
+    internal async Task<WorkItemRetryResult> RetryQuotaAutoDetailedAsync(
         WorkItem item,
         string? from,
         string trigger,
         CancellationToken ct = default)
         => await RetryCoreAsync(item, from, trigger, RetryAccounting.QuotaAutoRetry, ct);
 
-    public async Task<WorkItemRetryResult> RetryTransientAutoAsync(
-        WorkItem item,
-        string? from,
-        string trigger,
-        CancellationToken ct = default)
-        => await RetryCoreAsync(item, from, trigger, RetryAccounting.TransientAutoRetry, ct);
+    private static (bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions) ToPublicResult(
+        WorkItemRetryResult result) =>
+        (
+            result.Success,
+            result.Error,
+            result.ResumeState,
+            result.ActualFrom,
+            result.OpenQuestions);
 
     private async Task<WorkItemRetryResult> RetryCoreAsync(
         WorkItem item,

@@ -1399,9 +1399,15 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         await _writeLock.WaitAsync(ct);
         try
         {
+            var skipFilter = string.Empty;
+            if (skipIds.Count > 0)
+            {
+                await PopulateDispatchSkipTableAsync(skipIds, ct);
+                skipFilter = DispatchSkipFilterSql;
+            }
+
             using (var cmd = _conn.CreateCommand())
             {
-                var skipFilter = BuildSkipIdFilter(skipIds, cmd);
                 cmd.CommandText = $"""
                     SELECT * FROM (
                         SELECT wi.*, wi.state AS dispatch_ordering_state, 0 AS dispatch_source_order
@@ -1473,23 +1479,38 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
 
-    private static string BuildSkipIdFilter(
-        IReadOnlySet<WorkItemId> skipIds,
-        SqliteCommand cmd)
-    {
-        if (skipIds.Count == 0)
-            return string.Empty;
+    private const string DispatchSkipFilterSql =
+        "AND NOT EXISTS (SELECT 1 FROM temp.codeybox_dispatch_skip_ids skipped WHERE skipped.id = wi.id)";
 
-        var parameterNames = new List<string>(skipIds.Count);
-        var index = 0;
-        foreach (var id in skipIds)
+    private async Task PopulateDispatchSkipTableAsync(
+        IReadOnlySet<WorkItemId> skipIds,
+        CancellationToken ct)
+    {
+        using (var reset = _conn.CreateCommand())
         {
-            var parameterName = $"$skip_id_{index++}";
-            parameterNames.Add(parameterName);
-            cmd.Parameters.AddWithValue(parameterName, id.ToString());
+            reset.CommandText = """
+                DROP TABLE IF EXISTS temp.codeybox_dispatch_skip_ids;
+                CREATE TEMP TABLE codeybox_dispatch_skip_ids (
+                    id TEXT PRIMARY KEY
+                ) WITHOUT ROWID;
+                """;
+            await reset.ExecuteNonQueryAsync(ct);
         }
 
-        return $"AND wi.id NOT IN ({string.Join(", ", parameterNames)})";
+        using var tx = _conn.BeginTransaction();
+        using var insert = _conn.CreateCommand();
+        insert.Transaction = tx;
+        insert.CommandText = "INSERT INTO temp.codeybox_dispatch_skip_ids (id) VALUES ($id);";
+        var idParameter = insert.CreateParameter();
+        idParameter.ParameterName = "$id";
+        insert.Parameters.Add(idParameter);
+        foreach (var id in skipIds)
+        {
+            idParameter.Value = id.ToString();
+            await insert.ExecuteNonQueryAsync(ct);
+        }
+
+        tx.Commit();
     }
 
     public async Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default)
