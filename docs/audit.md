@@ -340,17 +340,22 @@ the pipeline checks infrastructure-failure evidence:
    terminal auth-required failure. Stdout-only auth evidence, and built-in
    stderr login transcripts on the clean-exit/no-diff branch, are routed
    through the existing in-VM corroboration policy before they can bench the
-   agent globally. Operator-configured stderr auth patterns and runner-owned
-   terminal diagnostics are trusted directly.
+   agent globally. Operator-configured stderr auth patterns are trusted
+   directly. Terminal diagnostics extracted from runner logs use the same
+   corroboration gate before they can publish global auth-required side effects.
 2. The **quota / usage classifier** runs on the **rework** no-diff branch
-   over the run's captured stdout/stderr and the runner-owned
-   `TerminalDiagnostic` side channel. It also checks trusted
-   `TerminalDiagnostic` quota evidence on initial work no-diff, preserving
-   the Antigravity / `agy` exit-0 usage-cap park while keeping genuine
-   initial no-ops fail-fast. Several CLIs swallow usage-cap errors as exit-0;
-   a quota match throws `TerminalQuotaError`, which the agent-class fallback
-   wrapper converts into a re-route to a healthy class member (or, on the
-   single-agent path, parks the item in `WaitingForQuotaReset`).
+   over trusted CLI stderr directly. Captured stdout and runner log
+   `TerminalDiagnostic` text can contain model/tool/repository-controlled
+   content, so on the rework path they require a fresh quota probe to
+   corroborate exhaustion before the pipeline records observed quota state or
+   re-routes. It also checks `TerminalDiagnostic` quota evidence on initial
+   work no-diff, preserving the Antigravity / `agy` exit-0 usage-cap park while
+   keeping genuine initial no-ops fail-fast. Several CLIs swallow usage-cap
+   errors as exit-0; a quota match throws `TerminalQuotaError`, which the
+   agent-class fallback wrapper converts into a re-route to a healthy class
+   member (or, on the single-agent path, parks the item in
+   `WaitingForQuotaReset`). Unauthorized quota detections (`401` / `403`) are
+   routed as auth-required infrastructure failures, not quota reset parks.
 
 Neither infra path counts against convergence, parks the item as
 operator-input, or terminal-fails it as "cannot resolve findings."

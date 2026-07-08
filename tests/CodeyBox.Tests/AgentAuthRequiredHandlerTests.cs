@@ -108,7 +108,7 @@ public class AgentAuthRequiredHandlerTests
             "rework",
             classification,
             stdoutOnlyEvidence: false,
-            stdoutOnlyNote: "auth evidence accepted for item failure only");
+            evidenceTrustNote: "auth evidence accepted for item failure only");
 
         Assert.Contains("auth/login prompt pattern matched in stderr", reason);
         Assert.Contains("auth evidence accepted for item failure only", reason);
@@ -141,7 +141,7 @@ public class AgentAuthRequiredHandlerTests
             "release-deep-audit:archcoherence",
             classification,
             stdoutOnlyEvidence: true,
-            stdoutOnlyNote: "stdout accepted for release failure only because deep-audit stdout is model-controlled");
+            evidenceTrustNote: "stdout accepted for release failure only because deep-audit stdout is model-controlled");
 
         Assert.Contains("stdout accepted for release failure only", reason);
         Assert.DoesNotContain("stdout accepted as authoritative CLI output", reason);

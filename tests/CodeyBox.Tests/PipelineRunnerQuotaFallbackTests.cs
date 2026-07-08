@@ -535,10 +535,14 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
-    public async Task AuditDrivenRework_CleanExitNoDiffTrustedQuotaDiagnostic_FallsBackToHealthyMember()
+    public async Task AuditDrivenRework_CleanExitNoDiffTerminalQuotaDiagnostic_WithProbeCorroboration_FallsBackToHealthyMember()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2);
+        using var fix = BuildPipeline(
+            seed,
+            [new OnceFailingAuditor()],
+            maxAuditIterations: 2,
+            codexQuotaSnapshot: new AgentQuotaSnapshot { AvailablePct = 0.0 });
 
         fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
         fix.Codex.ReworkScriptedFailures.Enqueue(new AgentResult(
@@ -566,7 +570,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         Assert.True(fix.Claude.CallCount >= 1);
         Assert.True(metrics.Any("codeybox.agent.fallbacks",
                 ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "quota"), ("phase", "rework")),
-            "expected trusted clean-exit quota diagnostic to reroute the same rework iteration");
+            "expected corroborated clean-exit quota diagnostic to reroute the same rework iteration");
 
         var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
         var fallback = Assert.Single(history, h => h.Phase == "rework" && h.ToAgent == AgentKind.Claude);
@@ -574,10 +578,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         Assert.Contains("quota failure", fallback.Reason, StringComparison.OrdinalIgnoreCase);
     }
 
-    [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public async Task AuditDrivenRework_CleanExitNoDiffCapturedQuotaOutput_FallsBackToHealthyMember(bool quotaOnStdout)
+    [Fact]
+    public async Task AuditDrivenRework_CleanExitNoDiffCapturedQuotaStderr_FallsBackToHealthyMember()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2);
@@ -586,11 +588,9 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         fix.Codex.ReworkScriptedFailures.Enqueue(new AgentResult(
             Success: true,
             Summary: "ok",
-            Stdout: quotaOnStdout ? "API Error: rate_limit_exceeded; please try again after 1h" : null,
-            Stderr: quotaOnStdout ? null : "API Error: rate_limit_exceeded; please try again after 1h"));
-        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", quotaOnStdout
-            ? "fixed after stdout quota"
-            : "fixed after stderr quota"));
+            Stdout: null,
+            Stderr: "API Error: rate_limit_exceeded; please try again after 1h"));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "fixed after stderr quota"));
 
         using var metrics = new MetricCapture("codeybox.agent.fallbacks");
 
@@ -609,6 +609,65 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var fallback = Assert.Single(history, h => h.Phase == "rework" && h.ToAgent == AgentKind.Claude);
         Assert.Equal(AgentKind.Codex, fallback.FromAgent);
         Assert.Contains("quota failure", fallback.Reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task AuditDrivenRework_CleanExitNoDiffCapturedQuotaStdout_WithProbeCorroboration_FallsBackToHealthyMember()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(
+            seed,
+            [new OnceFailingAuditor()],
+            maxAuditIterations: 2,
+            codexQuotaSnapshot: new AgentQuotaSnapshot { AvailablePct = 0.0 });
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Codex.ReworkScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: "API Error: rate_limit_exceeded; please try again after 1h",
+            Stderr: null));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "fixed after corroborated stdout quota"));
+
+        using var metrics = new MetricCapture("codeybox.agent.fallbacks");
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.True(metrics.Any("codeybox.agent.fallbacks",
+                ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "quota"), ("phase", "rework")),
+            "expected probe-corroborated stdout quota output to reroute the same rework iteration");
+    }
+
+    [Fact]
+    public async Task AuditDrivenRework_CleanExitNoDiffCapturedQuotaStdout_WithoutProbeCorroboration_ParksAsEmptyRework()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Codex.ReworkScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: "API Error: rate_limit_exceeded; please try again after 1h",
+            Stderr: null));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "should not run"));
+
+        using var metrics = new MetricCapture("codeybox.agent.fallbacks");
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
+        Assert.False(metrics.Any("codeybox.agent.fallbacks",
+            ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "quota"), ("phase", "rework")));
     }
 
     [Fact]
@@ -700,8 +759,11 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
     }
 
-    [Fact]
-    public async Task AuditDrivenRework_CleanExitNoDiffUnauthorizedDiagnostic_FallsBackAsAuthNotQuota()
+    [Theory]
+    [InlineData("API Error: 401 Unauthorized: token expired")]
+    [InlineData("API Error: 403: permission denied")]
+    public async Task AuditDrivenRework_CleanExitNoDiffUnauthorizedDiagnostic_FallsBackAsAuthNotQuota(
+        string terminalDiagnostic)
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2);
@@ -713,7 +775,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             Stdout: null,
             Stderr: null)
         {
-            TerminalDiagnostic = "API Error: 401 Unauthorized: token expired",
+            TerminalDiagnostic = terminalDiagnostic,
         });
         fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "fixed after unauthorized fallback"));
 

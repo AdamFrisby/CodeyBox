@@ -4059,6 +4059,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
         return ("CodeyBox", "codeybox@local");
     }
 
+    private enum ReworkNoDiffHandling
+    {
+        TerminalError,
+        AuditEmptyRework,
+    }
+
     /// <summary>
     /// Runs the agent in a sandbox against <paramref name="branch"/>. On the
     /// first call (work phase), <paramref name="isInitial"/> is true and the
@@ -4082,7 +4088,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         CancellationToken hostShutdownToken,
         RequiredBuildPolicy buildFailurePolicy,
         int? iteration = null,
-        IReadOnlyList<IAuditor>? auditorsForPreemptiveSelfReview = null)
+        IReadOnlyList<IAuditor>? auditorsForPreemptiveSelfReview = null,
+        ReworkNoDiffHandling reworkNoDiffHandling = ReworkNoDiffHandling.TerminalError)
     {
         var credential = await ResolveAgentCredentialAsync(runner.Kind, project, item, ct);
         var selectedMemberForSession = TryResolveSelectedMember(runner.Kind, project, item);
@@ -4736,6 +4743,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     // side effects because this is the silent-failure path.
                     // Operator-configured stderr patterns are explicit trusted
                     // diagnostics and bench directly.
+                    var matchedConfiguredStderrPattern =
+                        AuthClassifierMatchesConfiguredStderrPattern(runner.Kind, agentResult.Stderr);
                     await HandleAuthRequiredDetectionAsync(
                         item,
                         project,
@@ -4746,7 +4755,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         stdoutOnlyEvidence: deferredSuccessAuthDetection.IsStdoutOnly,
                         requireStdoutOnlyCorroboration: true,
                         requireAuthCorroboration: !deferredSuccessAuthDetection.IsStdoutOnly
-                            && !deferredSuccessAuthDetection.MatchedConfiguredStderrPattern,
+                            && !matchedConfiguredStderrPattern,
                         ct: ct);
                 }
 
@@ -4766,6 +4775,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 {
                     await ThrowIfNoDiffReworkQuotaFailureAsync(
                         item,
+                        project,
                         runner.Kind,
                         observedModelId,
                         agentResult,
@@ -4782,7 +4792,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         agentResult,
                         ct);
 
-                    await ThrowIfTrustedNoDiffAuthDiagnosticAsync(
+                    await ThrowIfNoDiffTerminalAuthDiagnosticAsync(
                         item,
                         project,
                         runner.Kind,
@@ -4833,15 +4843,20 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     throw new InvalidOperationException("Agent produced no changes to commit");
                 }
 
-                // Rework phase: surface the empty-diff outcome via a typed
-                // exception the audit/rework loop catches. The loop applies
-                // converge-aware handling (escalation re-dispatch, then park,
-                // and only terminal when there is no budget AND no convergence
-                // progress) instead of unconditionally terminal-failing the
-                // item on the FIRST empty pass.
-                throw new ReworkProducedNoChangesException(
-                    runner.Kind,
-                    message: "Rework agent produced no changes; cannot resolve audit findings");
+                if (reworkNoDiffHandling == ReworkNoDiffHandling.AuditEmptyRework)
+                {
+                    // Audit rework: surface the empty-diff outcome via a typed
+                    // exception the audit/rework loop catches. The loop applies
+                    // converge-aware handling instead of terminal-failing the item
+                    // on the first empty pass.
+                    throw new ReworkProducedNoChangesException(
+                        runner.Kind,
+                        message: "Rework agent produced no changes; cannot resolve audit findings");
+                }
+
+                // Non-audit rework callers keep the pre-existing terminal error
+                // contract; only the audit loop owns the converge-aware policy.
+                throw new InvalidOperationException("Rework agent produced no changes; cannot resolve audit findings");
             }
 
             if (deferredSuccessAuthDetection is { IsStdoutOnly: false })
@@ -6717,6 +6732,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
             RequiresStructuredStreamForSessionId: true,
         };
 
+    private bool AuthClassifierMatchesConfiguredStderrPattern(AgentKind agent, string? stderr) =>
+        _authFailureClassifier is AgentAuthFailureClassifier classifier
+        && classifier.ContainsConfiguredStderrPattern(agent, stderr);
+
     private async Task<bool> HandleAuthRequiredOutputAsync(
         WorkItem? item,
         Project project,
@@ -6763,7 +6782,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string? authCorroborationNote = null;
         if (requireAuthCorroboration || stdoutOnlyEvidence && requireStdoutOnlyCorroboration)
         {
-            var corroboration = await TryCorroborateStdoutOnlyAuthRequiredAsync(item, project, agent, phase, ct);
+            var corroboration = await TryCorroborateAuthRequiredAsync(item, project, agent, phase, ct);
             // Fail-CLOSED on the irreversible fleet-wide "operator action
             // required" bench: only POSITIVELY corroborated stdout-only
             // evidence (or generic captured auth output that explicitly asked
@@ -6772,12 +6791,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // degrade to item-level handling — the resolver reroutes to another
             // class member — rather than benching a possibly-authenticated
             // agent fleet-wide on uncorroborated agent output.
-            publishSideEffects = corroboration == StdoutOnlyAuthCorroboration.Corroborated;
+            publishSideEffects = corroboration == AuthRequiredCorroboration.Corroborated;
             authCorroborationNote = corroboration switch
             {
-                StdoutOnlyAuthCorroboration.Corroborated =>
+                AuthRequiredCorroboration.Corroborated =>
                     "auth evidence corroborated by forced in-VM smoke probe for global benching",
-                StdoutOnlyAuthCorroboration.NotCorroborated =>
+                AuthRequiredCorroboration.NotCorroborated =>
                     "auth evidence accepted for item failure only; forced in-VM smoke probe did not corroborate auth",
                 _ =>
                     "auth evidence NOT corroborated (forced in-VM smoke unavailable); item-level failure only, no fleet-wide bench",
@@ -6797,6 +6816,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
     private async Task ThrowIfNoDiffReworkQuotaFailureAsync(
         WorkItem item,
+        Project project,
         AgentKind agent,
         string? observedModelId,
         AgentResult agentResult,
@@ -6805,37 +6825,56 @@ public sealed partial class PipelineRunner : IPipelineRunner
         DateTimeOffset agentEndedAt,
         CancellationToken ct)
     {
-        // Rework-only clean-exit/no-diff infra classification. Captured
-        // stdout/stderr are checked before the run is treated as a genuine
-        // "agent made no changes" result. Initial work intentionally skips this
-        // branch and remains fail-fast.
+        // Rework-only clean-exit/no-diff infra classification. CLI stderr is
+        // accepted directly; stdout and terminal diagnostics can include model,
+        // tool, or repository-controlled text, so they need quota-probe
+        // corroboration before they can write observed-failure state or reroute.
         await ThrowIfNoDiffQuotaFailureFromTextAsync(
-            item,
-            agent,
-            observedModelId,
-            agentResult.Summary,
-            agentResult.Stderr,
-            agentResult.Stdout,
-            phase,
-            sandboxId,
-            agentEndedAt,
-            "captured output",
-            ct);
+            item: item,
+            project: project,
+            agent: agent,
+            observedModelId: observedModelId,
+            summary: agentResult.Summary,
+            stderr: agentResult.Stderr,
+            stdout: null,
+            phase: phase,
+            sandboxId: sandboxId,
+            agentEndedAt: agentEndedAt,
+            evidenceSource: "captured stderr",
+            evidenceTrust: NoDiffQuotaEvidenceTrust.CliOwned,
+            ct: ct);
+
+        await ThrowIfNoDiffQuotaFailureFromTextAsync(
+            item: item,
+            project: project,
+            agent: agent,
+            observedModelId: observedModelId,
+            summary: agentResult.Summary,
+            stderr: null,
+            stdout: agentResult.Stdout,
+            phase: phase,
+            sandboxId: sandboxId,
+            agentEndedAt: agentEndedAt,
+            evidenceSource: "captured stdout",
+            evidenceTrust: NoDiffQuotaEvidenceTrust.RequiresQuotaProbe,
+            ct: ct);
 
         if (!string.IsNullOrWhiteSpace(agentResult.TerminalDiagnostic))
         {
             await ThrowIfNoDiffQuotaFailureFromTextAsync(
-                item,
-                agent,
-                observedModelId,
-                agentResult.Summary,
-                agentResult.TerminalDiagnostic,
-                agentResult.Stdout,
-                phase,
-                sandboxId,
-                agentEndedAt,
-                "terminal diagnostic",
-                ct);
+                item: item,
+                project: project,
+                agent: agent,
+                observedModelId: observedModelId,
+                summary: agentResult.Summary,
+                stderr: agentResult.TerminalDiagnostic,
+                stdout: null,
+                phase: phase,
+                sandboxId: sandboxId,
+                agentEndedAt: agentEndedAt,
+                evidenceSource: "terminal diagnostic",
+                evidenceTrust: NoDiffQuotaEvidenceTrust.RequiresQuotaProbe,
+                ct: ct);
         }
     }
 
@@ -6853,21 +6892,30 @@ public sealed partial class PipelineRunner : IPipelineRunner
             return;
 
         await ThrowIfNoDiffQuotaFailureFromTextAsync(
-            item,
-            agent,
-            observedModelId,
-            agentResult.Summary,
-            agentResult.TerminalDiagnostic,
-            agentResult.Stdout,
-            phase,
-            sandboxId,
-            agentEndedAt,
-            "terminal diagnostic",
-            ct);
+            item: item,
+            project: null,
+            agent: agent,
+            observedModelId: observedModelId,
+            summary: agentResult.Summary,
+            stderr: agentResult.TerminalDiagnostic,
+            stdout: agentResult.Stdout,
+            phase: phase,
+            sandboxId: sandboxId,
+            agentEndedAt: agentEndedAt,
+            evidenceSource: "terminal diagnostic",
+            evidenceTrust: NoDiffQuotaEvidenceTrust.CliOwned,
+            ct: ct);
+    }
+
+    private enum NoDiffQuotaEvidenceTrust
+    {
+        CliOwned,
+        RequiresQuotaProbe,
     }
 
     private async Task ThrowIfNoDiffQuotaFailureFromTextAsync(
         WorkItem item,
+        Project? project,
         AgentKind agent,
         string? observedModelId,
         string summary,
@@ -6877,14 +6925,47 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string sandboxId,
         DateTimeOffset agentEndedAt,
         string evidenceSource,
+        NoDiffQuotaEvidenceTrust evidenceTrust,
         CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(stderr) && string.IsNullOrWhiteSpace(stdout))
             return;
 
         var noChangeQuota = _quotaClassifier.Detect(agent, stderr, stdout);
+        if (noChangeQuota is null)
+            return;
+
+        if (noChangeQuota.Kind == QuotaFailureKind.Unauthorized && project is not null)
+        {
+            var authRequired = ToAuthRequiredClassification(new AgentFailureClassification(
+                AgentFailureKind.AuthError,
+                Reason: "auth pattern matched"));
+            await HandleAuthRequiredDetectionAsync(
+                item,
+                project,
+                agent,
+                phase,
+                authRequired,
+                throwOnMatch: true,
+                stdoutOnlyEvidence: string.IsNullOrWhiteSpace(stderr) && !string.IsNullOrWhiteSpace(stdout),
+                requireStdoutOnlyCorroboration: true,
+                requireAuthCorroboration: evidenceTrust == NoDiffQuotaEvidenceTrust.RequiresQuotaProbe,
+                ct: ct);
+        }
+
         if (!IsParkableQuotaKind(noChangeQuota))
             return;
+
+        if (evidenceTrust == NoDiffQuotaEvidenceTrust.RequiresQuotaProbe
+            && !await TryCorroborateNoDiffQuotaFailureAsync(item, project, agent, observedModelId, phase, ct))
+        {
+            _log.LogWarning(
+                "Ignoring uncorroborated clean-exit/no-diff quota evidence from {Source} for agent {Agent} during {Phase}; treating run as genuine no-diff",
+                evidenceSource,
+                agent.Value,
+                phase);
+            return;
+        }
 
         _quotaAuditEmitter.EmitAdvisoryAuditEvents(agent, stderr, stdout, phase, sandboxId);
         // Feed the observed-failure store so the router proactively gates this
@@ -6909,6 +6990,72 @@ public sealed partial class PipelineRunner : IPipelineRunner
             noChangeQuota.ResetAt);
     }
 
+    private async Task<bool> TryCorroborateNoDiffQuotaFailureAsync(
+        WorkItem item,
+        Project? project,
+        AgentKind agent,
+        string? observedModelId,
+        string phase,
+        CancellationToken ct)
+    {
+        if (project is null
+            || _quotaProbesByKind is null
+            || !_quotaProbesByKind.TryGetValue(agent, out var probe))
+        {
+            return false;
+        }
+
+        var member = BuildNoDiffQuotaProbeMember(item, project, agent, observedModelId);
+        try
+        {
+            var snapshot = await probe.GetAvailabilityAsync(member, ct).ConfigureAwait(false);
+            var quota = QuotaGatePolicy.ResolveMemberQuota(snapshot, member);
+            if (!quota.IsKnown)
+                return false;
+
+            var gate = _auditQuotaGatePolicy.Evaluate(member, quota, _opts.TimeProvider.GetUtcNow());
+            return !gate.Allow;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "Quota probe corroboration failed for no-diff quota evidence from agent {Agent} during {Phase}; ignoring untrusted quota text",
+                agent.Value,
+                phase);
+            return false;
+        }
+    }
+
+    private AgentMembership BuildNoDiffQuotaProbeMember(
+        WorkItem item,
+        Project project,
+        AgentKind agent,
+        string? observedModelId)
+    {
+        var selected = TryResolveSelectedMember(agent, project, item);
+        if (selected is not null)
+        {
+            return observedModelId is null
+                ? selected
+                : selected with { ModelId = observedModelId };
+        }
+
+        return new AgentMembership
+        {
+            Agent = agent,
+            InstanceId = item.AgentInstanceId,
+            ModelId = observedModelId ?? item.ModelId,
+            ReasoningMode = item.ReasoningMode,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+    }
+
     private async Task ThrowIfNoDiffReworkCapturedAuthErrorAsync(
         WorkItem item,
         Project project,
@@ -6923,19 +7070,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
             return;
         }
 
-        var classification = _authFailureClassifier.ClassifyOutput(
+        var classification = _authFailureClassifier.ClassifyFailure(
             agent,
-            agentResult.Stderr,
-            agentResult.Stdout,
-            summary: null);
+            new AgentResult(
+                Success: true,
+                Summary: "clean-exit/no-diff rework",
+                Stdout: agentResult.Stdout,
+                Stderr: agentResult.Stderr));
         if (classification.Kind is not AgentFailureKind.AuthError)
             return;
 
-        var authRequired = classification with
-        {
-            Kind = AgentFailureKind.AuthRequired,
-            Reason = classification.Reason ?? "auth pattern matched",
-        };
+        var authRequired = ToAuthRequiredClassification(classification);
         await HandleAuthRequiredDetectionAsync(
             item,
             project,
@@ -6950,7 +7095,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             ct: ct);
     }
 
-    private async Task ThrowIfTrustedNoDiffAuthDiagnosticAsync(
+    private async Task ThrowIfNoDiffTerminalAuthDiagnosticAsync(
         WorkItem item,
         Project project,
         AgentKind agent,
@@ -6961,17 +7106,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (string.IsNullOrWhiteSpace(terminalDiagnostic))
             return;
 
-        var classification = _authFailureClassifier.ClassifyTrustedDiagnostic(agent, terminalDiagnostic);
+        var classification = _authFailureClassifier.ClassifyFailure(
+            agent,
+            new AgentResult(
+                Success: true,
+                Summary: "agent terminal diagnostic",
+                Stdout: null,
+                Stderr: terminalDiagnostic));
         if (classification.Kind is not (AgentFailureKind.AuthError or AgentFailureKind.AuthRequired))
             return;
 
-        var authRequired = classification.Kind == AgentFailureKind.AuthRequired
-            ? classification
-            : classification with
-            {
-                Kind = AgentFailureKind.AuthRequired,
-                Reason = classification.Reason ?? "auth pattern matched",
-            };
+        var authRequired = ToAuthRequiredClassification(classification);
         await HandleAuthRequiredDetectionAsync(
             item,
             project,
@@ -6981,17 +7126,28 @@ public sealed partial class PipelineRunner : IPipelineRunner
             throwOnMatch: true,
             stdoutOnlyEvidence: false,
             requireStdoutOnlyCorroboration: false,
+            requireAuthCorroboration: true,
             ct: ct);
     }
 
-    private enum StdoutOnlyAuthCorroboration
+    private static AgentFailureClassification ToAuthRequiredClassification(
+        AgentFailureClassification classification)
+        => classification.Kind == AgentFailureKind.AuthRequired
+            ? classification
+            : classification with
+            {
+                Kind = AgentFailureKind.AuthRequired,
+                Reason = classification.Reason ?? "auth pattern matched",
+            };
+
+    private enum AuthRequiredCorroboration
     {
         Unavailable,
         NotCorroborated,
         Corroborated,
     }
 
-    private async Task<StdoutOnlyAuthCorroboration> TryCorroborateStdoutOnlyAuthRequiredAsync(
+    private async Task<AuthRequiredCorroboration> TryCorroborateAuthRequiredAsync(
         WorkItem? item,
         Project project,
         AgentKind agent,
@@ -6999,17 +7155,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
         CancellationToken ct)
     {
         if (_inVmSmokeGate is not { Enabled: true })
-            return StdoutOnlyAuthCorroboration.Unavailable;
+            return AuthRequiredCorroboration.Unavailable;
 
         try
         {
             var target = ResolveAuthCorroborationSmokeTarget(project, phase, item?.BaselineImageRef);
             var availability = await _inVmSmokeGate.ForceProbeAsync(agent, target, ct);
             if (availability is null)
-                return StdoutOnlyAuthCorroboration.Unavailable;
+                return AuthRequiredCorroboration.Unavailable;
             return IsAuthCorroboratingSmokeFailure(agent, availability)
-                ? StdoutOnlyAuthCorroboration.Corroborated
-                : StdoutOnlyAuthCorroboration.NotCorroborated;
+                ? AuthRequiredCorroboration.Corroborated
+                : AuthRequiredCorroboration.NotCorroborated;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -7022,7 +7178,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 "Forced in-VM smoke corroboration failed for auth evidence from agent {Agent} during {Phase}; continuing item-level auth failure without global bench",
                 agent.Value,
                 phase);
-            return StdoutOnlyAuthCorroboration.Unavailable;
+            return AuthRequiredCorroboration.Unavailable;
         }
     }
 
@@ -8024,7 +8180,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             // failure as a blocking finding. Terminal-failing here would defeat
                             // the loop's purpose of converging on a fix within the audit budget.
                             buildFailurePolicy: RequiredBuildPolicy.DeferToAuditLoop,
-                            iteration: reworkIterationNumber),
+                            iteration: reworkIterationNumber,
+                            reworkNoDiffHandling: ReworkNoDiffHandling.AuditEmptyRework),
                         workToken: attemptCt),
                 ct,
                 phaseCancellation: reworkPhase,
@@ -8045,8 +8202,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // The agent finished cleanly without committing any change AND no
             // infra (auth / quota) signature was matched on its output — those
             // would have thrown TerminalQuotaError / AgentAuthRequiredException
-            // before reaching here, which the availability breaker handles by
-            // benching the agent and re-routing the item.
+            // before reaching here. The fallback wrapper routes infra failures
+            // before empty-rework handling; auth evidence only publishes a
+            // fleet-wide bench when it is authoritative or corroborated.
             //
             // Apply converge-aware item-level handling: if the audit history
             // shows convergence, re-dispatch with an escalated instruction so a
@@ -8139,8 +8297,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         _log.LogWarning(
             "Work item {Id} rework iteration {Iter} produced no changes (agent {Agent}); " +
-            "converging={Converging}, configured escalation retries={Retries}",
-            item.Id, reworkIterationNumber, emptyEx.Agent.Value, converging, attempts);
+            "converging={Converging}, configured escalation retries={ConfiguredRetries}, effective escalation attempts={Attempts}",
+            item.Id, reworkIterationNumber, emptyEx.Agent.Value, converging, configuredRetries, attempts);
         CodeyBoxMeters.ReworkEmptyEvents.Add(1,
             new KeyValuePair<string, object?>("outcome", "detected"));
 

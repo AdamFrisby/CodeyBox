@@ -71,6 +71,7 @@ public sealed class AgentFailureClassifierTests
 
     [Theory]
     [InlineData("API Error: 401 Unauthorized")]
+    [InlineData("API Error: 403")]
     [InlineData("invalid_api_key supplied")]
     [InlineData("OAuth token expired; please reauthenticate")]
     public void AuthPatterns_Classified_AsAuthError(string snippet)

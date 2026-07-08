@@ -100,10 +100,10 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
     }
 
     [Fact]
-    public async Task EmptyRework_WithQuotaStdout_ClassifiedAsInfraQuota_NotEmptyReworkPark()
+    public async Task EmptyRework_WithQuotaStderr_ClassifiedAsInfraQuota_NotEmptyReworkPark()
     {
         // A clean-exit/no-diff rework that carries a quota signature in captured
-        // stdout is infra, not a genuine empty rework. With no class fallback in
+        // stderr is infra, not a genuine empty rework. With no class fallback in
         // this fixture the top-level quota handler parks for reset rather than
         // the empty-rework operator-input path.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -128,9 +128,22 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
             projectAudit: audit,
             pipelineTuning: tuning,
             quotaFailures: quotaFailures);
-        tp.Agent.ResultStdout = "rate_limit_exceeded";
-        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "v1\n"));
-        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "v1\n"));
+        var agentRuns = 0;
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            agentRuns++;
+            if (agentRuns != 1)
+                return;
+
+            var write = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/work.txt"],
+                Stdin = "v1\n",
+            }, ct);
+            Assert.True(write.Success, write.Stderr);
+        };
+        tp.Agent.WorkResults.Enqueue(new AgentResult(true, "ok", null, null));
+        tp.Agent.WorkResults.Enqueue(new AgentResult(true, "ok", null, "rate_limit_exceeded"));
 
         var item = NewItem("feature/empty-rework-quota-signature");
         await tp.Store.CreateAsync(item);
