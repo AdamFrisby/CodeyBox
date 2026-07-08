@@ -148,6 +148,7 @@ internal static class TestSupport
         CancellationRegistry? cancellationRegistry = null,
         AgentAvailabilityRegistry? availabilityRegistry = null,
         ScriptedAgent? agentOverride = null,
+        IQuotaFailureStore? quotaFailures = null,
         IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? toolCallCounters = null,
         IMergeScopeResolver? mergeScopeResolver = null,
         IReadOnlyDictionary<string, string>? projectKnobs = null)
@@ -271,6 +272,7 @@ internal static class TestSupport
             auditReports: auditReportStore,
             agentStreams: agentStreams,
             auditQuotaOptions: auditQuotaOptions,
+            quotaFailures: quotaFailures,
             classRouter: classRouter,
             costStore: costStore,
             costExtractors: costExtractors,

@@ -136,12 +136,15 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
         {
             EmptyReworkEscalationRetries = 2,
         });
+        using var quotaFailures = new SqliteQuotaFailureStore(
+            Path.Combine(_workspace, $"quota-failures-{Guid.NewGuid():N}.db"));
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
             auditors: [auditor],
             projectAudit: audit,
-            pipelineTuning: tuning);
+            pipelineTuning: tuning,
+            quotaFailures: quotaFailures);
         // Every work/rework result the ScriptedAgent produces from its WorkPlan
         // carries this stdout. The Claude quota detector (wired into the test
         // pipeline's CompositeQuotaFailureClassifier) matches the plain-text
@@ -172,6 +175,12 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
         Assert.Equal(1, auditor.Calls);
         Assert.DoesNotContain(tp.Agent.WorkPrompts, p =>
             p.Contains("[empty-rework escalation attempt", StringComparison.Ordinal));
+        var observations = await quotaFailures.ListRecentAsync(
+            TimeSpan.FromHours(1), DateTimeOffset.UtcNow, CancellationToken.None);
+        var observation = Assert.Single(observations);
+        Assert.Equal(AgentKind.Claude, observation.Agent);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, observation.FailureKind);
+        Assert.Equal(item.ProjectId, observation.ProjectId);
     }
 
     [Fact]

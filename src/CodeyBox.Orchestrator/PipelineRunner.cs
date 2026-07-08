@@ -4868,7 +4868,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             _auditQuotaOptions.ObservedFailureRetention,
                             ct,
                             projectId: item.ProjectId,
-                            stdout: agentResult.Stdout);
+                            stdout: agentResult.Stdout,
+                            bypassExitedSummaryGuard: true);
 
                         throw new TerminalQuotaError(
                             noDiffQuotaDetection.Kind,
