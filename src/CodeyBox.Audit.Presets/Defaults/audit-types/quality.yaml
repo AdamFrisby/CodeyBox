@@ -1,6 +1,7 @@
 id: quality
 displayName: "Quality review"
 llmAuditorName: quality:llm-review
+targets: [plan, code]
 planReviewFocus: |-
   You are reviewing QUALITY at the PLAN stage, before code exists. Judge whether the plan is
   maintainable enough to guide implementation: clear file/component ownership, simple

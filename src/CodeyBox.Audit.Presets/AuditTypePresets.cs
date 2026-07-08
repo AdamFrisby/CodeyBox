@@ -17,18 +17,20 @@ internal static class AuditTypePresets
     public static void Register(
         PresetCatalog catalog,
         IReadOnlyDictionary<string, AuditTypePresetDefinition> auditTypes,
-        string frameTemplate)
+        string frameTemplate,
+        string planFrameTemplate)
     {
         foreach (var (id, definition) in auditTypes)
         {
             var captured = definition;
-            catalog.RegisterAuditType(id, ctx => BuildAuditType(captured, frameTemplate, ctx));
+            catalog.RegisterAuditType(id, ctx => BuildAuditType(captured, frameTemplate, planFrameTemplate, ctx));
         }
     }
 
     private static IReadOnlyList<IAuditor> BuildAuditType(
         AuditTypePresetDefinition definition,
         string frameTemplate,
+        string planFrameTemplate,
         PresetContext ctx)
     {
         var auditors = new List<IAuditor>();
@@ -88,7 +90,7 @@ internal static class AuditTypePresets
         // 3. Add LlmReviewAuditor if a review focus is present.
         if (!string.IsNullOrWhiteSpace(definition.ReviewFocus))
         {
-            auditors.Add(Llm(definition, frameTemplate, ctx));
+            auditors.Add(Llm(definition, frameTemplate, planFrameTemplate, ctx));
         }
 
         return auditors;
@@ -102,18 +104,11 @@ internal static class AuditTypePresets
             Severity = AuditSeverityParser.Parse(d.Severity),
         }).ToList();
 
-    // Subjective/architectural review is most valuable BEFORE any code exists.
-    // These built-in review categories opt into the plan-review phase in
-    // addition to the code-audit phase; every other LLM auditor stays code-only.
-    private static readonly IReadOnlySet<string> PlanReviewingAuditTypes =
-        new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            "architecture",
-            "completeness",
-            "quality",
-        };
-
-    private static IAuditor Llm(AuditTypePresetDefinition definition, string frameTemplate, PresetContext ctx)
+    private static IAuditor Llm(
+        AuditTypePresetDefinition definition,
+        string frameTemplate,
+        string planFrameTemplate,
+        PresetContext ctx)
         => new LlmReviewAuditor(new LlmReviewAuditorOptions
         {
             Name = definition.LlmAuditorName ?? $"{definition.Id}:llm-review",
@@ -121,10 +116,14 @@ internal static class AuditTypePresets
             ReviewFocus = definition.ReviewFocus,
             PlanReviewFocus = definition.PlanReviewFocus,
             FrameTemplate = frameTemplate,
-            Targets = PlanReviewingAuditTypes.Contains(definition.Id)
-                ? AuditTargets.PlanAndCode
-                : AuditTargets.CodeOnly,
+            PlanFrameTemplate = planFrameTemplate,
+            Targets = ParseTargets(definition.Targets),
         });
+
+    private static IReadOnlySet<AuditTarget> ParseTargets(IReadOnlyList<string> targets)
+        => targets.Count == 0
+            ? AuditTargets.CodeOnly
+            : AuditTargets.Of(targets.Select(t => new AuditTarget(t)).ToArray());
 
     private static IAuditor Shell(
         string name,

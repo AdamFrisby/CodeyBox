@@ -921,9 +921,10 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal(2, gate.Calls);
         Assert.Equal(1, agent.WorkCalls);
         Assert.NotNull(final.PlanReviewedAt);
-        // The rework turn carried the prior review's blocking feedback.
+        // The rework turn carries bounded local metadata, not reviewer prose.
         Assert.Contains("was REJECTED by plan review", agent.LastPlanningPrompt, StringComparison.Ordinal);
-        Assert.Contains("needs a different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("PLAN_REVIEW_REWORK_FEEDBACK_JSON", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("needs a different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -964,7 +965,9 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal(2, agent.PlanningCalls);
         Assert.Equal(1, agent.WorkCalls);
         Assert.Contains("PLAN_REVIEW_REWORK_FEEDBACK_JSON", agent.LastPlanningPrompt, StringComparison.Ordinal);
-        Assert.Contains("needs a different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("\"Category\":\"plan\"", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("needs a different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("The data flow is backward", agent.LastPlanningPrompt, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1047,12 +1050,12 @@ public sealed class PlanningPipelineTests : IDisposable
         var final = await setup.Store.GetAsync(item.Id);
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.Equal(0, reviewAgent.TextOnlyCalls);
-        Assert.Equal(2, reviewAgent.SandboxRunCalls);
+        Assert.Equal(2, reviewAgent.TextOnlyCalls);
+        Assert.Equal(0, reviewAgent.SandboxRunCalls);
         Assert.Equal(2, agent.PlanningCalls);
         Assert.Equal(1, agent.WorkCalls);
         Assert.Contains("PLAN_REVIEW_REWORK_FEEDBACK_JSON", agent.LastPlanningPrompt, StringComparison.Ordinal);
-        Assert.Contains("needs a different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("needs a different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
     }
 
     [Fact]

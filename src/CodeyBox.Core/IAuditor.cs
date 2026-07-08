@@ -246,9 +246,12 @@ public sealed record AuditContext(
     /// <summary>
     /// The effective review target: <see cref="Target"/> when set, otherwise
     /// <see cref="AuditTarget.Code"/>. Auditors branch on this so a null Target
-    /// (legacy call sites) behaves exactly as a code audit.
+    /// (legacy call sites) or a CLR-default <see cref="AuditTarget"/> behaves
+    /// exactly as a code audit.
     /// </summary>
-    public AuditTarget EffectiveTarget => Target ?? AuditTarget.Code;
+    public AuditTarget EffectiveTarget => Target is { } target && !target.IsDefault
+        ? target
+        : AuditTarget.Code;
 }
 
 /// <summary>Result from a single auditor invocation.</summary>

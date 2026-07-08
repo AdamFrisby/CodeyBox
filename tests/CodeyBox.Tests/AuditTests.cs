@@ -3,6 +3,8 @@ using CodeyBox.Audit;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
+using CodeyBox.Sandbox.Process;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
@@ -223,6 +225,34 @@ public sealed class AuditTests
         Assert.NotNull(command.ExtraEnvironment);
         Assert.Equal("plan", command.ExtraEnvironment!["CODEYBOX_AUDIT_TARGET"]);
         Assert.Equal("/tmp/codeybox-plan-artifact.json", command.ExtraEnvironment["CODEYBOX_PLAN_ARTIFACT_PATH"]);
+    }
+
+    [Fact]
+    public async Task ShellCommandAuditor_PlanTargetProcessSandbox_ReadsMaterialisedPlanAndEnvironment()
+    {
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "plan-shell-real",
+            Argv =
+            [
+                "sh",
+                "-c",
+                "test \"$CODEYBOX_AUDIT_TARGET\" = plan && test -n \"$CODEYBOX_PLAN_ARTIFACT_PATH\" && grep -F 'process sandbox plan' \"$CODEYBOX_PLAN_ARTIFACT_PATH\"",
+            ],
+            Targets = AuditTargets.PlanOnly,
+        });
+        var context = FakeContext() with
+        {
+            Target = AuditTarget.Plan,
+            PlanArtifact = "{\"summary\":\"process sandbox plan\"}",
+        };
+
+        var result = await auditor.RunAsync(sandbox, "/work", context, CancellationToken.None);
+
+        Assert.True(result.Passed, result.RawOutput);
+        Assert.Empty(result.Findings);
     }
 
     [Fact]

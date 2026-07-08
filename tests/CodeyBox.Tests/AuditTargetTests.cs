@@ -23,6 +23,10 @@ public sealed class AuditTargetTests
         => Assert.Throws<ArgumentException>(() => AuditTargets.Of());
 
     [Fact]
+    public void AuditTargets_Of_RejectsDefaultTarget()
+        => Assert.Throws<ArgumentException>(() => AuditTargets.Of(default(AuditTarget)));
+
+    [Fact]
     public void AuditTarget_NormalizesCaseAndWhitespace()
     {
         Assert.Equal(AuditTarget.Plan, new AuditTarget(" Plan "));
@@ -39,6 +43,9 @@ public sealed class AuditTargetTests
 
         var planCtx = ctx with { Target = AuditTarget.Plan };
         Assert.Equal(AuditTarget.Plan, planCtx.EffectiveTarget);
+
+        var defaultCtx = ctx with { Target = default };
+        Assert.Equal(AuditTarget.Code, defaultCtx.EffectiveTarget);
     }
 
     [Fact]
@@ -72,11 +79,11 @@ public sealed class AuditTargetTests
         Assert.True(result.Passed);
         Assert.Empty(result.Findings);
         // The plan-review prompt targets the PLAN, embeds the artifact + focus,
-        // and still uses the standard audit/result.json verdict contract.
+        // and runs through the text-only verdict contract.
         Assert.Contains("reviewing a proposed implementation PLAN", runner.LastPrompt, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("Layering violations", runner.LastPrompt, StringComparison.Ordinal);
         Assert.Contains("rewrite the widget", runner.LastPrompt, StringComparison.Ordinal);
-        Assert.Contains("audit/result.json", runner.LastPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("audit/result.json", runner.LastPrompt, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -157,7 +164,7 @@ public sealed class AuditTargetTests
         Assert.False(result.Passed);
         var finding = Assert.Single(result.Findings);
         Assert.Equal(AuditSeverity.Error, finding.Severity);
-        Assert.Contains("agent did not write audit/result.json", finding.Title, StringComparison.Ordinal);
+        Assert.Contains("produced no verdict", finding.Title, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -184,8 +191,6 @@ public sealed class AuditTargetTests
     {
         var auditor = PlanAuditor();
         var result = await auditor.RunAsync(new PlanResultSandbox("""
-            The plan is acceptable.
-
             ```json
             {"passed":true,"findings":[{"severity":"warning","title":"minor risk","description":"watch rollout"}]}
             ```
@@ -220,7 +225,7 @@ public sealed class AuditTargetTests
             => Task.FromResult(new AuditResult(true, []));
     }
 
-    private sealed class FakePlanRunner(bool success = true) : IAgentRunner
+    private sealed class FakePlanRunner(bool success = true) : IAgentRunner, ITextOnlyAgentRunner
     {
         public AgentKind Kind => AgentKind.Claude;
         public string LastPrompt { get; private set; } = string.Empty;
@@ -235,16 +240,41 @@ public sealed class AuditTargetTests
                 ? new AgentResult(true, "ok", "review complete", null)
                 : new AgentResult(false, "failed", null, "failed"));
         }
+
+        public Task<TextOnlyAgentResult> RunTextOnlyAsync(
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            ISandbox? sandbox = null,
+            string? workingDirectory = null)
+        {
+            _ = credential;
+            _ = modelId;
+            _ = reasoningMode;
+            _ = sandbox;
+            _ = workingDirectory;
+            ct.ThrowIfCancellationRequested();
+            LastPrompt = prompt;
+            if (!success)
+                return Task.FromResult(new TextOnlyAgentResult(false, "failed", null, "failed"));
+            var output = sandbox is PlanResultSandbox planSandbox
+                ? planSandbox.ResultJson
+                : """{"passed":true,"findings":[]}""";
+            return Task.FromResult(new TextOnlyAgentResult(true, "ok", output, null));
+        }
     }
 
     private sealed class PlanResultSandbox(string resultJson) : ISandbox
     {
         public string Id => "plan-result";
+        public string ResultJson { get; } = resultJson;
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             if (exec.Argv.Count > 0 && exec.Argv[0] == "cat")
-                return Task.FromResult(new SandboxExecResult(0, resultJson, ""));
+                return Task.FromResult(new SandboxExecResult(0, ResultJson, ""));
 
             return Task.FromResult(new SandboxExecResult(0, "", ""));
         }

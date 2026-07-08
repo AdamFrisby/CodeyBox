@@ -146,6 +146,8 @@ public sealed class ProjectRepositoryTests
                 ["CodeyBox:Projects:0:Id"] = "alpha",
                 ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example.com/x.git",
                 ["CodeyBox:Projects:0:Audit:AuditTypes:security:ReviewFocus"] = "project security focus",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:security:PlanReviewFocus"] = "project security plan focus",
+                ["CodeyBox:Projects:0:Audit:AuditTypes:security:Targets:0"] = "code",
                 ["CodeyBox:Projects:0:Audit:AuditTypes:custom:DisplayName"] = "Custom review",
                 ["CodeyBox:Projects:0:Audit:AuditTypes:custom:ReviewFocus"] = "custom focus",
                 ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Name"] = "custom:test-pass",
@@ -154,6 +156,7 @@ public sealed class ProjectRepositoryTests
                 ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:Role"] = "build-test-gate",
                 ["CodeyBox:Projects:0:Audit:AuditTypes:custom:Auditors:0:GateEvidence"] = "test",
                 ["CodeyBox:Projects:0:Audit:LlmPromptFrameTemplate"] = "{{reviewFocus}}\n{{resultFile}}",
+                ["CodeyBox:Projects:0:Audit:LlmPlanPromptFrameTemplate"] = "{{reviewFocus}}\n{{planArtifact}}\n{{resultFile}}",
             })
             .Build();
 
@@ -163,10 +166,13 @@ public sealed class ProjectRepositoryTests
 
         Assert.Equal(["custom", "security"], p!.Audit.AuditTypes.Order(StringComparer.Ordinal).ToArray());
         Assert.Equal("project security focus", p.Audit.AuditTypeOverrides["security"].ReviewFocus);
+        Assert.Equal("project security plan focus", p.Audit.AuditTypeOverrides["security"].PlanReviewFocus);
+        Assert.Equal(["code"], p.Audit.AuditTypeOverrides["security"].Targets);
         Assert.Equal("Custom review", p.Audit.AuditTypeOverrides["custom"].DisplayName);
         Assert.Equal("build-test-gate", p.Audit.AuditTypeOverrides["custom"].Auditors.Single().Role);
         Assert.Equal("test", p.Audit.AuditTypeOverrides["custom"].Auditors.Single().GateEvidence);
         Assert.Equal("{{reviewFocus}}\n{{resultFile}}", p.Audit.LlmPromptFrameTemplate);
+        Assert.Equal("{{reviewFocus}}\n{{planArtifact}}\n{{resultFile}}", p.Audit.LlmPlanPromptFrameTemplate);
     }
 
     [Fact]

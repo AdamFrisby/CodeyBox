@@ -32,6 +32,9 @@ public interface IPresetCatalog
 
     /// <summary>Validated LLM review frame template used by configured LLM auditors.</summary>
     string LlmPromptFrameTemplate { get; }
+
+    /// <summary>Validated LLM plan-review frame template used by configured LLM auditors.</summary>
+    string LlmPlanPromptFrameTemplate { get; }
 }
 
 /// <summary>

@@ -10,6 +10,7 @@ public readonly record struct AgentPromptPhase(string Value)
     public static AgentPromptPhase Rework { get; } = new("rework");
     public static AgentPromptPhase SelfReview { get; } = new("self-review");
     public static AgentPromptPhase Audit { get; } = new("audit");
+    public static AgentPromptPhase PlanReview { get; } = new("plan-review");
     public static AgentPromptPhase Merge { get; } = new("merge");
     public static AgentPromptPhase CheckAndAct { get; } = new("check-and-act");
 
@@ -47,7 +48,8 @@ public sealed record PromptContext(
     int Iteration,
     Project Project,
     ISandbox Sandbox,
-    string WorkingDirectory);
+    string WorkingDirectory,
+    AuditTarget? AuditTarget = null);
 
 /// <summary>
 /// Transforms an agent prompt immediately before CodeyBox invokes an agent.

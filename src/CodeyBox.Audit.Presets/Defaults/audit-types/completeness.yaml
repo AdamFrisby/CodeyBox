@@ -1,6 +1,7 @@
 id: completeness
 displayName: "Completeness review"
 llmAuditorName: completeness:llm-review
+targets: [plan, code]
 planReviewFocus: |-
   You are reviewing COMPLETENESS at the PLAN stage, before implementation. Compare the
   original task to the plan artifact and decide whether the plan, if followed, would address

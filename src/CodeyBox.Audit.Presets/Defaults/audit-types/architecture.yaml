@@ -1,6 +1,7 @@
 id: architecture
 displayName: "Architecture review"
 llmAuditorName: architecture:llm-review
+targets: [plan, code]
 planReviewFocus: |-
   You are reviewing ARCHITECTURE at the PLAN stage, before code exists. Judge the proposed
   approach, boundaries, dependency direction, public contracts, and sequencing described in

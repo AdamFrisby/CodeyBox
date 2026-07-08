@@ -55,6 +55,7 @@ internal sealed class PresetConfigLoader
         var languages = LoadEmbeddedLanguages(assembly);
         var auditTypes = LoadEmbeddedAuditTypes(assembly);
         var frame = LoadEmbeddedFrame(assembly);
+        var planFrame = LoadEmbeddedPlanFrame(assembly);
 
         foreach (var projectRoot in ProjectRoots(options))
         {
@@ -62,11 +63,12 @@ internal sealed class PresetConfigLoader
             LoadUserAuditTypeFiles(projectRoot, auditTypes);
         }
 
-        ApplyProjectConfigOverrides(options, languages, auditTypes, ref frame);
+        ApplyProjectConfigOverrides(options, languages, auditTypes, ref frame, ref planFrame);
         ApplyMandatoryReviewFocusRules(auditTypes);
         ValidateFrame("llm-prompt-frame.yaml", frame.Frame);
+        ValidateFrame("llm-plan-prompt-frame.yaml", planFrame.Frame);
 
-        return new PresetConfigSnapshot(languages, auditTypes, frame.Frame);
+        return new PresetConfigSnapshot(languages, auditTypes, frame.Frame, planFrame.Frame);
     }
 
     private static Dictionary<string, LanguagePresetDefinition> LoadEmbeddedLanguages(Assembly assembly)
@@ -100,6 +102,13 @@ internal sealed class PresetConfigLoader
         return frame;
     }
 
+    private static FramePresetDefinition LoadEmbeddedPlanFrame(Assembly assembly)
+    {
+        var frame = ReadYamlResource<FramePresetDefinition>(assembly, ResourcePrefix + "llm-plan-prompt-frame.yaml", "frame");
+        ValidateFrame("Defaults/llm-plan-prompt-frame.yaml", frame.Frame);
+        return frame;
+    }
+
     private static void LoadUserLanguageFiles(string? projectRoot, Dictionary<string, LanguagePresetDefinition> languages)
     {
         foreach (var file in PresetFiles(projectRoot, "languages"))
@@ -122,6 +131,10 @@ internal sealed class PresetConfigLoader
                 throw new PresetConfigurationException($"{file}: /llmAuditorName is not allowed in repository-provided configuration for security reasons.");
             if (!string.IsNullOrWhiteSpace(definition.ReviewFocus))
                 throw new PresetConfigurationException($"{file}: /reviewFocus is not allowed in repository-provided configuration for security reasons.");
+            if (!string.IsNullOrWhiteSpace(definition.PlanReviewFocus))
+                throw new PresetConfigurationException($"{file}: /planReviewFocus is not allowed in repository-provided configuration for security reasons.");
+            if (definition.Targets.Count > 0)
+                throw new PresetConfigurationException($"{file}: /targets is not allowed in repository-provided configuration for security reasons.");
 
             ValidateAuditType(file, definition, isTrusted: false);
             ComposeAuditType(auditTypes, definition, isTrusted: false);
@@ -132,7 +145,8 @@ internal sealed class PresetConfigLoader
         PresetCatalogOptions options,
         Dictionary<string, LanguagePresetDefinition> languages,
         Dictionary<string, AuditTypePresetDefinition> auditTypes,
-        ref FramePresetDefinition frame)
+        ref FramePresetDefinition frame,
+        ref FramePresetDefinition planFrame)
     {
         foreach (var (id, ov) in options.LanguageOverrides)
         {
@@ -165,7 +179,9 @@ internal sealed class PresetConfigLoader
                 Id = id,
                 DisplayName = ov.DisplayName,
                 ReviewFocus = ov.ReviewFocus ?? string.Empty,
+                PlanReviewFocus = ov.PlanReviewFocus,
                 Replace = ov.Replace,
+                Targets = [.. ov.Targets],
                 Auditors = ov.Auditors.Select(a => new AuditorDefinition
                 {
                     Name = a.Name,
@@ -195,6 +211,11 @@ internal sealed class PresetConfigLoader
             frame = new FramePresetDefinition { Frame = options.LlmPromptFrameTemplate };
             ValidateFrame("Audit.LlmPromptFrame", frame.Frame);
         }
+        if (options.LlmPlanPromptFrameTemplate is not null)
+        {
+            planFrame = new FramePresetDefinition { Frame = options.LlmPlanPromptFrameTemplate };
+            ValidateFrame("Audit.LlmPlanPromptFrame", planFrame.Frame);
+        }
     }
 
     private static void ComposeAuditType(
@@ -217,6 +238,8 @@ internal sealed class PresetConfigLoader
             existing.PlanReviewFocus = incoming.PlanReviewFocus;
         if (!string.IsNullOrWhiteSpace(incoming.LlmAuditorName))
             existing.LlmAuditorName = incoming.LlmAuditorName;
+        if (incoming.Targets.Count > 0)
+            existing.Targets = [.. incoming.Targets];
 
         existing.Auditors.AddRange(incoming.Auditors);
         existing.Patterns.AddRange(incoming.Patterns);
@@ -622,6 +645,13 @@ internal sealed class PresetConfigLoader
                 throw new PresetConfigurationException($"{source}: {pointer}/regex '{pattern.Regex}' is not a valid regex: {ex.Message}", ex);
             }
         }
+
+        for (var i = 0; i < definition.Targets.Count; i++)
+        {
+            if (string.IsNullOrWhiteSpace(definition.Targets[i]))
+                throw new PresetConfigurationException($"{source}: /targets/{i} must be non-empty.");
+            _ = new AuditTarget(definition.Targets[i]);
+        }
     }
 
     private static void ValidateFrame(string source, string? frame)
@@ -758,7 +788,8 @@ internal sealed class PresetConfigLoader
 internal sealed record PresetConfigSnapshot(
     IReadOnlyDictionary<string, LanguagePresetDefinition> Languages,
     IReadOnlyDictionary<string, AuditTypePresetDefinition> AuditTypes,
-    string LlmPromptFrame);
+    string LlmPromptFrame,
+    string LlmPlanPromptFrame);
 
 internal sealed class LanguagePresetDefinition
 {
@@ -807,6 +838,7 @@ internal sealed class AuditTypePresetDefinition
     public string ReviewFocus { get; set; } = string.Empty;
     public string? PlanReviewFocus { get; set; }
     public string? LlmAuditorName { get; set; }
+    public List<string> Targets { get; set; } = [];
     public bool Replace { get; set; }
     public List<AuditorDefinition> Auditors { get; set; } = [];
     public List<DiffPatternDefinition> Patterns { get; set; } = [];

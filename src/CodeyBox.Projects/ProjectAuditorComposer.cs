@@ -91,7 +91,7 @@ public sealed class ProjectAuditorComposer
         IAgentRunner agentForLlmAuditors,
         AuditTarget target,
         string? profile = null)
-        => Compose(project, agentForLlmAuditors, profile)
+        => Compose(project, agentForLlmAuditors, profile, target)
             .Where(a => a.Targets.Contains(target))
             .ToList();
 
@@ -99,6 +99,13 @@ public sealed class ProjectAuditorComposer
         Project project,
         IAgentRunner agentForLlmAuditors,
         string? profile = null)
+        => Compose(project, agentForLlmAuditors, profile, target: null);
+
+    private IReadOnlyList<IAuditor> Compose(
+        Project project,
+        IAgentRunner agentForLlmAuditors,
+        string? profile,
+        AuditTarget? target)
     {
         var audit = project.Audit.ResolveProfile(profile);
         project = project with { Audit = audit };
@@ -117,11 +124,15 @@ public sealed class ProjectAuditorComposer
         {
             if (custom.Kind.Equals("plugin", StringComparison.OrdinalIgnoreCase))
             {
+                if (!CustomDescriptorTargetsTarget(custom, target))
+                    continue;
                 IncludePluginAuditor(custom, auditors);
             }
             else
             {
-                auditors.Add(MaterialiseCustom(custom, ctx, catalog.LlmPromptFrameTemplate));
+                if (!CustomDescriptorTargetsTarget(custom, target))
+                    continue;
+                auditors.Add(MaterialiseCustom(custom, ctx, catalog.LlmPromptFrameTemplate, catalog.LlmPlanPromptFrameTemplate));
             }
         }
 
@@ -214,7 +225,8 @@ public sealed class ProjectAuditorComposer
     private static bool HasProjectPresetOverrides(Project project)
         => project.Audit.LanguageOverrides.Count > 0 ||
            project.Audit.AuditTypeOverrides.Count > 0 ||
-           project.Audit.LlmPromptFrameTemplate is not null;
+           project.Audit.LlmPromptFrameTemplate is not null ||
+           project.Audit.LlmPlanPromptFrameTemplate is not null;
 
     private static void ValidateSelectedPresets(Project project, IPresetCatalog catalog)
     {
@@ -253,7 +265,11 @@ public sealed class ProjectAuditorComposer
     ///   "diff-pattern" — DiffPatternAuditor with the given Patterns
     ///   "llm"          — LlmReviewAuditor with the given ReviewFocus
     /// </summary>
-    private static IAuditor MaterialiseCustom(CustomAuditorDescriptor c, PresetContext ctx, string frameTemplate)
+    private static IAuditor MaterialiseCustom(
+        CustomAuditorDescriptor c,
+        PresetContext ctx,
+        string frameTemplate,
+        string planFrameTemplate)
     {
         if (string.IsNullOrWhiteSpace(c.Name))
             throw new InvalidOperationException($"Custom auditor of kind '{c.Kind}' requires a non-empty Name");
@@ -293,10 +309,20 @@ public sealed class ProjectAuditorComposer
                 Agent = ctx.Agent,
                 ReviewFocus = c.ReviewFocus ?? throw new InvalidOperationException($"llm auditor '{c.Name}' needs ReviewFocus"),
                 FrameTemplate = frameTemplate,
+                PlanFrameTemplate = planFrameTemplate,
                 Targets = targets,
             }),
             _ => throw new InvalidOperationException($"Unknown custom auditor kind '{c.Kind}' for '{c.Name}' (expected: shell | diff-pattern | llm)"),
         };
+    }
+
+    private static bool CustomDescriptorTargetsTarget(CustomAuditorDescriptor descriptor, AuditTarget? target)
+    {
+        if (target is null)
+            return true;
+
+        var targets = ParseCustomAuditorTargets(descriptor);
+        return targets.Contains(target.Value);
     }
 
     private static IReadOnlySet<AuditTarget> ParseCustomAuditorTargets(CustomAuditorDescriptor descriptor)

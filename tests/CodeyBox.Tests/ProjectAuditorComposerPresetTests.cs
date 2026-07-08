@@ -628,7 +628,7 @@ public sealed class ProjectAuditorComposerPresetTests
         Assert.Contains("cannot override /marker", ex.Message, StringComparison.Ordinal);
     }
 
-    private sealed class CapturingAgent : IAgentRunner
+    private sealed class CapturingAgent : IAgentRunner, ITextOnlyAgentRunner
     {
         public AgentKind Kind => AgentKind.Claude;
         public string Prompt { get; private set; } = string.Empty;
@@ -647,6 +647,25 @@ public sealed class ProjectAuditorComposerPresetTests
             Prompt = prompt;
             return Task.FromResult(new AgentResult(true, "ok", "review complete", null));
         }
+
+        public Task<TextOnlyAgentResult> RunTextOnlyAsync(
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            ISandbox? sandbox = null,
+            string? workingDirectory = null)
+        {
+            _ = credential;
+            _ = modelId;
+            _ = reasoningMode;
+            _ = sandbox;
+            _ = workingDirectory;
+            ct.ThrowIfCancellationRequested();
+            Prompt = prompt;
+            return Task.FromResult(new TextOnlyAgentResult(true, "ok", """{"passed":true,"findings":[]}""", null));
+        }
     }
 
     private static Project ProjectWithCustom(params CustomAuditorDescriptor[] custom) => new()
@@ -664,6 +683,7 @@ public sealed class ProjectAuditorComposerPresetTests
         public IReadOnlyList<string> KnownLanguages => [];
         public IReadOnlyList<string> KnownAuditTypes => ["default-type", "uat-type"];
         public string LlmPromptFrameTemplate => "{{reviewFocus}}\n{{resultFile}}";
+        public string LlmPlanPromptFrameTemplate => CodeyBox.Audit.Llm.LlmPromptFrameTemplate.DefaultPlanFrameTemplate;
     }
 
     private sealed class NamedAuditor(string name) : IAuditor

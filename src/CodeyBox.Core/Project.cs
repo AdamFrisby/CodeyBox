@@ -466,6 +466,7 @@ public sealed record ProjectAudit
     public IReadOnlyDictionary<string, ProjectAuditTypeOverride> AuditTypeOverrides { get; init; }
         = new Dictionary<string, ProjectAuditTypeOverride>(StringComparer.OrdinalIgnoreCase);
     public string? LlmPromptFrameTemplate { get; init; }
+    public string? LlmPlanPromptFrameTemplate { get; init; }
     public IReadOnlyList<CustomAuditorDescriptor> Custom { get; init; } = [];
     public IReadOnlyList<string> ExcludedAuditors { get; init; } = [];
     /// <summary>
@@ -553,6 +554,8 @@ public sealed record ProjectAuditTypeOverride
 {
     public string? DisplayName { get; init; }
     public string? ReviewFocus { get; init; }
+    public string? PlanReviewFocus { get; init; }
+    public IReadOnlyList<string> Targets { get; init; } = [];
     public bool Replace { get; init; }
     public IReadOnlyList<ProjectConfiguredAuditor> Auditors { get; init; } = [];
     public IReadOnlyList<DiffPatternDescriptor> Patterns { get; init; } = [];

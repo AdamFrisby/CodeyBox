@@ -19,6 +19,7 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
     protected readonly AgentPromptPhase Phase;
     protected readonly int Iteration;
     protected readonly Project Project;
+    protected readonly AuditTarget? AuditTarget;
 
     protected PromptPreprocessingAgentRunner(
         IAgentRunner inner,
@@ -26,7 +27,8 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
         WorkItemId itemId,
         AgentPromptPhase phase,
         int iteration,
-        Project project)
+        Project project,
+        AuditTarget? auditTarget = null)
     {
         Inner = inner;
         Chain = chain;
@@ -34,6 +36,7 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
         Phase = phase;
         Iteration = iteration;
         Project = project;
+        AuditTarget = auditTarget;
     }
 
     public static PromptPreprocessingAgentRunner Wrap(
@@ -42,19 +45,20 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
         WorkItemId itemId,
         AgentPromptPhase phase,
         int iteration,
-        Project project)
+        Project project,
+        AuditTarget? auditTarget = null)
     {
         var textOnly = inner is ITextOnlyAgentRunner;
         var cliSessionResumable = inner is ICliSessionResumableAgentRunner;
 
         if (textOnly && cliSessionResumable)
-            return new TextOnlyCliSessionResumablePromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project);
+            return new TextOnlyCliSessionResumablePromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project, auditTarget);
         if (textOnly)
-            return new TextOnlyPromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project);
+            return new TextOnlyPromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project, auditTarget);
         if (cliSessionResumable)
-            return new CliSessionResumablePromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project);
+            return new CliSessionResumablePromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project, auditTarget);
 
-        return new PromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project);
+        return new PromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project, auditTarget);
     }
 
     public AgentKind Kind => Inner.Kind;
@@ -77,7 +81,7 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
         bool captureStructuredStream = false)
     {
         var processed = await Chain.ProcessAsync(
-            new PromptContext(ItemId, Inner.Kind, Phase, Iteration, Project, sandbox, workingDirectory),
+            new PromptContext(ItemId, Inner.Kind, Phase, Iteration, Project, sandbox, workingDirectory, AuditTarget),
             prompt,
             ct).ConfigureAwait(false);
 
@@ -116,7 +120,7 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
                 ? SandboxConventions.WorkDir
                 : workingDirectory;
             prompt = await Chain.ProcessAsync(
-                new PromptContext(ItemId, Inner.Kind, Phase, Iteration, Project, sandbox, resolvedWorkingDirectory),
+                new PromptContext(ItemId, Inner.Kind, Phase, Iteration, Project, sandbox, resolvedWorkingDirectory, AuditTarget),
                 prompt,
                 ct).ConfigureAwait(false);
         }
@@ -140,8 +144,9 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
             WorkItemId itemId,
             AgentPromptPhase phase,
             int iteration,
-            Project project)
-            : base(inner, chain, itemId, phase, iteration, project)
+            Project project,
+            AuditTarget? auditTarget = null)
+            : base(inner, chain, itemId, phase, iteration, project, auditTarget)
         {
         }
 
@@ -167,8 +172,9 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
             WorkItemId itemId,
             AgentPromptPhase phase,
             int iteration,
-            Project project)
-            : base(inner, chain, itemId, phase, iteration, project)
+            Project project,
+            AuditTarget? auditTarget = null)
+            : base(inner, chain, itemId, phase, iteration, project, auditTarget)
         {
         }
 
@@ -198,8 +204,9 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
             WorkItemId itemId,
             AgentPromptPhase phase,
             int iteration,
-            Project project)
-            : base(inner, chain, itemId, phase, iteration, project)
+            Project project,
+            AuditTarget? auditTarget = null)
+            : base(inner, chain, itemId, phase, iteration, project, auditTarget)
         {
         }
 

@@ -15,6 +15,13 @@ namespace CodeyBox.Core;
 /// </summary>
 public readonly record struct AuditTarget
 {
+    /// <summary>
+    /// The CLR default has no target value. Treat it as unset at nullable
+    /// boundaries and reject it in declared target sets so a default struct
+    /// cannot silently publish a non-runnable target.
+    /// </summary>
+    public bool IsDefault => string.IsNullOrWhiteSpace(Value);
+
     public AuditTarget(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -60,6 +67,8 @@ public static class AuditTargets
     {
         if (targets is null || targets.Length == 0)
             throw new ArgumentException("An auditor must declare at least one target.", nameof(targets));
+        if (targets.Any(t => t.IsDefault))
+            throw new ArgumentException("Audit target values must be non-empty.", nameof(targets));
         return targets.ToFrozenSet();
     }
 }

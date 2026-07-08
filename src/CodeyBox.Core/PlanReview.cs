@@ -33,7 +33,8 @@ public sealed record PlanReviewDecision(
 /// <summary>
 /// Structured, bounded feedback that may be shown to a later planning-agent turn.
 /// Free-form reviewer prose stays on <see cref="PlanReviewDecision.RejectionReason"/>
-/// for operator diagnostics; the planner receives this allowlisted shape instead.
+/// and persisted audit reports for operator diagnostics; the planner receives
+/// only locally generated metadata and stable finding ids.
 /// </summary>
 public sealed record PlanReviewFeedback(
     int BlockingIssueCount,

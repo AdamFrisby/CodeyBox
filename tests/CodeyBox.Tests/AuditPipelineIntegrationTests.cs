@@ -3449,6 +3449,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         public IReadOnlyList<string> KnownLanguages => ["csharp"];
         public IReadOnlyList<string> KnownAuditTypes => ["security", "cheating"];
         public string LlmPromptFrameTemplate => "{{reviewFocus}}\n{{resultFile}}";
+        public string LlmPlanPromptFrameTemplate => CodeyBox.Audit.Llm.LlmPromptFrameTemplate.DefaultPlanFrameTemplate;
     }
 
     private sealed class PassingAuditor(string name) : IAuditor

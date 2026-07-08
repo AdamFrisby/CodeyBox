@@ -189,6 +189,7 @@ public sealed class ProjectAuditConfig
     public List<string>? AuditTypes { get; set; }
     public Dictionary<string, ProjectAuditTypeOverrideConfig>? AuditTypeOverrides { get; set; }
     public string? LlmPromptFrameTemplate { get; set; }
+    public string? LlmPlanPromptFrameTemplate { get; set; }
     public List<CustomAuditorConfig>? Custom { get; set; }
     public List<string>? ExcludedAuditors { get; set; }
     /// <summary>
@@ -218,6 +219,8 @@ public sealed class ProjectAuditTypeOverrideConfig
 {
     public string? DisplayName { get; set; }
     public string? ReviewFocus { get; set; }
+    public string? PlanReviewFocus { get; set; }
+    public List<string>? Targets { get; set; }
     public bool Replace { get; set; }
     public List<ProjectConfiguredAuditorConfig>? Auditors { get; set; }
     public List<DiffPatternConfig>? Patterns { get; set; }
@@ -350,6 +353,8 @@ public static class ProjectsOptionsBinder
     private static bool HasAuditTypeOverrideContent(ProjectAuditTypeOverrideConfig ov)
         => ov.DisplayName is not null
            || ov.ReviewFocus is not null
+           || ov.PlanReviewFocus is not null
+           || ov.Targets is { Count: > 0 }
            || ov.Replace
            || ov.Auditors is { Count: > 0 }
            || ov.Patterns is { Count: > 0 };
