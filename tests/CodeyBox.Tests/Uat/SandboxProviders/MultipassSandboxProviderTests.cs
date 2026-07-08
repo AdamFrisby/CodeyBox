@@ -630,17 +630,13 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     {
         if (OperatingSystem.IsWindows()) return;
         var runner = new DefaultProcessRunner();
-        // The sh busy-loop competes for CPU with the .NET reader. On a fast
-        // host the kill fires in milliseconds, but in a CPU-constrained
-        // sandbox (e.g. an audit Multipass VM) the reader can be starved
-        // long enough for a 5s cap to fire WaitForExitAsync via OCE before
-        // the reader observes the limit. The ct here is only a backstop
-        // against hangs — it must NOT be tight enough to race the actual
-        // limit-detection path.
+        // Emit a finite oversized burst, then wait. This exercises the
+        // output-limit kill path without a CPU-bound producer starving the
+        // async reader under loaded audit VMs.
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
 
         var result = await runner.RunAsync(
-            ["sh", "-c", "while :; do printf 1234567890; done"],
+            ["sh", "-c", "printf '%2048s' ''; sleep 60"],
             stdin: null,
             ct: timeout.Token,
             maxStdoutBytes: 1024,
@@ -3814,12 +3810,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     {
         if (OperatingSystem.IsWindows()) return;
         var runner = new DefaultProcessRunner();
-        // See sibling stdout test for the rationale: the cap is a hang
-        // backstop, not a tight bound on limit-detection latency.
+        // See sibling stdout test for the rationale: the cap is only a hang
+        // backstop for the deterministic oversized-write scenario.
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
 
         var result = await runner.RunAsync(
-            ["sh", "-c", "while :; do printf 1234567890 >&2; done"],
+            ["sh", "-c", "printf '%2048s' '' >&2; sleep 60"],
             stdin: null,
             ct: timeout.Token,
             maxStdoutBytes: 1024,
