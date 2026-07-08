@@ -10,6 +10,8 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using CodeyBox.Projects;
 
 namespace CodeyBox.Tests;
@@ -29,7 +31,11 @@ public sealed class StartupResumeApiAvailabilityTests
         var configuredTimeout = mode == SandboxResumeMode.Background
             ? TimeSpan.FromSeconds(4)
             : TimeSpan.FromSeconds(3);
-        using var factory = new StartupResumeFullHostFactory(behavior, mode, configuredTimeout);
+        using var factory = new StartupResumeFullHostFactory(
+            behavior,
+            mode,
+            configuredTimeout,
+            isolateStartupResumeHostedServices: true);
         var item = new WorkItem
         {
             Id = WorkItemId.New(),
@@ -139,6 +145,7 @@ public sealed class StartupResumeApiAvailabilityTests
             mode: SandboxResumeMode.Background,
             resumeTimeout: initialTimeout,
             adoptionDeadlineSeconds: 1800,
+            isolateStartupResumeHostedServices: true,
             reloadBeforeStartup: new Dictionary<string, string?>
             {
                 ["CodeyBox:Shutdown:SandboxResumeMode"] = SandboxResumeMode.Blocking.ToString(),
@@ -181,12 +188,12 @@ public sealed class StartupResumeApiAvailabilityTests
         HttpResponseMessage? response = null;
         try
         {
-            // This is a full-host test: the startup resume sweep is the
-            // behavior under test, but unrelated hosted services still start
-            // before Kestrel serves the request. Keep the HTTP availability
-            // guard broad enough for parallel audit-suite load; the persisted
-            // work item assertion below proves the hot-reloaded 250 ms timeout
-            // was the value used by the resume handler.
+            // Keep the real Kestrel endpoint in the path, but isolate hosted
+            // startup work to the reload shim plus SandboxResumeOnStartupService
+            // so this measures the behavior under test instead of unrelated
+            // background services. The persisted work item assertion below
+            // proves the hot-reloaded 250 ms timeout was the value used by the
+            // resume handler.
             response = await RunOnDedicatedThreadAsync(() =>
             {
                 bootstrapClient = factory.CreateClient();
@@ -200,11 +207,10 @@ public sealed class StartupResumeApiAvailabilityTests
             response.EnsureSuccessStatusCode();
             // Availability guard: 30 s, chosen to sit well below the 90 s
             // un-reloaded initial timeout (so it still fails loudly if the reload
-            // is ignored and the hanging resume blocks for the initial window) yet
-            // well above the ~18 s of HTTP-serving latency observed under parallel
-            // audit-suite thread-pool starvation. The reloaded 250 ms timeout being
-            // the value actually applied is proven independently by the >= reloaded
-            // assertion below plus the persisted work-item assertion.
+            // is ignored and the hanging resume blocks for the initial window).
+            // The reloaded 250 ms timeout being the value actually applied is
+            // proven independently by the >= reloaded assertion below plus the
+            // persisted work-item assertion.
             Assert.True(sw.Elapsed < TimeSpan.FromSeconds(30),
                 $"GET /quota was blocked for {sw.Elapsed}; hot-reloaded startup resume timeout {reloadedTimeout} should keep API availability well under the {initialTimeout} un-reloaded window.");
             Assert.True(sw.Elapsed >= reloadedTimeout,
@@ -277,6 +283,7 @@ public sealed class StartupResumeApiAvailabilityTests
         private readonly TimeSpan _resumeTimeout;
         private readonly int? _adoptionDeadlineSeconds;
         private readonly IReadOnlyDictionary<string, string?>? _reloadBeforeStartup;
+        private readonly bool _isolateStartupResumeHostedServices;
         private readonly ReloadableConfigurationSource _configSource;
         private readonly string _dbPath = Path.Combine(
             Path.GetTempPath(), $"codeybox-startup-resume-api-{Guid.NewGuid():N}.db");
@@ -290,6 +297,7 @@ public sealed class StartupResumeApiAvailabilityTests
             SandboxResumeMode mode,
             TimeSpan resumeTimeout,
             int? adoptionDeadlineSeconds = null,
+            bool isolateStartupResumeHostedServices = false,
             IReadOnlyDictionary<string, string?>? reloadBeforeStartup = null)
         {
             _behavior = behavior;
@@ -297,6 +305,7 @@ public sealed class StartupResumeApiAvailabilityTests
             _resumeTimeout = resumeTimeout;
             _adoptionDeadlineSeconds = adoptionDeadlineSeconds;
             _reloadBeforeStartup = reloadBeforeStartup;
+            _isolateStartupResumeHostedServices = isolateStartupResumeHostedServices;
             _configSource = new ReloadableConfigurationSource(BuildInitialConfig());
             Store = new SqliteWorkItemStore(_dbPath);
             Registry = new SqliteWorkerRegistry(_dbPath);
@@ -313,11 +322,27 @@ public sealed class StartupResumeApiAvailabilityTests
             });
             builder.ConfigureTestServices(services =>
             {
+                if (_isolateStartupResumeHostedServices)
+                    RemoveCodeyBoxHostedServices(services);
+
                 if (_reloadBeforeStartup is not null)
                 {
                     services.Insert(0, ServiceDescriptor.Singleton<IHostedService>(
                         new ReloadShutdownConfigBeforeStartupService(
                             () => _configSource.SetValues(_reloadBeforeStartup))));
+                }
+
+                if (_isolateStartupResumeHostedServices)
+                {
+                    services.AddSingleton<IHostedService>(sp => new SandboxResumeOnStartupService(
+                        sp.GetService<ISandboxProvider>(),
+                        sp.GetRequiredService<IWorkItemStore>(),
+                        sp.GetRequiredService<ILogger<SandboxResumeOnStartupService>>(),
+                        () => Program.BuildSandboxStartupResumeOptions(
+                            sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Shutdown),
+                        sp.GetRequiredService<IStartupRecoveryInputSink>(),
+                        sp.GetRequiredService<IInfrastructureDeferralScheduler>(),
+                        sp.GetRequiredService<IHostApplicationLifetime>()));
                 }
 
                 services.RemoveAll<IWorkItemStore>();
@@ -344,6 +369,22 @@ public sealed class StartupResumeApiAvailabilityTests
                     }));
             });
         }
+
+        private static void RemoveCodeyBoxHostedServices(IServiceCollection services)
+        {
+            var descriptors = services
+                .Where(descriptor => descriptor.ServiceType == typeof(IHostedService)
+                    && !IsAspNetCoreWebHostService(descriptor))
+                .ToArray();
+            foreach (var descriptor in descriptors)
+                services.Remove(descriptor);
+        }
+
+        private static bool IsAspNetCoreWebHostService(ServiceDescriptor descriptor) =>
+            string.Equals(
+                descriptor.ImplementationType?.FullName,
+                "Microsoft.AspNetCore.Hosting.GenericWebHostService",
+                StringComparison.Ordinal);
 
         protected override void Dispose(bool disposing)
         {

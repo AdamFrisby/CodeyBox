@@ -3114,14 +3114,7 @@ builder.Services.AddHostedService(sp => new SandboxResumeOnStartupService(
     () =>
     {
         var shutdown = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Shutdown;
-        return new SandboxStartupResumeOptions
-        {
-            Mode = shutdown.SandboxResumeMode == SandboxResumeMode.Blocking
-                ? SandboxStartupResumeMode.Blocking
-                : SandboxStartupResumeMode.Background,
-            ResumeTimeout = shutdown.SandboxResumeTimeout,
-            AdoptionDeadline = TimeSpan.FromSeconds(shutdown.SandboxAdoptionDeadlineSeconds),
-        };
+        return Program.BuildSandboxStartupResumeOptions(shutdown);
     },
     sp.GetRequiredService<IStartupRecoveryInputSink>(),
     sp.GetRequiredService<IInfrastructureDeferralScheduler>(),
@@ -5770,5 +5763,20 @@ public partial class Program
             : TimeSpan.FromMilliseconds(Math.Max(100, grace.TotalMilliseconds * 0.2));
         var drain = grace - reserve;
         return drain > TimeSpan.Zero ? drain : TimeSpan.FromMilliseconds(100);
+    }
+
+    internal static SandboxStartupResumeOptions BuildSandboxStartupResumeOptions(
+        ShutdownOptions shutdown)
+    {
+        ArgumentNullException.ThrowIfNull(shutdown);
+
+        return new SandboxStartupResumeOptions
+        {
+            Mode = shutdown.SandboxResumeMode == SandboxResumeMode.Blocking
+                ? SandboxStartupResumeMode.Blocking
+                : SandboxStartupResumeMode.Background,
+            ResumeTimeout = shutdown.SandboxResumeTimeout,
+            AdoptionDeadline = TimeSpan.FromSeconds(shutdown.SandboxAdoptionDeadlineSeconds),
+        };
     }
 }
