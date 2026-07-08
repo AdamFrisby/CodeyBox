@@ -26,17 +26,20 @@ public sealed class InVmSmokeProbeService : BackgroundService
     private readonly InVmSmokeOptions _opts;
     private readonly ILogger<InVmSmokeProbeService> _log;
     private readonly IProjectRepository? _projects;
+    private readonly TimeProvider _timeProvider;
 
     public InVmSmokeProbeService(
         IInVmSmokeGate gate,
         InVmSmokeOptions opts,
         ILogger<InVmSmokeProbeService> log,
-        IProjectRepository? projects = null)
+        IProjectRepository? projects = null,
+        TimeProvider? timeProvider = null)
     {
         _gate = gate;
         _opts = opts;
         _log = log;
         _projects = projects;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -52,7 +55,7 @@ public sealed class InVmSmokeProbeService : BackgroundService
         {
             try
             {
-                await Task.Delay(interval, stoppingToken);
+                await Task.Delay(interval, _timeProvider, stoppingToken);
             }
             catch (OperationCanceledException) { return; }
 

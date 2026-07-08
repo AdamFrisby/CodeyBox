@@ -4,6 +4,7 @@ using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
 using CodeyBox.Webhooks;
 using Microsoft.Extensions.Logging.Abstractions;
+using ControllableTimeProvider = Microsoft.Extensions.Time.Testing.FakeTimeProvider;
 
 namespace CodeyBox.Tests;
 
@@ -46,10 +47,14 @@ public sealed class InVmSmokeProbeServiceTests
     private static AgentAvailabilityRegistry NewRegistry() =>
         new(new AvailabilityOptions(), TimeProvider.System, NullLogger<AgentAvailabilityRegistry>.Instance);
 
-    private static InVmSmokeProbeService BuildService(InVmSmokeProber prober, int sweepIntervalSeconds = 0) =>
+    private static InVmSmokeProbeService BuildService(
+        InVmSmokeProber prober,
+        int sweepIntervalSeconds = 0,
+        TimeProvider? timeProvider = null) =>
         new(prober,
             new InVmSmokeOptions { Enabled = true, ImageReference = "img", NetworkProfile = "work-profile", SweepIntervalSeconds = sweepIntervalSeconds },
-            NullLogger<InVmSmokeProbeService>.Instance);
+            NullLogger<InVmSmokeProbeService>.Instance,
+            timeProvider: timeProvider);
 
     private static async Task AwaitExecute(InVmSmokeProbeService service)
     {
@@ -120,35 +125,48 @@ public sealed class InVmSmokeProbeServiceTests
         // regression that dropped the re-sweep (or the delay wiring) would slip
         // past them. A counting gate proves ProbeAllAsync fires more than once.
         var gate = new CountingGate();
+        var time = new ControllableTimeProvider();
         var service = new InVmSmokeProbeService(
             gate,
             new InVmSmokeOptions { Enabled = true, ImageReference = "img", NetworkProfile = "work-profile", SweepIntervalSeconds = 1 },
-            NullLogger<InVmSmokeProbeService>.Instance);
+            NullLogger<InVmSmokeProbeService>.Instance,
+            timeProvider: time);
 
         await service.StartAsync(CancellationToken.None);
-        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
-        await gate.WaitForAtLeastAsync(2, cts.Token);
-        await service.StopAsync(CancellationToken.None);
-
-        Assert.True(gate.SweepCount >= 2, $"expected the interval loop to sweep >=2 times, saw {gate.SweepCount}");
+        try
+        {
+            await gate.WaitForAtLeastAsync(1);
+            time.Advance(TimeSpan.FromSeconds(1));
+            await gate.WaitForAtLeastAsync(2);
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
     }
 
     [Fact]
     public async Task PeriodicSweep_StaysAlive_WhenGateStartsDisabledAndLaterEnables()
     {
         var gate = new CountingGate { Enabled = false };
+        var time = new ControllableTimeProvider();
         var service = new InVmSmokeProbeService(
             gate,
             new InVmSmokeOptions { Enabled = true, ImageReference = "img", NetworkProfile = "work-profile", SweepIntervalSeconds = 1 },
-            NullLogger<InVmSmokeProbeService>.Instance);
+            NullLogger<InVmSmokeProbeService>.Instance,
+            timeProvider: time);
 
         await service.StartAsync(CancellationToken.None);
-        gate.Enabled = true;
-        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
-        await gate.WaitForAtLeastAsync(1, cts.Token);
-        await service.StopAsync(CancellationToken.None);
-
-        Assert.True(gate.SweepCount >= 1, "expected the periodic service to observe the live gate after it was re-enabled");
+        try
+        {
+            gate.Enabled = true;
+            time.Advance(TimeSpan.FromSeconds(1));
+            await gate.WaitForAtLeastAsync(1);
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
     }
 
     [Fact]
@@ -275,11 +293,11 @@ public sealed class InVmSmokeProbeServiceTests
     private sealed class CountingGate : IInVmSmokeGate
     {
         private readonly object _sync = new();
-        private readonly TaskCompletionSource _reached = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly List<(int Target, TaskCompletionSource Tcs)> _waiters = [];
+        private volatile bool _enabled = true;
         private int _count;
-        private int _target = int.MaxValue;
 
-        public bool Enabled { get; set; } = true;
+        public bool Enabled { get => _enabled; set => _enabled = value; }
         public int SweepCount { get { lock (_sync) return _count; } }
         public List<InVmSmokeSandboxTarget> Targets { get; } = [];
 
@@ -288,7 +306,13 @@ public sealed class InVmSmokeProbeServiceTests
             lock (_sync)
             {
                 _count++;
-                if (_count >= _target) _reached.TrySetResult();
+                for (var i = _waiters.Count - 1; i >= 0; i--)
+                {
+                    var waiter = _waiters[i];
+                    if (_count < waiter.Target) continue;
+                    _waiters.RemoveAt(i);
+                    waiter.Tcs.TrySetResult();
+                }
             }
             return Task.CompletedTask;
         }
@@ -308,16 +332,17 @@ public sealed class InVmSmokeProbeServiceTests
         public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
             => Task.FromResult<AgentAvailability?>(new AgentAvailability(true, null, null));
 
-        public async Task WaitForAtLeastAsync(int target, CancellationToken ct)
+        public async Task WaitForAtLeastAsync(int target)
         {
             Task task;
             lock (_sync)
             {
-                _target = target;
                 if (_count >= target) return;
-                task = _reached.Task;
+                var waiter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _waiters.Add((target, waiter));
+                task = waiter.Task;
             }
-            await task.WaitAsync(ct);
+            await task;
         }
     }
 

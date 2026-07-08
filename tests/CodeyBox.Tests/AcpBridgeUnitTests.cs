@@ -2675,6 +2675,9 @@ public sealed class AcpBridgeUnitTests
 
             var exitCode = await ctx.WaitForExitAsync(TimeSpan.FromSeconds(15));
             Assert.Equal(0, exitCode);
+            var claudeExit = await ctx.WaitForEnvelopeAsync("claude_exit", TimeSpan.FromSeconds(10));
+            Assert.Equal(0, claudeExit.GetProperty("code").GetInt32());
+            Assert.Equal(JsonValueKind.Null, claudeExit.GetProperty("signal").ValueKind);
 
             // Give the bash trap a brief moment to flush its marker file —
             // TerminateClaudeProcess returns as soon as p.HasExited goes true,
