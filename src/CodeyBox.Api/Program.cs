@@ -3357,6 +3357,7 @@ QuotaRetryStatusEndpoints.Map(app);
 QuotaHistoryEndpoints.Map(app);
 CapacityEndpoints.Map(app);
 ResetCreditEndpoints.Map(app);
+ResetAdviceEndpoints.Map(app);
 ReleaseEndpoints.Map(app);
 AgentPauseEndpoints.Map(app);
 

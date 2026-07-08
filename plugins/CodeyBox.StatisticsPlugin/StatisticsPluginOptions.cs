@@ -53,6 +53,12 @@ public sealed record StatisticsPluginOptions
     /// </summary>
     public ResetCreditExpiryOptions ResetCreditExpiry { get; init; } = new();
 
+    /// <summary>
+    /// Knobs for the reset-optimality advisor. Bound from the nested
+    /// <c>ResetOptimality</c> config sub-section.
+    /// </summary>
+    public ResetOptimalityConfigOptions ResetOptimality { get; init; } = new();
+
     public static StatisticsPluginOptions FromConfiguration(IConfigurationSection section)
     {
         if (section is null)
@@ -77,6 +83,8 @@ public sealed record StatisticsPluginOptions
             MaxQueryRows = ReadInt(section, "MaxQueryRows", defaults.MaxQueryRows, minimum: 1),
             ResetCreditExpiry = ResetCreditExpiryOptions.FromConfiguration(
                 section.GetSection("ResetCreditExpiry")),
+            ResetOptimality = ResetOptimalityConfigOptions.FromConfiguration(
+                section.GetSection("ResetOptimality")),
         };
     }
 
@@ -212,4 +220,149 @@ public sealed record SeededResetCreditOption
 
     /// <summary>Optional operator label describing the estimate's basis.</summary>
     public string? Label { get; init; }
+}
+
+/// <summary>
+/// Operator knobs for the reset-optimality advisor. Bound from
+/// <c>CodeyBox:Plugins:codeybox.statistics:ResetOptimality</c>. All values are
+/// read per request so hot-reload applies without a host restart.
+/// </summary>
+public sealed record ResetOptimalityConfigOptions
+{
+    /// <summary>Agents the advisor covers. Codex today; add claude later. Empty = advise for none.</summary>
+    public IReadOnlyList<string> Agents { get; init; } = new[] { "codex" };
+
+    /// <summary>Subscription plan end. Caps the decision deadline. Null = no plan-end pressure.</summary>
+    public DateTimeOffset? PlanEndsAt { get; init; }
+
+    /// <summary>
+    /// Known instant on the natural-reset schedule (e.g. a recent Monday
+    /// 06:00 UTC boundary). Null disables spend advice. Phase-refined from the
+    /// quota logger when <see cref="RefineAnchorFromLogger"/> is set.
+    /// </summary>
+    public DateTimeOffset? CadenceAnchor { get; init; }
+
+    /// <summary>Natural-reset period. Codex resets weekly; default 7 days.</summary>
+    public TimeSpan CadencePeriod { get; init; } = TimeSpan.FromDays(7);
+
+    /// <summary>
+    /// Name of the cap window a banked reset re-anchors (the window burn-first
+    /// reasons over). For Codex the <c>weekly</c> window. Null/empty falls the
+    /// evaluator back to the aggregated availability. See
+    /// <see cref="ResetOptimalityConfig.ResetTargetWindow"/>.
+    /// </summary>
+    public string? ResetTargetWindow { get; init; } = "weekly";
+
+    /// <summary>Usable-quota % at/below which the window counts as spent (burn-first satisfied). Default 1%.</summary>
+    public double DustThresholdPct { get; init; } = 1.0;
+
+    /// <summary>Slack around the deadline-vs-natural-reset comparison. Default 6 hours.</summary>
+    public TimeSpan TimeTolerance { get; init; } = TimeSpan.FromHours(6);
+
+    /// <summary>
+    /// Phase-drift below which cadence-anchor self-calibration treats an observed
+    /// reset as noise and keeps the configured anchor (passed to
+    /// <see cref="NaturalResetCadence.RefineAnchor"/>). Semantically distinct from
+    /// <see cref="TimeTolerance"/> — one governs "is the natural reset close enough
+    /// to the deadline to wait for", this one governs "how far must the learned
+    /// phase drift before we re-anchor". Default 6 hours.
+    /// </summary>
+    public TimeSpan AnchorRefineTolerance { get; init; } = TimeSpan.FromHours(6);
+
+    /// <summary>
+    /// When true (default) the configured <see cref="CadenceAnchor"/> is
+    /// phase-refined from observed reset-target-window refills in the quota
+    /// logger — the self-calibration path. When false the configured anchor is
+    /// used verbatim.
+    /// </summary>
+    public bool RefineAnchorFromLogger { get; init; } = true;
+
+    public static ResetOptimalityConfigOptions FromConfiguration(IConfigurationSection section)
+    {
+        if (section is null)
+            return new ResetOptimalityConfigOptions();
+
+        var defaults = new ResetOptimalityConfigOptions();
+        var agents = ReadAgents(section.GetSection("Agents"), defaults.Agents);
+        return new ResetOptimalityConfigOptions
+        {
+            Agents = agents,
+            PlanEndsAt = ReadDateTimeOffset(section, "PlanEndsAt", defaults.PlanEndsAt),
+            CadenceAnchor = ReadDateTimeOffset(section, "CadenceAnchor", defaults.CadenceAnchor),
+            CadencePeriod = ReadSpanDays(section, "CadencePeriodDays", defaults.CadencePeriod, TimeSpan.FromHours(1)),
+            ResetTargetWindow = ReadOptionalString(section, "ResetTargetWindow", defaults.ResetTargetWindow),
+            DustThresholdPct = ReadPercent(section, "DustThresholdPct", defaults.DustThresholdPct),
+            TimeTolerance = ReadSpanHours(section, "TimeToleranceHours", defaults.TimeTolerance, TimeSpan.Zero),
+            AnchorRefineTolerance = ReadSpanHours(section, "AnchorRefineToleranceHours", defaults.AnchorRefineTolerance, TimeSpan.Zero),
+            RefineAnchorFromLogger = ReadBool(section, "RefineAnchorFromLogger", defaults.RefineAnchorFromLogger),
+        };
+    }
+
+    private static IReadOnlyList<string> ReadAgents(IConfigurationSection agentsSection, IReadOnlyList<string> fallback)
+    {
+        var agents = new List<string>();
+        foreach (var child in agentsSection.GetChildren())
+        {
+            var value = child.Value?.Trim();
+            if (!string.IsNullOrEmpty(value))
+                agents.Add(value);
+        }
+
+        // A present-but-empty Agents section is an explicit "advise for none";
+        // only fall back to the default when the section was absent entirely.
+        return agentsSection.Exists() ? agents : new List<string>(fallback);
+    }
+
+    private static bool ReadBool(IConfigurationSection section, string key, bool fallback)
+    {
+        var raw = section[key];
+        if (string.IsNullOrWhiteSpace(raw)) return fallback;
+        return bool.TryParse(raw, out var parsed) ? parsed : fallback;
+    }
+
+    private static string? ReadOptionalString(IConfigurationSection section, string key, string? fallback)
+    {
+        var child = section.GetSection(key);
+        if (!child.Exists()) return fallback;
+        return string.IsNullOrWhiteSpace(child.Value) ? null : child.Value.Trim();
+    }
+
+    private static DateTimeOffset? ReadDateTimeOffset(IConfigurationSection section, string key, DateTimeOffset? fallback)
+    {
+        var raw = section[key];
+        if (string.IsNullOrWhiteSpace(raw)) return fallback;
+        return DateTimeOffset.TryParse(
+            raw,
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+            out var parsed)
+            ? parsed
+            : fallback;
+    }
+
+    private static double ReadPercent(IConfigurationSection section, string key, double fallback)
+    {
+        var raw = section[key];
+        if (string.IsNullOrWhiteSpace(raw)) return fallback;
+        if (!double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed))
+            return fallback;
+        // Clamp to a sane percentage range so a typo cannot invert burn-first.
+        return Math.Clamp(parsed, 0.0, 100.0);
+    }
+
+    private static TimeSpan ReadSpanDays(IConfigurationSection section, string key, TimeSpan fallback, TimeSpan minimum)
+        => ReadSpan(section, key, fallback, minimum, TimeSpan.FromDays(1));
+
+    private static TimeSpan ReadSpanHours(IConfigurationSection section, string key, TimeSpan fallback, TimeSpan minimum)
+        => ReadSpan(section, key, fallback, minimum, TimeSpan.FromHours(1));
+
+    private static TimeSpan ReadSpan(IConfigurationSection section, string key, TimeSpan fallback, TimeSpan minimum, TimeSpan unit)
+    {
+        var raw = section[key];
+        if (string.IsNullOrWhiteSpace(raw)) return fallback;
+        if (!double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed) || parsed < 0)
+            return fallback;
+        var span = parsed * unit;
+        return span < minimum ? minimum : span;
+    }
 }

@@ -284,6 +284,33 @@ public sealed class StatisticsQuotaPluginTests : IDisposable
     }
 
     [Fact]
+    public async Task QueryFilter_Descending_ReturnsNewestFirst_AndLimitKeepsNewest()
+    {
+        var clock = new FakeClock(DateTimeOffset.Parse("2026-06-14T10:00:00Z"));
+        await using var plugin = await BuildPluginAsync(
+            [new StubProbe(AgentKind.Claude, new AgentQuotaSnapshot { AvailablePct = 20 })],
+            clock);
+
+        await plugin.SampleOnceAsync(CancellationToken.None); // 10:00
+        clock.Advance(TimeSpan.FromHours(1));
+        await plugin.SampleOnceAsync(CancellationToken.None); // 11:00
+        clock.Advance(TimeSpan.FromHours(1));
+        await plugin.SampleOnceAsync(CancellationToken.None); // 12:00 (newest)
+
+        // Descending + Limit 1 must return ONLY the newest sample — an ascending
+        // query would keep the OLDEST row under truncation and hand back a stale read.
+        var newestSample = await plugin.QueryAsync(
+            new QuotaTimeSeriesFilter { Agent = "claude", WindowName = "overall", Descending = true, Limit = 1 },
+            default);
+        Assert.Equal(DateTimeOffset.Parse("2026-06-14T12:00:00Z"), Assert.Single(newestSample).SampledAt);
+
+        var newestRaw = await plugin.QueryRawAsync(
+            new QuotaTimeSeriesFilter { Agent = "claude", Descending = true, Limit = 1 },
+            default);
+        Assert.Equal(DateTimeOffset.Parse("2026-06-14T12:00:00Z"), Assert.Single(newestRaw).SampledAt);
+    }
+
+    [Fact]
     public async Task Prune_RemovesRowsOlderThanRetention()
     {
         // Retention = 1 hour, so rows older than (now - 1h) are dropped.

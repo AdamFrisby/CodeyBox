@@ -15,7 +15,8 @@ public interface IQuotaTimeSeriesStore
 {
     /// <summary>
     /// Returns normalised quota-sample rows matching <paramref name="filter"/>,
-    /// ordered by <c>sampled_at</c> ascending. Each call to the underlying
+    /// ordered by <c>sampled_at</c> (ascending by default, descending when
+    /// <see cref="QuotaTimeSeriesFilter.Descending"/> is set). Each call to the underlying
     /// quota probe produces one row per (overall + per-window + per-model
     /// permutation), so a typical filter for "the last 24 hours of
     /// <c>claude</c> overall availability" returns one row per sampler tick.
@@ -27,8 +28,9 @@ public interface IQuotaTimeSeriesStore
     /// <summary>
     /// Returns the raw <see cref="AgentQuotaSnapshot"/> JSON for each probe
     /// invocation matching <paramref name="filter"/>, ordered by
-    /// <c>sampled_at</c> ascending. Useful for back-fill or for fields the
-    /// normalised schema does not yet expose.
+    /// <c>sampled_at</c> (ascending by default, descending when
+    /// <see cref="QuotaTimeSeriesFilter.Descending"/> is set). Useful for
+    /// back-fill or for fields the normalised schema does not yet expose.
     /// </summary>
     Task<IReadOnlyList<QuotaRawSnapshotRow>> QueryRawAsync(
         QuotaTimeSeriesFilter filter,
@@ -68,6 +70,16 @@ public sealed record QuotaTimeSeriesFilter
     /// 10+ days of 15-minute samples for a single (agent, window) pair.
     /// </summary>
     public int Limit { get; init; } = 1000;
+
+    /// <summary>
+    /// When false (default) rows are returned oldest-first (<c>sampled_at</c>
+    /// ascending); when true, newest-first (descending). Recency-sensitive reads
+    /// (e.g. "the latest snapshot", or "the newest N resets") MUST set this so the
+    /// <see cref="Limit"/> clamp keeps the newest rows rather than silently
+    /// truncating them away — an ascending + <see cref="Limit"/> query returns the
+    /// OLDEST rows when the match count exceeds the limit.
+    /// </summary>
+    public bool Descending { get; init; }
 }
 
 /// <summary>One normalised quota-sample row.</summary>

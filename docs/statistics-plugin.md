@@ -25,8 +25,9 @@ quota-burned.
 4. [Storage layout](#storage-layout)
 5. [REST: `GET /quota/history`](#rest-get-quotahistory)
 6. [REST: `GET /quota/reset-credits`](#rest-get-quotareset-credits)
-7. [Adding further metric streams](#adding-further-metric-streams)
-8. [Migrating off the standalone poller](#migrating-off-the-standalone-poller)
+7. [REST: `GET /quota/reset-advice`](#rest-get-quotareset-advice)
+8. [Adding further metric streams](#adding-further-metric-streams)
+9. [Migrating off the standalone poller](#migrating-off-the-standalone-poller)
 
 ---
 
@@ -89,7 +90,7 @@ tick.
 Bind from `CodeyBox:Plugins:codeybox.statistics` in `appsettings.json`. All
 keys are hot-reloadable — changes to the config file are observed via the
 plugin's own change-token registration and take effect on the next tick /
-next prune cycle.
+next prune cycle / advice query.
 
 ```json
 {
@@ -110,6 +111,16 @@ next prune cycle.
             { "EstimatedExpiresAt": "2026-07-16T00:00:00Z", "Label": "credit A — burn within 2 weeks" },
             { "EstimatedExpiresAt": "2026-08-01T00:00:00Z", "Label": "credit B — just arrived (~30d)" }
           ]
+        },
+        "ResetOptimality": {
+          "Agents": ["codex"],
+          "ResetTargetWindow": "weekly",
+          "CadenceAnchor": "2026-06-29T06:00:00Z",
+          "CadencePeriodDays": 7,
+          "DustThresholdPct": 1,
+          "TimeToleranceHours": 6,
+          "AnchorRefineToleranceHours": 6,
+          "RefineAnchorFromLogger": true
         }
       }
     }
@@ -129,6 +140,15 @@ next prune cycle.
 | `ResetCreditExpiry:SafetyBufferHours` | `double` | `24` | Margin subtracted from a credit's raw expiry to produce its advised spend-by moment. |
 | `ResetCreditExpiry:LookbackDays` | `double` | `60` | How far back the count series is read when a query supplies no `from`. Bounded in practice by `RetentionHours`. |
 | `ResetCreditExpiry:Seeds` | array | `[]` | Operator estimates for pre-observation credits — see [Reset-credit expiry](#rest-get-quotareset-credits). Entries without a parseable `EstimatedExpiresAt` are dropped. |
+| `ResetOptimality:Agents` | array | `["codex"]` | Agents the reset advisor covers. A present-but-empty array means "advise for none". Codex today; add claude later. |
+| `ResetOptimality:PlanEndsAt` | RFC 3339 | unset | When the subscription plan ends. Caps the decision deadline — quota past this is worthless. |
+| `ResetOptimality:CadenceAnchor` | RFC 3339 | unset | A known instant on the natural-reset schedule (e.g. a recent Monday 06:00 UTC boundary). **Unset disables spend advice.** Phase-refined from the logger when `RefineAnchorFromLogger` is on. |
+| `ResetOptimality:CadencePeriodDays` | `double` | `7` | Natural-reset period. Codex resets weekly. Floor 1h. |
+| `ResetOptimality:ResetTargetWindow` | `string` | `weekly` | Cap window a banked reset re-anchors and burn-first evaluates. A present blank value uses the aggregate quota reading. Also selects the logged series used for cadence-anchor refinement. |
+| `ResetOptimality:DustThresholdPct` | `double` | `1` | Usable-quota % at/below which the current window counts as spent (burn-first satisfied). Clamped to 0–100. |
+| `ResetOptimality:TimeToleranceHours` | `double` | `6` | Slack around the deadline-vs-natural-reset comparison; the natural reset must land later than the deadline by more than this before a spend is advised. |
+| `ResetOptimality:AnchorRefineToleranceHours` | `double` | `6` | Phase-drift tolerance for logger-based cadence refinement. Drift at or below this keeps the configured `CadenceAnchor`; larger drift shifts it. |
+| `ResetOptimality:RefineAnchorFromLogger` | `bool` | `true` | Phase-refine `CadenceAnchor` from observed reset-target-window refills in the logged series (self-calibration). When false the configured anchor is used verbatim. |
 
 ---
 
@@ -399,6 +419,78 @@ curl 'http://orchestrator/quota/reset-credits?agent=codex'
 `latestObservedCount` is the provider's own count; when it differs from
 `credits.length` the seed list does not exactly cover the pre-observation
 baseline — a signal to adjust `Seeds`.
+
+---
+
+## REST: `GET /quota/reset-advice`
+
+Composes the live quota snapshot (from the probe) and the derived banked-credit
+expiry (above) into a single **report-only** verdict: *should I spend a banked
+quota-reset credit now?* It never notifies and never triggers a reset — it only
+reports. Resolves `IResetOptimalityAdvisor` from DI and degrades to `503` when
+the statistics plugin is not loaded.
+
+### Decision algorithm
+
+The advisor encodes the operator's reset-optimality rules, with the corrections
+established from real Codex data:
+
+1. **Burn-first.** Never advise spending while usable quota is above the dust
+   threshold. Applying a reset re-anchors the current window, so any quota left
+   in it at the reset moment is forfeited — burn it down first.
+2. **Re-anchor model.** A banked reset sets the window to `now + period` and
+   **destroys** the upcoming natural reset (which would have refilled the window
+   for free). So only spend when the natural reset would land *too late* to
+   help; otherwise wait for the free reset and keep the credit.
+3. **Predicted natural reset.** Codex's real reset is a fixed weekly boundary
+   (~Monday 06:00 UTC). The provider's `reset_at` field **over-predicts** and is
+   not used — the boundary is predicted from `CadenceAnchor` + `CadencePeriodDays`,
+   optionally phase-refined from observed reset-target-window refills in the
+   logged series (`RefineAnchorFromLogger`).
+4. **Decision deadline.** `min(PlanEndsAt, nextCreditExpiresAt)` — the latest
+   moment at which spending still has value AND is still possible. Spend only
+   when the natural reset lands after this deadline (beyond `TimeToleranceHours`).
+
+The `reason` field is a stable string code: `NotApplicableAgent`,
+`ConfigurationInvalid`, `QuotaReadingUnavailable`, `NoBankedCredit`, `BurnFirst`,
+`DeadlinePassed`, `NaturalResetArrivesInTime`, or `SpendBeforeDeadline`.
+
+### Query parameters
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `agent` | string | first of `ResetOptimality:Agents` | Agent to advise on. |
+| `from` | RFC 3339 | now − `LookbackDays` | Lower bound on the credit-count series used to derive expiries. |
+| `to` | RFC 3339 | now | Upper bound on the credit-count series. |
+
+### Example
+
+```sh
+curl 'http://orchestrator/quota/reset-advice?agent=codex'
+```
+
+```json
+{
+  "agent": "codex",
+  "evaluatedAt": "2026-07-03T12:00:00+00:00",
+  "shouldSpend": true,
+  "reason": "SpendBeforeDeadline",
+  "rationale": "Quota is exhausted and the natural reset at 2026-07-08 06:00:00Z lands after the deadline 2026-07-05 00:00:00Z — spend a banked credit before then, else the plan ends or the credit expires unused.",
+  "predictedNaturalReset": "2026-07-08T06:00:00+00:00",
+  "decisionDeadline": "2026-07-05T00:00:00+00:00",
+  "planEndsAt": "2026-07-05T00:00:00+00:00",
+  "nextCreditExpiresAt": "2026-07-19T12:00:00+00:00",
+  "nextCreditIsEstimated": false,
+  "usableQuotaPct": 0.0,
+  "dustThresholdPct": 1.0,
+  "optimalWindow": { "opensAt": "2026-07-03T12:00:00+00:00", "closesAt": "2026-07-05T00:00:00+00:00" }
+}
+```
+
+`optimalWindow` is present only when `shouldSpend` is true. When
+`nextCreditIsEstimated` is true the deadline is driven by an operator-seeded
+estimate (not an observed grant) and must not be rendered as a precise provider
+deadline.
 
 ---
 

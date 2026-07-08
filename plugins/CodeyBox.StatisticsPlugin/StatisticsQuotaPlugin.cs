@@ -25,11 +25,9 @@ namespace CodeyBox.StatisticsPlugin;
 /// loopback dependency between the API and the plugin, and stays cheap even
 /// when the API is degraded.</para>
 ///
-/// <para>This class is the only public extension point the plugin loader sees.
-/// It implements <see cref="IMetricSampler"/> (the host's per-tick driver),
-/// <see cref="IQuotaTimeSeriesStore"/> (the read-side the API queries), and
-/// <see cref="IPluginInitializer"/> (so it can open its SQLite store before
-/// the first tick). Persistence and pruning live in the
+/// <para>This class is the only public extension point the plugin loader sees:
+/// it coordinates sampling, the quota time-series read side, capacity and reset
+/// advice, plugin initialization, and disposal. Persistence and pruning live in the
 /// <see cref="QuotaTimeSeriesSqliteStore"/> helper so they remain
 /// unit-testable without spinning up the plugin lifecycle.</para>
 /// </summary>
@@ -38,7 +36,7 @@ namespace CodeyBox.StatisticsPlugin;
     displayName: "CodeyBox: Statistics",
     minHostApiVersion: "1.2")]
 public sealed class StatisticsQuotaPlugin
-    : IMetricSampler, IQuotaTimeSeriesStore, ICapacityCalculator, IResetCreditExpiryEstimator, IPluginInitializer, IAsyncDisposable
+    : IMetricSampler, IQuotaTimeSeriesStore, ICapacityCalculator, IResetCreditExpiryEstimator, IResetOptimalityAdvisor, IPluginInitializer, IAsyncDisposable
 {
     public const string PluginId = "codeybox.statistics";
     public const string QuotaSamplerKind = "quota";
@@ -322,9 +320,9 @@ public sealed class StatisticsQuotaPlugin
         {
             Agent = agent,
             FromUtc = fromUtc,
-            // The store treats ToUtc as exclusive; add a second of slop so the
-            // most recent sample (written at ~now) is not silently excluded.
-            ToUtc = toUtc + TimeSpan.FromSeconds(1),
+            // The store treats ToUtc as exclusive; nudge it past the requested
+            // instant so the most recent sample (written at ~now) is not excluded.
+            ToUtc = InclusiveUpperBound(toUtc),
             Limit = maxRows,
         };
 
@@ -383,6 +381,165 @@ public sealed class StatisticsQuotaPlugin
             return null;
         }
     }
+
+    /// <inheritdoc/>
+    public async Task<ResetSpendAdvice> AdviseAsync(
+        ResetAdviceRequest request,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        var store = _store
+            ?? throw new InvalidOperationException("Statistics plugin: store not initialised — InitializeAsync has not run yet");
+
+        ResetOptimalityConfigOptions opts;
+        int maxRows;
+        TimeSpan lookback;
+        lock (_stateLock)
+        {
+            opts = _options.ResetOptimality;
+            maxRows = _options.MaxQueryRows;
+            lookback = _options.ResetCreditExpiry.Lookback;
+        }
+
+        var agent = string.IsNullOrWhiteSpace(request.Agent)
+            ? (opts.Agents.Count > 0 ? opts.Agents[0] : "codex")
+            : request.Agent.Trim();
+
+        var now = _timeProvider.GetUtcNow();
+        var toUtc = request.ToUtc?.ToUniversalTime() ?? now;
+        var fromUtc = request.FromUtc?.ToUniversalTime() ?? toUtc - lookback;
+
+        // Reuse the credit-expiry derivation (2/5) for the banked-credit reading.
+        var credits = await EstimateAsync(
+            new ResetCreditExpiryQuery { Agent = agent, FromUtc = fromUtc, ToUtc = toUtc },
+            ct);
+
+        // Latest quota snapshot (1/5): the most recent raw row for the agent.
+        var quota = await ReadLatestSnapshotAsync(store, agent, fromUtc, toUtc, ct);
+
+        // Self-calibrate the cadence anchor from observed target-window resets
+        // in the logger, when enabled and an anchor is configured to refine.
+        var anchor = opts.CadenceAnchor;
+        if (anchor is { } configuredAnchor && opts.RefineAnchorFromLogger)
+        {
+            var observedResets = await DetectNaturalResetsAsync(
+                store,
+                agent,
+                opts.ResetTargetWindow,
+                fromUtc,
+                toUtc,
+                maxRows,
+                ct);
+            anchor = NaturalResetCadence.RefineAnchor(
+                configuredAnchor, opts.CadencePeriod, observedResets, opts.AnchorRefineTolerance);
+        }
+
+        var config = new ResetOptimalityConfig
+        {
+            PlanEndsAt = opts.PlanEndsAt,
+            CadenceAnchor = anchor,
+            CadencePeriod = opts.CadencePeriod,
+            ResetTargetWindow = opts.ResetTargetWindow,
+            DustThresholdPct = opts.DustThresholdPct,
+            TimeTolerance = opts.TimeTolerance,
+            Agents = opts.Agents,
+        };
+
+        return ResetOptimalityEvaluator.Evaluate(agent, quota, credits, config, now);
+    }
+
+    /// <summary>
+    /// Returns the most recent persisted <see cref="AgentQuotaSnapshot"/> for
+    /// <paramref name="agent"/> in the window, or an unknown snapshot when the
+    /// series is empty / unparseable — so the advisor holds (burn-first cannot
+    /// be evaluated) rather than acting on a fabricated reading.
+    /// </summary>
+    private async Task<AgentQuotaSnapshot> ReadLatestSnapshotAsync(
+        QuotaTimeSeriesSqliteStore store,
+        string agent,
+        DateTimeOffset fromUtc,
+        DateTimeOffset toUtc,
+        CancellationToken ct)
+    {
+        // Newest-first, single row: burn-first must run against the true latest
+        // snapshot. An ascending + LIMIT query would return the OLDEST rows and
+        // hand back a stale reading once the window exceeds MaxQueryRows, so this
+        // read is descending + LIMIT 1 (O(1) rather than materialising the window).
+        var filter = new QuotaTimeSeriesFilter
+        {
+            Agent = agent,
+            FromUtc = fromUtc,
+            ToUtc = InclusiveUpperBound(toUtc),
+            Descending = true,
+            Limit = 1,
+        };
+
+        var rawRows = await store.QueryRawAsync(filter, ct);
+        if (rawRows.Count == 0)
+            return AgentQuotaSnapshot.UnknownSnapshot(
+                QuotaUnknownReason.Transient, "no quota snapshot logged for the requested window");
+
+        // Descending order → the first (only) row is the most recent.
+        var rawJson = rawRows[0].RawJson;
+        try
+        {
+            var snapshot = JsonSerializer.Deserialize<AgentQuotaSnapshot>(rawJson);
+            return snapshot ?? AgentQuotaSnapshot.UnknownSnapshot(
+                QuotaUnknownReason.Permanent, "latest quota snapshot deserialised to null");
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogDebug(ex, "Statistics plugin: latest quota snapshot for {Agent} is unparseable", agent);
+            return AgentQuotaSnapshot.UnknownSnapshot(
+                QuotaUnknownReason.Permanent, "latest quota snapshot is unparseable");
+        }
+    }
+
+    /// <summary>
+    /// Detects natural-reset instants from the configured reset-target window:
+    /// a sample whose usable % jumps up across the reset thresholds (from a
+    /// spent window to a fresh one) marks a reset. These feed cadence-anchor
+    /// self-calibration.
+    /// </summary>
+    private async Task<IReadOnlyList<DateTimeOffset>> DetectNaturalResetsAsync(
+        QuotaTimeSeriesSqliteStore store,
+        string agent,
+        string? resetTargetWindow,
+        DateTimeOffset fromUtc,
+        DateTimeOffset toUtc,
+        int maxRows,
+        CancellationToken ct)
+    {
+        // Fetch newest-first so a series exceeding the row limit keeps the most
+        // recent (most relevant) reset boundaries instead of silently dropping
+        // them; the detector needs oldest-first, so reverse before handing off.
+        var filter = new QuotaTimeSeriesFilter
+        {
+            Agent = agent,
+            WindowName = ResetDetectionWindowName(resetTargetWindow),
+            FromUtc = fromUtc,
+            ToUtc = InclusiveUpperBound(toUtc),
+            Descending = true,
+            Limit = maxRows,
+        };
+
+        var rows = await store.QueryAsync(filter, ct);
+        var ascending = rows.Reverse().ToList();
+        return WeeklyNaturalResetDetector.Detect(ascending);
+    }
+
+    private static string ResetDetectionWindowName(string? resetTargetWindow)
+        => string.IsNullOrWhiteSpace(resetTargetWindow) ? "overall" : resetTargetWindow.Trim();
+
+    /// <summary>
+    /// Converts the advice window's inclusive upper bound into the store's
+    /// exclusive <c>sampled_at &lt; ToUtc</c> form. The store excludes the upper
+    /// bound, so nudge it just past the requested instant to keep a sample taken
+    /// exactly at <paramref name="toUtc"/>. One place, so the three advisor reads
+    /// stay consistent with the store's tick-preserving timestamp format.
+    /// </summary>
+    private static DateTimeOffset InclusiveUpperBound(DateTimeOffset toUtc)
+        => toUtc + TimeSpan.FromTicks(1);
 
     private QuotaTimeSeriesFilter ClampFilterLimit(QuotaTimeSeriesFilter filter)
     {

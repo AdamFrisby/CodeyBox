@@ -309,7 +309,7 @@ public sealed class QuotaTimeSeriesSqliteStore : IQuotaTimeSeriesStore, IAsyncDi
                    window_name, window_pct, window_reset_at, is_known, unknown_reason
             FROM quota_sample
             {where}
-            ORDER BY sampled_at ASC, id ASC
+            ORDER BY sampled_at {(filter.Descending ? "DESC" : "ASC")}, id {(filter.Descending ? "DESC" : "ASC")}
             LIMIT $limit;
             """;
         foreach (var (name, value) in parameters)
@@ -357,7 +357,7 @@ public sealed class QuotaTimeSeriesSqliteStore : IQuotaTimeSeriesStore, IAsyncDi
             SELECT sampled_at, agent, model_id, raw_json
             FROM quota_raw
             {where}
-            ORDER BY sampled_at ASC, id ASC
+            ORDER BY sampled_at {(filter.Descending ? "DESC" : "ASC")}, id {(filter.Descending ? "DESC" : "ASC")}
             LIMIT $limit;
             """;
         foreach (var (name, value) in parameters)
