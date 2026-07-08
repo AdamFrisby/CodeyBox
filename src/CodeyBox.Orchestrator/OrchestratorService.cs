@@ -1481,15 +1481,20 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     continue;
                 }
 
-                if (await IsBlockedByHigherPriorityQuotaRetryCandidateAsync(
-                        candidate,
-                        quotaRetryBlockers,
-                        quotaAdmission,
-                        stoppingToken))
+                var quotaRetryBlocker = await TryPromoteHigherPriorityQuotaRetryBlockerAsync(
+                    candidate,
+                    quotaRetryBlockers,
+                    quotaAdmission,
+                    stoppingToken);
+                if (quotaRetryBlocker.Outcome == QuotaRetryBlockerPromotionOutcome.Promoted)
+                    return quotaRetryBlocker.PromotedId;
+                if (quotaRetryBlocker.Outcome == QuotaRetryBlockerPromotionOutcome.RestartSelection)
                 {
-                    _log.LogDebug(
-                        "Dispatch skip {Id}: higher-priority due quota retry candidate owns the same admission pool",
-                        candidate.Id);
+                    restartSelection = true;
+                    break;
+                }
+                if (quotaRetryBlocker.Outcome == QuotaRetryBlockerPromotionOutcome.Blocked)
+                {
                     continue;
                 }
 
@@ -1608,23 +1613,44 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             return false;
         }
 
-        async Task<bool> IsBlockedByHigherPriorityQuotaRetryCandidateAsync(
+        async Task<(QuotaRetryBlockerPromotionOutcome Outcome, WorkItemId? PromotedId)> TryPromoteHigherPriorityQuotaRetryBlockerAsync(
             WorkItem candidate,
             IReadOnlyList<WorkItem> blockers,
             QuotaRetryAdmissionPolicy admission,
             CancellationToken ct)
         {
             if (blockers.Count == 0)
-                return false;
+                return (QuotaRetryBlockerPromotionOutcome.NotBlocked, null);
 
             foreach (var blocker in blockers)
             {
-                if (await admission.BlocksLowerPriorityCandidateAsync(blocker, candidate, ct))
-                    return true;
+                if (!await admission.BlocksLowerPriorityCandidateAsync(blocker, candidate, ct))
+                    continue;
+
+                _log.LogDebug(
+                    "Dispatch skip {Id}: higher-priority due quota retry candidate {BlockerId} owns the same admission pool",
+                    candidate.Id,
+                    blocker.Id);
+
+                var promotion = await TryPromoteQuotaRetryCandidateForDispatchAsync(blocker, ct);
+                if (promotion.Promoted)
+                    return (QuotaRetryBlockerPromotionOutcome.Promoted, blocker.Id);
+                if (promotion.Disposition == QuotaRetryDispatchDisposition.RestartSelection)
+                    return (QuotaRetryBlockerPromotionOutcome.RestartSelection, null);
+                if (promotion.Disposition == QuotaRetryDispatchDisposition.Blocked)
+                    return (QuotaRetryBlockerPromotionOutcome.Blocked, null);
             }
 
-            return false;
+            return (QuotaRetryBlockerPromotionOutcome.NotBlocked, null);
         }
+    }
+
+    private enum QuotaRetryBlockerPromotionOutcome
+    {
+        NotBlocked,
+        Blocked,
+        Promoted,
+        RestartSelection,
     }
 
     private async IAsyncEnumerable<WorkItem> EnumeratePickupCandidatesByPriorityAsync(

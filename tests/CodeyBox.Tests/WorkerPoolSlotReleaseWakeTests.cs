@@ -385,15 +385,9 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             await _store.CreateAsync(queuedLowPriority);
 
             await queue.EnqueueAsync(queuedLowPriority.Id);
-            Assert.False(
-                await pipeline.WaitForEnteredAsync(queuedLowPriority.Id, NoDispatchQuietPeriod),
-                "The lower-priority queued item must not get a second quota probe after the higher-priority parked item just saw exhaustion.");
-            Assert.False(pipeline.HasEntered(waitingHighPriority.Id));
-
-            await queue.EnqueueAsync(queuedLowPriority.Id);
             Assert.True(
                 await pipeline.WaitForEnteredAsync(waitingHighPriority.Id, DispatchWaitTimeout),
-                "The next available quota probe should promote the higher-priority parked item before the lower-priority queued item can run.");
+                "The same wake that discovers a currently routable overlapping quota pool should assign it to the higher-priority parked item.");
             Assert.False(pipeline.HasEntered(queuedLowPriority.Id));
 
             pipeline.Release(waitingHighPriority.Id);
@@ -560,7 +554,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         var picked = await svc.PickNextEligibleForTestAsync(CancellationToken.None);
 
         Assert.Null(picked);
-        Assert.Equal(1, promoter.CallCount);
+        Assert.Equal(2, promoter.CallCount);
     }
 
     [Fact]
@@ -882,7 +876,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         var picked = await svc.PickNextEligibleForTestAsync(CancellationToken.None);
 
         Assert.Null(picked);
-        Assert.Equal(1, promoter.CallCount);
+        Assert.Equal(2, promoter.CallCount);
     }
 
     [Fact]
