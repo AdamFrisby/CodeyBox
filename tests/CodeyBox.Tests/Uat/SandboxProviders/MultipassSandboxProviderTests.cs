@@ -1910,7 +1910,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             [launchScript],
             environmentOverrides: FakeSudoPathEnvironment());
 
-        Assert.Equal(88, exit);
+        Assert.True(
+            exit == 88,
+            $"Expected marker-timeout exit 88, got {exit}. stdout: {stdout}; stderr: {stderr}");
         Assert.Equal("", stdout);
         Assert.Contains("codeybox-detached: timed out waiting for launch lock", stderr, StringComparison.Ordinal);
         Assert.False(File.Exists(processGroupMarker));
@@ -2326,7 +2328,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             virtualTime.AdvanceTo(5);
             var (exit, stdout, stderr) = await launchTask;
 
-            Assert.Equal(88, exit);
+            Assert.True(
+                exit == 88,
+                $"Expected marker-timeout exit 88, got {exit}. stdout: {stdout}; stderr: {stderr}");
             Assert.Equal("", stdout);
             Assert.Contains("codeybox-detached: timed out waiting for process group marker", stderr, StringComparison.Ordinal);
             Assert.False(File.Exists(processGroupMarker));
@@ -2419,7 +2423,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             virtualTime.AdvanceTo(5);
             var (exit, stdout, stderr) = await launchTask;
 
-            Assert.Equal(88, exit);
+            Assert.True(
+                exit == 88,
+                $"Expected marker-timeout exit 88, got {exit}. stdout: {stdout}; stderr: {stderr}");
             Assert.Equal("", stdout);
             Assert.Contains("codeybox-detached: timed out waiting for process group marker", stderr, StringComparison.Ordinal);
             Assert.False(File.Exists(processGroupMarker));
