@@ -34,6 +34,9 @@ public sealed partial class DiffPatternAuditor : IAuditor
 
     public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
     {
+        if (context.EffectiveTarget == AuditTarget.Plan)
+            return AuditPlanArtifact(context);
+
         // Diff workBranch against baseBranch (three-dot: "the changes on
         // workBranch since it diverged from baseBranch"). --unified=0 keeps
         // only added/removed lines, no surrounding context, so our line-
@@ -116,6 +119,39 @@ public sealed partial class DiffPatternAuditor : IAuditor
         }
 
         return new AuditResult(findings.Count == 0, findings, RawOutput: diff.Stdout);
+    }
+
+    private AuditResult AuditPlanArtifact(AuditContext context)
+    {
+        if (string.IsNullOrWhiteSpace(context.PlanArtifact))
+        {
+            return new AuditResult(false, [new AuditFinding(
+                Name,
+                AuditSeverity.Error,
+                "no plan artifact to review",
+                "The plan-review context carried no PLAN artifact.")]);
+        }
+
+        var findings = new List<AuditFinding>();
+        var lines = context.PlanArtifact.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
+        for (var i = 0; i < lines.Length; i++)
+        {
+            var line = lines[i];
+            foreach (var pattern in _opts.Patterns)
+            {
+                if (pattern.Regex.IsMatch(line))
+                {
+                    findings.Add(new AuditFinding(
+                        AuditorName: Name,
+                        Severity: pattern.Severity,
+                        Title: pattern.Description,
+                        Description: line.Trim(),
+                        Location: $"PLAN:{i + 1}"));
+                }
+            }
+        }
+
+        return new AuditResult(findings.Count == 0, findings, RawOutput: context.PlanArtifact);
     }
 
     [GeneratedRegex(@"\+(\d+)(?:,(\d+))? @@", RegexOptions.CultureInvariant)]

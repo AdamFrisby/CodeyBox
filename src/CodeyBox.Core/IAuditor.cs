@@ -79,9 +79,10 @@ public interface IAuditor
     /// <summary>
     /// Runs the auditor for the target described by <paramref name="context"/>.
     /// Code-target auditors inspect the working tree at
-    /// <paramref name="workingDirectory"/>. Plan-target auditors that require a
-    /// text-only host call implement <see cref="IPlanTextReviewer"/> and are
-    /// invoked through that seam instead of this sandbox method.
+    /// <paramref name="workingDirectory"/>. Plan-target auditors receive the
+    /// structured plan text on <see cref="AuditContext.PlanArtifact"/> and run
+    /// through the same sandbox, credential, quota, and post-processing path as
+    /// code auditors.
     /// </summary>
     Task<AuditResult> RunAsync(
         ISandbox sandbox,

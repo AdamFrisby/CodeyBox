@@ -12,11 +12,11 @@ namespace CodeyBox.Orchestrator;
 /// structural validation and for tests/custom deployments that inject a
 /// different gate.
 /// </summary>
-public sealed class AuditorPlanReviewGate : IPlanReviewGate
+public sealed class PlanArtifactValidationGate : IPlanReviewGate
 {
-    private readonly ILogger<AuditorPlanReviewGate> _log;
+    private readonly ILogger<PlanArtifactValidationGate> _log;
 
-    public AuditorPlanReviewGate(ILogger<AuditorPlanReviewGate> log)
+    public PlanArtifactValidationGate(ILogger<PlanArtifactValidationGate> log)
     {
         _log = log;
     }

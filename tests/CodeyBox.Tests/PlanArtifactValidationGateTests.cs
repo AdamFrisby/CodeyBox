@@ -4,7 +4,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
-public sealed class AuditorPlanReviewGateTests
+public sealed class PlanArtifactValidationGateTests
 {
     private const string ValidPlan = """
         {"approach":"a","files":["f.cs"],"testStrategy":["unit"],"risks":["none"],"satisfiesTask":"yes"}
@@ -30,8 +30,8 @@ public sealed class AuditorPlanReviewGateTests
             await gate.ReviewAsync(Request(artifact: """{"approach":"a"}""")));
     }
 
-    private static AuditorPlanReviewGate BuildGate()
-        => new(NullLogger<AuditorPlanReviewGate>.Instance);
+    private static PlanArtifactValidationGate BuildGate()
+        => new(NullLogger<PlanArtifactValidationGate>.Instance);
 
     private static PlanReviewRequest Request(string artifact = ValidPlan) => new(
         WorkItemId.New(),

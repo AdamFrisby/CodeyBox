@@ -927,7 +927,7 @@ public sealed class PlanningPipelineTests : IDisposable
     }
 
     [Fact]
-    public async Task PlanOn_PlanTargetTextReviewer_ReworksThenApproves()
+    public async Task PlanOn_PlanTargetAuditor_ReworksThenApproves()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var agent = new PlanningAwareAgent();
@@ -1001,7 +1001,7 @@ public sealed class PlanningPipelineTests : IDisposable
     }
 
     [Fact]
-    public async Task PlanReview_LlmReviewAuditorUsesTextOnlyPathAndBlocksBeforeImplementation()
+    public async Task PlanReview_LlmReviewAuditorUsesSharedAuditPathAndBlocksBeforeImplementation()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var agent = new PlanningAwareAgent();
@@ -1047,12 +1047,49 @@ public sealed class PlanningPipelineTests : IDisposable
         var final = await setup.Store.GetAsync(item.Id);
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.Equal(2, reviewAgent.TextOnlyCalls);
-        Assert.Equal(0, reviewAgent.SandboxRunCalls);
+        Assert.Equal(0, reviewAgent.TextOnlyCalls);
+        Assert.Equal(2, reviewAgent.SandboxRunCalls);
         Assert.Equal(2, agent.PlanningCalls);
         Assert.Equal(1, agent.WorkCalls);
         Assert.Contains("PLAN_REVIEW_REWORK_FEEDBACK_JSON", agent.LastPlanningPrompt, StringComparison.Ordinal);
         Assert.Contains("needs a different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PlanReview_RejectVerdictWithoutErrorFinding_IsNormalizedToBlocking()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        var auditor = new ScriptedPlanTextAuditor([
+            new AuditResult(false, [new AuditFinding(
+                "plan:approach",
+                AuditSeverity.Warning,
+                "reviewer rejected without error",
+                "The reviewer rejected the plan but only emitted advisory severity.")]),
+        ]);
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxPlanReviewIterations: 1);
+        var item = NewItem("feature/plan-reject-normalized") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(1, auditor.Calls);
+        Assert.Equal(0, agent.WorkCalls);
+        Assert.Contains("plan rejected by reviewer", final.LastError, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -2405,7 +2442,7 @@ internal sealed class MutatingPlanReviewGate : IPlanReviewGate
     }
 }
 
-internal sealed class ScriptedPlanTextAuditor(IReadOnlyList<AuditResult> results) : IAuditor, IPlanTextReviewer
+internal sealed class ScriptedPlanTextAuditor(IReadOnlyList<AuditResult> results) : IAuditor
 {
     public string? NameOverride { get; init; }
     public string Name => NameOverride ?? "plan:approach";
@@ -2423,19 +2460,6 @@ internal sealed class ScriptedPlanTextAuditor(IReadOnlyList<AuditResult> results
     {
         _ = sandbox;
         _ = workingDirectory;
-        _ = context;
-        _ = ct;
-        throw new InvalidOperationException("plan text reviewer must not run through sandbox RunAsync");
-    }
-
-    public Task<AuditResult> ReviewPlanAsync(
-        AuditContext context,
-        ITextOnlyAgentRunner runner,
-        AgentCredential? credential,
-        CancellationToken ct = default)
-    {
-        _ = runner;
-        _ = credential;
         ct.ThrowIfCancellationRequested();
         Calls++;
         LastContext = context;
@@ -2467,7 +2491,7 @@ internal sealed class ThrowingPlanOnlyAuditor : IAuditor
     }
 }
 
-internal sealed class RoutedPlanAuditor : IAuditor, IPlanTextReviewer
+internal sealed class RoutedPlanAuditor : IAuditor
 {
     public string Name => "plan:routed";
     public string Kind => "llm";
@@ -2484,19 +2508,9 @@ internal sealed class RoutedPlanAuditor : IAuditor, IPlanTextReviewer
     {
         _ = sandbox;
         _ = workingDirectory;
-        _ = context;
-        _ = ct;
-        throw new InvalidOperationException("routed plan reviewer must not run through sandbox RunAsync");
-    }
-    public Task<AuditResult> ReviewPlanAsync(
-        AuditContext context,
-        ITextOnlyAgentRunner runner,
-        AgentCredential? credential,
-        CancellationToken ct = default)
-    {
         ct.ThrowIfCancellationRequested();
-        ObservedRunnerKind = runner.Kind;
-        ObservedCredentialKind = credential?.Agent;
+        ObservedRunnerKind = context.AuditRunner?.Kind;
+        ObservedCredentialKind = context.AuditCredential?.Agent;
         return Task.FromResult(new AuditResult(true, []));
     }
 }
@@ -2544,17 +2558,21 @@ internal sealed class PlanReviewTextAgent(AgentKind kind, IReadOnlyList<string> 
         Action<string>? stdoutChunkCallback = null,
         bool captureStructuredStream = false)
     {
-        _ = sandbox;
-        _ = workingDirectory;
-        _ = prompt;
         _ = credential;
         _ = modelId;
         _ = reasoningMode;
-        _ = ct;
         _ = stdoutChunkCallback;
         _ = captureStructuredStream;
+        ct.ThrowIfCancellationRequested();
         SandboxRunCalls++;
-        return Task.FromResult(new AgentResult(false, "sandbox path should not be used for plan review", null, null));
+        if (!prompt.Contains("reviewing a proposed implementation PLAN", StringComparison.Ordinal) ||
+            !prompt.Contains("audit/result.json", StringComparison.Ordinal))
+        {
+            return Task.FromResult(new AgentResult(false, "unexpected prompt", null, prompt));
+        }
+
+        var output = _outputs.Count > 0 ? _outputs.Dequeue() : """{"passed":true,"findings":[]}""";
+        return WriteResultAsync(sandbox, workingDirectory, output, ct);
     }
 
     public Task<TextOnlyAgentResult> RunTextOnlyAsync(
@@ -2577,6 +2595,24 @@ internal sealed class PlanReviewTextAgent(AgentKind kind, IReadOnlyList<string> 
             return Task.FromResult(new TextOnlyAgentResult(false, "unexpected prompt", null, prompt));
         var output = _outputs.Count > 0 ? _outputs.Dequeue() : """{"passed":true,"findings":[]}""";
         return Task.FromResult(new TextOnlyAgentResult(true, "reviewed", output, null));
+    }
+
+    private static async Task<AgentResult> WriteResultAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string output,
+        CancellationToken ct)
+    {
+        var write = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat > audit/result.json"],
+            WorkingDirectory = workingDirectory,
+            Stdin = output,
+        }, ct);
+
+        return write.Success
+            ? new AgentResult(true, "reviewed", "reviewed", null)
+            : new AgentResult(false, "write failed", write.Stdout, write.Stderr);
     }
 }
 

@@ -637,9 +637,8 @@ public sealed record WorkItem
     public DateTimeOffset? PlanGeneratedAt { get; init; }
 
     /// <summary>
-    /// UTC timestamp when the plan-review gate approved the current
-    /// <see cref="PlanArtifact"/>. The initial scaffold uses an always-pass
-    /// placeholder reviewer.
+    /// UTC timestamp when Plan-target auditors and the compatibility
+    /// plan-review gate approved the current <see cref="PlanArtifact"/>.
     /// </summary>
     public DateTimeOffset? PlanReviewedAt { get; init; }
 

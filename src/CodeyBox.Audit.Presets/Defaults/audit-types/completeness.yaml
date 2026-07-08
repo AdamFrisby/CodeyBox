@@ -1,6 +1,14 @@
 id: completeness
 displayName: "Completeness review"
 llmAuditorName: completeness:llm-review
+planReviewFocus: |-
+  You are reviewing COMPLETENESS at the PLAN stage, before implementation. Compare the
+  original task to the plan artifact and decide whether the plan, if followed, would address
+  every required deliverable. Block when a required deliverable is absent from the plan,
+  explicitly deferred without permission, narrowed to only part of the requested scope, or
+  described as a stub/fake success. Warnings are appropriate for ambiguous or minor implied
+  gaps. Quote the task clause or plan field that supports each finding and name the concrete
+  plan edit needed before implementation starts.
 reviewFocus: |-
   You are reviewing COMPLETENESS: is the task ACTUALLY AND FULLY SOLVED by this diff? Did
   the agent implement everything that was requested — or only part of it, a stubbed or

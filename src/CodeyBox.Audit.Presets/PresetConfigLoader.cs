@@ -213,6 +213,8 @@ internal sealed class PresetConfigLoader
             existing.DisplayName = incoming.DisplayName;
         if (!string.IsNullOrWhiteSpace(incoming.ReviewFocus))
             existing.ReviewFocus = incoming.ReviewFocus;
+        if (!string.IsNullOrWhiteSpace(incoming.PlanReviewFocus))
+            existing.PlanReviewFocus = incoming.PlanReviewFocus;
         if (!string.IsNullOrWhiteSpace(incoming.LlmAuditorName))
             existing.LlmAuditorName = incoming.LlmAuditorName;
 
@@ -803,6 +805,7 @@ internal sealed class AuditTypePresetDefinition
     public string Id { get; set; } = string.Empty;
     public string? DisplayName { get; set; }
     public string ReviewFocus { get; set; } = string.Empty;
+    public string? PlanReviewFocus { get; set; }
     public string? LlmAuditorName { get; set; }
     public bool Replace { get; set; }
     public List<AuditorDefinition> Auditors { get; set; } = [];

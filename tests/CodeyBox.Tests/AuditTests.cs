@@ -191,6 +191,70 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public async Task ShellCommandAuditor_PlanTargetMaterialisesArtifactAndEnvironment()
+    {
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "plan-shell",
+            Argv = ["review-plan"],
+            Targets = AuditTargets.PlanOnly,
+        });
+        var execs = new List<SandboxExec>();
+        var sandbox = new FakeSandbox(exec =>
+        {
+            execs.Add(exec);
+            if (IsToolProbe(exec))
+                return new SandboxExecResult(0, "/usr/bin/review-plan\n", "");
+
+            return new SandboxExecResult(0, "ok", "");
+        });
+        var context = FakeContext() with
+        {
+            Target = AuditTarget.Plan,
+            PlanArtifact = "{\"summary\":\"check this plan\"}",
+        };
+
+        var result = await auditor.RunAsync(sandbox, "/work", context, CancellationToken.None);
+
+        Assert.True(result.Passed);
+        var write = Assert.Single(execs, exec => exec.Stdin == context.PlanArtifact);
+        Assert.Equal(["sh", "-c", "cat > \"$1\"", "sh", "/tmp/codeybox-plan-artifact.json"], write.Argv);
+        var command = Assert.Single(execs, exec => exec.Argv.SequenceEqual(auditor.Argv));
+        Assert.NotNull(command.ExtraEnvironment);
+        Assert.Equal("plan", command.ExtraEnvironment!["CODEYBOX_AUDIT_TARGET"]);
+        Assert.Equal("/tmp/codeybox-plan-artifact.json", command.ExtraEnvironment["CODEYBOX_PLAN_ARTIFACT_PATH"]);
+    }
+
+    [Fact]
+    public async Task ShellCommandAuditor_PlanTargetFailsWhenArtifactMissing()
+    {
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "plan-shell",
+            Argv = ["review-plan"],
+            Targets = AuditTargets.PlanOnly,
+        });
+        var commandRan = false;
+        var sandbox = new FakeSandbox(exec =>
+        {
+            if (IsToolProbe(exec))
+                return new SandboxExecResult(0, "/usr/bin/review-plan\n", "");
+
+            commandRan = true;
+            return new SandboxExecResult(0, "ok", "");
+        });
+        var context = FakeContext() with { Target = AuditTarget.Plan };
+
+        var result = await auditor.RunAsync(sandbox, "/work", context, CancellationToken.None);
+
+        Assert.False(result.Passed);
+        Assert.False(commandRan);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Equal("no plan artifact to review", finding.Title);
+    }
+
+    [Fact]
     public async Task ShellCommandAuditor_FailsWhenExecutionUnavailableEvenWithZeroExit()
     {
         var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions

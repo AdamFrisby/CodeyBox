@@ -208,7 +208,7 @@ Whether to run a planning-only phase before implementation.
 | Value | Behaviour |
 |-------|-----------|
 | `off` | *(none)* — current default lifecycle: `Queued → Working`. |
-| `on` | Runs `Planning → PlanReview → PlanApproved` before `Working`. The agent produces a stored PLAN artifact without imported code changes; the initial review scaffold always approves the artifact so the pipeline can proceed end-to-end. |
+| `on` | Runs `Planning → PlanReview → PlanApproved` before `Working`. The agent produces a stored PLAN artifact without imported code changes; `Plan`-target auditors review that artifact, blocking findings trigger plan rework, and the loop stops only when the plan passes or `MaxPlanReviewIterations` is reached. |
 
 When `plan=on`, the approved plan is surfaced on the work item API/dashboard and
 is included in the subsequent implementation prompt. Planning uses the work

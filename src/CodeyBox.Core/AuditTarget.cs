@@ -13,15 +13,24 @@ namespace CodeyBox.Core;
 /// script) can be introduced as additional values without changing this
 /// type.</para>
 /// </summary>
-public readonly record struct AuditTarget(string Value)
+public readonly record struct AuditTarget
 {
+    public AuditTarget(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            throw new ArgumentException("Audit target value must be non-empty.", nameof(value));
+        Value = value.Trim().ToLowerInvariant();
+    }
+
+    public string Value { get; }
+
     /// <summary>Reviews the structured PLAN artifact before implementation.</summary>
     public static AuditTarget Plan { get; } = new("plan");
 
     /// <summary>Reviews the work-phase diff (the default target).</summary>
     public static AuditTarget Code { get; } = new("code");
 
-    public override string ToString() => Value;
+    public override string ToString() => Value ?? string.Empty;
 }
 
 /// <summary>

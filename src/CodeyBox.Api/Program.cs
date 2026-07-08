@@ -2806,7 +2806,7 @@ builder.Services.AddSingleton<IWorkItemTerminalRevisionBuilder>(sp =>
 // Plan-review gate. The pipeline always composes and runs AuditTarget.Plan
 // auditors before implementation; this registered gate is retained as the
 // compatibility structural-review hook.
-builder.Services.AddSingleton<IPlanReviewGate, AuditorPlanReviewGate>();
+builder.Services.AddSingleton<IPlanReviewGate, PlanArtifactValidationGate>();
 
 builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<ISandboxProvider>(),

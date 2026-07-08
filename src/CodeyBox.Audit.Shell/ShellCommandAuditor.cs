@@ -23,6 +23,8 @@ namespace CodeyBox.Audit.Shell;
 /// </summary>
 public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
 {
+    private const string PlanArtifactPath = "/tmp/codeybox-plan-artifact.json";
+
     private readonly ShellCommandAuditorOptions _opts;
 
     public ShellCommandAuditor(ShellCommandAuditorOptions opts)
@@ -68,10 +70,15 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         if (await IsDirectToolMissingAsync(sandbox, workingDirectory, toolName, ct))
             return MissingToolResult(toolName, string.Empty);
 
+        var extraEnvironment = await PrepareAuditEnvironmentAsync(sandbox, workingDirectory, context, ct);
+        if (extraEnvironment.Failure is not null)
+            return extraEnvironment.Failure;
+
         var result = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = _opts.Argv,
             WorkingDirectory = workingDirectory,
+            ExtraEnvironment = extraEnvironment.Environment,
         }, ct);
 
         var combinedOutput = CombinedOutput(result);
@@ -93,6 +100,50 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         }
 
         return new AuditResult(false, [finding], RawOutput: combinedOutput);
+    }
+
+    private async Task<(IReadOnlyDictionary<string, string> Environment, AuditResult? Failure)> PrepareAuditEnvironmentAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        CancellationToken ct)
+    {
+        var environment = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["CODEYBOX_AUDIT_TARGET"] = context.EffectiveTarget.Value,
+        };
+
+        if (context.EffectiveTarget != AuditTarget.Plan)
+            return (environment, null);
+
+        if (string.IsNullOrWhiteSpace(context.PlanArtifact))
+        {
+            return (environment, new AuditResult(false, [new AuditFinding(
+                Name,
+                AuditSeverity.Error,
+                "no plan artifact to review",
+                "The plan-review context carried no PLAN artifact.")]));
+        }
+
+        var write = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat > \"$1\"", "sh", PlanArtifactPath],
+            WorkingDirectory = workingDirectory,
+            Stdin = context.PlanArtifact,
+        }, ct);
+
+        if (!write.Success)
+        {
+            return (environment, new AuditResult(false, [new AuditFinding(
+                Name,
+                AuditSeverity.Error,
+                "failed to materialise plan artifact",
+                DescriptionOutput(write).TrimEnd())],
+                RawOutput: CombinedOutput(write)));
+        }
+
+        environment["CODEYBOX_PLAN_ARTIFACT_PATH"] = PlanArtifactPath;
+        return (environment, null);
     }
 
     private AuditFinding BuildCommandFinding(SandboxExecResult result, string toolName)

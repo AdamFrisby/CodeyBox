@@ -3,7 +3,9 @@ using CodeyBox.Core;
 using CodeyBox.PluginSdk;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Tests;
 
@@ -128,6 +130,38 @@ public sealed class ProjectAuditorComposerPresetTests
     }
 
     [Fact]
+    public async Task BuiltInBothTargetAuditor_UsesPlanFocusedPromptForPlanTarget()
+    {
+        var runner = new CapturingAgent();
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.com/repo.git",
+            Audit = new ProjectAudit
+            {
+                AuditTypes = ["completeness"],
+            },
+        };
+        var auditor = Assert.Single(composer.ComposeForTarget(project, runner, AuditTarget.Plan));
+
+        await auditor.RunAsync(new ResultFileSandbox(), "/work", new AuditContext(
+            WorkItemId.New(),
+            WorkBranch: "main",
+            BaseBranch: "main",
+            Iteration: 1,
+            OriginalPrompt: "add migration support",
+            Target: AuditTarget.Plan,
+            PlanArtifact: """{"approach":"plan the migration","files":["migrations/001.sql"],"testStrategy":["unit"],"risks":["rollback"],"satisfiesTask":"yes"}"""));
+
+        Assert.Contains("COMPLETENESS at the PLAN stage", runner.Prompt, StringComparison.Ordinal);
+        Assert.Contains("before implementation", runner.Prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("this diff", runner.Prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Read the task text and the diff together", runner.Prompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void ComposeForTarget_CustomLlmAuditorCanOptIntoPlanTarget()
     {
         var composer = new ProjectAuditorComposer(new PresetCatalog());
@@ -148,6 +182,41 @@ public sealed class ProjectAuditorComposerPresetTests
 
         Assert.DoesNotContain("custom:plan-review", codeTargets);
         Assert.Contains("custom:plan-review", planTargets);
+    }
+
+    [Fact]
+    public async Task ComposeForTarget_ConfigBackedCustomAuditorSupportsFutureTarget()
+    {
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:Projects:0:Id"] = "alpha",
+                ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example.com/repo.git",
+                ["CodeyBox:Projects:0:Audit:Custom:0:Name"] = "custom:migration-review",
+                ["CodeyBox:Projects:0:Audit:Custom:0:Kind"] = "llm",
+                ["CodeyBox:Projects:0:Audit:Custom:0:ReviewFocus"] = "review migration sequencing",
+                ["CodeyBox:Projects:0:Audit:Custom:0:Targets:0"] = "Migration",
+            })
+            .Build();
+        var options = ProjectsOptionsBinder.Bind(config.GetSection("CodeyBox"));
+        using var repo = new ProjectRepository(Options.Create(options));
+        var project = await repo.GetAsync(new ProjectId("alpha"));
+        Assert.NotNull(project);
+
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var migrationTargets = composer.ComposeForTarget(project!, new CapturingAgent(), new AuditTarget("migration"))
+            .Select(a => a.Name)
+            .ToArray();
+        var codeTargets = composer.ComposeForTarget(project!, new CapturingAgent(), AuditTarget.Code)
+            .Select(a => a.Name)
+            .ToArray();
+        var planTargets = composer.ComposeForTarget(project!, new CapturingAgent(), AuditTarget.Plan)
+            .Select(a => a.Name)
+            .ToArray();
+
+        Assert.Equal(["custom:migration-review"], migrationTargets);
+        Assert.DoesNotContain("custom:migration-review", codeTargets);
+        Assert.DoesNotContain("custom:migration-review", planTargets);
     }
 
     [Fact]

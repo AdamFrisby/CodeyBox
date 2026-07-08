@@ -56,8 +56,9 @@ public enum WorkItemState
     /// </summary>
     Planning = 15,
     /// <summary>
-    /// Planning artifact exists and is awaiting plan-review approval. The
-    /// initial rollout uses an always-pass placeholder reviewer.
+    /// Planning artifact exists and is in the auditor-backed review loop.
+    /// Blocking findings keep the item here while the plan is reworked; the
+    /// item cannot proceed to implementation until the current plan is approved.
     /// </summary>
     PlanReview = 16,
     /// <summary>

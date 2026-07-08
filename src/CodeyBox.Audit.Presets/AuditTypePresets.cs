@@ -119,6 +119,7 @@ internal static class AuditTypePresets
             Name = definition.LlmAuditorName ?? $"{definition.Id}:llm-review",
             Agent = ctx.Agent,
             ReviewFocus = definition.ReviewFocus,
+            PlanReviewFocus = definition.PlanReviewFocus,
             FrameTemplate = frameTemplate,
             Targets = PlanReviewingAuditTypes.Contains(definition.Id)
                 ? AuditTargets.PlanAndCode

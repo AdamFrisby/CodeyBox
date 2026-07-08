@@ -16,13 +16,13 @@ namespace CodeyBox.Tests;
 public sealed class PlanReviewGateProgramWiringTests
 {
     [Fact]
-    public void Program_RegistersAuditorPlanReviewGateAsIPlanReviewGateByDefault()
+    public void Program_RegistersPlanArtifactValidationGateAsIPlanReviewGateByDefault()
     {
         using var factory = new PlanReviewGateWiringFactory();
 
         var gate = factory.Services.GetRequiredService<IPlanReviewGate>();
 
-        Assert.IsType<AuditorPlanReviewGate>(gate);
+        Assert.IsType<PlanArtifactValidationGate>(gate);
     }
 
     [Fact]
@@ -36,7 +36,7 @@ public sealed class PlanReviewGateProgramWiringTests
         var gate = factory.Services.GetRequiredService<IPlanReviewGate>();
         var options = factory.Services.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
 
-        Assert.IsType<AuditorPlanReviewGate>(gate);
+        Assert.IsType<PlanArtifactValidationGate>(gate);
         Assert.False(options.PlanReview.UseAuditors);
     }
 

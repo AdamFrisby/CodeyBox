@@ -55,7 +55,7 @@ The reaper also runs **once synchronously at orchestrator startup** (before the 
 |---|---|---|
 | `Working` | `Failed` | No committed work to preserve; explicit retry required unless a preempt checkpoint exists |
 | `Planning` | `Queued` | Planning edits are discarded; rerun the planning-only turn from a clean sandbox |
-| `PlanReview` | `PlanReview` | A plan artifact already exists; rerun the review placeholder and continue |
+| `PlanReview` | `PlanReview` | A plan artifact already exists; rerun the auditor-backed plan-review loop, including plan rework if reviewers still block |
 | `PlanApproved` | `PlanApproved` | Re-dispatch implementation from the approved-plan boundary and count the recovery handoff |
 | `Reworking` | `WorkComplete` | Re-run audit against the preserved rework branch, then rework again if findings remain |
 | `WorkComplete` | `WorkComplete` | Re-dispatch audit from the phase boundary and count the recovery handoff |

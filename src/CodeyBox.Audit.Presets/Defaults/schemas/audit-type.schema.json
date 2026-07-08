@@ -19,6 +19,9 @@
     "reviewFocus": {
       "type": "string"
     },
+    "planReviewFocus": {
+      "type": "string"
+    },
     "replace": {
       "type": "boolean"
     },

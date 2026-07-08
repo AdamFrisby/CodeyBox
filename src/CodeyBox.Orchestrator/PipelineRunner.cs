@@ -1278,6 +1278,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             current,
             project,
             workRunner,
+            repoId,
             baseBranch,
             ct);
         if (auditorDecision is not null && !auditorDecision.Approved)
@@ -1378,6 +1379,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         WorkItem current,
         Project project,
         IAgentRunner workRunner,
+        string repoId,
         string baseBranch,
         CancellationToken ct)
     {
@@ -1398,12 +1400,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
             Target: AuditTarget.Plan,
             PlanArtifact: current.PlanArtifact);
 
-        var collection = await CollectPlanTextReviewFindingsAsync(
+        var collection = await CollectFindingsAsync(
             current,
             project,
             workRunner,
             auditors,
+            repoId,
             ctx,
+            _pipelineTuning.Current.AuditShortCircuitEnabled,
+            BuildTestGateEvidence.None,
+            progressUpdate: null,
             ct);
 
         if (collection.IncompleteVerdict && collection.Findings.Count == 0)
@@ -1436,170 +1442,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
             $"Plan review found {blocking.Count} blocking issue(s).",
             RejectionReason: FormatPlanReviewFindings(blocking),
             ReworkFeedback: BuildPlanReworkFeedback(blocking));
-    }
-
-    private async Task<AuditorBatchResult> CollectPlanTextReviewFindingsAsync(
-        WorkItem item,
-        Project project,
-        IAgentRunner workRunner,
-        IReadOnlyList<IAuditor> auditors,
-        AuditContext ctx,
-        CancellationToken ct)
-    {
-        var findings = new List<AuditFinding>();
-        var completedAuditors = new List<string>();
-        AgentKind? activeAuditAgentKind = null;
-
-        foreach (var auditor in auditors)
-        {
-            if (auditor is not IPlanTextReviewer reviewer)
-            {
-                throw new AuditUnavailableException(
-                    $"Plan-target auditor '{auditor.Name}' cannot run in the plan-review phase because it does not implement {nameof(IPlanTextReviewer)}.");
-            }
-
-            var needsCreds = auditor.Required.HasFlag(AuditCapabilities.AgentCredentials);
-            var selection = needsCreds
-                ? await ResolveAuditAgentRunnerAsync(item, project, auditor.Name, auditor.Required, workRunner, ct)
-                : new AuditAgentSelection(workRunner, TryResolveSelectedMember(workRunner.Kind, project, item));
-            if (selection.Runner is not ITextOnlyAgentRunner textRunner)
-            {
-                throw new AuditUnavailableException(
-                    $"Plan-target auditor '{auditor.Name}' selected agent '{selection.Runner.Kind.Value}', which does not support host-only text review.");
-            }
-            if (textRunner.TextOnlyRequiresSandbox)
-            {
-                throw new AuditUnavailableException(
-                    $"Plan-target auditor '{auditor.Name}' selected agent '{textRunner.Kind.Value}', whose text-only path requires a sandbox; plan review is host-only.");
-            }
-
-            var credential = needsCreds
-                ? selection.Member is not null
-                    ? await ResolveAgentCredentialAsync(selection.Member, project, ct)
-                    : await ResolveAgentCredentialAsync(textRunner.Kind, project, item, ct)
-                : null;
-            if (textRunner.GetTextOnlyUnavailabilityReason(credential) is { } unavailable)
-            {
-                throw new AuditUnavailableException(
-                    $"Plan-target auditor '{auditor.Name}' cannot run with agent '{textRunner.Kind.Value}': {unavailable}");
-            }
-
-            var run = await ExecPlanTextReviewerAsync(
-                auditor,
-                reviewer,
-                textRunner,
-                workRunner,
-                credential,
-                selection.Member?.RouteKey,
-                project,
-                ctx,
-                ct);
-            await PostProcessAuditorRunAsync(run, workRunner, needsCreds, item, project, ctx, ct);
-            if (IsLlmAgentExecutionFailure(run.Result))
-            {
-                var summary = run.Result.AgentSummary ?? run.Result.AgentStderr ?? "agent execution failed";
-                throw new AuditUnavailableException(
-                    $"Plan-review auditor '{run.Auditor.Name}' could not run: agent execution failed ({SingleLineSummary(summary)})");
-            }
-
-            if (needsCreds && textRunner.Kind != workRunner.Kind)
-                activeAuditAgentKind ??= textRunner.Kind;
-            findings.AddRange(run.Result.Findings);
-            completedAuditors.Add(auditor.Name);
-
-            if (project.Audit.StopOnFirstFailure && HasAuditBlockingFinding(run.Result, project))
-            {
-                return new AuditorBatchResult(
-                    findings.ToList(),
-                    activeAuditAgentKind,
-                    DeclaredShortCircuitBlocking: false,
-                    CompletedAuditors: completedAuditors.ToList());
-            }
-        }
-
-        return new AuditorBatchResult(
-            findings.ToList(),
-            activeAuditAgentKind,
-            DeclaredShortCircuitBlocking: false,
-            CompletedAuditors: completedAuditors.ToList());
-    }
-
-    private async Task<AuditorRunRecord> ExecPlanTextReviewerAsync(
-        IAuditor auditor,
-        IPlanTextReviewer reviewer,
-        ITextOnlyAgentRunner runner,
-        IAgentRunner workRunner,
-        AgentCredential? credential,
-        string? agentInstanceId,
-        Project project,
-        AuditContext ctx,
-        CancellationToken ct)
-    {
-        _log.LogInformation("Running plan text reviewer {Name} (iteration {Iter})", auditor.Name, ctx.Iteration);
-        var startedAt = DateTimeOffset.UtcNow;
-        var sw = Stopwatch.StartNew();
-        var crossKind = runner.Kind != workRunner.Kind;
-        var auditModelId = crossKind ? null : ctx.ModelId;
-        var reviewerCtx = ctx with
-        {
-            AuditRunner = runner,
-            AuditCredential = credential,
-            ModelId = auditModelId,
-            ReasoningMode = ctx.ReasoningMode,
-        };
-        var timingScope = await TimingScope.BeginAsync(
-            _timings,
-            ctx.WorkItemId,
-            "audit",
-            $"plan-review.{auditor.Name}",
-            iteration: ctx.Iteration,
-            metadata: new Dictionary<string, object>
-            {
-                ["agent"] = runner.Kind.Value,
-                ["agent.instance"] = agentInstanceId ?? runner.Kind.Value,
-            },
-            log: _log,
-            activitySource: CodeyBoxActivities.Audit);
-
-        var involvementId = await RecordInvolvementStartAsync(
-            ctx.WorkItemId,
-            runner.Kind,
-            agentInstanceId,
-            auditModelId,
-            $"plan-review:{auditor.Name}",
-            ctx.Iteration);
-        AuditResult result;
-        try
-        {
-            await using (timingScope)
-            {
-                result = await reviewer.ReviewPlanAsync(reviewerCtx, runner, credential, ct);
-            }
-        }
-        catch (Exception ex)
-        {
-            await FinalizeInvolvementAsync(involvementId, OutcomeForFailure(ex));
-            throw;
-        }
-
-        result = NormalizePlanReviewRunResult(auditor, ctx, result);
-        sw.Stop();
-        await FinalizeInvolvementAsync(involvementId, AuditorRunOutcome(runner, result));
-        CodeyBoxMeters.AuditorDuration.Record(
-            (long)sw.Elapsed.TotalMilliseconds,
-            new KeyValuePair<string, object?>("auditor.name", auditor.Name),
-            new KeyValuePair<string, object?>("auditor.kind", auditor.Kind),
-            new KeyValuePair<string, object?>("iteration", ctx.Iteration.ToString()));
-
-        return new AuditorRunRecord(
-            auditor,
-            runner,
-            agentInstanceId,
-            result,
-            startedAt,
-            sw.Elapsed,
-            timingScope.ElapsedMs,
-            CapturedStructuredStream: false);
     }
 
     private static string FormatPlanReviewFindings(IReadOnlyList<AuditFinding> findings)
@@ -8938,13 +8780,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (auditors.Count == 0)
             return EmptyAuditorBatchResult(initialPassedBuildTestGateEvidence);
 
-        var buildTestGateAuditors = auditors
-            .Where(a => a.Role == AuditorRole.BuildTestGate)
-            .Select((auditor, index) => new { Auditor = auditor, Index = index })
-            .OrderBy(x => BuildTestGateOrderingTier(x.Auditor))
-            .ThenBy(x => x.Index)
-            .Select(x => x.Auditor)
-            .ToList();
+        var enforceBuildTestGates = ctx.EffectiveTarget == AuditTarget.Code;
+        var buildTestGateAuditors = enforceBuildTestGates
+            ? auditors
+                .Where(a => a.Role == AuditorRole.BuildTestGate)
+                .Select((auditor, index) => new { Auditor = auditor, Index = index })
+                .OrderBy(x => BuildTestGateOrderingTier(x.Auditor))
+                .ThenBy(x => x.Index)
+                .Select(x => x.Auditor)
+                .ToList()
+            : new List<IAuditor>();
         var remainingAuditors = buildTestGateAuditors.Count == 0
             ? auditors
             : auditors.Where(a => a.Role != AuditorRole.BuildTestGate).ToList();
@@ -8978,9 +8823,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (remainingAuditors.Count == 0)
             return prefix;
 
-        var gatedReviewAuditors = remainingAuditors
-            .Where(RequiresPassedBuildTestGate)
-            .ToList();
+        var gatedReviewAuditors = enforceBuildTestGates
+            ? remainingAuditors
+                .Where(RequiresPassedBuildTestGate)
+                .ToList()
+            : new List<IAuditor>();
         if (gatedReviewAuditors.Count > 0
             && (prefix.BuildTestGateFailed || !HasPassedBuildAndTestGateEvidence(prefix)))
         {

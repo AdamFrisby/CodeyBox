@@ -1,6 +1,15 @@
 id: quality
 displayName: "Quality review"
 llmAuditorName: quality:llm-review
+planReviewFocus: |-
+  You are reviewing QUALITY at the PLAN stage, before code exists. Judge whether the plan is
+  maintainable enough to guide implementation: clear file/component ownership, simple
+  sequencing, explicit error-handling and rollback strategy where needed, no unnecessary
+  complexity, and no obvious local duplication or confusing naming baked into the proposed
+  structure. Block only when the plan itself would steer the implementation into misleading
+  names, false-success handling, unbounded retry/concurrency/resource behavior, or avoidable
+  complexity that the next maintainer would have to untangle. Advisory maintainability notes
+  are warnings.
 reviewFocus: |-
   You are reviewing code QUALITY: the maintainability of this change — will the next
   maintainer read it correctly and change it safely? You are a fault-finder, not a
