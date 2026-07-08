@@ -1898,6 +1898,7 @@ public sealed class MechanicalFixerTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
         Assert.Contains("produced no changes", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Audit reached max iteration budget", final.LastError, StringComparison.Ordinal);
         Assert.Equal(1, auditor.Calls);
         Assert.Equal([1], fixer.SeenIterations);
 

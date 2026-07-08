@@ -8252,9 +8252,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         IReadOnlyList<AuditProgressSnapshot> history,
         CancellationToken ct)
     {
-        var message =
-            "Rework agent produced no changes during audit rework; parked for operator review instead of hard-failing. " +
-            BuildAuditMaxIterationEscalationMessage(history);
+        var message = BuildEmptyReworkEscalationMessage(history);
         var details = BuildAuditMaxIterationEscalationDetails(item.Id, history);
         await ParkAuditForOperatorAsync(
             item,
@@ -8265,6 +8263,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
             message,
             details,
             auditLogReason: "empty rework produced no changes");
+    }
+
+    private static string BuildEmptyReworkEscalationMessage(
+        IReadOnlyList<AuditProgressSnapshot> history)
+    {
+        var last = history[^1];
+        var remaining = BuildBlockingFindingSummary(last);
+
+        return
+            $"Rework agent produced no changes during audit rework ({last.Iteration}/{last.MaxIterations}); parked for operator review instead of hard-failing and discarding accumulated work. " +
+            $"{remaining.Count} blocking finding(s) remain: {remaining.Summary}";
     }
 
     private async Task ParkAuditForOperatorAsync(
@@ -8726,14 +8735,21 @@ public sealed partial class PipelineRunner : IPipelineRunner
         IReadOnlyList<AuditProgressSnapshot> history)
     {
         var last = history[^1];
-        var remaining = BlockingProgressFindingsForSummary(last);
-        var summary = string.Join("; ", remaining
-            .Take(5)
-            .Select(f => $"[{f.AuditorName}] {f.Title}"));
+        var remaining = BuildBlockingFindingSummary(last);
 
         return
             $"Audit reached max iteration budget ({last.Iteration}/{last.MaxIterations}) with progress still visible; parked for operator review instead of hard-failing and discarding accumulated work. " +
-            $"{remaining.Count} blocking finding(s) remain: {summary}";
+            $"{remaining.Count} blocking finding(s) remain: {remaining.Summary}";
+    }
+
+    private static (int Count, string Summary) BuildBlockingFindingSummary(
+        AuditProgressSnapshot snapshot)
+    {
+        var remaining = BlockingProgressFindingsForSummary(snapshot);
+        var summary = string.Join("; ", remaining
+            .Take(5)
+            .Select(f => $"[{f.AuditorName}] {f.Title}"));
+        return (remaining.Count, summary);
     }
 
     private static AuditMaxIterationsEscalationDetails BuildAuditMaxIterationEscalationDetails(

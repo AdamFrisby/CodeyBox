@@ -1739,6 +1739,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
         Assert.Contains("no changes", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Audit reached max iteration budget", final.LastError, StringComparison.Ordinal);
     }
 
     [Fact]

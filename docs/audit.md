@@ -374,8 +374,10 @@ agent declining to commit anything. `RunAgentPhaseAsync` throws
 * **Park for operator review** — when escalation is disabled, the history
   has no convergence, or every escalation pass came back empty, the item
   parks through the existing audit max-iteration operator-input path and
-  `AuditMaxIterationsEscalationDetails` payload. The operator can resume
-  the item with a clearer prompt or merge by hand.
+  `AuditMaxIterationsEscalationDetails` payload. The parked `LastError`
+  names the empty rework (`produced no changes`) instead of claiming the
+  audit reached its iteration ceiling. The operator can resume the item
+  with a clearer prompt or merge by hand.
 
 Hard terminal failure for genuinely-empty rework is reserved for the
 audit-loop ceiling branch (no budget *and* no convergence) — the existing
