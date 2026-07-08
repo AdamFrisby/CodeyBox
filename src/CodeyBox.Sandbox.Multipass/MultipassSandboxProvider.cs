@@ -6671,12 +6671,9 @@ while True:
         sb.AppendLine("            kill -KILL \"-$codeybox_detached_pgid\" 2>/dev/null || true");
         sb.AppendLine("        fi");
         sb.AppendLine("        kill -KILL \"$codeybox_detached_pid\" 2>/dev/null || true");
-        sb.AppendLine("        if ! kill -0 \"$codeybox_detached_pid\" 2>/dev/null; then");
-        sb.AppendLine("            set +e");
-        sb.AppendLine("            wait \"$codeybox_detached_pid\" 2>/dev/null");
-        sb.AppendLine("            set -e");
-        sb.AppendLine("        fi");
-        sb.AppendLine("        disown \"$codeybox_detached_pid\" 2>/dev/null || true");
+        sb.AppendLine("        set +e");
+        sb.AppendLine("        wait \"$codeybox_detached_pid\" 2>/dev/null");
+        sb.AppendLine("        set -e");
         sb.AppendLine("        echo \"codeybox-detached: timed out waiting for process group marker\" >&2");
         sb.AppendLine($"        exit {DetachedSupervisorSetupFailedExitCode}");
         sb.AppendLine("    fi");
