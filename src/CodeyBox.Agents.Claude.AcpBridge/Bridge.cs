@@ -764,7 +764,22 @@ internal sealed class Bridge : IAsyncDisposable
         try { _turnDeadline?.Dispose(); } catch { }
 
         // CRITICAL: Delete the lockfile first to prevent any leak if we get terminated early.
-        try { if (_lockPath is not null) File.Delete(_lockPath); } catch { }
+        if (_lockPath is not null)
+        {
+            try
+            {
+                File.Delete(_lockPath);
+            }
+            catch (Exception ex)
+            {
+                Emitter.Emit("lockfile_delete_failed", w =>
+                {
+                    w.WriteString("path", _lockPath);
+                    w.WriteString("exception", ex.GetType().FullName);
+                    w.WriteString("message", ex.Message);
+                });
+            }
+        }
 
         // Clean up connections and streams to immediately unblock the main thread's stdin read
         WebSocketConnection? peerToClose;

@@ -1908,7 +1908,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         Assert.True(
             exit == 88,
-            $"Expected marker-timeout exit 88, got {exit}. stdout: {stdout}; stderr: {stderr}");
+            $"Expected launch-lock-timeout exit 88, got {exit}. stdout: {stdout}; stderr: {stderr}");
         Assert.Equal("", stdout);
         Assert.Contains("codeybox-detached: timed out waiting for launch lock", stderr, StringComparison.Ordinal);
         Assert.False(File.Exists(processGroupMarker));

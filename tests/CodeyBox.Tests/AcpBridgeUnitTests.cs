@@ -2262,7 +2262,8 @@ public sealed class AcpBridgeUnitTests
         using var client = new TcpClient();
         await client.ConnectAsync(IPAddress.Loopback, port);
         var s = client.GetStream();
-        // `Bearer <token>` — accepted only after parsing the Bearer scheme.
+        // `Bearer <token>` — admitted by explicit Bearer scheme parsing, without
+        // admitting arbitrary auth values that merely end in the real token.
         var req = Encoding.ASCII.GetBytes(
             "GET / HTTP/1.1\r\n" +
             "Host: 127.0.0.1\r\n" +

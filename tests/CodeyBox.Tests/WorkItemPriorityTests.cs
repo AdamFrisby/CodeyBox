@@ -279,7 +279,7 @@ public sealed class WorkItemPriorityTests : IDisposable
         await svc.StopAsync(CancellationToken.None);
 
         Assert.True(allDone);
-        await bumped.Task;
+        await bumped.Task.WaitAsync(TimeSpan.FromSeconds(30));
         Assert.Equal(new[] { a.Id, c.Id, b.Id }, pipeline.Order);
     }
 
