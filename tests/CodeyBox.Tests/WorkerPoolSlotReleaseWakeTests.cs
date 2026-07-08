@@ -1095,9 +1095,9 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
 
         Assert.Equal(
             [
-                queuedHighPriority.Id,
                 upstreamLowPriority.Id,
                 mergeLowPriority.Id,
+                queuedHighPriority.Id,
                 conflictLowPriority.Id,
                 auditLowPriority.Id,
             ],
@@ -1203,6 +1203,104 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         }
 
         Assert.Equal([first.Id, second.Id], ordered);
+    }
+
+    [Fact]
+    public async Task UnifiedPickupQuery_ExplicitRecoveryModeIncludesFutureQuotaRetryRows()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var futureWaiting = MakeQuotaWaitingItem(now, priority: 500) with
+        {
+            NextQuotaRetryAt = now.AddHours(1),
+        };
+        var queued = MakeItem(now.AddMilliseconds(1)) with { Priority = 100 };
+
+        await _store.CreateAsync(futureWaiting);
+        await _store.CreateAsync(queued);
+
+        var dueOnly = new List<WorkItemId>();
+        await foreach (var item in _store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
+            new HashSet<WorkItemId>(),
+            now,
+            limit: 10))
+        {
+            dueOnly.Add(item.Id);
+        }
+
+        var recovery = new List<WorkItemId>();
+        await foreach (var item in _store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
+            new HashSet<WorkItemId>(),
+            now,
+            limit: 10,
+            quotaRetryEligibility: QuotaRetryDispatchEligibility.IncludeFuture))
+        {
+            recovery.Add(item.Id);
+        }
+
+        Assert.DoesNotContain(futureWaiting.Id, dueOnly);
+        Assert.Contains(queued.Id, dueOnly);
+        Assert.Contains(futureWaiting.Id, recovery);
+        Assert.True(recovery.IndexOf(futureWaiting.Id) < recovery.IndexOf(queued.Id));
+    }
+
+    [Theory]
+    [InlineData("rework", WorkItemState.WorkComplete)]
+    [InlineData("plan_review", WorkItemState.PlanReview)]
+    [InlineData("plan_approved", WorkItemState.PlanApproved)]
+    public void QuotaRetryOrdering_UsesSharedRetryFromPolicy(
+        string retryFrom,
+        WorkItemState expectedResumeState)
+    {
+        var item = MakeQuotaWaitingItem(DateTimeOffset.UtcNow, priority: 100) with
+        {
+            QuotaRetryPhase = null,
+            QuotaRetryFrom = retryFrom,
+        };
+
+        Assert.Equal(expectedResumeState, QuotaRetryPhasePolicy.OrderingStateForQuotaRetryCandidate(item));
+        Assert.Equal(expectedResumeState, RetryFromPolicy.ResumeStateForRetryFrom(retryFrom));
+    }
+
+    [Fact]
+    public async Task DispatchWake_BoundsDueQuotaRetryPromotionScanAndSchedulesFollowUpWake()
+    {
+        const int expectedScanBudget = 512;
+        var now = DateTimeOffset.UtcNow;
+        var queue = new ObservedTaskQueue();
+        var fakeTime = new ControllableTimeProvider();
+        fakeTime.SetUtcNow(now);
+        var promoter = new RecordingQuotaRetryDispatchPromoter(
+            new QuotaRetryDispatchPromotionResult(
+                Promoted: false,
+                Outcome: "skipped:quota-still-gated",
+                Disposition: QuotaRetryDispatchDisposition.Blocked));
+
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue,
+            _store,
+            new ReleaseControlledPipeline(_store),
+            registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            quotaRetryDispatchPromoter: promoter,
+            timeProvider: fakeTime);
+
+        for (var i = 0; i < expectedScanBudget + 8; i++)
+        {
+            await _store.CreateAsync(MakeQuotaWaitingItem(now.AddTicks(i), priority: 1000));
+        }
+
+        await _store.CreateAsync(MakeItem(now.AddSeconds(1)) with { Priority = -1000 });
+
+        var picked = await svc.PickNextEligibleForTestAsync(CancellationToken.None);
+
+        Assert.Null(picked);
+        Assert.Equal(expectedScanBudget, promoter.CallCount);
+        Assert.True(await AdvanceUntilAsync(
+            fakeTime,
+            TimeSpan.FromMilliseconds(250),
+            () => queue.GenericWakeEnqueueCount >= 1));
     }
 
     [Fact]
@@ -2055,19 +2153,6 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
             CancellationToken ct,
             string? requiredCapability = null) =>
             Task.FromResult<DateTimeOffset?>(null);
-
-        public IReadOnlySet<QuotaRetryAdmissionPoolKey> GetQuotaRetryAdmissionPool(
-            WorkItem item,
-            Project? project,
-            string? requiredCapability = null) =>
-            throw new InvalidOperationException("quota retry router failed");
-
-        public Task<QuotaRetryAdmissionPoolKey?> ResolveCurrentQuotaRetryAdmissionAsync(
-            WorkItem item,
-            Project? project,
-            CancellationToken ct,
-            string? requiredCapability = null) =>
-            throw new InvalidOperationException("quota retry router failed");
     }
 
     private sealed class RecordingQuotaRetryDispatchPromoter : IQuotaRetryDispatchPromoter

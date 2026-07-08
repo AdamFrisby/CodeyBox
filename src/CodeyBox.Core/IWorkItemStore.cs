@@ -32,6 +32,12 @@ public readonly record struct PromptReplaceResult(PromptReplaceOutcome Outcome, 
 
 public enum PromptReplaceOutcome { Updated, NotFound, TerminalState }
 
+public enum QuotaRetryDispatchEligibility
+{
+    DueOnly,
+    IncludeFuture,
+}
+
 /// <summary>
 /// Outcome of <see cref="IWorkItemStore.UpdateDependsOnAsync"/>.
 /// </summary>
@@ -295,10 +301,15 @@ public interface IWorkItemStore
     IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default);
 
     /// <summary>
-    /// Returns the dispatcher pickup set in one priority-first order: ordinary
+    /// Returns the dispatcher pickup set in one unified dispatch order: ordinary
     /// dispatch-eligible rows plus <see cref="WorkItemState.WaitingForQuotaReset"/>
-    /// rows whose <see cref="WorkItem.NextQuotaRetryAt"/> is null or due, ordered
-    /// by <c>priority DESC</c>, then <c>created_at ASC</c>.
+    /// rows whose <see cref="WorkItem.NextQuotaRetryAt"/> is null or due,
+    /// unless <paramref name="quotaRetryEligibility"/> is
+    /// <see cref="QuotaRetryDispatchEligibility.IncludeFuture"/>. Finishing
+    /// phases retain the same precedence as
+    /// <see cref="ListDispatchEligibleByPriorityAsync"/>; rows are then ordered
+    /// by <c>priority DESC</c>, then <c>created_at ASC</c> inside each phase
+    /// bucket.
     /// Implementations should apply <paramref name="limit"/> as close to the
     /// storage query as possible so dispatch wakes cannot scan an unbounded
     /// parked-quota backlog.
@@ -307,6 +318,7 @@ public interface IWorkItemStore
         IReadOnlySet<WorkItemId> skipIds,
         DateTimeOffset now,
         int limit,
+        QuotaRetryDispatchEligibility quotaRetryEligibility = QuotaRetryDispatchEligibility.DueOnly,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<(WorkItem Item, WorkItemState OrderingState, int Sequence)>();
@@ -317,16 +329,17 @@ public interface IWorkItemStore
 
         await foreach (var item in ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct).ConfigureAwait(false))
         {
-            if (skipIds.Contains(item.Id) || !IsDueQuotaRetryCandidate(item, now))
+            if (skipIds.Contains(item.Id)
+                || !IsQuotaRetryCandidateEligible(item, now, quotaRetryEligibility))
                 continue;
 
             rows.Add((item, QuotaRetryPhasePolicy.OrderingStateForQuotaRetryCandidate(item), sequence++));
         }
 
         foreach (var row in rows
-            .OrderByDescending(static row => row.Item.Priority)
+            .OrderBy(static row => QuotaRetryPhasePolicy.DispatchPhaseBucket(row.OrderingState))
+            .ThenByDescending(static row => row.Item.Priority)
             .ThenBy(static row => row.Item.CreatedAt)
-            .ThenBy(static row => QuotaRetryPhasePolicy.DispatchPhaseBucket(row.OrderingState))
             .ThenBy(static row => row.Sequence)
             .Take(Math.Max(0, limit)))
         {
@@ -334,8 +347,13 @@ public interface IWorkItemStore
         }
     }
 
-    private static bool IsDueQuotaRetryCandidate(WorkItem item, DateTimeOffset now) =>
-        item.NextQuotaRetryAt is null || item.NextQuotaRetryAt <= now;
+    private static bool IsQuotaRetryCandidateEligible(
+        WorkItem item,
+        DateTimeOffset now,
+        QuotaRetryDispatchEligibility eligibility) =>
+        eligibility == QuotaRetryDispatchEligibility.IncludeFuture
+        || item.NextQuotaRetryAt is null
+        || item.NextQuotaRetryAt <= now;
 
     /// <summary>
     /// Count of work items for <paramref name="projectId"/> whose

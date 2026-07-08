@@ -1388,6 +1388,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         IReadOnlySet<WorkItemId> skipIds,
         DateTimeOffset now,
         int limit,
+        QuotaRetryDispatchEligibility quotaRetryEligibility = QuotaRetryDispatchEligibility.DueOnly,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         if (limit <= 0)
@@ -1430,12 +1431,14 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                             1 AS dispatch_source_order
                         FROM work_items wi
                         WHERE wi.state = {(int)WorkItemState.WaitingForQuotaReset}
-                          AND (wi.next_quota_retry_at IS NULL OR julianday(wi.next_quota_retry_at) <= julianday($now))
+                          AND (
+                              $include_future_quota_retries = 1
+                              OR wi.next_quota_retry_at IS NULL
+                              OR julianday(wi.next_quota_retry_at) <= julianday($now)
+                          )
                         {skipFilter}
                     )
                     ORDER BY
-                        priority DESC,
-                        created_at ASC,
                         CASE
                             WHEN dispatch_ordering_state IN (
                                 {(int)WorkItemState.AuditPassed},
@@ -1445,10 +1448,15 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                             ) THEN 0
                             ELSE 1
                         END ASC,
+                        priority DESC,
+                        created_at ASC,
                         dispatch_source_order ASC
                     LIMIT $limit;
                     """;
                 cmd.Parameters.AddWithValue("$now", now.ToString("O"));
+                cmd.Parameters.AddWithValue(
+                    "$include_future_quota_retries",
+                    quotaRetryEligibility == QuotaRetryDispatchEligibility.IncludeFuture ? 1 : 0);
                 cmd.Parameters.AddWithValue("$limit", limit);
                 using var reader = await cmd.ExecuteReaderAsync(ct);
                 while (await reader.ReadAsync(ct))

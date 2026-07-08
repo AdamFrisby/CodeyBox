@@ -1776,6 +1776,8 @@ builder.Services.AddSingleton<IAgentQuotaAvailabilitySignal>(sp =>
     sp.GetRequiredService<AgentClassRouter>());
 builder.Services.AddSingleton<IQuotaRetryRouter>(sp =>
     sp.GetRequiredService<AgentClassRouter>());
+builder.Services.AddSingleton<IQuotaRetryAdmissionRouter>(sp =>
+    sp.GetRequiredService<AgentClassRouter>());
 builder.Services.AddSingleton<IAgentRoutingReadiness>(sp =>
     sp.GetRequiredService<AgentClassRouter>());
 
@@ -3017,7 +3019,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<IStartupInitialRecoverySink>(),
     dispatchAvailability: sp.GetRequiredService<IAgentDispatchAvailability>(),
     knobRegistry: sp.GetRequiredService<IKnobRegistry>(),
-    quotaRetryDispatchPromoter: sp.GetRequiredService<IQuotaRetryDispatchPromoter>()));
+    quotaRetryDispatchPromoter: sp.GetRequiredService<IQuotaRetryDispatchPromoter>(),
+    quotaRetryAdmissionRouter: sp.GetRequiredService<IQuotaRetryAdmissionRouter>()));
 builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<IRefactorProjectGateStatusProvider>(

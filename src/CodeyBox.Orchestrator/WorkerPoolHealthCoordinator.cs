@@ -87,8 +87,9 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         // visible while still using the same combined candidate ordering as pickup.
         await foreach (var candidate in _store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
             skipIds,
-            DateTimeOffset.MaxValue,
+            DateTimeOffset.UtcNow,
             scanLimit,
+            QuotaRetryDispatchEligibility.IncludeFuture,
             ct))
         {
             if (inspected++ >= scanLimit)

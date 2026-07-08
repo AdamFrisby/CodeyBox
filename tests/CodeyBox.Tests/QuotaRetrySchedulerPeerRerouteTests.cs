@@ -317,19 +317,6 @@ public sealed class QuotaRetrySchedulerPeerRerouteTests : IDisposable
         public Task<DateTimeOffset?> ComputeEarliestExhaustedResetAsync(
             WorkItem item, Project? project, CancellationToken ct, string? requiredCapability = null)
             => Task.FromResult<DateTimeOffset?>(null);
-
-        public IReadOnlySet<QuotaRetryAdmissionPoolKey> GetQuotaRetryAdmissionPool(
-            WorkItem item,
-            Project? project,
-            string? requiredCapability = null) =>
-            new HashSet<QuotaRetryAdmissionPoolKey>();
-
-        public Task<QuotaRetryAdmissionPoolKey?> ResolveCurrentQuotaRetryAdmissionAsync(
-            WorkItem item,
-            Project? project,
-            CancellationToken ct,
-            string? requiredCapability = null) =>
-            Task.FromResult<QuotaRetryAdmissionPoolKey?>(null);
     }
 
     private sealed class FakeAgentPauseSignal : IAgentPauseSignal

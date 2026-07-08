@@ -3,11 +3,9 @@ using CodeyBox.Core;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// Focused routing port used by quota auto-retry re-evaluation and dispatch
-/// admission. It exposes the router operations needed to decide whether a
-/// parked quota item can run now, when exhausted class members are expected to
-/// refill, and which routing bucket a lower-priority dispatch candidate would
-/// currently consume.
+/// Focused routing port used by quota auto-retry re-evaluation. It exposes the
+/// router operations needed to decide whether a parked quota item can run now
+/// and when exhausted class members are expected to refill.
 /// </summary>
 public interface IQuotaRetryRouter
 {
@@ -22,7 +20,14 @@ public interface IQuotaRetryRouter
         Project? project,
         CancellationToken ct,
         string? requiredCapability = null);
+}
 
+/// <summary>
+/// Dispatch-admission routing port used to compare a due quota retry candidate
+/// with lower-priority candidates that would consume the same routing bucket.
+/// </summary>
+public interface IQuotaRetryAdmissionRouter
+{
     /// <summary>
     /// Returns the static routing buckets that <paramref name="item"/> could use
     /// after class, capability, and score filtering. This describes admission

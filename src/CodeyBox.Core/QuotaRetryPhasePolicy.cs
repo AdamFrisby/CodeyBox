@@ -6,48 +6,48 @@ namespace CodeyBox.Core;
 /// </summary>
 public static class QuotaRetryPhasePolicy
 {
+    public const string PlanningPhase = RetryFromPolicy.Planning;
+    public const string AuditPhase = RetryFromPolicy.Audit;
+    public const string ReworkPhase = RetryFromPolicy.Rework;
+    public const string MergePhase = RetryFromPolicy.Merge;
+    public const string UpstreamPhase = RetryFromPolicy.Upstream;
+    public const string WorkPhase = RetryFromPolicy.Work;
+
+    /// <summary>
+    /// Normalizes quota park phase labels. Supported phase labels are
+    /// <c>planning</c>, <c>audit</c>, <c>rework</c>, <c>merge</c>, and
+    /// <c>upstream</c>; unknown historical values fall back to <c>work</c>.
+    /// </summary>
     public static string NormalizePhase(string? phase) =>
         phase?.Trim().ToLowerInvariant() switch
         {
-            "planning" => "planning",
-            "audit" => "audit",
-            "rework" => "rework",
-            "merge" => "merge",
-            "upstream" => "upstream",
-            _ => "work",
+            PlanningPhase => PlanningPhase,
+            AuditPhase => AuditPhase,
+            ReworkPhase => ReworkPhase,
+            MergePhase => MergePhase,
+            UpstreamPhase => UpstreamPhase,
+            _ => WorkPhase,
         };
 
     public static string RetryFromForPhase(string? phase) => NormalizePhase(phase) switch
     {
-        "planning" => "planning",
-        "audit" => "audit",
-        "rework" => "audit",
-        "merge" => "merge",
-        "upstream" => "upstream",
-        _ => "work",
+        PlanningPhase => RetryFromPolicy.Planning,
+        AuditPhase => RetryFromPolicy.Audit,
+        ReworkPhase => RetryFromPolicy.Audit,
+        MergePhase => RetryFromPolicy.Merge,
+        UpstreamPhase => RetryFromPolicy.Upstream,
+        _ => RetryFromPolicy.Work,
     };
 
+    /// <summary>
+    /// Normalizes persisted retry-from values using the shared retry contract.
+    /// Unknown historical values fall back to <c>work</c>.
+    /// </summary>
     public static string NormalizeRetryFrom(string? retryFrom) =>
-        retryFrom?.Trim().ToLowerInvariant() switch
-        {
-            "planning" => "planning",
-            "audit" => "audit",
-            "conflict_rework" => "conflict_rework",
-            "merge" => "merge",
-            "upstream" => "upstream",
-            _ => "work",
-        };
+        RetryFromPolicy.NormalizeOrWork(retryFrom);
 
     public static WorkItemState ResumeStateForRetryFrom(string? retryFrom) =>
-        NormalizeRetryFrom(retryFrom) switch
-        {
-            "planning" => WorkItemState.Queued,
-            "audit" => WorkItemState.WorkComplete,
-            "conflict_rework" => WorkItemState.ReworkingForConflict,
-            "merge" => WorkItemState.AuditPassed,
-            "upstream" => WorkItemState.Merged,
-            _ => WorkItemState.Queued,
-        };
+        RetryFromPolicy.ResumeStateForRetryFrom(retryFrom);
 
     public static WorkItemState OrderingStateForQuotaRetryCandidate(WorkItem item)
     {
@@ -80,7 +80,7 @@ public static class QuotaRetryPhasePolicy
         if (!string.IsNullOrWhiteSpace(item.QuotaRetryPhase))
             return RequiredCapabilityForPhase(item.QuotaRetryPhase);
 
-        return NormalizeRetryFrom(item.QuotaRetryFrom) == "audit"
+        return ResumeStateForRetryFrom(item.QuotaRetryFrom) == WorkItemState.WorkComplete
             ? WellKnownCapabilities.Audit
             : null;
     }
@@ -96,7 +96,7 @@ public static class QuotaRetryPhasePolicy
     }
 
     public static string? RequiredCapabilityForPhase(string? phase) =>
-        string.Equals(NormalizePhase(phase), "audit", StringComparison.Ordinal)
+        string.Equals(NormalizePhase(phase), AuditPhase, StringComparison.Ordinal)
             ? WellKnownCapabilities.Audit
             : null;
 }

@@ -16,6 +16,8 @@ namespace CodeyBox.Orchestrator;
 public sealed class OrchestratorService : BackgroundService, IAgentRunningCounters, IAgentSlotGate, IShutdownDispatchGate, IWorkerPoolRecoverySlotReleaser, IWorkerPoolOccupancy, IInfrastructureDeferralScheduler, IRefactorProjectGateStatusProvider, IRefactorProjectDispatchGate
 {
     private const int DispatchPickupCandidatePageSize = 128;
+    private const int DispatchPickupCandidateScanBudget = DispatchPickupCandidatePageSize * 4;
+    private static readonly TimeSpan DispatchPickupCandidateScanBudgetWakeDelay = TimeSpan.FromMilliseconds(250);
     // A promotion can lose a state race to another worker or operator action.
     // Restart a small number of times so the picker observes the fresh row state
     // without spinning indefinitely on a hot item.
@@ -72,6 +74,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private readonly OrchestratorOptions _opts;
     private readonly ILogger<OrchestratorService> _log;
     private readonly AgentClassRouter? _router;
+    private readonly IQuotaRetryAdmissionRouter? _quotaRetryAdmissionRouter;
     private readonly IProjectRepository? _projects;
     private readonly IQueueController? _queueController;
     private readonly IAgentDispatchAvailability? _dispatchAvailability;
@@ -263,6 +266,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         IAgentDispatchAvailability? dispatchAvailability = null,
         IKnobRegistry? knobRegistry = null,
         IQuotaRetryDispatchPromoter? quotaRetryDispatchPromoter = null,
+        IQuotaRetryAdmissionRouter? quotaRetryAdmissionRouter = null,
         TimeProvider? timeProvider = null)
     {
         _queue = queue;
@@ -272,6 +276,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _opts = opts;
         _log = log;
         _router = router;
+        _quotaRetryAdmissionRouter = quotaRetryAdmissionRouter ?? router;
         _projects = projects;
         _queueController = queueController;
         _dispatchAvailability = dispatchAvailability;
@@ -1446,7 +1451,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         Dictionary<WorkItemId, WorkItemState>? statesById = null;
         var pendingRefactorProjects = (await CollectActiveRefactorDrainClaimsAsync(stoppingToken))
             .ToDictionary(c => c.ProjectId.Value, c => c.RefactorWorkItemId, StringComparer.Ordinal);
-        var quotaAdmission = new QuotaRetryAdmissionPolicy(_router, _projects, _log);
+        var quotaAdmission = new QuotaRetryAdmissionPolicy(_quotaRetryAdmissionRouter, _projects, _log);
 
         for (var selectionAttempt = 0; selectionAttempt < MaxQuotaPromotionRaceSelectionRestarts; selectionAttempt++)
         {
@@ -1630,23 +1635,52 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         }
 
         var pageSkipIds = new HashSet<WorkItemId>(skipIds);
-        while (true)
+        var scanned = 0;
+        while (scanned < DispatchPickupCandidateScanBudget)
         {
+            var pageLimit = Math.Min(
+                DispatchPickupCandidatePageSize,
+                DispatchPickupCandidateScanBudget - scanned);
             var pageCount = 0;
             await foreach (var item in _store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
                 pageSkipIds,
                 _time.GetUtcNow(),
-                DispatchPickupCandidatePageSize,
-                ct))
+                pageLimit,
+                ct: ct))
             {
                 pageCount++;
+                scanned++;
                 pageSkipIds.Add(item.Id);
                 yield return item;
             }
 
-            if (pageCount < DispatchPickupCandidatePageSize)
+            if (pageCount < pageLimit)
                 yield break;
         }
+
+        _log.LogDebug(
+            "Dispatch pickup candidate scan reached the per-wake budget of {Budget}; scheduling a follow-up wake",
+            DispatchPickupCandidateScanBudget);
+        ScheduleDispatchScanBudgetWake(ct);
+    }
+
+    private void ScheduleDispatchScanBudgetWake(CancellationToken stoppingToken)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(DispatchPickupCandidateScanBudgetWakeDelay, _time, stoppingToken);
+                await _queue.EnqueueDispatchWakeAsync(stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(ex, "Failed to enqueue dispatch wake after pickup scan budget was exhausted");
+            }
+        }, CancellationToken.None);
     }
 
     private async Task<QuotaRetryDispatchPromotionResult> TryPromoteQuotaRetryCandidateForDispatchAsync(

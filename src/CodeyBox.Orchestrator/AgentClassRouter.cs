@@ -27,7 +27,7 @@ namespace CodeyBox.Orchestrator;
 /// TOD windows are pre-parsed at construction time so evaluation is allocation-free.
 /// <see cref="TimeProvider"/> is the clock source; inject a fake for tests.
 /// </summary>
-public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQuotaAvailabilitySignal, IQuotaRetryRouter, IAgentRoutingReadiness
+public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQuotaAvailabilitySignal, IQuotaRetryRouter, IQuotaRetryAdmissionRouter, IAgentRoutingReadiness
 {
     // The class catalog and pre-parsed TOD modifiers are bundled into a single
     // record so the hot-reload coordinator can publish a coherent (catalog,

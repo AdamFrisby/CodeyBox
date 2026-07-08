@@ -5,14 +5,14 @@ namespace CodeyBox.Orchestrator;
 
 internal sealed class QuotaRetryAdmissionPolicy
 {
-    private readonly IQuotaRetryRouter? _router;
+    private readonly IQuotaRetryAdmissionRouter? _router;
     private readonly IProjectRepository? _projects;
     private readonly ILogger _log;
     private readonly Dictionary<WorkItemId, IReadOnlySet<QuotaRetryAdmissionPoolKey>> _poolsByItem = [];
     private readonly Dictionary<WorkItemId, Project?> _projectsByItem = [];
 
     public QuotaRetryAdmissionPolicy(
-        IQuotaRetryRouter? router,
+        IQuotaRetryAdmissionRouter? router,
         IProjectRepository? projects,
         ILogger log)
     {

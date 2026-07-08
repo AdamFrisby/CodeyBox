@@ -149,22 +149,8 @@ public sealed class WorkItemRetrier
             }
         }
 
-        var requestedFrom = from!.Trim().ToLowerInvariant();
-        var resumeState = requestedFrom switch
-        {
-            "planning" => WorkItemState.Queued,
-            "plan_review" => WorkItemState.PlanReview,
-            "plan_approved" => WorkItemState.PlanApproved,
-            "work" => WorkItemState.Queued,
-            "rework" => WorkItemState.WorkComplete,
-            "audit" => WorkItemState.WorkComplete,
-            "conflict_rework" => WorkItemState.ReworkingForConflict,
-            "merge" => WorkItemState.AuditPassed,
-            "upstream" => WorkItemState.Merged,
-            _ => (WorkItemState?)null,
-        };
-
-        if (resumeState is null)
+        if (!RetryFromPolicy.TryNormalize(from, out var requestedFrom)
+            || !RetryFromPolicy.TryGetResumeState(requestedFrom, out var resumeState))
         {
             return new WorkItemRetryResult(
                 false,
@@ -175,7 +161,7 @@ public sealed class WorkItemRetrier
         }
 
         var actualFrom = requestedFrom;
-        var retryingBeforeWork = resumeState.Value is WorkItemState.PlanReview or WorkItemState.PlanApproved;
+        var retryingBeforeWork = resumeState is WorkItemState.PlanReview or WorkItemState.PlanApproved;
 
         if (ValidatePlanningResumeBoundary(item, requestedFrom) is { } planningBoundaryError)
             return new WorkItemRetryResult(false, planningBoundaryError, null, null, null);
@@ -214,7 +200,7 @@ public sealed class WorkItemRetrier
                 actualFrom = "work";
             }
         }
-        var clearingQueuedPlan = resumeState.Value == WorkItemState.Queued;
+        var clearingQueuedPlan = resumeState == WorkItemState.Queued;
 
         // Reset RecoveryAttempts and increment only the counter owned by the
         // auto-retry path that invoked us. Terminal-failure-recovery and manual
@@ -223,7 +209,7 @@ public sealed class WorkItemRetrier
         // next sweep. A manual retry also clears TerminalRetryAttempts:
         // operator-forgiveness lets the cap reset.
         var resetsTerminalRetries = trigger == "manual";
-        var resumed = item.With(resumeState.Value, error: null) with
+        var resumed = item.With(resumeState, error: null) with
         {
             RecoveryAttempts = 0,
             RecoveryAttemptSourceState = null,
@@ -291,7 +277,7 @@ public sealed class WorkItemRetrier
             var reverted = false;
             try
             {
-                reverted = await _store.TryUpdateIfStateAsync(item, resumeState.Value, CancellationToken.None);
+                reverted = await _store.TryUpdateIfStateAsync(item, resumeState, CancellationToken.None);
             }
             catch (Exception rollbackEx)
             {
@@ -304,7 +290,7 @@ public sealed class WorkItemRetrier
             {
                 _log.LogWarning(ex,
                     "Retry of work item {Id} updated state to {State} but queue kick failed; rolled back to {PreviousState}",
-                    item.Id, resumeState.Value, item.State);
+                    item.Id, resumeState, item.State);
                 return new WorkItemRetryResult(
                     false,
                     $"queue enqueue failed after state update; rolled back to {item.State}: {ex.Message}",
@@ -315,7 +301,7 @@ public sealed class WorkItemRetrier
 
             _log.LogError(ex,
                 "Retry of work item {Id} updated state to {State} but queue kick failed and rollback did not apply",
-                item.Id, resumeState.Value);
+                item.Id, resumeState);
             return new WorkItemRetryResult(
                 false,
                 $"queue enqueue failed after state update and rollback did not apply: {ex.Message}",
@@ -569,24 +555,17 @@ public sealed class WorkItemRetrier
                 null,
                 null);
 
-        var requestedFrom = (from ?? "work").Trim().ToLowerInvariant();
-        var resumeState = requestedFrom switch
+        var rawFrom = from ?? RetryFromPolicy.Work;
+        if (!RetryFromPolicy.TryNormalize(rawFrom, out var requestedFrom)
+            || requestedFrom is RetryFromPolicy.ConflictRework or RetryFromPolicy.Upstream
+            || !RetryFromPolicy.TryGetResumeState(requestedFrom, out var resumeState))
         {
-            "planning" => WorkItemState.Queued,
-            "plan_review" => WorkItemState.PlanReview,
-            "plan_approved" => WorkItemState.PlanApproved,
-            "work" => WorkItemState.Queued,
-            "rework" => WorkItemState.WorkComplete,
-            "audit" => WorkItemState.WorkComplete,
-            "merge" => WorkItemState.AuditPassed,
-            _ => (WorkItemState?)null,
-        };
-        if (resumeState is null)
             return new ResumeOutcome(
                 ResumeStatus.BadRequest,
                 $"invalid 'from' value '{from}'; expected one of: planning, plan_review, plan_approved, work, rework, audit, merge",
                 null,
                 null);
+        }
         if (ValidatePlanningResumeBoundary(item, requestedFrom) is { } planningBoundaryError)
             return new ResumeOutcome(
                 ResumeStatus.Conflict,
@@ -631,7 +610,7 @@ public sealed class WorkItemRetrier
         // audit progress. Audit reports are diagnostic rows and may be
         // retention-swept, so they are deliberately not used as a resume
         // precondition.
-        if (!resumingBeforeWork && resumeState.Value != WorkItemState.Queued && _auditProgress is not null)
+        if (!resumingBeforeWork && resumeState != WorkItemState.Queued && _auditProgress is not null)
         {
             var currentWorkAttemptStartedAt = await ResolveCurrentWorkAttemptStartedAtAsync(item.Id, ct);
             var progress = await _auditProgress.GetAuditProgressAsync(item.Id, currentWorkAttemptStartedAt, ct);
@@ -653,7 +632,7 @@ public sealed class WorkItemRetrier
         // by this rebuild.
         var resumed = item with
         {
-            State = resumeState.Value,
+            State = resumeState,
             UpdatedAt = DateTimeOffset.UtcNow,
             LastError = null,
             CancellationReason = null,
@@ -670,7 +649,7 @@ public sealed class WorkItemRetrier
             PlanGeneratedAt = resumingFromPlanning ? null : item.PlanGeneratedAt,
             PlanReviewedAt = resumingFromPlanning ? null : item.PlanReviewedAt,
             PlanReviewSummary = resumingFromPlanning ? null : item.PlanReviewSummary,
-            PreserveWorkBranchOnQueuedPickup = resumeState.Value == WorkItemState.Queued && !resumingFromPlanning,
+            PreserveWorkBranchOnQueuedPickup = resumeState == WorkItemState.Queued && !resumingFromPlanning,
         };
 
         // Conditional update guards against a racing cascade-cancel or
