@@ -18,29 +18,13 @@ public static class WorkItemFailureKinds
     /// </summary>
     public const string AgentUnavailable = "agent_unavailable";
 
-    /// <summary>
-    /// Failure kinds whose root cause is the AGENT's environment — when the
-    /// agent recovers (smoke passes again, missing binary installed, auth
-    /// fixed), the pipeline can usefully re-attempt items that failed for
-    /// these reasons during the outage. Genuine code-work failures (build,
-    /// agent, configuration, audit non-convergence) are excluded — those
-    /// would only re-fail on the same input.
-    /// </summary>
-    public static readonly IReadOnlyList<string> InfraShaped =
-    [
+    private static readonly HashSet<string> InfraShaped = new(StringComparer.OrdinalIgnoreCase)
+    {
         Infrastructure,
         AgentUnavailable,
         AuthRequired,
-    ];
+    };
 
     public static bool IsInfraShaped(string? failureKind)
-    {
-        if (string.IsNullOrEmpty(failureKind)) return false;
-        foreach (var candidate in InfraShaped)
-        {
-            if (string.Equals(failureKind, candidate, StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-        return false;
-    }
+        => !string.IsNullOrEmpty(failureKind) && InfraShaped.Contains(failureKind);
 }

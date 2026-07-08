@@ -14,16 +14,17 @@ namespace CodeyBox.Orchestrator;
 ///
 /// <para>Bounds:</para>
 /// <list type="bullet">
-///   <item>Only items whose <see cref="WorkItem.FailureKind"/> is in
-///   <see cref="WorkItemFailureKinds.InfraShaped"/> — genuine work-side
+///   <item>Only items whose <see cref="WorkItem.FailureKind"/> is
+///   infrastructure-shaped according to <see cref="WorkItemFailureKinds.IsInfraShaped"/>
+///   — genuine work-side
 ///   rejections (build, agent, configuration, audit non-convergence) are
 ///   never touched, because re-running them against a freshly-healthy agent
 ///   would only re-fail on the same input.</item>
-///   <item>Only items whose <see cref="WorkItem.Agent"/> matches the
-///   restored agent. The <c>Agent</c> field reflects the LAST phase's
-///   chosen agent (overwritten as the item moves through Work → Audit →
-///   Rework → Merge), so this picks the items whose final failed attempt
-///   was on the recovered agent.</item>
+///   <item>Only items whose failed agent resolves to the restored agent. The
+///   sweep prefers a recent failed agent-involvement row when the history
+///   store is wired, then falls back to <see cref="WorkItem.Agent"/>, then
+///   to the project's default agent for legacy direct-agent rows whose
+///   persisted <c>Agent</c> was never stamped.</item>
 ///   <item>Only items whose <see cref="WorkItem.UpdatedAt"/> falls inside
 ///   the outage window
 ///   <c>[OutageStartedAt - lookbackGrace, RestoredAt + margin]</c>. Items
@@ -43,7 +44,7 @@ namespace CodeyBox.Orchestrator;
 /// router prefers it. The just-restored agent only gets the item back when
 /// it is the highest-scored eligible member.</para>
 ///
-/// <para>OFF by default. Operators enable per the
+/// <para>Enabled by default. Operators may disable it with the
 /// <see cref="AgentRestoreRetryOptions.Enabled"/> flag.</para>
 /// </summary>
 public sealed class AgentRestoreRetryScheduler : BackgroundService
@@ -53,8 +54,8 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
     private readonly IAgentRestoreSignal? _signal;
     private readonly IWebhookDispatcher? _webhooks;
     private readonly IProjectRepository? _projects;
+    private readonly IAgentInvolvementStore? _involvement;
     private readonly Func<AgentRestoreRetryOptions> _optionsAccessor;
-    private readonly TimeProvider _time;
     private readonly ILogger<AgentRestoreRetryScheduler> _log;
 
     private readonly System.Threading.Channels.Channel<AgentRestoredEvent> _events =
@@ -73,7 +74,7 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
         IAgentRestoreSignal? signal = null,
         IWebhookDispatcher? webhooks = null,
         IProjectRepository? projects = null,
-        TimeProvider? timeProvider = null)
+        IAgentInvolvementStore? involvement = null)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _retrier = retrier ?? throw new ArgumentNullException(nameof(retrier));
@@ -82,7 +83,7 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
         _signal = signal;
         _webhooks = webhooks;
         _projects = projects;
-        _time = timeProvider ?? TimeProvider.System;
+        _involvement = involvement;
         if (_signal is not null)
             _signal.AgentRestored += EnqueueEvent;
     }
@@ -179,6 +180,8 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
             // seeing silence in all three.
             AuditLog.AgentRestoreRequeueSwept(
                 evt.Agent, evt.OutageStartedAt, evt.RestoredAt, 0, 0);
+            await EmitSweepWebhookAsync(evt, requeued: 0, skipped: 0, capHit: false, opts: opts, ct: ct)
+                .ConfigureAwait(false);
             return new AgentRestoreSweepSummary(0, 0);
         }
 
@@ -186,7 +189,6 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
         var windowEnd = evt.RestoredAt + opts.PostRestoreMargin;
         var requeued = 0;
         var skipped = 0;
-        var capHitDropped = 0;
         var capWasHit = false;
 
         var candidateStates = new[]
@@ -197,10 +199,9 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
 
         foreach (var state in candidateStates)
         {
-            if (capWasHit) break;
             await foreach (var item in _store.ListByStateAsync(state, ct))
             {
-                if (!IsCandidate(item, evt.Agent, windowStart, windowEnd))
+                if (!await IsCandidateAsync(item, evt.Agent, windowStart, windowEnd, ct).ConfigureAwait(false))
                 {
                     continue;
                 }
@@ -208,12 +209,11 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
                 if (requeued >= opts.MaxItemsPerRestore)
                 {
                     capWasHit = true;
-                    capHitDropped++;
-                    // Drop the per-row warning: with a multi-thousand-row
-                    // backlog this loop would otherwise spam the log once per
-                    // candidate. Break out of both loops below; the single
-                    // summary line + audit event carry the durable signal.
-                    break;
+                    skipped++;
+                    // Count every over-cap candidate quietly so the summary's
+                    // skipped count remains the exhaustive "matched but not
+                    // retried" value promised by the audit-log contract.
+                    continue;
                 }
 
                 bool success; string? error; string? actualFrom;
@@ -253,7 +253,6 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
 
         if (capWasHit)
         {
-            skipped += capHitDropped;
             _log.LogWarning(
                 "AgentRestoreRetryScheduler: per-restore cap {Cap} reached for {Agent}; remaining candidates left parked (operator can re-trigger via /admin/agent/{Agent}/reset)",
                 opts.MaxItemsPerRestore, evt.Agent.Value, evt.Agent.Value);
@@ -261,27 +260,149 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
 
         AuditLog.AgentRestoreRequeueSwept(
             evt.Agent, evt.OutageStartedAt, evt.RestoredAt, requeued, skipped);
+        await EmitSweepWebhookAsync(evt, requeued, skipped, capWasHit, opts, ct)
+            .ConfigureAwait(false);
         return new AgentRestoreSweepSummary(requeued, skipped);
     }
 
-    private static bool IsCandidate(
+    private async Task<bool> IsCandidateAsync(
         WorkItem item,
         AgentKind restoredAgent,
         DateTimeOffset windowStart,
-        DateTimeOffset windowEnd)
+        DateTimeOffset windowEnd,
+        CancellationToken ct)
     {
-        if (!WorkItemFailureKinds.IsInfraShaped(item.FailureKind))
-            return false;
-
-        if (item.Agent is not { } itemAgent)
-            return false;
-        if (itemAgent != restoredAgent)
+        if (!IsRestoreSweepEligibleFailure(item))
             return false;
 
         if (item.UpdatedAt < windowStart || item.UpdatedAt > windowEnd)
             return false;
 
+        if (await TryResolveLastFailedInvolvementAgentAsync(item.Id, item.UpdatedAt, ct).ConfigureAwait(false) is { } failedAgent)
+            return failedAgent == restoredAgent;
+
+        if (item.Agent is { } itemAgent)
+            return itemAgent == restoredAgent;
+
+        if (_projects is not null)
+        {
+            try
+            {
+                var project = await _projects.GetAsync(item.ProjectId, ct).ConfigureAwait(false);
+                if (project is not null)
+                    return project.DefaultAgent == restoredAgent;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(ex,
+                    "AgentRestoreRetryScheduler: project lookup failed for {Id}; cannot infer default agent for restore sweep",
+                    item.Id);
+            }
+        }
+
+        return false;
+    }
+
+    private async Task<AgentKind?> TryResolveLastFailedInvolvementAgentAsync(
+        WorkItemId id,
+        DateTimeOffset terminalUpdatedAt,
+        CancellationToken ct)
+    {
+        if (_involvement is null) return null;
+
+        try
+        {
+            var rows = await _involvement.ListByWorkItemAsync(id, ct).ConfigureAwait(false);
+            return rows
+                .Where(row => row.Outcome is not null
+                    && row.Outcome.StartsWith("failure:", StringComparison.OrdinalIgnoreCase)
+                    && IsNearTerminalUpdate(row.EndedAt ?? row.StartedAt, terminalUpdatedAt))
+                .OrderByDescending(static row => row.EndedAt ?? row.StartedAt)
+                .FirstOrDefault()
+                ?.AgentKind;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex,
+                "AgentRestoreRetryScheduler: involvement lookup failed for {Id}; falling back to work item agent",
+                id);
+            return null;
+        }
+    }
+
+    private static bool IsNearTerminalUpdate(DateTimeOffset involvementAt, DateTimeOffset terminalUpdatedAt) =>
+        involvementAt >= terminalUpdatedAt - TimeSpan.FromMinutes(15)
+        && involvementAt <= terminalUpdatedAt + TimeSpan.FromMinutes(1);
+
+    private static bool IsRestoreSweepEligibleFailure(WorkItem item)
+    {
+        if (!WorkItemFailureKinds.IsInfraShaped(item.FailureKind))
+            return false;
+
+        if (string.Equals(item.FailureKind, WorkItemFailureKinds.AuthRequired, StringComparison.OrdinalIgnoreCase)
+            && IsUncorroboratedStdoutOnlyAuthFailure(item.LastError))
+            return false;
+
         return true;
+    }
+
+    private static bool IsUncorroboratedStdoutOnlyAuthFailure(string? lastError)
+    {
+        if (string.IsNullOrWhiteSpace(lastError))
+            return false;
+
+        return lastError.Contains("stdout accepted for item failure only", StringComparison.OrdinalIgnoreCase)
+            || lastError.Contains("forced in-VM smoke probe did not corroborate auth", StringComparison.OrdinalIgnoreCase)
+            || lastError.Contains("item-level failure only, no fleet-wide bench", StringComparison.OrdinalIgnoreCase)
+            || lastError.Contains("stdout auth evidence NOT corroborated", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task EmitSweepWebhookAsync(
+        AgentRestoredEvent evt,
+        int requeued,
+        int skipped,
+        bool capHit,
+        AgentRestoreRetryOptions opts,
+        CancellationToken ct)
+    {
+        if (_webhooks is null) return;
+
+        try
+        {
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "agent.restore_requeue_swept",
+                Details = new
+                {
+                    reason = "agent_restore",
+                    restoredAgent = evt.Agent.Value,
+                    outageStartedAt = evt.OutageStartedAt,
+                    restoredAt = evt.RestoredAt,
+                    requeued,
+                    skipped,
+                    capHit,
+                    maxItemsPerRestore = opts.MaxItemsPerRestore,
+                },
+            }, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "AgentRestoreRetryScheduler: sweep webhook delivery failed after agent {Agent} restore",
+                evt.Agent.Value);
+        }
     }
 
     private async Task EmitAutoRetryWebhookAsync(
@@ -343,12 +464,10 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
 public sealed record AgentRestoreRetryOptions
 {
     /// <summary>
-    /// Master switch. Default <c>false</c> so the sweep is opt-in for the
-    /// first ship — operators flip it on after confirming the failure-class
-    /// signal is producing the expected partition (infra vs real) in their
-    /// audit log.
+    /// Master switch. Default <c>true</c>; set false to disable restore-driven
+    /// infra-failure sweeps.
     /// </summary>
-    public bool Enabled { get; init; }
+    public bool Enabled { get; init; } = true;
 
     /// <summary>
     /// How far back from <see cref="AgentRestoredEvent.OutageStartedAt"/> the

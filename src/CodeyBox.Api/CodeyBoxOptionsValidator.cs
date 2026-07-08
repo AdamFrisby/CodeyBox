@@ -282,6 +282,22 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             failures.Add("CodeyBox:SharedUpstreamMirrorDirectory must not be empty if EnableSharedUpstreamMirror is true");
         }
 
+        if (options.AutoRequeueOnAgentRestore.Enabled)
+        {
+            try
+            {
+                _ = OrchestratorOptionsFactory.BuildAgentRestoreRetryOptions(
+                    options.AutoRequeueOnAgentRestore.Enabled,
+                    options.AutoRequeueOnAgentRestore.LookbackGrace,
+                    options.AutoRequeueOnAgentRestore.PostRestoreMargin,
+                    options.AutoRequeueOnAgentRestore.MaxItemsPerRestore);
+            }
+            catch (InvalidOperationException ex)
+            {
+                failures.Add(ex.Message);
+            }
+        }
+
         failures.AddRange(AuditLogStartup.Validate(options.AuditLog));
 
         return failures.Count == 0

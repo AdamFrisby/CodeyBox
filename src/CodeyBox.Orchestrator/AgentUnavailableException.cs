@@ -15,6 +15,13 @@ namespace CodeyBox.Orchestrator;
 public sealed class AgentUnavailableException : Exception
 {
     /// <summary>
+    /// Agent most directly responsible for the unavailability when the failure
+    /// is attributable to a single rejected runner. Null for aggregate "no
+    /// candidate" cases.
+    /// </summary>
+    public AgentKind? Agent { get; }
+
+    /// <summary>
     /// Comma-separated short reasons explaining which candidates were
     /// considered and why each was rejected (e.g.
     /// <c>"gemini: GEMINI_API_KEY is required; claude: CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY is required"</c>).
@@ -22,9 +29,10 @@ public sealed class AgentUnavailableException : Exception
     /// </summary>
     public string CandidateReasons { get; }
 
-    public AgentUnavailableException(string message, string candidateReasons)
+    public AgentUnavailableException(string message, string candidateReasons, AgentKind? agent = null)
         : base(message)
     {
+        Agent = agent;
         CandidateReasons = candidateReasons;
     }
 }

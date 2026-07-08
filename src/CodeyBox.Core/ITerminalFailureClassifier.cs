@@ -59,7 +59,7 @@ public sealed class DefaultTerminalFailureClassifier : ITerminalFailureClassifie
         // Transient (auto-retryable) infrastructure / network / agent-process
         // / VM-provisioning failure shapes. The orchestrator stamps these on
         // failures that originated outside the agent's reasoning loop.
-        if (string.Equals(item.FailureKind, "infrastructure", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(item.FailureKind, WorkItemFailureKinds.Infrastructure, StringComparison.OrdinalIgnoreCase))
             return new TerminalFailureClassification(
                 TerminalFailureClass.Transient,
                 "failureKind=infrastructure: provisioning/network/sandbox transient");
@@ -67,7 +67,7 @@ public sealed class DefaultTerminalFailureClassifier : ITerminalFailureClassifie
         // Smoke-gate / pickup-time credential failures. The credential may
         // have rotated since the cache was filled; a later retry should
         // re-probe and re-evaluate.
-        if (string.Equals(item.FailureKind, "agent_unavailable", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(item.FailureKind, WorkItemFailureKinds.AgentUnavailable, StringComparison.OrdinalIgnoreCase))
             return new TerminalFailureClassification(
                 TerminalFailureClass.Transient,
                 "failureKind=agent_unavailable: credential/smoke transient");

@@ -285,11 +285,9 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
 
         Assert.Equal(2, summary.Requeued);
-        // Cap reached: at least one over-cap candidate counted in Skipped.
-        // The sweep breaks out at the cap rather than iterating to the end —
-        // the exact remaining-candidate count is not asserted because the
-        // implementation may not enumerate past the break point.
-        Assert.True(summary.Skipped >= 1);
+        // Cap reached: every over-cap candidate is still counted in Skipped
+        // so the sweep summary is exhaustive.
+        Assert.Equal(3, summary.Skipped);
         // Two items requeued, three still parked — operator can re-trigger
         // (eg. POST /admin/agent/<name>/reset) to drain the rest in a
         // subsequent burst.
@@ -382,7 +380,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         registry.MarkAuthRequired(AgentKind.Antigravity, "OAuth refresh token rejected");
 
         fakeTime.Advance(TimeSpan.FromHours(2));
-        registry.Reset(AgentKind.Antigravity);
+        NewReset(registry).Reset(AgentKind.Antigravity);
 
         Assert.Single(captured);
         Assert.Equal(authFailureAt, captured[0].OutageStartedAt);
@@ -421,7 +419,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         await store.UpdateAsync(item);
 
         fakeTime.Advance(TimeSpan.FromMinutes(20));
-        registry.Reset(AgentKind.Antigravity);
+        NewReset(registry).Reset(AgentKind.Antigravity);
         Assert.Single(capturedRestores);
         Assert.NotNull(capturedRestores[0].OutageStartedAt);
 
@@ -460,7 +458,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
 
         Assert.Equal(2, summary.Requeued);
-        Assert.True(summary.Skipped >= 1);
+        Assert.Equal(8, summary.Skipped);
         var capWarnings = log.Entries.Count(e =>
             e.Level == Microsoft.Extensions.Logging.LogLevel.Warning &&
             e.Message.Contains("per-restore cap", StringComparison.OrdinalIgnoreCase));
@@ -486,6 +484,306 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
 
         Assert.Equal(0, summary.Requeued);
         Assert.Equal(0, summary.Skipped);
+    }
+
+    [Fact]
+    public async Task RestoreSignal_BackgroundService_RequeuesFromRegistryEvent()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var registry = NewRegistry();
+        var scheduler = NewScheduler(store, queue, enabled: true, signal: registry);
+
+        await scheduler.StartAsync(CancellationToken.None);
+        try
+        {
+            registry.MarkSmokeResult(
+                AgentKind.Claude,
+                new AgentSmokeResult(false, "missing binary", TimeSpan.Zero, SmokeFailureCategory.Persistent));
+
+            var item = NewItem(
+                agent: AgentKind.Claude,
+                state: WorkItemState.Failed,
+                failureKind: WorkItemFailureKinds.Infrastructure,
+                updatedAt: DateTimeOffset.UtcNow);
+            await store.CreateAsync(item);
+            await store.UpdateAsync(item);
+
+            registry.MarkSmokeResult(
+                AgentKind.Claude,
+                new AgentSmokeResult(true, null, TimeSpan.FromMilliseconds(10), SmokeFailureCategory.None));
+
+            await WaitUntilAsync(async () =>
+                (await store.GetAsync(item.Id))?.State == WorkItemState.Queued);
+            Assert.Equal(1, queue.Count);
+        }
+        finally
+        {
+            await scheduler.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task Sweep_RequeuesDefaultAgentRowsWhenPersistedAgentIsUnset()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = new ProjectId("proj"),
+            DisplayName = "Test",
+            RepositoryUrl = "https://example.invalid/repo.git",
+            DefaultAgent = AgentKind.Claude,
+        });
+        var scheduler = NewScheduler(store, queue, enabled: true, projects: projects);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var item = NewItem(
+            agent: null,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.Infrastructure,
+            updatedAt: outageStart.AddMinutes(1));
+        await store.CreateAsync(item);
+        await store.UpdateAsync(item);
+
+        var summary = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
+
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(item.Id))!.State);
+    }
+
+    [Fact]
+    public async Task Sweep_UsesLatestFailedInvolvementWhenWorkItemAgentIsStale()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var involvement = new InMemoryAgentInvolvementStore();
+        var scheduler = NewScheduler(store, queue, enabled: true, involvement: involvement);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var item = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AuthRequired,
+            updatedAt: outageStart.AddMinutes(2),
+            lastError: "auth required from agent output during audit: login prompt matched");
+        await store.CreateAsync(item);
+        await store.UpdateAsync(item);
+
+        var involvementId = Guid.NewGuid();
+        await involvement.RecordStartAsync(new AgentInvolvement(
+            Id: involvementId,
+            WorkItemId: item.Id,
+            AgentKind: AgentKind.Codex,
+            ModelId: null,
+            Phase: "audit:llm-review",
+            StartedAt: outageStart.AddMinutes(1),
+            EndedAt: null,
+            Iteration: 1,
+            Outcome: null));
+        await involvement.FinalizeAsync(involvementId, outageStart.AddMinutes(2), "failure:auth");
+
+        var summary = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Codex, outageStart, DateTimeOffset.UtcNow));
+
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(item.Id))!.State);
+    }
+
+    [Fact]
+    public async Task Sweep_IgnoresOldFailedInvolvementWhenTerminalAgentIsCurrent()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var involvement = new InMemoryAgentInvolvementStore();
+        var scheduler = NewScheduler(store, queue, enabled: true, involvement: involvement);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-40);
+        var item = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.Infrastructure,
+            updatedAt: outageStart.AddMinutes(30));
+        await store.CreateAsync(item);
+        await store.UpdateAsync(item);
+
+        var oldInvolvementId = Guid.NewGuid();
+        await involvement.RecordStartAsync(new AgentInvolvement(
+            Id: oldInvolvementId,
+            WorkItemId: item.Id,
+            AgentKind: AgentKind.Codex,
+            ModelId: null,
+            Phase: "audit:llm-review",
+            StartedAt: outageStart.AddMinutes(1),
+            EndedAt: null,
+            Iteration: 1,
+            Outcome: null));
+        await involvement.FinalizeAsync(oldInvolvementId, outageStart.AddMinutes(2), "failure:auth");
+
+        var codexSummary = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Codex, outageStart, DateTimeOffset.UtcNow));
+        Assert.Equal(0, codexSummary.Requeued);
+        Assert.Equal(WorkItemState.Failed, (await store.GetAsync(item.Id))!.State);
+
+        var claudeSummary = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
+        Assert.Equal(1, claudeSummary.Requeued);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(item.Id))!.State);
+    }
+
+    [Fact]
+    public async Task Sweep_DoesNotRequeueUncorroboratedStdoutOnlyAuthFailures()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var scheduler = NewScheduler(store, queue, enabled: true);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var itemLocal = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AuthRequired,
+            updatedAt: outageStart.AddMinutes(2),
+            lastError: "auth required from agent output during work: login prompt matched; stdout accepted for item failure only; forced in-VM smoke probe did not corroborate auth");
+        var corroborated = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AuthRequired,
+            updatedAt: outageStart.AddMinutes(3),
+            lastError: "auth required from agent output during work: login prompt matched; stdout corroborated by forced in-VM smoke probe for global benching");
+        await store.CreateAsync(itemLocal);
+        await store.UpdateAsync(itemLocal);
+        await store.CreateAsync(corroborated);
+        await store.UpdateAsync(corroborated);
+
+        var summary = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
+
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(WorkItemState.Failed, (await store.GetAsync(itemLocal.Id))!.State);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(corroborated.Id))!.State);
+    }
+
+    [Fact]
+    public async Task Sweep_EmitsSweepLevelWebhookAlert()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var webhooks = new CapturingWebhookDispatcher();
+        var scheduler = NewScheduler(store, queue, enabled: true, webhooks: webhooks);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var item = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.Infrastructure,
+            updatedAt: outageStart.AddMinutes(2));
+        await store.CreateAsync(item);
+        await store.UpdateAsync(item);
+
+        await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
+
+        var sweep = Assert.Single(webhooks.Events, e => e.Event == "agent.restore_requeue_swept");
+        Assert.Equal("agent_restore", Detail(sweep, "reason"));
+        Assert.Equal("claude", Detail(sweep, "restoredAgent"));
+        Assert.Equal("1", Detail(sweep, "requeued"));
+        Assert.Equal("0", Detail(sweep, "skipped"));
+
+        var retry = Assert.Single(webhooks.Events, e => e.Event == "work_item.auto_retry");
+        Assert.Equal("agent_restore", Detail(retry, "reason"));
+        Assert.Equal("claude", Detail(retry, "restoredAgent"));
+        Assert.Equal(WorkItemState.Queued, retry.WorkItem!.State);
+    }
+
+    [Fact]
+    public async Task OperatorReset_PublishesRestoreAfterInVmSmokeCacheInvalidation()
+    {
+        var registry = NewRegistry();
+        var cache = new InVmSmokeCache(TimeSpan.FromMinutes(30));
+        cache.Set(
+            AgentKind.Claude,
+            "baseline",
+            new AgentSmokeResult(true, null, TimeSpan.FromMilliseconds(5), SmokeFailureCategory.None));
+        var reset = new AgentAvailabilityReset(registry, cache);
+        var observedCacheWasCleared = false;
+        ((IAgentRestoreSignal)registry).AgentRestored += _ =>
+            observedCacheWasCleared = cache.TryGet(AgentKind.Claude, "baseline") is null;
+
+        registry.MarkSmokeResult(
+            AgentKind.Claude,
+            new AgentSmokeResult(false, "missing binary", TimeSpan.Zero, SmokeFailureCategory.Persistent));
+
+        reset.Reset(AgentKind.Claude);
+
+        Assert.True(observedCacheWasCleared);
+        await Task.CompletedTask;
+    }
+
+    [Fact]
+    public async Task BreakerResetRestoreEventCarriesOutageWindowAndDrivesRequeue()
+    {
+        var fakeTime = new FakeTimeProvider(DateTimeOffset.UtcNow);
+        var registry = new AgentAvailabilityRegistry(
+            new AvailabilityOptions { MaxConsecutiveFastFails = 1 },
+            fakeTime,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        var captured = new List<AgentRestoredEvent>();
+        ((IAgentRestoreSignal)registry).AgentRestored += captured.Add;
+
+        var outageStart = fakeTime.GetUtcNow();
+        registry.RecordRunOutcome(AgentKind.Claude, success: false, duration: TimeSpan.FromMilliseconds(10));
+        Assert.False(registry.GetAvailability(AgentKind.Claude).Available);
+
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var item = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.Infrastructure,
+            updatedAt: outageStart.AddMinutes(1));
+        await store.CreateAsync(item);
+        await store.UpdateAsync(item);
+
+        fakeTime.Advance(TimeSpan.FromMinutes(5));
+        NewReset(registry).Reset(AgentKind.Claude);
+
+        var evt = Assert.Single(captured);
+        Assert.Equal(outageStart, evt.OutageStartedAt);
+
+        var summary = await NewScheduler(store, queue, enabled: true).SweepForTestAsync(evt);
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(item.Id))!.State);
+    }
+
+    [Fact]
+    public void RestoreSignal_DoesNotFireUntilAllExclusionSourcesClear()
+    {
+        var registry = NewRegistry();
+        var captured = new List<AgentRestoredEvent>();
+        ((IAgentRestoreSignal)registry).AgentRestored += captured.Add;
+
+        registry.MarkSmokeResult(
+            AgentKind.Claude,
+            new AgentSmokeResult(false, "host auth", TimeSpan.Zero, SmokeFailureCategory.Persistent),
+            SmokeExclusionSource.HostSmoke);
+        registry.MarkSmokeResult(
+            AgentKind.Claude,
+            new AgentSmokeResult(false, "vm binary", TimeSpan.Zero, SmokeFailureCategory.Persistent),
+            SmokeExclusionSource.InVmSmoke);
+
+        registry.MarkSmokeResult(
+            AgentKind.Claude,
+            new AgentSmokeResult(true, null, TimeSpan.FromMilliseconds(10), SmokeFailureCategory.None),
+            SmokeExclusionSource.HostSmoke);
+        Assert.Empty(captured);
+
+        registry.MarkSmokeResult(
+            AgentKind.Claude,
+            new AgentSmokeResult(true, null, TimeSpan.FromMilliseconds(10), SmokeFailureCategory.None),
+            SmokeExclusionSource.InVmSmoke);
+        Assert.Single(captured);
     }
 
     [Fact]
@@ -562,7 +860,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             AgentKind.Codex,
             new AgentSmokeResult(false, "missing binary", TimeSpan.Zero, SmokeFailureCategory.Persistent));
 
-        registry.Reset(AgentKind.Codex);
+        NewReset(registry).Reset(AgentKind.Codex);
 
         Assert.Single(captured);
         Assert.Equal(AgentKind.Codex.Value, captured[0].Agent.Value);
@@ -577,7 +875,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
 
         // No prior failure recorded — reset of a never-excluded agent must
         // not fabricate a restore event the consumer would then sweep on.
-        registry.Reset(AgentKind.Gemini);
+        NewReset(registry).Reset(AgentKind.Gemini);
 
         Assert.Empty(captured);
     }
@@ -586,12 +884,35 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         new(new AvailabilityOptions(), TimeProvider.System,
             NullLogger<AgentAvailabilityRegistry>.Instance);
 
+    private static AgentAvailabilityReset NewReset(AgentAvailabilityRegistry registry) =>
+        new(registry, new InVmSmokeCache(TimeSpan.FromMinutes(15)));
+
+    private static string? Detail(WebhookEvent evt, string propertyName)
+        => evt.Details?.GetType().GetProperty(propertyName)?.GetValue(evt.Details)?.ToString();
+
+    private static async Task WaitUntilAsync(Func<Task<bool>> predicate)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (await predicate())
+                return;
+            await Task.Delay(25);
+        }
+
+        Assert.True(await predicate(), "condition was not met before timeout");
+    }
+
     private static AgentRestoreRetryScheduler NewScheduler(
         IWorkItemStore store,
         InMemoryTaskQueue queue,
         bool enabled,
         int maxItemsPerRestore = 200,
-        ILogger<AgentRestoreRetryScheduler>? schedulerLogger = null)
+        ILogger<AgentRestoreRetryScheduler>? schedulerLogger = null,
+        IAgentRestoreSignal? signal = null,
+        IWebhookDispatcher? webhooks = null,
+        IProjectRepository? projects = null,
+        IAgentInvolvementStore? involvement = null)
     {
         var retrier = new WorkItemRetrier(
             store,
@@ -609,14 +930,19 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             store,
             retrier,
             () => opts,
-            schedulerLogger ?? NullLogger<AgentRestoreRetryScheduler>.Instance);
+            schedulerLogger ?? NullLogger<AgentRestoreRetryScheduler>.Instance,
+            signal,
+            webhooks,
+            projects,
+            involvement);
     }
 
     private static WorkItem NewItem(
-        AgentKind agent,
+        AgentKind? agent,
         WorkItemState state,
         string failureKind,
-        DateTimeOffset updatedAt) => new()
+        DateTimeOffset updatedAt,
+        string? lastError = "synthetic infra failure") => new()
         {
             Id = WorkItemId.New(),
             ProjectId = new ProjectId("proj"),
@@ -625,7 +951,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             Agent = agent,
             State = state,
             FailureKind = failureKind,
-            LastError = "synthetic infra failure",
+            LastError = lastError,
             UpdatedAt = updatedAt,
         };
 

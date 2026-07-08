@@ -3059,7 +3059,8 @@ builder.Services.AddSingleton<AgentRestoreRetryScheduler>(sp => new AgentRestore
     sp.GetRequiredService<ILogger<AgentRestoreRetryScheduler>>(),
     sp.GetRequiredService<IAgentRestoreSignal>(),
     sp.GetRequiredService<IWebhookDispatcher>(),
-    sp.GetRequiredService<IProjectRepository>()));
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetService<IAgentInvolvementStore>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentRestoreRetryScheduler>());
 
 // --- Failure-class recovery -------------------------------------------------
@@ -4664,9 +4665,9 @@ namespace CodeyBox.Api
 
         /// <summary>
         /// Auto-requeue policy for infra-failed work items on agent recovery —
-        /// see <see cref="AutoRequeueOnAgentRestoreConfig"/>. OFF by default;
-        /// enable after confirming the failure-class signal partitions cleanly
-        /// in your audit log.
+        /// see <see cref="AutoRequeueOnAgentRestoreConfig"/>. Enabled by
+        /// default so restored agents automatically drain outage-window
+        /// infra-failed victims through normal routing.
         /// </summary>
         public AutoRequeueOnAgentRestoreConfig AutoRequeueOnAgentRestore { get; set; } = new();
 
@@ -4996,9 +4997,32 @@ namespace CodeyBox.Api
     /// </summary>
     public sealed class AutoRequeueOnAgentRestoreConfig
     {
-        public bool Enabled { get; set; } = false;
+        /// <summary>
+        /// Master switch for restore-driven infra-failure sweeps. Default
+        /// <c>true</c>; set false only when an operator wants to perform these
+        /// recovery sweeps manually.
+        /// </summary>
+        public bool Enabled { get; set; } = true;
+
+        /// <summary>
+        /// Non-negative <see cref="TimeSpan"/> string (for example
+        /// <c>"00:30:00"</c>) subtracted from the restore event's outage start
+        /// when selecting failed candidates.
+        /// </summary>
         public string LookbackGrace { get; set; } = "00:30:00";
+
+        /// <summary>
+        /// Non-negative <see cref="TimeSpan"/> string (for example
+        /// <c>"00:05:00"</c>) added after the restore timestamp to absorb
+        /// ordering races between terminal writes and the restore signal.
+        /// </summary>
         public string PostRestoreMargin { get; set; } = "00:05:00";
+
+        /// <summary>
+        /// Positive cap on how many matching work items one restore event may
+        /// requeue. Additional matching candidates are counted as skipped and
+        /// left parked for a later reset/sweep.
+        /// </summary>
         public int MaxItemsPerRestore { get; set; } = 200;
     }
 

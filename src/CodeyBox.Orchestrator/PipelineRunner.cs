@@ -2208,7 +2208,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 }, CancellationToken.None);
                 await TransitionFailed(item,
                     $"credential smoke test failed: {smokeResult.FailureReason}",
-                    CancellationToken.None, project, failureKind: "infrastructure");
+                    CancellationToken.None, project, failureKind: WorkItemFailureKinds.Infrastructure, agent: agentKind);
                 return;
             }
 
@@ -2282,7 +2282,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 }, CancellationToken.None);
                 await TransitionFailed(item,
                     $"in-VM smoke gate: {reason}",
-                    CancellationToken.None, project, failureKind: "infrastructure");
+                    CancellationToken.None, project, failureKind: WorkItemFailureKinds.Infrastructure, agent: agentKind);
                 return;
             }
         }
@@ -3020,7 +3020,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             _log.LogWarning(
                 "Work item {Id} failed because agent {Agent} requires re-authentication in phase {Phase}: {Reason}",
                 item.Id, ex.Agent.Value, ex.Phase, ex.Message);
-            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: WorkItemFailureKinds.AuthRequired);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: WorkItemFailureKinds.AuthRequired, agent: ex.Agent);
         }
         catch (AgentUnavailableException ex)
         {
@@ -3031,7 +3031,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // failureKind=agent_unavailable and fix the routing, quota, or
             // credential gap rather than chasing a phantom merge bug.
             _log.LogWarning("Work item {Id} agent unavailable: {Error}", item.Id, ex.Message);
-            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "agent_unavailable");
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: WorkItemFailureKinds.AgentUnavailable, agent: ex.Agent);
         }
         catch (AgentStuckException stuckEx)
         {
@@ -3152,7 +3152,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     _authRequiredHandler.BuildReason("session-resume", authDetection.Classification, authDetection.IsStdoutOnly),
                     CancellationToken.None,
                     project,
-                    failureKind: WorkItemFailureKinds.AuthRequired);
+                    failureKind: WorkItemFailureKinds.AuthRequired,
+                    agent: exhaustedRunner.Kind);
                 return;
             }
 
@@ -5959,7 +5960,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             _log.LogWarning(
                 "Work item {Id} check-and-act failed because agent {Agent} requires re-authentication in phase {Phase}: {Reason}",
                 item.Id, authEx.Agent.Value, authEx.Phase, authEx.Message);
-            await TransitionFailed(item, authEx.Message, CancellationToken.None, project, failureKind: WorkItemFailureKinds.AuthRequired);
+            await TransitionFailed(item, authEx.Message, CancellationToken.None, project, failureKind: WorkItemFailureKinds.AuthRequired, agent: authEx.Agent);
         }
         catch (Exception ex)
         {
@@ -13128,7 +13129,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 var reason = smokeAvailability.Reason ?? "unavailable";
                 throw new AgentUnavailableException(
                     $"agent '{initialRunner.Kind.Value}' rejected by in-VM smoke gate in phase '{phase}': {reason}",
-                    $"{initialRunner.Kind.Value}: smoke gate: {reason}");
+                    $"{initialRunner.Kind.Value}: smoke gate: {reason}",
+                    initialRunner.Kind);
             }
 
             try
@@ -13346,7 +13348,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 if (smokeRejected)
                     throw new AgentUnavailableException(
                         $"all eligible member(s) of class '{classId}' were rejected by the in-VM smoke gate in phase '{phase}'; last rejection: {safeReason}",
-                        safeReason);
+                        safeReason,
+                        currentMember.Agent);
 
                 if (pausedRejected && sawQuotaBlockedCandidate)
                 {
@@ -13528,7 +13531,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     quotaResetAt: null,
                     terminalException: new AgentUnavailableException(
                         $"agent '{currentRunner.Kind.Value}' rejected by in-VM smoke gate in phase '{phase}': {safeReason}",
-                        safeReason),
+                        safeReason,
+                        currentRunner.Kind),
                     smokeRejected: true);
                 continue;
             }
@@ -17044,7 +17048,15 @@ Original merge-phase failure (JSON string, for context only):
         }
     }
 
-    private async Task TransitionFailed(WorkItem item, string error, CancellationToken ct, Project? project = null, string? failureKind = null, DateTimeOffset? quotaResetAt = null, string? cancellationSource = null)
+    private async Task TransitionFailed(
+        WorkItem item,
+        string error,
+        CancellationToken ct,
+        Project? project = null,
+        string? failureKind = null,
+        DateTimeOffset? quotaResetAt = null,
+        string? cancellationSource = null,
+        AgentKind? agent = null)
     {
         if (string.Equals(failureKind, "transient", StringComparison.OrdinalIgnoreCase))
         {
@@ -17073,6 +17085,7 @@ Original merge-phase failure (JSON string, for context only):
                 new WorkItemTerminalFailureTransitionCommand
                 {
                     FailureKind = failureKind,
+                    Agent = agent,
                     QuotaResetAt = effectiveQuotaResetAt,
                     CancellationSource = cancellationSource,
                 },

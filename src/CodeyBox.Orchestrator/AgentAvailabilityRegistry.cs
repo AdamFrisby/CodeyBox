@@ -52,7 +52,7 @@ namespace CodeyBox.Orchestrator;
 /// <para>Thread-safe; updates use a small per-agent lock so concurrent
 /// outcomes from many in-flight items don't corrupt counters.</para>
 /// </summary>
-public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmokeAvailabilityRegistry, IAgentAuthAvailabilityRegistry, IAgentAuthRequiredAvailabilityReader, IAgentAvailabilityRecoverySignal, IAgentRestoreSignal
+public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmokeAvailabilityRegistry, IAgentAuthAvailabilityRegistry, IAgentAuthRequiredAvailabilityReader, IAgentAvailabilityRecoverySignal, IAgentRestoreSignal, IAgentRestorePublisher
 {
     private readonly AvailabilityOptions _opts;
     private readonly TimeProvider _time;
@@ -238,6 +238,8 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
             Reason: entry.CombinedReason(),
             SourceChanged: !hadSourceExclusion);
     }
+
+    public void PublishRestored(AgentRestoredEvent payload) => FireRestoredEvent(payload);
 
     private void FireRestoredEvent(AgentRestoredEvent payload)
     {
@@ -438,9 +440,9 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
     /// observation, so the snapshot accurately reflects post-reset state
     /// rather than mixing stale and fresh evidence.
     /// </summary>
-    public void Reset(AgentKind kind)
+    public AgentRestoredEvent? Reset(AgentKind kind)
     {
-        if (!_entries.TryGetValue(kind, out var entry)) return;
+        if (!_entries.TryGetValue(kind, out var entry)) return null;
         var recovered = false;
         AgentRestoredEvent? restored = null;
         var now = _time.GetUtcNow();
@@ -463,10 +465,9 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
                 restored = new AgentRestoredEvent(kind, outageStart, now);
         }
         _log.LogInformation("Agent {Agent} availability reset by operator", kind.Value);
-        if (restored is not null)
-            FireRestoredEvent(restored);
         if (recovered)
             NotifyAgentRecovered(kind);
+        return restored;
     }
 
     /// <summary>
@@ -679,15 +680,24 @@ public interface ISmokeAvailabilityRegistry : IAgentEffectiveAvailabilityReader
 
     /// <summary>
     /// Clears <paramref name="kind"/>'s exclusion state, fast-fail counter, and
-    /// prior probe timestamps. Lives on the smoke port (which owns the exclusion
-    /// taxonomy) rather than the narrow routing port, so the operator-reset
-    /// adapter (<see cref="AgentAvailabilityReset"/>) can pair it with the in-VM
-    /// cache invalidation through an abstraction instead of binding to the
-    /// concrete registry. Deliberately absent from
-    /// <see cref="IAgentAvailabilityRegistry"/> so routing/dispatch consumers
-    /// cannot clear the registry without also dropping the cache.
+    /// prior probe timestamps, returning the restore event payload when the
+    /// reset changed the agent from excluded to available. The operator-reset
+    /// adapter (<see cref="AgentAvailabilityReset"/>) publishes that payload
+    /// only after it also invalidates the in-VM smoke cache. Deliberately absent
+    /// from <see cref="IAgentAvailabilityRegistry"/> so routing/dispatch
+    /// consumers cannot clear the registry without also dropping the cache.
     /// </summary>
-    void Reset(AgentKind kind);
+    AgentRestoredEvent? Reset(AgentKind kind);
+}
+
+/// <summary>
+/// Internal publisher side of <see cref="IAgentRestoreSignal"/>. The operator
+/// reset adapter uses this to emit the restore event only after the companion
+/// in-VM smoke cache invalidation has completed.
+/// </summary>
+public interface IAgentRestorePublisher
+{
+    void PublishRestored(AgentRestoredEvent payload);
 }
 
 /// <summary>
