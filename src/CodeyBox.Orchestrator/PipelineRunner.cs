@@ -9501,7 +9501,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     continue;
                 }
                 var maxPar = project.Audit.MaxLlmAuditorParallelism;
-                using var sem = new SemaphoreSlim(maxPar, maxPar);
+                var sem = new SemaphoreSlim(maxPar, maxPar);
+                var disposeSemaphoreOnExit = true;
 
                 (SandboxSpec Spec, AuditReviewDotnetShim DotnetShim) BuildLlmSandboxSpec(AgentCredential? candidateCredential)
                 {
@@ -9711,128 +9712,195 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         .ConfigureAwait(false);
                 }
 
-                var llmTasks = llmPairs.Select(async (pair, index) =>
+                try
                 {
-                    await sem.WaitAsync(ct);
-                    try
+                    var llmTasks = llmPairs.Select(async (pair, index) =>
                     {
-                        AuditorRunRecord run;
+                        await sem.WaitAsync(ct);
                         try
                         {
-                            run = await RunLlmPairAsync(pair);
+                            AuditorRunRecord run;
+                            try
+                            {
+                                run = await RunLlmPairAsync(pair);
+                            }
+                            catch (AgentClassExhaustedException ex)
+                            {
+                                // Every class member exhausted mid-iteration while
+                                // running THIS auditor. The whole spill-to-peer pool
+                                // is gone: capture and re-raise as the task's
+                                // exception so we can surface it after sibling
+                                // tasks finish. The bug report's hard invariant —
+                                // a Pass verdict requires every configured auditor
+                                // to have produced a verdict — means we must park,
+                                // not silently skip. Counting as a finding would
+                                // re-introduce the 1aa5a13f false-AuditFailed
+                                // regression; raising as a transient execution
+                                // failure parks the item in WaitingForQuotaReset
+                                // and the QuotaRetryScheduler resumes it without
+                                // burning a rework iteration.
+                                AuditLog.LlmAuditorParkedQuota(item.Id, pair.Auditor.Name, ex.MemberCount);
+                                _log.LogWarning(
+                                    "LLM auditor '{Auditor}' could not run mid-iteration: all {Members} class member(s) exhausted ({Reason}); parking work item",
+                                    pair.Auditor.Name, ex.MemberCount, ex.Message);
+                                throw;
+                            }
+                            await PublishLlmPartialProgressAsync(index, run, ct);
+                            return (Run: run, Auditor: pair.Auditor, Index: index);
                         }
-                        catch (AgentClassExhaustedException ex)
+                        finally { sem.Release(); }
+                    }).ToList();
+
+                    // Wait for ALL tasks to settle (success OR failure) before
+                    // inspecting outcomes. Task.WhenAll itself does wait for every
+                    // supplied task to complete, but `await Task.WhenAll(tasks)`
+                    // surfaces only ONE of the faulted exceptions (typically the
+                    // first observed by the awaiter), which can mask a sibling
+                    // task's AgentClassExhaustedException behind an unrelated
+                    // failure and route the work item to the generic
+                    // infrastructure-failure path even though a configured
+                    // auditor was quota-blocked and should have parked the item
+                    // in WaitingForQuotaReset. The continuation form below never
+                    // throws — exceptions stay on each Task and we walk them in
+                    // stable order so exhaustion wins over sibling faults.
+                    var allLlmTasksSettled = Task.WhenAll(llmTasks).ContinueWith(
+                        completed =>
                         {
-                            // Every class member exhausted mid-iteration while
-                            // running THIS auditor. The whole spill-to-peer pool
-                            // is gone: capture and re-raise as the task's
-                            // exception so we can surface it after sibling
-                            // tasks finish. The bug report's hard invariant —
-                            // a Pass verdict requires every configured auditor
-                            // to have produced a verdict — means we must park,
-                            // not silently skip. Counting as a finding would
-                            // re-introduce the 1aa5a13f false-AuditFailed
-                            // regression; raising as a transient execution
-                            // failure parks the item in WaitingForQuotaReset
-                            // and the QuotaRetryScheduler resumes it without
-                            // burning a rework iteration.
-                            AuditLog.LlmAuditorParkedQuota(item.Id, pair.Auditor.Name, ex.MemberCount);
-                            _log.LogWarning(
-                                "LLM auditor '{Auditor}' could not run mid-iteration: all {Members} class member(s) exhausted ({Reason}); parking work item",
-                                pair.Auditor.Name, ex.MemberCount, ex.Message);
-                            throw;
-                        }
-                        await PublishLlmPartialProgressAsync(index, run, ct);
-                        return (Run: run, Auditor: pair.Auditor, Index: index);
-                    }
-                    finally { sem.Release(); }
-                }).ToList();
+                            _ = completed.Exception;
+                        },
+                        CancellationToken.None,
+                        TaskContinuationOptions.ExecuteSynchronously,
+                        TaskScheduler.Default);
 
-                // Wait for ALL tasks to settle (success OR failure) before
-                // inspecting outcomes. Task.WhenAll itself does wait for every
-                // supplied task to complete, but `await Task.WhenAll(tasks)`
-                // surfaces only ONE of the faulted exceptions (typically the
-                // first observed by the awaiter), which can mask a sibling
-                // task's AgentClassExhaustedException behind an unrelated
-                // failure and route the work item to the generic
-                // infrastructure-failure path even though a configured
-                // auditor was quota-blocked and should have parked the item
-                // in WaitingForQuotaReset. The continuation form below never
-                // throws — exceptions stay on each Task and we walk them in
-                // stable order so exhaustion wins over sibling faults.
-                await Task.WhenAll(llmTasks).ContinueWith(
-                    _ => { },
-                    CancellationToken.None,
-                    TaskContinuationOptions.ExecuteSynchronously,
-                    TaskScheduler.Default);
-
-                // Cancellation MUST be honoured before exhaustion / generic
-                // failures are inspected: a cancelled audit phase has to
-                // transition the work item to Cancelled, not Failed. Without
-                // this explicit re-throw, the loop below would skip the
-                // (cancelled, task.Exception=null) entries silently and the
-                // pipeline would mis-route an Operator-initiated cancel.
-                ct.ThrowIfCancellationRequested();
-
-                // HARD INVARIANT: a Pass verdict must never emerge while an
-                // auditor was unable to run because the entire spill-to-peer
-                // pool was quota-exhausted. Surface exhaustion FIRST (in
-                // stable auditor order), before propagating any sibling
-                // execution exception, so the work item parks for quota
-                // reset instead of being routed to failureKind="other" or
-                // "infrastructure". QuotaRetryScheduler resumes the same
-                // iteration at the earliest reset.
-                AgentClassExhaustedException? firstExhaustion = null;
-                ExceptionDispatchInfo? firstOtherException = null;
-                var incompleteAuditors = new List<string>();
-                foreach (var task in llmTasks)
-                {
-                    if (task.IsCompletedSuccessfully) continue;
-                    if (task.IsCanceled)
+                    var completedLlmWait = await Task.WhenAny(allLlmTasksSettled, WaitForCancellationAsync(ct))
+                        .ConfigureAwait(false);
+                    if (completedLlmWait != allLlmTasksSettled)
                     {
-                        // A per-task cancellation that wasn't covered by the
-                        // outer ct check above (e.g. a phase timeout firing
-                        // on a child token). Surface as cancellation rather
-                        // than letting a downstream .Result re-wrap it as a
-                        // generic failure.
-                        throw new OperationCanceledException(ct);
+                        disposeSemaphoreOnExit = false;
+                        _ = allLlmTasksSettled.ContinueWith(
+                            static (_, state) => ((SemaphoreSlim)state!).Dispose(),
+                            sem,
+                            CancellationToken.None,
+                            TaskContinuationOptions.ExecuteSynchronously,
+                            TaskScheduler.Default);
+                        ct.ThrowIfCancellationRequested();
                     }
-                    var inner = task.Exception?.InnerException ?? task.Exception;
-                    if (inner is null) continue;
-                    if (firstExhaustion is null && inner is AgentClassExhaustedException exhaustion)
-                        firstExhaustion = exhaustion;
-                    else if (inner is AuditorIdleTimeoutException timeout)
-                        incompleteAuditors.Add(timeout.AuditorName);
-                    else if (firstExhaustion is null && firstOtherException is null)
-                        firstOtherException = ExceptionDispatchInfo.Capture(inner);
-                }
-                if (firstExhaustion is not null)
-                {
-                    await PublishPartialProgressAsync(
-                        [],
-                        [],
-                        ct,
-                        AuditProgressUpdateOperation.Replace).ConfigureAwait(false);
-                    throw firstExhaustion;
-                }
 
-                if (firstOtherException is not null)
-                {
-                    await ClearPartialProgressAsync(ct).ConfigureAwait(false);
-                    firstOtherException.Throw();
-                }
+                    await allLlmTasksSettled.ConfigureAwait(false);
 
-                if (incompleteAuditors.Count > 0)
-                {
-                    var completedSnapshot = completedLlmProgress
-                        .OrderBy(e => e.Index)
-                        .ToList();
-                    foreach (var entry in completedSnapshot)
+                    // Cancellation MUST be honoured before exhaustion / generic
+                    // failures are inspected: a cancelled audit phase has to
+                    // transition the work item to Cancelled, not Failed. Without
+                    // this explicit re-throw, the loop below would skip the
+                    // (cancelled, task.Exception=null) entries silently and the
+                    // pipeline would mis-route an Operator-initiated cancel.
+                    ct.ThrowIfCancellationRequested();
+
+                    // HARD INVARIANT: a Pass verdict must never emerge while an
+                    // auditor was unable to run because the entire spill-to-peer
+                    // pool was quota-exhausted. Surface exhaustion FIRST (in
+                    // stable auditor order), before propagating any sibling
+                    // execution exception, so the work item parks for quota
+                    // reset instead of being routed to failureKind="other" or
+                    // "infrastructure". QuotaRetryScheduler resumes the same
+                    // iteration at the earliest reset.
+                    AgentClassExhaustedException? firstExhaustion = null;
+                    ExceptionDispatchInfo? firstOtherException = null;
+                    var incompleteAuditors = new List<string>();
+                    foreach (var task in llmTasks)
+                    {
+                        if (task.IsCompletedSuccessfully) continue;
+                        if (task.IsCanceled)
+                        {
+                            // A per-task cancellation that wasn't covered by the
+                            // outer ct check above (e.g. a phase timeout firing
+                            // on a child token). Surface as cancellation rather
+                            // than letting a downstream .Result re-wrap it as a
+                            // generic failure.
+                            throw new OperationCanceledException(ct);
+                        }
+                        var inner = task.Exception?.InnerException ?? task.Exception;
+                        if (inner is null) continue;
+                        if (firstExhaustion is null && inner is AgentClassExhaustedException exhaustion)
+                            firstExhaustion = exhaustion;
+                        else if (inner is AuditorIdleTimeoutException timeout)
+                            incompleteAuditors.Add(timeout.AuditorName);
+                        else if (firstExhaustion is null && firstOtherException is null)
+                            firstOtherException = ExceptionDispatchInfo.Capture(inner);
+                    }
+                    if (firstExhaustion is not null)
+                    {
+                        await PublishPartialProgressAsync(
+                            [],
+                            [],
+                            ct,
+                            AuditProgressUpdateOperation.Replace).ConfigureAwait(false);
+                        throw firstExhaustion;
+                    }
+
+                    if (firstOtherException is not null)
+                    {
+                        await ClearPartialProgressAsync(ct).ConfigureAwait(false);
+                        firstOtherException.Throw();
+                    }
+
+                    if (incompleteAuditors.Count > 0)
+                    {
+                        var completedSnapshot = completedLlmProgress
+                            .OrderBy(e => e.Index)
+                            .ToList();
+                        foreach (var entry in completedSnapshot)
+                        {
+                            var run = entry.Run;
+                            await PostProcessAuditorRunAsync(run, workRunner, needsCreds, item, project, ctx, ct);
+                            if (needsCreds && run.Runner.Kind != workRunner.Kind)
+                                activeAuditAgentKind ??= run.Runner.Kind;
+                            if (detectDeclaredShortCircuit
+                                && run.Auditor.CanShortCircuitOnBlockingFinding
+                                && IsDeclaredShortCircuitBlockingResult(run.Result))
+                            {
+                                declaredShortCircuitBlocking = true;
+                            }
+                        }
+
+                        var partialFindings = baseFindingsBeforeLlm
+                            .Concat(completedSnapshot.SelectMany(e => e.Run.Result.Findings))
+                            .ToList();
+                        var partialCompleted = baseCompletedBeforeLlm
+                            .Concat(completedSnapshot.Select(e => e.Run.Auditor.Name))
+                            .ToList();
+                        _log.LogWarning(
+                            "Audit iteration {Iteration} has incomplete LLM auditor verdict(s): {Auditors}; continuing with {FindingCount} completed finding(s)",
+                            ctx.Iteration,
+                            string.Join(", ", incompleteAuditors),
+                            partialFindings.Count);
+                        return new AuditorBatchResult(
+                            partialFindings,
+                            activeAuditAgentKind,
+                            declaredShortCircuitBlocking,
+                            IncompleteVerdict: true,
+                            CompletedAuditors: partialCompleted,
+                            IncompleteAuditors: incompleteAuditors,
+                            PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
+                            BuildTestGateFailed: buildTestGateFailed);
+                    }
+
+                    // Every task succeeded — gather results in stable order.
+                    var llmRuns = llmTasks.Select(t => t.Result).OrderBy(t => t.Index).ToList();
+
+                    // Post-process in stable auditor order (same as llmPairs).
+                    // entry.Run is non-nullable here: the only path that could
+                    // produce a null record was the silent-skip variant the patch
+                    // removed, and exhaustion is now thrown above before we
+                    // reach this loop.
+                    foreach (var entry in llmRuns)
                     {
                         var run = entry.Run;
                         await PostProcessAuditorRunAsync(run, workRunner, needsCreds, item, project, ctx, ct);
                         if (needsCreds && run.Runner.Kind != workRunner.Kind)
                             activeAuditAgentKind ??= run.Runner.Kind;
+                        findings.AddRange(run.Result.Findings);
+                        completedAuditors.Add(run.Auditor.Name);
                         if (detectDeclaredShortCircuit
                             && run.Auditor.CanShortCircuitOnBlockingFinding
                             && IsDeclaredShortCircuitBlockingResult(run.Result))
@@ -9840,60 +9908,20 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             declaredShortCircuitBlocking = true;
                         }
                     }
-
-                    var partialFindings = baseFindingsBeforeLlm
-                        .Concat(completedSnapshot.SelectMany(e => e.Run.Result.Findings))
-                        .ToList();
-                    var partialCompleted = baseCompletedBeforeLlm
-                        .Concat(completedSnapshot.Select(e => e.Run.Auditor.Name))
-                        .ToList();
-                    _log.LogWarning(
-                        "Audit iteration {Iteration} has incomplete LLM auditor verdict(s): {Auditors}; continuing with {FindingCount} completed finding(s)",
-                        ctx.Iteration,
-                        string.Join(", ", incompleteAuditors),
-                        partialFindings.Count);
-                    return new AuditorBatchResult(
-                        partialFindings,
-                        activeAuditAgentKind,
-                        declaredShortCircuitBlocking,
-                        IncompleteVerdict: true,
-                        CompletedAuditors: partialCompleted,
-                        IncompleteAuditors: incompleteAuditors,
-                        PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
-                        BuildTestGateFailed: buildTestGateFailed);
+                    if (project.Audit.StopOnFirstFailure && findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
+                        return new AuditorBatchResult(
+                            findings.ToList(),
+                            activeAuditAgentKind,
+                            declaredShortCircuitBlocking,
+                            CompletedAuditors: completedAuditors.ToList(),
+                            PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
+                            BuildTestGateFailed: buildTestGateFailed);
                 }
-
-                // Every task succeeded — gather results in stable order.
-                var llmRuns = llmTasks.Select(t => t.Result).OrderBy(t => t.Index).ToList();
-
-                // Post-process in stable auditor order (same as llmPairs).
-                // entry.Run is non-nullable here: the only path that could
-                // produce a null record was the silent-skip variant the patch
-                // removed, and exhaustion is now thrown above before we
-                // reach this loop.
-                foreach (var entry in llmRuns)
+                finally
                 {
-                    var run = entry.Run;
-                    await PostProcessAuditorRunAsync(run, workRunner, needsCreds, item, project, ctx, ct);
-                    if (needsCreds && run.Runner.Kind != workRunner.Kind)
-                        activeAuditAgentKind ??= run.Runner.Kind;
-                    findings.AddRange(run.Result.Findings);
-                    completedAuditors.Add(run.Auditor.Name);
-                    if (detectDeclaredShortCircuit
-                        && run.Auditor.CanShortCircuitOnBlockingFinding
-                        && IsDeclaredShortCircuitBlockingResult(run.Result))
-                    {
-                        declaredShortCircuitBlocking = true;
-                    }
+                    if (disposeSemaphoreOnExit)
+                        sem.Dispose();
                 }
-                if (project.Audit.StopOnFirstFailure && findings.Any(f => f.Severity >= project.Audit.FailingSeverity))
-                    return new AuditorBatchResult(
-                        findings.ToList(),
-                        activeAuditAgentKind,
-                        declaredShortCircuitBlocking,
-                        CompletedAuditors: completedAuditors.ToList(),
-                        PassedBuildTestGateEvidence: passedBuildTestGateEvidence,
-                        BuildTestGateFailed: buildTestGateFailed);
             }
         }
 
