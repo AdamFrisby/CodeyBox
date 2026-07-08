@@ -33,8 +33,12 @@ public interface IPresetCatalog
     /// <summary>Validated LLM review frame template used by configured LLM auditors.</summary>
     string LlmPromptFrameTemplate { get; }
 
-    /// <summary>Validated LLM plan-review frame template used by configured LLM auditors.</summary>
-    string LlmPlanPromptFrameTemplate { get; }
+    /// <summary>
+    /// Validated LLM plan-review frame template used by configured LLM auditors.
+    /// External catalogs that predate plan review remain source-compatible via
+    /// the standard built-in plan frame.
+    /// </summary>
+    string LlmPlanPromptFrameTemplate => CodeyBox.Audit.Llm.LlmPromptFrameTemplate.DefaultPlanFrameTemplate;
 }
 
 /// <summary>

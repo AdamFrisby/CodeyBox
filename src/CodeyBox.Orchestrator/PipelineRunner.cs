@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.Runtime.ExceptionServices;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
@@ -1480,22 +1479,28 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     Auditor: "plan-review-gate",
                     Severity: "error",
                     Category: "plan-review",
-                    Summary: "Blocking deterministic plan validation issue",
-                    Evidence: "Reviewer prose is withheld from the planning prompt; inspect the audit report by findingId.",
-                    FindingId: BuildPlanReviewFindingId("plan-review-gate", decision.Summary, text)),
+                    Summary: SanitizePlanReviewFeedbackText(
+                        decision.Summary,
+                        MaxPlanReworkFeedbackSummaryChars),
+                    Evidence: BuildPlanReviewFeedbackEvidence(text, location: null),
+                    FindingId: FindingIdComputer.Compute("plan-review-gate", decision.Summary, [])),
             ]);
     }
 
     private static PlanReviewFeedbackIssue BuildPlanReworkFeedbackIssue(AuditFinding finding)
     {
         var category = InferPlanReviewFeedbackCategory(finding.AuditorName);
+        var summary = SanitizePlanReviewFeedbackText(finding.Title, MaxPlanReworkFeedbackSummaryChars);
+        if (string.IsNullOrWhiteSpace(summary))
+            summary = $"Blocking {category} plan review issue";
+
         return new PlanReviewFeedbackIssue(
             Auditor: SanitizePlanReviewFeedbackText(finding.AuditorName, MaxPlanReworkFeedbackAuditorChars),
             Severity: finding.Severity.ToString().ToLowerInvariant(),
             Category: category,
-            Summary: $"Blocking {category} plan review issue",
-            Evidence: "Reviewer prose is withheld from the planning prompt; inspect the audit report by findingId.",
-            FindingId: BuildPlanReviewFindingId(finding.AuditorName, finding.Title, finding.Description));
+            Summary: summary,
+            Evidence: BuildPlanReviewFeedbackEvidence(finding.Description, finding.Location),
+            FindingId: BuildPlanReviewFindingId(finding));
     }
 
     private static string InferPlanReviewFeedbackCategory(string auditorName)
@@ -1535,18 +1540,34 @@ public sealed partial class PipelineRunner : IPipelineRunner
         return sb.ToString().Trim();
     }
 
-    private static string BuildPlanReviewFindingId(string auditor, string? title, string? description)
+    private static string BuildPlanReviewFeedbackEvidence(string? description, string? location)
     {
-        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes($"{auditor}\n{title}\n{description}"));
-        return Convert.ToHexString(bytes)[..PlanReviewFindingIdHexChars].ToLowerInvariant();
+        var evidence = SanitizePlanReviewFeedbackText(description, MaxPlanReworkFeedbackEvidenceChars);
+        var sanitizedLocation = SanitizePlanReviewFeedbackText(location, MaxPlanReworkFeedbackLocationChars);
+        if (!string.IsNullOrWhiteSpace(sanitizedLocation))
+        {
+            evidence = string.IsNullOrWhiteSpace(evidence)
+                ? $"Location: {sanitizedLocation}"
+                : $"{evidence} Location: {sanitizedLocation}";
+        }
+
+        return string.IsNullOrWhiteSpace(evidence)
+            ? "No additional reviewer evidence was provided."
+            : evidence;
+    }
+
+    private static string BuildPlanReviewFindingId(AuditFinding finding)
+    {
+        var (files, _) = ParseLocation(finding.Location);
+        return FindingIdComputer.Compute(finding.AuditorName, finding.Title, files);
     }
 
     private const int MaxPlanReworkFeedbackIssues = 12;
     private const int MaxPlanReworkFeedbackAuditorChars = 80;
     private const int MaxPlanReworkFeedbackCategoryChars = 40;
-    // 12 hex chars gives 48 bits: short enough for prompts/logs, with
-    // negligible collision risk for a bounded per-plan feedback list.
-    private const int PlanReviewFindingIdHexChars = 12;
+    private const int MaxPlanReworkFeedbackSummaryChars = 220;
+    private const int MaxPlanReworkFeedbackEvidenceChars = 1200;
+    private const int MaxPlanReworkFeedbackLocationChars = 200;
 
     private async Task<WorkItem> ApproveReviewedPlanAsync(
         WorkItem current,

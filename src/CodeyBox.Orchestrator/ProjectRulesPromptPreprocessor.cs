@@ -40,6 +40,14 @@ public sealed class ProjectRulesPromptPreprocessor : IAgentPromptPreprocessor
 
     public async Task<string> ProcessAsync(PromptContext ctx, string prompt, CancellationToken ct = default)
     {
+        if (ctx.Phase == AgentPromptPhase.PlanReview)
+        {
+            _log.LogDebug(
+                "Project rules prompt preprocessor skipped plan-review prompt for work item {WorkItemId}",
+                ctx.ItemId);
+            return prompt;
+        }
+
         var path = NormalizeRulesPath(_options.CurrentValue.ProjectRulesPath);
         if (path is null)
         {

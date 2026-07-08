@@ -36,6 +36,16 @@ public sealed class ProjectAuditorComposerPresetTests
     }
 
     [Fact]
+    public void IPresetCatalog_DefaultPlanFrameKeepsLegacyCatalogsSourceCompatible()
+    {
+        IPresetCatalog catalog = new LegacyCatalog();
+
+        Assert.Equal(
+            CodeyBox.Audit.Llm.LlmPromptFrameTemplate.DefaultPlanFrameTemplate,
+            catalog.LlmPlanPromptFrameTemplate);
+    }
+
+    [Fact]
     public void Compose_UatPresetGoldenAuditorList()
     {
         var composer = new ProjectAuditorComposer(new PresetCatalog());
@@ -182,6 +192,108 @@ public sealed class ProjectAuditorComposerPresetTests
 
         Assert.DoesNotContain("custom:plan-review", codeTargets);
         Assert.Contains("custom:plan-review", planTargets);
+    }
+
+    [Fact]
+    public void ComposeForTarget_AuditTypeTargetsApplyToShellPatternsAndLlmAuditors()
+    {
+        var catalog = new PresetCatalog(new PresetCatalogOptions
+        {
+            AuditTypeOverrides = new Dictionary<string, AuditTypePresetOverride>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["plan-tools"] = new()
+                {
+                    Replace = true,
+                    ReviewFocus = "review the plan",
+                    Targets = ["plan"],
+                    Auditors =
+                    [
+                        new ConfiguredAuditor
+                        {
+                            Name = "plan-tools:shell",
+                            Argv = ["true"],
+                        },
+                    ],
+                    Patterns =
+                    [
+                        new ConfiguredDiffPattern
+                        {
+                            Regex = "unsafe",
+                            Description = "unsafe plan marker",
+                        },
+                    ],
+                },
+            },
+        });
+        var composer = new ProjectAuditorComposer(catalog);
+        var project = new Project
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.com/repo.git",
+            Audit = new ProjectAudit { AuditTypes = ["plan-tools"] },
+        };
+
+        var codeTargets = composer.ComposeForTarget(project, new CapturingAgent(), AuditTarget.Code)
+            .Select(a => a.Name)
+            .ToArray();
+        var planTargets = composer.ComposeForTarget(project, new CapturingAgent(), AuditTarget.Plan)
+            .Select(a => a.Name)
+            .ToArray();
+
+        Assert.Empty(codeTargets);
+        Assert.Equal(
+            ["plan-tools:shell", "plan-tools:deterministic-patterns", "plan-tools:llm-review"],
+            planTargets);
+    }
+
+    [Fact]
+    public void ComposeForTarget_PluginAuditorUsesItsOwnTargetsWhenDescriptorOmitsTargets()
+    {
+        var composer = new ProjectAuditorComposer(
+            new PresetCatalog(),
+            [new PlanOnlyPluginAuditor()],
+            NullLogger<ProjectAuditorComposer>.Instance);
+        var project = ProjectWithCustom(new CustomAuditorDescriptor
+        {
+            Kind = "plugin",
+            PluginId = "test.plan-plugin-auditor",
+        });
+
+        var codeTargets = composer.ComposeForTarget(project, new CapturingAgent(), AuditTarget.Code)
+            .Select(a => a.Name)
+            .ToArray();
+        var planTargets = composer.ComposeForTarget(project, new CapturingAgent(), AuditTarget.Plan)
+            .Select(a => a.Name)
+            .ToArray();
+
+        Assert.DoesNotContain("test:plan-plugin-auditor", codeTargets);
+        Assert.Contains("test:plan-plugin-auditor", planTargets);
+    }
+
+    [Fact]
+    public void ComposeForTarget_PluginDescriptorTargetsNarrowPluginTargets()
+    {
+        var composer = new ProjectAuditorComposer(
+            new PresetCatalog(),
+            [new BothTargetsPluginAuditor()],
+            NullLogger<ProjectAuditorComposer>.Instance);
+        var project = ProjectWithCustom(new CustomAuditorDescriptor
+        {
+            Kind = "plugin",
+            PluginId = "test.both-targets-plugin-auditor",
+            Targets = ["plan"],
+        });
+
+        var codeTargets = composer.ComposeForTarget(project, new CapturingAgent(), AuditTarget.Code)
+            .Select(a => a.Name)
+            .ToArray();
+        var planTargets = composer.ComposeForTarget(project, new CapturingAgent(), AuditTarget.Plan)
+            .Select(a => a.Name)
+            .ToArray();
+
+        Assert.DoesNotContain("test:both-targets-plugin-auditor", codeTargets);
+        Assert.Contains("test:both-targets-plugin-auditor", planTargets);
     }
 
     [Fact]
@@ -703,6 +815,37 @@ public sealed class ProjectAuditorComposerPresetTests
         public AuditCapabilities Required => AuditCapabilities.None;
         public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
             => Task.FromResult(new AuditResult(true, []));
+    }
+
+    [CodeyBoxPlugin("test.plan-plugin-auditor", "Plan Plugin Auditor")]
+    private sealed class PlanOnlyPluginAuditor : IAuditor
+    {
+        public string Name => "test:plan-plugin-auditor";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public IReadOnlySet<AuditTarget> Targets => AuditTargets.PlanOnly;
+        public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
+            => Task.FromResult(new AuditResult(true, []));
+    }
+
+    [CodeyBoxPlugin("test.both-targets-plugin-auditor", "Both Targets Plugin Auditor")]
+    private sealed class BothTargetsPluginAuditor : IAuditor
+    {
+        public string Name => "test:both-targets-plugin-auditor";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public IReadOnlySet<AuditTarget> Targets => AuditTargets.PlanAndCode;
+        public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
+            => Task.FromResult(new AuditResult(true, []));
+    }
+
+    private sealed class LegacyCatalog : IPresetCatalog
+    {
+        public IReadOnlyList<IAuditor> ResolveLanguage(string name, PresetContext ctx) => [];
+        public IReadOnlyList<IAuditor> ResolveAuditType(string name, PresetContext ctx) => [];
+        public IReadOnlyList<string> KnownLanguages => [];
+        public IReadOnlyList<string> KnownAuditTypes => [];
+        public string LlmPromptFrameTemplate => "{{reviewFocus}}\n{{resultFile}}";
     }
 
     private sealed class ResultFileSandbox : ISandbox

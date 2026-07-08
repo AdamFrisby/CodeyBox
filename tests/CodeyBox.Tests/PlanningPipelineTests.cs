@@ -921,10 +921,11 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal(2, gate.Calls);
         Assert.Equal(1, agent.WorkCalls);
         Assert.NotNull(final.PlanReviewedAt);
-        // The rework turn carries bounded local metadata, not reviewer prose.
+        // The rework turn carries bounded, sanitized feedback so the planner
+        // can revise the actual problem.
         Assert.Contains("was REJECTED by plan review", agent.LastPlanningPrompt, StringComparison.Ordinal);
         Assert.Contains("PLAN_REVIEW_REWORK_FEEDBACK_JSON", agent.LastPlanningPrompt, StringComparison.Ordinal);
-        Assert.DoesNotContain("needs a different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -966,8 +967,61 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal(1, agent.WorkCalls);
         Assert.Contains("PLAN_REVIEW_REWORK_FEEDBACK_JSON", agent.LastPlanningPrompt, StringComparison.Ordinal);
         Assert.Contains("\"Category\":\"plan\"", agent.LastPlanningPrompt, StringComparison.Ordinal);
-        Assert.DoesNotContain("needs a different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
-        Assert.DoesNotContain("The data flow is backward", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("needs a different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("The data flow is backward", agent.LastPlanningPrompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PlanOn_ReworkedPlanArtifactIsReviewedAndPersisted()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        const string RevisedMarker = "revised-marker";
+        var initialPlan = """
+            {
+              "approach": "initial approach without the required marker.",
+              "files": ["output.txt"],
+              "testStrategy": ["pipeline integration verifies final branch."],
+              "risks": ["none for this fixture."],
+              "satisfiesTask": "creates output.txt."
+            }
+            """;
+        var revisedPlan = $$"""
+            {
+              "approach": "updated approach with {{RevisedMarker}}.",
+              "files": ["output.txt"],
+              "testStrategy": ["pipeline integration verifies final branch."],
+              "risks": ["none for this fixture."],
+              "satisfiesTask": "creates output.txt with the revised plan."
+            }
+            """;
+        var agent = new PlanningAwareAgent { PlanOutputs = [initialPlan, revisedPlan] };
+        var auditor = new ArtifactMarkerPlanAuditor(RevisedMarker);
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            auditors: [auditor]);
+        var item = NewItem("feature/reworked-plan-artifact") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(2, agent.PlanningCalls);
+        Assert.Equal(2, auditor.SeenArtifacts.Count);
+        Assert.DoesNotContain(RevisedMarker, auditor.SeenArtifacts[0], StringComparison.Ordinal);
+        Assert.Contains(RevisedMarker, auditor.SeenArtifacts[1], StringComparison.Ordinal);
+        Assert.NotNull(final.PlanArtifact);
+        Assert.Contains(RevisedMarker, final.PlanArtifact!, StringComparison.Ordinal);
+        Assert.Equal(1, agent.WorkCalls);
     }
 
     [Fact]
@@ -1055,7 +1109,7 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal(2, agent.PlanningCalls);
         Assert.Equal(1, agent.WorkCalls);
         Assert.Contains("PLAN_REVIEW_REWORK_FEEDBACK_JSON", agent.LastPlanningPrompt, StringComparison.Ordinal);
-        Assert.DoesNotContain("needs a different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("needs a different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1904,6 +1958,7 @@ internal sealed partial class PlanningAwareAgent : IAgentRunner, ITextOnlyAgentR
     public bool ClassifyPlanningFailureAsTransient { get; init; }
     public bool StreamPlanningOutput { get; init; } = true;
     public string PlanOutput { get; init; } = DefaultPlan;
+    public IReadOnlyList<string>? PlanOutputs { get; init; }
     public AgentResult? PlanningResult { get; init; }
     public Func<CancellationToken, Task>? OnPlanningBeforeReturnAsync { get; set; }
     public string LastPlanningPrompt { get; private set; } = string.Empty;
@@ -1978,9 +2033,10 @@ internal sealed partial class PlanningAwareAgent : IAgentRunner, ITextOnlyAgentR
             if (PlanningResult is not null)
                 return PlanningResult;
 
+            var planOutput = CurrentPlanOutput();
             if (StreamPlanningOutput)
-                stdoutChunkCallback?.Invoke(PlanOutput);
-            return new AgentResult(true, "planned", PlanOutput, null);
+                stdoutChunkCallback?.Invoke(planOutput);
+            return new AgentResult(true, "planned", planOutput, null);
         }
 
         WorkCalls++;
@@ -2047,7 +2103,16 @@ internal sealed partial class PlanningAwareAgent : IAgentRunner, ITextOnlyAgentR
                 PlanningResult.Stderr);
         }
 
-        return new TextOnlyAgentResult(true, "planned", PlanOutput, null);
+        return new TextOnlyAgentResult(true, "planned", CurrentPlanOutput(), null);
+    }
+
+    private string CurrentPlanOutput()
+    {
+        if (PlanOutputs is not { Count: > 0 })
+            return PlanOutput;
+
+        var index = Math.Clamp(PlanningCalls - 1, 0, PlanOutputs.Count - 1);
+        return PlanOutputs[index];
     }
 
     private static async Task<AgentResult> HandleMergeAsync(
@@ -2468,6 +2533,36 @@ internal sealed class ScriptedPlanTextAuditor(IReadOnlyList<AuditResult> results
         LastContext = context;
         var idx = Math.Min(Calls - 1, results.Count - 1);
         return Task.FromResult(results[idx]);
+    }
+}
+
+internal sealed class ArtifactMarkerPlanAuditor(string requiredMarker) : IAuditor
+{
+    public string Name => "plan:artifact-marker";
+    public string Kind => "tool";
+    public AuditCapabilities Required => AuditCapabilities.None;
+    public IReadOnlySet<AuditTarget> Targets => AuditTargets.PlanOnly;
+    public List<string> SeenArtifacts { get; } = [];
+
+    public Task<AuditResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        CancellationToken ct = default)
+    {
+        _ = sandbox;
+        _ = workingDirectory;
+        ct.ThrowIfCancellationRequested();
+        var artifact = context.PlanArtifact ?? string.Empty;
+        SeenArtifacts.Add(artifact);
+        if (artifact.Contains(requiredMarker, StringComparison.Ordinal))
+            return Task.FromResult(new AuditResult(true, []));
+
+        return Task.FromResult(new AuditResult(false, [new AuditFinding(
+            Name,
+            AuditSeverity.Error,
+            "revised plan marker missing",
+            $"The plan must include {requiredMarker} before implementation.")]));
     }
 }
 

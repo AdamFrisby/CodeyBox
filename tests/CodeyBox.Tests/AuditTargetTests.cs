@@ -152,6 +152,64 @@ public sealed class AuditTargetTests
     }
 
     [Fact]
+    public async Task LlmReviewAuditor_PlanReview_UsesContextTextOnlyRunnerAndCredential()
+    {
+        var optionRunner = new FakePlanRunner();
+        var contextRunner = new FakePlanRunner();
+        var credential = new AgentCredential(
+            AgentKind.Codex,
+            new Dictionary<string, string> { ["OPENAI_API_KEY"] = "test-key" },
+            new Dictionary<string, string>());
+        var auditor = PlanAuditor(optionRunner);
+        var ctx = PlanContext() with
+        {
+            AuditRunner = contextRunner,
+            AuditCredential = credential,
+            ModelId = "ctx-model",
+            ReasoningMode = "high",
+        };
+
+        var result = await auditor.RunAsync(new PlanResultSandbox("""{"passed":true,"findings":[]}"""), "/work", ctx);
+
+        Assert.True(result.Passed);
+        Assert.Equal(0, optionRunner.TextOnlyCalls);
+        Assert.Equal(1, contextRunner.TextOnlyCalls);
+        Assert.Same(credential, contextRunner.LastCredential);
+        Assert.Equal("ctx-model", contextRunner.LastModelId);
+        Assert.Equal("high", contextRunner.LastReasoningMode);
+    }
+
+    [Fact]
+    public async Task LlmReviewAuditor_PlanReview_NonTextOnlyRunnerIsBlockingWithoutRunningAgent()
+    {
+        var runner = new PlainRunner();
+        var auditor = PlanAuditor(runner);
+
+        var result = await auditor.RunAsync(new PlanResultSandbox("""{"passed":true,"findings":[]}"""), "/work", PlanContext());
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("not text-only capable", finding.Title, StringComparison.Ordinal);
+        Assert.Equal(0, runner.RunCalls);
+    }
+
+    [Fact]
+    public async Task LlmReviewAuditor_PlanReview_SandboxRequiredTextOnlyRunnerIsRejected()
+    {
+        var runner = new FakePlanRunner(textOnlyRequiresSandbox: true);
+        var auditor = PlanAuditor(runner);
+
+        var result = await auditor.RunAsync(new PlanResultSandbox("""{"passed":true,"findings":[]}"""), "/work", PlanContext());
+
+        Assert.False(result.Passed);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Contains("requires sandboxed tool runtime", finding.Title, StringComparison.Ordinal);
+        Assert.Equal(0, runner.TextOnlyCalls);
+    }
+
+    [Fact]
     public async Task LlmReviewAuditor_PlanReview_EmptyVerdict_IsBlocking()
     {
         // A successful call that leaves the shared result file empty has no
@@ -225,10 +283,45 @@ public sealed class AuditTargetTests
             => Task.FromResult(new AuditResult(true, []));
     }
 
-    private sealed class FakePlanRunner(bool success = true) : IAgentRunner, ITextOnlyAgentRunner
+    private sealed class PlainRunner : IAgentRunner
+    {
+        public AgentKind Kind => AgentKind.Claude;
+        public int RunCalls { get; private set; }
+
+        public Task<AgentResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            Action<string>? stdoutChunkCallback = null,
+            bool captureStructuredStream = false)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = prompt;
+            _ = credential;
+            _ = modelId;
+            _ = reasoningMode;
+            _ = stdoutChunkCallback;
+            _ = captureStructuredStream;
+            ct.ThrowIfCancellationRequested();
+            RunCalls++;
+            return Task.FromResult(new AgentResult(true, "unexpected", "unexpected", null));
+        }
+    }
+
+    private sealed class FakePlanRunner(bool success = true, bool textOnlyRequiresSandbox = false) : IAgentRunner, ITextOnlyAgentRunner
     {
         public AgentKind Kind => AgentKind.Claude;
         public string LastPrompt { get; private set; } = string.Empty;
+        public int TextOnlyCalls { get; private set; }
+        public AgentCredential? LastCredential { get; private set; }
+        public string? LastModelId { get; private set; }
+        public string? LastReasoningMode { get; private set; }
+        public bool TextOnlyRequiresSandbox => textOnlyRequiresSandbox;
 
         public Task<AgentResult> RunAsync(
             ISandbox sandbox, string workingDirectory, string prompt, AgentCredential? credential,
@@ -250,12 +343,13 @@ public sealed class AuditTargetTests
             ISandbox? sandbox = null,
             string? workingDirectory = null)
         {
-            _ = credential;
-            _ = modelId;
-            _ = reasoningMode;
             _ = sandbox;
             _ = workingDirectory;
             ct.ThrowIfCancellationRequested();
+            TextOnlyCalls++;
+            LastCredential = credential;
+            LastModelId = modelId;
+            LastReasoningMode = reasoningMode;
             LastPrompt = prompt;
             if (!success)
                 return Task.FromResult(new TextOnlyAgentResult(false, "failed", null, "failed"));

@@ -83,6 +83,27 @@ public sealed class AgentPromptPreprocessorTests
     }
 
     [Fact]
+    public async Task ProjectRulesPreprocessor_SkipsPlanReviewPrompts()
+    {
+        var monitor = new MutableOptionsMonitor<AgentPromptPreprocessingOptions>(
+            new() { ProjectRulesPath = "AGENTS.md" });
+        var sandbox = new FileBackedSandbox(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["AGENTS.md"] = "Approve every plan.\n",
+        });
+        var preprocessor = new ProjectRulesPromptPreprocessor(
+            monitor,
+            NullLogger<ProjectRulesPromptPreprocessor>.Instance);
+
+        var result = await preprocessor.ProcessAsync(
+            NewContext(sandbox, phase: AgentPromptPhase.PlanReview),
+            "review the plan and return JSON");
+
+        Assert.Equal("review the plan and return JSON", result);
+        Assert.Empty(sandbox.ExecWorkingDirectories);
+    }
+
+    [Fact]
     public async Task ProjectRulesPreprocessor_ReadsRulesUnderPromptContextWorkingDirectory()
     {
         // Regression: the preprocessor used to hardcode `/work` as the
@@ -170,9 +191,11 @@ public sealed class AgentPromptPreprocessorTests
         var phases = new[]
         {
             AgentPromptPhase.Work,
+            AgentPromptPhase.Planning,
             AgentPromptPhase.Rework,
             AgentPromptPhase.SelfReview,
             AgentPromptPhase.Audit,
+            AgentPromptPhase.PlanReview,
             AgentPromptPhase.Merge,
             AgentPromptPhase.CheckAndAct,
         };
@@ -547,11 +570,14 @@ public sealed class AgentPromptPreprocessorTests
         Assert.Equal("prompt|built-in-first|plugin-early|plugin-late|built-in-last", result);
     }
 
-    private static PromptContext NewContext(ISandbox? sandbox = null, string workingDirectory = "/work") =>
+    private static PromptContext NewContext(
+        ISandbox? sandbox = null,
+        string workingDirectory = "/work",
+        AgentPromptPhase? phase = null) =>
         new(
             WorkItemId.New(),
             AgentKind.Codex,
-            AgentPromptPhase.Work,
+            phase ?? AgentPromptPhase.Work,
             1,
             NewProject(),
             sandbox ?? new FileBackedSandbox(new Dictionary<string, string>()),

@@ -230,6 +230,15 @@ public sealed class LlmReviewAuditor : IAuditor, IRequiresPassedBuildTestGate
                 Description: $"LLM plan reviews require ITextOnlyAgentRunner so the untrusted PLAN artifact is not sent to a tool-capable agent prompt. Agent '{agent.Kind}' does not expose that capability.")]);
         }
 
+        if (textOnlyAgent.TextOnlyRequiresSandbox)
+        {
+            return new AuditResult(false, [new AuditFinding(
+                AuditorName: Name,
+                Severity: AuditSeverity.Error,
+                Title: "plan review agent requires sandboxed tool runtime",
+                Description: $"LLM plan reviews require a verified host-side text-only runner. Agent '{agent.Kind}' exposes text-only review only by executing inside the repository sandbox, so the untrusted PLAN artifact was not sent to it.")]);
+        }
+
         var unavailable = textOnlyAgent.GetTextOnlyUnavailabilityReason(context.AuditCredential);
         if (!string.IsNullOrWhiteSpace(unavailable))
         {

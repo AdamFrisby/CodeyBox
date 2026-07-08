@@ -124,13 +124,12 @@ public sealed class ProjectAuditorComposer
         {
             if (custom.Kind.Equals("plugin", StringComparison.OrdinalIgnoreCase))
             {
-                if (!CustomDescriptorTargetsTarget(custom, target))
-                    continue;
-                IncludePluginAuditor(custom, auditors);
+                IncludePluginAuditor(custom, auditors, target);
             }
             else
             {
-                if (!CustomDescriptorTargetsTarget(custom, target))
+                var descriptorTargets = ParseCustomAuditorTargets(custom);
+                if (target is not null && !descriptorTargets.Contains(target.Value))
                     continue;
                 auditors.Add(MaterialiseCustom(custom, ctx, catalog.LlmPromptFrameTemplate, catalog.LlmPlanPromptFrameTemplate));
             }
@@ -235,7 +234,7 @@ public sealed class ProjectAuditorComposer
         PresetCatalogSelectionValidator.ValidateAuditTypeIds(owner, project.Audit.AuditTypes, catalog.KnownAuditTypes);
     }
 
-    private void IncludePluginAuditor(CustomAuditorDescriptor descriptor, List<IAuditor> auditors)
+    private void IncludePluginAuditor(CustomAuditorDescriptor descriptor, List<IAuditor> auditors, AuditTarget? target)
     {
         if (HasCustomGateMetadata(descriptor))
             throw new InvalidOperationException(
@@ -253,6 +252,12 @@ public sealed class ProjectAuditorComposer
             _logger.LogWarning(
                 "Plugin auditor '{PluginId}' is not loaded or not in the allowlist; skipping entry",
                 descriptor.PluginId);
+            return;
+        }
+
+        if (target is not null && TryParseCustomAuditorTargetNarrowing(descriptor, out var narrowedTargets)
+            && !narrowedTargets.Contains(target.Value))
+        {
             return;
         }
 
@@ -316,15 +321,6 @@ public sealed class ProjectAuditorComposer
         };
     }
 
-    private static bool CustomDescriptorTargetsTarget(CustomAuditorDescriptor descriptor, AuditTarget? target)
-    {
-        if (target is null)
-            return true;
-
-        var targets = ParseCustomAuditorTargets(descriptor);
-        return targets.Contains(target.Value);
-    }
-
     private static IReadOnlySet<AuditTarget> ParseCustomAuditorTargets(CustomAuditorDescriptor descriptor)
     {
         if (descriptor.Targets.Count == 0)
@@ -340,6 +336,20 @@ public sealed class ProjectAuditorComposer
         }
 
         return AuditTargets.Of(targets.ToArray());
+    }
+
+    private static bool TryParseCustomAuditorTargetNarrowing(
+        CustomAuditorDescriptor descriptor,
+        out IReadOnlySet<AuditTarget> targets)
+    {
+        if (descriptor.Targets.Count == 0)
+        {
+            targets = AuditTargets.CodeOnly;
+            return false;
+        }
+
+        targets = ParseCustomAuditorTargets(descriptor);
+        return true;
     }
 
     private static bool HasCustomGateMetadata(CustomAuditorDescriptor descriptor)
