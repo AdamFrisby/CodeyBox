@@ -11,6 +11,7 @@ namespace CodeyBox.Tests;
 /// validation and re-ordering, persistence across restart, and the
 /// equal-priority FIFO tie-break.
 /// </summary>
+[Collection("Background service timing")]
 public sealed class WorkItemPriorityTests : IDisposable
 {
     private readonly string _dbPath =
