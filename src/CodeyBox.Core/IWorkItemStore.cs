@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+
 namespace CodeyBox.Core;
 
 /// <summary>
@@ -297,6 +299,39 @@ public interface IWorkItemStore
         CancellationToken ct = default) =>
         throw new NotSupportedException(
             "This work item store must implement bounded WaitingForQuotaReset priority queries before quota recovery sweeps can run.");
+
+    /// <summary>
+    /// Returns at most <paramref name="limit"/> terminal rows eligible for the
+    /// agent-restore retry sweep's heavier attribution checks. Implementations
+    /// should push the state, window, failure-kind, ordering, and limit into the
+    /// backing store so a restore event cannot buffer all historical failures.
+    /// </summary>
+    async IAsyncEnumerable<WorkItem> ListRestoreRetryCandidatesAsync(
+        DateTimeOffset windowStart,
+        DateTimeOffset windowEnd,
+        int limit,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        if (limit <= 0)
+            yield break;
+
+        var yielded = 0;
+        foreach (var state in new[] { WorkItemState.Failed, WorkItemState.MergeConflictResolutionFailed })
+        {
+            await foreach (var item in ListByStateAsync(state, ct).ConfigureAwait(false))
+            {
+                if (yielded >= limit)
+                    yield break;
+                if (item.UpdatedAt < windowStart || item.UpdatedAt > windowEnd)
+                    continue;
+                if (!WorkItemFailureKinds.IsInfraShaped(item.FailureKind))
+                    continue;
+
+                yielded++;
+                yield return item;
+            }
+        }
+    }
 
     /// <summary>
     /// Returns the number of work items currently persisted in

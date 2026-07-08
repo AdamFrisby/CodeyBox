@@ -411,14 +411,14 @@ public sealed class AgentFailureClassifierTests
     }
 
     [Fact]
-    public void Exit127BinaryLaunchFailure_InStdout_Classified_AsInfrastructure()
+    public void Exit127BinaryLaunchFailure_InStdoutOnly_IsNotInfrastructure()
     {
         var c = AgentFailureClassifier.Classify(
             stderr: null,
             stdout: "bash: codex: command not found",
             summary: "agent exited 127");
 
-        Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
+        Assert.NotEqual(AgentFailureKind.Infrastructure, c.Kind);
     }
 
     // Realistic non-binary filesystem ENOENT shapes that the broad

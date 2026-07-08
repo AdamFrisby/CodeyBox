@@ -227,6 +227,17 @@ public sealed class TransitionHealthClassifierTests
     }
 
     [Fact]
+    public void Work_failure_infrastructure_is_infra_failure_infrastructure()
+    {
+        var snapshot = Snapshot(involvements: [Involvement("work", "failure:infrastructure", Now.AddMinutes(-2))]);
+
+        var report = TransitionHealthClassifier.Compute(snapshot, Now, DefaultOptions());
+
+        Assert.Equal(1, report.InfraFailureTransitions);
+        Assert.Equal(1, report.InfraByKind["infrastructure"]);
+    }
+
+    [Fact]
     public void Operator_cancellation_is_skipped_not_counted()
     {
         // Operator-driven cancel is neither healthy forward progress nor

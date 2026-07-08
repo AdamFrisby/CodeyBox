@@ -1486,6 +1486,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Contains("in-VM smoke gate", final.LastError);
         Assert.Contains("agent binary not runnable", final.LastError);
+        Assert.Equal(WorkItemFailureKinds.AgentUnavailable, final.FailureKind);
+        Assert.Equal(AgentKind.Cursor, final.Agent);
         Assert.Equal(0, cursorAgent.CallCount);
 
         // The prober benched cursor on the exit-127 version step.

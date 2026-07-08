@@ -165,7 +165,11 @@ public static class OrchestratorOptionsFactory
     public static AgentRestoreRetryOptions BuildAgentRestoreRetryOptions(
         bool enabled,
         string lookbackGrace,
-        string postRestoreMargin)
+        string postRestoreMargin,
+        string involvementTerminalLookback = "00:15:00",
+        string involvementTerminalClockSkew = "00:01:00",
+        int maxCandidatesPerSweep = AgentRestoreRetryOptions.DefaultMaxCandidatesPerSweep,
+        int eventQueueCapacity = AgentRestoreRetryOptions.DefaultEventQueueCapacity)
     {
         if (!enabled)
             return new AgentRestoreRetryOptions { Enabled = false };
@@ -184,11 +188,37 @@ public static class OrchestratorOptionsFactory
             throw new InvalidOperationException(
                 "CodeyBox:AutoRequeueOnAgentRestore:PostRestoreMargin must be non-negative");
 
+        if (!TimeSpan.TryParse(involvementTerminalLookback, out TimeSpan terminalLookback))
+            throw new InvalidOperationException(
+                "CodeyBox:AutoRequeueOnAgentRestore:InvolvementTerminalLookback must be a valid TimeSpan (e.g. '00:15:00')");
+        if (terminalLookback < TimeSpan.Zero)
+            throw new InvalidOperationException(
+                "CodeyBox:AutoRequeueOnAgentRestore:InvolvementTerminalLookback must be non-negative");
+
+        if (!TimeSpan.TryParse(involvementTerminalClockSkew, out TimeSpan terminalClockSkew))
+            throw new InvalidOperationException(
+                "CodeyBox:AutoRequeueOnAgentRestore:InvolvementTerminalClockSkew must be a valid TimeSpan (e.g. '00:01:00')");
+        if (terminalClockSkew < TimeSpan.Zero)
+            throw new InvalidOperationException(
+                "CodeyBox:AutoRequeueOnAgentRestore:InvolvementTerminalClockSkew must be non-negative");
+
+        if (maxCandidatesPerSweep <= 0)
+            throw new InvalidOperationException(
+                "CodeyBox:AutoRequeueOnAgentRestore:MaxCandidatesPerSweep must be positive");
+
+        if (eventQueueCapacity <= 0)
+            throw new InvalidOperationException(
+                "CodeyBox:AutoRequeueOnAgentRestore:EventQueueCapacity must be positive");
+
         return new AgentRestoreRetryOptions
         {
             Enabled = true,
             LookbackGrace = lookback,
             PostRestoreMargin = margin,
+            InvolvementTerminalLookback = terminalLookback,
+            InvolvementTerminalClockSkew = terminalClockSkew,
+            MaxCandidatesPerSweep = maxCandidatesPerSweep,
+            EventQueueCapacity = eventQueueCapacity,
         };
     }
 

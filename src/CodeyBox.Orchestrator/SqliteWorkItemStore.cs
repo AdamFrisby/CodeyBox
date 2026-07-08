@@ -173,6 +173,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             // Additive migration: capture failure details for auto-retry logic.
             RunMigration("ALTER TABLE work_items ADD COLUMN failure_kind TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN auth_failure_scope TEXT;");
+            RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_restore_retry_candidates ON work_items(state, failure_kind, updated_at, created_at);");
             RunMigration("ALTER TABLE work_items ADD COLUMN quota_reset_at TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN next_quota_retry_at TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN quota_retry_attempts INTEGER NOT NULL DEFAULT 0;");
@@ -1374,6 +1375,56 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         }
         var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), readConn, ct, tx);
         tx.Commit();
+
+        foreach (var item in rows)
+            yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
+    }
+
+    public async IAsyncEnumerable<WorkItem> ListRestoreRetryCandidatesAsync(
+        DateTimeOffset windowStart,
+        DateTimeOffset windowEnd,
+        int limit,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        if (limit <= 0)
+            yield break;
+
+        var rows = new List<WorkItem>(Math.Min(limit, 256));
+        IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = """
+                    SELECT *
+                    FROM work_items
+                    WHERE state IN ($failed, $merge_conflict_failed)
+                      AND updated_at >= $window_start
+                      AND updated_at <= $window_end
+                      AND failure_kind IN ($infrastructure, $agent_unavailable, $auth_required)
+                    ORDER BY updated_at ASC, created_at ASC
+                    LIMIT $limit;
+                    """;
+                cmd.Parameters.AddWithValue("$failed", (int)WorkItemState.Failed);
+                cmd.Parameters.AddWithValue("$merge_conflict_failed", (int)WorkItemState.MergeConflictResolutionFailed);
+                cmd.Parameters.AddWithValue("$window_start", windowStart.ToString("O"));
+                cmd.Parameters.AddWithValue("$window_end", windowEnd.ToString("O"));
+                cmd.Parameters.AddWithValue("$infrastructure", WorkItemFailureKinds.Infrastructure);
+                cmd.Parameters.AddWithValue("$agent_unavailable", WorkItemFailureKinds.AgentUnavailable);
+                cmd.Parameters.AddWithValue("$auth_required", WorkItemFailureKinds.AuthRequired);
+                cmd.Parameters.AddWithValue("$limit", limit);
+                using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+                while (await reader.ReadAsync(ct).ConfigureAwait(false))
+                    rows.Add(Read(reader));
+            }
+            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
 
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
@@ -2873,9 +2924,15 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     private static WorkItemAuthFailureScope? ReadNullableAuthFailureScope(SqliteDataReader r, string column)
     {
         var raw = ReadNullableString(r, column);
-        return Enum.TryParse<WorkItemAuthFailureScope>(raw, ignoreCase: true, out var value)
-            ? value
-            : null;
+        if (string.IsNullOrWhiteSpace(raw))
+            return null;
+        if (Enum.TryParse<WorkItemAuthFailureScope>(raw, ignoreCase: true, out var value))
+            return value;
+
+        var idOrd = r.GetOrdinal("id");
+        var id = r.IsDBNull(idOrd) ? "(unknown)" : r.GetString(idOrd);
+        throw new InvalidDataException(
+            $"work item {id}: auth_failure_scope value '{raw}' is not a known WorkItemAuthFailureScope; refusing to read the row as legacy null.");
     }
 
     private static WorkItemState? ReadNullableWorkItemState(SqliteDataReader r, string column)

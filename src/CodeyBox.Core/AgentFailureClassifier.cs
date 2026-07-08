@@ -433,14 +433,12 @@ public static class AgentFailureClassifier
     {
         if (IsExit127(summary)
             && (ContainsAny(stderr, BinaryNotFoundPatterns)
-                || ContainsAny(stdout, BinaryNotFoundPatterns)
                 || string.IsNullOrWhiteSpace(stderr) && string.IsNullOrWhiteSpace(stdout)))
         {
             return true;
         }
 
-        return IsSandboxWrapperBinaryLaunchFailure(stderr)
-            || IsSandboxWrapperBinaryLaunchFailure(stdout);
+        return IsSandboxWrapperBinaryLaunchFailure(stderr);
     }
 
     private static bool IsMaterialisationFailure(string? summary) =>

@@ -3056,7 +3056,11 @@ builder.Services.AddSingleton<AgentRestoreRetryScheduler>(sp => new AgentRestore
         return OrchestratorOptionsFactory.BuildAgentRestoreRetryOptions(
             live.Enabled,
             live.LookbackGrace,
-            live.PostRestoreMargin);
+            live.PostRestoreMargin,
+            live.InvolvementTerminalLookback,
+            live.InvolvementTerminalClockSkew,
+            live.MaxCandidatesPerSweep,
+            live.EventQueueCapacity);
     },
     sp.GetRequiredService<ILogger<AgentRestoreRetryScheduler>>(),
     sp.GetRequiredService<IAgentRestoreSignal>(),
@@ -5019,6 +5023,32 @@ namespace CodeyBox.Api
         /// ordering races between terminal writes and the restore signal.
         /// </summary>
         public string PostRestoreMargin { get; set; } = "00:05:00";
+
+        /// <summary>
+        /// Non-negative <see cref="TimeSpan"/> string (for example
+        /// <c>"00:15:00"</c>) used to match a failed agent-involvement row to a
+        /// nearby terminal work-item write.
+        /// </summary>
+        public string InvolvementTerminalLookback { get; set; } = "00:15:00";
+
+        /// <summary>
+        /// Non-negative <see cref="TimeSpan"/> string (for example
+        /// <c>"00:01:00"</c>) allowing failed involvement rows to land slightly
+        /// after the terminal work-item update they explain.
+        /// </summary>
+        public string InvolvementTerminalClockSkew { get; set; } = "00:01:00";
+
+        /// <summary>
+        /// Positive cap applied inside the work-item store before buffering
+        /// restore-sweep candidates. Default 500.
+        /// </summary>
+        public int MaxCandidatesPerSweep { get; set; } = AgentRestoreRetryOptions.DefaultMaxCandidatesPerSweep;
+
+        /// <summary>
+        /// Positive bounded-channel capacity for pending restore notifications.
+        /// Default 128.
+        /// </summary>
+        public int EventQueueCapacity { get; set; } = AgentRestoreRetryOptions.DefaultEventQueueCapacity;
 
     }
 

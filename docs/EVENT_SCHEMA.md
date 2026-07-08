@@ -96,6 +96,7 @@ subscribe to.
 | `agent.fallback` | 1.0 | Agent class router fell back to an alternate agent. |
 | `agent.paused` | 1.3 | Operator paused new dispatch to one agent kind or pooled instance route. |
 | `agent.resumed` | 1.3 | Operator resumed dispatch to one agent kind or pooled instance route. |
+| `agent.restore_requeue_swept` | 1.5 | Agent restore triggered the infra-failure retry sweep; details include restored agent, outage window, requeued count, and skipped count. |
 | `sandbox.leak_detected` | 1.0 | Leaked `codeybox-*` sandbox detected by reaper. |
 | `sandbox.leak_disposed` | 1.0 | Reaper successfully disposed a leaked sandbox. |
 | `sandbox.leak_dispose_failed` | 1.0 | Reaper failed to dispose a leaked sandbox. |

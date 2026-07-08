@@ -45,7 +45,7 @@ public sealed class AgentRestoreRetryProgramWiringTests
             Prompt = "retry after restore",
             Agent = AgentKind.Claude,
             State = WorkItemState.Failed,
-            FailureKind = WorkItemFailureKinds.Infrastructure,
+            FailureKind = WorkItemFailureKinds.AgentUnavailable,
             LastError = "agent binary missing",
             UpdatedAt = DateTimeOffset.UtcNow,
         };

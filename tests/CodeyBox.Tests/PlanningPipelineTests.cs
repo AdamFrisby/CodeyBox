@@ -890,6 +890,41 @@ public sealed class PlanningPipelineTests : IDisposable
     }
 
     [Fact]
+    public async Task PlanOn_PlanningInfrastructureFailure_FailsWithInfraMetadata()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent
+        {
+            PlanningResult = new AgentResult(
+                Success: false,
+                Summary: "agent exited 127",
+                Stdout: null,
+                Stderr: "env: 'claude': No such file or directory"),
+        };
+        using var setup = BuildPipeline(agent, _workspace, seed);
+        var item = NewItem("feature/planning-infra") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, final.FailureKind);
+        Assert.Equal(AgentKind.Claude, final.Agent);
+        Assert.Equal(1, agent.PlanningCalls);
+        Assert.Equal(0, agent.WorkCalls);
+        Assert.Contains("Planning agent claude reported failure", final.LastError, StringComparison.Ordinal);
+        Assert.Contains("agent exited 127", final.LastError, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task PlanOn_PlanReviewAlwaysRejects_FailsAfterMaxPlanIterations()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

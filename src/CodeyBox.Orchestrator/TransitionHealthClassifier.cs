@@ -19,9 +19,11 @@ namespace CodeyBox.Orchestrator;
 /// auditor itself failing to run (the LlmReviewAuditor "review agent failed to
 /// run" / "agent did not write audit/result.json" / "review agent produced
 /// invalid JSON" Error finding); agent transport failure / non-zero exit /
-/// SIGTERM-kill; quota-exhaustion mid-run; agent-unavailable timeouts; the
-/// silent "produced no changes to commit" path (which surfaces in the
-/// involvement row as <c>failure:agent</c>).</item>
+    /// SIGTERM-kill; quota-exhaustion mid-run; transient/auth/provisioning
+    /// agent involvement failures (<c>failure:transient</c>,
+    /// <c>failure:auth</c>, <c>failure:infrastructure</c>);
+    /// agent-unavailable timeouts; the silent "produced no changes to commit"
+    /// path (which surfaces in the involvement row as <c>failure:agent</c>).</item>
 /// <item><b>SKIPPED</b> — operator-driven cancel (<c>failure:cancelled</c> /
 /// <c>cancelled</c>), unfinalised in-flight rows, terminal-Failed with a
 /// FailureKind we do not score (<c>other</c> — ambiguous; documented as
@@ -119,36 +121,37 @@ public static class TransitionHealthClassifier
         if (stage == TransitionStage.Audit)
             return null;
 
-        switch (row.Outcome)
+        if (string.Equals(row.Outcome, AgentInvolvementOutcomes.Success, StringComparison.Ordinal))
+            return new TransitionRecord(stage, TransitionClassification.Legitimate, null, row.EndedAt);
+
+        if (!AgentInvolvementOutcomes.TryParseFailure(row.Outcome, out var failureCategory))
         {
-            case "success":
-                return new TransitionRecord(stage, TransitionClassification.Legitimate, null, row.EndedAt);
-            case "failure:quota":
-                return new TransitionRecord(stage, TransitionClassification.InfraFailure, "quota", row.EndedAt);
-            case "failure:timeout":
-                return new TransitionRecord(stage, TransitionClassification.InfraFailure, "timeout", row.EndedAt);
-            case "failure:agent":
-                return new TransitionRecord(stage, TransitionClassification.InfraFailure, "agent", row.EndedAt);
-            case "failure:cancelled":
-            case "cancelled":
-                // Operator-driven cancel: not an infra failure, not a
-                // legitimate forward step. Excluded from scoring.
-                return null;
-            case "failure:semantic-incompatible":
-                // The conflict-rework agent declared the upstream/downstream
-                // branches semantically irreconcilable (PipelineRunner emits
-                // this on conflict_rework involvements). The agent did its
-                // job — this is a real, intended disposition, not an infra
-                // failure. Excluded from scoring rather than counted as
-                // legitimate so a conflict-heavy fleet does not artificially
-                // inflate the Merge-stage success number.
-                return null;
-            default:
-                // Includes "error" (transient default before a path-specific
-                // outcome was set) and any future label we have not classified
-                // yet. Drop rather than guess.
-                return null;
+            // Includes "error" (transient default before a path-specific
+            // outcome was set) and any future label we have not classified
+            // yet. Drop rather than guess.
+            return null;
         }
+
+        if (failureCategory is AgentInvolvementFailureCategory.Cancelled)
+        {
+            // Operator-driven cancel: not an infra failure, not a legitimate
+            // forward step. Excluded from scoring.
+            return null;
+        }
+
+        if (failureCategory is AgentInvolvementFailureCategory.SemanticIncompatible)
+        {
+            // The conflict-rework agent declared the upstream/downstream
+            // branches semantically irreconcilable. The agent did its job —
+            // this is a real, intended disposition, not an infra failure.
+            return null;
+        }
+
+        return new TransitionRecord(
+            stage,
+            TransitionClassification.InfraFailure,
+            AgentInvolvementOutcomes.InfraKind(failureCategory),
+            row.EndedAt);
     }
 
     internal static TransitionRecord ClassifyAuditReport(TransitionAuditReportRow row)

@@ -2207,7 +2207,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 }, CancellationToken.None);
                 await TransitionFailed(item,
                     $"credential smoke test failed: {smokeResult.FailureReason}",
-                    CancellationToken.None, project, failureKind: WorkItemFailureKinds.Infrastructure, agent: agentKind);
+                    CancellationToken.None, project, failureKind: WorkItemFailureKinds.AgentUnavailable, agent: agentKind);
                 return;
             }
 
@@ -2281,7 +2281,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 }, CancellationToken.None);
                 await TransitionFailed(item,
                     $"in-VM smoke gate: {reason}",
-                    CancellationToken.None, project, failureKind: WorkItemFailureKinds.Infrastructure, agent: agentKind);
+                    CancellationToken.None, project, failureKind: WorkItemFailureKinds.AgentUnavailable, agent: agentKind);
                 return;
             }
         }
@@ -6227,7 +6227,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             $"in-VM smoke gate: {reason}",
             CancellationToken.None,
             project,
-            failureKind: "infrastructure");
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
+            agent: agentKind);
         return false;
     }
 

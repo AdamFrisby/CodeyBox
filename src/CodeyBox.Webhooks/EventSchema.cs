@@ -86,6 +86,7 @@ public static class EventSchema
         "agent.fallback",
         "agent.paused",
         "agent.resumed",
+        "agent.restore_requeue_swept",
         // Sandbox lifecycle (leak reaper only — provisioning is audit-log not webhook)
         "sandbox.leak_detected",
         "sandbox.leak_disposed",

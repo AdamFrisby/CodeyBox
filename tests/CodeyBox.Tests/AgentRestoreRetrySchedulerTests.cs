@@ -27,7 +27,8 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     {
         using var store = new SqliteWorkItemStore(_dbPath);
         var queue = new InMemoryTaskQueue();
-        var scheduler = NewScheduler(store, queue, enabled: true);
+        var involvement = new InMemoryAgentInvolvementStore();
+        var scheduler = NewScheduler(store, queue, enabled: true, involvement: involvement);
 
         var outageStart = DateTimeOffset.UtcNow.AddMinutes(-15);
         var item = NewItem(
@@ -36,7 +37,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             failureKind: WorkItemFailureKinds.Infrastructure,
             updatedAt: outageStart.AddMinutes(5));
         await store.CreateAsync(item);
-        await store.UpdateAsync(item);
+        await RecordFailedInvolvementAsync(involvement, item.Id, AgentKind.Claude, outageStart.AddMinutes(5));
 
         var restoredAt = DateTimeOffset.UtcNow;
         var summary = await scheduler.SweepForTestAsync(
@@ -56,7 +57,8 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     {
         using var store = new SqliteWorkItemStore(_dbPath);
         var queue = new InMemoryTaskQueue();
-        var scheduler = NewScheduler(store, queue, enabled: true);
+        var involvement = new InMemoryAgentInvolvementStore();
+        var scheduler = NewScheduler(store, queue, enabled: true, involvement: involvement);
 
         var outageStart = DateTimeOffset.UtcNow.AddMinutes(-30);
 
@@ -84,7 +86,8 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             agent: AgentKind.Claude,
             state: WorkItemState.Failed,
             failureKind: WorkItemFailureKinds.AuthRequired,
-            updatedAt: outageStart.AddMinutes(5));
+            updatedAt: outageStart.AddMinutes(5),
+            authFailureScope: WorkItemAuthFailureScope.Fleet);
         var agentUnavailableItem = NewItem(
             agent: AgentKind.Claude,
             state: WorkItemState.Failed,
@@ -94,8 +97,8 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         foreach (var item in new[] { infraItem, buildItem, agentInternalItem, configItem, authRequiredItem, agentUnavailableItem })
         {
             await store.CreateAsync(item);
-            await store.UpdateAsync(item);
         }
+        await RecordFailedInvolvementAsync(involvement, infraItem.Id, AgentKind.Claude, outageStart.AddMinutes(5));
 
         var summary = await scheduler.SweepForTestAsync(
             new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
@@ -123,10 +126,9 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         var item = NewItem(
             agent: AgentKind.Claude,
             state: WorkItemState.Failed,
-            failureKind: WorkItemFailureKinds.Infrastructure,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
             updatedAt: outageStart.AddMinutes(2));
         await store.CreateAsync(item);
-        await store.UpdateAsync(item);
 
         var evt = new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow);
 
@@ -156,19 +158,17 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         var ancientFailure = NewItem(
             agent: AgentKind.Claude,
             state: WorkItemState.Failed,
-            failureKind: WorkItemFailureKinds.Infrastructure,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
             updatedAt: outageStart.AddHours(-2));
         await store.CreateAsync(ancientFailure);
-        await store.UpdateAsync(ancientFailure);
 
         // Failure 10 min before outage start IS in window (within the 30-min grace).
         var withinGrace = NewItem(
             agent: AgentKind.Claude,
             state: WorkItemState.Failed,
-            failureKind: WorkItemFailureKinds.Infrastructure,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
             updatedAt: outageStart.AddMinutes(-10));
         await store.CreateAsync(withinGrace);
-        await store.UpdateAsync(withinGrace);
 
         var summary = await scheduler.SweepForTestAsync(
             new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
@@ -189,17 +189,15 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         var claudeItem = NewItem(
             agent: AgentKind.Claude,
             state: WorkItemState.Failed,
-            failureKind: WorkItemFailureKinds.Infrastructure,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
             updatedAt: outageStart.AddMinutes(5));
         var codexItem = NewItem(
             agent: AgentKind.Codex,
             state: WorkItemState.Failed,
-            failureKind: WorkItemFailureKinds.Infrastructure,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
             updatedAt: outageStart.AddMinutes(5));
         await store.CreateAsync(claudeItem);
-        await store.UpdateAsync(claudeItem);
         await store.CreateAsync(codexItem);
-        await store.UpdateAsync(codexItem);
 
         var summary = await scheduler.SweepForTestAsync(
             new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
@@ -219,10 +217,9 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         var item = NewItem(
             agent: AgentKind.Claude,
             state: WorkItemState.Failed,
-            failureKind: WorkItemFailureKinds.Infrastructure,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
             updatedAt: DateTimeOffset.UtcNow.AddMinutes(-10));
         await store.CreateAsync(item);
-        await store.UpdateAsync(item);
 
         // OutageStartedAt=null happens when an operator resets an agent that was
         // never marked failed (or on a startup pass). Without a window the sweep
@@ -242,7 +239,8 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     {
         using var store = new SqliteWorkItemStore(_dbPath);
         var queue = new InMemoryTaskQueue();
-        var scheduler = NewScheduler(store, queue, enabled: true);
+        var involvement = new InMemoryAgentInvolvementStore();
+        var scheduler = NewScheduler(store, queue, enabled: true, involvement: involvement);
 
         var outageStart = DateTimeOffset.UtcNow.AddMinutes(-15);
         var item = NewItem(
@@ -251,7 +249,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             failureKind: WorkItemFailureKinds.Infrastructure,
             updatedAt: outageStart.AddMinutes(5));
         await store.CreateAsync(item);
-        await store.UpdateAsync(item);
+        await RecordFailedInvolvementAsync(involvement, item.Id, AgentKind.Claude, outageStart.AddMinutes(5));
 
         var summary = await scheduler.SweepForTestAsync(
             new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
@@ -261,11 +259,11 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     }
 
     [Fact]
-    public async Task Sweep_RequeuesEveryMatchingCandidate()
+    public async Task Sweep_StopsAtConfiguredCandidateCap()
     {
         using var store = new SqliteWorkItemStore(_dbPath);
         var queue = new InMemoryTaskQueue();
-        var scheduler = NewScheduler(store, queue, enabled: true);
+        var scheduler = NewScheduler(store, queue, enabled: true, maxCandidatesPerSweep: 3);
 
         var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
         var items = new List<WorkItem>();
@@ -274,17 +272,16 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             var item = NewItem(
                 agent: AgentKind.Claude,
                 state: WorkItemState.Failed,
-                failureKind: WorkItemFailureKinds.Infrastructure,
+                failureKind: WorkItemFailureKinds.AgentUnavailable,
                 updatedAt: outageStart.AddMinutes(2 + i));
             await store.CreateAsync(item);
-            await store.UpdateAsync(item);
             items.Add(item);
         }
 
         var summary = await scheduler.SweepForTestAsync(
             new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
 
-        Assert.Equal(5, summary.Requeued);
+        Assert.Equal(3, summary.Requeued);
         Assert.Equal(0, summary.Skipped);
         var queuedCount = 0;
         foreach (var item in items)
@@ -292,7 +289,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             var state = (await store.GetAsync(item.Id))!.State;
             if (state == WorkItemState.Queued) queuedCount++;
         }
-        Assert.Equal(5, queuedCount);
+        Assert.Equal(3, queuedCount);
     }
 
     [Fact]
@@ -409,9 +406,9 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             agent: AgentKind.Antigravity,
             state: WorkItemState.Failed,
             failureKind: WorkItemFailureKinds.AuthRequired,
-            updatedAt: fakeTime.GetUtcNow());
+            updatedAt: fakeTime.GetUtcNow(),
+            authFailureScope: WorkItemAuthFailureScope.Fleet);
         await store.CreateAsync(item);
-        await store.UpdateAsync(item);
 
         fakeTime.Advance(TimeSpan.FromMinutes(20));
         NewReset(registry).Reset(AgentKind.Antigravity);
@@ -436,17 +433,15 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         var insideMargin = NewItem(
             agent: AgentKind.Claude,
             state: WorkItemState.Failed,
-            failureKind: WorkItemFailureKinds.Infrastructure,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
             updatedAt: restoredAt.AddMinutes(4));
         var afterMargin = NewItem(
             agent: AgentKind.Claude,
             state: WorkItemState.Failed,
-            failureKind: WorkItemFailureKinds.Infrastructure,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
             updatedAt: restoredAt.AddMinutes(6));
         await store.CreateAsync(insideMargin);
-        await store.UpdateAsync(insideMargin);
         await store.CreateAsync(afterMargin);
-        await store.UpdateAsync(afterMargin);
 
         var summary = await scheduler.SweepForTestAsync(
             new AgentRestoredEvent(AgentKind.Claude, outageStart, restoredAt));
@@ -495,10 +490,9 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             var item = NewItem(
                 agent: AgentKind.Claude,
                 state: WorkItemState.Failed,
-                failureKind: WorkItemFailureKinds.Infrastructure,
+                failureKind: WorkItemFailureKinds.AgentUnavailable,
                 updatedAt: DateTimeOffset.UtcNow);
             await store.CreateAsync(item);
-            await store.UpdateAsync(item);
 
             registry.MarkSmokeResult(
                 AgentKind.Claude,
@@ -515,7 +509,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     }
 
     [Fact]
-    public async Task Sweep_RequeuesDefaultAgentRowsWhenPersistedAgentIsUnset()
+    public async Task Sweep_DoesNotInferDefaultAgentWhenFailureLacksAgentAttribution()
     {
         using var store = new SqliteWorkItemStore(_dbPath);
         var queue = new InMemoryTaskQueue();
@@ -535,13 +529,12 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             failureKind: WorkItemFailureKinds.Infrastructure,
             updatedAt: outageStart.AddMinutes(1));
         await store.CreateAsync(item);
-        await store.UpdateAsync(item);
 
         var summary = await scheduler.SweepForTestAsync(
             new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
 
-        Assert.Equal(1, summary.Requeued);
-        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(item.Id))!.State);
+        Assert.Equal(0, summary.Requeued);
+        Assert.Equal(WorkItemState.Failed, (await store.GetAsync(item.Id))!.State);
     }
 
     [Fact]
@@ -558,9 +551,9 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             state: WorkItemState.Failed,
             failureKind: WorkItemFailureKinds.AuthRequired,
             updatedAt: outageStart.AddMinutes(2),
-            lastError: "auth required from agent output during audit: login prompt matched");
+            lastError: "auth required from agent output during audit: login prompt matched",
+            authFailureScope: WorkItemAuthFailureScope.Fleet);
         await store.CreateAsync(item);
-        await store.UpdateAsync(item);
 
         var involvementId = Guid.NewGuid();
         await involvement.RecordStartAsync(new AgentInvolvement(
@@ -594,10 +587,9 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         var item = NewItem(
             agent: AgentKind.Claude,
             state: WorkItemState.Failed,
-            failureKind: WorkItemFailureKinds.Infrastructure,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
             updatedAt: outageStart.AddMinutes(30));
         await store.CreateAsync(item);
-        await store.UpdateAsync(item);
 
         var oldInvolvementId = Guid.NewGuid();
         await involvement.RecordStartAsync(new AgentInvolvement(
@@ -652,11 +644,8 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             updatedAt: outageStart.AddMinutes(4),
             lastError: "auth required from agent output during work: login prompt matched; stdout accepted for item failure only; forced in-VM smoke probe did not corroborate auth");
         await store.CreateAsync(itemLocal);
-        await store.UpdateAsync(itemLocal);
         await store.CreateAsync(corroborated);
-        await store.UpdateAsync(corroborated);
         await store.CreateAsync(legacyItemLocal);
-        await store.UpdateAsync(legacyItemLocal);
 
         var summary = await scheduler.SweepForTestAsync(
             new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
@@ -679,10 +668,9 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         var item = NewItem(
             agent: AgentKind.Claude,
             state: WorkItemState.Failed,
-            failureKind: WorkItemFailureKinds.Infrastructure,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
             updatedAt: outageStart.AddMinutes(2));
         await store.CreateAsync(item);
-        await store.UpdateAsync(item);
 
         await scheduler.SweepForTestAsync(
             new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
@@ -743,10 +731,9 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         var item = NewItem(
             agent: AgentKind.Claude,
             state: WorkItemState.Failed,
-            failureKind: WorkItemFailureKinds.Infrastructure,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
             updatedAt: outageStart.AddMinutes(1));
         await store.CreateAsync(item);
-        await store.UpdateAsync(item);
 
         fakeTime.Advance(TimeSpan.FromMinutes(5));
         NewReset(registry).Reset(AgentKind.Claude);
@@ -882,6 +869,27 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     private static string? Detail(WebhookEvent evt, string propertyName)
         => evt.Details?.GetType().GetProperty(propertyName)?.GetValue(evt.Details)?.ToString();
 
+    private static async Task RecordFailedInvolvementAsync(
+        IAgentInvolvementStore involvement,
+        WorkItemId workItemId,
+        AgentKind agent,
+        DateTimeOffset endedAt,
+        string outcome = AgentInvolvementOutcomes.FailureInfrastructure)
+    {
+        var involvementId = Guid.NewGuid();
+        await involvement.RecordStartAsync(new AgentInvolvement(
+            Id: involvementId,
+            WorkItemId: workItemId,
+            AgentKind: agent,
+            ModelId: null,
+            Phase: "work",
+            StartedAt: endedAt.AddSeconds(-1),
+            EndedAt: null,
+            Iteration: 1,
+            Outcome: null));
+        await involvement.FinalizeAsync(involvementId, endedAt, outcome);
+    }
+
     private static AgentRestoreRetryScheduler NewScheduler(
         IWorkItemStore store,
         InMemoryTaskQueue queue,
@@ -890,7 +898,8 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         IAgentRestoreSignal? signal = null,
         IWebhookDispatcher? webhooks = null,
         IProjectRepository? projects = null,
-        IAgentInvolvementStore? involvement = null)
+        IAgentInvolvementStore? involvement = null,
+        int maxCandidatesPerSweep = AgentRestoreRetryOptions.DefaultMaxCandidatesPerSweep)
     {
         var retrier = new WorkItemRetrier(
             store,
@@ -902,6 +911,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             Enabled = enabled,
             LookbackGrace = TimeSpan.FromMinutes(30),
             PostRestoreMargin = TimeSpan.FromMinutes(5),
+            MaxCandidatesPerSweep = maxCandidatesPerSweep,
         };
         return new AgentRestoreRetryScheduler(
             store,
@@ -940,21 +950,4 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         public override DateTimeOffset GetUtcNow() => _now;
         public void Advance(TimeSpan duration) => _now += duration;
     }
-
-    private sealed class ListLogger<T> : Microsoft.Extensions.Logging.ILogger<T>
-    {
-        public List<(LogLevel Level, string Message)> Entries { get; } = new();
-        IDisposable? Microsoft.Extensions.Logging.ILogger.BeginScope<TState>(TState state) => null;
-        public bool IsEnabled(LogLevel logLevel) => true;
-        public void Log<TState>(
-            LogLevel logLevel,
-            EventId eventId,
-            TState state,
-            Exception? exception,
-            Func<TState, Exception?, string> formatter)
-        {
-            Entries.Add((logLevel, formatter(state, exception)));
-        }
-    }
-
 }

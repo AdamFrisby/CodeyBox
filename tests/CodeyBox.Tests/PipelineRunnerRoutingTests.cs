@@ -133,7 +133,7 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
             AgentClassId = "frontier-coding",
             MinModelScore = 80,
             State = WorkItemState.Failed,
-            FailureKind = WorkItemFailureKinds.Infrastructure,
+            FailureKind = WorkItemFailureKinds.AgentUnavailable,
             LastError = "agent binary missing",
             UpdatedAt = outageStart.AddMinutes(2),
         };
