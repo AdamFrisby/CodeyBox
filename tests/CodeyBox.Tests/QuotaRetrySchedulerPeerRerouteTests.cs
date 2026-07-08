@@ -108,38 +108,27 @@ public sealed class QuotaRetrySchedulerPeerRerouteTests : IDisposable
     /// periodic interval or the stale NextQuotaRetryAt.
     /// </summary>
     [Fact]
-    public async Task SignalingQuotaProbe_ExhaustedToAvailable_RequeuesPromptly()
+    public async Task RouterQuotaTransition_ExhaustedToAvailable_RequeuesPromptly()
     {
         var probes = new MutablePeerProbes(claude: 0.0, codex: 0.0);
-        var quotaPolicy = new QuotaGatePolicy(new QuotaRouterOptions { MinQuotaPct = 10 });
         var quotaBroadcaster = new AgentQuotaAvailabilityBroadcaster();
-        var signalingProbes = probes.AsProbes()
-            .Select(p => new SignalingQuotaProbe(p, quotaBroadcaster, quotaPolicy))
-            .Cast<IAgentQuotaProbe>()
-            .ToArray();
-        var codexMember = new AgentMembership
-        {
-            Agent = AgentKind.Codex,
-            Billing = AgentBilling.Subscription,
-            QualityScore = 90,
-        };
-
-        // Seed the broadcaster with the known exhausted state. First readings
-        // are only recorded, so this prevents the later healthy probe from
-        // being mistaken for a first observation.
-        await signalingProbes.Single(p => p.Kind == AgentKind.Codex)
-            .GetAvailabilityAsync(codexMember, CancellationToken.None);
-
-        using var fixture = BuildSchedulerWithPeers(probes, quotaSignal: quotaBroadcaster, probeOverride: signalingProbes);
+        using var fixture = BuildSchedulerWithPeers(
+            probes,
+            quotaSignal: quotaBroadcaster,
+            quotaPublisher: quotaBroadcaster);
         var item = ParkedItem() with
         {
             NextQuotaRetryAt = DateTimeOffset.UtcNow.AddDays(5),
         };
         await fixture.Store.CreateAsync(item);
 
+        var probeItem = item with { Id = WorkItemId.New(), State = WorkItemState.Queued };
+        var denied = await fixture.Router!.ResolveAsync(probeItem, Project(), CancellationToken.None);
+        Assert.True(denied.ShouldWait);
+
         probes.UpdateCodex(100.0);
-        await signalingProbes.Single(p => p.Kind == AgentKind.Codex)
-            .GetAvailabilityAsync(codexMember, CancellationToken.None);
+        var allowed = await fixture.Router.ResolveAsync(probeItem with { Id = WorkItemId.New() }, Project(), CancellationToken.None);
+        Assert.NotNull(allowed.Chosen);
         await WaitForWakeUpSweepAsync(fixture.Scheduler);
 
         var stored = await fixture.Store.GetAsync(item.Id);
@@ -189,7 +178,8 @@ public sealed class QuotaRetrySchedulerPeerRerouteTests : IDisposable
         TimeProvider? timeProvider = null,
         IAgentPauseSignal? pauseSignal = null,
         IAgentQuotaAvailabilitySignal? quotaSignal = null,
-        IEnumerable<IAgentQuotaProbe>? probeOverride = null)
+        IEnumerable<IAgentQuotaProbe>? probeOverride = null,
+        IAgentQuotaAvailabilityPublisher? quotaPublisher = null)
     {
         var router = new AgentClassRouter(
             [
@@ -216,15 +206,17 @@ public sealed class QuotaRetrySchedulerPeerRerouteTests : IDisposable
             ],
             probeOverride ?? probes.AsProbes(),
             new QuotaRouterOptions { MinQuotaPct = 10 },
-            NullLogger<AgentClassRouter>.Instance);
-        return BuildScheduler(router, timeProvider, pauseSignal, quotaSignal);
+            NullLogger<AgentClassRouter>.Instance,
+            quotaAvailabilityPublisher: quotaPublisher);
+        return BuildScheduler(router, timeProvider, pauseSignal, quotaSignal, router);
     }
 
     private SchedulerFixture BuildScheduler(
         IQuotaRetryRouter? router,
         TimeProvider? timeProvider = null,
         IAgentPauseSignal? pauseSignal = null,
-        IAgentQuotaAvailabilitySignal? quotaSignal = null)
+        IAgentQuotaAvailabilitySignal? quotaSignal = null,
+        AgentClassRouter? classRouter = null)
     {
         var dbPath = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N") + ".db");
         var store = new SqliteWorkItemStore(dbPath);
@@ -262,8 +254,16 @@ public sealed class QuotaRetrySchedulerPeerRerouteTests : IDisposable
             autoRetryOptionsAccessor: null,
             quotaAvailabilitySignal: quotaSignal,
             pauseSignal: pauseSignal);
-        return new SchedulerFixture(store, scheduler);
+        return new SchedulerFixture(store, scheduler, classRouter);
     }
+
+    private static Project Project() => new()
+    {
+        Id = TestProjectId,
+        DisplayName = "Test",
+        RepositoryUrl = "https://example.invalid/repo.git",
+        DefaultAgentClass = "frontier",
+    };
 
     private static WorkItem ParkedItem() => new()
     {
@@ -307,14 +307,16 @@ public sealed class QuotaRetrySchedulerPeerRerouteTests : IDisposable
 
     public sealed class SchedulerFixture : IDisposable
     {
-        public SchedulerFixture(SqliteWorkItemStore store, QuotaRetryScheduler scheduler)
+        public SchedulerFixture(SqliteWorkItemStore store, QuotaRetryScheduler scheduler, AgentClassRouter? router = null)
         {
             Store = store;
             Scheduler = scheduler;
+            Router = router;
         }
 
         public SqliteWorkItemStore Store { get; }
         public QuotaRetryScheduler Scheduler { get; }
+        public AgentClassRouter? Router { get; }
 
         public void Dispose()
         {

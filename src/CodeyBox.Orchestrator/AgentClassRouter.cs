@@ -27,7 +27,7 @@ namespace CodeyBox.Orchestrator;
 /// TOD windows are pre-parsed at construction time so evaluation is allocation-free.
 /// <see cref="TimeProvider"/> is the clock source; inject a fake for tests.
 /// </summary>
-public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQuotaAvailabilitySignal, IQuotaRetryRouter, IQuotaRetryAdmissionRouter, IAgentRoutingReadiness
+public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IQuotaRetryRouter, IQuotaRetryAdmissionRouter, IAgentRoutingReadiness
 {
     // The class catalog and pre-parsed TOD modifiers are bundled into a single
     // record so the hot-reload coordinator can publish a coherent (catalog,
@@ -75,8 +75,6 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<MemberQuotaKey, EffectiveQuota> _lastEffectiveQuota
         = new();
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<MemberQuotaKey, bool> _lastQuotaUsable
-        = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<WorkItemId, QuotaRetryAdmission> _quotaRetryAdmissions
         = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _roundRobinCursors
@@ -90,14 +88,6 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         DateTimeOffset ExpiresAt);
     private sealed record ExhaustionEntry(DateTimeOffset ExpiresAt);
     private sealed record PrecomputedQuota(AgentQuotaSnapshot Snapshot, BudgetAdjustedQuota Budgeted);
-
-    /// <summary>
-    /// Raised when a routing probe observes an eligible member move from below
-    /// the effective quota floor to usable. Exposed through
-    /// <see cref="IAgentQuotaAvailabilitySignal"/> so consumers do not need the
-    /// concrete router for quota wake-up notifications.
-    /// </summary>
-    public event Action? QuotaUsableThresholdCrossed;
 
     public AgentClassRouter(
         IReadOnlyList<AgentClass> catalog,
@@ -1297,7 +1287,6 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             existing.ExpiresAt <= nowUtc || next.ExpiresAt < existing.ExpiresAt
                 ? next
                 : existing);
-        RecordQuotaUsableTransition(key, isUsable: false);
         _quotaAvailabilityPublisher?.RecordQuotaUsability(member, isUsable: false);
     }
 
@@ -1929,10 +1918,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         EffectiveQuota quota,
         QuotaGateDecision gate)
     {
-        var key = RecordObservedAvailability(member, quota);
+        RecordObservedAvailability(member, quota);
         _quotaAvailabilityPublisher?.RecordQuotaUsability(member, gate.Allow);
-        if (RecordQuotaUsableTransition(key, gate.Allow))
-            NotifyQuotaUsableThresholdCrossed();
     }
 
     private MemberQuotaKey RecordObservedAvailability(
@@ -2184,44 +2171,6 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             member.Agent.Value,
             member.ModelId ?? "(default)",
             reason);
-    }
-
-    private void NotifyQuotaUsableThresholdCrossed()
-    {
-        var handlers = QuotaUsableThresholdCrossed;
-        if (handlers is null)
-            return;
-
-        foreach (Action handler in handlers.GetInvocationList().Cast<Action>())
-        {
-            try
-            {
-                handler();
-            }
-            catch (Exception ex)
-            {
-                _log.LogWarning(ex, "Quota usable threshold subscriber threw; routing decision will continue");
-            }
-        }
-    }
-
-    private bool RecordQuotaUsableTransition(MemberQuotaKey key, bool isUsable)
-    {
-        while (true)
-        {
-            if (!_lastQuotaUsable.TryGetValue(key, out var previous))
-            {
-                if (_lastQuotaUsable.TryAdd(key, isUsable))
-                    return false;
-                continue;
-            }
-
-            if (previous == isUsable)
-                return false;
-
-            if (_lastQuotaUsable.TryUpdate(key, isUsable, previous))
-                return !previous && isUsable;
-        }
     }
 
     /// <summary>

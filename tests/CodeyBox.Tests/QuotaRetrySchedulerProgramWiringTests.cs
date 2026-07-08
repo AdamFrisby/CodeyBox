@@ -2,6 +2,7 @@ using System.Reflection;
 using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Projects;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -156,6 +157,56 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
         Assert.Equal(TimeSpan.FromMinutes(2), stored!.NextTransientRetryAt - stored.TransientRetryFirstFailedAt);
     }
 
+    [Fact]
+    public async Task ProgramWiredQuotaRecoverySignalRequeuesWaitingItemBeforePeriodicPoll()
+    {
+        using var factory = new QuotaRecoverySignalWiringFactory();
+
+        var scheduler = factory.Services.GetRequiredService<QuotaRetryScheduler>();
+        var wiredSignal = typeof(QuotaRetryScheduler)
+            .GetField("_quotaAvailabilitySignal", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(scheduler);
+        Assert.Same(factory.Services.GetRequiredService<IAgentQuotaAvailabilitySignal>(), wiredSignal);
+        Assert.Same(
+            factory.Services.GetRequiredService<IAgentQuotaAvailabilitySignal>(),
+            factory.Services.GetRequiredService<IAgentQuotaAvailabilityPublisher>());
+
+        var store = factory.Services.GetRequiredService<IWorkItemStore>();
+        var project = await factory.Services
+            .GetRequiredService<IProjectRepository>()
+            .GetAsync(new ProjectId("quota-signal-project"), CancellationToken.None);
+        Assert.NotNull(project);
+
+        var parked = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = project!.Id,
+            Title = "parked",
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            QuotaRetryAttempts = 0,
+            AgentClassId = "quota-signal-class",
+            NextQuotaRetryAt = DateTimeOffset.UtcNow.AddDays(7),
+        };
+        await store.CreateAsync(parked);
+
+        var router = factory.Services.GetRequiredService<AgentClassRouter>();
+        var probeItem = parked with { Id = WorkItemId.New(), State = WorkItemState.Queued };
+
+        var denied = await router.ResolveAsync(probeItem, project, CancellationToken.None);
+        Assert.True(denied.ShouldWait);
+        Assert.Null(denied.Chosen);
+
+        factory.Probe.AvailablePct = 90;
+        var allowed = await router.ResolveAsync(probeItem with { Id = WorkItemId.New() }, project, CancellationToken.None);
+        Assert.NotNull(allowed.Chosen);
+
+        var retried = await WaitForQuotaRetryAttemptAsync(store, parked.Id, TimeSpan.FromSeconds(5));
+        Assert.Equal(WorkItemState.Queued, retried.State);
+        Assert.Equal(1, retried.QuotaRetryAttempts);
+    }
+
     private static CodeyBoxOptions OptionsWithQuotaRetry(
         bool enabled,
         string interval,
@@ -244,6 +295,61 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
         }
     }
 
+    private sealed class QuotaRecoverySignalWiringFactory : WebApplicationFactory<Program>
+    {
+        private readonly string _dbPath = Path.Combine(
+            Path.GetTempPath(), $"codeybox-quota-signal-wiring-{Guid.NewGuid():N}.db");
+
+        public MutableProgramQuotaProbe Probe { get; } = new(AgentKind.Codex, 0);
+
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            builder.UseEnvironment("Development");
+            builder.ConfigureAppConfiguration((_, cfg) =>
+            {
+                cfg.Sources.Clear();
+                var tmp = Path.GetTempPath();
+                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["CodeyBox:DangerouslyDisableAuth"] = "true",
+                    ["CodeyBox:Smoke:Enabled"] = "false",
+                    ["CodeyBox:StateDatabasePath"] = _dbPath,
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:AutoRetryOnQuotaFailure:Enabled"] = "true",
+                    ["CodeyBox:AutoRetryOnQuotaFailure:PeriodicCheckInterval"] = "06:00:00",
+                    ["CodeyBox:AutoRetryOnQuotaFailure:MaxAutoRetriesPerWorkItem"] = "3",
+                    ["CodeyBox:QuotaRouter:MinQuotaPct"] = "10",
+                    ["CodeyBox:AgentClasses:0:Id"] = "quota-signal-class",
+                    ["CodeyBox:AgentClasses:0:DisplayName"] = "Quota Signal",
+                    ["CodeyBox:AgentClasses:0:Members:0:Agent"] = "codex",
+                    ["CodeyBox:AgentClasses:0:Members:0:Billing"] = "Subscription",
+                    ["CodeyBox:AgentClasses:0:Members:0:QualityScore"] = "100",
+                    ["CodeyBox:Projects:0:Id"] = "quota-signal-project",
+                    ["CodeyBox:Projects:0:DisplayName"] = "Quota Signal Project",
+                    ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example.invalid/repo.git",
+                    ["CodeyBox:Projects:0:DefaultAgentClass"] = "quota-signal-class",
+                });
+            });
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IHostedService>();
+                services.RemoveAll<IAgentQuotaProbe>();
+                services.AddSingleton(Probe);
+                services.AddSingleton<IAgentQuotaProbe>(sp => sp.GetRequiredService<MutableProgramQuotaProbe>());
+            });
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+                try { File.Delete(_dbPath); } catch { /* best-effort */ }
+            base.Dispose(disposing);
+        }
+    }
+
     private sealed class DefaultTransientRetryWiringFactory : WebApplicationFactory<Program>
     {
         private readonly string _dbPath = Path.Combine(
@@ -296,5 +402,41 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
         {
             public void Dispose() { }
         }
+    }
+
+    private sealed class MutableProgramQuotaProbe : IAgentQuotaProbe
+    {
+        public MutableProgramQuotaProbe(AgentKind kind, double availablePct)
+        {
+            Kind = kind;
+            AvailablePct = availablePct;
+        }
+
+        public AgentKind Kind { get; }
+        public double AvailablePct { get; set; }
+
+        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+            => Task.FromResult(new AgentQuotaSnapshot { AvailablePct = AvailablePct });
+    }
+
+    private static async Task<WorkItem> WaitForQuotaRetryAttemptAsync(
+        IWorkItemStore store,
+        WorkItemId id,
+        TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        WorkItem? latest = null;
+        while (DateTime.UtcNow < deadline)
+        {
+            latest = await store.GetAsync(id);
+            if (latest?.QuotaRetryAttempts > 0)
+                return latest;
+
+            await Task.Delay(25);
+        }
+
+        latest = await store.GetAsync(id);
+        Assert.Fail($"Timed out waiting for quota retry attempt; latest state={latest?.State}, attempts={latest?.QuotaRetryAttempts}");
+        throw new InvalidOperationException("unreachable");
     }
 }

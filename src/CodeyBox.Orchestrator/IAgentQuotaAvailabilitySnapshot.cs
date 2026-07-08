@@ -31,9 +31,9 @@ public interface IAgentQuotaAvailabilitySnapshot
 }
 
 /// <summary>
-/// Emits a wake-up signal when a quota probe observes a class member cross from
-/// below its effective floor to usable. Consumers can react without depending
-/// on the concrete router.
+/// Emits a wake-up signal when quota availability observations cross from
+/// unroutable to routable. Consumers can react without depending on the
+/// concrete transition tracker.
 /// </summary>
 public interface IAgentQuotaAvailabilitySignal
 {

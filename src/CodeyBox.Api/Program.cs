@@ -1469,17 +1469,13 @@ static IAgentQuotaProbe WrapLastKnownGood(IAgentQuotaProbe inner, IServiceProvid
 {
     var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
     var lf = sp.GetRequiredService<ILoggerFactory>();
-    var retained = new LastKnownGoodQuotaProbe(
+    return new LastKnownGoodQuotaProbe(
         inner,
         () => new LastKnownGoodQuotaOptions
         {
             MaxStaleness = TimeSpan.FromSeconds(monitor.CurrentValue.QuotaRouter.ProbeMaxStalenessSeconds),
         },
-        lf.CreateLogger<LastKnownGoodQuotaProbe>());
-    return new SignalingQuotaProbe(
-        retained,
-        sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>(),
-        sp.GetRequiredService<QuotaGatePolicy>(),
+        lf.CreateLogger<LastKnownGoodQuotaProbe>(),
         sp.GetService<TimeProvider>());
 }
 

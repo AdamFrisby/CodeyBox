@@ -166,4 +166,26 @@ public sealed class LastKnownGoodQuotaProbeTests
         Assert.True(stale.IsKnown);
         Assert.Equal(71, stale.AvailablePct);
     }
+
+    [Fact]
+    public async Task MarkExhausted_SuppressesCachedPositiveUntilTtl()
+    {
+        var clock = new Clock(new DateTimeOffset(2026, 6, 10, 12, 0, 0, TimeSpan.Zero));
+        var inner = new StubProbe { Next = new AgentQuotaSnapshot { AvailablePct = 98 } };
+        var lkg = Build(inner, clock);
+        var member = Member();
+
+        Assert.Equal(98, (await lkg.GetAvailabilityAsync(member, default)).AvailablePct);
+
+        var resetAt = clock.GetUtcNow().AddDays(7);
+        await lkg.MarkExhaustedAsync(member, TimeSpan.FromHours(1), resetAt);
+
+        var suppressed = await lkg.GetAvailabilityAsync(member, default);
+        Assert.True(suppressed.IsKnown);
+        Assert.Equal(0, suppressed.AvailablePct);
+        Assert.Equal(resetAt, suppressed.ResetAt);
+
+        clock.Advance(TimeSpan.FromHours(1) + TimeSpan.FromSeconds(1));
+        Assert.Equal(98, (await lkg.GetAvailabilityAsync(member, default)).AvailablePct);
+    }
 }

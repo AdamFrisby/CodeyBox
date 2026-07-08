@@ -1699,6 +1699,8 @@ public sealed class QuotaAutoRetryTests : IDisposable
         };
         var projects = new InMemoryProjectRepository(project);
         var probe = new MutableProbe(AgentKind.Claude, availablePct: 0);
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
         var router = new AgentClassRouter(
             [
                 new AgentClass
@@ -1714,7 +1716,8 @@ public sealed class QuotaAutoRetryTests : IDisposable
             [probe],
             new QuotaRouterOptions { MinQuotaPct = 10 },
             NullLogger<AgentClassRouter>.Instance,
-            _time);
+            _time,
+            quotaAvailabilityPublisher: quotaSignal);
         var scheduler = new QuotaRetryScheduler(
             store,
             retrier,
@@ -1733,7 +1736,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
             null,
             null,
             _time,
-            quotaAvailabilitySignal: router);
+            quotaAvailabilitySignal: quotaSignal);
 
         var parked = new WorkItem
         {
@@ -1773,6 +1776,8 @@ public sealed class QuotaAutoRetryTests : IDisposable
             DefaultAgentClass = "subscriber-class",
         };
         var probe = new MutableProbe(AgentKind.Claude, availablePct: 0);
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
         var router = new AgentClassRouter(
             [
                 new AgentClass
@@ -1788,8 +1793,9 @@ public sealed class QuotaAutoRetryTests : IDisposable
             [probe],
             new QuotaRouterOptions { MinQuotaPct = 10 },
             NullLogger<AgentClassRouter>.Instance,
-            _time);
-        router.QuotaUsableThresholdCrossed += () => throw new InvalidOperationException("subscriber failed");
+            _time,
+            quotaAvailabilityPublisher: quotaSignal);
+        quotaSignal.QuotaUsableThresholdCrossed += () => throw new InvalidOperationException("subscriber failed");
 
         var probeItem = new WorkItem
         {
@@ -1836,6 +1842,8 @@ public sealed class QuotaAutoRetryTests : IDisposable
                 new WindowQuota { Name = "seven_day", AvailablePct = 80 },
             ],
         });
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
         var router = new AgentClassRouter(
             [
                 new AgentClass
@@ -1861,7 +1869,8 @@ public sealed class QuotaAutoRetryTests : IDisposable
                 },
             },
             NullLogger<AgentClassRouter>.Instance,
-            _time);
+            _time,
+            quotaAvailabilityPublisher: quotaSignal);
         using var scheduler = new QuotaRetryScheduler(
             store,
             retrier,
@@ -1880,7 +1889,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
             null,
             null,
             _time,
-            quotaAvailabilitySignal: router);
+            quotaAvailabilitySignal: quotaSignal);
 
         var parked = new WorkItem
         {
@@ -1919,7 +1928,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
     }
 
     [Fact]
-    public async Task Scheduler_QuotaProbeRecoverySignal_RequeuesWaitingForQuotaResetItem()
+    public async Task Scheduler_RouterQuotaRecoverySignal_RequeuesWaitingForQuotaResetItem()
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -1946,12 +1955,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
             Billing = AgentBilling.Subscription,
             QualityScore = 100,
         };
-        var innerProbe = new MutableProbe(AgentKind.Codex, availablePct: 0);
-        var signalingProbe = new SignalingQuotaProbe(
-            innerProbe,
-            quotaSignal,
-            new QuotaGatePolicy(routerOptions),
-            _time);
+        var probe = new MutableProbe(AgentKind.Codex, availablePct: 0);
         var router = new AgentClassRouter(
             [
                 new AgentClass
@@ -1961,7 +1965,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
                     Members = [member],
                 },
             ],
-            [signalingProbe],
+            [probe],
             routerOptions,
             NullLogger<AgentClassRouter>.Instance,
             _time,
@@ -2000,15 +2004,22 @@ public sealed class QuotaAutoRetryTests : IDisposable
         };
         await store.CreateAsync(parked);
 
-        await signalingProbe.MarkExhaustedAsync(member, TimeSpan.FromDays(7), _time.Now.AddDays(7));
-        await signalingProbe.GetAvailabilityAsync(member, CancellationToken.None);
-        await Task.Delay(100);
+        var signalCount = 0;
+        quotaSignal.QuotaUsableThresholdCrossed += () => System.Threading.Interlocked.Increment(ref signalCount);
+
+        var probeItem = parked with { Id = WorkItemId.New(), State = WorkItemState.Queued };
+        var deniedDecision = await router.ResolveAsync(probeItem, project, CancellationToken.None);
+        Assert.True(deniedDecision.ShouldWait);
+        Assert.Equal(0, System.Threading.Volatile.Read(ref signalCount));
+
         var stillParked = await store.GetAsync(parked.Id);
         Assert.Equal(WorkItemState.WaitingForQuotaReset, stillParked!.State);
         Assert.Equal(0, stillParked.QuotaRetryAttempts);
 
-        innerProbe.AvailablePct = 80;
-        await signalingProbe.GetAvailabilityAsync(member, CancellationToken.None);
+        probe.AvailablePct = 80;
+        var allowedDecision = await router.ResolveAsync(probeItem with { Id = WorkItemId.New() }, project, CancellationToken.None);
+        Assert.NotNull(allowedDecision.Chosen);
+        Assert.Equal(1, System.Threading.Volatile.Read(ref signalCount));
 
         var retried = await WaitForAttemptsAsync(store, parked.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));
         Assert.Equal(WorkItemState.Queued, retried.State);
@@ -2104,6 +2115,8 @@ public sealed class QuotaAutoRetryTests : IDisposable
         };
         var projects = new InMemoryProjectRepository(project);
         var probe = new MutableProbe(AgentKind.Claude, availablePct: 0);
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
         var router = new AgentClassRouter(
             [
                 new AgentClass
@@ -2119,7 +2132,8 @@ public sealed class QuotaAutoRetryTests : IDisposable
             [probe],
             new QuotaRouterOptions { MinQuotaPct = 10 },
             NullLogger<AgentClassRouter>.Instance,
-            _time);
+            _time,
+            quotaAvailabilityPublisher: quotaSignal);
         using var scheduler = new QuotaRetryScheduler(
             store,
             retrier,
@@ -2138,10 +2152,10 @@ public sealed class QuotaAutoRetryTests : IDisposable
             null,
             null,
             _time,
-            quotaAvailabilitySignal: router);
+            quotaAvailabilitySignal: quotaSignal);
 
         var signalCount = 0;
-        router.QuotaUsableThresholdCrossed += () => System.Threading.Interlocked.Increment(ref signalCount);
+        quotaSignal.QuotaUsableThresholdCrossed += () => System.Threading.Interlocked.Increment(ref signalCount);
 
         var parked = new WorkItem
         {

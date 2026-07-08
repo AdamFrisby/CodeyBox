@@ -78,10 +78,17 @@ public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilityS
 }
 
 /// <summary>
-/// Publisher side of <see cref="IAgentQuotaAvailabilitySignal"/>. Quota
-/// observers call this after evaluating a member against the effective floor.
+/// Publisher side of <see cref="IAgentQuotaAvailabilitySignal"/>.
 /// </summary>
 public interface IAgentQuotaAvailabilityPublisher
 {
+    /// <summary>
+    /// Records the caller's fully evaluated routing verdict for
+    /// <paramref name="member"/>. Implementations publish only after they have
+    /// previously observed the same member as unusable, so callers must record
+    /// both the denied observation and the later allowed observation. Calls may
+    /// arrive concurrently from independent router/probe paths and must be
+    /// handled without relying on single-threaded ordering.
+    /// </summary>
     void RecordQuotaUsability(AgentMembership member, bool isUsable);
 }

@@ -42,6 +42,7 @@ public sealed class LastKnownGoodQuotaProbe : IAgentQuotaProbe
 
     private readonly object _lock = new();
     private readonly Dictionary<(string RouteKey, string ModelKey), (AgentQuotaSnapshot Snapshot, DateTimeOffset CapturedAt)> _retained = new();
+    private readonly Dictionary<(string RouteKey, string ModelKey), ForcedExhaustion> _forcedExhaustions = new();
 
     public AgentKind Kind => _inner.Kind;
 
@@ -59,6 +60,14 @@ public sealed class LastKnownGoodQuotaProbe : IAgentQuotaProbe
 
     public async Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
     {
+        var key = KeyFor(member);
+        var now = _time.GetUtcNow();
+        lock (_lock)
+        {
+            if (TryBuildForcedExhaustionSnapshotLocked(key, now, out var suppressed))
+                return suppressed;
+        }
+
         AgentQuotaSnapshot snapshot;
         try
         {
@@ -78,11 +87,13 @@ public sealed class LastKnownGoodQuotaProbe : IAgentQuotaProbe
                 QuotaUnknownReason.Transient, $"probe threw: {ex.GetType().Name}");
         }
 
-        var key = (member.RouteKey, string.IsNullOrWhiteSpace(member.ModelId) ? "" : member.ModelId!);
-        var now = _time.GetUtcNow();
+        now = _time.GetUtcNow();
 
         lock (_lock)
         {
+            if (TryBuildForcedExhaustionSnapshotLocked(key, now, out var suppressed))
+                return suppressed;
+
             if (snapshot.IsKnown)
             {
                 _retained[key] = (snapshot, now);
@@ -132,7 +143,71 @@ public sealed class LastKnownGoodQuotaProbe : IAgentQuotaProbe
         TimeSpan ttl,
         DateTimeOffset? resetAt = null,
         CancellationToken ct = default)
-        => _inner.MarkExhaustedAsync(member, ttl, resetAt, ct);
+        => MarkExhaustedCoreAsync(member, ttl, resetAt, ct);
+
+    private async Task MarkExhaustedCoreAsync(
+        AgentMembership member,
+        TimeSpan ttl,
+        DateTimeOffset? resetAt,
+        CancellationToken ct)
+    {
+        await _inner.MarkExhaustedAsync(member, ttl, resetAt, ct).ConfigureAwait(false);
+
+        var key = KeyFor(member);
+        var now = _time.GetUtcNow();
+        lock (_lock)
+        {
+            _retained.Remove(key);
+
+            if (ttl <= TimeSpan.Zero)
+            {
+                _forcedExhaustions.Remove(key);
+                return;
+            }
+
+            var expiresAt = now + ttl;
+            if (resetAt is { } reset && reset < expiresAt)
+                expiresAt = reset;
+
+            if (expiresAt <= now)
+            {
+                _forcedExhaustions.Remove(key);
+                return;
+            }
+
+            _forcedExhaustions[key] = new ForcedExhaustion(expiresAt, resetAt);
+        }
+    }
+
+    private bool TryBuildForcedExhaustionSnapshotLocked(
+        (string RouteKey, string ModelKey) key,
+        DateTimeOffset now,
+        out AgentQuotaSnapshot snapshot)
+    {
+        if (_forcedExhaustions.TryGetValue(key, out var forced))
+        {
+            if (forced.ExpiresAt > now)
+            {
+                snapshot = new AgentQuotaSnapshot
+                {
+                    AvailablePct = 0,
+                    ResetAt = forced.ResetAt ?? forced.ExpiresAt,
+                    Notes = $"marked exhausted until {forced.ExpiresAt:O}",
+                };
+                return true;
+            }
+
+            _forcedExhaustions.Remove(key);
+        }
+
+        snapshot = default!;
+        return false;
+    }
+
+    private static (string RouteKey, string ModelKey) KeyFor(AgentMembership member) =>
+        (member.RouteKey, string.IsNullOrWhiteSpace(member.ModelId) ? "" : member.ModelId!);
+
+    private sealed record ForcedExhaustion(DateTimeOffset ExpiresAt, DateTimeOffset? ResetAt);
 }
 
 /// <summary>
