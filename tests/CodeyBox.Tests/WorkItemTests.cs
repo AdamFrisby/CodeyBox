@@ -118,6 +118,33 @@ public sealed class WorkItemTests
         Assert.Null(queued.QuotaRetryPhase);
     }
 
+    [Fact]
+    public void With_MergeConflictResolutionFailedCarriesFailureKind()
+    {
+        var item = Sample();
+
+        var failed = item.With(
+            WorkItemState.MergeConflictResolutionFailed,
+            "merge resolver failed",
+            failureKind: WorkItemFailureKinds.Infrastructure);
+
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, failed.FailureKind);
+    }
+
+    [Fact]
+    public void With_AuthRequiredFailedCarriesAuthFailureScope()
+    {
+        var item = Sample();
+
+        var failed = item.With(
+            WorkItemState.Failed,
+            "auth required",
+            failureKind: WorkItemFailureKinds.AuthRequired,
+            authFailureScope: WorkItemAuthFailureScope.Item);
+
+        Assert.Equal(WorkItemAuthFailureScope.Item, failed.AuthFailureScope);
+    }
+
     [Theory]
     [InlineData(WorkItemState.Working, WorkItemState.WorkComplete)]
     [InlineData(WorkItemState.Auditing, WorkItemState.AuditPassed)]

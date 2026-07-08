@@ -62,6 +62,10 @@ public sealed class PipelineRunnerInfrastructureAuditSignalTests : IDisposable
         await fix.Pipeline.RunAsync(item, CancellationToken.None);
 
         Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
+        var failed = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, failed!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, failed.FailureKind);
+        Assert.Equal(AgentKind.Codex, failed.Agent);
         var snap = fix.Registry.Snapshot().SingleOrDefault(s => s.Agent == AgentKind.Codex);
         Assert.True(snap is null || snap.ConsecutiveFastFails == 0);
         Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
@@ -122,6 +126,10 @@ public sealed class PipelineRunnerInfrastructureAuditSignalTests : IDisposable
 
         // Registry untouched — infra filter must also fire on the merge path.
         Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
+        var failed = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, failed!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, failed.FailureKind);
+        Assert.Equal(AgentKind.Codex, failed.Agent);
         var snap = fix.Registry.Snapshot().SingleOrDefault(s => s.Agent == AgentKind.Codex);
         Assert.True(snap is null || snap.ConsecutiveFastFails == 0);
         Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");

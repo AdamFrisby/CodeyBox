@@ -49,6 +49,9 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class AgentRestoreRetryScheduler : BackgroundService
 {
+    private static readonly TimeSpan NearTerminalLookback = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan NearTerminalClockSkew = TimeSpan.FromMinutes(1);
+
     private readonly IWorkItemStore _store;
     private readonly WorkItemRetrier _retrier;
     private readonly IAgentRestoreSignal? _signal;
@@ -92,7 +95,12 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
     {
         try
         {
-            _events.Writer.TryWrite(evt);
+            if (!_events.Writer.TryWrite(evt))
+            {
+                _log.LogWarning(
+                    "AgentRestoreRetryScheduler: restore event queue rejected event for {Agent}; sweep skipped",
+                    evt.Agent.Value);
+            }
         }
         catch (Exception ex)
         {
@@ -180,7 +188,7 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
             // seeing silence in all three.
             AuditLog.AgentRestoreRequeueSwept(
                 evt.Agent, evt.OutageStartedAt, evt.RestoredAt, 0, 0);
-            await EmitSweepWebhookAsync(evt, requeued: 0, skipped: 0, capHit: false, opts: opts, ct: ct)
+            await EmitSweepWebhookAsync(evt, requeued: 0, skipped: 0, ct: ct)
                 .ConfigureAwait(false);
             return new AgentRestoreSweepSummary(0, 0);
         }
@@ -189,7 +197,6 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
         var windowEnd = evt.RestoredAt + opts.PostRestoreMargin;
         var requeued = 0;
         var skipped = 0;
-        var capWasHit = false;
 
         var candidateStates = new[]
         {
@@ -203,16 +210,6 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
             {
                 if (!await IsCandidateAsync(item, evt.Agent, windowStart, windowEnd, ct).ConfigureAwait(false))
                 {
-                    continue;
-                }
-
-                if (requeued >= opts.MaxItemsPerRestore)
-                {
-                    capWasHit = true;
-                    skipped++;
-                    // Count every over-cap candidate quietly so the summary's
-                    // skipped count remains the exhaustive "matched but not
-                    // retried" value promised by the audit-log contract.
                     continue;
                 }
 
@@ -251,16 +248,9 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
             }
         }
 
-        if (capWasHit)
-        {
-            _log.LogWarning(
-                "AgentRestoreRetryScheduler: per-restore cap {Cap} reached for {Agent}; remaining candidates left parked (operator can re-trigger via /admin/agent/{Agent}/reset)",
-                opts.MaxItemsPerRestore, evt.Agent.Value, evt.Agent.Value);
-        }
-
         AuditLog.AgentRestoreRequeueSwept(
             evt.Agent, evt.OutageStartedAt, evt.RestoredAt, requeued, skipped);
-        await EmitSweepWebhookAsync(evt, requeued, skipped, capWasHit, opts, ct)
+        await EmitSweepWebhookAsync(evt, requeued, skipped, ct)
             .ConfigureAwait(false);
         return new AgentRestoreSweepSummary(requeued, skipped);
     }
@@ -339,22 +329,29 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
     }
 
     private static bool IsNearTerminalUpdate(DateTimeOffset involvementAt, DateTimeOffset terminalUpdatedAt) =>
-        involvementAt >= terminalUpdatedAt - TimeSpan.FromMinutes(15)
-        && involvementAt <= terminalUpdatedAt + TimeSpan.FromMinutes(1);
+        involvementAt >= terminalUpdatedAt - NearTerminalLookback
+        && involvementAt <= terminalUpdatedAt + NearTerminalClockSkew;
 
     private static bool IsRestoreSweepEligibleFailure(WorkItem item)
     {
         if (!WorkItemFailureKinds.IsInfraShaped(item.FailureKind))
             return false;
 
-        if (string.Equals(item.FailureKind, WorkItemFailureKinds.AuthRequired, StringComparison.OrdinalIgnoreCase)
-            && IsUncorroboratedStdoutOnlyAuthFailure(item.LastError))
+        if (!string.Equals(item.FailureKind, WorkItemFailureKinds.AuthRequired, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (item.AuthFailureScope == WorkItemAuthFailureScope.Item)
             return false;
 
-        return true;
+        if (item.AuthFailureScope == WorkItemAuthFailureScope.Fleet)
+            return true;
+
+        // Legacy rows from before auth_failure_scope existed only carried the
+        // item-vs-fleet distinction in the formatted diagnostic text.
+        return !IsLegacyUncorroboratedStdoutOnlyAuthFailure(item.LastError);
     }
 
-    private static bool IsUncorroboratedStdoutOnlyAuthFailure(string? lastError)
+    private static bool IsLegacyUncorroboratedStdoutOnlyAuthFailure(string? lastError)
     {
         if (string.IsNullOrWhiteSpace(lastError))
             return false;
@@ -369,8 +366,6 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
         AgentRestoredEvent evt,
         int requeued,
         int skipped,
-        bool capHit,
-        AgentRestoreRetryOptions opts,
         CancellationToken ct)
     {
         if (_webhooks is null) return;
@@ -388,8 +383,6 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
                     restoredAt = evt.RestoredAt,
                     requeued,
                     skipped,
-                    capHit,
-                    maxItemsPerRestore = opts.MaxItemsPerRestore,
                 },
             }, ct).ConfigureAwait(false);
         }
@@ -484,20 +477,12 @@ public sealed record AgentRestoreRetryOptions
     /// restore notification by milliseconds.
     /// </summary>
     public TimeSpan PostRestoreMargin { get; init; } = TimeSpan.FromMinutes(5);
-
-    /// <summary>
-    /// Per-restore-event cap on how many items the sweep may requeue. A
-    /// safety valve against re-enqueuing thousands of items in one burst if
-    /// the operator was already running an unrelated cleanup. Default 200.
-    /// </summary>
-    public int MaxItemsPerRestore { get; init; } = 200;
 }
 
 /// <summary>
 /// Outcome of one restore-driven sweep. <see cref="Requeued"/> is the count
 /// of items the sweep actually transitioned back to Queued; <see cref="Skipped"/>
 /// is the count of candidates that matched the filter but were not retried
-/// (concurrent state change, per-restore cap reached, retrier-internal
-/// reject like an open operator question).
+/// (concurrent state change, retrier-internal reject like an open operator question).
 /// </summary>
 public readonly record struct AgentRestoreSweepSummary(int Requeued, int Skipped);

@@ -165,8 +165,7 @@ public static class OrchestratorOptionsFactory
     public static AgentRestoreRetryOptions BuildAgentRestoreRetryOptions(
         bool enabled,
         string lookbackGrace,
-        string postRestoreMargin,
-        int maxItemsPerRestore)
+        string postRestoreMargin)
     {
         if (!enabled)
             return new AgentRestoreRetryOptions { Enabled = false };
@@ -185,16 +184,11 @@ public static class OrchestratorOptionsFactory
             throw new InvalidOperationException(
                 "CodeyBox:AutoRequeueOnAgentRestore:PostRestoreMargin must be non-negative");
 
-        if (maxItemsPerRestore <= 0)
-            throw new InvalidOperationException(
-                "CodeyBox:AutoRequeueOnAgentRestore:MaxItemsPerRestore must be positive");
-
         return new AgentRestoreRetryOptions
         {
             Enabled = true,
             LookbackGrace = lookback,
             PostRestoreMargin = margin,
-            MaxItemsPerRestore = maxItemsPerRestore,
         };
     }
 

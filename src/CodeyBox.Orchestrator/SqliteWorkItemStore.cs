@@ -172,6 +172,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
 
             // Additive migration: capture failure details for auto-retry logic.
             RunMigration("ALTER TABLE work_items ADD COLUMN failure_kind TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN auth_failure_scope TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN quota_reset_at TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN next_quota_retry_at TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN quota_retry_attempts INTEGER NOT NULL DEFAULT 0;");
@@ -486,7 +487,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         local_squash_sha, merged_pr_number, merged_pr_url,
                         min_model_score, cancellation_reason, recovery_attempts, recovery_attempt_source_state, release_id, preempted_at, preempt_checkpoint,
                         suspended_vm_name, suspended_at, agent_log_path,
-                        failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from,
+                        failure_kind, auth_failure_scope, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from,
                         quota_retry_phase,
                         next_transient_retry_at, transient_retry_attempts, transient_retry_first_failed_at, transient_retry_from,
                         agent_pause_target, agent_pause_retry_from, auditor_profile, priority,
@@ -503,7 +504,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         $local_squash_sha, $merged_pr_number, $merged_pr_url,
                         $min_model_score, $cancellation_reason, $recovery_attempts, $recovery_attempt_source_state, $release_id, $preempted_at, $preempt_checkpoint,
                         $suspended_vm_name, $suspended_at, $agent_log_path,
-                        $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from,
+                        $failure_kind, $auth_failure_scope, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from,
                         $quota_retry_phase,
                         $next_transient_retry_at, $transient_retry_attempts, $transient_retry_first_failed_at, $transient_retry_from,
                         $agent_pause_target, $agent_pause_retry_from, $auditor_profile, $priority,
@@ -638,6 +639,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     suspended_at = $suspended_at,
                     agent_log_path = $agent_log_path,
                     failure_kind = $failure_kind,
+                    auth_failure_scope = $auth_failure_scope,
                     quota_reset_at = $quota_reset_at,
                     next_quota_retry_at = $next_quota_retry_at,
                     quota_retry_attempts = $quota_retry_attempts,
@@ -723,6 +725,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     suspended_at = $suspended_at,
                     agent_log_path = $agent_log_path,
                     failure_kind = $failure_kind,
+                    auth_failure_scope = $auth_failure_scope,
                     quota_reset_at = $quota_reset_at,
                     next_quota_retry_at = $next_quota_retry_at,
                     quota_retry_attempts = $quota_retry_attempts,
@@ -809,6 +812,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     suspended_at = $suspended_at,
                     agent_log_path = $agent_log_path,
                     failure_kind = $failure_kind,
+                    auth_failure_scope = $auth_failure_scope,
                     quota_reset_at = $quota_reset_at,
                     next_quota_retry_at = $next_quota_retry_at,
                     quota_retry_attempts = $quota_retry_attempts,
@@ -2578,6 +2582,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$suspended_at", (object?)item.SuspendedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$agent_log_path", (object?)item.AgentLogPath ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$failure_kind", (object?)item.FailureKind ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$auth_failure_scope",
+            item.AuthFailureScope.HasValue ? (object)item.AuthFailureScope.Value.ToString() : DBNull.Value);
         cmd.Parameters.AddWithValue("$quota_reset_at", (object?)item.QuotaResetAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$next_quota_retry_at", (object?)item.NextQuotaRetryAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$quota_retry_attempts", item.QuotaRetryAttempts);
@@ -2704,6 +2710,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         SuspendedAt = ReadNullableDateTimeOffset(r, "suspended_at"),
         AgentLogPath = ReadNullableString(r, "agent_log_path"),
         FailureKind = r.IsDBNull(r.GetOrdinal("failure_kind")) ? null : r.GetString(r.GetOrdinal("failure_kind")),
+        AuthFailureScope = ReadNullableAuthFailureScope(r, "auth_failure_scope"),
         QuotaResetAt = ReadNullableDateTimeOffset(r, "quota_reset_at"),
         NextQuotaRetryAt = ReadNullableDateTimeOffset(r, "next_quota_retry_at"),
         QuotaRetryAttempts = ReadInt32OrDefault(r, "quota_retry_attempts", defaultValue: 0),
@@ -2861,6 +2868,14 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     {
         var raw = ReadNullableString(r, column);
         return string.IsNullOrWhiteSpace(raw) ? null : new AgentKind(raw);
+    }
+
+    private static WorkItemAuthFailureScope? ReadNullableAuthFailureScope(SqliteDataReader r, string column)
+    {
+        var raw = ReadNullableString(r, column);
+        return Enum.TryParse<WorkItemAuthFailureScope>(raw, ignoreCase: true, out var value)
+            ? value
+            : null;
     }
 
     private static WorkItemState? ReadNullableWorkItemState(SqliteDataReader r, string column)

@@ -289,8 +289,7 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
                 _ = OrchestratorOptionsFactory.BuildAgentRestoreRetryOptions(
                     options.AutoRequeueOnAgentRestore.Enabled,
                     options.AutoRequeueOnAgentRestore.LookbackGrace,
-                    options.AutoRequeueOnAgentRestore.PostRestoreMargin,
-                    options.AutoRequeueOnAgentRestore.MaxItemsPerRestore);
+                    options.AutoRequeueOnAgentRestore.PostRestoreMargin);
             }
             catch (InvalidOperationException ex)
             {

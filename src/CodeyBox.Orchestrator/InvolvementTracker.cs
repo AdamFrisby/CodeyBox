@@ -74,6 +74,7 @@ internal sealed class InvolvementTracker
         AgentAuthRequiredException => "failure:auth",
         AuditorIdleTimeoutException => "failure:timeout",
         TerminalTransientNetworkError => "failure:transient",
+        AgentInfrastructureFailureException => "failure:infrastructure",
         PipelineRunner.AgentAttemptTimeoutException => "failure:timeout",
         OperationCanceledException => "failure:cancelled",
         _ => "failure:agent",

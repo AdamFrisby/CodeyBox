@@ -20,6 +20,14 @@ public interface IWorkItemTerminalRevisionBuilder
 public sealed record WorkItemTerminalFailureTransitionCommand
 {
     public string? FailureKind { get; init; }
+    public WorkItemAuthFailureScope? AuthFailureScope { get; init; }
+
+    /// <summary>
+    /// Failed agent attribution. When set, the transition rewrites
+    /// <see cref="WorkItem.Agent"/> to this value and clears
+    /// <see cref="WorkItem.AgentInstanceId"/> if the prior instance belonged to
+    /// a different agent.
+    /// </summary>
     public AgentKind? Agent { get; init; }
     public DateTimeOffset? QuotaResetAt { get; init; }
     public string? CancellationSource { get; init; }
@@ -125,7 +133,8 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
             error,
             failureKind: command.FailureKind,
             quotaResetAt: command.QuotaResetAt,
-            cancellationSource: command.CancellationSource);
+            cancellationSource: command.CancellationSource,
+            authFailureScope: command.AuthFailureScope);
 
         if (string.Equals(command.FailureKind, "quota", StringComparison.OrdinalIgnoreCase))
         {

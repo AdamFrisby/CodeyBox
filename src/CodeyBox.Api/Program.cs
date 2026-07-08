@@ -1988,6 +1988,8 @@ builder.Services.AddSingleton<IAgentAuthAvailabilityRegistry>(sp =>
     sp.GetRequiredService<AgentAvailabilityRegistry>());
 builder.Services.AddSingleton<IAgentAuthRequiredAvailabilityReader>(sp =>
     sp.GetRequiredService<AgentAvailabilityRegistry>());
+builder.Services.AddSingleton<IAgentRestorePublisher>(sp =>
+    sp.GetRequiredService<AgentAvailabilityRegistry>());
 builder.Services.AddSingleton<IAgentDispatchAvailability>(sp => new AgentDispatchAvailability(
     sp.GetService<IAgentEffectiveAvailabilityReader>(),
     sp.GetService<IInVmSmokeGate>(),
@@ -2040,7 +2042,8 @@ builder.Services.AddSingleton<IInVmSmokeCache>(sp =>
 // re-verified. The admin endpoint depends on this one contract.
 builder.Services.AddSingleton<IAgentAvailabilityReset>(sp => new AgentAvailabilityReset(
     sp.GetRequiredService<ISmokeAvailabilityRegistry>(),
-    sp.GetRequiredService<IInVmSmokeCache>()));
+    sp.GetRequiredService<IInVmSmokeCache>(),
+    sp.GetRequiredService<IAgentRestorePublisher>()));
 builder.Services.AddSingleton<InVmSmokeProber>(sp => new InVmSmokeProber(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IBaselineImageResolver>(),
@@ -3053,8 +3056,7 @@ builder.Services.AddSingleton<AgentRestoreRetryScheduler>(sp => new AgentRestore
         return OrchestratorOptionsFactory.BuildAgentRestoreRetryOptions(
             live.Enabled,
             live.LookbackGrace,
-            live.PostRestoreMargin,
-            live.MaxItemsPerRestore);
+            live.PostRestoreMargin);
     },
     sp.GetRequiredService<ILogger<AgentRestoreRetryScheduler>>(),
     sp.GetRequiredService<IAgentRestoreSignal>(),
@@ -5018,12 +5020,6 @@ namespace CodeyBox.Api
         /// </summary>
         public string PostRestoreMargin { get; set; } = "00:05:00";
 
-        /// <summary>
-        /// Positive cap on how many matching work items one restore event may
-        /// requeue. Additional matching candidates are counted as skipped and
-        /// left parked for a later reset/sweep.
-        /// </summary>
-        public int MaxItemsPerRestore { get; set; } = 200;
     }
 
     /// <summary>

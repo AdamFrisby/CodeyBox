@@ -10,11 +10,16 @@ public sealed class AgentAvailabilityReset : IAgentAvailabilityReset
 {
     private readonly ISmokeAvailabilityRegistry _registry;
     private readonly IInVmSmokeCache _cache;
+    private readonly IAgentRestorePublisher _restorePublisher;
 
-    public AgentAvailabilityReset(ISmokeAvailabilityRegistry registry, IInVmSmokeCache cache)
+    public AgentAvailabilityReset(
+        ISmokeAvailabilityRegistry registry,
+        IInVmSmokeCache cache,
+        IAgentRestorePublisher restorePublisher)
     {
         _registry = registry;
         _cache = cache;
+        _restorePublisher = restorePublisher;
     }
 
     public void Reset(AgentKind kind)
@@ -24,7 +29,7 @@ public sealed class AgentAvailabilityReset : IAgentAvailabilityReset
         // the CLI rather than replaying a result captured before the operator's
         // fix (which would otherwise reconcile straight back onto the registry).
         _cache.Invalidate(kind);
-        if (restored is not null && _registry is IAgentRestorePublisher publisher)
-            publisher.PublishRestored(restored);
+        if (restored is not null)
+            _restorePublisher.PublishRestored(restored);
     }
 }

@@ -139,7 +139,6 @@ public sealed class CodeyBoxOptionsValidatorTests
     [Theory]
     [InlineData("lookback", "CodeyBox:AutoRequeueOnAgentRestore:LookbackGrace")]
     [InlineData("post-margin", "CodeyBox:AutoRequeueOnAgentRestore:PostRestoreMargin")]
-    [InlineData("cap", "CodeyBox:AutoRequeueOnAgentRestore:MaxItemsPerRestore")]
     public void Validate_RejectsInvalidAutoRequeueOnAgentRestoreOptions(
         string scenario,
         string expectedFailure)
@@ -152,9 +151,6 @@ public sealed class CodeyBoxOptionsValidatorTests
                 break;
             case "post-margin":
                 options.AutoRequeueOnAgentRestore.PostRestoreMargin = "-00:00:01";
-                break;
-            case "cap":
-                options.AutoRequeueOnAgentRestore.MaxItemsPerRestore = 0;
                 break;
         }
 

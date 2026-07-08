@@ -70,6 +70,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             // target to consume the slot).
             var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
             Assert.Equal(WorkItemState.Failed, final!.State);
+            Assert.Equal(WorkItemFailureKinds.Infrastructure, final.FailureKind);
+            Assert.Equal(AgentKind.Codex, final.Agent);
         }
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);

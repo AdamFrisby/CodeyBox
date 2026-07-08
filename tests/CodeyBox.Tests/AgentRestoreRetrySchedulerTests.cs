@@ -261,11 +261,11 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     }
 
     [Fact]
-    public async Task Sweep_RespectsMaxItemsPerRestoreCap()
+    public async Task Sweep_RequeuesEveryMatchingCandidate()
     {
         using var store = new SqliteWorkItemStore(_dbPath);
         var queue = new InMemoryTaskQueue();
-        var scheduler = NewScheduler(store, queue, enabled: true, maxItemsPerRestore: 2);
+        var scheduler = NewScheduler(store, queue, enabled: true);
 
         var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
         var items = new List<WorkItem>();
@@ -284,20 +284,15 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         var summary = await scheduler.SweepForTestAsync(
             new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
 
-        Assert.Equal(2, summary.Requeued);
-        // Cap reached: every over-cap candidate is still counted in Skipped
-        // so the sweep summary is exhaustive.
-        Assert.Equal(3, summary.Skipped);
-        // Two items requeued, three still parked — operator can re-trigger
-        // (eg. POST /admin/agent/<name>/reset) to drain the rest in a
-        // subsequent burst.
+        Assert.Equal(5, summary.Requeued);
+        Assert.Equal(0, summary.Skipped);
         var queuedCount = 0;
         foreach (var item in items)
         {
             var state = (await store.GetAsync(item.Id))!.State;
             if (state == WorkItemState.Queued) queuedCount++;
         }
-        Assert.Equal(2, queuedCount);
+        Assert.Equal(5, queuedCount);
     }
 
     [Fact]
@@ -430,39 +425,35 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     }
 
     [Fact]
-    public async Task Sweep_PerRestoreCap_EmitsSingleWarning_NotPerRowSpam()
+    public async Task Sweep_BoundedByWindow_DoesNotRequeueItemFailedAfterPostRestoreMargin()
     {
-        // Regression pin for the cap-reached short-circuit. Pre-fix the loop
-        // kept iterating after hitting MaxItemsPerRestore, emitting a WARN
-        // for every remaining candidate (potentially thousands per restore).
-        // Now it should break out of both state loops once the cap is hit
-        // and emit a single summary warning instead.
         using var store = new SqliteWorkItemStore(_dbPath);
         var queue = new InMemoryTaskQueue();
-        var log = new ListLogger<AgentRestoreRetryScheduler>();
-        var scheduler = NewScheduler(store, queue, enabled: true, maxItemsPerRestore: 2, schedulerLogger: log);
+        var scheduler = NewScheduler(store, queue, enabled: true);
 
         var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
-        for (var i = 0; i < 10; i++)
-        {
-            var item = NewItem(
-                agent: AgentKind.Claude,
-                state: WorkItemState.Failed,
-                failureKind: WorkItemFailureKinds.Infrastructure,
-                updatedAt: outageStart.AddMinutes(2 + i));
-            await store.CreateAsync(item);
-            await store.UpdateAsync(item);
-        }
+        var restoredAt = outageStart.AddMinutes(10);
+        var insideMargin = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.Infrastructure,
+            updatedAt: restoredAt.AddMinutes(4));
+        var afterMargin = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.Infrastructure,
+            updatedAt: restoredAt.AddMinutes(6));
+        await store.CreateAsync(insideMargin);
+        await store.UpdateAsync(insideMargin);
+        await store.CreateAsync(afterMargin);
+        await store.UpdateAsync(afterMargin);
 
         var summary = await scheduler.SweepForTestAsync(
-            new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
+            new AgentRestoredEvent(AgentKind.Claude, outageStart, restoredAt));
 
-        Assert.Equal(2, summary.Requeued);
-        Assert.Equal(8, summary.Skipped);
-        var capWarnings = log.Entries.Count(e =>
-            e.Level == Microsoft.Extensions.Logging.LogLevel.Warning &&
-            e.Message.Contains("per-restore cap", StringComparison.OrdinalIgnoreCase));
-        Assert.Equal(1, capWarnings);
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(insideMargin.Id))!.State);
+        Assert.Equal(WorkItemState.Failed, (await store.GetAsync(afterMargin.Id))!.State);
     }
 
     [Fact]
@@ -513,9 +504,9 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
                 AgentKind.Claude,
                 new AgentSmokeResult(true, null, TimeSpan.FromMilliseconds(10), SmokeFailureCategory.None));
 
-            await WaitUntilAsync(async () =>
-                (await store.GetAsync(item.Id))?.State == WorkItemState.Queued);
-            Assert.Equal(1, queue.Count);
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            Assert.Equal(item.Id, await queue.DequeueAsync(timeout.Token));
+            Assert.Equal(WorkItemState.Queued, (await store.GetAsync(item.Id))!.State);
         }
         finally
         {
@@ -645,17 +636,27 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             state: WorkItemState.Failed,
             failureKind: WorkItemFailureKinds.AuthRequired,
             updatedAt: outageStart.AddMinutes(2),
-            lastError: "auth required from agent output during work: login prompt matched; stdout accepted for item failure only; forced in-VM smoke probe did not corroborate auth");
+            lastError: "auth required from agent output during work: login prompt matched",
+            authFailureScope: WorkItemAuthFailureScope.Item);
         var corroborated = NewItem(
             agent: AgentKind.Claude,
             state: WorkItemState.Failed,
             failureKind: WorkItemFailureKinds.AuthRequired,
             updatedAt: outageStart.AddMinutes(3),
-            lastError: "auth required from agent output during work: login prompt matched; stdout corroborated by forced in-VM smoke probe for global benching");
+            lastError: "auth required from agent output during work: login prompt matched",
+            authFailureScope: WorkItemAuthFailureScope.Fleet);
+        var legacyItemLocal = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AuthRequired,
+            updatedAt: outageStart.AddMinutes(4),
+            lastError: "auth required from agent output during work: login prompt matched; stdout accepted for item failure only; forced in-VM smoke probe did not corroborate auth");
         await store.CreateAsync(itemLocal);
         await store.UpdateAsync(itemLocal);
         await store.CreateAsync(corroborated);
         await store.UpdateAsync(corroborated);
+        await store.CreateAsync(legacyItemLocal);
+        await store.UpdateAsync(legacyItemLocal);
 
         var summary = await scheduler.SweepForTestAsync(
             new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
@@ -663,6 +664,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         Assert.Equal(1, summary.Requeued);
         Assert.Equal(WorkItemState.Failed, (await store.GetAsync(itemLocal.Id))!.State);
         Assert.Equal(WorkItemState.Queued, (await store.GetAsync(corroborated.Id))!.State);
+        Assert.Equal(WorkItemState.Failed, (await store.GetAsync(legacyItemLocal.Id))!.State);
     }
 
     [Fact]
@@ -706,7 +708,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             AgentKind.Claude,
             "baseline",
             new AgentSmokeResult(true, null, TimeSpan.FromMilliseconds(5), SmokeFailureCategory.None));
-        var reset = new AgentAvailabilityReset(registry, cache);
+        var reset = new AgentAvailabilityReset(registry, cache, registry);
         var observedCacheWasCleared = false;
         ((IAgentRestoreSignal)registry).AgentRestored += _ =>
             observedCacheWasCleared = cache.TryGet(AgentKind.Claude, "baseline") is null;
@@ -792,7 +794,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         var ex = Assert.Throws<InvalidOperationException>(() =>
             OrchestratorOptionsFactory.BuildAgentRestoreRetryOptions(
                 enabled: true, lookbackGrace: "not-a-timespan",
-                postRestoreMargin: "00:05:00", maxItemsPerRestore: 200));
+                postRestoreMargin: "00:05:00"));
         Assert.Contains("LookbackGrace", ex.Message);
     }
 
@@ -802,7 +804,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         var ex = Assert.Throws<InvalidOperationException>(() =>
             OrchestratorOptionsFactory.BuildAgentRestoreRetryOptions(
                 enabled: true, lookbackGrace: "-00:01:00",
-                postRestoreMargin: "00:05:00", maxItemsPerRestore: 200));
+                postRestoreMargin: "00:05:00"));
         Assert.Contains("LookbackGrace", ex.Message);
     }
 
@@ -812,7 +814,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         var ex = Assert.Throws<InvalidOperationException>(() =>
             OrchestratorOptionsFactory.BuildAgentRestoreRetryOptions(
                 enabled: true, lookbackGrace: "00:30:00",
-                postRestoreMargin: "not-a-timespan", maxItemsPerRestore: 200));
+                postRestoreMargin: "not-a-timespan"));
         Assert.Contains("PostRestoreMargin", ex.Message);
     }
 
@@ -822,18 +824,8 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         var ex = Assert.Throws<InvalidOperationException>(() =>
             OrchestratorOptionsFactory.BuildAgentRestoreRetryOptions(
                 enabled: true, lookbackGrace: "00:30:00",
-                postRestoreMargin: "-00:05:00", maxItemsPerRestore: 200));
+                postRestoreMargin: "-00:05:00"));
         Assert.Contains("PostRestoreMargin", ex.Message);
-    }
-
-    [Fact]
-    public void BuildOptions_NonPositiveMaxItemsPerRestore_Throws()
-    {
-        var ex = Assert.Throws<InvalidOperationException>(() =>
-            OrchestratorOptionsFactory.BuildAgentRestoreRetryOptions(
-                enabled: true, lookbackGrace: "00:30:00",
-                postRestoreMargin: "00:05:00", maxItemsPerRestore: 0));
-        Assert.Contains("MaxItemsPerRestore", ex.Message);
     }
 
     [Fact]
@@ -844,7 +836,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         // because the feature happens to be off.
         var opts = OrchestratorOptionsFactory.BuildAgentRestoreRetryOptions(
             enabled: false, lookbackGrace: "not-a-timespan",
-            postRestoreMargin: "not-a-timespan", maxItemsPerRestore: 0);
+            postRestoreMargin: "not-a-timespan");
         Assert.False(opts.Enabled);
     }
 
@@ -885,29 +877,15 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             NullLogger<AgentAvailabilityRegistry>.Instance);
 
     private static AgentAvailabilityReset NewReset(AgentAvailabilityRegistry registry) =>
-        new(registry, new InVmSmokeCache(TimeSpan.FromMinutes(15)));
+        new(registry, new InVmSmokeCache(TimeSpan.FromMinutes(15)), registry);
 
     private static string? Detail(WebhookEvent evt, string propertyName)
         => evt.Details?.GetType().GetProperty(propertyName)?.GetValue(evt.Details)?.ToString();
-
-    private static async Task WaitUntilAsync(Func<Task<bool>> predicate)
-    {
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
-        while (DateTimeOffset.UtcNow < deadline)
-        {
-            if (await predicate())
-                return;
-            await Task.Delay(25);
-        }
-
-        Assert.True(await predicate(), "condition was not met before timeout");
-    }
 
     private static AgentRestoreRetryScheduler NewScheduler(
         IWorkItemStore store,
         InMemoryTaskQueue queue,
         bool enabled,
-        int maxItemsPerRestore = 200,
         ILogger<AgentRestoreRetryScheduler>? schedulerLogger = null,
         IAgentRestoreSignal? signal = null,
         IWebhookDispatcher? webhooks = null,
@@ -924,7 +902,6 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             Enabled = enabled,
             LookbackGrace = TimeSpan.FromMinutes(30),
             PostRestoreMargin = TimeSpan.FromMinutes(5),
-            MaxItemsPerRestore = maxItemsPerRestore,
         };
         return new AgentRestoreRetryScheduler(
             store,
@@ -942,7 +919,8 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         WorkItemState state,
         string failureKind,
         DateTimeOffset updatedAt,
-        string? lastError = "synthetic infra failure") => new()
+        string? lastError = "synthetic infra failure",
+        WorkItemAuthFailureScope? authFailureScope = null) => new()
         {
             Id = WorkItemId.New(),
             ProjectId = new ProjectId("proj"),
@@ -951,6 +929,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             Agent = agent,
             State = state,
             FailureKind = failureKind,
+            AuthFailureScope = authFailureScope,
             LastError = lastError,
             UpdatedAt = updatedAt,
         };

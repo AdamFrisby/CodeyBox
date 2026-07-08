@@ -21,8 +21,20 @@ public sealed class ScopeFenceViolation : Exception
 
 public sealed class MergeConflictResolutionFailedException : Exception
 {
-    public MergeConflictResolutionFailedException(string message, Exception? innerException = null)
-        : base(message, innerException) { }
+    public string? FailureKind { get; }
+    public AgentKind? Agent { get; }
+
+    public MergeConflictResolutionFailedException(
+        string message,
+        Exception? innerException = null,
+        string? failureKind = null,
+        AgentKind? agent = null)
+        : base(message, innerException)
+    {
+        var prior = innerException as MergeConflictResolutionFailedException;
+        FailureKind = failureKind ?? prior?.FailureKind;
+        Agent = agent ?? prior?.Agent;
+    }
 }
 
 internal sealed record ConflictHunk(string Path, int StartLine, int EndLine);

@@ -86,6 +86,87 @@ public sealed class PipelineRunnerRoutingTests : IDisposable
     }
 
     [Fact]
+    public async Task RestoreRequeuedClassedItem_ReroutesThroughNormalScoring()
+    {
+        var frontierClass = new AgentClass
+        {
+            Id = "frontier-coding",
+            DisplayName = "Frontier",
+            Members =
+            [
+                new AgentMembership { Agent = AgentKind.Claude, Billing = AgentBilling.Subscription, QualityScore = 90 },
+                new AgentMembership { Agent = AgentKind.Codex,  Billing = AgentBilling.Subscription, QualityScore = 100 },
+            ],
+        };
+
+        var router = new AgentClassRouter(
+            [frontierClass],
+            [new FakeProbe(AgentKind.Claude, 80.0), new FakeProbe(AgentKind.Codex, 80.0)],
+            new QuotaRouterOptions { MinQuotaPct = 10.0, QuotaRecheckInterval = TimeSpan.FromSeconds(5) },
+            NullLogger<AgentClassRouter>.Instance);
+
+        var queue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(
+            _store,
+            queue,
+            new NullGitHost(),
+            NullLogger<WorkItemRetrier>.Instance);
+        var scheduler = new AgentRestoreRetryScheduler(
+            _store,
+            retrier,
+            () => new AgentRestoreRetryOptions
+            {
+                Enabled = true,
+                LookbackGrace = TimeSpan.FromMinutes(30),
+                PostRestoreMargin = TimeSpan.FromMinutes(5),
+            },
+            NullLogger<AgentRestoreRetryScheduler>.Instance);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("proj"),
+            Title = "restore reroute",
+            Prompt = "p",
+            Agent = AgentKind.Claude,
+            AgentClassId = "frontier-coding",
+            MinModelScore = 80,
+            State = WorkItemState.Failed,
+            FailureKind = WorkItemFailureKinds.Infrastructure,
+            LastError = "agent binary missing",
+            UpdatedAt = outageStart.AddMinutes(2),
+        };
+        await _store.CreateAsync(item);
+
+        var summary = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
+
+        Assert.Equal(1, summary.Requeued);
+        var requeued = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Queued, requeued!.State);
+        Assert.Equal("frontier-coding", requeued.AgentClassId);
+
+        var tracking = new AgentTrackingPipeline(_store);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        var svc = new OrchestratorService(
+            queue, _store, tracking, registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            router,
+            projects: null);
+
+        await svc.StartAsync(CancellationToken.None);
+        var completed = await Task.WhenAny(tracking.Ran, Task.Delay(TimeSpan.FromSeconds(5)));
+        await svc.StopAsync(CancellationToken.None);
+
+        Assert.Same(tracking.Ran, completed);
+        Assert.Equal(AgentKind.Codex, tracking.LastAgent);
+        var stored = await _store.GetAsync(item.Id);
+        Assert.Equal(AgentKind.Codex, stored?.Agent);
+    }
+
+    [Fact]
     public async Task ClaudeExhausted_CodexAvailable_RoutesToCodex()
     {
         // Arrange: frontier-coding class — Claude sub (exhausted), Codex sub (available).
