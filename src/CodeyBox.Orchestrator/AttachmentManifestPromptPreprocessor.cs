@@ -30,13 +30,19 @@ public sealed class AttachmentManifestPromptPreprocessor : IAgentPromptPreproces
     private const int MaxCaptionChars = 500;
 
     private readonly IWorkItemAttachmentSource? _source;
+    private readonly IWorkItemAttachmentStore? _store;
+    private readonly IWorkItemAttachmentBlobStore? _blobStore;
     private readonly ILogger<AttachmentManifestPromptPreprocessor> _log;
 
     public AttachmentManifestPromptPreprocessor(
         ILogger<AttachmentManifestPromptPreprocessor> log,
-        IWorkItemAttachmentSource? source = null)
+        IWorkItemAttachmentSource? source = null,
+        IWorkItemAttachmentStore? store = null,
+        IWorkItemAttachmentBlobStore? blobStore = null)
     {
         _source = source;
+        _store = store;
+        _blobStore = blobStore;
         _log = log;
     }
 
@@ -46,6 +52,11 @@ public sealed class AttachmentManifestPromptPreprocessor : IAgentPromptPreproces
     {
         if (_source is null)
             return prompt;
+
+        if (_store is not null && _blobStore is not null)
+        {
+            await MaterialiseAttachmentsAsync(ctx.Sandbox, ctx.ItemId, ct).ConfigureAwait(false);
+        }
 
         IReadOnlyList<WorkItemAttachment> attachments;
         try
@@ -145,4 +156,72 @@ public sealed class AttachmentManifestPromptPreprocessor : IAgentPromptPreproces
             .Replace('`', 'ˋ')
             .Replace("[", "​[")
             .Replace("]", "​]");
+
+    private async Task MaterialiseAttachmentsAsync(ISandbox sandbox, WorkItemId itemId, CancellationToken ct)
+    {
+        IReadOnlyList<WorkItemAttachmentRecord> records;
+        try
+        {
+            records = await _store!.ListForWorkItemAsync(itemId, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex, "Failed to list attachments for work item {WorkItemId}", itemId);
+            return;
+        }
+
+        if (records.Count == 0)
+            return;
+
+        // Ensure the staging directory exists in the VM
+        var mkdirResult = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["mkdir", "-p", StoreWorkItemAttachmentSource.SandboxStagingDirectory]
+        }, ct).ConfigureAwait(false);
+
+        if (!mkdirResult.Success)
+        {
+            throw new InvalidOperationException(
+                $"Failed to create staging directory {StoreWorkItemAttachmentSource.SandboxStagingDirectory} in sandbox: {mkdirResult.Stderr}");
+        }
+
+        var seenNames = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var record in records)
+        {
+            var fileName = record.FileName;
+            var deliveryName = fileName;
+            if (!seenNames.Add(deliveryName))
+            {
+                deliveryName = $"{record.Id}-{fileName}";
+                seenNames.Add(deliveryName);
+            }
+
+            var fullPath = $"{StoreWorkItemAttachmentSource.SandboxStagingDirectory}/{deliveryName}";
+
+            using var stream = _blobStore!.OpenRead(record.Sha256);
+            if (stream is null)
+            {
+                _log.LogWarning("Attachment blob {Sha256} not found on disk for file {FileName}", record.Sha256, fileName);
+                continue;
+            }
+
+            // Read the stream and encode as base64
+            using var ms = new MemoryStream();
+            await stream.CopyToAsync(ms, ct).ConfigureAwait(false);
+            var bytes = ms.ToArray();
+            var base64Content = Convert.ToBase64String(bytes);
+
+            // Write to sandbox using base64 -d
+            var write = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "base64 -d > \"$0\"", fullPath],
+                Stdin = base64Content,
+            }, ct).ConfigureAwait(false);
+
+            if (!write.Success)
+            {
+                throw new InvalidOperationException($"Failed to write attachment file {fileName} to sandbox: {write.Stderr}");
+            }
+        }
+    }
 }

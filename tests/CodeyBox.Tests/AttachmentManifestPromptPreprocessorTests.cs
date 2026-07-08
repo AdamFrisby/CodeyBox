@@ -310,6 +310,57 @@ public sealed class AttachmentManifestPromptPreprocessorTests
         }
     }
 
+    [Fact]
+    public async Task StagesAttachmentsInSandbox_WhenStoreAndBlobStoreAreProvided()
+    {
+        var id = WorkItemId.New();
+        var record = new WorkItemAttachmentRecord
+        {
+            Id = "att-123",
+            WorkItemId = id,
+            FileName = "test.txt",
+            ContentType = "text/plain",
+            SizeBytes = 5,
+            Sha256 = "abc123sha",
+            Caption = "Test file",
+            CreatedAt = DateTimeOffset.UtcNow,
+        };
+
+        var store = new InMemoryAttachmentStore();
+        await store.CreateAsync(record);
+
+        var blobStore = new InMemoryBlobStore();
+        blobStore.Add("abc123sha", "hello");
+
+        var source = new StoreWorkItemAttachmentSource(store);
+        var preprocessor = new AttachmentManifestPromptPreprocessor(
+            NullLogger<AttachmentManifestPromptPreprocessor>.Instance,
+            source,
+            store,
+            blobStore);
+
+        var sandbox = new RecordingSandbox();
+        var ctx = new PromptContext(
+            id,
+            AgentKind.Claude,
+            AgentPromptPhase.Work,
+            1,
+            NewProject(),
+            sandbox,
+            "/work");
+
+        var result = await preprocessor.ProcessAsync(ctx, "do the work");
+
+        // Verify the command to create the staging directory was executed
+        var mkdir = Assert.Single(sandbox.Executed, e => e.Argv[0] == "mkdir");
+        Assert.Equal(new[] { "mkdir", "-p", "/work/.codeybox/attachments" }, mkdir.Argv);
+
+        // Verify the command to write the base64 content was executed
+        var write = Assert.Single(sandbox.Executed, e => e.Argv[0] == "sh");
+        Assert.Equal(new[] { "sh", "-c", "base64 -d > \"$0\"", "/work/.codeybox/attachments/test.txt" }, write.Argv);
+        Assert.Equal(Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("hello")), write.Stdin);
+    }
+
     private sealed class NoopSandbox : ISandbox
     {
         public string Id => "noop";
@@ -319,6 +370,99 @@ public sealed class AttachmentManifestPromptPreprocessorTests
             _ = exec;
             _ = ct;
             return Task.FromResult(new SandboxExecResult(0, "", ""));
+        }
+    }
+
+    private sealed class RecordingSandbox : ISandbox
+    {
+        public string Id => "recording";
+        public List<SandboxExec> Executed { get; } = new();
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            Executed.Add(exec);
+            return Task.FromResult(new SandboxExecResult(0, "", ""));
+        }
+    }
+
+    private sealed class InMemoryBlobStore : IWorkItemAttachmentBlobStore
+    {
+        private readonly Dictionary<string, byte[]> _blobs = new(StringComparer.OrdinalIgnoreCase);
+
+        public void Add(string sha256, string content)
+        {
+            _blobs[sha256] = System.Text.Encoding.UTF8.GetBytes(content);
+        }
+
+        public System.IO.Stream? OpenRead(string sha256)
+        {
+            if (_blobs.TryGetValue(sha256, out var bytes))
+                return new System.IO.MemoryStream(bytes);
+            return null;
+        }
+
+        public Task<AttachmentBlobStageResult> StageAsync(
+            System.IO.Stream source,
+            long maxBytes,
+            CancellationToken ct = default)
+        {
+            throw new NotImplementedException();
+        }
+
+        public bool Exists(string sha256)
+        {
+            return _blobs.ContainsKey(sha256);
+        }
+    }
+
+    private sealed class InMemoryAttachmentStore : IWorkItemAttachmentStore
+    {
+        private readonly List<WorkItemAttachmentRecord> _rows = new();
+
+        public Task CreateAsync(WorkItemAttachmentRecord record, CancellationToken ct = default)
+        { _rows.Add(record); return Task.CompletedTask; }
+
+        public Task<WorkItemAttachmentRecord?> GetAsync(string id, CancellationToken ct = default) =>
+            Task.FromResult(_rows.FirstOrDefault(r => r.Id == id));
+
+        public Task<IReadOnlyList<WorkItemAttachmentRecord>> ListForWorkItemAsync(WorkItemId workItemId, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<WorkItemAttachmentRecord>>(_rows.Where(r => r.WorkItemId == workItemId).ToList());
+
+        public Task<(int Count, long TotalBytes)> AggregateForWorkItemAsync(WorkItemId workItemId, CancellationToken ct = default)
+        {
+            var rows = _rows.Where(r => r.WorkItemId == workItemId).ToList();
+            return Task.FromResult((rows.Count, rows.Sum(r => r.SizeBytes)));
+        }
+
+        public Task<WorkItemAttachmentRecord?> DeleteAsync(string id, WorkItemId? scopeByWorkItemId = null, CancellationToken ct = default)
+        {
+            var row = _rows.FirstOrDefault(r => r.Id == id);
+            if (row is not null) _rows.Remove(row);
+            return Task.FromResult(row);
+        }
+
+        public Task<int> CountReferencesAsync(string sha256, CancellationToken ct = default) =>
+            Task.FromResult(_rows.Count(r => r.Sha256 == sha256));
+
+        public Task<IReadOnlyCollection<string>> ListReferencedHashesAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyCollection<string>>(_rows.Select(r => r.Sha256).Distinct().ToList());
+
+        public async IAsyncEnumerable<WorkItemId> ListTerminalWithAttachmentsAsync(DateTimeOffset olderThan, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        { await Task.CompletedTask; yield break; }
+
+        public Task<IReadOnlyList<WorkItemAttachmentRecord>> DeleteAllForWorkItemAsync(WorkItemId workItemId, CancellationToken ct = default)
+        {
+            var rows = _rows.Where(r => r.WorkItemId == workItemId).ToList();
+            _rows.RemoveAll(r => r.WorkItemId == workItemId);
+            return Task.FromResult<IReadOnlyList<WorkItemAttachmentRecord>>(rows);
+        }
+
+        public Task<bool> CreateBatchIfUnderCapAsync(IReadOnlyList<WorkItemAttachmentRecord> records, int maxCount, long maxTotalBytes, CancellationToken ct = default)
+        {
+            foreach (var r in records) _rows.Add(r);
+            return Task.FromResult(true);
         }
     }
 }

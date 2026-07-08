@@ -2430,14 +2430,7 @@ builder.Services.AddSingleton<IWorkItemAttachmentBlobStore>(sp =>
     sp.GetRequiredService<HostWorkItemAttachmentBlobStore>());
 builder.Services.AddSingleton<IWorkItemAttachmentBlobStoreAdmin>(sp =>
     sp.GetRequiredService<HostWorkItemAttachmentBlobStore>());
-// NOTE: IWorkItemAttachmentSource (StoreWorkItemAttachmentSource) is intentionally
-// NOT registered here. It fabricates InVmPath values like
-// /work/.codeybox/attachments/<name> that no code in this foundation ticket
-// actually stages into the sandbox — in-VM blob delivery is a dependent task.
-// Registering it now would make AttachmentManifestPromptPreprocessor inject a
-// manifest pointing at paths the agent cannot open, wasting turns and
-// confusing the agent. The registration lands with the delivery ticket, which
-// is also when the blobs are actually written to SandboxStagingDirectory.
+builder.Services.AddSingleton<IWorkItemAttachmentSource, StoreWorkItemAttachmentSource>();
 builder.Services.AddHostedService(sp => new AttachmentCleanupService(
     sp.GetRequiredService<IWorkItemAttachmentStore>(),
     sp.GetRequiredService<IWorkItemAttachmentBlobStoreAdmin>(),
