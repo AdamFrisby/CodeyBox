@@ -2309,6 +2309,18 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             $$"""
             #!/bin/sh
             {{MultipassSandboxProvider.ShellSingleQuote(realSetsid)}} "$@" &
+            child=$!
+            i=0
+            while [ "$i" -lt 200 ]; do
+                if [ -f {{MultipassSandboxProvider.ShellSingleQuote(sudoProcessGroupFile)}} ]; then
+                    exit 88
+                fi
+                if ! kill -0 "$child" 2>/dev/null; then
+                    exit 88
+                fi
+                i=$((i + 1))
+                sleep 0.05
+            done
             exit 88
             """);
         File.SetUnixFileMode(fakeSetsid, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
