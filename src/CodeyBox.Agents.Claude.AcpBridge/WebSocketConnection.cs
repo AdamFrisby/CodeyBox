@@ -68,7 +68,7 @@ internal sealed class WebSocketConnection
             var supplied = "";
             if (request.Headers.TryGetValue(AuthHeaderName, out var a)) supplied = a;
             else if (request.Headers.TryGetValue("authorization", out var b)) supplied = b;
-            if (supplied != authToken && !supplied.EndsWith(authToken, StringComparison.Ordinal))
+            if (!AuthHeaderMatches(supplied, authToken))
             {
                 await WriteRawAsync("HTTP/1.1 401 Unauthorized\r\n\r\n", ct).ConfigureAwait(false);
                 return false;
@@ -83,6 +83,23 @@ internal sealed class WebSocketConnection
             "Sec-WebSocket-Accept: " + accept + "\r\n\r\n";
         await WriteRawAsync(reply, ct).ConfigureAwait(false);
         return true;
+    }
+
+    private static bool AuthHeaderMatches(string supplied, string authToken)
+    {
+        if (string.Equals(supplied, authToken, StringComparison.Ordinal))
+            return true;
+
+        var separator = supplied.IndexOf(' ');
+        if (separator <= 0)
+            return false;
+
+        var scheme = supplied[..separator];
+        if (!scheme.Equals("Bearer", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var bearerToken = supplied[(separator + 1)..].Trim();
+        return string.Equals(bearerToken, authToken, StringComparison.Ordinal);
     }
 
     /// <summary>

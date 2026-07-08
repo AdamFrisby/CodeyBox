@@ -2194,7 +2194,7 @@ public sealed class AcpBridgeUnitTests
     // AcceptHandshakeAsync admits two auth header shapes the dedicated handshake
     // fixtures don't cover: (1) the lowercase `authorization` header used as a
     // fallback when `x-claude-code-ide-authorization` is absent, and (2) the
-    // `Bearer <token>` prefixed form admitted via the EndsWith fallback. Both
+    // `Bearer <token>` prefixed form admitted by explicit Bearer parsing. Both
     // are claimed as "drop-in JS parity" but neither was pinned. A regression
     // that drops either path would silently break claude --ide releases that
     // pick the other header shape (releases have been observed using both).
@@ -2258,7 +2258,7 @@ public sealed class AcpBridgeUnitTests
         using var client = new TcpClient();
         await client.ConnectAsync(IPAddress.Loopback, port);
         var s = client.GetStream();
-        // `Bearer <token>` — admitted by the EndsWith branch.
+        // `Bearer <token>` — accepted only after parsing the Bearer scheme.
         var req = Encoding.ASCII.GetBytes(
             "GET / HTTP/1.1\r\n" +
             "Host: 127.0.0.1\r\n" +
@@ -2276,6 +2276,44 @@ public sealed class AcpBridgeUnitTests
         var resp = Encoding.ASCII.GetString(respBuf, 0, n);
         Assert.StartsWith("HTTP/1.1 101 Switching Protocols", resp);
         Assert.True(await acceptTask);
+        listener.Stop();
+    }
+
+    [Fact]
+    public async Task WebSocketConnection_AcceptHandshake_RejectsSuffixAuthTokenMatch()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        const string authToken = "suffix-token-deadbeef";
+        var acceptTask = Task.Run(async () =>
+        {
+            using var server = await listener.AcceptTcpClientAsync();
+            var ws = new WebSocketConnection(server.GetStream());
+            return await ws.AcceptHandshakeAsync(authToken, CancellationToken.None);
+        });
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, port);
+        var s = client.GetStream();
+        var req = Encoding.ASCII.GetBytes(
+            "GET / HTTP/1.1\r\n" +
+            "Host: 127.0.0.1\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+            "Sec-WebSocket-Version: 13\r\n" +
+            "x-claude-code-ide-authorization: attacker-prefix-" + authToken + "\r\n" +
+            "\r\n");
+        await s.WriteAsync(req);
+        await s.FlushAsync();
+
+        var respBuf = new byte[1024];
+        var n = await s.ReadAsync(respBuf.AsMemory());
+        var resp = Encoding.ASCII.GetString(respBuf, 0, n);
+        Assert.StartsWith("HTTP/1.1 401 Unauthorized", resp);
+        Assert.False(await acceptTask);
         listener.Stop();
     }
 
@@ -2762,7 +2800,7 @@ public sealed class AcpBridgeUnitTests
         string[]? execArgv = null;
         var argv = new[] { "dotnet", "exec", "/tmp/bridge.dll" };
 
-        var ran = SignalBootstrap.TryRunSignalBootstrap(
+        var ran = SignalBootstrap.RunSignalBootstrapIfNeeded(
             isLinux: true,
             guardValue: null,
             needsBootstrap: () =>
@@ -2774,13 +2812,13 @@ public sealed class AcpBridgeUnitTests
             setGuard: value => guardValue = value,
             exec: value =>
             {
-                Assert.Equal("1", guardValue);
+                Assert.Equal(SignalBootstrap.SignalBootstrapGuardSetValue, guardValue);
                 execArgv = value;
             });
 
         Assert.True(ran);
         Assert.Equal(1, needsCalled);
-        Assert.Equal("1", guardValue);
+        Assert.Equal(SignalBootstrap.SignalBootstrapGuardSetValue, guardValue);
         Assert.Same(argv, execArgv);
     }
 
@@ -2805,7 +2843,7 @@ public sealed class AcpBridgeUnitTests
         if (paramName == "exec")
             exec = null!;
 
-        var ex = Assert.Throws<ArgumentNullException>(() => SignalBootstrap.TryRunSignalBootstrap(
+        var ex = Assert.Throws<ArgumentNullException>(() => SignalBootstrap.RunSignalBootstrapIfNeeded(
             isLinux: true,
             guardValue: null,
             needsBootstrap: needsBootstrap,
@@ -2819,9 +2857,9 @@ public sealed class AcpBridgeUnitTests
     [Fact]
     public void SignalBootstrap_OneShotGuardSkipsNeedCheckArgvReadAndExec()
     {
-        var ran = SignalBootstrap.TryRunSignalBootstrap(
+        var ran = SignalBootstrap.RunSignalBootstrapIfNeeded(
             isLinux: true,
-            guardValue: "1",
+            guardValue: SignalBootstrap.SignalBootstrapGuardSetValue,
             needsBootstrap: () => throw new InvalidOperationException("guard should skip needs check"),
             readArgv: () => throw new InvalidOperationException("guard should skip argv read"),
             setGuard: _ => throw new InvalidOperationException("guard should not be rewritten"),
@@ -2833,7 +2871,7 @@ public sealed class AcpBridgeUnitTests
     [Fact]
     public void SignalBootstrap_NonLinuxSkipsNeedCheckArgvReadAndExec()
     {
-        var ran = SignalBootstrap.TryRunSignalBootstrap(
+        var ran = SignalBootstrap.RunSignalBootstrapIfNeeded(
             isLinux: false,
             guardValue: null,
             needsBootstrap: () => throw new InvalidOperationException("non-Linux should skip needs check"),
@@ -2849,7 +2887,7 @@ public sealed class AcpBridgeUnitTests
     {
         var needsCalled = 0;
 
-        var ran = SignalBootstrap.TryRunSignalBootstrap(
+        var ran = SignalBootstrap.RunSignalBootstrapIfNeeded(
             isLinux: true,
             guardValue: null,
             needsBootstrap: () =>
@@ -2876,7 +2914,7 @@ public sealed class AcpBridgeUnitTests
             var guardWasSet = false;
             var execWasCalled = false;
 
-            var ran = SignalBootstrap.TryRunSignalBootstrap(
+            var ran = SignalBootstrap.RunSignalBootstrapIfNeeded(
                 isLinux: true,
                 guardValue: null,
                 needsBootstrap: () => true,
@@ -2944,11 +2982,11 @@ public sealed class AcpBridgeUnitTests
 """);
 
             await File.WriteAllTextAsync(helperProgramPath, """
-using System.Runtime.InteropServices;
 using System.Text.Json;
 using CodeyBox.Agents.Claude.AcpBridge;
 
-var reexeced = Environment.GetEnvironmentVariable(SignalBootstrap.SignalBootstrapReexecEnv) == "1";
+var reexeced = Environment.GetEnvironmentVariable(SignalBootstrap.SignalBootstrapReexecEnv)
+    == SignalBootstrap.SignalBootstrapGuardSetValue;
 Console.WriteLine(JsonSerializer.Serialize(new
 {
     phase = reexeced ? "after" : "before",
@@ -2961,8 +2999,7 @@ Console.Out.Flush();
 if (reexeced)
     return 0;
 
-_ = Libc.Signal(15, IntPtr.Zero);
-var ran = SignalBootstrap.ReexecOnceIfSignalRegistrationUnavailable(IntPtr.Zero, null, null);
+var ran = SignalBootstrap.RunSignalBootstrapIfNeeded(() => true);
 Console.WriteLine(JsonSerializer.Serialize(new
 {
     phase = "returned",
@@ -2970,12 +3007,6 @@ Console.WriteLine(JsonSerializer.Serialize(new
     ran
 }));
 return ran ? 90 : 91;
-
-internal static partial class Libc
-{
-    [DllImport("libc", EntryPoint = "signal", SetLastError = true)]
-    internal static extern IntPtr Signal(int sig, IntPtr handler);
-}
 """);
 
             var dotnetEnv = new Dictionary<string, string?>
@@ -3018,7 +3049,7 @@ internal static partial class Libc
             Assert.Equal("before", before.GetProperty("phase").GetString());
             Assert.Equal("after", after.GetProperty("phase").GetString());
             Assert.Equal(before.GetProperty("pid").GetInt32(), after.GetProperty("pid").GetInt32());
-            Assert.Equal("1", after.GetProperty("guard").GetString());
+            Assert.Equal(SignalBootstrap.SignalBootstrapGuardSetValue, after.GetProperty("guard").GetString());
 
             Assert.Equal(new[] { "alpha", "", marker }, ReadArgvTail(before));
             Assert.Equal(new[] { "alpha", "", marker }, ReadArgvTail(after));
@@ -3081,13 +3112,13 @@ internal static partial class Libc
     }
 
     [Fact]
-    public void SignalBootstrap_TryRunSignalBootstrap_ThrowsWhenExecThrows()
+    public void SignalBootstrap_RunSignalBootstrapIfNeeded_ThrowsWhenExecThrows()
     {
         var argv = new[] { "dotnet", "exec", "/tmp/bridge.dll" };
         string? guardValue = null;
 
         var ex = Assert.Throws<InvalidOperationException>(() =>
-            SignalBootstrap.TryRunSignalBootstrap(
+            SignalBootstrap.RunSignalBootstrapIfNeeded(
                 isLinux: true,
                 guardValue: null,
                 needsBootstrap: () => true,
@@ -3137,22 +3168,9 @@ internal static partial class Libc
             var workDir = Path.Combine(tmpDir, "work");
             var lockDir = Path.Combine(tmpDir, "locks");
             Directory.CreateDirectory(workDir);
-            // Long-running stub so the bridge stays alive until we signal it.
             var rootPidPath = Path.Combine(tmpDir, "claude-root.pid");
             var childPidPath = Path.Combine(tmpDir, "claude-child.pid");
-            var stubPath = Path.Combine(tmpDir, "claude-longsleep-stub.sh");
-            File.WriteAllText(stubPath,
-                "#!/bin/bash\n" +
-                "ROOT_PID_FILE=\"" + rootPidPath + "\"\n" +
-                "CHILD_PID_FILE=\"" + childPidPath + "\"\n" +
-                "sleep 60 &\n" +
-                "child=$!\n" +
-                "trap 'kill \"$child\" 2>/dev/null || true; wait \"$child\" 2>/dev/null || true; exit 0' TERM INT HUP\n" +
-                "echo $$ > \"$ROOT_PID_FILE\"\n" +
-                "echo \"$child\" > \"$CHILD_PID_FILE\"\n" +
-                "wait \"$child\"\n");
-            File.SetUnixFileMode(stubPath,
-                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            var stubPath = WriteSignalCleanupClaudeStub(tmpDir, rootPidPath, childPidPath);
 
             var psi = CreateBridgeSignalTestStartInfo(
                 bridgeDllPath,
@@ -3166,65 +3184,12 @@ internal static partial class Libc
 
             try
             {
-                var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
-                    + "\",\"workingDirectory\":\"" + workDir
-                    + "\",\"lockDir\":\"" + lockDir
-                    + "\",\"turnTimeoutSeconds\":60}";
-                await proc.StandardInput.WriteLineAsync(hello);
-                await proc.StandardInput.FlushAsync();
-
-                // Read stdout line-by-line until we see the `ready` envelope —
-                // confirms the bridge is up, the lockfile is written, and the
-                // signal handlers have been registered (HandleHello completes
-                // before `ready` fires, but PosixSignalRegistration.Create
-                // happens at the top of RunAsync which runs first).
-                string? lockPath = null;
-                var envelopes = new List<JsonDocument>();
-                var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
-                while (DateTime.UtcNow < deadline)
-                {
-                    var line = await proc.StandardOutput.ReadLineAsync().WaitAsync(
-                        TimeSpan.FromSeconds(5));
-                    if (line is null) break;
-                    if (string.IsNullOrEmpty(line)) continue;
-                    var doc = JsonDocument.Parse(line);
-                    envelopes.Add(doc);
-                    if (doc.RootElement.TryGetProperty("type", out var typeEl) && typeEl.GetString() == "ready")
-                    {
-                        lockPath = doc.RootElement.GetProperty("lockPath").GetString();
-                        break;
-                    }
-                }
-
-                try
-                {
-                    Assert.NotNull(lockPath);
-                    Assert.True(envelopes.Count >= 2, "Expected at least 2 envelopes (bridge_started and ready)");
-                    
-                    var firstEnvelope = envelopes[0].RootElement;
-                    Assert.True(firstEnvelope.TryGetProperty("type", out var firstType) && firstType.GetString() == "bridge_started",
-                        $"First envelope must be 'bridge_started', but got '{firstEnvelope.GetRawText()}'");
-                    
-                    var secondEnvelope = envelopes[1].RootElement;
-                    Assert.True(secondEnvelope.TryGetProperty("type", out var secondType) && secondType.GetString() == "ready",
-                        $"Second envelope must be 'ready', but got '{secondEnvelope.GetRawText()}'");
-                }
-                finally
-                {
-                    foreach (var doc in envelopes)
-                    {
-                        doc.Dispose();
-                    }
-                }
+                await SendBridgeHelloAsync(proc, stubPath, workDir, lockDir);
+                var lockPath = await WaitForReadyEnvelopeAsync(proc);
 
                 Assert.True(File.Exists(lockPath),
                     "Lockfile must exist after `ready` envelope — pre-signal state.");
-                for (int i = 0; i < 100 && (!File.Exists(rootPidPath) || !File.Exists(childPidPath)); i++)
-                    await Task.Delay(50);
-                Assert.True(File.Exists(rootPidPath), "Signal cleanup fixture did not record the claude root pid.");
-                Assert.True(File.Exists(childPidPath), "Signal cleanup fixture did not record the claude child pid.");
-                var rootPid = int.Parse(File.ReadAllText(rootPidPath).Trim(), CultureInfo.InvariantCulture);
-                var childPid = int.Parse(File.ReadAllText(childPidPath).Trim(), CultureInfo.InvariantCulture);
+                var (rootPid, childPid) = await WaitForSignalCleanupStubPidsAsync(rootPidPath, childPidPath);
 
                 if (inheritIgnoredSignal)
                 {
@@ -3234,14 +3199,7 @@ internal static partial class Libc
 
                 // Drain remaining stdout in the background so the pipe doesn't
                 // fill up and block the bridge while we wait for the signal.
-                var drainTask = Task.Run(async () =>
-                {
-                    try
-                    {
-                        while (await proc.StandardOutput.ReadLineAsync() is not null) { }
-                    }
-                    catch { }
-                });
+                var drainTask = DrainStandardOutputAsync(proc);
 
                 // Send the signal directly via libc.kill(2). The bridge's
                 // PosixSignalRegistration handler runs, sets ctx.Cancel=true
@@ -3267,8 +3225,7 @@ internal static partial class Libc
                     "Lockfile leaked after " + signalName +
                     " — Shutdown(0) ran but the per-turn lockfile cleanup was skipped.");
 
-                await AssertProcessExitedAsync(rootPid, "claude root process leaked after " + signalName + ".");
-                await AssertProcessExitedAsync(childPid, "claude child process leaked after " + signalName + ".");
+                await AssertClaudeStubExitedAsync(rootPid, childPid, signalName);
 
                 await drainTask.WaitAsync(TimeSpan.FromSeconds(5));
             }
@@ -3285,6 +3242,122 @@ internal static partial class Libc
             }
             try { Directory.Delete(tmpDir, recursive: true); } catch { }
         }
+    }
+
+    private static string WriteSignalCleanupClaudeStub(string tmpDir, string rootPidPath, string childPidPath)
+    {
+        var stubPath = Path.Combine(tmpDir, "claude-longsleep-stub.sh");
+        File.WriteAllText(stubPath,
+            "#!/bin/bash\n" +
+            "ROOT_PID_FILE=\"" + rootPidPath + "\"\n" +
+            "CHILD_PID_FILE=\"" + childPidPath + "\"\n" +
+            "sleep 60 &\n" +
+            "child=$!\n" +
+            "trap 'kill \"$child\" 2>/dev/null || true; wait \"$child\" 2>/dev/null || true; exit 0' TERM INT HUP\n" +
+            "echo $$ > \"$ROOT_PID_FILE\"\n" +
+            "echo \"$child\" > \"$CHILD_PID_FILE\"\n" +
+            "wait \"$child\"\n");
+        File.SetUnixFileMode(stubPath,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        return stubPath;
+    }
+
+    private static async Task SendBridgeHelloAsync(
+        Process proc,
+        string stubPath,
+        string workDir,
+        string lockDir)
+    {
+        var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
+            + "\",\"workingDirectory\":\"" + workDir
+            + "\",\"lockDir\":\"" + lockDir
+            + "\",\"turnTimeoutSeconds\":60}";
+        await proc.StandardInput.WriteLineAsync(hello);
+        await proc.StandardInput.FlushAsync();
+    }
+
+    private static async Task<string> WaitForReadyEnvelopeAsync(Process proc)
+    {
+        // Read stdout line-by-line until we see the `ready` envelope —
+        // confirms the bridge is up, the lockfile is written, and the signal
+        // handlers have been registered before the test sends a real signal.
+        string? lockPath = null;
+        var envelopes = new List<JsonDocument>();
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
+        try
+        {
+            while (DateTime.UtcNow < deadline)
+            {
+                var line = await proc.StandardOutput.ReadLineAsync().WaitAsync(
+                    TimeSpan.FromSeconds(5));
+                if (line is null) break;
+                if (string.IsNullOrEmpty(line)) continue;
+                var doc = JsonDocument.Parse(line);
+                envelopes.Add(doc);
+                if (doc.RootElement.TryGetProperty("type", out var typeEl) && typeEl.GetString() == "ready")
+                {
+                    lockPath = doc.RootElement.GetProperty("lockPath").GetString();
+                    break;
+                }
+            }
+
+            Assert.NotNull(lockPath);
+            AssertBridgeReadyEnvelopeOrdering(envelopes);
+            return lockPath!;
+        }
+        finally
+        {
+            foreach (var doc in envelopes)
+                doc.Dispose();
+        }
+    }
+
+    private static void AssertBridgeReadyEnvelopeOrdering(IReadOnlyList<JsonDocument> envelopes)
+    {
+        Assert.True(envelopes.Count >= 2, "Expected at least 2 envelopes (bridge_started and ready)");
+
+        var firstEnvelope = envelopes[0].RootElement;
+        Assert.True(
+            firstEnvelope.TryGetProperty("type", out var firstType) && firstType.GetString() == "bridge_started",
+            $"First envelope must be 'bridge_started', but got '{firstEnvelope.GetRawText()}'");
+
+        var secondEnvelope = envelopes[1].RootElement;
+        Assert.True(
+            secondEnvelope.TryGetProperty("type", out var secondType) && secondType.GetString() == "ready",
+            $"Second envelope must be 'ready', but got '{secondEnvelope.GetRawText()}'");
+    }
+
+    private static async Task<(int RootPid, int ChildPid)> WaitForSignalCleanupStubPidsAsync(
+        string rootPidPath,
+        string childPidPath)
+    {
+        for (int i = 0; i < 100 && (!File.Exists(rootPidPath) || !File.Exists(childPidPath)); i++)
+            await Task.Delay(50);
+
+        Assert.True(File.Exists(rootPidPath), "Signal cleanup fixture did not record the claude root pid.");
+        Assert.True(File.Exists(childPidPath), "Signal cleanup fixture did not record the claude child pid.");
+
+        var rootPid = int.Parse(File.ReadAllText(rootPidPath).Trim(), CultureInfo.InvariantCulture);
+        var childPid = int.Parse(File.ReadAllText(childPidPath).Trim(), CultureInfo.InvariantCulture);
+        return (rootPid, childPid);
+    }
+
+    private static Task DrainStandardOutputAsync(Process proc)
+    {
+        return Task.Run(async () =>
+        {
+            try
+            {
+                while (await proc.StandardOutput.ReadLineAsync() is not null) { }
+            }
+            catch { }
+        });
+    }
+
+    private static async Task AssertClaudeStubExitedAsync(int rootPid, int childPid, string signalName)
+    {
+        await AssertProcessExitedAsync(rootPid, "claude root process leaked after " + signalName + ".");
+        await AssertProcessExitedAsync(childPid, "claude child process leaked after " + signalName + ".");
     }
 
     private static ProcessStartInfo CreateBridgeSignalTestStartInfo(
@@ -4168,7 +4241,7 @@ exit 9
             UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
     }
 
-    private static async Task<(int ExitCode, string Stdout, string Stderr)> RunProcessAsync(
+    private static ProcessStartInfo CreateProcessStartInfo(
         string fileName,
         IReadOnlyList<string> args,
         IReadOnlyDictionary<string, string?> env)
@@ -4192,6 +4265,16 @@ exit 9
                 psi.Environment[key] = value;
         }
 
+        return psi;
+    }
+
+    private static async Task<(int ExitCode, string Stdout, string Stderr)> RunProcessAsync(
+        string fileName,
+        IReadOnlyList<string> args,
+        IReadOnlyDictionary<string, string?> env)
+    {
+        var psi = CreateProcessStartInfo(fileName, args, env);
+
         using var process = Process.Start(psi)
             ?? throw new InvalidOperationException("Failed to start " + fileName);
         var stdout = await process.StandardOutput.ReadToEndAsync();
@@ -4206,24 +4289,7 @@ exit 9
         IReadOnlyDictionary<string, string?> env,
         TimeSpan timeout)
     {
-        var psi = new ProcessStartInfo(fileName)
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        };
-
-        psi.Environment.Remove("CODEYBOX_ACP_BRIDGE_VERIFY_VM");
-        psi.Environment.Remove("CODEYBOX_ACP_BRIDGE_SKIP_VM_VERIFY");
-        foreach (var arg in args)
-            psi.ArgumentList.Add(arg);
-        foreach (var (key, value) in env)
-        {
-            if (value is null)
-                psi.Environment.Remove(key);
-            else
-                psi.Environment[key] = value;
-        }
+        var psi = CreateProcessStartInfo(fileName, args, env);
 
         using var process = Process.Start(psi)
             ?? throw new InvalidOperationException("Failed to start " + fileName);
@@ -4261,8 +4327,9 @@ exit 9
     /// NativeAOT PInvoke resolver falls back to <c>dlopen("libc.so")</c> on
     /// first call which throws <see cref="DllNotFoundException"/> in a fully-
     /// static binary. <c>Bridge.NativeMethods</c> P/Invokes libc for
-    /// <c>kill(2)</c>, signal-disposition inspection/reset, setenv/unsetenv
-    /// guard propagation, and execvp. On the polite
+    /// <c>kill(2)</c>, and <c>SignalBootstrap.NativeMethods</c> P/Invokes libc
+    /// for signal-disposition inspection/reset, setenv/unsetenv guard
+    /// propagation, and execvp. On the polite
     /// SIGTERM-then-grace-then-SIGKILL teardown of <c>claude --ide</c>, that
     /// exception is caught silently by <c>TerminateClaudeProcess</c> and the
     /// SIGTERM-grace path regresses to bare SIGKILL, re-introducing the

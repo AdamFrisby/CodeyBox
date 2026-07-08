@@ -19,10 +19,6 @@ namespace CodeyBox.Agents.Claude.AcpBridge;
 /// </summary>
 internal sealed class Bridge : IAsyncDisposable
 {
-    private const int SigHup = 1;
-    private const int SigInt = 2;
-    private const int SigTerm = 15;
-
     private readonly CancellationTokenSource _cts = new();
     private readonly Func<TcpListener> _listenerFactory;
     private readonly Func<TcpClient, Process?, bool> _peerAuthorizer;
@@ -55,9 +51,7 @@ internal sealed class Bridge : IAsyncDisposable
     private Task? _claudeMonitorTask;
     private Task? _claudeStdoutPumpTask;
     private Task? _claudeStderrPumpTask;
-    private PosixSignalRegistration? _sigterm;
-    private PosixSignalRegistration? _sigint;
-    private PosixSignalRegistration? _sighup;
+    private PosixSignalRegistration[] _shutdownSignalRegistrations = Array.Empty<PosixSignalRegistration>();
 
     private bool ShutdownStarted => Volatile.Read(ref _shutdownState) != 0;
 
@@ -119,19 +113,14 @@ internal sealed class Bridge : IAsyncDisposable
         // CoreCLR remembered an ignored startup disposition before RunAsync
         // got control, re-exec once before publishing stdout envelopes so the
         // runtime starts from the now-default dispositions.
-        var sigtermBefore = SignalBootstrap.ReadSignalHandlerOrNull(SigTerm);
-        var sigintBefore = SignalBootstrap.ReadSignalHandlerOrNull(SigInt);
-        var sighupBefore = SignalBootstrap.ReadSignalHandlerOrNull(SigHup);
-
-        SignalBootstrap.ResetInheritedIgnoredSignalToDefault(SigTerm);
-        _sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
-        SignalBootstrap.ResetInheritedIgnoredSignalToDefault(SigInt);
-        _sigint = PosixSignalRegistration.Create(PosixSignal.SIGINT, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
-        SignalBootstrap.ResetInheritedIgnoredSignalToDefault(SigHup);
-        _sighup = PosixSignalRegistration.Create(PosixSignal.SIGHUP, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
-        if (_stdinOverride is null)
-            _ = SignalBootstrap.ReexecOnceIfSignalRegistrationUnavailable(sigtermBefore, sigintBefore, sighupBefore);
-        SignalBootstrap.SetSignalBootstrapGuard(null);
+        _shutdownSignalRegistrations = SignalBootstrap.RegisterShutdownHandlers(
+            ctx =>
+            {
+                ctx.Cancel = true;
+                Shutdown(0);
+                ScheduleForceExitAfterSignal();
+            },
+            enableReexec: _stdinOverride is null);
         AppDomain.CurrentDomain.ProcessExit += (_, _) => Shutdown(0);
 
         Emitter.Emit("bridge_started", w => w.WriteNumber("pid", Environment.ProcessId));
@@ -152,9 +141,8 @@ internal sealed class Bridge : IAsyncDisposable
         await WaitForBackgroundTasksAsync().ConfigureAwait(false);
         _cts.Dispose();
         _turnDeadline?.Dispose();
-        _sigterm?.Dispose();
-        _sigint?.Dispose();
-        _sighup?.Dispose();
+        foreach (var registration in _shutdownSignalRegistrations)
+            registration.Dispose();
     }
 
     private async Task ReadStdinAsync(CancellationToken ct)
