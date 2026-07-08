@@ -9,20 +9,27 @@ namespace CodeyBox.Orchestrator;
 /// the existing wake-up signal only on unusable -> usable transitions; first
 /// observations and usable -> unusable changes are just recorded.
 /// </summary>
-public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilitySignal, IAgentQuotaAvailabilityPublisher
+public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilitySignal, IAgentQuotaAvailabilityPublisher, IAgentQuotaAvailabilityObservationSource
 {
-    private readonly ConcurrentDictionary<MemberQuotaKey, bool> _lastUsable = new();
+    private readonly ConcurrentDictionary<AgentQuotaMemberKey, bool> _lastUsable = new();
     private readonly ILogger<AgentQuotaAvailabilityBroadcaster> _log;
 
     public AgentQuotaAvailabilityBroadcaster(ILogger<AgentQuotaAvailabilityBroadcaster>? log = null)
         => _log = log ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance;
 
     public event Action? QuotaUsableThresholdCrossed;
+    public event Action<AgentQuotaUsabilityObservation>? QuotaUsabilityObserved;
 
-    public void RecordQuotaUsability(AgentMembership member, bool isUsable)
+    public void RecordQuotaUsability(
+        AgentMembership member,
+        bool isUsable,
+        bool publishRecoverySignal = true)
     {
-        var key = MemberQuotaKey.From(member);
-        if (!RecordTransition(key, isUsable))
+        var key = AgentQuotaMemberKey.From(member);
+        var crossedToUsable = RecordTransition(key, isUsable);
+        NotifyQuotaUsabilityObserved(new AgentQuotaUsabilityObservation(member, isUsable, publishRecoverySignal));
+
+        if (!publishRecoverySignal || !crossedToUsable)
             return;
 
         _log.LogInformation(
@@ -32,7 +39,7 @@ public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilityS
         NotifyQuotaUsableThresholdCrossed();
     }
 
-    private bool RecordTransition(MemberQuotaKey key, bool isUsable)
+    private bool RecordTransition(AgentQuotaMemberKey key, bool isUsable)
     {
         while (true)
         {
@@ -48,6 +55,25 @@ public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilityS
 
             if (_lastUsable.TryUpdate(key, isUsable, previous))
                 return !previous && isUsable;
+        }
+    }
+
+    private void NotifyQuotaUsabilityObserved(AgentQuotaUsabilityObservation observation)
+    {
+        var handlers = QuotaUsabilityObserved;
+        if (handlers is null)
+            return;
+
+        foreach (Action<AgentQuotaUsabilityObservation> handler in handlers.GetInvocationList().Cast<Action<AgentQuotaUsabilityObservation>>())
+        {
+            try
+            {
+                handler(observation);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Quota usability-observation subscriber threw; continuing");
+            }
         }
     }
 
@@ -69,13 +95,12 @@ public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilityS
             }
         }
     }
-
-    private readonly record struct MemberQuotaKey(string RouteKey, AgentKind Agent, string ModelId)
-    {
-        public static MemberQuotaKey From(AgentMembership member) =>
-            new(member.RouteKey, member.Agent, member.ModelId ?? string.Empty);
-    }
 }
+
+public sealed record AgentQuotaUsabilityObservation(
+    AgentMembership Member,
+    bool IsUsable,
+    bool PublishRecoverySignal);
 
 /// <summary>
 /// Publisher side of <see cref="IAgentQuotaAvailabilitySignal"/>.
@@ -86,9 +111,20 @@ public interface IAgentQuotaAvailabilityPublisher
     /// Records the caller's fully evaluated routing verdict for
     /// <paramref name="member"/>. Implementations publish only after they have
     /// previously observed the same member as unusable, so callers must record
-    /// both the denied observation and the later allowed observation. Calls may
-    /// arrive concurrently from independent router/probe paths and must be
-    /// handled without relying on single-threaded ordering.
+    /// both the denied observation and the later allowed observation. Set
+    /// <paramref name="publishRecoverySignal"/> to <c>false</c> for read-only
+    /// probes such as readiness checks; command-style dispatch/retry/fallback
+    /// paths should leave it enabled so parked-item recovery wakes deliberately.
+    /// Calls may arrive concurrently from independent router/probe paths and
+    /// must be handled without relying on single-threaded ordering.
     /// </summary>
-    void RecordQuotaUsability(AgentMembership member, bool isUsable);
+    void RecordQuotaUsability(
+        AgentMembership member,
+        bool isUsable,
+        bool publishRecoverySignal = true);
+}
+
+public interface IAgentQuotaAvailabilityObservationSource
+{
+    event Action<AgentQuotaUsabilityObservation>? QuotaUsabilityObserved;
 }

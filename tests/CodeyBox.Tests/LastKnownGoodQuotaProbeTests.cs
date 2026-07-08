@@ -24,11 +24,28 @@ public sealed class LastKnownGoodQuotaProbeTests
         public AgentKind Kind => AgentKind.Claude;
         public AgentQuotaSnapshot Next { get; set; } = new() { AvailablePct = 100 };
         public Exception? ThrowOnCall { get; set; }
+        public AgentMembership? MarkedMember { get; private set; }
+        public TimeSpan? MarkedTtl { get; private set; }
+        public DateTimeOffset? MarkedResetAt { get; private set; }
+        public CancellationToken MarkedCancellationToken { get; private set; }
 
         public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
             => ThrowOnCall is not null
                 ? Task.FromException<AgentQuotaSnapshot>(ThrowOnCall)
                 : Task.FromResult(Next);
+
+        public Task MarkExhaustedAsync(
+            AgentMembership member,
+            TimeSpan ttl,
+            DateTimeOffset? resetAt = null,
+            CancellationToken ct = default)
+        {
+            MarkedMember = member;
+            MarkedTtl = ttl;
+            MarkedResetAt = resetAt;
+            MarkedCancellationToken = ct;
+            return Task.CompletedTask;
+        }
     }
 
     private sealed class Clock : TimeProvider
@@ -168,7 +185,7 @@ public sealed class LastKnownGoodQuotaProbeTests
     }
 
     [Fact]
-    public async Task MarkExhausted_SuppressesCachedPositiveUntilTtl()
+    public async Task MarkExhausted_ForwardsAndDoesNotSuppressLiveRecovery()
     {
         var clock = new Clock(new DateTimeOffset(2026, 6, 10, 12, 0, 0, TimeSpan.Zero));
         var inner = new StubProbe { Next = new AgentQuotaSnapshot { AvailablePct = 98 } };
@@ -178,14 +195,18 @@ public sealed class LastKnownGoodQuotaProbeTests
         Assert.Equal(98, (await lkg.GetAvailabilityAsync(member, default)).AvailablePct);
 
         var resetAt = clock.GetUtcNow().AddDays(7);
-        await lkg.MarkExhaustedAsync(member, TimeSpan.FromHours(1), resetAt);
+        using var cts = new CancellationTokenSource();
+        await lkg.MarkExhaustedAsync(member, TimeSpan.FromHours(1), resetAt, cts.Token);
 
-        var suppressed = await lkg.GetAvailabilityAsync(member, default);
-        Assert.True(suppressed.IsKnown);
-        Assert.Equal(0, suppressed.AvailablePct);
-        Assert.Equal(resetAt, suppressed.ResetAt);
+        Assert.Same(member, inner.MarkedMember);
+        Assert.Equal(TimeSpan.FromHours(1), inner.MarkedTtl);
+        Assert.Equal(resetAt, inner.MarkedResetAt);
+        Assert.Equal(cts.Token, inner.MarkedCancellationToken);
 
-        clock.Advance(TimeSpan.FromHours(1) + TimeSpan.FromSeconds(1));
+        inner.Next = AgentQuotaSnapshot.UnknownSnapshot(QuotaUnknownReason.Transient, "probe down");
+        Assert.False((await lkg.GetAvailabilityAsync(member, default)).IsKnown);
+
+        inner.Next = new AgentQuotaSnapshot { AvailablePct = 98 };
         Assert.Equal(98, (await lkg.GetAvailabilityAsync(member, default)).AvailablePct);
     }
 }

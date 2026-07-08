@@ -57,7 +57,7 @@ namespace CodeyBox.Agents.Cursor;
 /// <para>Thread-safe; results are cached for <c>cacheTtl</c> to avoid hammering
 /// the endpoint when several work items pick up close together.</para>
 /// </summary>
-public sealed class CursorQuotaProbe : IAgentQuotaProbe
+public sealed class CursorQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalidator
 {
     internal const string UsageEndpoint =
         "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage";

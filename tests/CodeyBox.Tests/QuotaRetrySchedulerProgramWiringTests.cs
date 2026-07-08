@@ -170,6 +170,9 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
         Assert.Same(
             factory.Services.GetRequiredService<IAgentQuotaAvailabilitySignal>(),
             factory.Services.GetRequiredService<IAgentQuotaAvailabilityPublisher>());
+        Assert.Same(
+            factory.Services.GetRequiredService<IAgentQuotaAvailabilitySignal>(),
+            factory.Services.GetRequiredService<IAgentQuotaAvailabilityObservationSource>());
 
         var store = factory.Services.GetRequiredService<IWorkItemStore>();
         var project = await factory.Services
@@ -192,15 +195,11 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
         await store.CreateAsync(parked);
 
         var router = factory.Services.GetRequiredService<AgentClassRouter>();
-        var probeItem = parked with { Id = WorkItemId.New(), State = WorkItemState.Queued };
-
-        var denied = await router.ResolveAsync(probeItem, project, CancellationToken.None);
-        Assert.True(denied.ShouldWait);
-        Assert.Null(denied.Chosen);
-
+        var member = router.GetClassMembers("quota-signal-class")[0];
+        var monitor = factory.Services.GetRequiredService<AgentQuotaRecoveryProbeMonitor>();
+        router.MarkExhausted(member, TimeSpan.FromHours(6), DateTimeOffset.UtcNow.AddDays(7));
         factory.Probe.AvailablePct = 90;
-        var allowed = await router.ResolveAsync(probeItem with { Id = WorkItemId.New() }, project, CancellationToken.None);
-        Assert.NotNull(allowed.Chosen);
+        Assert.Equal(1, await monitor.ProbeTrackedMembersOnceAsync(CancellationToken.None));
 
         var retried = await WaitForQuotaRetryAttemptAsync(store, parked.Id, TimeSpan.FromSeconds(5));
         Assert.Equal(WorkItemState.Queued, retried.State);

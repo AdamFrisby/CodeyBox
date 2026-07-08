@@ -1422,6 +1422,8 @@ builder.Services.AddSingleton<IQuotaFailureStore>(sp =>
 builder.Services.AddSingleton<AgentQuotaAvailabilityBroadcaster>();
 builder.Services.AddSingleton<IAgentQuotaAvailabilityPublisher>(sp =>
     sp.GetRequiredService<AgentQuotaAvailabilityBroadcaster>());
+builder.Services.AddSingleton<IAgentQuotaAvailabilityObservationSource>(sp =>
+    sp.GetRequiredService<AgentQuotaAvailabilityBroadcaster>());
 builder.Services.AddSingleton<IAgentFallbackHistoryStore>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -2934,7 +2936,9 @@ builder.Services.AddSingleton<IWorkItemAutoRetryScheduler>(sp =>
     new WorkItemAutoRetryScheduler(
         sp.GetRequiredService<IQuotaFailureAutoRetryScheduler>(),
         sp.GetRequiredService<ITransientFailureAutoRetryScheduler>()));
+builder.Services.AddSingleton<AgentQuotaRecoveryProbeMonitor>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<QuotaRetryScheduler>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentQuotaRecoveryProbeMonitor>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<TransientRetryScheduler>());
 builder.Services.AddSingleton<AgentPauseRetryScheduler>(sp => new AgentPauseRetryScheduler(
     sp.GetRequiredService<IWorkItemStore>(),

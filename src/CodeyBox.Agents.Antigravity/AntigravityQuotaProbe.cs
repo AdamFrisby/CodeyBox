@@ -54,7 +54,7 @@ namespace CodeyBox.Agents.Antigravity;
 /// reads), the probe surfaces that exact moment so failed items park cleanly in
 /// <c>WaitingForQuotaReset</c> instead of churning.</para>
 /// </summary>
-public sealed class AntigravityQuotaProbe : IAgentQuotaProbe
+public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalidator
 {
     /// <summary>
     /// The <c>agy</c> gateway host. The <c>daily-</c> prefix is what agy 1.0.7
@@ -87,11 +87,11 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe
     // Cache keyed by (route key, token, modelKey). Per-model so two members on
     // the same account but different gateway models don't clobber each other.
     private readonly Dictionary<(string RouteKey, string Token, string ModelKey), CacheEntry> _cache = new();
-    // In-process exhaustion overrides written by MarkExhaustedAsync, keyed the
-    // same way. Synthetic AvailablePct=0 + the gateway's reset is surfaced
-    // until expiry so a real-time 429 from the runner gates subsequent picks
-    // without waiting for the next probe call.
-    private readonly Dictionary<(string RouteKey, string Token, string ModelKey), ExhaustionOverride> _exhausted = new();
+    // In-process exhaustion overrides written by MarkExhaustedAsync. Synthetic
+    // AvailablePct=0 + the gateway's reset is surfaced until expiry so a
+    // real-time 429 from the runner gates subsequent picks without waiting for
+    // the next probe call. Expiry/key semantics are shared with the router.
+    private readonly AgentQuotaExhaustionTracker _exhausted = new();
     private readonly SemaphoreSlim _lock = new(1, 1);
 
     public AgentKind Kind => AgentKind.Antigravity;
@@ -125,7 +125,7 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe
         try
         {
             var now = _timeProvider.GetUtcNow();
-            if (_exhausted.TryGetValue(cacheKey, out var ex) && ex.ExpiresAt > now)
+            if (_exhausted.TryGet(member, now, out var ex))
             {
                 snapshot = new AgentQuotaSnapshot
                 {
@@ -135,7 +135,6 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe
                 };
                 return snapshot;
             }
-            _exhausted.Remove(cacheKey);
 
             if (_cache.TryGetValue(cacheKey, out var entry) && entry.ExpiresAt > now)
                 return entry.Snapshot;
@@ -165,14 +164,11 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe
         try
         {
             var now = _timeProvider.GetUtcNow();
-            // Cap the lockout window at the gateway-provided reset when it is
-            // sooner than TTL — a runtime hint shouldn't push the parking
-            // window past the actual reset moment.
-            var expiry = now + (ttl > TimeSpan.Zero ? ttl : TimeSpan.FromMinutes(1));
-            if (resetAt is { } r && r > now && r < expiry)
-                expiry = r;
-            var modelKey = string.IsNullOrWhiteSpace(member.ModelId) ? "" : member.ModelId!;
-            _exhausted[(member.RouteKey, token, modelKey)] = new ExhaustionOverride(expiry, resetAt);
+            _exhausted.MarkExhausted(
+                member,
+                ttl > TimeSpan.Zero ? ttl : TimeSpan.FromMinutes(1),
+                now,
+                resetAt);
         }
         finally
         {
@@ -183,7 +179,7 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe
     public void InvalidateCache()
     {
         _lock.Wait();
-        try { _cache.Clear(); _exhausted.Clear(); }
+        try { _cache.Clear(); }
         finally { _lock.Release(); }
     }
 
@@ -344,5 +340,4 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe
         AgentQuotaSnapshot.UnknownSnapshot(reason, notes);
 
     private sealed record CacheEntry(AgentQuotaSnapshot Snapshot, DateTimeOffset ExpiresAt);
-    private sealed record ExhaustionOverride(DateTimeOffset ExpiresAt, DateTimeOffset? ResetAt);
 }

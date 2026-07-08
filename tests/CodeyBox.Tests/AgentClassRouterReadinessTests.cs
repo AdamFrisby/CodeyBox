@@ -113,6 +113,36 @@ public sealed class AgentClassRouterReadinessTests
     }
 
     [Fact]
+    public async Task CheckReadiness_DoesNotPublishQuotaRecoverySignal()
+    {
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster();
+        var signalCount = 0;
+        quotaSignal.QuotaUsableThresholdCrossed += () => Interlocked.Increment(ref signalCount);
+        var probe = new MutableReadinessProbe(Claude, availablePct: 1);
+        var router = BuildRouter(
+            [Class(Member(Claude))],
+            [probe],
+            quotaAvailabilityPublisher: quotaSignal);
+        var item = Item();
+
+        var blocked = await router.CheckReadinessAsync(
+            item,
+            project: null,
+            new FixedCapacity(),
+            CancellationToken.None);
+        probe.AvailablePct = 100;
+        var recovered = await router.CheckReadinessAsync(
+            item with { Id = WorkItemId.New() },
+            project: null,
+            new FixedCapacity(),
+            CancellationToken.None);
+
+        Assert.Equal(AgentRoutingReadinessState.Unavailable, blocked.State);
+        Assert.Equal(AgentRoutingReadinessState.Available, recovered.State);
+        Assert.Equal(0, Volatile.Read(ref signalCount));
+    }
+
+    [Fact]
     public async Task CheckReadiness_DoesNotConsumeQuotaRetryAdmission()
     {
         var time = new ManualTimeProvider();
@@ -225,7 +255,8 @@ public sealed class AgentClassRouterReadinessTests
         IAgentEffectiveAvailabilityReader? availability = null,
         IAgentBudgetProvider? budgetProvider = null,
         TimeProvider? timeProvider = null,
-        IQuotaFailureStore? quotaFailures = null)
+        IQuotaFailureStore? quotaFailures = null,
+        IAgentQuotaAvailabilityPublisher? quotaAvailabilityPublisher = null)
         => new(
             classes,
             probes,
@@ -234,7 +265,8 @@ public sealed class AgentClassRouterReadinessTests
             timeProvider: timeProvider,
             quotaFailures: quotaFailures,
             budgetProvider: budgetProvider,
-            dispatchAvailability: availability is null ? null : new AgentDispatchAvailability(availability));
+            dispatchAvailability: availability is null ? null : new AgentDispatchAvailability(availability),
+            quotaAvailabilityPublisher: quotaAvailabilityPublisher);
 
     private static AgentClass Class(params AgentMembership[] members) => new()
     {
@@ -296,6 +328,21 @@ public sealed class AgentClassRouterReadinessTests
         public void RecordChangesProduced(AgentKind kind) { }
 
         public IReadOnlyList<AgentAvailabilitySnapshot> Snapshot() => [];
+    }
+
+    private sealed class MutableReadinessProbe : IAgentQuotaProbe
+    {
+        public MutableReadinessProbe(AgentKind kind, double availablePct)
+        {
+            Kind = kind;
+            AvailablePct = availablePct;
+        }
+
+        public AgentKind Kind { get; }
+        public double AvailablePct { get; set; }
+
+        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct) =>
+            Task.FromResult(new AgentQuotaSnapshot { AvailablePct = AvailablePct });
     }
 
     private sealed class FixedBudget : IAgentBudgetProvider

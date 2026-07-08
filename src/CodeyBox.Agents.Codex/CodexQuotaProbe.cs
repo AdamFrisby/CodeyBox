@@ -16,7 +16,7 @@ namespace CodeyBox.Agents.Codex;
 /// Thread-safe; results are cached for <c>cacheTtl</c> to avoid hammering
 /// the endpoint when several work items pick up close together.
 /// </summary>
-public sealed class CodexQuotaProbe : IAgentQuotaProbe
+public sealed class CodexQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalidator
 {
     internal const string UsageEndpoint = "https://chatgpt.com/backend-api/wham/usage";
     internal const string DefaultRoutedModelId = "gpt-5.5";

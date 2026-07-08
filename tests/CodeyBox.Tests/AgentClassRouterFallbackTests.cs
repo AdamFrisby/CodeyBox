@@ -213,6 +213,32 @@ public sealed class AgentClassRouterFallbackTests
         Assert.False(recovered.ShouldWait);
     }
 
+    [Fact]
+    public async Task OrderedFallbackCandidates_PublishesRecoverySignal_WhenProbeRecovers()
+    {
+        var member = Sub(Codex);
+        var probe = new MutableSnapshotProbe(Codex, new AgentQuotaSnapshot { AvailablePct = 80.0 });
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster();
+        var signalCount = 0;
+        quotaSignal.QuotaUsableThresholdCrossed += () => Interlocked.Increment(ref signalCount);
+        quotaSignal.RecordQuotaUsability(member, isUsable: false);
+        var router = new AgentClassRouter(
+            [Frontier(member)],
+            [probe],
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance,
+            quotaAvailabilityPublisher: quotaSignal);
+
+        var candidates = await router.OrderedFallbackCandidatesAsync(
+            Item(),
+            project: null,
+            CancellationToken.None);
+
+        Assert.Single(candidates);
+        Assert.Equal(Codex, candidates[0].Agent);
+        Assert.Equal(1, Volatile.Read(ref signalCount));
+    }
+
     private sealed class MutableSnapshotProbe : IAgentQuotaProbe
     {
         public MutableSnapshotProbe(AgentKind kind, AgentQuotaSnapshot snapshot)

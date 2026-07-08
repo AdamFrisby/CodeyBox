@@ -1928,7 +1928,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
     }
 
     [Fact]
-    public async Task Scheduler_RouterQuotaRecoverySignal_RequeuesWaitingForQuotaResetItem()
+    public async Task Scheduler_QuotaRecoveryProbeMonitor_RequeuesWaitingForQuotaResetItem()
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -1970,6 +1970,14 @@ public sealed class QuotaAutoRetryTests : IDisposable
             NullLogger<AgentClassRouter>.Instance,
             _time,
             quotaAvailabilityPublisher: quotaSignal);
+        using var monitor = new AgentQuotaRecoveryProbeMonitor(
+            quotaSignal,
+            quotaSignal,
+            [probe],
+            new QuotaGateAvailability(new QuotaGatePolicy(routerOptions)),
+            routerOptions,
+            NullLogger<AgentQuotaRecoveryProbeMonitor>.Instance,
+            _time);
         using var scheduler = new QuotaRetryScheduler(
             store,
             retrier,
@@ -2007,9 +2015,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
         var signalCount = 0;
         quotaSignal.QuotaUsableThresholdCrossed += () => System.Threading.Interlocked.Increment(ref signalCount);
 
-        var probeItem = parked with { Id = WorkItemId.New(), State = WorkItemState.Queued };
-        var deniedDecision = await router.ResolveAsync(probeItem, project, CancellationToken.None);
-        Assert.True(deniedDecision.ShouldWait);
+        router.MarkExhausted(member, TimeSpan.FromHours(6), _time.Now.AddDays(7));
         Assert.Equal(0, System.Threading.Volatile.Read(ref signalCount));
 
         var stillParked = await store.GetAsync(parked.Id);
@@ -2017,8 +2023,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
         Assert.Equal(0, stillParked.QuotaRetryAttempts);
 
         probe.AvailablePct = 80;
-        var allowedDecision = await router.ResolveAsync(probeItem with { Id = WorkItemId.New() }, project, CancellationToken.None);
-        Assert.NotNull(allowedDecision.Chosen);
+        Assert.Equal(1, await monitor.ProbeTrackedMembersOnceAsync(CancellationToken.None));
         Assert.Equal(1, System.Threading.Volatile.Read(ref signalCount));
 
         var retried = await WaitForAttemptsAsync(store, parked.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));

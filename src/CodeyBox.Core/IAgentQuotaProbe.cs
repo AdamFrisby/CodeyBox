@@ -43,6 +43,11 @@ public interface IAgentQuotaProbe
         CancellationToken ct = default) => Task.CompletedTask;
 }
 
+public interface IAgentQuotaCacheInvalidator
+{
+    void InvalidateCache();
+}
+
 /// <summary>OAuth/subscription credentials used by quota probes.</summary>
 public sealed record AgentQuotaCredentials(string? AccessToken, string? AccountId = null);
 
