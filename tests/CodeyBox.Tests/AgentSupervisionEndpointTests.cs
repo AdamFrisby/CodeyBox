@@ -14,6 +14,7 @@ using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Tests;
 
+[Collection("GlobalSerilog")]
 public sealed class AgentSupervisionEndpointTests : IDisposable
 {
     private readonly AgentSupervisionApiFactory _factory = new();

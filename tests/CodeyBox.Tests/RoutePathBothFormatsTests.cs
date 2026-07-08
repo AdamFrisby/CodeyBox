@@ -8,6 +8,7 @@ namespace CodeyBox.Tests;
 /// composite &lt;projectId&gt;:&lt;externalId&gt; path formats and return the same record.
 /// Also verifies mismatched project:externalId returns 404.
 /// </summary>
+[Collection("GlobalSerilog")]
 public sealed class RoutePathBothFormatsTests : IDisposable
 {
     private readonly WorkItemApiFactory _factory = new();

@@ -14,6 +14,7 @@ using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Tests;
 
+[Collection("GlobalSerilog")]
 public sealed class QuotaRetrySchedulerProgramWiringTests
 {
     [Fact]
