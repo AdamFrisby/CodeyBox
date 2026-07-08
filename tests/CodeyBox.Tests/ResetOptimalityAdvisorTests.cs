@@ -165,6 +165,50 @@ public sealed class ResetOptimalityAdvisorTests : IDisposable
     }
 
     [Fact]
+    public async Task Advise_SelfCalibratesFromConfiguredResetTargetWindow()
+    {
+        // The weekly and seven_day windows refill at different phases. With
+        // ResetTargetWindow=seven_day, refinement must learn the seven_day phase,
+        // not the default weekly one.
+        var probe = new MutableProbe(AgentKind.Codex)
+        {
+            AvailablePct = 0,
+            ResetCreditsAvailable = 0,
+            WeeklyPct = 10,
+            SevenDayPct = 10,
+        };
+        var clock = new FakeClock(T0);
+        await using var plugin = await BuildPluginAsync([probe], clock, new()
+        {
+            ["ResetOptimality:CadenceAnchor"] = "2026-06-01T00:00:00Z",
+            ["ResetOptimality:ResetTargetWindow"] = "seven_day",
+            ["ResetOptimality:RefineAnchorFromLogger"] = "true",
+            ["ResetOptimality:AnchorRefineToleranceHours"] = "6",
+        });
+
+        await plugin.SampleOnceAsync(CancellationToken.None); // t+0: both windows spent
+        clock.Advance(TimeSpan.FromHours(2));
+        probe.WeeklyPct = 90; // weekly refills at +2h
+        await plugin.SampleOnceAsync(CancellationToken.None);
+
+        clock.Advance(TimeSpan.FromHours(8));
+        probe.SevenDayPct = 90;             // configured target refills at +10h
+        probe.ResetCreditsAvailable = 1;    // and a credit is granted here
+        await plugin.SampleOnceAsync(CancellationToken.None);
+
+        clock.Advance(TimeSpan.FromHours(1));
+        probe.WeeklyPct = 0;
+        probe.SevenDayPct = 0;
+        await plugin.SampleOnceAsync(CancellationToken.None); // latest target window spent
+
+        var advice = await plugin.AdviseAsync(new ResetAdviceRequest());
+
+        Assert.Equal(ResetAdviceReason.NaturalResetArrivesInTime, advice.Reason);
+        Assert.Equal(T0 + TimeSpan.FromDays(7) + TimeSpan.FromHours(10), advice.PredictedNaturalReset);
+        Assert.Equal(0.0, advice.UsableQuotaPct);
+    }
+
+    [Fact]
     public async Task Advise_NoLoggedSnapshot_ReportsQuotaReadingUnavailable()
     {
         // Nothing sampled into the store → ReadLatestSnapshotAsync must translate
@@ -185,10 +229,58 @@ public sealed class ResetOptimalityAdvisorTests : IDisposable
         Assert.Null(advice.UsableQuotaPct);
     }
 
+    [Fact]
+    public async Task Advise_HotReloadedResetOptimalityOptionsAffectSubsequentAdvice()
+    {
+        var probe = new MutableProbe(AgentKind.Codex) { AvailablePct = 0, ResetCreditsAvailable = 0 };
+        var clock = new FakeClock(T0);
+        var source = new ReloadableMemorySource
+        {
+            Data = BuildSettings(new()
+            {
+                ["ResetOptimality:CadenceAnchor"] = "2026-06-01T00:00:00Z",
+                ["ResetOptimality:RefineAnchorFromLogger"] = "false",
+                ["ResetOptimality:PlanEndsAt"] = "2026-06-03T00:00:00Z",
+            }),
+        };
+        var configRoot = new ConfigurationBuilder().Add(source).Build();
+        await using var plugin = new StatisticsQuotaPlugin([probe], configRoot, quotaGate: null, timeProvider: clock);
+        await plugin.InitializeAsync(BuildPluginContext(configRoot));
+
+        await plugin.SampleOnceAsync(CancellationToken.None); // t+0, count 0
+        clock.Advance(TimeSpan.FromMinutes(15));
+        probe.ResetCreditsAvailable = 1;
+        await plugin.SampleOnceAsync(CancellationToken.None); // t+15, count 1 (grant)
+
+        var beforeReload = await plugin.AdviseAsync(new ResetAdviceRequest());
+        Assert.True(beforeReload.ShouldSpend);
+        Assert.Equal(ResetAdviceReason.SpendBeforeDeadline, beforeReload.Reason);
+
+        source.TriggerReload(BuildSettings(new()
+        {
+            ["ResetOptimality:CadenceAnchor"] = "2026-06-01T00:00:00Z",
+            ["ResetOptimality:RefineAnchorFromLogger"] = "false",
+            ["ResetOptimality:PlanEndsAt"] = "2026-07-01T00:00:00Z",
+        }));
+
+        var afterReload = await plugin.AdviseAsync(new ResetAdviceRequest());
+        Assert.False(afterReload.ShouldSpend);
+        Assert.Equal(ResetAdviceReason.NaturalResetArrivesInTime, afterReload.Reason);
+        Assert.Equal(DateTimeOffset.Parse("2026-07-01T00:00:00Z"), afterReload.PlanEndsAt);
+    }
+
     private async Task<StatisticsQuotaPlugin> BuildPluginAsync(
         IEnumerable<IAgentQuotaProbe> probes,
         TimeProvider timeProvider,
         Dictionary<string, string?> extraConfig)
+    {
+        var configRoot = new ConfigurationBuilder().AddInMemoryCollection(BuildSettings(extraConfig)).Build();
+        var plugin = new StatisticsQuotaPlugin(probes, configRoot, quotaGate: null, timeProvider: timeProvider);
+        await plugin.InitializeAsync(BuildPluginContext(configRoot));
+        return plugin;
+    }
+
+    private Dictionary<string, string?> BuildSettings(Dictionary<string, string?> extraConfig)
     {
         var settings = new Dictionary<string, string?>
         {
@@ -196,16 +288,17 @@ public sealed class ResetOptimalityAdvisorTests : IDisposable
         };
         foreach (var (key, value) in extraConfig)
             settings[$"CodeyBox:Plugins:{StatisticsQuotaPlugin.PluginId}:{key}"] = value;
+        return settings;
+    }
 
-        var configRoot = new ConfigurationBuilder().AddInMemoryCollection(settings).Build();
-        var plugin = new StatisticsQuotaPlugin(probes, configRoot, quotaGate: null, timeProvider: timeProvider);
+    private static PluginContext BuildPluginContext(IConfiguration configRoot)
+    {
         var host = new TestPluginHost(configRoot.GetSection($"CodeyBox:Plugins:{StatisticsQuotaPlugin.PluginId}"));
-        await plugin.InitializeAsync(new PluginContext(
+        return new PluginContext(
             HostApiVersion: CodeyBoxApiVersion.Current,
             PluginId: StatisticsQuotaPlugin.PluginId,
             PluginDisplayName: "CodeyBox: Statistics",
-            Host: host));
-        return plugin;
+            Host: host);
     }
 
     private sealed class MutableProbe : IAgentQuotaProbe
@@ -218,16 +311,25 @@ public sealed class ResetOptimalityAdvisorTests : IDisposable
 
         /// <summary>Weekly-window usable %. Null omits the weekly window entirely.</summary>
         public double? WeeklyPct { get; set; }
+        public double? SevenDayPct { get; set; }
 
         public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
             => Task.FromResult(new AgentQuotaSnapshot
             {
                 AvailablePct = AvailablePct,
                 ResetCreditsAvailable = ResetCreditsAvailable,
-                Windows = WeeklyPct is { } pct
-                    ? new[] { new WindowQuota { Name = "weekly", AvailablePct = pct } }
-                    : Array.Empty<WindowQuota>(),
+                Windows = BuildWindows(),
             });
+
+        private WindowQuota[] BuildWindows()
+        {
+            var windows = new List<WindowQuota>(capacity: 2);
+            if (WeeklyPct is { } weekly)
+                windows.Add(new WindowQuota { Name = "weekly", AvailablePct = weekly });
+            if (SevenDayPct is { } sevenDay)
+                windows.Add(new WindowQuota { Name = "seven_day", AvailablePct = sevenDay });
+            return windows.ToArray();
+        }
     }
 
     private sealed class FakeClock : TimeProvider
@@ -243,5 +345,43 @@ public sealed class ResetOptimalityAdvisorTests : IDisposable
         public TestPluginHost(IConfigurationSection scoped) => ScopedConfig = scoped;
         public Microsoft.Extensions.Logging.ILogger Logger { get; } = NullLogger.Instance;
         public IConfigurationSection ScopedConfig { get; }
+    }
+
+    private sealed class ReloadableMemorySource : IConfigurationSource
+    {
+        public Dictionary<string, string?> Data { get; set; } =
+            new(StringComparer.OrdinalIgnoreCase);
+        public ReloadableMemoryProvider? Provider { get; private set; }
+
+        public IConfigurationProvider Build(IConfigurationBuilder builder)
+        {
+            Provider = new ReloadableMemoryProvider(this);
+            return Provider;
+        }
+
+        public void TriggerReload(Dictionary<string, string?> next)
+        {
+            Data = new Dictionary<string, string?>(next, StringComparer.OrdinalIgnoreCase);
+            Provider!.ReloadFromSource();
+        }
+    }
+
+    private sealed class ReloadableMemoryProvider : ConfigurationProvider
+    {
+        private readonly ReloadableMemorySource _source;
+
+        public ReloadableMemoryProvider(ReloadableMemorySource source)
+        {
+            _source = source;
+            ReloadFromSource();
+        }
+
+        public override void Load() { }
+
+        public void ReloadFromSource()
+        {
+            Data = new Dictionary<string, string?>(_source.Data, StringComparer.OrdinalIgnoreCase);
+            OnReload();
+        }
     }
 }

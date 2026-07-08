@@ -25,11 +25,9 @@ namespace CodeyBox.StatisticsPlugin;
 /// loopback dependency between the API and the plugin, and stays cheap even
 /// when the API is degraded.</para>
 ///
-/// <para>This class is the only public extension point the plugin loader sees.
-/// It implements <see cref="IMetricSampler"/> (the host's per-tick driver),
-/// <see cref="IQuotaTimeSeriesStore"/> (the read-side the API queries), and
-/// <see cref="IPluginInitializer"/> (so it can open its SQLite store before
-/// the first tick). Persistence and pruning live in the
+/// <para>This class is the only public extension point the plugin loader sees:
+/// it coordinates sampling, the quota time-series read side, capacity and reset
+/// advice, plugin initialization, and disposal. Persistence and pruning live in the
 /// <see cref="QuotaTimeSeriesSqliteStore"/> helper so they remain
 /// unit-testable without spinning up the plugin lifecycle.</para>
 /// </summary>
@@ -419,12 +417,19 @@ public sealed class StatisticsQuotaPlugin
         // Latest quota snapshot (1/5): the most recent raw row for the agent.
         var quota = await ReadLatestSnapshotAsync(store, agent, fromUtc, toUtc, ct);
 
-        // Self-calibrate the cadence anchor from observed weekly resets in the
-        // logger, when enabled and an anchor is configured to refine.
+        // Self-calibrate the cadence anchor from observed target-window resets
+        // in the logger, when enabled and an anchor is configured to refine.
         var anchor = opts.CadenceAnchor;
         if (anchor is { } configuredAnchor && opts.RefineAnchorFromLogger)
         {
-            var observedResets = await DetectWeeklyResetsAsync(store, agent, fromUtc, toUtc, maxRows, ct);
+            var observedResets = await DetectNaturalResetsAsync(
+                store,
+                agent,
+                opts.ResetTargetWindow,
+                fromUtc,
+                toUtc,
+                maxRows,
+                ct);
             anchor = NaturalResetCadence.RefineAnchor(
                 configuredAnchor, opts.CadencePeriod, observedResets, opts.AnchorRefineTolerance);
         }
@@ -491,14 +496,15 @@ public sealed class StatisticsQuotaPlugin
     }
 
     /// <summary>
-    /// Detects weekly natural-reset instants from the logged <c>weekly</c>-window
-    /// series: a sample whose usable % jumps up across the reset thresholds
-    /// (from a spent window to a fresh one) marks a reset. These feed the
-    /// cadence-anchor self-calibration.
+    /// Detects natural-reset instants from the configured reset-target window:
+    /// a sample whose usable % jumps up across the reset thresholds (from a
+    /// spent window to a fresh one) marks a reset. These feed cadence-anchor
+    /// self-calibration.
     /// </summary>
-    private async Task<IReadOnlyList<DateTimeOffset>> DetectWeeklyResetsAsync(
+    private async Task<IReadOnlyList<DateTimeOffset>> DetectNaturalResetsAsync(
         QuotaTimeSeriesSqliteStore store,
         string agent,
+        string? resetTargetWindow,
         DateTimeOffset fromUtc,
         DateTimeOffset toUtc,
         int maxRows,
@@ -510,7 +516,7 @@ public sealed class StatisticsQuotaPlugin
         var filter = new QuotaTimeSeriesFilter
         {
             Agent = agent,
-            WindowName = "weekly",
+            WindowName = ResetDetectionWindowName(resetTargetWindow),
             FromUtc = fromUtc,
             ToUtc = InclusiveUpperBound(toUtc),
             Descending = true,
@@ -522,15 +528,18 @@ public sealed class StatisticsQuotaPlugin
         return WeeklyNaturalResetDetector.Detect(ascending);
     }
 
+    private static string ResetDetectionWindowName(string? resetTargetWindow)
+        => string.IsNullOrWhiteSpace(resetTargetWindow) ? "overall" : resetTargetWindow.Trim();
+
     /// <summary>
     /// Converts the advice window's inclusive upper bound into the store's
     /// exclusive <c>sampled_at &lt; ToUtc</c> form. The store excludes the upper
     /// bound, so nudge it just past the requested instant to keep a sample taken
-    /// exactly at <paramref name="toUtc"/> (samples are whole-second). One place,
-    /// so the three advisor reads stay consistent.
+    /// exactly at <paramref name="toUtc"/>. One place, so the three advisor reads
+    /// stay consistent with the store's tick-preserving timestamp format.
     /// </summary>
     private static DateTimeOffset InclusiveUpperBound(DateTimeOffset toUtc)
-        => toUtc + TimeSpan.FromSeconds(1);
+        => toUtc + TimeSpan.FromTicks(1);
 
     private QuotaTimeSeriesFilter ClampFilterLimit(QuotaTimeSeriesFilter filter)
     {

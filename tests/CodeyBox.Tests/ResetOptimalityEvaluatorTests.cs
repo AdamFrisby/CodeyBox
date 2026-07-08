@@ -235,6 +235,43 @@ public sealed class ResetOptimalityEvaluatorTests
     }
 
     [Fact]
+    public void Deadline_IgnoresConflictingProviderResetAt_UsesCadencePrediction()
+    {
+        // Real Codex snapshots can surface reset_at values that over-predict the
+        // natural reset. The evaluator must derive the natural reset from the
+        // configured cadence only. If this "soon" provider reset_at were trusted,
+        // the decision would incorrectly hold for a free reset before the deadline.
+        var providerResetAt = Now + TimeSpan.FromHours(1);
+        var deadline = Now + TimeSpan.FromDays(1);
+        var quota = new AgentQuotaSnapshot
+        {
+            AvailablePct = 0.0,
+            ResetAt = providerResetAt,
+            Windows =
+            [
+                new WindowQuota
+                {
+                    Name = "weekly",
+                    AvailablePct = 0.0,
+                    ResetAt = providerResetAt,
+                },
+            ],
+        };
+
+        var advice = ResetOptimalityEvaluator.Evaluate(
+            "codex",
+            quota,
+            Credit(deadline),
+            Config(),
+            Now);
+
+        Assert.True(advice.ShouldSpend);
+        Assert.Equal(ResetAdviceReason.SpendBeforeDeadline, advice.Reason);
+        Assert.Equal(deadline, advice.DecisionDeadline);
+        Assert.Equal(Now + TimeSpan.FromDays(5), advice.PredictedNaturalReset);
+    }
+
+    [Fact]
     public void Deadline_PlanEndsBeforeNaturalReset_AdvisesSpend()
     {
         // Quota exhausted, credit healthy (20d), but the PLAN ends in 2 days —

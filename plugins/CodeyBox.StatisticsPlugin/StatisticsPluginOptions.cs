@@ -271,8 +271,9 @@ public sealed record ResetOptimalityConfigOptions
 
     /// <summary>
     /// When true (default) the configured <see cref="CadenceAnchor"/> is
-    /// phase-refined from observed weekly resets in the quota logger — the
-    /// self-calibration path. When false the configured anchor is used verbatim.
+    /// phase-refined from observed reset-target-window refills in the quota
+    /// logger — the self-calibration path. When false the configured anchor is
+    /// used verbatim.
     /// </summary>
     public bool RefineAnchorFromLogger { get; init; } = true;
 
@@ -289,7 +290,7 @@ public sealed record ResetOptimalityConfigOptions
             PlanEndsAt = ReadDateTimeOffset(section, "PlanEndsAt", defaults.PlanEndsAt),
             CadenceAnchor = ReadDateTimeOffset(section, "CadenceAnchor", defaults.CadenceAnchor),
             CadencePeriod = ReadSpanDays(section, "CadencePeriodDays", defaults.CadencePeriod, TimeSpan.FromHours(1)),
-            ResetTargetWindow = ReadString(section, "ResetTargetWindow", defaults.ResetTargetWindow),
+            ResetTargetWindow = ReadOptionalString(section, "ResetTargetWindow", defaults.ResetTargetWindow),
             DustThresholdPct = ReadPercent(section, "DustThresholdPct", defaults.DustThresholdPct),
             TimeTolerance = ReadSpanHours(section, "TimeToleranceHours", defaults.TimeTolerance, TimeSpan.Zero),
             AnchorRefineTolerance = ReadSpanHours(section, "AnchorRefineToleranceHours", defaults.AnchorRefineTolerance, TimeSpan.Zero),
@@ -319,10 +320,11 @@ public sealed record ResetOptimalityConfigOptions
         return bool.TryParse(raw, out var parsed) ? parsed : fallback;
     }
 
-    private static string? ReadString(IConfigurationSection section, string key, string? fallback)
+    private static string? ReadOptionalString(IConfigurationSection section, string key, string? fallback)
     {
-        var raw = section[key];
-        return string.IsNullOrWhiteSpace(raw) ? fallback : raw.Trim();
+        var child = section.GetSection(key);
+        if (!child.Exists()) return fallback;
+        return string.IsNullOrWhiteSpace(child.Value) ? null : child.Value.Trim();
     }
 
     private static DateTimeOffset? ReadDateTimeOffset(IConfigurationSection section, string key, DateTimeOffset? fallback)

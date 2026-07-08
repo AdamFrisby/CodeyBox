@@ -90,7 +90,7 @@ tick.
 Bind from `CodeyBox:Plugins:codeybox.statistics` in `appsettings.json`. All
 keys are hot-reloadable — changes to the config file are observed via the
 plugin's own change-token registration and take effect on the next tick /
-next prune cycle.
+next prune cycle / advice query.
 
 ```json
 {
@@ -111,6 +111,16 @@ next prune cycle.
             { "EstimatedExpiresAt": "2026-07-16T00:00:00Z", "Label": "credit A — burn within 2 weeks" },
             { "EstimatedExpiresAt": "2026-08-01T00:00:00Z", "Label": "credit B — just arrived (~30d)" }
           ]
+        },
+        "ResetOptimality": {
+          "Agents": ["codex"],
+          "ResetTargetWindow": "weekly",
+          "CadenceAnchor": "2026-06-29T06:00:00Z",
+          "CadencePeriodDays": 7,
+          "DustThresholdPct": 1,
+          "TimeToleranceHours": 6,
+          "AnchorRefineToleranceHours": 6,
+          "RefineAnchorFromLogger": true
         }
       }
     }
@@ -134,9 +144,11 @@ next prune cycle.
 | `ResetOptimality:PlanEndsAt` | RFC 3339 | unset | When the subscription plan ends. Caps the decision deadline — quota past this is worthless. |
 | `ResetOptimality:CadenceAnchor` | RFC 3339 | unset | A known instant on the natural-reset schedule (e.g. a recent Monday 06:00 UTC boundary). **Unset disables spend advice.** Phase-refined from the logger when `RefineAnchorFromLogger` is on. |
 | `ResetOptimality:CadencePeriodDays` | `double` | `7` | Natural-reset period. Codex resets weekly. Floor 1h. |
+| `ResetOptimality:ResetTargetWindow` | `string` | `weekly` | Cap window a banked reset re-anchors and burn-first evaluates. A present blank value uses the aggregate quota reading. Also selects the logged series used for cadence-anchor refinement. |
 | `ResetOptimality:DustThresholdPct` | `double` | `1` | Usable-quota % at/below which the current window counts as spent (burn-first satisfied). Clamped to 0–100. |
 | `ResetOptimality:TimeToleranceHours` | `double` | `6` | Slack around the deadline-vs-natural-reset comparison; the natural reset must land later than the deadline by more than this before a spend is advised. |
-| `ResetOptimality:RefineAnchorFromLogger` | `bool` | `true` | Phase-refine `CadenceAnchor` from observed weekly resets in the logged series (self-calibration). When false the configured anchor is used verbatim. |
+| `ResetOptimality:AnchorRefineToleranceHours` | `double` | `6` | Phase-drift tolerance for logger-based cadence refinement. Drift at or below this keeps the configured `CadenceAnchor`; larger drift shifts it. |
+| `ResetOptimality:RefineAnchorFromLogger` | `bool` | `true` | Phase-refine `CadenceAnchor` from observed reset-target-window refills in the logged series (self-calibration). When false the configured anchor is used verbatim. |
 
 ---
 
@@ -433,8 +445,8 @@ established from real Codex data:
 3. **Predicted natural reset.** Codex's real reset is a fixed weekly boundary
    (~Monday 06:00 UTC). The provider's `reset_at` field **over-predicts** and is
    not used — the boundary is predicted from `CadenceAnchor` + `CadencePeriodDays`,
-   optionally phase-refined from observed weekly resets in the logged series
-   (`RefineAnchorFromLogger`).
+   optionally phase-refined from observed reset-target-window refills in the
+   logged series (`RefineAnchorFromLogger`).
 4. **Decision deadline.** `min(PlanEndsAt, nextCreditExpiresAt)` — the latest
    moment at which spending still has value AND is still possible. Spend only
    when the natural reset lands after this deadline (beyond `TimeToleranceHours`).

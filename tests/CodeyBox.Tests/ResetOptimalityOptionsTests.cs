@@ -55,6 +55,17 @@ public sealed class ResetOptimalityOptionsTests
     }
 
     [Fact]
+    public void BlankResetTargetWindow_IsPreservedAsAggregateFallback()
+    {
+        var opts = ResetOptimalityConfigOptions.FromConfiguration(Section(new()
+        {
+            ["Root:ResetTargetWindow"] = "   ",
+        }));
+
+        Assert.Null(opts.ResetTargetWindow);
+    }
+
+    [Fact]
     public void ReadsAgentsArray()
     {
         var opts = ResetOptimalityConfigOptions.FromConfiguration(Section(new()
