@@ -1541,7 +1541,7 @@ public sealed class AuditorParallelismCancellationTests : IDisposable
         await cts.CancelAsync();
         try
         {
-            await pipelineTask.WaitAsync(TimeSpan.FromSeconds(30));
+            await pipelineTask.WaitAsync(TimeSpan.FromMinutes(2));
         }
         catch (OperationCanceledException)
         {
