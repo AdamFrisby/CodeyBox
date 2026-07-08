@@ -2955,42 +2955,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private static int DispatchPhaseBucket(WorkItemState state) =>
         QuotaRetryPhasePolicy.DispatchPhaseBucket(state);
 
-    private static int DispatchPhaseBucket(RefactorDispatchCandidate item) =>
-        QuotaRetryPhasePolicy.DispatchPhaseBucket(item.State);
-
-    /// <summary>
-    /// Mirrors the SQL ordering of <see cref="IWorkItemStore.ListDispatchEligibleByPriorityAsync"/>:
-    /// phase bucket ASC (finishing phases before fresh queued work), then
-    /// priority DESC, then <c>CreatedAt</c> ASC. Returns true iff
-    /// <paramref name="left"/> would be picked before <paramref name="right"/>
-    /// by the dispatcher. NOTE: priority is the primary tie-breaker —
-    /// <c>CreatedAt</c> only matters when priorities are equal. A lower-priority
-    /// item never precedes a higher-priority one even if it was created earlier.
-    /// </summary>
-    private static bool DispatchPrecedes(WorkItem left, RefactorDispatchCandidate right)
-    {
-        var leftBucket = DispatchPhaseBucket(left);
-        var rightBucket = DispatchPhaseBucket(right);
-        if (leftBucket != rightBucket)
-            return leftBucket < rightBucket;
-
-        if (left.Priority != right.Priority)
-            return left.Priority > right.Priority;
-
-        return left.CreatedAt < right.CreatedAt;
-    }
-
     /// <summary>
     /// Returns the queued refactor (if any) for <paramref name="candidate"/>'s
     /// project that precedes <paramref name="candidate"/> in the dispatcher's
-    /// total order (phase bucket, priority DESC, then <c>CreatedAt</c> ASC —
-    /// see <see cref="DispatchPrecedes"/>). When multiple refactors precede,
-    /// the one that the dispatcher would pick first is returned. This is the
-    /// "drain owner" — the refactor whose turn it is, in front of which the
-    /// candidate non-refactor item must hold. A lower-priority refactor is
-    /// NEVER selected over a higher-priority normal item; the dispatch-order
-    /// gate ensures the drain only fires on refactors that have actually
-    /// earned their turn under the standard priority rules.
+    /// current candidate order. When multiple refactors precede, the one that
+    /// the dispatcher would pick first is returned. This is the "drain owner" —
+    /// the refactor whose turn it is, in front of which the candidate non-refactor
+    /// item must hold.
     /// </summary>
     private async Task<WorkItem?> FindFreshRefactorPrecedingFreshNormalInDispatchOrderAsync(
         RefactorDispatchCandidate candidate,
@@ -2999,7 +2970,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         if (candidate.StartedAt is not null || candidate.JobType == JobType.Refactor)
             return null;
 
-        var skipIds = new HashSet<WorkItemId>(_activeItems.Keys);
+        var skipIds = new HashSet<WorkItemId>();
+        foreach (var activeId in _activeItems.Keys)
+        {
+            if (activeId != candidate.Id)
+                skipIds.Add(activeId);
+        }
+
         foreach (var deferredId in _deferredItems.Keys)
         {
             if (deferredId != candidate.Id)
@@ -3007,18 +2984,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         }
 
         Dictionary<WorkItemId, WorkItemState>? statesById = null;
-        WorkItem? selected = null;
-        // Iteration is already in dispatch order (priority DESC, then created_at
-        // ASC), so the first eligible refactor is the highest-priority one.
-        // The inner DispatchPrecedes guard handles any reordering nuance and
-        // keeps the selection invariant identical to PickNextEligibleAsync.
-        await foreach (var refactorCandidate in _store.ListDispatchEligibleByPriorityAsync(skipIds, ct))
+        await foreach (var refactorCandidate in EnumeratePickupCandidatesByPriorityAsync(skipIds, ct))
         {
-            if (refactorCandidate.Id == candidate.Id
-                || refactorCandidate.ProjectId != candidate.ProjectId
+            if (refactorCandidate.Id == candidate.Id)
+                return null;
+
+            if (refactorCandidate.ProjectId != candidate.ProjectId
                 || refactorCandidate.JobType != JobType.Refactor
-                || refactorCandidate.StartedAt is not null
-                || !DispatchPrecedes(refactorCandidate, candidate))
+                || refactorCandidate.StartedAt is not null)
             {
                 continue;
             }
@@ -3036,13 +3009,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     continue;
             }
 
-            if (selected is null || DispatchPrecedes(refactorCandidate, RefactorDispatchCandidate.FromWorkItem(selected)))
-            {
-                selected = refactorCandidate;
-            }
+            return refactorCandidate;
         }
 
-        return selected;
+        return null;
     }
 
     private static string RefactorCandidateBlockedReason(

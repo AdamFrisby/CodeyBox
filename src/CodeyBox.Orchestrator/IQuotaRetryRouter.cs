@@ -3,9 +3,11 @@ using CodeyBox.Core;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// Focused routing port used by quota auto-retry re-evaluation. It exposes only
-/// the router operations needed to decide whether a parked quota item can run
-/// now and when exhausted class members are expected to refill.
+/// Focused routing port used by quota auto-retry re-evaluation and dispatch
+/// admission. It exposes the router operations needed to decide whether a
+/// parked quota item can run now, when exhausted class members are expected to
+/// refill, and which routing bucket a lower-priority dispatch candidate would
+/// currently consume.
 /// </summary>
 public interface IQuotaRetryRouter
 {
@@ -21,9 +23,30 @@ public interface IQuotaRetryRouter
         CancellationToken ct,
         string? requiredCapability = null);
 
+    /// <summary>
+    /// Returns the static routing buckets that <paramref name="item"/> could use
+    /// after class, capability, and score filtering. This describes admission
+    /// overlap only; it intentionally does not mean any returned member currently
+    /// has quota or dispatch availability.
+    /// </summary>
     IReadOnlySet<QuotaRetryAdmissionPoolKey> GetQuotaRetryAdmissionPool(
         WorkItem item,
         Project? project,
+        string? requiredCapability = null);
+
+    /// <summary>
+    /// Returns the single routing bucket that <paramref name="item"/> would use
+    /// right now after applying current quota and availability gates, or
+    /// <c>null</c> when the item has no currently routable class member. The
+    /// optional <paramref name="requiredCapability"/> is the phase-specific
+    /// capability gate, such as audit, and composes with the item's own
+    /// <see cref="WorkItem.RequiredCapabilities"/> and
+    /// <see cref="WorkItem.MinModelScore"/>.
+    /// </summary>
+    Task<QuotaRetryAdmissionPoolKey?> ResolveCurrentQuotaRetryAdmissionAsync(
+        WorkItem item,
+        Project? project,
+        CancellationToken ct,
         string? requiredCapability = null);
 }
 

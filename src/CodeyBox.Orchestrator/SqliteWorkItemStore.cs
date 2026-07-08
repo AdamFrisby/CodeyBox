@@ -1400,7 +1400,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         {
             using (var cmd = _conn.CreateCommand())
             {
-                var skipFilter = BuildSkipIdFilter(skipIds, cmd, "wi.id");
+                var skipFilter = BuildSkipIdFilter(skipIds, cmd);
                 cmd.CommandText = $"""
                     SELECT * FROM (
                         SELECT wi.*, wi.state AS dispatch_ordering_state, 0 AS dispatch_source_order
@@ -1434,6 +1434,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         {skipFilter}
                     )
                     ORDER BY
+                        priority DESC,
+                        created_at ASC,
                         CASE
                             WHEN dispatch_ordering_state IN (
                                 {(int)WorkItemState.AuditPassed},
@@ -1443,8 +1445,6 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                             ) THEN 0
                             ELSE 1
                         END ASC,
-                        priority DESC,
-                        created_at ASC,
                         dispatch_source_order ASC
                     LIMIT $limit;
                     """;
@@ -1467,8 +1467,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
 
     private static string BuildSkipIdFilter(
         IReadOnlySet<WorkItemId> skipIds,
-        SqliteCommand cmd,
-        string columnName)
+        SqliteCommand cmd)
     {
         if (skipIds.Count == 0)
             return string.Empty;
@@ -1482,7 +1481,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             cmd.Parameters.AddWithValue(parameterName, id.ToString());
         }
 
-        return $"AND {columnName} NOT IN ({string.Join(", ", parameterNames)})";
+        return $"AND wi.id NOT IN ({string.Join(", ", parameterNames)})";
     }
 
     public async Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default)

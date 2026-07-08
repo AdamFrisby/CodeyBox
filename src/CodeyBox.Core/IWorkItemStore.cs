@@ -295,9 +295,10 @@ public interface IWorkItemStore
     IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(IReadOnlySet<WorkItemId> skipIds, CancellationToken ct = default);
 
     /// <summary>
-    /// Returns the dispatcher pickup set in one priority order: ordinary
+    /// Returns the dispatcher pickup set in one priority-first order: ordinary
     /// dispatch-eligible rows plus <see cref="WorkItemState.WaitingForQuotaReset"/>
-    /// rows whose <see cref="WorkItem.NextQuotaRetryAt"/> is null or due.
+    /// rows whose <see cref="WorkItem.NextQuotaRetryAt"/> is null or due, ordered
+    /// by <c>priority DESC</c>, then <c>created_at ASC</c>.
     /// Implementations should apply <paramref name="limit"/> as close to the
     /// storage query as possible so dispatch wakes cannot scan an unbounded
     /// parked-quota backlog.
@@ -323,9 +324,9 @@ public interface IWorkItemStore
         }
 
         foreach (var row in rows
-            .OrderBy(static row => QuotaRetryPhasePolicy.DispatchPhaseBucket(row.OrderingState))
-            .ThenByDescending(static row => row.Item.Priority)
+            .OrderByDescending(static row => row.Item.Priority)
             .ThenBy(static row => row.Item.CreatedAt)
+            .ThenBy(static row => QuotaRetryPhasePolicy.DispatchPhaseBucket(row.OrderingState))
             .ThenBy(static row => row.Sequence)
             .Take(Math.Max(0, limit)))
         {

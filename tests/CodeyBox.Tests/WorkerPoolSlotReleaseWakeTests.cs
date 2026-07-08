@@ -634,7 +634,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
     }
 
     [Fact]
-    public async Task Pickup_BlockedQuotaPromotionBlocksQueuedWorkWithOverlappingBroaderPool()
+    public async Task Pickup_BlockedQuotaPromotionAllowsQueuedWorkWithCurrentlyAvailableNonOverlappingRoute()
     {
         var queue = new ObservedTaskQueue();
         var pipeline = new ReleaseControlledPipeline(_store);
@@ -696,7 +696,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
 
         var picked = await svc.PickNextEligibleForTestAsync(CancellationToken.None);
 
-        Assert.Null(picked);
+        Assert.Equal(queuedLowPriority.Id, picked);
         Assert.Equal(1, promoter.CallCount);
     }
 
@@ -1047,7 +1047,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
     }
 
     [Fact]
-    public async Task UnifiedPickupQuery_OrdersDueQuotaRetryRowsByResumePhase()
+    public async Task UnifiedPickupQuery_OrdersQueuedAndDueQuotaRetryRowsByPriority()
     {
         var now = DateTimeOffset.UtcNow;
         var queuedHighPriority = MakeItem(createdAt: now.AddMilliseconds(10)) with
@@ -1093,10 +1093,15 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         Assert.Contains(auditLowPriority.Id, ordered);
         Assert.Contains(conflictLowPriority.Id, ordered);
 
-        Assert.True(ordered.IndexOf(mergeLowPriority.Id) < ordered.IndexOf(queuedHighPriority.Id));
-        Assert.True(ordered.IndexOf(upstreamLowPriority.Id) < ordered.IndexOf(queuedHighPriority.Id));
-        Assert.True(ordered.IndexOf(queuedHighPriority.Id) < ordered.IndexOf(auditLowPriority.Id));
-        Assert.True(ordered.IndexOf(queuedHighPriority.Id) < ordered.IndexOf(conflictLowPriority.Id));
+        Assert.Equal(
+            [
+                queuedHighPriority.Id,
+                upstreamLowPriority.Id,
+                mergeLowPriority.Id,
+                conflictLowPriority.Id,
+                auditLowPriority.Id,
+            ],
+            ordered);
     }
 
     [Fact]
@@ -2054,6 +2059,13 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         public IReadOnlySet<QuotaRetryAdmissionPoolKey> GetQuotaRetryAdmissionPool(
             WorkItem item,
             Project? project,
+            string? requiredCapability = null) =>
+            throw new InvalidOperationException("quota retry router failed");
+
+        public Task<QuotaRetryAdmissionPoolKey?> ResolveCurrentQuotaRetryAdmissionAsync(
+            WorkItem item,
+            Project? project,
+            CancellationToken ct,
             string? requiredCapability = null) =>
             throw new InvalidOperationException("quota retry router failed");
     }

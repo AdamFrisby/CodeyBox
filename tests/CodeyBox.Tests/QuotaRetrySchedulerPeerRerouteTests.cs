@@ -323,6 +323,13 @@ public sealed class QuotaRetrySchedulerPeerRerouteTests : IDisposable
             Project? project,
             string? requiredCapability = null) =>
             new HashSet<QuotaRetryAdmissionPoolKey>();
+
+        public Task<QuotaRetryAdmissionPoolKey?> ResolveCurrentQuotaRetryAdmissionAsync(
+            WorkItem item,
+            Project? project,
+            CancellationToken ct,
+            string? requiredCapability = null) =>
+            Task.FromResult<QuotaRetryAdmissionPoolKey?>(null);
     }
 
     private sealed class FakeAgentPauseSignal : IAgentPauseSignal

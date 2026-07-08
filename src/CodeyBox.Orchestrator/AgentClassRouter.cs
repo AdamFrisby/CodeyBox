@@ -1357,6 +1357,27 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             .ToHashSet();
     }
 
+    public async Task<QuotaRetryAdmissionPoolKey?> ResolveCurrentQuotaRetryAdmissionAsync(
+        WorkItem item,
+        Project? project,
+        CancellationToken ct,
+        string? requiredCapability = null)
+    {
+        var decision = await ResolveCoreAsync(
+            item,
+            project,
+            ct,
+            slotGate: null,
+            bypassRecentFailurePrecheck: false,
+            bypassInProcessExhaustion: false,
+            commitDispatchSideEffects: false,
+            requiredCapability: requiredCapability);
+
+        return decision.Chosen is { } chosen
+            ? QuotaRetryAdmissionPoolKey.FromMembership(chosen)
+            : null;
+    }
+
     /// <summary>
     /// Counts class members that <see cref="OrderedFallbackCandidatesAsync"/>
     /// would have considered for <paramref name="item"/> — i.e. they pass the

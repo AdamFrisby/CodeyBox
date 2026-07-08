@@ -1049,6 +1049,18 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
 
             return new HashSet<QuotaRetryAdmissionPoolKey>();
         }
+
+        public Task<QuotaRetryAdmissionPoolKey?> ResolveCurrentQuotaRetryAdmissionAsync(
+            WorkItem item,
+            Project? project,
+            CancellationToken ct,
+            string? requiredCapability = null)
+        {
+            if (item.Id == _throwFor)
+                throw new InvalidOperationException("startup router failed");
+
+            return Task.FromResult<QuotaRetryAdmissionPoolKey?>(null);
+        }
     }
 
     private sealed class RecordingQuotaRetryRouter : IQuotaRetryRouter
@@ -1088,6 +1100,14 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
             Project? project,
             string? requiredCapability = null) =>
             new HashSet<QuotaRetryAdmissionPoolKey>();
+
+        public Task<QuotaRetryAdmissionPoolKey?> ResolveCurrentQuotaRetryAdmissionAsync(
+            WorkItem item,
+            Project? project,
+            CancellationToken ct,
+            string? requiredCapability = null) =>
+            Task.FromResult<QuotaRetryAdmissionPoolKey?>(null);
+
     }
 
     private sealed class ThrowingWebhookDispatcher : IWebhookDispatcher

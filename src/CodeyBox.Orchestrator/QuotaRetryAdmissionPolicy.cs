@@ -5,14 +5,14 @@ namespace CodeyBox.Orchestrator;
 
 internal sealed class QuotaRetryAdmissionPolicy
 {
-    private readonly AgentClassRouter? _router;
+    private readonly IQuotaRetryRouter? _router;
     private readonly IProjectRepository? _projects;
     private readonly ILogger _log;
     private readonly Dictionary<WorkItemId, IReadOnlySet<QuotaRetryAdmissionPoolKey>> _poolsByItem = [];
     private readonly Dictionary<WorkItemId, Project?> _projectsByItem = [];
 
     public QuotaRetryAdmissionPolicy(
-        AgentClassRouter? router,
+        IQuotaRetryRouter? router,
         IProjectRepository? projects,
         ILogger log)
     {
@@ -29,6 +29,10 @@ internal sealed class QuotaRetryAdmissionPolicy
         var blockerPool = await ResolveAdmissionPoolAsync(blockedQuotaRetry, ct);
         if (blockerPool.Count == 0)
             return false;
+
+        var currentCandidateRoute = await ResolveCurrentAdmissionRouteAsync(lowerPriorityCandidate, ct);
+        if (currentCandidateRoute is { } route)
+            return blockerPool.Contains(route);
 
         var candidatePool = await ResolveAdmissionPoolAsync(lowerPriorityCandidate, ct);
         if (candidatePool.Count == 0)
@@ -54,6 +58,12 @@ internal sealed class QuotaRetryAdmissionPolicy
                 _poolsByItem[item.Id] = routerPool;
                 return routerPool;
             }
+
+            if (HasConfiguredAgentClass(item, project))
+            {
+                _poolsByItem[item.Id] = routerPool;
+                return routerPool;
+            }
         }
 
         var directAgent = item.Agent ?? project?.DefaultAgent;
@@ -70,6 +80,38 @@ internal sealed class QuotaRetryAdmissionPolicy
         _poolsByItem[item.Id] = resolved;
         return resolved;
     }
+
+    private async Task<QuotaRetryAdmissionPoolKey?> ResolveCurrentAdmissionRouteAsync(
+        WorkItem item,
+        CancellationToken ct)
+    {
+        var project = await ResolveProjectAsync(item, ct);
+        var requiredCapability = QuotaRetryPhasePolicy.RequiredCapabilityForDispatchAdmission(item);
+        if (_router is not null)
+        {
+            var route = await _router.ResolveCurrentQuotaRetryAdmissionAsync(
+                item,
+                project,
+                ct,
+                requiredCapability);
+            if (route is not null)
+                return route;
+        }
+
+        if (_router is not null && HasConfiguredAgentClass(item, project))
+            return null;
+
+        var directAgent = item.Agent ?? project?.DefaultAgent;
+        return directAgent is { } agent
+            ? QuotaRetryAdmissionPoolKey.FromDirectAgent(
+                agent,
+                AgentInstanceIds.RouteKey(agent, item.AgentInstanceId),
+                item.ModelId)
+            : null;
+    }
+
+    private static bool HasConfiguredAgentClass(WorkItem item, Project? project) =>
+        !string.IsNullOrWhiteSpace(item.AgentClassId ?? project?.DefaultAgentClass);
 
     private async Task<Project?> ResolveProjectAsync(WorkItem item, CancellationToken ct)
     {
