@@ -329,28 +329,29 @@ do anything" outcome.
 ### Step 1: classify before deciding
 
 Before treating an empty rework as the agent's verdict on the findings,
-the pipeline runs the agent failure classifiers over the run's captured
-stdout/stderr:
+the pipeline checks the trusted infrastructure-failure channels:
 
 1. The **auth-required classifier** is consulted at the *top* of the
    no-diff branch, before the empty result is treated as a verdict — a
    Success exit with an auth-required signature throws
    `AgentAuthRequiredException` from `RunAgentPhaseAsync`, which the
-   availability breaker turns into a per-agent exclusion. The work item
-   re-routes through the agent-class router's normal scoring. (This
-   classifier deliberately spans both the initial and rework phases.)
+   availability breaker can turn into a per-agent exclusion. In an
+   agent class, the same exception is a fallback trigger, so the work
+   item re-routes through normal scoring before falling back to a
+   terminal auth-required failure. Stdout-only auth evidence is routed
+   through the existing in-VM corroboration policy before it can bench
+   the agent globally.
 2. The **quota / usage classifier** runs on the **rework** no-diff branch
-   only (`isInitial==false`, clean-exit-but-no-commit). Several CLIs
-   (Antigravity / `agy` in particular) swallow usage-cap errors as exit-0
-   with the cap signature printed to stdout/stderr; without this check the
-   failure would be mis-attributed to "the agent declined to fix findings"
-   instead of infrastructure exhaustion. A quota match throws
-   `TerminalQuotaError`, which the agent-class fallback wrapper converts
-   into a re-route to a healthy class member (or, on the single-agent
-   path, parks the item in `WaitingForQuotaReset`). The classifier is
-   gated behind `isInitial` so an empty *initial* commit is never
-   re-routed on a model-controlled quota-shaped string — initial work
-   stays fail-fast (see below).
+   through the runner-owned `TerminalDiagnostic` side channel. Several
+   CLIs (Antigravity / `agy` in particular) swallow usage-cap errors as
+   exit-0; the runner lifts the terminal provider diagnostic into that
+   field when it can prove the source. Plain stdout/stderr quota-looking
+   text is not accepted as quota evidence on a clean exit, because the
+   model can print detector substrings while making no changes. A trusted
+   quota match throws `TerminalQuotaError`, which the agent-class
+   fallback wrapper converts into a re-route to a healthy class member
+   (or, on the single-agent path, parks the item in
+   `WaitingForQuotaReset`).
 
 Neither infra path counts against convergence, parks the item as
 operator-input, or terminal-fails it as "cannot resolve findings."
@@ -367,15 +368,15 @@ agent declining to commit anything. `RunAgentPhaseAsync` throws
   and `CodeyBox:PipelineTuning:EmptyReworkEscalationRetries` is positive,
   the rework is re-dispatched up to that many times. Each retry appends
   an escalation header to the rework prompt instructing the agent that
-  its previous pass committed nothing and it MUST either modify files or
-  justify each finding as already-satisfied / invalid in its output. If
-  any retry produces a real commit the loop continues normally; otherwise
+  its previous pass committed nothing and it MUST modify files. If any
+  retry produces a real commit the loop continues normally; otherwise
   it falls through to the park path below.
 * **Park for operator review** — when escalation is disabled, the history
   has no convergence, or every escalation pass came back empty, the item
-  parks via the same `ParkAuditMaxIterationsForOperatorAsync` flow used
-  by the audit-iteration ceiling. The operator can resume the item with a
-  clearer prompt or merge by hand.
+  parks via the generic operator-input transition with an
+  `EmptyReworkOperatorInputDetails` payload. The audit-iteration ceiling
+  continues to use its max-iteration-specific payload. The operator can
+  resume the item with a clearer prompt or merge by hand.
 
 Hard terminal failure for genuinely-empty rework is reserved for the
 audit-loop ceiling branch (no budget *and* no convergence) — the existing

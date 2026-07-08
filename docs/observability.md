@@ -117,10 +117,11 @@ Outbound HTTP calls (GitHub API, agent quota probes, webhooks) automatically rec
 | `codeybox.work_item.transitions` | `{transition}` | `to_state` | Incremented on every work-item state transition. |
 | `codeybox.dispatch.count` | `{dispatch}` | — | Incremented when a work item is dispatched to a worker. |
 | `codeybox.agent.invocations` | `{invocation}` | `agent.kind`, `model`, `agent_class`, `phase`, `outcome` (`success` \| `error` \| `canceled`) | One per agent invocation attempt. |
-| `codeybox.agent.fallbacks` | `{fallback}` | `from_agent`, `to_agent` (`(none)` on class exhaustion), `kind` (`quota` \| `timeout`), `phase` | One per agent fallback / class-exhaustion event. |
+| `codeybox.agent.fallbacks` | `{fallback}` | `from_agent`, `to_agent` (`(none)` on class exhaustion), `kind` (`quota` \| `auth` \| `timeout` \| `resume_exhausted`), `phase` | One per agent fallback / class-exhaustion event. |
 | `codeybox.agent.tokens` | `{token}` | `agent.kind`, `model`, `token_type` (`input` \| `cached_input` \| `output`) | Tokens consumed, summed as cost rows are recorded. |
 | `codeybox.agent.cost_usd` | `USD` | `agent.kind`, `model` | Estimated agent cost, summed as cost rows are recorded (aligned with the per-work-item cost rows — no double counting). |
 | `codeybox.audit.iterations` | `{iteration}` | `outcome` (`passed` \| `reworking` \| `failed`) | Incremented once per completed audit iteration. |
+| `codeybox.audit.rework_empty.events` | `{event}` | `outcome` (`detected` \| `escalation_succeeded` \| `parked`) | Empty audit-rework handling sub-events. |
 | `codeybox.webhook.deliveries` | `{delivery}` | `endpoint`, `event`, `outcome` (`delivered` \| `failed`) | One per terminal webhook delivery outcome. |
 
 ### Histograms

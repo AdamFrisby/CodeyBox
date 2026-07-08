@@ -12,20 +12,14 @@ namespace CodeyBox.Tests;
 /// unconditional terminal failure. The audit/rework loop:
 /// </para>
 /// <list type="bullet">
-///   <item>STEP 1 — classifies infra (auth / quota) signatures on the
-///         clean-exit + no-diff REWORK branch: before the empty result is
-///         treated as "produced no changes", the quota classifier runs over the
-///         run's captured stdout/stderr; a match throws
-///         <c>TerminalQuotaError</c> so the availability breaker excludes the
-///         agent and the item re-routes / parks in
-///         <see cref="WorkItemState.WaitingForQuotaReset"/> (NOT terminal, NOT
-///         the operator-input park, NOT counted against convergence). This
-///         exit-0 no-diff detection is distinct from the earlier failure-path
-///         (non-zero exit) detector and is exercised by
-///         <see cref="EmptyRework_WithQuotaSignature_ClassifiedAsInfra_ReRoutes"/>.</item>
+///   <item>STEP 1 — classifies trusted infra signatures on the clean-exit +
+///         no-diff REWORK branch before the empty result is treated as
+///         "produced no changes". Auth-required output uses the shared
+///         corroboration policy; quota output must come from the runner-owned
+///         terminal diagnostic side channel, not model-controlled stdout.</item>
 ///   <item>When no infra signature applies, converge-aware handling kicks in:
 ///         escalation re-dispatch with an explicit "you committed nothing,
-///         either modify files or justify each finding" instruction (gated on
+///         modify files" instruction (gated on
 ///         <see cref="PipelineTuningOptions.EmptyReworkEscalationRetries"/>
 ///         and <c>HasAuditConvergenceProgress</c>); on still-empty falls back
 ///         to the operator-input park flow.</item>
@@ -103,23 +97,12 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
     }
 
     [Fact]
-    public async Task EmptyRework_WithQuotaSignature_ClassifiedAsInfra_ReRoutes()
+    public async Task EmptyRework_WithForgedQuotaStdout_TreatedAsGenuineEmpty_ParksForOperator()
     {
-        // STEP 1 acceptance: an empty rework whose clean-exit output carries a
-        // usage/quota signature is classified as an INFRA failure — NOT the
-        // "produced no changes" verdict. The item must re-route (park in
-        // WaitingForQuotaReset so QuotaRetryScheduler re-dispatches on reset),
-        // NOT terminal-fail, NOT go through the operator-input park, and NOT be
-        // counted against convergence / reach a second audit iteration.
-        //
-        // Sequence:
-        //   work iter 1  → "v1\n" (initial diff; no-diff branch not hit, quota
-        //                  classifier not consulted for initial work)
-        //   audit iter 1 → 1 blocking finding → rework
-        //   rework iter 2 → writes "v1\n" again → NO diff → clean-exit no-diff
-        //                  branch. ResultStdout carries a Claude quota signature
-        //                  ("rate_limit_exceeded"), so the STEP 1 classifier
-        //                  matches → TerminalQuotaError → WaitingForQuotaReset.
+        // Model-controlled stdout is not trusted quota evidence on a clean
+        // exit/no-diff rework. A bare detector substring must not forge a quota
+        // park or exclude a healthy agent; with no trusted terminal diagnostic,
+        // this remains a genuine empty rework and parks for operator review.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new OnceFailingAuditor();
         var audit = new ProjectAudit
@@ -127,14 +110,11 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
             MaxIterations = 3,
             AuditTypes = ["scripted"],
         };
-        // Escalation retries are irrelevant: STEP 1 fires before STEP 2 ever
-        // runs. A generous value would let the genuine-empty escalation branch
-        // run if the quota classification were (wrongly) skipped, so leaving it
-        // >0 makes the test stricter — any escalation dispatch would appear in
-        // WorkPrompts and fail the assertions below.
+        // Keep escalation disabled so the test focuses only on the trust
+        // boundary: stdout quota text is not enough to enter the quota path.
         var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
         {
-            EmptyReworkEscalationRetries = 2,
+            EmptyReworkEscalationRetries = 0,
         });
         using var quotaFailures = new SqliteQuotaFailureStore(
             Path.Combine(_workspace, $"quota-failures-{Guid.NewGuid():N}.db"));
@@ -145,12 +125,6 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
             projectAudit: audit,
             pipelineTuning: tuning,
             quotaFailures: quotaFailures);
-        // Every work/rework result the ScriptedAgent produces from its WorkPlan
-        // carries this stdout. The Claude quota detector (wired into the test
-        // pipeline's CompositeQuotaFailureClassifier) matches the plain-text
-        // "rate_limit_exceeded" substring. It only influences the outcome on the
-        // no-diff branch (rework iter 2); the initial diff-producing work ignores
-        // it.
         tp.Agent.ResultStdout = "rate_limit_exceeded";
         tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "v1\n"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "v1\n"));
@@ -161,26 +135,16 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.NotNull(final);
-        // Infra classification re-routes via the quota path, NOT terminal /
-        // operator-park.
-        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
         Assert.NotEqual(WorkItemState.Failed, final.State);
-        Assert.NotEqual(WorkItemState.NeedsOperatorInput, final.State);
-        // The empty-rework "produced no changes" verdict must NOT have been
-        // reached — the quota classifier short-circuited before it.
-        Assert.DoesNotContain("produced no changes", final.LastError ?? string.Empty,
+        Assert.Contains("produced no changes", final.LastError ?? string.Empty,
             StringComparison.OrdinalIgnoreCase);
-        // Not counted against convergence: the loop never re-entered audit
-        // iteration 2, and no escalation re-dispatch ran.
         Assert.Equal(1, auditor.Calls);
         Assert.DoesNotContain(tp.Agent.WorkPrompts, p =>
             p.Contains("[empty-rework escalation attempt", StringComparison.Ordinal));
         var observations = await quotaFailures.ListRecentAsync(
             TimeSpan.FromHours(1), DateTimeOffset.UtcNow, CancellationToken.None);
-        var observation = Assert.Single(observations);
-        Assert.Equal(AgentKind.Claude, observation.Agent);
-        Assert.Equal(QuotaFailureKind.RateLimitExceeded, observation.FailureKind);
-        Assert.Equal(item.ProjectId, observation.ProjectId);
+        Assert.Empty(observations);
     }
 
     [Fact]
@@ -244,7 +208,7 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
     {
         // Like the escalation-recovers test but the escalation dispatches are
         // also no-op (same content), so retries exhaust and the loop falls
-        // back to ParkAuditMaxIterationsForOperatorAsync rather than
+        // back to the operator-input park flow rather than
         // terminal-failing the item.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new ConvergingAuditor(blockingPerIteration: [2, 1, 0]);
@@ -332,10 +296,10 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
     {
         // The hot-reload contract: changing PipelineTuning at runtime via
         // PipelineTuningSnapshot.Replace must be visible to subsequent reads
-        // through .Current. PipelineRunner's empty-rework handler reads
-        // _pipelineTuning.Current.EmptyReworkEscalationRetries on every
-        // dispatch, so a Replace before the next empty-rework attempt
-        // immediately takes effect (no orchestrator restart required).
+        // through .Current. PipelineRunner's empty-rework handler reads the
+        // current value when each empty-rework handling cycle starts, so a
+        // Replace before the next empty-rework attempt takes effect without an
+        // orchestrator restart.
         var snapshot = new PipelineTuningSnapshot(new PipelineTuningOptions
         {
             EmptyReworkEscalationRetries = 1,
@@ -347,6 +311,50 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
 
         snapshot.Replace(new PipelineTuningOptions { EmptyReworkEscalationRetries = 0 });
         Assert.Equal(0, snapshot.Current.EmptyReworkEscalationRetries);
+    }
+
+    [Fact]
+    public async Task EscalationRetries_HotReloadedSnapshot_IsReadByExistingPipelineRunner()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ConvergingAuditor(blockingPerIteration: [2, 1, 0]);
+        var audit = new ProjectAudit
+        {
+            MaxIterations = 4,
+            AuditTypes = ["scripted"],
+        };
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            EmptyReworkEscalationRetries = 0,
+        });
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectAudit: audit,
+            pipelineTuning: tuning);
+
+        // Replace after PipelineRunner construction. If the runner cached the
+        // original zero value, it would park immediately and neither escalation
+        // prompt below would be consumed.
+        tuning.Replace(new PipelineTuningOptions { EmptyReworkEscalationRetries = 2 });
+
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "v1\n"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "v2\n"));
+        for (var i = 0; i < 3; i++)
+            tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "v2\n"));
+
+        var item = NewItem("feature/empty-rework-hot-reload-runner");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
+        Assert.Contains(tp.Agent.WorkPrompts, p =>
+            p.Contains("[empty-rework escalation attempt 1/2]", StringComparison.Ordinal));
+        Assert.Contains(tp.Agent.WorkPrompts, p =>
+            p.Contains("[empty-rework escalation attempt 2/2]", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -407,35 +415,4 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
         }
     }
 
-    /// <summary>
-    /// Mirrors <c>OnceFailingAuditor</c> from <c>MechanicalFixerTests</c> —
-    /// fails once with one finding, passes on every subsequent call. Local
-    /// copy so this test file is self-contained.
-    /// </summary>
-    private sealed class OnceFailingAuditor : IAuditor
-    {
-        public string Name => "test:once-failing";
-        public string Kind => "tool";
-        public AuditCapabilities Required => AuditCapabilities.None;
-        public int Calls { get; private set; }
-
-        public Task<AuditResult> RunAsync(
-            ISandbox sandbox,
-            string workingDirectory,
-            AuditContext context,
-            CancellationToken ct = default)
-        {
-            _ = sandbox;
-            _ = workingDirectory;
-            _ = context;
-            _ = ct;
-            Calls++;
-            return Calls == 1
-                ? Task.FromResult(new AuditResult(false,
-                [
-                    new AuditFinding(Name, AuditSeverity.Error, "first audit requires rework", "scripted one-time failure"),
-                ]))
-                : Task.FromResult(new AuditResult(true, []));
-        }
-    }
 }

@@ -199,6 +199,25 @@ public sealed record AuditMaxIterationsEscalationDetails
     public required string ResumeHint { get; init; }
 }
 
+/// <summary>
+/// Details payload for <c>work_item.needs_operator_input</c> when an audit
+/// rework pass repeatedly returns no commit while audit budget still remains.
+/// </summary>
+public sealed record EmptyReworkOperatorInputDetails
+{
+    public required string WorkItemId { get; init; }
+    public required int Iteration { get; init; }
+    public required int MaxIterations { get; init; }
+    public required string Agent { get; init; }
+    public required bool Converging { get; init; }
+    public required int EscalationRetriesAttempted { get; init; }
+    public required bool ProgressObserved { get; init; }
+    public required IReadOnlyList<string> ProgressSignals { get; init; }
+    public required IReadOnlyList<AuditProgressIterationDetails> History { get; init; }
+    public required IReadOnlyList<AuditFindingPayload> RemainingBlockingFindings { get; init; }
+    public required string ResumeHint { get; init; }
+}
+
 /// <summary>One audit iteration inside <see cref="AuditMaxIterationsEscalationDetails"/>.</summary>
 public sealed record AuditProgressIterationDetails
 {

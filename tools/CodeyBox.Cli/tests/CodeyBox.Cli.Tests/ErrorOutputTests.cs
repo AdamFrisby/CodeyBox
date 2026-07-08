@@ -10,6 +10,8 @@ namespace CodeyBox.Cli.Tests;
 [Collection("cli-sequential")]
 public sealed class ErrorOutputTests
 {
+    private const int MaxTempDirCandidateAttempts = 100;
+
     private static Func<ResolvedConfig, CodeyBoxClient> MakeFactory(HttpStatusCode status, string body = "Unauthorized")
     {
         return config => new CodeyBoxClient(
@@ -973,7 +975,7 @@ public sealed class ErrorOutputTests
 
     private static string NewTempDirExcluding(params string[] forbidden)
     {
-        for (var i = 0; i < 100; i++)
+        for (var i = 0; i < MaxTempDirCandidateAttempts; i++)
         {
             var path = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
             if (!Array.Exists(forbidden, value => path.Contains(value, StringComparison.Ordinal)))

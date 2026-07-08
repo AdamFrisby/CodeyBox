@@ -71,6 +71,7 @@ internal sealed class InvolvementTracker
     public static string OutcomeForFailure(Exception ex) => ex switch
     {
         TerminalQuotaError => "failure:quota",
+        AgentAuthRequiredException => "failure:auth",
         AuditorIdleTimeoutException => "failure:timeout",
         TerminalTransientNetworkError => "failure:transient",
         PipelineRunner.AgentAttemptTimeoutException => "failure:timeout",

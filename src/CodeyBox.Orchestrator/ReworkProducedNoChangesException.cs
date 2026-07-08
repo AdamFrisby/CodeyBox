@@ -11,33 +11,20 @@ namespace CodeyBox.Orchestrator;
 /// remaining iteration budget.
 /// </summary>
 /// <remarks>
-/// <para>
 /// Distinct from the initial-work no-changes path, which still terminal-fails
 /// fast through <see cref="InvalidOperationException"/>. There is no audit loop
 /// behind initial work to recover from "agent declined to do anything," so the
 /// asymmetry is deliberate.
-/// </para>
-/// <para>
-/// Carries the rework agent's stdout / stderr so callers can attach the agent's
-/// last word to follow-up telemetry (park-for-operator messages, audit log
-/// entries) without re-querying the dead sandbox.
-/// </para>
 /// </remarks>
-public sealed class ReworkProducedNoChangesException : Exception
+internal sealed class ReworkProducedNoChangesException : Exception
 {
     public AgentKind Agent { get; }
-    public string? AgentStdout { get; }
-    public string? AgentStderr { get; }
 
     public ReworkProducedNoChangesException(
         AgentKind agent,
-        string? agentStdout,
-        string? agentStderr,
         string message)
         : base(message)
     {
         Agent = agent;
-        AgentStdout = agentStdout;
-        AgentStderr = agentStderr;
     }
 }

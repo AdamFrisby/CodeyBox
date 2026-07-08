@@ -4603,6 +4603,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             authDetection.Classification,
                             throwOnMatch: true,
                             stdoutOnlyEvidence: false,
+                            allowAgentFallback: !isInitial,
                             ct: ct);
                     }
                 }
@@ -4767,6 +4768,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         ct: ct);
                 }
 
+                await ThrowIfTrustedNoDiffAuthErrorAsync(
+                    item,
+                    project,
+                    runner.Kind,
+                    agentPhase,
+                    agentResult.Stderr,
+                    agentResult.TerminalDiagnostic,
+                    allowAgentFallback: !isInitial,
+                    ct);
+
                 // Exit-0 terminal quota block. Some CLIs (notably agy) exit 0 and
                 // make no file changes when a consumer-tier RESOURCE_EXHAUSTED (429)
                 // stops them, writing the 429 only to an internal log. Such a run
@@ -4783,9 +4794,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 // terminal-fails below, so this adds no false quota parks. Runs BEFORE
                 // RecordNoChangesOutcomeAsync so a quota park never trips the
                 // no-changes circuit breaker. TerminalDiagnostic is a runner-lifted
-                // side-channel (not model-controlled), so this runs in both the
-                // initial and rework phases — the rework-only model-controlled-string
-                // concern that gates the Stderr-based fallback below does not apply.
+                // side-channel (not model-controlled), so it is the only success
+                // no-diff quota evidence accepted here; stdout/stderr quota-looking
+                // text is treated as agent output unless a runner lifts it.
                 if (!string.IsNullOrEmpty(agentResult.TerminalDiagnostic))
                 {
                     var noChangeQuota = _quotaClassifier.Detect(
@@ -4823,58 +4834,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         throw new TerminalQuotaError(noChangeQuota!.Kind,
                             $"Agent {runner.Kind} reported quota failure on clean exit with no changes: {RedactAndTruncateAgentDetail(agentResult.TerminalDiagnostic)}",
                             noChangeQuota.ResetAt);
-                    }
-                }
-
-                // Quota / usage classifier on the clean-exit + no-diff branch —
-                // REWORK ONLY (isInitial==false). The failure-path detector
-                // (above) only fires when the runner exits non-zero, but several
-                // CLIs (Antigravity / agy in particular) swallow usage-cap errors
-                // as exit 0 with the cap signature printed to stdout / stderr.
-                // Without this check the empty result is mis-attributed to "agent
-                // declined to fix findings" rather than infrastructure
-                // exhaustion, and the availability breaker never excludes the
-                // broken agent for peer items in the same class. Match the
-                // failure-path's contract: record an observed quota failure and
-                // throw TerminalQuotaError so the existing router / agent-class
-                // fallback re-routes through a healthy member.
-                //
-                // Scoped to rework only, mirroring STEP 1 of the empty-rework
-                // disambiguation: the initial work phase stays fail-fast and
-                // falls through to the InvalidOperationException below, so an
-                // initial empty commit is never re-routed on a model-controlled
-                // quota-shaped string. (The auth detection above deliberately
-                // spans both phases and is unchanged; only the newly-added quota
-                // classification is gated here.) This is the Stderr-based
-                // fallback for CLIs whose cap signature is printed to stdout /
-                // stderr but not lifted into TerminalDiagnostic by the runner;
-                // the TerminalDiagnostic block above handles the lifted-signal
-                // case in both phases.
-                if (!isInitial)
-                {
-                    _quotaAuditEmitter.EmitAdvisoryAuditEvents(
-                        runner.Kind, agentResult.Stderr, agentResult.Stdout, agentPhase, sandbox.Id);
-                    var noDiffQuotaDetection = _quotaClassifier.Detect(
-                        runner.Kind, agentResult.Stderr, agentResult.Stdout);
-                    if (noDiffQuotaDetection is not null)
-                    {
-                        await _quotaClassifier.RecordIfQuotaFailureAsync(
-                            _quotaFailures,
-                            runner.Kind,
-                            observedModelId,
-                            agentResult.Summary,
-                            agentResult.Stderr,
-                            agentEndedAt,
-                            _auditQuotaOptions.ObservedFailureRetention,
-                            ct,
-                            projectId: item.ProjectId,
-                            stdout: agentResult.Stdout,
-                            bypassExitedSummaryGuard: true);
-
-                        throw new TerminalQuotaError(
-                            noDiffQuotaDetection.Kind,
-                            $"Agent {runner.Kind} reported quota failure (clean exit, no changes): {agentResult.Summary}",
-                            noDiffQuotaDetection.ResetAt);
                     }
                 }
 
@@ -4928,8 +4887,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 // item on the FIRST empty pass.
                 throw new ReworkProducedNoChangesException(
                     runner.Kind,
-                    agentStdout: agentResult.Stdout,
-                    agentStderr: agentResult.Stderr,
                     message: "Rework agent produced no changes; cannot resolve audit findings");
             }
 
@@ -6815,9 +6772,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
             phase,
             detection.Classification,
             throwOnMatch,
-            detection.IsStdoutOnly,
-            requireStdoutOnlyCorroboration,
-            ct);
+            stdoutOnlyEvidence: detection.IsStdoutOnly,
+            requireStdoutOnlyCorroboration: requireStdoutOnlyCorroboration,
+            ct: ct);
     }
 
     private async Task<bool> HandleAuthRequiredDetectionAsync(
@@ -6829,6 +6786,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         bool throwOnMatch,
         bool stdoutOnlyEvidence = false,
         bool requireStdoutOnlyCorroboration = false,
+        bool allowAgentFallback = false,
         CancellationToken ct = default)
     {
         if (classification.Kind != AgentFailureKind.AuthRequired)
@@ -6864,9 +6822,65 @@ public sealed partial class PipelineRunner : IPipelineRunner
             await _authRequiredHandler.PublishSideEffectsAsync(agent, reason, item, project, ct: ct);
 
         if (throwOnMatch)
-            throw new AgentAuthRequiredException(agent, phase, reason);
+            throw new AgentAuthRequiredException(agent, phase, reason, allowAgentFallback);
 
         return true;
+    }
+
+    private async Task ThrowIfTrustedNoDiffAuthErrorAsync(
+        WorkItem item,
+        Project project,
+        AgentKind agent,
+        string phase,
+        string? stderr,
+        string? terminalDiagnostic,
+        bool allowAgentFallback,
+        CancellationToken ct)
+    {
+        await ThrowIfTrustedNoDiffAuthErrorTextAsync(item, project, agent, phase, stderr, allowAgentFallback, ct);
+        await ThrowIfTrustedNoDiffAuthErrorTextAsync(item, project, agent, phase, terminalDiagnostic, allowAgentFallback, ct);
+    }
+
+    private async Task ThrowIfTrustedNoDiffAuthErrorTextAsync(
+        WorkItem item,
+        Project project,
+        AgentKind agent,
+        string phase,
+        string? trustedText,
+        bool allowAgentFallback,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(trustedText))
+            return;
+
+        var classification = _authFailureClassifier.ClassifyFailure(
+            agent,
+            new AgentResult(
+                Success: false,
+                Summary: "agent exited 1",
+                Stdout: null,
+                Stderr: trustedText));
+        if (classification.Kind is not (AgentFailureKind.AuthError or AgentFailureKind.AuthRequired))
+            return;
+
+        var authRequired = classification.Kind == AgentFailureKind.AuthRequired
+            ? classification
+            : classification with
+            {
+                Kind = AgentFailureKind.AuthRequired,
+                Reason = classification.Reason ?? "auth pattern matched",
+            };
+        await HandleAuthRequiredDetectionAsync(
+            item,
+            project,
+            agent,
+            phase,
+            authRequired,
+            throwOnMatch: true,
+            stdoutOnlyEvidence: false,
+            requireStdoutOnlyCorroboration: false,
+            allowAgentFallback: allowAgentFallback,
+            ct: ct);
     }
 
     private enum StdoutOnlyAuthCorroboration
@@ -7928,13 +7942,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // shows convergence, re-dispatch with an escalated instruction so a
             // single empty pass on a converging item does not discard the
             // remaining iteration budget. If retries are still empty, fall back
-            // to ParkAuditMaxIterationsForOperatorAsync (operator picks up the
-            // partially-converged item) rather than terminal-failing it. Only
-            // hard-fail when both budget AND convergence are absent — that path
-            // is handled by the audit-loop ceiling branch.
+            // to the operator-input park flow (operator picks up the partially
+            // converged item) rather than terminal-failing it. Only hard-fail
+            // when both budget AND convergence are absent — that path is
+            // handled by the audit-loop ceiling branch.
             var parked = await HandleEmptyReworkAsync(
                 item, project, emptyEx, auditHistory, reworkIterationNumber, maxIterations,
-                baseReworkPrompt, DispatchAsync, reworkStart, repoId, workBranch, ct);
+                baseReworkPrompt, DispatchAsync, reworkPhase, reworkStart, repoId, workBranch, ct);
             return parked;
         }
 
@@ -7979,11 +7993,15 @@ public sealed partial class PipelineRunner : IPipelineRunner
         int maxIterations,
         string baseReworkPrompt,
         Func<string, Task<string?>> dispatchAsync,
+        PhaseCancellation reworkPhase,
         DateTimeOffset reworkStart,
         string repoId,
         string workBranch,
         CancellationToken ct)
     {
+        if (auditHistory.Count == 0)
+            throw new InvalidOperationException("Empty rework handling requires at least one audit progress snapshot.");
+
         var converging = HasAuditConvergenceProgress(auditHistory);
         var configuredRetries = Math.Max(0, _pipelineTuning.Current.EmptyReworkEscalationRetries);
         var attempts = converging ? configuredRetries : 0;
@@ -7992,14 +8010,20 @@ public sealed partial class PipelineRunner : IPipelineRunner
             "Work item {Id} rework iteration {Iter} produced no changes (agent {Agent}); " +
             "converging={Converging}, configured escalation retries={Retries}",
             item.Id, reworkIterationNumber, emptyEx.Agent.Value, converging, attempts);
-        CodeyBoxMeters.AuditIterations.Add(1,
-            new KeyValuePair<string, object?>("outcome", "rework_empty_detected"));
+        CodeyBoxMeters.ReworkEmptyEvents.Add(1,
+            new KeyValuePair<string, object?>("outcome", "detected"));
 
         string? lastStdout = null;
         for (var attempt = 1; attempt <= attempts; attempt++)
         {
-            if (ct.IsCancellationRequested)
-                break;
+            try
+            {
+                ct.ThrowIfCancellationRequested();
+            }
+            catch (OperationCanceledException oce)
+            {
+                throw reworkPhase.Wrap(oce);
+            }
 
             var escalatedPrompt = BuildEmptyReworkEscalationPrompt(
                 originalPrompt: baseReworkPrompt,
@@ -8011,8 +8035,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             try
             {
                 lastStdout = await dispatchAsync(escalatedPrompt);
-                CodeyBoxMeters.AuditIterations.Add(1,
-                    new KeyValuePair<string, object?>("outcome", "rework_empty_escalation_succeeded"));
+                CodeyBoxMeters.ReworkEmptyEvents.Add(1,
+                    new KeyValuePair<string, object?>("outcome", "escalation_succeeded"));
                 // The escalation pass committed changes; resume the normal
                 // post-rework bookkeeping the catch-free path would have run.
                 await PublishIterationCompletedAsync(item, project, IterationPhase.Rework, reworkIterationNumber,
@@ -8029,6 +8053,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 }
                 return false;
             }
+            catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
+            {
+                throw reworkPhase.Wrap(oce);
+            }
             catch (ReworkProducedNoChangesException)
             {
                 // Still empty — try the next escalation, or fall through to
@@ -8043,21 +8071,25 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // convergence — both are "in-budget but the agent won't make progress
         // unaided." Auditors and operators can resume the item with a clearer
         // prompt or merge by hand.
-        CodeyBoxMeters.AuditIterations.Add(1,
-            new KeyValuePair<string, object?>("outcome", "rework_empty_parked"));
-        var parkHistory = auditHistory.Count > 0
-            ? auditHistory
-            : BuildSyntheticEmptyReworkHistory(reworkIterationNumber, maxIterations);
+        CodeyBoxMeters.ReworkEmptyEvents.Add(1,
+            new KeyValuePair<string, object?>("outcome", "parked"));
         var parkMessage =
             $"Rework agent {emptyEx.Agent.Value} produced no changes for audit iteration {reworkIterationNumber} " +
             $"(converging={converging}, escalation retries attempted={attempts}); " +
             "no infra (auth / quota) signature was matched on the agent output. " +
             "Parked for operator review instead of terminal-failing the work item — operator can re-prompt " +
             "or merge by hand.";
-        await ParkAuditMaxIterationsForOperatorAsync(
-            item, project, parkHistory, ct,
-            messageOverride: parkMessage,
-            auditLogReasonOverride: "rework produced no changes");
+        await ParkAuditEmptyReworkForOperatorAsync(
+            item,
+            project,
+            auditHistory,
+            reworkIterationNumber,
+            maxIterations,
+            emptyEx.Agent,
+            converging,
+            attempts,
+            parkMessage,
+            ct);
         return true;
     }
 
@@ -8069,53 +8101,76 @@ public sealed partial class PipelineRunner : IPipelineRunner
         var header = $"""
             [empty-rework escalation attempt {attempt}/{totalAttempts}]
             Your previous pass committed NO changes. You MUST modify files to
-            address the listed audit findings, OR for each finding state
-            precisely why it is invalid / already-satisfied in your output so
-            the operator can re-classify it. Returning again with no commit
-            AND no per-finding justification will park this work item for
-            operator review.
+            address the listed audit findings. Returning again with no commit
+            will park this work item for operator review.
 
             """;
         return string.IsNullOrEmpty(originalPrompt) ? header : header + originalPrompt;
-    }
-
-    /// <summary>
-    /// Build a single-snapshot synthetic history covering the empty-rework
-    /// iteration, used when the persisted history is empty (legacy data or
-    /// resume from parked state with no prior snapshots). Ensures the park
-    /// flow has a non-empty record to attribute the escalation to.
-    /// </summary>
-    private static IReadOnlyList<AuditProgressSnapshot> BuildSyntheticEmptyReworkHistory(
-        int reworkIterationNumber,
-        int maxIterations)
-    {
-        return [new AuditProgressSnapshot(
-            Math.Max(1, reworkIterationNumber - 1),
-            maxIterations,
-            BlockingFindings: 0,
-            NonBlockingFindings: 0,
-            BlockingFindingIds: [],
-            BlockingFindingsDetails: [],
-            Findings: [],
-            WorkBranchTip: null,
-            Status: AuditProgressStatuses.Incomplete,
-            ScheduledAuditors: null,
-            CompletedAuditors: null)];
     }
 
     private async Task ParkAuditMaxIterationsForOperatorAsync(
         WorkItem item,
         Project project,
         IReadOnlyList<AuditProgressSnapshot> history,
+        CancellationToken ct)
+    {
+        var message = BuildAuditMaxIterationEscalationMessage(history);
+        var details = BuildAuditMaxIterationEscalationDetails(item.Id, history);
+        await ParkAuditForOperatorAsync(
+            item,
+            project,
+            history,
+            ct,
+            stepName: "audit-max-iterations-escalate",
+            message,
+            details,
+            auditLogReason: "audit max iterations with progress");
+    }
+
+    private Task ParkAuditEmptyReworkForOperatorAsync(
+        WorkItem item,
+        Project project,
+        IReadOnlyList<AuditProgressSnapshot> history,
+        int reworkIterationNumber,
+        int maxIterations,
+        AgentKind agent,
+        bool converging,
+        int attempts,
+        string message,
+        CancellationToken ct)
+    {
+        var details = BuildEmptyReworkOperatorInputDetails(
+            item.Id,
+            history,
+            reworkIterationNumber,
+            maxIterations,
+            agent,
+            converging,
+            attempts);
+        return ParkAuditForOperatorAsync(
+            item,
+            project,
+            history,
+            ct,
+            stepName: "audit-empty-rework-escalate",
+            message,
+            details,
+            auditLogReason: "rework produced no changes");
+    }
+
+    private async Task ParkAuditForOperatorAsync(
+        WorkItem item,
+        Project project,
+        IReadOnlyList<AuditProgressSnapshot> history,
         CancellationToken ct,
-        string? messageOverride = null,
-        string? auditLogReasonOverride = null)
+        string stepName,
+        string message,
+        object details,
+        string auditLogReason)
     {
         var last = history[^1];
-        var message = messageOverride ?? BuildAuditMaxIterationEscalationMessage(history);
-        var details = BuildAuditMaxIterationEscalationDetails(item.Id, history);
 
-        await RunBoundedPostAgentAsync(item.Id, "audit-max-iterations-escalate", ct, async transitionCt =>
+        await RunBoundedPostAgentAsync(item.Id, stepName, ct, async transitionCt =>
         {
             var current = await _store.GetAsync(item.Id, transitionCt) ?? item;
             var parked = current.With(WorkItemState.NeedsOperatorInput, message);
@@ -8130,11 +8185,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
             _log.LogWarning(
                 "Work item {Id} parked at iteration {Iteration}/{MaxIterations} for operator review: {Reason}",
-                item.Id, last.Iteration, last.MaxIterations,
-                auditLogReasonOverride ?? "audit max iterations with progress");
+                item.Id, last.Iteration, last.MaxIterations, auditLogReason);
             AuditLog.WorkItemTransitioned(
                 item.Id,
-                $"NeedsOperatorInput ({auditLogReasonOverride ?? "audit max iterations with progress"})");
+                $"NeedsOperatorInput ({auditLogReason})");
             CodeyBoxMeters.PipelineTransitions.Add(1,
                 new KeyValuePair<string, object?>("to_state", WorkItemState.NeedsOperatorInput.ToString()));
 
@@ -8577,7 +8631,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
     {
         var last = history[^1];
         var signals = BuildAuditProgressSignals(history);
-        var emittedHistory = history.TakeLast(AuditEscalationHistoryLimit).ToList();
         return new AuditMaxIterationsEscalationDetails
         {
             WorkItemId = workItemId.ToString(),
@@ -8587,7 +8640,49 @@ public sealed partial class PipelineRunner : IPipelineRunner
             NonBlockingFindings = last.NonBlockingFindings,
             ProgressObserved = signals.Count > 0,
             ProgressSignals = signals,
-            History = emittedHistory.Select(h => new AuditProgressIterationDetails
+            History = BuildAuditProgressIterationDetails(history),
+            RemainingBlockingFindings = BlockingProgressFindingsForSummary(last)
+                .Take(AuditEscalationFindingsPerIterationLimit)
+                .Select(ToEscalationWebhookFinding)
+                .ToList(),
+            ResumeHint = "Use POST /workitems/{id}/retry with from omitted or from='audit' to continue from the existing work branch.",
+        };
+    }
+
+    private static EmptyReworkOperatorInputDetails BuildEmptyReworkOperatorInputDetails(
+        WorkItemId workItemId,
+        IReadOnlyList<AuditProgressSnapshot> history,
+        int reworkIterationNumber,
+        int maxIterations,
+        AgentKind agent,
+        bool converging,
+        int attempts)
+    {
+        var last = history[^1];
+        var signals = BuildAuditProgressSignals(history);
+        return new EmptyReworkOperatorInputDetails
+        {
+            WorkItemId = workItemId.ToString(),
+            Iteration = reworkIterationNumber,
+            MaxIterations = maxIterations,
+            Agent = agent.Value,
+            Converging = converging,
+            EscalationRetriesAttempted = attempts,
+            ProgressObserved = signals.Count > 0,
+            ProgressSignals = signals,
+            History = BuildAuditProgressIterationDetails(history),
+            RemainingBlockingFindings = BlockingProgressFindingsForSummary(last)
+                .Take(AuditEscalationFindingsPerIterationLimit)
+                .Select(ToEscalationWebhookFinding)
+                .ToList(),
+            ResumeHint = "Use POST /workitems/{id}/retry with from omitted or from='audit' to continue from the existing work branch.",
+        };
+    }
+
+    private static IReadOnlyList<AuditProgressIterationDetails> BuildAuditProgressIterationDetails(
+        IReadOnlyList<AuditProgressSnapshot> history)
+        => history.TakeLast(AuditEscalationHistoryLimit)
+            .Select(h => new AuditProgressIterationDetails
             {
                 Iteration = h.Iteration,
                 BlockingFindings = h.BlockingFindings,
@@ -8600,14 +8695,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     .Take(AuditEscalationFindingsPerIterationLimit)
                     .Select(ToEscalationWebhookFinding)
                     .ToList(),
-            }).ToList(),
-            RemainingBlockingFindings = BlockingProgressFindingsForSummary(last)
-                .Take(AuditEscalationFindingsPerIterationLimit)
-                .Select(ToEscalationWebhookFinding)
-                .ToList(),
-            ResumeHint = "Use POST /workitems/{id}/retry with from omitted or from='audit' to continue from the existing work branch.",
-        };
-    }
+            })
+            .ToList();
 
     private static IReadOnlyList<string> BuildAuditProgressSignals(IReadOnlyList<AuditProgressSnapshot> history)
     {
@@ -12433,6 +12522,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         reason: safeReason);
                 }
             }
+            else if (trigger == AgentFallbackTrigger.AuthRequired)
+            {
+                _log.LogWarning(
+                    "Class '{ClassId}' member {FromAgent}/{FromModel} requires authentication; routing phase '{Phase}' to {ToAgent}/{ToModel}",
+                    classId, currentMember.Agent.Value, currentMember.ModelId ?? "(default)",
+                    phase, nextMember.Agent.Value, nextMember.ModelId ?? "(default)");
+            }
             else
             {
                 AuditLog.AgentResumeExhaustedFallback(
@@ -12569,6 +12665,15 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     quotaResetAt: quotaEx.ResetAt,
                     terminalException: quotaEx);
             }
+            catch (AgentAuthRequiredException authEx) when (authEx.AllowAgentFallback)
+            {
+                var safeReason = SingleLineSummary(authEx.Message);
+                await MoveToNextMemberOrThrowAsync(
+                    safeReason,
+                    AgentFallbackTrigger.AuthRequired,
+                    quotaResetAt: null,
+                    terminalException: authEx);
+            }
             catch (AgentAttemptTimeoutException timeoutEx)
             {
                 var safeReason = SingleLineSummary(timeoutEx.Message);
@@ -12593,6 +12698,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private enum AgentFallbackTrigger
     {
         Quota,
+        AuthRequired,
         Timeout,
         ResumeExhausted,
     }
@@ -12600,6 +12706,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private static string FallbackMetricKind(AgentFallbackTrigger trigger) => trigger switch
     {
         AgentFallbackTrigger.Quota => "quota",
+        AgentFallbackTrigger.AuthRequired => "auth",
         AgentFallbackTrigger.Timeout => "timeout",
         AgentFallbackTrigger.ResumeExhausted => "resume_exhausted",
         _ => "agent",

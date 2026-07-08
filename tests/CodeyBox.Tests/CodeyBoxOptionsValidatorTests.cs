@@ -1000,6 +1000,18 @@ public sealed class CodeyBoxOptionsValidatorTests
             result.FailureMessage);
     }
 
+    [Fact]
+    public void Validate_RejectsNegativeEmptyReworkEscalationRetries()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.PipelineTuning.EmptyReworkEscalationRetries = -1;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:PipelineTuning:EmptyReworkEscalationRetries must be non-negative", result.FailureMessage);
+    }
+
     [Theory]
     [InlineData("MaxPromptChars")]
     [InlineData("MaxOutputBufferChars")]

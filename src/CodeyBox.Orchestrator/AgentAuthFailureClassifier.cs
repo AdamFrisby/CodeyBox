@@ -123,11 +123,17 @@ public sealed class AgentAuthRequiredException : Exception
 {
     public AgentKind Agent { get; }
     public string Phase { get; }
+    public bool AllowAgentFallback { get; }
 
-    public AgentAuthRequiredException(AgentKind agent, string phase, string message)
+    public AgentAuthRequiredException(
+        AgentKind agent,
+        string phase,
+        string message,
+        bool allowAgentFallback = false)
         : base(message)
     {
         Agent = agent;
         Phase = phase;
+        AllowAgentFallback = allowAgentFallback;
     }
 }

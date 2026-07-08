@@ -535,6 +535,116 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
+    public async Task AuditDrivenRework_CleanExitNoDiffTrustedQuotaDiagnostic_FallsBackToHealthyMember()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Codex.ReworkScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: null,
+            Stderr: null)
+        {
+            TerminalDiagnostic = "API Error: rate_limit_exceeded; please try again after 1h",
+        });
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "fixed by fallback"));
+
+        using var metrics = new MetricCapture("codeybox.agent.fallbacks");
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(final);
+        Assert.True(
+            final!.State == WorkItemState.Done,
+            $"expected Done but was {final.State}: {final.LastError}");
+        Assert.True(fix.Codex.CallCount >= 2);
+        Assert.True(fix.Claude.CallCount >= 1);
+        Assert.True(metrics.Any("codeybox.agent.fallbacks",
+                ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "quota"), ("phase", "rework")),
+            "expected trusted clean-exit quota diagnostic to reroute the same rework iteration");
+
+        var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        var fallback = Assert.Single(history, h => h.Phase == "rework" && h.ToAgent == AgentKind.Claude);
+        Assert.Equal(AgentKind.Codex, fallback.FromAgent);
+        Assert.Contains("quota failure", fallback.Reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task AuditDrivenRework_CleanExitNoDiffAuthRequired_FallsBackToHealthyMember()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Codex.ReworkScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: null,
+            Stderr: "Authentication required. Please visit https://accounts.google.com/o/oauth2/auth?client_id=redacted"));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "fixed after auth fallback"));
+
+        using var metrics = new MetricCapture("codeybox.agent.fallbacks");
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(final);
+        Assert.True(
+            final!.State == WorkItemState.Done,
+            $"expected Done but was {final.State}: {final.LastError}");
+        Assert.True(fix.Codex.CallCount >= 2);
+        Assert.True(fix.Claude.CallCount >= 1);
+        Assert.True(metrics.Any("codeybox.agent.fallbacks",
+                ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "auth"), ("phase", "rework")),
+            "expected auth-required rework output to reroute through the class fallback path");
+
+        var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        var fallback = Assert.Single(history, h => h.Phase == "rework" && h.ToAgent == AgentKind.Claude);
+        Assert.Equal(AgentKind.Codex, fallback.FromAgent);
+        Assert.Contains("auth required", fallback.Reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task AuditDrivenRework_CleanExitNoDiffUnauthorizedDiagnostic_FallsBackAsAuthNotQuota()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Codex.ReworkScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: null,
+            Stderr: null)
+        {
+            TerminalDiagnostic = "API Error: 401 Unauthorized: token expired",
+        });
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "fixed after unauthorized fallback"));
+
+        using var metrics = new MetricCapture("codeybox.agent.fallbacks");
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.True(metrics.Any("codeybox.agent.fallbacks",
+                ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "auth"), ("phase", "rework")),
+            "expected 401/403 diagnostics to reroute as auth, not quota");
+        Assert.False(metrics.Any("codeybox.agent.fallbacks",
+            ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "quota"), ("phase", "rework")));
+    }
+
+    [Fact]
     public async Task AuditDrivenRework_AllClassMembersQuotaExhausted_ParksWithOriginalReworkPhase()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -2959,6 +3069,7 @@ internal sealed class OnceFailingAuditor : IAuditor
     public string Name => "once-failing-fallback";
     public string Kind => "tool";
     public AuditCapabilities Required => AuditCapabilities.None;
+    public int Calls => _calls;
 
     public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct)
     {
