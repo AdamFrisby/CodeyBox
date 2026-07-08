@@ -1,3 +1,5 @@
+using Microsoft.Data.Sqlite;
+
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
@@ -6,6 +8,8 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 internal static class SqliteConnectionDisposal
 {
+    private const int SqliteBusy = 5;
+
     /// <summary>
     /// Disposes a connection, tolerating the internal teardown-race exceptions
     /// that <c>Microsoft.Data.Sqlite.SqliteConnection.Close()</c> has been
@@ -18,6 +22,9 @@ internal static class SqliteConnectionDisposal
     ///   enumeration operation may not execute" from
     ///   <c>SqliteCommand.DisposePreparedStatements</c> when an in-flight
     ///   finalize mutates the prepared-statement list mid-iteration.</item>
+    ///   <item><see cref="SqliteException"/> with <c>SQLITE_BUSY</c> from
+    ///   <c>SqliteConnection.Deactivate</c> when active statements outlive
+    ///   connection teardown.</item>
     /// </list>
     /// The connection is being discarded either way, so swallowing these races
     /// keeps the dispose contract clean; callers should still release every
@@ -39,6 +46,10 @@ internal static class SqliteConnectionDisposal
         {
             // SqliteCommand.DisposePreparedStatements race against an in-flight finalize.
         }
+        catch (SqliteException ex) when (IsBusySqliteTeardownRace(ex))
+        {
+            // SqliteConnection.Deactivate can report active statements as SQLITE_BUSY while closing.
+        }
     }
 
     /// <summary>
@@ -53,4 +64,8 @@ internal static class SqliteConnectionDisposal
         return trace is not null
             && trace.Contains("Microsoft.Data.Sqlite", StringComparison.Ordinal);
     }
+
+    private static bool IsBusySqliteTeardownRace(SqliteException ex)
+        => ex.SqliteErrorCode == SqliteBusy
+            && IsSqliteTeardownRace(ex);
 }

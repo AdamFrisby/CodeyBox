@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using Microsoft.Data.Sqlite;
 
 namespace CodeyBox.Tests;
 
@@ -41,6 +42,15 @@ public sealed class SqliteConnectionDisposalTests
     }
 
     [Fact]
+    public void DisposeTolerantOfTeardownRace_SwallowsSqliteBusyActiveStatementRace()
+    {
+        var busy = MakeBusyFromSqliteTeardown();
+        var thrower = new ThrowingDisposable(busy);
+        SqliteConnectionDisposal.DisposeTolerantOfTeardownRace(thrower);
+        Assert.True(thrower.DisposeCalled);
+    }
+
+    [Fact]
     public void DisposeTolerantOfTeardownRace_LetsOtherExceptionsBubble()
     {
         // Anything that isn't a SQLite-driver teardown race points at a real
@@ -58,6 +68,15 @@ public sealed class SqliteConnectionDisposalTests
         var thrower = new ThrowingDisposable(new NullReferenceException("Object reference not set"));
         Assert.Throws<NullReferenceException>(() =>
             SqliteConnectionDisposal.DisposeTolerantOfTeardownRace(thrower));
+    }
+
+    [Fact]
+    public void DisposeTolerantOfTeardownRace_LetsNonBusySqliteExceptionBubble()
+    {
+        var thrower = new ThrowingDisposable(MakeNonBusySqliteFromTeardown());
+        var ex = Assert.Throws<SqliteException>(() =>
+            SqliteConnectionDisposal.DisposeTolerantOfTeardownRace(thrower));
+        Assert.Equal(11, ex.SqliteErrorCode);
     }
 
     /// <summary>
@@ -94,6 +113,30 @@ public sealed class SqliteConnectionDisposalTests
         }
     }
 
+    private static SqliteException MakeBusyFromSqliteTeardown()
+    {
+        try
+        {
+            throw new MicrosoftDataSqliteSyntheticFrame().ThrowBusy();
+        }
+        catch (SqliteException ex)
+        {
+            return ex;
+        }
+    }
+
+    private static SqliteException MakeNonBusySqliteFromTeardown()
+    {
+        try
+        {
+            throw new MicrosoftDataSqliteSyntheticFrame().ThrowCorrupt();
+        }
+        catch (SqliteException ex)
+        {
+            return ex;
+        }
+    }
+
     private sealed class MicrosoftDataSqliteSyntheticFrame
     {
         // The full class name is irrelevant; only the runtime-formatted stack
@@ -120,6 +163,29 @@ public sealed class SqliteConnectionDisposalTests
                 "   at Microsoft.Data.Sqlite.SqliteConnection.Close()\n" +
                 "   at Microsoft.Data.Sqlite.SqliteConnection.Dispose(Boolean disposing)\n");
             throw nre;
+        }
+
+        public SqliteException ThrowBusy()
+        {
+            var busy = new SqliteException(
+                "SQLite Error 5: 'unable to delete/modify user-function due to active statements'.",
+                errorCode: 5);
+            ExceptionDispatchInfoSetRemoteStackTrace(
+                busy,
+                "   at Microsoft.Data.Sqlite.SqliteConnection.Deactivate()\n" +
+                "   at Microsoft.Data.Sqlite.SqliteConnectionInternal.Deactivate()\n" +
+                "   at Microsoft.Data.Sqlite.SqliteConnection.Close()\n");
+            throw busy;
+        }
+
+        public SqliteException ThrowCorrupt()
+        {
+            var corrupt = new SqliteException("SQLite Error 11: 'database disk image is malformed'.", errorCode: 11);
+            ExceptionDispatchInfoSetRemoteStackTrace(
+                corrupt,
+                "   at Microsoft.Data.Sqlite.SqliteConnection.Close()\n" +
+                "   at Microsoft.Data.Sqlite.SqliteConnection.Dispose(Boolean disposing)\n");
+            throw corrupt;
         }
 
         private static void ExceptionDispatchInfoSetRemoteStackTrace(Exception ex, string trace)
