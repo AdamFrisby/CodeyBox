@@ -376,17 +376,18 @@ agent declining to commit anything. `RunAgentPhaseAsync` throws
   precisely why each finding is invalid or already satisfied. If any retry
   produces a real commit the loop continues normally; otherwise it falls
   through to the park path below.
-* **Park for operator review** — when escalation is disabled before the final
-  rework budget, or every escalation pass came back empty after convergence,
-  the item parks through the existing audit max-iteration operator-input path
-  and `AuditMaxIterationsEscalationDetails` payload. The operator can resume
+* **Park for operator review** — when escalation is disabled, or every
+  escalation pass came back empty after convergence, the item parks through
+  the same operator-input event/details shape as the audit max-iteration path
+  while using an empty-rework-specific `LastError`. The operator can resume
   the item with a clearer prompt or merge by hand.
 
-Hard terminal failure for genuinely-empty rework is reserved for the
-final-budget no-convergence branch — the same "no progress" policy as the
-audit-loop ceiling path through `AuditFailedException`. A first in-budget
-blank pass no longer discards a converging item, but the last available
-rework pass with no convergence still fails instead of parking.
+Hard terminal failure for no-progress work remains the audit-loop ceiling
+path through `AuditFailedException`: once the final audit iteration itself
+still has blocking findings and no convergence signals, the item fails. A
+blank rework after audit iteration N is still in-budget when it feeds audit
+iteration N+1, so it parks rather than claiming the max-iteration ceiling was
+reached early.
 
 ### Configuration
 

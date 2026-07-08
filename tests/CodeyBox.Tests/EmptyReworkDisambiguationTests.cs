@@ -101,12 +101,12 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
     }
 
     [Fact]
-    public async Task EmptyRework_FinalBudgetNoConvergence_FailsAuditInsteadOfParking()
+    public async Task EmptyRework_LastReworkBeforeFinalAudit_NoConvergence_Parks()
     {
-        // MaxIterations=2 means the rework after audit iteration 1 is the last
-        // available rework opportunity. With no convergence history and no
-        // auth/quota signature, a no-diff rework remains terminal rather than
-        // parking for operator review.
+        // MaxIterations=2 means the rework after audit iteration 1 feeds the
+        // final audit pass; it is still in-budget. With no convergence history
+        // and no auth/quota signature, a no-diff rework parks for operator
+        // review instead of terminal-failing early.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new OnceFailingAuditor();
         var audit = new ProjectAudit
@@ -129,15 +129,17 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
         tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "v1\n"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "v1\n"));
 
-        var item = NewItem("feature/empty-rework-final-budget");
+        var item = NewItem("feature/empty-rework-last-rework-before-final-audit");
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.NotNull(final);
-        Assert.Equal(WorkItemState.AuditFailed, final!.State);
-        Assert.Contains("final audit iteration budget", final.LastError ?? string.Empty, StringComparison.Ordinal);
-        Assert.DoesNotContain(webhooks.Events, e => e.Event == "work_item.needs_operator_input");
+        Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
+        Assert.Contains("produced no changes", final.LastError ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Audit reached max iteration budget", final.LastError ?? string.Empty, StringComparison.Ordinal);
+        var parked = Assert.Single(webhooks.Events, e => e.Event == "work_item.needs_operator_input");
+        Assert.IsType<AuditMaxIterationsEscalationDetails>(parked.Details);
         Assert.DoesNotContain(tp.Agent.WorkPrompts, p =>
             p.Contains("[empty-rework escalation attempt", StringComparison.Ordinal));
         Assert.Equal(1, auditor.Calls);

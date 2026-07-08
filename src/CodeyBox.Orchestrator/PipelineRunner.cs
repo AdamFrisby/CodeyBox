@@ -8220,7 +8220,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // when both budget AND convergence are absent — that path is
             // handled by the audit-loop ceiling branch.
             var parked = await HandleEmptyReworkAsync(
-                item, project, emptyEx, auditHistory, reworkIterationNumber, maxIterations,
+                item, project, emptyEx, auditHistory, auditIteration, reworkIterationNumber, maxIterations,
                 baseReworkPrompt, DispatchAsync, reworkPhase, reworkStart, repoId, workBranch, ct);
             return parked;
         }
@@ -8269,20 +8269,20 @@ public sealed partial class PipelineRunner : IPipelineRunner
     /// history shows convergence progress; otherwise (or when retries exhaust)
     /// parks the item via the same operator-input flow the audit-iteration
     /// ceiling uses, so a partially-converged item is preserved instead of
-    /// being terminal-failed on a single declined pass. A final-budget empty
-    /// rework with no convergence is still terminal, mirroring the audit
-    /// ceiling's no-progress branch.
+    /// being terminal-failed on a single declined pass. Terminal no-progress
+    /// failure still belongs to the audit ceiling itself.
     /// </summary>
     /// <remarks>
-    /// Hard terminal-fail for genuinely-empty rework is limited to the
-    /// no-convergence case where this empty pass has consumed the last rework
-    /// opportunity in the configured audit budget.
+    /// Rework after audit iteration N feeds audit iteration N+1, so
+    /// reworkIterationNumber can equal maxIterations while the blank pass is
+    /// still in-budget.
     /// </remarks>
     private async Task<bool> HandleEmptyReworkAsync(
         WorkItem item,
         Project project,
         ReworkProducedNoChangesException emptyEx,
         IReadOnlyList<AuditProgressSnapshot> auditHistory,
+        int auditIteration,
         int reworkIterationNumber,
         int maxIterations,
         string baseReworkPrompt,
@@ -8354,12 +8354,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
 
         // Either we never had convergence, escalation retries are disabled, or
-        // every escalation pass came back empty. If this was the last available
-        // rework opportunity and there is still no convergence, mirror the
-        // audit ceiling's terminal no-progress branch. Otherwise park through
-        // the same operator-input flow the audit ceiling uses for visible
-        // progress.
-        if (!converging && reworkIterationNumber >= maxIterations)
+        // every escalation pass came back empty. The failed audit iteration is
+        // the budget boundary; reworkIterationNumber is the future audit pass
+        // this rework would feed. So rework N of max N is still in-budget.
+        if (!converging && auditIteration >= maxIterations)
         {
             CodeyBoxMeters.ReworkEmptyEvents.Add(1,
                 new KeyValuePair<string, object?>("outcome", "failed"));
@@ -8367,14 +8365,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
             var remaining = BuildBlockingFindingSummary(last);
             AuditLog.AuditFailed(last.Iteration, remaining.Count);
             throw new AuditFailedException(
-                $"Rework agent produced no changes at final audit iteration budget ({reworkIterationNumber}/{maxIterations}) with no convergence progress. " +
+                $"Rework agent produced no changes after final audit iteration budget ({auditIteration}/{maxIterations}) with no convergence progress. " +
                 $"{remaining.Count} blocking finding(s): {remaining.Summary}");
         }
 
         CodeyBoxMeters.ReworkEmptyEvents.Add(1,
             new KeyValuePair<string, object?>("outcome", "parked"));
         _log.LogWarning(
-            "Work item {Id} empty rework exhausted escalation attempts; parking through audit max-iteration operator path " +
+            "Work item {Id} empty rework exhausted escalation attempts; parking through operator-input path " +
             "(agent {Agent}, iteration {Iter}/{MaxIterations}, converging={Converging}, attempts={Attempts})",
             item.Id,
             emptyEx.Agent.Value,
@@ -8382,7 +8380,15 @@ public sealed partial class PipelineRunner : IPipelineRunner
             maxIterations,
             converging,
             attempts);
-        await ParkAuditMaxIterationsForOperatorAsync(item, project, auditHistory, ct);
+        await ParkEmptyReworkForOperatorAsync(
+            item,
+            project,
+            auditHistory,
+            emptyEx.Agent,
+            reworkIterationNumber,
+            attempts,
+            converging,
+            ct);
         return true;
     }
 
@@ -8419,6 +8425,34 @@ public sealed partial class PipelineRunner : IPipelineRunner
             message,
             details,
             auditLogReason: "audit max iterations with progress");
+    }
+
+    private async Task ParkEmptyReworkForOperatorAsync(
+        WorkItem item,
+        Project project,
+        IReadOnlyList<AuditProgressSnapshot> history,
+        AgentKind agent,
+        int reworkIterationNumber,
+        int attempts,
+        bool converging,
+        CancellationToken ct)
+    {
+        var message = BuildEmptyReworkEscalationMessage(
+            history,
+            agent,
+            reworkIterationNumber,
+            attempts,
+            converging);
+        var details = BuildAuditMaxIterationEscalationDetails(item.Id, history);
+        await ParkAuditForOperatorAsync(
+            item,
+            project,
+            history,
+            ct,
+            stepName: "audit-empty-rework-escalate",
+            message,
+            details,
+            auditLogReason: "empty audit rework");
     }
 
     private async Task ParkAuditForOperatorAsync(
@@ -8885,6 +8919,28 @@ public sealed partial class PipelineRunner : IPipelineRunner
         return
             $"Audit reached max iteration budget ({last.Iteration}/{last.MaxIterations}) with progress still visible; parked for operator review instead of hard-failing and discarding accumulated work. " +
             $"{remaining.Count} blocking finding(s) remain: {remaining.Summary}";
+    }
+
+    private static string BuildEmptyReworkEscalationMessage(
+        IReadOnlyList<AuditProgressSnapshot> history,
+        AgentKind agent,
+        int reworkIterationNumber,
+        int attempts,
+        bool converging)
+    {
+        var last = history[^1];
+        var remaining = BuildBlockingFindingSummary(last);
+        var retrySummary = attempts == 0
+            ? "without an escalation retry"
+            : $"after {attempts} escalation retry attempt(s)";
+        var progressSummary = converging
+            ? "audit history was converging"
+            : "audit history had not established convergence yet";
+
+        return
+            $"Rework agent {agent.Value} produced no changes on rework iteration {reworkIterationNumber} {retrySummary}; " +
+            $"{progressSummary}. Parked for operator review instead of hard-failing on a blank in-budget rework pass. " +
+            $"{remaining.Count} blocking finding(s) remain after audit iteration {last.Iteration}/{last.MaxIterations}: {remaining.Summary}";
     }
 
     private static (int Count, string Summary) BuildBlockingFindingSummary(
