@@ -1331,6 +1331,47 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
     }
 
     [Fact]
+    public async Task RefactorGateScanBudget_DoesNotScheduleDispatchWake()
+    {
+        const int expectedScanBudget = 512;
+        var now = DateTimeOffset.UtcNow;
+        var queue = new ObservedTaskQueue();
+        var timeProvider = new ImmediateTimerTimeProvider(now);
+        var promoter = new RecordingQuotaRetryDispatchPromoter(
+            new QuotaRetryDispatchPromotionResult(
+                Promoted: false,
+                Outcome: "skipped:quota-still-gated",
+                Disposition: QuotaRetryDispatchDisposition.Blocked));
+
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        using var svc = new OrchestratorService(
+            queue,
+            _store,
+            new ReleaseControlledPipeline(_store),
+            registry,
+            new OrchestratorOptions { MaxConcurrentWorkers = 1 },
+            NullLogger<OrchestratorService>.Instance,
+            quotaRetryDispatchPromoter: promoter,
+            timeProvider: timeProvider);
+
+        for (var i = 0; i < expectedScanBudget; i++)
+            await _store.CreateAsync(MakeQuotaWaitingItem(now.AddTicks(i), priority: 1000));
+
+        var candidate = MakeItem(now.AddSeconds(1)) with { Priority = -1000 };
+        await _store.CreateAsync(candidate);
+
+        var decision = await svc.CheckRefactorDispatchGateAsync(
+            RefactorDispatchCandidate.FromWorkItem(candidate),
+            CancellationToken.None);
+
+        Assert.False(decision.IsBlocked);
+        Assert.Equal(0, promoter.CallCount);
+        Assert.False(await timeProvider.WaitForTimerCreatedAsync(TimeSpan.FromSeconds(1)));
+        Assert.Equal(0, timeProvider.TimerCreateCount);
+        Assert.Equal(0, queue.GenericWakeEnqueueCount);
+    }
+
+    [Fact]
     public async Task SlotReleaseWake_DoesNotClearDeferredBacklogItem()
     {
         var queue = new ObservedTaskQueue();
@@ -2385,6 +2426,60 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         {
             public static ObservedDispatch ForWorkItem(WorkItemId id) => new(id, false);
             public static ObservedDispatch GenericWake { get; } = new(null, true);
+        }
+    }
+
+    private sealed class ImmediateTimerTimeProvider(DateTimeOffset now) : TimeProvider
+    {
+        private readonly TaskCompletionSource _timerCreated =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _timerCreateCount;
+
+        public override DateTimeOffset GetUtcNow() => now;
+
+        public int TimerCreateCount => Volatile.Read(ref _timerCreateCount);
+
+        public async Task<bool> WaitForTimerCreatedAsync(TimeSpan timeout)
+        {
+            var completed = await Task.WhenAny(_timerCreated.Task, Task.Delay(timeout));
+            return completed == _timerCreated.Task;
+        }
+
+        public override ITimer CreateTimer(
+            TimerCallback callback,
+            object? state,
+            TimeSpan dueTime,
+            TimeSpan period)
+        {
+            Interlocked.Increment(ref _timerCreateCount);
+            _timerCreated.TrySetResult();
+            var timer = new ImmediateTimer();
+            if (dueTime != Timeout.InfiniteTimeSpan)
+                ThreadPool.QueueUserWorkItem(_ => timer.Invoke(callback, state));
+
+            return timer;
+        }
+
+        private sealed class ImmediateTimer : ITimer
+        {
+            private int _disposed;
+
+            public bool Change(TimeSpan dueTime, TimeSpan period) =>
+                Volatile.Read(ref _disposed) == 0;
+
+            public void Dispose() => Volatile.Write(ref _disposed, 1);
+
+            public ValueTask DisposeAsync()
+            {
+                Dispose();
+                return ValueTask.CompletedTask;
+            }
+
+            public void Invoke(TimerCallback callback, object? state)
+            {
+                if (Volatile.Read(ref _disposed) == 0)
+                    callback(state);
+            }
         }
     }
 

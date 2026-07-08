@@ -1457,7 +1457,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         {
             var quotaRetryBlockers = new List<WorkItem>();
             var restartSelection = false;
-            await foreach (var candidate in EnumeratePickupCandidatesByPriorityAsync(skipIds, stoppingToken))
+            var scanProgress = new PickupCandidateScanProgress();
+            await foreach (var candidate in EnumeratePickupCandidatesByPriorityAsync(skipIds, stoppingToken, scanProgress))
             {
                 if (!await DependenciesSatisfiedForPickupAsync(candidate, stoppingToken))
                     continue;
@@ -1573,6 +1574,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 return candidate.Id;
             }
 
+            if (scanProgress.ExhaustedBudget)
+                ScheduleDispatchScanBudgetWake(stoppingToken);
+
             if (!restartSelection)
                 return null;
         }
@@ -1625,7 +1629,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
     private async IAsyncEnumerable<WorkItem> EnumeratePickupCandidatesByPriorityAsync(
         IReadOnlySet<WorkItemId> skipIds,
-        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct,
+        PickupCandidateScanProgress? scanProgress = null)
     {
         if (_quotaRetryDispatchPromoter is null)
         {
@@ -1658,14 +1663,16 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 yield break;
         }
 
-        _log.LogDebug(
-            "Dispatch pickup candidate scan reached the per-wake budget of {Budget}; scheduling a follow-up wake",
-            DispatchPickupCandidateScanBudget);
-        ScheduleDispatchScanBudgetWake(ct);
+        if (scanProgress is not null)
+            scanProgress.ExhaustedBudget = true;
     }
 
     private void ScheduleDispatchScanBudgetWake(CancellationToken stoppingToken)
     {
+        _log.LogDebug(
+            "Dispatch pickup candidate scan reached the per-wake budget of {Budget}; scheduling a follow-up wake",
+            DispatchPickupCandidateScanBudget);
+
         _ = Task.Run(async () =>
         {
             try
@@ -1681,6 +1688,11 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 _log.LogDebug(ex, "Failed to enqueue dispatch wake after pickup scan budget was exhausted");
             }
         }, CancellationToken.None);
+    }
+
+    private sealed class PickupCandidateScanProgress
+    {
+        public bool ExhaustedBudget { get; set; }
     }
 
     private async Task<QuotaRetryDispatchPromotionResult> TryPromoteQuotaRetryCandidateForDispatchAsync(
