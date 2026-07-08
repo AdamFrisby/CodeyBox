@@ -2,12 +2,12 @@ using CodeyBox.Core;
 
 namespace CodeyBox.Audit.Shell;
 
-public sealed class DotnetFormatCommandResultClassifier : IShellCommandResultClassifier
+public sealed class DotnetFormatCommandResultClassifier : IAuditResultClassifier
 {
     private const int MaxViolationLines = 40;
     private const int MaxFallbackOutputChars = 4_000;
 
-    public AuditResult? ClassifyFailedCommand(ShellCommandResultContext context)
+    public AuditResult? ClassifyFailedCommand(AuditResultClassificationContext context)
     {
         if (context.Argv.Count < 2 ||
             !context.Argv[0].Equals("dotnet", StringComparison.OrdinalIgnoreCase) ||

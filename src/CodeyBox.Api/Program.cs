@@ -2070,7 +2070,50 @@ builder.Services.AddSingleton(_ =>
     options.ProjectRoot ??= builder.Environment.ContentRootPath;
     return options;
 });
-builder.Services.AddSingleton<IPresetCatalog>(sp => new PresetCatalog(sp.GetRequiredService<PresetCatalogOptions>()));
+// Bridges the hot-reloadable pipeline-tuning knobs
+// (CodeyBox:PipelineTuning:CSharpTestPass*) into the TestRunOptions that
+// DotnetTestAuditor reads at run time. Reading through PipelineTuningSnapshot on
+// each call keeps blame-hang / test-idle-timeout edits hot-reloadable without a
+// restart. Defaults (unset knobs) yield TestRunOptions.Default → byte-identical
+// legacy dotnet-test command.
+static Func<TestRunOptions> DotnetTestRunOptionsAccessor(IServiceProvider sp)
+{
+    var tuning = sp.GetRequiredService<PipelineTuningSnapshot>();
+    return () =>
+    {
+        var current = tuning.Current;
+        return new TestRunOptions
+        {
+            BlameHangTimeout = current.CSharpTestPassBlameHangTimeout,
+            IdleTimeout = current.CSharpTestPassAuditorIdleTimeout,
+        };
+    };
+}
+
+// Bind the run-options accessor ONCE and share the single closure across the
+// preset catalog, the DI-registered test runner, and every per-project catalog
+// the ProjectAuditorComposer builds. One closure — all consumers observe the
+// same hot-reloadable PipelineTuningSnapshot.
+builder.Services.AddSingleton<Func<TestRunOptions>>(DotnetTestRunOptionsAccessor);
+
+builder.Services.AddSingleton<IPresetCatalog>(sp => new PresetCatalog(
+    sp.GetRequiredService<PresetCatalogOptions>(),
+    sp.GetRequiredService<Func<TestRunOptions>>()));
+
+// The canonical dotnet-test runner, registered so the ITestSelector seam
+// (a separate work item) can resolve ITestRunnerAuditor from DI and enumerate
+// its TestSuiteDescriptor. The preset catalog builds its own instance for the
+// audit run from the csharp language YAML; this registration mirrors that
+// command with the same hot-reloadable run options.
+builder.Services.AddSingleton<ITestRunnerAuditor>(sp => new DotnetTestAuditor(new DotnetTestAuditorOptions
+{
+    Name = "csharp:test-pass",
+    BaseArgv = ["dotnet", "test", "--no-build"],
+    CanShortCircuitOnBlockingFinding = true,
+    Role = AuditorRole.BuildTestGate,
+    BuildTestGateEvidence = BuildTestGateEvidence.Test,
+    RunOptionsAccessor = sp.GetRequiredService<Func<TestRunOptions>>(),
+}));
 builder.Services.AddSingleton<IAuditor, GraphicalSmokeAuditor>();
 builder.Services.AddSingleton<IAuditor>(sp => new BuildScriptAuditor(
     () => sp.GetRequiredService<IOptionsMonitor<BuildScriptAuditorOptions>>().CurrentValue));

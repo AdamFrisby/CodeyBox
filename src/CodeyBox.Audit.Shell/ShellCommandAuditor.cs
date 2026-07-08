@@ -81,7 +81,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         var finding = BuildCommandFinding(result, toolName);
         if (_opts.ResultClassifier is not null)
         {
-            var classified = _opts.ResultClassifier.ClassifyFailedCommand(new ShellCommandResultContext(
+            var classified = _opts.ResultClassifier.ClassifyFailedCommand(new AuditResultClassificationContext(
                 Name,
                 _opts.Argv,
                 result,
@@ -176,7 +176,7 @@ public sealed record ShellCommandAuditorOptions
     public required IReadOnlyList<string> Argv { get; init; }
     public string? ToolName { get; init; }
     public bool? TreatExit127AsMissingTool { get; init; }
-    public IShellCommandResultClassifier? ResultClassifier { get; init; }
+    public IAuditResultClassifier? ResultClassifier { get; init; }
     public AuditCapabilities Required { get; init; } = AuditCapabilities.None;
     public AuditSeverity? MissingToolSeverity { get; init; }
     public bool CanShortCircuitOnBlockingFinding { get; init; }

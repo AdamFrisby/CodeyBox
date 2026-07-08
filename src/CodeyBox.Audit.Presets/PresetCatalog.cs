@@ -19,6 +19,15 @@ public sealed class PresetCatalog : IPresetCatalog
         : this(null) { }
 
     public PresetCatalog(PresetCatalogOptions? options)
+        : this(options, null) { }
+
+    /// <param name="testRunOptions">
+    /// Live accessor for hot-reloadable <see cref="TestRunOptions"/> (blame-hang
+    /// / test-specific idle-timeout) sourced by the host from pipeline tuning.
+    /// Null keeps the default (byte-identical) test-runner behaviour, which is
+    /// what unit tests and the parameterless path use.
+    /// </param>
+    public PresetCatalog(PresetCatalogOptions? options, Func<TestRunOptions>? testRunOptions)
     {
         var snapshot = new PresetConfigLoader().Load(options);
         LlmPromptFrameTemplate = snapshot.LlmPromptFrame;
@@ -27,7 +36,7 @@ public sealed class PresetCatalog : IPresetCatalog
         foreach (var (name, definition) in snapshot.Languages)
         {
             var captured = definition;
-            RegisterLanguage(name, _ => PresetConfigLoader.MaterialiseLanguage(captured));
+            RegisterLanguage(name, _ => PresetConfigLoader.MaterialiseLanguage(captured, testRunOptions));
         }
 
         AuditTypePresets.Register(this, snapshot.AuditTypes, snapshot.LlmPromptFrame);

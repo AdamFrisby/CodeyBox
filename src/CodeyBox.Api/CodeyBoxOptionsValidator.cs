@@ -224,6 +224,16 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             failures.Add("CodeyBox:PipelineTuning:AuditorIdleTimeout must be non-negative");
         }
 
+        if (options.PipelineTuning.CSharpTestPassAuditorIdleTimeout is { } cSharpTestIdle && cSharpTestIdle < TimeSpan.Zero)
+        {
+            failures.Add("CodeyBox:PipelineTuning:CSharpTestPassAuditorIdleTimeout must be non-negative when set");
+        }
+
+        if (options.PipelineTuning.CSharpTestPassBlameHangTimeout is { } cSharpTestBlameHang && cSharpTestBlameHang <= TimeSpan.Zero)
+        {
+            failures.Add("CodeyBox:PipelineTuning:CSharpTestPassBlameHangTimeout must be positive when set");
+        }
+
         try
         {
             options.AgentSupervision.Validate();

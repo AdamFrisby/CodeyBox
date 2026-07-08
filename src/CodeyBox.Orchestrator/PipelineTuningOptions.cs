@@ -123,6 +123,27 @@ public sealed class PipelineTuningOptions
     public bool BlockRedundantDotnetBuildTestInAuditSandbox { get; set; } = true;
 
     /// <summary>
+    /// Test-runner-specific idle guard applied to the <c>csharp:test-pass</c>
+    /// (dotnet test) auditor in place of <see cref="AuditorIdleTimeout"/>. A long
+    /// test suite legitimately produces no stdout for longer than a mechanical
+    /// gate, so this lets operators grant it a larger idle window without
+    /// loosening the guard for every other auditor. Null (the default) means the
+    /// generic <see cref="AuditorIdleTimeout"/> applies unchanged. Sourced
+    /// through <c>DotnetTestAuditor</c> (an <c>ITestRunnerAuditor</c>), which the
+    /// pipeline reads via <see cref="Core.TestRunOptions.IdleTimeout"/>.
+    /// </summary>
+    public TimeSpan? CSharpTestPassAuditorIdleTimeout { get; set; }
+
+    /// <summary>
+    /// Per-test hang-dump timeout injected into the <c>csharp:test-pass</c>
+    /// command as <c>--blame-hang --blame-hang-timeout</c>. A single wedged test
+    /// then produces a dump instead of stalling the whole run until the idle
+    /// guard fires. Null (the default) omits blame-hang, keeping the emitted
+    /// command byte-identical to the legacy path.
+    /// </summary>
+    public TimeSpan? CSharpTestPassBlameHangTimeout { get; set; }
+
+    /// <summary>
     /// Whether to build and seed a cross-agent handoff brief on the next
     /// invocation after the orchestrator falls back from one
     /// <c>AgentKind</c> to another mid-iteration. The brief itself is built
@@ -168,6 +189,14 @@ public sealed class PipelineTuningOptions
         if (AuditorIdleTimeout < TimeSpan.Zero)
         {
             throw new ArgumentOutOfRangeException(nameof(AuditorIdleTimeout), "AuditorIdleTimeout must be non-negative");
+        }
+        if (CSharpTestPassAuditorIdleTimeout is { } idle && idle < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(CSharpTestPassAuditorIdleTimeout), "CSharpTestPassAuditorIdleTimeout must be non-negative when set");
+        }
+        if (CSharpTestPassBlameHangTimeout is { } hang && hang <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(CSharpTestPassBlameHangTimeout), "CSharpTestPassBlameHangTimeout must be positive when set");
         }
     }
 }

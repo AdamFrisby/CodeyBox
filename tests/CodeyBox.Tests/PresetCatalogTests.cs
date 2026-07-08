@@ -92,6 +92,41 @@ public sealed class PresetCatalogTests
     }
 
     [Fact]
+    public void CSharpTestPass_IsRoutedThroughDotnetTestRunnerAuditor()
+    {
+        var catalog = new PresetCatalog();
+        var ctx = new PresetContext(new FakeAgent());
+
+        var testPass = catalog.ResolveLanguage("csharp", ctx)
+            .Single(a => a.Name == "csharp:test-pass");
+
+        // The auditor is the multi-project language wrapper, which exposes the
+        // inner dotnet-test runner via ITestRunnerAuditorProvider so the pipeline
+        // and the future test selector can reach it.
+        var provider = Assert.IsAssignableFrom<ITestRunnerAuditorProvider>(testPass);
+        var runner = Assert.IsAssignableFrom<ITestRunnerAuditor>(provider.TestRunner);
+
+        Assert.Equal(TestFramework.DotnetTest, runner.TestSuite.Framework);
+        Assert.Equal<string[]>(
+            ["dotnet", "test", "--no-build"],
+            [.. runner.BuildInvocation(TestSelection.All, TestRunOptions.Default)]);
+
+        // The promotion from ShellCommandAuditor to DotnetTestAuditor must
+        // preserve the build-test-gate role/evidence declared in csharp.yaml
+        // (role: build-test-gate, gateEvidence: test) ON THE PROMOTED TYPE
+        // ITSELF — the merge/release verification path depends on this evidence
+        // surviving the promotion, and it flows through the new gated branch
+        // (Role==BuildTestGate ? evidence : None) on DotnetTestAuditor.
+        Assert.Equal(AuditorRole.BuildTestGate, runner.Role);
+        Assert.Equal(BuildTestGateEvidence.Test, runner.BuildTestGateEvidence);
+
+        // A non-test csharp auditor must NOT masquerade as a test runner.
+        var buildGate = catalog.ResolveLanguage("csharp", ctx)
+            .Single(a => a.Name == "csharp:build-WaE");
+        Assert.Null(Assert.IsAssignableFrom<ITestRunnerAuditorProvider>(buildGate).TestRunner);
+    }
+
+    [Fact]
     public void LanguagePresetYamlLoading_WiresBuildTestGateRolesFromBuiltInYaml()
     {
         var catalog = new PresetCatalog();

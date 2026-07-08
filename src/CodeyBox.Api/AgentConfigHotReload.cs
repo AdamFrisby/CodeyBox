@@ -1029,6 +1029,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.AuditShortCircuitEnabled,
                 AuditorIdleTimeoutSeconds = opts.AuditorIdleTimeout.TotalSeconds,
                 opts.BlockRedundantDotnetBuildTestInAuditSandbox,
+                CSharpTestPassAuditorIdleTimeoutSeconds = opts.CSharpTestPassAuditorIdleTimeout?.TotalSeconds,
+                CSharpTestPassBlameHangTimeoutSeconds = opts.CSharpTestPassBlameHangTimeout?.TotalSeconds,
             },
             JsonOpts);
 

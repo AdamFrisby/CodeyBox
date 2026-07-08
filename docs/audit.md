@@ -181,6 +181,33 @@ non-zero on findings.
 
 Capability: `None`.
 
+### `DotnetTestAuditor` (`CodeyBox.Audit.Shell`)
+
+Backs the built-in `csharp:test-pass` gate. It is a first-class
+`ITestRunnerAuditor` rather than a generic `ShellCommandAuditor`, so
+test-command construction, the `dotnet test` result classifier, per-test
+hang handling, and (future) test selection are declared members of the type
+instead of scattered `argv`-shape special-casing.
+
+`BuildInvocation(selection, options)` owns the full argv:
+
+- Base command comes from the `csharp` language YAML (`dotnet test --no-build`).
+- A narrowed `TestSelection` appends `--filter` (OR-joined, defaulting bare
+  names to `FullyQualifiedName=`).
+- A configured `CSharpTestPassBlameHangTimeout` appends
+  `--blame-hang --blame-hang-timeout <value>`.
+
+With an all-tests selection and default options the emitted command is
+byte-identical to the legacy generic-shell path. Execution (tool-presence
+probe, missing-tool handling, classification) is delegated to a
+`ShellCommandAuditor`, so run semantics are unchanged. The type is
+DI-registered as `ITestRunnerAuditor` so the test-selector seam can enumerate
+its `TestSuiteDescriptor`. Run options
+(`CSharpTestPassAuditorIdleTimeout` / `CSharpTestPassBlameHangTimeout`) are
+sourced through the type from `CodeyBox:PipelineTuning` and hot-reload.
+
+Capability: `None`.
+
 ### `process:build-script`
 
 Runs `./build.sh` from the work-branch repository root in the credential-free

@@ -952,6 +952,54 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.Contains("CodeyBox:PipelineTuning:AuditorIdleTimeout must be non-negative", result.FailureMessage);
     }
 
+    [Fact]
+    public void Validate_RejectsNegativeCSharpTestPassAuditorIdleTimeout()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.PipelineTuning.CSharpTestPassAuditorIdleTimeout = TimeSpan.FromSeconds(-1);
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(
+            "CodeyBox:PipelineTuning:CSharpTestPassAuditorIdleTimeout must be non-negative when set",
+            result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_AllowsZeroCSharpTestPassAuditorIdleTimeout()
+    {
+        // The idle knob uses '< Zero' (zero disables the guard), unlike blame-hang.
+        var options = ValidCodeyBoxOptions();
+        options.PipelineTuning.CSharpTestPassAuditorIdleTimeout = TimeSpan.Zero;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.False(result.Failed);
+    }
+
+    [Fact]
+    public void Validate_RejectsNonPositiveCSharpTestPassBlameHangTimeout()
+    {
+        // The blame-hang knob uses '<= Zero', so zero is rejected too.
+        var options = ValidCodeyBoxOptions();
+        options.PipelineTuning.CSharpTestPassBlameHangTimeout = TimeSpan.Zero;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(
+            "CodeyBox:PipelineTuning:CSharpTestPassBlameHangTimeout must be positive when set",
+            result.FailureMessage);
+
+        options.PipelineTuning.CSharpTestPassBlameHangTimeout = TimeSpan.FromSeconds(-1);
+        result = new CodeyBoxOptionsValidator().Validate(null, options);
+        Assert.True(result.Failed);
+        Assert.Contains(
+            "CodeyBox:PipelineTuning:CSharpTestPassBlameHangTimeout must be positive when set",
+            result.FailureMessage);
+    }
+
     [Theory]
     [InlineData("MaxPromptChars")]
     [InlineData("MaxOutputBufferChars")]

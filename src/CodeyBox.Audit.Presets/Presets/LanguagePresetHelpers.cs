@@ -15,12 +15,20 @@ internal static class LanguagePresetHelpers
         AuditorRole role = AuditorRole.None,
         BuildTestGateEvidence gateEvidence = BuildTestGateEvidence.None,
         AuditSeverity? missingToolSeverity = null,
-        AuditCapabilities required = AuditCapabilities.None)
-        => new LanguagePresetAuditor(
-            language,
-            markerDescription,
-            markerScript,
-            new ShellCommandAuditor(new ShellCommandAuditorOptions
+        AuditCapabilities required = AuditCapabilities.None,
+        Func<TestRunOptions>? testRunOptions = null)
+    {
+        var inner = IsDotnetTestPass(language, name)
+            ? (IAuditor)new DotnetTestAuditor(new DotnetTestAuditorOptions
+            {
+                Name = name,
+                BaseArgv = argv,
+                CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding,
+                Role = role,
+                BuildTestGateEvidence = gateEvidence,
+                RunOptionsAccessor = testRunOptions,
+            })
+            : new ShellCommandAuditor(new ShellCommandAuditorOptions
             {
                 Name = name,
                 Argv = argv,
@@ -30,7 +38,10 @@ internal static class LanguagePresetHelpers
                 CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding,
                 Role = role,
                 BuildTestGateEvidence = gateEvidence,
-            }));
+            });
+
+        return new LanguagePresetAuditor(language, markerDescription, markerScript, inner);
+    }
 
     public static IAuditor ShellScript(
         string language,
@@ -62,7 +73,11 @@ internal static class LanguagePresetHelpers
                 BuildTestGateEvidence = gateEvidence,
             }));
 
-    private static IShellCommandResultClassifier? ResultClassifierFor(
+    private static bool IsDotnetTestPass(string language, string name)
+        => string.Equals(language, "csharp", StringComparison.Ordinal)
+           && string.Equals(name, "csharp:test-pass", StringComparison.Ordinal);
+
+    private static IAuditResultClassifier? ResultClassifierFor(
         string language,
         string name,
         IReadOnlyList<string> argv)
@@ -74,15 +89,6 @@ internal static class LanguagePresetHelpers
             && string.Equals(argv[1], "format", StringComparison.Ordinal))
         {
             return new DotnetFormatCommandResultClassifier();
-        }
-
-        if (string.Equals(language, "csharp", StringComparison.Ordinal)
-            && string.Equals(name, "csharp:test-pass", StringComparison.Ordinal)
-            && argv.Count >= 2
-            && string.Equals(argv[0], "dotnet", StringComparison.Ordinal)
-            && string.Equals(argv[1], "test", StringComparison.Ordinal))
-        {
-            return new DotnetTestCommandResultClassifier();
         }
 
         return null;
