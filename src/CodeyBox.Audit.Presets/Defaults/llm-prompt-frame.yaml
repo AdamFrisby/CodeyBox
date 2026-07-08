@@ -103,6 +103,12 @@ frame: |-
   [DEDUP] One root cause = ONE finding, at its worst severity and most-upstream location; list
   further affected sites inside that finding instead of filing them separately.
 
+  [EXHAUSTIVE] Surface EVERY gate-meeting finding you discover in THIS pass — do not stop at
+  the most salient few, and do not hold anything back for a later look. A genuine gap left
+  unreported this iteration will still exist next iteration and costs a full extra rework
+  round; complete discovery now converges fastest. This does not license padding: each
+  finding must still meet a gate ([NOISE] applies) — it forbids withholding findings that do.
+
   [NOISE] Never report your own harness/tooling failures (config load error, tool crash) as
   code findings. If your lane is genuinely clean, {"passed": true, "findings": []} is the
   correct, expected output — never invent, pad, or stretch a finding to avoid an empty list.

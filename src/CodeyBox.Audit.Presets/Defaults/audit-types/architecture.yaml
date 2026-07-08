@@ -42,6 +42,13 @@ reviewFocus: |-
   (ii)  CONTRACT change visible in the diff: a signature, constructor, interface,
         serialized/wire shape, or error contract that other code compiles against, imports,
         or deserializes.
+  DEGENERATE SPREAD DOES NOT COUNT — for BOTH (i) and (ii): a consumer, caller, or
+        contract-dependent that THIS SAME DIFF introduces is not spread evidence. New code
+        consuming its own new member (the diff's Bridge calling the diff's SignalBootstrap;
+        a new method whose only call sites are in this diff; test doubles forced to
+        implement a new member) is CONFINED → Warning. Spread requires the cited consumer
+        to be PRE-EXISTING code outside the diff, or a published/serialized surface that
+        external parties already consume.
   (iii) DUPLICATION fork: the diff itself repeats a pattern 2+ times (visible and countable
         in the diff), OR duplicates a pattern VISIBLE in the diff or surrounding code WITH
         divergent behavior (a latent correctness fork). An "existing pattern" you were not
