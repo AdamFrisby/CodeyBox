@@ -6655,9 +6655,6 @@ while True:
         sb.AppendLine("    if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
         sb.AppendLine("        break");
         sb.AppendLine("    fi");
-        sb.AppendLine("    if codeybox_report_child_status_if_present; then");
-        sb.AppendLine("        :");
-        sb.AppendLine("    fi");
         sb.AppendLine("    if [ \"$SECONDS\" -ge \"$codeybox_marker_deadline\" ]; then");
         sb.AppendLine("        if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
         sb.AppendLine("            break");
@@ -6681,6 +6678,9 @@ while True:
         sb.AppendLine("        fi");
         sb.AppendLine("        echo \"codeybox-detached: timed out waiting for process group marker\" >&2");
         sb.AppendLine($"        exit {DetachedSupervisorSetupFailedExitCode}");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    if codeybox_report_child_status_if_present; then");
+        sb.AppendLine("        :");
         sb.AppendLine("    fi");
         sb.AppendLine("    if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
         sb.AppendLine("        break");
