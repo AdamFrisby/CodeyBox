@@ -79,7 +79,9 @@ public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
             AgentQuotaSnapshot snapshot;
             try
             {
-                if (probe is IAgentQuotaCacheInvalidator invalidator)
+                if (probe is IAgentQuotaRecoveryStateInvalidator recoveryInvalidator)
+                    recoveryInvalidator.InvalidateRecoveryState(member);
+                else if (probe is IAgentQuotaCacheInvalidator invalidator)
                     invalidator.InvalidateResponseCache();
 
                 snapshot = await probe.GetAvailabilityAsync(member, ct).ConfigureAwait(false);

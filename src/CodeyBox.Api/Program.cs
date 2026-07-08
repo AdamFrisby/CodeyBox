@@ -1517,8 +1517,9 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
             };
         },
         timeProvider: null);
-    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)probe).InvalidateCredentialState;
-    return WrapLastKnownGood(probe, sp);
+    var wrapped = WrapLastKnownGood(probe, sp);
+    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
+    return wrapped;
 });
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
@@ -1538,8 +1539,9 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
         }) ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<CodexQuotaProbe>());
-    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)probe).InvalidateCredentialState;
-    return WrapLastKnownGood(probe, sp);
+    var wrapped = WrapLastKnownGood(probe, sp);
+    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
+    return wrapped;
 });
 // Gemini OAuth-subscription path (Code Assist Individual / AI Pro / AI Ultra).
 // API-key (PayPerApi) and Vertex paths have no analogous endpoint and stay
@@ -1560,8 +1562,9 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
             ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<GeminiQuotaProbe>());
-    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)probe).InvalidateCredentialState;
-    return WrapLastKnownGood(probe, sp);
+    var wrapped = WrapLastKnownGood(probe, sp);
+    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
+    return wrapped;
 });
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
@@ -1578,8 +1581,9 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
             ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<CursorQuotaProbe>());
-    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)probe).InvalidateCredentialState;
-    return WrapLastKnownGood(probe, sp);
+    var wrapped = WrapLastKnownGood(probe, sp);
+    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
+    return wrapped;
 });
 
 // opencode: no verified usage endpoint at integration time. The probe ships
@@ -1617,8 +1621,9 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
             ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<AntigravityQuotaProbe>());
-    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)probe).InvalidateCredentialState;
-    return WrapLastKnownGood(probe, sp);
+    var wrapped = WrapLastKnownGood(probe, sp);
+    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
+    return wrapped;
 });
 
 // --- Agent class router ------------------------------------------------------
@@ -2876,7 +2881,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     authRequiredReader: sp.GetRequiredService<IAgentAuthRequiredAvailabilityReader>(),
     planReviewGate: sp.GetRequiredService<IPlanReviewGate>(),
     testCaseStore: sp.GetService<ITestCaseStore>(),
-    mergeScopeResolver: sp.GetRequiredService<IMergeScopeResolver>()));
+    mergeScopeResolver: sp.GetRequiredService<IMergeScopeResolver>(),
+    quotaAvailabilityPublisher: sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

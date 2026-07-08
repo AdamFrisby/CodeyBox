@@ -80,6 +80,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private readonly IAgentStreamStore? _agentStreams;
     private readonly IWorkItemAutoRetryScheduler? _retryScheduler;
     private readonly AgentClassRouter? _classRouter;
+    private readonly IAgentQuotaAvailabilityPublisher? _quotaAvailabilityPublisher;
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
     private readonly IAgentInvolvementStore? _involvement;
     private readonly InvolvementTracker _involvementTracker;
@@ -314,7 +315,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // entirely (plans still approve). Only planned items reach the emit path,
         // so unplanned items are never touched regardless of wiring.
         ITestCaseStore? testCaseStore = null,
-        IMergeScopeResolver? mergeScopeResolver = null)
+        IMergeScopeResolver? mergeScopeResolver = null,
+        IAgentQuotaAvailabilityPublisher? quotaAvailabilityPublisher = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -364,6 +366,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _inVmSmokeGate = inVmSmokeGate;
         _retryScheduler = retryScheduler;
         _classRouter = classRouter;
+        _quotaAvailabilityPublisher = quotaAvailabilityPublisher;
         _fallbackHistory = fallbackHistory;
         _involvement = involvement;
         _log = log;
@@ -16188,16 +16191,18 @@ Original merge-phase failure (JSON string, for context only):
             return;
         }
 
-        if (_retryScheduler is not null)
-            await _retryScheduler.NotifyQuotaFailureAsync(next);
-
-        AuditLog.WorkItemTransitioned(item.Id, WorkItemState.WaitingForQuotaReset.ToString());
         var effectiveProject = project ?? new Project
         {
             Id = item.ProjectId,
             DisplayName = item.ProjectId.Value,
             RepositoryUrl = string.Empty,
         };
+        await RecordDirectQuotaParkAsync(next, effectiveProject, effectiveResetAt, ct);
+
+        if (_retryScheduler is not null)
+            await _retryScheduler.NotifyQuotaFailureAsync(next);
+
+        AuditLog.WorkItemTransitioned(item.Id, WorkItemState.WaitingForQuotaReset.ToString());
         await _webhooks.PublishAsync(new WebhookEvent
         {
             Event = "work_item.waiting_for_quota_reset",
@@ -16212,7 +16217,69 @@ Original merge-phase failure (JSON string, for context only):
                 ToAgent: null,
                 ToModel: null,
                 Reason: error),
-        }, ct);
+            }, ct);
+    }
+
+    private async Task RecordDirectQuotaParkAsync(
+        WorkItem item,
+        Project? project,
+        DateTimeOffset? resetAt,
+        CancellationToken ct)
+    {
+        if (!IsDirectQuotaPark(item, project))
+            return;
+
+        var agent = item.Agent ?? project?.DefaultAgent;
+        if (agent is null)
+            return;
+
+        var member = new AgentMembership
+        {
+            Agent = agent.Value,
+            InstanceId = item.AgentInstanceId,
+            ModelId = item.ModelId,
+            ReasoningMode = item.ReasoningMode,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+
+        if (_quotaProbesByKind is not null
+            && _quotaProbesByKind.TryGetValue(member.Agent, out var probe))
+        {
+            try
+            {
+                await probe.MarkExhaustedAsync(
+                    member,
+                    _pipelineTuning.Current.QuotaExhaustionFallbackTtl,
+                    resetAt,
+                    ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(
+                    ex,
+                    "Direct quota park probe write-back failed for {Agent}/{Model}",
+                    member.Agent.Value,
+                    member.ModelId ?? "(default)");
+            }
+        }
+
+        _quotaAvailabilityPublisher?.RecordQuotaUsability(
+            member,
+            isUsable: false,
+            publishRecoverySignal: true);
+    }
+
+    private bool IsDirectQuotaPark(WorkItem item, Project? project)
+    {
+        if (_classRouter is null)
+            return true;
+
+        return string.IsNullOrWhiteSpace(item.AgentClassId ?? project?.DefaultAgentClass);
     }
 
     /// <summary>

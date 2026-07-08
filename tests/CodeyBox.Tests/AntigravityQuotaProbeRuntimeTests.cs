@@ -407,9 +407,9 @@ public sealed class AntigravityQuotaProbeRuntimeTests
     [Fact]
     public async Task InvalidateCache_AfterPrime_ForcesFreshHttpOnNextCall()
     {
-        // InvalidateCache is wired to GeminiOAuthCredentialFileSource.TokenUpdated
-        // (Program.cs) so a token rotation drops stale cache + exhaustion entries
-        // before the next probe.
+        // Response-cache invalidation forces a fresh authorization read without
+        // clearing runtime 429 overrides; credential-state invalidation is the
+        // wider token-rotation boundary.
         var handler = new LoadCodeAssistRouter(HttpStatusCode.OK, TierBody);
         var probe = BuildProbe(handler, cacheTtl: TimeSpan.FromMinutes(5));
 
@@ -445,6 +445,27 @@ public sealed class AntigravityQuotaProbeRuntimeTests
         Assert.Equal(0.0, snapshot.AvailablePct);
         Assert.Equal(now.AddMinutes(10), snapshot.ResetAt);
         Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task RecoveryStateInvalidation_BypassesRuntimeGateForOneLiveProbe()
+    {
+        var now = new DateTimeOffset(2026, 6, 9, 12, 0, 0, TimeSpan.Zero);
+        var time = new FixedClock(now);
+        var handler = new LoadCodeAssistRouter(HttpStatusCode.OK, TierBody);
+        var probe = BuildProbe(handler, time: time);
+        var member = Member();
+
+        await probe.MarkExhaustedAsync(member, TimeSpan.FromHours(6), now.AddHours(6));
+        var gated = await probe.GetAvailabilityAsync(member, CancellationToken.None);
+        Assert.Equal(0.0, gated.AvailablePct);
+        Assert.Empty(handler.Requests);
+
+        ((IAgentQuotaRecoveryStateInvalidator)probe).InvalidateRecoveryState(member);
+        var recovered = await probe.GetAvailabilityAsync(member, CancellationToken.None);
+
+        Assert.Equal(100.0, recovered.AvailablePct);
+        Assert.Single(handler.Requests);
     }
 
     // ── Test helpers ─────────────────────────────────────────────────────────

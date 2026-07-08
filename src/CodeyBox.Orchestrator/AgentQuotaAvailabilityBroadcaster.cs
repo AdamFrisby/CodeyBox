@@ -26,17 +26,32 @@ public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilityS
         bool publishRecoverySignal = true)
     {
         var key = AgentQuotaMemberKey.From(member);
-        var crossedToUsable = publishRecoverySignal && RecordTransition(key, isUsable);
-        NotifyQuotaUsabilityObserved(new AgentQuotaUsabilityObservation(member, isUsable, publishRecoverySignal));
-
-        if (!crossedToUsable)
+        if (!publishRecoverySignal)
+        {
+            NotifyQuotaUsabilityObserved(new AgentQuotaUsabilityObservation(member, isUsable, publishRecoverySignal));
             return true;
+        }
+
+        var crossedToUsable = RecordTransition(key, isUsable);
+        if (!crossedToUsable)
+        {
+            NotifyQuotaUsabilityObserved(new AgentQuotaUsabilityObservation(member, isUsable, publishRecoverySignal));
+            return true;
+        }
 
         _log.LogInformation(
             "Quota availability for {Agent}/{Model} crossed from unusable to usable; triggering parked-item recovery sweep",
             member.Agent.Value,
             member.ModelId ?? "(default)");
-        return NotifyQuotaUsableThresholdCrossed();
+        var delivered = NotifyQuotaUsableThresholdCrossed();
+        if (!delivered)
+        {
+            RollBackUsableTransition(key);
+            return false;
+        }
+
+        NotifyQuotaUsabilityObserved(new AgentQuotaUsabilityObservation(member, isUsable, publishRecoverySignal));
+        return true;
     }
 
     private bool RecordTransition(AgentQuotaMemberKey key, bool isUsable)
@@ -69,6 +84,15 @@ public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilityS
             QuotaUsableThresholdCrossed,
             handler => handler(),
             ex => _log.LogWarning(ex, "Quota usable threshold subscriber threw; continuing"));
+
+    private void RollBackUsableTransition(AgentQuotaMemberKey key)
+    {
+        while (_lastUsable.TryGetValue(key, out var current) && current)
+        {
+            if (_lastUsable.TryUpdate(key, false, current))
+                return;
+        }
+    }
 
     private bool NotifySubscribers<TDelegate>(
         TDelegate? handlers,

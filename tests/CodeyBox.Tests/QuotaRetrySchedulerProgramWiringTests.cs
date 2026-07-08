@@ -246,6 +246,53 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
         Assert.Equal(1, retried.QuotaRetryAttempts);
     }
 
+    [Fact]
+    public async Task ProgramWiredCursorTokenUpdatedClearsLastKnownGoodWrapper()
+    {
+        var root = Directory.CreateTempSubdirectory("codeybox-cursor-wrapper-").FullName;
+        var previousCursorAuthFile = Environment.GetEnvironmentVariable("CODEYBOX_CURSOR_AUTH_FILE");
+        try
+        {
+            var cursorAuthPath = Path.Combine(root, "cursor-auth.json");
+            File.WriteAllText(cursorAuthPath, """{"accessToken":"same-token","refresh":"r1"}""");
+            Environment.SetEnvironmentVariable("CODEYBOX_CURSOR_AUTH_FILE", cursorAuthPath);
+            using var factory = new CursorWrapperInvalidationFactory(root, cursorAuthPath);
+            var probe = factory.Services
+                .GetServices<IAgentQuotaProbe>()
+                .Single(p => p.Kind == AgentKind.Cursor);
+            Assert.IsType<LastKnownGoodQuotaProbe>(probe);
+            var member = new AgentMembership
+            {
+                Agent = AgentKind.Cursor,
+                Billing = AgentBilling.Subscription,
+                ModelId = "composer-2.5",
+                QualityScore = 98,
+            };
+
+            var first = await probe.GetAvailabilityAsync(member, CancellationToken.None);
+            Assert.True(first.IsKnown, $"{first.Unknown}: {first.Notes}; calls={factory.Handler.CallCount}");
+            Assert.Equal(70.0, first.AvailablePct);
+            Assert.Equal(1, factory.Handler.CallCount);
+
+            factory.Handler.ThrowTransient = true;
+            File.WriteAllText(cursorAuthPath, """{"accessToken":"same-token","refresh":"changed-r2"}""");
+            File.SetLastWriteTimeUtc(cursorAuthPath, DateTime.UtcNow.AddSeconds(1));
+            var source = factory.Services.GetRequiredService<CursorCredentialFileSource>();
+            Assert.Contains("changed-r2", source.GetRaw());
+
+            var second = await probe.GetAvailabilityAsync(member, CancellationToken.None);
+
+            Assert.Equal(2, factory.Handler.CallCount);
+            Assert.False(second.IsKnown);
+            Assert.Equal(QuotaUnknownReason.Transient, second.Unknown);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEYBOX_CURSOR_AUTH_FILE", previousCursorAuthFile);
+            try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
     private static CodeyBoxOptions OptionsWithQuotaRetry(
         bool enabled,
         string interval,
@@ -392,6 +439,80 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
             if (disposing)
                 try { File.Delete(_dbPath); } catch { /* best-effort */ }
             base.Dispose(disposing);
+        }
+    }
+
+    private sealed class CursorWrapperInvalidationFactory : WebApplicationFactory<Program>
+    {
+        private readonly string _root;
+        private readonly string _cursorAuthPath;
+
+        public CursorWrapperInvalidationFactory(string root, string cursorAuthPath)
+        {
+            _root = root;
+            _cursorAuthPath = cursorAuthPath;
+        }
+
+        public MutableCursorUsageHandler Handler { get; } = new();
+
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            builder.UseEnvironment("Development");
+            builder.ConfigureAppConfiguration((_, cfg) =>
+            {
+                cfg.Sources.Clear();
+                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["CodeyBox:DangerouslyDisableAuth"] = "true",
+                    ["CodeyBox:Smoke:Enabled"] = "false",
+                    [CredentialFileWatcherSettings.ConfigurationKey] = "false",
+                    ["CodeyBox:StateDatabasePath"] = Path.Combine(_root, "state.db"),
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(_root, "git"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(_root, "logs", "api-.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_root, "logs", "audit-.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(_root, "agent-streams"),
+                    ["CodeyBox:CursorAuthFile"] = _cursorAuthPath,
+                    ["CodeyBox:QuotaRouter:ProbeMaxStalenessSeconds"] = "300",
+                });
+            });
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IHostedService>();
+                services.RemoveAll<IHttpClientFactory>();
+                services.AddSingleton<IHttpClientFactory>(
+                    new QuotaFakeHttpClientFactory("agent-quota", Handler));
+            });
+        }
+    }
+
+    private sealed class MutableCursorUsageHandler : HttpMessageHandler
+    {
+        private const string UsageBody = """
+        {
+          "planUsage": {
+            "autoPercentUsed": 25,
+            "apiPercentUsed": 10,
+            "totalPercentUsed": 30
+          },
+          "enabled": true,
+          "autoBucketModels": ["composer-2.5"]
+        }
+        """;
+
+        private int _callCount;
+        public int CallCount => Volatile.Read(ref _callCount);
+        public bool ThrowTransient { get; set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _callCount);
+            if (ThrowTransient)
+                throw new HttpRequestException("simulated cursor quota outage");
+
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(UsageBody),
+            });
         }
     }
 

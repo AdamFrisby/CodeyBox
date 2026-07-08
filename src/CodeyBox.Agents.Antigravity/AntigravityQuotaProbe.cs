@@ -54,7 +54,7 @@ namespace CodeyBox.Agents.Antigravity;
 /// reads), the probe surfaces that exact moment so failed items park cleanly in
 /// <c>WaitingForQuotaReset</c> instead of churning.</para>
 /// </summary>
-public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalidator
+public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalidator, IAgentQuotaRecoveryStateInvalidator
 {
     /// <summary>
     /// The <c>agy</c> gateway host. The <c>daily-</c> prefix is what agy 1.0.7
@@ -94,6 +94,7 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
     // credential under the same route is not pinned behind the prior account's
     // runtime 429.
     private readonly Dictionary<RuntimeExhaustionKey, AgentQuotaExhaustionEntry> _exhausted = new();
+    private readonly HashSet<RuntimeExhaustionKey> _recoveryProbeBypass = [];
     private readonly SemaphoreSlim _lock = new(1, 1);
 
     public AgentKind Kind => AgentKind.Antigravity;
@@ -119,15 +120,17 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
         if (string.IsNullOrEmpty(token))
             return Unknown(QuotaUnknownReason.NoCredential, "no token configured");
         var routeKey = member.RouteKey;
-        var modelKey = string.IsNullOrWhiteSpace(member.ModelId) ? "" : member.ModelId!;
+        var modelKey = ModelKeyFor(member);
         var cacheKey = (routeKey, token, modelKey);
+        var runtimeKey = new RuntimeExhaustionKey(routeKey, token, modelKey);
 
         AgentQuotaSnapshot snapshot;
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             var now = _timeProvider.GetUtcNow();
-            if (TryGetExhausted(new RuntimeExhaustionKey(routeKey, token, modelKey), now, out var ex))
+            var bypassRuntimeGate = _recoveryProbeBypass.Remove(runtimeKey);
+            if (!bypassRuntimeGate && TryGetExhausted(runtimeKey, now, out var ex))
             {
                 snapshot = new AgentQuotaSnapshot
                 {
@@ -143,6 +146,8 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
 
             snapshot = await ProbeAuthorizationAsync(token, modelKey, ct).ConfigureAwait(false);
             _cache[cacheKey] = new CacheEntry(snapshot, now + _cacheTtl);
+            if (bypassRuntimeGate && snapshot.IsKnown && snapshot.AvailablePct > 0)
+                _exhausted.Remove(runtimeKey);
         }
         finally
         {
@@ -167,10 +172,7 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
         {
             var now = _timeProvider.GetUtcNow();
             MarkExhausted(
-                new RuntimeExhaustionKey(
-                    member.RouteKey,
-                    token,
-                    string.IsNullOrWhiteSpace(member.ModelId) ? "" : member.ModelId!),
+                new RuntimeExhaustionKey(member.RouteKey, token, ModelKeyFor(member)),
                 ttl > TimeSpan.Zero ? ttl : TimeSpan.FromMinutes(1),
                 now,
                 resetAt);
@@ -188,7 +190,42 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
         finally { _lock.Release(); }
     }
 
-    public void InvalidateCredentialState() => InvalidateCache();
+    public void InvalidateCredentialState()
+    {
+        _lock.Wait();
+        try
+        {
+            _cache.Clear();
+            _recoveryProbeBypass.Clear();
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
+    public void InvalidateRecoveryState(AgentMembership member)
+    {
+        var credentials = _credentialsProvider(member);
+        var token = credentials.AccessToken;
+        if (string.IsNullOrEmpty(token))
+            return;
+
+        var routeKey = member.RouteKey;
+        var modelKey = ModelKeyFor(member);
+        var runtimeKey = new RuntimeExhaustionKey(routeKey, token, modelKey);
+        var cacheKey = (routeKey, token, modelKey);
+        _lock.Wait();
+        try
+        {
+            _cache.Remove(cacheKey);
+            _recoveryProbeBypass.Add(runtimeKey);
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
 
     private void MarkExhausted(
         RuntimeExhaustionKey key,
@@ -208,6 +245,7 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
         }
 
         var next = new AgentQuotaExhaustionEntry(expiresAt, storedResetAt);
+        _recoveryProbeBypass.Remove(key);
         if (!_exhausted.TryGetValue(key, out var existing)
             || existing.ExpiresAt <= nowUtc
             || next.ExpiresAt < existing.ExpiresAt)
@@ -390,4 +428,7 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
 
     private sealed record CacheEntry(AgentQuotaSnapshot Snapshot, DateTimeOffset ExpiresAt);
     private readonly record struct RuntimeExhaustionKey(string RouteKey, string Token, string ModelKey);
+
+    private static string ModelKeyFor(AgentMembership member) =>
+        string.IsNullOrWhiteSpace(member.ModelId) ? "" : member.ModelId!;
 }

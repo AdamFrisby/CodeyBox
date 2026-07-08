@@ -70,6 +70,17 @@ public interface IAgentQuotaCacheInvalidator
     void InvalidateCache();
 }
 
+public interface IAgentQuotaRecoveryStateInvalidator
+{
+    /// <summary>
+    /// Prepares <paramref name="member"/> for a recovery-monitor probe. Unlike
+    /// ordinary response-cache invalidation, implementations may bypass
+    /// short-lived runtime exhaustion hints for this one probe so an early quota
+    /// recovery can be observed before the pessimistic reset estimate elapses.
+    /// </summary>
+    void InvalidateRecoveryState(AgentMembership member);
+}
+
 /// <summary>OAuth/subscription credentials used by quota probes.</summary>
 public sealed record AgentQuotaCredentials(string? AccessToken, string? AccountId = null);
 

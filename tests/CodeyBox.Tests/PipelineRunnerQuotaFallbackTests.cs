@@ -635,6 +635,43 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
+    public async Task DirectQuotaFailure_PublishesUnusableObservationForRecoveryMonitor()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster();
+        var observations = new List<AgentQuotaUsabilityObservation>();
+        quotaSignal.QuotaUsabilityObserved += observations.Add;
+        using var fix = BuildPipeline(
+            seed,
+            useClassRouter: false,
+            quotaAvailabilityPublisher: quotaSignal);
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: "API Error: rate_limit_exceeded; please try again after 1h"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex) with
+        {
+            AgentClassId = null,
+        };
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var parked = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
+        Assert.Contains(fix.CodexProbe.MarkedExhausted, agent => agent == AgentKind.Codex);
+        var observation = Assert.Single(
+            observations,
+            o => o.Member.Agent == AgentKind.Codex && !o.IsUsable);
+        Assert.True(observation.PublishRecoverySignal);
+        Assert.Equal(item.ModelId, observation.Member.ModelId);
+    }
+
+    [Fact]
     public async Task Claude_RateLimitEventStdout_FallsBackToPeerWithinClass_SameIteration()
     {
         // The exact regression that prompted the mid-rework Claude 5h-window
@@ -1991,7 +2028,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         bool wireAuditProgress = false,
         IAgentAuthFailureClassifier? authFailureClassifier = null,
         IAgentAvailabilityRegistry? availability = null,
-        PipelineTuningSnapshot? pipelineTuning = null)
+        PipelineTuningSnapshot? pipelineTuning = null,
+        IAgentQuotaAvailabilityPublisher? quotaAvailabilityPublisher = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -2056,7 +2094,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             [codexProbe, claudeProbe],
             resolvedQuotaOptions,
             NullLogger<AgentClassRouter>.Instance,
-            quotaFailures: quotaFailures);
+            quotaFailures: quotaFailures,
+            quotaAvailabilityPublisher: quotaAvailabilityPublisher);
 
         var fallbackHistory = new InMemoryAgentFallbackHistoryStore();
         var involvement = new InMemoryAgentInvolvementStore();
@@ -2099,7 +2138,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             authFailureClassifier: authFailureClassifier,
             availability: availability,
             authAvailability: authAvailability,
-            pipelineTuning: pipelineTuning);
+            pipelineTuning: pipelineTuning,
+            quotaAvailabilityPublisher: quotaAvailabilityPublisher);
 
         return new TestFixture(pipeline, router, store, gitHost, codex, claude, codexProbe, claudeProbe, webhooks, fallbackHistory, involvement);
     }

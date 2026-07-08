@@ -283,6 +283,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IQuotaRe
         CancellationToken ct,
         string? requiredCapability = null)
     {
+        if (string.IsNullOrWhiteSpace(item.AgentClassId ?? project?.DefaultAgentClass))
+            return await ResolveDirectQuotaRetryAsync(item, project, ct).ConfigureAwait(false);
+
         var decision = await ResolveCoreAsync(
             item,
             project,
@@ -300,6 +303,53 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IQuotaRe
             decision.NoEligibleMembers,
             decision.Reason,
             decision.WaitingForPausedAgent);
+    }
+
+    private async Task<QuotaRetryRoutingDecision> ResolveDirectQuotaRetryAsync(
+        WorkItem item,
+        Project? project,
+        CancellationToken ct)
+    {
+        var agent = item.Agent ?? project?.DefaultAgent;
+        if (agent is null)
+            return new QuotaRetryRoutingDecision(
+                ShouldWait: false,
+                NoEligibleMembers: true,
+                Reason: "no direct agent configured",
+                WaitingForPausedAgent: false);
+
+        var member = new AgentMembership
+        {
+            Agent = agent.Value,
+            InstanceId = item.AgentInstanceId,
+            ModelId = item.ModelId,
+            ReasoningMode = item.ReasoningMode,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+        var nowUtc = _time.GetUtcNow();
+        var snapshot = await ProbeOrUnknownAsync(member, ct).ConfigureAwait(false);
+        var quota = ResolveMemberQuota(snapshot, member);
+        quota = (await ApplyBudgetAsync(member, quota, ct).ConfigureAwait(false)).Quota;
+        RecordObservedAvailability(member, quota);
+
+        var gate = await EvaluateGateAsync(member, item.ProjectId, quota, nowUtc, ct).ConfigureAwait(false);
+        _quotaAvailabilityPublisher?.RecordQuotaUsability(
+            member,
+            gate.Allow,
+            publishRecoverySignal: true);
+        if (!gate.Allow)
+            return new QuotaRetryRoutingDecision(
+                ShouldWait: true,
+                NoEligibleMembers: false,
+                Reason: gate.Reason,
+                WaitingForPausedAgent: false);
+
+        return new QuotaRetryRoutingDecision(
+            ShouldWait: false,
+            NoEligibleMembers: false,
+            Reason: "direct agent quota available",
+            WaitingForPausedAgent: false);
     }
 
     private async Task<AgentRoutingDecision> ResolveCoreAsync(
