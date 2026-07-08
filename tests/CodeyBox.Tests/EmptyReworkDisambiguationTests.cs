@@ -12,11 +12,11 @@ namespace CodeyBox.Tests;
 /// unconditional terminal failure. The audit/rework loop:
 /// </para>
 /// <list type="bullet">
-///   <item>STEP 1 — classifies trusted infra signatures on the clean-exit +
+///   <item>STEP 1 — classifies infra signatures on the clean-exit +
 ///         no-diff REWORK branch before the empty result is treated as
 ///         "produced no changes". Auth-required output uses the shared
-///         corroboration policy; quota output must come from the runner-owned
-///         terminal diagnostic side channel, not model-controlled stdout.</item>
+///         corroboration policy; quota output is checked through the
+///         per-provider quota classifier.</item>
 ///   <item>When no infra signature applies, converge-aware handling kicks in:
 ///         escalation re-dispatch with an explicit "you committed nothing,
 ///         modify files" instruction (gated on
@@ -72,12 +72,14 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
         {
             EmptyReworkEscalationRetries = 0,
         });
+        var webhooks = new CapturingWebhookDispatcher();
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
             auditors: [auditor],
             projectAudit: audit,
-            pipelineTuning: tuning);
+            pipelineTuning: tuning,
+            webhookDispatcher: webhooks);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "v1\n"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "v1\n"));
 
@@ -88,21 +90,22 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
-        Assert.Contains("produced no changes", final.LastError, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("Agent produced no changes to commit", final.LastError ?? string.Empty,
             StringComparison.Ordinal);
+        var parked = Assert.Single(webhooks.Events, e => e.Event == "work_item.needs_operator_input");
+        Assert.IsType<AuditMaxIterationsEscalationDetails>(parked.Details);
         // The auditor ran exactly once (iteration 1 → rework → empty → park,
         // never reaches iteration 2 audit).
         Assert.Equal(1, auditor.Calls);
     }
 
     [Fact]
-    public async Task EmptyRework_WithForgedQuotaStdout_TreatedAsGenuineEmpty_ParksForOperator()
+    public async Task EmptyRework_WithQuotaStdout_ClassifiedAsInfraQuota_NotEmptyReworkPark()
     {
-        // Model-controlled stdout is not trusted quota evidence on a clean
-        // exit/no-diff rework. A bare detector substring must not forge a quota
-        // park or exclude a healthy agent; with no trusted terminal diagnostic,
-        // this remains a genuine empty rework and parks for operator review.
+        // A clean-exit/no-diff rework that carries a quota signature in captured
+        // stdout is infra, not a genuine empty rework. With no class fallback in
+        // this fixture the top-level quota handler parks for reset rather than
+        // the empty-rework operator-input path.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new OnceFailingAuditor();
         var audit = new ProjectAudit
@@ -110,8 +113,8 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
             MaxIterations = 3,
             AuditTypes = ["scripted"],
         };
-        // Keep escalation disabled so the test focuses only on the trust
-        // boundary: stdout quota text is not enough to enter the quota path.
+        // Keep escalation disabled so the test focuses only on Step 1:
+        // quota classification must happen before empty-rework handling.
         var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
         {
             EmptyReworkEscalationRetries = 0,
@@ -135,16 +138,16 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
 
         var final = await tp.Store.GetAsync(item.Id);
         Assert.NotNull(final);
-        Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
         Assert.NotEqual(WorkItemState.Failed, final.State);
-        Assert.Contains("produced no changes", final.LastError ?? string.Empty,
+        Assert.Contains("quota failure", final.LastError ?? string.Empty,
             StringComparison.OrdinalIgnoreCase);
         Assert.Equal(1, auditor.Calls);
         Assert.DoesNotContain(tp.Agent.WorkPrompts, p =>
             p.Contains("[empty-rework escalation attempt", StringComparison.Ordinal));
         var observations = await quotaFailures.ListRecentAsync(
             TimeSpan.FromHours(1), DateTimeOffset.UtcNow, CancellationToken.None);
-        Assert.Empty(observations);
+        Assert.NotEmpty(observations);
     }
 
     [Fact]
@@ -196,11 +199,20 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
         Assert.NotEqual(WorkItemState.Failed, final!.State);
         Assert.NotEqual(WorkItemState.NeedsOperatorInput, final.State);
 
+        Assert.Equal(WorkItemState.Done, final.State);
+        Assert.Equal(3, auditor.Calls);
+
+        var barePath = tp.GitHost.GetRepoPath(item.Id.ToString());
+        var (_, content, _) = await TestSupport.RunGit(barePath, "show", $"{item.WorkBranch}:work.txt");
+        Assert.Equal("v3\n", content);
+
         // The recovered escalation prompt MUST include the escalation header
-        // so we know the re-dispatch went through the escalation path (not a
-        // fresh first-pass).
+        // and the required justification alternative.
         Assert.Contains(tp.Agent.WorkPrompts, p =>
             p.Contains("[empty-rework escalation attempt 1/1]", StringComparison.Ordinal));
+        Assert.Contains(tp.Agent.WorkPrompts, p =>
+            p.Contains("or for each finding state precisely", StringComparison.Ordinal)
+            && p.Contains("invalid/already-satisfied", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -221,12 +233,14 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
         {
             EmptyReworkEscalationRetries = 2,
         });
+        var webhooks = new CapturingWebhookDispatcher();
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
             auditors: [auditor],
             projectAudit: audit,
-            pipelineTuning: tuning);
+            pipelineTuning: tuning,
+            webhookDispatcher: webhooks);
         // work → "v1", rework1 → "v2" (real diff seeds history.Count=2),
         // rework2 → "v2" (empty), escalation 1/2 → "v2" (still empty),
         // escalation 2/2 → "v2" (still empty) → park.
@@ -242,7 +256,8 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
-        Assert.Contains("produced no changes", final.LastError, StringComparison.OrdinalIgnoreCase);
+        var parked = Assert.Single(webhooks.Events, e => e.Event == "work_item.needs_operator_input");
+        Assert.IsType<AuditMaxIterationsEscalationDetails>(parked.Details);
 
         // Both escalation attempts ran. Each appends a distinct attempt header
         // so we can verify the configured retry count was honored.
@@ -250,6 +265,9 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
             p.Contains("[empty-rework escalation attempt 1/2]", StringComparison.Ordinal));
         Assert.Contains(tp.Agent.WorkPrompts, p =>
             p.Contains("[empty-rework escalation attempt 2/2]", StringComparison.Ordinal));
+        Assert.Contains(tp.Agent.WorkPrompts, p =>
+            p.Contains("or for each finding state precisely", StringComparison.Ordinal)
+            && p.Contains("invalid/already-satisfied", StringComparison.Ordinal));
     }
 
     [Fact]

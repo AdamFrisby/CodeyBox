@@ -574,11 +574,49 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         Assert.Contains("quota failure", fallback.Reason, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task AuditDrivenRework_CleanExitNoDiffCapturedQuotaOutput_FallsBackToHealthyMember(bool quotaOnStdout)
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Codex.ReworkScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: quotaOnStdout ? "API Error: rate_limit_exceeded; please try again after 1h" : null,
+            Stderr: quotaOnStdout ? null : "API Error: rate_limit_exceeded; please try again after 1h"));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", quotaOnStdout
+            ? "fixed after stdout quota"
+            : "fixed after stderr quota"));
+
+        using var metrics = new MetricCapture("codeybox.agent.fallbacks");
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.True(metrics.Any("codeybox.agent.fallbacks",
+                ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "quota"), ("phase", "rework")),
+            "expected captured clean-exit/no-diff quota output to reroute the same rework iteration");
+
+        var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        var fallback = Assert.Single(history, h => h.Phase == "rework" && h.ToAgent == AgentKind.Claude);
+        Assert.Equal(AgentKind.Codex, fallback.FromAgent);
+        Assert.Contains("quota failure", fallback.Reason, StringComparison.OrdinalIgnoreCase);
+    }
+
     [Fact]
     public async Task AuditDrivenRework_CleanExitNoDiffAuthRequired_FallsBackToHealthyMember()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2);
+        var gate = new AuthCorroboratingInVmSmokeGate();
+        using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2, inVmSmokeGate: gate);
 
         fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
         fix.Codex.ReworkScriptedFailures.Enqueue(new AgentResult(
@@ -601,6 +639,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             $"expected Done but was {final.State}: {final.LastError}");
         Assert.True(fix.Codex.CallCount >= 2);
         Assert.True(fix.Claude.CallCount >= 1);
+        Assert.Equal(1, gate.ForceProbeCalls);
         Assert.True(metrics.Any("codeybox.agent.fallbacks",
                 ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "auth"), ("phase", "rework")),
             "expected auth-required rework output to reroute through the class fallback path");
@@ -609,6 +648,56 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var fallback = Assert.Single(history, h => h.Phase == "rework" && h.ToAgent == AgentKind.Claude);
         Assert.Equal(AgentKind.Codex, fallback.FromAgent);
         Assert.Contains("auth required", fallback.Reason, StringComparison.OrdinalIgnoreCase);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
+    }
+
+    [Fact]
+    public async Task AuditDrivenRework_CleanExitNoDiffStdoutOnlyAuthRequired_WithCorroboration_ExcludesAndFallsBack()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gate = new AuthCorroboratingInVmSmokeGate();
+        using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2, inVmSmokeGate: gate);
+
+        fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
+        fix.Codex.ReworkScriptedFailures.Enqueue(new AgentResult(
+            Success: true,
+            Summary: "ok",
+            Stdout: """
+                Authentication required. Please visit the URL to log in:
+                https://accounts.google.com/o/oauth2/auth?client_id=redacted
+                Waiting for authentication (timeout 30s)...
+                Error: authentication timed out.
+                """,
+            Stderr: null));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "fixed after stdout auth fallback"));
+
+        using var metrics = new MetricCapture("codeybox.agent.fallbacks");
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(1, gate.ForceProbeCalls);
+        Assert.True(metrics.Any("codeybox.agent.fallbacks",
+                ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "auth"), ("phase", "rework")),
+            "expected corroborated stdout-only auth output to reroute through the class fallback path");
+
+        var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        var fallback = Assert.Single(history, h => h.Phase == "rework" && h.ToAgent == AgentKind.Claude);
+        Assert.Equal(AgentKind.Codex, fallback.FromAgent);
+        Assert.Contains("auth required", fallback.Reason, StringComparison.OrdinalIgnoreCase);
+
+        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
+        Assert.Equal("codex", details.AgentKind);
+        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
     }
 
     [Fact]
@@ -2218,6 +2307,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
                 new AvailabilityOptions(),
                 TimeProvider.System,
                 NullLogger<AgentAvailabilityRegistry>.Instance);
+        if (inVmSmokeGate is AuthCorroboratingInVmSmokeGate authCorroboratingGate)
+            authCorroboratingGate.AttachAuthRegistry(authAvailability, webhooks);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, new StaticCredentialProvider(), prs,
@@ -2243,6 +2334,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             dispatchAvailability: inVmSmokeGate is null
                 ? null
                 : new AgentDispatchAvailability(inVmSmokeGate: inVmSmokeGate),
+            inVmSmokeGate: inVmSmokeGate,
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions,
             authFailureClassifier: authFailureClassifier,

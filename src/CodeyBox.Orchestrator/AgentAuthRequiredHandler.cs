@@ -17,7 +17,8 @@ public interface IAgentAuthRequiredHandler
     /// <c>agent.smoke_failed</c> webhook, the availability registry, and the
     /// raised <see cref="AgentAuthRequiredException"/>. Format:
     /// <c>auth required from agent output during {phase}[ for release {id}]: {detail}</c>
-    /// with optional stdout-only annotation when the evidence is model-controlled.
+    /// with an optional evidence-trust annotation when the caller had to
+    /// corroborate model- or process-controlled output.
     /// </summary>
     string BuildReason(
         string phase,
@@ -65,7 +66,7 @@ public sealed class AgentAuthRequiredHandler : IAgentAuthRequiredHandler
         Release? release = null)
     {
         var detail = classification.Reason ?? "login prompt matched";
-        if (stdoutOnlyEvidence)
+        if (stdoutOnlyEvidence || !string.IsNullOrWhiteSpace(stdoutOnlyNote))
             detail = $"{detail}; {stdoutOnlyNote ?? "stdout accepted as authoritative CLI output for this phase"}";
 
         var phaseScope = release is null ? phase : $"{phase} for release {release.Id}";

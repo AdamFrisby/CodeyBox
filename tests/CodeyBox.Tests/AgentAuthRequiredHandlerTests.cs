@@ -97,6 +97,25 @@ public class AgentAuthRequiredHandlerTests
     }
 
     [Fact]
+    public void BuildReason_StderrEvidence_CustomTrustNote_Appends()
+    {
+        var handler = NewHandler();
+        var classification = new AgentFailureClassification(
+            AgentFailureKind.AuthRequired,
+            Reason: "auth/login prompt pattern matched in stderr");
+
+        var reason = handler.BuildReason(
+            "rework",
+            classification,
+            stdoutOnlyEvidence: false,
+            stdoutOnlyNote: "auth evidence accepted for item failure only");
+
+        Assert.Contains("auth/login prompt pattern matched in stderr", reason);
+        Assert.Contains("auth evidence accepted for item failure only", reason);
+        Assert.DoesNotContain("stdout accepted as authoritative CLI output", reason);
+    }
+
+    [Fact]
     public void BuildReason_StdoutOnlyEvidence_AppendsDefaultNote()
     {
         var handler = NewHandler();

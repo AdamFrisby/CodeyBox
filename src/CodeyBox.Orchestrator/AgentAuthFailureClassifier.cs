@@ -34,6 +34,23 @@ public interface IAgentAuthFailureClassifier
     AgentFailureClassification ClassifyFailure(AgentKind kind, AgentResult result);
 
     /// <summary>
+    /// Classifies captured CLI output without requiring callers to fabricate an
+    /// <see cref="AgentResult"/> solely to reach the shared classifier.
+    /// </summary>
+    AgentFailureClassification ClassifyOutput(
+        AgentKind kind,
+        string? stderr,
+        string? stdout,
+        string? summary = null);
+
+    /// <summary>
+    /// Classifies runner-owned terminal diagnostic text. This is for side-channel
+    /// diagnostics such as <see cref="AgentResult.TerminalDiagnostic"/>, not
+    /// model-controlled task prose.
+    /// </summary>
+    AgentFailureClassification ClassifyTrustedDiagnostic(AgentKind kind, string? diagnostic);
+
+    /// <summary>
     /// Classifies a runner result using configured auth/login-prompt patterns
     /// first, then falling back to the runner's own classifier.
     /// </summary>
@@ -72,12 +89,24 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
         => AgentFailureClassifier.DetectAuthRequired(kind, stderr, stdout, _additionalPatternsByAgent);
 
     public AgentFailureClassification ClassifyFailure(AgentKind kind, AgentResult result)
+        => ClassifyOutput(kind, result.Stderr, result.Stdout, result.Summary);
+
+    public AgentFailureClassification ClassifyOutput(
+        AgentKind kind,
+        string? stderr,
+        string? stdout,
+        string? summary = null)
         => AgentFailureClassifier.Classify(
             kind,
-            result.Stderr,
-            result.Stdout,
-            result.Summary,
+            stderr,
+            stdout,
+            summary,
             _additionalPatternsByAgent);
+
+    public AgentFailureClassification ClassifyTrustedDiagnostic(AgentKind kind, string? diagnostic)
+        => string.IsNullOrWhiteSpace(diagnostic)
+            ? new AgentFailureClassification(AgentFailureKind.Normal)
+            : ClassifyOutput(kind, diagnostic, stdout: null, summary: "agent trusted diagnostic");
 
     public AgentFailureClassification ClassifyFailure(IAgentRunner runner, AgentResult result)
     {
@@ -123,17 +152,14 @@ public sealed class AgentAuthRequiredException : Exception
 {
     public AgentKind Agent { get; }
     public string Phase { get; }
-    public bool AllowAgentFallback { get; }
 
     public AgentAuthRequiredException(
         AgentKind agent,
         string phase,
-        string message,
-        bool allowAgentFallback = false)
+        string message)
         : base(message)
     {
         Agent = agent;
         Phase = phase;
-        AllowAgentFallback = allowAgentFallback;
     }
 }
