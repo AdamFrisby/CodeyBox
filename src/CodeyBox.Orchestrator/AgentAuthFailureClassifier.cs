@@ -79,26 +79,6 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
             result.Summary,
             _additionalPatternsByAgent);
 
-    internal bool ContainsConfiguredStderrPattern(AgentKind kind, string? stderr)
-    {
-        if (string.IsNullOrEmpty(stderr)
-            || string.IsNullOrWhiteSpace(kind.Value)
-            || !_additionalPatternsByAgent.TryGetValue(kind.Value, out var patterns))
-        {
-            return false;
-        }
-
-        foreach (var pattern in patterns)
-        {
-            if (!pattern.MatchesStderr || string.IsNullOrWhiteSpace(pattern.Pattern))
-                continue;
-            if (stderr.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-
-        return false;
-    }
-
     public AgentFailureClassification ClassifyFailure(IAgentRunner runner, AgentResult result)
     {
         var authAwareClassification = ClassifyFailure(runner.Kind, result);
@@ -115,7 +95,15 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
         if (AgentFailureClassifier.ContainsAuthRequiredFragmentInStdout(stdout))
             return true;
 
-        if (string.IsNullOrEmpty(stdout)
+        return ContainsConfiguredPattern(kind, stdout, static pattern => pattern.MatchesStdout);
+    }
+
+    private bool ContainsConfiguredPattern(
+        AgentKind kind,
+        string? text,
+        Func<AuthFailurePattern, bool> matchesStream)
+    {
+        if (string.IsNullOrEmpty(text)
             || string.IsNullOrWhiteSpace(kind.Value)
             || !_additionalPatternsByAgent.TryGetValue(kind.Value, out var patterns))
         {
@@ -124,11 +112,12 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
 
         foreach (var pattern in patterns)
         {
-            if (!pattern.MatchesStdout || string.IsNullOrWhiteSpace(pattern.Pattern))
+            if (!matchesStream(pattern) || string.IsNullOrWhiteSpace(pattern.Pattern))
                 continue;
-            if (stdout.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
+            if (text.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
                 return true;
         }
+
         return false;
     }
 }

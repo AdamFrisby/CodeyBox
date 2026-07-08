@@ -337,25 +337,25 @@ the pipeline checks infrastructure-failure evidence:
    availability breaker can turn into a per-agent exclusion. In an
    agent class, the same exception is a fallback trigger, so the work
    item re-routes through normal scoring before falling back to a
-   terminal auth-required failure. Stdout-only auth evidence, and built-in
-   stderr login transcripts on the clean-exit/no-diff branch, are routed
-   through the existing in-VM corroboration policy before they can bench the
-   agent globally. Operator-configured stderr auth patterns are trusted
-   directly. Terminal diagnostics extracted from runner logs use the same
-   corroboration gate before they can publish global auth-required side effects.
+   terminal auth-required failure. On audit rework clean-exit/no-diff,
+   captured stdout/stderr auth signatures publish the availability exclusion
+   before reroute. Other stdout-only auth evidence and runner terminal
+   diagnostics still use the existing in-VM corroboration policy before they
+   can bench the agent globally. Operator-configured stderr auth patterns are
+   trusted directly.
 2. The **quota / usage classifier** runs on the **rework** no-diff branch
-   over trusted CLI stderr directly. Captured stdout and runner log
-   `TerminalDiagnostic` text can contain model/tool/repository-controlled
-   content, so on the rework path they require a fresh quota probe to
-   corroborate exhaustion before the pipeline records observed quota state or
-   re-routes. It also checks `TerminalDiagnostic` quota evidence on initial
-   work no-diff, preserving the Antigravity / `agy` exit-0 usage-cap park while
-   keeping genuine initial no-ops fail-fast. Several CLIs swallow usage-cap
-   errors as exit-0; a quota match throws `TerminalQuotaError`, which the
-   agent-class fallback wrapper converts into a re-route to a healthy class
-   member (or, on the single-agent path, parks the item in
-   `WaitingForQuotaReset`). Unauthorized quota detections (`401` / `403`) are
-   routed as auth-required infrastructure failures, not quota reset parks.
+   over captured stdout/stderr before the empty result is treated as genuine.
+   Runner log `TerminalDiagnostic` text is a separate side channel, so on the
+   rework path it requires a fresh quota probe to corroborate exhaustion before
+   the pipeline records observed quota state or re-routes. It also checks
+   `TerminalDiagnostic` quota evidence on initial work no-diff, preserving the
+   Antigravity / `agy` exit-0 usage-cap park while keeping genuine initial
+   no-ops fail-fast. Several CLIs swallow usage-cap errors as exit-0; a quota
+   match throws `TerminalQuotaError`, which the agent-class fallback wrapper
+   converts into a re-route to a healthy class member (or, on the single-agent
+   path, parks the item in `WaitingForQuotaReset`). Unauthorized quota
+   detections (`401` / `403`) are routed as auth-required infrastructure
+   failures, not quota reset parks.
 
 Neither infra path counts against convergence, parks the item as
 operator-input, or terminal-fails it as "cannot resolve findings."
@@ -370,34 +370,30 @@ agent declining to commit anything. `RunAgentPhaseAsync` throws
   shows convergence progress (blocking-findings decreased, fingerprint
   changed, work-branch tip moved, &c — see `HasAuditConvergenceProgress`)
   and `CodeyBox:PipelineTuning:EmptyReworkEscalationRetries` is positive,
-  the rework is re-dispatched up to that many times. Each retry appends
+  the rework is re-dispatched up to that many times. Each retry prepends
   an escalation header to the rework prompt instructing the agent that
   its previous pass committed nothing and it MUST modify files, or state
   precisely why each finding is invalid or already satisfied. If any retry
   produces a real commit the loop continues normally; otherwise it falls
   through to the park path below.
-* **Park for operator review** — when escalation is disabled, the history
-  has no convergence, or every escalation pass came back empty, the item
-  parks through the existing audit max-iteration operator-input path and
-  `AuditMaxIterationsEscalationDetails` payload. The parked `LastError`
-  names the empty rework (`produced no changes`) instead of claiming the
-  audit reached its iteration ceiling. The operator can resume the item
-  with a clearer prompt or merge by hand.
+* **Park for operator review** — when escalation is disabled before the final
+  rework budget, or every escalation pass came back empty after convergence,
+  the item parks through the existing audit max-iteration operator-input path
+  and `AuditMaxIterationsEscalationDetails` payload. The operator can resume
+  the item with a clearer prompt or merge by hand.
 
 Hard terminal failure for genuinely-empty rework is reserved for the
-audit-loop ceiling branch (no budget *and* no convergence) — the existing
-"no progress" path through `AuditFailedException`. Inside
-`RunAuditReworkAsync` we still have audit budget by construction (the
-ceiling check fires before `RunAuditReworkAsync` is invoked), so the
-worst case is "park," never a fresh terminal failure for the empty-rework
-reason.
+final-budget no-convergence branch — the same "no progress" policy as the
+audit-loop ceiling path through `AuditFailedException`. A first in-budget
+blank pass no longer discards a converging item, but the last available
+rework pass with no convergence still fails instead of parking.
 
 ### Configuration
 
 `CodeyBox:PipelineTuning:EmptyReworkEscalationRetries` — non-negative
 integer. Default `1`. Set to `0` to skip escalation entirely (empty
-non-infra rework parks straight away). Hot-reloaded with the rest of
-`PipelineTuning`.
+non-infra rework goes straight to the park/fail policy). Hot-reloaded with
+the rest of `PipelineTuning`.
 
 ### Why initial work stays fail-fast
 

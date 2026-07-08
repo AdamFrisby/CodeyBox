@@ -38,7 +38,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
 {
     private const int AuditEscalationHistoryLimit = 25;
     private const int AuditEscalationFindingsPerIterationLimit = 20;
+    private const int AuditEscalationSummaryFindingLimit = 5;
     private const int AuditEscalationFindingDescriptionLimit = 2000;
+    // Synthetic quota probes only ask provider availability; router score is
+    // irrelevant, but AgentMembership requires a valid score.
+    private const int SyntheticQuotaProbeQualityScore = 100;
     private const string ElapsedFallbackMetadataSource = "elapsed_fallback";
     private const int CompletionReviewContextMaxChars = 64 * 1024;
     private const int CompletionReviewFileMaxChars = 8 * 1024;
@@ -4737,14 +4741,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
             {
                 if (deferredSuccessAuthDetection is not null)
                 {
-                    // Captured stdout is not trusted enough to bench the whole
-                    // fleet on its own. Built-in stderr login transcripts on
-                    // clean-exit/no-diff are also corroborated before global
-                    // side effects because this is the silent-failure path.
-                    // Operator-configured stderr patterns are explicit trusted
-                    // diagnostics and bench directly.
+                    // Audit rework clean-exit/no-diff is the ambiguous empty
+                    // result this policy exists to disambiguate. A matched
+                    // captured auth signature is infra, so publish the
+                    // availability exclusion before throwing and let class
+                    // fallback reroute the item. Other phases retain the
+                    // existing stdout / built-in stderr corroboration guard.
+                    var isAuditEmptyRework = !isInitial
+                        && reworkNoDiffHandling == ReworkNoDiffHandling.AuditEmptyRework;
                     var matchedConfiguredStderrPattern =
-                        AuthClassifierMatchesConfiguredStderrPattern(runner.Kind, agentResult.Stderr);
+                        deferredSuccessAuthDetection.MatchedConfiguredStderrPattern;
                     await HandleAuthRequiredDetectionAsync(
                         item,
                         project,
@@ -4753,8 +4759,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         deferredSuccessAuthDetection.Classification,
                         throwOnMatch: true,
                         stdoutOnlyEvidence: deferredSuccessAuthDetection.IsStdoutOnly,
-                        requireStdoutOnlyCorroboration: true,
-                        requireAuthCorroboration: !deferredSuccessAuthDetection.IsStdoutOnly
+                        requireStdoutOnlyCorroboration: !isAuditEmptyRework,
+                        requireAuthCorroboration: !isAuditEmptyRework
+                            && !deferredSuccessAuthDetection.IsStdoutOnly
                             && !matchedConfiguredStderrPattern,
                         ct: ct);
                 }
@@ -4851,7 +4858,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     // on the first empty pass.
                     throw new ReworkProducedNoChangesException(
                         runner.Kind,
-                        message: "Rework agent produced no changes; cannot resolve audit findings");
+                        message: "Rework agent produced no changes");
                 }
 
                 // Non-audit rework callers keep the pre-existing terminal error
@@ -6732,10 +6739,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
             RequiresStructuredStreamForSessionId: true,
         };
 
-    private bool AuthClassifierMatchesConfiguredStderrPattern(AgentKind agent, string? stderr) =>
-        _authFailureClassifier is AgentAuthFailureClassifier classifier
-        && classifier.ContainsConfiguredStderrPattern(agent, stderr);
-
     private async Task<bool> HandleAuthRequiredOutputAsync(
         WorkItem? item,
         Project project,
@@ -6825,10 +6828,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
         DateTimeOffset agentEndedAt,
         CancellationToken ct)
     {
-        // Rework-only clean-exit/no-diff infra classification. CLI stderr is
-        // accepted directly; stdout and terminal diagnostics can include model,
-        // tool, or repository-controlled text, so they need quota-probe
-        // corroboration before they can write observed-failure state or reroute.
+        // Rework-only clean-exit/no-diff infra classification. Captured
+        // stdout/stderr are the rework run's output and must be disambiguated
+        // before genuine empty-rework handling. Runner terminal diagnostics are
+        // a separate side channel, so they still need quota-probe corroboration.
         await ThrowIfNoDiffQuotaFailureFromTextAsync(
             item: item,
             project: project,
@@ -6856,7 +6859,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             sandboxId: sandboxId,
             agentEndedAt: agentEndedAt,
             evidenceSource: "captured stdout",
-            evidenceTrust: NoDiffQuotaEvidenceTrust.RequiresQuotaProbe,
+            evidenceTrust: NoDiffQuotaEvidenceTrust.CliOwned,
             ct: ct);
 
         if (!string.IsNullOrWhiteSpace(agentResult.TerminalDiagnostic))
@@ -6898,7 +6901,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             observedModelId: observedModelId,
             summary: agentResult.Summary,
             stderr: agentResult.TerminalDiagnostic,
-            stdout: agentResult.Stdout,
+            stdout: null,
             phase: phase,
             sandboxId: sandboxId,
             agentEndedAt: agentEndedAt,
@@ -6948,7 +6951,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 authRequired,
                 throwOnMatch: true,
                 stdoutOnlyEvidence: string.IsNullOrWhiteSpace(stderr) && !string.IsNullOrWhiteSpace(stdout),
-                requireStdoutOnlyCorroboration: true,
+                requireStdoutOnlyCorroboration: evidenceTrust == NoDiffQuotaEvidenceTrust.RequiresQuotaProbe,
                 requireAuthCorroboration: evidenceTrust == NoDiffQuotaEvidenceTrust.RequiresQuotaProbe,
                 ct: ct);
         }
@@ -6985,7 +6988,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             stdout: stdout,
             bypassExitedSummaryGuard: true);
 
-        throw new TerminalQuotaError(noChangeQuota!.Kind,
+        throw new TerminalQuotaError(noChangeQuota.Kind,
             $"Agent {agent} reported quota failure on clean-exit/no-diff rework from {evidenceSource}: {RedactAndTruncateAgentDetail(stderr ?? stdout ?? string.Empty)}",
             noChangeQuota.ResetAt);
     }
@@ -7052,7 +7055,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             ModelId = observedModelId ?? item.ModelId,
             ReasoningMode = item.ReasoningMode,
             Billing = AgentBilling.Subscription,
-            QualityScore = 100,
+            QualityScore = SyntheticQuotaProbeQualityScore,
         };
     }
 
@@ -7090,8 +7093,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             throwOnMatch: true,
             stdoutOnlyEvidence: string.IsNullOrWhiteSpace(agentResult.Stderr)
                 && !string.IsNullOrWhiteSpace(agentResult.Stdout),
-            requireStdoutOnlyCorroboration: true,
-            requireAuthCorroboration: true,
+            requireStdoutOnlyCorroboration: false,
+            requireAuthCorroboration: false,
             ct: ct);
     }
 
@@ -7911,7 +7914,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     iterationTag);
                 EmitSessionAuditOutcomeMetrics(iteration, "failed");
                 AuditLog.AuditFailed(iteration, blocking.Count);
-                var summary = string.Join("; ", blocking.Take(5).Select(f => $"[{f.AuditorName}] {f.Title}"));
+                var summary = string.Join("; ", blocking
+                    .Take(AuditEscalationSummaryFindingLimit)
+                    .Select(f => $"[{f.AuditorName}] {f.Title}"));
                 throw new AuditFailedException(
                     $"Audit did not pass after {iteration} iterations. {blocking.Count} blocking finding(s): {summary}");
             }
@@ -8027,7 +8032,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         var blockingFindings = BlockingProgressFindingsForSummary(last);
         AuditLog.AuditFailed(last.Iteration, blockingFindings.Count);
         var summary = string.Join("; ", blockingFindings
-            .Take(5)
+            .Take(AuditEscalationSummaryFindingLimit)
             .Select(f => $"[{f.AuditorName}] {f.Title}"));
         throw new AuditFailedException(
             $"Audit did not pass after {last.Iteration} iterations. {blockingFindings.Count} blocking finding(s): {summary}");
@@ -8264,14 +8269,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
     /// history shows convergence progress; otherwise (or when retries exhaust)
     /// parks the item via the same operator-input flow the audit-iteration
     /// ceiling uses, so a partially-converged item is preserved instead of
-    /// being terminal-failed on a single declined pass.
+    /// being terminal-failed on a single declined pass. A final-budget empty
+    /// rework with no convergence is still terminal, mirroring the audit
+    /// ceiling's no-progress branch.
     /// </summary>
     /// <remarks>
-    /// Hard terminal-fail for genuinely-empty rework is left to the audit-loop
-    /// ceiling branch (no budget AND no convergence). Inside this helper we
-    /// always still have audit budget (RunAuditReworkAsync is only invoked
-    /// below the ceiling), so the worst case is "park" — never a fresh
-    /// AuditFailedException for the empty-rework case.
+    /// Hard terminal-fail for genuinely-empty rework is limited to the
+    /// no-convergence case where this empty pass has consumed the last rework
+    /// opportunity in the configured audit budget.
     /// </remarks>
     private async Task<bool> HandleEmptyReworkAsync(
         WorkItem item,
@@ -8349,11 +8354,23 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
 
         // Either we never had convergence, escalation retries are disabled, or
-        // every escalation pass came back empty. Park for operator review using
-        // the same flow the audit ceiling uses when the run still shows
-        // convergence — both are "in-budget but the agent won't make progress
-        // unaided." Auditors and operators can resume the item with a clearer
-        // prompt or merge by hand.
+        // every escalation pass came back empty. If this was the last available
+        // rework opportunity and there is still no convergence, mirror the
+        // audit ceiling's terminal no-progress branch. Otherwise park through
+        // the same operator-input flow the audit ceiling uses for visible
+        // progress.
+        if (!converging && reworkIterationNumber >= maxIterations)
+        {
+            CodeyBoxMeters.ReworkEmptyEvents.Add(1,
+                new KeyValuePair<string, object?>("outcome", "failed"));
+            var last = auditHistory[^1];
+            var remaining = BuildBlockingFindingSummary(last);
+            AuditLog.AuditFailed(last.Iteration, remaining.Count);
+            throw new AuditFailedException(
+                $"Rework agent produced no changes at final audit iteration budget ({reworkIterationNumber}/{maxIterations}) with no convergence progress. " +
+                $"{remaining.Count} blocking finding(s): {remaining.Summary}");
+        }
+
         CodeyBoxMeters.ReworkEmptyEvents.Add(1,
             new KeyValuePair<string, object?>("outcome", "parked"));
         _log.LogWarning(
@@ -8365,7 +8382,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             maxIterations,
             converging,
             attempts);
-        await ParkEmptyReworkForOperatorAsync(item, project, auditHistory, ct);
+        await ParkAuditMaxIterationsForOperatorAsync(item, project, auditHistory, ct);
         return true;
     }
 
@@ -8402,36 +8419,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
             message,
             details,
             auditLogReason: "audit max iterations with progress");
-    }
-
-    private async Task ParkEmptyReworkForOperatorAsync(
-        WorkItem item,
-        Project project,
-        IReadOnlyList<AuditProgressSnapshot> history,
-        CancellationToken ct)
-    {
-        var message = BuildEmptyReworkEscalationMessage(history);
-        var details = BuildAuditMaxIterationEscalationDetails(item.Id, history);
-        await ParkAuditForOperatorAsync(
-            item,
-            project,
-            history,
-            ct,
-            stepName: "audit-empty-rework-escalate",
-            message,
-            details,
-            auditLogReason: "empty rework produced no changes");
-    }
-
-    private static string BuildEmptyReworkEscalationMessage(
-        IReadOnlyList<AuditProgressSnapshot> history)
-    {
-        var last = history[^1];
-        var remaining = BuildBlockingFindingSummary(last);
-
-        return
-            $"Rework agent produced no changes during audit rework ({last.Iteration}/{last.MaxIterations}); parked for operator review instead of hard-failing and discarding accumulated work. " +
-            $"{remaining.Count} blocking finding(s) remain: {remaining.Summary}";
     }
 
     private async Task ParkAuditForOperatorAsync(
@@ -8905,7 +8892,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     {
         var remaining = BlockingProgressFindingsForSummary(snapshot);
         var summary = string.Join("; ", remaining
-            .Take(5)
+            .Take(AuditEscalationSummaryFindingLimit)
             .Select(f => $"[{f.AuditorName}] {f.Title}"));
         return (remaining.Count, summary);
     }

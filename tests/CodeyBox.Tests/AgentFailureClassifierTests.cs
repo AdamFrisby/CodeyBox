@@ -214,7 +214,9 @@ public sealed class AgentFailureClassifierTests
                 ["custom"] = [new AuthFailurePattern("custom auth ceremony required")],
             });
 
-        Assert.NotNull(classifier.Detect(new AgentKind("custom"), "custom auth ceremony required", null));
+        var hit = classifier.DetectDetailed(new AgentKind("custom"), "custom auth ceremony required", null);
+        Assert.NotNull(hit);
+        Assert.True(hit.MatchedConfiguredStderrPattern);
         Assert.Null(classifier.Detect(AgentKind.Codex, "custom auth ceremony required", null));
     }
 

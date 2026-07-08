@@ -365,6 +365,7 @@ public static class AgentFailureClassifier
         var matchedDefaultStdout = matchedTrustedStdoutTranscript
             || ContainsShortAuthRequiredStdout(stdout);
         var matchedStdoutFragment = ContainsAuthRequiredFragmentInStdout(stdout);
+        var matchedConfiguredStderr = false;
         var matchedConfiguredStdout = false;
 
         foreach (var pattern in AdditionalAuthPatternsFor(kind, additionalPatternsByAgent))
@@ -376,6 +377,7 @@ public static class AgentFailureClassifier
                 && !string.IsNullOrEmpty(stderr)
                 && stderr.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
             {
+                matchedConfiguredStderr = true;
                 matchedStderr = true;
             }
 
@@ -406,7 +408,8 @@ public static class AgentFailureClassifier
             matchedStdout,
             matchedTrustedStdoutTranscript,
             matchedConfiguredStdout,
-            matchedDefaultStdout);
+            matchedDefaultStdout,
+            matchedConfiguredStderr);
     }
 
     private static IEnumerable<AuthFailurePattern> AdditionalAuthPatternsFor(

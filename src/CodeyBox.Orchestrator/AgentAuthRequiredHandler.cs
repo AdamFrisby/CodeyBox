@@ -24,7 +24,7 @@ public interface IAgentAuthRequiredHandler
         string phase,
         AgentFailureClassification classification,
         bool stdoutOnlyEvidence,
-        string? evidenceTrustNote = null,
+        string? stdoutOnlyNote = null,
         Release? release = null);
 
     /// <summary>
@@ -62,12 +62,12 @@ public sealed class AgentAuthRequiredHandler : IAgentAuthRequiredHandler
         string phase,
         AgentFailureClassification classification,
         bool stdoutOnlyEvidence,
-        string? evidenceTrustNote = null,
+        string? stdoutOnlyNote = null,
         Release? release = null)
     {
         var detail = classification.Reason ?? "login prompt matched";
-        if (stdoutOnlyEvidence || !string.IsNullOrWhiteSpace(evidenceTrustNote))
-            detail = $"{detail}; {evidenceTrustNote ?? "stdout accepted as authoritative CLI output for this phase"}";
+        if (stdoutOnlyEvidence || !string.IsNullOrWhiteSpace(stdoutOnlyNote))
+            detail = $"{detail}; {stdoutOnlyNote ?? "stdout accepted as authoritative CLI output for this phase"}";
 
         var phaseScope = release is null ? phase : $"{phase} for release {release.Id}";
         return SingleLineSummary($"auth required from agent output during {phaseScope}: {detail}");

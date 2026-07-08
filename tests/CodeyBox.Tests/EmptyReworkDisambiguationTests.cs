@@ -21,8 +21,9 @@ namespace CodeyBox.Tests;
 ///         escalation re-dispatch with an explicit "you committed nothing,
 ///         modify files" instruction (gated on
 ///         <see cref="PipelineTuningOptions.EmptyReworkEscalationRetries"/>
-///         and <c>HasAuditConvergenceProgress</c>); on still-empty falls back
-///         to the operator-input park flow.</item>
+///         and <c>HasAuditConvergenceProgress</c>); on still-empty it parks
+///         when progress is visible, while final-budget no-progress empty
+///         rework remains terminal.</item>
 ///   <item>Initial work phase (<c>isInitial==true</c>) stays fail-fast — no
 ///         audit loop sits behind it to recover an empty pass.</item>
 /// </list>
@@ -96,6 +97,49 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
         Assert.IsType<AuditMaxIterationsEscalationDetails>(parked.Details);
         // The auditor ran exactly once (iteration 1 → rework → empty → park,
         // never reaches iteration 2 audit).
+        Assert.Equal(1, auditor.Calls);
+    }
+
+    [Fact]
+    public async Task EmptyRework_FinalBudgetNoConvergence_FailsAuditInsteadOfParking()
+    {
+        // MaxIterations=2 means the rework after audit iteration 1 is the last
+        // available rework opportunity. With no convergence history and no
+        // auth/quota signature, a no-diff rework remains terminal rather than
+        // parking for operator review.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new OnceFailingAuditor();
+        var audit = new ProjectAudit
+        {
+            MaxIterations = 2,
+            AuditTypes = ["scripted"],
+        };
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            EmptyReworkEscalationRetries = 3,
+        });
+        var webhooks = new CapturingWebhookDispatcher();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectAudit: audit,
+            pipelineTuning: tuning,
+            webhookDispatcher: webhooks);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "v1\n"));
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "v1\n"));
+
+        var item = NewItem("feature/empty-rework-final-budget");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.AuditFailed, final!.State);
+        Assert.Contains("final audit iteration budget", final.LastError ?? string.Empty, StringComparison.Ordinal);
+        Assert.DoesNotContain(webhooks.Events, e => e.Event == "work_item.needs_operator_input");
+        Assert.DoesNotContain(tp.Agent.WorkPrompts, p =>
+            p.Contains("[empty-rework escalation attempt", StringComparison.Ordinal));
         Assert.Equal(1, auditor.Calls);
     }
 
