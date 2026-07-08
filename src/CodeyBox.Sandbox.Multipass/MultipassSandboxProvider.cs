@@ -2370,16 +2370,20 @@ git push origin HEAD:{refName}";
             ? opts.VmStartTimeout
             : MultipassSandboxOptions.DefaultVmStartTimeout;
         var deadline = DateTime.UtcNow + startTimeout;
+        var reachedRunning = false;
         while (DateTime.UtcNow < deadline)
         {
             ct.ThrowIfCancellationRequested();
             var info = await RunAsync(opts, [opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct, workItemId: workItemId);
             ThrowIfProvisioningRetryExhausted("info", info);
             if (info.ExitCode == 0 && info.Stdout.Contains("Running", StringComparison.Ordinal))
+            {
+                reachedRunning = true;
                 break;
+            }
             await Task.Delay(TimeSpan.FromSeconds(1), ct);
         }
-        if (DateTime.UtcNow >= deadline)
+        if (!reachedRunning)
         {
             ThrowProvisioningDeferred(
                 "vm-start",
