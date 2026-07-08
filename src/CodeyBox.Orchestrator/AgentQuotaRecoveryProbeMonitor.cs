@@ -101,8 +101,7 @@ public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
             }
 
             var nowUtc = _time.GetUtcNow();
-            if (!snapshot.IsKnown
-                || !await _quotaGate.AllowsAsync(member, snapshot, nowUtc, ct).ConfigureAwait(false))
+            if (!await _quotaGate.AllowsAsync(member, snapshot, nowUtc, ct).ConfigureAwait(false))
             {
                 _publisher.RecordQuotaUsability(
                     member,

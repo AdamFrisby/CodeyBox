@@ -27,7 +27,7 @@ namespace CodeyBox.Orchestrator;
 /// TOD windows are pre-parsed at construction time so evaluation is allocation-free.
 /// <see cref="TimeProvider"/> is the clock source; inject a fake for tests.
 /// </summary>
-public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IQuotaRetryRouter, IQuotaRetryAdmissionRouter, IAgentRoutingReadiness
+public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQuotaAvailabilitySignal, IQuotaRetryRouter, IQuotaRetryAdmissionRouter, IAgentRoutingReadiness
 {
     // The class catalog and pre-parsed TOD modifiers are bundled into a single
     // record so the hot-reload coordinator can publish a coherent (catalog,
@@ -55,6 +55,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IQuotaRe
     private readonly InVmSmokeSandboxTarget? _configuredSmokeTarget;
     private readonly IAgentDispatchAvailability? _dispatchAvailability;
     private readonly IAgentQuotaAvailabilityPublisher? _quotaAvailabilityPublisher;
+    private readonly AgentQuotaAvailabilityBroadcaster? _localQuotaAvailability;
     // Default fit when no historical samples exist (spec: "fits 2 concurrent
     // burns" so the queue does not stall on cold start). Exposed as a constant
     // so /concurrency surface and tests reference the same value.
@@ -122,6 +123,26 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IQuotaRe
         _configuredSmokeTarget = configuredSmokeTarget;
         _dispatchAvailability = dispatchAvailability;
         _quotaAvailabilityPublisher = quotaAvailabilityPublisher;
+        if (quotaAvailabilityPublisher is not IAgentQuotaAvailabilitySignal)
+            _localQuotaAvailability = new AgentQuotaAvailabilityBroadcaster();
+    }
+
+    public event Action? QuotaUsableThresholdCrossed
+    {
+        add
+        {
+            if (_quotaAvailabilityPublisher is IAgentQuotaAvailabilitySignal signal)
+                signal.QuotaUsableThresholdCrossed += value;
+            else
+                _localQuotaAvailability!.QuotaUsableThresholdCrossed += value;
+        }
+        remove
+        {
+            if (_quotaAvailabilityPublisher is IAgentQuotaAvailabilitySignal signal)
+                signal.QuotaUsableThresholdCrossed -= value;
+            else
+                _localQuotaAvailability!.QuotaUsableThresholdCrossed -= value;
+        }
     }
 
     /// <summary>
@@ -334,7 +355,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IQuotaRe
         RecordObservedAvailability(member, quota);
 
         var gate = await EvaluateGateAsync(member, item.ProjectId, quota, nowUtc, ct).ConfigureAwait(false);
-        _quotaAvailabilityPublisher?.RecordQuotaUsability(
+        RecordQuotaUsability(
             member,
             gate.Allow,
             publishRecoverySignal: true);
@@ -651,7 +672,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IQuotaRe
             else
             {
                 RecordObservedAvailability(member, quota);
-                _quotaAvailabilityPublisher?.RecordQuotaUsability(
+                RecordQuotaUsability(
                     member,
                     gate.Allow,
                     publishRecoverySignal: false);
@@ -1235,7 +1256,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IQuotaRe
             RecordObservedAvailability(member, quota);
 
             var gate = await EvaluateGateAsync(member, item.ProjectId, quota, nowUtc, ct);
-            _quotaAvailabilityPublisher?.RecordQuotaUsability(
+            RecordQuotaUsability(
                 member,
                 gate.Allow,
                 publishRecoverySignal: true);
@@ -1301,9 +1322,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IQuotaRe
     }
 
     /// <summary>
-    /// Marks a class member as exhausted in this process for <paramref name="ttl"/>
-    /// (or until <paramref name="resetAt"/>, whichever is sooner). Subsequent
-    /// calls to <see cref="OrderedFallbackCandidatesAsync"/> and
+    /// Marks a class member as exhausted in this process for <paramref name="ttl"/>.
+    /// A future <paramref name="resetAt"/> hint may shorten the gate; past or
+    /// current reset hints are ignored. Subsequent calls to
+    /// <see cref="OrderedFallbackCandidatesAsync"/> and
     /// <see cref="ResolveAsync"/> will skip the member while the suppression is
     /// active. Always combine with <see cref="IAgentQuotaProbe.MarkExhaustedAsync"/>
     /// so the suppression also reaches any probe-side cache.
@@ -1321,7 +1343,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IQuotaRe
         }
 
         if (_exhausted.MarkExhausted(member, ttl, nowUtc, resetAt, earliestKnownReset))
-            _quotaAvailabilityPublisher?.RecordQuotaUsability(member, isUsable: false);
+            RecordQuotaUsability(member, isUsable: false, publishRecoverySignal: true);
     }
 
     public bool IsExhausted(AgentMembership member, DateTimeOffset nowUtc)
@@ -1930,20 +1952,38 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IQuotaRe
         bool publishRecoverySignal)
     {
         RecordObservedAvailability(member, quota);
-        _quotaAvailabilityPublisher?.RecordQuotaUsability(
+        RecordQuotaUsability(
             member,
             gate.Allow,
             publishRecoverySignal);
     }
 
-    private AgentQuotaMemberKey RecordObservedAvailability(
+    private bool RecordQuotaUsability(
+        AgentMembership member,
+        bool isUsable,
+        bool publishRecoverySignal = true)
+    {
+        var recorded = _quotaAvailabilityPublisher?.RecordQuotaUsability(
+            member,
+            isUsable,
+            publishRecoverySignal) ?? true;
+        if (_localQuotaAvailability is not null)
+        {
+            recorded = _localQuotaAvailability.RecordQuotaUsability(
+                member,
+                isUsable,
+                publishRecoverySignal) && recorded;
+        }
+        return recorded;
+    }
+
+    private void RecordObservedAvailability(
         AgentMembership member,
         EffectiveQuota quota)
     {
         var key = ExhaustionKey(member);
         _lastAvailablePct[key] = quota.AvailablePct;
         _lastEffectiveQuota[key] = quota;
-        return key;
     }
 
     private bool KnownQuotaMeetsFloor(AgentMembership member, EffectiveQuota quota, DateTimeOffset nowUtc)

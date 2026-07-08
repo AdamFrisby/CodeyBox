@@ -39,6 +39,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
     private readonly ConcurrentDictionary<string, bool> _invalidIntervalWarnings = new(StringComparer.Ordinal);
     private Task? _wakeUpSweepTask;
     private int _wakeUpSweepScheduled;
+    private int _wakeUpSweepPending;
     private int _disposed;
 
     // Active timers for targeted wakeups. Key = WorkItemId.
@@ -530,9 +531,15 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             return;
         if (_wakeUpSweepCts.IsCancellationRequested)
             return;
-        if (Interlocked.Exchange(ref _wakeUpSweepScheduled, 1) == 1)
+        Interlocked.Exchange(ref _wakeUpSweepPending, 1);
+        if (Interlocked.CompareExchange(ref _wakeUpSweepScheduled, 1, 0) == 1)
             return;
 
+        StartClassAvailabilityWakeUpSweep();
+    }
+
+    private void StartClassAvailabilityWakeUpSweep()
+    {
         var task = Task.Run(() => RunClassAvailabilityWakeUpSweepAsync(_wakeUpSweepCts.Token));
         lock (_wakeUpSweepLock)
         {
@@ -544,7 +551,10 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
     {
         try
         {
-            await RunPeriodicSweepAsync(ct);
+            while (Interlocked.Exchange(ref _wakeUpSweepPending, 0) == 1)
+            {
+                await RunPeriodicSweepAsync(ct);
+            }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -556,6 +566,13 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         finally
         {
             Interlocked.Exchange(ref _wakeUpSweepScheduled, 0);
+            if (Volatile.Read(ref _wakeUpSweepPending) == 1
+                && Volatile.Read(ref _disposed) == 0
+                && !_wakeUpSweepCts.IsCancellationRequested
+                && Interlocked.CompareExchange(ref _wakeUpSweepScheduled, 1, 0) == 0)
+            {
+                StartClassAvailabilityWakeUpSweep();
+            }
         }
     }
 

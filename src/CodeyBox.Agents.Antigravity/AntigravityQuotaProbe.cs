@@ -94,7 +94,6 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
     // credential under the same route is not pinned behind the prior account's
     // runtime 429.
     private readonly Dictionary<RuntimeExhaustionKey, AgentQuotaExhaustionEntry> _exhausted = new();
-    private readonly HashSet<RuntimeExhaustionKey> _recoveryProbeBypass = [];
     private readonly SemaphoreSlim _lock = new(1, 1);
 
     public AgentKind Kind => AgentKind.Antigravity;
@@ -129,8 +128,7 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
         try
         {
             var now = _timeProvider.GetUtcNow();
-            var bypassRuntimeGate = _recoveryProbeBypass.Remove(runtimeKey);
-            if (!bypassRuntimeGate && TryGetExhausted(runtimeKey, now, out var ex))
+            if (TryGetExhausted(runtimeKey, now, out var ex))
             {
                 snapshot = new AgentQuotaSnapshot
                 {
@@ -146,8 +144,6 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
 
             snapshot = await ProbeAuthorizationAsync(token, modelKey, ct).ConfigureAwait(false);
             _cache[cacheKey] = new CacheEntry(snapshot, now + _cacheTtl);
-            if (bypassRuntimeGate && snapshot.IsKnown && snapshot.AvailablePct > 0)
-                _exhausted.Remove(runtimeKey);
         }
         finally
         {
@@ -196,7 +192,6 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
         try
         {
             _cache.Clear();
-            _recoveryProbeBypass.Clear();
         }
         finally
         {
@@ -213,13 +208,11 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
 
         var routeKey = member.RouteKey;
         var modelKey = ModelKeyFor(member);
-        var runtimeKey = new RuntimeExhaustionKey(routeKey, token, modelKey);
         var cacheKey = (routeKey, token, modelKey);
         _lock.Wait();
         try
         {
             _cache.Remove(cacheKey);
-            _recoveryProbeBypass.Add(runtimeKey);
         }
         finally
         {
@@ -245,7 +238,6 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
         }
 
         var next = new AgentQuotaExhaustionEntry(expiresAt, storedResetAt);
-        _recoveryProbeBypass.Remove(key);
         if (!_exhausted.TryGetValue(key, out var existing)
             || existing.ExpiresAt <= nowUtc
             || next.ExpiresAt < existing.ExpiresAt)

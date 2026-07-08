@@ -94,8 +94,6 @@ public sealed class AgentQuotaExhaustionTracker
                 _entries.TryRemove(entry);
         }
     }
-
-    public void Clear() => _entries.Clear();
 }
 
 public readonly record struct AgentQuotaExhaustionEntry(DateTimeOffset ExpiresAt, DateTimeOffset? ResetAt);

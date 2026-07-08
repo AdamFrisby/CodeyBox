@@ -29,9 +29,10 @@ namespace CodeyBox.Orchestrator;
 ///
 /// <para>Keyed by <c>(RouteKey, ModelId)</c> — <c>RouteKey</c> is account-scoped
 /// (<c>agent/instanceId</c>), so distinct accounts never share a retained value.
-/// A within-account token rotation needs no special handling: the rotated read
-/// either succeeds (overwrites the retained value) or fails Permanent (drops it),
-/// and the account's quota is unchanged in the meantime.</para>
+/// Credential-state invalidation is required on token rotation: it clears
+/// retained last-known-good readings before the next live probe so a new token
+/// is never admitted or denied by stale data captured under the previous
+/// credential.</para>
 /// </summary>
 public sealed class LastKnownGoodQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalidator, IAgentQuotaRecoveryStateInvalidator
 {

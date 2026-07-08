@@ -11346,6 +11346,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 _auditQuotaOptions.ObservedFailureWindow,
                 DateTimeOffset.UtcNow, ct))
         {
+            _quotaAvailabilityPublisher?.RecordQuotaUsability(
+                member,
+                isUsable: false,
+                publishRecoverySignal: true);
             return (false, "recent observed quota failure");
         }
 
@@ -11401,7 +11405,22 @@ public sealed partial class PipelineRunner : IPipelineRunner
             AvailablePct = combinedPct,
         };
 
-        return EvaluateAuditQuotaGate(member, combinedQuota, budgetOnly: false);
+        var decision = EvaluateAuditQuotaGate(member, combinedQuota, budgetOnly: false);
+        var providerGate = _auditQuotaGatePolicy.Evaluate(member, probeQuota, DateTimeOffset.UtcNow);
+        var denialIsBudgetOnly = !decision.Allowed
+            && providerGate.Allow
+            && budgetPct >= 0
+            && combinedPct >= 0
+            && (probeQuota.AvailablePct < 0 || budgetPct <= probeQuota.AvailablePct);
+        if (!denialIsBudgetOnly)
+        {
+            _quotaAvailabilityPublisher?.RecordQuotaUsability(
+                member,
+                isUsable: decision.Allowed,
+                publishRecoverySignal: true);
+        }
+
+        return decision;
     }
 
     private (bool Allowed, string Reason) EvaluateAuditQuotaGate(
@@ -16260,7 +16279,7 @@ Original merge-phase failure (JSON string, for context only):
             }
             catch (Exception ex)
             {
-                _log.LogDebug(
+                _log.LogWarning(
                     ex,
                     "Direct quota park probe write-back failed for {Agent}/{Model}",
                     member.Agent.Value,

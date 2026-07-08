@@ -240,6 +240,26 @@ public sealed class AgentClassRouterFallbackTests
         Assert.Equal(1, Volatile.Read(ref signalCount));
     }
 
+    [Fact]
+    public async Task ConcreteRouter_QuotaUsableSignal_SurfaceStillPublishesRecoveryEdge()
+    {
+        var member = Sub(Codex);
+        var probe = new MutableSnapshotProbe(Codex, new AgentQuotaSnapshot { AvailablePct = 1.0 });
+        var router = Build(Frontier(member), probe);
+        var signalCount = 0;
+        router.QuotaUsableThresholdCrossed += () => Interlocked.Increment(ref signalCount);
+
+        var blocked = await router.ResolveAsync(Item(), project: null, CancellationToken.None);
+        Assert.True(blocked.ShouldWait);
+        Assert.Equal(0, Volatile.Read(ref signalCount));
+
+        probe.Snapshot = new AgentQuotaSnapshot { AvailablePct = 80.0 };
+        var recovered = await router.ResolveAsync(Item(), project: null, CancellationToken.None);
+
+        Assert.Equal(Codex, recovered.Chosen!.Agent);
+        Assert.Equal(1, Volatile.Read(ref signalCount));
+    }
+
     private sealed class MutableSnapshotProbe : IAgentQuotaProbe
     {
         public MutableSnapshotProbe(AgentKind kind, AgentQuotaSnapshot snapshot)

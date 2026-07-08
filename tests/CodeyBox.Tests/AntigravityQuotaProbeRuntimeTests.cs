@@ -448,7 +448,7 @@ public sealed class AntigravityQuotaProbeRuntimeTests
     }
 
     [Fact]
-    public async Task RecoveryStateInvalidation_BypassesRuntimeGateForOneLiveProbe()
+    public async Task RecoveryStateInvalidation_PreservesRuntimeGateUntilExpiry()
     {
         var now = new DateTimeOffset(2026, 6, 9, 12, 0, 0, TimeSpan.Zero);
         var time = new FixedClock(now);
@@ -462,6 +462,13 @@ public sealed class AntigravityQuotaProbeRuntimeTests
         Assert.Empty(handler.Requests);
 
         ((IAgentQuotaRecoveryStateInvalidator)probe).InvalidateRecoveryState(member);
+        var stillGated = await probe.GetAvailabilityAsync(member, CancellationToken.None);
+
+        Assert.Equal(0.0, stillGated.AvailablePct);
+        Assert.Equal(now.AddHours(6), stillGated.ResetAt);
+        Assert.Empty(handler.Requests);
+
+        time.Advance(TimeSpan.FromHours(7));
         var recovered = await probe.GetAvailabilityAsync(member, CancellationToken.None);
 
         Assert.Equal(100.0, recovered.AvailablePct);

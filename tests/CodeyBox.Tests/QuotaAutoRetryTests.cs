@@ -1158,6 +1158,54 @@ public sealed class QuotaAutoRetryTests : IDisposable
             Task.FromResult(_snapshot);
     }
 
+    private sealed class ManualQuotaAvailabilitySignal : IAgentQuotaAvailabilitySignal
+    {
+        public event Action? QuotaUsableThresholdCrossed;
+        public void Fire() => QuotaUsableThresholdCrossed?.Invoke();
+    }
+
+    private sealed class SignalDuringFirstRetryRouter : IQuotaRetryRouter
+    {
+        private readonly Action _signalDuringFirstCall;
+        private int _resolveCalls;
+
+        public SignalDuringFirstRetryRouter(Action signalDuringFirstCall)
+            => _signalDuringFirstCall = signalDuringFirstCall;
+
+        public int ResolveCalls => Volatile.Read(ref _resolveCalls);
+
+        public Task<QuotaRetryRoutingDecision> ResolveQuotaRetryAsync(
+            WorkItem item,
+            Project? project,
+            CancellationToken ct,
+            string? requiredCapability = null)
+        {
+            var call = Interlocked.Increment(ref _resolveCalls);
+            if (call == 1)
+            {
+                _signalDuringFirstCall();
+                return Task.FromResult(new QuotaRetryRoutingDecision(
+                    ShouldWait: true,
+                    NoEligibleMembers: false,
+                    Reason: "first pass still gated",
+                    WaitingForPausedAgent: false));
+            }
+
+            return Task.FromResult(new QuotaRetryRoutingDecision(
+                ShouldWait: false,
+                NoEligibleMembers: false,
+                Reason: "second pass available",
+                WaitingForPausedAgent: false));
+        }
+
+        public Task<DateTimeOffset?> ComputeEarliestExhaustedResetAsync(
+            WorkItem item,
+            Project? project,
+            CancellationToken ct,
+            string? requiredCapability = null)
+            => Task.FromResult<DateTimeOffset?>(null);
+    }
+
     private sealed class MutableProbe : IAgentQuotaProbe
     {
         public MutableProbe(AgentKind kind, double availablePct)
@@ -2267,6 +2315,102 @@ public sealed class QuotaAutoRetryTests : IDisposable
             options,
             NullLogger<AgentQuotaRecoveryProbeMonitor>.Instance,
             _time));
+    }
+
+    [Fact]
+    public async Task QuotaRecoveryProbeMonitor_DelegatesUnknownSnapshotPolicyToGate()
+    {
+        var options = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10,
+            UnknownPolicy = QuotaUnknownPolicy.FailOpen,
+        };
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Codex,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+        var probe = new MutableProbe(
+            AgentKind.Codex,
+            AgentQuotaSnapshot.UnknownSnapshot(QuotaUnknownReason.Transient, "test unknown"));
+        using var monitor = new AgentQuotaRecoveryProbeMonitor(
+            quotaSignal,
+            quotaSignal,
+            [probe],
+            new QuotaGateAvailability(new QuotaGatePolicy(options)),
+            options,
+            NullLogger<AgentQuotaRecoveryProbeMonitor>.Instance,
+            _time);
+        var signalCount = 0;
+        quotaSignal.QuotaUsableThresholdCrossed += () => Interlocked.Increment(ref signalCount);
+
+        quotaSignal.RecordQuotaUsability(member, isUsable: false);
+
+        Assert.Equal(1, await monitor.ProbeTrackedMembersOnceAsync(CancellationToken.None));
+        Assert.Equal(1, Volatile.Read(ref signalCount));
+    }
+
+    [Fact]
+    public async Task Scheduler_QuotaUsableSignalDuringActiveSweep_QueuesFollowUpSweep()
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        var store = new SqliteWorkItemStore(stateDb);
+        using var _ = store;
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var projectId = new ProjectId("test-project");
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = projectId,
+            DisplayName = "Test",
+            RepositoryUrl = "http://fake",
+            DefaultAgentClass = "signal-race-class",
+        });
+        var quotaSignal = new ManualQuotaAvailabilitySignal();
+        var router = new SignalDuringFirstRetryRouter(quotaSignal.Fire);
+        using var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = TimeSpan.FromHours(6),
+                    MaxAutoRetriesPerWorkItem = 3,
+                },
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            projects,
+            null,
+            null,
+            _time,
+            quotaAvailabilitySignal: quotaSignal);
+        var parked = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = "parked",
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            QuotaRetryAttempts = 0,
+            AgentClassId = "signal-race-class",
+            NextQuotaRetryAt = _time.Now.AddDays(7),
+        };
+        await store.CreateAsync(parked);
+
+        quotaSignal.Fire();
+
+        var retried = await WaitForAttemptsAsync(store, parked.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));
+        Assert.Equal(WorkItemState.Queued, retried.State);
+        Assert.True(router.ResolveCalls >= 2);
     }
 
     [Fact]

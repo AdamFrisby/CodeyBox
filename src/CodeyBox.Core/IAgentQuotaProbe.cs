@@ -26,8 +26,10 @@ public interface IAgentQuotaProbe
     /// without waiting for the next periodic probe. Called by the pipeline when an
     /// agent invocation classifies as <see cref="AgentFailureKind.QuotaExhausted"/>:
     /// the probe should suppress positive availability for <paramref name="ttl"/>
-    /// (or until <paramref name="resetAt"/>, whichever is sooner) so subsequent
-    /// pickups skip this member.
+    /// so subsequent pickups skip this member. A future <paramref name="resetAt"/>
+    /// hint may shorten the suppression window; past or current reset hints must
+    /// be ignored because they are often parsed from runtime output and must not
+    /// clear a real quota lockout immediately.
     ///
     /// <para>
     /// Default implementation is a no-op so existing probes don't have to opt in;
@@ -73,10 +75,12 @@ public interface IAgentQuotaCacheInvalidator
 public interface IAgentQuotaRecoveryStateInvalidator
 {
     /// <summary>
-    /// Prepares <paramref name="member"/> for a recovery-monitor probe. Unlike
-    /// ordinary response-cache invalidation, implementations may bypass
-    /// short-lived runtime exhaustion hints for this one probe so an early quota
-    /// recovery can be observed before the pessimistic reset estimate elapses.
+    /// Prepares <paramref name="member"/> for a recovery-monitor probe by
+    /// clearing stale response data that could hide early recovery. Implementations
+    /// must preserve runtime exhaustion gates written by
+    /// <see cref="IAgentQuotaProbe.MarkExhaustedAsync"/> unless the recovery read
+    /// actually exercises the same quota bucket and can authoritatively prove the
+    /// gate has cleared.
     /// </summary>
     void InvalidateRecoveryState(AgentMembership member);
 }
