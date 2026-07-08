@@ -378,13 +378,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // Null intentionally disables durable audit-progress history for narrow
         // test fixtures; production DI wires this dependency explicitly.
         _auditProgress = auditProgress;
-        // PayPerApi and Null probes are routing utilities, not real quota sources —
-        // exclude them so only genuine subscription probes gate the audit agent
-        // and only genuine subscription probes receive mid-iteration write-back.
         _quotaProbesByKind = auditQuotaProbes is null ? null
-            : auditQuotaProbes
-                .Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe)
-                .ToDictionary(p => p.Kind);
+            : AgentQuotaProbeCatalog.BuildKindLookup(auditQuotaProbes);
         _auditQuotaOptions = auditQuotaOptions ?? new QuotaRouterOptions();
         _auditQuotaGatePolicy = new QuotaGatePolicy(_auditQuotaOptions);
         _questionStore = questionStore;
@@ -16248,19 +16243,9 @@ Original merge-phase failure (JSON string, for context only):
         if (!IsDirectQuotaPark(item, project))
             return;
 
-        var agent = item.Agent ?? project?.DefaultAgent;
-        if (agent is null)
+        var member = DirectAgentMembership.TryCreate(item, project);
+        if (member is null)
             return;
-
-        var member = new AgentMembership
-        {
-            Agent = agent.Value,
-            InstanceId = item.AgentInstanceId,
-            ModelId = item.ModelId,
-            ReasoningMode = item.ReasoningMode,
-            Billing = AgentBilling.Subscription,
-            QualityScore = 100,
-        };
 
         if (_quotaProbesByKind is not null
             && _quotaProbesByKind.TryGetValue(member.Agent, out var probe))
@@ -16290,15 +16275,13 @@ Original merge-phase failure (JSON string, for context only):
         _quotaAvailabilityPublisher?.RecordQuotaUsability(
             member,
             isUsable: false,
-            publishRecoverySignal: true);
+            publishRecoverySignal: true,
+            resetAt);
     }
 
     private bool IsDirectQuotaPark(WorkItem item, Project? project)
     {
-        if (_classRouter is null)
-            return true;
-
-        return string.IsNullOrWhiteSpace(item.AgentClassId ?? project?.DefaultAgentClass);
+        return DirectAgentMembership.IsDirectRoute(item, project);
     }
 
     /// <summary>

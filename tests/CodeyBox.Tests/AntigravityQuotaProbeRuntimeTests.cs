@@ -262,11 +262,8 @@ public sealed class AntigravityQuotaProbeRuntimeTests
     }
 
     [Fact]
-    public async Task MarkExhausted_DefaultsToOneMinute_WhenTtlIsZero()
+    public async Task MarkExhausted_NonPositiveTtlClearsRuntimeGate()
     {
-        // TimeSpan.Zero (or negative) TTL is a probe-pipeline tripwire; the
-        // implementation falls back to a 1-minute window so the override is
-        // still meaningful instead of being instantly expired.
         var now = new DateTimeOffset(2026, 6, 9, 12, 0, 0, TimeSpan.Zero);
         var time = new FixedClock(now);
         var handler = new LoadCodeAssistRouter(HttpStatusCode.OK, TierBody);
@@ -275,14 +272,8 @@ public sealed class AntigravityQuotaProbeRuntimeTests
         await probe.MarkExhaustedAsync(Member(), TimeSpan.Zero, resetAt: null);
         var snapshot = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
 
-        // Still gating now (override is in the 1-minute fallback window).
-        Assert.Equal(0.0, snapshot.AvailablePct);
-
-        // Advance just past the 1-minute fallback; the override should expire and
-        // a fresh probe must flow.
-        time.Advance(TimeSpan.FromMinutes(2));
-        var freshSnapshot = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
-        Assert.Equal(100.0, freshSnapshot.AvailablePct);
+        Assert.Equal(100.0, snapshot.AvailablePct);
+        Assert.Single(handler.Requests);
     }
 
     [Fact]

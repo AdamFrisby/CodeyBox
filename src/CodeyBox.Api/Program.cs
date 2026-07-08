@@ -5460,7 +5460,8 @@ namespace CodeyBox.Api
         /// Seconds between event-driven recovery probes for members already
         /// observed as quota-unusable. Default 5.
         /// </summary>
-        public int QuotaRecoveryProbeIntervalSeconds { get; set; } = 5;
+        public int QuotaRecoveryProbeIntervalSeconds { get; set; } =
+            QuotaRouterDefaults.DefaultQuotaRecoveryProbeIntervalSeconds;
         /// <summary>Seconds to cache a probe result. Default 60.</summary>
         public int QuotaCacheTtlSeconds { get; set; } = 60;
         /// <summary>How the router treats unknown probe snapshots. Default UseObservedFailures.</summary>

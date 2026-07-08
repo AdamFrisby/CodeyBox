@@ -4,7 +4,7 @@ namespace CodeyBox.Core;
 
 public sealed class AgentQuotaExhaustionTracker
 {
-    private readonly ConcurrentDictionary<AgentQuotaMemberKey, AgentQuotaExhaustionEntry> _entries = new();
+    private readonly AgentQuotaExhaustionTracker<AgentQuotaMemberKey> _inner = new();
 
     /// <summary>
     /// Records an in-process exhaustion gate for <paramref name="member"/>.
@@ -19,8 +19,42 @@ public sealed class AgentQuotaExhaustionTracker
         DateTimeOffset nowUtc,
         DateTimeOffset? resetAt = null,
         DateTimeOffset? earliestKnownReset = null)
+        => _inner.MarkExhausted(
+            AgentQuotaMemberKey.From(member),
+            ttl,
+            nowUtc,
+            resetAt,
+            earliestKnownReset);
+
+    public bool TryGet(AgentMembership member, DateTimeOffset nowUtc, out AgentQuotaExhaustionEntry entry)
+        => _inner.TryGet(AgentQuotaMemberKey.From(member), nowUtc, out entry);
+
+    public bool TryClear(AgentMembership member, out AgentQuotaExhaustionEntry removed) =>
+        _inner.TryClear(AgentQuotaMemberKey.From(member), out removed);
+
+    public bool TryShorten(AgentMembership member, DateTimeOffset expiresAt, out AgentQuotaExhaustionEntry previous)
+        => _inner.TryShorten(AgentQuotaMemberKey.From(member), expiresAt, out previous);
+
+    public void PruneExpired(DateTimeOffset nowUtc) => _inner.PruneExpired(nowUtc);
+}
+
+public sealed class AgentQuotaExhaustionTracker<TKey>
+    where TKey : notnull
+{
+    private readonly ConcurrentDictionary<TKey, AgentQuotaExhaustionEntry> _entries = new();
+
+    /// <summary>
+    /// Records an in-process exhaustion gate for <paramref name="key"/>.
+    /// Non-positive TTLs clear the key instead of installing a synthetic gate.
+    /// Future reset hints shorten the gate; past or current hints are ignored.
+    /// </summary>
+    public bool MarkExhausted(
+        TKey key,
+        TimeSpan ttl,
+        DateTimeOffset nowUtc,
+        DateTimeOffset? resetAt = null,
+        DateTimeOffset? earliestKnownReset = null)
     {
-        var key = AgentQuotaMemberKey.From(member);
         if (ttl <= TimeSpan.Zero)
         {
             _entries.TryRemove(key, out _);
@@ -52,26 +86,24 @@ public sealed class AgentQuotaExhaustionTracker
         }
     }
 
-    public bool TryGet(AgentMembership member, DateTimeOffset nowUtc, out AgentQuotaExhaustionEntry entry)
+    public bool TryGet(TKey key, DateTimeOffset nowUtc, out AgentQuotaExhaustionEntry entry)
     {
-        var key = AgentQuotaMemberKey.From(member);
         if (!_entries.TryGetValue(key, out entry))
             return false;
 
         if (entry.ExpiresAt > nowUtc)
             return true;
 
-        _entries.TryRemove(new KeyValuePair<AgentQuotaMemberKey, AgentQuotaExhaustionEntry>(key, entry));
+        _entries.TryRemove(new KeyValuePair<TKey, AgentQuotaExhaustionEntry>(key, entry));
         entry = default;
         return false;
     }
 
-    public bool TryClear(AgentMembership member, out AgentQuotaExhaustionEntry removed) =>
-        _entries.TryRemove(AgentQuotaMemberKey.From(member), out removed);
+    public bool TryClear(TKey key, out AgentQuotaExhaustionEntry removed) =>
+        _entries.TryRemove(key, out removed);
 
-    public bool TryShorten(AgentMembership member, DateTimeOffset expiresAt, out AgentQuotaExhaustionEntry previous)
+    public bool TryShorten(TKey key, DateTimeOffset expiresAt, out AgentQuotaExhaustionEntry previous)
     {
-        var key = AgentQuotaMemberKey.From(member);
         while (_entries.TryGetValue(key, out previous))
         {
             if (expiresAt >= previous.ExpiresAt)

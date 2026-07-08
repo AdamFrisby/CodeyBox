@@ -201,7 +201,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                     count++;
             }
         }
-        await foreach (var item in _store.ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct))
+        foreach (var item in await ListWaitingForQuotaResetByPriorityAsync(ct))
         {
             if (await TryStartupRequeueWaitingItemAsync(item, ct))
                 count++;
@@ -370,7 +370,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                 await TryPeriodicRetryAsync(item, ct);
             }
         }
-        await foreach (var item in _store.ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct))
+        foreach (var item in await ListWaitingForQuotaResetByPriorityAsync(ct))
         {
             await TryPeriodicRetryAsync(item, ct);
         }
@@ -379,7 +379,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
     public async Task RunWatchdogRecoverySweepAsync(CancellationToken ct)
     {
         _log.LogWarning("Worker-pool health watchdog triggered quota retry recovery sweep");
-        await foreach (var item in _store.ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct))
+        foreach (var item in await ListWaitingForQuotaResetByPriorityAsync(ct))
         {
             await TryWatchdogRecoveryRetryAsync(item, ct);
         }
@@ -890,6 +890,17 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             retry.ActualFrom == retryFrom ? $"from={retryFrom}" : $"from={retryFrom}; actualFrom={retry.ActualFrom}");
     }
 
+    private async Task<IReadOnlyList<WorkItem>> ListWaitingForQuotaResetByPriorityAsync(CancellationToken ct)
+    {
+        var waiting = new List<WorkItem>();
+        await foreach (var item in _store.ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct))
+            waiting.Add(item);
+
+        return waiting
+            .OrderByDescending(item => item.Priority)
+            .ThenBy(item => item.CreatedAt)
+            .ToList();
+    }
     /// <summary>
     /// Notifies the scheduler that a work item has failed with a quota error,
     /// so it can schedule a targeted retry.

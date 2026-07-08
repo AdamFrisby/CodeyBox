@@ -16,7 +16,7 @@ internal static class QuotaRouterConfigMapper
         QuotaRecheckInterval = TimeSpan.FromSeconds(qr.QuotaRecheckIntervalSeconds),
         QuotaRecoveryProbeInterval = BuildPositiveDuration(
             qr.QuotaRecoveryProbeIntervalSeconds,
-            TimeSpan.FromSeconds(5)),
+            QuotaRouterDefaults.DefaultQuotaRecoveryProbeInterval),
         QuotaCacheTtl = TimeSpan.FromSeconds(qr.QuotaCacheTtlSeconds),
         UnknownPolicy = qr.UnknownPolicy,
         ObservedFailureWindow = TimeSpan.FromMinutes(qr.ObservedFailureWindowMinutes),
@@ -41,7 +41,7 @@ internal static class QuotaRouterConfigMapper
         dst.QuotaRecheckInterval = TimeSpan.FromSeconds(src.QuotaRecheckIntervalSeconds);
         dst.QuotaRecoveryProbeInterval = BuildPositiveDuration(
             src.QuotaRecoveryProbeIntervalSeconds,
-            TimeSpan.FromSeconds(5));
+            QuotaRouterDefaults.DefaultQuotaRecoveryProbeInterval);
         dst.UnknownPolicy = src.UnknownPolicy;
         dst.ObservedFailureWindow = TimeSpan.FromMinutes(src.ObservedFailureWindowMinutes);
         dst.ObservedFailureRetention = TimeSpan.FromMinutes(src.ObservedFailureRetentionMinutes);

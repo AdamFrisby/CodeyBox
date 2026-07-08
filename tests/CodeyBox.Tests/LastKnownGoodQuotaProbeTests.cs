@@ -266,4 +266,22 @@ public sealed class LastKnownGoodQuotaProbeTests
         Assert.Equal(2, inner.LiveFetchCount);
         Assert.Equal(98, recovered.AvailablePct);
     }
+
+    [Fact]
+    public async Task RecoveryStateInvalidation_EvictsRetainedSnapshot()
+    {
+        var clock = new Clock(new DateTimeOffset(2026, 6, 10, 12, 0, 0, TimeSpan.Zero));
+        var inner = new StubProbe { Next = new AgentQuotaSnapshot { AvailablePct = 0 } };
+        var lkg = Build(inner, clock, staleness: TimeSpan.FromHours(1));
+        var member = Member();
+
+        Assert.Equal(0, (await lkg.GetAvailabilityAsync(member, default)).AvailablePct);
+
+        inner.Next = AgentQuotaSnapshot.UnknownSnapshot(QuotaUnknownReason.Transient, "probe down");
+        lkg.InvalidateRecoveryState(member);
+        var result = await lkg.GetAvailabilityAsync(member, default);
+
+        Assert.False(result.IsKnown);
+        Assert.Equal(QuotaUnknownReason.Transient, result.Unknown);
+    }
 }

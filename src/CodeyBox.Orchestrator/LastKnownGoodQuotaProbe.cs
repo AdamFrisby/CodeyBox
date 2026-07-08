@@ -162,6 +162,10 @@ public sealed class LastKnownGoodQuotaProbe : IAgentQuotaProbe, IAgentQuotaCache
 
     public void InvalidateRecoveryState(AgentMembership member)
     {
+        var key = KeyFor(member);
+        lock (_lock)
+            _retained.Remove(key);
+
         if (_inner is IAgentQuotaRecoveryStateInvalidator recoveryInvalidator)
         {
             recoveryInvalidator.InvalidateRecoveryState(member);

@@ -93,7 +93,7 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
     // the next probe call. Keyed by route, token, and model so rotating the agy
     // credential under the same route is not pinned behind the prior account's
     // runtime 429.
-    private readonly Dictionary<RuntimeExhaustionKey, AgentQuotaExhaustionEntry> _exhausted = new();
+    private readonly AgentQuotaExhaustionTracker<RuntimeExhaustionKey> _exhausted = new();
     private readonly SemaphoreSlim _lock = new(1, 1);
 
     public AgentKind Kind => AgentKind.Antigravity;
@@ -128,7 +128,7 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
         try
         {
             var now = _timeProvider.GetUtcNow();
-            if (TryGetExhausted(runtimeKey, now, out var ex))
+            if (_exhausted.TryGet(runtimeKey, now, out var ex))
             {
                 snapshot = new AgentQuotaSnapshot
                 {
@@ -167,9 +167,9 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
         try
         {
             var now = _timeProvider.GetUtcNow();
-            MarkExhausted(
+            _exhausted.MarkExhausted(
                 new RuntimeExhaustionKey(member.RouteKey, token, ModelKeyFor(member)),
-                ttl > TimeSpan.Zero ? ttl : TimeSpan.FromMinutes(1),
+                ttl,
                 now,
                 resetAt);
         }
@@ -218,48 +218,6 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
         {
             _lock.Release();
         }
-    }
-
-    private void MarkExhausted(
-        RuntimeExhaustionKey key,
-        TimeSpan ttl,
-        DateTimeOffset nowUtc,
-        DateTimeOffset? resetAt)
-    {
-        var expiresAt = nowUtc + ttl;
-        DateTimeOffset? storedResetAt = resetAt is { } reset && reset > nowUtc ? reset : null;
-        if (storedResetAt is { } futureReset && futureReset < expiresAt)
-            expiresAt = futureReset;
-
-        if (expiresAt <= nowUtc)
-        {
-            _exhausted.Remove(key);
-            return;
-        }
-
-        var next = new AgentQuotaExhaustionEntry(expiresAt, storedResetAt);
-        if (!_exhausted.TryGetValue(key, out var existing)
-            || existing.ExpiresAt <= nowUtc
-            || next.ExpiresAt < existing.ExpiresAt)
-        {
-            _exhausted[key] = next;
-        }
-    }
-
-    private bool TryGetExhausted(
-        RuntimeExhaustionKey key,
-        DateTimeOffset nowUtc,
-        out AgentQuotaExhaustionEntry entry)
-    {
-        if (!_exhausted.TryGetValue(key, out entry))
-            return false;
-
-        if (entry.ExpiresAt > nowUtc)
-            return true;
-
-        _exhausted.Remove(key);
-        entry = default;
-        return false;
     }
 
     private const int MaxResponseChars = 64 * 1024;

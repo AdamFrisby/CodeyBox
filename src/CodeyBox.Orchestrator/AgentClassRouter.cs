@@ -331,23 +331,14 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         Project? project,
         CancellationToken ct)
     {
-        var agent = item.Agent ?? project?.DefaultAgent;
-        if (agent is null)
+        var member = DirectAgentMembership.TryCreate(item, project);
+        if (member is null)
             return new QuotaRetryRoutingDecision(
                 ShouldWait: false,
                 NoEligibleMembers: true,
                 Reason: "no direct agent configured",
                 WaitingForPausedAgent: false);
 
-        var member = new AgentMembership
-        {
-            Agent = agent.Value,
-            InstanceId = item.AgentInstanceId,
-            ModelId = item.ModelId,
-            ReasoningMode = item.ReasoningMode,
-            Billing = AgentBilling.Subscription,
-            QualityScore = 100,
-        };
         var nowUtc = _time.GetUtcNow();
         var snapshot = await ProbeOrUnknownAsync(member, ct).ConfigureAwait(false);
         var quota = ResolveMemberQuota(snapshot, member);
@@ -675,7 +666,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 RecordQuotaUsability(
                     member,
                     gate.Allow,
-                    publishRecoverySignal: false);
+                    publishRecoverySignal: false,
+                    resetAt: gate.Allow || !quota.IsKnown ? null : QuotaGatePolicy.ResolveResetHint(quota, gate));
             }
             if (gate.Allow)
             {
@@ -1259,7 +1251,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             RecordQuotaUsability(
                 member,
                 gate.Allow,
-                publishRecoverySignal: true);
+                publishRecoverySignal: true,
+                resetAt: gate.Allow || !quota.IsKnown ? null : QuotaGatePolicy.ResolveResetHint(quota, gate));
             if (gate.Allow)
                 result.Add(member);
         }
@@ -1343,7 +1336,11 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         }
 
         if (_exhausted.MarkExhausted(member, ttl, nowUtc, resetAt, earliestKnownReset))
-            RecordQuotaUsability(member, isUsable: false, publishRecoverySignal: true);
+            RecordQuotaUsability(
+                member,
+                isUsable: false,
+                publishRecoverySignal: true,
+                resetAt: earliestKnownReset ?? resetAt);
     }
 
     public bool IsExhausted(AgentMembership member, DateTimeOffset nowUtc)
@@ -1952,27 +1949,34 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         bool publishRecoverySignal)
     {
         RecordObservedAvailability(member, quota);
+        var resetAt = gate.Allow || !quota.IsKnown
+            ? null
+            : QuotaGatePolicy.ResolveResetHint(quota, gate);
         RecordQuotaUsability(
             member,
             gate.Allow,
-            publishRecoverySignal);
+            publishRecoverySignal,
+            resetAt);
     }
 
     private bool RecordQuotaUsability(
         AgentMembership member,
         bool isUsable,
-        bool publishRecoverySignal = true)
+        bool publishRecoverySignal = true,
+        DateTimeOffset? resetAt = null)
     {
         var recorded = _quotaAvailabilityPublisher?.RecordQuotaUsability(
             member,
             isUsable,
-            publishRecoverySignal) ?? true;
+            publishRecoverySignal,
+            resetAt) ?? true;
         if (_localQuotaAvailability is not null)
         {
             recorded = _localQuotaAvailability.RecordQuotaUsability(
                 member,
                 isUsable,
-                publishRecoverySignal) && recorded;
+                publishRecoverySignal,
+                resetAt) && recorded;
         }
         return recorded;
     }
@@ -2855,7 +2859,8 @@ public sealed class QuotaRouterOptions
     /// monitor is a prompt recovery path for parked work, while quota recheck is
     /// the normal router retry delay. Default 5 seconds.
     /// </summary>
-    public TimeSpan QuotaRecoveryProbeInterval { get; set; } = TimeSpan.FromSeconds(5);
+    public TimeSpan QuotaRecoveryProbeInterval { get; set; } =
+        QuotaRouterDefaults.DefaultQuotaRecoveryProbeInterval;
 
     /// <summary>
     /// How long a quota probe result is cached before a new HTTP call is made.

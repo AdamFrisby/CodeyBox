@@ -23,20 +23,21 @@ public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilityS
     public bool RecordQuotaUsability(
         AgentMembership member,
         bool isUsable,
-        bool publishRecoverySignal = true)
+        bool publishRecoverySignal = true,
+        DateTimeOffset? resetAt = null)
     {
         var key = AgentQuotaMemberKey.From(member);
+        var observation = new AgentQuotaUsabilityObservation(member, isUsable, publishRecoverySignal, resetAt);
         if (!publishRecoverySignal)
-        {
-            NotifyQuotaUsabilityObserved(new AgentQuotaUsabilityObservation(member, isUsable, publishRecoverySignal));
-            return true;
-        }
+            return NotifyQuotaUsabilityObserved(observation);
 
-        var crossedToUsable = RecordTransition(key, isUsable);
-        if (!crossedToUsable)
+        var transition = RecordTransition(key, isUsable);
+        if (!transition.CrossedToUsable)
         {
-            NotifyQuotaUsabilityObserved(new AgentQuotaUsabilityObservation(member, isUsable, publishRecoverySignal));
-            return true;
+            var observed = NotifyQuotaUsabilityObserved(observation);
+            if (!observed)
+                RollBackTransition(key, transition);
+            return observed;
         }
 
         _log.LogInformation(
@@ -46,30 +47,32 @@ public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilityS
         var delivered = NotifyQuotaUsableThresholdCrossed();
         if (!delivered)
         {
-            RollBackUsableTransition(key);
+            RollBackTransition(key, transition);
             return false;
         }
 
-        NotifyQuotaUsabilityObserved(new AgentQuotaUsabilityObservation(member, isUsable, publishRecoverySignal));
-        return true;
+        var observationDelivered = NotifyQuotaUsabilityObserved(observation);
+        if (!observationDelivered)
+            RollBackTransition(key, transition);
+        return observationDelivered;
     }
 
-    private bool RecordTransition(AgentQuotaMemberKey key, bool isUsable)
+    private QuotaUsabilityTransitionRecord RecordTransition(AgentQuotaMemberKey key, bool isUsable)
     {
         while (true)
         {
             if (!_lastUsable.TryGetValue(key, out var previous))
             {
                 if (_lastUsable.TryAdd(key, isUsable))
-                    return false;
+                    return new QuotaUsabilityTransitionRecord(null, isUsable, Changed: true, CrossedToUsable: false);
                 continue;
             }
 
             if (previous == isUsable)
-                return false;
+                return new QuotaUsabilityTransitionRecord(previous, isUsable, Changed: false, CrossedToUsable: false);
 
             if (_lastUsable.TryUpdate(key, isUsable, previous))
-                return !previous && isUsable;
+                return new QuotaUsabilityTransitionRecord(previous, isUsable, Changed: true, CrossedToUsable: !previous && isUsable);
         }
     }
 
@@ -85,12 +88,18 @@ public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilityS
             handler => handler(),
             ex => _log.LogWarning(ex, "Quota usable threshold subscriber threw; continuing"));
 
-    private void RollBackUsableTransition(AgentQuotaMemberKey key)
+    private void RollBackTransition(AgentQuotaMemberKey key, QuotaUsabilityTransitionRecord transition)
     {
-        while (_lastUsable.TryGetValue(key, out var current) && current)
+        if (!transition.Changed)
+            return;
+
+        if (transition.Previous is { } previous)
         {
-            if (_lastUsable.TryUpdate(key, false, current))
-                return;
+            _lastUsable.TryUpdate(key, previous, transition.Current);
+        }
+        else
+        {
+            _lastUsable.TryRemove(new KeyValuePair<AgentQuotaMemberKey, bool>(key, transition.Current));
         }
     }
 
@@ -124,7 +133,14 @@ public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilityS
 public sealed record AgentQuotaUsabilityObservation(
     AgentMembership Member,
     bool IsUsable,
-    bool PublishRecoverySignal);
+    bool PublishRecoverySignal,
+    DateTimeOffset? ResetAt = null);
+
+internal readonly record struct QuotaUsabilityTransitionRecord(
+    bool? Previous,
+    bool Current,
+    bool Changed,
+    bool CrossedToUsable);
 
 /// <summary>
 /// Publisher side of <see cref="IAgentQuotaAvailabilitySignal"/>.
@@ -151,7 +167,8 @@ public interface IAgentQuotaAvailabilityPublisher
     bool RecordQuotaUsability(
         AgentMembership member,
         bool isUsable,
-        bool publishRecoverySignal = true);
+        bool publishRecoverySignal = true,
+        DateTimeOffset? resetAt = null);
 }
 
 public interface IAgentQuotaAvailabilityObservationSource
