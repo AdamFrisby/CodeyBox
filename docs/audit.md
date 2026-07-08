@@ -337,18 +337,20 @@ the pipeline checks infrastructure-failure evidence:
    availability breaker can turn into a per-agent exclusion. In an
    agent class, the same exception is a fallback trigger, so the work
    item re-routes through normal scoring before falling back to a
-   terminal auth-required failure. Stdout-only auth evidence, and generic
-   captured auth-error text such as a 401 on the clean-exit/no-diff branch,
-   is routed through the existing in-VM corroboration policy before it can
-   bench the agent globally. Runner-owned terminal diagnostics are trusted
-   directly.
+   terminal auth-required failure. Stdout-only auth evidence, and built-in
+   stderr login transcripts on the clean-exit/no-diff branch, are routed
+   through the existing in-VM corroboration policy before they can bench the
+   agent globally. Operator-configured stderr auth patterns and runner-owned
+   terminal diagnostics are trusted directly.
 2. The **quota / usage classifier** runs on the **rework** no-diff branch
    over the run's captured stdout/stderr and the runner-owned
-   `TerminalDiagnostic` side channel. Several CLIs (Antigravity / `agy` in
-   particular) swallow usage-cap errors as exit-0; a quota match throws
-   `TerminalQuotaError`, which the agent-class fallback wrapper converts
-   into a re-route to a healthy class member (or, on the single-agent path,
-   parks the item in `WaitingForQuotaReset`).
+   `TerminalDiagnostic` side channel. It also checks trusted
+   `TerminalDiagnostic` quota evidence on initial work no-diff, preserving
+   the Antigravity / `agy` exit-0 usage-cap park while keeping genuine
+   initial no-ops fail-fast. Several CLIs swallow usage-cap errors as exit-0;
+   a quota match throws `TerminalQuotaError`, which the agent-class fallback
+   wrapper converts into a re-route to a healthy class member (or, on the
+   single-agent path, parks the item in `WaitingForQuotaReset`).
 
 Neither infra path counts against convergence, parks the item as
 operator-input, or terminal-fails it as "cannot resolve findings."
@@ -394,13 +396,15 @@ non-infra rework parks straight away). Hot-reloaded with the rest of
 
 The initial work phase (`isInitial==true` in `RunAgentPhaseAsync`)
 continues to throw `InvalidOperationException("Agent produced no changes
-to commit")` on an empty commit. There is no audit/rework loop sitting
-behind it to converge a "declined to work" outcome — the failure must be
-visible to the operator immediately so they can re-prompt or re-route to
-a different agent rather than the orchestrator silently spending budget on
-escalation retries that have nowhere to land. The Step-1 quota classifier
-is gated to the rework phase for the same reason: the initial no-diff
-outcome always terminal-fails, never re-routes on a quota signature.
+to commit")` on a genuine empty commit. There is no audit/rework loop
+sitting behind it to converge a "declined to work" outcome — the failure
+must be visible to the operator immediately so they can re-prompt or
+re-route to a different agent rather than the orchestrator silently
+spending budget on escalation retries that have nowhere to land. The one
+exception is runner-owned `TerminalDiagnostic` quota evidence: because that
+side channel is produced by the runner, not task prose, an initial
+clean-exit/no-diff quota block parks as `WaitingForQuotaReset` instead of
+being mislabeled as a prompt/no-op failure.
 
 ### Relation to the agent-level no-changes breaker
 

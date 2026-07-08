@@ -9,7 +9,8 @@ public sealed record AgentAuthFailureDetection(
     bool MatchedStdout,
     bool MatchedTrustedStdoutTranscript,
     bool MatchedConfiguredStdoutPattern = false,
-    bool MatchedDefaultStdoutPattern = false)
+    bool MatchedDefaultStdoutPattern = false,
+    bool MatchedConfiguredStderrPattern = false)
 {
     public bool IsStdoutOnly => MatchedStdout && !MatchedStderr;
 }

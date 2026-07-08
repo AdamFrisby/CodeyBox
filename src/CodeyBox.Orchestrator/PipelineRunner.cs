@@ -4730,10 +4730,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
             {
                 if (deferredSuccessAuthDetection is not null)
                 {
-                    // Captured agent output is not trusted enough to bench the
-                    // whole fleet on its own. Stdout-only login transcripts and
-                    // no-diff stderr auth text both require forced in-VM smoke
-                    // corroboration before auth-required side effects publish.
+                    // Captured stdout is not trusted enough to bench the whole
+                    // fleet on its own. Built-in stderr login transcripts on
+                    // clean-exit/no-diff are also corroborated before global
+                    // side effects because this is the silent-failure path.
+                    // Operator-configured stderr patterns are explicit trusted
+                    // diagnostics and bench directly.
                     await HandleAuthRequiredDetectionAsync(
                         item,
                         project,
@@ -4743,11 +4745,24 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         throwOnMatch: true,
                         stdoutOnlyEvidence: deferredSuccessAuthDetection.IsStdoutOnly,
                         requireStdoutOnlyCorroboration: true,
-                        requireAuthCorroboration: !deferredSuccessAuthDetection.IsStdoutOnly,
+                        requireAuthCorroboration: !deferredSuccessAuthDetection.IsStdoutOnly
+                            && !deferredSuccessAuthDetection.MatchedConfiguredStderrPattern,
                         ct: ct);
                 }
 
-                if (!isInitial)
+                if (isInitial)
+                {
+                    await ThrowIfNoDiffTerminalDiagnosticQuotaFailureAsync(
+                        item,
+                        runner.Kind,
+                        observedModelId,
+                        agentResult,
+                        agentPhase,
+                        sandbox.Id,
+                        agentEndedAt,
+                        ct);
+                }
+                else
                 {
                     await ThrowIfNoDiffReworkQuotaFailureAsync(
                         item,
@@ -6794,7 +6809,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // stdout/stderr are checked before the run is treated as a genuine
         // "agent made no changes" result. Initial work intentionally skips this
         // branch and remains fail-fast.
-        await ThrowIfNoDiffReworkQuotaFailureFromTextAsync(
+        await ThrowIfNoDiffQuotaFailureFromTextAsync(
             item,
             agent,
             observedModelId,
@@ -6809,7 +6824,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         if (!string.IsNullOrWhiteSpace(agentResult.TerminalDiagnostic))
         {
-            await ThrowIfNoDiffReworkQuotaFailureFromTextAsync(
+            await ThrowIfNoDiffQuotaFailureFromTextAsync(
                 item,
                 agent,
                 observedModelId,
@@ -6824,7 +6839,34 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
     }
 
-    private async Task ThrowIfNoDiffReworkQuotaFailureFromTextAsync(
+    private async Task ThrowIfNoDiffTerminalDiagnosticQuotaFailureAsync(
+        WorkItem item,
+        AgentKind agent,
+        string? observedModelId,
+        AgentResult agentResult,
+        string phase,
+        string sandboxId,
+        DateTimeOffset agentEndedAt,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(agentResult.TerminalDiagnostic))
+            return;
+
+        await ThrowIfNoDiffQuotaFailureFromTextAsync(
+            item,
+            agent,
+            observedModelId,
+            agentResult.Summary,
+            agentResult.TerminalDiagnostic,
+            agentResult.Stdout,
+            phase,
+            sandboxId,
+            agentEndedAt,
+            "terminal diagnostic",
+            ct);
+    }
+
+    private async Task ThrowIfNoDiffQuotaFailureFromTextAsync(
         WorkItem item,
         AgentKind agent,
         string? observedModelId,
@@ -7016,15 +7058,24 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
 
         // Backstop for legacy/embedded paths where the auth registry isn't
-        // wired or the prober ran without the auth-routing patch: any other
-        // probe failure here is NOT treated as corroboration, because a
-        // generic smoke-fail reason ("credential file path missing", future
-        // "authoring policy mismatch", etc.) is not authoritative login-prompt
-        // evidence. Silence over false-positive: a misbehaving agent will
-        // still be benched per-item, just not globally without a structured
-        // AuthRequired signal.
-        _ = availability;
-        return false;
+        // wired or a test double cannot publish the structured channel. The
+        // forced in-VM smoke reason is orchestrator-owned evidence, not model
+        // output, but keep the fallback narrow so generic smoke failures
+        // ("transient: try later", missing binary, policy mismatch) do not
+        // become fleet-wide auth benches.
+        return availability is { Available: false }
+            && IsLegacyAuthSmokeReason(availability.Reason);
+    }
+
+    private static bool IsLegacyAuthSmokeReason(string? reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason))
+            return false;
+
+        return reason.Contains("credential login required", StringComparison.OrdinalIgnoreCase)
+            || reason.Contains("auth required", StringComparison.OrdinalIgnoreCase)
+            || reason.Contains("authentication required", StringComparison.OrdinalIgnoreCase)
+            || reason.Contains("login required", StringComparison.OrdinalIgnoreCase);
     }
 
     private Task ThrowIfAuthRequiredOutputAsync(
@@ -8156,7 +8207,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             maxIterations,
             converging,
             attempts);
-        await ParkAuditMaxIterationsForOperatorAsync(item, project, auditHistory, ct);
+        await ParkEmptyReworkForOperatorAsync(item, project, auditHistory, ct);
         return true;
     }
 
@@ -8193,6 +8244,27 @@ public sealed partial class PipelineRunner : IPipelineRunner
             message,
             details,
             auditLogReason: "audit max iterations with progress");
+    }
+
+    private async Task ParkEmptyReworkForOperatorAsync(
+        WorkItem item,
+        Project project,
+        IReadOnlyList<AuditProgressSnapshot> history,
+        CancellationToken ct)
+    {
+        var message =
+            "Rework agent produced no changes during audit rework; parked for operator review instead of hard-failing. " +
+            BuildAuditMaxIterationEscalationMessage(history);
+        var details = BuildAuditMaxIterationEscalationDetails(item.Id, history);
+        await ParkAuditForOperatorAsync(
+            item,
+            project,
+            history,
+            ct,
+            stepName: "audit-empty-rework-escalate",
+            message,
+            details,
+            auditLogReason: "empty rework produced no changes");
     }
 
     private async Task ParkAuditForOperatorAsync(
