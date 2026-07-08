@@ -1517,7 +1517,7 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
             };
         },
         timeProvider: null);
-    source.TokenUpdated += probe.InvalidateCache;
+    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)probe).InvalidateCredentialState;
     return WrapLastKnownGood(probe, sp);
 });
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
@@ -1538,7 +1538,7 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
         }) ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<CodexQuotaProbe>());
-    source.TokenUpdated += probe.InvalidateCache;
+    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)probe).InvalidateCredentialState;
     return WrapLastKnownGood(probe, sp);
 });
 // Gemini OAuth-subscription path (Code Assist Individual / AI Pro / AI Ultra).
@@ -1560,7 +1560,7 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
             ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<GeminiQuotaProbe>());
-    source.TokenUpdated += probe.InvalidateCache;
+    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)probe).InvalidateCredentialState;
     return WrapLastKnownGood(probe, sp);
 });
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
@@ -1578,7 +1578,7 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
             ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<CursorQuotaProbe>());
-    source.TokenUpdated += probe.InvalidateCache;
+    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)probe).InvalidateCredentialState;
     return WrapLastKnownGood(probe, sp);
 });
 
@@ -1617,7 +1617,7 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
             ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<AntigravityQuotaProbe>());
-    source.TokenUpdated += probe.InvalidateCache;
+    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)probe).InvalidateCredentialState;
     return WrapLastKnownGood(probe, sp);
 });
 

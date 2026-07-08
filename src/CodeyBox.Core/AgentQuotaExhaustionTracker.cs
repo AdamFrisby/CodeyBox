@@ -9,8 +9,9 @@ public sealed class AgentQuotaExhaustionTracker
     /// <summary>
     /// Records an in-process exhaustion gate for <paramref name="member"/>.
     /// Returns <c>true</c> when the member remains actively exhausted after the
-    /// call, including the case where an existing longer-lived entry is kept;
+    /// call, including the case where an existing shorter-lived entry is kept;
     /// returns <c>false</c> only when no active entry remains.
+    /// Future reset hints shorten the gate; past or current hints are ignored.
     /// </summary>
     public bool MarkExhausted(
         AgentMembership member,
@@ -29,6 +30,7 @@ public sealed class AgentQuotaExhaustionTracker
         var expiresAt = nowUtc + ttl;
         ConsiderCap(resetAt);
         ConsiderCap(earliestKnownReset);
+        DateTimeOffset? storedResetAt = resetAt is { } reset && reset > nowUtc ? reset : null;
 
         if (expiresAt <= nowUtc)
         {
@@ -36,7 +38,7 @@ public sealed class AgentQuotaExhaustionTracker
             return false;
         }
 
-        var next = new AgentQuotaExhaustionEntry(expiresAt, resetAt);
+        var next = new AgentQuotaExhaustionEntry(expiresAt, storedResetAt);
         _entries.AddOrUpdate(key, next, (_, existing) =>
             existing.ExpiresAt <= nowUtc || next.ExpiresAt < existing.ExpiresAt
                 ? next
@@ -45,7 +47,7 @@ public sealed class AgentQuotaExhaustionTracker
 
         void ConsiderCap(DateTimeOffset? candidate)
         {
-            if (candidate is { } cap && cap < expiresAt)
+            if (candidate is { } cap && cap > nowUtc && cap < expiresAt)
                 expiresAt = cap;
         }
     }

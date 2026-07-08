@@ -1186,6 +1186,49 @@ public sealed class QuotaAutoRetryTests : IDisposable
         }
     }
 
+    private sealed class CachingMutableProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalidator
+    {
+        private AgentQuotaSnapshot? _cached;
+
+        public CachingMutableProbe(AgentKind kind, double availablePct)
+            : this(kind, new AgentQuotaSnapshot { AvailablePct = availablePct })
+        {
+        }
+
+        public CachingMutableProbe(AgentKind kind, AgentQuotaSnapshot snapshot)
+        {
+            Kind = kind;
+            Snapshot = snapshot;
+        }
+
+        public AgentKind Kind { get; }
+        public int CallCount { get; private set; }
+        public int Invalidations { get; private set; }
+        public AgentQuotaSnapshot Snapshot { get; set; }
+        public double AvailablePct
+        {
+            get => Snapshot.AvailablePct;
+            set => Snapshot = Snapshot with { AvailablePct = value };
+        }
+
+        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+        {
+            if (_cached is null)
+            {
+                CallCount++;
+                _cached = Snapshot;
+            }
+
+            return Task.FromResult(_cached);
+        }
+
+        public void InvalidateCache()
+        {
+            Invalidations++;
+            _cached = null;
+        }
+    }
+
     [Fact]
     public async Task Scheduler_Rearm_LoadsTimersFromDb()
     {
@@ -1959,7 +2002,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
             Billing = AgentBilling.Subscription,
             QualityScore = 100,
         };
-        var probe = new MutableProbe(AgentKind.Codex, availablePct: 0);
+        var probe = new CachingMutableProbe(AgentKind.Codex, availablePct: 0);
         var router = new AgentClassRouter(
             [
                 new AgentClass
@@ -2041,6 +2084,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
             Assert.Equal(WorkItemState.Queued, retried.State);
             Assert.Equal(1, retried.QuotaRetryAttempts);
             Assert.Equal(1, System.Threading.Volatile.Read(ref signalCount));
+            Assert.True(probe.Invalidations > 0);
         }
         finally
         {

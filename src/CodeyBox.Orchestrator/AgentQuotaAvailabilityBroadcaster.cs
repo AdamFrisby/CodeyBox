@@ -20,7 +20,7 @@ public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilityS
     public event Action? QuotaUsableThresholdCrossed;
     public event Action<AgentQuotaUsabilityObservation>? QuotaUsabilityObserved;
 
-    public void RecordQuotaUsability(
+    public bool RecordQuotaUsability(
         AgentMembership member,
         bool isUsable,
         bool publishRecoverySignal = true)
@@ -30,13 +30,13 @@ public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilityS
         NotifyQuotaUsabilityObserved(new AgentQuotaUsabilityObservation(member, isUsable, publishRecoverySignal));
 
         if (!crossedToUsable)
-            return;
+            return true;
 
         _log.LogInformation(
             "Quota availability for {Agent}/{Model} crossed from unusable to usable; triggering parked-item recovery sweep",
             member.Agent.Value,
             member.ModelId ?? "(default)");
-        NotifyQuotaUsableThresholdCrossed();
+        return NotifyQuotaUsableThresholdCrossed();
     }
 
     private bool RecordTransition(AgentQuotaMemberKey key, bool isUsable)
@@ -58,27 +58,28 @@ public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilityS
         }
     }
 
-    private void NotifyQuotaUsabilityObserved(AgentQuotaUsabilityObservation observation)
+    private bool NotifyQuotaUsabilityObserved(AgentQuotaUsabilityObservation observation)
         => NotifySubscribers(
             QuotaUsabilityObserved,
             handler => handler(observation),
             ex => _log.LogWarning(ex, "Quota usability-observation subscriber threw; continuing"));
 
-    private void NotifyQuotaUsableThresholdCrossed()
+    private bool NotifyQuotaUsableThresholdCrossed()
         => NotifySubscribers(
             QuotaUsableThresholdCrossed,
             handler => handler(),
             ex => _log.LogWarning(ex, "Quota usable threshold subscriber threw; continuing"));
 
-    private void NotifySubscribers<TDelegate>(
+    private bool NotifySubscribers<TDelegate>(
         TDelegate? handlers,
         Action<TDelegate> notify,
         Action<Exception> logFailure)
         where TDelegate : Delegate
     {
         if (handlers is null)
-            return;
+            return true;
 
+        var delivered = true;
         foreach (TDelegate handler in handlers.GetInvocationList().Cast<TDelegate>())
         {
             try
@@ -88,8 +89,11 @@ public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilityS
             catch (Exception ex)
             {
                 logFailure(ex);
+                delivered = false;
             }
         }
+
+        return delivered;
     }
 }
 
@@ -115,7 +119,12 @@ public interface IAgentQuotaAvailabilityPublisher
     /// concurrently from independent router/probe paths and must be handled
     /// without relying on single-threaded ordering.
     /// </summary>
-    void RecordQuotaUsability(
+    /// <returns>
+    /// <c>true</c> when no recovery threshold signal was needed or every
+    /// recovery-signal subscriber completed; <c>false</c> when a subscriber
+    /// threw and the caller should keep any best-effort recovery tracking.
+    /// </returns>
+    bool RecordQuotaUsability(
         AgentMembership member,
         bool isUsable,
         bool publishRecoverySignal = true);

@@ -29,9 +29,7 @@ public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
     {
         _observations = observations;
         _publisher = publisher;
-        _probesByKind = probes
-            .Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe)
-            .ToDictionary(p => p.Kind);
+        _probesByKind = AgentQuotaProbeCatalog.BuildKindLookup(probes);
         _quotaGate = quotaGate;
         _options = options;
         _log = log;
@@ -81,6 +79,9 @@ public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
             AgentQuotaSnapshot snapshot;
             try
             {
+                if (probe is IAgentQuotaCacheInvalidator invalidator)
+                    invalidator.InvalidateResponseCache();
+
                 snapshot = await probe.GetAvailabilityAsync(member, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -108,10 +109,13 @@ public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
                 continue;
             }
 
-            _publisher.RecordQuotaUsability(
+            var published = _publisher.RecordQuotaUsability(
                 member,
                 isUsable: true,
                 publishRecoverySignal: true);
+            if (!published)
+                continue;
+
             _tracked.TryRemove(key, out _);
             recovered++;
         }

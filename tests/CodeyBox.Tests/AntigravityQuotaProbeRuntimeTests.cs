@@ -2,6 +2,7 @@ using System.Net;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents.Antigravity;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Tests;
 
@@ -242,6 +243,25 @@ public sealed class AntigravityQuotaProbeRuntimeTests
     }
 
     [Fact]
+    public async Task MarkExhausted_PastResetHintDoesNotClearRuntimeGate()
+    {
+        // Reset hints can originate in runtime stderr/stdout parsing. A past
+        // hint must be ignored instead of shortening the synthetic 429 gate to
+        // "already expired".
+        var now = new DateTimeOffset(2026, 6, 9, 12, 0, 0, TimeSpan.Zero);
+        var time = new FixedClock(now);
+        var handler = new LoadCodeAssistRouter(HttpStatusCode.OK, TierBody);
+        var probe = BuildProbe(handler, time: time);
+
+        await probe.MarkExhaustedAsync(Member(), TimeSpan.FromMinutes(10), now.AddMinutes(-1));
+        var snapshot = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
+
+        Assert.Equal(0.0, snapshot.AvailablePct);
+        Assert.Equal(now.AddMinutes(10), snapshot.ResetAt);
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
     public async Task MarkExhausted_DefaultsToOneMinute_WhenTtlIsZero()
     {
         // TimeSpan.Zero (or negative) TTL is a probe-pipeline tripwire; the
@@ -283,6 +303,31 @@ public sealed class AntigravityQuotaProbeRuntimeTests
 
         Assert.Equal(0.0, opusSnap.AvailablePct);
         Assert.Equal(100.0, flashSnap.AvailablePct);
+    }
+
+    [Fact]
+    public async Task MarkExhausted_TokenRotationDoesNotInheritPriorRuntimeGate()
+    {
+        // The agy probe's live quota read is route+token+model scoped. Learned
+        // runtime 429 gates must use the same credential boundary so an operator
+        // rotating to a different account under the same route is not stranded.
+        var token = "agy-old-token";
+        var handler = new LoadCodeAssistRouter(HttpStatusCode.OK, TierBody);
+        var factory = new QuotaFakeHttpClientFactory("agent-quota", handler);
+        var probe = new AntigravityQuotaProbe(
+            factory,
+            _ => new AgentQuotaCredentials(token),
+            TimeSpan.FromMinutes(5),
+            NullLogger<AntigravityQuotaProbe>.Instance);
+
+        await probe.MarkExhaustedAsync(Member(), TimeSpan.FromMinutes(30), DateTimeOffset.UtcNow.AddMinutes(30));
+        token = "agy-new-token";
+        probe.InvalidateCredentialState();
+
+        var snapshot = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
+
+        Assert.Equal(100.0, snapshot.AvailablePct);
+        Assert.Single(handler.Requests);
     }
 
     [Fact]
@@ -375,6 +420,31 @@ public sealed class AntigravityQuotaProbeRuntimeTests
 
         _ = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
         Assert.Equal(2, handler.Requests.Count);
+    }
+
+    [Fact]
+    public async Task MarkExhaustedThenInvalidateCache_PreservesRuntimeGateWithoutHttp()
+    {
+        // LastKnownGoodQuotaProbe.MarkExhaustedAsync invalidates the wrapped
+        // response cache after recording the runtime override. That invalidation
+        // must not erase Antigravity's synthetic 0% gate.
+        var now = new DateTimeOffset(2026, 6, 9, 12, 0, 0, TimeSpan.Zero);
+        var time = new FixedClock(now);
+        var handler = new LoadCodeAssistRouter(HttpStatusCode.OK, TierBody);
+        var inner = BuildProbe(handler, time: time);
+        var wrapped = new LastKnownGoodQuotaProbe(
+            inner,
+            () => new LastKnownGoodQuotaOptions { MaxStaleness = TimeSpan.FromMinutes(5) },
+            NullLogger<LastKnownGoodQuotaProbe>.Instance,
+            time);
+        var member = Member();
+
+        await wrapped.MarkExhaustedAsync(member, TimeSpan.FromMinutes(10), now.AddMinutes(10));
+        var snapshot = await wrapped.GetAvailabilityAsync(member, CancellationToken.None);
+
+        Assert.Equal(0.0, snapshot.AvailablePct);
+        Assert.Equal(now.AddMinutes(10), snapshot.ResetAt);
+        Assert.Empty(handler.Requests);
     }
 
     // ── Test helpers ─────────────────────────────────────────────────────────

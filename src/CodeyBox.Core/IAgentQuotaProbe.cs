@@ -52,6 +52,21 @@ public interface IAgentQuotaCacheInvalidator
     /// callers use this after writing an exhaustion mark so the next recovery
     /// probe refetches provider data without erasing the just-recorded gate.
     /// </summary>
+    void InvalidateResponseCache() => InvalidateCache();
+
+    /// <summary>
+    /// Clears cached state after the credential source changes. Implementations
+    /// that keep credential-scoped runtime state should ensure a newly rotated
+    /// credential is not gated by the prior credential's learned quota state.
+    /// </summary>
+    void InvalidateCredentialState() => InvalidateCache();
+
+    /// <summary>
+    /// Backwards-compatible response-cache invalidation hook. New call sites
+    /// should prefer <see cref="InvalidateResponseCache"/> or
+    /// <see cref="InvalidateCredentialState"/> so the intended state boundary is
+    /// explicit.
+    /// </summary>
     void InvalidateCache();
 }
 

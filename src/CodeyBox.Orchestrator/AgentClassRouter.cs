@@ -59,10 +59,11 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IQuotaRe
     // burns" so the queue does not stall on cold start). Exposed as a constant
     // so /concurrency surface and tests reference the same value.
     public const double DefaultColdStartFitInWindow = 2.0;
-    // In-process short-lived exhaustion cache populated by mid-iteration fallback.
-    // Keyed by (route key, model id ?? ""); value is the UTC instant at which
-    // the suppression expires. Survives only the current process lifetime —
-    // QuotaRetryScheduler / IQuotaFailureStore cover cross-restart durability.
+    // In-process short-lived exhaustion tracker populated by mid-iteration
+    // fallback. Keys come from AgentQuotaMemberKey and values carry ExpiresAt
+    // plus an optional provider ResetAt. Survives only the current process
+    // lifetime — QuotaRetryScheduler / IQuotaFailureStore cover cross-restart
+    // durability.
     private readonly AgentQuotaExhaustionTracker _exhausted = new();
 
     // Last quota-availability percentage observed per (agent, model) during
@@ -106,11 +107,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IQuotaRe
             catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase),
             todModifiers ?? []);
         var probeList = probes.ToList();
-        // PayPerApiQuotaProbe and NullQuotaProbe are selected by billing type, not kind;
-        // exclude them from the kind-based lookup to avoid polluting the dictionary.
-        _probesByKind = probeList
-            .Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe)
-            .ToDictionary(p => p.Kind);
+        _probesByKind = AgentQuotaProbeCatalog.BuildKindLookup(probeList);
         _payPerApiProbe = probeList.OfType<PayPerApiQuotaProbe>().FirstOrDefault() ?? new PayPerApiQuotaProbe();
         _nullProbe = probeList.OfType<NullQuotaProbe>().FirstOrDefault() ?? new NullQuotaProbe();
         _opts = opts;

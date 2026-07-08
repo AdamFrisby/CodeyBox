@@ -98,16 +98,17 @@ public sealed class AgentClassRouterFallbackTests
     }
 
     [Fact]
-    public async Task MarkExhausted_RespectsResetAt_WhenSoonerThanTtl()
+    public async Task MarkExhausted_IgnoresPastResetAt()
     {
         var cls = Frontier(Sub(Codex), Sub(Claude));
         var router = Build(cls);
 
-        // Reset is in the past — exhaustion should expire immediately.
+        // Reset hints are parsed from less-trusted runtime output. A past hint
+        // must not clear the in-process exhaustion gate.
         router.MarkExhausted(Sub(Codex), TimeSpan.FromHours(1), resetAt: DateTimeOffset.UtcNow.AddSeconds(-1));
         var candidates = await router.OrderedFallbackCandidatesAsync(Item(), project: null, CancellationToken.None);
 
-        Assert.Equal([Codex, Claude], candidates.Select(c => c.Agent).ToArray());
+        Assert.Equal([Claude], candidates.Select(c => c.Agent).ToArray());
     }
 
     [Fact]

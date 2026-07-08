@@ -33,7 +33,7 @@ namespace CodeyBox.Orchestrator;
 /// either succeeds (overwrites the retained value) or fails Permanent (drops it),
 /// and the account's quota is unchanged in the meantime.</para>
 /// </summary>
-public sealed class LastKnownGoodQuotaProbe : IAgentQuotaProbe
+public sealed class LastKnownGoodQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalidator
 {
     private readonly IAgentQuotaProbe _inner;
     private readonly Func<LastKnownGoodQuotaOptions> _optionsProvider;
@@ -135,11 +135,28 @@ public sealed class LastKnownGoodQuotaProbe : IAgentQuotaProbe
     {
         await _inner.MarkExhaustedAsync(member, ttl, resetAt, ct).ConfigureAwait(false);
         if (_inner is IAgentQuotaCacheInvalidator invalidator)
-            invalidator.InvalidateCache();
+            invalidator.InvalidateResponseCache();
 
         var key = KeyFor(member);
         lock (_lock)
             _retained.Remove(key);
+    }
+
+    public void InvalidateCache() => InvalidateResponseCache();
+
+    public void InvalidateResponseCache()
+    {
+        if (_inner is IAgentQuotaCacheInvalidator invalidator)
+            invalidator.InvalidateResponseCache();
+    }
+
+    public void InvalidateCredentialState()
+    {
+        if (_inner is IAgentQuotaCacheInvalidator invalidator)
+            invalidator.InvalidateCredentialState();
+
+        lock (_lock)
+            _retained.Clear();
     }
 
     private static (string RouteKey, string ModelKey) KeyFor(AgentMembership member) =>
