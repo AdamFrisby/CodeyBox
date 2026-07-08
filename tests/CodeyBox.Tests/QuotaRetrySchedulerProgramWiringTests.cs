@@ -206,6 +206,46 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
         Assert.Equal(1, retried.QuotaRetryAttempts);
     }
 
+    [Fact]
+    public async Task ProgramWiredQuotaRecoveryHostedLoopRequeuesWaitingItemBeforePeriodicPoll()
+    {
+        using var factory = new QuotaRecoverySignalWiringFactory(startHostedServices: true);
+
+        var monitor = factory.Services.GetRequiredService<AgentQuotaRecoveryProbeMonitor>();
+        Assert.Contains(
+            factory.Services.GetServices<IHostedService>(),
+            hosted => ReferenceEquals(hosted, monitor));
+
+        var store = factory.Services.GetRequiredService<IWorkItemStore>();
+        var project = await factory.Services
+            .GetRequiredService<IProjectRepository>()
+            .GetAsync(new ProjectId("quota-signal-project"), CancellationToken.None);
+        Assert.NotNull(project);
+
+        var parked = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = project!.Id,
+            Title = "parked",
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            QuotaRetryAttempts = 0,
+            AgentClassId = "quota-signal-class",
+            NextQuotaRetryAt = DateTimeOffset.UtcNow.AddDays(7),
+        };
+        await store.CreateAsync(parked);
+
+        var router = factory.Services.GetRequiredService<AgentClassRouter>();
+        var member = router.GetClassMembers("quota-signal-class")[0];
+        router.MarkExhausted(member, TimeSpan.FromHours(6), DateTimeOffset.UtcNow.AddDays(7));
+        factory.Probe.AvailablePct = 90;
+
+        var retried = await WaitForQuotaRetryAttemptAsync(store, parked.Id, TimeSpan.FromSeconds(10));
+        Assert.Equal(WorkItemState.Queued, retried.State);
+        Assert.Equal(1, retried.QuotaRetryAttempts);
+    }
+
     private static CodeyBoxOptions OptionsWithQuotaRetry(
         bool enabled,
         string interval,
@@ -298,8 +338,12 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
     {
         private readonly string _dbPath = Path.Combine(
             Path.GetTempPath(), $"codeybox-quota-signal-wiring-{Guid.NewGuid():N}.db");
+        private readonly bool _startHostedServices;
 
         public MutableProgramQuotaProbe Probe { get; } = new(AgentKind.Codex, 0);
+
+        public QuotaRecoverySignalWiringFactory(bool startHostedServices = false)
+            => _startHostedServices = startHostedServices;
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
@@ -321,6 +365,7 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
                     ["CodeyBox:AutoRetryOnQuotaFailure:PeriodicCheckInterval"] = "06:00:00",
                     ["CodeyBox:AutoRetryOnQuotaFailure:MaxAutoRetriesPerWorkItem"] = "3",
                     ["CodeyBox:QuotaRouter:MinQuotaPct"] = "10",
+                    ["CodeyBox:QuotaRouter:QuotaRecoveryProbeIntervalSeconds"] = "1",
                     ["CodeyBox:AgentClasses:0:Id"] = "quota-signal-class",
                     ["CodeyBox:AgentClasses:0:DisplayName"] = "Quota Signal",
                     ["CodeyBox:AgentClasses:0:Members:0:Agent"] = "codex",
@@ -334,7 +379,8 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
             });
             builder.ConfigureTestServices(services =>
             {
-                services.RemoveAll<IHostedService>();
+                if (!_startHostedServices)
+                    services.RemoveAll<IHostedService>();
                 services.RemoveAll<IAgentQuotaProbe>();
                 services.AddSingleton(Probe);
                 services.AddSingleton<IAgentQuotaProbe>(sp => sp.GetRequiredService<MutableProgramQuotaProbe>());

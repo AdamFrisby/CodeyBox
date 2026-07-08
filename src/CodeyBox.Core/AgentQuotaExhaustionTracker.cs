@@ -6,6 +6,12 @@ public sealed class AgentQuotaExhaustionTracker
 {
     private readonly ConcurrentDictionary<AgentQuotaMemberKey, AgentQuotaExhaustionEntry> _entries = new();
 
+    /// <summary>
+    /// Records an in-process exhaustion gate for <paramref name="member"/>.
+    /// Returns <c>true</c> when the member remains actively exhausted after the
+    /// call, including the case where an existing longer-lived entry is kept;
+    /// returns <c>false</c> only when no active entry remains.
+    /// </summary>
     public bool MarkExhausted(
         AgentMembership member,
         TimeSpan ttl,

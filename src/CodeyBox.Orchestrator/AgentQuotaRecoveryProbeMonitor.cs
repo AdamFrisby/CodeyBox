@@ -7,7 +7,7 @@ namespace CodeyBox.Orchestrator;
 
 public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
 {
-    private static readonly TimeSpan MaxProbeInterval = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan DefaultProbeInterval = TimeSpan.FromSeconds(5);
 
     private readonly ConcurrentDictionary<AgentQuotaMemberKey, AgentMembership> _tracked = new();
     private readonly IAgentQuotaAvailabilityObservationSource _observations;
@@ -31,8 +31,7 @@ public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
         _publisher = publisher;
         _probesByKind = probes
             .Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe)
-            .GroupBy(p => p.Kind)
-            .ToDictionary(g => g.Key, g => g.First());
+            .ToDictionary(p => p.Kind);
         _quotaGate = quotaGate;
         _options = options;
         _log = log;
@@ -134,9 +133,9 @@ public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
 
     private TimeSpan ResolveProbeInterval()
     {
-        var configured = _options.QuotaRecheckInterval;
-        if (configured <= TimeSpan.Zero || configured > MaxProbeInterval)
-            return MaxProbeInterval;
+        var configured = _options.QuotaRecoveryProbeInterval;
+        if (configured <= TimeSpan.Zero)
+            return DefaultProbeInterval;
 
         return configured;
     }

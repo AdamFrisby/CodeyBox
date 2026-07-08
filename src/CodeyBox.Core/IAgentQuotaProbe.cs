@@ -45,6 +45,13 @@ public interface IAgentQuotaProbe
 
 public interface IAgentQuotaCacheInvalidator
 {
+    /// <summary>
+    /// Clears only cached response snapshots used by <see cref="IAgentQuotaProbe.GetAvailabilityAsync"/>.
+    /// Implementations must preserve explicit runtime exhaustion overrides or
+    /// other state written through <see cref="IAgentQuotaProbe.MarkExhaustedAsync"/>;
+    /// callers use this after writing an exhaustion mark so the next recovery
+    /// probe refetches provider data without erasing the just-recorded gate.
+    /// </summary>
     void InvalidateCache();
 }
 

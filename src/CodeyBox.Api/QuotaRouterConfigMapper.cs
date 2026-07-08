@@ -14,6 +14,9 @@ internal static class QuotaRouterConfigMapper
         RampWindow = TimeSpan.FromSeconds(qr.RampWindowSeconds),
         RampWindowByAgent = BuildRampWindowOverrides(qr.RampWindowByAgentSeconds),
         QuotaRecheckInterval = TimeSpan.FromSeconds(qr.QuotaRecheckIntervalSeconds),
+        QuotaRecoveryProbeInterval = BuildPositiveDuration(
+            qr.QuotaRecoveryProbeIntervalSeconds,
+            TimeSpan.FromSeconds(5)),
         QuotaCacheTtl = TimeSpan.FromSeconds(qr.QuotaCacheTtlSeconds),
         UnknownPolicy = qr.UnknownPolicy,
         ObservedFailureWindow = TimeSpan.FromMinutes(qr.ObservedFailureWindowMinutes),
@@ -36,6 +39,9 @@ internal static class QuotaRouterConfigMapper
             dst.RampWindow = TimeSpan.FromSeconds(src.RampWindowSeconds);
         dst.RampWindowByAgent = BuildRampWindowOverrides(src.RampWindowByAgentSeconds);
         dst.QuotaRecheckInterval = TimeSpan.FromSeconds(src.QuotaRecheckIntervalSeconds);
+        dst.QuotaRecoveryProbeInterval = BuildPositiveDuration(
+            src.QuotaRecoveryProbeIntervalSeconds,
+            TimeSpan.FromSeconds(5));
         dst.UnknownPolicy = src.UnknownPolicy;
         dst.ObservedFailureWindow = TimeSpan.FromMinutes(src.ObservedFailureWindowMinutes);
         dst.ObservedFailureRetention = TimeSpan.FromMinutes(src.ObservedFailureRetentionMinutes);
@@ -57,6 +63,9 @@ internal static class QuotaRouterConfigMapper
         }
         return dst;
     }
+
+    private static TimeSpan BuildPositiveDuration(int seconds, TimeSpan fallback) =>
+        seconds > 0 ? TimeSpan.FromSeconds(seconds) : fallback;
 
     private static Dictionary<string, QuotaFloorOverrideOptions> BuildFloorOverrides(
         IDictionary<string, QuotaRouterFloorConfig>? src)

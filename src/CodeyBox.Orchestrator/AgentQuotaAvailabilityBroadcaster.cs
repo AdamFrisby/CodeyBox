@@ -26,10 +26,10 @@ public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilityS
         bool publishRecoverySignal = true)
     {
         var key = AgentQuotaMemberKey.From(member);
-        var crossedToUsable = RecordTransition(key, isUsable);
+        var crossedToUsable = publishRecoverySignal && RecordTransition(key, isUsable);
         NotifyQuotaUsabilityObserved(new AgentQuotaUsabilityObservation(member, isUsable, publishRecoverySignal));
 
-        if (!publishRecoverySignal || !crossedToUsable)
+        if (!crossedToUsable)
             return;
 
         _log.LogInformation(
@@ -59,39 +59,35 @@ public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilityS
     }
 
     private void NotifyQuotaUsabilityObserved(AgentQuotaUsabilityObservation observation)
-    {
-        var handlers = QuotaUsabilityObserved;
-        if (handlers is null)
-            return;
-
-        foreach (Action<AgentQuotaUsabilityObservation> handler in handlers.GetInvocationList().Cast<Action<AgentQuotaUsabilityObservation>>())
-        {
-            try
-            {
-                handler(observation);
-            }
-            catch (Exception ex)
-            {
-                _log.LogWarning(ex, "Quota usability-observation subscriber threw; continuing");
-            }
-        }
-    }
+        => NotifySubscribers(
+            QuotaUsabilityObserved,
+            handler => handler(observation),
+            ex => _log.LogWarning(ex, "Quota usability-observation subscriber threw; continuing"));
 
     private void NotifyQuotaUsableThresholdCrossed()
+        => NotifySubscribers(
+            QuotaUsableThresholdCrossed,
+            handler => handler(),
+            ex => _log.LogWarning(ex, "Quota usable threshold subscriber threw; continuing"));
+
+    private void NotifySubscribers<TDelegate>(
+        TDelegate? handlers,
+        Action<TDelegate> notify,
+        Action<Exception> logFailure)
+        where TDelegate : Delegate
     {
-        var handlers = QuotaUsableThresholdCrossed;
         if (handlers is null)
             return;
 
-        foreach (Action handler in handlers.GetInvocationList().Cast<Action>())
+        foreach (TDelegate handler in handlers.GetInvocationList().Cast<TDelegate>())
         {
             try
             {
-                handler();
+                notify(handler);
             }
             catch (Exception ex)
             {
-                _log.LogWarning(ex, "Quota usable threshold subscriber threw; continuing");
+                logFailure(ex);
             }
         }
     }
@@ -108,15 +104,16 @@ public sealed record AgentQuotaUsabilityObservation(
 public interface IAgentQuotaAvailabilityPublisher
 {
     /// <summary>
-    /// Records the caller's fully evaluated routing verdict for
-    /// <paramref name="member"/>. Implementations publish only after they have
-    /// previously observed the same member as unusable, so callers must record
-    /// both the denied observation and the later allowed observation. Set
-    /// <paramref name="publishRecoverySignal"/> to <c>false</c> for read-only
-    /// probes such as readiness checks; command-style dispatch/retry/fallback
-    /// paths should leave it enabled so parked-item recovery wakes deliberately.
-    /// Calls may arrive concurrently from independent router/probe paths and
-    /// must be handled without relying on single-threaded ordering.
+    /// Records a quota-usability observation for <paramref name="member"/>.
+    /// Implementations publish only after a signal-producing observation has
+    /// previously recorded the same member as unusable, so command-style
+    /// dispatch/retry/fallback paths must record both the denied observation and
+    /// the later allowed observation. Set <paramref name="publishRecoverySignal"/>
+    /// to <c>false</c> for read-only probes such as readiness checks; those
+    /// observations may be forwarded to subscribers for telemetry, but must not
+    /// advance the signal-producing transition memory. Calls may arrive
+    /// concurrently from independent router/probe paths and must be handled
+    /// without relying on single-threaded ordering.
     /// </summary>
     void RecordQuotaUsability(
         AgentMembership member,

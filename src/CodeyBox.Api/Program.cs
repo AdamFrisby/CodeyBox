@@ -5450,6 +5450,11 @@ namespace CodeyBox.Api
             = new(StringComparer.OrdinalIgnoreCase);
         /// <summary>Seconds to wait before re-probing when all subscription members are exhausted. Default 300 (5 min).</summary>
         public int QuotaRecheckIntervalSeconds { get; set; } = 300;
+        /// <summary>
+        /// Seconds between event-driven recovery probes for members already
+        /// observed as quota-unusable. Default 5.
+        /// </summary>
+        public int QuotaRecoveryProbeIntervalSeconds { get; set; } = 5;
         /// <summary>Seconds to cache a probe result. Default 60.</summary>
         public int QuotaCacheTtlSeconds { get; set; } = 60;
         /// <summary>How the router treats unknown probe snapshots. Default UseObservedFailures.</summary>

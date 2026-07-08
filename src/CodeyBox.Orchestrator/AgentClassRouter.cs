@@ -2762,6 +2762,15 @@ public sealed class QuotaRouterOptions
     public TimeSpan QuotaRecheckInterval { get; set; } = TimeSpan.FromMinutes(5);
 
     /// <summary>
+    /// Cadence for the event-driven quota recovery monitor while it is tracking
+    /// members that have already emitted an unusable quota observation. This is
+    /// intentionally separate from <see cref="QuotaRecheckInterval"/>: the
+    /// monitor is a prompt recovery path for parked work, while quota recheck is
+    /// the normal router retry delay. Default 5 seconds.
+    /// </summary>
+    public TimeSpan QuotaRecoveryProbeInterval { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
     /// How long a quota probe result is cached before a new HTTP call is made.
     /// Shared across all probe implementations via constructor injection.
     /// Default 60 seconds.

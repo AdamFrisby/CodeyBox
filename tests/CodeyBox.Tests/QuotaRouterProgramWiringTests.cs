@@ -26,6 +26,7 @@ public sealed class QuotaRouterProgramWiringTests
         Assert.Equal(0.0, codexFloor.EndFloorPct);
         Assert.Equal(TimeSpan.FromDays(1), codexFloor.RampWindow);
         Assert.Equal(1.75, options.DrainAggressiveness);
+        Assert.Equal(TimeSpan.FromSeconds(2), options.QuotaRecoveryProbeInterval);
         Assert.True(options.ExpectedResets.TryGetValue("CODEX", out var codexReset));
         Assert.Equal(TimeSpan.FromDays(7), codexReset.Cadence);
         Assert.Equal(
@@ -197,6 +198,7 @@ public sealed class QuotaRouterProgramWiringTests
                     ["CodeyBox:QuotaRouter:FloorByAgent:codex:StartFloorPct"] = "1",
                     ["CodeyBox:QuotaRouter:FloorByAgent:codex:EndFloorPct"] = "0",
                     ["CodeyBox:QuotaRouter:FloorByAgent:codex:RampWindowSeconds"] = "86400",
+                    ["CodeyBox:QuotaRouter:QuotaRecoveryProbeIntervalSeconds"] = "2",
                     ["CodeyBox:QuotaRouter:DrainAggressiveness"] = "1.75",
                     ["CodeyBox:QuotaRouter:ExpectedResets:codex:Timestamps:0"] = "2026-06-01T00:20:00Z",
                     ["CodeyBox:QuotaRouter:ExpectedResets:codex:CadenceSeconds"] = "604800",

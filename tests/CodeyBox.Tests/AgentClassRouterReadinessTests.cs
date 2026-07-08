@@ -143,6 +143,41 @@ public sealed class AgentClassRouterReadinessTests
     }
 
     [Fact]
+    public async Task CheckReadiness_DoesNotConsumePublishEnabledQuotaRecoveryEdge()
+    {
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster();
+        var signalCount = 0;
+        quotaSignal.QuotaUsableThresholdCrossed += () => Interlocked.Increment(ref signalCount);
+        var probe = new MutableReadinessProbe(Claude, availablePct: 1);
+        var router = BuildRouter(
+            [Class(Member(Claude))],
+            [probe],
+            quotaAvailabilityPublisher: quotaSignal);
+        var item = Item();
+
+        var deniedDispatch = await router.ResolveAsync(item, project: null, CancellationToken.None);
+        Assert.True(deniedDispatch.ShouldWait);
+        Assert.Equal(0, Volatile.Read(ref signalCount));
+
+        probe.AvailablePct = 100;
+        var readiness = await router.CheckReadinessAsync(
+            item with { Id = WorkItemId.New() },
+            project: null,
+            new FixedCapacity(),
+            CancellationToken.None);
+        Assert.Equal(AgentRoutingReadinessState.Available, readiness.State);
+        Assert.Equal(0, Volatile.Read(ref signalCount));
+
+        var allowedDispatch = await router.ResolveAsync(
+            item with { Id = WorkItemId.New() },
+            project: null,
+            CancellationToken.None);
+
+        Assert.NotNull(allowedDispatch.Chosen);
+        Assert.Equal(1, Volatile.Read(ref signalCount));
+    }
+
+    [Fact]
     public async Task CheckReadiness_DoesNotConsumeQuotaRetryAdmission()
     {
         var time = new ManualTimeProvider();

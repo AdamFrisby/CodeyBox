@@ -1946,7 +1946,11 @@ public sealed class QuotaAutoRetryTests : IDisposable
             DefaultAgentClass = "probe-signal-class",
         };
         var projects = new InMemoryProjectRepository(project);
-        var routerOptions = new QuotaRouterOptions { MinQuotaPct = 10 };
+        var routerOptions = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10,
+            QuotaRecoveryProbeInterval = TimeSpan.FromMilliseconds(50),
+        };
         var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
             NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
         var member = new AgentMembership
@@ -2022,13 +2026,46 @@ public sealed class QuotaAutoRetryTests : IDisposable
         Assert.Equal(WorkItemState.WaitingForQuotaReset, stillParked!.State);
         Assert.Equal(0, stillParked.QuotaRetryAttempts);
 
-        probe.AvailablePct = 80;
-        Assert.Equal(1, await monitor.ProbeTrackedMembersOnceAsync(CancellationToken.None));
-        Assert.Equal(1, System.Threading.Volatile.Read(ref signalCount));
+        await monitor.StartAsync(CancellationToken.None);
+        try
+        {
+            await WaitForConditionAsync(() => probe.CallCount > 0, TimeSpan.FromSeconds(2));
+            Assert.Equal(0, System.Threading.Volatile.Read(ref signalCount));
 
-        var retried = await WaitForAttemptsAsync(store, parked.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));
-        Assert.Equal(WorkItemState.Queued, retried.State);
-        Assert.Equal(1, retried.QuotaRetryAttempts);
+            stillParked = await store.GetAsync(parked.Id);
+            Assert.Equal(WorkItemState.WaitingForQuotaReset, stillParked!.State);
+            Assert.Equal(0, stillParked.QuotaRetryAttempts);
+
+            probe.AvailablePct = 80;
+            var retried = await WaitForAttemptsAsync(store, parked.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));
+            Assert.Equal(WorkItemState.Queued, retried.State);
+            Assert.Equal(1, retried.QuotaRetryAttempts);
+            Assert.Equal(1, System.Threading.Volatile.Read(ref signalCount));
+        }
+        finally
+        {
+            await monitor.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public void QuotaRecoveryProbeMonitor_DuplicateProbeRegistrationFailsFast()
+    {
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
+        var options = new QuotaRouterOptions { MinQuotaPct = 10 };
+
+        Assert.Throws<ArgumentException>(() => new AgentQuotaRecoveryProbeMonitor(
+            quotaSignal,
+            quotaSignal,
+            [
+                new MutableProbe(AgentKind.Codex, availablePct: 0),
+                new MutableProbe(AgentKind.Codex, availablePct: 100),
+            ],
+            new QuotaGateAvailability(new QuotaGatePolicy(options)),
+            options,
+            NullLogger<AgentQuotaRecoveryProbeMonitor>.Instance,
+            _time));
     }
 
     [Fact]

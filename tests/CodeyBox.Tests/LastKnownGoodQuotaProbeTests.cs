@@ -48,6 +48,33 @@ public sealed class LastKnownGoodQuotaProbeTests
         }
     }
 
+    private sealed class CachedInvalidatingProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalidator
+    {
+        private AgentQuotaSnapshot? _cached;
+
+        public AgentKind Kind => AgentKind.Claude;
+        public AgentQuotaSnapshot Next { get; set; } = new() { AvailablePct = 100 };
+        public int LiveFetchCount { get; private set; }
+        public int Invalidations { get; private set; }
+
+        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+        {
+            if (_cached is null)
+            {
+                LiveFetchCount++;
+                _cached = Next;
+            }
+
+            return Task.FromResult(_cached);
+        }
+
+        public void InvalidateCache()
+        {
+            Invalidations++;
+            _cached = null;
+        }
+    }
+
     private sealed class Clock : TimeProvider
     {
         private DateTimeOffset _now;
@@ -57,6 +84,12 @@ public sealed class LastKnownGoodQuotaProbeTests
     }
 
     private static LastKnownGoodQuotaProbe Build(StubProbe inner, Clock clock, TimeSpan? staleness = null) =>
+        new(inner,
+            () => new LastKnownGoodQuotaOptions { MaxStaleness = staleness ?? TimeSpan.FromMinutes(5) },
+            NullLogger<LastKnownGoodQuotaProbe>.Instance,
+            clock);
+
+    private static LastKnownGoodQuotaProbe Build(CachedInvalidatingProbe inner, Clock clock, TimeSpan? staleness = null) =>
         new(inner,
             () => new LastKnownGoodQuotaOptions { MaxStaleness = staleness ?? TimeSpan.FromMinutes(5) },
             NullLogger<LastKnownGoodQuotaProbe>.Instance,
@@ -208,5 +241,29 @@ public sealed class LastKnownGoodQuotaProbeTests
 
         inner.Next = new AgentQuotaSnapshot { AvailablePct = 98 };
         Assert.Equal(98, (await lkg.GetAvailabilityAsync(member, default)).AvailablePct);
+    }
+
+    [Fact]
+    public async Task MarkExhausted_InvalidatesInnerResponseCacheBeforeRecoveryProbe()
+    {
+        var clock = new Clock(new DateTimeOffset(2026, 6, 10, 12, 0, 0, TimeSpan.Zero));
+        var inner = new CachedInvalidatingProbe
+        {
+            Next = new AgentQuotaSnapshot { AvailablePct = 0 },
+        };
+        var lkg = Build(inner, clock);
+        var member = Member();
+
+        Assert.Equal(0, (await lkg.GetAvailabilityAsync(member, default)).AvailablePct);
+        Assert.Equal(1, inner.LiveFetchCount);
+
+        inner.Next = new AgentQuotaSnapshot { AvailablePct = 98 };
+        await lkg.MarkExhaustedAsync(member, TimeSpan.FromHours(1), clock.GetUtcNow().AddDays(7));
+
+        var recovered = await lkg.GetAvailabilityAsync(member, default);
+
+        Assert.Equal(1, inner.Invalidations);
+        Assert.Equal(2, inner.LiveFetchCount);
+        Assert.Equal(98, recovered.AvailablePct);
     }
 }
