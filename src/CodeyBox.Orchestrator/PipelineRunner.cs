@@ -10186,6 +10186,20 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (!needsCreds)
             return;
 
+        // A completed audit that produced a VALID verdict did not hit a quota wall:
+        // it ran to completion and wrote audit/result.json. Scanning a successful
+        // audit's stdout/stderr for quota phrases false-positives when the code under
+        // review is itself quota / rate-limit code — the reviewer legitimately quotes
+        // "429" / "usage limit reached" / "quota exhausted" from the diff, and the
+        // classifier reads the agent's own review text as an exhaustion signal. With a
+        // single-member audit class that parks the whole item despite the agent having
+        // ample quota (and starves the very fix for this bug, whose diff is quota code).
+        // Only classify quota when the audit FAILED to produce a verdict (agent CLI
+        // died / no result.json / invalid JSON) — what a genuine mid-audit exhaustion
+        // looks like. Auth detection is handled separately and keeps its own precedence.
+        if (AuditProducedValidVerdict(run.Result))
+            return;
+
         if (run.Result.AgentStderr is not null || run.Result.AgentStdout is not null)
         {
             _quotaAuditEmitter.EmitAdvisoryAuditEvents(
@@ -10284,6 +10298,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
         Func<T, string> titleSelector) =>
         findings.Any(f =>
             string.Equals(titleSelector(f), "review agent failed to run", StringComparison.OrdinalIgnoreCase));
+
+    // A "valid verdict" means the auditor parsed audit/result.json into a real
+    // pass/fail decision — its findings are the review's own findings, not one of
+    // LlmReviewAuditor's synthetic run-failure sentinels ("review agent failed to
+    // run", "agent did not write audit/result.json", "review agent produced invalid
+    // JSON"). Used to suppress false quota classification on a successful audit whose
+    // review text merely quotes quota/rate-limit code under review.
+    private static bool AuditProducedValidVerdict(AuditResult result) =>
+        !result.Findings.Any(f =>
+            string.Equals(f.Title, "review agent failed to run", StringComparison.OrdinalIgnoreCase)
+            || f.Title.StartsWith("agent did not write ", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(f.Title, "review agent produced invalid JSON", StringComparison.OrdinalIgnoreCase));
 
     private sealed record AuditorRunRecord(
         IAuditor Auditor,

@@ -192,6 +192,48 @@ public sealed class AuditQuotaPauseTests : IDisposable
     }
 
     [Fact]
+    public async Task AuditSuccessfulVerdict_WithQuotaTextInReviewOutput_DoesNotParkForQuota()
+    {
+        // Regression: a SUCCESSFUL audit that produced a valid verdict must NOT be
+        // classified as a quota failure merely because its review output quotes
+        // quota / rate-limit code under review (e.g. a diff handling
+        // RESOURCE_EXHAUSTED / "usage limit reached"). The ungated audit quota check
+        // previously scanned a successful audit's stdout and parked the whole item
+        // (single audit member) despite the agent having ample quota — which starved
+        // quota/retry-related work items, including this bug's own fix (whose diff is
+        // quota code). A valid verdict means the audit ran to completion, so it
+        // cannot have hit a quota wall.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RoutingLlmAuditor("cheating:llm-review", _ => new AuditResult(
+            true,
+            [],
+            AgentSummary: "ok",
+            AgentStdout:
+                "Reviewing the quota-park diff: it handles RESOURCE_EXHAUSTED (code 429): " +
+                "Individual quota reached (Resets in 8m14s) and '5 hour usage limit reached. " +
+                "It will reset in 5 hours 23 minutes.' — the handling looks correct."));
+        using var fix = BuildFixture(
+            seed,
+            auditor,
+            [AgentKind.Gemini, AgentKind.Antigravity],
+            auditAgent: AgentKind.Antigravity);
+        fix.Gemini.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Gemini);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        // The valid verdict is honored: no false quota park on the reviewer's own
+        // quota-code quotes; the item proceeds.
+        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_quota_reset");
+        Assert.Equal(WorkItemState.Done, final.State);
+    }
+
+    [Fact]
     public async Task AuditRouting_SkipsPausedPreferredAuditorAndUsesClassFallback()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
