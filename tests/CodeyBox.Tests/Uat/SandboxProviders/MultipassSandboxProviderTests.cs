@@ -1534,7 +1534,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 listenerAccepted.TrySetResult();
                 await releaseListener.Task.WaitAsync(acceptCts.Token);
             }
-            catch (OperationCanceledException)
+            catch (Exception ex) when (acceptCts.IsCancellationRequested
+                && ex is OperationCanceledException or ObjectDisposedException or SocketException)
             {
             }
             catch (ObjectDisposedException) when (acceptCts.IsCancellationRequested)
