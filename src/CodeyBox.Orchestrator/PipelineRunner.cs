@@ -3005,6 +3005,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 ex.Message,
                 failureKind: ex.FailureKind);
             await _store.UpdateAsync(failed, CancellationToken.None);
+            await RecordMergeConflictFailureAttributionAsync(failed, ex);
             var mergeFailedRevision = await BuildTerminalRevisionAsync(failed, CancellationToken.None);
             await _webhooks.PublishAsync(new WebhookEvent
             {
@@ -4052,6 +4053,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             resolveResult.FailureRunner,
                             resolveResult.FailureClassificationResult,
                             "rebase");
+                        var classification = _authFailureClassifier.ClassifyFailure(
+                            resolveResult.FailureRunner,
+                            resolveResult.FailureClassificationResult);
+                        if (classification.Kind == AgentFailureKind.Infrastructure)
+                        {
+                            throw new MergeConflictResolutionFailedException(
+                                $"pickup-time rebase resolver failed for work branch '{workBranch}'; work branch left at original tip {oldTip}: {resolveResult.Summary}",
+                                failureKind: WorkItemFailureKinds.Infrastructure,
+                                agent: resolveResult.FailureRunner.Kind,
+                                phase: "rebase-resolver");
+                        }
                     }
                     throw new MergeConflictResolutionFailedException(
                         $"pickup-time rebase resolver failed for work branch '{workBranch}'; work branch left at original tip {oldTip}: {resolveResult.Summary}");
@@ -14335,7 +14347,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     throw new MergeConflictResolutionFailedException(
                         $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}",
                         failureKind: WorkItemFailureKinds.Infrastructure,
-                        agent: chosenMergeRunner.Kind);
+                        agent: chosenMergeRunner.Kind,
+                        phase: "merge");
                 }
                 ThrowIfInfrastructureAgentFailure(
                     chosenMergeRunner,
@@ -17338,6 +17351,38 @@ Original merge-phase failure (JSON string, for context only):
     /// </summary>
     internal async Task<TerminalRevisionAttribution?> BuildTerminalRevisionAsync(WorkItem item, CancellationToken ct)
         => await _terminalRevisionBuilder.BuildTerminalRevisionAsync(item, ct);
+
+    private async Task RecordMergeConflictFailureAttributionAsync(
+        WorkItem failed,
+        MergeConflictResolutionFailedException ex)
+    {
+        if (ex.Agent is not { } agent || !WorkItemFailureKinds.IsInfraShaped(ex.FailureKind))
+            return;
+
+        var phase = string.IsNullOrWhiteSpace(ex.Phase)
+            ? "merge_conflict_resolution"
+            : ex.Phase;
+        var agentInstanceId = failed.Agent == agent ? failed.AgentInstanceId : null;
+        var modelId = failed.Agent == agent ? failed.ModelId : null;
+        var involvementId = await RecordInvolvementStartAsync(
+            failed.Id,
+            agent,
+            agentInstanceId,
+            modelId,
+            phase,
+            iteration: null);
+        await FinalizeInvolvementAsync(
+            involvementId,
+            MergeConflictFailureInvolvementOutcome(ex.FailureKind));
+    }
+
+    private static string MergeConflictFailureInvolvementOutcome(string? failureKind)
+    {
+        if (string.Equals(failureKind, WorkItemFailureKinds.AuthRequired, StringComparison.OrdinalIgnoreCase))
+            return AgentInvolvementOutcomes.FailureAuth;
+
+        return AgentInvolvementOutcomes.FailureInfrastructure;
+    }
 
     /// <summary>
     /// Best-effort cost summary lookup for webhook usage blocks. Returns null

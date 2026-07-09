@@ -468,6 +468,49 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
     }
 
     [Fact]
+    public async Task PickupRebaseInfrastructureFailure_PersistsInfraAttributionAndRestoreSweepRequeues()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+
+        var claude = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Claude };
+        claude.AgenticConflictResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 127",
+            Stdout: null,
+            Stderr: "env: 'claude': No such file or directory"));
+
+        using var fix = BuildRoutingFixture(seed, [claude]);
+
+        var item = NewItem(AgentKind.Claude) with { State = WorkItemState.WorkComplete };
+        var repoId = await fix.GitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = fix.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "README.md", "work branch change\n", "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, final.FailureKind);
+        Assert.Equal(AgentKind.Claude, final.Agent);
+
+        var involvementRows = await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.Contains(
+            involvementRows,
+            row => row.AgentKind == AgentKind.Claude
+                && row.Phase == "rebase-resolver"
+                && row.Outcome == AgentInvolvementOutcomes.FailureInfrastructure
+                && row.EndedAt is not null);
+
+        await AssertRestoreSweepRequeuesAsync(
+            fix,
+            item.Id,
+            new AgentRestoredEvent(AgentKind.Claude, DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow));
+    }
+
+    [Fact]
     public async Task AuditAgentUnregistered_ResolverFallsBackToWorkAgent()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -682,6 +725,7 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
 
         var store = new SqliteWorkItemStore(stateDb);
+        var involvement = new SqliteAgentInvolvementStore(stateDb);
         var gitHost = new LocalGitHost(
             new LocalGitHostOptions { RootDirectory = gitRoot },
             NullLogger<LocalGitHost>.Instance);
@@ -750,13 +794,46 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions,
-            mergeScopeResolver: mergeScopeResolver);
+            mergeScopeResolver: mergeScopeResolver,
+            involvement: involvement);
 
-        return new RoutingFixture(pipeline, store, gitHost);
+        return new RoutingFixture(pipeline, store, involvement, gitHost);
     }
 
     private static ChangeScopeMergeScopeResolver NewMergeScopeResolver() =>
         new(new KnobRegistry([new ChangeScopeKnob()]));
+
+    private static async Task AssertRestoreSweepRequeuesAsync(
+        RoutingFixture fix,
+        WorkItemId itemId,
+        AgentRestoredEvent restored)
+    {
+        var queue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(
+            fix.Store,
+            queue,
+            new NullGitHost(),
+            NullLogger<WorkItemRetrier>.Instance);
+        var scheduler = new AgentRestoreRetryScheduler(
+            fix.Store,
+            retrier,
+            () => new AgentRestoreRetryOptions
+            {
+                Enabled = true,
+                LookbackGrace = TimeSpan.FromMinutes(30),
+                PostRestoreMargin = TimeSpan.FromMinutes(5),
+                MaxCandidatesPerSweep = 10,
+            },
+            NullLogger<AgentRestoreRetryScheduler>.Instance,
+            involvement: fix.Involvement);
+
+        var summary = await scheduler.SweepForTestAsync(restored);
+
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(0, summary.Skipped);
+        Assert.Equal(WorkItemState.Queued, (await fix.Store.GetAsync(itemId, CancellationToken.None))!.State);
+        Assert.Equal(itemId, await queue.DequeueAsync(CancellationToken.None));
+    }
 
     private static WorkItem NewItem(AgentKind agent)
     {
@@ -815,9 +892,14 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
     private sealed record RoutingFixture(
         PipelineRunner Pipeline,
         SqliteWorkItemStore Store,
+        SqliteAgentInvolvementStore Involvement,
         LocalGitHost GitHost) : IDisposable
     {
-        public void Dispose() => Store.Dispose();
+        public void Dispose()
+        {
+            Involvement.Dispose();
+            Store.Dispose();
+        }
     }
 
     private sealed class PermissiveCredentialProvider : ICredentialProvider

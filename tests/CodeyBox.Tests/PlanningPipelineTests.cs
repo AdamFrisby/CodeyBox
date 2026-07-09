@@ -922,6 +922,43 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal(0, agent.WorkCalls);
         Assert.Contains("Planning agent claude reported failure", final.LastError, StringComparison.Ordinal);
         Assert.Contains("agent exited 127", final.LastError, StringComparison.Ordinal);
+
+        var involvement = await setup.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.Contains(
+            involvement,
+            row => row.AgentKind == AgentKind.Claude
+                && row.Phase == "planning"
+                && row.Outcome == AgentInvolvementOutcomes.FailureInfrastructure
+                && row.EndedAt is not null);
+
+        var queue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(
+            setup.Store,
+            queue,
+            new NullGitHost(),
+            NullLogger<WorkItemRetrier>.Instance);
+        var scheduler = new AgentRestoreRetryScheduler(
+            setup.Store,
+            retrier,
+            () => new AgentRestoreRetryOptions
+            {
+                Enabled = true,
+                LookbackGrace = TimeSpan.FromMinutes(30),
+                PostRestoreMargin = TimeSpan.FromMinutes(5),
+                MaxCandidatesPerSweep = 10,
+            },
+            NullLogger<AgentRestoreRetryScheduler>.Instance,
+            involvement: setup.Involvement);
+
+        var summary = await scheduler.SweepForTestAsync(new AgentRestoredEvent(
+            AgentKind.Claude,
+            DateTimeOffset.UtcNow.AddMinutes(-5),
+            DateTimeOffset.UtcNow));
+
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(0, summary.Skipped);
+        Assert.Equal(WorkItemState.Queued, (await setup.Store.GetAsync(item.Id))!.State);
+        Assert.Equal(item.Id, await queue.DequeueAsync(CancellationToken.None));
     }
 
     [Fact]
@@ -2118,6 +2155,7 @@ public sealed class PlanningPipelineTests : IDisposable
 
         var store = new SqliteWorkItemStore(stateDb);
         var pipelineStore = workItemStoreDecorator?.Invoke(store) ?? store;
+        var involvement = new SqliteAgentInvolvementStore(stateDb);
         // Share the same DB file so the test_cases FK to work_items resolves.
         var testCaseStore = wireTestCaseStore ? new SqliteTestCaseStore(stateDb) : null;
         var gitHost = new LocalGitHost(
@@ -2172,9 +2210,10 @@ public sealed class PlanningPipelineTests : IDisposable
             pipelineTuning: pipelineTuning ?? new PipelineTuningSnapshot(new PipelineTuningOptions
             {
                 MaxPlanReviewIterations = maxPlanReviewIterations,
-            }));
+            }),
+            involvement: involvement);
 
-        return new PlanningPipelineSetup(pipeline, store, webhooks, gitRoot, testCaseStore);
+        return new PlanningPipelineSetup(pipeline, store, involvement, webhooks, gitRoot, testCaseStore);
     }
 
     private static WorkItem NewItem(string branch) => new()
@@ -2190,12 +2229,14 @@ public sealed class PlanningPipelineTests : IDisposable
 internal sealed class PlanningPipelineSetup(
     PipelineRunner Pipeline,
     SqliteWorkItemStore Store,
+    SqliteAgentInvolvementStore Involvement,
     CapturingWebhookDispatcher Webhooks,
     string GitRoot,
     SqliteTestCaseStore? TestCaseStore = null) : IDisposable
 {
     public PipelineRunner Pipeline { get; } = Pipeline;
     public SqliteWorkItemStore Store { get; } = Store;
+    public SqliteAgentInvolvementStore Involvement { get; } = Involvement;
     public CapturingWebhookDispatcher Webhooks { get; } = Webhooks;
     public string GitRoot { get; } = GitRoot;
     public SqliteTestCaseStore? TestCaseStore { get; } = TestCaseStore;
@@ -2203,6 +2244,7 @@ internal sealed class PlanningPipelineSetup(
     public void Dispose()
     {
         TestCaseStore?.Dispose();
+        Involvement.Dispose();
         Store.Dispose();
     }
 }

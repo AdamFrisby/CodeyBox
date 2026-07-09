@@ -23,17 +23,20 @@ public sealed class MergeConflictResolutionFailedException : Exception
 {
     public string? FailureKind { get; }
     public AgentKind? Agent { get; }
+    public string? Phase { get; }
 
     public MergeConflictResolutionFailedException(
         string message,
         Exception? innerException = null,
         string? failureKind = null,
-        AgentKind? agent = null)
+        AgentKind? agent = null,
+        string? phase = null)
         : base(message, innerException)
     {
         var prior = innerException as MergeConflictResolutionFailedException;
         FailureKind = failureKind ?? prior?.FailureKind;
         Agent = agent ?? prior?.Agent;
+        Phase = phase ?? prior?.Phase;
     }
 }
 

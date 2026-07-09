@@ -1384,6 +1384,22 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, final.FailureKind);
+        Assert.Equal(AgentKind.Codex, final.Agent);
+
+        var involvementRows = await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.Contains(
+            involvementRows,
+            row => row.AgentKind == AgentKind.Codex
+                && row.Phase == "merge"
+                && row.Outcome == AgentInvolvementOutcomes.FailureInfrastructure
+                && row.EndedAt is not null);
+
+        await AssertRestoreSweepRequeuesAsync(
+            fix,
+            item.Id,
+            new AgentRestoredEvent(AgentKind.Codex, DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow));
+
         Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
 
         // An infra failure must not touch the breaker. Because work is skipped
@@ -1442,8 +1458,24 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, final.FailureKind);
+        Assert.Equal(AgentKind.Claude, final.Agent);
         Assert.Single(codex.AgenticConflictInvocations);
         Assert.Single(claude.AgenticConflictInvocations);
+
+        var involvementRows = await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.Contains(
+            involvementRows,
+            row => row.AgentKind == AgentKind.Claude
+                && row.Phase == "rebase-resolver"
+                && row.Outcome == AgentInvolvementOutcomes.FailureInfrastructure
+                && row.EndedAt is not null);
+
+        await AssertRestoreSweepRequeuesAsync(
+            fix.Store,
+            fix.Involvement,
+            item.Id,
+            new AgentRestoredEvent(AgentKind.Claude, DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow));
 
         Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
         Assert.True(fix.Registry.GetAvailability(AgentKind.Claude).Available);
@@ -1711,10 +1743,17 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         TestFixture fix,
         WorkItemId itemId,
         AgentRestoredEvent restored)
+        => await AssertRestoreSweepRequeuesAsync(fix.Store, fix.Involvement, itemId, restored);
+
+    private static async Task AssertRestoreSweepRequeuesAsync(
+        SqliteWorkItemStore store,
+        SqliteAgentInvolvementStore involvement,
+        WorkItemId itemId,
+        AgentRestoredEvent restored)
     {
         var queue = new InMemoryTaskQueue();
         var retrier = new WorkItemRetrier(
-            fix.Store,
+            store,
             queue,
             new NullGitHost(),
             NullLogger<WorkItemRetrier>.Instance);
@@ -1726,17 +1765,17 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             MaxCandidatesPerSweep = 10,
         };
         var scheduler = new AgentRestoreRetryScheduler(
-            fix.Store,
+            store,
             retrier,
             () => options,
             NullLogger<AgentRestoreRetryScheduler>.Instance,
-            involvement: fix.Involvement);
+            involvement: involvement);
 
         var summary = await scheduler.SweepForTestAsync(restored);
 
         Assert.Equal(1, summary.Requeued);
         Assert.Equal(0, summary.Skipped);
-        Assert.Equal(WorkItemState.Queued, (await fix.Store.GetAsync(itemId, CancellationToken.None))!.State);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(itemId, CancellationToken.None))!.State);
         Assert.Equal(itemId, await queue.DequeueAsync(CancellationToken.None));
     }
 
@@ -1834,6 +1873,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
 
         var store = new SqliteWorkItemStore(stateDb);
+        var involvement = new SqliteAgentInvolvementStore(stateDb);
         var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
         var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var prs = new InMemoryPullRequestService();
@@ -1899,9 +1939,10 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             authAvailability: availability,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,
-            terminalRevisionBuilder: terminalTransitions);
+            terminalRevisionBuilder: terminalTransitions,
+            involvement: involvement);
 
-        return new ConflictMergeFixture(pipeline, store, gitHost, webhooks, availability);
+        return new ConflictMergeFixture(pipeline, store, involvement, gitHost, webhooks, availability);
     }
 
     private sealed class RejectingInVmSmokeGate : IInVmSmokeGate
@@ -2202,10 +2243,15 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     private sealed record ConflictMergeFixture(
         PipelineRunner Pipeline,
         SqliteWorkItemStore Store,
+        SqliteAgentInvolvementStore Involvement,
         LocalGitHost GitHost,
         CapturingWebhookDispatcher Webhooks,
         AgentAvailabilityRegistry Registry) : IDisposable
     {
-        public void Dispose() => Store.Dispose();
+        public void Dispose()
+        {
+            Involvement.Dispose();
+            Store.Dispose();
+        }
     }
 }
