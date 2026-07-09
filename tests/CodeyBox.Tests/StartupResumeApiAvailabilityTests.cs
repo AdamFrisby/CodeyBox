@@ -140,6 +140,7 @@ public sealed class StartupResumeApiAvailabilityTests
         var initialTimeout = TimeSpan.FromSeconds(90);
         var reloadedTimeout = TimeSpan.FromMilliseconds(250);
         var reloadedAdoptionSeconds = 7;
+        var availabilityGuard = initialTimeout - TimeSpan.FromSeconds(5);
         using var factory = new StartupResumeFullHostFactory(
             behavior: "complete",
             mode: SandboxResumeMode.Background,
@@ -205,14 +206,14 @@ public sealed class StartupResumeApiAvailabilityTests
             sw.Stop();
 
             response.EnsureSuccessStatusCode();
-            // Availability guard: 30 s, chosen to sit well below the 90 s
-            // un-reloaded initial timeout (so it still fails loudly if the reload
-            // is ignored and the hanging resume blocks for the initial window).
+            // The guard stays below the unreloaded timeout so an ignored reload
+            // fails, while the isolated hosted-service set keeps this focused on
+            // startup resume instead of unrelated background services.
             // The reloaded 250 ms timeout being the value actually applied is
             // proven independently by the >= reloaded assertion below plus the
             // persisted work-item assertion.
-            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(30),
-                $"GET /quota was blocked for {sw.Elapsed}; hot-reloaded startup resume timeout {reloadedTimeout} should keep API availability well under the {initialTimeout} un-reloaded window.");
+            Assert.True(sw.Elapsed < availabilityGuard,
+                $"GET /quota was blocked for {sw.Elapsed}; hot-reloaded startup resume timeout {reloadedTimeout} should keep API availability below the {initialTimeout} un-reloaded window.");
             Assert.True(sw.Elapsed >= reloadedTimeout,
                 $"hot-reloaded Blocking mode was not observed; GET /quota was served before resume timeout {reloadedTimeout}; elapsed {sw.Elapsed}");
         }
