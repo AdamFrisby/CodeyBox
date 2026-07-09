@@ -6361,73 +6361,89 @@ public sealed partial class PipelineRunner : IPipelineRunner
             SandboxConventions.WorkDir,
             source: "check-and-act",
             ct);
-        var startedAt = DateTimeOffset.UtcNow;
-        var result = supervision is null
-            ? await agentRunner.RunAsync(
-                sandbox, SandboxConventions.WorkDir, prompt, credential,
-                item.ModelId, item.ReasoningMode, ct,
-                stdoutChunkCallback: chunkCallback,
-                captureStructuredStream: false)
-            : await AgentSupervisionTurnRunner.RunAutonomousAndQueuedInjectionsAsync(
-                agentRunner,
-                sandbox,
-                SandboxConventions.WorkDir,
-                prompt,
-                credential,
-                item.ModelId,
-                item.ReasoningMode,
-                supervision,
-                chunkCallback,
-                captureStructuredStream: false,
-                promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
-                    item.Id, agentRunner.Kind, AgentPromptPhase.CheckAndAct,
-                    1, project, sandbox, raw, pct),
-                ct);
-        var endedAt = DateTimeOffset.UtcNow;
-
-        var aggregatedStdout = aggregator.ToString();
-        if (!string.IsNullOrEmpty(result.Stdout) && !aggregatedStdout.EndsWith(result.Stdout, StringComparison.Ordinal))
+        var involvementId = await RecordInvolvementStartAsync(
+            item.Id,
+            agentRunner.Kind,
+            item.AgentInstanceId,
+            item.ModelId,
+            "check",
+            iteration: null);
+        try
         {
-            aggregator.Append(result.Stdout);
-            aggregatedStdout = aggregator.ToString();
+            var startedAt = DateTimeOffset.UtcNow;
+            var result = supervision is null
+                ? await agentRunner.RunAsync(
+                    sandbox, SandboxConventions.WorkDir, prompt, credential,
+                    item.ModelId, item.ReasoningMode, ct,
+                    stdoutChunkCallback: chunkCallback,
+                    captureStructuredStream: false)
+                : await AgentSupervisionTurnRunner.RunAutonomousAndQueuedInjectionsAsync(
+                    agentRunner,
+                    sandbox,
+                    SandboxConventions.WorkDir,
+                    prompt,
+                    credential,
+                    item.ModelId,
+                    item.ReasoningMode,
+                    supervision,
+                    chunkCallback,
+                    captureStructuredStream: false,
+                    promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
+                        item.Id, agentRunner.Kind, AgentPromptPhase.CheckAndAct,
+                        1, project, sandbox, raw, pct),
+                    ct);
+            var endedAt = DateTimeOffset.UtcNow;
+
+            var aggregatedStdout = aggregator.ToString();
+            if (!string.IsNullOrEmpty(result.Stdout) && !aggregatedStdout.EndsWith(result.Stdout, StringComparison.Ordinal))
+            {
+                aggregator.Append(result.Stdout);
+                aggregatedStdout = aggregator.ToString();
+            }
+
+            await TryRecordCostAsync(aggregatedStdout, result.Stderr,
+                agentRunner.Kind, item.AgentInstanceId, item.Id, "check", iteration: null,
+                startedAt, endedAt, ResolveObservedModelId(agentRunner, item.ModelId));
+
+            // Check-and-act stdout is parsed model output. Detect auth evidence so
+            // the item fails as infrastructure instead of verdict-parse noise, but
+            // force an in-VM corroboration attempt before publishing the fleet-wide
+            // auth bench reason. A missing/inconclusive probe must not suppress the
+            // fail-fast auth exclusion because smoke can be disabled during the exact
+            // outage this detector is meant to catch.
+            await ThrowIfAuthRequiredOutputAsync(
+                item, project, agentRunner.Kind, "check", aggregatedStdout, result.Stderr,
+                requireStdoutOnlyCorroboration: true,
+                ct: ct);
+
+            if (!result.Success)
+            {
+                await ThrowIfAuthErrorAgentFailureAsync(
+                    item,
+                    project,
+                    agentRunner,
+                    result,
+                    "check",
+                    classification: null,
+                    ct);
+                ThrowIfTransientAgentFailure(agentRunner, result, "check");
+                ThrowIfInfrastructureAgentFailure(
+                    agentRunner,
+                    result,
+                    "check",
+                    $"Check-and-act agent {agentRunner.Kind} reported failure");
+                var stderrTail = string.IsNullOrEmpty(result.Stderr) ? "" : $" — stderr: {result.Stderr}";
+                throw new InvalidOperationException($"check-and-act agent failed: {result.Summary}{stderrTail}");
+            }
+
+            await FinalizeInvolvementAsync(involvementId, AgentInvolvementOutcomes.Success);
+            return aggregatedStdout;
         }
-
-        await TryRecordCostAsync(aggregatedStdout, result.Stderr,
-            agentRunner.Kind, item.AgentInstanceId, item.Id, "check", iteration: null,
-            startedAt, endedAt, ResolveObservedModelId(agentRunner, item.ModelId));
-
-        // Check-and-act stdout is parsed model output. Detect auth evidence so
-        // the item fails as infrastructure instead of verdict-parse noise, but
-        // force an in-VM corroboration attempt before publishing the fleet-wide
-        // auth bench reason. A missing/inconclusive probe must not suppress the
-        // fail-fast auth exclusion because smoke can be disabled during the exact
-        // outage this detector is meant to catch.
-        await ThrowIfAuthRequiredOutputAsync(
-            item, project, agentRunner.Kind, "check", aggregatedStdout, result.Stderr,
-            requireStdoutOnlyCorroboration: true,
-            ct: ct);
-
-        if (!result.Success)
+        catch (Exception ex)
         {
-            await ThrowIfAuthErrorAgentFailureAsync(
-                item,
-                project,
-                agentRunner,
-                result,
-                "check",
-                classification: null,
-                ct);
-            ThrowIfTransientAgentFailure(agentRunner, result, "check");
-            ThrowIfInfrastructureAgentFailure(
-                agentRunner,
-                result,
-                "check",
-                $"Check-and-act agent {agentRunner.Kind} reported failure");
-            var stderrTail = string.IsNullOrEmpty(result.Stderr) ? "" : $" — stderr: {result.Stderr}";
-            throw new InvalidOperationException($"check-and-act agent failed: {result.Summary}{stderrTail}");
+            await FinalizeInvolvementAsync(involvementId, OutcomeForFailure(ex));
+            throw;
         }
-
-        return aggregatedStdout;
     }
 
     private void ThrowIfTransientAgentFailure(

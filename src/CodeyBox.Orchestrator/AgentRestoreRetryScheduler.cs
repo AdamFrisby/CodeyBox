@@ -36,11 +36,11 @@ namespace CodeyBox.Orchestrator;
 ///   <see cref="AgentRestoredEvent.OutageStartedAt"/> is null the sweep
 ///   does not retry anything because there is no window to scope by, but it
 ///   still emits zero-count audit/webhook telemetry.</item>
-///   <item>Idempotent. A prior successful claim for the restore event window
-///   blocks duplicate sweeps before retry, and successful re-enqueues are then
-///   claimed after <see cref="WorkItemRetrier.RetryAgentRestoreAsync"/>'s
-///   snapshot-guarded conditional update reports success. Failed enqueue
-///   attempts do not consume the idempotency key.</item>
+///   <item>Idempotent. A prior claim for the restore event window blocks
+///   duplicate sweeps before retry, and a new claim must persist before
+///   <see cref="WorkItemRetrier.RetryAgentRestoreAsync"/>'s snapshot-guarded
+///   conditional update is attempted. Failed retry attempts release the
+///   idempotency key so a later sweep can try again.</item>
 /// </list>
 ///
 /// <para>Routing: the requeued item flows through the normal class router,
@@ -296,11 +296,15 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
                 continue;
             }
 
-            bool success; string? error; string? actualFrom;
+            bool claimPersisted;
             try
             {
-                (success, error, _, actualFrom, _) = await _retrier.RetryAgentRestoreAsync(
-                    item, from: null, trigger: "agent-restore", ct).ConfigureAwait(false);
+                claimPersisted = await _store.TryClaimAgentRestoreRetryAsync(
+                    item.Id,
+                    evt.Agent,
+                    evt.OutageStartedAt.Value,
+                    evt.RestoredAt,
+                    ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -309,6 +313,40 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
             catch (Exception ex)
             {
                 skipped++;
+                _log.LogError(ex,
+                    "AgentRestoreRetryScheduler: failed to persist idempotency claim for {Id} before agent {Agent} restore retry; skipping",
+                    item.Id,
+                    evt.Agent.Value);
+                continue;
+            }
+
+            if (!claimPersisted)
+            {
+                skipped++;
+                _log.LogDebug(
+                    "AgentRestoreRetryScheduler: skipped {Id}; restore event for {Agent} was claimed by a concurrent sweep",
+                    item.Id,
+                    evt.Agent.Value);
+                continue;
+            }
+
+            bool success; string? error; string? actualFrom;
+            try
+            {
+                (success, error, _, actualFrom, _) = await _retrier.RetryAgentRestoreAsync(
+                    item, from: null, trigger: "agent-restore", ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                await ReleaseClaimAfterRetryFailureAsync(item.Id, evt, "retry was cancelled", CancellationToken.None)
+                    .ConfigureAwait(false);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                skipped++;
+                await ReleaseClaimAfterRetryFailureAsync(item.Id, evt, "retry threw", ct)
+                    .ConfigureAwait(false);
                 _log.LogWarning(ex,
                     "AgentRestoreRetryScheduler: retry threw for {Id}; skipping and continuing sweep",
                     item.Id);
@@ -318,42 +356,12 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
             if (!success)
             {
                 skipped++;
+                await ReleaseClaimAfterRetryFailureAsync(item.Id, evt, "retry did not requeue", ct)
+                    .ConfigureAwait(false);
                 _log.LogDebug(
                     "AgentRestoreRetryScheduler: skipped {Id}: {Error}",
                     item.Id, error);
                 continue;
-            }
-
-            var claimPersisted = false;
-            var claimPersistenceFailed = false;
-            try
-            {
-                claimPersisted = await _store.TryClaimAgentRestoreRetryAsync(
-                        item.Id,
-                        evt.Agent,
-                        evt.OutageStartedAt.Value,
-                        evt.RestoredAt,
-                        ct).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                claimPersistenceFailed = true;
-                _log.LogError(ex,
-                    "AgentRestoreRetryScheduler: requeued {Id} after agent {Agent} restore but failed to persist idempotency claim",
-                    item.Id,
-                    evt.Agent.Value);
-            }
-
-            if (!claimPersisted && !claimPersistenceFailed)
-            {
-                _log.LogDebug(
-                    "AgentRestoreRetryScheduler: requeued {Id}; restore event for {Agent} was claimed by a concurrent sweep",
-                    item.Id,
-                    evt.Agent.Value);
             }
 
             requeued++;
@@ -367,6 +375,36 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
         await EmitSweepWebhookAsync(evt, requeued, skipped, ct)
             .ConfigureAwait(false);
         return new AgentRestoreSweepSummary(requeued, skipped);
+    }
+
+    private async Task ReleaseClaimAfterRetryFailureAsync(
+        WorkItemId id,
+        AgentRestoredEvent evt,
+        string reason,
+        CancellationToken ct)
+    {
+        if (evt.OutageStartedAt is not { } outageStartedAt)
+            return;
+
+        try
+        {
+            await _store.ReleaseAgentRestoreRetryClaimAsync(
+                id,
+                evt.Agent,
+                outageStartedAt,
+                ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "AgentRestoreRetryScheduler: failed to release idempotency claim for {Id} after {Reason}",
+                id,
+                reason);
+        }
     }
 
     private async Task<bool> IsCandidateAsync(

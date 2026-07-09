@@ -389,7 +389,13 @@ public sealed class CheckAndActPipelineTests : IDisposable
     public async Task InfrastructureFailureDuringCheck_TransitionsCheckToFailed_WithInfraMetadata()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+        var stateDbPath = Path.Combine(_workspace, $"check-infra-{Guid.NewGuid():N}.db");
+        using var involvement = new SqliteAgentInvolvementStore(stateDbPath);
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            stateDbPathOverride: stateDbPath,
+            involvement: involvement);
 
         tp.Agent.CheckResults.Enqueue(new AgentResult(
             Success: false,
@@ -408,6 +414,34 @@ public sealed class CheckAndActPipelineTests : IDisposable
         Assert.Equal(AgentKind.Claude, final.Agent);
         Assert.Contains("Check-and-act agent claude reported failure", final.LastError);
         Assert.Contains("agent exited 127", final.LastError);
+
+        var involvementRows = await involvement.ListByWorkItemAsync(check.Id);
+        var failedInvolvement = Assert.Single(involvementRows);
+        Assert.Equal(AgentKind.Claude, failedInvolvement.AgentKind);
+        Assert.Equal(AgentInvolvementOutcomes.FailureInfrastructure, failedInvolvement.Outcome);
+
+        var restoreQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(
+            tp.Store,
+            restoreQueue,
+            tp.GitHost,
+            NullLogger<WorkItemRetrier>.Instance);
+        var scheduler = new AgentRestoreRetryScheduler(
+            tp.Store,
+            retrier,
+            () => new AgentRestoreRetryOptions(),
+            NullLogger<AgentRestoreRetryScheduler>.Instance,
+            involvement: involvement);
+
+        var summary = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(
+                AgentKind.Claude,
+                final.UpdatedAt.AddMinutes(-1),
+                final.UpdatedAt.AddMinutes(1)));
+
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(WorkItemState.Queued, (await tp.Store.GetAsync(check.Id))!.State);
+        Assert.Equal(1, restoreQueue.Count);
     }
 
     [Fact]

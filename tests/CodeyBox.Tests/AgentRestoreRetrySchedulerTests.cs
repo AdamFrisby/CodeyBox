@@ -216,6 +216,33 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     }
 
     [Fact]
+    public async Task Sweep_ClaimPersistenceFailure_DoesNotRetryOrReportRequeued()
+    {
+        using var inner = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var item = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
+            updatedAt: outageStart.AddMinutes(2));
+        await inner.CreateAsync(item);
+
+        var store = new ThrowingClaimWorkItemStore(inner);
+        var scheduler = NewScheduler(store, queue, enabled: true);
+
+        var summary = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
+
+        Assert.Equal(0, summary.Requeued);
+        Assert.Equal(1, summary.Skipped);
+        Assert.Equal(1, store.ClaimAttempts);
+        Assert.Equal(WorkItemState.Failed, (await inner.GetAsync(item.Id))!.State);
+        Assert.Equal(0, queue.Count);
+    }
+
+    [Fact]
     public async Task Sweep_ConcurrentDuplicateRestoreEvents_OnlyOneRetryWritesAndEnqueues()
     {
         using var store = new SqliteWorkItemStore(_dbPath);
@@ -912,6 +939,36 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     }
 
     [Fact]
+    public async Task Sweep_UsesCentralFailureOutcomePredicateForSqliteInvolvement()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        using var involvement = new SqliteAgentInvolvementStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var scheduler = NewScheduler(store, queue, enabled: true, involvement: involvement);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var item = NewItem(
+            agent: AgentKind.Codex,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.Infrastructure,
+            updatedAt: outageStart.AddMinutes(2),
+            lastError: "check agent execution failed: claude binary missing");
+        await store.CreateAsync(item);
+        await RecordFailedInvolvementAsync(
+            involvement,
+            item.Id,
+            AgentKind.Claude,
+            outageStart.AddMinutes(2),
+            AgentInvolvementOutcomes.Cancelled);
+
+        var summary = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
+
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(item.Id))!.State);
+    }
+
+    [Fact]
     public async Task Sweep_FleetAuthPrefilterRunsBeforeLimit()
     {
         using var store = new SqliteWorkItemStore(_dbPath);
@@ -1222,6 +1279,34 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         Assert.Contains("PostRestoreMargin", ex.Message);
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void BuildOptions_NonPositiveMaxCandidatesPerSweep_Throws(int maxCandidatesPerSweep)
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            OrchestratorOptionsFactory.BuildAgentRestoreRetryOptions(
+                enabled: true,
+                lookbackGrace: "00:30:00",
+                postRestoreMargin: "00:05:00",
+                maxCandidatesPerSweep: maxCandidatesPerSweep));
+        Assert.Contains("MaxCandidatesPerSweep", ex.Message);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void BuildOptions_NonPositiveEventQueueCapacity_Throws(int eventQueueCapacity)
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            OrchestratorOptionsFactory.BuildAgentRestoreRetryOptions(
+                enabled: true,
+                lookbackGrace: "00:30:00",
+                postRestoreMargin: "00:05:00",
+                eventQueueCapacity: eventQueueCapacity));
+        Assert.Contains("EventQueueCapacity", ex.Message);
+    }
+
     [Fact]
     public void BuildOptions_Disabled_ReturnsDisabledOptionsWithoutValidating()
     {
@@ -1362,6 +1447,190 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         if (typeof(T) == typeof(int) && sv.Value is long l)
             return (T)(object)(int)l;
         return default;
+    }
+
+    private sealed class ThrowingClaimWorkItemStore : IWorkItemStore
+    {
+        private readonly IWorkItemStore _inner;
+
+        public ThrowingClaimWorkItemStore(IWorkItemStore inner) => _inner = inner;
+        public int ClaimAttempts { get; private set; }
+
+        public Task CreateAsync(WorkItem item, CancellationToken ct = default) =>
+            _inner.CreateAsync(item, ct);
+
+        public Task UpdateAsync(WorkItem item, CancellationToken ct = default) =>
+            _inner.UpdateAsync(item, ct);
+
+        public Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default) =>
+            _inner.TryUpdateIfStateAsync(item, onlyIfState, ct);
+
+        public Task<PriorityUpdateResult> UpdatePriorityAsync(
+            WorkItemId id,
+            int priority,
+            DateTimeOffset updatedAt,
+            CancellationToken ct = default) =>
+            _inner.UpdatePriorityAsync(id, priority, updatedAt, ct);
+
+        public Task<DependsOnUpdateResult> UpdateDependsOnAsync(
+            WorkItemId id,
+            IReadOnlyList<WorkItemId> dependsOn,
+            DateTimeOffset updatedAt,
+            CancellationToken ct = default) =>
+            _inner.UpdateDependsOnAsync(id, dependsOn, updatedAt, ct);
+
+        public Task<AuditBudgetUpdateResult> UpdateAuditBudgetAsync(
+            WorkItemId id,
+            int? auditMaxIterations,
+            string? auditComplexity,
+            DateTimeOffset updatedAt,
+            CancellationToken ct = default) =>
+            _inner.UpdateAuditBudgetAsync(id, auditMaxIterations, auditComplexity, updatedAt, ct);
+
+        public Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default) =>
+            _inner.GetAsync(id, ct);
+
+        public IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default) =>
+            _inner.ListAsync(ct);
+
+        public IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default) =>
+            _inner.ListByStateAsync(state, ct);
+
+        public IAsyncEnumerable<WorkItem> ListRestoreRetryCandidatesAsync(
+            AgentKind restoredAgent,
+            DateTimeOffset windowStart,
+            DateTimeOffset windowEnd,
+            TimeSpan involvementTerminalLookback,
+            TimeSpan involvementTerminalClockSkew,
+            int limit,
+            CancellationToken ct = default) =>
+            _inner.ListRestoreRetryCandidatesAsync(
+                restoredAgent,
+                windowStart,
+                windowEnd,
+                involvementTerminalLookback,
+                involvementTerminalClockSkew,
+                limit,
+                ct);
+
+        public Task<bool> HasAgentRestoreRetryClaimAsync(
+            WorkItemId id,
+            AgentKind restoredAgent,
+            DateTimeOffset outageStartedAt,
+            CancellationToken ct = default) =>
+            _inner.HasAgentRestoreRetryClaimAsync(id, restoredAgent, outageStartedAt, ct);
+
+        public Task<bool> TryClaimAgentRestoreRetryAsync(
+            WorkItemId id,
+            AgentKind restoredAgent,
+            DateTimeOffset outageStartedAt,
+            DateTimeOffset restoredAt,
+            CancellationToken ct = default)
+        {
+            ClaimAttempts++;
+            throw new InvalidOperationException("claim persistence failed");
+        }
+
+        public Task ReleaseAgentRestoreRetryClaimAsync(
+            WorkItemId id,
+            AgentKind restoredAgent,
+            DateTimeOffset outageStartedAt,
+            CancellationToken ct = default) =>
+            _inner.ReleaseAgentRestoreRetryClaimAsync(id, restoredAgent, outageStartedAt, ct);
+
+        public Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default) =>
+            _inner.CountByStateAsync(state, ct);
+
+        public Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default) =>
+            _inner.ReorderAsync(orderedIds, ct);
+
+        public IAsyncEnumerable<WorkItem> ListDispatchEligibleByPriorityAsync(
+            IReadOnlySet<WorkItemId> skipIds,
+            CancellationToken ct = default) =>
+            _inner.ListDispatchEligibleByPriorityAsync(skipIds, ct);
+
+        public Task<int> CountStartedInWindowAsync(
+            ProjectId projectId,
+            DateTimeOffset since,
+            CancellationToken ct = default) =>
+            _inner.CountStartedInWindowAsync(projectId, since, ct);
+
+        public Task<int> CountInFlightAsync(ProjectId projectId, CancellationToken ct = default) =>
+            _inner.CountInFlightAsync(projectId, ct);
+
+        public Task<WorkItem?> GetByExternalIdAsync(
+            ProjectId projectId,
+            string externalId,
+            CancellationToken ct = default) =>
+            _inner.GetByExternalIdAsync(projectId, externalId, ct);
+
+        public Task<WorkItem?> GetByNamespacedExternalIdAsync(
+            ProjectId projectId,
+            string @namespace,
+            string externalId,
+            CancellationToken ct = default) =>
+            _inner.GetByNamespacedExternalIdAsync(projectId, @namespace, externalId, ct);
+
+        public Task<WorkItem?> ReplaceExternalIdsAsync(
+            WorkItemId id,
+            IReadOnlyDictionary<string, string> externalIds,
+            DateTimeOffset updatedAt,
+            CancellationToken ct = default) =>
+            _inner.ReplaceExternalIdsAsync(id, externalIds, updatedAt, ct);
+
+        public Task<IReadOnlyList<(string ProjectId, int State)>> GetFleetRecentOutcomesAsync(
+            int perProject = 5,
+            CancellationToken ct = default) =>
+            _inner.GetFleetRecentOutcomesAsync(perProject, ct);
+
+        public Task<IReadOnlyList<(string ProjectId, int State, int Count, string MaxUpdatedAt)>> GetFleetStateCountsAsync(
+            CancellationToken ct = default) =>
+            _inner.GetFleetStateCountsAsync(ct);
+
+        public Task<IReadOnlyDictionary<string, bool>> GetFleetPauseStatesAsync(CancellationToken ct = default) =>
+            _inner.GetFleetPauseStatesAsync(ct);
+
+        public IAsyncEnumerable<WorkItem> ListByReplaySourceAsync(
+            WorkItemId sourceId,
+            CancellationToken ct = default) =>
+            _inner.ListByReplaySourceAsync(sourceId, ct);
+
+        public IAsyncEnumerable<WorkItem> ListSuspendedAsync(CancellationToken ct = default) =>
+            _inner.ListSuspendedAsync(ct);
+
+        public Task<IReadOnlySet<string>> GetActiveBaselineImageRefsAsync(CancellationToken ct = default) =>
+            _inner.GetActiveBaselineImageRefsAsync(ct);
+
+        public Task<IReadOnlyList<(WorkItemId Id, string Title, WorkItemState State)>> ListWorkItemsForBaselineAsync(
+            string baselineImageRef,
+            CancellationToken ct = default) =>
+            _inner.ListWorkItemsForBaselineAsync(baselineImageRef, ct);
+
+        public Task OrphanReplaysAsync(WorkItemId sourceId, CancellationToken ct = default) =>
+            _inner.OrphanReplaysAsync(sourceId, ct);
+
+        public IAsyncEnumerable<WorkItem> ListByReleaseAsync(ReleaseId releaseId, CancellationToken ct = default) =>
+            _inner.ListByReleaseAsync(releaseId, ct);
+
+        public Task<PromptReplaceResult> TryReplacePromptAsync(
+            WorkItemId id,
+            string newPrompt,
+            DateTimeOffset updatedAt,
+            CancellationToken ct = default) =>
+            _inner.TryReplacePromptAsync(id, newPrompt, updatedAt, ct);
+
+        public Task RecordIterationDispatchAsync(
+            WorkItemId workItemId,
+            int iteration,
+            int promptRevisionAtDispatch,
+            DateTimeOffset dispatchedAt,
+            CancellationToken ct = default) =>
+            _inner.RecordIterationDispatchAsync(workItemId, iteration, promptRevisionAtDispatch, dispatchedAt, ct);
+
+        public Task<IReadOnlyList<WorkItemIteration>> GetIterationsAsync(
+            WorkItemId workItemId,
+            CancellationToken ct = default) =>
+            _inner.GetIterationsAsync(workItemId, ct);
     }
 
     private sealed class ThrowingForWorkItemQueue : ITaskQueue

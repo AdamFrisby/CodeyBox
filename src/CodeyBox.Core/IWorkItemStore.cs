@@ -339,9 +339,10 @@ public interface IWorkItemStore
     }
 
     /// <summary>
-    /// Returns true when a successful agent-restore retry was already claimed
-    /// for the same work item, restored agent, and outage start. Used before
-    /// retrying so failed enqueue attempts do not consume the idempotency key.
+    /// Returns true when an agent-restore retry was already claimed for the
+    /// same work item, restored agent, and outage start. Used before retrying so
+    /// duplicate restore events do not repeat work already handled for this
+    /// outage window.
     /// </summary>
     Task<bool> HasAgentRestoreRetryClaimAsync(
         WorkItemId id,
@@ -352,10 +353,10 @@ public interface IWorkItemStore
             "This work item store does not implement agent-restore retry claim lookup.");
 
     /// <summary>
-    /// Claims a successfully requeued work item for a single agent-restore
-    /// sweep key. Persistent stores should make this atomic and return false
-    /// when another duplicate restore event already claimed the same
-    /// item/window.
+    /// Claims a work item for a single agent-restore sweep key before the retry
+    /// mutation is attempted. Persistent stores should make this atomic and
+    /// return false when another duplicate restore event already claimed the
+    /// same item/window.
     /// </summary>
     Task<bool> TryClaimAgentRestoreRetryAsync(
         WorkItemId id,
@@ -365,6 +366,20 @@ public interface IWorkItemStore
         CancellationToken ct = default)
         => throw new NotSupportedException(
             "This work item store does not implement agent-restore retry claims.");
+
+    /// <summary>
+    /// Releases a previously created agent-restore retry claim when the retry
+    /// mutation or queue kick failed, so a later sweep for the same restore
+    /// window can try again. Must match the same idempotency key as
+    /// <see cref="TryClaimAgentRestoreRetryAsync"/>.
+    /// </summary>
+    Task ReleaseAgentRestoreRetryClaimAsync(
+        WorkItemId id,
+        AgentKind restoredAgent,
+        DateTimeOffset outageStartedAt,
+        CancellationToken ct = default)
+        => throw new NotSupportedException(
+            "This work item store does not implement agent-restore retry claim release.");
 
     /// <summary>
     /// Returns the number of work items currently persisted in
