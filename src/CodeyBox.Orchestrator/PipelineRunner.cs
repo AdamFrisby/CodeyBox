@@ -2830,7 +2830,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         countAttempt: !conflictReworkAttemptAlreadyReserved);
                     if (!reworkOutcome.Success)
                     {
-                        throw new MergeConflictResolutionFailedException(reworkOutcome.ParkReason!, firstFailure);
+                        throw new MergeConflictResolutionFailedException(
+                            reworkOutcome.ParkReason!,
+                            firstFailure,
+                            failureKind: reworkOutcome.FailureKind,
+                            agent: reworkOutcome.Agent);
                     }
 
                     // Refresh the local snapshot so subsequent UpdateAsync
@@ -15524,7 +15528,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
     /// message the outer catch will record on
     /// <see cref="WorkItemState.MergeConflictResolutionFailed"/>.
     /// </summary>
-    private readonly record struct ConflictReworkResult(bool Success, string? ParkReason);
+    private readonly record struct ConflictReworkResult(
+        bool Success,
+        string? ParkReason,
+        string? FailureKind = null,
+        AgentKind? Agent = null);
 
     /// <summary>
     /// Runs the focused conflict-rework iteration: re-engages the original
@@ -15597,8 +15605,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 item = bumped ?? item;
             }
 
-            return new ConflictReworkResult(false,
-                $"in-VM smoke gate: {smokeAvailability.Reason ?? "unavailable"}");
+            return new ConflictReworkResult(
+                false,
+                $"in-VM smoke gate: {smokeAvailability.Reason ?? "unavailable"}",
+                FailureKind: WorkItemFailureKinds.AgentUnavailable,
+                Agent: runner.Kind);
         }
 
         if (countAttempt)
@@ -15718,7 +15729,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 success: false, newTip: outcome.NewTip, filesChanged: outcome.FilesChanged,
                 insertions: outcome.Insertions, deletions: outcome.Deletions,
                 semanticIncompatible: null, parkReason: parkMsg);
-            return new ConflictReworkResult(false, parkMsg);
+            return new ConflictReworkResult(
+                false,
+                parkMsg,
+                FailureKind: outcome.FailureKind,
+                Agent: outcome.Agent);
         }
 
         // Anti-abandonment guard: the file-set the work agent touched
@@ -15810,7 +15825,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string? SemanticIncompatibleReason,
         IReadOnlyList<string>? FilesChanged,
         int? Insertions,
-        int? Deletions);
+        int? Deletions,
+        string? FailureKind = null,
+        AgentKind? Agent = null);
 
     /// <summary>
     /// Drives the agent through a single conflict-rework iteration inside an
@@ -16030,6 +16047,19 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         ? "failure:transient"
                         : "failure:agent");
                 ThrowIfTransientAgentFailure(runner, ex, ConflictReworkPhaseKey);
+                if (classification.Kind == AgentFailureKind.Infrastructure)
+                {
+                    return new ConflictReworkAgentOutcome(
+                        AgentSucceeded: false,
+                        NewTip: null,
+                        FailureReason: BuildAgentFailureDetail(
+                            $"Conflict-rework agent {runner.Kind} reported infrastructure failure after exhausting session resume",
+                            ex.LastResult),
+                        SemanticIncompatibleReason: null,
+                        FilesChanged: null, Insertions: null, Deletions: null,
+                        FailureKind: WorkItemFailureKinds.Infrastructure,
+                        Agent: runner.Kind);
+                }
                 throw;
             }
             catch (Exception ex)
@@ -16096,7 +16126,22 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
             if (!agentResult.Success)
             {
+                var classification = _authFailureClassifier.ClassifyFailure(runner, agentResult);
                 ThrowIfTransientAgentFailure(runner, agentResult, ConflictReworkPhaseKey);
+                if (classification.Kind == AgentFailureKind.Infrastructure)
+                {
+                    return new ConflictReworkAgentOutcome(
+                        AgentSucceeded: false,
+                        NewTip: null,
+                        FailureReason: BuildAgentFailureDetail(
+                            $"Conflict-rework agent {runner.Kind} reported infrastructure failure",
+                            agentResult),
+                        SemanticIncompatibleReason: null,
+                        FilesChanged: null, Insertions: null, Deletions: null,
+                        FailureKind: WorkItemFailureKinds.Infrastructure,
+                        Agent: runner.Kind);
+                }
+
                 return new ConflictReworkAgentOutcome(
                     AgentSucceeded: false,
                     NewTip: null,

@@ -62,7 +62,11 @@ public static class EventSchema
         {
             "agent.paused" or "agent.resumed" or "work_item.waiting_for_agent_resume" => AgentPauseVersion,
             "work_item.waiting_for_transient_retry" => TransientRetryVersion,
-            "work_item.planning" or "work_item.plan_review" or "work_item.plan_approved" => PlanningVersion,
+            "agent.restore_requeue_swept"
+                or "work_item.agent_restore_requeued"
+                or "work_item.planning"
+                or "work_item.plan_review"
+                or "work_item.plan_approved" => PlanningVersion,
             _ when name.StartsWith("worker_pool.", StringComparison.Ordinal) => WorkerPoolHealthVersion,
             _ => InitialVersion,
         };
@@ -124,6 +128,7 @@ public static class EventSchema
         // Work-item lifecycle / operator interaction
         "work_item.agent_stuck",
         "work_item.auto_retry",
+        "work_item.agent_restore_requeued",
         "work_item.recovered",
         "work_item.suggestion",
         "work_item.question_asked",

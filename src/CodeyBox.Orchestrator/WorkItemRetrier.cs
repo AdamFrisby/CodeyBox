@@ -44,6 +44,7 @@ public sealed class WorkItemRetrier
         None,
         QuotaAutoRetry,
         TransientAutoRetry,
+        AgentRestoreAutoRetry,
     }
 
     private readonly IWorkItemStore _store;
@@ -100,6 +101,13 @@ public sealed class WorkItemRetrier
         string trigger,
         CancellationToken ct = default)
         => ToPublicResult(await RetryCoreAsync(item, from, trigger, RetryAccounting.TransientAutoRetry, ct));
+
+    public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryAgentRestoreAsync(
+        WorkItem item,
+        string? from,
+        string trigger,
+        CancellationToken ct = default)
+        => ToPublicResult(await RetryCoreAsync(item, from, trigger, RetryAccounting.AgentRestoreAutoRetry, ct));
 
     internal async Task<WorkItemRetryResult> RetryQuotaAutoDetailedAsync(
         WorkItem item,
@@ -259,7 +267,7 @@ public sealed class WorkItemRetrier
         // WaitingForQuotaReset, or WaitingForTransientRetry. Eligibility gates
         // that must apply across HTTP, scheduler, and operator paths live in
         // this retrier before the write.
-        var updated = accounting == RetryAccounting.TransientAutoRetry
+        var updated = accounting is RetryAccounting.TransientAutoRetry or RetryAccounting.AgentRestoreAutoRetry
             ? await _store.TryUpdateIfStateAndUpdatedAtAsync(resumed, item.State, item.UpdatedAt, ct)
             : await _store.TryUpdateIfStateAsync(resumed, item.State, ct);
         if (!updated)

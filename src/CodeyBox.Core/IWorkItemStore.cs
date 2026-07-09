@@ -305,8 +305,11 @@ public interface IWorkItemStore
     /// agent-restore retry sweep's heavier attribution checks. Implementations
     /// should push the state, window, failure-kind, ordering, and limit into the
     /// backing store so a restore event cannot buffer all historical failures.
+    /// The cheap restored-agent filter must also happen before the limit so
+    /// unrelated agents' failures cannot consume the sweep cap.
     /// </summary>
     async IAsyncEnumerable<WorkItem> ListRestoreRetryCandidatesAsync(
+        AgentKind restoredAgent,
         DateTimeOffset windowStart,
         DateTimeOffset windowEnd,
         int limit,
@@ -326,11 +329,37 @@ public interface IWorkItemStore
                     continue;
                 if (!WorkItemFailureKinds.IsInfraShaped(item.FailureKind))
                     continue;
+                if (!MayBelongToRestoredAgent(item, restoredAgent))
+                    continue;
 
                 yielded++;
                 yield return item;
             }
         }
+    }
+
+    /// <summary>
+    /// Claims a work item for a single agent-restore sweep key. Persistent stores
+    /// should make this atomic and return false when another duplicate restore
+    /// event already claimed the same item/window.
+    /// </summary>
+    Task<bool> TryClaimAgentRestoreRetryAsync(
+        WorkItemId id,
+        AgentKind restoredAgent,
+        DateTimeOffset outageStartedAt,
+        DateTimeOffset restoredAt,
+        CancellationToken ct = default)
+        => Task.FromResult(true);
+
+    private static bool MayBelongToRestoredAgent(WorkItem item, AgentKind restoredAgent)
+    {
+        if (string.Equals(item.FailureKind, WorkItemFailureKinds.AuthRequired, StringComparison.OrdinalIgnoreCase))
+            return item.AuthFailureScope == WorkItemAuthFailureScope.Fleet;
+
+        if (string.Equals(item.FailureKind, WorkItemFailureKinds.Infrastructure, StringComparison.OrdinalIgnoreCase))
+            return item.Agent is null || item.Agent == restoredAgent;
+
+        return item.Agent == restoredAgent;
     }
 
     /// <summary>

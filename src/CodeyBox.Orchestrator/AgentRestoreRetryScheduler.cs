@@ -32,13 +32,14 @@ namespace CodeyBox.Orchestrator;
 ///   <c>[OutageStartedAt - lookbackGrace, RestoredAt + margin]</c>. Items
 ///   that failed before the outage was even noticed (lookback grace) are
 ///   included; items that failed long before the outage are not. When
-///   <see cref="AgentRestoredEvent.OutageStartedAt"/> is null (operator
-///   reset on a never-failed agent, startup pass on an agent never
-///   excluded) the sweep is a no-op — there is no window to scope by.</item>
-///   <item>Idempotent. Each candidate is re-enqueued through
-///   <see cref="WorkItemRetrier.RetryAsync"/>'s
-///   <c>TryUpdateIfStateAsync</c> conditional update, so two restore
-///   events firing in quick succession can't double-retry the same item.</item>
+///   <see cref="AgentRestoredEvent.OutageStartedAt"/> is null the sweep
+///   does not retry anything because there is no window to scope by, but it
+///   still emits zero-count audit/webhook telemetry.</item>
+///   <item>Idempotent. Each candidate is claimed against the restore event
+///   window before being re-enqueued and is then written through
+///   <see cref="WorkItemRetrier.RetryAgentRestoreAsync"/>'s snapshot-guarded
+///   conditional update, so duplicate restore events cannot double-retry the
+///   same outage victim.</item>
 /// </list>
 ///
 /// <para>Routing: the requeued item flows through the normal class router,
@@ -199,6 +200,7 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
         var skipped = 0;
 
         await foreach (var item in _store.ListRestoreRetryCandidatesAsync(
+            evt.Agent,
             windowStart,
             windowEnd,
             opts.MaxCandidatesPerSweep,
@@ -209,10 +211,25 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
                 continue;
             }
 
+            if (!await _store.TryClaimAgentRestoreRetryAsync(
+                    item.Id,
+                    evt.Agent,
+                    evt.OutageStartedAt.Value,
+                    evt.RestoredAt,
+                    ct).ConfigureAwait(false))
+            {
+                skipped++;
+                _log.LogDebug(
+                    "AgentRestoreRetryScheduler: skipped {Id}; restore event for {Agent} was already claimed",
+                    item.Id,
+                    evt.Agent.Value);
+                continue;
+            }
+
             bool success; string? error; string? actualFrom;
             try
             {
-                (success, error, _, actualFrom, _) = await _retrier.RetryAsync(
+                (success, error, _, actualFrom, _) = await _retrier.RetryAgentRestoreAsync(
                     item, from: null, trigger: "agent-restore", ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -240,7 +257,7 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
             requeued++;
             AuditLog.AgentRestoreRequeueItem(
                 item.Id, evt.Agent, item.FailureKind, actualFrom ?? "work");
-            await EmitAutoRetryWebhookAsync(item, evt, actualFrom, ct).ConfigureAwait(false);
+            await EmitAgentRestoreRetryWebhookAsync(item, evt, actualFrom, ct).ConfigureAwait(false);
         }
 
         AuditLog.AgentRestoreRequeueSwept(
@@ -354,7 +371,7 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
         }
     }
 
-    private async Task EmitAutoRetryWebhookAsync(
+    private async Task EmitAgentRestoreRetryWebhookAsync(
         WorkItem item,
         AgentRestoredEvent evt,
         string? actualFrom,
@@ -376,7 +393,7 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
             var updated = await _store.GetAsync(item.Id, ct).ConfigureAwait(false);
             await _webhooks.PublishAsync(new WebhookEvent
             {
-                Event = "work_item.auto_retry",
+                Event = "work_item.agent_restore_requeued",
                 WorkItem = updated ?? item,
                 Project = project,
                 Details = new
@@ -407,8 +424,10 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
 }
 
 /// <summary>
-/// Hot-reloadable options for <see cref="AgentRestoreRetryScheduler"/>. Bound
-/// from <c>CodeyBox:AutoRequeueOnAgentRestore</c>.
+/// Options for <see cref="AgentRestoreRetryScheduler"/>. Bound from
+/// <c>CodeyBox:AutoRequeueOnAgentRestore</c>. All values are hot-reloadable
+/// except <see cref="EventQueueCapacity"/>, which sizes the scheduler channel
+/// at startup.
 /// </summary>
 public sealed record AgentRestoreRetryOptions
 {
@@ -446,7 +465,8 @@ public sealed record AgentRestoreRetryOptions
 
     /// <summary>
     /// Bounded channel capacity for restore notifications awaiting the scheduler
-    /// loop. Default 128.
+    /// loop. Read once when the scheduler is constructed; restart the API to
+    /// apply changes. Default 128.
     /// </summary>
     public int EventQueueCapacity { get; init; } = DefaultEventQueueCapacity;
 

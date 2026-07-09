@@ -85,6 +85,21 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 """;
             cmd.ExecuteNonQuery();
 
+            using (var restoreClaimCmd = _conn.CreateCommand())
+            {
+                restoreClaimCmd.CommandText = """
+                    CREATE TABLE IF NOT EXISTS agent_restore_retry_claims (
+                        work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                        restored_agent TEXT NOT NULL,
+                        outage_started_at TEXT NOT NULL,
+                        restored_at TEXT NOT NULL,
+                        claimed_at TEXT NOT NULL,
+                        PRIMARY KEY (work_item_id, restored_agent, outage_started_at, restored_at)
+                    );
+                    """;
+                restoreClaimCmd.ExecuteNonQuery();
+            }
+
             // Additive migration: add depends_on_json column if it doesn't exist yet.
             // Existing rows get the default '[]' so behaviour is unchanged.
             RunMigration("ALTER TABLE work_items ADD COLUMN depends_on_json TEXT NOT NULL DEFAULT '[]';");
@@ -1381,6 +1396,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     }
 
     public async IAsyncEnumerable<WorkItem> ListRestoreRetryCandidatesAsync(
+        AgentKind restoredAgent,
         DateTimeOffset windowStart,
         DateTimeOffset windowEnd,
         int limit,
@@ -1402,8 +1418,25 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     WHERE state IN ($failed, $merge_conflict_failed)
                       AND updated_at >= $window_start
                       AND updated_at <= $window_end
-                      AND failure_kind IN ($infrastructure, $agent_unavailable, $auth_required)
-                    ORDER BY updated_at ASC, created_at ASC
+                      AND (
+                          (
+                              failure_kind COLLATE NOCASE = $infrastructure
+                              AND (agent IS NULL OR agent COLLATE NOCASE = $restored_agent)
+                          )
+                          OR (
+                              failure_kind COLLATE NOCASE = $agent_unavailable
+                              AND agent COLLATE NOCASE = $restored_agent
+                          )
+                          OR (
+                              failure_kind COLLATE NOCASE = $auth_required
+                              AND auth_failure_scope COLLATE NOCASE = $fleet_auth_scope
+                          )
+                      )
+                    ORDER BY CASE
+                        WHEN agent COLLATE NOCASE = $restored_agent THEN 0
+                        WHEN agent IS NULL THEN 1
+                        ELSE 2
+                    END, updated_at ASC, created_at ASC
                     LIMIT $limit;
                     """;
                 cmd.Parameters.AddWithValue("$failed", (int)WorkItemState.Failed);
@@ -1413,6 +1446,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 cmd.Parameters.AddWithValue("$infrastructure", WorkItemFailureKinds.Infrastructure);
                 cmd.Parameters.AddWithValue("$agent_unavailable", WorkItemFailureKinds.AgentUnavailable);
                 cmd.Parameters.AddWithValue("$auth_required", WorkItemFailureKinds.AuthRequired);
+                cmd.Parameters.AddWithValue("$restored_agent", restoredAgent.Value);
+                cmd.Parameters.AddWithValue("$fleet_auth_scope", WorkItemAuthFailureScope.Fleet.ToString());
                 cmd.Parameters.AddWithValue("$limit", limit);
                 using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
                 while (await reader.ReadAsync(ct).ConfigureAwait(false))
@@ -1428,6 +1463,50 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
 
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
+    }
+
+    public async Task<bool> TryClaimAgentRestoreRetryAsync(
+        WorkItemId id,
+        AgentKind restoredAgent,
+        DateTimeOffset outageStartedAt,
+        DateTimeOffset restoredAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT OR IGNORE INTO agent_restore_retry_claims (
+                    work_item_id,
+                    restored_agent,
+                    outage_started_at,
+                    restored_at,
+                    claimed_at
+                )
+                VALUES (
+                    $work_item_id,
+                    $restored_agent,
+                    $outage_started_at,
+                    $restored_at,
+                    $claimed_at
+                );
+                """;
+            cmd.Parameters.AddWithValue("$work_item_id", id.ToString());
+            cmd.Parameters.AddWithValue("$restored_agent", restoredAgent.Value);
+            cmd.Parameters.AddWithValue("$outage_started_at", outageStartedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$restored_at", restoredAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$claimed_at", DateTimeOffset.UtcNow.ToString("O"));
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) > 0;
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("TryClaimAgentRestoreRetryAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default)

@@ -2,6 +2,8 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using Serilog;
+using Serilog.Events;
 
 namespace CodeyBox.Tests;
 
@@ -11,14 +13,25 @@ namespace CodeyBox.Tests;
 /// infra-vs-real filter, idempotency, and window bounding. Each test isolates
 /// a single bound so a regression in any one is unambiguous.
 /// </summary>
+[Collection("GlobalSerilog")]
 public sealed class AgentRestoreRetrySchedulerTests : IDisposable
 {
+    private readonly TestSink _sink = new();
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(),
         $"codeybox-agent-restore-retry-{Guid.NewGuid():N}.db");
 
+    public AgentRestoreRetrySchedulerTests()
+    {
+        Log.Logger = new LoggerConfiguration()
+            .Enrich.FromLogContext()
+            .WriteTo.Sink(_sink)
+            .CreateLogger();
+    }
+
     public void Dispose()
     {
+        Log.CloseAndFlush();
         try { File.Delete(_dbPath); } catch { }
     }
 
@@ -144,6 +157,46 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         var secondSweep = await scheduler.SweepForTestAsync(evt);
         Assert.Equal(0, secondSweep.Requeued);
         Assert.Equal(1, queue.Count);
+
+        var afterFirstRetry = await store.GetAsync(item.Id);
+        Assert.NotNull(afterFirstRetry);
+        await store.UpdateAsync(afterFirstRetry! with
+        {
+            State = WorkItemState.Failed,
+            FailureKind = WorkItemFailureKinds.AgentUnavailable,
+            LastError = "agent still broken after restore retry",
+            UpdatedAt = evt.RestoredAt.AddMinutes(1),
+        });
+
+        var duplicateAfterRefailure = await scheduler.SweepForTestAsync(evt);
+        Assert.Equal(0, duplicateAfterRefailure.Requeued);
+        Assert.Equal(1, queue.Count);
+        Assert.Equal(WorkItemState.Failed, (await store.GetAsync(item.Id))!.State);
+    }
+
+    [Fact]
+    public async Task Sweep_ConcurrentDuplicateRestoreEvents_OnlyOneRetryWritesAndEnqueues()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var scheduler = NewScheduler(store, queue, enabled: true);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var item = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
+            updatedAt: outageStart.AddMinutes(2));
+        await store.CreateAsync(item);
+
+        var evt = new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow);
+        var sweeps = await Task.WhenAll(
+            scheduler.SweepForTestAsync(evt),
+            scheduler.SweepForTestAsync(evt));
+
+        Assert.Equal(1, sweeps.Sum(static sweep => sweep.Requeued));
+        Assert.Equal(1, queue.Count);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(item.Id))!.State);
     }
 
     [Fact]
@@ -205,6 +258,57 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         Assert.Equal(1, summary.Requeued);
         Assert.Equal(WorkItemState.Queued, (await store.GetAsync(claudeItem.Id))!.State);
         Assert.Equal(WorkItemState.Failed, (await store.GetAsync(codexItem.Id))!.State);
+    }
+
+    [Fact]
+    public async Task Sweep_CandidateCapAppliesAfterRestoredAgentPrefilter()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var scheduler = NewScheduler(store, queue, enabled: true, maxCandidatesPerSweep: 1);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-20);
+        var unrelatedEarlier = NewItem(
+            agent: AgentKind.Codex,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
+            updatedAt: outageStart.AddMinutes(1));
+        var restoredAgentItem = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
+            updatedAt: outageStart.AddMinutes(2));
+        await store.CreateAsync(unrelatedEarlier);
+        await store.CreateAsync(restoredAgentItem);
+
+        var summary = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
+
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(WorkItemState.Failed, (await store.GetAsync(unrelatedEarlier.Id))!.State);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(restoredAgentItem.Id))!.State);
+    }
+
+    [Fact]
+    public async Task Sweep_TreatsInfraFailureKindCaseInsensitivelyInSqliteStore()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var scheduler = NewScheduler(store, queue, enabled: true);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var item = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AgentUnavailable.ToUpperInvariant(),
+            updatedAt: outageStart.AddMinutes(2));
+        await store.CreateAsync(item);
+
+        var summary = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
+
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(item.Id))!.State);
     }
 
     [Fact]
@@ -454,13 +558,8 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     [Fact]
     public async Task Sweep_NullOutageStartedAt_StillReturnsSummaryForObservability()
     {
-        // The audit-log emission for the null-window no-op case is verified by
-        // inspection of SweepAsync; asserting it here via the global Serilog
-        // sink would race with the rest of the test suite (the static
-        // Log.Logger is shared across non-GlobalSerilog collections). Instead
-        // we pin the observable behavior: the summary is returned with
-        // Requeued=0 so callers can distinguish "feature disabled" (no call)
-        // from "no candidates matched / null window" (call returning zeros).
+        // Null window still emits sweep-level telemetry, but no item can be
+        // retried because there is no bounded outage interval to select from.
         using var store = new SqliteWorkItemStore(_dbPath);
         var queue = new InMemoryTaskQueue();
         var scheduler = NewScheduler(store, queue, enabled: true);
@@ -535,6 +634,29 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
 
         Assert.Equal(0, summary.Requeued);
         Assert.Equal(WorkItemState.Failed, (await store.GetAsync(item.Id))!.State);
+    }
+
+    [Fact]
+    public async Task Sweep_DoesNotFallbackToWorkItemAgentForGenericInfrastructureWithoutInvolvement()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var scheduler = NewScheduler(store, queue, enabled: true);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var item = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.Infrastructure,
+            updatedAt: outageStart.AddMinutes(2));
+        await store.CreateAsync(item);
+
+        var summary = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
+
+        Assert.Equal(0, summary.Requeued);
+        Assert.Equal(WorkItemState.Failed, (await store.GetAsync(item.Id))!.State);
+        Assert.Equal(0, queue.Count);
     }
 
     [Fact]
@@ -681,10 +803,42 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         Assert.Equal("1", Detail(sweep, "requeued"));
         Assert.Equal("0", Detail(sweep, "skipped"));
 
-        var retry = Assert.Single(webhooks.Events, e => e.Event == "work_item.auto_retry");
+        var retry = Assert.Single(webhooks.Events, e => e.Event == "work_item.agent_restore_requeued");
         Assert.Equal("agent_restore", Detail(retry, "reason"));
         Assert.Equal("claude", Detail(retry, "restoredAgent"));
         Assert.Equal(WorkItemState.Queued, retry.WorkItem!.State);
+    }
+
+    [Fact]
+    public async Task Sweep_AuditLogsSweepAndRequeuedItemCounts()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var scheduler = NewScheduler(store, queue, enabled: true);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var item = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
+            updatedAt: outageStart.AddMinutes(2));
+        await store.CreateAsync(item);
+
+        await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
+
+        var sweep = Assert.Single(_sink.Events,
+            e => GetScalar<string>(e, "EventName") == "agent.restore_requeue_swept");
+        Assert.Equal("claude", GetScalar<string>(sweep, "Agent"));
+        Assert.Equal(1, GetScalar<int>(sweep, "Requeued"));
+        Assert.Equal(0, GetScalar<int>(sweep, "Skipped"));
+
+        var requeuedItem = Assert.Single(_sink.Events,
+            e => GetScalar<string>(e, "EventName") == "agent.restore_requeue_item");
+        Assert.Equal(item.Id.ToString(), GetScalar<string>(requeuedItem, "WorkItemId"));
+        Assert.Equal("claude", GetScalar<string>(requeuedItem, "Agent"));
+        Assert.Equal(WorkItemFailureKinds.AgentUnavailable, GetScalar<string>(requeuedItem, "FailureKind"));
+        Assert.Equal("work", GetScalar<string>(requeuedItem, "From"));
     }
 
     [Fact]
@@ -943,6 +1097,17 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             LastError = lastError,
             UpdatedAt = updatedAt,
         };
+
+    private static T? GetScalar<T>(LogEvent evt, string key)
+    {
+        if (!evt.Properties.TryGetValue(key, out var prop) || prop is not ScalarValue sv)
+            return default;
+        if (sv.Value is T t)
+            return t;
+        if (typeof(T) == typeof(int) && sv.Value is long l)
+            return (T)(object)(int)l;
+        return default;
+    }
 
     private sealed class FakeTimeProvider(DateTimeOffset now) : TimeProvider
     {

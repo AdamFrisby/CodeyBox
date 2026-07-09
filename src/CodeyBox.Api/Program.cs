@@ -3884,8 +3884,20 @@ app.MapPost("/admin/agent/{name}/smoke", async (
     });
 });
 
-app.MapPost("/admin/agent/{name}/reset", (string name, IAgentAvailabilityRegistry registry, IAgentRegistry agents, IAgentAvailabilityReset reset) =>
+app.MapPost("/admin/agent/{name}/reset", (
+    string name,
+    HttpContext httpContext,
+    ApiKeyState apiKeyState,
+    IAgentAvailabilityRegistry registry,
+    IAgentRegistry agents,
+    IAgentAvailabilityReset reset) =>
 {
+    if (!ApiKeyAuth.IsAuthorized(httpContext, apiKeyState))
+    {
+        httpContext.Response.Headers["WWW-Authenticate"] = "Bearer";
+        return Results.Text("unauthorized", statusCode: StatusCodes.Status401Unauthorized);
+    }
+
     // Mirror /smoke: normalise to lowercase so case-mismatched names match the
     // canonical kinds returned by IAgentRegistry.Available.
     var kind = new AgentKind(name.ToLowerInvariant());
@@ -4997,8 +5009,10 @@ namespace CodeyBox.Api
     }
 
     /// <summary>
-    /// Bound from <c>CodeyBox:AutoRequeueOnAgentRestore</c>. Hot-reloadable.
-    /// See <see cref="CodeyBox.Orchestrator.AgentRestoreRetryScheduler"/> for
+    /// Bound from <c>CodeyBox:AutoRequeueOnAgentRestore</c>. Hot-reloadable
+    /// except <see cref="EventQueueCapacity"/>, which sizes the scheduler
+    /// channel at startup. See
+    /// <see cref="CodeyBox.Orchestrator.AgentRestoreRetryScheduler"/> for
     /// runtime semantics.
     /// </summary>
     public sealed class AutoRequeueOnAgentRestoreConfig
@@ -5046,7 +5060,7 @@ namespace CodeyBox.Api
 
         /// <summary>
         /// Positive bounded-channel capacity for pending restore notifications.
-        /// Default 128.
+        /// Startup-only; restart the API to apply changes. Default 128.
         /// </summary>
         public int EventQueueCapacity { get; set; } = AgentRestoreRetryOptions.DefaultEventQueueCapacity;
 

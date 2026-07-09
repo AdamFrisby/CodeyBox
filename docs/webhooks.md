@@ -28,6 +28,7 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `agent.smoke_failed` | Credential smoke test failed, runtime auth/login-prompt detection benched an agent, or the fast-fail breaker excluded an agent (see [Details](#agent_smoke_failed-details)) |
 | `agent.paused` | Operator paused new dispatch to one agent kind (see [Details](#agent_paused-details)) |
 | `agent.resumed` | Operator resumed dispatch to one agent kind (see [Details](#agent_resumed-details)) |
+| `agent.restore_requeue_swept` | Agent restore triggered an infra-failure retry sweep (see [Details](#agentrestore_requeue_swept-details)) |
 | `queue.paused` | Operator paused the global pickup queue (see [Details](#queue_paused-details)) |
 | `queue.resumed` | Operator resumed the global pickup queue (see [Details](#queue_resumed-details)) |
 | `budget.deferred` | A work item was deferred by a per-project budget cap (see [Details](#budget_deferred-details)) |
@@ -39,6 +40,7 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `project.queue_resumed` | Per-project queue was resumed |
 | `work_item.recovered` | Dead-worker reaper recovered a work item with a state-changing crash recovery transition (see [Details](#recovered-details)) |
 | `work_item.auto_retry` | Auto-retry scheduler re-queued a work item after quota reset or transient retry backoff (see [Details](#auto_retry-details)) |
+| `work_item.agent_restore_requeued` | Agent-restore infra sweep re-queued a failed work item (see [Details](#agent_restore_requeued-details)) |
 | `work_item.suggestion` | Agent emitted a suggestion (one event per suggestion entry; see [Details](#suggestion-details)) |
 | `work_item.needs_operator_input` | Work item parked waiting for operator to answer one or more questions |
 | `work_item.waiting_for_agent_resume` | Work item parked because its only eligible agent is paused |
@@ -436,6 +438,62 @@ When `event` is `work_item.auto_retry`, the `details` field is populated:
 | `reason` | string | Why the retry was scheduled: `"quota"` or `"transient"`. |
 | `attemptNumber` | int | Which auto-retry attempt this is (1-indexed). Capped by the matching `AutoRetryOnQuotaFailure` or `AutoRetryOnTransientFailure` max-attempt setting. |
 | `triggeredBy` | string | `"targeted"` if fired by a per-item timer, `"periodic"` if fired by the safety-net sweep, `"rearm-overdue"` if fired immediately during startup re-arm because the persisted retry timestamp was already in the past, or `"startup"` for quota waiting rows requeued during startup. |
+
+### `agent.restore_requeue_swept` details
+
+When `event` is `agent.restore_requeue_swept`, the `details` field is populated:
+
+```json
+{
+  "details": {
+    "reason": "agent_restore",
+    "restoredAgent": "claude",
+    "outageStartedAt": "2026-06-10T03:15:00Z",
+    "restoredAt": "2026-06-10T04:05:00Z",
+    "requeued": 3,
+    "skipped": 1
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `reason` | string | Always `"agent_restore"`. |
+| `restoredAgent` | string | Agent kind that transitioned back to routable. |
+| `outageStartedAt` | string\|null | Outage-window start used by the sweep. Null means no retroactive retries were attempted. |
+| `restoredAt` | string | Restore timestamp used as the end of the bounded outage window. |
+| `requeued` | int | Number of eligible infra-shaped failures requeued. |
+| `skipped` | int | Number of matched candidates that were not requeued because attribution, idempotency, or retry guards rejected them. |
+
+### `agent_restore_requeued` details
+
+When `event` is `work_item.agent_restore_requeued`, the `details` field is populated:
+
+```json
+{
+  "details": {
+    "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "reason": "agent_restore",
+    "restoredAgent": "claude",
+    "failureKind": "agent_unavailable",
+    "triggeredBy": "agent-restore",
+    "from": "work",
+    "outageStartedAt": "2026-06-10T03:15:00Z",
+    "restoredAt": "2026-06-10T04:05:00Z"
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `workItemId` | string | UUID of the work item that was requeued. |
+| `reason` | string | Always `"agent_restore"`. |
+| `restoredAgent` | string | Agent kind whose restore event triggered the retry sweep. |
+| `failureKind` | string\|null | Persisted infra-shaped failure kind that made the item eligible. |
+| `triggeredBy` | string | Always `"agent-restore"`. |
+| `from` | string\|null | Resume phase selected by the shared retrier. |
+| `outageStartedAt` | string | Outage-window start used by the sweep. |
+| `restoredAt` | string | Restore timestamp used as the end of the bounded outage window. |
 
 ### `cancelled` details
 

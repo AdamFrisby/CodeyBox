@@ -2,8 +2,9 @@ namespace CodeyBox.Core;
 
 /// <summary>
 /// Fired when an agent's availability flips from excluded to routable —
-/// either because a smoke probe transitioned FAIL → PASS or because an
-/// operator <c>POST /admin/agent/{name}/reset</c> cleared its exclusion.
+/// either because a smoke probe transitioned FAIL -> PASS or because an
+/// operator <c>POST /admin/agent/{name}/reset</c> cleared an existing
+/// exclusion. Resetting an already-routable agent does not publish this event.
 /// Consumers use the signal to re-evaluate Failed/parked work items whose
 /// last attempt landed on the now-restored agent during the outage window.
 ///
@@ -33,11 +34,10 @@ public interface IAgentRestoreSignal
 /// ANY source (smoke probe, fast-fail breaker, no-changes breaker,
 /// missing-probe, runtime auth-required), and pinned across follow-up
 /// failures so a long multi-hour outage keeps the outage start, not the
-/// most recent failure. Null when the registry never recorded an outage
-/// (operator reset on a never-excluded agent, startup probe pass with
-/// nothing to clear). Consumers should treat null as "no outage window
-/// known" and skip retroactive sweeps rather than retrying every Failed
-/// item.
+    /// most recent failure. Null only when a publisher cannot reconstruct an
+    /// outage window for a restore it did emit. Consumers should treat null as
+    /// "no outage window known" and skip retroactive retries while still
+    /// producing zero-count telemetry where applicable.
 /// </param>
 /// <param name="RestoredAt">UTC timestamp of the transition.</param>
 public sealed record AgentRestoredEvent(

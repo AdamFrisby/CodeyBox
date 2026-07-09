@@ -144,6 +144,24 @@ public sealed class AgentAvailabilityAdminEndpointTests
     }
 
     [Fact]
+    public async Task PostReset_WithoutBearerToken_WhenAuthEnabled_Returns401AndDoesNotReset()
+    {
+        const string validToken = "0123456789abcdef0123456789abcdef";
+        using var env = new EnvironmentVariableScope("CODEYBOX_API_KEY", validToken);
+        using var authFactory = new AvailabilityAdminApiFactory { DisableAuth = false };
+        var registry = authFactory.Services.GetRequiredService<AgentAvailabilityRegistry>();
+        for (var i = 0; i < 3; i++)
+            registry.RecordRunOutcome(AgentKind.Claude, success: false, duration: TimeSpan.FromSeconds(1));
+        Assert.False(registry.GetAvailability(AgentKind.Claude).Available);
+
+        var client = authFactory.CreateClient();
+        var resp = await client.PostAsync("/admin/agent/claude/reset", content: null);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, resp.StatusCode);
+        Assert.False(registry.GetAvailability(AgentKind.Claude).Available);
+    }
+
+    [Fact]
     public async Task PostReset_InvalidatesInVmSmokeCache_ForcingReprobe()
     {
         // The reset endpoint must drop any cached passing in-VM verdict so the
@@ -251,6 +269,8 @@ public sealed class AgentAvailabilityAdminEndpointTests
         private readonly ControllableSmokeProbe _codexProbe = new(AgentKind.Codex);
         internal readonly ControllableInVmSmokeGate InVmGate = new();
 
+        public bool DisableAuth { get; init; } = true;
+
         public void SetProbeResult(AgentKind kind, bool pass)
         {
             if (kind == AgentKind.Claude) _claudeProbe.ShouldPass = pass;
@@ -281,7 +301,7 @@ public sealed class AgentAvailabilityAdminEndpointTests
                 var tmp = Path.GetTempPath();
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
-                    ["CodeyBox:DangerouslyDisableAuth"] = "true",
+                    ["CodeyBox:DangerouslyDisableAuth"] = DisableAuth ? "true" : "false",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
                     ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
                     ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
@@ -380,5 +400,20 @@ public sealed class AgentAvailabilityAdminEndpointTests
             ForceProbeCalls.Add(kind);
             return Task.FromResult(Enabled ? ForceProbeResult : null);
         }
+    }
+
+    private sealed class EnvironmentVariableScope : IDisposable
+    {
+        private readonly string _name;
+        private readonly string? _previous;
+
+        public EnvironmentVariableScope(string name, string? value)
+        {
+            _name = name;
+            _previous = Environment.GetEnvironmentVariable(name);
+            Environment.SetEnvironmentVariable(name, value);
+        }
+
+        public void Dispose() => Environment.SetEnvironmentVariable(_name, _previous);
     }
 }

@@ -18,13 +18,14 @@ public static class WorkItemFailureKinds
     /// </summary>
     public const string AgentUnavailable = "agent_unavailable";
 
-    private static readonly HashSet<string> InfraShaped = new(StringComparer.OrdinalIgnoreCase)
-    {
+    private static readonly string[] InfraShaped =
+    [
         Infrastructure,
         AgentUnavailable,
         AuthRequired,
-    };
+    ];
 
     public static bool IsInfraShaped(string? failureKind)
-        => !string.IsNullOrEmpty(failureKind) && InfraShaped.Contains(failureKind);
+        => !string.IsNullOrEmpty(failureKind)
+            && InfraShaped.Contains(failureKind, StringComparer.OrdinalIgnoreCase);
 }
