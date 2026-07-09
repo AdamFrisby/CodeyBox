@@ -8,7 +8,9 @@ namespace CodeyBox.Orchestrator;
 /// runner has a viable credential for it. Distinct from
 /// <see cref="MergeConflictResolutionFailedException"/>: the resolver never
 /// got to run, so the work item is parked at the failure with
-/// <c>failureKind=agent_unavailable</c> rather than
+/// <c>failureKind=agent_unavailable</c> for a single rejected runner or
+/// <c>failureKind=agent_routing_unavailable</c> for aggregate no-candidate
+/// misses rather than
 /// <see cref="WorkItemState.MergeConflictResolutionFailed"/> — the latter
 /// implies the resolver ran but couldn't reconcile the conflict.
 /// </summary>

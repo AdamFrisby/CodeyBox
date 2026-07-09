@@ -671,8 +671,8 @@ public static class AuditLog
     /// Emitted when every candidate (configured primary + class chain) failed
     /// the resolver's pre-dispatch gates, so the pickup-time rebase resolver
     /// could not run at all. The work item is failed with
-    /// <c>failureKind=agent_unavailable</c>; distinct from resolver failures
-    /// where an agent ran but produced an unmergeable answer.
+    /// <c>failureKind=agent_routing_unavailable</c>; distinct from resolver
+    /// failures where an agent ran but produced an unmergeable answer.
     /// <paramref name="candidateReasons"/> carries the per-agent gate reasons
     /// so operators can tell a credential gap from a quota steer.
     /// </summary>

@@ -435,7 +435,7 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
     }
 
     [Fact]
-    public async Task AuditAgentQuotaExhausted_NoViableFallback_FailsCleanlyWithAgentUnavailable()
+    public async Task AuditAgentQuotaExhausted_NoViableFallback_FailsCleanlyWithRoutingUnavailable()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
 
@@ -458,7 +458,8 @@ public sealed class RebaseResolverAgentRoutingTests : IDisposable
         var final = await fix.Store.GetAsync(item.Id);
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal("agent_unavailable", final.FailureKind);
+        Assert.Equal(WorkItemFailureKinds.AgentRoutingUnavailable, final.FailureKind);
+        Assert.Null(final.Agent);
         Assert.Contains("no agent has viable credentials", final.LastError);
         Assert.Contains("claude:", final.LastError);
         Assert.Contains("quota exhausted", final.LastError);

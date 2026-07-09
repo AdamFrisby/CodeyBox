@@ -549,6 +549,33 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
+    public async Task FailedWorkRun_WithPure401AuthError_RequeuesAfterAgentRestore()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: "API Error: 401 Unauthorized"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Equal(WorkItemAuthFailureScope.Fleet, final.AuthFailureScope);
+
+        var restored = fix.Registry.Reset(AgentKind.Codex);
+        Assert.NotNull(restored);
+
+        await AssertRestoreSweepRequeuesAsync(fix, item.Id, restored!);
+    }
+
+    [Fact]
     public async Task AuthLoginPrompt_SurvivesSmokeDisabled_DoesNotBenchAgentForNextItem()
     {
         // Master smoke switch OFF. Captured agent stderr is not trusted enough
@@ -1190,6 +1217,42 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
+    public async Task InfrastructureWorkFailure_WithPipelineInvolvement_RequeuesAfterAgentRestore()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-1);
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 127",
+            Stdout: null,
+            Stderr: "env: 'codex': No such file or directory"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, final.FailureKind);
+        Assert.Equal(AgentKind.Codex, final.Agent);
+
+        var involvementRows = await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.Contains(
+            involvementRows,
+            row => row.AgentKind == AgentKind.Codex
+                && row.Phase == "work"
+                && row.Outcome == AgentInvolvementOutcomes.FailureInfrastructure
+                && row.EndedAt is not null);
+
+        await AssertRestoreSweepRequeuesAsync(
+            fix,
+            item.Id,
+            new AgentRestoredEvent(AgentKind.Codex, outageStart, DateTimeOffset.UtcNow));
+    }
+
+    [Fact]
     public async Task SuccessfulWorkRun_ResetsFastFailCounterFromPipeline()
     {
         // Pin the contract that a SUCCESSFUL run also feeds the registry — a
@@ -1644,6 +1707,39 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
     // ── Harness ──────────────────────────────────────────────────────────────
 
+    private static async Task AssertRestoreSweepRequeuesAsync(
+        TestFixture fix,
+        WorkItemId itemId,
+        AgentRestoredEvent restored)
+    {
+        var queue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(
+            fix.Store,
+            queue,
+            new NullGitHost(),
+            NullLogger<WorkItemRetrier>.Instance);
+        var options = new AgentRestoreRetryOptions
+        {
+            Enabled = true,
+            LookbackGrace = TimeSpan.FromMinutes(30),
+            PostRestoreMargin = TimeSpan.FromMinutes(5),
+            MaxCandidatesPerSweep = 10,
+        };
+        var scheduler = new AgentRestoreRetryScheduler(
+            fix.Store,
+            retrier,
+            () => options,
+            NullLogger<AgentRestoreRetryScheduler>.Instance,
+            involvement: fix.Involvement);
+
+        var summary = await scheduler.SweepForTestAsync(restored);
+
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(0, summary.Skipped);
+        Assert.Equal(WorkItemState.Queued, (await fix.Store.GetAsync(itemId, CancellationToken.None))!.State);
+        Assert.Equal(itemId, await queue.DequeueAsync(CancellationToken.None));
+    }
+
     private TestFixture BuildPipeline(
         string seedRepoUrl,
         int maxConsecutiveFastFails = 3,
@@ -1655,6 +1751,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
 
         var store = new SqliteWorkItemStore(stateDb);
+        var involvement = new SqliteAgentInvolvementStore(stateDb);
         var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
         var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var prs = new InMemoryPullRequestService();
@@ -1722,9 +1819,10 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             dispatchAvailability: new AgentDispatchAvailability(availability, inVmSmokeGate, smokeOptions),
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions,
-            inVmSmokeGate: inVmSmokeGate);
+            inVmSmokeGate: inVmSmokeGate,
+            involvement: involvement);
 
-        return new TestFixture(pipeline, store, codex, webhooks, availability, gitHost);
+        return new TestFixture(pipeline, store, involvement, codex, webhooks, availability, gitHost);
     }
 
     private ConflictMergeFixture BuildConflictMergePipeline(
@@ -2070,6 +2168,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     {
         public PipelineRunner Pipeline { get; }
         public SqliteWorkItemStore Store { get; }
+        public SqliteAgentInvolvementStore Involvement { get; }
         public ScriptableAgent Codex { get; }
         public CapturingWebhookDispatcher Webhooks { get; }
         public AgentAvailabilityRegistry Registry { get; }
@@ -2078,6 +2177,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         public TestFixture(
             PipelineRunner pipeline,
             SqliteWorkItemStore store,
+            SqliteAgentInvolvementStore involvement,
             ScriptableAgent codex,
             CapturingWebhookDispatcher webhooks,
             AgentAvailabilityRegistry registry,
@@ -2085,13 +2185,18 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         {
             Pipeline = pipeline;
             Store = store;
+            Involvement = involvement;
             Codex = codex;
             Webhooks = webhooks;
             Registry = registry;
             GitHost = gitHost;
         }
 
-        public void Dispose() => Store.Dispose();
+        public void Dispose()
+        {
+            Involvement.Dispose();
+            Store.Dispose();
+        }
     }
 
     private sealed record ConflictMergeFixture(

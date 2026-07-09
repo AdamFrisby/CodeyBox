@@ -349,7 +349,8 @@ public interface IWorkItemStore
         DateTimeOffset outageStartedAt,
         DateTimeOffset restoredAt,
         CancellationToken ct = default)
-        => Task.FromResult(true);
+        => throw new NotSupportedException(
+            "This work item store does not implement agent-restore retry claims.");
 
     private static bool MayBelongToRestoredAgent(WorkItem item, AgentKind restoredAgent)
     {

@@ -18,6 +18,12 @@ public static class WorkItemFailureKinds
     /// </summary>
     public const string AgentUnavailable = "agent_unavailable";
 
+    /// <summary>
+    /// Aggregate routing/capacity failure where no single agent was invoked
+    /// and therefore no restored-agent sweep can safely attribute blame.
+    /// </summary>
+    public const string AgentRoutingUnavailable = "agent_routing_unavailable";
+
     private static readonly string[] InfraShaped =
     [
         Infrastructure,

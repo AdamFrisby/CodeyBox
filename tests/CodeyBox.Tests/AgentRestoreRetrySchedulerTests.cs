@@ -106,8 +106,13 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             state: WorkItemState.Failed,
             failureKind: WorkItemFailureKinds.AgentUnavailable,
             updatedAt: outageStart.AddMinutes(5));
+        var aggregateRoutingItem = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AgentRoutingUnavailable,
+            updatedAt: outageStart.AddMinutes(5));
 
-        foreach (var item in new[] { infraItem, buildItem, agentInternalItem, configItem, authRequiredItem, agentUnavailableItem })
+        foreach (var item in new[] { infraItem, buildItem, agentInternalItem, configItem, authRequiredItem, agentUnavailableItem, aggregateRoutingItem })
         {
             await store.CreateAsync(item);
         }
@@ -123,6 +128,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         Assert.Equal(WorkItemState.Queued, (await store.GetAsync(infraItem.Id))!.State);
         Assert.Equal(WorkItemState.Queued, (await store.GetAsync(authRequiredItem.Id))!.State);
         Assert.Equal(WorkItemState.Queued, (await store.GetAsync(agentUnavailableItem.Id))!.State);
+        Assert.Equal(WorkItemState.Failed, (await store.GetAsync(aggregateRoutingItem.Id))!.State);
         Assert.Equal(WorkItemState.Failed, (await store.GetAsync(buildItem.Id))!.State);
         Assert.Equal(WorkItemState.Failed, (await store.GetAsync(agentInternalItem.Id))!.State);
         Assert.Equal(WorkItemState.Failed, (await store.GetAsync(configItem.Id))!.State);
@@ -665,7 +671,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     {
         using var store = new SqliteWorkItemStore(_dbPath);
         var queue = new InMemoryTaskQueue();
-        var involvement = new InMemoryAgentInvolvementStore();
+        using var involvement = new SqliteAgentInvolvementStore(_dbPath);
         var scheduler = NewScheduler(store, queue, enabled: true, involvement: involvement);
 
         var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
@@ -689,13 +695,82 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             EndedAt: null,
             Iteration: 1,
             Outcome: null));
-        await involvement.FinalizeAsync(involvementId, outageStart.AddMinutes(2), "failure:auth");
+        await involvement.FinalizeAsync(involvementId, outageStart.AddMinutes(2), AgentInvolvementOutcomes.FailureAuth);
 
         var summary = await scheduler.SweepForTestAsync(
             new AgentRestoredEvent(AgentKind.Codex, outageStart, DateTimeOffset.UtcNow));
 
         Assert.Equal(1, summary.Requeued);
         Assert.Equal(WorkItemState.Queued, (await store.GetAsync(item.Id))!.State);
+    }
+
+    [Fact]
+    public async Task Sweep_UsesSqliteInvolvementForGenericInfrastructureWhenWorkItemAgentIsStale()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        using var involvement = new SqliteAgentInvolvementStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var scheduler = NewScheduler(store, queue, enabled: true, involvement: involvement);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var item = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.Infrastructure,
+            updatedAt: outageStart.AddMinutes(2),
+            lastError: "audit agent execution failed: codex binary missing");
+        await store.CreateAsync(item);
+        await RecordFailedInvolvementAsync(
+            involvement,
+            item.Id,
+            AgentKind.Codex,
+            outageStart.AddMinutes(2),
+            AgentInvolvementOutcomes.FailureInfrastructure);
+
+        var summary = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Codex, outageStart, DateTimeOffset.UtcNow));
+
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(item.Id))!.State);
+    }
+
+    [Fact]
+    public async Task Sweep_FleetAuthPrefilterRunsBeforeLimit()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        using var involvement = new SqliteAgentInvolvementStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var scheduler = NewScheduler(
+            store,
+            queue,
+            enabled: true,
+            involvement: involvement,
+            maxCandidatesPerSweep: 1);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var unrelated = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AuthRequired,
+            updatedAt: outageStart.AddMinutes(1),
+            lastError: "claude auth required",
+            authFailureScope: WorkItemAuthFailureScope.Fleet);
+        var restoredAgentItem = NewItem(
+            agent: AgentKind.Codex,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AuthRequired,
+            updatedAt: outageStart.AddMinutes(2),
+            lastError: "codex auth required",
+            authFailureScope: WorkItemAuthFailureScope.Fleet);
+        await store.CreateAsync(unrelated);
+        await store.CreateAsync(restoredAgentItem);
+
+        var summary = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Codex, outageStart, DateTimeOffset.UtcNow));
+
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(WorkItemState.Failed, (await store.GetAsync(unrelated.Id))!.State);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(restoredAgentItem.Id))!.State);
     }
 
     [Fact]

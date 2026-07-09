@@ -223,6 +223,7 @@ public static class TransitionHealthClassifier
             "timeout" => Infra("timeout"),
             "agent" => Infra("agent"),
             "agent_unavailable" => Infra("agent_unavailable"),
+            "agent_routing_unavailable" => Infra("agent_routing_unavailable"),
             "infrastructure" => Infra("infrastructure"),
             "configuration" => Infra("configuration"),
             // "build", "cancelled", and "other" are intentionally not scored:

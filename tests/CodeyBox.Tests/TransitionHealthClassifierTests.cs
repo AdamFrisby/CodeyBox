@@ -329,6 +329,7 @@ public sealed class TransitionHealthClassifierTests
     [InlineData("timeout")]
     [InlineData("agent")]
     [InlineData("agent_unavailable")]
+    [InlineData("agent_routing_unavailable")]
     [InlineData("infrastructure")]
     [InlineData("configuration")]
     public void Terminal_failed_infra_kinds_count_as_infra_failure(string kind)

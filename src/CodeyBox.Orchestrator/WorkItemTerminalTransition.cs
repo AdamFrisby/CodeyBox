@@ -29,6 +29,7 @@ public sealed record WorkItemTerminalFailureTransitionCommand
     /// a different agent.
     /// </summary>
     public AgentKind? Agent { get; init; }
+    public bool ClearAgent { get; init; }
     public DateTimeOffset? QuotaResetAt { get; init; }
     public string? CancellationSource { get; init; }
     public IReadOnlyCollection<WorkItemState>? ExpectedStates { get; init; }
@@ -120,7 +121,13 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
                 CurrentWorkItem: current);
         }
 
-        var attributed = command.Agent is { } agent
+        var attributed = command.ClearAgent
+            ? current with
+            {
+                Agent = null,
+                AgentInstanceId = null,
+            }
+            : command.Agent is { } agent
             ? current with
             {
                 Agent = agent,

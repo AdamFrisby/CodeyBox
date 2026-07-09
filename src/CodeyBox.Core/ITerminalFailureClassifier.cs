@@ -72,6 +72,11 @@ public sealed class DefaultTerminalFailureClassifier : ITerminalFailureClassifie
                 TerminalFailureClass.Transient,
                 "failureKind=agent_unavailable: credential/smoke transient");
 
+        if (string.Equals(item.FailureKind, WorkItemFailureKinds.AgentRoutingUnavailable, StringComparison.OrdinalIgnoreCase))
+            return new TerminalFailureClassification(
+                TerminalFailureClass.Transient,
+                "failureKind=agent_routing_unavailable: routing/capacity transient");
+
         // Wall-clock timeouts and unattributed cancellations carry a
         // counter so we can degrade from Transient → Deterministic when
         // the same time-budget keeps blowing up. Persistent
