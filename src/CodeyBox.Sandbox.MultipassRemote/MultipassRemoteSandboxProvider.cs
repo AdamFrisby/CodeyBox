@@ -456,7 +456,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             ProcessRunResultLike result;
             try
             {
-                result = await RunRemoteAsync(transport, argv, ct).ConfigureAwait(false);
+                result = await RunRemoteInventoryAsync(opts, transport, argv, ct).ConfigureAwait(false);
                 MarkRuntimeHealthy(opts.HostId);
             }
             catch (RemoteSshTransportException ex)
@@ -466,6 +466,14 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                 MarkRuntimeUnhealthy(opts, ex);
                 _log.LogWarning(ex,
                     "ListAllManagedAsync: SSH transport failure on remote host {HostId}; continuing with other hosts",
+                    opts.HostId);
+                continue;
+            }
+            catch (RemoteHostProvisioningException ex) when (ex.IsHostRuntimeFailure)
+            {
+                MarkRuntimeUnhealthy(opts, ex);
+                _log.LogWarning(ex,
+                    "ListAllManagedAsync: inventory command failed on remote host {HostId}; continuing with other hosts",
                     opts.HostId);
                 continue;
             }
@@ -494,6 +502,13 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                 MarkRuntimeUnhealthy(opts, ex);
                 _log.LogWarning(ex,
                     "ListAllManagedAsync: metadata scan transport failure on remote host {HostId}; continuing with other hosts",
+                    opts.HostId);
+            }
+            catch (RemoteHostProvisioningException ex) when (ex.IsHostRuntimeFailure)
+            {
+                MarkRuntimeUnhealthy(opts, ex);
+                _log.LogWarning(ex,
+                    "ListAllManagedAsync: metadata scan failed on remote host {HostId}; continuing with other hosts",
                     opts.HostId);
             }
             catch (JsonException ex)
@@ -728,15 +743,54 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         string? stdin,
         Action<string>? stdoutChunkCallback,
         Action<string>? stderrChunkCallback,
-        CancellationToken ct)
+        CancellationToken ct,
+        int? maxStdoutBytes = null,
+        int? maxStderrBytes = null,
+        bool killOnOutputLimit = true)
     {
         var native = await transport.RunAsync(
             argv,
             stdin,
             ct,
             stdoutChunkCallback: stdoutChunkCallback,
-            stderrChunkCallback: stderrChunkCallback).ConfigureAwait(false);
+            stderrChunkCallback: stderrChunkCallback,
+            maxStdoutBytes: maxStdoutBytes,
+            maxStderrBytes: maxStderrBytes,
+            killOnOutputLimit: killOnOutputLimit).ConfigureAwait(false);
         return new ProcessRunResultLike(native.ExitCode, native.Stdout, native.Stderr, native.StdoutLimitExceeded, native.StderrLimitExceeded);
+    }
+
+    private async Task<ProcessRunResultLike> RunRemoteInventoryAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        IReadOnlyList<string> argv,
+        CancellationToken ct)
+    {
+        var maxOutputBytes = opts.RemoteInventoryMaxOutputBytes;
+        var result = await RunRemoteAsync(
+            transport,
+            argv,
+            stdin: null,
+            stdoutChunkCallback: null,
+            stderrChunkCallback: null,
+            ct,
+            maxStdoutBytes: maxOutputBytes,
+            maxStderrBytes: maxOutputBytes,
+            killOnOutputLimit: true).ConfigureAwait(false);
+
+        if (!result.StdoutLimitExceeded && !result.StderrLimitExceeded)
+            return result;
+
+        var streams = result.StdoutLimitExceeded && result.StderrLimitExceeded
+            ? "stdout/stderr"
+            : result.StdoutLimitExceeded
+                ? "stdout"
+                : "stderr";
+        throw new RemoteHostProvisioningException(
+            opts.HostId,
+            CommandName(argv),
+            $"Remote inventory command exceeded {maxOutputBytes.ToString(CultureInfo.InvariantCulture)} byte {streams} cap: argv=[{string.Join(' ', argv)}]",
+            isHostRuntimeFailure: true);
     }
 
     private async Task<IReadOnlyDictionary<string, DateTimeOffset>> ReadRemoteCreatedAtMetadataAsync(
@@ -751,7 +805,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         ProcessRunResultLike result;
         try
         {
-            result = await RunRemoteAsync(transport, ["sh", "-c", script], ct).ConfigureAwait(false);
+            result = await RunRemoteInventoryAsync(opts, transport, ["sh", "-c", script], ct).ConfigureAwait(false);
         }
         catch (RemoteSshTransportException ex)
         {
@@ -1101,6 +1155,8 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                 throw new InvalidOperationException("MultipassRemoteSandboxOptions.PlacementRecheckIn must be positive.");
             if (host.RuntimeUnhealthyBackoff <= TimeSpan.Zero)
                 throw new InvalidOperationException("MultipassRemoteSandboxOptions.RuntimeUnhealthyBackoff must be positive.");
+            if (host.RemoteInventoryMaxOutputBytes <= 0)
+                throw new InvalidOperationException("MultipassRemoteSandboxOptions.RemoteInventoryMaxOutputBytes must be positive.");
         }
 
         return hosts;
@@ -1164,7 +1220,8 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             var transport = _transportFactory(opts);
             try
             {
-                var result = await RunRemoteAsync(
+                var result = await RunRemoteInventoryAsync(
+                    opts,
                     transport,
                     [opts.RemoteMultipassPath, "list", "--format", "json"],
                     ct).ConfigureAwait(false);
@@ -1182,6 +1239,11 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                 MarkRuntimeHealthy(opts.HostId);
             }
             catch (RemoteSshTransportException ex)
+            {
+                lastFailure = ex;
+                MarkRuntimeUnhealthy(opts, ex);
+            }
+            catch (RemoteHostProvisioningException ex) when (ex.IsHostRuntimeFailure)
             {
                 lastFailure = ex;
                 MarkRuntimeUnhealthy(opts, ex);

@@ -345,6 +345,8 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             failures.Add("CodeyBox:MultipassRemoteSandbox:StageOutMaxEntries must be > 0 when set");
         if (cfg.StageOutMaxExpansionRatio is { } ratio && (double.IsNaN(ratio) || double.IsInfinity(ratio) || ratio < 1.0d))
             failures.Add("CodeyBox:MultipassRemoteSandbox:StageOutMaxExpansionRatio must be >= 1 when set");
+        if (cfg.RemoteInventoryMaxOutputBytes is <= 0)
+            failures.Add("CodeyBox:MultipassRemoteSandbox:RemoteInventoryMaxOutputBytes must be > 0 when set");
 
         var hasTopLevelTarget = !string.IsNullOrWhiteSpace(cfg.SshTarget);
         var hosts = cfg.ExecutorHosts ?? [];
@@ -376,6 +378,8 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
                 failures.Add($"{prefix}:StageOutMaxEntries must be > 0 when set");
             if (host.StageOutMaxExpansionRatio is { } hostRatio && (double.IsNaN(hostRatio) || double.IsInfinity(hostRatio) || hostRatio < 1.0d))
                 failures.Add($"{prefix}:StageOutMaxExpansionRatio must be >= 1 when set");
+            if (host.RemoteInventoryMaxOutputBytes is <= 0)
+                failures.Add($"{prefix}:RemoteInventoryMaxOutputBytes must be > 0 when set");
             if (host.VmStartTimeout is { } start && start <= TimeSpan.Zero)
                 failures.Add($"{prefix}:VmStartTimeout must be positive when set");
             if (host.VmStopTimeout is { } stop && stop <= TimeSpan.Zero)

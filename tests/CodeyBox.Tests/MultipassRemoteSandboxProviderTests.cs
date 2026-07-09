@@ -1551,7 +1551,7 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     internal sealed record StreamSinks(Action<string>? Stdout, Action<string>? Stderr);
-    internal sealed record RecordedCall(IReadOnlyList<string> Argv, string? Stdin);
+    internal sealed record RecordedCall(IReadOnlyList<string> Argv, string? Stdin, int? MaxStdoutBytes, int? MaxStderrBytes);
     internal sealed record StageInCall(string HostPath, string RemotePath);
     internal sealed record StageOutCall(string RemotePath, string HostPath);
     public sealed record TarSpec(TarEntryType Type, string Name, string? Content = null, string? LinkName = null);
@@ -1573,9 +1573,12 @@ public sealed class MultipassRemoteSandboxProviderTests
             string? stdin,
             CancellationToken ct,
             Action<string>? stdoutChunkCallback = null,
-            Action<string>? stderrChunkCallback = null)
+            Action<string>? stderrChunkCallback = null,
+            int? maxStdoutBytes = null,
+            int? maxStderrBytes = null,
+            bool killOnOutputLimit = true)
         {
-            var call = new RecordedCall(argv.ToArray(), stdin);
+            var call = new RecordedCall(argv.ToArray(), stdin, maxStdoutBytes, maxStderrBytes);
             RecordedCalls.Add(call);
             RecordedCallsQueue.Enqueue(call);
             var sinks = new StreamSinks(stdoutChunkCallback, stderrChunkCallback);

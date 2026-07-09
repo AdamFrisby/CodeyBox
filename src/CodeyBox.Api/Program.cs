@@ -4099,6 +4099,9 @@ namespace CodeyBox.Api
         /// <summary>Maximum declared-payload/archive-byte ratio accepted during remote sync-back validation. Null = provider default.</summary>
         public double? StageOutMaxExpansionRatio { get; set; }
 
+        /// <summary>Maximum stdout/stderr bytes accepted from remote inventory commands. Null = provider default.</summary>
+        public int? RemoteInventoryMaxOutputBytes { get; set; }
+
         /// <summary>Absolute path to <c>multipass</c> on the remote host.</summary>
         public string? RemoteMultipassPath { get; set; }
 
@@ -4172,6 +4175,7 @@ namespace CodeyBox.Api
         public long? StageOutMaxArchiveBytes { get; set; }
         public int? StageOutMaxEntries { get; set; }
         public double? StageOutMaxExpansionRatio { get; set; }
+        public int? RemoteInventoryMaxOutputBytes { get; set; }
         public string? RemoteMultipassPath { get; set; }
         public string? RemoteStagingRoot { get; set; }
         public string? DefaultImage { get; set; }

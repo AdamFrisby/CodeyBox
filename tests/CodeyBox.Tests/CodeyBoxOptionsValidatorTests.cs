@@ -1158,6 +1158,7 @@ public sealed class CodeyBoxOptionsValidatorTests
             StageOutMaxArchiveBytes = 0,
             StageOutMaxEntries = 0,
             StageOutMaxExpansionRatio = 0.5d,
+            RemoteInventoryMaxOutputBytes = 0,
             ExecutorHosts =
             [
                 new MultipassRemoteExecutorHostConfig
@@ -1170,6 +1171,7 @@ public sealed class CodeyBoxOptionsValidatorTests
                     StageOutMaxArchiveBytes = -1,
                     StageOutMaxEntries = -1,
                     StageOutMaxExpansionRatio = double.NaN,
+                    RemoteInventoryMaxOutputBytes = -1,
                     VmStartTimeout = TimeSpan.Zero,
                     VmStopTimeout = TimeSpan.Zero,
                     VmStateCheckInterval = TimeSpan.Zero,
@@ -1185,6 +1187,7 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.Contains("StageOutMaxArchiveBytes must be > 0", result.FailureMessage);
         Assert.Contains("StageOutMaxEntries must be > 0", result.FailureMessage);
         Assert.Contains("StageOutMaxExpansionRatio must be >= 1", result.FailureMessage);
+        Assert.Contains("RemoteInventoryMaxOutputBytes must be > 0", result.FailureMessage);
         Assert.Contains("ExecutorHosts:0:Id is required", result.FailureMessage);
         Assert.Contains("ExecutorHosts:0:SshTarget is required", result.FailureMessage);
         Assert.Contains("ExecutorHosts:0:MaxConcurrentSandboxes must be > 0", result.FailureMessage);
@@ -1194,6 +1197,7 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.Contains("ExecutorHosts:0:StageOutMaxArchiveBytes must be > 0", result.FailureMessage);
         Assert.Contains("ExecutorHosts:0:StageOutMaxEntries must be > 0", result.FailureMessage);
         Assert.Contains("ExecutorHosts:0:StageOutMaxExpansionRatio must be >= 1", result.FailureMessage);
+        Assert.Contains("ExecutorHosts:0:RemoteInventoryMaxOutputBytes must be > 0", result.FailureMessage);
         Assert.Contains("ExecutorHosts:0:VmStartTimeout must be positive", result.FailureMessage);
         Assert.Contains("ExecutorHosts:0:VmStopTimeout must be positive", result.FailureMessage);
         Assert.Contains("ExecutorHosts:0:VmStateCheckInterval must be positive", result.FailureMessage);
@@ -1291,6 +1295,7 @@ public sealed class CodeyBoxOptionsValidatorTests
             StageOutMaxArchiveBytes = 123_456,
             StageOutMaxEntries = 123,
             StageOutMaxExpansionRatio = 1.25d,
+            RemoteInventoryMaxOutputBytes = 4_096,
             RemoteMultipassPath = "/remote/multipass",
             RemoteStagingRoot = "/stage/default",
             DefaultImage = "22.04",
@@ -1322,6 +1327,7 @@ public sealed class CodeyBoxOptionsValidatorTests
                     StageOutMaxArchiveBytes = 654_321,
                     StageOutMaxEntries = 321,
                     StageOutMaxExpansionRatio = 1.75d,
+                    RemoteInventoryMaxOutputBytes = 8_192,
                     RemoteMultipassPath = "/usr/bin/multipass",
                     RemoteStagingRoot = "/stage/a",
                     DefaultImage = "24.04",
@@ -1359,6 +1365,7 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.Equal(123_456, mapped.StageOutMaxArchiveBytes);
         Assert.Equal(123, mapped.StageOutMaxEntries);
         Assert.Equal(1.25d, mapped.StageOutMaxExpansionRatio);
+        Assert.Equal(4_096, mapped.RemoteInventoryMaxOutputBytes);
         Assert.Equal("/remote/multipass", mapped.RemoteMultipassPath);
         Assert.Equal("/stage/default", mapped.RemoteStagingRoot);
         Assert.Equal("22.04", mapped.DefaultImage);
@@ -1388,6 +1395,7 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.Equal(654_321, host.StageOutMaxArchiveBytes);
         Assert.Equal(321, host.StageOutMaxEntries);
         Assert.Equal(1.75d, host.StageOutMaxExpansionRatio);
+        Assert.Equal(8_192, host.RemoteInventoryMaxOutputBytes);
         Assert.Equal("/usr/bin/multipass", host.RemoteMultipassPath);
         Assert.Equal("/stage/a", host.RemoteStagingRoot);
         Assert.Equal("24.04", host.DefaultImage);

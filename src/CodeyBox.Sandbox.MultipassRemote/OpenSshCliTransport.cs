@@ -57,7 +57,10 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         string? stdin,
         CancellationToken ct,
         Action<string>? stdoutChunkCallback = null,
-        Action<string>? stderrChunkCallback = null)
+        Action<string>? stderrChunkCallback = null,
+        int? maxStdoutBytes = null,
+        int? maxStderrBytes = null,
+        bool killOnOutputLimit = true)
     {
         ArgumentNullException.ThrowIfNull(argv);
         if (argv.Count == 0) throw new ArgumentException("argv must be non-empty.", nameof(argv));
@@ -76,7 +79,10 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
             stdin,
             ct,
             stdoutChunkCallback: stdoutChunkCallback,
-            stderrChunkCallback: stderrChunkCallback).ConfigureAwait(false);
+            stderrChunkCallback: stderrChunkCallback,
+            maxStdoutBytes: maxStdoutBytes,
+            maxStderrBytes: maxStderrBytes,
+            killOnOutputLimit: killOnOutputLimit).ConfigureAwait(false);
 
         if (result.StartFailed)
             throw new RemoteSshTransportException(

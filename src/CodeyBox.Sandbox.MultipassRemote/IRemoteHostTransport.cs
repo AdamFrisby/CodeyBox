@@ -51,7 +51,10 @@ public interface IRemoteHostTransport
         string? stdin,
         CancellationToken ct,
         Action<string>? stdoutChunkCallback = null,
-        Action<string>? stderrChunkCallback = null);
+        Action<string>? stderrChunkCallback = null,
+        int? maxStdoutBytes = null,
+        int? maxStderrBytes = null,
+        bool killOnOutputLimit = true);
 
     /// <summary>
     /// Stage a host-local source path into the remote host at

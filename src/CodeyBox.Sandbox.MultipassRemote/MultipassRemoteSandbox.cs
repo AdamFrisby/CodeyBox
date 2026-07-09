@@ -35,7 +35,8 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
     private readonly ConcurrentDictionary<CancellationTokenSource, byte> _activeExecCts = new();
     private readonly SemaphoreSlim _disposeLock = new(1, 1);
     private int _disposed; // 0/1 via Interlocked
-    private int _cleanupComplete;
+    private int _activeTrackingReleased;
+    private int _executionTransportLost;
 
     public MultipassRemoteSandbox(
         string vmName,
@@ -66,19 +67,14 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
     public string Id { get; }
     public string HostId { get; }
 
-    // Reaper-exemption gate. This MUST track "cleanup not yet complete", NOT
-    // "dispose not yet started" (_disposed). DisposeAsync sets _disposed=1 up
-    // front (to reject further ExecAsync) but then performs the fallible
-    // sync-back at line 275; if that throws SandboxProvisioningDeferredException
-    // the VM + staged writable mounts (holding the agent's committed work) are
-    // deliberately retained for a retry and _onDispose is NOT called, so the
-    // sandbox stays in _active. Were IsTrackedActive keyed on _disposed, that
-    // retained-for-retry sandbox would report as a leak and the
-    // SandboxLeakReaper would purge the un-synced work before the retry runs.
-    // Keying on _cleanupComplete keeps a mid-dispose / pending-sync-back
-    // sandbox reaper-exempt until cleanup genuinely finishes (at which point
-    // _onDispose removes it from _active and it no longer appears at all).
-    internal bool IsTrackedActive => Volatile.Read(ref _cleanupComplete) == 0;
+    // Reaper-exemption gate. DisposeAsync sets _disposed=1 up front to reject
+    // new ExecAsync calls, then performs fallible sync-back. While sync-back
+    // might still preserve a successful agent commit, the sandbox must remain
+    // active/reaper-exempt. After sync-back succeeds, or after an exec-time
+    // host loss proves sync-back cannot run and the work will be rescheduled,
+    // active tracking is released so the leak reaper can reclaim any remaining
+    // remote VM/staging state when the host is reachable.
+    internal bool IsTrackedActive => Volatile.Read(ref _activeTrackingReleased) == 0;
     internal MultipassRemoteSandboxOptions HostOptions => _opts;
     internal IRemoteHostTransport Transport => _transport;
 
@@ -181,6 +177,8 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
             catch (RemoteSshTransportException ex)
             {
                 _onTransportFailure(ex);
+                if (ex.IsHostTransportFailure)
+                    Volatile.Write(ref _executionTransportLost, 1);
                 throw new SandboxProvisioningDeferredException(
                     provider: "multipass-remote",
                     operation: "exec",
@@ -227,13 +225,13 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
 
     public async Task SyncStateToHostAsync(CancellationToken ct = default)
     {
-        if (Volatile.Read(ref _cleanupComplete) != 0)
+        if (Volatile.Read(ref _activeTrackingReleased) != 0)
             return;
 
         await _disposeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            if (Volatile.Read(ref _cleanupComplete) != 0)
+            if (Volatile.Read(ref _activeTrackingReleased) != 0)
                 return;
             await SyncWritableMountsAsync(ct).ConfigureAwait(false);
         }
@@ -245,13 +243,13 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
 
     public async ValueTask DisposeAsync()
     {
-        if (Volatile.Read(ref _cleanupComplete) != 0)
+        if (Volatile.Read(ref _activeTrackingReleased) != 0)
             return;
 
         await _disposeLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
         try
         {
-            if (Volatile.Read(ref _cleanupComplete) != 0)
+            if (Volatile.Read(ref _activeTrackingReleased) != 0)
                 return;
 
             Volatile.Write(ref _disposed, 1);
@@ -287,7 +285,19 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
             // 2) Sync writable mounts back to the orchestrator host BEFORE we
             //    delete the staged copy. If this fails, keep the remote staged
             //    data intact and surface infrastructure deferral to the caller.
-            await SyncWritableMountsAsync(CancellationToken.None).ConfigureAwait(false);
+            try
+            {
+                await SyncWritableMountsAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (SandboxProvisioningDeferredException ex) when (ShouldReleaseAfterExecutionHostLoss(ex))
+            {
+                _log.LogWarning(
+                    ex,
+                    "Remote VM {Vm} sync-back could not run after execution transport loss; releasing active tracking for leak reaper recovery",
+                    vmName);
+                ReleaseActiveTracking(vmName);
+                return;
+            }
 
             // 3) Delete VM + staging dir. Cleanup failures after sync-back are
             //    infrastructure hygiene, not a reason to replay completed work.
@@ -295,9 +305,7 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
             if (deleteConfirmed)
                 await TryRemoveRemoteStagingAsync(vmName).ConfigureAwait(false);
 
-            SandboxLiveCounter.Decrement();
-            Volatile.Write(ref _cleanupComplete, 1);
-            _onDispose(HostId, vmName);
+            ReleaseActiveTracking(vmName);
         }
         finally
         {
@@ -307,20 +315,18 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
 
     internal async Task ForceDisposeLeakedAsync(CancellationToken ct)
     {
-        if (Volatile.Read(ref _cleanupComplete) != 0)
+        if (Volatile.Read(ref _activeTrackingReleased) != 0)
             return;
 
         await _disposeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            if (Volatile.Read(ref _cleanupComplete) != 0)
+            if (Volatile.Read(ref _activeTrackingReleased) != 0)
                 return;
 
             Volatile.Write(ref _disposed, 1);
             await DeleteVmAndStagingOrThrowAsync(_opts, Id, ct).ConfigureAwait(false);
-            SandboxLiveCounter.Decrement();
-            Volatile.Write(ref _cleanupComplete, 1);
-            _onDispose(HostId, Id);
+            ReleaseActiveTracking(Id);
         }
         finally
         {
@@ -535,6 +541,17 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
             retainedSandboxName: Id,
             retainedSandboxHostId: HostId,
             innerException: inner);
+
+    private bool ShouldReleaseAfterExecutionHostLoss(SandboxProvisioningDeferredException ex) =>
+        Volatile.Read(ref _executionTransportLost) != 0
+        && ex.InnerException is RemoteSshTransportException { IsHostTransportFailure: true };
+
+    private void ReleaseActiveTracking(string vmName)
+    {
+        SandboxLiveCounter.Decrement();
+        Volatile.Write(ref _activeTrackingReleased, 1);
+        _onDispose(HostId, vmName);
+    }
 
     private static string QuoteArgvForShell(IReadOnlyList<string> argv)
     {

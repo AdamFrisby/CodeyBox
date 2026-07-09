@@ -15,6 +15,7 @@ public sealed record MultipassRemoteSandboxOptions
     public const long DefaultStageOutMaxArchiveBytes = 2L * 1024 * 1024 * 1024;
     public const int DefaultStageOutMaxEntries = 200_000;
     public const double DefaultStageOutMaxExpansionRatio = 1.5d;
+    public const int DefaultRemoteInventoryMaxOutputBytes = 4 * 1024 * 1024;
     public static readonly TimeSpan DefaultVmStartTimeout = TimeSpan.FromMinutes(3);
     public static readonly TimeSpan DefaultVmStopTimeout = TimeSpan.FromMinutes(2);
 
@@ -170,6 +171,14 @@ public sealed record MultipassRemoteSandboxOptions
     public double StageOutMaxExpansionRatio { get; init; } = DefaultStageOutMaxExpansionRatio;
 
     /// <summary>
+    /// Maximum stdout and stderr bytes accepted from remote inventory commands
+    /// such as <c>multipass list --format json</c> and staging metadata scans.
+    /// This bounds executor-controlled output before the coordinator buffers
+    /// or parses it.
+    /// </summary>
+    public int RemoteInventoryMaxOutputBytes { get; init; } = DefaultRemoteInventoryMaxOutputBytes;
+
+    /// <summary>
     /// Absolute path to the multipass binary on the remote host. The remote
     /// host may have multipass installed via snap (<c>/snap/bin/multipass</c>)
     /// or as a system package; this lets the operator point at whichever.
@@ -238,6 +247,7 @@ public sealed record MultipassRemoteSandboxOptions
                     StageOutMaxArchiveBytes = options.StageOutMaxArchiveBytes,
                     StageOutMaxEntries = options.StageOutMaxEntries,
                     StageOutMaxExpansionRatio = options.StageOutMaxExpansionRatio,
+                    RemoteInventoryMaxOutputBytes = options.RemoteInventoryMaxOutputBytes,
                     RemoteMultipassPath = options.RemoteMultipassPath,
                     RemoteStagingRoot = options.RemoteStagingRoot,
                     DefaultImage = options.DefaultImage,
@@ -282,6 +292,7 @@ public sealed record MultipassRemoteSandboxOptions
                 StageOutMaxArchiveBytes = host.StageOutMaxArchiveBytes ?? options.StageOutMaxArchiveBytes,
                 StageOutMaxEntries = host.StageOutMaxEntries ?? options.StageOutMaxEntries,
                 StageOutMaxExpansionRatio = host.StageOutMaxExpansionRatio ?? options.StageOutMaxExpansionRatio,
+                RemoteInventoryMaxOutputBytes = host.RemoteInventoryMaxOutputBytes ?? options.RemoteInventoryMaxOutputBytes,
                 RemoteMultipassPath = FirstNonWhiteSpace(host.RemoteMultipassPath, options.RemoteMultipassPath),
                 RemoteStagingRoot = FirstNonWhiteSpace(host.RemoteStagingRoot, options.RemoteStagingRoot),
                 DefaultImage = host.DefaultImage ?? options.DefaultImage,
@@ -324,6 +335,7 @@ public sealed record MultipassRemoteExecutorHostOptions
     public long? StageOutMaxArchiveBytes { get; init; }
     public int? StageOutMaxEntries { get; init; }
     public double? StageOutMaxExpansionRatio { get; init; }
+    public int? RemoteInventoryMaxOutputBytes { get; init; }
     public string? RemoteMultipassPath { get; init; }
     public string? RemoteStagingRoot { get; init; }
     public string? DefaultImage { get; init; }

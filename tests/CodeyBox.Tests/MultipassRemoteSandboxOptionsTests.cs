@@ -96,6 +96,7 @@ public sealed class MultipassRemoteSandboxOptionsTests
             ServerAliveCountMax = 22,
             ConnectTimeoutSeconds = 23,
             LocalTarBinary = "/usr/local/bin/tar",
+            RemoteInventoryMaxOutputBytes = 7_777,
             RemoteMultipassPath = "/remote/multipass",
             RemoteStagingRoot = "/stage/default",
             DefaultImage = "22.04",
@@ -127,6 +128,7 @@ public sealed class MultipassRemoteSandboxOptionsTests
         Assert.Equal(22, host.ServerAliveCountMax);
         Assert.Equal(23, host.ConnectTimeoutSeconds);
         Assert.Equal("/usr/local/bin/tar", host.LocalTarBinary);
+        Assert.Equal(7_777, host.RemoteInventoryMaxOutputBytes);
         Assert.Equal("/remote/multipass", host.RemoteMultipassPath);
         Assert.Equal("/stage/default", host.RemoteStagingRoot);
         Assert.Equal("22.04", host.DefaultImage);

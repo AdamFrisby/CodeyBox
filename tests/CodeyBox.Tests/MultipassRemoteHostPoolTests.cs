@@ -46,6 +46,102 @@ public sealed class MultipassRemoteHostPoolTests
     }
 
     [Fact]
+    public async Task CreateAsync_concurrent_requests_never_oversubscribe_host_caps()
+    {
+        const int perHostCapacity = 3;
+        const int aggregateCapacity = perHostCapacity * 2;
+        const int requestedSandboxes = aggregateCapacity + 12;
+
+        var opts = Options(
+            Host("a", cap: perHostCapacity),
+            Host("b", cap: perHostCapacity));
+        var transports = new HostTransportSet();
+        var stagingGate = new AsyncGate(aggregateCapacity);
+        transports["a"].StagingGate = stagingGate;
+        transports["b"].StagingGate = stagingGate;
+        var provider = Provider(() => opts, transports);
+
+        var createTasks = Enumerable.Range(0, requestedSandboxes)
+            .Select(_ => provider.CreateAsync(Spec()))
+            .ToArray();
+
+        IReadOnlyList<SandboxHostPoolEntry> blockedSnapshot = [];
+        int blockedLaunchCountA = 0;
+        int blockedLaunchCountB = 0;
+        try
+        {
+            await stagingGate.WaitForExpectedAsync().WaitAsync(TimeSpan.FromSeconds(5));
+            blockedSnapshot = provider.SnapshotHostPool();
+            blockedLaunchCountA = transports["a"].LaunchCount;
+            blockedLaunchCountB = transports["b"].LaunchCount;
+        }
+        finally
+        {
+            stagingGate.Release();
+        }
+
+        var outcomes = await Task.WhenAll(createTasks.Select(ObserveCreateAsync));
+        var sandboxes = outcomes
+            .Where(static outcome => outcome.Sandbox is not null)
+            .Select(static outcome => outcome.Sandbox!)
+            .ToArray();
+        try
+        {
+            Assert.All(blockedSnapshot, row =>
+                Assert.True(row.Reserved <= row.Capacity, $"{row.HostId} reserved {row.Reserved}/{row.Capacity}"));
+            Assert.True(blockedLaunchCountA <= perHostCapacity);
+            Assert.True(blockedLaunchCountB <= perHostCapacity);
+            Assert.Equal(aggregateCapacity, sandboxes.Length);
+            Assert.Equal(
+                requestedSandboxes - aggregateCapacity,
+                outcomes.Count(static outcome => outcome.Error is SandboxProvisioningDeferredException
+                {
+                    Operation: "placement",
+                    ErrorClass: "no-eligible-host",
+                }));
+            Assert.True(transports["a"].LaunchCount <= perHostCapacity);
+            Assert.True(transports["b"].LaunchCount <= perHostCapacity);
+        }
+        finally
+        {
+            foreach (var sandbox in sandboxes)
+                await sandbox.DisposeAsync();
+        }
+
+        static async Task<(ISandbox? Sandbox, Exception? Error)> ObserveCreateAsync(Task<ISandbox> task)
+        {
+            try
+            {
+                return (await task.ConfigureAwait(false), null);
+            }
+            catch (Exception ex)
+            {
+                return (null, ex);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task CreateAsync_defers_when_remote_inventory_output_exceeds_cap()
+    {
+        var opts = Options(Host("a", cap: 1)) with { RemoteInventoryMaxOutputBytes = 32 };
+        var transports = new HostTransportSet();
+        transports["a"].ListStdoutOverride = "{\"list\":[" + new string('x', 256) + "]}";
+        var provider = Provider(() => opts, transports);
+
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
+            await provider.CreateAsync(Spec()));
+
+        Assert.Equal("placement", ex.Operation);
+        Assert.Equal("all-hosts-unavailable", ex.ErrorClass);
+        Assert.Contains(transports["a"].ListStdoutCaps, cap => cap == opts.RemoteInventoryMaxOutputBytes);
+        var host = Assert.Single(provider.SnapshotHostPool());
+        Assert.False(host.RuntimeHealthy);
+        Assert.Equal(0, host.Reserved);
+        Assert.Equal(0, transports["a"].LaunchCount);
+    }
+
+    [Fact]
     public async Task CreateAsync_honors_hot_reloaded_cordon_state()
     {
         var current = Options(
@@ -216,6 +312,43 @@ public sealed class MultipassRemoteHostPoolTests
 
         var afterDispose = Assert.Single(provider.SnapshotHostPool());
         Assert.Equal(0, afterDispose.Reserved);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_after_exec_transport_drop_releases_active_tracking_when_syncback_cannot_run()
+    {
+        var opts = Options(Host("a", cap: 1));
+        var transports = new HostTransportSet();
+        var provider = Provider(() => opts, transports);
+        var hostTemp = Path.Combine(Path.GetTempPath(), "codeybox-remote-host-pool-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(hostTemp);
+        try
+        {
+            var sandbox = await provider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = "24.04",
+                WorkingDirectory = "/work",
+                Mounts = [new SandboxMount { SandboxPath = "/repo", HostPath = hostTemp, ReadOnly = false }],
+            });
+            transports["a"].ManagedNames.Add(sandbox.Id);
+            transports["a"].ThrowTransportOnExec = true;
+
+            await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
+                await sandbox.ExecAsync(new SandboxExec { Argv = ["echo", "hello"] }));
+
+            transports["a"].ThrowTransportOnStageOut = true;
+            await sandbox.DisposeAsync();
+
+            Assert.Equal(0, Assert.Single(provider.SnapshotHostPool()).Reserved);
+            var leaked = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
+            Assert.Equal(sandbox.Id, leaked.Name);
+            Assert.False(leaked.IsTrackedActive);
+            Assert.Equal(0, transports["a"].DeleteCount);
+        }
+        finally
+        {
+            try { Directory.Delete(hostTemp, recursive: true); } catch { }
+        }
     }
 
     [Fact]
@@ -712,31 +845,40 @@ public sealed class MultipassRemoteHostPoolTests
         public bool ThrowTransportOnRun { get; set; }
         public bool ThrowTransportOnLaunch { get; set; }
         public bool ThrowTransportOnExec { get; set; }
+        public bool ThrowTransportOnStageOut { get; set; }
         public bool ThrowTransportOnMetadataScan { get; set; }
+        public AsyncGate? StagingGate { get; set; }
         public int LaunchExitCode { get; set; }
         public int DeleteExitCode { get; set; }
         public int InfoExitCode { get; set; }
         public int ListExitCode { get; set; }
+        public string? ListStdoutOverride { get; set; }
         public string InfoStderr { get; set; } = "";
         public List<string> ManagedNames { get; } = [];
+        public ConcurrentQueue<int?> ListStdoutCaps { get; } = new();
         public int LaunchCount => _calls.Count(argv => argv.Contains("launch"));
         public int DeleteCount => _calls.Count(argv => argv.Contains("delete"));
         public int RmCount => _calls.Count(argv => argv.Count >= 2 && argv[0] == "rm" && argv[1] == "-rf");
         public int ListCount => _calls.Count(argv => argv.Contains("list"));
         public int InfoCount => _calls.Count(argv => argv.Contains("info"));
 
-        public Task<ProcessRunResult> RunAsync(
+        public async Task<ProcessRunResult> RunAsync(
             IReadOnlyList<string> argv,
             string? stdin,
             CancellationToken ct,
             Action<string>? stdoutChunkCallback = null,
-            Action<string>? stderrChunkCallback = null)
+            Action<string>? stderrChunkCallback = null,
+            int? maxStdoutBytes = null,
+            int? maxStderrBytes = null,
+            bool killOnOutputLimit = true)
         {
             _calls.Enqueue(argv.ToArray());
             if (ThrowTransportOnRun)
                 throw new RemoteSshTransportException($"{hostId}: simulated transport drop");
             if (ThrowTransportOnLaunch && argv.Contains("launch"))
                 throw new RemoteSshTransportException($"{hostId}: simulated transport drop during launch");
+            if (IsStagingDirectorySetup(argv) && StagingGate is { } stagingGate)
+                await stagingGate.WaitAsync(ct).ConfigureAwait(false);
             if (ThrowTransportOnExec && argv.Contains("exec") && argv.Contains("bash"))
                 throw new RemoteSshTransportException($"{hostId}: simulated transport drop during exec");
             if (ThrowTransportOnMetadataScan
@@ -748,33 +890,66 @@ public sealed class MultipassRemoteHostPoolTests
                 throw new RemoteSshTransportException($"{hostId}: simulated transport drop during metadata scan");
             }
             if (argv.Contains("launch") && LaunchExitCode != 0)
-                return Task.FromResult(new ProcessRunResult(LaunchExitCode, "", "launch failed"));
+                return new ProcessRunResult(LaunchExitCode, "", "launch failed");
             if (argv.Contains("delete") && DeleteExitCode != 0)
-                return Task.FromResult(new ProcessRunResult(DeleteExitCode, "", "delete failed"));
+                return new ProcessRunResult(DeleteExitCode, "", "delete failed");
             if (argv.Contains("info"))
             {
                 var vm = argv.SkipWhile(a => a != "info").Skip(1).First();
                 if (InfoExitCode != 0)
-                    return Task.FromResult(new ProcessRunResult(InfoExitCode, "", InfoStderr));
-                return Task.FromResult(new ProcessRunResult(
+                    return new ProcessRunResult(InfoExitCode, "", InfoStderr);
+                return new ProcessRunResult(
                     0,
                     $"{{\"info\":{{\"{vm}\":{{\"state\":\"Running\"}}}}}}",
-                    ""));
+                    "");
             }
             if (argv.Contains("list"))
             {
+                ListStdoutCaps.Enqueue(maxStdoutBytes);
                 if (ListExitCode != 0)
-                    return Task.FromResult(new ProcessRunResult(ListExitCode, "", "list failed"));
-                var entries = string.Join(",", ManagedNames.Select(name => $"{{\"name\":\"{name}\",\"state\":\"Running\"}}"));
-                return Task.FromResult(new ProcessRunResult(0, $"{{\"list\":[{entries}]}}", ""));
+                    return new ProcessRunResult(ListExitCode, "", "list failed");
+                var stdout = ListStdoutOverride
+                    ?? $"{{\"list\":[{string.Join(",", ManagedNames.Select(name => $"{{\"name\":\"{name}\",\"state\":\"Running\"}}"))}]}}";
+                if (maxStdoutBytes is { } cap && System.Text.Encoding.UTF8.GetByteCount(stdout) > cap)
+                    return new ProcessRunResult(137, stdout[..Math.Min(stdout.Length, cap)], "", StdoutLimitExceeded: true);
+                return new ProcessRunResult(0, stdout, "");
             }
-            return Task.FromResult(new ProcessRunResult(0, "", ""));
+            return new ProcessRunResult(0, "", "");
         }
 
         public Task StageInAsync(string hostPath, string remotePath, CancellationToken ct) =>
             Task.CompletedTask;
 
-        public Task StageOutAsync(string remotePath, string hostPath, CancellationToken ct) =>
-            Task.CompletedTask;
+        public Task StageOutAsync(string remotePath, string hostPath, CancellationToken ct)
+        {
+            if (ThrowTransportOnStageOut)
+                throw new RemoteSshTransportException($"{hostId}: simulated transport drop during stage-out");
+            return Task.CompletedTask;
+        }
+
+        private static bool IsStagingDirectorySetup(IReadOnlyList<string> argv) =>
+            argv.Count >= 3
+            && argv[0] == "sh"
+            && argv[1] == "-c"
+            && argv[2].Contains("mkdir -p", StringComparison.Ordinal)
+            && argv[2].Contains("chmod 0700", StringComparison.Ordinal);
+    }
+
+    private sealed class AsyncGate(int expectedWaiters)
+    {
+        private readonly TaskCompletionSource _expectedReached = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _started;
+
+        public Task WaitForExpectedAsync() => _expectedReached.Task;
+
+        public void Release() => _release.TrySetResult();
+
+        public async Task WaitAsync(CancellationToken ct)
+        {
+            if (Interlocked.Increment(ref _started) >= expectedWaiters)
+                _expectedReached.TrySetResult();
+            await _release.Task.WaitAsync(ct).ConfigureAwait(false);
+        }
     }
 }
