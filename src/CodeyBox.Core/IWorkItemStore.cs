@@ -339,9 +339,23 @@ public interface IWorkItemStore
     }
 
     /// <summary>
-    /// Claims a work item for a single agent-restore sweep key. Persistent stores
-    /// should make this atomic and return false when another duplicate restore
-    /// event already claimed the same item/window.
+    /// Returns true when a successful agent-restore retry was already claimed
+    /// for the same work item, restored agent, and outage start. Used before
+    /// retrying so failed enqueue attempts do not consume the idempotency key.
+    /// </summary>
+    Task<bool> HasAgentRestoreRetryClaimAsync(
+        WorkItemId id,
+        AgentKind restoredAgent,
+        DateTimeOffset outageStartedAt,
+        CancellationToken ct = default)
+        => throw new NotSupportedException(
+            "This work item store does not implement agent-restore retry claim lookup.");
+
+    /// <summary>
+    /// Claims a successfully requeued work item for a single agent-restore
+    /// sweep key. Persistent stores should make this atomic and return false
+    /// when another duplicate restore event already claimed the same
+    /// item/window.
     /// </summary>
     Task<bool> TryClaimAgentRestoreRetryAsync(
         WorkItemId id,

@@ -1653,6 +1653,35 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         }
     }
 
+    public async Task<bool> HasAgentRestoreRetryClaimAsync(
+        WorkItemId id,
+        AgentKind restoredAgent,
+        DateTimeOffset outageStartedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT 1
+                FROM agent_restore_retry_claims
+                WHERE work_item_id = $work_item_id
+                  AND restored_agent = $restored_agent
+                  AND outage_started_at = $outage_started_at
+                LIMIT 1;
+                """;
+            cmd.Parameters.AddWithValue("$work_item_id", id.ToString());
+            cmd.Parameters.AddWithValue("$restored_agent", restoredAgent.Value);
+            cmd.Parameters.AddWithValue("$outage_started_at", outageStartedAt.ToString("O"));
+            return await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false) is not null;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default)
     {
         await _writeLock.WaitAsync(ct);

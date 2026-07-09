@@ -182,6 +182,40 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     }
 
     [Fact]
+    public async Task Sweep_DoesNotPersistClaimWhenRetryFails()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var item = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
+            updatedAt: outageStart.AddMinutes(2));
+        await store.CreateAsync(item);
+
+        var evt = new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow);
+        var failingQueue = new ThrowingForWorkItemQueue(item.Id);
+        var failingScheduler = NewScheduler(store, failingQueue, enabled: true);
+
+        var failedSweep = await failingScheduler.SweepForTestAsync(evt);
+
+        Assert.Equal(0, failedSweep.Requeued);
+        Assert.Equal(1, failedSweep.Skipped);
+        Assert.Equal(WorkItemState.Failed, (await store.GetAsync(item.Id))!.State);
+        Assert.Equal(0, failingQueue.Count);
+
+        var retryQueue = new InMemoryTaskQueue();
+        var retryScheduler = NewScheduler(store, retryQueue, enabled: true);
+
+        var retrySweep = await retryScheduler.SweepForTestAsync(evt);
+
+        Assert.Equal(1, retrySweep.Requeued);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(item.Id))!.State);
+        Assert.Equal(1, retryQueue.Count);
+    }
+
+    [Fact]
     public async Task Sweep_ConcurrentDuplicateRestoreEvents_OnlyOneRetryWritesAndEnqueues()
     {
         using var store = new SqliteWorkItemStore(_dbPath);
@@ -648,6 +682,60 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
             Assert.Equal(item.Id, await queue.DequeueAsync(timeout.Token));
             Assert.Equal(WorkItemState.Queued, (await store.GetAsync(item.Id))!.State);
+        }
+        finally
+        {
+            await scheduler.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task RestoreSignal_BackgroundService_DefersWhenEventQueueFull()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var registry = NewRegistry();
+        var scheduler = NewScheduler(
+            store,
+            queue,
+            enabled: true,
+            signal: registry,
+            eventQueueCapacity: 1);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var restoredAt = DateTimeOffset.UtcNow;
+        var first = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
+            updatedAt: outageStart.AddMinutes(2));
+        var second = NewItem(
+            agent: AgentKind.Codex,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
+            updatedAt: outageStart.AddMinutes(3));
+        await store.CreateAsync(first);
+        await store.CreateAsync(second);
+
+        registry.PublishRestored(new AgentRestoredEvent(AgentKind.Claude, outageStart, restoredAt));
+        registry.PublishRestored(new AgentRestoredEvent(AgentKind.Codex, outageStart, restoredAt));
+
+        await scheduler.StartAsync(CancellationToken.None);
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            var dequeued = new List<WorkItemId>();
+            for (var i = 0; i < 2; i++)
+            {
+                var id = await queue.DequeueAsync(timeout.Token);
+                Assert.True(id.HasValue);
+                dequeued.Add(id.Value);
+            }
+
+            Assert.Contains(first.Id, dequeued);
+            Assert.Contains(second.Id, dequeued);
+            Assert.Equal(WorkItemState.Queued, (await store.GetAsync(first.Id))!.State);
+            Assert.Equal(WorkItemState.Queued, (await store.GetAsync(second.Id))!.State);
         }
         finally
         {
@@ -1211,14 +1299,15 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
 
     private static AgentRestoreRetryScheduler NewScheduler(
         IWorkItemStore store,
-        InMemoryTaskQueue queue,
+        ITaskQueue queue,
         bool enabled,
         ILogger<AgentRestoreRetryScheduler>? schedulerLogger = null,
         IAgentRestoreSignal? signal = null,
         IWebhookDispatcher? webhooks = null,
         IProjectRepository? projects = null,
         IAgentInvolvementStore? involvement = null,
-        int maxCandidatesPerSweep = AgentRestoreRetryOptions.DefaultMaxCandidatesPerSweep)
+        int maxCandidatesPerSweep = AgentRestoreRetryOptions.DefaultMaxCandidatesPerSweep,
+        int eventQueueCapacity = AgentRestoreRetryOptions.DefaultEventQueueCapacity)
     {
         var retrier = new WorkItemRetrier(
             store,
@@ -1231,6 +1320,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             LookbackGrace = TimeSpan.FromMinutes(30),
             PostRestoreMargin = TimeSpan.FromMinutes(5),
             MaxCandidatesPerSweep = maxCandidatesPerSweep,
+            EventQueueCapacity = eventQueueCapacity,
         };
         return new AgentRestoreRetryScheduler(
             store,
@@ -1272,6 +1362,33 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         if (typeof(T) == typeof(int) && sv.Value is long l)
             return (T)(object)(int)l;
         return default;
+    }
+
+    private sealed class ThrowingForWorkItemQueue : ITaskQueue
+    {
+        private readonly WorkItemId _throwFor;
+        private readonly InMemoryTaskQueue _inner = new();
+
+        public ThrowingForWorkItemQueue(WorkItemId throwFor) => _throwFor = throwFor;
+
+        public int Count => _inner.Count;
+
+        public ValueTask EnqueueAsync(WorkItemId id, CancellationToken ct = default)
+        {
+            if (id == _throwFor)
+                throw new InvalidOperationException("queue enqueue failed");
+
+            return _inner.EnqueueAsync(id, ct);
+        }
+
+        public ValueTask EnqueueDispatchWakeAsync(CancellationToken ct = default) =>
+            _inner.EnqueueDispatchWakeAsync(ct);
+
+        public ValueTask<WorkItemId?> DequeueAsync(CancellationToken ct = default) =>
+            _inner.DequeueAsync(ct);
+
+        public ValueTask<bool> DequeueDispatchSignalAsync(CancellationToken ct = default) =>
+            _inner.DequeueDispatchSignalAsync(ct);
     }
 
     private sealed class FakeTimeProvider(DateTimeOffset now) : TimeProvider

@@ -1,6 +1,7 @@
+using System.Collections.Concurrent;
+using System.Threading.Channels;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using System.Threading.Channels;
 using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
@@ -35,11 +36,11 @@ namespace CodeyBox.Orchestrator;
 ///   <see cref="AgentRestoredEvent.OutageStartedAt"/> is null the sweep
 ///   does not retry anything because there is no window to scope by, but it
 ///   still emits zero-count audit/webhook telemetry.</item>
-///   <item>Idempotent. Each candidate is claimed against the restore event
-///   window before being re-enqueued and is then written through
-///   <see cref="WorkItemRetrier.RetryAgentRestoreAsync"/>'s snapshot-guarded
-///   conditional update, so duplicate restore events cannot double-retry the
-///   same outage victim.</item>
+///   <item>Idempotent. A prior successful claim for the restore event window
+///   blocks duplicate sweeps before retry, and successful re-enqueues are then
+///   claimed after <see cref="WorkItemRetrier.RetryAgentRestoreAsync"/>'s
+///   snapshot-guarded conditional update reports success. Failed enqueue
+///   attempts do not consume the idempotency key.</item>
 /// </list>
 ///
 /// <para>Routing: the requeued item flows through the normal class router,
@@ -61,6 +62,7 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
     private readonly Func<AgentRestoreRetryOptions> _optionsAccessor;
     private readonly ILogger<AgentRestoreRetryScheduler> _log;
     private readonly Channel<AgentRestoredEvent> _events;
+    private readonly ConcurrentDictionary<Task, byte> _deferredEventWrites = new();
 
     public AgentRestoreRetryScheduler(
         IWorkItemStore store,
@@ -101,12 +103,17 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
     {
         try
         {
-            if (!_events.Writer.TryWrite(evt))
-            {
-                _log.LogWarning(
-                    "AgentRestoreRetryScheduler: restore event queue rejected event for {Agent}; sweep skipped",
-                    evt.Agent.Value);
-            }
+            if (_events.Writer.TryWrite(evt))
+                return;
+
+            var deferredWrite = _events.Writer.WriteAsync(evt);
+            if (deferredWrite.IsCompletedSuccessfully)
+                return;
+
+            TrackDeferredEventWrite(deferredWrite.AsTask(), evt);
+            _log.LogWarning(
+                "AgentRestoreRetryScheduler: restore event queue is full for {Agent}; sweep deferred until queue capacity is available",
+                evt.Agent.Value);
         }
         catch (Exception ex)
         {
@@ -114,6 +121,49 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
                 "Failed to enqueue agent-restore event for {Agent}; sweep skipped",
                 evt.Agent.Value);
         }
+    }
+
+    private void TrackDeferredEventWrite(Task writeTask, AgentRestoredEvent evt)
+    {
+        var handle = new DeferredEventWriteHandle();
+        var observerTask = ObserveDeferredEventWriteAsync(writeTask, evt, handle);
+        handle.ObserverTask = observerTask;
+        _deferredEventWrites.TryAdd(observerTask, 0);
+        if (observerTask.IsCompleted)
+            _deferredEventWrites.TryRemove(observerTask, out _);
+    }
+
+    private async Task ObserveDeferredEventWriteAsync(
+        Task writeTask,
+        AgentRestoredEvent evt,
+        DeferredEventWriteHandle handle)
+    {
+        try
+        {
+            await writeTask.ConfigureAwait(false);
+        }
+        catch (ChannelClosedException ex)
+        {
+            _log.LogDebug(ex,
+                "AgentRestoreRetryScheduler: restore event for {Agent} was not enqueued because the scheduler is stopping",
+                evt.Agent.Value);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "AgentRestoreRetryScheduler: deferred restore event enqueue failed for {Agent}; sweep skipped",
+                evt.Agent.Value);
+        }
+        finally
+        {
+            if (handle.ObserverTask is { } observerTask)
+                _deferredEventWrites.TryRemove(observerTask, out _);
+        }
+    }
+
+    private sealed class DeferredEventWriteHandle
+    {
+        public Task? ObserverTask { get; set; }
     }
 
     /// <summary>
@@ -174,6 +224,20 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
             _signal.AgentRestored -= EnqueueEvent;
         _events.Writer.TryComplete();
         await base.StopAsync(cancellationToken).ConfigureAwait(false);
+        var deferredWrites = _deferredEventWrites.Keys.ToArray();
+        if (deferredWrites.Length == 0)
+            return;
+
+        try
+        {
+            await Task.WhenAll(deferredWrites).WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // The host is giving up on graceful stop; pending deferred writes
+            // will fault against the completed channel.
+        }
     }
 
     private async Task<AgentRestoreSweepSummary> SweepAsync(
@@ -218,12 +282,11 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
                 continue;
             }
 
-            if (!await _store.TryClaimAgentRestoreRetryAsync(
-                    item.Id,
-                    evt.Agent,
-                    evt.OutageStartedAt.Value,
-                    evt.RestoredAt,
-                    ct).ConfigureAwait(false))
+            if (await _store.HasAgentRestoreRetryClaimAsync(
+                item.Id,
+                evt.Agent,
+                evt.OutageStartedAt.Value,
+                ct).ConfigureAwait(false))
             {
                 skipped++;
                 _log.LogDebug(
@@ -259,6 +322,38 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
                     "AgentRestoreRetryScheduler: skipped {Id}: {Error}",
                     item.Id, error);
                 continue;
+            }
+
+            var claimPersisted = false;
+            var claimPersistenceFailed = false;
+            try
+            {
+                claimPersisted = await _store.TryClaimAgentRestoreRetryAsync(
+                        item.Id,
+                        evt.Agent,
+                        evt.OutageStartedAt.Value,
+                        evt.RestoredAt,
+                        ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                claimPersistenceFailed = true;
+                _log.LogError(ex,
+                    "AgentRestoreRetryScheduler: requeued {Id} after agent {Agent} restore but failed to persist idempotency claim",
+                    item.Id,
+                    evt.Agent.Value);
+            }
+
+            if (!claimPersisted && !claimPersistenceFailed)
+            {
+                _log.LogDebug(
+                    "AgentRestoreRetryScheduler: requeued {Id}; restore event for {Agent} was claimed by a concurrent sweep",
+                    item.Id,
+                    evt.Agent.Value);
             }
 
             requeued++;
