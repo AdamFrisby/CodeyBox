@@ -5,6 +5,7 @@ using System.Text;
 using CodeyBox.Core;
 using CodeyBox.HostProcess;
 using CodeyBox.Sandbox.MultipassRemote;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
@@ -264,6 +265,56 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
+    public async Task ExecAsync_passes_output_caps_to_transport_and_reports_transport_limits()
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            if (Contains(argv, "exec") && argv.Contains("bash"))
+            {
+                return new ProcessRunResult(
+                    137,
+                    "abcdef",
+                    "uvwxyz",
+                    StdoutLimitExceeded: true,
+                    StderrLimitExceeded: true);
+            }
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+        var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            WorkingDirectory = "/work",
+        });
+
+        var result = await sb.ExecAsync(new SandboxExec
+        {
+            Argv = ["printf", "x"],
+            MaxStdoutBytes = 4,
+            MaxStderrBytes = 3,
+            KillOnOutputLimit = true,
+        });
+
+        var execCall = Assert.Single(
+            transport.RecordedCalls,
+            c => c.Argv.Contains("exec") && c.Argv.Contains("bash"));
+        Assert.Equal(4, execCall.MaxStdoutBytes);
+        Assert.Equal(3, execCall.MaxStderrBytes);
+        Assert.True(result.StdoutLimitExceeded);
+        Assert.True(result.StderrLimitExceeded);
+        Assert.Equal("abcd", result.Stdout);
+        Assert.Equal("uvw", result.Stderr);
+        await sb.DisposeAsync();
+    }
+
+    [Fact]
     public async Task CreateAsync_cleans_up_remote_state_when_launch_fails()
     {
         var opts = DefaultOptions();
@@ -515,6 +566,31 @@ public sealed class MultipassRemoteSandboxProviderTests
         transport.OnRun = (argv, _) => throw new RemoteSshTransportException("network down");
         var infosOnDrop = await provider.ListAllManagedAsync(CancellationToken.None);
         Assert.Empty(infosOnDrop);
+    }
+
+    [Fact]
+    public async Task ListManagedInventoryAsync_sanitizes_remote_stderr_before_logging()
+    {
+        var opts = DefaultOptions();
+        var logger = new CapturingLogger<MultipassRemoteSandboxProvider>();
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "list"))
+                return new ProcessRunResult(1, "", "first\r\n\u001b[31mred\u001b[0m");
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(opts, transport, logger);
+
+        _ = await provider.ListManagedInventoryAsync(CancellationToken.None);
+
+        var stderr = Assert.IsType<string>(Assert.Single(logger.ValuesFor("Stderr")));
+        Assert.DoesNotContain('\r', stderr);
+        Assert.DoesNotContain('\n', stderr);
+        Assert.DoesNotContain('\u001b', stderr);
+        Assert.Contains("\\r\\n", stderr);
+        Assert.Contains("\\u001B", stderr);
     }
 
     [Fact]
@@ -1259,6 +1335,49 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
+    public async Task OpenSshCliTransport_StageOut_rejects_remote_stderr_cap_before_replacing_host_path()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var root = Directory.CreateTempSubdirectory("codeybox-stageout-stderr-cap-").FullName;
+        try
+        {
+            var fakeSsh = Path.Combine(root, "fake-ssh");
+            await WriteExecutableScriptAsync(
+                fakeSsh,
+                "#!/usr/bin/env bash\nprintf '" + new string('x', 128) + "' >&2\nexit 2\n");
+
+            var hostTarget = Path.Combine(root, "host-target");
+            Directory.CreateDirectory(hostTarget);
+            await File.WriteAllTextAsync(Path.Combine(hostTarget, "existing.txt"), "existing\n");
+
+            var opts = DefaultOptions() with
+            {
+                SshBinary = fakeSsh,
+                SshTarget = "ignored",
+                RemoteInventoryMaxOutputBytes = 32,
+            };
+            var transport = new OpenSshCliTransport(
+                () => opts,
+                new DefaultProcessRunner(),
+                NullLogger<OpenSshCliTransport>.Instance);
+
+            var ex = await Assert.ThrowsAsync<RemoteSshTransportException>(async () =>
+                await transport.StageOutAsync("/remote/staged/repo", hostTarget, CancellationToken.None));
+
+            Assert.Equal(RemoteSshTransportFailureKind.ResourceLimit, ex.Kind);
+            Assert.Contains("RemoteInventoryMaxOutputBytes", ex.Message);
+            Assert.Equal("existing\n", await File.ReadAllTextAsync(Path.Combine(hostTarget, "existing.txt")));
+            Assert.False(File.Exists(Path.Combine(hostTarget, "file.txt")));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task OpenSshCliTransport_StageOut_rejects_expansion_ratio_before_replacing_host_path()
     {
         if (OperatingSystem.IsWindows())
@@ -1329,6 +1448,88 @@ public sealed class MultipassRemoteSandboxProviderTests
 
             Assert.Equal(RemoteSshTransportFailureKind.Transport, ex.Kind);
             Assert.Contains("SSH transport failure", ex.Message);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task OpenSshCliTransport_StageIn_rejects_remote_stderr_cap()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var root = Directory.CreateTempSubdirectory("codeybox-stagein-stderr-cap-").FullName;
+        try
+        {
+            var source = Path.Combine(root, "source");
+            Directory.CreateDirectory(source);
+            await File.WriteAllTextAsync(Path.Combine(source, "payload.txt"), "payload\n");
+
+            var fakeSsh = Path.Combine(root, "fake-ssh");
+            await WriteExecutableScriptAsync(
+                fakeSsh,
+                "#!/usr/bin/env bash\nprintf '" + new string('x', 128) + "' >&2\ncat >/dev/null\n");
+
+            var opts = DefaultOptions() with
+            {
+                SshBinary = fakeSsh,
+                SshTarget = "ignored",
+                RemoteInventoryMaxOutputBytes = 32,
+            };
+            var transport = new OpenSshCliTransport(
+                () => opts,
+                new DefaultProcessRunner(),
+                NullLogger<OpenSshCliTransport>.Instance);
+
+            var ex = await Assert.ThrowsAsync<RemoteSshTransportException>(async () =>
+                await transport.StageInAsync(source, "/remote/source", CancellationToken.None));
+
+            Assert.Equal(RemoteSshTransportFailureKind.ResourceLimit, ex.Kind);
+            Assert.Contains("RemoteInventoryMaxOutputBytes", ex.Message);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task OpenSshCliTransport_StageIn_rejects_remote_stdout_cap()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var root = Directory.CreateTempSubdirectory("codeybox-stagein-stdout-cap-").FullName;
+        try
+        {
+            var source = Path.Combine(root, "source");
+            Directory.CreateDirectory(source);
+            await File.WriteAllTextAsync(Path.Combine(source, "payload.txt"), "payload\n");
+
+            var fakeSsh = Path.Combine(root, "fake-ssh");
+            await WriteExecutableScriptAsync(
+                fakeSsh,
+                "#!/usr/bin/env bash\nprintf '" + new string('x', 128) + "'\ncat >/dev/null\n");
+
+            var opts = DefaultOptions() with
+            {
+                SshBinary = fakeSsh,
+                SshTarget = "ignored",
+                RemoteInventoryMaxOutputBytes = 32,
+            };
+            var transport = new OpenSshCliTransport(
+                () => opts,
+                new DefaultProcessRunner(),
+                NullLogger<OpenSshCliTransport>.Instance);
+
+            var ex = await Assert.ThrowsAsync<RemoteSshTransportException>(async () =>
+                await transport.StageInAsync(source, "/remote/source", CancellationToken.None));
+
+            Assert.Equal(RemoteSshTransportFailureKind.ResourceLimit, ex.Kind);
+            Assert.Contains("RemoteInventoryMaxOutputBytes", ex.Message);
         }
         finally
         {
@@ -1555,6 +1756,50 @@ public sealed class MultipassRemoteSandboxProviderTests
     internal sealed record StageInCall(string HostPath, string RemotePath);
     internal sealed record StageOutCall(string RemotePath, string HostPath);
     public sealed record TarSpec(TarEntryType Type, string Name, string? Content = null, string? LinkName = null);
+
+    private sealed class CapturingLogger<T> : ILogger<T>
+    {
+        private readonly ConcurrentQueue<IReadOnlyList<KeyValuePair<string, object?>>> _states = new();
+
+        public IEnumerable<object?> ValuesFor(string key) =>
+            _states
+                .SelectMany(static state => state)
+                .Where(kvp => kvp.Key == key)
+                .Select(kvp => kvp.Value);
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull =>
+            NullScope.Instance;
+
+        public bool IsEnabled(LogLevel logLevel)
+        {
+            _ = logLevel;
+            return true;
+        }
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            _ = logLevel;
+            _ = eventId;
+            _ = exception;
+            _ = formatter;
+            if (state is IEnumerable<KeyValuePair<string, object?>> values)
+                _states.Enqueue(values.ToArray());
+        }
+
+        private sealed class NullScope : IDisposable
+        {
+            public static readonly NullScope Instance = new();
+
+            public void Dispose()
+            {
+            }
+        }
+    }
 
     internal sealed class FakeRemoteHostTransport : IRemoteHostTransport
     {

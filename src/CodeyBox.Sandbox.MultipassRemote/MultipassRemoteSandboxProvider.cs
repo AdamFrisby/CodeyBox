@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -484,7 +485,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                     opts,
                     $"multipass list exited {result.ExitCode}: {TruncateForLog(result.Stderr)}");
                 _log.LogWarning("multipass list (remote host {HostId}) exited {Exit}: {Stderr}",
-                    opts.HostId, result.ExitCode, result.Stderr);
+                    opts.HostId, result.ExitCode, TruncateForLog(result.Stderr));
                 continue;
             }
 
@@ -1693,8 +1694,26 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
     {
         if (string.IsNullOrEmpty(s)) return "";
         var trimmed = s.Trim();
-        if (trimmed.Length <= max) return trimmed;
-        return trimmed[..max] + "…";
+        var sb = new StringBuilder(Math.Min(trimmed.Length, max));
+        foreach (var ch in trimmed)
+        {
+            var escaped = ch switch
+            {
+                '\r' => "\\r",
+                '\n' => "\\n",
+                '\t' => "\\t",
+                _ when char.IsControl(ch) => "\\u" + ((int)ch).ToString("X4", CultureInfo.InvariantCulture),
+                _ => ch.ToString(),
+            };
+
+            if (sb.Length + escaped.Length > max)
+            {
+                sb.Append("...");
+                break;
+            }
+            sb.Append(escaped);
+        }
+        return sb.ToString();
     }
 }
 

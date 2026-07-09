@@ -29,6 +29,8 @@ namespace CodeyBox.Sandbox.MultipassRemote;
 /// </summary>
 public sealed class OpenSshCliTransport : IRemoteHostTransport
 {
+    private const int ReadBufferChars = 4096;
+
     /// <summary>
     /// OpenSSH's reserved exit code for "the ssh client itself failed before
     /// the remote command even ran." Used to distinguish a transport drop
@@ -152,7 +154,12 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
             // IProcessRunner doesn't accept a binary stdin stream — tar
             // produces opaque bytes — so the staging path runs the OpenSSH
             // child directly and copies tar.stdout → ssh.stdin.
-            var sshResult = await RunSshWithBinaryStdinAsync(opts, sshArgv, tarProc.StandardOutput.BaseStream, ct).ConfigureAwait(false);
+            var sshResult = await RunSshWithBinaryStdinAsync(
+                opts,
+                sshArgv,
+                tarProc.StandardOutput.BaseStream,
+                opts.RemoteInventoryMaxOutputBytes,
+                ct).ConfigureAwait(false);
 
             await tarProc.WaitForExitAsync(ct).ConfigureAwait(false);
             var tarStderr = await tarStderrTask.ConfigureAwait(false);
@@ -164,6 +171,8 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
             if (sshResult.StartFailed)
                 throw new RemoteSshTransportException(
                     $"OpenSSH client failed to start during StageInAsync at '{opts.SshBinary}'.");
+
+            ThrowIfStagingOutputLimitExceeded("StageInAsync", opts, sshResult);
 
             if (sshResult.ExitCode == SshTransportFailureExitCode)
                 throw new RemoteSshTransportException(
@@ -215,9 +224,20 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         var extractRoot = Path.Combine(tempRoot, "extract");
         var archivePath = Path.Combine(tempRoot, "archive.tar");
         Directory.CreateDirectory(extractRoot);
+        var outputLimitKilled = 0;
+        void KillForOutputLimit()
+        {
+            Interlocked.Exchange(ref outputLimitKilled, 1);
+            try { if (!sshProc.HasExited) sshProc.Kill(entireProcessTree: true); } catch { }
+        }
+
         try
         {
-            var sshErrTask = sshProc.StandardError.ReadToEndAsync(ct);
+            var sshErrTask = ReadTextToLimitAsync(
+                sshProc.StandardError,
+                opts.RemoteInventoryMaxOutputBytes,
+                KillForOutputLimit,
+                ct);
             await using (var archive = new FileStream(
                 archivePath,
                 FileMode.CreateNew,
@@ -235,7 +255,10 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
             }
 
             await sshProc.WaitForExitAsync(ct).ConfigureAwait(false);
-            var sshErr = await sshErrTask.ConfigureAwait(false);
+            var sshErrResult = await sshErrTask.ConfigureAwait(false);
+            if (sshErrResult.LimitExceeded)
+                throw BuildStagingOutputLimitException("StageOutAsync", opts, "stderr", null);
+            var sshErr = sshErrResult.Text;
 
             if (sshProc.ExitCode == SshTransportFailureExitCode)
                 throw new RemoteSshTransportException(
@@ -261,10 +284,18 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
 
             ReplacePath(extracted, Path.Combine(hostParent, basename));
         }
+        catch (IOException ex) when (Volatile.Read(ref outputLimitKilled) != 0)
+        {
+            throw BuildStagingOutputLimitException("StageOutAsync", opts, "stderr", ex);
+        }
         finally
         {
             try { if (!sshProc.HasExited) sshProc.Kill(entireProcessTree: true); } catch { }
-            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true); } catch { }
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true); }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Failed to remove StageOut temp directory {TempRoot}", tempRoot);
+            }
         }
     }
 
@@ -620,6 +651,7 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         MultipassRemoteSandboxOptions opts,
         IReadOnlyList<string> sshArgv,
         Stream binaryStdin,
+        int maxOutputBytes,
         CancellationToken ct)
     {
         var psi = new System.Diagnostics.ProcessStartInfo
@@ -636,8 +668,15 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         if (!StartWithTextBusyRetry(p))
             return new ProcessRunResult(1, "", "", StartFailed: true);
 
-        var stderrTask = p.StandardError.ReadToEndAsync(ct);
-        var stdoutTask = p.StandardOutput.ReadToEndAsync(ct);
+        var outputLimitKilled = 0;
+        void KillForOutputLimit()
+        {
+            Interlocked.Exchange(ref outputLimitKilled, 1);
+            try { if (!p.HasExited) p.Kill(entireProcessTree: true); } catch { }
+        }
+
+        var stderrTask = ReadTextToLimitAsync(p.StandardError, maxOutputBytes, KillForOutputLimit, ct);
+        var stdoutTask = ReadTextToLimitAsync(p.StandardOutput, maxOutputBytes, KillForOutputLimit, ct);
 
         try
         {
@@ -647,13 +686,25 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         {
             try { p.StandardInput.Close(); } catch { }
             try { await p.WaitForExitAsync(ct).ConfigureAwait(false); } catch { }
-            var partialStdout = await ReadCompletedOrEmptyAsync(stdoutTask).ConfigureAwait(false);
-            var partialStderr = await ReadCompletedOrEmptyAsync(stderrTask).ConfigureAwait(false);
+            var partialStdout = await ReadCompletedOrEmptyLimitedAsync(stdoutTask).ConfigureAwait(false);
+            var partialStderr = await ReadCompletedOrEmptyLimitedAsync(stderrTask).ConfigureAwait(false);
+            if (Volatile.Read(ref outputLimitKilled) != 0)
+                return new ProcessRunResult(
+                    p.HasExited ? p.ExitCode : 137,
+                    partialStdout.Text,
+                    partialStderr.Text,
+                    partialStdout.LimitExceeded,
+                    partialStderr.LimitExceeded);
             if (p.HasExited && p.ExitCode != SshTransportFailureExitCode)
-                return new ProcessRunResult(p.ExitCode, partialStdout, partialStderr);
+                return new ProcessRunResult(
+                    p.ExitCode,
+                    partialStdout.Text,
+                    partialStderr.Text,
+                    partialStdout.LimitExceeded,
+                    partialStderr.LimitExceeded);
 
             throw new RemoteSshTransportException(
-                $"SSH transport failure streaming binary stdin to '{opts.SshTarget}': {TailFor(partialStderr)}",
+                $"SSH transport failure streaming binary stdin to '{opts.SshTarget}': {TailFor(partialStderr.Text)}",
                 ex);
         }
         finally
@@ -665,20 +716,111 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         var stdout = await stdoutTask.ConfigureAwait(false);
         var stderr = await stderrTask.ConfigureAwait(false);
         _ = opts;
-        return new ProcessRunResult(p.ExitCode, stdout, stderr);
+        return new ProcessRunResult(
+            p.ExitCode,
+            stdout.Text,
+            stderr.Text,
+            stdout.LimitExceeded,
+            stderr.LimitExceeded);
     }
 
-    private static async Task<string> ReadCompletedOrEmptyAsync(Task<string> task)
+    private static async Task<LimitedTextReadResult> ReadCompletedOrEmptyLimitedAsync(Task<LimitedTextReadResult> task)
     {
         try
         {
-            return task.IsCompleted ? await task.ConfigureAwait(false) : "";
+            return task.IsCompleted
+                ? await task.ConfigureAwait(false)
+                : new LimitedTextReadResult("", LimitExceeded: false);
         }
         catch
         {
-            return "";
+            return new LimitedTextReadResult("", LimitExceeded: false);
         }
     }
+
+    private static async Task<LimitedTextReadResult> ReadTextToLimitAsync(
+        StreamReader reader,
+        int maxBytes,
+        Action? onLimitExceeded,
+        CancellationToken ct)
+    {
+        var output = new StringBuilder();
+        var buffer = new char[ReadBufferChars];
+        var totalBytes = 0;
+
+        while (true)
+        {
+            var read = await reader.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
+            if (read == 0)
+                return new LimitedTextReadResult(output.ToString(), LimitExceeded: false);
+
+            var chunk = new string(buffer, 0, read);
+            var chunkBytes = Encoding.UTF8.GetByteCount(chunk);
+            if (totalBytes + chunkBytes > maxBytes)
+            {
+                var remaining = Math.Max(0, maxBytes - totalBytes);
+                if (remaining > 0)
+                    output.Append(TakeUtf8Prefix(chunk, remaining));
+                onLimitExceeded?.Invoke();
+                return new LimitedTextReadResult(output.ToString(), LimitExceeded: true);
+            }
+
+            output.Append(chunk);
+            totalBytes += chunkBytes;
+        }
+    }
+
+    private static string TakeUtf8Prefix(string value, int maxBytes)
+    {
+        var used = 0;
+        for (var i = 0; i < value.Length;)
+        {
+            var charCount = char.IsHighSurrogate(value[i])
+                && i + 1 < value.Length
+                && char.IsLowSurrogate(value[i + 1])
+                    ? 2
+                    : 1;
+            var charBytes = Encoding.UTF8.GetByteCount(value.AsSpan(i, charCount));
+            if (used + charBytes > maxBytes)
+                return value[..i];
+            used += charBytes;
+            i += charCount;
+        }
+
+        return value;
+    }
+
+    private static void ThrowIfStagingOutputLimitExceeded(
+        string operation,
+        MultipassRemoteSandboxOptions opts,
+        ProcessRunResult result)
+    {
+        if (!result.StdoutLimitExceeded && !result.StderrLimitExceeded)
+            return;
+
+        var stream = result.StdoutLimitExceeded && result.StderrLimitExceeded
+            ? "stdout/stderr"
+            : result.StdoutLimitExceeded
+                ? "stdout"
+                : "stderr";
+        throw BuildStagingOutputLimitException(operation, opts, stream, null);
+    }
+
+    private static RemoteSshTransportException BuildStagingOutputLimitException(
+        string operation,
+        MultipassRemoteSandboxOptions opts,
+        string stream,
+        Exception? inner) =>
+        inner is null
+            ? new RemoteSshTransportException(
+                $"SSH {operation} {stream} exceeded RemoteInventoryMaxOutputBytes ({opts.RemoteInventoryMaxOutputBytes.ToString(CultureInfo.InvariantCulture)} bytes) for '{opts.SshTarget}'.",
+                RemoteSshTransportFailureKind.ResourceLimit)
+            : new RemoteSshTransportException(
+                $"SSH {operation} {stream} exceeded RemoteInventoryMaxOutputBytes ({opts.RemoteInventoryMaxOutputBytes.ToString(CultureInfo.InvariantCulture)} bytes) for '{opts.SshTarget}'.",
+                RemoteSshTransportFailureKind.ResourceLimit,
+                inner);
+
+    private readonly record struct LimitedTextReadResult(string Text, bool LimitExceeded);
 
     private static IReadOnlyList<string> BuildSshArgv(MultipassRemoteSandboxOptions opts, string remoteCommand)
     {

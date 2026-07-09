@@ -400,7 +400,10 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
 
         var releaseAdmission = false;
         if (innerDisposeSucceeded)
-            releaseAdmission = !await IsManagedSandboxStillPresentAsync(identity).ConfigureAwait(false);
+        {
+            releaseAdmission = ShouldReleaseAdmissionAfterHostLoss(sandbox)
+                || !await IsManagedSandboxStillPresentAsync(identity).ConfigureAwait(false);
+        }
 
         if (releaseAdmission)
             lease.Dispose();
@@ -414,6 +417,20 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
             }
             _disposedSandboxAdmissions.Retain(identity, lease);
         }
+    }
+
+    private static bool ShouldReleaseAdmissionAfterHostLoss(ISandbox sandbox)
+    {
+        var current = sandbox;
+        while (current is ISandboxDecorator decorator)
+        {
+            var inner = decorator.InnerSandbox;
+            if (ReferenceEquals(inner, current))
+                break;
+            current = inner;
+        }
+
+        return current is IReleaseAdmissionOnHostLossSandbox { ReleaseAdmissionAfterHostLoss: true };
     }
 
     private void OnSandboxPreserved(AdmissionControlledSandbox sandbox)

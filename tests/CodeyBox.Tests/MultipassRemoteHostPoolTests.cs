@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics.Metrics;
 using CodeyBox.Core;
 using CodeyBox.HostProcess;
+using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox.MultipassRemote;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -348,6 +349,224 @@ public sealed class MultipassRemoteHostPoolTests
         finally
         {
             try { Directory.Delete(hostTemp, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task AdmissionWrapped_exec_host_loss_releases_global_slot_for_healthy_replacement()
+    {
+        var opts = Options(
+            Host("a", cap: 1),
+            Host("b", cap: 1));
+        var transports = new HostTransportSet();
+        var inner = Provider(() => opts, transports);
+        var provider = SandboxAdmissionControlledProvider.Wrap(
+            inner,
+            maxConcurrentSandboxes: 1,
+            NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+        var hostTemp = Path.Combine(Path.GetTempPath(), "codeybox-remote-host-loss-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(hostTemp);
+        try
+        {
+            var sandbox = await provider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = "24.04",
+                WorkingDirectory = "/work",
+                Mounts = [new SandboxMount { SandboxPath = "/repo", HostPath = hostTemp, ReadOnly = false }],
+            });
+            Assert.Equal("a", Assert.IsAssignableFrom<IHostQualifiedSandbox>(sandbox).HostId);
+            transports["a"].ThrowTransportOnExec = true;
+
+            await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
+                await sandbox.ExecAsync(new SandboxExec { Argv = ["echo", "hello"] }));
+
+            transports["a"].ThrowTransportOnStageOut = true;
+            await sandbox.DisposeAsync();
+
+            Assert.Equal(0, admission.CurrentAdmittedSandboxes);
+            await using var replacement = await provider.CreateAsync(Spec()).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal("b", Assert.IsAssignableFrom<IHostQualifiedSandbox>(replacement).HostId);
+        }
+        finally
+        {
+            try { Directory.Delete(hostTemp, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Orchestrator_worker_cap_limits_remote_host_pool_placement()
+    {
+        const int workerCap = 3;
+        var opts = Options(
+            Host("a", cap: 2),
+            Host("b", cap: 2));
+        var transports = new HostTransportSet();
+        var inner = Provider(() => opts, transports);
+        var provider = SandboxAdmissionControlledProvider.Wrap(
+            inner,
+            maxConcurrentSandboxes: 10,
+            NullLogger.Instance);
+        var dbPath = Path.Combine(
+            Path.GetTempPath(),
+            $"codeybox-remote-worker-cap-{Guid.NewGuid():N}.db");
+        using var store = new SqliteWorkItemStore(dbPath);
+        var queue = new InMemoryTaskQueue();
+        var pipeline = new HoldingSandboxPipeline(provider, store, expectedHeld: workerCap);
+        var service = new OrchestratorService(
+            queue,
+            store,
+            pipeline,
+            new CancellationRegistry(CancellationToken.None),
+            new OrchestratorOptions
+            {
+                MaxConcurrentWorkers = workerCap,
+                ShutdownDrainTimeout = TimeSpan.FromSeconds(5),
+            },
+            NullLogger<OrchestratorService>.Instance,
+            projects: new InMemoryProjectRepository(new Project
+            {
+                Id = new ProjectId("test-project"),
+                DisplayName = "Test Project",
+                RepositoryUrl = "unused",
+                Budget = new ProjectBudget { MaxConcurrentForProject = workerCap },
+            }));
+
+        try
+        {
+            for (var i = 0; i < 6; i++)
+            {
+                var item = new WorkItem
+                {
+                    Id = WorkItemId.New(),
+                    ProjectId = new ProjectId("test-project"),
+                    Title = $"remote capacity {i}",
+                    Prompt = "hold",
+                    State = WorkItemState.Queued,
+                };
+                await store.CreateAsync(item);
+                await queue.EnqueueAsync(item.Id);
+            }
+
+            await service.StartAsync(CancellationToken.None);
+            await pipeline.WaitForHeldAsync().WaitAsync(TimeSpan.FromSeconds(5));
+
+            var snapshot = Assert.IsAssignableFrom<ISandboxHostPoolSnapshot>(provider).SnapshotHostPool();
+            Assert.Equal(workerCap, snapshot.Sum(static h => h.Reserved));
+            Assert.All(snapshot, h =>
+                Assert.True(h.Reserved <= h.Capacity, $"{h.HostId} reserved {h.Reserved}/{h.Capacity}"));
+            Assert.Equal(workerCap, transports["a"].LaunchCount + transports["b"].LaunchCount);
+            Assert.True(transports["a"].LaunchCount <= 2);
+            Assert.True(transports["b"].LaunchCount <= 2);
+            Assert.Equal(workerCap, pipeline.PeakRunning);
+        }
+        finally
+        {
+            pipeline.Release();
+            await service.StopAsync(CancellationToken.None);
+            service.Dispose();
+            try { File.Delete(dbPath); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Orchestrator_requeues_remote_exec_transport_loss_with_preempt_checkpoint_intact()
+    {
+        var workspace = Directory.CreateTempSubdirectory("codeybox-remote-pipeline-loss-").FullName;
+        try
+        {
+            var itemId = WorkItemId.New();
+            var seed = await TestSupport.CreateSeedRepoAsync(workspace);
+            await TestSupport.RunGit(seed, "branch", $"codeybox/preempt/{itemId}", "main");
+            var opts = Options(Host("a", cap: 1)) with
+            {
+                PlacementRecheckIn = TimeSpan.FromMinutes(5),
+            };
+            var transports = new HostTransportSet();
+            transports["a"].ThrowTransportOnExecWhen = argv =>
+                argv.Any(arg => arg.Contains("cat >", StringComparison.Ordinal));
+            var remoteProvider = Provider(() => opts, transports);
+            var admittedProvider = SandboxAdmissionControlledProvider.Wrap(
+                remoteProvider,
+                maxConcurrentSandboxes: 2,
+                NullLogger.Instance);
+            var agent = new ScriptedAgent([MergeStrategy.RealMerge]);
+            agent.WorkPlan.Enqueue(new FileWrite("change.txt", "change\n"));
+            using var tp = TestSupport.BuildPipeline(
+                workspace,
+                seed,
+                sandboxProvider: admittedProvider,
+                agentOverride: agent,
+                pipelineOptions: new PipelineOptions
+                {
+                    SandboxImageReference = "24.04",
+                    AgentAllowedHosts = [],
+                });
+            var workBranch = $"codeybox/{itemId.ToString()[..8]}";
+            var checkpoint = $"refs/heads/codeybox/preempt/{itemId}";
+            var item = new WorkItem
+            {
+                Id = itemId,
+                ProjectId = new ProjectId("test-project"),
+                Title = "remote host loss",
+                Prompt = "write",
+                State = WorkItemState.Queued,
+                WorkBranch = workBranch,
+                PreemptedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
+                PreemptCheckpoint = checkpoint,
+            };
+            await tp.Store.CreateAsync(item);
+            await tp.Queue.EnqueueAsync(item.Id);
+
+            using var service = new OrchestratorService(
+                tp.Queue,
+                tp.Store,
+                tp.Pipeline,
+                new CancellationRegistry(CancellationToken.None),
+                new OrchestratorOptions
+                {
+                    MaxConcurrentWorkers = 1,
+                    MaxRecoveryAttempts = 3,
+                    ShutdownDrainTimeout = TimeSpan.FromSeconds(5),
+                },
+                NullLogger<OrchestratorService>.Instance,
+                projects: new InMemoryProjectRepository(new Project
+                {
+                    Id = new ProjectId("test-project"),
+                    DisplayName = "Test Project",
+                    RepositoryUrl = seed,
+                    DefaultBaseBranch = "main",
+                    DefaultAgent = AgentKind.Claude,
+                    Budget = new ProjectBudget { MaxConcurrentForProject = 1 },
+                }));
+
+            await service.StartAsync(CancellationToken.None);
+            try
+            {
+                var recovered = await WaitForAsync(async () =>
+                {
+                    var current = await tp.Store.GetAsync(item.Id);
+                    return transports["a"].ExecCount > 0 && current is { StartedAt: null, PreemptCheckpoint: not null }
+                        ? current
+                        : null;
+                }, TimeSpan.FromSeconds(10));
+
+                Assert.Equal(WorkItemState.Working, recovered.State);
+                Assert.Equal(workBranch, recovered.WorkBranch);
+                Assert.Equal(checkpoint, recovered.PreemptCheckpoint);
+                Assert.Null(recovered.StartedAt);
+                Assert.Null(recovered.LastError);
+                Assert.Null(recovered.FailureKind);
+                Assert.Equal(1, transports["a"].ExecTransportDropCount);
+            }
+            finally
+            {
+                await service.StopAsync(CancellationToken.None);
+            }
+        }
+        finally
+        {
+            try { Directory.Delete(workspace, recursive: true); } catch { }
         }
     }
 
@@ -829,6 +1048,82 @@ public sealed class MultipassRemoteHostPoolTests
             VmNamePrefix = vmNamePrefix,
         };
 
+    private static async Task<T> WaitForAsync<T>(Func<Task<T?>> read, TimeSpan timeout)
+        where T : class
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            var value = await read().ConfigureAwait(false);
+            if (value is not null)
+                return value;
+
+            await Task.Delay(TimeSpan.FromMilliseconds(25)).ConfigureAwait(false);
+        }
+
+        var final = await read().ConfigureAwait(false);
+        if (final is not null)
+            return final;
+
+        throw new TimeoutException($"Timed out after {timeout} waiting for expected state.");
+    }
+
+    private sealed class HoldingSandboxPipeline(
+        ISandboxProvider provider,
+        IWorkItemStore store,
+        int expectedHeld) : IPipelineRunner
+    {
+        private readonly TaskCompletionSource _held = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _running;
+        private int _peak;
+        private int _heldCount;
+
+        public int PeakRunning => Volatile.Read(ref _peak);
+
+        public Task WaitForHeldAsync() => _held.Task;
+
+        public void Release() => _release.TrySetResult();
+
+        public async Task RunAsync(
+            WorkItem item,
+            CancellationToken ct,
+            CancellationToken hostShutdownToken = default)
+        {
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, hostShutdownToken);
+            var running = Interlocked.Increment(ref _running);
+            UpdateMax(ref _peak, running);
+            try
+            {
+                await using var sandbox = await provider.CreateAsync(new SandboxSpec
+                {
+                    ImageReference = "24.04",
+                    WorkingDirectory = "/work",
+                    TimingWorkItemId = item.Id,
+                }, linkedCts.Token).ConfigureAwait(false);
+
+                if (Interlocked.Increment(ref _heldCount) >= expectedHeld)
+                    _held.TrySetResult();
+
+                await _release.Task.WaitAsync(linkedCts.Token).ConfigureAwait(false);
+                await store.UpdateAsync(item.With(WorkItemState.Done), linkedCts.Token).ConfigureAwait(false);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _running);
+            }
+        }
+
+        private static void UpdateMax(ref int target, int value)
+        {
+            int current;
+            do
+            {
+                current = Volatile.Read(ref target);
+            } while (value > current && Interlocked.CompareExchange(ref target, value, current) != current);
+        }
+    }
+
     private sealed class HostTransportSet
     {
         private readonly ConcurrentDictionary<string, ScriptedTransport> _transports = new(StringComparer.Ordinal);
@@ -845,6 +1140,7 @@ public sealed class MultipassRemoteHostPoolTests
         public bool ThrowTransportOnRun { get; set; }
         public bool ThrowTransportOnLaunch { get; set; }
         public bool ThrowTransportOnExec { get; set; }
+        public Func<IReadOnlyList<string>, bool>? ThrowTransportOnExecWhen { get; set; }
         public bool ThrowTransportOnStageOut { get; set; }
         public bool ThrowTransportOnMetadataScan { get; set; }
         public AsyncGate? StagingGate { get; set; }
@@ -861,6 +1157,9 @@ public sealed class MultipassRemoteHostPoolTests
         public int RmCount => _calls.Count(argv => argv.Count >= 2 && argv[0] == "rm" && argv[1] == "-rf");
         public int ListCount => _calls.Count(argv => argv.Contains("list"));
         public int InfoCount => _calls.Count(argv => argv.Contains("info"));
+        public int ExecCount => _calls.Count(argv => argv.Contains("exec") && argv.Contains("bash"));
+        public int ExecTransportDropCount => Volatile.Read(ref _execTransportDropCount);
+        private int _execTransportDropCount;
 
         public async Task<ProcessRunResult> RunAsync(
             IReadOnlyList<string> argv,
@@ -879,8 +1178,12 @@ public sealed class MultipassRemoteHostPoolTests
                 throw new RemoteSshTransportException($"{hostId}: simulated transport drop during launch");
             if (IsStagingDirectorySetup(argv) && StagingGate is { } stagingGate)
                 await stagingGate.WaitAsync(ct).ConfigureAwait(false);
-            if (ThrowTransportOnExec && argv.Contains("exec") && argv.Contains("bash"))
+            if (argv.Contains("exec") && argv.Contains("bash")
+                && (ThrowTransportOnExec || ThrowTransportOnExecWhen?.Invoke(argv) == true))
+            {
+                Interlocked.Increment(ref _execTransportDropCount);
                 throw new RemoteSshTransportException($"{hostId}: simulated transport drop during exec");
+            }
             if (ThrowTransportOnMetadataScan
                 && argv.Count >= 3
                 && argv[0] == "sh"

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Text;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -21,7 +22,7 @@ namespace CodeyBox.Sandbox.MultipassRemote;
 /// snapshot is correctly typed and a future suspend implementation slots in
 /// without changing the provider surface.</para>
 /// </summary>
-internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQualifiedSandbox
+internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQualifiedSandbox, IReleaseAdmissionOnHostLossSandbox
 {
     private readonly SandboxSpec _spec;
     private readonly IReadOnlyList<StagedBindMount> _stagedMounts;
@@ -37,6 +38,7 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
     private int _disposed; // 0/1 via Interlocked
     private int _activeTrackingReleased;
     private int _executionTransportLost;
+    private int _releaseAdmissionAfterHostLoss;
 
     public MultipassRemoteSandbox(
         string vmName,
@@ -75,8 +77,7 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
     // active tracking is released so the leak reaper can reclaim any remaining
     // remote VM/staging state when the host is reachable.
     internal bool IsTrackedActive => Volatile.Read(ref _activeTrackingReleased) == 0;
-    internal MultipassRemoteSandboxOptions HostOptions => _opts;
-    internal IRemoteHostTransport Transport => _transport;
+    public bool ReleaseAdmissionAfterHostLoss => Volatile.Read(ref _releaseAdmissionAfterHostLoss) != 0;
 
     public WorkItemId? OwningWorkItemId => _spec.TimingWorkItemId;
 
@@ -165,14 +166,20 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
                     stdin: exec.Stdin,
                     linkedCts.Token,
                     stdoutChunkCallback: OnStdout,
-                    stderrChunkCallback: OnStderr).ConfigureAwait(false);
+                    stderrChunkCallback: OnStderr,
+                    maxStdoutBytes: exec.MaxStdoutBytes,
+                    maxStderrBytes: exec.MaxStderrBytes,
+                    killOnOutputLimit: exec.KillOnOutputLimit).ConfigureAwait(false);
+
+                var stdoutLimitExceeded = stdoutLimitHit || run.StdoutLimitExceeded;
+                var stderrLimitExceeded = stderrLimitHit || run.StderrLimitExceeded;
 
                 return new SandboxExecResult(
                     ExitCode: run.ExitCode,
-                    Stdout: stdoutLimitHit ? TruncateUtf8(run.Stdout, exec.MaxStdoutBytes!.Value) : run.Stdout,
-                    Stderr: stderrLimitHit ? TruncateUtf8(run.Stderr, exec.MaxStderrBytes!.Value) : run.Stderr,
-                    StdoutLimitExceeded: stdoutLimitHit,
-                    StderrLimitExceeded: stderrLimitHit);
+                    Stdout: ApplyOutputLimit(run.Stdout, exec.MaxStdoutBytes, stdoutLimitExceeded),
+                    Stderr: ApplyOutputLimit(run.Stderr, exec.MaxStderrBytes, stderrLimitExceeded),
+                    StdoutLimitExceeded: stdoutLimitExceeded,
+                    StderrLimitExceeded: stderrLimitExceeded);
             }
             catch (RemoteSshTransportException ex)
             {
@@ -295,6 +302,7 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
                     ex,
                     "Remote VM {Vm} sync-back could not run after execution transport loss; releasing active tracking for leak reaper recovery",
                     vmName);
+                Volatile.Write(ref _releaseAdmissionAfterHostLoss, 1);
                 ReleaseActiveTracking(vmName);
                 return;
             }
@@ -597,11 +605,34 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
         return s;
     }
 
+    private static string ApplyOutputLimit(string value, int? maxBytes, bool limitExceeded) =>
+        limitExceeded && maxBytes is { } cap
+            ? TruncateUtf8(value, cap)
+            : value;
+
     private static string TruncateForLog(string s, int max = 200)
     {
         if (string.IsNullOrEmpty(s)) return "";
         var trimmed = s.Trim();
-        if (trimmed.Length <= max) return trimmed;
-        return trimmed[..max] + "...";
+        var sb = new StringBuilder(Math.Min(trimmed.Length, max));
+        foreach (var ch in trimmed)
+        {
+            var escaped = ch switch
+            {
+                '\r' => "\\r",
+                '\n' => "\\n",
+                '\t' => "\\t",
+                _ when char.IsControl(ch) => "\\u" + ((int)ch).ToString("X4", CultureInfo.InvariantCulture),
+                _ => ch.ToString(),
+            };
+
+            if (sb.Length + escaped.Length > max)
+            {
+                sb.Append("...");
+                break;
+            }
+            sb.Append(escaped);
+        }
+        return sb.ToString();
     }
 }

@@ -289,6 +289,24 @@ public interface IHostQualifiedSandbox
 }
 
 /// <summary>
+/// Optional sandbox capability for providers that can positively identify a
+/// successful dispose as an execution-host loss recovery hand-off. Admission
+/// wrappers may release the global sandbox slot even when a host-scoped
+/// inventory is partial, because the owning work item will be replayed on a new
+/// sandbox and the old host is no longer part of active capacity.
+/// </summary>
+public interface IReleaseAdmissionOnHostLossSandbox : ISandbox
+{
+    /// <summary>
+    /// True after a successful <see cref="IAsyncDisposable.DisposeAsync"/> when
+    /// the provider intentionally abandoned the old host-local sandbox for leak
+    /// reaper cleanup after an execution-time host transport loss. False for
+    /// normal cleanup failures where a live sandbox may still consume capacity.
+    /// </summary>
+    bool ReleaseAdmissionAfterHostLoss { get; }
+}
+
+/// <summary>
 /// Optional sandbox capability used during graceful host shutdown. A provider
 /// that can preserve an interrupted sandbox should stop it and make subsequent
 /// disposal a no-op so cached state can survive the orchestrator restart.
