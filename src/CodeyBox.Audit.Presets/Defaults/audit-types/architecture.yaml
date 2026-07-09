@@ -7,8 +7,9 @@ reviewFocus: |-
   cheap to change later?
 
   SCOPE — IN-LANE: coupling and seams; dependency direction and layering; module boundaries
-  and contracts (public signatures, serialized/wire shapes, error contracts); cohesion (god
-  objects, misplaced responsibility); abstraction fit (missing seam, premature abstraction,
+  and contracts (durable/persisted formats and concrete-type coupling — internal-signature
+  backwards-compatibility is NOT a blocking basis, see COMPATIBILITY IS NOT A GATE below);
+  cohesion (god objects, misplaced responsibility); abstraction fit (missing seam, premature abstraction,
   leaky abstraction); CROSS-MODULE duplication (policy forks); dependency hygiene (DI misuse,
   static mutable state, cycles); RUNTIME DYNAMISM where compile-time enforcement is
   available (reflection, dynamic dispatch, type escapes); PURITY AND IMMUTABILITY of new
@@ -17,12 +18,14 @@ reviewFocus: |-
   dead code, and SINGLE-FILE/adjacent-file copy-paste (maintainability subjects); task
   completeness; security — except per [CROSS-LANE-SECURITY].
 
-  EVIDENCE FOR SPREAD: you are NOT handed a call graph. Grep the clone by symbol name for
-  consumers, callers, and duplicates of the changed surface, then OPEN what you find; cite
-  file:line for every consumer or duplicate a severity rests on. A clean search means "no
-  consumer FOUND" (grep can miss reflection, DI wiring, and dynamic dispatch) — treat that as
-  absence of evidence, never as license to assert a consumer you did not find. Never infer a
-  consumer from a namespace or folder name (Core, Domain, Application, ...) — go look.
+  EVIDENCE FOR SPREAD: you are NOT handed a call graph. For the gates that rest on spread —
+  (ii) duplication and (iii) shared-behavior — grep the clone by symbol name for the call
+  sites and duplicates, then OPEN what you find; cite file:line for every call site or
+  duplicate a severity rests on. A clean search means "no call site FOUND" (grep can miss
+  reflection, DI wiring, and dynamic dispatch) — treat that as absence of evidence, never as
+  license to assert one you did not find. Never infer a call site from a namespace or folder
+  name (Core, Domain, Application, ...) — go look. (Mere COUNT of callers is never itself a
+  gate — compatibility is not a gate; spread matters only for duplication and behavior change.)
 
   DOUBT DIRECTION (explicit): spread-doubt DE-ESCALATES — if a genuine search does not
   establish a SPREAD gate, the finding is CONFINED (Warning ceiling; do not block on a smell
@@ -32,31 +35,40 @@ reviewFocus: |-
   ===== SEVERITY RUBRIC — ARCHITECTURE =====
   Walk the ladder and assign the highest tier whose gate holds.
 
-  ERROR — the SPREAD test: any ONE of (i)-(vi), each resting on evidence you found by
-  reading/searching the clone (cite the file:line):
-  (i)   EXTERNAL CONSUMER of the changed surface: the diff adds or alters a member/type that
-        code OUTSIDE its declaring class/file consumes — grep for it and cite that consumer.
-        Adding a NEW member or responsibility to an already-referenced class does NOT satisfy
-        (i): the pre-existing external references point at OTHER members, not at what you
-        changed.
-  (ii)  CONTRACT change visible in the diff: a signature, constructor, interface,
-        serialized/wire shape, or error contract that other code compiles against, imports,
-        or deserializes.
-  DEGENERATE SPREAD DOES NOT COUNT — for BOTH (i) and (ii): a consumer, caller, or
-        contract-dependent that THIS SAME DIFF introduces is not spread evidence. New code
-        consuming its own new member (the diff's Bridge calling the diff's SignalBootstrap;
-        a new method whose only call sites are in this diff; test doubles forced to
-        implement a new member) is CONFINED → Warning. Spread requires the cited consumer
-        to be PRE-EXISTING code outside the diff, or a published/serialized surface that
-        external parties already consume.
-  (iii) DUPLICATION fork: the diff itself repeats a pattern 2+ times (visible and countable
+  ERROR — a GENUINE STRUCTURAL or SEMANTIC defect: any ONE of (i)-(v), each resting on
+  evidence you found by reading/searching the clone (cite the file:line).
+
+  COMPATIBILITY IS NOT A GATE. This codebase ships and deploys as ONE unit: there is no
+  external, published, versioned, or binary-compatible API surface, and no plugin or consumer
+  ecosystem to keep stable. CI has already compiled the ENTIRE repo warnings-clean, and that
+  compile IS the only compatibility contract. Changing or removing any in-repo signature,
+  constructor, record shape, interface, visibility, parameter name, field, or error/exception
+  contract is NEVER an Error or a Warning on compatibility grounds — no matter how many call
+  sites reference it: every caller lives in the same unit and was updated, or the build would
+  have failed. NEVER rest a finding on "breaking backwards/API/binary compatibility," an
+  "external/plugin consumer," a "published surface," "callers depend on this contract," or
+  "changed a public contract." A finding whose ONLY basis is compatibility is INFO at most.
+  (This does not excuse the STRUCTURAL/SEMANTIC defects below — they stand on their own,
+  independent of who consumes the surface.)
+
+  (i)   PERSISTED / CROSS-DEPLOY FORMAT break (data-integrity, NOT API-compat): the diff
+        changes a format that DURABLE data already exists in and that must survive a
+        restart/deploy — an on-disk file layout, a database schema/column/index, or a
+        message/event replayed from a persisted log across versions — with NO migration or
+        backward-read path, such that the running system loading PRE-EXISTING persisted data
+        would fail or silently misread it. Cite the persisted read/write site and the absent
+        migration. Internal wire between components that compile and deploy together does NOT
+        count — it recompiles as one unit (see COMPATIBILITY IS NOT A GATE).
+  (ii)  DUPLICATION fork: the diff itself repeats a pattern 2+ times (visible and countable
         in the diff), OR duplicates a pattern VISIBLE in the diff or surrounding code WITH
         divergent behavior (a latent correctness fork). An "existing pattern" you were not
         shown and did not read does not count.
-  (iv)  SHARED-BEHAVIOR change: the diff alters behavior of a function/method that the diff
-        or surrounding code SHOWS is called from 2+ distinct sites (cite both), or whose
-        documented contract the surrounding code depends on.
-  (v)   LAYERING inversion: a lower/inner layer newly depends on a higher/outer one, or
+  (iii) SHARED-BEHAVIOR change (SEMANTIC, not signature): the diff alters the RUNTIME BEHAVIOR
+        of a function/method that the diff or surrounding code SHOWS is called from 2+ distinct
+        sites (cite both), such that a COMPILING caller now silently gets different results. A
+        pure signature/type change is compile-checked and is NOT this gate; the defect is a
+        changed MEANING the callers were not adjusted for.
+  (iv)  LAYERING inversion: a lower/inner layer newly depends on a higher/outer one, or
         takes a dependency the project's layering forbids. Derive the layer direction from
         the repo itself (project/package references, import graph, build manifests, stated
         conventions) — do not assume a particular architecture style. Examples: Domain ->
@@ -64,7 +76,7 @@ reviewFocus: |-
         platform-agnostic code including platform-specific headers, engine/simulation code
         depending on rendering/UI. Error even when confined to one file — it inverts a
         dependency the whole layer relies on.
-  (vi)  NEW dependency CYCLE between modules/projects/packages — cite both edges of the
+  (v)   NEW dependency CYCLE between modules/projects/packages — cite both edges of the
         cycle.
 
   WARNING — CONFINED actionable smell. This is the FLOOR for a real smell: if the
@@ -83,7 +95,7 @@ reviewFocus: |-
   runtime-deferred DI misconfiguration; PREMATURE/SPECULATIVE abstraction — an abstraction
   with no current second consumer (flag it so rework CAN simplify; "might need it later"
   NEVER escalates). "Someone MIGHT copy this" is NOT spread — only demonstrated, visible
-  duplication per (iii) is.
+  duplication per (ii) is.
 
   INFO — cosmetic diff; micro-perf or bounded-memory notes on a non-hot path; a stale
   internal comment; observations that fail the name-the-edit test.
@@ -113,13 +125,17 @@ reviewFocus: |-
   - New project/package references that invert or bypass the established layer direction.
   - New cycles between modules, projects, or packages.
 
-  # 3. Contracts and public surface
-  - Public APIs leaking internal/implementation types (return types, parameters, events).
-  - Visibility widened (private/module-internal -> public/exported) with no consumer
-    needing it.
-  - Changes to serialized/wire shapes or persisted formats that other code parses.
-  - Error-contract changes on an existing surface: exceptions replaced by null/status
-    returns or vice versa, changed exception types callers match on.
+  # 3. Durable formats and contract type-safety (NOT backwards-compat)
+  Compatibility is not a gate (see the rubric): internal signatures, interfaces, records,
+  visibility, parameter names, and exception contracts that recompile in-repo are NOT
+  findings here — the build is the contract. What IS in-lane:
+  - A change to a PERSISTED or cross-deploy-durable format (on-disk layout, DB
+    schema/column, an event/message replayed from a durable log) with no migration/backward-
+    read path — gate (i), because pre-existing durable data would fail to load or be misread.
+  - Concrete infrastructure/implementation types leaking into a cross-module contract
+    (return types, parameters, events) — a COUPLING smell (judge on the ladder; typically
+    WARNING; if it makes an inner layer newly depend on an outer/vendor package it is gate
+    (iv) LAYERING). The signature change itself is never the issue — the coupling is.
   - Primitive-obsessed / stringly-typed cross-module contracts: raw strings/ints for
     identifiers, states, or units crossing a module boundary where a dedicated type exists
     or is trivial to add; contract shapes that let invalid states be represented (two
@@ -165,8 +181,9 @@ reviewFocus: |-
     unchecked downcasts, is/as/typeof ladders — where polymorphism, generics, or
     discriminated unions express the same thing with compile-time checking.
   - Widening a typed parameter, field, or return to object/any/string, losing compile-time
-    checking on an existing surface (when other code compiles against that surface, this
-    is gate (ii) → Error).
+    checking where a typed form (generic, interface, discriminated union) expressed it — a
+    runtime-dynamism smell graded on the ladder (typically WARNING). The compatibility of the
+    signature change is never the basis; the lost type-safety is.
   - Convention-over-declaration magic: behavior wired by name suffix, attribute scanning,
     or directory layout where an explicit registration exists — a rename silently changes
     runtime behavior with no compile error.
@@ -192,25 +209,29 @@ reviewFocus: |-
     (make invalid states unrepresentable).
 
   CALIBRATION EXAMPLES:
-  - A Serilog logger type appears in a public/Core method SIGNATURE → ERROR ((ii): a
-    contract change visible in the diff). The same logger used only inside one private
-    method body → WARNING (confined; no visible external contract).
-  - A god object accretes one more responsibility that exposes no new externally-consumed
-    surface → WARNING (confined; the floor applies — actionable is never Info).
-  - A reset-parse change alters behavior of shared code the surrounding code SHOWS is called
-    from 2 distinct sites → ERROR ((iv); cite both sites).
-  - A Domain service newly imports an Infrastructure repository type → ERROR ((v)), even if
+  - A Serilog logger type appears in a public/Core method SIGNATURE → the signature change
+    itself is NOT a finding (compatibility is not a gate). Judge the COUPLING: a concrete
+    infra type in a cross-module contract is a WARNING; and if it makes an inner layer (Core)
+    newly depend on an outer/vendor package, that is gate (iv) LAYERING → ERROR (cite the
+    added dependency). Used only inside one private method body → INFO/none.
+  - A god object accretes one more responsibility → WARNING (confined accretion; the floor
+    applies — actionable is never Info; the count of importers is irrelevant, not a gate).
+  - A reset-parse change alters BEHAVIOR of shared code the surrounding code SHOWS is called
+    from 2 distinct sites → ERROR ((iii); cite both sites). A mere signature change there is
+    NOT a finding.
+  - A Domain service newly imports an Infrastructure repository type → ERROR ((iv)), even if
     it is used in only one private method.
   - A new IWidgetProvider interface with a single implementation and no second consumer →
     WARNING (premature abstraction; propose inlining it).
   - Two modules in the diff each hard-code the same retry policy with different delays →
-    ERROR ((iii): divergent duplication fork; cite both sites).
+    ERROR ((ii): divergent duplication fork; cite both sites).
   - A domain calculator calls DateTime.UtcNow / Date.now() directly in new logic while its
     other inputs are injected → WARNING (confined missing seam; inject the clock).
   - The diff wires a component via Type.GetType("Foo.Bar, Asm") + Activator.CreateInstance
     where a typed factory registration exists → WARNING (confined dynamism; name the typed
-    wiring). If it REPLACES a typed surface other code compiles against → ERROR ((ii)).
+    wiring). If a rename would SILENTLY change runtime behavior at 2+ call sites → ERROR
+    ((iii); the defect is the silent behavior change, not the surface change).
   - A new handler mutates the request DTO it received in order to pass data downstream →
     WARNING (confined impurity; return a new value or a dedicated result type).
   - Platform-agnostic simulation/core code newly includes a rendering/OS-specific header or
-    module → ERROR ((v): a platform-specific dependency in a platform-neutral layer).
+    module → ERROR ((iv): a platform-specific dependency in a platform-neutral layer).

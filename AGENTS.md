@@ -66,9 +66,13 @@ deserialize) must be safe to call with anything.
   platform-neutral code stays platform-free.
 - Use existing abstractions; inject dependencies — including clock, randomness, env, config.
   No new global mutable state, hand-rolled singletons, or service-locator reads inside logic.
-- Keep contracts tight: don't leak internal types from public surfaces, don't widen visibility
-  without a consumer, don't casually change signatures, wire/serialized shapes, or error
-  contracts others depend on.
+- Backwards/API/binary compatibility is NOT a concern here: this codebase ships as one unit
+  with no external, published, or plugin-consumed surface. Change or remove any signature,
+  record, interface, visibility, or error contract freely — the warnings-clean build is the
+  only compatibility bar. The one exception is PERSISTED/cross-deploy state (on-disk formats,
+  DB schema, durable event/log replay): those need a migration or backward-read path so
+  pre-existing data still loads. Do keep concrete infrastructure/vendor types out of
+  cross-module contracts (that's coupling/layering, not compatibility).
 - One source of truth: never re-implement a policy/rule/constant that exists in another module
   — reuse or extract it.
 - Compile-time over runtime: no reflection, string-based lookup, or type escapes where a typed
