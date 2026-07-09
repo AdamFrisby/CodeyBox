@@ -2919,7 +2919,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 throw;
             }
 
-            await HandleOperatorCancelAsync(item, project);
+            await HandleOperatorCancelAsync(item, project, pex.Phase);
             throw;
         }
         catch (PhaseCancellationException pex) when (CancellationSources.IsPhaseTimeout(pex.Source))
@@ -17485,13 +17485,22 @@ Original merge-phase failure (JSON string, for context only):
     /// catch route through identical state-write logic. Idempotent — if the
     /// item is already in a terminal-ish state, the cancel is skipped.
     /// </summary>
-    private async Task HandleOperatorCancelAsync(WorkItem item, Project? project)
+    private async Task HandleOperatorCancelAsync(WorkItem item, Project? project, string? phase = null)
     {
         var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
         if (current.State is WorkItemState.Done or WorkItemState.Failed
             or WorkItemState.MergeConflictResolutionFailed
             or WorkItemState.AbandonedAfterRecoveryAttempts)
             return;
+        if (IsRecoveredResumeStateForCancelledPhase(current, phase))
+        {
+            _log.LogInformation(
+                "Work item {Id} already advanced to recovery resume state {State} for cancelled phase '{Phase}'; skipping operator-cancel write",
+                item.Id,
+                current.State,
+                phase);
+            return;
+        }
 
         var cancelled = current.With(WorkItemState.Cancelled, "cancelled via API",
             WorkItemCancellationReason.OperatorRequested,
@@ -17521,6 +17530,15 @@ Original merge-phase failure (JSON string, for context only):
 
     private bool IsRecoveryCancellation(WorkItemId itemId) =>
         _cancellations?.GetRequestKind(itemId) == CancellationRequestKind.Recovery;
+
+    private static bool IsRecoveredResumeStateForCancelledPhase(WorkItem current, string? phase)
+    {
+        if (string.IsNullOrWhiteSpace(phase))
+            return false;
+
+        var resumeState = DurableResumeStateForInterruptedPhase(phase);
+        return resumeState is not null && current.State == resumeState.Value;
+    }
 
     /// <summary>
     /// Handles a <see cref="PhaseCancellationException"/> whose source could
@@ -17614,7 +17632,14 @@ Original merge-phase failure (JSON string, for context only):
     /// — driving the full pipeline through each phase to exercise this switch
     /// would dwarf the table it verifies.
     /// </summary>
-    internal static WorkItemState ResumeStateForTransientRetry(WorkItem current, string phase) => phase switch
+    internal static WorkItemState ResumeStateForTransientRetry(WorkItem current, string phase)
+    {
+        _ = current;
+        // Unknown phase name: re-queue from the start — safer than guessing.
+        return DurableResumeStateForInterruptedPhase(phase) ?? WorkItemState.Queued;
+    }
+
+    private static WorkItemState? DurableResumeStateForInterruptedPhase(string phase) => phase switch
     {
         // Work / rework-resume / rework / audit all left the agent commits on
         // the work branch (or about to); resume at the matching phase entry.
@@ -17626,8 +17651,7 @@ Original merge-phase failure (JSON string, for context only):
         "audit" => WorkItemState.WorkComplete,
         "merge" => WorkItemState.AuditPassed,
         "upstream" => WorkItemState.Merged,
-        // Unknown phase name: re-queue from the start — safer than guessing.
-        _ => WorkItemState.Queued,
+        _ => null,
     };
 
     private async Task<DateTimeOffset> ResolveQuotaResetAtForFailedTransitionAsync(
@@ -17732,7 +17756,7 @@ Original merge-phase failure (JSON string, for context only):
             _log.LogInformation(
                 "Work item {Id} has an active operator cancellation; applying cancellation instead of scheduling transient retry",
                 item.Id);
-            await HandleOperatorCancelAsync(item, project);
+            await HandleOperatorCancelAsync(item, project, phase);
             return;
         }
 
@@ -17753,7 +17777,7 @@ Original merge-phase failure (JSON string, for context only):
                 _log.LogInformation(
                     "Work item {Id} has an active operator cancellation; applying cancellation instead of scheduling transient retry",
                     item.Id);
-                await HandleOperatorCancelAsync(current, project);
+                await HandleOperatorCancelAsync(current, project, phase);
                 return;
             }
 
