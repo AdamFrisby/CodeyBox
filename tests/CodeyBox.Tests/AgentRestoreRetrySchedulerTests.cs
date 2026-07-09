@@ -216,6 +216,38 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     }
 
     [Fact]
+    public async Task Sweep_StalePreRetryClaim_DoesNotStrandFailedItem()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var scheduler = NewScheduler(store, queue, enabled: true);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var item = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
+            updatedAt: outageStart.AddMinutes(2));
+        await store.CreateAsync(item);
+
+        var restoredAt = DateTimeOffset.UtcNow;
+        Assert.True(await store.TryClaimAgentRestoreRetryAsync(
+            item.Id,
+            AgentKind.Claude,
+            outageStart,
+            restoredAt,
+            CancellationToken.None));
+
+        var summary = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Claude, outageStart, restoredAt));
+
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(0, summary.Skipped);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(item.Id))!.State);
+        Assert.Equal(1, queue.Count);
+    }
+
+    [Fact]
     public async Task Sweep_ClaimPersistenceFailure_DoesNotRetryOrReportRequeued()
     {
         using var inner = new SqliteWorkItemStore(_dbPath);
@@ -374,12 +406,12 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         var attributedToOtherAgent = NewItem(
             agent: AgentKind.Claude,
             state: WorkItemState.Failed,
-            failureKind: WorkItemFailureKinds.AgentUnavailable,
+            failureKind: WorkItemFailureKinds.Infrastructure,
             updatedAt: outageStart.AddMinutes(1));
         var restoredAgentItem = NewItem(
             agent: AgentKind.Claude,
             state: WorkItemState.Failed,
-            failureKind: WorkItemFailureKinds.AgentUnavailable,
+            failureKind: WorkItemFailureKinds.Infrastructure,
             updatedAt: outageStart.AddMinutes(2));
         await store.CreateAsync(attributedToOtherAgent);
         await store.CreateAsync(restoredAgentItem);
@@ -389,6 +421,12 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             AgentKind.Codex,
             outageStart.AddMinutes(1),
             AgentInvolvementOutcomes.FailureAuth);
+        await RecordFailedInvolvementAsync(
+            involvement,
+            restoredAgentItem.Id,
+            AgentKind.Claude,
+            outageStart.AddMinutes(2),
+            AgentInvolvementOutcomes.FailureInfrastructure);
 
         var summary = await scheduler.SweepForTestAsync(
             new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
@@ -472,7 +510,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     }
 
     [Fact]
-    public async Task Sweep_StopsAtConfiguredCandidateCap()
+    public async Task Sweep_DrainsMultipleBoundedCandidatePages()
     {
         using var store = new SqliteWorkItemStore(_dbPath);
         var queue = new InMemoryTaskQueue();
@@ -494,7 +532,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         var summary = await scheduler.SweepForTestAsync(
             new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
 
-        Assert.Equal(3, summary.Requeued);
+        Assert.Equal(5, summary.Requeued);
         Assert.Equal(0, summary.Skipped);
         var queuedCount = 0;
         foreach (var item in items)
@@ -502,7 +540,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             var state = (await store.GetAsync(item.Id))!.State;
             if (state == WorkItemState.Queued) queuedCount++;
         }
-        Assert.Equal(3, queuedCount);
+        Assert.Equal(5, queuedCount);
     }
 
     [Fact]
@@ -709,6 +747,66 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
             Assert.Equal(item.Id, await queue.DequeueAsync(timeout.Token));
             Assert.Equal(WorkItemState.Queued, (await store.GetAsync(item.Id))!.State);
+        }
+        finally
+        {
+            await scheduler.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task RestoreSignal_BackgroundService_DelayedPassRequeuesLatePostRestoreFailure()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var registry = NewRegistry();
+        var time = new SignalingTimeProvider(DateTimeOffset.UtcNow);
+        var webhooks = new CapturingWebhookDispatcher();
+        var firstSweepPublished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sweepEvents = 0;
+        webhooks.OnPublishAsync = (evt, _) =>
+        {
+            if (evt.Event == "agent.restore_requeue_swept"
+                && Interlocked.Increment(ref sweepEvents) == 1)
+            {
+                firstSweepPublished.TrySetResult();
+            }
+
+            return Task.CompletedTask;
+        };
+        var scheduler = NewScheduler(
+            store,
+            queue,
+            enabled: true,
+            signal: registry,
+            webhooks: webhooks,
+            timeProvider: time,
+            postRestoreMargin: TimeSpan.FromMinutes(1));
+
+        await scheduler.StartAsync(CancellationToken.None);
+        try
+        {
+            var outageStart = time.GetUtcNow().AddMinutes(-10);
+            var restoredAt = time.GetUtcNow();
+            registry.PublishRestored(new AgentRestoredEvent(AgentKind.Claude, outageStart, restoredAt));
+
+            await firstSweepPublished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await time.WaitForTimerAsync(TimeSpan.FromSeconds(5));
+
+            time.Advance(TimeSpan.FromSeconds(30));
+            var lateFailure = NewItem(
+                agent: AgentKind.Claude,
+                state: WorkItemState.Failed,
+                failureKind: WorkItemFailureKinds.AgentUnavailable,
+                updatedAt: time.GetUtcNow());
+            await store.CreateAsync(lateFailure);
+
+            time.Advance(TimeSpan.FromSeconds(30));
+
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            Assert.Equal(lateFailure.Id, await queue.DequeueAsync(timeout.Token));
+            Assert.Equal(WorkItemState.Queued, (await store.GetAsync(lateFailure.Id))!.State);
+            Assert.True(sweepEvents >= 2);
         }
         finally
         {
@@ -1012,7 +1110,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     {
         using var store = new SqliteWorkItemStore(_dbPath);
         var queue = new InMemoryTaskQueue();
-        var involvement = new InMemoryAgentInvolvementStore();
+        using var involvement = new SqliteAgentInvolvementStore(_dbPath);
         var scheduler = NewScheduler(store, queue, enabled: true, involvement: involvement);
 
         var outageStart = DateTimeOffset.UtcNow.AddMinutes(-40);
@@ -1039,6 +1137,42 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         var codexSummary = await scheduler.SweepForTestAsync(
             new AgentRestoredEvent(AgentKind.Codex, outageStart, DateTimeOffset.UtcNow));
         Assert.Equal(0, codexSummary.Requeued);
+        Assert.Equal(WorkItemState.Failed, (await store.GetAsync(item.Id))!.State);
+
+        var claudeSummary = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
+        Assert.Equal(1, claudeSummary.Requeued);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(item.Id))!.State);
+    }
+
+    [Fact]
+    public async Task Sweep_AgentUnavailableUsesTerminalAgentOverRecentFailedInvolvement()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        using var involvement = new SqliteAgentInvolvementStore(_dbPath);
+        var scheduler = NewScheduler(store, queue, enabled: true, involvement: involvement);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var terminalAt = outageStart.AddMinutes(5);
+        var item = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
+            updatedAt: terminalAt);
+        await store.CreateAsync(item);
+
+        await RecordFailedInvolvementAsync(
+            involvement,
+            item.Id,
+            AgentKind.Codex,
+            terminalAt.AddSeconds(-10),
+            AgentInvolvementOutcomes.FailureAuth);
+
+        var codexSummary = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Codex, outageStart, DateTimeOffset.UtcNow));
+        Assert.Equal(0, codexSummary.Requeued);
+        Assert.Equal(0, codexSummary.Skipped);
         Assert.Equal(WorkItemState.Failed, (await store.GetAsync(item.Id))!.State);
 
         var claudeSummary = await scheduler.SweepForTestAsync(
@@ -1392,7 +1526,9 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         IProjectRepository? projects = null,
         IAgentInvolvementStore? involvement = null,
         int maxCandidatesPerSweep = AgentRestoreRetryOptions.DefaultMaxCandidatesPerSweep,
-        int eventQueueCapacity = AgentRestoreRetryOptions.DefaultEventQueueCapacity)
+        int eventQueueCapacity = AgentRestoreRetryOptions.DefaultEventQueueCapacity,
+        TimeProvider? timeProvider = null,
+        TimeSpan? postRestoreMargin = null)
     {
         var retrier = new WorkItemRetrier(
             store,
@@ -1403,7 +1539,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         {
             Enabled = enabled,
             LookbackGrace = TimeSpan.FromMinutes(30),
-            PostRestoreMargin = TimeSpan.FromMinutes(5),
+            PostRestoreMargin = postRestoreMargin ?? TimeSpan.FromMinutes(5),
             MaxCandidatesPerSweep = maxCandidatesPerSweep,
             EventQueueCapacity = eventQueueCapacity,
         };
@@ -1415,7 +1551,8 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             signal,
             webhooks,
             projects,
-            involvement);
+            involvement,
+            timeProvider);
     }
 
     private static WorkItem NewItem(
@@ -1503,6 +1640,8 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             TimeSpan involvementTerminalLookback,
             TimeSpan involvementTerminalClockSkew,
             int limit,
+            DateTimeOffset? afterUpdatedAt = null,
+            WorkItemId? afterId = null,
             CancellationToken ct = default) =>
             _inner.ListRestoreRetryCandidatesAsync(
                 restoredAgent,
@@ -1511,6 +1650,8 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
                 involvementTerminalLookback,
                 involvementTerminalClockSkew,
                 limit,
+                afterUpdatedAt,
+                afterId,
                 ct);
 
         public Task<bool> HasAgentRestoreRetryClaimAsync(
@@ -1658,6 +1799,137 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
 
         public ValueTask<bool> DequeueDispatchSignalAsync(CancellationToken ct = default) =>
             _inner.DequeueDispatchSignalAsync(ct);
+    }
+
+    private sealed class SignalingTimeProvider(DateTimeOffset now) : TimeProvider
+    {
+        private readonly object _gate = new();
+        private readonly List<ManualTimer> _timers = [];
+        private readonly TaskCompletionSource _timerCreated =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private DateTimeOffset _now = now;
+
+        public override DateTimeOffset GetUtcNow()
+        {
+            lock (_gate)
+                return _now;
+        }
+
+        public override ITimer CreateTimer(
+            TimerCallback callback,
+            object? state,
+            TimeSpan dueTime,
+            TimeSpan period)
+        {
+            var timer = new ManualTimer(this, callback, state);
+            lock (_gate)
+                _timers.Add(timer);
+            timer.Change(dueTime, period);
+            _timerCreated.TrySetResult();
+            return timer;
+        }
+
+        public Task WaitForTimerAsync(TimeSpan timeout) =>
+            _timerCreated.Task.WaitAsync(timeout);
+
+        public void Advance(TimeSpan duration)
+        {
+            if (duration < TimeSpan.Zero)
+                throw new ArgumentOutOfRangeException(nameof(duration));
+
+            List<(TimerCallback Callback, object? State)> callbacks = [];
+            lock (_gate)
+            {
+                _now += duration;
+                foreach (var timer in _timers.ToArray())
+                {
+                    if (timer.TryConsumeDue(_now, out var callback))
+                        callbacks.Add(callback);
+                }
+
+                _timers.RemoveAll(static timer => timer.IsDisposed);
+            }
+
+            foreach (var (callback, state) in callbacks)
+                callback(state);
+        }
+
+        private sealed class ManualTimer : ITimer
+        {
+            private readonly SignalingTimeProvider _provider;
+            private readonly TimerCallback _callback;
+            private readonly object? _state;
+            private DateTimeOffset? _dueAt;
+            private TimeSpan _period;
+            private bool _disposed;
+
+            public ManualTimer(
+                SignalingTimeProvider provider,
+                TimerCallback callback,
+                object? state)
+            {
+                _provider = provider;
+                _callback = callback;
+                _state = state;
+            }
+
+            public bool IsDisposed => _disposed;
+
+            public bool Change(TimeSpan dueTime, TimeSpan period)
+            {
+                lock (_provider._gate)
+                {
+                    if (_disposed)
+                        return false;
+
+                    _period = period;
+                    _dueAt = dueTime == Timeout.InfiniteTimeSpan
+                        ? null
+                        : _provider._now + dueTime;
+                    return true;
+                }
+            }
+
+            public bool TryConsumeDue(
+                DateTimeOffset now,
+                out (TimerCallback Callback, object? State) callback)
+            {
+                lock (_provider._gate)
+                {
+                    callback = default;
+                    if (_disposed || _dueAt is not { } dueAt || dueAt > now)
+                        return false;
+
+                    callback = (_callback, _state);
+                    if (_period > TimeSpan.Zero && _period != Timeout.InfiniteTimeSpan)
+                    {
+                        do
+                        {
+                            dueAt += _period;
+                        } while (dueAt <= now);
+                        _dueAt = dueAt;
+                    }
+                    else
+                    {
+                        _dueAt = null;
+                    }
+
+                    return true;
+                }
+            }
+
+            public void Dispose()
+            {
+                lock (_provider._gate)
+                    _disposed = true;
+            }
+
+            public ValueTask DisposeAsync()
+            {
+                Dispose();
+                return ValueTask.CompletedTask;
+            }
+        }
     }
 
     private sealed class FakeTimeProvider(DateTimeOffset now) : TimeProvider

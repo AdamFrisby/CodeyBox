@@ -58,6 +58,12 @@ public static class AgentRestoreRetryCandidatePolicy
         if (!IsEligibleFailure(failureKind, authFailureScope))
             return false;
 
+        if (IsAgentUnavailableFailure(failureKind))
+        {
+            return itemAgent is { } unavailableAgent
+                && AgentMatches(unavailableAgent, restoredAgent);
+        }
+
         if (latestFailedInvolvementAgent is { } failedAgent)
             return AgentMatches(failedAgent, restoredAgent);
 
@@ -80,10 +86,13 @@ public static class AgentRestoreRetryCandidatePolicy
         string? failureKind,
         WorkItemAuthFailureScope? authFailureScope)
     {
-        return string.Equals(failureKind, WorkItemFailureKinds.AgentUnavailable, StringComparison.OrdinalIgnoreCase)
+        return IsAgentUnavailableFailure(failureKind)
             || (string.Equals(failureKind, WorkItemFailureKinds.AuthRequired, StringComparison.OrdinalIgnoreCase)
                 && authFailureScope == WorkItemAuthFailureScope.Fleet);
     }
+
+    private static bool IsAgentUnavailableFailure(string? failureKind) =>
+        string.Equals(failureKind, WorkItemFailureKinds.AgentUnavailable, StringComparison.OrdinalIgnoreCase);
 
     public static AgentKind? LatestFailedInvolvementAgent(
         IEnumerable<AgentInvolvement> involvements,

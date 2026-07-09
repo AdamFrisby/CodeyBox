@@ -32,6 +32,11 @@ internal readonly record struct WorkItemRetryResult(
     }
 }
 
+internal readonly record struct AgentRestoreRetryClaim(
+    AgentKind RestoredAgent,
+    DateTimeOffset OutageStartedAt,
+    DateTimeOffset RestoredAt);
+
 /// <summary>
 /// Consolidates retry logic for terminal and operator-parked work items,
 /// ensuring consistent state transitions, audit logs, and side effects (e.g.
@@ -86,35 +91,44 @@ public sealed class WorkItemRetrier
         string? from = null,
         string trigger = "manual",
         CancellationToken ct = default)
-        => ToPublicResult(await RetryCoreAsync(item, from, trigger, RetryAccounting.None, ct));
+        => ToPublicResult(await RetryCoreAsync(item, from, trigger, RetryAccounting.None, agentRestoreClaim: null, ct));
 
     public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryQuotaAutoAsync(
         WorkItem item,
         string? from,
         string trigger,
         CancellationToken ct = default)
-        => ToPublicResult(await RetryCoreAsync(item, from, trigger, RetryAccounting.QuotaAutoRetry, ct));
+        => ToPublicResult(await RetryCoreAsync(item, from, trigger, RetryAccounting.QuotaAutoRetry, agentRestoreClaim: null, ct));
 
     public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryTransientAutoAsync(
         WorkItem item,
         string? from,
         string trigger,
         CancellationToken ct = default)
-        => ToPublicResult(await RetryCoreAsync(item, from, trigger, RetryAccounting.TransientAutoRetry, ct));
+        => ToPublicResult(await RetryCoreAsync(item, from, trigger, RetryAccounting.TransientAutoRetry, agentRestoreClaim: null, ct));
 
     public async Task<(bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions)> RetryAgentRestoreAsync(
         WorkItem item,
         string? from,
         string trigger,
+        AgentKind restoredAgent,
+        DateTimeOffset outageStartedAt,
+        DateTimeOffset restoredAt,
         CancellationToken ct = default)
-        => ToPublicResult(await RetryCoreAsync(item, from, trigger, RetryAccounting.AgentRestoreAutoRetry, ct));
+        => ToPublicResult(await RetryCoreAsync(
+            item,
+            from,
+            trigger,
+            RetryAccounting.AgentRestoreAutoRetry,
+            new AgentRestoreRetryClaim(restoredAgent, outageStartedAt, restoredAt),
+            ct));
 
     internal async Task<WorkItemRetryResult> RetryQuotaAutoDetailedAsync(
         WorkItem item,
         string? from,
         string trigger,
         CancellationToken ct = default)
-        => await RetryCoreAsync(item, from, trigger, RetryAccounting.QuotaAutoRetry, ct);
+        => await RetryCoreAsync(item, from, trigger, RetryAccounting.QuotaAutoRetry, agentRestoreClaim: null, ct);
 
     private static (bool Success, string? Error, WorkItemState? ResumeState, string? ActualFrom, IReadOnlyList<string>? OpenQuestions) ToPublicResult(
         WorkItemRetryResult result) =>
@@ -130,6 +144,7 @@ public sealed class WorkItemRetrier
         string? from,
         string trigger,
         RetryAccounting accounting,
+        AgentRestoreRetryClaim? agentRestoreClaim,
         CancellationToken ct)
     {
         if (item.State == WorkItemState.NeedsOperatorInput && _questions is not null)
@@ -267,9 +282,24 @@ public sealed class WorkItemRetrier
         // WaitingForQuotaReset, or WaitingForTransientRetry. Eligibility gates
         // that must apply across HTTP, scheduler, and operator paths live in
         // this retrier before the write.
-        var updated = accounting is RetryAccounting.TransientAutoRetry or RetryAccounting.AgentRestoreAutoRetry
-            ? await _store.TryUpdateIfStateAndUpdatedAtAsync(resumed, item.State, item.UpdatedAt, ct)
-            : await _store.TryUpdateIfStateAsync(resumed, item.State, ct);
+        var updated = accounting switch
+        {
+            RetryAccounting.AgentRestoreAutoRetry when agentRestoreClaim is { } claim =>
+                await _store.TryUpdateIfStateAndUpdatedAtWithAgentRestoreRetryClaimAsync(
+                    resumed,
+                    item.State,
+                    item.UpdatedAt,
+                    claim.RestoredAgent,
+                    claim.OutageStartedAt,
+                    claim.RestoredAt,
+                    ct).ConfigureAwait(false),
+            RetryAccounting.TransientAutoRetry =>
+                await _store.TryUpdateIfStateAndUpdatedAtAsync(resumed, item.State, item.UpdatedAt, ct)
+                    .ConfigureAwait(false),
+            RetryAccounting.AgentRestoreAutoRetry =>
+                throw new InvalidOperationException("Agent-restore retry requires an idempotency claim."),
+            _ => await _store.TryUpdateIfStateAsync(resumed, item.State, ct).ConfigureAwait(false),
+        };
         if (!updated)
         {
             return new WorkItemRetryResult(
@@ -312,6 +342,25 @@ public sealed class WorkItemRetrier
 
             if (reverted)
             {
+                if (agentRestoreClaim is { } restoreClaim)
+                {
+                    try
+                    {
+                        await _store.ReleaseAgentRestoreRetryClaimAsync(
+                                item.Id,
+                                restoreClaim.RestoredAgent,
+                                restoreClaim.OutageStartedAt,
+                                CancellationToken.None)
+                            .ConfigureAwait(false);
+                    }
+                    catch (Exception releaseEx)
+                    {
+                        _log.LogError(releaseEx,
+                            "Failed to release agent-restore retry claim for work item {Id} after retry queue kick rollback",
+                            item.Id);
+                    }
+                }
+
                 _log.LogWarning(ex,
                     "Retry of work item {Id} updated state to {State} but queue kick failed; rolled back to {PreviousState}",
                     item.Id, resumeState, item.State);

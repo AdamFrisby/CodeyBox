@@ -36,11 +36,12 @@ namespace CodeyBox.Orchestrator;
 ///   <see cref="AgentRestoredEvent.OutageStartedAt"/> is null the sweep
 ///   does not retry anything because there is no window to scope by, but it
 ///   still emits zero-count audit/webhook telemetry.</item>
-///   <item>Idempotent. A prior claim for the restore event window blocks
-///   duplicate sweeps before retry, and a new claim must persist before
+///   <item>Idempotent. A prior successful claim for the restore event window
+///   blocks duplicate sweeps. The new claim is committed atomically with
 ///   <see cref="WorkItemRetrier.RetryAgentRestoreAsync"/>'s snapshot-guarded
-///   conditional update is attempted. Failed retry attempts release the
-///   idempotency key so a later sweep can try again.</item>
+///   conditional update so a crash cannot strand an unrequeued terminal item.
+///   Failed retry attempts release the idempotency key so a later sweep can
+///   try again.</item>
 /// </list>
 ///
 /// <para>Routing: the requeued item flows through the normal class router,
@@ -61,8 +62,10 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
     private readonly IAgentInvolvementStore? _involvement;
     private readonly Func<AgentRestoreRetryOptions> _optionsAccessor;
     private readonly ILogger<AgentRestoreRetryScheduler> _log;
+    private readonly TimeProvider _time;
     private readonly Channel<AgentRestoredEvent> _events;
     private readonly ConcurrentDictionary<Task, byte> _deferredEventWrites = new();
+    private readonly ConcurrentDictionary<Task, byte> _delayedSweepTasks = new();
 
     public AgentRestoreRetryScheduler(
         IWorkItemStore store,
@@ -72,7 +75,8 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
         IAgentRestoreSignal? signal = null,
         IWebhookDispatcher? webhooks = null,
         IProjectRepository? projects = null,
-        IAgentInvolvementStore? involvement = null)
+        IAgentInvolvementStore? involvement = null,
+        TimeProvider? timeProvider = null)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _retrier = retrier ?? throw new ArgumentNullException(nameof(retrier));
@@ -82,6 +86,7 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
         _webhooks = webhooks;
         _projects = projects;
         _involvement = involvement;
+        _time = timeProvider ?? TimeProvider.System;
         var queueCapacity = _optionsAccessor().EventQueueCapacity;
         if (queueCapacity <= 0)
             throw new ArgumentOutOfRangeException(
@@ -197,7 +202,7 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
                         evt.Agent.Value);
                     continue;
                 }
-                await SweepAsync(evt, opts, stoppingToken).ConfigureAwait(false);
+                await ProcessRestoreEventAsync(evt, opts, stoppingToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -225,18 +230,115 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
         _events.Writer.TryComplete();
         await base.StopAsync(cancellationToken).ConfigureAwait(false);
         var deferredWrites = _deferredEventWrites.Keys.ToArray();
-        if (deferredWrites.Length == 0)
+        if (deferredWrites.Length > 0)
+        {
+            try
+            {
+                await Task.WhenAll(deferredWrites).WaitAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                // The host is giving up on graceful stop; pending deferred writes
+                // will fault against the completed channel.
+            }
+        }
+
+        var delayedSweeps = _delayedSweepTasks.Keys.ToArray();
+        if (delayedSweeps.Length == 0)
             return;
 
         try
         {
-            await Task.WhenAll(deferredWrites).WaitAsync(cancellationToken)
+            await Task.WhenAll(delayedSweeps).WaitAsync(cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            // The host is giving up on graceful stop; pending deferred writes
-            // will fault against the completed channel.
+            // Host shutdown already cancelled the scheduler token; delayed
+            // post-restore passes may finish cancellation after StopAsync's
+            // grace period.
+        }
+    }
+
+    private async Task ProcessRestoreEventAsync(
+        AgentRestoredEvent evt,
+        AgentRestoreRetryOptions opts,
+        CancellationToken ct)
+    {
+        await SweepAsync(evt, opts, ct).ConfigureAwait(false);
+
+        if (evt.OutageStartedAt is null || opts.PostRestoreMargin <= TimeSpan.Zero)
+            return;
+
+        var delayedSweepAt = evt.RestoredAt + opts.PostRestoreMargin;
+        var delay = delayedSweepAt - _time.GetUtcNow();
+        if (delay <= TimeSpan.Zero)
+            return;
+
+        TrackDelayedPostRestoreSweep(evt, delayedSweepAt, delay, ct);
+    }
+
+    private void TrackDelayedPostRestoreSweep(
+        AgentRestoredEvent evt,
+        DateTimeOffset delayedSweepAt,
+        TimeSpan delay,
+        CancellationToken ct)
+    {
+        _log.LogDebug(
+            "AgentRestoreRetryScheduler: scheduling delayed post-restore sweep for {Agent} at {DelayedSweepAt}",
+            evt.Agent.Value,
+            delayedSweepAt);
+        var handle = new DelayedSweepHandle();
+        var task = RunDelayedPostRestoreSweepAsync(evt, delay, ct, handle);
+        handle.Task = task;
+        _delayedSweepTasks.TryAdd(task, 0);
+        if (task.IsCompleted)
+            _delayedSweepTasks.TryRemove(task, out _);
+    }
+
+    private sealed class DelayedSweepHandle
+    {
+        public Task? Task { get; set; }
+    }
+
+    private async Task RunDelayedPostRestoreSweepAsync(
+        AgentRestoredEvent evt,
+        TimeSpan delay,
+        CancellationToken ct,
+        DelayedSweepHandle handle)
+    {
+        try
+        {
+            await Task.Delay(delay, _time, ct).ConfigureAwait(false);
+
+            var latestOptions = _optionsAccessor();
+            if (!latestOptions.Enabled)
+            {
+                _log.LogDebug(
+                    "AgentRestoreRetryScheduler: delayed restore sweep for {Agent} skipped because feature disabled",
+                    evt.Agent.Value);
+                return;
+            }
+
+            await SweepAsync(evt, latestOptions, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            _log.LogDebug(
+                "AgentRestoreRetryScheduler: delayed restore sweep for {Agent} cancelled because the scheduler is stopping",
+                evt.Agent.Value);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "AgentRestoreRetryScheduler: delayed restore sweep for {Agent} failed",
+                evt.Agent.Value);
+        }
+        finally
+        {
+            if (handle.Task is { } task)
+                _delayedSweepTasks.TryRemove(task, out _);
         }
     }
 
@@ -267,107 +369,99 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
         var windowEnd = evt.RestoredAt + opts.PostRestoreMargin;
         var requeued = 0;
         var skipped = 0;
+        DateTimeOffset? afterUpdatedAt = null;
+        WorkItemId? afterId = null;
 
-        await foreach (var item in _store.ListRestoreRetryCandidatesAsync(
-            evt.Agent,
-            windowStart,
-            windowEnd,
-            opts.InvolvementTerminalLookback,
-            opts.InvolvementTerminalClockSkew,
-            opts.MaxCandidatesPerSweep,
-            ct).ConfigureAwait(false))
+        while (true)
         {
-            if (!await IsCandidateAsync(item, evt.Agent, opts, ct).ConfigureAwait(false))
-            {
-                continue;
-            }
-
-            if (await _store.HasAgentRestoreRetryClaimAsync(
-                item.Id,
+            var pageCount = 0;
+            await foreach (var item in _store.ListRestoreRetryCandidatesAsync(
                 evt.Agent,
-                evt.OutageStartedAt.Value,
+                windowStart,
+                windowEnd,
+                opts.InvolvementTerminalLookback,
+                opts.InvolvementTerminalClockSkew,
+                opts.MaxCandidatesPerSweep,
+                afterUpdatedAt,
+                afterId,
                 ct).ConfigureAwait(false))
             {
-                skipped++;
-                _log.LogDebug(
-                    "AgentRestoreRetryScheduler: skipped {Id}; restore event for {Agent} was already claimed",
-                    item.Id,
-                    evt.Agent.Value);
-                continue;
-            }
+                pageCount++;
+                afterUpdatedAt = item.UpdatedAt;
+                afterId = item.Id;
 
-            bool claimPersisted;
-            try
-            {
-                claimPersisted = await _store.TryClaimAgentRestoreRetryAsync(
+                if (!await IsCandidateAsync(item, evt.Agent, opts, ct).ConfigureAwait(false))
+                {
+                    skipped++;
+                    _log.LogDebug(
+                        "AgentRestoreRetryScheduler: skipped {Id}; final attribution guard rejected agent {Agent}",
+                        item.Id,
+                        evt.Agent.Value);
+                    continue;
+                }
+
+                if (await _store.HasAgentRestoreRetryClaimAsync(
                     item.Id,
                     evt.Agent,
                     evt.OutageStartedAt.Value,
-                    evt.RestoredAt,
-                    ct).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                skipped++;
-                _log.LogError(ex,
-                    "AgentRestoreRetryScheduler: failed to persist idempotency claim for {Id} before agent {Agent} restore retry; skipping",
-                    item.Id,
-                    evt.Agent.Value);
-                continue;
+                    ct).ConfigureAwait(false))
+                {
+                    skipped++;
+                    _log.LogDebug(
+                        "AgentRestoreRetryScheduler: skipped {Id}; restore event for {Agent} was already claimed",
+                        item.Id,
+                        evt.Agent.Value);
+                    continue;
+                }
+
+                bool success; string? error; string? actualFrom;
+                try
+                {
+                    (success, error, _, actualFrom, _) = await _retrier.RetryAgentRestoreAsync(
+                        item,
+                        from: null,
+                        trigger: "agent-restore",
+                        evt.Agent,
+                        evt.OutageStartedAt.Value,
+                        evt.RestoredAt,
+                        ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    await ReleaseClaimAfterRetryFailureAsync(item.Id, evt, "retry was cancelled", CancellationToken.None)
+                        .ConfigureAwait(false);
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    skipped++;
+                    await ReleaseClaimAfterRetryFailureAsync(item.Id, evt, "retry threw", ct)
+                        .ConfigureAwait(false);
+                    _log.LogWarning(ex,
+                        "AgentRestoreRetryScheduler: retry threw for {Id}; skipping and continuing sweep",
+                        item.Id);
+                    continue;
+                }
+
+                if (!success)
+                {
+                    skipped++;
+                    await ReleaseClaimAfterRetryFailureAsync(item.Id, evt, "retry did not requeue", ct)
+                        .ConfigureAwait(false);
+                    _log.LogDebug(
+                        "AgentRestoreRetryScheduler: skipped {Id}: {Error}",
+                        item.Id, error);
+                    continue;
+                }
+
+                requeued++;
+                AuditLog.AgentRestoreRequeueItem(
+                    item.Id, evt.Agent, item.FailureKind, actualFrom ?? "work");
+                await EmitAgentRestoreRetryWebhookAsync(item, evt, actualFrom, ct).ConfigureAwait(false);
             }
 
-            if (!claimPersisted)
-            {
-                skipped++;
-                _log.LogDebug(
-                    "AgentRestoreRetryScheduler: skipped {Id}; restore event for {Agent} was claimed by a concurrent sweep",
-                    item.Id,
-                    evt.Agent.Value);
-                continue;
-            }
-
-            bool success; string? error; string? actualFrom;
-            try
-            {
-                (success, error, _, actualFrom, _) = await _retrier.RetryAgentRestoreAsync(
-                    item, from: null, trigger: "agent-restore", ct).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                await ReleaseClaimAfterRetryFailureAsync(item.Id, evt, "retry was cancelled", CancellationToken.None)
-                    .ConfigureAwait(false);
-                throw;
-            }
-            catch (Exception ex)
-            {
-                skipped++;
-                await ReleaseClaimAfterRetryFailureAsync(item.Id, evt, "retry threw", ct)
-                    .ConfigureAwait(false);
-                _log.LogWarning(ex,
-                    "AgentRestoreRetryScheduler: retry threw for {Id}; skipping and continuing sweep",
-                    item.Id);
-                continue;
-            }
-
-            if (!success)
-            {
-                skipped++;
-                await ReleaseClaimAfterRetryFailureAsync(item.Id, evt, "retry did not requeue", ct)
-                    .ConfigureAwait(false);
-                _log.LogDebug(
-                    "AgentRestoreRetryScheduler: skipped {Id}: {Error}",
-                    item.Id, error);
-                continue;
-            }
-
-            requeued++;
-            AuditLog.AgentRestoreRequeueItem(
-                item.Id, evt.Agent, item.FailureKind, actualFrom ?? "work");
-            await EmitAgentRestoreRetryWebhookAsync(item, evt, actualFrom, ct).ConfigureAwait(false);
+            if (pageCount < opts.MaxCandidatesPerSweep)
+                break;
         }
 
         AuditLog.AgentRestoreRequeueSwept(

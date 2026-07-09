@@ -327,7 +327,7 @@ public static class AgentFailureClassifier
         }
 
         var stderrAuthError = ContainsAuthErrorPattern(stderr);
-        if (stderrAuthError || ContainsAny(stdout, AuthPatterns))
+        if (stderrAuthError)
             return new AgentFailureClassification(AgentFailureKind.AuthError, Reason: "auth pattern matched");
 
         // The transient list is intentionally conservative; apply it to the

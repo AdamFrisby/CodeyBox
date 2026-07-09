@@ -315,6 +315,8 @@ public interface IWorkItemStore
         TimeSpan involvementTerminalLookback,
         TimeSpan involvementTerminalClockSkew,
         int limit,
+        DateTimeOffset? afterUpdatedAt = null,
+        WorkItemId? afterId = null,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         if (limit <= 0)
@@ -329,6 +331,14 @@ public interface IWorkItemStore
                     yield break;
                 if (item.UpdatedAt < windowStart || item.UpdatedAt > windowEnd)
                     continue;
+                if (afterUpdatedAt is { } cursorUpdatedAt
+                    && (item.UpdatedAt < cursorUpdatedAt
+                        || item.UpdatedAt == cursorUpdatedAt
+                        && afterId is { } cursorId
+                        && item.Id.Value.CompareTo(cursorId.Value) <= 0))
+                {
+                    continue;
+                }
                 if (!AgentRestoreRetryCandidatePolicy.IsEligible(item, restoredAgent, latestFailedInvolvementAgent: null))
                     continue;
 
@@ -366,6 +376,49 @@ public interface IWorkItemStore
         CancellationToken ct = default)
         => throw new NotSupportedException(
             "This work item store does not implement agent-restore retry claims.");
+
+    /// <summary>
+    /// Atomically claims an agent-restore retry key and applies the guarded
+    /// retry update. Persistent stores should commit the claim and state
+    /// transition together so a process crash cannot leave a terminal item
+    /// permanently skipped by an idempotency row that never requeued it.
+    /// </summary>
+    async Task<bool> TryUpdateIfStateAndUpdatedAtWithAgentRestoreRetryClaimAsync(
+        WorkItem item,
+        WorkItemState onlyIfState,
+        DateTimeOffset onlyIfUpdatedAt,
+        AgentKind restoredAgent,
+        DateTimeOffset outageStartedAt,
+        DateTimeOffset restoredAt,
+        CancellationToken ct = default)
+    {
+        if (!await TryClaimAgentRestoreRetryAsync(
+                item.Id,
+                restoredAgent,
+                outageStartedAt,
+                restoredAt,
+                ct).ConfigureAwait(false))
+        {
+            return false;
+        }
+
+        var updated = await TryUpdateIfStateAndUpdatedAtAsync(
+                item,
+                onlyIfState,
+                onlyIfUpdatedAt,
+                ct)
+            .ConfigureAwait(false);
+        if (updated)
+            return true;
+
+        await ReleaseAgentRestoreRetryClaimAsync(
+                item.Id,
+                restoredAgent,
+                outageStartedAt,
+                ct)
+            .ConfigureAwait(false);
+        return false;
+    }
 
     /// <summary>
     /// Releases a previously created agent-restore retry claim when the retry

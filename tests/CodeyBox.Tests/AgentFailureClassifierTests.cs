@@ -82,6 +82,15 @@ public sealed class AgentFailureClassifierTests
     }
 
     [Theory]
+    [InlineData("The API can return 401 Unauthorized when a token expires.")]
+    [InlineData("Handle API Error: 401 by refreshing credentials in the sample client.")]
+    public void AuthPatterns_InStdoutOnlyTaskOutput_AreNotAuthError(string snippet)
+    {
+        var c = AgentFailureClassifier.Classify(stderr: null, stdout: snippet);
+        Assert.NotEqual(AgentFailureKind.AuthError, c.Kind);
+    }
+
+    [Theory]
     [InlineData("Authentication required. Please visit the URL to log in:")]
     [InlineData("Waiting for authentication (timeout 30s)... Error: authentication timed out.")]
     [InlineData("not logged into agy; run `agy login`")]

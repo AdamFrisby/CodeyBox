@@ -3066,7 +3066,8 @@ builder.Services.AddSingleton<AgentRestoreRetryScheduler>(sp => new AgentRestore
     sp.GetRequiredService<IAgentRestoreSignal>(),
     sp.GetRequiredService<IWebhookDispatcher>(),
     sp.GetRequiredService<IProjectRepository>(),
-    sp.GetService<IAgentInvolvementStore>()));
+    sp.GetService<IAgentInvolvementStore>(),
+    sp.GetService<TimeProvider>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentRestoreRetryScheduler>());
 
 // --- Failure-class recovery -------------------------------------------------
