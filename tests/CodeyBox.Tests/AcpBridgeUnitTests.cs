@@ -13,6 +13,7 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Claude.AcpBridge;
 
 namespace CodeyBox.Tests;
@@ -3147,20 +3148,34 @@ return ran ? 90 : 91;
     public Task Bridge_PosixSignalHandlers_ResetInheritedIgnoredDispositionAndCleanUp(int signo, string signalName) =>
         RunBridgeSignalCleanupScenarioAsync(signo, signalName, inheritIgnoredSignal: true);
 
+    [Theory]
+    [InlineData(15, "SIGTERM")] // sandbox provider's normal stop signal
+    [InlineData(2, "SIGINT")]  // Ctrl+C
+    [InlineData(1, "SIGHUP")]  // controlling-terminal hangup
+    public Task Bridge_NativeResource_PosixSignalHandlers_ResetInheritedIgnoredDispositionAndCleanUp(int signo, string signalName)
+    {
+        if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
+            return Task.CompletedTask; // Resources/acp-bridge is published as linux-musl-x64.
+        if (AcpBridgeBinary.IsPlaceholderBuild)
+            return Task.CompletedTask; // honour dev builds that intentionally embed the placeholder.
+
+        return RunBridgeSignalCleanupScenarioAsync(
+            signo,
+            signalName,
+            inheritIgnoredSignal: true,
+            useNativeResource: true);
+    }
+
     private static async Task RunBridgeSignalCleanupScenarioAsync(
         int signo,
         string signalName,
-        bool inheritIgnoredSignal)
+        bool inheritIgnoredSignal,
+        bool useNativeResource = false)
     {
         if (!File.Exists("/bin/bash"))
             return; // honour Skippable shape without taking the dependency
         if (inheritIgnoredSignal && !CommandExists("python3"))
             return; // honour Skippable shape without taking the dependency
-
-        var bridgeDllPath = typeof(Bridge).Assembly.Location;
-        Assert.True(File.Exists(bridgeDllPath),
-            "AcpBridge dll missing at " + bridgeDllPath +
-            " — the test project should ProjectReference the AcpBridge assembly.");
 
         var ignoredMarkerPath = inheritIgnoredSignal ? Path.Combine(
             Path.GetTempPath(),
@@ -3168,6 +3183,9 @@ return ran ? 90 : 91;
         var tmpDir = Directory.CreateTempSubdirectory("cb-acp-posixsig-" + signalName + "-").FullName;
         try
         {
+            var bridgeTarget = useNativeResource
+                ? CreateNativeResourceSignalTestTarget(tmpDir)
+                : CreateDotnetAssemblySignalTestTarget();
             var workDir = Path.Combine(tmpDir, "work");
             var lockDir = Path.Combine(tmpDir, "locks");
             Directory.CreateDirectory(workDir);
@@ -3176,7 +3194,7 @@ return ran ? 90 : 91;
             var stubPath = WriteSignalCleanupClaudeStub(tmpDir, rootPidPath, childPidPath);
 
             var psi = CreateBridgeSignalTestStartInfo(
-                bridgeDllPath,
+                bridgeTarget,
                 tmpDir,
                 signo,
                 inheritIgnoredSignal,
@@ -3245,6 +3263,31 @@ return ran ? 90 : 91;
             }
             try { Directory.Delete(tmpDir, recursive: true); } catch { }
         }
+    }
+
+    private static BridgeSignalTestTarget CreateDotnetAssemblySignalTestTarget()
+    {
+        var bridgeDllPath = typeof(Bridge).Assembly.Location;
+        Assert.True(File.Exists(bridgeDllPath),
+            "AcpBridge dll missing at " + bridgeDllPath +
+            " — the test project should ProjectReference the AcpBridge assembly.");
+
+        return new BridgeSignalTestTarget("dotnet", bridgeDllPath);
+    }
+
+    private static BridgeSignalTestTarget CreateNativeResourceSignalTestTarget(string tmpDir)
+    {
+        var bytes = AcpBridgeBinary.LoadBinary();
+        Assert.False(
+            AcpBridgeBinary.IsPlaceholderPayload(bytes),
+            "AcpBridge native resource is a placeholder; run scripts/publish-acp-bridge.sh before this fixture.");
+
+        var path = Path.Combine(tmpDir, "acp-bridge-resource");
+        File.WriteAllBytes(path, bytes);
+        File.SetUnixFileMode(
+            path,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        return new BridgeSignalTestTarget(path, null);
     }
 
     private static string WriteSignalCleanupClaudeStub(string tmpDir, string rootPidPath, string childPidPath)
@@ -3365,13 +3408,13 @@ return ran ? 90 : 91;
     }
 
     private static ProcessStartInfo CreateBridgeSignalTestStartInfo(
-        string bridgeDllPath,
+        BridgeSignalTestTarget bridgeTarget,
         string workingDirectory,
         int signo,
         bool inheritIgnoredSignal,
         string? ignoredMarkerPath)
     {
-        var psi = new ProcessStartInfo(inheritIgnoredSignal ? "python3" : "dotnet")
+        var psi = new ProcessStartInfo(inheritIgnoredSignal ? "python3" : bridgeTarget.ExecutablePath)
         {
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
@@ -3383,8 +3426,7 @@ return ran ? 90 : 91;
 
         if (!inheritIgnoredSignal)
         {
-            psi.ArgumentList.Add("exec");
-            psi.ArgumentList.Add(bridgeDllPath);
+            bridgeTarget.AddArguments(psi.ArgumentList);
             return psi;
         }
 
@@ -3398,8 +3440,9 @@ import signal
 import sys
 
 signo = int(sys.argv[1])
-bridge_dll = sys.argv[2]
-marker = sys.argv[3]
+mode = sys.argv[2]
+target = sys.argv[3]
+marker = sys.argv[4]
 
 signal.signal(signo, signal.SIG_IGN)
 
@@ -3415,12 +3458,34 @@ if not ignored:
 with open(marker, "w", encoding="utf-8") as handle:
     handle.write("ignored\n")
 
-os.execvp("dotnet", ["dotnet", "exec", bridge_dll])
+if mode == "dotnet":
+    os.execvp("dotnet", ["dotnet", "exec", target])
+if mode == "native":
+    os.execv(target, [target])
+
+sys.exit(87)
 """);
         psi.ArgumentList.Add(signo.ToString(CultureInfo.InvariantCulture));
-        psi.ArgumentList.Add(bridgeDllPath);
+        psi.ArgumentList.Add(bridgeTarget.Mode);
+        psi.ArgumentList.Add(bridgeTarget.TargetPath);
         psi.ArgumentList.Add(ignoredMarkerPath);
         return psi;
+    }
+
+    private readonly record struct BridgeSignalTestTarget(string ExecutablePath, string? DotnetAssemblyPath)
+    {
+        public string Mode => DotnetAssemblyPath is null ? "native" : "dotnet";
+
+        public string TargetPath => DotnetAssemblyPath ?? ExecutablePath;
+
+        public void AddArguments(IList<string> arguments)
+        {
+            if (DotnetAssemblyPath is null)
+                return;
+
+            arguments.Add("exec");
+            arguments.Add(DotnetAssemblyPath);
+        }
     }
 
     [DllImport("libc", EntryPoint = "kill", SetLastError = true)]
