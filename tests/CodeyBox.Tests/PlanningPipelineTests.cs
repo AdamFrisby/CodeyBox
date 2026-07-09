@@ -962,6 +962,81 @@ public sealed class PlanningPipelineTests : IDisposable
     }
 
     [Fact]
+    public async Task PlanOn_PlanningAuthFailure_FailsWithAuthMetadataAndRestoresFromAgent()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var registry = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(),
+            TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        var agent = new PlanningAwareAgent
+        {
+            PlanningResult = new AgentResult(
+                Success: false,
+                Summary: "agent exited 1",
+                Stdout: null,
+                Stderr: "API Error: 401 Unauthorized"),
+        };
+        using var setup = BuildPipeline(agent, _workspace, seed, authAvailability: registry);
+        var item = NewItem("feature/planning-auth") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Equal(WorkItemAuthFailureScope.Fleet, final.AuthFailureScope);
+        Assert.Equal(AgentKind.Claude, final.Agent);
+        Assert.Equal(1, agent.PlanningCalls);
+        Assert.Equal(0, agent.WorkCalls);
+        Assert.Contains("auth required from agent output during planning", final.LastError, StringComparison.Ordinal);
+
+        var involvement = await setup.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.Contains(
+            involvement,
+            row => row.AgentKind == AgentKind.Claude
+                && row.Phase == "planning"
+                && row.Outcome == AgentInvolvementOutcomes.FailureAuth
+                && row.EndedAt is not null);
+
+        var queue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(
+            setup.Store,
+            queue,
+            new NullGitHost(),
+            NullLogger<WorkItemRetrier>.Instance);
+        var scheduler = new AgentRestoreRetryScheduler(
+            setup.Store,
+            retrier,
+            () => new AgentRestoreRetryOptions
+            {
+                Enabled = true,
+                LookbackGrace = TimeSpan.FromMinutes(30),
+                PostRestoreMargin = TimeSpan.FromMinutes(5),
+                MaxCandidatesPerSweep = 10,
+            },
+            NullLogger<AgentRestoreRetryScheduler>.Instance,
+            involvement: setup.Involvement);
+
+        var restored = registry.Reset(AgentKind.Claude);
+        Assert.NotNull(restored);
+        var summary = await scheduler.SweepForTestAsync(restored!);
+
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(0, summary.Skipped);
+        Assert.Equal(WorkItemState.Queued, (await setup.Store.GetAsync(item.Id))!.State);
+        Assert.Equal(item.Id, await queue.DequeueAsync(CancellationToken.None));
+    }
+
+    [Fact]
     public async Task PlanOn_PlanReviewAlwaysRejects_FailsAfterMaxPlanIterations()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -2148,7 +2223,8 @@ public sealed class PlanningPipelineTests : IDisposable
         ILogger<PipelineRunner>? pipelineLogger = null,
         IAuditReportStore? auditReportStore = null,
         PipelineTuningSnapshot? pipelineTuning = null,
-        int maxPlanReviewIterations = 3)
+        int maxPlanReviewIterations = 3,
+        IAgentAuthAvailabilityRegistry? authAvailability = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -2211,7 +2287,8 @@ public sealed class PlanningPipelineTests : IDisposable
             {
                 MaxPlanReviewIterations = maxPlanReviewIterations,
             }),
-            involvement: involvement);
+            involvement: involvement,
+            authAvailability: authAvailability);
 
         return new PlanningPipelineSetup(pipeline, store, involvement, webhooks, gitRoot, testCaseStore);
     }

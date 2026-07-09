@@ -1950,12 +1950,30 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 detection.ResetAt);
         }
 
+        await ThrowIfAuthRequiredOutputAsync(
+            item,
+            project,
+            runner.Kind,
+            "planning",
+            result,
+            requireStdoutOnlyCorroboration: true,
+            ct);
+        var classification = _authFailureClassifier.ClassifyFailure(runner, result);
+        await ThrowIfAuthErrorAgentFailureAsync(
+            item,
+            project,
+            runner,
+            result,
+            "planning",
+            classification,
+            ct);
         ThrowIfTransientAgentFailure(runner, result, "planning");
         ThrowIfInfrastructureAgentFailure(
             runner,
             result,
             "planning",
-            $"Planning agent {runner.Kind} reported failure");
+            $"Planning agent {runner.Kind} reported failure",
+            classification);
         var detail = BuildAgentFailureDetail($"Planning agent {runner.Kind} reported failure", result);
         throw new InvalidOperationException(detail);
     }

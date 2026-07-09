@@ -63,6 +63,65 @@ public sealed class AgentRestoreRetryProgramWiringTests
         Assert.Equal(WorkItemState.Queued, requeued!.State);
     }
 
+    [Fact]
+    public async Task ProgramHostedRestoreScheduler_RequeuesGenericInfrastructureFailureFromInvolvement()
+    {
+        using var factory = new RestoreRetryWiringFactory();
+
+        var store = factory.Services.GetRequiredService<IWorkItemStore>();
+        var involvement = factory.Services.GetRequiredService<IAgentInvolvementStore>();
+        var queue = factory.Services.GetRequiredService<RecordingTaskQueue>();
+        var registry = factory.Services.GetRequiredService<AgentAvailabilityRegistry>();
+
+        registry.MarkSmokeResult(
+            AgentKind.Codex,
+            new AgentSmokeResult(false, "codex binary missing", TimeSpan.Zero, SmokeFailureCategory.Persistent));
+
+        var failedAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("restore-program-test"),
+            Title = "restore infrastructure wiring",
+            Prompt = "retry after restore",
+            Agent = AgentKind.Claude,
+            State = WorkItemState.Failed,
+            FailureKind = WorkItemFailureKinds.Infrastructure,
+            LastError = "planning agent codex reported failure: binary missing",
+            UpdatedAt = failedAt,
+        };
+        await store.CreateAsync(item);
+
+        var involvementId = Guid.NewGuid();
+        await involvement.RecordStartAsync(new AgentInvolvement(
+            Id: involvementId,
+            WorkItemId: item.Id,
+            AgentKind: AgentKind.Codex,
+            AgentInstanceId: null,
+            ModelId: null,
+            Phase: "planning",
+            StartedAt: failedAt.AddSeconds(-5),
+            EndedAt: null,
+            Iteration: null,
+            Outcome: null));
+        await involvement.FinalizeAsync(
+            involvementId,
+            failedAt,
+            AgentInvolvementOutcomes.FailureInfrastructure);
+        queue.CaptureWithoutForwarding(item.Id);
+
+        registry.MarkSmokeResult(
+            AgentKind.Codex,
+            new AgentSmokeResult(true, null, TimeSpan.FromMilliseconds(10), SmokeFailureCategory.None));
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        Assert.Equal(item.Id, await queue.WaitForCapturedEnqueueAsync(timeout.Token));
+
+        var requeued = await store.GetAsync(item.Id, timeout.Token);
+        Assert.Equal(WorkItemState.Queued, requeued!.State);
+        Assert.Equal(AgentKind.Claude, requeued.Agent);
+    }
+
     private sealed class RestoreRetryWiringFactory : WebApplicationFactory<Program>
     {
         private readonly string _dbPath = Path.Combine(
