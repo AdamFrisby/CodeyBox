@@ -45,7 +45,10 @@ WorkComplete ──→ Auditing ──pass──→ AuditPassed ──→ Mergin
                     │
                     └─fail──→ Reworking ──→ Auditing  (loop)
                                        │
-                                       └─no-changes──→ Failed
+                                       └─no-changes──→ infra fallback,
+                                                        escalation, park,
+                                                        or AuditFailed at
+                                                        the no-progress ceiling
                     │
                     └─maxIters──→ AuditFailed (terminal)
 ```
