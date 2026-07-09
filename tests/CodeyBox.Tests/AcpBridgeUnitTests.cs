@@ -2955,6 +2955,42 @@ public sealed class AcpBridgeUnitTests
         if (!CommandExists("dotnet"))
             return;
 
+        var marker = "marker-" + Guid.NewGuid().ToString("N");
+        var run = await RunSignalBootstrapProductionReexecAsync(["alpha", "", marker], hostileArgv0: null);
+
+        AssertSignalBootstrapReexecSucceeded(run);
+        Assert.Equal(new[] { "alpha", "", marker }, run.Before.Args.TakeLast(3).ToArray());
+        Assert.Equal(new[] { "alpha", "", marker }, run.After.Args.TakeLast(3).ToArray());
+    }
+
+    [Fact]
+    public async Task Bridge_SignalBootstrap_ProductionReexecIgnoresHostileArgv0()
+    {
+        if (!CommandExists("dotnet") || !CommandExists("python3"))
+            return;
+
+        const string hostileArgv0 = "codeybox-hostile-argv0";
+        var marker = "marker-" + Guid.NewGuid().ToString("N");
+        var run = await RunSignalBootstrapProductionReexecAsync(["alpha", marker], hostileArgv0);
+
+        AssertSignalBootstrapReexecSucceeded(run);
+        Assert.True(run.Before.ProcArgv.Length >= 3, "before re-exec /proc/self/cmdline was shorter than dotnet exec argv.");
+        Assert.True(run.After.ProcArgv.Length >= 3, "after re-exec /proc/self/cmdline was shorter than dotnet exec argv.");
+        Assert.Equal(hostileArgv0, run.Before.ProcArgv[0]);
+        Assert.Equal("exec", run.Before.ProcArgv[1]);
+        Assert.EndsWith("CodeyBox.Tests.dll", run.Before.ProcArgv[2], StringComparison.Ordinal);
+        Assert.NotEqual(hostileArgv0, run.After.ProcArgv[0]);
+        Assert.True(
+            Path.IsPathFullyQualified(run.After.ProcArgv[0]),
+            "SignalBootstrap must re-exec through the trusted /proc/self/exe target, not the untrusted argv[0].");
+        Assert.Equal(run.Before.ProcArgv.Skip(1).ToArray(), run.After.ProcArgv.Skip(1).ToArray());
+        Assert.Equal(new[] { "alpha", marker }, run.After.Args.TakeLast(2).ToArray());
+    }
+
+    private static async Task<SignalBootstrapReexecRun> RunSignalBootstrapProductionReexecAsync(
+        IReadOnlyList<string> appArgs,
+        string? hostileArgv0)
+    {
         var bridgeDllPath = typeof(Bridge).Assembly.Location;
         Assert.True(File.Exists(bridgeDllPath),
             "AcpBridge dll missing at " + bridgeDllPath +
@@ -2996,7 +3032,8 @@ Console.WriteLine(JsonSerializer.Serialize(new
     phase = reexeced ? "after" : "before",
     pid = Environment.ProcessId,
     guard = Environment.GetEnvironmentVariable(SignalBootstrap.SignalBootstrapReexecEnv),
-    args = Environment.GetCommandLineArgs()
+    args = Environment.GetCommandLineArgs(),
+    procArgv = SignalBootstrap.ParseProcCmdlineArgv(File.ReadAllBytes("/proc/self/cmdline")) ?? Array.Empty<string>()
 }));
 Console.Out.Flush();
 
@@ -3031,45 +3068,111 @@ return ran ? 90 : 91;
             var helperDllPath = Path.Combine(outputDir, "CodeyBox.Tests.dll");
             Assert.True(File.Exists(helperDllPath), "helper dll missing at " + helperDllPath);
 
-            var marker = "marker-" + Guid.NewGuid().ToString("N");
-            var run = await RunProcessWithTimeoutAsync(
-                "dotnet",
-                ["exec", helperDllPath, "alpha", "", marker],
-                dotnetEnv,
-                TimeSpan.FromSeconds(15));
+            var run = hostileArgv0 is null
+                ? await RunProcessWithTimeoutAsync(
+                    "dotnet",
+                    BuildDotnetExecArgs(helperDllPath, appArgs),
+                    dotnetEnv,
+                    TimeSpan.FromSeconds(15))
+                : await RunProcessWithTimeoutAsync(
+                    "python3",
+                    BuildHostileArgv0LauncherArgs(helperDllPath, hostileArgv0, appArgs),
+                    dotnetEnv,
+                    TimeSpan.FromSeconds(15));
             Assert.True(run.ExitCode == 0,
                 "bootstrap helper failed with exit " + run.ExitCode +
                 "\nstdout:\n" + run.Stdout +
                 "\nstderr:\n" + run.Stderr);
 
-            var lines = run.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-            Assert.Equal(2, lines.Length);
-
-            using var beforeDoc = JsonDocument.Parse(lines[0]);
-            using var afterDoc = JsonDocument.Parse(lines[1]);
-            var before = beforeDoc.RootElement;
-            var after = afterDoc.RootElement;
-
-            Assert.Equal("before", before.GetProperty("phase").GetString());
-            Assert.Equal("after", after.GetProperty("phase").GetString());
-            Assert.Equal(before.GetProperty("pid").GetInt32(), after.GetProperty("pid").GetInt32());
-            Assert.Equal(SignalBootstrap.SignalBootstrapGuardSetValue, after.GetProperty("guard").GetString());
-
-            Assert.Equal(new[] { "alpha", "", marker }, ReadArgvTail(before));
-            Assert.Equal(new[] { "alpha", "", marker }, ReadArgvTail(after));
+            return ParseSignalBootstrapReexecRun(run.Stdout);
         }
         finally
         {
             try { Directory.Delete(tmpDir, recursive: true); } catch { }
         }
-
-        static string[] ReadArgvTail(JsonElement root) =>
-            root.GetProperty("args")
-                .EnumerateArray()
-                .Select(arg => arg.GetString() ?? "")
-                .TakeLast(3)
-                .ToArray();
     }
+
+    private static string[] BuildDotnetExecArgs(string helperDllPath, IReadOnlyList<string> appArgs)
+    {
+        var args = new List<string> { "exec", helperDllPath };
+        args.AddRange(appArgs);
+        return args.ToArray();
+    }
+
+    private static string[] BuildHostileArgv0LauncherArgs(
+        string helperDllPath,
+        string hostileArgv0,
+        IReadOnlyList<string> appArgs)
+    {
+        var args = new List<string>
+        {
+            "-c",
+            """
+import os
+import shutil
+import sys
+
+target = sys.argv[1]
+hostile_argv0 = sys.argv[2]
+dotnet = shutil.which("dotnet")
+if dotnet is None:
+    sys.exit(86)
+
+os.execv(dotnet, [hostile_argv0, "exec", target, *sys.argv[3:]])
+""",
+            helperDllPath,
+            hostileArgv0,
+        };
+        args.AddRange(appArgs);
+        return args.ToArray();
+    }
+
+    private static SignalBootstrapReexecRun ParseSignalBootstrapReexecRun(string stdout)
+    {
+        var lines = stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        Assert.Equal(2, lines.Length);
+        return new SignalBootstrapReexecRun(
+            ParseSignalBootstrapReexecSnapshot(lines[0]),
+            ParseSignalBootstrapReexecSnapshot(lines[1]));
+    }
+
+    private static SignalBootstrapReexecSnapshot ParseSignalBootstrapReexecSnapshot(string json)
+    {
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+        var guard = root.GetProperty("guard");
+        return new SignalBootstrapReexecSnapshot(
+            root.GetProperty("phase").GetString() ?? "",
+            root.GetProperty("pid").GetInt32(),
+            guard.ValueKind == JsonValueKind.Null ? null : guard.GetString(),
+            ReadStringArray(root.GetProperty("args")),
+            ReadStringArray(root.GetProperty("procArgv")));
+    }
+
+    private static string[] ReadStringArray(JsonElement element) =>
+        element
+            .EnumerateArray()
+            .Select(value => value.GetString() ?? "")
+            .ToArray();
+
+    private static void AssertSignalBootstrapReexecSucceeded(SignalBootstrapReexecRun run)
+    {
+        Assert.Equal("before", run.Before.Phase);
+        Assert.Equal("after", run.After.Phase);
+        Assert.Equal(run.Before.Pid, run.After.Pid);
+        Assert.Equal(SignalBootstrap.SignalBootstrapGuardSetValue, run.After.Guard);
+    }
+
+    private sealed record SignalBootstrapReexecRun(
+        SignalBootstrapReexecSnapshot Before,
+        SignalBootstrapReexecSnapshot After);
+
+    private sealed record SignalBootstrapReexecSnapshot(
+        string Phase,
+        int Pid,
+        string? Guard,
+        string[] Args,
+        string[] ProcArgv);
 
     [Fact]
     public void SignalBootstrap_ResetInheritedIgnoredSignalToDefault_PreservesExistingCatchableHandler()
@@ -3128,7 +3231,7 @@ return ran ? 90 : 91;
                 needsBootstrap: () => true,
                 readArgv: () => argv,
                 setGuard: value => guardValue = value,
-                exec: _ => throw new InvalidOperationException("Simulated execvp failure")));
+                exec: _ => throw new InvalidOperationException("Simulated execv failure")));
 
         Assert.Contains("Failed to re-exec signal bootstrap", ex.Message);
         Assert.Null(guardValue);
@@ -4410,7 +4513,7 @@ exit 9
     /// static binary. <c>Bridge.NativeMethods</c> P/Invokes libc for
     /// <c>kill(2)</c>, and <c>SignalBootstrap.NativeMethods</c> P/Invokes libc
     /// for signal-disposition inspection/reset, setenv/unsetenv guard
-    /// propagation, and execvp. On the polite
+    /// propagation, and execv. On the polite
     /// SIGTERM-then-grace-then-SIGKILL teardown of <c>claude --ide</c>, that
     /// exception is caught silently by <c>TerminateClaudeProcess</c> and the
     /// SIGTERM-grace path regresses to bare SIGKILL, re-introducing the

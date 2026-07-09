@@ -57,7 +57,7 @@
     binary. Bridge.NativeMethods uses libc for kill(2), and
     SignalBootstrap.NativeMethods uses libc for signal disposition
     inspection/reset, setenv/unsetenv guard propagation, and the one-time
-    signal-bootstrap execvp(3). Without
+    signal-bootstrap execv(3). Without
     DirectPInvoke those calls would throw instead of preserving bridge
     shutdown cleanup. The kill(2) path would silently regress to bare
     Process.Kill (SIGKILL only), re-introducing the thinking-block-
