@@ -1279,7 +1279,7 @@ public sealed class SandboxAdmissionControlledProviderTests
 
         public IReadOnlyList<SandboxHostPoolEntry> SnapshotHostPool() => rows;
 
-        Task ISandboxProvider.DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
+        Task IManagedSandboxLifecycle.DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
         {
             lock (_managedDisposedLeaks)
                 _managedDisposedLeaks.Add((sandbox.Name, sandbox.HostId));

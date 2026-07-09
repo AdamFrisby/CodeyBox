@@ -312,13 +312,17 @@ public sealed class MultipassRemoteSandboxProviderTests
         var provider = new MultipassRemoteSandboxProvider(
             opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
             provider.CreateAsync(new SandboxSpec
             {
                 ImageReference = "ignored",
                 BaselineImageRef = baseline,
                 WorkingDirectory = "/work",
             }));
+        Assert.Equal("placement", ex.Operation);
+        Assert.Equal("all-hosts-unavailable", ex.ErrorClass);
+        var hostFailure = Assert.IsType<RemoteHostProvisioningException>(ex.InnerException);
+        Assert.Equal(failingCommand, hostFailure.Operation);
 
         Assert.Contains(transport.RecordedCalls, c =>
             c.Argv.Contains("delete") && c.Argv.Contains("--purge"));
@@ -346,13 +350,17 @@ public sealed class MultipassRemoteSandboxProviderTests
         var provider = new MultipassRemoteSandboxProvider(
             opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
 
-        await Assert.ThrowsAsync<TimeoutException>(() =>
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
             provider.CreateAsync(new SandboxSpec
             {
                 ImageReference = "ignored",
                 BaselineImageRef = baseline,
                 WorkingDirectory = "/work",
             }));
+        Assert.Equal("placement", ex.Operation);
+        Assert.Equal("all-hosts-unavailable", ex.ErrorClass);
+        var hostFailure = Assert.IsType<RemoteHostProvisioningException>(ex.InnerException);
+        Assert.Equal("wait-state", hostFailure.Operation);
 
         Assert.Contains(transport.RecordedCalls, c =>
             c.Argv.Contains("delete") && c.Argv.Contains("--purge"));
