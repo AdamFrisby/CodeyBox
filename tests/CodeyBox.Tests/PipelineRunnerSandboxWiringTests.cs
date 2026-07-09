@@ -35,6 +35,10 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     private const string MarkerHost = "agent.example.invalid";
     private const string CursorAuthEnvKey = "CODEYBOX_CURSOR_AUTH_JSON";
     private const string CursorAuthJson = """{"token":"cursor-fallback-token"}""";
+    private const string CodexApiKeyEnvKey = "OPENAI_API_KEY";
+    private const string CodexApiKeyValue = "codex-candidate-api-key";
+    private const string NonCandidateEnvKey = "CODEYBOX_NON_CANDIDATE_SECRET";
+    private const string NonCandidateEnvValue = "must-not-enter-resolver-sandbox";
     private const string AuditDotnetShimDir = AuditReviewDotnetShim.Directory;
     private const string AuditDotnetShimNotice = AuditReviewDotnetShim.Notice;
 
@@ -159,6 +163,82 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.DoesNotContain("Authentication required", final.LastError ?? string.Empty, StringComparison.OrdinalIgnoreCase);
         Assert.Single(primary.AgenticConflictInvocations);
+        Assert.Equal(
+            CursorAuthJson,
+            (await ReadBareBranchFileAsync(barePath, item.WorkBranch!, "cursor-auth-observed.json")).TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
+    public async Task PickupRebaseResolver_DoesNotResolveOrBakeRegisteredNonCandidateCredential()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var recorder = new RecordingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        var primary = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+        primary.AgenticConflictResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "codex resolver failed before editing",
+            Stdout: null,
+            Stderr: "ordinary resolver failure"));
+        var cursor = new CursorAgentRunner { Binary = await InstallFakeCursorAgentAsync("cursor-isolation") };
+        var registeredNonCandidate = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Opencode };
+        var classRouter = BuildResolverClassRouter(primary, cursor);
+        var credentials = new TrackingResolverCredentialProvider();
+        var project = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test Project",
+            RepositoryUrl = seed,
+            DefaultBaseBranch = "main",
+            DefaultAgent = AgentKind.Codex,
+            DefaultAgentClass = "frontier",
+            Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+        };
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            projectRepository: new InMemoryProjectRepository(project),
+            classRouter: classRouter,
+            credentials: credentials,
+            agentOverride: primary,
+            extraAgentRunners: [cursor, registeredNonCandidate],
+            sandboxProvider: recorder,
+            pipelineOptions: new PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                AgentAllowedHosts = [],
+            });
+
+        var itemId = WorkItemId.New();
+        var item = NewItem($"codeybox/{itemId.ToString()[..8]}") with
+        {
+            Id = itemId,
+            Agent = AgentKind.Codex,
+            AgentClassId = "frontier",
+            State = WorkItemState.WorkComplete,
+        };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(
+            barePath,
+            item.WorkBranch!,
+            "README.md",
+            "work branch change\n",
+            "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.DoesNotContain(AgentKind.Opencode, credentials.RequestedAgents);
+
+        var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
+        Assert.Equal(CodexApiKeyValue, pickupSpec.Environment[CodexApiKeyEnvKey]);
+        Assert.Equal(CursorAuthJson, pickupSpec.Environment[CursorAuthEnvKey]);
+        Assert.False(pickupSpec.Environment.ContainsKey(NonCandidateEnvKey));
         Assert.Equal(
             CursorAuthJson,
             (await ReadBareBranchFileAsync(barePath, item.WorkBranch!, "cursor-auth-observed.json")).TrimEnd('\r', '\n'));
@@ -1067,29 +1147,69 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
 
         public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
         {
-            AgentCredential? credential = agent == AgentKind.Codex
-                ? new AgentCredential(
+            AgentCredential? credential = agent switch
+            {
+                var kind when kind == AgentKind.Codex => new AgentCredential(
                     AgentKind.Codex,
-                    EnvironmentVariables: new Dictionary<string, string>(),
+                    EnvironmentVariables: new Dictionary<string, string>
+                    {
+                        [CodexApiKeyEnvKey] = CodexApiKeyValue,
+                    },
                     Files: new Dictionary<string, string>
                     {
                         ["codex/auth.json"] = """{"tokens":{"access_token":"codex-token"}}""",
-                    })
-                : agent == AgentKind.Cursor
-                    ? new AgentCredential(
-                        AgentKind.Cursor,
-                        EnvironmentVariables: new Dictionary<string, string> { [CursorAuthEnvKey] = CursorAuthJson },
-                        Files: new Dictionary<string, string>())
-                    : agent == AgentKind.Claude
-                        ? new AgentCredential(
-                            AgentKind.Claude,
-                            EnvironmentVariables: new Dictionary<string, string>(),
-                            Files: new Dictionary<string, string>
-                            {
-                                ["claude/credentials.json"] = ClaudeCredentialJson,
-                            })
-                    : null;
+                    }),
+                var kind when kind == AgentKind.Cursor => new AgentCredential(
+                    AgentKind.Cursor,
+                    EnvironmentVariables: new Dictionary<string, string> { [CursorAuthEnvKey] = CursorAuthJson },
+                    Files: new Dictionary<string, string>()),
+                var kind when kind == AgentKind.Claude => new AgentCredential(
+                    AgentKind.Claude,
+                    EnvironmentVariables: new Dictionary<string, string>(),
+                    Files: new Dictionary<string, string>
+                    {
+                        ["claude/credentials.json"] = ClaudeCredentialJson,
+                    }),
+                _ => null,
+            };
             return Task.FromResult(credential);
+        }
+    }
+
+    private sealed class TrackingResolverCredentialProvider : ICredentialProvider
+    {
+        private readonly ResolverCredentialProvider _inner = new();
+        private readonly List<AgentKind> _requestedAgents = new();
+
+        public IReadOnlyList<AgentKind> RequestedAgents
+        {
+            get
+            {
+                lock (_requestedAgents)
+                    return _requestedAgents.ToList();
+            }
+        }
+
+        public async Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+        {
+            lock (_requestedAgents)
+                _requestedAgents.Add(agent);
+
+            if (agent == AgentKind.Opencode)
+            {
+                return new AgentCredential(
+                    AgentKind.Opencode,
+                    EnvironmentVariables: new Dictionary<string, string>
+                    {
+                        [NonCandidateEnvKey] = NonCandidateEnvValue,
+                    },
+                    Files: new Dictionary<string, string>
+                    {
+                        ["opencode/auth.json"] = """{"token":"opencode-non-candidate"}""",
+                    });
+            }
+
+            return await _inner.GetAsync(agent, ct);
         }
     }
 

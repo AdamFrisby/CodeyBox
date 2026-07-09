@@ -275,6 +275,44 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task ResolveAsync_CredentialFileMaterialiserFailure_DoesNotInvokeCandidate()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+
+        var runner = new FakeAgentResolverRunner(sb =>
+        {
+            sb.WriteFile("src/a.txt", "m + w\n");
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "should not run", null, null);
+        })
+        { Kind = new AgentKind("file-agent") };
+        var credential = new AgentCredential(
+            runner.Kind,
+            new Dictionary<string, string>(),
+            new Dictionary<string, string> { ["agent/auth.json"] = "{}" });
+        var resolver = new AgenticConflictResolver(
+            credentialFileMaterialiser: (_, _, _) =>
+                throw new InvalidOperationException("credential tmpfs is read-only"));
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(runner, credential)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal(0, runner.InvocationCount);
+        Assert.Same(runner, result.FailureRunner);
+        Assert.Same(credential, result.FailureCredential);
+        var classificationResult = Assert.IsType<AgentResult>(result.FailureClassificationResult);
+        Assert.Contains("failed to materialise file credentials", classificationResult.Summary, StringComparison.Ordinal);
+        Assert.Contains("credential materialisation failed", result.Summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task ResolveAsync_FailureClassificationResult_UsesLastFailedCandidate_NotAggregateTrail()
     {
         var sandbox = new ConflictSandbox();

@@ -1,6 +1,8 @@
 using CodeyBox.Agents.Opencode;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
+using CodeyBox.Sandbox.Process;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
@@ -363,6 +365,88 @@ public sealed class OpencodeAgentRunnerTests
         Assert.DoesNotContain(secret, authExec.Argv);
         Assert.Equal(cred.EnvironmentVariables["OPENCODE_AUTH_JSON"], authExec.Stdin);
         Assert.DoesNotContain("OPENCODE_AUTH_JSON", script);
+    }
+
+    [Fact]
+    public async Task RunAsync_ProcessSandbox_WritesCredentialToDestinationOverride()
+    {
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        var runner = new OpencodeAgentRunner { Binary = "/bin/true" };
+        const string authJson = """{"providers":{"deepseek":{"apiKey":"sk-test"}}}""";
+        var credential = OpencodeCred(authJson, "$HOME/.config/opencode/auth.json");
+
+        var result = await runner.RunAsync(sandbox, "/work", "x", credential);
+
+        Assert.True(result.Success, result.Stderr);
+        var readOverride = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat \"$HOME/.config/opencode/auth.json\""],
+        });
+        Assert.True(readOverride.Success, readOverride.Stderr);
+        Assert.Equal(authJson, readOverride.Stdout.TrimEnd('\r', '\n'));
+
+        var defaultPathMissing = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "test ! -e \"$HOME/.local/share/opencode/auth.json\""],
+        });
+        Assert.True(defaultPathMissing.Success, defaultPathMissing.Stderr);
+    }
+
+    [Fact]
+    public async Task RunAsync_ProcessSandbox_RejectsEscapingDestinationOverrides()
+    {
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        var runner = new OpencodeAgentRunner { Binary = "/bin/true" };
+        var outside = Path.Combine(Path.GetTempPath(), "codeybox-opencode-outside-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(outside);
+        try
+        {
+            var absoluteOutside = Path.Combine(outside, "absolute-auth.json");
+            var absoluteResult = await runner.RunAsync(
+                sandbox,
+                "/work",
+                "x",
+                OpencodeCred("""{"x":1}""", absoluteOutside));
+            Assert.False(absoluteResult.Success);
+            Assert.Contains("failed to materialise opencode auth", absoluteResult.Summary, StringComparison.Ordinal);
+            Assert.False(File.Exists(absoluteOutside));
+
+            var traversalResult = await runner.RunAsync(
+                sandbox,
+                "/work",
+                "x",
+                OpencodeCred("""{"x":2}""", "../outside-auth.json"));
+            Assert.False(traversalResult.Success);
+            Assert.Contains("failed to materialise opencode auth", traversalResult.Summary, StringComparison.Ordinal);
+            var traversalMissing = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "test ! -e \"$HOME/../outside-auth.json\""],
+            });
+            Assert.True(traversalMissing.Success, traversalMissing.Stderr);
+
+            var symlinkTarget = Path.Combine(outside, "symlink-target");
+            Directory.CreateDirectory(symlinkTarget);
+            var setupSymlink = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "ln -s -- \"$1\" \"$HOME/link-parent\"", "setup", symlinkTarget],
+            });
+            Assert.True(setupSymlink.Success, setupSymlink.Stderr);
+
+            var symlinkResult = await runner.RunAsync(
+                sandbox,
+                "/work",
+                "x",
+                OpencodeCred("""{"x":3}""", "link-parent/auth.json"));
+            Assert.False(symlinkResult.Success);
+            Assert.Contains("failed to materialise opencode auth", symlinkResult.Summary, StringComparison.Ordinal);
+            Assert.False(File.Exists(Path.Combine(symlinkTarget, "auth.json")));
+        }
+        finally
+        {
+            try { Directory.Delete(outside, recursive: true); } catch { }
+        }
     }
 
     [Fact]

@@ -400,12 +400,10 @@ public sealed class AgenticConflictResolver
             var runner = candidate.Runner;
             var isStrongest = candidate.QualityScore == maxQuality;
 
-            // Cross-kind fallback: the sandbox was provisioned for whichever
-            // runner the orchestrator pre-baked at create time. Writing this
-            // candidate's explicit file credentials before invoking it lets a
-            // fallback CLI authenticate even when the sandbox env vars are still
-            // pinned to the primary. Env-backed auth files are handled by the
-            // candidate runner from candidate.Credential during RunAsync.
+            // Cross-kind fallback: file credentials are materialised immediately
+            // before this candidate's CLI runs. If the write fails, this candidate
+            // is not invoked; running it without the requested credential would
+            // turn an infrastructure failure into a misleading auth failure.
             if (_credentialFileMaterialiser is not null
                 && candidate.Credential is { Files.Count: > 0 })
             {
@@ -420,8 +418,20 @@ public sealed class AgenticConflictResolver
                 catch (Exception ex)
                 {
                     _log.LogWarning(ex,
-                        "Agentic conflict resolver: failed to materialise file credentials for agent '{Agent}' on {WorkItemId} (sandbox {Sandbox}); will still attempt the runner",
+                        "Agentic conflict resolver: failed to materialise file credentials for agent '{Agent}' on {WorkItemId} (sandbox {Sandbox}); skipping this candidate",
                         runner.Kind.Value, workItemId, sandbox.Id);
+                    var materialisationFailure = new AgentResult(
+                        false,
+                        $"failed to materialise file credentials: {ex.Message}",
+                        Stdout: null,
+                        Stderr: ex.Message);
+                    lastAgentResult = materialisationFailure;
+                    lastFailureRunner = runner;
+                    lastFailureCredential = candidate.Credential;
+                    lastFailureClassificationResult = materialisationFailure;
+                    attemptTrail.Add(
+                        $"{runner.Kind.Value}#0(credential materialisation failed: {RedactAndTruncate(ex.Message, 200)})");
+                    continue;
                 }
             }
 
