@@ -2370,16 +2370,20 @@ git push origin HEAD:{refName}";
             ? opts.VmStartTimeout
             : MultipassSandboxOptions.DefaultVmStartTimeout;
         var deadline = DateTime.UtcNow + startTimeout;
+        var reachedRunning = false;
         while (DateTime.UtcNow < deadline)
         {
             ct.ThrowIfCancellationRequested();
             var info = await RunAsync(opts, [opts.MultipassBinary, "info", name, "--format=csv"], stdin: null, ct: ct, workItemId: workItemId);
             ThrowIfProvisioningRetryExhausted("info", info);
             if (info.ExitCode == 0 && info.Stdout.Contains("Running", StringComparison.Ordinal))
+            {
+                reachedRunning = true;
                 break;
+            }
             await Task.Delay(TimeSpan.FromSeconds(1), ct);
         }
-        if (DateTime.UtcNow >= deadline)
+        if (!reachedRunning)
         {
             ThrowProvisioningDeferred(
                 "vm-start",
@@ -6651,9 +6655,6 @@ while True:
         sb.AppendLine("    if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
         sb.AppendLine("        break");
         sb.AppendLine("    fi");
-        sb.AppendLine("    if codeybox_report_child_status_if_present; then");
-        sb.AppendLine("        :");
-        sb.AppendLine("    fi");
         sb.AppendLine("    if [ \"$SECONDS\" -ge \"$codeybox_marker_deadline\" ]; then");
         sb.AppendLine("        if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
         sb.AppendLine("            break");
@@ -6677,6 +6678,9 @@ while True:
         sb.AppendLine("        fi");
         sb.AppendLine("        echo \"codeybox-detached: timed out waiting for process group marker\" >&2");
         sb.AppendLine($"        exit {DetachedSupervisorSetupFailedExitCode}");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    if codeybox_report_child_status_if_present; then");
+        sb.AppendLine("        :");
         sb.AppendLine("    fi");
         sb.AppendLine("    if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
         sb.AppendLine("        break");

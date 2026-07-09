@@ -98,16 +98,17 @@ public sealed class AgentClassRouterFallbackTests
     }
 
     [Fact]
-    public async Task MarkExhausted_RespectsResetAt_WhenSoonerThanTtl()
+    public async Task MarkExhausted_IgnoresPastResetAt()
     {
         var cls = Frontier(Sub(Codex), Sub(Claude));
         var router = Build(cls);
 
-        // Reset is in the past — exhaustion should expire immediately.
+        // Reset hints are parsed from less-trusted runtime output. A past hint
+        // must not clear the in-process exhaustion gate.
         router.MarkExhausted(Sub(Codex), TimeSpan.FromHours(1), resetAt: DateTimeOffset.UtcNow.AddSeconds(-1));
         var candidates = await router.OrderedFallbackCandidatesAsync(Item(), project: null, CancellationToken.None);
 
-        Assert.Equal([Codex, Claude], candidates.Select(c => c.Agent).ToArray());
+        Assert.Equal([Claude], candidates.Select(c => c.Agent).ToArray());
     }
 
     [Fact]
@@ -211,6 +212,52 @@ public sealed class AgentClassRouterFallbackTests
         var recovered = await router.ResolveAsync(Item(), project: null, CancellationToken.None);
         Assert.Equal(Codex, recovered.Chosen!.Agent);
         Assert.False(recovered.ShouldWait);
+    }
+
+    [Fact]
+    public async Task OrderedFallbackCandidates_PublishesRecoverySignal_WhenProbeRecovers()
+    {
+        var member = Sub(Codex);
+        var probe = new MutableSnapshotProbe(Codex, new AgentQuotaSnapshot { AvailablePct = 80.0 });
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster();
+        var signalCount = 0;
+        quotaSignal.QuotaUsableThresholdCrossed += () => Interlocked.Increment(ref signalCount);
+        quotaSignal.RecordQuotaUsability(member, isUsable: false);
+        var router = new AgentClassRouter(
+            [Frontier(member)],
+            [probe],
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance,
+            quotaAvailabilityPublisher: quotaSignal);
+
+        var candidates = await router.OrderedFallbackCandidatesAsync(
+            Item(),
+            project: null,
+            CancellationToken.None);
+
+        Assert.Single(candidates);
+        Assert.Equal(Codex, candidates[0].Agent);
+        Assert.Equal(1, Volatile.Read(ref signalCount));
+    }
+
+    [Fact]
+    public async Task ConcreteRouter_QuotaUsableSignal_SurfaceStillPublishesRecoveryEdge()
+    {
+        var member = Sub(Codex);
+        var probe = new MutableSnapshotProbe(Codex, new AgentQuotaSnapshot { AvailablePct = 1.0 });
+        var router = Build(Frontier(member), probe);
+        var signalCount = 0;
+        router.QuotaUsableThresholdCrossed += () => Interlocked.Increment(ref signalCount);
+
+        var blocked = await router.ResolveAsync(Item(), project: null, CancellationToken.None);
+        Assert.True(blocked.ShouldWait);
+        Assert.Equal(0, Volatile.Read(ref signalCount));
+
+        probe.Snapshot = new AgentQuotaSnapshot { AvailablePct = 80.0 };
+        var recovered = await router.ResolveAsync(Item(), project: null, CancellationToken.None);
+
+        Assert.Equal(Codex, recovered.Chosen!.Agent);
+        Assert.Equal(1, Volatile.Read(ref signalCount));
     }
 
     private sealed class MutableSnapshotProbe : IAgentQuotaProbe

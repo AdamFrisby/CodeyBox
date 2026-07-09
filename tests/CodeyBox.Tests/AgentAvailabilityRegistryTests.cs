@@ -88,6 +88,21 @@ public sealed class AgentAvailabilityRegistryTests
         Assert.False(transition.NowExcluded);
     }
 
+    [Fact]
+    public void SmokeRecover_EmitsAvailabilityRecoverySignalOnce()
+    {
+        var reg = NewRegistry();
+        var recovered = new List<AgentKind>();
+        reg.AgentRecovered += recovered.Add;
+
+        reg.MarkSmokeResult(Codex, new AgentSmokeResult(false, "auth", TimeSpan.Zero));
+        reg.MarkSmokeResult(Codex, new AgentSmokeResult(false, "auth", TimeSpan.Zero));
+        reg.MarkSmokeResult(Codex, new AgentSmokeResult(true, null, TimeSpan.Zero));
+        reg.MarkSmokeResult(Codex, new AgentSmokeResult(true, null, TimeSpan.Zero));
+
+        Assert.Equal([Codex], recovered);
+    }
+
     // ── Fast-fail circuit breaker ─────────────────────────────────────────────
 
     [Fact]

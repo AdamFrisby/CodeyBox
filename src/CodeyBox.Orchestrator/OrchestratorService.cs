@@ -3520,10 +3520,14 @@ public sealed record OrchestratorOptions
 
 public sealed record AutoRetryOnQuotaFailureOptions
 {
+    public const int DefaultWaitingForQuotaResetSweepBatchSize = 128;
+
     public bool Enabled { get; init; } = false;
     public TimeSpan PeriodicCheckInterval { get; init; } = TimeSpan.FromMinutes(5);
     public TimeSpan ClockDriftSafetyMargin { get; init; } = TimeSpan.FromMinutes(2);
     public int MaxAutoRetriesPerWorkItem { get; init; } = 3;
+    public int MaxWaitingForQuotaResetSweepBatchSize { get; init; } =
+        DefaultWaitingForQuotaResetSweepBatchSize;
 }
 
 public enum TransientRetryJitterMode

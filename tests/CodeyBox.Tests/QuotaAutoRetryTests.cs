@@ -1145,6 +1145,171 @@ public sealed class QuotaAutoRetryTests : IDisposable
         Assert.Contains(webhooks.Events, e => e.Event == "work_item.auto_retry");
     }
 
+    [Fact]
+    public async Task PeriodicSweep_PagesPastStillExhaustedPriorityPrefix()
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var projectId = new ProjectId("periodic-backstop-project");
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = projectId,
+            DisplayName = "Periodic backstop",
+            RepositoryUrl = "http://fake",
+            DefaultAgent = AgentKind.Claude,
+        });
+        var router = new AgentClassRouter(
+            [],
+            [
+                new StaticProbe(AgentKind.Claude, new AgentQuotaSnapshot { AvailablePct = 0 }),
+                new StaticProbe(AgentKind.Codex, new AgentQuotaSnapshot { AvailablePct = 80 }),
+            ],
+            new QuotaRouterOptions { MinQuotaPct = 10 },
+            NullLogger<AgentClassRouter>.Instance,
+            _time);
+        var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = TimeSpan.FromHours(1),
+                    MaxAutoRetriesPerWorkItem = 3,
+                    MaxWaitingForQuotaResetSweepBatchSize = 2,
+                },
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            projects,
+            timeProvider: _time);
+
+        var firstExhausted = NewWaitingQuotaItem(projectId, "exhausted high 1", AgentKind.Claude, priority: 100, createdAt: _time.Now.AddMinutes(-3));
+        var secondExhausted = NewWaitingQuotaItem(projectId, "exhausted high 2", AgentKind.Claude, priority: 90, createdAt: _time.Now.AddMinutes(-2));
+        var recoveredLower = NewWaitingQuotaItem(projectId, "recovered low", AgentKind.Codex, priority: 1, createdAt: _time.Now.AddMinutes(-1));
+        await store.CreateAsync(firstExhausted);
+        await store.CreateAsync(secondExhausted);
+        await store.CreateAsync(recoveredLower);
+
+        var sweepMethod = typeof(QuotaRetryScheduler).GetMethod(
+            "RunPeriodicSweepAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        await (Task)sweepMethod!.Invoke(scheduler, [CancellationToken.None])!;
+
+        var first = await store.GetAsync(firstExhausted.Id);
+        var second = await store.GetAsync(secondExhausted.Id);
+        var retried = await store.GetAsync(recoveredLower.Id);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, first!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, second!.State);
+        Assert.Equal(0, first.QuotaRetryAttempts);
+        Assert.Equal(0, second.QuotaRetryAttempts);
+        Assert.Equal(WorkItemState.Queued, retried!.State);
+        Assert.Equal(1, retried.QuotaRetryAttempts);
+    }
+
+    [Fact]
+    public async Task Scheduler_QuotaUsableSignal_RequeuesDirectDefaultAgentPastPriorityPrefix()
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var projectId = new ProjectId("default-agent-recovery-project");
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = projectId,
+            DisplayName = "Default agent recovery",
+            RepositoryUrl = "http://fake",
+            DefaultAgent = AgentKind.Codex,
+        });
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
+        var codexMember = new AgentMembership
+        {
+            Agent = AgentKind.Codex,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+        var router = new AgentClassRouter(
+            [],
+            [
+                new StaticProbe(AgentKind.Claude, new AgentQuotaSnapshot { AvailablePct = 0 }),
+                new StaticProbe(AgentKind.Codex, new AgentQuotaSnapshot { AvailablePct = 80 }),
+            ],
+            new QuotaRouterOptions { MinQuotaPct = 10 },
+            NullLogger<AgentClassRouter>.Instance,
+            _time,
+            quotaAvailabilityPublisher: quotaSignal);
+        using var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = TimeSpan.FromHours(6),
+                    MaxAutoRetriesPerWorkItem = 3,
+                    MaxWaitingForQuotaResetSweepBatchSize = 2,
+                },
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            projects,
+            null,
+            null,
+            _time,
+            quotaAvailabilitySignal: quotaSignal);
+
+        var firstOtherAgent = NewWaitingQuotaItem(projectId, "other high 1", AgentKind.Claude, priority: 100, createdAt: _time.Now.AddMinutes(-3));
+        var secondOtherAgent = NewWaitingQuotaItem(projectId, "other high 2", AgentKind.Claude, priority: 90, createdAt: _time.Now.AddMinutes(-2));
+        var defaultAgentItem = NewWaitingQuotaItem(projectId, "default codex low", agent: null, priority: 1, createdAt: _time.Now.AddMinutes(-1));
+        await store.CreateAsync(firstOtherAgent);
+        await store.CreateAsync(secondOtherAgent);
+        await store.CreateAsync(defaultAgentItem);
+
+        quotaSignal.RecordQuotaUsability(codexMember, isUsable: false, resetAt: _time.Now.AddDays(7));
+        quotaSignal.RecordQuotaUsability(codexMember, isUsable: true);
+
+        var retried = await WaitForAttemptsAsync(store, defaultAgentItem.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));
+        Assert.Equal(WorkItemState.Queued, retried.State);
+
+        var first = await store.GetAsync(firstOtherAgent.Id);
+        var second = await store.GetAsync(secondOtherAgent.Id);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, first!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, second!.State);
+        Assert.Equal(0, first.QuotaRetryAttempts);
+        Assert.Equal(0, second.QuotaRetryAttempts);
+    }
+
+    private WorkItem NewWaitingQuotaItem(
+        ProjectId projectId,
+        string title,
+        AgentKind? agent,
+        int priority,
+        DateTimeOffset createdAt) =>
+        new()
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = title,
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            QuotaRetryAttempts = 0,
+            Agent = agent,
+            Priority = priority,
+            CreatedAt = createdAt,
+            NextQuotaRetryAt = _time.Now.AddDays(7),
+        };
+
     private sealed class StaticProbe : IAgentQuotaProbe
     {
         private readonly AgentQuotaSnapshot _snapshot;
@@ -1156,6 +1321,56 @@ public sealed class QuotaAutoRetryTests : IDisposable
         public AgentKind Kind { get; }
         public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct) =>
             Task.FromResult(_snapshot);
+    }
+
+    private sealed class ManualQuotaAvailabilitySignal : IAgentQuotaAvailabilitySignal
+    {
+        public event Action? QuotaUsableThresholdCrossed;
+        public event Action<AgentQuotaMemberKey>? QuotaMemberUsableThresholdCrossed;
+        public void Fire() => QuotaUsableThresholdCrossed?.Invoke();
+        public void Fire(AgentQuotaMemberKey member) => QuotaMemberUsableThresholdCrossed?.Invoke(member);
+    }
+
+    private sealed class SignalDuringFirstRetryRouter : IQuotaRetryRouter
+    {
+        private readonly Action _signalDuringFirstCall;
+        private int _resolveCalls;
+
+        public SignalDuringFirstRetryRouter(Action signalDuringFirstCall)
+            => _signalDuringFirstCall = signalDuringFirstCall;
+
+        public int ResolveCalls => Volatile.Read(ref _resolveCalls);
+
+        public Task<QuotaRetryRoutingDecision> ResolveQuotaRetryAsync(
+            WorkItem item,
+            Project? project,
+            CancellationToken ct,
+            string? requiredCapability = null)
+        {
+            var call = Interlocked.Increment(ref _resolveCalls);
+            if (call == 1)
+            {
+                _signalDuringFirstCall();
+                return Task.FromResult(new QuotaRetryRoutingDecision(
+                    ShouldWait: true,
+                    NoEligibleMembers: false,
+                    Reason: "first pass still gated",
+                    WaitingForPausedAgent: false));
+            }
+
+            return Task.FromResult(new QuotaRetryRoutingDecision(
+                ShouldWait: false,
+                NoEligibleMembers: false,
+                Reason: "second pass available",
+                WaitingForPausedAgent: false));
+        }
+
+        public Task<DateTimeOffset?> ComputeEarliestExhaustedResetAsync(
+            WorkItem item,
+            Project? project,
+            CancellationToken ct,
+            string? requiredCapability = null)
+            => Task.FromResult<DateTimeOffset?>(null);
     }
 
     private sealed class MutableProbe : IAgentQuotaProbe
@@ -1183,6 +1398,76 @@ public sealed class QuotaAutoRetryTests : IDisposable
         {
             CallCount++;
             return Task.FromResult(Snapshot);
+        }
+    }
+
+    private sealed class CachingMutableProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalidator
+    {
+        private AgentQuotaSnapshot? _cached;
+
+        public CachingMutableProbe(AgentKind kind, double availablePct)
+            : this(kind, new AgentQuotaSnapshot { AvailablePct = availablePct })
+        {
+        }
+
+        public CachingMutableProbe(AgentKind kind, AgentQuotaSnapshot snapshot)
+        {
+            Kind = kind;
+            Snapshot = snapshot;
+        }
+
+        public AgentKind Kind { get; }
+        public int CallCount { get; private set; }
+        public int Invalidations { get; private set; }
+        public AgentQuotaSnapshot Snapshot { get; set; }
+        public double AvailablePct
+        {
+            get => Snapshot.AvailablePct;
+            set => Snapshot = Snapshot with { AvailablePct = value };
+        }
+
+        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+        {
+            if (_cached is null)
+            {
+                CallCount++;
+                _cached = Snapshot;
+            }
+
+            return Task.FromResult(_cached);
+        }
+
+        public void InvalidateCache()
+        {
+            Invalidations++;
+            _cached = null;
+        }
+    }
+
+    private sealed class ThrowOnceThenMutableProbe : IAgentQuotaProbe
+    {
+        private bool _throwNext = true;
+
+        public ThrowOnceThenMutableProbe(AgentKind kind, double availablePct)
+        {
+            Kind = kind;
+            AvailablePct = availablePct;
+        }
+
+        public AgentKind Kind { get; }
+        public int CallCount { get; private set; }
+        public double AvailablePct { get; set; }
+
+        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+        {
+            CallCount++;
+            if (_throwNext)
+            {
+                _throwNext = false;
+                throw new InvalidOperationException("probe unavailable");
+            }
+
+            return Task.FromResult(new AgentQuotaSnapshot { AvailablePct = AvailablePct });
         }
     }
 
@@ -1699,6 +1984,8 @@ public sealed class QuotaAutoRetryTests : IDisposable
         };
         var projects = new InMemoryProjectRepository(project);
         var probe = new MutableProbe(AgentKind.Claude, availablePct: 0);
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
         var router = new AgentClassRouter(
             [
                 new AgentClass
@@ -1714,7 +2001,8 @@ public sealed class QuotaAutoRetryTests : IDisposable
             [probe],
             new QuotaRouterOptions { MinQuotaPct = 10 },
             NullLogger<AgentClassRouter>.Instance,
-            _time);
+            _time,
+            quotaAvailabilityPublisher: quotaSignal);
         var scheduler = new QuotaRetryScheduler(
             store,
             retrier,
@@ -1733,7 +2021,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
             null,
             null,
             _time,
-            quotaAvailabilitySignal: router);
+            quotaAvailabilitySignal: quotaSignal);
 
         var parked = new WorkItem
         {
@@ -1763,6 +2051,95 @@ public sealed class QuotaAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public async Task Scheduler_AgentAvailabilityRecoverySignal_RequeuesWaitingForQuotaResetItem()
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        var store = new SqliteWorkItemStore(stateDb);
+        using var _ = store;
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var projectId = new ProjectId("availability-recovery-project");
+        var project = new Project
+        {
+            Id = projectId,
+            DisplayName = "Availability Recovery",
+            RepositoryUrl = "http://fake",
+            DefaultAgentClass = "availability-recovery-class",
+        };
+        var projects = new InMemoryProjectRepository(project);
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(),
+            _time,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        var dispatchAvailability = new AgentDispatchAvailability(availability);
+        var probe = new MutableProbe(AgentKind.Codex, availablePct: 80);
+        var router = new AgentClassRouter(
+            [
+                new AgentClass
+                {
+                    Id = "availability-recovery-class",
+                    DisplayName = "Availability Recovery",
+                    Members =
+                    [
+                        new AgentMembership { Agent = AgentKind.Codex, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                    ],
+                },
+            ],
+            [probe],
+            new QuotaRouterOptions { MinQuotaPct = 10 },
+            NullLogger<AgentClassRouter>.Instance,
+            _time,
+            dispatchAvailability: dispatchAvailability);
+        using var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = TimeSpan.FromHours(6),
+                    MaxAutoRetriesPerWorkItem = 3,
+                },
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            projects,
+            null,
+            null,
+            _time,
+            agentAvailabilityRecoverySignal: availability);
+
+        availability.MarkSmokeResult(
+            AgentKind.Codex,
+            new AgentSmokeResult(false, "quota probe exhausted", TimeSpan.Zero));
+
+        var parked = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = "parked",
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            QuotaRetryAttempts = 0,
+            AgentClassId = "availability-recovery-class",
+            NextQuotaRetryAt = _time.Now.AddDays(7),
+        };
+        await store.CreateAsync(parked);
+
+        availability.MarkSmokeResult(
+            AgentKind.Codex,
+            new AgentSmokeResult(true, null, TimeSpan.Zero));
+
+        var retried = await WaitForAttemptsAsync(store, parked.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));
+        Assert.Equal(WorkItemState.Queued, retried.State);
+        Assert.Equal(1, retried.QuotaRetryAttempts);
+    }
+
+    [Fact]
     public async Task Router_QuotaUsableSignal_SubscriberExceptionDoesNotBreakResolve()
     {
         var project = new Project
@@ -1773,6 +2150,8 @@ public sealed class QuotaAutoRetryTests : IDisposable
             DefaultAgentClass = "subscriber-class",
         };
         var probe = new MutableProbe(AgentKind.Claude, availablePct: 0);
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
         var router = new AgentClassRouter(
             [
                 new AgentClass
@@ -1788,8 +2167,9 @@ public sealed class QuotaAutoRetryTests : IDisposable
             [probe],
             new QuotaRouterOptions { MinQuotaPct = 10 },
             NullLogger<AgentClassRouter>.Instance,
-            _time);
-        router.QuotaUsableThresholdCrossed += () => throw new InvalidOperationException("subscriber failed");
+            _time,
+            quotaAvailabilityPublisher: quotaSignal);
+        quotaSignal.QuotaUsableThresholdCrossed += () => throw new InvalidOperationException("subscriber failed");
 
         var probeItem = new WorkItem
         {
@@ -1836,6 +2216,8 @@ public sealed class QuotaAutoRetryTests : IDisposable
                 new WindowQuota { Name = "seven_day", AvailablePct = 80 },
             ],
         });
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
         var router = new AgentClassRouter(
             [
                 new AgentClass
@@ -1861,7 +2243,8 @@ public sealed class QuotaAutoRetryTests : IDisposable
                 },
             },
             NullLogger<AgentClassRouter>.Instance,
-            _time);
+            _time,
+            quotaAvailabilityPublisher: quotaSignal);
         using var scheduler = new QuotaRetryScheduler(
             store,
             retrier,
@@ -1880,7 +2263,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
             null,
             null,
             _time,
-            quotaAvailabilitySignal: router);
+            quotaAvailabilitySignal: quotaSignal);
 
         var parked = new WorkItem
         {
@@ -1916,6 +2299,873 @@ public sealed class QuotaAutoRetryTests : IDisposable
         var retried = await WaitForAttemptsAsync(store, parked.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));
         Assert.Equal(WorkItemState.Queued, retried.State);
         Assert.Equal(1, retried.QuotaRetryAttempts);
+    }
+
+    [Fact]
+    public async Task Scheduler_QuotaRecoveryProbeMonitor_RequeuesWaitingForQuotaResetItem()
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        var store = new SqliteWorkItemStore(stateDb);
+        using var _ = store;
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var projectId = new ProjectId("test-project");
+        var project = new Project
+        {
+            Id = projectId,
+            DisplayName = "Test",
+            RepositoryUrl = "http://fake",
+            DefaultAgentClass = "probe-signal-class",
+        };
+        var projects = new InMemoryProjectRepository(project);
+        var routerOptions = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10,
+            QuotaRecoveryProbeInterval = TimeSpan.FromMilliseconds(50),
+        };
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Codex,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+        var probe = new CachingMutableProbe(AgentKind.Codex, availablePct: 0);
+        var router = new AgentClassRouter(
+            [
+                new AgentClass
+                {
+                    Id = "probe-signal-class",
+                    DisplayName = "Probe Signal",
+                    Members = [member],
+                },
+            ],
+            [probe],
+            routerOptions,
+            NullLogger<AgentClassRouter>.Instance,
+            _time,
+            quotaAvailabilityPublisher: quotaSignal);
+        using var monitor = new AgentQuotaRecoveryProbeMonitor(
+            quotaSignal,
+            quotaSignal,
+            [probe],
+            new QuotaGateAvailability(new QuotaGatePolicy(routerOptions)),
+            routerOptions,
+            NullLogger<AgentQuotaRecoveryProbeMonitor>.Instance,
+            _time,
+            store,
+            projects,
+            router);
+        using var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = TimeSpan.FromHours(6),
+                    MaxAutoRetriesPerWorkItem = 3,
+                },
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            projects,
+            null,
+            null,
+            _time,
+            quotaAvailabilitySignal: quotaSignal);
+
+        var parked = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = "parked",
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            QuotaRetryAttempts = 0,
+            AgentClassId = "probe-signal-class",
+            NextQuotaRetryAt = _time.Now.AddDays(7),
+        };
+        await store.CreateAsync(parked);
+
+        var signalCount = 0;
+        quotaSignal.QuotaUsableThresholdCrossed += () => System.Threading.Interlocked.Increment(ref signalCount);
+
+        router.MarkExhausted(member, TimeSpan.FromHours(6), _time.Now.AddDays(7));
+        Assert.Equal(0, System.Threading.Volatile.Read(ref signalCount));
+
+        var stillParked = await store.GetAsync(parked.Id);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, stillParked!.State);
+        Assert.Equal(0, stillParked.QuotaRetryAttempts);
+
+        await monitor.StartAsync(CancellationToken.None);
+        try
+        {
+            await WaitForConditionAsync(() => probe.CallCount > 0, TimeSpan.FromSeconds(2));
+            Assert.Equal(0, System.Threading.Volatile.Read(ref signalCount));
+
+            stillParked = await store.GetAsync(parked.Id);
+            Assert.Equal(WorkItemState.WaitingForQuotaReset, stillParked!.State);
+            Assert.Equal(0, stillParked.QuotaRetryAttempts);
+
+            probe.AvailablePct = 80;
+            _time.Now = _time.Now.Add(routerOptions.QuotaRecoveryProbeInterval);
+            var retried = await WaitForAttemptsAsync(store, parked.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));
+            Assert.Equal(WorkItemState.Queued, retried.State);
+            Assert.Equal(1, retried.QuotaRetryAttempts);
+            Assert.Equal(1, System.Threading.Volatile.Read(ref signalCount));
+            Assert.True(probe.Invalidations > 0);
+        }
+        finally
+        {
+            await monitor.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task QuotaRecoveryProbeMonitor_SubscriberFailureKeepsMemberTrackedForNextProbe()
+    {
+        var routerOptions = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10,
+            QuotaRecoveryProbeInterval = TimeSpan.FromMilliseconds(50),
+        };
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Codex,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+        var probe = new CachingMutableProbe(AgentKind.Codex, availablePct: 0);
+        using var monitor = new AgentQuotaRecoveryProbeMonitor(
+            quotaSignal,
+            quotaSignal,
+            [probe],
+            new QuotaGateAvailability(new QuotaGatePolicy(routerOptions)),
+            routerOptions,
+            NullLogger<AgentQuotaRecoveryProbeMonitor>.Instance,
+            _time);
+        var signalCount = 0;
+        void ThrowingSubscriber()
+        {
+            System.Threading.Interlocked.Increment(ref signalCount);
+            throw new InvalidOperationException("subscriber failed");
+        }
+
+        quotaSignal.QuotaUsableThresholdCrossed += ThrowingSubscriber;
+        quotaSignal.RecordQuotaUsability(member, isUsable: false);
+        probe.AvailablePct = 80;
+
+        Assert.Equal(0, await monitor.ProbeTrackedMembersOnceAsync(CancellationToken.None));
+        Assert.Equal(1, System.Threading.Volatile.Read(ref signalCount));
+
+        quotaSignal.QuotaUsableThresholdCrossed -= ThrowingSubscriber;
+        quotaSignal.QuotaUsableThresholdCrossed += () => System.Threading.Interlocked.Increment(ref signalCount);
+
+        Assert.Equal(1, await monitor.ProbeTrackedMembersOnceAsync(CancellationToken.None));
+        Assert.Equal(2, System.Threading.Volatile.Read(ref signalCount));
+    }
+
+    [Fact]
+    public async Task QuotaRecoveryProbeMonitor_ProbeExceptionKeepsMemberTrackedForLaterRecovery()
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        var store = new SqliteWorkItemStore(stateDb);
+        using var _ = store;
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var projectId = new ProjectId("probe-exception-project");
+        var project = new Project
+        {
+            Id = projectId,
+            DisplayName = "Probe exception",
+            RepositoryUrl = "http://fake",
+            DefaultAgent = AgentKind.Codex,
+        };
+        var projects = new InMemoryProjectRepository(project);
+        var routerOptions = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10,
+            QuotaRecoveryProbeInterval = TimeSpan.FromMilliseconds(50),
+        };
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Codex,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+        var probe = new ThrowOnceThenMutableProbe(AgentKind.Codex, availablePct: 80);
+        var router = new AgentClassRouter(
+            [],
+            [probe],
+            routerOptions,
+            NullLogger<AgentClassRouter>.Instance,
+            _time,
+            quotaAvailabilityPublisher: quotaSignal);
+        using var monitor = new AgentQuotaRecoveryProbeMonitor(
+            quotaSignal,
+            quotaSignal,
+            [probe],
+            new QuotaGateAvailability(new QuotaGatePolicy(routerOptions)),
+            routerOptions,
+            NullLogger<AgentQuotaRecoveryProbeMonitor>.Instance,
+            _time,
+            store,
+            projects,
+            router);
+        using var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = TimeSpan.FromHours(6),
+                    MaxAutoRetriesPerWorkItem = 3,
+                },
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            projects,
+            null,
+            null,
+            _time,
+            quotaAvailabilitySignal: quotaSignal);
+
+        var parked = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = "parked after probe exception",
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            Agent = AgentKind.Codex,
+            NextQuotaRetryAt = _time.Now.AddDays(7),
+        };
+        await store.CreateAsync(parked);
+
+        quotaSignal.RecordQuotaUsability(member, isUsable: false, resetAt: _time.Now.AddDays(7));
+
+        Assert.Equal(0, await monitor.ProbeTrackedMembersOnceAsync(CancellationToken.None));
+        Assert.Equal(1, probe.CallCount);
+        var stillParked = await store.GetAsync(parked.Id);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, stillParked!.State);
+        Assert.Equal(0, stillParked.QuotaRetryAttempts);
+
+        Assert.Equal(1, await monitor.ProbeTrackedMembersOnceAsync(CancellationToken.None));
+        var retried = await WaitForAttemptsAsync(store, parked.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));
+        Assert.Equal(WorkItemState.Queued, retried.State);
+        Assert.True(probe.CallCount >= 2);
+    }
+
+    [Fact]
+    public async Task QuotaRecoveryProbeMonitor_DirectAgentRecovery_RequeuesOnlyRecoveredAgent()
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        var store = new SqliteWorkItemStore(stateDb);
+        using var _ = store;
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var projectId = new ProjectId("direct-quota-project");
+        var project = new Project
+        {
+            Id = projectId,
+            DisplayName = "Direct quota",
+            RepositoryUrl = "http://fake",
+            DefaultAgent = AgentKind.Codex,
+        };
+        var projects = new InMemoryProjectRepository(project);
+        var routerOptions = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10,
+            QuotaRecoveryProbeInterval = TimeSpan.FromMilliseconds(50),
+        };
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
+        var codexMember = new AgentMembership
+        {
+            Agent = AgentKind.Codex,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+        var codexProbe = new CachingMutableProbe(AgentKind.Codex, availablePct: 0);
+        var claudeProbe = new CachingMutableProbe(AgentKind.Claude, availablePct: 0);
+        var router = new AgentClassRouter(
+            [],
+            [codexProbe, claudeProbe],
+            routerOptions,
+            NullLogger<AgentClassRouter>.Instance,
+            _time,
+            quotaAvailabilityPublisher: quotaSignal);
+        using var monitor = new AgentQuotaRecoveryProbeMonitor(
+            quotaSignal,
+            quotaSignal,
+            [codexProbe, claudeProbe],
+            new QuotaGateAvailability(new QuotaGatePolicy(routerOptions)),
+            routerOptions,
+            NullLogger<AgentQuotaRecoveryProbeMonitor>.Instance,
+            _time,
+            store,
+            projects,
+            router);
+        using var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = TimeSpan.FromHours(6),
+                    MaxAutoRetriesPerWorkItem = 3,
+                    MaxWaitingForQuotaResetSweepBatchSize = 2,
+                },
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            projects,
+            null,
+            null,
+            _time,
+            quotaAvailabilitySignal: quotaSignal);
+
+        var codexParked = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = "codex parked",
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            QuotaRetryAttempts = 0,
+            Agent = AgentKind.Codex,
+            Priority = 1,
+            NextQuotaRetryAt = _time.Now.AddDays(7),
+        };
+        var firstClaudeParked = codexParked with
+        {
+            Id = WorkItemId.New(),
+            Title = "claude parked 1",
+            Agent = AgentKind.Claude,
+            Priority = 100,
+        };
+        var secondClaudeParked = codexParked with
+        {
+            Id = WorkItemId.New(),
+            Title = "claude parked 2",
+            Agent = AgentKind.Claude,
+            Priority = 90,
+        };
+        await store.CreateAsync(codexParked);
+        await store.CreateAsync(firstClaudeParked);
+        await store.CreateAsync(secondClaudeParked);
+
+        quotaSignal.RecordQuotaUsability(codexMember, isUsable: false);
+        Assert.Equal(0, await monitor.ProbeTrackedMembersOnceAsync(CancellationToken.None));
+
+        var stillCodexParked = await store.GetAsync(codexParked.Id);
+        var stillFirstClaudeParked = await store.GetAsync(firstClaudeParked.Id);
+        var stillSecondClaudeParked = await store.GetAsync(secondClaudeParked.Id);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, stillCodexParked!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, stillFirstClaudeParked!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, stillSecondClaudeParked!.State);
+        Assert.Equal(0, stillFirstClaudeParked.QuotaRetryAttempts);
+        Assert.Equal(0, stillSecondClaudeParked.QuotaRetryAttempts);
+
+        codexProbe.AvailablePct = 80;
+        _time.Now = _time.Now.Add(routerOptions.QuotaRecoveryProbeInterval);
+        Assert.Equal(1, await monitor.ProbeTrackedMembersOnceAsync(CancellationToken.None));
+
+        var retried = await WaitForAttemptsAsync(store, codexParked.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));
+        Assert.Equal(WorkItemState.Queued, retried.State);
+        Assert.Equal(1, retried.QuotaRetryAttempts);
+
+        stillFirstClaudeParked = await store.GetAsync(firstClaudeParked.Id);
+        stillSecondClaudeParked = await store.GetAsync(secondClaudeParked.Id);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, stillFirstClaudeParked!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, stillSecondClaudeParked!.State);
+        Assert.Equal(0, stillFirstClaudeParked.QuotaRetryAttempts);
+        Assert.Equal(0, stillSecondClaudeParked.QuotaRetryAttempts);
+    }
+
+    [Fact]
+    public async Task QuotaRecoveryProbeMonitor_ReworkRetryRequiresAuditCapableRecoveredMember()
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        var store = new SqliteWorkItemStore(stateDb);
+        using var _ = store;
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var projectId = new ProjectId("audit-quota-project");
+        var project = new Project
+        {
+            Id = projectId,
+            DisplayName = "Audit quota",
+            RepositoryUrl = "http://fake",
+            DefaultAgentClass = "audit-quota-class",
+        };
+        var projects = new InMemoryProjectRepository(project);
+        var routerOptions = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10,
+            QuotaRecoveryProbeInterval = TimeSpan.FromMilliseconds(50),
+        };
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
+        var codexMember = new AgentMembership
+        {
+            Agent = AgentKind.Codex,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+        var claudeAuditMember = new AgentMembership
+        {
+            Agent = AgentKind.Claude,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 90,
+            Capabilities = [WellKnownCapabilities.Audit],
+        };
+        var codexProbe = new CachingMutableProbe(AgentKind.Codex, availablePct: 80);
+        var claudeProbe = new CachingMutableProbe(AgentKind.Claude, availablePct: 80);
+        var router = new AgentClassRouter(
+            [
+                new AgentClass
+                {
+                    Id = "audit-quota-class",
+                    DisplayName = "Audit quota",
+                    Members = [codexMember, claudeAuditMember],
+                },
+            ],
+            [codexProbe, claudeProbe],
+            routerOptions,
+            NullLogger<AgentClassRouter>.Instance,
+            _time,
+            quotaAvailabilityPublisher: quotaSignal);
+        using var monitor = new AgentQuotaRecoveryProbeMonitor(
+            quotaSignal,
+            quotaSignal,
+            [codexProbe, claudeProbe],
+            new QuotaGateAvailability(new QuotaGatePolicy(routerOptions)),
+            routerOptions,
+            NullLogger<AgentQuotaRecoveryProbeMonitor>.Instance,
+            _time,
+            store,
+            projects,
+            router);
+        using var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = TimeSpan.FromHours(6),
+                    MaxAutoRetriesPerWorkItem = 3,
+                },
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            projects,
+            null,
+            null,
+            _time,
+            quotaAvailabilitySignal: quotaSignal);
+
+        var workItemId = WorkItemId.New();
+        var workBranch = "codeybox/rework-" + Guid.NewGuid().ToString("N")[..8];
+        await gitHost.EnsureRepositoryAsync(workItemId, seedFromUrl: null, CancellationToken.None);
+        await CommitToBareBranchAsync(gitHost.GetRepoPath(workItemId.ToString()), workBranch);
+
+        var parked = new WorkItem
+        {
+            Id = workItemId,
+            ProjectId = projectId,
+            Title = "parked rework",
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            AgentClassId = "audit-quota-class",
+            WorkBranch = workBranch,
+            QuotaRetryFrom = RetryFromPolicy.Rework,
+            NextQuotaRetryAt = _time.Now.AddDays(7),
+        };
+        await store.CreateAsync(parked);
+
+        quotaSignal.RecordQuotaUsability(codexMember, isUsable: false, resetAt: _time.Now.AddDays(7));
+        quotaSignal.RecordQuotaUsability(claudeAuditMember, isUsable: false, resetAt: _time.Now.AddDays(7));
+
+        Assert.Equal(1, await monitor.ProbeTrackedMembersOnceAsync(CancellationToken.None));
+        Assert.Equal(0, codexProbe.CallCount);
+        Assert.True(claudeProbe.CallCount > 0);
+
+        var retried = await WaitForAttemptsAsync(store, parked.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));
+        Assert.Equal(WorkItemState.WorkComplete, retried.State);
+        Assert.Equal(1, retried.QuotaRetryAttempts);
+    }
+
+    [Fact]
+    public async Task QuotaRecoveryProbeMonitor_NoEligibleParkedWork_DoesNotProbe()
+    {
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+        var projectId = new ProjectId("direct-no-work-project");
+        var project = new Project
+        {
+            Id = projectId,
+            DisplayName = "Direct no work",
+            RepositoryUrl = "http://fake",
+            DefaultAgent = AgentKind.Claude,
+        };
+        var projects = new InMemoryProjectRepository(project);
+        var routerOptions = new QuotaRouterOptions { MinQuotaPct = 10 };
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Codex,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+        var probe = new CachingMutableProbe(AgentKind.Codex, availablePct: 80);
+        var router = new AgentClassRouter(
+            [],
+            [probe],
+            routerOptions,
+            NullLogger<AgentClassRouter>.Instance,
+            _time,
+            quotaAvailabilityPublisher: quotaSignal);
+        using var monitor = new AgentQuotaRecoveryProbeMonitor(
+            quotaSignal,
+            quotaSignal,
+            [probe],
+            new QuotaGateAvailability(new QuotaGatePolicy(routerOptions)),
+            routerOptions,
+            NullLogger<AgentQuotaRecoveryProbeMonitor>.Instance,
+            _time,
+            store,
+            projects,
+            router);
+
+        await store.CreateAsync(new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = "parked on claude",
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            Agent = AgentKind.Claude,
+            NextQuotaRetryAt = _time.Now.AddDays(7),
+        });
+
+        quotaSignal.RecordQuotaUsability(member, isUsable: false, resetAt: _time.Now.AddDays(7));
+
+        Assert.Equal(0, await monitor.ProbeTrackedMembersOnceAsync(CancellationToken.None));
+        Assert.Equal(0, probe.CallCount);
+        Assert.Equal(0, probe.Invalidations);
+    }
+
+    [Fact]
+    public async Task QuotaRecoveryProbeMonitor_DeniedProbeBacksOff()
+    {
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+        var projectId = new ProjectId("direct-backoff-project");
+        var project = new Project
+        {
+            Id = projectId,
+            DisplayName = "Direct backoff",
+            RepositoryUrl = "http://fake",
+            DefaultAgent = AgentKind.Codex,
+        };
+        var projects = new InMemoryProjectRepository(project);
+        var routerOptions = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10,
+            QuotaRecoveryProbeInterval = TimeSpan.FromSeconds(5),
+        };
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Codex,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+        var probe = new CachingMutableProbe(AgentKind.Codex, availablePct: 0);
+        var router = new AgentClassRouter(
+            [],
+            [probe],
+            routerOptions,
+            NullLogger<AgentClassRouter>.Instance,
+            _time,
+            quotaAvailabilityPublisher: quotaSignal);
+        using var monitor = new AgentQuotaRecoveryProbeMonitor(
+            quotaSignal,
+            quotaSignal,
+            [probe],
+            new QuotaGateAvailability(new QuotaGatePolicy(routerOptions)),
+            routerOptions,
+            NullLogger<AgentQuotaRecoveryProbeMonitor>.Instance,
+            _time,
+            store,
+            projects,
+            router);
+
+        await store.CreateAsync(new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = "parked on codex",
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            Agent = AgentKind.Codex,
+            NextQuotaRetryAt = _time.Now.AddDays(7),
+        });
+
+        quotaSignal.RecordQuotaUsability(member, isUsable: false, resetAt: _time.Now.AddDays(7));
+
+        Assert.Equal(0, await monitor.ProbeTrackedMembersOnceAsync(CancellationToken.None));
+        Assert.Equal(1, probe.CallCount);
+
+        Assert.Equal(0, await monitor.ProbeTrackedMembersOnceAsync(CancellationToken.None));
+        Assert.Equal(1, probe.CallCount);
+
+        _time.Now = _time.Now.Add(routerOptions.QuotaRecoveryProbeInterval);
+        Assert.Equal(0, await monitor.ProbeTrackedMembersOnceAsync(CancellationToken.None));
+        Assert.Equal(2, probe.CallCount);
+    }
+
+    [Fact]
+    public void QuotaRecoveryProbeMonitor_DuplicateProbeRegistrationFailsFast()
+    {
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
+        var options = new QuotaRouterOptions { MinQuotaPct = 10 };
+
+        Assert.Throws<ArgumentException>(() => new AgentQuotaRecoveryProbeMonitor(
+            quotaSignal,
+            quotaSignal,
+            [
+                new MutableProbe(AgentKind.Codex, availablePct: 0),
+                new MutableProbe(AgentKind.Codex, availablePct: 100),
+            ],
+            new QuotaGateAvailability(new QuotaGatePolicy(options)),
+            options,
+            NullLogger<AgentQuotaRecoveryProbeMonitor>.Instance,
+            _time));
+    }
+
+    [Fact]
+    public async Task QuotaRecoveryProbeMonitor_DelegatesUnknownSnapshotPolicyToGate()
+    {
+        var options = new QuotaRouterOptions
+        {
+            MinQuotaPct = 10,
+            UnknownPolicy = QuotaUnknownPolicy.FailOpen,
+        };
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Codex,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+        var probe = new MutableProbe(
+            AgentKind.Codex,
+            AgentQuotaSnapshot.UnknownSnapshot(QuotaUnknownReason.Transient, "test unknown"));
+        using var monitor = new AgentQuotaRecoveryProbeMonitor(
+            quotaSignal,
+            quotaSignal,
+            [probe],
+            new QuotaGateAvailability(new QuotaGatePolicy(options)),
+            options,
+            NullLogger<AgentQuotaRecoveryProbeMonitor>.Instance,
+            _time);
+        var signalCount = 0;
+        quotaSignal.QuotaUsableThresholdCrossed += () => Interlocked.Increment(ref signalCount);
+
+        quotaSignal.RecordQuotaUsability(member, isUsable: false);
+
+        Assert.Equal(1, await monitor.ProbeTrackedMembersOnceAsync(CancellationToken.None));
+        Assert.Equal(1, Volatile.Read(ref signalCount));
+    }
+
+    [Fact]
+    public async Task Scheduler_QuotaUsableSignalDuringActiveSweep_QueuesFollowUpSweep()
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        var store = new SqliteWorkItemStore(stateDb);
+        using var _ = store;
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var projectId = new ProjectId("test-project");
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = projectId,
+            DisplayName = "Test",
+            RepositoryUrl = "http://fake",
+            DefaultAgentClass = "signal-race-class",
+        });
+        var quotaSignal = new ManualQuotaAvailabilitySignal();
+        var router = new SignalDuringFirstRetryRouter(quotaSignal.Fire);
+        using var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = TimeSpan.FromHours(6),
+                    MaxAutoRetriesPerWorkItem = 3,
+                },
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            projects,
+            null,
+            null,
+            _time,
+            quotaAvailabilitySignal: quotaSignal);
+        var parked = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = "parked",
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            QuotaRetryAttempts = 0,
+            AgentClassId = "signal-race-class",
+            NextQuotaRetryAt = _time.Now.AddDays(7),
+        };
+        await store.CreateAsync(parked);
+
+        quotaSignal.Fire();
+
+        var retried = await WaitForAttemptsAsync(store, parked.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));
+        Assert.Equal(WorkItemState.Queued, retried.State);
+        Assert.True(router.ResolveCalls >= 2);
+    }
+
+    [Fact]
+    public async Task Scheduler_QuotaUsableSignal_RequeuesWaitingItemsInPriorityOrder()
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var projectId = new ProjectId("priority-recovery-project");
+        var project = new Project
+        {
+            Id = projectId,
+            DisplayName = "Priority recovery",
+            RepositoryUrl = "http://fake",
+            DefaultAgentClass = "priority-recovery-class",
+        };
+        var projects = new InMemoryProjectRepository(project);
+        var routerOptions = new QuotaRouterOptions { MinQuotaPct = 10 };
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Codex,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+        var probe = new MutableProbe(AgentKind.Codex, availablePct: 80);
+        var router = new AgentClassRouter(
+            [
+                new AgentClass
+                {
+                    Id = "priority-recovery-class",
+                    DisplayName = "Priority recovery",
+                    Members = [member],
+                },
+            ],
+            [probe],
+            routerOptions,
+            NullLogger<AgentClassRouter>.Instance,
+            _time,
+            quotaAvailabilityPublisher: quotaSignal);
+        using var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = TimeSpan.FromHours(6),
+                    MaxAutoRetriesPerWorkItem = 3,
+                },
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            projects,
+            null,
+            null,
+            _time,
+            quotaAvailabilitySignal: quotaSignal);
+
+        var low = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = "low priority",
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            AgentClassId = "priority-recovery-class",
+            NextQuotaRetryAt = _time.Now.AddDays(7),
+            CreatedAt = _time.Now,
+            Priority = 1,
+        };
+        var high = low with
+        {
+            Id = WorkItemId.New(),
+            Title = "high priority",
+            CreatedAt = _time.Now.AddMinutes(1),
+            Priority = 100,
+        };
+        await store.CreateAsync(low);
+        await store.CreateAsync(high);
+
+        quotaSignal.RecordQuotaUsability(member, isUsable: false, resetAt: _time.Now.AddDays(7));
+        quotaSignal.RecordQuotaUsability(member, isUsable: true);
+
+        var highRetried = await WaitForAttemptsAsync(store, high.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));
+        var lowRetried = await WaitForAttemptsAsync(store, low.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));
+        Assert.Equal(WorkItemState.Queued, highRetried.State);
+        Assert.Equal(WorkItemState.Queued, lowRetried.State);
+
+        Assert.Equal(high.Id, await taskQueue.DequeueAsync(CancellationToken.None));
+        Assert.Equal(low.Id, await taskQueue.DequeueAsync(CancellationToken.None));
     }
 
     [Fact]
@@ -2007,6 +3257,8 @@ public sealed class QuotaAutoRetryTests : IDisposable
         };
         var projects = new InMemoryProjectRepository(project);
         var probe = new MutableProbe(AgentKind.Claude, availablePct: 0);
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
         var router = new AgentClassRouter(
             [
                 new AgentClass
@@ -2022,7 +3274,8 @@ public sealed class QuotaAutoRetryTests : IDisposable
             [probe],
             new QuotaRouterOptions { MinQuotaPct = 10 },
             NullLogger<AgentClassRouter>.Instance,
-            _time);
+            _time,
+            quotaAvailabilityPublisher: quotaSignal);
         using var scheduler = new QuotaRetryScheduler(
             store,
             retrier,
@@ -2041,10 +3294,10 @@ public sealed class QuotaAutoRetryTests : IDisposable
             null,
             null,
             _time,
-            quotaAvailabilitySignal: router);
+            quotaAvailabilitySignal: quotaSignal);
 
         var signalCount = 0;
-        router.QuotaUsableThresholdCrossed += () => System.Threading.Interlocked.Increment(ref signalCount);
+        quotaSignal.QuotaUsableThresholdCrossed += () => System.Threading.Interlocked.Increment(ref signalCount);
 
         var parked = new WorkItem
         {
@@ -2163,6 +3416,19 @@ public sealed class QuotaAutoRetryTests : IDisposable
 
         throw new TimeoutException(
             $"Work item {id} did not reach quotaRetryAttempts={expectedAttempts}; latest={latest?.QuotaRetryAttempts}");
+    }
+
+    private async Task CommitToBareBranchAsync(string barePath, string branch)
+    {
+        var clone = Path.Combine(_workspace, "bare-edit-" + Guid.NewGuid().ToString("N")[..8]);
+        await TestSupport.RunGit(_workspace, "clone", barePath, clone);
+        await TestSupport.RunGit(clone, "config", "user.email", "test@test.com");
+        await TestSupport.RunGit(clone, "config", "user.name", "Test");
+        await TestSupport.RunGit(clone, "checkout", "-B", branch);
+        await File.WriteAllTextAsync(Path.Combine(clone, "work.txt"), "work complete\n");
+        await TestSupport.RunGit(clone, "add", "work.txt");
+        await TestSupport.RunGit(clone, "commit", "-m", $"work complete\n\n{CodeyBoxTrailers.CoAuthoredBy}");
+        await TestSupport.RunGit(clone, "push", "origin", $"{branch}:{branch}");
     }
 
     private static async Task WaitForConditionAsync(Func<bool> condition, TimeSpan timeout)

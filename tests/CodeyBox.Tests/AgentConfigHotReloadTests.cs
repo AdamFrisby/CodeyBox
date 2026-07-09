@@ -2211,14 +2211,11 @@ public sealed class AgentConfigHotReloadTests
             {
                 MinQuotaPct = 10.0,
                 ColdStartFitInWindow = 2.0,
+                QuotaRecoveryProbeIntervalSeconds = 5,
             },
         };
         var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
-        var qro = new QuotaRouterOptions
-        {
-            MinQuotaPct = initial.QuotaRouter.MinQuotaPct,
-            ColdStartFitInWindow = initial.QuotaRouter.ColdStartFitInWindow,
-        };
+        var qro = QuotaRouterConfigMapper.ToOptions(initial.QuotaRouter);
         var router = new AgentClassRouter(
             Array.Empty<AgentClass>(),
             Array.Empty<IAgentQuotaProbe>(),
@@ -2236,18 +2233,31 @@ public sealed class AgentConfigHotReloadTests
         await coordinator.StartAsync(CancellationToken.None);
 
         Assert.Equal(2.0, qro.ColdStartFitInWindow);
+        Assert.Equal(TimeSpan.FromSeconds(5), qro.QuotaRecoveryProbeInterval);
 
         monitor.Fire(new CodeyBoxOptions
         {
-            QuotaRouter = new QuotaRouterConfig { MinQuotaPct = 10.0, ColdStartFitInWindow = 5.0 },
+            QuotaRouter = new QuotaRouterConfig
+            {
+                MinQuotaPct = 10.0,
+                ColdStartFitInWindow = 5.0,
+                QuotaRecoveryProbeIntervalSeconds = 2,
+            },
         });
         Assert.Equal(5.0, qro.ColdStartFitInWindow);
+        Assert.Equal(TimeSpan.FromSeconds(2), qro.QuotaRecoveryProbeInterval);
 
         monitor.Fire(new CodeyBoxOptions
         {
-            QuotaRouter = new QuotaRouterConfig { MinQuotaPct = 10.0, ColdStartFitInWindow = 1.5 },
+            QuotaRouter = new QuotaRouterConfig
+            {
+                MinQuotaPct = 10.0,
+                ColdStartFitInWindow = 1.5,
+                QuotaRecoveryProbeIntervalSeconds = 3,
+            },
         });
         Assert.Equal(1.5, qro.ColdStartFitInWindow);
+        Assert.Equal(TimeSpan.FromSeconds(3), qro.QuotaRecoveryProbeInterval);
 
         await coordinator.StopAsync(CancellationToken.None);
     }

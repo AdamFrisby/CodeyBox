@@ -31,11 +31,19 @@ public interface IAgentQuotaAvailabilitySnapshot
 }
 
 /// <summary>
-/// Emits a wake-up signal when a quota probe observes a class member cross from
-/// below its effective floor to usable. Consumers can react without depending
-/// on the concrete router.
+/// Emits a wake-up signal when quota availability observations cross from
+/// unroutable to routable. Consumers can react without depending on the
+/// concrete transition tracker.
 /// </summary>
 public interface IAgentQuotaAvailabilitySignal
 {
     event Action? QuotaUsableThresholdCrossed;
+
+    /// <summary>
+    /// Instance-aware quota recovery signal. The legacy no-argument event is
+    /// retained for broad wake-ups; subscribers that can act on a recovered
+    /// member should use this event to avoid being limited by a global priority
+    /// prefix.
+    /// </summary>
+    event Action<AgentQuotaMemberKey>? QuotaMemberUsableThresholdCrossed;
 }

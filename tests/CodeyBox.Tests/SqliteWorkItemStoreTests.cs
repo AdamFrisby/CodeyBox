@@ -185,6 +185,101 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task ListWaitingForQuotaResetByPriorityAsync_AppliesLimitAndPriorityOrder()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var highOlder = Sample() with
+        {
+            State = WorkItemState.WaitingForQuotaReset,
+            Priority = 10,
+            CreatedAt = now.AddMinutes(-3),
+        };
+        var highNewer = Sample() with
+        {
+            State = WorkItemState.WaitingForQuotaReset,
+            Priority = 10,
+            CreatedAt = now.AddMinutes(-1),
+        };
+        var low = Sample() with
+        {
+            State = WorkItemState.WaitingForQuotaReset,
+            Priority = 1,
+            CreatedAt = now.AddMinutes(-5),
+        };
+        var queued = Sample() with
+        {
+            State = WorkItemState.Queued,
+            Priority = 100,
+            CreatedAt = now.AddMinutes(-10),
+        };
+        await _store.CreateAsync(low);
+        await _store.CreateAsync(highNewer);
+        await _store.CreateAsync(queued);
+        await _store.CreateAsync(highOlder);
+
+        var results = new List<WorkItem>();
+        await foreach (var item in _store.ListWaitingForQuotaResetByPriorityAsync(limit: 2))
+            results.Add(item);
+
+        Assert.Equal([highOlder.Id, highNewer.Id], results.Select(item => item.Id));
+    }
+
+    [Fact]
+    public async Task ListWaitingForQuotaResetByPriorityAsync_PagesInPriorityOrder()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var highCodex = Sample() with
+        {
+            State = WorkItemState.WaitingForQuotaReset,
+            Agent = AgentKind.Codex,
+            Priority = 10,
+            CreatedAt = now.AddMinutes(-3),
+        };
+        var skippedClaude = Sample() with
+        {
+            State = WorkItemState.WaitingForQuotaReset,
+            Agent = AgentKind.Claude,
+            Priority = 100,
+            CreatedAt = now.AddMinutes(-4),
+        };
+        var lowCodex = Sample() with
+        {
+            State = WorkItemState.WaitingForQuotaReset,
+            Agent = AgentKind.Codex,
+            Priority = 1,
+            CreatedAt = now.AddMinutes(-5),
+        };
+        var queuedCodex = Sample() with
+        {
+            State = WorkItemState.Queued,
+            Agent = AgentKind.Codex,
+            Priority = 100,
+            CreatedAt = now.AddMinutes(-10),
+        };
+        await _store.CreateAsync(lowCodex);
+        await _store.CreateAsync(skippedClaude);
+        await _store.CreateAsync(queuedCodex);
+        await _store.CreateAsync(highCodex);
+
+        var firstPage = new List<WorkItem>();
+        await foreach (var item in _store.ListWaitingForQuotaResetByPriorityAsync(limit: 2))
+        {
+            firstPage.Add(item);
+        }
+
+        var secondPage = new List<WorkItem>();
+        await foreach (var item in _store.ListWaitingForQuotaResetByPriorityAsync(
+            limit: 1,
+            after: WaitingForQuotaResetPriorityCursor.From(firstPage.Last())))
+        {
+            secondPage.Add(item);
+        }
+
+        Assert.Equal([skippedClaude.Id, highCodex.Id], firstPage.Select(item => item.Id));
+        Assert.Equal([lowCodex.Id], secondPage.Select(item => item.Id));
+    }
+
+    [Fact]
     public async Task ReadMethods_WaitBehindSharedConnectionGate()
     {
         var queued = Sample();

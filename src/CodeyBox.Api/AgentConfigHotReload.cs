@@ -935,6 +935,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                             : (int?)null,
                     }),
                 opts.QuotaRecheckIntervalSeconds,
+                opts.QuotaRecoveryProbeIntervalSeconds,
+                opts.MaxQuotaRecoveryProbeEligibilityScan,
                 UnknownPolicy = opts.UnknownPolicy.ToString(),
                 opts.ObservedFailureWindowMinutes,
                 opts.ObservedFailureRetentionMinutes,

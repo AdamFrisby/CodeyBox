@@ -18,6 +18,7 @@ namespace CodeyBox.Tests;
 /// HTTP-level tests for GET /workitems/{id}/audit-reports and
 /// GET /workitems/{id}/audit-reports/{iteration}/{auditor}/raw.
 /// </summary>
+[Collection("GlobalSerilog")]
 public sealed class AuditReportsEndpointTests : IDisposable
 {
     private readonly AuditReportApiFactory _factory = new();

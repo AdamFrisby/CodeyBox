@@ -9,6 +9,7 @@ namespace CodeyBox.Tests;
 /// Verifies the priority surface on POST /workitems, PATCH /workitems/{id}/priority,
 /// and the priority field in the work-item DTO responses.
 /// </summary>
+[Collection("GlobalSerilog")]
 public sealed class WorkItemPriorityApiTests : IDisposable
 {
     private readonly WorkItemApiFactory _factory;

@@ -54,49 +54,39 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     private readonly AgentConcurrencySnapshot? _concurrencySnapshot;
     private readonly InVmSmokeSandboxTarget? _configuredSmokeTarget;
     private readonly IAgentDispatchAvailability? _dispatchAvailability;
+    private readonly IAgentQuotaAvailabilityPublisher? _quotaAvailabilityPublisher;
+    private readonly AgentQuotaAvailabilityBroadcaster? _localQuotaAvailability;
     // Default fit when no historical samples exist (spec: "fits 2 concurrent
     // burns" so the queue does not stall on cold start). Exposed as a constant
     // so /concurrency surface and tests reference the same value.
     public const double DefaultColdStartFitInWindow = 2.0;
-    // In-process short-lived exhaustion cache populated by mid-iteration fallback.
-    // Keyed by (route key, model id ?? ""); value is the UTC instant at which
-    // the suppression expires. Survives only the current process lifetime —
-    // QuotaRetryScheduler / IQuotaFailureStore cover cross-restart durability.
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<MemberQuotaKey, ExhaustionEntry> _exhausted
-        = new();
+    // In-process short-lived exhaustion tracker populated by mid-iteration
+    // fallback. Keys come from AgentQuotaMemberKey and values carry ExpiresAt
+    // plus an optional provider ResetAt. Survives only the current process
+    // lifetime — QuotaRetryScheduler / IQuotaFailureStore cover cross-restart
+    // durability.
+    private readonly AgentQuotaExhaustionTracker _exhausted = new();
 
     // Last quota-availability percentage observed per (agent, model) during
     // routing. Read by the OpenTelemetry observable gauge so dashboards can
     // chart subscription headroom without issuing fresh probe round-trips on
     // the metrics-collection thread. -1 means "unknown" (the probe could not
     // determine availability). Updated on every ProbeAsync result.
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<MemberQuotaKey, double> _lastAvailablePct
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<AgentQuotaMemberKey, double> _lastAvailablePct
         = new();
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<MemberQuotaKey, EffectiveQuota> _lastEffectiveQuota
-        = new();
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<MemberQuotaKey, bool> _lastQuotaUsable
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<AgentQuotaMemberKey, EffectiveQuota> _lastEffectiveQuota
         = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<WorkItemId, QuotaRetryAdmission> _quotaRetryAdmissions
         = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _roundRobinCursors
         = new(StringComparer.OrdinalIgnoreCase);
 
-    private readonly record struct MemberQuotaKey(string RouteKey, AgentKind Agent, string ModelId);
     private sealed record QuotaRetryAdmission(
         string RouteKey,
         string ModelId,
         string? RequiredCapability,
         DateTimeOffset ExpiresAt);
-    private sealed record ExhaustionEntry(DateTimeOffset ExpiresAt);
     private sealed record PrecomputedQuota(AgentQuotaSnapshot Snapshot, BudgetAdjustedQuota Budgeted);
-
-    /// <summary>
-    /// Raised when a routing probe observes an eligible member move from below
-    /// the effective quota floor to usable. Exposed through
-    /// <see cref="IAgentQuotaAvailabilitySignal"/> so consumers do not need the
-    /// concrete router for quota wake-up notifications.
-    /// </summary>
-    public event Action? QuotaUsableThresholdCrossed;
 
     public AgentClassRouter(
         IReadOnlyList<AgentClass> catalog,
@@ -111,17 +101,14 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         IAgentBudgetProvider? budgetProvider = null,
         AgentConcurrencySnapshot? concurrencySnapshot = null,
         InVmSmokeSandboxTarget? configuredSmokeTarget = null,
-        IAgentDispatchAvailability? dispatchAvailability = null)
+        IAgentDispatchAvailability? dispatchAvailability = null,
+        IAgentQuotaAvailabilityPublisher? quotaAvailabilityPublisher = null)
     {
         _routingConfig = new RoutingConfig(
             catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase),
             todModifiers ?? []);
         var probeList = probes.ToList();
-        // PayPerApiQuotaProbe and NullQuotaProbe are selected by billing type, not kind;
-        // exclude them from the kind-based lookup to avoid polluting the dictionary.
-        _probesByKind = probeList
-            .Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe)
-            .ToDictionary(p => p.Kind);
+        _probesByKind = AgentQuotaProbeCatalog.BuildSubscriptionProbeKindLookup(probeList);
         _payPerApiProbe = probeList.OfType<PayPerApiQuotaProbe>().FirstOrDefault() ?? new PayPerApiQuotaProbe();
         _nullProbe = probeList.OfType<NullQuotaProbe>().FirstOrDefault() ?? new NullQuotaProbe();
         _opts = opts;
@@ -135,6 +122,45 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         _concurrencySnapshot = concurrencySnapshot;
         _configuredSmokeTarget = configuredSmokeTarget;
         _dispatchAvailability = dispatchAvailability;
+        _quotaAvailabilityPublisher = quotaAvailabilityPublisher;
+        if (quotaAvailabilityPublisher is not IAgentQuotaAvailabilitySignal)
+            _localQuotaAvailability = new AgentQuotaAvailabilityBroadcaster();
+    }
+
+    public event Action? QuotaUsableThresholdCrossed
+    {
+        add
+        {
+            if (_quotaAvailabilityPublisher is IAgentQuotaAvailabilitySignal signal)
+                signal.QuotaUsableThresholdCrossed += value;
+            else
+                _localQuotaAvailability!.QuotaUsableThresholdCrossed += value;
+        }
+        remove
+        {
+            if (_quotaAvailabilityPublisher is IAgentQuotaAvailabilitySignal signal)
+                signal.QuotaUsableThresholdCrossed -= value;
+            else
+                _localQuotaAvailability!.QuotaUsableThresholdCrossed -= value;
+        }
+    }
+
+    public event Action<AgentQuotaMemberKey>? QuotaMemberUsableThresholdCrossed
+    {
+        add
+        {
+            if (_quotaAvailabilityPublisher is IAgentQuotaAvailabilitySignal signal)
+                signal.QuotaMemberUsableThresholdCrossed += value;
+            else
+                _localQuotaAvailability!.QuotaMemberUsableThresholdCrossed += value;
+        }
+        remove
+        {
+            if (_quotaAvailabilityPublisher is IAgentQuotaAvailabilitySignal signal)
+                signal.QuotaMemberUsableThresholdCrossed -= value;
+            else
+                _localQuotaAvailability!.QuotaMemberUsableThresholdCrossed -= value;
+        }
     }
 
     /// <summary>
@@ -296,6 +322,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         CancellationToken ct,
         string? requiredCapability = null)
     {
+        if (string.IsNullOrWhiteSpace(item.AgentClassId ?? project?.DefaultAgentClass))
+            return await ResolveDirectQuotaRetryAsync(item, project, ct).ConfigureAwait(false);
+
         var decision = await ResolveCoreAsync(
             item,
             project,
@@ -313,6 +342,44 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             decision.NoEligibleMembers,
             decision.Reason,
             decision.WaitingForPausedAgent);
+    }
+
+    private async Task<QuotaRetryRoutingDecision> ResolveDirectQuotaRetryAsync(
+        WorkItem item,
+        Project? project,
+        CancellationToken ct)
+    {
+        var member = DirectAgentMembership.TryCreate(item, project);
+        if (member is null)
+            return new QuotaRetryRoutingDecision(
+                ShouldWait: false,
+                NoEligibleMembers: true,
+                Reason: "no direct agent configured",
+                WaitingForPausedAgent: false);
+
+        var nowUtc = _time.GetUtcNow();
+        var snapshot = await ProbeOrUnknownAsync(member, ct).ConfigureAwait(false);
+        var quota = ResolveMemberQuota(snapshot, member);
+        quota = (await ApplyBudgetAsync(member, quota, ct).ConfigureAwait(false)).Quota;
+        RecordObservedAvailability(member, quota);
+
+        var gate = await EvaluateGateAsync(member, item.ProjectId, quota, nowUtc, ct).ConfigureAwait(false);
+        RecordQuotaUsability(
+            member,
+            gate.Allow,
+            publishRecoverySignal: true);
+        if (!gate.Allow)
+            return new QuotaRetryRoutingDecision(
+                ShouldWait: true,
+                NoEligibleMembers: false,
+                Reason: gate.Reason,
+                WaitingForPausedAgent: false);
+
+        return new QuotaRetryRoutingDecision(
+            ShouldWait: false,
+            NoEligibleMembers: false,
+            Reason: "direct agent quota available",
+            WaitingForPausedAgent: false);
     }
 
     private async Task<AgentRoutingDecision> ResolveCoreAsync(
@@ -398,7 +465,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             .ThenBy(x => x.Member.Billing == AgentBilling.Subscription ? 0 : 1)
             .ThenBy(x => x.ConfigIndex)
             .ToList();
-        var precomputedQuotas = new Dictionary<MemberQuotaKey, PrecomputedQuota>();
+        var precomputedQuotas = new Dictionary<AgentQuotaMemberKey, PrecomputedQuota>();
         var ordered = await ApplyIntraKindPolicyAsync(
             classId,
             item,
@@ -610,9 +677,16 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
             var gate = await EvaluateGateAsync(member, item.ProjectId, quota, nowUtc, ct);
             if (commitDispatchSideEffects)
-                RecordAvailabilityAndMaybeNotify(member, quota, gate);
+                RecordAvailabilityAndMaybeNotify(member, quota, gate, publishRecoverySignal: true);
             else
+            {
                 RecordObservedAvailability(member, quota);
+                RecordQuotaUsability(
+                    member,
+                    gate.Allow,
+                    publishRecoverySignal: false,
+                    resetAt: gate.Allow || !quota.IsKnown ? null : QuotaGatePolicy.ResolveResetHint(quota, gate));
+            }
             if (gate.Allow)
             {
                 // Per-agent concurrency cap: spill to the next eligible member
@@ -1192,6 +1266,11 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             RecordObservedAvailability(member, quota);
 
             var gate = await EvaluateGateAsync(member, item.ProjectId, quota, nowUtc, ct);
+            RecordQuotaUsability(
+                member,
+                gate.Allow,
+                publishRecoverySignal: true,
+                resetAt: gate.Allow || !quota.IsKnown ? null : QuotaGatePolicy.ResolveResetHint(quota, gate));
             if (gate.Allow)
                 result.Add(member);
         }
@@ -1254,20 +1333,19 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     }
 
     /// <summary>
-    /// Marks a class member as exhausted in this process for <paramref name="ttl"/>
-    /// (or until <paramref name="resetAt"/>, whichever is sooner). Subsequent
-    /// calls to <see cref="OrderedFallbackCandidatesAsync"/> and
+    /// Marks a class member as exhausted in this process for <paramref name="ttl"/>.
+    /// A future <paramref name="resetAt"/> hint may shorten the gate; past or
+    /// current reset hints are ignored. Subsequent calls to
+    /// <see cref="OrderedFallbackCandidatesAsync"/> and
     /// <see cref="ResolveAsync"/> will skip the member while the suppression is
     /// active. Always combine with <see cref="IAgentQuotaProbe.MarkExhaustedAsync"/>
     /// so the suppression also reaches any probe-side cache.
     /// </summary>
     public void MarkExhausted(AgentMembership member, TimeSpan ttl, DateTimeOffset? resetAt = null)
     {
-        if (ttl <= TimeSpan.Zero) return;
         var nowUtc = _time.GetUtcNow();
-        var until = nowUtc + ttl;
-        var key = ExhaustionKey(member);
         var earliestKnownReset = resetAt;
+        var key = ExhaustionKey(member);
         if (_lastEffectiveQuota.TryGetValue(key, out var lastQuota)
             && EarliestKnownWindowReset(lastQuota, nowUtc, futureOnly: true) is { } windowReset
             && (earliestKnownReset is null || windowReset < earliestKnownReset.Value))
@@ -1275,21 +1353,12 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             earliestKnownReset = windowReset;
         }
 
-        // Cap by the earliest known reset — including a past resetAt, which means
-        // the agent's own reset hint says we're already through the window.
-        if (earliestKnownReset is { } reset && reset < until)
-            until = reset;
-        if (until <= nowUtc)
-        {
-            _exhausted.TryRemove(key, out _);
-            return;
-        }
-
-        var next = new ExhaustionEntry(until);
-        _exhausted.AddOrUpdate(key, next, (_, existing) =>
-            existing.ExpiresAt <= nowUtc || next.ExpiresAt < existing.ExpiresAt
-                ? next
-                : existing);
+        if (_exhausted.MarkExhausted(member, ttl, nowUtc, resetAt, earliestKnownReset))
+            RecordQuotaUsability(
+                member,
+                isUsable: false,
+                publishRecoverySignal: true,
+                resetAt: earliestKnownReset ?? resetAt);
     }
 
     public bool IsExhausted(AgentMembership member, DateTimeOffset nowUtc)
@@ -1434,40 +1503,24 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         return true;
     }
 
-    private static MemberQuotaKey ExhaustionKey(AgentMembership member) =>
-        new(member.RouteKey, member.Agent, member.ModelId ?? string.Empty);
+    private static AgentQuotaMemberKey ExhaustionKey(AgentMembership member) =>
+        AgentQuotaMemberKey.From(member);
 
     private bool TryGetExhaustedUntil(AgentMembership member, DateTimeOffset nowUtc, out DateTimeOffset expiresAt)
     {
-        var key = ExhaustionKey(member);
-        if (!_exhausted.TryGetValue(key, out var entry))
+        if (_exhausted.TryGet(member, nowUtc, out var entry))
         {
-            expiresAt = default;
-            return false;
+            expiresAt = entry.ExpiresAt;
+            return true;
         }
 
-        if (entry.ExpiresAt <= nowUtc)
-        {
-            _exhausted.TryRemove(new KeyValuePair<MemberQuotaKey, ExhaustionEntry>(key, entry));
-            expiresAt = default;
-            return false;
-        }
-
-        expiresAt = entry.ExpiresAt;
-        return true;
+        expiresAt = default;
+        return false;
     }
 
     private void PruneExpiredExhaustion(DateTimeOffset nowUtc)
     {
-        // Drop expired exhaustion entries lazily so the cache doesn't grow unbounded
-        // across long-running processes. TryRemove(KeyValuePair) only removes when
-        // the value still matches what we observed — a concurrent MarkExhausted that
-        // refreshed the expiry between the read and the remove is preserved.
-        foreach (var entry in _exhausted)
-        {
-            if (entry.Value.ExpiresAt <= nowUtc)
-                _exhausted.TryRemove(entry);
-        }
+        _exhausted.PruneExpired(nowUtc);
     }
 
     private void RefreshExhaustionFromProbe(
@@ -1476,10 +1529,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         bool knownQuotaUsable,
         DateTimeOffset nowUtc)
     {
-        var key = ExhaustionKey(member);
         if (knownQuotaUsable)
         {
-            if (_exhausted.TryRemove(key, out var removed))
+            if (_exhausted.TryClear(member, out var removed))
             {
                 _log.LogInformation(
                     "Quota probe cleared in-process exhaustion for {Agent}/{Model}; previousExpiry={PreviousExpiry:O} available={Available:F1}%",
@@ -1491,24 +1543,17 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             return;
         }
 
-        if (!_exhausted.TryGetValue(key, out var existing))
-            return;
-
         if (EarliestKnownWindowReset(quota, nowUtc, futureOnly: true) is not { } earliestReset)
             return;
 
-        if (earliestReset >= existing.ExpiresAt)
-            return;
-
-        var shortened = new ExhaustionEntry(earliestReset);
-        if (_exhausted.TryUpdate(key, shortened, existing))
+        if (_exhausted.TryShorten(member, earliestReset, out var existing))
         {
             _log.LogInformation(
                 "Quota probe shortened in-process exhaustion for {Agent}/{Model}: previousExpiry={PreviousExpiry:O} nextExpiry={NextExpiry:O} available={Available:F1}%",
                 member.Agent.Value,
                 member.ModelId ?? "(default)",
                 existing.ExpiresAt,
-                shortened.ExpiresAt,
+                earliestReset,
                 quota.AvailablePct);
         }
     }
@@ -1623,7 +1668,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         string classId,
         WorkItem item,
         List<ScoredMember> sorted,
-        Dictionary<MemberQuotaKey, PrecomputedQuota> precomputedQuotas,
+        Dictionary<AgentQuotaMemberKey, PrecomputedQuota> precomputedQuotas,
         bool commitDispatchSideEffects,
         CancellationToken ct)
     {
@@ -1666,7 +1711,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
     private async Task PrecomputeQuotaForPolicyAsync(
         List<ScoredMember> sorted,
-        Dictionary<MemberQuotaKey, PrecomputedQuota> precomputedQuotas,
+        Dictionary<AgentQuotaMemberKey, PrecomputedQuota> precomputedQuotas,
         bool includeSingleMemberGroups,
         CancellationToken ct)
     {
@@ -1692,7 +1737,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
     private List<ScoredMember> OrderDeadlineAwareDrain(
         List<ScoredMember> sorted,
-        Dictionary<MemberQuotaKey, PrecomputedQuota> precomputedQuotas,
+        Dictionary<AgentQuotaMemberKey, PrecomputedQuota> precomputedQuotas,
         DateTimeOffset nowUtc)
     {
         var ranked = sorted
@@ -1727,7 +1772,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         WorkItem item,
         AgentKind agent,
         List<ScoredMember> group,
-        Dictionary<MemberQuotaKey, PrecomputedQuota> precomputedQuotas,
+        Dictionary<AgentQuotaMemberKey, PrecomputedQuota> precomputedQuotas,
         IntraKindRoutingPolicy policy,
         bool commitDispatchSideEffects)
     {
@@ -1785,7 +1830,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
     private static double QuotaRank(
         AgentMembership member,
-        Dictionary<MemberQuotaKey, PrecomputedQuota> precomputedQuotas)
+        Dictionary<AgentQuotaMemberKey, PrecomputedQuota> precomputedQuotas)
     {
         if (!precomputedQuotas.TryGetValue(ExhaustionKey(member), out var precomputed))
             return member.Billing == AgentBilling.PayPerApi ? 100.0 : double.NegativeInfinity;
@@ -1794,7 +1839,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
     private static int DrainFallbackKindRank(
         AgentMembership member,
-        Dictionary<MemberQuotaKey, PrecomputedQuota> precomputedQuotas)
+        Dictionary<AgentQuotaMemberKey, PrecomputedQuota> precomputedQuotas)
     {
         if (member.Billing == AgentBilling.PayPerApi)
             return 0;
@@ -1918,21 +1963,49 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     private void RecordAvailabilityAndMaybeNotify(
         AgentMembership member,
         EffectiveQuota quota,
-        QuotaGateDecision gate)
+        QuotaGateDecision gate,
+        bool publishRecoverySignal)
     {
-        var key = RecordObservedAvailability(member, quota);
-        if (RecordQuotaUsableTransition(key, gate.Allow))
-            NotifyQuotaUsableThresholdCrossed();
+        RecordObservedAvailability(member, quota);
+        var resetAt = gate.Allow || !quota.IsKnown
+            ? null
+            : QuotaGatePolicy.ResolveResetHint(quota, gate);
+        RecordQuotaUsability(
+            member,
+            gate.Allow,
+            publishRecoverySignal,
+            resetAt);
     }
 
-    private MemberQuotaKey RecordObservedAvailability(
+    private bool RecordQuotaUsability(
+        AgentMembership member,
+        bool isUsable,
+        bool publishRecoverySignal = true,
+        DateTimeOffset? resetAt = null)
+    {
+        var recorded = _quotaAvailabilityPublisher?.RecordQuotaUsability(
+            member,
+            isUsable,
+            publishRecoverySignal,
+            resetAt) ?? true;
+        if (_localQuotaAvailability is not null)
+        {
+            recorded = _localQuotaAvailability.RecordQuotaUsability(
+                member,
+                isUsable,
+                publishRecoverySignal,
+                resetAt) && recorded;
+        }
+        return recorded;
+    }
+
+    private void RecordObservedAvailability(
         AgentMembership member,
         EffectiveQuota quota)
     {
         var key = ExhaustionKey(member);
         _lastAvailablePct[key] = quota.AvailablePct;
         _lastEffectiveQuota[key] = quota;
-        return key;
     }
 
     private bool KnownQuotaMeetsFloor(AgentMembership member, EffectiveQuota quota, DateTimeOffset nowUtc)
@@ -1990,7 +2063,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
     private DeadlineDrainSignal ComputeDeadlineDrainSignal(
         AgentMembership member,
-        Dictionary<MemberQuotaKey, PrecomputedQuota> precomputedQuotas,
+        Dictionary<AgentQuotaMemberKey, PrecomputedQuota> precomputedQuotas,
         DateTimeOffset nowUtc)
     {
         if (member.Billing != AgentBilling.Subscription)
@@ -2174,44 +2247,6 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             member.Agent.Value,
             member.ModelId ?? "(default)",
             reason);
-    }
-
-    private void NotifyQuotaUsableThresholdCrossed()
-    {
-        var handlers = QuotaUsableThresholdCrossed;
-        if (handlers is null)
-            return;
-
-        foreach (Action handler in handlers.GetInvocationList().Cast<Action>())
-        {
-            try
-            {
-                handler();
-            }
-            catch (Exception ex)
-            {
-                _log.LogWarning(ex, "Quota usable threshold subscriber threw; routing decision will continue");
-            }
-        }
-    }
-
-    private bool RecordQuotaUsableTransition(MemberQuotaKey key, bool isUsable)
-    {
-        while (true)
-        {
-            if (!_lastQuotaUsable.TryGetValue(key, out var previous))
-            {
-                if (_lastQuotaUsable.TryAdd(key, isUsable))
-                    return false;
-                continue;
-            }
-
-            if (previous == isUsable)
-                return false;
-
-            if (_lastQuotaUsable.TryUpdate(key, isUsable, previous))
-                return !previous && isUsable;
-        }
     }
 
     /// <summary>
@@ -2817,7 +2852,7 @@ public sealed class QuotaRouterOptions
     /// (claude/codex weekly cap). Override per agent via
     /// <see cref="RampWindowByAgent"/> when an agent's binding window differs.
     /// </summary>
-    public TimeSpan RampWindow { get; set; } = TimeSpan.FromDays(7);
+    public TimeSpan RampWindow { get; set; } = QuotaRouterDefaults.DefaultRampWindow;
 
     /// <summary>
     /// Per-agent override for the ramp window length, keyed by
@@ -2834,6 +2869,24 @@ public sealed class QuotaRouterOptions
     /// are exhausted. Default 5 minutes.
     /// </summary>
     public TimeSpan QuotaRecheckInterval { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Cadence for the event-driven quota recovery monitor while it is tracking
+    /// members that have already emitted an unusable quota observation. This is
+    /// intentionally separate from <see cref="QuotaRecheckInterval"/>: the
+    /// monitor is a prompt recovery path for parked work, while quota recheck is
+    /// the normal router retry delay. Default 5 seconds.
+    /// </summary>
+    public TimeSpan QuotaRecoveryProbeInterval { get; set; } =
+        QuotaRouterDefaults.DefaultQuotaRecoveryProbeInterval;
+
+    /// <summary>
+    /// Maximum parked quota rows the recovery probe monitor inspects on each
+    /// eligibility pass before probing a recovered member. The cap keeps the
+    /// prompt recovery path bounded even when the parked backlog is large.
+    /// </summary>
+    public int MaxQuotaRecoveryProbeEligibilityScan { get; set; } =
+        QuotaRouterDefaults.DefaultQuotaRecoveryProbeEligibilityScanLimit;
 
     /// <summary>
     /// How long a quota probe result is cached before a new HTTP call is made.

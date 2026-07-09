@@ -49,7 +49,7 @@ namespace CodeyBox.Agents.Gemini;
 /// <see cref="AgentQuotaSnapshot.AvailablePct"/> = -1.
 /// </para>
 /// </summary>
-public sealed class GeminiQuotaProbe : IAgentQuotaProbe
+public sealed class GeminiQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalidator
 {
     internal const string UsageEndpoint = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
     internal const string GenerateContentEndpoint = "https://cloudcode-pa.googleapis.com/v1internal:generateContent";

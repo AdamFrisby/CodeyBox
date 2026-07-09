@@ -80,6 +80,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private readonly IAgentStreamStore? _agentStreams;
     private readonly IWorkItemAutoRetryScheduler? _retryScheduler;
     private readonly AgentClassRouter? _classRouter;
+    private readonly IAgentQuotaAvailabilityPublisher? _quotaAvailabilityPublisher;
     private readonly IAgentFallbackHistoryStore? _fallbackHistory;
     private readonly IAgentInvolvementStore? _involvement;
     private readonly InvolvementTracker _involvementTracker;
@@ -314,7 +315,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // entirely (plans still approve). Only planned items reach the emit path,
         // so unplanned items are never touched regardless of wiring.
         ITestCaseStore? testCaseStore = null,
-        IMergeScopeResolver? mergeScopeResolver = null)
+        IMergeScopeResolver? mergeScopeResolver = null,
+        IAgentQuotaAvailabilityPublisher? quotaAvailabilityPublisher = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -364,6 +366,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _inVmSmokeGate = inVmSmokeGate;
         _retryScheduler = retryScheduler;
         _classRouter = classRouter;
+        _quotaAvailabilityPublisher = quotaAvailabilityPublisher;
         _fallbackHistory = fallbackHistory;
         _involvement = involvement;
         _log = log;
@@ -375,13 +378,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // Null intentionally disables durable audit-progress history for narrow
         // test fixtures; production DI wires this dependency explicitly.
         _auditProgress = auditProgress;
-        // PayPerApi and Null probes are routing utilities, not real quota sources —
-        // exclude them so only genuine subscription probes gate the audit agent
-        // and only genuine subscription probes receive mid-iteration write-back.
         _quotaProbesByKind = auditQuotaProbes is null ? null
-            : auditQuotaProbes
-                .Where(p => p is not PayPerApiQuotaProbe and not NullQuotaProbe)
-                .ToDictionary(p => p.Kind);
+            : AgentQuotaProbeCatalog.BuildSubscriptionProbeKindLookup(auditQuotaProbes);
         _auditQuotaOptions = auditQuotaOptions ?? new QuotaRouterOptions();
         _auditQuotaGatePolicy = new QuotaGatePolicy(_auditQuotaOptions);
         _questionStore = questionStore;
@@ -11332,17 +11330,22 @@ public sealed partial class PipelineRunner : IPipelineRunner
         AgentMembership member,
         CancellationToken ct)
     {
+        var nowUtc = _opts.TimeProvider.GetUtcNow();
         var hasQuotaRetryAdmission = _classRouter?.HasQuotaRetryAdmission(
             itemId,
             member,
-            _opts.TimeProvider.GetUtcNow()) == true;
+            nowUtc) == true;
         if (_quotaFailures is not null
             && !hasQuotaRetryAdmission
             && await _quotaFailures.HasRecentAsync(
                 kind, member.ModelId,
                 _auditQuotaOptions.ObservedFailureWindow,
-                DateTimeOffset.UtcNow, ct))
+                nowUtc, ct))
         {
+            _quotaAvailabilityPublisher?.RecordQuotaUsability(
+                member,
+                isUsable: false,
+                publishRecoverySignal: true);
             return (false, "recent observed quota failure");
         }
 
@@ -11365,7 +11368,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 return (true, "no probe registered");
 
             var budgetQuota = new EffectiveQuota(budgetPct, null, null, budget?.Windows);
-            return EvaluateAuditQuotaGate(member, budgetQuota, budgetOnly: true);
+            return EvaluateAuditQuotaGate(member, budgetQuota, nowUtc, budgetOnly: true);
         }
 
         EffectiveQuota probeQuota;
@@ -11398,16 +11401,32 @@ public sealed partial class PipelineRunner : IPipelineRunner
             AvailablePct = combinedPct,
         };
 
-        return EvaluateAuditQuotaGate(member, combinedQuota, budgetOnly: false);
+        var decision = EvaluateAuditQuotaGate(member, combinedQuota, nowUtc, budgetOnly: false);
+        var providerGate = _auditQuotaGatePolicy.Evaluate(member, probeQuota, nowUtc);
+        var denialIsBudgetOnly = !decision.Allowed
+            && providerGate.Allow
+            && budgetPct >= 0
+            && combinedPct >= 0
+            && (probeQuota.AvailablePct < 0 || budgetPct <= probeQuota.AvailablePct);
+        if (!denialIsBudgetOnly)
+        {
+            _quotaAvailabilityPublisher?.RecordQuotaUsability(
+                member,
+                isUsable: decision.Allowed,
+                publishRecoverySignal: true);
+        }
+
+        return decision;
     }
 
     private (bool Allowed, string Reason) EvaluateAuditQuotaGate(
         AgentMembership member,
         EffectiveQuota quota,
+        DateTimeOffset nowUtc,
         bool budgetOnly)
     {
         var combinedPct = quota.AvailablePct;
-        var gate = _auditQuotaGatePolicy.Evaluate(member, quota, DateTimeOffset.UtcNow);
+        var gate = _auditQuotaGatePolicy.Evaluate(member, quota, nowUtc);
         if (gate.Allow)
         {
             return budgetOnly
@@ -16188,16 +16207,18 @@ Original merge-phase failure (JSON string, for context only):
             return;
         }
 
-        if (_retryScheduler is not null)
-            await _retryScheduler.NotifyQuotaFailureAsync(next);
-
-        AuditLog.WorkItemTransitioned(item.Id, WorkItemState.WaitingForQuotaReset.ToString());
         var effectiveProject = project ?? new Project
         {
             Id = item.ProjectId,
             DisplayName = item.ProjectId.Value,
             RepositoryUrl = string.Empty,
         };
+        await RecordDirectQuotaParkAsync(next, effectiveProject, effectiveResetAt, ct);
+
+        if (_retryScheduler is not null)
+            await _retryScheduler.NotifyQuotaFailureAsync(next);
+
+        AuditLog.WorkItemTransitioned(item.Id, WorkItemState.WaitingForQuotaReset.ToString());
         await _webhooks.PublishAsync(new WebhookEvent
         {
             Event = "work_item.waiting_for_quota_reset",
@@ -16212,7 +16233,57 @@ Original merge-phase failure (JSON string, for context only):
                 ToAgent: null,
                 ToModel: null,
                 Reason: error),
-        }, ct);
+            }, ct);
+    }
+
+    private async Task RecordDirectQuotaParkAsync(
+        WorkItem item,
+        Project? project,
+        DateTimeOffset? resetAt,
+        CancellationToken ct)
+    {
+        if (!IsDirectQuotaPark(item, project))
+            return;
+
+        var member = DirectAgentMembership.TryCreate(item, project);
+        if (member is null)
+            return;
+
+        if (_quotaProbesByKind is not null
+            && _quotaProbesByKind.TryGetValue(member.Agent, out var probe))
+        {
+            try
+            {
+                await probe.MarkExhaustedAsync(
+                    member,
+                    _pipelineTuning.Current.QuotaExhaustionFallbackTtl,
+                    resetAt,
+                    ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(
+                    ex,
+                    "Direct quota park probe write-back failed for {Agent}/{Model}",
+                    member.Agent.Value,
+                    member.ModelId ?? "(default)");
+            }
+        }
+
+        _quotaAvailabilityPublisher?.RecordQuotaUsability(
+            member,
+            isUsable: false,
+            publishRecoverySignal: true,
+            resetAt);
+    }
+
+    private bool IsDirectQuotaPark(WorkItem item, Project? project)
+    {
+        return DirectAgentMembership.IsDirectRoute(item, project);
     }
 
     /// <summary>

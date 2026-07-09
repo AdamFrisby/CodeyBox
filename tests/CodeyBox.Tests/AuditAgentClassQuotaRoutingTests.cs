@@ -99,6 +99,9 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         // AuditQuotaPauseTests.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new RecordingLlmAuditor("security:llm-review");
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster();
+        var observations = new List<AgentQuotaUsabilityObservation>();
+        quotaSignal.QuotaUsabilityObserved += observations.Add;
         using var fix = BuildFixture(seed, auditor,
             classMembers: [AgentKind.Gemini, AgentKind.Claude, AgentKind.Codex],
             quotas: new()
@@ -106,7 +109,8 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
                 [AgentKind.Gemini] = 1.0,
                 [AgentKind.Claude] = 2.0,
                 [AgentKind.Codex] = 3.0,
-            });
+            },
+            quotaAvailabilityPublisher: quotaSignal);
         fix.Codex!.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
 
         var item = NewItem(AgentKind.Codex);
@@ -124,6 +128,9 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         // The fix guarantees the LastError never carries the old
         // "agent exited 1" string when the auditor cannot run for quota.
         Assert.DoesNotContain("agent exited 1", final.LastError ?? string.Empty);
+        Assert.Contains(observations, o => o.Member.Agent == AgentKind.Gemini && !o.IsUsable && o.PublishRecoverySignal);
+        Assert.Contains(observations, o => o.Member.Agent == AgentKind.Claude && !o.IsUsable && o.PublishRecoverySignal);
+        Assert.Contains(observations, o => o.Member.Agent == AgentKind.Codex && !o.IsUsable && o.PublishRecoverySignal);
     }
 
     // ── Resume after quota return: every auditor runs before a Pass verdict ─
@@ -720,7 +727,8 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
         QuotaRouterOptions? auditQuotaOptions = null,
         DateTimeOffset? quotaResetAt = null,
         Dictionary<AgentKind, IReadOnlyList<WindowQuota>>? quotaWindows = null,
-        bool wireRetrier = false)
+        bool wireRetrier = false,
+        IAgentQuotaAvailabilityPublisher? quotaAvailabilityPublisher = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -774,7 +782,8 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
             [frontier],
             probes,
             effectiveRouterQuotaOptions,
-            NullLogger<AgentClassRouter>.Instance);
+            NullLogger<AgentClassRouter>.Instance,
+            quotaAvailabilityPublisher: quotaAvailabilityPublisher);
 
         var project = new Project
         {
@@ -831,7 +840,8 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
             budgetProvider: budgetProvider,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,
-            terminalRevisionBuilder: terminalTransitions);
+            terminalRevisionBuilder: terminalTransitions,
+            quotaAvailabilityPublisher: quotaAvailabilityPublisher);
 
         return new RoutingFixture(pipeline, store, webhooks, codex, router, configurableProbes, retrier);
     }

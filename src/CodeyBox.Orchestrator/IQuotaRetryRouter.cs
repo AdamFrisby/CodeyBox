@@ -61,26 +61,25 @@ public sealed record QuotaRetryRoutingDecision(
     string? Reason,
     bool WaitingForPausedAgent = false);
 
-public readonly record struct QuotaRetryAdmissionPoolKey(
-    string RouteKey,
-    AgentKind Agent,
-    string ModelId)
+public readonly record struct QuotaRetryAdmissionPoolKey
 {
+    public QuotaRetryAdmissionPoolKey(string routeKey, AgentKind agent, string? modelId)
+    {
+        RouteKey = AgentQuotaMemberKey.NormalizeRouteKey(routeKey);
+        Agent = agent;
+        ModelId = modelId ?? string.Empty;
+    }
+
+    public string RouteKey { get; }
+    public AgentKind Agent { get; }
+    public string ModelId { get; }
+
     public static QuotaRetryAdmissionPoolKey FromMembership(AgentMembership member) =>
-        new(
-            NormalizeRouteKey(member.RouteKey),
-            member.Agent,
-            member.ModelId ?? string.Empty);
+        new(member.RouteKey, member.Agent, member.ModelId);
 
     public static QuotaRetryAdmissionPoolKey FromDirectAgent(
         AgentKind agent,
         string routeKey,
         string? modelId) =>
-        new(
-            NormalizeRouteKey(routeKey),
-            agent,
-            modelId ?? string.Empty);
-
-    private static string NormalizeRouteKey(string routeKey) =>
-        routeKey.Trim().ToLowerInvariant();
+        new(routeKey, agent, modelId);
 }

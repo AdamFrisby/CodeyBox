@@ -26,8 +26,10 @@ public interface IAgentQuotaProbe
     /// without waiting for the next periodic probe. Called by the pipeline when an
     /// agent invocation classifies as <see cref="AgentFailureKind.QuotaExhausted"/>:
     /// the probe should suppress positive availability for <paramref name="ttl"/>
-    /// (or until <paramref name="resetAt"/>, whichever is sooner) so subsequent
-    /// pickups skip this member.
+    /// so subsequent pickups skip this member. A future <paramref name="resetAt"/>
+    /// hint may shorten the suppression window; past or current reset hints must
+    /// be ignored because they are often parsed from runtime output and must not
+    /// clear a real quota lockout immediately.
     ///
     /// <para>
     /// Default implementation is a no-op so existing probes don't have to opt in;
@@ -41,6 +43,46 @@ public interface IAgentQuotaProbe
         TimeSpan ttl,
         DateTimeOffset? resetAt = null,
         CancellationToken ct = default) => Task.CompletedTask;
+}
+
+public interface IAgentQuotaCacheInvalidator
+{
+    /// <summary>
+    /// Clears only cached response snapshots used by <see cref="IAgentQuotaProbe.GetAvailabilityAsync"/>.
+    /// Implementations must preserve explicit runtime exhaustion overrides or
+    /// other state written through <see cref="IAgentQuotaProbe.MarkExhaustedAsync"/>;
+    /// callers use this after writing an exhaustion mark so the next recovery
+    /// probe refetches provider data without erasing the just-recorded gate.
+    /// </summary>
+    void InvalidateResponseCache() => InvalidateCache();
+
+    /// <summary>
+    /// Clears cached state after the credential source changes. Implementations
+    /// that keep credential-scoped runtime state should ensure a newly rotated
+    /// credential is not gated by the prior credential's learned quota state.
+    /// </summary>
+    void InvalidateCredentialState() => InvalidateCache();
+
+    /// <summary>
+    /// Backwards-compatible response-cache invalidation hook. New call sites
+    /// should prefer <see cref="InvalidateResponseCache"/> or
+    /// <see cref="InvalidateCredentialState"/> so the intended state boundary is
+    /// explicit.
+    /// </summary>
+    void InvalidateCache();
+}
+
+public interface IAgentQuotaRecoveryStateInvalidator
+{
+    /// <summary>
+    /// Prepares <paramref name="member"/> for a recovery-monitor probe by
+    /// clearing stale response data that could hide early recovery. Implementations
+    /// must preserve runtime exhaustion gates written by
+    /// <see cref="IAgentQuotaProbe.MarkExhaustedAsync"/> unless the recovery read
+    /// actually exercises the same quota bucket and can authoritatively prove the
+    /// gate has cleared.
+    /// </summary>
+    void InvalidateRecoveryState(AgentMembership member);
 }
 
 /// <summary>OAuth/subscription credentials used by quota probes.</summary>

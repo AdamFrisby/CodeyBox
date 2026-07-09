@@ -39,6 +39,19 @@ public enum QuotaRetryDispatchEligibility
 }
 
 /// <summary>
+/// Seek cursor for priority-ordered <see cref="WorkItemState.WaitingForQuotaReset"/> scans.
+/// The ordering is priority descending, then created time ascending, then id ascending.
+/// </summary>
+public readonly record struct WaitingForQuotaResetPriorityCursor(
+    int Priority,
+    DateTimeOffset CreatedAt,
+    WorkItemId Id)
+{
+    public static WaitingForQuotaResetPriorityCursor From(WorkItem item) =>
+        new(item.Priority, item.CreatedAt, item.Id);
+}
+
+/// <summary>
 /// Outcome of <see cref="IWorkItemStore.UpdateDependsOnAsync"/>.
 /// </summary>
 public enum DependsOnUpdateOutcome
@@ -270,6 +283,20 @@ public interface IWorkItemStore
     Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default);
     IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default);
     IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns at most <paramref name="limit"/> parked quota rows in the retry
+    /// sweep order: highest priority first, then oldest created time. Persistent
+    /// stores should apply the limit inside the storage query so recovery paths
+    /// cannot buffer an unbounded parked backlog before retrying anything.
+    /// <paramref name="after"/> is an exclusive seek cursor from the prior page.
+    /// </summary>
+    IAsyncEnumerable<WorkItem> ListWaitingForQuotaResetByPriorityAsync(
+        int limit,
+        WaitingForQuotaResetPriorityCursor? after = null,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This work item store must implement bounded WaitingForQuotaReset priority queries before quota recovery sweeps can run.");
 
     /// <summary>
     /// Returns the number of work items currently persisted in

@@ -8,6 +8,7 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace CodeyBox.Tests;
 
+[Collection("GlobalSerilog")]
 public sealed class TaskTemplateApiTests : IDisposable
 {
     private readonly string _templateDir = Directory.CreateTempSubdirectory("codeybox-api-templates-").FullName;

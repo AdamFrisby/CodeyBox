@@ -1419,6 +1419,11 @@ builder.Services.AddSingleton<IQuotaFailureStore>(sp =>
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteQuotaFailureStore(cbOpts.StateDatabasePath);
 });
+builder.Services.AddSingleton<AgentQuotaAvailabilityBroadcaster>();
+builder.Services.AddSingleton<IAgentQuotaAvailabilityPublisher>(sp =>
+    sp.GetRequiredService<AgentQuotaAvailabilityBroadcaster>());
+builder.Services.AddSingleton<IAgentQuotaAvailabilityObservationSource>(sp =>
+    sp.GetRequiredService<AgentQuotaAvailabilityBroadcaster>());
 builder.Services.AddSingleton<IAgentFallbackHistoryStore>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -1472,7 +1477,8 @@ static IAgentQuotaProbe WrapLastKnownGood(IAgentQuotaProbe inner, IServiceProvid
         {
             MaxStaleness = TimeSpan.FromSeconds(monitor.CurrentValue.QuotaRouter.ProbeMaxStalenessSeconds),
         },
-        lf.CreateLogger<LastKnownGoodQuotaProbe>());
+        lf.CreateLogger<LastKnownGoodQuotaProbe>(),
+        sp.GetService<TimeProvider>());
 }
 
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
@@ -1511,8 +1517,9 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
             };
         },
         timeProvider: null);
-    source.TokenUpdated += probe.InvalidateCache;
-    return WrapLastKnownGood(probe, sp);
+    var wrapped = WrapLastKnownGood(probe, sp);
+    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
+    return wrapped;
 });
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
@@ -1532,8 +1539,9 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
         }) ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<CodexQuotaProbe>());
-    source.TokenUpdated += probe.InvalidateCache;
-    return WrapLastKnownGood(probe, sp);
+    var wrapped = WrapLastKnownGood(probe, sp);
+    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
+    return wrapped;
 });
 // Gemini OAuth-subscription path (Code Assist Individual / AI Pro / AI Ultra).
 // API-key (PayPerApi) and Vertex paths have no analogous endpoint and stay
@@ -1554,8 +1562,9 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
             ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<GeminiQuotaProbe>());
-    source.TokenUpdated += probe.InvalidateCache;
-    return WrapLastKnownGood(probe, sp);
+    var wrapped = WrapLastKnownGood(probe, sp);
+    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
+    return wrapped;
 });
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
@@ -1572,8 +1581,9 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
             ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<CursorQuotaProbe>());
-    source.TokenUpdated += probe.InvalidateCache;
-    return WrapLastKnownGood(probe, sp);
+    var wrapped = WrapLastKnownGood(probe, sp);
+    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
+    return wrapped;
 });
 
 // opencode: no verified usage endpoint at integration time. The probe ships
@@ -1611,8 +1621,9 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
             ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<AntigravityQuotaProbe>());
-    source.TokenUpdated += probe.InvalidateCache;
-    return WrapLastKnownGood(probe, sp);
+    var wrapped = WrapLastKnownGood(probe, sp);
+    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
+    return wrapped;
 });
 
 // --- Agent class router ------------------------------------------------------
@@ -1648,7 +1659,8 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         sp.GetService<IAgentBudgetProvider>(),
         sp.GetService<AgentConcurrencySnapshot>(),
         configuredSmokeTarget,
-        sp.GetService<IAgentDispatchAvailability>());
+        sp.GetService<IAgentDispatchAvailability>(),
+        sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>());
 });
 
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------
@@ -1773,7 +1785,7 @@ builder.Services.AddSingleton<IWorkerPoolOccupancy>(sp =>
 builder.Services.AddSingleton<IAgentQuotaAvailabilitySnapshot>(sp =>
     sp.GetRequiredService<AgentClassRouter>());
 builder.Services.AddSingleton<IAgentQuotaAvailabilitySignal>(sp =>
-    sp.GetRequiredService<AgentClassRouter>());
+    sp.GetRequiredService<AgentQuotaAvailabilityBroadcaster>());
 builder.Services.AddSingleton<IQuotaRetryRouter>(sp =>
     sp.GetRequiredService<AgentClassRouter>());
 builder.Services.AddSingleton<IQuotaRetryAdmissionRouter>(sp =>
@@ -1954,6 +1966,8 @@ builder.Services.AddSingleton<AgentAvailabilityRegistry>(sp => new AgentAvailabi
 builder.Services.AddSingleton<IAgentAvailabilityRegistry>(sp =>
     sp.GetRequiredService<AgentAvailabilityRegistry>());
 builder.Services.AddSingleton<IAgentEffectiveAvailabilityReader>(sp =>
+    sp.GetRequiredService<AgentAvailabilityRegistry>());
+builder.Services.AddSingleton<IAgentAvailabilityRecoverySignal>(sp =>
     sp.GetRequiredService<AgentAvailabilityRegistry>());
 // The smoke-mutator port the in-VM prober, coverage policy, and host smoke
 // services bind to — same singleton, exposed as the exclusion-taxonomy
@@ -2869,7 +2883,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     authRequiredReader: sp.GetRequiredService<IAgentAuthRequiredAvailabilityReader>(),
     planReviewGate: sp.GetRequiredService<IPlanReviewGate>(),
     testCaseStore: sp.GetService<ITestCaseStore>(),
-    mergeScopeResolver: sp.GetRequiredService<IMergeScopeResolver>()));
+    mergeScopeResolver: sp.GetRequiredService<IMergeScopeResolver>(),
+    quotaAvailabilityPublisher: sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -2890,9 +2905,11 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
             current.Enabled,
             current.PeriodicCheckInterval,
             current.ClockDriftSafetyMargin,
-            current.MaxAutoRetriesPerWorkItem);
+            current.MaxAutoRetriesPerWorkItem,
+            current.MaxWaitingForQuotaResetSweepBatchSize);
     },
     quotaAvailabilitySignal: sp.GetRequiredService<IAgentQuotaAvailabilitySignal>(),
+    agentAvailabilityRecoverySignal: sp.GetRequiredService<IAgentAvailabilityRecoverySignal>(),
     pauseSignal: sp.GetRequiredService<IAgentPauseSignal>()));
 builder.Services.AddSingleton<TransientRetryScheduler>(sp => new TransientRetryScheduler(
     sp.GetRequiredService<IWorkItemStore>(),
@@ -2929,7 +2946,9 @@ builder.Services.AddSingleton<IWorkItemAutoRetryScheduler>(sp =>
     new WorkItemAutoRetryScheduler(
         sp.GetRequiredService<IQuotaFailureAutoRetryScheduler>(),
         sp.GetRequiredService<ITransientFailureAutoRetryScheduler>()));
+builder.Services.AddSingleton<AgentQuotaRecoveryProbeMonitor>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<QuotaRetryScheduler>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentQuotaRecoveryProbeMonitor>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<TransientRetryScheduler>());
 builder.Services.AddSingleton<AgentPauseRetryScheduler>(sp => new AgentPauseRetryScheduler(
     sp.GetRequiredService<IWorkItemStore>(),
@@ -2973,7 +2992,8 @@ builder.Services.AddSingleton<OrchestratorOptions>(sp =>
         cbOpts.AutoRetryOnQuotaFailure.PeriodicCheckInterval,
         cbOpts.AutoRetryOnQuotaFailure.ClockDriftSafetyMargin,
         cbOpts.AutoRetryOnQuotaFailure.MaxAutoRetriesPerWorkItem,
-        startupLog) with
+        startupLog,
+        cbOpts.AutoRetryOnQuotaFailure.MaxWaitingForQuotaResetSweepBatchSize) with
     {
         AutoRetryOnTransientFailure = OrchestratorOptionsFactory.BuildTransientRetryOptions(
             cbOpts.AutoRetryOnTransientFailure.Enabled,
@@ -4798,6 +4818,8 @@ namespace CodeyBox.Api
         public string PeriodicCheckInterval { get; set; } = "00:05:00";
         public string ClockDriftSafetyMargin { get; set; } = "00:02:00";
         public int MaxAutoRetriesPerWorkItem { get; set; } = 3;
+        public int MaxWaitingForQuotaResetSweepBatchSize { get; set; } =
+            AutoRetryOnQuotaFailureOptions.DefaultWaitingForQuotaResetSweepBatchSize;
     }
 
     public sealed class AutoRetryOnTransientFailureConfig
@@ -5441,6 +5463,18 @@ namespace CodeyBox.Api
             = new(StringComparer.OrdinalIgnoreCase);
         /// <summary>Seconds to wait before re-probing when all subscription members are exhausted. Default 300 (5 min).</summary>
         public int QuotaRecheckIntervalSeconds { get; set; } = 300;
+        /// <summary>
+        /// Seconds between event-driven recovery probes for members already
+        /// observed as quota-unusable. Default 5.
+        /// </summary>
+        public int QuotaRecoveryProbeIntervalSeconds { get; set; } =
+            QuotaRouterDefaults.DefaultQuotaRecoveryProbeIntervalSeconds;
+        /// <summary>
+        /// Maximum parked quota rows inspected by each event-driven recovery
+        /// eligibility pass. Default 128.
+        /// </summary>
+        public int MaxQuotaRecoveryProbeEligibilityScan { get; set; } =
+            QuotaRouterDefaults.DefaultQuotaRecoveryProbeEligibilityScanLimit;
         /// <summary>Seconds to cache a probe result. Default 60.</summary>
         public int QuotaCacheTtlSeconds { get; set; } = 60;
         /// <summary>How the router treats unknown probe snapshots. Default UseObservedFailures.</summary>

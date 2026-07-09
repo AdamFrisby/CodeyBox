@@ -14,6 +14,7 @@ namespace CodeyBox.Tests;
 ///   - reject bad shapes (missing question, missing onYes, oversize fields)
 ///   - surface the verdict (when present) in GET /workitems/{id}
 /// </summary>
+[Collection("GlobalSerilog")]
 public sealed class CheckAndActApiTests : IDisposable
 {
     private readonly WorkItemApiFactory _factory = new();

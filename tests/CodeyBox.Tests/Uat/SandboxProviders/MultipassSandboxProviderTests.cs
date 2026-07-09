@@ -20,6 +20,7 @@ namespace CodeyBox.Tests.Uat.SandboxProviders;
 /// UAT coverage for <c>Multipass sandbox provider - Runs agents in isolated Ubuntu VMs with host-enforced network profiles</c>.
 /// Plan anchor: docs/uat/00-plan.md#multipass-sandbox-provider---runs-agents-in-isolated-ubuntu-vms-with-host-enforced-network-profiles
 /// </summary>
+[Collection("Background service timing")]
 public sealed class MultipassSandboxProviderTests : IDisposable
 {
     private static readonly byte[] TinyPng = Convert.FromBase64String(
@@ -1795,12 +1796,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             [launchScript],
             environmentOverrides: FakeSudoPathEnvironment(),
             stdin: "retry-token-line-that-must-not-reach-agent\nagent prompt\n");
-        await WaitForFileAsync(capturedPromptFile, TimeSpan.FromSeconds(30));
-        await WaitForExitCodeAsync(session, 0, TimeSpan.FromSeconds(30));
 
         Assert.Equal(0, exit);
         Assert.Equal("", stdout);
         Assert.Equal("", stderr);
+        await WaitForFileAsync(capturedPromptFile, TimeSpan.FromSeconds(30));
+        await WaitForExitCodeAsync(session, 0, TimeSpan.FromSeconds(30));
         Assert.Equal("agent prompt\n", await File.ReadAllTextAsync(capturedPromptFile));
         Assert.False(File.Exists(exitTokenFile));
     }

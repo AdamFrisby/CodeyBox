@@ -2,6 +2,7 @@ using System.Net;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents.Antigravity;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Tests;
 
@@ -242,11 +243,27 @@ public sealed class AntigravityQuotaProbeRuntimeTests
     }
 
     [Fact]
-    public async Task MarkExhausted_DefaultsToOneMinute_WhenTtlIsZero()
+    public async Task MarkExhausted_PastResetHintDoesNotClearRuntimeGate()
     {
-        // TimeSpan.Zero (or negative) TTL is a probe-pipeline tripwire; the
-        // implementation falls back to a 1-minute window so the override is
-        // still meaningful instead of being instantly expired.
+        // Reset hints can originate in runtime stderr/stdout parsing. A past
+        // hint must be ignored instead of shortening the synthetic 429 gate to
+        // "already expired".
+        var now = new DateTimeOffset(2026, 6, 9, 12, 0, 0, TimeSpan.Zero);
+        var time = new FixedClock(now);
+        var handler = new LoadCodeAssistRouter(HttpStatusCode.OK, TierBody);
+        var probe = BuildProbe(handler, time: time);
+
+        await probe.MarkExhaustedAsync(Member(), TimeSpan.FromMinutes(10), now.AddMinutes(-1));
+        var snapshot = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
+
+        Assert.Equal(0.0, snapshot.AvailablePct);
+        Assert.Equal(now.AddMinutes(10), snapshot.ResetAt);
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task MarkExhausted_NonPositiveTtlClearsRuntimeGate()
+    {
         var now = new DateTimeOffset(2026, 6, 9, 12, 0, 0, TimeSpan.Zero);
         var time = new FixedClock(now);
         var handler = new LoadCodeAssistRouter(HttpStatusCode.OK, TierBody);
@@ -255,14 +272,8 @@ public sealed class AntigravityQuotaProbeRuntimeTests
         await probe.MarkExhaustedAsync(Member(), TimeSpan.Zero, resetAt: null);
         var snapshot = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
 
-        // Still gating now (override is in the 1-minute fallback window).
-        Assert.Equal(0.0, snapshot.AvailablePct);
-
-        // Advance just past the 1-minute fallback; the override should expire and
-        // a fresh probe must flow.
-        time.Advance(TimeSpan.FromMinutes(2));
-        var freshSnapshot = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
-        Assert.Equal(100.0, freshSnapshot.AvailablePct);
+        Assert.Equal(100.0, snapshot.AvailablePct);
+        Assert.Single(handler.Requests);
     }
 
     [Fact]
@@ -283,6 +294,31 @@ public sealed class AntigravityQuotaProbeRuntimeTests
 
         Assert.Equal(0.0, opusSnap.AvailablePct);
         Assert.Equal(100.0, flashSnap.AvailablePct);
+    }
+
+    [Fact]
+    public async Task MarkExhausted_TokenRotationDoesNotInheritPriorRuntimeGate()
+    {
+        // The agy probe's live quota read is route+token+model scoped. Learned
+        // runtime 429 gates must use the same credential boundary so an operator
+        // rotating to a different account under the same route is not stranded.
+        var token = "agy-old-token";
+        var handler = new LoadCodeAssistRouter(HttpStatusCode.OK, TierBody);
+        var factory = new QuotaFakeHttpClientFactory("agent-quota", handler);
+        var probe = new AntigravityQuotaProbe(
+            factory,
+            _ => new AgentQuotaCredentials(token),
+            TimeSpan.FromMinutes(5),
+            NullLogger<AntigravityQuotaProbe>.Instance);
+
+        await probe.MarkExhaustedAsync(Member(), TimeSpan.FromMinutes(30), DateTimeOffset.UtcNow.AddMinutes(30));
+        token = "agy-new-token";
+        probe.InvalidateCredentialState();
+
+        var snapshot = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
+
+        Assert.Equal(100.0, snapshot.AvailablePct);
+        Assert.Single(handler.Requests);
     }
 
     [Fact]
@@ -362,9 +398,9 @@ public sealed class AntigravityQuotaProbeRuntimeTests
     [Fact]
     public async Task InvalidateCache_AfterPrime_ForcesFreshHttpOnNextCall()
     {
-        // InvalidateCache is wired to GeminiOAuthCredentialFileSource.TokenUpdated
-        // (Program.cs) so a token rotation drops stale cache + exhaustion entries
-        // before the next probe.
+        // Response-cache invalidation forces a fresh authorization read without
+        // clearing runtime 429 overrides; credential-state invalidation is the
+        // wider token-rotation boundary.
         var handler = new LoadCodeAssistRouter(HttpStatusCode.OK, TierBody);
         var probe = BuildProbe(handler, cacheTtl: TimeSpan.FromMinutes(5));
 
@@ -375,6 +411,59 @@ public sealed class AntigravityQuotaProbeRuntimeTests
 
         _ = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
         Assert.Equal(2, handler.Requests.Count);
+    }
+
+    [Fact]
+    public async Task MarkExhaustedThenInvalidateCache_PreservesRuntimeGateWithoutHttp()
+    {
+        // LastKnownGoodQuotaProbe.MarkExhaustedAsync invalidates the wrapped
+        // response cache after recording the runtime override. That invalidation
+        // must not erase Antigravity's synthetic 0% gate.
+        var now = new DateTimeOffset(2026, 6, 9, 12, 0, 0, TimeSpan.Zero);
+        var time = new FixedClock(now);
+        var handler = new LoadCodeAssistRouter(HttpStatusCode.OK, TierBody);
+        var inner = BuildProbe(handler, time: time);
+        var wrapped = new LastKnownGoodQuotaProbe(
+            inner,
+            () => new LastKnownGoodQuotaOptions { MaxStaleness = TimeSpan.FromMinutes(5) },
+            NullLogger<LastKnownGoodQuotaProbe>.Instance,
+            time);
+        var member = Member();
+
+        await wrapped.MarkExhaustedAsync(member, TimeSpan.FromMinutes(10), now.AddMinutes(10));
+        var snapshot = await wrapped.GetAvailabilityAsync(member, CancellationToken.None);
+
+        Assert.Equal(0.0, snapshot.AvailablePct);
+        Assert.Equal(now.AddMinutes(10), snapshot.ResetAt);
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task RecoveryStateInvalidation_PreservesRuntimeGateUntilExpiry()
+    {
+        var now = new DateTimeOffset(2026, 6, 9, 12, 0, 0, TimeSpan.Zero);
+        var time = new FixedClock(now);
+        var handler = new LoadCodeAssistRouter(HttpStatusCode.OK, TierBody);
+        var probe = BuildProbe(handler, time: time);
+        var member = Member();
+
+        await probe.MarkExhaustedAsync(member, TimeSpan.FromHours(6), now.AddHours(6));
+        var gated = await probe.GetAvailabilityAsync(member, CancellationToken.None);
+        Assert.Equal(0.0, gated.AvailablePct);
+        Assert.Empty(handler.Requests);
+
+        ((IAgentQuotaRecoveryStateInvalidator)probe).InvalidateRecoveryState(member);
+        var stillGated = await probe.GetAvailabilityAsync(member, CancellationToken.None);
+
+        Assert.Equal(0.0, stillGated.AvailablePct);
+        Assert.Equal(now.AddHours(6), stillGated.ResetAt);
+        Assert.Empty(handler.Requests);
+
+        time.Advance(TimeSpan.FromHours(7));
+        var recovered = await probe.GetAvailabilityAsync(member, CancellationToken.None);
+
+        Assert.Equal(100.0, recovered.AvailablePct);
+        Assert.Single(handler.Requests);
     }
 
     // ── Test helpers ─────────────────────────────────────────────────────────

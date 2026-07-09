@@ -29,11 +29,12 @@ namespace CodeyBox.Orchestrator;
 ///
 /// <para>Keyed by <c>(RouteKey, ModelId)</c> — <c>RouteKey</c> is account-scoped
 /// (<c>agent/instanceId</c>), so distinct accounts never share a retained value.
-/// A within-account token rotation needs no special handling: the rotated read
-/// either succeeds (overwrites the retained value) or fails Permanent (drops it),
-/// and the account's quota is unchanged in the meantime.</para>
+/// Credential-state invalidation is required on token rotation: it clears
+/// retained last-known-good readings before the next live probe so a new token
+/// is never admitted or denied by stale data captured under the previous
+/// credential.</para>
 /// </summary>
-public sealed class LastKnownGoodQuotaProbe : IAgentQuotaProbe
+public sealed class LastKnownGoodQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalidator, IAgentQuotaRecoveryStateInvalidator
 {
     private readonly IAgentQuotaProbe _inner;
     private readonly Func<LastKnownGoodQuotaOptions> _optionsProvider;
@@ -59,6 +60,7 @@ public sealed class LastKnownGoodQuotaProbe : IAgentQuotaProbe
 
     public async Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
     {
+        var key = KeyFor(member);
         AgentQuotaSnapshot snapshot;
         try
         {
@@ -78,7 +80,6 @@ public sealed class LastKnownGoodQuotaProbe : IAgentQuotaProbe
                 QuotaUnknownReason.Transient, $"probe threw: {ex.GetType().Name}");
         }
 
-        var key = (member.RouteKey, string.IsNullOrWhiteSpace(member.ModelId) ? "" : member.ModelId!);
         var now = _time.GetUtcNow();
 
         lock (_lock)
@@ -127,12 +128,56 @@ public sealed class LastKnownGoodQuotaProbe : IAgentQuotaProbe
         }
     }
 
-    public Task MarkExhaustedAsync(
+    public async Task MarkExhaustedAsync(
         AgentMembership member,
         TimeSpan ttl,
         DateTimeOffset? resetAt = null,
         CancellationToken ct = default)
-        => _inner.MarkExhaustedAsync(member, ttl, resetAt, ct);
+    {
+        await _inner.MarkExhaustedAsync(member, ttl, resetAt, ct).ConfigureAwait(false);
+        if (_inner is IAgentQuotaCacheInvalidator invalidator)
+            invalidator.InvalidateResponseCache();
+
+        var key = KeyFor(member);
+        lock (_lock)
+            _retained.Remove(key);
+    }
+
+    public void InvalidateCache() => InvalidateResponseCache();
+
+    public void InvalidateResponseCache()
+    {
+        if (_inner is IAgentQuotaCacheInvalidator invalidator)
+            invalidator.InvalidateResponseCache();
+    }
+
+    public void InvalidateCredentialState()
+    {
+        if (_inner is IAgentQuotaCacheInvalidator invalidator)
+            invalidator.InvalidateCredentialState();
+
+        lock (_lock)
+            _retained.Clear();
+    }
+
+    public void InvalidateRecoveryState(AgentMembership member)
+    {
+        var key = KeyFor(member);
+        lock (_lock)
+            _retained.Remove(key);
+
+        if (_inner is IAgentQuotaRecoveryStateInvalidator recoveryInvalidator)
+        {
+            recoveryInvalidator.InvalidateRecoveryState(member);
+            return;
+        }
+
+        if (_inner is IAgentQuotaCacheInvalidator invalidator)
+            invalidator.InvalidateResponseCache();
+    }
+
+    private static (string RouteKey, string ModelKey) KeyFor(AgentMembership member) =>
+        (member.RouteKey, string.IsNullOrWhiteSpace(member.ModelId) ? "" : member.ModelId!);
 }
 
 /// <summary>
