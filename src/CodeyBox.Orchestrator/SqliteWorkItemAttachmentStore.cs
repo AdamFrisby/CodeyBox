@@ -98,21 +98,52 @@ public sealed class SqliteWorkItemAttachmentStore : IWorkItemAttachmentStore, ID
         await _writeLock.WaitAsync(ct);
         try
         {
-            var workItemId = records[0].WorkItemId;
-            var (currentCount, currentBytes) = await AggregateCoreAsync(workItemId, ct);
-            var newBytes = 0L;
-            foreach (var r in records) newBytes += r.SizeBytes;
+            var workItemId = ValidateSingleWorkItem(records);
+            using var tx = _conn.BeginTransaction();
+            var (currentCount, currentBytes) = await AggregateCoreAsync(workItemId, tx, ct);
+            var newBytes = SumSizeBytes(records);
             if (currentCount + records.Count > maxCount) return false;
             if (currentBytes + newBytes > maxTotalBytes) return false;
 
-            // The write gate already serialises every insertion; insert each
-            // row in turn. A failure mid-batch leaves a partial commit, but
-            // the only failure shape here is a duplicate id (caller generates
-            // fresh ids), so the partial-commit window is not reachable in
-            // practice.
             foreach (var record in records)
-                await InsertCoreAsync(record, null, ct);
+                await InsertCoreAsync(record, tx, ct);
+            tx.Commit();
             return true;
+        }
+        finally { _writeLock.Release(); }
+    }
+
+    public async Task<AttachmentBatchCreateResult> CreateBatchForQueuedWorkItemIfUnderCapAsync(
+        IReadOnlyList<WorkItemAttachmentRecord> records,
+        int maxCount,
+        long maxTotalBytes,
+        CancellationToken ct = default)
+    {
+        if (records.Count == 0)
+            return new AttachmentBatchCreateResult(AttachmentMutationOutcome.Applied);
+
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            var workItemId = ValidateSingleWorkItem(records);
+            using var tx = _conn.BeginTransaction();
+            var state = await GetWorkItemStateCoreAsync(workItemId, tx, ct);
+            if (state is null)
+                return new AttachmentBatchCreateResult(AttachmentMutationOutcome.NotFound);
+            if (state != WorkItemState.Queued)
+                return new AttachmentBatchCreateResult(AttachmentMutationOutcome.StateMismatch, state);
+
+            var (currentCount, currentBytes) = await AggregateCoreAsync(workItemId, tx, ct);
+            var newBytes = SumSizeBytes(records);
+            if (currentCount + records.Count > maxCount)
+                return new AttachmentBatchCreateResult(AttachmentMutationOutcome.CapExceeded, state);
+            if (currentBytes + newBytes > maxTotalBytes)
+                return new AttachmentBatchCreateResult(AttachmentMutationOutcome.CapExceeded, state);
+
+            foreach (var record in records)
+                await InsertCoreAsync(record, tx, ct);
+            tx.Commit();
+            return new AttachmentBatchCreateResult(AttachmentMutationOutcome.Applied, state);
         }
         finally { _writeLock.Release(); }
     }
@@ -158,6 +189,37 @@ public sealed class SqliteWorkItemAttachmentStore : IWorkItemAttachmentStore, ID
             cmd.Parameters.AddWithValue("$id", id);
             await cmd.ExecuteNonQueryAsync(ct);
             return existing;
+        }
+        finally { _writeLock.Release(); }
+    }
+
+    public async Task<AttachmentDeleteResult> DeleteIfWorkItemQueuedAsync(
+        string id,
+        WorkItemId workItemId,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var tx = _conn.BeginTransaction();
+            var existing = await GetCoreAsync(id, tx, ct);
+            if (existing is null || existing.WorkItemId != workItemId)
+                return new AttachmentDeleteResult(AttachmentMutationOutcome.NotFound);
+
+            var state = await GetWorkItemStateCoreAsync(workItemId, tx, ct);
+            if (state is null)
+                return new AttachmentDeleteResult(AttachmentMutationOutcome.NotFound);
+            if (state != WorkItemState.Queued)
+                return new AttachmentDeleteResult(AttachmentMutationOutcome.StateMismatch, existing, state);
+
+            using var cmd = _conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = "DELETE FROM work_item_attachments WHERE id = $id AND work_item_id = $wi;";
+            cmd.Parameters.AddWithValue("$id", id);
+            cmd.Parameters.AddWithValue("$wi", workItemId.ToString());
+            await cmd.ExecuteNonQueryAsync(ct);
+            tx.Commit();
+            return new AttachmentDeleteResult(AttachmentMutationOutcome.Applied, existing, state);
         }
         finally { _writeLock.Release(); }
     }
@@ -229,6 +291,37 @@ public sealed class SqliteWorkItemAttachmentStore : IWorkItemAttachmentStore, ID
             yield return id;
     }
 
+    public async IAsyncEnumerable<WorkItemId> ListCleanupCandidatesWithAttachmentsAsync(
+        DateTimeOffset updatedBefore,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        List<WorkItemId> results;
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = $"""
+                SELECT DISTINCT a.work_item_id
+                FROM work_item_attachments a
+                JOIN work_items w ON w.id = a.work_item_id
+                WHERE w.state IN ({TerminalStatesInList})
+                   OR w.updated_at < $cutoff;
+                """;
+            cmd.Parameters.AddWithValue("$cutoff", updatedBefore.ToString("O"));
+            results = new List<WorkItemId>();
+            using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            while (await reader.ReadAsync(ct).ConfigureAwait(false))
+                results.Add(WorkItemId.Parse(reader.GetString(0)));
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+
+        foreach (var id in results)
+            yield return id;
+    }
+
     public async Task<IReadOnlyList<WorkItemAttachmentRecord>> DeleteAllForWorkItemAsync(
         WorkItemId workItemId,
         CancellationToken ct = default)
@@ -276,9 +369,13 @@ public sealed class SqliteWorkItemAttachmentStore : IWorkItemAttachmentStore, ID
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
-    private async Task<WorkItemAttachmentRecord?> GetCoreAsync(string id, CancellationToken ct)
+    private async Task<WorkItemAttachmentRecord?> GetCoreAsync(string id, CancellationToken ct) =>
+        await GetCoreAsync(id, tx: null, ct);
+
+    private async Task<WorkItemAttachmentRecord?> GetCoreAsync(string id, SqliteTransaction? tx, CancellationToken ct)
     {
         using var cmd = _conn.CreateCommand();
+        if (tx is not null) cmd.Transaction = tx;
         cmd.CommandText = "SELECT * FROM work_item_attachments WHERE id = $id;";
         cmd.Parameters.AddWithValue("$id", id);
         using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -301,9 +398,16 @@ public sealed class SqliteWorkItemAttachmentStore : IWorkItemAttachmentStore, ID
 
     private async Task<(int Count, long TotalBytes)> AggregateCoreAsync(
         WorkItemId workItemId,
+        CancellationToken ct) =>
+        await AggregateCoreAsync(workItemId, tx: null, ct);
+
+    private async Task<(int Count, long TotalBytes)> AggregateCoreAsync(
+        WorkItemId workItemId,
+        SqliteTransaction? tx,
         CancellationToken ct)
     {
         using var cmd = _conn.CreateCommand();
+        if (tx is not null) cmd.Transaction = tx;
         cmd.CommandText = "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) FROM work_item_attachments WHERE work_item_id = $wi;";
         cmd.Parameters.AddWithValue("$wi", workItemId.ToString());
         using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -312,6 +416,38 @@ public sealed class SqliteWorkItemAttachmentStore : IWorkItemAttachmentStore, ID
         var count = reader.IsDBNull(0) ? 0 : (int)reader.GetInt64(0);
         var total = reader.IsDBNull(1) ? 0L : reader.GetInt64(1);
         return (count, total);
+    }
+
+    private async Task<WorkItemState?> GetWorkItemStateCoreAsync(
+        WorkItemId workItemId,
+        SqliteTransaction tx,
+        CancellationToken ct)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "SELECT state FROM work_items WHERE id = $id;";
+        cmd.Parameters.AddWithValue("$id", workItemId.ToString());
+        var result = await cmd.ExecuteScalarAsync(ct);
+        return result is long l ? (WorkItemState)(int)l : null;
+    }
+
+    private static WorkItemId ValidateSingleWorkItem(IReadOnlyList<WorkItemAttachmentRecord> records)
+    {
+        var workItemId = records[0].WorkItemId;
+        for (var i = 1; i < records.Count; i++)
+        {
+            if (records[i].WorkItemId != workItemId)
+                throw new ArgumentException("All attachment records in a batch must share one work item id.", nameof(records));
+        }
+        return workItemId;
+    }
+
+    private static long SumSizeBytes(IReadOnlyList<WorkItemAttachmentRecord> records)
+    {
+        var total = 0L;
+        foreach (var r in records)
+            total = checked(total + r.SizeBytes);
+        return total;
     }
 
     private static string BuildTerminalStatesInList()

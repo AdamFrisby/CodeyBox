@@ -11,19 +11,6 @@ namespace CodeyBox.Api;
 
 internal static class WorkItemAttachmentEndpoints
 {
-    /// <summary>
-    /// Per-caption upload cap (UTF-16 code units). Streamed-bounded at upload
-    /// time so an oversized caption is rejected mid-stream rather than
-    /// buffered whole. Intentionally larger than
-    /// <see cref="AttachmentManifestPromptPreprocessor.MaxCaptionChars"/>:
-    /// the preprocessor re-truncates defensively against pre-existing rows,
-    /// so the two constants are coupled by name but not by value. Edit them
-    /// together.
-    /// </summary>
-    private const int MaxCaptionChars = 2_000;
-
-    private const int MaxFileNameChars = 255;
-    private const int MaxContentTypeChars = 255;
     private const int StreamBufferSize = 81920;
 
     public static void Map(WebApplication app)
@@ -46,7 +33,7 @@ internal static class WorkItemAttachmentEndpoints
         HttpRequest request,
         IWorkItemStore items,
         IWorkItemAttachmentStore store,
-        IWorkItemAttachmentBlobStore blobs,
+        IWorkItemAttachmentBlobStoreAdmin blobs,
         IOptionsMonitor<CodeyBoxOptions> optsMonitor,
         CancellationToken ct)
     {
@@ -95,19 +82,23 @@ internal static class WorkItemAttachmentEndpoints
             // instead. Non-file section bodies are bounded by the caption
             // bounded-read helper, and any other form-data field is rejected
             // outright so its body is never drained for free.
-            HeadersCountLimit = 256,
-            HeadersLengthLimit = 8 * 1024,
+            HeadersCountLimit = opts.MultipartHeadersCountLimit,
+            HeadersLengthLimit = opts.MultipartHeadersLengthLimitBytes,
         };
 
         // Stage every file section first, then commit metadata as a single
-        // atomic batch. If a per-item cap is crossed, NO metadata row is
-        // written and the staged blobs are left on disk as orphans for the
-        // orphan-sweep grace window to reclaim — the reference-count race
-        // (delete a blob out from under a concurrent upload's not-yet-written
-        // row) cannot happen because we never delete blobs on the upload path.
+        // atomic batch. If the request is later rejected, fresh unreferenced
+        // blobs staged by this request are removed immediately; deduplicated
+        // blobs are left alone because another row may already reference them.
         var staged = new List<StagedAttachment>();
         long stagedBytes = 0;
         string? pendingCaption = null;
+
+        async Task<IResult> RejectAsync(IResult result)
+        {
+            await CleanupUncommittedStagedBlobsAsync(staged, store, blobs, ct).ConfigureAwait(false);
+            return result;
+        }
 
         try
         {
@@ -115,12 +106,12 @@ internal static class WorkItemAttachmentEndpoints
             while ((section = await reader.ReadNextSectionAsync(ct)) is not null)
             {
                 if (!ContentDispositionHeaderValue.TryParse(section.ContentDisposition, out var disposition))
-                    return Results.BadRequest(new { error = "malformed content-disposition header" });
+                    return await RejectAsync(Results.BadRequest(new { error = "malformed content-disposition header" }));
 
                 if (MultipartRequestHelper.HasFileContentDisposition(disposition))
                 {
                     if (currentCount + staged.Count >= opts.MaxAttachmentsPerWorkItem)
-                        return Conflict(new { error = $"max attachments per work item reached ({opts.MaxAttachmentsPerWorkItem})" });
+                        return await RejectAsync(Conflict(new { error = $"max attachments per work item reached ({opts.MaxAttachmentsPerWorkItem})" }));
 
                     // Prefer RFC 5987 filename* (UTF-8, used by modern clients
                     // for non-ASCII names) when the legacy filename field is
@@ -137,31 +128,42 @@ internal static class WorkItemAttachmentEndpoints
 
                     var sanitized = FileNameSanitizer.Sanitize(originalFileName);
                     if (sanitized is null)
-                        return Results.BadRequest(new { error = $"filename '{originalFileName}' is invalid (path traversal or empty)" });
-                    if (sanitized.Length > MaxFileNameChars)
-                        return Results.BadRequest(new { error = $"filename exceeds {MaxFileNameChars} chars" });
+                        return await RejectAsync(Results.BadRequest(new { error = $"filename '{originalFileName}' is invalid (path traversal or empty)" }));
+                    if (sanitized.Length > opts.MaxFileNameChars)
+                        return await RejectAsync(Results.BadRequest(new { error = $"filename exceeds {opts.MaxFileNameChars} chars" }));
 
-                    var declaredType = ValidateContentType(section.ContentType);
+                    var declaredType = ValidateContentType(section.ContentType, opts.MaxContentTypeChars);
+                    if (!declaredType.IsValid)
+                        return await RejectAsync(Results.BadRequest(new { error = declaredType.Error }));
+
+                    var remainingTotalBytes = opts.MaxTotalBytesPerWorkItem - currentBytes - stagedBytes;
+                    if (remainingTotalBytes <= 0)
+                        return await RejectAsync(PayloadTooLarge(
+                            $"adding this file would exceed the per-work-item total cap of {opts.MaxTotalBytesPerWorkItem} bytes"));
+                    var stageLimit = Math.Min(opts.MaxFileSizeBytes, remainingTotalBytes);
 
                     AttachmentBlobStageResult stage;
                     try
                     {
-                        stage = await blobs.StageAsync(section.Body, opts.MaxFileSizeBytes, ct);
+                        stage = await blobs.StageAsync(section.Body, stageLimit, ct);
                     }
                     catch (AttachmentBlobTooLargeException)
                     {
-                        return PayloadTooLarge($"file exceeds max-file-size of {opts.MaxFileSizeBytes} bytes");
+                        return await RejectAsync(stageLimit == opts.MaxFileSizeBytes
+                            ? PayloadTooLarge($"file exceeds max-file-size of {opts.MaxFileSizeBytes} bytes")
+                            : PayloadTooLarge(
+                                $"adding this file would exceed the per-work-item total cap of {opts.MaxTotalBytesPerWorkItem} bytes"));
                     }
 
                     if (stage.SizeBytes == 0)
-                        return Results.BadRequest(new { error = "zero-byte attachments are not permitted" });
+                        return await RejectAsync(Results.BadRequest(new { error = "zero-byte attachments are not permitted" }));
 
                     if (currentBytes + stagedBytes + stage.SizeBytes > opts.MaxTotalBytesPerWorkItem)
-                        return PayloadTooLarge(
-                            $"adding this file would exceed the per-work-item total cap of {opts.MaxTotalBytesPerWorkItem} bytes");
+                        return await RejectAsync(PayloadTooLarge(
+                            $"adding this file would exceed the per-work-item total cap of {opts.MaxTotalBytesPerWorkItem} bytes"));
 
                     stagedBytes += stage.SizeBytes;
-                    staged.Add(new StagedAttachment(stage, sanitized, declaredType, pendingCaption ?? string.Empty));
+                    staged.Add(new StagedAttachment(stage, sanitized, declaredType.Value, pendingCaption ?? string.Empty));
                     pendingCaption = null;
                 }
                 else if (MultipartRequestHelper.HasFormDataContentDisposition(disposition))
@@ -173,31 +175,31 @@ internal static class WorkItemAttachmentEndpoints
                     {
                         // Bounded read: stop the moment the cap is crossed so a
                         // multi-GB caption section cannot be buffered whole.
-                        var caption = await ReadBoundedStringAsync(section.Body, MaxCaptionChars, ct);
+                        var caption = await ReadBoundedStringAsync(section.Body, opts.MaxCaptionChars, ct);
                         if (caption is null)
-                            return Results.BadRequest(new { error = $"caption exceeds {MaxCaptionChars} chars" });
+                            return await RejectAsync(Results.BadRequest(new { error = $"caption exceeds {opts.MaxCaptionChars} chars" }));
                         pendingCaption = caption;
                     }
                     else
                     {
                         // Reject unrecognised form fields rather than silently
                         // draining an unbounded section body.
-                        return Results.BadRequest(new { error = $"unrecognised form-data field '{name}'" });
+                        return await RejectAsync(Results.BadRequest(new { error = $"unrecognised form-data field '{name}'" }));
                     }
                 }
                 else
                 {
-                    return Results.BadRequest(new { error = "unrecognised multipart section disposition" });
+                    return await RejectAsync(Results.BadRequest(new { error = "unrecognised multipart section disposition" }));
                 }
             }
         }
         catch (System.IO.InvalidDataException ex)
         {
-            return Results.BadRequest(new { error = $"malformed multipart body: {TruncateMessage(ex.Message)}" });
+            return await RejectAsync(Results.BadRequest(new { error = $"malformed multipart body: {TruncateMessage(ex.Message, opts.MaxMultipartErrorMessageChars)}" }));
         }
 
         if (pendingCaption is not null)
-            return Results.BadRequest(new { error = "caption field must be followed by a file field" });
+            return await RejectAsync(Results.BadRequest(new { error = "caption field must be followed by a file field" }));
         if (staged.Count == 0)
             return Results.BadRequest(new { error = "no file field found in multipart body" });
 
@@ -218,15 +220,15 @@ internal static class WorkItemAttachmentEndpoints
             });
         }
 
-        var committed = await store.CreateBatchIfUnderCapAsync(
+        var committed = await store.CreateBatchForQueuedWorkItemIfUnderCapAsync(
             records, opts.MaxAttachmentsPerWorkItem, opts.MaxTotalBytesPerWorkItem, ct);
-        if (!committed)
+        if (committed.Outcome != AttachmentMutationOutcome.Applied)
         {
-            // No metadata rows were written. The staged blobs are unreferenced
-            // and will be reclaimed by the orphan sweep after the grace
-            // window — we do NOT delete them here, because a concurrent upload
-            // of the same bytes may have just staged a dedup'd copy and be
-            // about to write its own row.
+            await CleanupUncommittedStagedBlobsAsync(staged, store, blobs, ct).ConfigureAwait(false);
+            if (committed.Outcome == AttachmentMutationOutcome.NotFound)
+                return Results.NotFound();
+            if (committed.Outcome == AttachmentMutationOutcome.StateMismatch)
+                return Conflict(new { error = $"attachments can only be added while the work item is Queued; current state is {committed.CurrentState}" });
             return PayloadTooLarge(
                 $"upload would exceed per-work-item caps ({opts.MaxAttachmentsPerWorkItem} attachments or {opts.MaxTotalBytesPerWorkItem} bytes)");
         }
@@ -301,16 +303,18 @@ internal static class WorkItemAttachmentEndpoints
         if (item.State != WorkItemState.Queued)
             return Results.Conflict(new { error = $"attachments can only be deleted while the work item is Queued; current state is {item.State}" });
 
-        // Scope the delete by work item id inside the store so a single SQL
-        // round-trip both verifies ownership and removes the row. The on-disk
-        // blob is NOT deleted here: a concurrent upload of the same bytes may
-        // have staged a dedup'd copy and be about to write its metadata row,
-        // and deleting the blob out from under it would orphan that row. The
-        // orphan sweep reclaims the blob after the grace window once no row
-        // references it.
-        var deleted = await store.DeleteAsync(attachmentId, scopeByWorkItemId: workItemId, ct);
-        if (deleted is null) return Results.NotFound();
-        return Results.NoContent();
+        // Scope the delete by work item id and queued state inside the store's
+        // transaction so a racing pickup cannot move the item out of Queued
+        // between this handler's read and the metadata deletion. The on-disk
+        // blob is NOT deleted here; the orphan sweep reclaims it after the
+        // grace window once no row references it.
+        var deleted = await store.DeleteIfWorkItemQueuedAsync(attachmentId, workItemId, ct);
+        return deleted.Outcome switch
+        {
+            AttachmentMutationOutcome.Applied => Results.NoContent(),
+            AttachmentMutationOutcome.StateMismatch => Conflict(new { error = $"attachments can only be deleted while the work item is Queued; current state is {deleted.CurrentState}" }),
+            _ => Results.NotFound(),
+        };
     }
 
     private static IResult PayloadTooLarge(string error) =>
@@ -334,21 +338,27 @@ internal static class WorkItemAttachmentEndpoints
     /// Validates a client-supplied Content-Type for safe storage and later
     /// echoing into a download response's Content-Type header. Returns the
     /// normalised value, or empty string when the client sent none. Rejects
-    /// (by capping and stripping control characters) anything that is not a
-    /// parseable media type — the caller can decide to 400 on the length cap
-    /// upstream, but a stored value that round-trips through
-    /// <see cref="MediaTypeHeaderValue"/> cannot carry header injection
+    /// overlong values, control characters, and anything that is not a
+    /// parseable media type so stored values cannot carry header injection
     /// payloads.
     /// </summary>
-    private static string ValidateContentType(string? sectionContentType)
+    private static ContentTypeValidationResult ValidateContentType(string? sectionContentType, int maxContentTypeChars)
     {
         if (string.IsNullOrWhiteSpace(sectionContentType))
-            return string.Empty;
-        if (sectionContentType.Length > MaxContentTypeChars)
-            return string.Empty;
+            return ContentTypeValidationResult.Valid(string.Empty);
+        if (sectionContentType.Length > maxContentTypeChars)
+            return ContentTypeValidationResult.Invalid($"content type exceeds {maxContentTypeChars} chars");
+        foreach (var c in sectionContentType)
+        {
+            if (c < 0x20 || c == 0x7f)
+                return ContentTypeValidationResult.Invalid("content type contains control characters");
+        }
         if (!MediaTypeHeaderValue.TryParse(sectionContentType, out var parsed))
-            return string.Empty;
-        return parsed.ToString().Trim();
+            return ContentTypeValidationResult.Invalid("content type is invalid");
+        var normalized = parsed.ToString().Trim();
+        if (normalized.Length > maxContentTypeChars)
+            return ContentTypeValidationResult.Invalid($"content type exceeds {maxContentTypeChars} chars");
+        return ContentTypeValidationResult.Valid(normalized);
     }
 
     /// <summary>
@@ -380,9 +390,9 @@ internal static class WorkItemAttachmentEndpoints
         if (totalRead > byteCap)
         {
             // There is at least one byte beyond the cap — the section is
-            // oversized. Drain the rest so the next section boundary is still
-            // findable, then signal rejection.
-            await DrainAsync(body, ct);
+            // oversized. Return immediately; the caller rejects the request
+            // and must not drain an unbounded section body after the limit has
+            // already been crossed.
             return null;
         }
         var decoded = Encoding.UTF8.GetString(collected.GetBuffer(), 0, (int)collected.Length);
@@ -391,18 +401,28 @@ internal static class WorkItemAttachmentEndpoints
         return decoded;
     }
 
-    private static async Task DrainAsync(Stream body, CancellationToken ct)
-    {
-        var buffer = new byte[StreamBufferSize];
-        try
-        {
-            while (await body.ReadAsync(buffer, ct).ConfigureAwait(false) > 0) { }
-        }
-        catch { /* best-effort drain; the caller is already rejecting */ }
-    }
+    private static string TruncateMessage(string s, int maxChars) =>
+        s.Length <= maxChars ? s : s[..maxChars];
 
-    private static string TruncateMessage(string s) =>
-        s.Length <= 240 ? s : s[..240];
+    private static async Task CleanupUncommittedStagedBlobsAsync(
+        IReadOnlyList<StagedAttachment> staged,
+        IWorkItemAttachmentStore store,
+        IWorkItemAttachmentBlobStoreAdmin blobs,
+        CancellationToken ct)
+    {
+        if (staged.Count == 0) return;
+
+        var hashes = staged
+            .Where(static s => !s.Stage.WasDeduplicated)
+            .Select(static s => s.Stage.Sha256)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        foreach (var hash in hashes)
+        {
+            if (await store.CountReferencesAsync(hash, ct).ConfigureAwait(false) == 0)
+                blobs.TryDelete(hash);
+        }
+    }
 
     private static AttachmentDto ToDto(WorkItemAttachmentRecord r) => new(
         r.Id,
@@ -419,6 +439,12 @@ internal static class WorkItemAttachmentEndpoints
         string FileName,
         string ContentType,
         string Caption);
+
+    private readonly record struct ContentTypeValidationResult(bool IsValid, string Value, string Error)
+    {
+        public static ContentTypeValidationResult Valid(string value) => new(true, value, string.Empty);
+        public static ContentTypeValidationResult Invalid(string error) => new(false, string.Empty, error);
+    }
 }
 
 internal sealed record AttachmentDto(

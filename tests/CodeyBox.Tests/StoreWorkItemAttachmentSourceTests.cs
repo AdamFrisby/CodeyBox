@@ -112,5 +112,30 @@ public sealed class StoreWorkItemAttachmentSourceTests
             foreach (var r in records) _rows.Add(r);
             return Task.FromResult(true);
         }
+
+        public Task<AttachmentBatchCreateResult> CreateBatchForQueuedWorkItemIfUnderCapAsync(
+            IReadOnlyList<WorkItemAttachmentRecord> records,
+            int maxCount,
+            long maxTotalBytes,
+            CancellationToken ct = default)
+        {
+            foreach (var r in records) _rows.Add(r);
+            return Task.FromResult(new AttachmentBatchCreateResult(AttachmentMutationOutcome.Applied));
+        }
+
+        public Task<AttachmentDeleteResult> DeleteIfWorkItemQueuedAsync(
+            string id,
+            WorkItemId workItemId,
+            CancellationToken ct = default)
+        {
+            var row = _rows.FirstOrDefault(r => r.Id == id && r.WorkItemId == workItemId);
+            if (row is null)
+                return Task.FromResult(new AttachmentDeleteResult(AttachmentMutationOutcome.NotFound));
+            _rows.Remove(row);
+            return Task.FromResult(new AttachmentDeleteResult(AttachmentMutationOutcome.Applied, row, WorkItemState.Queued));
+        }
+
+        public async IAsyncEnumerable<WorkItemId> ListCleanupCandidatesWithAttachmentsAsync(DateTimeOffset updatedBefore, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        { await Task.CompletedTask; yield break; }
     }
 }

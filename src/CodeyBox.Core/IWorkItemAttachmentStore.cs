@@ -1,5 +1,22 @@
 namespace CodeyBox.Core;
 
+public enum AttachmentMutationOutcome
+{
+    Applied,
+    NotFound,
+    StateMismatch,
+    CapExceeded,
+}
+
+public readonly record struct AttachmentBatchCreateResult(
+    AttachmentMutationOutcome Outcome,
+    WorkItemState? CurrentState = null);
+
+public readonly record struct AttachmentDeleteResult(
+    AttachmentMutationOutcome Outcome,
+    WorkItemAttachmentRecord? Record = null,
+    WorkItemState? CurrentState = null);
+
 /// <summary>
 /// SQLite-resident metadata index for work-item attachments. The blob bytes
 /// live on the host filesystem under a content-addressed root keyed by
@@ -84,5 +101,36 @@ public interface IWorkItemAttachmentStore
         IReadOnlyList<WorkItemAttachmentRecord> records,
         int maxCount,
         long maxTotalBytes,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Atomically inserts a batch under the same caps as
+    /// <see cref="CreateBatchIfUnderCapAsync"/> only if the owning work item
+    /// still exists and is currently <see cref="WorkItemState.Queued"/> at the
+    /// metadata write sink.
+    /// </summary>
+    Task<AttachmentBatchCreateResult> CreateBatchForQueuedWorkItemIfUnderCapAsync(
+        IReadOnlyList<WorkItemAttachmentRecord> records,
+        int maxCount,
+        long maxTotalBytes,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Deletes one attachment row scoped by work item id only if that work
+    /// item still exists and is currently <see cref="WorkItemState.Queued"/>
+    /// at the delete sink.
+    /// </summary>
+    Task<AttachmentDeleteResult> DeleteIfWorkItemQueuedAsync(
+        string id,
+        WorkItemId workItemId,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns work items with attachment rows that must be cleaned because
+    /// the work item is terminal or its last update is older than
+    /// <paramref name="updatedBefore"/>.
+    /// </summary>
+    IAsyncEnumerable<WorkItemId> ListCleanupCandidatesWithAttachmentsAsync(
+        DateTimeOffset updatedBefore,
         CancellationToken ct = default);
 }

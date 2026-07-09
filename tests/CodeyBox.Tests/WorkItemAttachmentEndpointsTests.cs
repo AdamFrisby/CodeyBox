@@ -10,6 +10,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Api;
@@ -49,6 +50,13 @@ public sealed class WorkItemAttachmentEndpointsTests : IDisposable
             fileContent.Headers.ContentType = MediaTypeHeaderValue.Parse(contentType);
         form.Add(fileContent, "file", filename);
         return form;
+    }
+
+    private static ByteArrayContent RawMultipart(string boundary, string body)
+    {
+        var content = new ByteArrayContent(Encoding.UTF8.GetBytes(body));
+        content.Headers.TryAddWithoutValidation("Content-Type", $"multipart/form-data; boundary={boundary}");
+        return content;
     }
 
     [Fact]
@@ -104,11 +112,18 @@ public sealed class WorkItemAttachmentEndpointsTests : IDisposable
     [Fact]
     public async Task Upload_ReturnsPayloadTooLarge_WhenFileExceedsLimit()
     {
+        using var factory = new AttachmentApiFactory(opts =>
+        {
+            opts.MaxFileSizeBytes = 1024;
+            opts.MaxTotalBytesPerWorkItem = 10_000;
+        });
+        using var client = factory.CreateClient();
         var item = Sample(WorkItemState.Queued);
-        await _factory.WorkItemStore.CreateAsync(item);
+        await factory.WorkItemStore.CreateAsync(item);
 
-        // Default factory MaxFileSizeBytes is 1024.
-        var response = await _client.PostAsync(
+        // Local factory MaxFileSizeBytes is 1024 and total cap is higher, so
+        // this trips the per-file guard rather than the per-item total guard.
+        var response = await client.PostAsync(
             $"/workitems/{item.Id}/attachments",
             FormWithFile(new byte[1500], "large.bin"));
 
@@ -234,6 +249,56 @@ public sealed class WorkItemAttachmentEndpointsTests : IDisposable
     }
 
     [Fact]
+    public async Task Upload_RejectsInvalidContentTypeHeader()
+    {
+        var item = Sample(WorkItemState.Queued);
+        await _factory.WorkItemStore.CreateAsync(item);
+
+        var boundary = "----codeybox-invalid-content-type";
+        var overlongContentType = new string('a', 260);
+        using var content = RawMultipart(
+            boundary,
+            $"--{boundary}\r\n" +
+            "Content-Disposition: form-data; name=\"file\"; filename=\"evil.txt\"\r\n" +
+            $"Content-Type: {overlongContentType}\r\n\r\n" +
+            "payload\r\n" +
+            $"--{boundary}--\r\n");
+
+        var response = await _client.PostAsync($"/workitems/{item.Id}/attachments", content);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var rows = await _factory.AttachmentStore.ListForWorkItemAsync(item.Id);
+        Assert.Empty(rows);
+    }
+
+    [Fact]
+    public async Task Upload_CleansFreshBlob_WhenLaterMultipartSectionIsRejected()
+    {
+        var item = Sample(WorkItemState.Queued);
+        await _factory.WorkItemStore.CreateAsync(item);
+
+        var boundary = "----codeybox-rejected-upload-cleanup";
+        var payload = $"unique rejected payload {Guid.NewGuid():N}";
+        var hash = HexSha256(Encoding.UTF8.GetBytes(payload));
+        using var content = RawMultipart(
+            boundary,
+            $"--{boundary}\r\n" +
+            "Content-Disposition: form-data; name=\"file\"; filename=\"fresh.txt\"\r\n" +
+            "Content-Type: text/plain\r\n\r\n" +
+            payload + "\r\n" +
+            $"--{boundary}\r\n" +
+            "Content-Disposition: form-data; name=\"unexpected\"\r\n\r\n" +
+            "nope\r\n" +
+            $"--{boundary}--\r\n");
+
+        var response = await _client.PostAsync($"/workitems/{item.Id}/attachments", content);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Empty(await _factory.AttachmentStore.ListForWorkItemAsync(item.Id));
+        Assert.False(_factory.BlobStore.Exists(hash));
+    }
+
+    [Fact]
     public async Task Upload_RejectsDanglingCaptionWithoutFollowingFile()
     {
         var item = Sample(WorkItemState.Queued);
@@ -321,6 +386,42 @@ public sealed class WorkItemAttachmentEndpointsTests : IDisposable
     }
 
     [Fact]
+    public async Task Upload_HotReloadsAttachmentLimitsAndRoot()
+    {
+        using var factory = new AttachmentApiFactory(opts =>
+        {
+            opts.MaxFileSizeBytes = 10;
+            opts.MaxTotalBytesPerWorkItem = 100;
+        });
+        using var client = factory.CreateClient();
+        var item = Sample(WorkItemState.Queued);
+        await factory.WorkItemStore.CreateAsync(item);
+
+        var payload = Encoding.UTF8.GetBytes("hot reload payload");
+        var rejected = await client.PostAsync(
+            $"/workitems/{item.Id}/attachments",
+            FormWithFile(payload, "hot.txt"));
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, rejected.StatusCode);
+
+        var reloadedRoot = Path.Combine(Path.GetTempPath(), $"codeybox-attachment-hot-root-{Guid.NewGuid():N}");
+        factory.UpdateAttachments(opts =>
+        {
+            opts.RootDirectory = reloadedRoot;
+            opts.MaxFileSizeBytes = 100;
+            opts.MaxTotalBytesPerWorkItem = 1000;
+        });
+
+        var accepted = await client.PostAsync(
+            $"/workitems/{item.Id}/attachments",
+            FormWithFile(payload, "hot.txt"));
+
+        Assert.Equal(HttpStatusCode.Created, accepted.StatusCode);
+        var dto = Assert.Single((await accepted.Content.ReadFromJsonAsync<List<AttachmentDto>>())!);
+        Assert.True(File.Exists(Path.Combine(reloadedRoot, dto.Sha256[..2], dto.Sha256)));
+        Assert.False(File.Exists(Path.Combine(factory.InitialRootDirectory, dto.Sha256[..2], dto.Sha256)));
+    }
+
+    [Fact]
     public async Task List_ReturnsAllAttachments()
     {
         var item = Sample(WorkItemState.Queued);
@@ -372,6 +473,25 @@ public sealed class WorkItemAttachmentEndpointsTests : IDisposable
     }
 
     [Fact]
+    public async Task Upload_DoesNotStoreBlobBytesInStateDatabase()
+    {
+        var item = Sample(WorkItemState.Queued);
+        await _factory.WorkItemStore.CreateAsync(item);
+
+        var marker = $"CODEYBOX_UNIQUE_BLOB_BYTES_{Guid.NewGuid():N}";
+        var payload = Encoding.UTF8.GetBytes(marker);
+        var response = await _client.PostAsync(
+            $"/workitems/{item.Id}/attachments",
+            FormWithFile(payload, "marker.bin"));
+        response.EnsureSuccessStatusCode();
+
+        Assert.False(ContainsSequence(File.ReadAllBytes(_factory.DatabasePath), payload));
+        var walPath = _factory.DatabasePath + "-wal";
+        if (File.Exists(walPath))
+            Assert.False(ContainsSequence(File.ReadAllBytes(walPath), payload));
+    }
+
+    [Fact]
     public async Task Download_Returns404_WhenAttachmentBelongsToDifferentWorkItem()
     {
         var itemA = Sample(WorkItemState.Queued);
@@ -409,6 +529,28 @@ public sealed class WorkItemAttachmentEndpointsTests : IDisposable
         var rGet = await _client.GetAsync($"/workitems/{item.Id}/attachments/{dto.Id}");
         Assert.Equal(HttpStatusCode.NotFound, rGet.StatusCode);
         Assert.Null(await _factory.AttachmentStore.GetAsync(dto.Id));
+    }
+
+    [Fact]
+    public async Task Delete_Returns404AndPreservesOwner_WhenAttachmentBelongsToDifferentWorkItem()
+    {
+        var itemA = Sample(WorkItemState.Queued);
+        var itemB = Sample(WorkItemState.Queued);
+        await _factory.WorkItemStore.CreateAsync(itemA);
+        await _factory.WorkItemStore.CreateAsync(itemB);
+
+        var rUpload = await _client.PostAsync(
+            $"/workitems/{itemA.Id}/attachments",
+            FormWithFile("owned by A"u8.ToArray(), "a.txt"));
+        rUpload.EnsureSuccessStatusCode();
+        var dto = (await rUpload.Content.ReadFromJsonAsync<List<AttachmentDto>>())![0];
+
+        var response = await _client.DeleteAsync($"/workitems/{itemB.Id}/attachments/{dto.Id}");
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        var record = await _factory.AttachmentStore.GetAsync(dto.Id);
+        Assert.NotNull(record);
+        Assert.Equal(itemA.Id, record.WorkItemId);
     }
 
     [Fact]
@@ -512,6 +654,27 @@ public sealed class WorkItemAttachmentEndpointsTests : IDisposable
         return Convert.ToHexString(sha.ComputeHash(data)).ToLowerInvariant();
     }
 
+    private static bool ContainsSequence(byte[] haystack, byte[] needle)
+    {
+        if (needle.Length == 0) return true;
+        if (needle.Length > haystack.Length) return false;
+
+        for (var i = 0; i <= haystack.Length - needle.Length; i++)
+        {
+            var matched = true;
+            for (var j = 0; j < needle.Length; j++)
+            {
+                if (haystack[i + j] != needle[j])
+                {
+                    matched = false;
+                    break;
+                }
+            }
+            if (matched) return true;
+        }
+        return false;
+    }
+
     [Fact]
     public async Task Upload_RejectsNonMultipartContentType()
     {
@@ -531,19 +694,35 @@ internal sealed class AttachmentApiFactory : WebApplicationFactory<Program>
         Path.GetTempPath(), $"codeybox-attachment-api-{Guid.NewGuid():N}.db");
     private readonly string _rootDir = Path.Combine(
         Path.GetTempPath(), $"codeybox-attachment-blobs-{Guid.NewGuid():N}");
+    private readonly HashSet<string> _attachmentRoots = new(StringComparer.Ordinal);
     private readonly Action<AttachmentsOptions>? _configureAttachments;
+    private readonly MutableOptionsMonitor<CodeyBoxOptions> _optionsMonitor;
 
     public AttachmentApiFactory(Action<AttachmentsOptions>? configureAttachments = null)
     {
         _configureAttachments = configureAttachments;
         WorkItemStore = new SqliteWorkItemStore(_dbPath);
         AttachmentStore = new SqliteWorkItemAttachmentStore(_dbPath);
-        BlobStore = new HostWorkItemAttachmentBlobStore(() => _rootDir);
+        var attachments = BuildInitialAttachmentOptions();
+        _optionsMonitor = new MutableOptionsMonitor<CodeyBoxOptions>(BuildCodeyBoxOptions(attachments));
+        TrackAttachmentRoot(attachments.RootDirectory);
+        BlobStore = new HostWorkItemAttachmentBlobStore(() =>
+            AttachmentsOptions.ResolveRoot(_optionsMonitor.CurrentValue.Attachments.RootDirectory));
     }
 
     public SqliteWorkItemStore WorkItemStore { get; }
     public SqliteWorkItemAttachmentStore AttachmentStore { get; }
     public HostWorkItemAttachmentBlobStore BlobStore { get; }
+    public string DatabasePath => _dbPath;
+    public string InitialRootDirectory => _rootDir;
+
+    public void UpdateAttachments(Action<AttachmentsOptions> update)
+    {
+        var attachments = _optionsMonitor.CurrentValue.Attachments;
+        update(attachments);
+        TrackAttachmentRoot(attachments.RootDirectory);
+        _optionsMonitor.Set(_optionsMonitor.CurrentValue);
+    }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
@@ -551,14 +730,7 @@ internal sealed class AttachmentApiFactory : WebApplicationFactory<Program>
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
             var tmp = Path.GetTempPath();
-            var attachments = new AttachmentsOptions
-            {
-                RootDirectory = _rootDir,
-                MaxFileSizeBytes = 1024, // low per-file cap so limit tests trip it cheaply
-                MaxAttachmentsPerWorkItem = 3,
-                MaxTotalBytesPerWorkItem = 1000,
-            };
-            _configureAttachments?.Invoke(attachments);
+            var attachments = _optionsMonitor.CurrentValue.Attachments;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -575,6 +747,9 @@ internal sealed class AttachmentApiFactory : WebApplicationFactory<Program>
         builder.ConfigureTestServices(services =>
         {
             services.RemoveAll<IHostedService>();
+            services.RemoveAll<IOptionsMonitor<CodeyBoxOptions>>();
+            services.AddSingleton<IOptionsMonitor<CodeyBoxOptions>>(_optionsMonitor);
+
             services.RemoveAll<IWorkItemStore>();
             services.AddSingleton<IWorkItemStore>(WorkItemStore);
 
@@ -599,8 +774,63 @@ internal sealed class AttachmentApiFactory : WebApplicationFactory<Program>
             WorkItemStore.Dispose();
             AttachmentStore.Dispose();
             try { File.Delete(_dbPath); } catch { }
-            try { if (Directory.Exists(_rootDir)) Directory.Delete(_rootDir, recursive: true); } catch { }
+            foreach (var root in _attachmentRoots)
+            {
+                try { if (Directory.Exists(root)) Directory.Delete(root, recursive: true); } catch { }
+            }
         }
         base.Dispose(disposing);
+    }
+
+    private AttachmentsOptions BuildInitialAttachmentOptions()
+    {
+        var attachments = new AttachmentsOptions
+        {
+            RootDirectory = _rootDir,
+            MaxFileSizeBytes = 1024,
+            MaxAttachmentsPerWorkItem = 3,
+            MaxTotalBytesPerWorkItem = 1000,
+        };
+        _configureAttachments?.Invoke(attachments);
+        return attachments;
+    }
+
+    private CodeyBoxOptions BuildCodeyBoxOptions(AttachmentsOptions attachments)
+    {
+        var tmp = Path.GetTempPath();
+        return new CodeyBoxOptions
+        {
+            StateDatabasePath = _dbPath,
+            GitRootDirectory = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
+            AuditLog = new AuditLogOptions
+            {
+                Path = Path.Combine(tmp, $"test-bsl-log-{Guid.NewGuid():N}-.json"),
+                AuditPath = Path.Combine(tmp, $"test-bsl-audit-{Guid.NewGuid():N}-.json"),
+            },
+            Attachments = attachments,
+        };
+    }
+
+    private void TrackAttachmentRoot(string root)
+    {
+        try { _attachmentRoots.Add(AttachmentsOptions.ResolveRoot(root)); }
+        catch { _attachmentRoots.Add(root); }
+    }
+
+    private sealed class MutableOptionsMonitor<T> : IOptionsMonitor<T>
+    {
+        private T _value;
+
+        public MutableOptionsMonitor(T value) => _value = value;
+
+        public T CurrentValue => _value;
+        public T Get(string? name) => _value;
+        public IDisposable OnChange(Action<T, string?> listener) => new NoopDisposable();
+        public void Set(T value) => _value = value;
+
+        private sealed class NoopDisposable : IDisposable
+        {
+            public void Dispose() { }
+        }
     }
 }

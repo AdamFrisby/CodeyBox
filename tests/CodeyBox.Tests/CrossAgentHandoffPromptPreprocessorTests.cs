@@ -272,12 +272,12 @@ public sealed class CrossAgentHandoffPromptPreprocessorTests
     }
 
     [Fact]
-    public async Task PreprocessorFiresThroughChain_OrderRespectedAfterProjectRulesAndAttachments()
+    public async Task PreprocessorFiresThroughChain_OrderRespectedWithReservedAttachmentNoOp()
     {
         var workItemId = WorkItemId.New();
         var attachments = new StubAttachmentSourceForChain(
         [
-            new WorkItemAttachment("/work/.codeybox/attachments/spec.md", "spec.md", "text/markdown", "spec"),
+            new WorkItemAttachment("/work/.codeybox/attachments/spec.md", "spec.md", "text/markdown", "do not expose"),
         ]);
         var history = new StubFallbackHistoryStore(
         [
@@ -299,11 +299,11 @@ public sealed class CrossAgentHandoffPromptPreprocessorTests
         var result = await chain.ProcessAsync(ctx, "next prompt");
 
         var handoffIdx = result.IndexOf("## Cross-agent handoff", StringComparison.Ordinal);
-        var attachmentIdx = result.IndexOf("## Attachments", StringComparison.Ordinal);
         var promptIdx = result.IndexOf("next prompt", StringComparison.Ordinal);
         Assert.True(handoffIdx >= 0);
-        Assert.True(attachmentIdx > handoffIdx);
-        Assert.True(promptIdx > attachmentIdx);
+        Assert.DoesNotContain("## Attachments", result);
+        Assert.DoesNotContain("do not expose", result);
+        Assert.True(promptIdx > handoffIdx);
     }
 
     [Fact]

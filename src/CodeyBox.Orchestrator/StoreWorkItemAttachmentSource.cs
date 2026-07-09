@@ -4,25 +4,20 @@ namespace CodeyBox.Orchestrator;
 
 /// <summary>
 /// Adapts <see cref="IWorkItemAttachmentStore"/> to
-/// <see cref="IWorkItemAttachmentSource"/> so the prompt-preprocessor chain
-/// (<see cref="AttachmentManifestPromptPreprocessor"/>,
-/// <see cref="CrossAgentHandoffPromptPreprocessor"/>) sees the operator-uploaded
-/// attachments at pickup time.
+/// <see cref="IWorkItemAttachmentSource"/> for the future in-VM attachment
+/// delivery task.
 /// </summary>
 /// <remarks>
-/// The actual in-VM blob delivery (writing the blob bytes from the host
-/// content-addressed root into each sandbox) is a dependent ticket; this
-/// adapter produces a planned staging path that the future delivery step will
-/// honour. The preprocessor describes what will be at that path; if the
-/// delivery step is not yet wired the agent will not find the file, but the
-/// manifest is still accurate for "what was attached".
+/// The current attachment foundation does not wire this adapter into the
+/// production agent prompt path. It only centralizes planned delivery names so
+/// a future staging service can share the same duplicate-name policy.
 /// </remarks>
 public sealed class StoreWorkItemAttachmentSource : IWorkItemAttachmentSource
 {
     /// <summary>
     /// Per-item staging directory inside the sandbox. The eventual delivery
-    /// step (out of scope here) writes blobs under this path keyed by the
-    /// operator-visible filename.
+    /// step (out of scope here) writes blobs under this path keyed by the safe
+    /// delivery filename.
     /// </summary>
     public const string SandboxStagingDirectory = "/work/.codeybox/attachments";
 

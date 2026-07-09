@@ -243,6 +243,15 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             failures.Add(ex.Message);
         }
 
+        try
+        {
+            options.Attachments.Validate();
+        }
+        catch (InvalidOperationException ex)
+        {
+            failures.Add(ex.Message);
+        }
+
         if (options.EnableSharedUpstreamMirror && string.IsNullOrWhiteSpace(options.SharedUpstreamMirrorDirectory))
         {
             failures.Add("CodeyBox:SharedUpstreamMirrorDirectory must not be empty if EnableSharedUpstreamMirror is true");

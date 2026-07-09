@@ -20,9 +20,9 @@ public static class FileNameSanitizer
     {
         if (string.IsNullOrWhiteSpace(value)) return null;
 
-        // Strip any directory components — the upload may have come from a
-        // client that passes the full local path. GetFileName handles both
-        // '/' and '\\' delimiters and any backslash present in the raw bytes.
+        // Strip directory components from full local paths. Normalize
+        // backslashes first because Path.GetFileName only treats the current
+        // platform's separator as path syntax.
         var name = Path.GetFileName(value.Replace('\\', '/'));
         if (string.IsNullOrWhiteSpace(name)) return null;
         if (name is "." or "..") return null;

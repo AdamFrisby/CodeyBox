@@ -49,6 +49,18 @@ public sealed class HostWorkItemAttachmentBlobStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task StageAsync_StopsReadingAfterLimitIsCrossed()
+    {
+        using var stream = new CountingStream(totalBytes: 10 * 1024 * 1024);
+
+        await Assert.ThrowsAsync<AttachmentBlobTooLargeException>(
+            async () => await _store.StageAsync(stream, maxBytes: 1024));
+
+        Assert.Equal(1, stream.ReadCalls);
+        Assert.True(stream.BytesRead < stream.TotalBytes);
+    }
+
+    [Fact]
     public async Task StageAsync_DeduplicatesSameContent()
     {
         var content = "Deduplicate me";
@@ -122,5 +134,51 @@ public sealed class HostWorkItemAttachmentBlobStoreTests : IDisposable
         Assert.Equal(2, hashes.Count);
         Assert.Contains(r1.Sha256, hashes);
         Assert.Contains(r2.Sha256, hashes);
+    }
+
+    private sealed class CountingStream(long totalBytes) : Stream
+    {
+        private long _position;
+
+        public long TotalBytes { get; } = totalBytes;
+        public int ReadCalls { get; private set; }
+        public long BytesRead { get; private set; }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => TotalBytes;
+        public override long Position
+        {
+            get => _position;
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            if (_position >= TotalBytes) return 0;
+            var read = (int)Math.Min(count, TotalBytes - _position);
+            Array.Fill<byte>(buffer, 0x5a, offset, read);
+            _position += read;
+            ReadCalls++;
+            BytesRead += read;
+            return read;
+        }
+
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (_position >= TotalBytes) return ValueTask.FromResult(0);
+            var read = (int)Math.Min(buffer.Length, TotalBytes - _position);
+            buffer.Span[..read].Fill(0x5a);
+            _position += read;
+            ReadCalls++;
+            BytesRead += read;
+            return ValueTask.FromResult(read);
+        }
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 }

@@ -67,7 +67,7 @@ public sealed class AttachmentCleanupServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task RunTerminalCleanupAsync_DeletesMetadataAndBlobs_WhenOlderThanTtl()
+    public async Task RunTerminalCleanupAsync_DeletesMetadataAndBlobs_ForTerminalOrExpiredItems()
     {
         var service = new AttachmentCleanupService(
             _store,
@@ -97,7 +97,7 @@ public sealed class AttachmentCleanupServiceTests : IDisposable
         };
         await _store.CreateAsync(rec1);
 
-        // Work Item 2: Terminal (Failed), but newer than TTL -> should NOT be cleaned up
+        // Work Item 2: Terminal (Failed), newer than TTL -> terminal cleanup still removes it.
         var wi2 = NewId();
         SeedWorkItem(wi2, WorkItemState.Failed, newerThanTtl);
         using var stream2 = new MemoryStream(Encoding.UTF8.GetBytes("content2"));
@@ -114,7 +114,7 @@ public sealed class AttachmentCleanupServiceTests : IDisposable
         };
         await _store.CreateAsync(rec2);
 
-        // Work Item 3: Non-terminal (Queued), older than TTL -> should NOT be cleaned up
+        // Work Item 3: Non-terminal (Queued), older than TTL -> TTL cleanup removes it.
         var wi3 = NewId();
         SeedWorkItem(wi3, WorkItemState.Queued, olderThanTtl);
         using var stream3 = new MemoryStream(Encoding.UTF8.GetBytes("content3"));
@@ -131,31 +131,58 @@ public sealed class AttachmentCleanupServiceTests : IDisposable
         };
         await _store.CreateAsync(rec3);
 
+        // Work Item 4: Terminal (Cancelled), newer than TTL -> terminal cleanup removes it.
+        var wi4 = NewId();
+        SeedWorkItem(wi4, WorkItemState.Cancelled, newerThanTtl);
+        using var stream4 = new MemoryStream(Encoding.UTF8.GetBytes("content4"));
+        var blob4 = await _blobs.StageAsync(stream4, 100);
+        var rec4 = new WorkItemAttachmentRecord
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            WorkItemId = wi4,
+            FileName = "file4.txt",
+            ContentType = "text/plain",
+            SizeBytes = blob4.SizeBytes,
+            Sha256 = blob4.Sha256,
+            CreatedAt = newerThanTtl
+        };
+        await _store.CreateAsync(rec4);
+
+        // Work Item 5: Non-terminal and fresh -> should be preserved.
+        var wi5 = NewId();
+        SeedWorkItem(wi5, WorkItemState.Working, newerThanTtl);
+        using var stream5 = new MemoryStream(Encoding.UTF8.GetBytes("content5"));
+        var blob5 = await _blobs.StageAsync(stream5, 100);
+        var rec5 = new WorkItemAttachmentRecord
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            WorkItemId = wi5,
+            FileName = "file5.txt",
+            ContentType = "text/plain",
+            SizeBytes = blob5.SizeBytes,
+            Sha256 = blob5.Sha256,
+            CreatedAt = newerThanTtl
+        };
+        await _store.CreateAsync(rec5);
+
         // Run the sweep
         var deletedCount = await service.RunTerminalCleanupAsync(_options, now, CancellationToken.None);
 
-        Assert.Equal(1, deletedCount);
+        Assert.Equal(4, deletedCount);
 
-        // Metadata for WI 1 should be gone (terminal cleanup deletes rows).
+        // Metadata and blobs for terminal/expired rows are gone in this pass.
         Assert.Null(await _store.GetAsync(rec1.Id));
-        // Blob 1 is NOT deleted by terminal cleanup — blob deletion is
-        // deferred to the orphan sweep so a concurrent upload of the same
-        // bytes cannot be orphaned. Verify it lingers, then reclaim it via
-        // the orphan sweep with a zero grace window.
-        Assert.True(_blobs.Exists(blob1.Sha256));
-        var reclaimOpts = new AttachmentsOptions
-        {
-            RootDirectory = _rootDir,
-            OrphanGracePeriod = TimeSpan.Zero,
-        };
-        await service.RunOrphanSweepAsync(reclaimOpts, CancellationToken.None);
         Assert.False(_blobs.Exists(blob1.Sha256));
+        Assert.Null(await _store.GetAsync(rec2.Id));
+        Assert.False(_blobs.Exists(blob2.Sha256));
+        Assert.Null(await _store.GetAsync(rec3.Id));
+        Assert.False(_blobs.Exists(blob3.Sha256));
+        Assert.Null(await _store.GetAsync(rec4.Id));
+        Assert.False(_blobs.Exists(blob4.Sha256));
 
-        // Metadata and blobs for WI 2 and WI 3 should be preserved
-        Assert.NotNull(await _store.GetAsync(rec2.Id));
-        Assert.True(_blobs.Exists(blob2.Sha256));
-        Assert.NotNull(await _store.GetAsync(rec3.Id));
-        Assert.True(_blobs.Exists(blob3.Sha256));
+        // Fresh non-terminal rows are preserved.
+        Assert.NotNull(await _store.GetAsync(rec5.Id));
+        Assert.True(_blobs.Exists(blob5.Sha256));
     }
 
     [Fact]

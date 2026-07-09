@@ -169,6 +169,77 @@ public sealed class SqliteWorkItemAttachmentStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateBatchIfUnderCapAsync_ReturnsFalseAndInsertsNoRows_WhenCapWouldBeExceeded()
+    {
+        var wi = NewId();
+        SeedWorkItem(wi);
+        var r1 = MakeRecord(wi, "1");
+        var r2 = MakeRecord(wi, "2");
+
+        var committed = await _store.CreateBatchIfUnderCapAsync(
+            [r1, r2],
+            maxCount: 1,
+            maxTotalBytes: 1_000);
+
+        Assert.False(committed);
+        Assert.Empty(await _store.ListForWorkItemAsync(wi));
+    }
+
+    [Fact]
+    public async Task CreateBatchIfUnderCapAsync_RollsBackWholeBatch_WhenSecondInsertFails()
+    {
+        var wi = NewId();
+        SeedWorkItem(wi);
+        var id = Guid.NewGuid().ToString("N");
+        var r1 = MakeRecord(wi, "1") with { Id = id };
+        var r2 = MakeRecord(wi, "2") with { Id = id };
+
+        await Assert.ThrowsAsync<SqliteException>(() =>
+            _store.CreateBatchIfUnderCapAsync([r1, r2], maxCount: 10, maxTotalBytes: 1_000));
+
+        Assert.Empty(await _store.ListForWorkItemAsync(wi));
+    }
+
+    [Fact]
+    public async Task CreateBatchForQueuedWorkItemIfUnderCapAsync_RejectsWhenWorkItemRacedOutOfQueued()
+    {
+        var wi = NewId();
+        SeedWorkItem(wi, WorkItemState.Working);
+        var record = MakeRecord(wi);
+
+        var result = await _store.CreateBatchForQueuedWorkItemIfUnderCapAsync(
+            [record],
+            maxCount: 10,
+            maxTotalBytes: 1_000);
+
+        Assert.Equal(AttachmentMutationOutcome.StateMismatch, result.Outcome);
+        Assert.Equal(WorkItemState.Working, result.CurrentState);
+        Assert.Empty(await _store.ListForWorkItemAsync(wi));
+    }
+
+    [Fact]
+    public async Task DeleteIfWorkItemQueuedAsync_RejectsWhenWorkItemRacedOutOfQueued()
+    {
+        var wi = NewId();
+        SeedWorkItem(wi, WorkItemState.Queued);
+        var record = MakeRecord(wi);
+        await _store.CreateAsync(record);
+        using (var cmd = _rawConn.CreateCommand())
+        {
+            cmd.CommandText = "UPDATE work_items SET state = $state WHERE id = $id;";
+            cmd.Parameters.AddWithValue("$state", (int)WorkItemState.Working);
+            cmd.Parameters.AddWithValue("$id", wi.ToString());
+            cmd.ExecuteNonQuery();
+        }
+
+        var result = await _store.DeleteIfWorkItemQueuedAsync(record.Id, wi);
+
+        Assert.Equal(AttachmentMutationOutcome.StateMismatch, result.Outcome);
+        Assert.Equal(WorkItemState.Working, result.CurrentState);
+        Assert.NotNull(await _store.GetAsync(record.Id));
+    }
+
+    [Fact]
     public async Task ListReferencedHashesAsync_ReturnsDistinctHashes()
     {
         var wi = NewId();
@@ -227,6 +298,32 @@ public sealed class SqliteWorkItemAttachmentStoreTests : IDisposable
         Assert.Contains(wi4, results);
         Assert.DoesNotContain(wi2, results);
         Assert.DoesNotContain(wi3, results);
+    }
+
+    [Fact]
+    public async Task ListCleanupCandidatesWithAttachmentsAsync_ReturnsTerminalOrOlderThanTtlItems()
+    {
+        var cutoff = DateTimeOffset.UtcNow.AddMinutes(-5);
+
+        var terminalNew = NewId();
+        SeedWorkItem(terminalNew, WorkItemState.Cancelled, DateTimeOffset.UtcNow);
+        await _store.CreateAsync(MakeRecord(terminalNew, "terminal"));
+
+        var nonTerminalOld = NewId();
+        SeedWorkItem(nonTerminalOld, WorkItemState.Working, DateTimeOffset.UtcNow.AddMinutes(-10));
+        await _store.CreateAsync(MakeRecord(nonTerminalOld, "old"));
+
+        var nonTerminalNew = NewId();
+        SeedWorkItem(nonTerminalNew, WorkItemState.Queued, DateTimeOffset.UtcNow);
+        await _store.CreateAsync(MakeRecord(nonTerminalNew, "new"));
+
+        var results = new List<WorkItemId>();
+        await foreach (var item in _store.ListCleanupCandidatesWithAttachmentsAsync(cutoff))
+            results.Add(item);
+
+        Assert.Contains(terminalNew, results);
+        Assert.Contains(nonTerminalOld, results);
+        Assert.DoesNotContain(nonTerminalNew, results);
     }
 
     [Fact]

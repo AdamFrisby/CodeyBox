@@ -8,12 +8,9 @@ namespace CodeyBox.Orchestrator;
 /// Background sweep that bounds attachment storage growth. Runs three passes
 /// on independent cadences:
 /// <list type="bullet">
-///   <item><b>Terminal-state cleanup</b> — removes metadata rows for work
-///   items that have been terminal longer than the configured TTL. On-disk
-///   blobs are NOT deleted here: a concurrent upload of the same bytes may
-///   have staged a dedup'd copy and be about to write its metadata row, and
-///   deleting the blob out from under it would orphan that row. The orphan
-///   sweep reclaims unreferenced blobs after the grace window.</item>
+///   <item><b>Terminal/TTL cleanup</b> — removes metadata rows for work items
+///   that are terminal or whose last update is older than the configured TTL,
+///   then deletes any blob that no remaining metadata row references.</item>
 ///   <item><b>Orphan-blob sweep</b> — removes blobs on disk that have no
 ///   metadata row referring to them. Protected by a grace window (sourced
 ///   from the blob's last-write time, which is refreshed on every stage /
@@ -61,9 +58,8 @@ public sealed class AttachmentCleanupService : BackgroundService
         var lastTerminal = DateTimeOffset.MinValue;
         var lastOrphan = DateTimeOffset.MinValue;
 
-        // Drive the loop on Task.Delay with the fresh opts value each cycle
-        // so a hot-reload of CleanupSweepInterval / OrphanSweepInterval is
-        // honoured immediately, not just on the elapsed-since-last branch.
+        // Read fresh options each cycle so hot-reloaded cleanup intervals and
+        // lifecycle windows apply to the next sweep decision and delay.
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -95,20 +91,7 @@ public sealed class AttachmentCleanupService : BackgroundService
 
     private async Task DelayAsync(TimeSpan delay, CancellationToken ct)
     {
-        if (_time == TimeProvider.System)
-            await Task.Delay(delay, ct).ConfigureAwait(false);
-        else
-        {
-            // Honour the injected clock in tests: spin on a short sleep so the
-            // ManualTimeProvider's Advance() can unblock the loop promptly.
-            var remaining = delay;
-            while (remaining > TimeSpan.Zero && !ct.IsCancellationRequested)
-            {
-                var step = TimeSpan.FromMilliseconds(Math.Min(50, remaining.TotalMilliseconds));
-                await Task.Delay(step, ct).ConfigureAwait(false);
-                remaining -= step;
-            }
-        }
+        await Task.Delay(delay, _time, ct).ConfigureAwait(false);
     }
 
     private static TimeSpan ComputeTick(AttachmentsOptions opts)
@@ -124,21 +107,26 @@ public sealed class AttachmentCleanupService : BackgroundService
     {
         var cutoff = now - opts.TerminalCleanupTtl;
         var deletedItems = 0;
-        await foreach (var itemId in _store.ListTerminalWithAttachmentsAsync(cutoff, ct).ConfigureAwait(false))
+        var deletedBlobs = 0;
+        await foreach (var itemId in _store.ListCleanupCandidatesWithAttachmentsAsync(cutoff, ct).ConfigureAwait(false))
         {
             ct.ThrowIfCancellationRequested();
-            // Delete metadata rows only. The on-disk blobs are left for the
-            // orphan sweep: a concurrent upload of the same bytes may have a
-            // staged dedup copy whose metadata row has not landed yet, and
-            // deleting the blob here would orphan that row.
             var rows = await _store.DeleteAllForWorkItemAsync(itemId, ct).ConfigureAwait(false);
             if (rows.Count == 0) continue;
             deletedItems++;
+            foreach (var hash in rows.Select(static r => r.Sha256).Distinct(StringComparer.Ordinal))
+            {
+                if (await _store.CountReferencesAsync(hash, ct).ConfigureAwait(false) == 0
+                    && _blobs.TryDelete(hash))
+                {
+                    deletedBlobs++;
+                }
+            }
         }
         if (deletedItems > 0)
             _log.LogInformation(
-                "AttachmentCleanup: terminal sweep removed attachment metadata for {Items} work item(s) older than {Cutoff:o}",
-                deletedItems, cutoff);
+                "AttachmentCleanup: terminal/TTL sweep removed attachment metadata for {Items} work item(s) and {Blobs} blob(s); TTL cutoff {Cutoff:o}",
+                deletedItems, deletedBlobs, cutoff);
         return deletedItems;
     }
 
