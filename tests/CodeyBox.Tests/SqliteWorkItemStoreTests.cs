@@ -185,6 +185,46 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task ListWaitingForQuotaResetByPriorityAsync_AppliesLimitAndPriorityOrder()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var highOlder = Sample() with
+        {
+            State = WorkItemState.WaitingForQuotaReset,
+            Priority = 10,
+            CreatedAt = now.AddMinutes(-3),
+        };
+        var highNewer = Sample() with
+        {
+            State = WorkItemState.WaitingForQuotaReset,
+            Priority = 10,
+            CreatedAt = now.AddMinutes(-1),
+        };
+        var low = Sample() with
+        {
+            State = WorkItemState.WaitingForQuotaReset,
+            Priority = 1,
+            CreatedAt = now.AddMinutes(-5),
+        };
+        var queued = Sample() with
+        {
+            State = WorkItemState.Queued,
+            Priority = 100,
+            CreatedAt = now.AddMinutes(-10),
+        };
+        await _store.CreateAsync(low);
+        await _store.CreateAsync(highNewer);
+        await _store.CreateAsync(queued);
+        await _store.CreateAsync(highOlder);
+
+        var results = new List<WorkItem>();
+        await foreach (var item in _store.ListWaitingForQuotaResetByPriorityAsync(limit: 2))
+            results.Add(item);
+
+        Assert.Equal([highOlder.Id, highNewer.Id], results.Select(item => item.Id));
+    }
+
+    [Fact]
     public async Task ReadMethods_WaitBehindSharedConnectionGate()
     {
         var queued = Sample();

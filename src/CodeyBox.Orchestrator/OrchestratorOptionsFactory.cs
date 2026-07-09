@@ -92,7 +92,9 @@ public static class OrchestratorOptionsFactory
         string autoRetryPeriodicInterval,
         string autoRetryDriftMargin,
         int autoRetryMaxRetries,
-        ILogger log)
+        ILogger log,
+        int autoRetryMaxWaitingForQuotaResetSweepBatchSize =
+            AutoRetryOnQuotaFailureOptions.DefaultWaitingForQuotaResetSweepBatchSize)
     {
         var options = Build(legacyConcurrency, workerPool, log);
 
@@ -102,7 +104,8 @@ public static class OrchestratorOptionsFactory
                 autoRetryEnabled,
                 autoRetryPeriodicInterval,
                 autoRetryDriftMargin,
-                autoRetryMaxRetries)
+                autoRetryMaxRetries,
+                autoRetryMaxWaitingForQuotaResetSweepBatchSize)
         };
 
         return options;
@@ -163,7 +166,9 @@ public static class OrchestratorOptionsFactory
         bool enabled,
         string periodicCheckInterval,
         string clockDriftMargin,
-        int maxRetriesPerWorkItem)
+        int maxRetriesPerWorkItem,
+        int maxWaitingForQuotaResetSweepBatchSize =
+            AutoRetryOnQuotaFailureOptions.DefaultWaitingForQuotaResetSweepBatchSize)
     {
         if (!enabled)
             return new AutoRetryOnQuotaFailureOptions { Enabled = false };
@@ -180,6 +185,8 @@ public static class OrchestratorOptionsFactory
 
         if (maxRetriesPerWorkItem < 0)
             throw new InvalidOperationException("CodeyBox:AutoRetryOnQuotaFailure:MaxAutoRetriesPerWorkItem must be non-negative");
+        if (maxWaitingForQuotaResetSweepBatchSize <= 0)
+            throw new InvalidOperationException("CodeyBox:AutoRetryOnQuotaFailure:MaxWaitingForQuotaResetSweepBatchSize must be positive");
 
         return new AutoRetryOnQuotaFailureOptions
         {
@@ -187,6 +194,7 @@ public static class OrchestratorOptionsFactory
             PeriodicCheckInterval = periodic,
             ClockDriftSafetyMargin = drift,
             MaxAutoRetriesPerWorkItem = maxRetriesPerWorkItem,
+            MaxWaitingForQuotaResetSweepBatchSize = maxWaitingForQuotaResetSweepBatchSize,
         };
     }
 

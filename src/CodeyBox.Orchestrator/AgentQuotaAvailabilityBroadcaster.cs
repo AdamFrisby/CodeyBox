@@ -160,9 +160,9 @@ public interface IAgentQuotaAvailabilityPublisher
     /// without relying on single-threaded ordering.
     /// </summary>
     /// <returns>
-    /// <c>true</c> when no recovery threshold signal was needed or every
-    /// recovery-signal subscriber completed; <c>false</c> when a subscriber
-    /// threw and the caller should keep any best-effort recovery tracking.
+    /// <c>true</c> when every required recovery-signal and observation
+    /// subscriber completed; <c>false</c> when any such subscriber threw and the
+    /// caller should keep any best-effort recovery tracking.
     /// </returns>
     bool RecordQuotaUsability(
         AgentMembership member,

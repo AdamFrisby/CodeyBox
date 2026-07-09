@@ -201,7 +201,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                     count++;
             }
         }
-        foreach (var item in await ListWaitingForQuotaResetByPriorityAsync(ct))
+        await foreach (var item in ListWaitingForQuotaResetByPriorityAsync(ct))
         {
             if (await TryStartupRequeueWaitingItemAsync(item, ct))
                 count++;
@@ -370,7 +370,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                 await TryPeriodicRetryAsync(item, ct);
             }
         }
-        foreach (var item in await ListWaitingForQuotaResetByPriorityAsync(ct))
+        await foreach (var item in ListWaitingForQuotaResetByPriorityAsync(ct))
         {
             await TryPeriodicRetryAsync(item, ct);
         }
@@ -379,7 +379,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
     public async Task RunWatchdogRecoverySweepAsync(CancellationToken ct)
     {
         _log.LogWarning("Worker-pool health watchdog triggered quota retry recovery sweep");
-        foreach (var item in await ListWaitingForQuotaResetByPriorityAsync(ct))
+        await foreach (var item in ListWaitingForQuotaResetByPriorityAsync(ct))
         {
             await TryWatchdogRecoveryRetryAsync(item, ct);
         }
@@ -890,16 +890,17 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             retry.ActualFrom == retryFrom ? $"from={retryFrom}" : $"from={retryFrom}; actualFrom={retry.ActualFrom}");
     }
 
-    private async Task<IReadOnlyList<WorkItem>> ListWaitingForQuotaResetByPriorityAsync(CancellationToken ct)
-    {
-        var waiting = new List<WorkItem>();
-        await foreach (var item in _store.ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct))
-            waiting.Add(item);
+    private IAsyncEnumerable<WorkItem> ListWaitingForQuotaResetByPriorityAsync(CancellationToken ct) =>
+        _store.ListWaitingForQuotaResetByPriorityAsync(
+            ResolveWaitingForQuotaResetSweepBatchSize(),
+            ct);
 
-        return waiting
-            .OrderByDescending(item => item.Priority)
-            .ThenBy(item => item.CreatedAt)
-            .ToList();
+    private int ResolveWaitingForQuotaResetSweepBatchSize()
+    {
+        var configured = CurrentRetryOptions.MaxWaitingForQuotaResetSweepBatchSize;
+        return configured > 0
+            ? configured
+            : AutoRetryOnQuotaFailureOptions.DefaultWaitingForQuotaResetSweepBatchSize;
     }
     /// <summary>
     /// Notifies the scheduler that a work item has failed with a quota error,

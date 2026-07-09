@@ -108,7 +108,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase),
             todModifiers ?? []);
         var probeList = probes.ToList();
-        _probesByKind = AgentQuotaProbeCatalog.BuildKindLookup(probeList);
+        _probesByKind = AgentQuotaProbeCatalog.BuildSubscriptionProbeKindLookup(probeList);
         _payPerApiProbe = probeList.OfType<PayPerApiQuotaProbe>().FirstOrDefault() ?? new PayPerApiQuotaProbe();
         _nullProbe = probeList.OfType<NullQuotaProbe>().FirstOrDefault() ?? new NullQuotaProbe();
         _opts = opts;
@@ -2834,7 +2834,7 @@ public sealed class QuotaRouterOptions
     /// (claude/codex weekly cap). Override per agent via
     /// <see cref="RampWindowByAgent"/> when an agent's binding window differs.
     /// </summary>
-    public TimeSpan RampWindow { get; set; } = TimeSpan.FromDays(7);
+    public TimeSpan RampWindow { get; set; } = QuotaRouterDefaults.DefaultRampWindow;
 
     /// <summary>
     /// Per-agent override for the ramp window length, keyed by
@@ -2861,6 +2861,14 @@ public sealed class QuotaRouterOptions
     /// </summary>
     public TimeSpan QuotaRecoveryProbeInterval { get; set; } =
         QuotaRouterDefaults.DefaultQuotaRecoveryProbeInterval;
+
+    /// <summary>
+    /// Maximum parked quota rows the recovery probe monitor inspects on each
+    /// eligibility pass before probing a recovered member. The cap keeps the
+    /// prompt recovery path bounded even when the parked backlog is large.
+    /// </summary>
+    public int MaxQuotaRecoveryProbeEligibilityScan { get; set; } =
+        QuotaRouterDefaults.DefaultQuotaRecoveryProbeEligibilityScanLimit;
 
     /// <summary>
     /// How long a quota probe result is cached before a new HTTP call is made.

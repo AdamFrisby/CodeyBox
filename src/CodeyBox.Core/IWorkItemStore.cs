@@ -272,6 +272,18 @@ public interface IWorkItemStore
     IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default);
 
     /// <summary>
+    /// Returns at most <paramref name="limit"/> parked quota rows in the retry
+    /// sweep order: highest priority first, then oldest created time. Persistent
+    /// stores should apply the limit inside the storage query so recovery paths
+    /// cannot buffer an unbounded parked backlog before retrying anything.
+    /// </summary>
+    IAsyncEnumerable<WorkItem> ListWaitingForQuotaResetByPriorityAsync(
+        int limit,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This work item store must implement bounded WaitingForQuotaReset priority queries before quota recovery sweeps can run.");
+
+    /// <summary>
     /// Returns the number of work items currently persisted in
     /// <paramref name="state"/> without loading the rows.
     /// </summary>

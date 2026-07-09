@@ -379,7 +379,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // test fixtures; production DI wires this dependency explicitly.
         _auditProgress = auditProgress;
         _quotaProbesByKind = auditQuotaProbes is null ? null
-            : AgentQuotaProbeCatalog.BuildKindLookup(auditQuotaProbes);
+            : AgentQuotaProbeCatalog.BuildSubscriptionProbeKindLookup(auditQuotaProbes);
         _auditQuotaOptions = auditQuotaOptions ?? new QuotaRouterOptions();
         _auditQuotaGatePolicy = new QuotaGatePolicy(_auditQuotaOptions);
         _questionStore = questionStore;
@@ -11330,16 +11330,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
         AgentMembership member,
         CancellationToken ct)
     {
+        var nowUtc = _opts.TimeProvider.GetUtcNow();
         var hasQuotaRetryAdmission = _classRouter?.HasQuotaRetryAdmission(
             itemId,
             member,
-            _opts.TimeProvider.GetUtcNow()) == true;
+            nowUtc) == true;
         if (_quotaFailures is not null
             && !hasQuotaRetryAdmission
             && await _quotaFailures.HasRecentAsync(
                 kind, member.ModelId,
                 _auditQuotaOptions.ObservedFailureWindow,
-                DateTimeOffset.UtcNow, ct))
+                nowUtc, ct))
         {
             _quotaAvailabilityPublisher?.RecordQuotaUsability(
                 member,
@@ -11367,7 +11368,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 return (true, "no probe registered");
 
             var budgetQuota = new EffectiveQuota(budgetPct, null, null, budget?.Windows);
-            return EvaluateAuditQuotaGate(member, budgetQuota, budgetOnly: true);
+            return EvaluateAuditQuotaGate(member, budgetQuota, nowUtc, budgetOnly: true);
         }
 
         EffectiveQuota probeQuota;
@@ -11400,8 +11401,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             AvailablePct = combinedPct,
         };
 
-        var decision = EvaluateAuditQuotaGate(member, combinedQuota, budgetOnly: false);
-        var providerGate = _auditQuotaGatePolicy.Evaluate(member, probeQuota, DateTimeOffset.UtcNow);
+        var decision = EvaluateAuditQuotaGate(member, combinedQuota, nowUtc, budgetOnly: false);
+        var providerGate = _auditQuotaGatePolicy.Evaluate(member, probeQuota, nowUtc);
         var denialIsBudgetOnly = !decision.Allowed
             && providerGate.Allow
             && budgetPct >= 0
@@ -11421,10 +11422,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private (bool Allowed, string Reason) EvaluateAuditQuotaGate(
         AgentMembership member,
         EffectiveQuota quota,
+        DateTimeOffset nowUtc,
         bool budgetOnly)
     {
         var combinedPct = quota.AvailablePct;
-        var gate = _auditQuotaGatePolicy.Evaluate(member, quota, DateTimeOffset.UtcNow);
+        var gate = _auditQuotaGatePolicy.Evaluate(member, quota, nowUtc);
         if (gate.Allow)
         {
             return budgetOnly

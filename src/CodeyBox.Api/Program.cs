@@ -2903,7 +2903,8 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
             current.Enabled,
             current.PeriodicCheckInterval,
             current.ClockDriftSafetyMargin,
-            current.MaxAutoRetriesPerWorkItem);
+            current.MaxAutoRetriesPerWorkItem,
+            current.MaxWaitingForQuotaResetSweepBatchSize);
     },
     quotaAvailabilitySignal: sp.GetRequiredService<IAgentQuotaAvailabilitySignal>(),
     pauseSignal: sp.GetRequiredService<IAgentPauseSignal>()));
@@ -2988,7 +2989,8 @@ builder.Services.AddSingleton<OrchestratorOptions>(sp =>
         cbOpts.AutoRetryOnQuotaFailure.PeriodicCheckInterval,
         cbOpts.AutoRetryOnQuotaFailure.ClockDriftSafetyMargin,
         cbOpts.AutoRetryOnQuotaFailure.MaxAutoRetriesPerWorkItem,
-        startupLog) with
+        startupLog,
+        cbOpts.AutoRetryOnQuotaFailure.MaxWaitingForQuotaResetSweepBatchSize) with
     {
         AutoRetryOnTransientFailure = OrchestratorOptionsFactory.BuildTransientRetryOptions(
             cbOpts.AutoRetryOnTransientFailure.Enabled,
@@ -4813,6 +4815,8 @@ namespace CodeyBox.Api
         public string PeriodicCheckInterval { get; set; } = "00:05:00";
         public string ClockDriftSafetyMargin { get; set; } = "00:02:00";
         public int MaxAutoRetriesPerWorkItem { get; set; } = 3;
+        public int MaxWaitingForQuotaResetSweepBatchSize { get; set; } =
+            AutoRetryOnQuotaFailureOptions.DefaultWaitingForQuotaResetSweepBatchSize;
     }
 
     public sealed class AutoRetryOnTransientFailureConfig
@@ -5462,6 +5466,12 @@ namespace CodeyBox.Api
         /// </summary>
         public int QuotaRecoveryProbeIntervalSeconds { get; set; } =
             QuotaRouterDefaults.DefaultQuotaRecoveryProbeIntervalSeconds;
+        /// <summary>
+        /// Maximum parked quota rows inspected by each event-driven recovery
+        /// eligibility pass. Default 128.
+        /// </summary>
+        public int MaxQuotaRecoveryProbeEligibilityScan { get; set; } =
+            QuotaRouterDefaults.DefaultQuotaRecoveryProbeEligibilityScanLimit;
         /// <summary>Seconds to cache a probe result. Default 60.</summary>
         public int QuotaCacheTtlSeconds { get; set; } = 60;
         /// <summary>How the router treats unknown probe snapshots. Default UseObservedFailures.</summary>

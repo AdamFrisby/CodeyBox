@@ -17,6 +17,9 @@ internal static class QuotaRouterConfigMapper
         QuotaRecoveryProbeInterval = BuildPositiveDuration(
             qr.QuotaRecoveryProbeIntervalSeconds,
             QuotaRouterDefaults.DefaultQuotaRecoveryProbeInterval),
+        MaxQuotaRecoveryProbeEligibilityScan = BuildPositiveLimit(
+            qr.MaxQuotaRecoveryProbeEligibilityScan,
+            QuotaRouterDefaults.DefaultQuotaRecoveryProbeEligibilityScanLimit),
         QuotaCacheTtl = TimeSpan.FromSeconds(qr.QuotaCacheTtlSeconds),
         UnknownPolicy = qr.UnknownPolicy,
         ObservedFailureWindow = TimeSpan.FromMinutes(qr.ObservedFailureWindowMinutes),
@@ -42,6 +45,9 @@ internal static class QuotaRouterConfigMapper
         dst.QuotaRecoveryProbeInterval = BuildPositiveDuration(
             src.QuotaRecoveryProbeIntervalSeconds,
             QuotaRouterDefaults.DefaultQuotaRecoveryProbeInterval);
+        dst.MaxQuotaRecoveryProbeEligibilityScan = BuildPositiveLimit(
+            src.MaxQuotaRecoveryProbeEligibilityScan,
+            QuotaRouterDefaults.DefaultQuotaRecoveryProbeEligibilityScanLimit);
         dst.UnknownPolicy = src.UnknownPolicy;
         dst.ObservedFailureWindow = TimeSpan.FromMinutes(src.ObservedFailureWindowMinutes);
         dst.ObservedFailureRetention = TimeSpan.FromMinutes(src.ObservedFailureRetentionMinutes);
@@ -66,6 +72,9 @@ internal static class QuotaRouterConfigMapper
 
     private static TimeSpan BuildPositiveDuration(int seconds, TimeSpan fallback) =>
         seconds > 0 ? TimeSpan.FromSeconds(seconds) : fallback;
+
+    private static int BuildPositiveLimit(int limit, int fallback) =>
+        limit > 0 ? limit : fallback;
 
     private static Dictionary<string, QuotaFloorOverrideOptions> BuildFloorOverrides(
         IDictionary<string, QuotaRouterFloorConfig>? src)

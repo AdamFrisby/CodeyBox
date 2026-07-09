@@ -44,7 +44,8 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
             enabled: true,
             interval: "00:00:07",
             margin: "00:00:03",
-            maxRetries: 9));
+            maxRetries: 9,
+            quotaSweepBatchSize: 11));
         using var factory = new QuotaRetrySchedulerWiringFactory(monitor);
 
         var scheduler = factory.Services.GetRequiredService<QuotaRetryScheduler>();
@@ -67,16 +68,19 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
         Assert.Equal(TimeSpan.FromSeconds(7), current.PeriodicCheckInterval);
         Assert.Equal(TimeSpan.FromSeconds(3), current.ClockDriftSafetyMargin);
         Assert.Equal(9, current.MaxAutoRetriesPerWorkItem);
+        Assert.Equal(11, current.MaxWaitingForQuotaResetSweepBatchSize);
 
         monitor.Set(OptionsWithQuotaRetry(
             enabled: true,
             interval: "00:00:13",
             margin: "00:00:05",
-            maxRetries: 4));
+            maxRetries: 4,
+            quotaSweepBatchSize: 12));
         var reloaded = accessor();
         Assert.Equal(TimeSpan.FromSeconds(13), reloaded.PeriodicCheckInterval);
         Assert.Equal(TimeSpan.FromSeconds(5), reloaded.ClockDriftSafetyMargin);
         Assert.Equal(4, reloaded.MaxAutoRetriesPerWorkItem);
+        Assert.Equal(12, reloaded.MaxWaitingForQuotaResetSweepBatchSize);
 
         var wiredSignal = typeof(QuotaRetryScheduler)
             .GetField("_quotaAvailabilitySignal", BindingFlags.NonPublic | BindingFlags.Instance)!
@@ -299,6 +303,7 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
         string interval,
         string margin,
         int maxRetries,
+        int quotaSweepBatchSize = AutoRetryOnQuotaFailureOptions.DefaultWaitingForQuotaResetSweepBatchSize,
         string transientBaseDelay = "00:00:45",
         double transientMultiplier = 2.5,
         string transientMaxDelay = "00:10:00",
@@ -313,6 +318,7 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
                 PeriodicCheckInterval = interval,
                 ClockDriftSafetyMargin = margin,
                 MaxAutoRetriesPerWorkItem = maxRetries,
+                MaxWaitingForQuotaResetSweepBatchSize = quotaSweepBatchSize,
             },
             AutoRetryOnTransientFailure = new AutoRetryOnTransientFailureConfig
             {

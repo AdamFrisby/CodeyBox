@@ -7,6 +7,7 @@ namespace CodeyBox.Orchestrator;
 
 public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
 {
+    private const int MaxDeniedProbeBackoffExponent = 6;
     private static readonly TimeSpan MaxDeniedProbeBackoff = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan DefaultNoResetTrackingTtl = TimeSpan.FromMinutes(30);
 
@@ -20,7 +21,7 @@ public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
     private readonly TimeProvider _time;
     private readonly IWorkItemStore? _store;
     private readonly IProjectRepository? _projects;
-    private readonly AgentClassRouter? _router;
+    private readonly IQuotaRetryAdmissionRouter? _admissionRouter;
 
     public AgentQuotaRecoveryProbeMonitor(
         IAgentQuotaAvailabilityObservationSource observations,
@@ -32,18 +33,18 @@ public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
         TimeProvider? timeProvider = null,
         IWorkItemStore? store = null,
         IProjectRepository? projects = null,
-        AgentClassRouter? router = null)
+        IQuotaRetryAdmissionRouter? admissionRouter = null)
     {
         _observations = observations;
         _publisher = publisher;
-        _probesByKind = AgentQuotaProbeCatalog.BuildKindLookup(probes);
+        _probesByKind = AgentQuotaProbeCatalog.BuildSubscriptionProbeKindLookup(probes);
         _quotaGate = quotaGate;
         _options = options;
         _log = log;
         _time = timeProvider ?? TimeProvider.System;
         _store = store;
         _projects = projects;
-        _router = router;
+        _admissionRouter = admissionRouter;
 
         _observations.QuotaUsabilityObserved += OnQuotaUsabilityObserved;
     }
@@ -74,6 +75,7 @@ public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
         if (_tracked.IsEmpty)
             return 0;
 
+        var eligibleParkedWorkBuckets = await BuildEligibleParkedWorkBucketsAsync(ct).ConfigureAwait(false);
         var recovered = 0;
         foreach (var (key, tracked) in _tracked.ToArray())
         {
@@ -97,7 +99,8 @@ public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
                 continue;
             }
 
-            if (!await HasEligibleParkedWorkAsync(member, ct).ConfigureAwait(false))
+            if (eligibleParkedWorkBuckets is not null
+                && !eligibleParkedWorkBuckets.Contains(QuotaRetryAdmissionPoolKey.FromMembership(member)))
             {
                 _tracked.TryRemove(key, out _);
                 continue;
@@ -203,19 +206,18 @@ public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
         if (nextProbeAt > trackUntil)
             nextProbeAt = trackUntil;
 
-        _tracked[key] = tracked with
+        var updated = tracked with
         {
             DeniedProbeCount = deniedCount,
             NextProbeAt = nextProbeAt,
             TrackUntil = trackUntil,
         };
+        _tracked.TryUpdate(key, updated, tracked);
     }
 
     private TimeSpan ResolveDeniedProbeBackoff(int deniedProbeCount)
     {
         var baseInterval = ResolveProbeInterval();
-        var multiplier = 1 << Math.Min(Math.Max(deniedProbeCount - 1, 0), 6);
-        var backoff = TimeSpan.FromTicks(baseInterval.Ticks * multiplier);
         var configuredRecheck = _options.QuotaRecheckInterval > TimeSpan.Zero
             ? _options.QuotaRecheckInterval
             : MaxDeniedProbeBackoff;
@@ -224,7 +226,20 @@ public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
             : MaxDeniedProbeBackoff;
         if (cap < baseInterval)
             cap = baseInterval;
+        var multiplier = 1L << Math.Min(Math.Max(deniedProbeCount - 1, 0), MaxDeniedProbeBackoffExponent);
+        var backoff = MultiplyAndClamp(baseInterval, multiplier, cap);
         return backoff <= cap ? backoff : cap;
+    }
+
+    private static TimeSpan MultiplyAndClamp(TimeSpan interval, long multiplier, TimeSpan cap)
+    {
+        if (multiplier <= 1)
+            return interval <= cap ? interval : cap;
+
+        if (interval.Ticks >= cap.Ticks / multiplier)
+            return cap;
+
+        return TimeSpan.FromTicks(interval.Ticks * multiplier);
     }
 
     private DateTimeOffset ResolveTrackUntil(
@@ -234,7 +249,7 @@ public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
     {
         var maxLifetime = _options.RampWindow > TimeSpan.Zero
             ? _options.RampWindow
-            : TimeSpan.FromDays(7);
+            : QuotaRouterDefaults.DefaultRampWindow;
         var maxUntil = firstTrackedAt + maxLifetime;
 
         if (resetAt is { } reset && reset > nowUtc)
@@ -255,34 +270,69 @@ public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
         return quota.ResetAt ?? snapshot.ResetAt;
     }
 
-    private async Task<bool> HasEligibleParkedWorkAsync(AgentMembership member, CancellationToken ct)
+    private async Task<IReadOnlySet<QuotaRetryAdmissionPoolKey>?> BuildEligibleParkedWorkBucketsAsync(CancellationToken ct)
     {
         if (_store is null)
-            return true;
+            return null;
 
-        await foreach (var item in _store.ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct))
+        var buckets = new HashSet<QuotaRetryAdmissionPoolKey>();
+        var projects = new Dictionary<ProjectId, Project?>();
+        var scanLimit = ResolveEligibilityScanLimit();
+        var scanned = 0;
+        await foreach (var item in _store.ListWaitingForQuotaResetByPriorityAsync(scanLimit, ct))
         {
-            var project = _projects is null
-                ? null
-                : await _projects.GetAsync(item.ProjectId, ct).ConfigureAwait(false);
-            if (IsEligibleParkedWorkForMember(item, project, member))
-                return true;
+            scanned++;
+            var project = await GetProjectForEligibilityAsync(item.ProjectId, projects, ct).ConfigureAwait(false);
+            if (!TryAddEligibleParkedWorkBuckets(item, project, buckets))
+                return null;
         }
 
-        return false;
+        return scanned < scanLimit ? buckets : null;
     }
 
-    private bool IsEligibleParkedWorkForMember(WorkItem item, Project? project, AgentMembership member)
+    private async Task<Project?> GetProjectForEligibilityAsync(
+        ProjectId projectId,
+        Dictionary<ProjectId, Project?> projects,
+        CancellationToken ct)
     {
-        var requiredCapability = QuotaRetryWorkItem.RequiredCapabilityForRetry(item);
+        if (_projects is null)
+            return null;
+
+        if (projects.TryGetValue(projectId, out var cached))
+            return cached;
+
+        var project = await _projects.GetAsync(projectId, ct).ConfigureAwait(false);
+        projects[projectId] = project;
+        return project;
+    }
+
+    private bool TryAddEligibleParkedWorkBuckets(
+        WorkItem item,
+        Project? project,
+        HashSet<QuotaRetryAdmissionPoolKey> buckets)
+    {
+        var requiredCapability = QuotaRetryPhasePolicy.RequiredCapabilityForQuotaRetryCandidate(item);
         if (DirectAgentMembership.IsDirectRoute(item, project))
-            return DirectAgentMembership.TryCreate(item, project) is { } direct
-                && DirectAgentMembership.SameQuotaBucket(direct, member);
-
-        if (_router is null)
+        {
+            if (DirectAgentMembership.TryCreate(item, project) is { } direct)
+                buckets.Add(QuotaRetryAdmissionPoolKey.FromMembership(direct));
             return true;
+        }
 
-        return _router.IsEligibleClassMemberWithCapability(item, project, member, requiredCapability);
+        if (_admissionRouter is null)
+            return false;
+
+        foreach (var poolKey in _admissionRouter.GetQuotaRetryAdmissionPool(item, project, requiredCapability))
+            buckets.Add(poolKey);
+        return true;
+    }
+
+    private int ResolveEligibilityScanLimit()
+    {
+        var configured = _options.MaxQuotaRecoveryProbeEligibilityScan;
+        return configured > 0
+            ? configured
+            : QuotaRouterDefaults.DefaultQuotaRecoveryProbeEligibilityScanLimit;
     }
 
     public override void Dispose()

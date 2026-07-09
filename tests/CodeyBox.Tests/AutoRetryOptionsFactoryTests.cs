@@ -24,12 +24,14 @@ public sealed class AutoRetryOptionsFactoryTests
             enabled: true,
             periodicCheckInterval: "00:03:00",
             clockDriftMargin: "00:00:15",
-            maxRetriesPerWorkItem: 7);
+            maxRetriesPerWorkItem: 7,
+            maxWaitingForQuotaResetSweepBatchSize: 19);
 
         Assert.True(opts.Enabled);
         Assert.Equal(TimeSpan.FromMinutes(3), opts.PeriodicCheckInterval);
         Assert.Equal(TimeSpan.FromSeconds(15), opts.ClockDriftSafetyMargin);
         Assert.Equal(7, opts.MaxAutoRetriesPerWorkItem);
+        Assert.Equal(19, opts.MaxWaitingForQuotaResetSweepBatchSize);
     }
 
     [Fact]
@@ -49,6 +51,9 @@ public sealed class AutoRetryOptionsFactoryTests
         Assert.Equal(TimeSpan.FromMinutes(4), opts.AutoRetryOnQuotaFailure.PeriodicCheckInterval);
         Assert.Equal(TimeSpan.FromSeconds(30), opts.AutoRetryOnQuotaFailure.ClockDriftSafetyMargin);
         Assert.Equal(5, opts.AutoRetryOnQuotaFailure.MaxAutoRetriesPerWorkItem);
+        Assert.Equal(
+            AutoRetryOnQuotaFailureOptions.DefaultWaitingForQuotaResetSweepBatchSize,
+            opts.AutoRetryOnQuotaFailure.MaxWaitingForQuotaResetSweepBatchSize);
     }
 
     [Theory]
@@ -72,6 +77,20 @@ public sealed class AutoRetryOptionsFactoryTests
                 maxRetriesPerWorkItem: maxRetries));
 
         Assert.Contains(expectedMessage, ex.Message);
+    }
+
+    [Fact]
+    public void BuildAutoRetryOptions_Enabled_RejectsInvalidWaitingForQuotaResetBatchSize()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            OrchestratorOptionsFactory.BuildAutoRetryOptions(
+                enabled: true,
+                periodicCheckInterval: "00:00:01",
+                clockDriftMargin: "00:00:01",
+                maxRetriesPerWorkItem: 1,
+                maxWaitingForQuotaResetSweepBatchSize: 0));
+
+        Assert.Contains("MaxWaitingForQuotaResetSweepBatchSize", ex.Message);
     }
 
     [Fact]
