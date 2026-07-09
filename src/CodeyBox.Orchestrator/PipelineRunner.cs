@@ -4751,6 +4751,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         && reworkNoDiffHandling == ReworkNoDiffHandling.AuditEmptyRework;
                     var matchedConfiguredStderrPattern =
                         deferredSuccessAuthDetection.MatchedConfiguredStderrPattern;
+                    // Captured rework output is agent-controlled even when it
+                    // arrived on stderr. It can classify this attempt as auth
+                    // required so the item reroutes, but global availability
+                    // benching requires runner-owned in-VM corroboration.
                     await HandleAuthRequiredDetectionAsync(
                         item,
                         project,
@@ -4759,10 +4763,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         deferredSuccessAuthDetection.Classification,
                         throwOnMatch: true,
                         stdoutOnlyEvidence: deferredSuccessAuthDetection.IsStdoutOnly,
-                        requireStdoutOnlyCorroboration: !isAuditEmptyRework,
-                        requireAuthCorroboration: !isAuditEmptyRework
-                            && !deferredSuccessAuthDetection.IsStdoutOnly
-                            && !matchedConfiguredStderrPattern,
+                        requireStdoutOnlyCorroboration: true,
+                        requireAuthCorroboration: isAuditEmptyRework
+                            || !deferredSuccessAuthDetection.IsStdoutOnly
+                                && !matchedConfiguredStderrPattern,
                         ct: ct);
                 }
 
@@ -6844,7 +6848,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             sandboxId: sandboxId,
             agentEndedAt: agentEndedAt,
             evidenceSource: "captured stderr",
-            evidenceTrust: NoDiffQuotaEvidenceTrust.CliOwned,
+            evidenceTrust: NoDiffQuotaEvidenceTrust.RequiresQuotaProbe,
             ct: ct);
 
         await ThrowIfNoDiffQuotaFailureFromTextAsync(
@@ -6859,7 +6863,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             sandboxId: sandboxId,
             agentEndedAt: agentEndedAt,
             evidenceSource: "captured stdout",
-            evidenceTrust: NoDiffQuotaEvidenceTrust.CliOwned,
+            evidenceTrust: NoDiffQuotaEvidenceTrust.RequiresQuotaProbe,
             ct: ct);
 
         if (!string.IsNullOrWhiteSpace(agentResult.TerminalDiagnostic))
@@ -7093,8 +7097,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             throwOnMatch: true,
             stdoutOnlyEvidence: string.IsNullOrWhiteSpace(agentResult.Stderr)
                 && !string.IsNullOrWhiteSpace(agentResult.Stdout),
-            requireStdoutOnlyCorroboration: false,
-            requireAuthCorroboration: false,
+            requireStdoutOnlyCorroboration: true,
+            requireAuthCorroboration: true,
             ct: ct);
     }
 
@@ -8190,7 +8194,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         workToken: attemptCt),
                 ct,
                 phaseCancellation: reworkPhase,
-                attemptTimeout: item.WorkTimeout);
+                attemptTimeout: item.WorkTimeout,
+                allowAuthRequiredFallback: true);
         }
 
         string? reworkStdout;
@@ -8277,7 +8282,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
     /// reworkIterationNumber can equal maxIterations while the blank pass is
     /// still in-budget.
     /// </remarks>
-    private async Task<bool> HandleEmptyReworkAsync(
+    internal async Task<bool> HandleEmptyReworkAsync(
         WorkItem item,
         Project project,
         ReworkProducedNoChangesException emptyEx,
@@ -12288,7 +12293,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         bool recordInvolvement = true,
         InVmSmokeSandboxTarget? smokeTarget = null,
         string? requireCapability = null,
-        bool skipInVmSmoke = false)
+        bool skipInVmSmoke = false,
+        bool allowAuthRequiredFallback = false)
     {
         // R8-core: every agent invocation gets a deterministic in-VM log path,
         // persisted on the work item BEFORE the runner starts. If SIGTERM fires
@@ -12963,7 +12969,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     quotaResetAt: quotaEx.ResetAt,
                     terminalException: quotaEx);
             }
-            catch (AgentAuthRequiredException authEx) when (CanFallbackAuthRequiredFailure(phase, iteration))
+            catch (AgentAuthRequiredException authEx) when (allowAuthRequiredFallback)
             {
                 var safeReason = SingleLineSummary(authEx.Message);
                 await MoveToNextMemberOrThrowAsync(
@@ -12992,10 +12998,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
         }
     }
-
-    private static bool CanFallbackAuthRequiredFailure(string phase, int? iteration) =>
-        iteration is not null
-        && string.Equals(phase, "rework", StringComparison.OrdinalIgnoreCase);
 
     private enum AgentFallbackTrigger
     {

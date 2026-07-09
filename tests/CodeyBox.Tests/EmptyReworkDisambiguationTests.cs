@@ -146,6 +146,66 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
     }
 
     [Fact]
+    public async Task EmptyRework_NoBudgetNoConvergence_TerminalFails()
+    {
+        // The normal audit loop owns the ceiling and does not dispatch rework
+        // after the last iteration. The handler still has a defensive
+        // exhausted-budget branch for resumed or direct callers, and it must
+        // preserve the no-progress terminal failure instead of parking.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var tp = TestSupport.BuildPipeline(_workspace, seed);
+        var item = NewItem("feature/empty-rework-no-budget");
+        var project = new Project
+        {
+            Id = item.ProjectId,
+            DisplayName = "Test Project",
+            RepositoryUrl = seed,
+            DefaultBaseBranch = "main",
+            DefaultAgent = AgentKind.Claude,
+            Audit = new ProjectAudit { MaxIterations = 2 },
+        };
+        var blocking = new AuditProgressFinding(
+            "scripted",
+            AuditSeverity.Error,
+            "still failing",
+            "the audit finding remains unresolved");
+        IReadOnlyList<AuditProgressSnapshot> history =
+        [
+            new AuditProgressSnapshot(
+                Iteration: 2,
+                MaxIterations: 2,
+                BlockingFindings: 1,
+                NonBlockingFindings: 0,
+                BlockingFindingIds: ["scripted:still-failing"],
+                BlockingFindingsDetails: [blocking],
+                Findings: [blocking],
+                WorkBranchTip: "abc123"),
+        ];
+        using var phase = new PhaseCancellation("rework", CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditFailedException>(() =>
+            tp.Pipeline.HandleEmptyReworkAsync(
+                item,
+                project,
+                new ReworkProducedNoChangesException(AgentKind.Claude, "Rework agent produced no changes"),
+                history,
+                auditIteration: 2,
+                reworkIterationNumber: 3,
+                maxIterations: 2,
+                baseReworkPrompt: "fix the findings",
+                dispatchAsync: _ => Task.FromException<string?>(
+                    new InvalidOperationException("exhausted-budget handler must not redispatch")),
+                reworkPhase: phase,
+                reworkStart: DateTimeOffset.UtcNow,
+                repoId: item.Id.ToString(),
+                workBranch: item.WorkBranch!,
+                ct: CancellationToken.None));
+
+        Assert.Contains("final audit iteration budget (2/2)", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("still failing", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task EmptyRework_WithQuotaStderr_ClassifiedAsInfraQuota_NotEmptyReworkPark()
     {
         // A clean-exit/no-diff rework that carries a quota signature in captured
@@ -173,7 +233,8 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
             auditors: [auditor],
             projectAudit: audit,
             pipelineTuning: tuning,
-            quotaFailures: quotaFailures);
+            quotaFailures: quotaFailures,
+            auditQuotaProbes: [new StaticQuotaProbe(AgentKind.Claude, availablePct: 0.0)]);
         var agentRuns = 0;
         tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
         {
@@ -207,6 +268,63 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
         var observations = await quotaFailures.ListRecentAsync(
             TimeSpan.FromHours(1), DateTimeOffset.UtcNow, CancellationToken.None);
         Assert.NotEmpty(observations);
+    }
+
+    [Fact]
+    public async Task EmptyRework_WithQuotaStderrButNoProbe_DoesNotMutateQuotaState()
+    {
+        // Captured stdout/stderr are agent-controlled. A quota phrase in a
+        // clean-exit/no-diff rework is item-local evidence unless a runner-owned
+        // quota probe corroborates it; without that proof it must not park the
+        // item for quota reset or write an observed quota failure.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new OnceFailingAuditor();
+        var audit = new ProjectAudit
+        {
+            MaxIterations = 3,
+            AuditTypes = ["scripted"],
+        };
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            EmptyReworkEscalationRetries = 0,
+        });
+        using var quotaFailures = new SqliteQuotaFailureStore(
+            Path.Combine(_workspace, $"quota-failures-{Guid.NewGuid():N}.db"));
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectAudit: audit,
+            pipelineTuning: tuning,
+            quotaFailures: quotaFailures);
+        var agentRuns = 0;
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            agentRuns++;
+            if (agentRuns != 1)
+                return;
+
+            var write = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/work.txt"],
+                Stdin = "v1\n",
+            }, ct);
+            Assert.True(write.Success, write.Stderr);
+        };
+        tp.Agent.WorkResults.Enqueue(new AgentResult(true, "ok", null, null));
+        tp.Agent.WorkResults.Enqueue(new AgentResult(true, "ok", null, "rate_limit_exceeded"));
+
+        var item = NewItem("feature/empty-rework-quota-signature-no-probe");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
+        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, final.State);
+        var observations = await quotaFailures.ListRecentAsync(
+            TimeSpan.FromHours(1), DateTimeOffset.UtcNow, CancellationToken.None);
+        Assert.Empty(observations);
     }
 
     [Fact]
@@ -490,6 +608,22 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
                 .ToArray();
             return Task.FromResult(new AuditResult(false, findings));
         }
+    }
+
+    private sealed class StaticQuotaProbe : IAgentQuotaProbe
+    {
+        private readonly AgentQuotaSnapshot _snapshot;
+
+        public StaticQuotaProbe(AgentKind kind, double availablePct)
+        {
+            Kind = kind;
+            _snapshot = new AgentQuotaSnapshot { AvailablePct = availablePct };
+        }
+
+        public AgentKind Kind { get; }
+
+        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
+            => Task.FromResult(_snapshot);
     }
 
 }

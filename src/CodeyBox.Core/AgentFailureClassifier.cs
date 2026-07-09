@@ -408,8 +408,10 @@ public static class AgentFailureClassifier
             matchedStdout,
             matchedTrustedStdoutTranscript,
             matchedConfiguredStdout,
-            matchedDefaultStdout,
-            matchedConfiguredStderr);
+            matchedDefaultStdout)
+        {
+            MatchedConfiguredStderrPattern = matchedConfiguredStderr,
+        };
     }
 
     private static IEnumerable<AuthFailurePattern> AdditionalAuthPatternsFor(

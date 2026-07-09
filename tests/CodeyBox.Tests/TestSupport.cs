@@ -149,6 +149,7 @@ internal static class TestSupport
         AgentAvailabilityRegistry? availabilityRegistry = null,
         ScriptedAgent? agentOverride = null,
         IQuotaFailureStore? quotaFailures = null,
+        IEnumerable<IAgentQuotaProbe>? auditQuotaProbes = null,
         IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? toolCallCounters = null,
         IMergeScopeResolver? mergeScopeResolver = null,
         IReadOnlyDictionary<string, string>? projectKnobs = null)
@@ -269,6 +270,7 @@ internal static class TestSupport
             resolvedOptions,
             NullLogger<PipelineRunner>.Instance,
             timingStore: timingStore,
+            auditQuotaProbes: auditQuotaProbes,
             auditReports: auditReportStore,
             agentStreams: agentStreams,
             auditQuotaOptions: auditQuotaOptions,

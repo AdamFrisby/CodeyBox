@@ -579,10 +579,14 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
-    public async Task AuditDrivenRework_CleanExitNoDiffCapturedQuotaStderr_FallsBackToHealthyMember()
+    public async Task AuditDrivenRework_CleanExitNoDiffCapturedQuotaStderr_WithProbeCorroboration_FallsBackToHealthyMember()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2);
+        using var fix = BuildPipeline(
+            seed,
+            [new OnceFailingAuditor()],
+            maxAuditIterations: 2,
+            codexQuotaSnapshot: new AgentQuotaSnapshot { AvailablePct = 0.0 });
 
         fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "initial"));
         fix.Codex.ReworkScriptedFailures.Enqueue(new AgentResult(
@@ -644,7 +648,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
-    public async Task AuditDrivenRework_CleanExitNoDiffCapturedQuotaStdout_WithoutProbeCorroboration_FallsBackAsInfraQuota()
+    public async Task AuditDrivenRework_CleanExitNoDiffCapturedQuotaStdout_WithPositiveProbe_DoesNotFallbackAsQuota()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed, [new OnceFailingAuditor()], maxAuditIterations: 2);
@@ -655,7 +659,6 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             Summary: "ok",
             Stdout: "API Error: rate_limit_exceeded; please try again after 1h",
             Stderr: null));
-        fix.Claude.WorkPlan.Enqueue(new FileWrite("a.txt", "fixed after stdout quota fallback"));
 
         using var metrics = new MetricCapture("codeybox.agent.fallbacks");
 
@@ -665,10 +668,11 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.NotNull(final);
-        Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.True(metrics.Any("codeybox.agent.fallbacks",
+        Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
+        Assert.False(metrics.Any("codeybox.agent.fallbacks",
                 ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "quota"), ("phase", "rework")),
-            "expected captured stdout quota output on clean-exit/no-diff rework to reroute as infra");
+            "uncorroborated captured stdout quota text must not mutate quota/fallback state");
+        Assert.Equal(0, fix.Claude.CallCount);
     }
 
     [Fact]
@@ -699,7 +703,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             $"expected Done but was {final.State}: {final.LastError}");
         Assert.True(fix.Codex.CallCount >= 2);
         Assert.True(fix.Claude.CallCount >= 1);
-        Assert.Equal(0, gate.ForceProbeCalls);
+        Assert.Equal(1, gate.ForceProbeCalls);
         Assert.True(metrics.Any("codeybox.agent.fallbacks",
                 ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "auth"), ("phase", "rework")),
             "expected auth-required rework output to reroute through the class fallback path");
@@ -723,7 +727,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
-    public async Task AuditDrivenRework_CleanExitNoDiffStdoutOnlyAuthRequired_WithoutCorroboration_ExcludesAndFallsBack()
+    public async Task AuditDrivenRework_CleanExitNoDiffStdoutOnlyAuthRequired_WithoutCorroboration_FallsBackWithoutFleetBench()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var availability = new AgentAvailabilityRegistry(
@@ -761,16 +765,15 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         Assert.True(metrics.Any("codeybox.agent.fallbacks",
                 ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "auth"), ("phase", "rework")),
             "expected empty-rework stdout auth output to reroute through class fallback");
-        Assert.True(availability.GetAuthRequiredAvailability(AgentKind.Codex).AuthRequired);
-        Assert.False(availability.GetAvailability(AgentKind.Codex).Available);
+        Assert.False(availability.GetAuthRequiredAvailability(AgentKind.Codex).AuthRequired);
+        var codexAvailability = availability.GetAvailability(AgentKind.Codex);
+        Assert.True(codexAvailability.Available, codexAvailability.Reason);
 
-        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("codex", details.AgentKind);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
-    public async Task AuditDrivenRework_CleanExitNoDiffStdoutOnlyAuthRequired_WithGateAvailable_ExcludesAndFallsBackWithoutProbe()
+    public async Task AuditDrivenRework_CleanExitNoDiffStdoutOnlyAuthRequired_WithGateCorroboration_ExcludesAndFallsBack()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var gate = new AuthCorroboratingInVmSmokeGate();
@@ -798,10 +801,10 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.Done, final!.State);
-        Assert.Equal(0, gate.ForceProbeCalls);
+        Assert.Equal(1, gate.ForceProbeCalls);
         Assert.True(metrics.Any("codeybox.agent.fallbacks",
                 ("from_agent", "codex"), ("to_agent", "claude"), ("kind", "auth"), ("phase", "rework")),
-            "expected empty-rework stdout auth output to reroute through the class fallback path without probing");
+            "expected empty-rework stdout auth output to reroute through the class fallback path after corroboration");
 
         var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
         var fallback = Assert.Single(history, h => h.Phase == "rework" && h.ToAgent == AgentKind.Claude);

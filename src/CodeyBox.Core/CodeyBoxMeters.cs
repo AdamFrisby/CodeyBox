@@ -26,7 +26,7 @@ public static class CodeyBoxMeters
     /// <summary>
     /// Incremented for empty-rework handling sub-events. Tag:
     /// <c>outcome</c> (<c>detected</c> | <c>escalation_succeeded</c> |
-    /// <c>parked</c>).
+    /// <c>parked</c> | <c>failed</c>).
     /// </summary>
     public static readonly Counter<long> ReworkEmptyEvents =
         AuditMeter.CreateCounter<long>("codeybox.audit.rework_empty.events", unit: "{event}");
