@@ -1967,6 +1967,8 @@ builder.Services.AddSingleton<IAgentAvailabilityRegistry>(sp =>
     sp.GetRequiredService<AgentAvailabilityRegistry>());
 builder.Services.AddSingleton<IAgentEffectiveAvailabilityReader>(sp =>
     sp.GetRequiredService<AgentAvailabilityRegistry>());
+builder.Services.AddSingleton<IAgentAvailabilityRecoverySignal>(sp =>
+    sp.GetRequiredService<AgentAvailabilityRegistry>());
 // The smoke-mutator port the in-VM prober, coverage policy, and host smoke
 // services bind to — same singleton, exposed as the exclusion-taxonomy
 // surface (MarkSmokeResult / ExcludeForMissingProbe) those owners need.
@@ -2907,6 +2909,7 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
             current.MaxWaitingForQuotaResetSweepBatchSize);
     },
     quotaAvailabilitySignal: sp.GetRequiredService<IAgentQuotaAvailabilitySignal>(),
+    agentAvailabilityRecoverySignal: sp.GetRequiredService<IAgentAvailabilityRecoverySignal>(),
     pauseSignal: sp.GetRequiredService<IAgentPauseSignal>()));
 builder.Services.AddSingleton<TransientRetryScheduler>(sp => new TransientRetryScheduler(
     sp.GetRequiredService<IWorkItemStore>(),

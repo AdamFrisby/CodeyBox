@@ -1884,6 +1884,95 @@ public sealed class QuotaAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public async Task Scheduler_AgentAvailabilityRecoverySignal_RequeuesWaitingForQuotaResetItem()
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        var store = new SqliteWorkItemStore(stateDb);
+        using var _ = store;
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var projectId = new ProjectId("availability-recovery-project");
+        var project = new Project
+        {
+            Id = projectId,
+            DisplayName = "Availability Recovery",
+            RepositoryUrl = "http://fake",
+            DefaultAgentClass = "availability-recovery-class",
+        };
+        var projects = new InMemoryProjectRepository(project);
+        var availability = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(),
+            _time,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        var dispatchAvailability = new AgentDispatchAvailability(availability);
+        var probe = new MutableProbe(AgentKind.Codex, availablePct: 80);
+        var router = new AgentClassRouter(
+            [
+                new AgentClass
+                {
+                    Id = "availability-recovery-class",
+                    DisplayName = "Availability Recovery",
+                    Members =
+                    [
+                        new AgentMembership { Agent = AgentKind.Codex, Billing = AgentBilling.Subscription, QualityScore = 100 },
+                    ],
+                },
+            ],
+            [probe],
+            new QuotaRouterOptions { MinQuotaPct = 10 },
+            NullLogger<AgentClassRouter>.Instance,
+            _time,
+            dispatchAvailability: dispatchAvailability);
+        using var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = TimeSpan.FromHours(6),
+                    MaxAutoRetriesPerWorkItem = 3,
+                },
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            projects,
+            null,
+            null,
+            _time,
+            agentAvailabilityRecoverySignal: availability);
+
+        availability.MarkSmokeResult(
+            AgentKind.Codex,
+            new AgentSmokeResult(false, "quota probe exhausted", TimeSpan.Zero));
+
+        var parked = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = "parked",
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            QuotaRetryAttempts = 0,
+            AgentClassId = "availability-recovery-class",
+            NextQuotaRetryAt = _time.Now.AddDays(7),
+        };
+        await store.CreateAsync(parked);
+
+        availability.MarkSmokeResult(
+            AgentKind.Codex,
+            new AgentSmokeResult(true, null, TimeSpan.Zero));
+
+        var retried = await WaitForAttemptsAsync(store, parked.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));
+        Assert.Equal(WorkItemState.Queued, retried.State);
+        Assert.Equal(1, retried.QuotaRetryAttempts);
+    }
+
+    [Fact]
     public async Task Router_QuotaUsableSignal_SubscriberExceptionDoesNotBreakResolve()
     {
         var project = new Project

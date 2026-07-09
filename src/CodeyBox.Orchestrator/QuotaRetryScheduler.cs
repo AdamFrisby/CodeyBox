@@ -25,6 +25,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
     private readonly OrchestratorOptions _opts;
     private readonly Func<AutoRetryOnQuotaFailureOptions> _autoRetryOptionsAccessor;
     private readonly IAgentQuotaAvailabilitySignal? _quotaAvailabilitySignal;
+    private readonly IAgentAvailabilityRecoverySignal? _agentAvailabilityRecoverySignal;
     private readonly IAgentPauseSignal? _pauseSignal;
     private readonly TimeProvider _time;
     private readonly IBaselineImageResolver _baselineResolver;
@@ -77,6 +78,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         IBaselineImageResolver? baselineResolver = null,
         Func<AutoRetryOnQuotaFailureOptions>? autoRetryOptionsAccessor = null,
         IAgentQuotaAvailabilitySignal? quotaAvailabilitySignal = null,
+        IAgentAvailabilityRecoverySignal? agentAvailabilityRecoverySignal = null,
         IAgentPauseSignal? pauseSignal = null)
     {
         _store = store;
@@ -93,6 +95,9 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         _quotaAvailabilitySignal = quotaAvailabilitySignal;
         if (_quotaAvailabilitySignal is not null)
             _quotaAvailabilitySignal.QuotaUsableThresholdCrossed += OnClassAvailabilityChanged;
+        _agentAvailabilityRecoverySignal = agentAvailabilityRecoverySignal;
+        if (_agentAvailabilityRecoverySignal is not null)
+            _agentAvailabilityRecoverySignal.AgentRecovered += OnAgentAvailabilityRecovered;
         // An operator pause/resume (or auto-expiry) of any agent can make a
         // class peer dispatchable for items parked on a sibling's exhaustion.
         // Without this hook, a WaitingForQuotaReset row pinned to an exhausted
@@ -537,6 +542,8 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
 
         StartClassAvailabilityWakeUpSweep();
     }
+
+    private void OnAgentAvailabilityRecovered(AgentKind _) => OnClassAvailabilityChanged();
 
     private void StartClassAvailabilityWakeUpSweep()
     {
@@ -1025,6 +1032,8 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
 
         if (_quotaAvailabilitySignal is not null)
             _quotaAvailabilitySignal.QuotaUsableThresholdCrossed -= OnClassAvailabilityChanged;
+        if (_agentAvailabilityRecoverySignal is not null)
+            _agentAvailabilityRecoverySignal.AgentRecovered -= OnAgentAvailabilityRecovered;
         if (_pauseSignal is not null)
             _pauseSignal.AgentPauseChanged -= OnClassAvailabilityChanged;
         foreach (var timer in _targetedTimers.Values)

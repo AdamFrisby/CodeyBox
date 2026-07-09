@@ -86,6 +86,10 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
             .GetField("_quotaAvailabilitySignal", BindingFlags.NonPublic | BindingFlags.Instance)!
             .GetValue(scheduler);
         Assert.Same(factory.Services.GetRequiredService<IAgentQuotaAvailabilitySignal>(), wiredSignal);
+        var wiredAgentAvailabilitySignal = typeof(QuotaRetryScheduler)
+            .GetField("_agentAvailabilityRecoverySignal", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(scheduler);
+        Assert.Same(factory.Services.GetRequiredService<IAgentAvailabilityRecoverySignal>(), wiredAgentAvailabilitySignal);
 
         var transientScheduler = factory.Services.GetRequiredService<TransientRetryScheduler>();
         var transientAccessor = Assert.IsType<Func<AutoRetryOnTransientFailureOptions>>(
@@ -172,6 +176,10 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
             .GetField("_quotaAvailabilitySignal", BindingFlags.NonPublic | BindingFlags.Instance)!
             .GetValue(scheduler);
         Assert.Same(factory.Services.GetRequiredService<IAgentQuotaAvailabilitySignal>(), wiredSignal);
+        var wiredAgentAvailabilitySignal = typeof(QuotaRetryScheduler)
+            .GetField("_agentAvailabilityRecoverySignal", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(scheduler);
+        Assert.Same(factory.Services.GetRequiredService<IAgentAvailabilityRecoverySignal>(), wiredAgentAvailabilitySignal);
         Assert.Same(
             factory.Services.GetRequiredService<IAgentQuotaAvailabilitySignal>(),
             factory.Services.GetRequiredService<IAgentQuotaAvailabilityPublisher>());

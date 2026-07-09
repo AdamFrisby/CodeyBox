@@ -52,7 +52,7 @@ namespace CodeyBox.Orchestrator;
 /// <para>Thread-safe; updates use a small per-agent lock so concurrent
 /// outcomes from many in-flight items don't corrupt counters.</para>
 /// </summary>
-public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmokeAvailabilityRegistry, IAgentAuthAvailabilityRegistry, IAgentAuthRequiredAvailabilityReader
+public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmokeAvailabilityRegistry, IAgentAuthAvailabilityRegistry, IAgentAuthRequiredAvailabilityReader, IAgentAvailabilityRecoverySignal
 {
     private readonly AvailabilityOptions _opts;
     private readonly TimeProvider _time;
@@ -68,6 +68,8 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
         _time = time ?? TimeProvider.System;
         _log = log ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<AgentAvailabilityRegistry>.Instance;
     }
+
+    public event Action<AgentKind>? AgentRecovered;
 
     /// <summary>
     /// Returns whether <paramref name="kind"/> is currently usable. The reason
@@ -139,6 +141,8 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
         var entry = _entries.GetOrAdd(kind, _ => new AgentAvailabilityEntry());
         var now = _time.GetUtcNow();
 
+        AvailabilityTransition transition;
+        var recovered = false;
         lock (entry.Sync)
         {
             var wasExcluded = entry.IsExcluded;
@@ -157,53 +161,60 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
                     _log.LogInformation(
                         "Agent {Agent} smoke transitioned FAIL -> PASS at {At} (source {Source})",
                         kind.Value, now, source);
-                return new AvailabilityTransition(
+                recovered = wasExcluded && !stillExcluded;
+                transition = new AvailabilityTransition(
                     PreviouslyExcluded: wasExcluded,
                     NowExcluded: stillExcluded,
                     Reason: entry.CombinedReason(),
                     SourceChanged: hadSourceExclusion);
             }
-
-            entry.LastSmokeFailedAt = now;
-            // Encode category in the reason string so downstream consumers
-            // (router log, /concurrency, audit log) can distinguish persistent
-            // (operator must re-authorize) from transient (will recover on
-            // retry) without threading a second field through every layer.
-            // Persistent is the load-bearing case: a silent "transient: try
-            // later" loop is what benched gemini for hours despite 100% quota.
-            var categoryTag = result.Category switch
+            else
             {
-                SmokeFailureCategory.Persistent => "persistent",
-                SmokeFailureCategory.Transient => "transient",
-                SmokeFailureCategory.Unknown => "unknown",
-                _ => "unknown",
-            };
-            entry.Exclusions[source] = $"smoke probe failed [{categoryTag}]: {result.FailureReason ?? "unknown"}";
-            if (!wasExcluded)
-            {
-                // Persistent smoke failures are the operator-actionable case:
-                // re-authorization (or fixing PATH / installing the binary)
-                // unblocks dispatch. Log louder so the bench is not lost in
-                // routine noise.
-                if (result.Category == SmokeFailureCategory.Persistent)
+                entry.LastSmokeFailedAt = now;
+                // Encode category in the reason string so downstream consumers
+                // (router log, /concurrency, audit log) can distinguish persistent
+                // (operator must re-authorize) from transient (will recover on
+                // retry) without threading a second field through every layer.
+                // Persistent is the load-bearing case: a silent "transient: try
+                // later" loop is what benched gemini for hours despite 100% quota.
+                var categoryTag = result.Category switch
                 {
-                    _log.LogError(
-                        "Agent {Agent} smoke PERSISTENTLY FAILED at {At} (source {Source}) — operator action required: {Reason}",
-                        kind.Value, now, source, entry.Exclusions[source]);
-                }
-                else
+                    SmokeFailureCategory.Persistent => "persistent",
+                    SmokeFailureCategory.Transient => "transient",
+                    SmokeFailureCategory.Unknown => "unknown",
+                    _ => "unknown",
+                };
+                entry.Exclusions[source] = $"smoke probe failed [{categoryTag}]: {result.FailureReason ?? "unknown"}";
+                if (!wasExcluded)
                 {
-                    _log.LogWarning(
-                        "Agent {Agent} smoke transitioned PASS -> FAIL at {At} (source {Source}): {Reason}",
-                        kind.Value, now, source, entry.Exclusions[source]);
+                    // Persistent smoke failures are the operator-actionable case:
+                    // re-authorization (or fixing PATH / installing the binary)
+                    // unblocks dispatch. Log louder so the bench is not lost in
+                    // routine noise.
+                    if (result.Category == SmokeFailureCategory.Persistent)
+                    {
+                        _log.LogError(
+                            "Agent {Agent} smoke PERSISTENTLY FAILED at {At} (source {Source}) — operator action required: {Reason}",
+                            kind.Value, now, source, entry.Exclusions[source]);
+                    }
+                    else
+                    {
+                        _log.LogWarning(
+                            "Agent {Agent} smoke transitioned PASS -> FAIL at {At} (source {Source}): {Reason}",
+                            kind.Value, now, source, entry.Exclusions[source]);
+                    }
                 }
+                transition = new AvailabilityTransition(
+                    PreviouslyExcluded: wasExcluded,
+                    NowExcluded: true,
+                    Reason: entry.CombinedReason(),
+                    SourceChanged: !hadSourceExclusion);
             }
-            return new AvailabilityTransition(
-                PreviouslyExcluded: wasExcluded,
-                NowExcluded: true,
-                Reason: entry.CombinedReason(),
-                SourceChanged: !hadSourceExclusion);
         }
+
+        if (recovered)
+            NotifyAgentRecovered(kind);
+        return transition;
     }
 
     /// <summary>
@@ -386,8 +397,10 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
     public void Reset(AgentKind kind)
     {
         if (!_entries.TryGetValue(kind, out var entry)) return;
+        var recovered = false;
         lock (entry.Sync)
         {
+            var wasExcluded = entry.IsExcluded;
             entry.ConsecutiveFastFails = 0;
             entry.Exclusions.Clear();
             entry.LastFastFailAt = null;
@@ -397,8 +410,11 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
             entry.NoChangesItems.Clear();
             entry.ConsecutiveNoChanges = 0;
             entry.LastNoChangesAt = null;
+            recovered = wasExcluded;
         }
         _log.LogInformation("Agent {Agent} availability reset by operator", kind.Value);
+        if (recovered)
+            NotifyAgentRecovered(kind);
     }
 
     /// <summary>
@@ -484,6 +500,35 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
         source is not SmokeExclusionSource.HostSmoke
             and not SmokeExclusionSource.InVmSmoke
             and not SmokeExclusionSource.MissingProbe;
+
+    private void NotifyAgentRecovered(AgentKind kind)
+    {
+        var handlers = AgentRecovered;
+        if (handlers is null)
+            return;
+
+        foreach (Action<AgentKind> handler in handlers.GetInvocationList().Cast<Action<AgentKind>>())
+        {
+            try
+            {
+                handler(kind);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Agent availability recovery subscriber threw for {Agent}; continuing", kind.Value);
+            }
+        }
+    }
+}
+
+/// <summary>
+/// Emits when the aggregate agent availability registry crosses from excluded
+/// to available. Consumers use it to wake recovery work without depending on
+/// the registry's exclusion taxonomy.
+/// </summary>
+public interface IAgentAvailabilityRecoverySignal
+{
+    event Action<AgentKind>? AgentRecovered;
 }
 
 /// <summary>
