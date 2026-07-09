@@ -16229,30 +16229,14 @@ Original merge-phase failure (JSON string, for context only):
     /// (<see cref="ResumeStateForTransientRetry"/>: <c>rework → WorkComplete</c>).
     /// Internal (not private) so the phase table is unit-testable directly.
     /// </summary>
-    internal static string RetryFromForQuotaPhase(string phase) => NormalizeQuotaRetryPhase(phase) switch
-    {
-        "planning" => "planning",
-        "audit" => "audit",
-        "rework" => "audit",
-        "merge" => "merge",
-        "upstream" => "upstream",
-        _ => "work",
-    };
+    internal static string RetryFromForQuotaPhase(string phase) =>
+        QuotaRetryPhasePolicy.RetryFromForPhase(phase);
 
-    internal static string NormalizeQuotaRetryPhase(string phase) => phase.Trim().ToLowerInvariant() switch
-    {
-        "planning" => "planning",
-        "audit" => "audit",
-        "rework" => "rework",
-        "merge" => "merge",
-        "upstream" => "upstream",
-        _ => "work",
-    };
+    internal static string NormalizeQuotaRetryPhase(string phase) =>
+        QuotaRetryPhasePolicy.NormalizePhase(phase);
 
     private static string? RequiredQuotaRetryCapabilityForPhase(string phase) =>
-        string.Equals(phase, "audit", StringComparison.OrdinalIgnoreCase)
-            ? WellKnownCapabilities.Audit
-            : null;
+        QuotaRetryPhasePolicy.RequiredCapabilityForPhase(phase);
 
     internal static string? RetryFromForTransientPhase(string? phase, WorkItemState currentState) => phase switch
     {

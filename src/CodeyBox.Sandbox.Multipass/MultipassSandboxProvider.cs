@@ -6660,6 +6660,7 @@ while True:
         sb.AppendLine("        fi");
         sb.AppendLine("        codeybox_detached_pgid=$(codeybox_read_child_pgid)");
         sb.AppendLine("        kill -TERM \"-$codeybox_detached_pgid\" 2>/dev/null || true");
+        sb.AppendLine("        kill -TERM \"$codeybox_detached_pid\" 2>/dev/null || true");
         sb.AppendLine("        codeybox_term_i=0");
         sb.AppendLine("        while kill -0 \"-$codeybox_detached_pgid\" 2>/dev/null && [ \"$codeybox_term_i\" -lt 20 ]; do");
         sb.AppendLine("            sleep 0.05");
@@ -6668,9 +6669,12 @@ while True:
         sb.AppendLine("        if kill -0 \"-$codeybox_detached_pgid\" 2>/dev/null; then");
         sb.AppendLine("            kill -KILL \"-$codeybox_detached_pgid\" 2>/dev/null || true");
         sb.AppendLine("        fi");
-        sb.AppendLine("        set +e");
-        sb.AppendLine("        wait \"$codeybox_detached_pid\" 2>/dev/null");
-        sb.AppendLine("        set -e");
+        sb.AppendLine("        kill -KILL \"$codeybox_detached_pid\" 2>/dev/null || true");
+        sb.AppendLine("        if ! kill -0 \"$codeybox_detached_pid\" 2>/dev/null; then");
+        sb.AppendLine("            set +e");
+        sb.AppendLine("            wait \"$codeybox_detached_pid\" 2>/dev/null");
+        sb.AppendLine("            set -e");
+        sb.AppendLine("        fi");
         sb.AppendLine("        echo \"codeybox-detached: timed out waiting for process group marker\" >&2");
         sb.AppendLine($"        exit {DetachedSupervisorSetupFailedExitCode}");
         sb.AppendLine("    fi");

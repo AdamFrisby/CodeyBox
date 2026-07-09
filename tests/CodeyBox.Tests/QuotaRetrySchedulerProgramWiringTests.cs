@@ -48,6 +48,13 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
         var scheduler = factory.Services.GetRequiredService<QuotaRetryScheduler>();
         Assert.IsType<WorkItemAutoRetryScheduler>(
             factory.Services.GetRequiredService<IWorkItemAutoRetryScheduler>());
+        Assert.Same(
+            scheduler,
+            factory.Services.GetRequiredService<IQuotaRetryDispatchPromoter>());
+        var orchestratorPromoter = typeof(OrchestratorService)
+            .GetField("_quotaRetryDispatchPromoter", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(factory.Services.GetRequiredService<OrchestratorService>());
+        Assert.Same(scheduler, orchestratorPromoter);
         var accessor = Assert.IsType<Func<AutoRetryOnQuotaFailureOptions>>(
             typeof(QuotaRetryScheduler)
                 .GetField("_autoRetryOptionsAccessor", BindingFlags.NonPublic | BindingFlags.Instance)!

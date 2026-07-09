@@ -471,7 +471,7 @@ public sealed class TransientRetryScheduler : BackgroundService, IDisposable, IT
             item.TransientRetryAttempts + 1);
         var retryFrom = string.IsNullOrWhiteSpace(item.TransientRetryFrom)
             ? null
-            : NormalizeRetryFrom(item.TransientRetryFrom);
+            : RetryFromPolicy.NormalizeOrWork(item.TransientRetryFrom);
 
         var (success, error, _, actualFrom, _) = await _retrier.RetryTransientAutoAsync(
             item,
@@ -518,16 +518,6 @@ public sealed class TransientRetryScheduler : BackgroundService, IDisposable, IT
 
         return new TransientRetryAttemptResult("retried", actualFrom is null ? null : $"actualFrom={actualFrom}");
     }
-
-    private static string NormalizeRetryFrom(string? retryFrom) => retryFrom?.Trim().ToLowerInvariant() switch
-    {
-        "planning" => "planning",
-        "audit" => "audit",
-        "conflict_rework" => "conflict_rework",
-        "merge" => "merge",
-        "upstream" => "upstream",
-        _ => "work",
-    };
 
     public async Task<WorkItemAutoRetryScheduleResult> NotifyTransientFailureAsync(WorkItem item, CancellationToken ct = default)
     {

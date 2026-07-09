@@ -17,6 +17,26 @@ public interface IQuotaFailureAutoRetryScheduler
     Task NotifyQuotaFailureAsync(WorkItem item, CancellationToken ct = default);
 }
 
+public interface IQuotaRetryDispatchPromoter
+{
+    Task<QuotaRetryDispatchPromotionResult> TryPromoteForDispatchAsync(
+        WorkItem item,
+        CancellationToken ct = default);
+}
+
+public enum QuotaRetryDispatchDisposition
+{
+    Continue,
+    RestartSelection,
+    Blocked,
+}
+
+public readonly record struct QuotaRetryDispatchPromotionResult(
+    bool Promoted,
+    string Outcome,
+    string? Reason = null,
+    QuotaRetryDispatchDisposition Disposition = QuotaRetryDispatchDisposition.Continue);
+
 public interface ITransientFailureAutoRetryScheduler
 {
     Task<WorkItemAutoRetryScheduleResult> NotifyTransientFailureAsync(WorkItem item, CancellationToken ct = default);

@@ -39,6 +39,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         try
         {
             _conn.Open();
+            RegisterQuotaRetryPhaseFunctions(_conn);
 
             // WAL mode allows concurrent readers; SqliteDatabaseWriteGate serializes writers in-process.
             // busy_timeout is per-connection and gives external lock holders a retry window.
@@ -231,6 +232,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             // Index for the priority-aware pickup query: state filter first, then priority,
             // then created_at. Speeds up the dispatch loop's per-tick "next eligible item" lookup.
             RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_state_priority ON work_items(state, priority DESC, created_at ASC);");
+            RunMigration($"""
+                CREATE INDEX IF NOT EXISTS idx_work_items_due_quota_retry
+                ON work_items(state, next_quota_retry_at, priority DESC, created_at ASC)
+                WHERE state = {(int)WorkItemState.WaitingForQuotaReset};
+                """);
 
             // Additive migration: capture the first contributor that cancelled a
             // pipeline phase so the operator can distinguish a configured timeout
@@ -384,6 +390,14 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         {
             _writeLock.Release();
         }
+    }
+
+    private static void RegisterQuotaRetryPhaseFunctions(SqliteConnection conn)
+    {
+        conn.CreateFunction<string?, string?, int>(
+            "codeybox_quota_retry_dispatch_ordering_state",
+            QuotaRetryPhasePolicy.OrderingStateForQuotaRetryCandidate,
+            isDeterministic: true);
     }
 
     private void RunMigration(string sql)
@@ -1368,6 +1382,135 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         }
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
+    }
+
+    public async IAsyncEnumerable<WorkItem> ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
+        IReadOnlySet<WorkItemId> skipIds,
+        DateTimeOffset now,
+        int limit,
+        QuotaRetryDispatchEligibility quotaRetryEligibility = QuotaRetryDispatchEligibility.DueOnly,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        if (limit <= 0)
+            yield break;
+
+        var rows = new List<WorkItem>();
+        IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            var skipFilter = string.Empty;
+            if (skipIds.Count > 0)
+            {
+                await PopulateDispatchSkipTableAsync(skipIds, ct);
+                skipFilter = DispatchSkipFilterSql;
+            }
+
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = $"""
+                    SELECT * FROM (
+                        SELECT wi.*, wi.state AS dispatch_ordering_state, 0 AS dispatch_source_order
+                        FROM work_items wi
+                        WHERE wi.state NOT IN (
+                            {(int)WorkItemState.Done},
+                            {(int)WorkItemState.Failed},
+                            {(int)WorkItemState.Cancelled},
+                            {(int)WorkItemState.AuditFailed},
+                            {(int)WorkItemState.MergeConflictResolutionFailed},
+                            {(int)WorkItemState.AbandonedAfterRecoveryAttempts},
+                            {(int)WorkItemState.NeedsOperatorInput},
+                            {(int)WorkItemState.WaitingForQuotaReset},
+                            {(int)WorkItemState.WaitingForAgentResume},
+                            {(int)WorkItemState.WaitingForTransientRetry}
+                        )
+                        {skipFilter}
+
+                        UNION ALL
+
+                        SELECT
+                            wi.*,
+                            codeybox_quota_retry_dispatch_ordering_state(
+                                wi.quota_retry_phase,
+                                wi.quota_retry_from
+                            ) AS dispatch_ordering_state,
+                            1 AS dispatch_source_order
+                        FROM work_items wi
+                        WHERE wi.state = {(int)WorkItemState.WaitingForQuotaReset}
+                          AND (
+                              $include_future_quota_retries = 1
+                              OR wi.next_quota_retry_at IS NULL
+                              OR julianday(wi.next_quota_retry_at) <= julianday($now)
+                          )
+                        {skipFilter}
+                    )
+                    ORDER BY
+                        CASE
+                            WHEN dispatch_ordering_state IN (
+                                {(int)WorkItemState.AuditPassed},
+                                {(int)WorkItemState.Merging},
+                                {(int)WorkItemState.Merged},
+                                {(int)WorkItemState.UpstreamPushing}
+                            ) THEN 0
+                            ELSE 1
+                        END ASC,
+                        priority DESC,
+                        created_at ASC,
+                        dispatch_source_order ASC
+                    LIMIT $limit;
+                    """;
+                cmd.Parameters.AddWithValue("$now", now.ToString("O"));
+                cmd.Parameters.AddWithValue(
+                    "$include_future_quota_retries",
+                    quotaRetryEligibility == QuotaRetryDispatchEligibility.IncludeFuture ? 1 : 0);
+                cmd.Parameters.AddWithValue("$limit", limit);
+                using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                    rows.Add(Read(reader));
+            }
+            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+
+        foreach (var item in rows)
+            yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
+    }
+
+    private const string DispatchSkipFilterSql =
+        "AND NOT EXISTS (SELECT 1 FROM temp.codeybox_dispatch_skip_ids skipped WHERE skipped.id = wi.id)";
+
+    private async Task PopulateDispatchSkipTableAsync(
+        IReadOnlySet<WorkItemId> skipIds,
+        CancellationToken ct)
+    {
+        using (var reset = _conn.CreateCommand())
+        {
+            reset.CommandText = """
+                DROP TABLE IF EXISTS temp.codeybox_dispatch_skip_ids;
+                CREATE TEMP TABLE codeybox_dispatch_skip_ids (
+                    id TEXT PRIMARY KEY
+                ) WITHOUT ROWID;
+                """;
+            await reset.ExecuteNonQueryAsync(ct);
+        }
+
+        using var tx = _conn.BeginTransaction();
+        using var insert = _conn.CreateCommand();
+        insert.Transaction = tx;
+        insert.CommandText = "INSERT INTO temp.codeybox_dispatch_skip_ids (id) VALUES ($id);";
+        var idParameter = insert.CreateParameter();
+        idParameter.ParameterName = "$id";
+        insert.Parameters.Add(idParameter);
+        foreach (var id in skipIds)
+        {
+            idParameter.Value = id.ToString();
+            await insert.ExecuteNonQueryAsync(ct);
+        }
+
+        tx.Commit();
     }
 
     public async Task ReorderAsync(IReadOnlyList<WorkItemId> orderedIds, CancellationToken ct = default)

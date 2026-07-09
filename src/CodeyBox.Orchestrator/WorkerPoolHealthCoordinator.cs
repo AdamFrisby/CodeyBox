@@ -83,27 +83,17 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
             return WorkItemDependencies.AreSatisfied(candidate.DependsOn, statesById);
         }
 
-        await foreach (var candidate in _store.ListDispatchEligibleByPriorityAsync(skipIds, ct))
+        // The watchdog is a recovery path, so make every WaitingForQuotaReset row
+        // visible while still using the same combined candidate ordering as pickup.
+        await foreach (var candidate in _store.ListDispatchEligibleIncludingDueQuotaRetryByPriorityAsync(
+            skipIds,
+            DateTimeOffset.UtcNow,
+            scanLimit,
+            QuotaRetryDispatchEligibility.IncludeFuture,
+            ct))
         {
             if (inspected++ >= scanLimit)
                 break;
-
-            if (!await IsRunnableCandidateAsync(candidate, DependenciesSatisfiedAsync, ct))
-                continue;
-
-            result.Add(new WorkerPoolHealthCandidate(candidate.Id, candidate.State));
-        }
-
-        if (inspected >= scanLimit)
-            return result;
-
-        await foreach (var candidate in _store.ListByStateAsync(WorkItemState.WaitingForQuotaReset, ct))
-        {
-            if (inspected++ >= scanLimit)
-                break;
-
-            if (skipIds.Contains(candidate.Id))
-                continue;
 
             if (!await IsRunnableCandidateAsync(candidate, DependenciesSatisfiedAsync, ct))
                 continue;

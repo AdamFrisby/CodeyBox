@@ -1776,6 +1776,8 @@ builder.Services.AddSingleton<IAgentQuotaAvailabilitySignal>(sp =>
     sp.GetRequiredService<AgentClassRouter>());
 builder.Services.AddSingleton<IQuotaRetryRouter>(sp =>
     sp.GetRequiredService<AgentClassRouter>());
+builder.Services.AddSingleton<IQuotaRetryAdmissionRouter>(sp =>
+    sp.GetRequiredService<AgentClassRouter>());
 builder.Services.AddSingleton<IAgentRoutingReadiness>(sp =>
     sp.GetRequiredService<AgentClassRouter>());
 
@@ -2919,6 +2921,8 @@ builder.Services.AddSingleton<IWorkerPoolQuotaRecovery>(sp =>
     sp.GetRequiredService<QuotaRetryScheduler>());
 builder.Services.AddSingleton<IQuotaFailureAutoRetryScheduler>(sp =>
     sp.GetRequiredService<QuotaRetryScheduler>());
+builder.Services.AddSingleton<IQuotaRetryDispatchPromoter>(sp =>
+    sp.GetRequiredService<QuotaRetryScheduler>());
 builder.Services.AddSingleton<ITransientFailureAutoRetryScheduler>(sp =>
     sp.GetRequiredService<TransientRetryScheduler>());
 builder.Services.AddSingleton<IWorkItemAutoRetryScheduler>(sp =>
@@ -3057,7 +3061,9 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     sp.GetRequiredService<IStartupRecoveryInputBarrier>(),
     sp.GetRequiredService<IStartupInitialRecoverySink>(),
     dispatchAvailability: sp.GetRequiredService<IAgentDispatchAvailability>(),
-    knobRegistry: sp.GetRequiredService<IKnobRegistry>()));
+    knobRegistry: sp.GetRequiredService<IKnobRegistry>(),
+    quotaRetryDispatchPromoter: sp.GetRequiredService<IQuotaRetryDispatchPromoter>(),
+    quotaRetryAdmissionRouter: sp.GetRequiredService<IQuotaRetryAdmissionRouter>()));
 builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<IRefactorProjectGateStatusProvider>(
@@ -3151,14 +3157,7 @@ builder.Services.AddHostedService(sp => new SandboxResumeOnStartupService(
     () =>
     {
         var shutdown = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Shutdown;
-        return new SandboxStartupResumeOptions
-        {
-            Mode = shutdown.SandboxResumeMode == SandboxResumeMode.Blocking
-                ? SandboxStartupResumeMode.Blocking
-                : SandboxStartupResumeMode.Background,
-            ResumeTimeout = shutdown.SandboxResumeTimeout,
-            AdoptionDeadline = TimeSpan.FromSeconds(shutdown.SandboxAdoptionDeadlineSeconds),
-        };
+        return Program.BuildSandboxStartupResumeOptions(shutdown);
     },
     sp.GetRequiredService<IStartupRecoveryInputSink>(),
     sp.GetRequiredService<IInfrastructureDeferralScheduler>(),
@@ -5807,5 +5806,20 @@ public partial class Program
             : TimeSpan.FromMilliseconds(Math.Max(100, grace.TotalMilliseconds * 0.2));
         var drain = grace - reserve;
         return drain > TimeSpan.Zero ? drain : TimeSpan.FromMilliseconds(100);
+    }
+
+    internal static SandboxStartupResumeOptions BuildSandboxStartupResumeOptions(
+        ShutdownOptions shutdown)
+    {
+        ArgumentNullException.ThrowIfNull(shutdown);
+
+        return new SandboxStartupResumeOptions
+        {
+            Mode = shutdown.SandboxResumeMode == SandboxResumeMode.Blocking
+                ? SandboxStartupResumeMode.Blocking
+                : SandboxStartupResumeMode.Background,
+            ResumeTimeout = shutdown.SandboxResumeTimeout,
+            AdoptionDeadline = TimeSpan.FromSeconds(shutdown.SandboxAdoptionDeadlineSeconds),
+        };
     }
 }

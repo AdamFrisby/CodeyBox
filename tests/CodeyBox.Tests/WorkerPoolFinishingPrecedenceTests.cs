@@ -123,7 +123,8 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
         using var svc = new OrchestratorService(
             queue, _store, pipeline, registry,
             new OrchestratorOptions { MaxConcurrentWorkers = 2 },
-            NullLogger<OrchestratorService>.Instance);
+            NullLogger<OrchestratorService>.Instance,
+            quotaRetryDispatchPromoter: NoopQuotaRetryDispatchPromoter.Instance);
 
         await svc.StartAsync(CancellationToken.None);
 
@@ -232,7 +233,8 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
             NullLogger<OrchestratorService>.Instance,
             router: router,
             projects: projectRepo,
-            agentConcurrency: concurrency);
+            agentConcurrency: concurrency,
+            quotaRetryDispatchPromoter: NoopQuotaRetryDispatchPromoter.Instance);
 
         var reworks = Enumerable.Range(0, 4)
             .Select(_ => Item(WorkItemState.Reworking) with { AgentClassId = "low-tier" })
@@ -312,6 +314,16 @@ public sealed class WorkerPoolFinishingPrecedenceTests : IDisposable
         Priority = priority,
         PushUpstream = false,
     };
+
+    private sealed class NoopQuotaRetryDispatchPromoter : IQuotaRetryDispatchPromoter
+    {
+        public static readonly NoopQuotaRetryDispatchPromoter Instance = new();
+
+        public Task<QuotaRetryDispatchPromotionResult> TryPromoteForDispatchAsync(
+            WorkItem item,
+            CancellationToken ct = default) =>
+            Task.FromResult(new QuotaRetryDispatchPromotionResult(false, "skipped:test-noop"));
+    }
 
     private sealed class FinishingPrecedencePipeline : IPipelineRunner
     {

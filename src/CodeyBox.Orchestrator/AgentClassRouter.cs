@@ -27,7 +27,7 @@ namespace CodeyBox.Orchestrator;
 /// TOD windows are pre-parsed at construction time so evaluation is allocation-free.
 /// <see cref="TimeProvider"/> is the clock source; inject a fake for tests.
 /// </summary>
-public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQuotaAvailabilitySignal, IQuotaRetryRouter, IAgentRoutingReadiness
+public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQuotaAvailabilitySignal, IQuotaRetryRouter, IQuotaRetryAdmissionRouter, IAgentRoutingReadiness
 {
     // The class catalog and pre-parsed TOD modifiers are bundled into a single
     // record so the hot-reload coordinator can publish a coherent (catalog,
@@ -1325,6 +1325,57 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
         var effectiveCapabilities = BuildEffectiveCapabilities(agentClass);
         return IsEligibleMemberForItem(member, item, effectiveCapabilities, capability);
+    }
+
+    public IReadOnlySet<QuotaRetryAdmissionPoolKey> GetQuotaRetryAdmissionPool(
+        WorkItem item,
+        Project? project,
+        string? requiredCapability = null)
+    {
+        var classId = item.AgentClassId ?? project?.DefaultAgentClass;
+        if (string.IsNullOrEmpty(classId))
+            return new HashSet<QuotaRetryAdmissionPoolKey>();
+
+        var cfg = Volatile.Read(ref _routingConfig);
+        if (!cfg.Catalog.TryGetValue(classId, out var agentClass))
+            return new HashSet<QuotaRetryAdmissionPoolKey>();
+
+        var effectiveCapabilities = BuildEffectiveCapabilities(agentClass);
+        var requiredCapabilityPoolActive = !string.IsNullOrWhiteSpace(requiredCapability)
+            && agentClass.Members.Any(member => MemberHasCapability(
+                member,
+                requiredCapability!,
+                effectiveCapabilities));
+
+        return agentClass.Members
+            .Where(member => IsEligibleMemberForItem(
+                member,
+                item,
+                effectiveCapabilities,
+                requiredCapabilityPoolActive ? requiredCapability : null))
+            .Select(QuotaRetryAdmissionPoolKey.FromMembership)
+            .ToHashSet();
+    }
+
+    public async Task<QuotaRetryAdmissionPoolKey?> ResolveCurrentQuotaRetryAdmissionAsync(
+        WorkItem item,
+        Project? project,
+        CancellationToken ct,
+        string? requiredCapability = null)
+    {
+        var decision = await ResolveCoreAsync(
+            item,
+            project,
+            ct,
+            slotGate: null,
+            bypassRecentFailurePrecheck: false,
+            bypassInProcessExhaustion: false,
+            commitDispatchSideEffects: false,
+            requiredCapability: requiredCapability);
+
+        return decision.Chosen is { } chosen
+            ? QuotaRetryAdmissionPoolKey.FromMembership(chosen)
+            : null;
     }
 
     /// <summary>
