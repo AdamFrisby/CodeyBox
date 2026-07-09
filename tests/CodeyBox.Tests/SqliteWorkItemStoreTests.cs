@@ -225,6 +225,64 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task ListWaitingForQuotaResetByAgentPriorityAsync_PagesOnlyMatchingAgentInPriorityOrder()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var highCodex = Sample() with
+        {
+            State = WorkItemState.WaitingForQuotaReset,
+            Agent = AgentKind.Codex,
+            Priority = 10,
+            CreatedAt = now.AddMinutes(-3),
+        };
+        var skippedClaude = Sample() with
+        {
+            State = WorkItemState.WaitingForQuotaReset,
+            Agent = AgentKind.Claude,
+            Priority = 100,
+            CreatedAt = now.AddMinutes(-4),
+        };
+        var lowCodex = Sample() with
+        {
+            State = WorkItemState.WaitingForQuotaReset,
+            Agent = AgentKind.Codex,
+            Priority = 1,
+            CreatedAt = now.AddMinutes(-5),
+        };
+        var queuedCodex = Sample() with
+        {
+            State = WorkItemState.Queued,
+            Agent = AgentKind.Codex,
+            Priority = 100,
+            CreatedAt = now.AddMinutes(-10),
+        };
+        await _store.CreateAsync(lowCodex);
+        await _store.CreateAsync(skippedClaude);
+        await _store.CreateAsync(queuedCodex);
+        await _store.CreateAsync(highCodex);
+
+        var firstPage = new List<WorkItem>();
+        await foreach (var item in _store.ListWaitingForQuotaResetByAgentPriorityAsync(
+            AgentKind.Codex,
+            limit: 1))
+        {
+            firstPage.Add(item);
+        }
+
+        var secondPage = new List<WorkItem>();
+        await foreach (var item in _store.ListWaitingForQuotaResetByAgentPriorityAsync(
+            AgentKind.Codex,
+            limit: 1,
+            after: WaitingForQuotaResetPriorityCursor.From(firstPage.Single())))
+        {
+            secondPage.Add(item);
+        }
+
+        Assert.Equal([highCodex.Id], firstPage.Select(item => item.Id));
+        Assert.Equal([lowCodex.Id], secondPage.Select(item => item.Id));
+    }
+
+    [Fact]
     public async Task ReadMethods_WaitBehindSharedConnectionGate()
     {
         var queued = Sample();

@@ -379,7 +379,10 @@ public sealed class QuotaRetrySchedulerPeerRerouteTests : IDisposable
     private sealed class FakeAgentQuotaAvailabilitySignal : IAgentQuotaAvailabilitySignal
     {
         public event Action? QuotaUsableThresholdCrossed;
+        public event Action<AgentQuotaMemberKey>? QuotaMemberUsableThresholdCrossed;
         public void FireQuotaUsableThresholdCrossed() => QuotaUsableThresholdCrossed?.Invoke();
+        public void FireQuotaMemberUsableThresholdCrossed(AgentQuotaMemberKey member) =>
+            QuotaMemberUsableThresholdCrossed?.Invoke(member);
     }
 
     private sealed class InertTimeProvider : TimeProvider

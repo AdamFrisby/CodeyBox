@@ -39,6 +39,19 @@ public enum QuotaRetryDispatchEligibility
 }
 
 /// <summary>
+/// Seek cursor for priority-ordered <see cref="WorkItemState.WaitingForQuotaReset"/> scans.
+/// The ordering is priority descending, then created time ascending, then id ascending.
+/// </summary>
+public readonly record struct WaitingForQuotaResetPriorityCursor(
+    int Priority,
+    DateTimeOffset CreatedAt,
+    WorkItemId Id)
+{
+    public static WaitingForQuotaResetPriorityCursor From(WorkItem item) =>
+        new(item.Priority, item.CreatedAt, item.Id);
+}
+
+/// <summary>
 /// Outcome of <see cref="IWorkItemStore.UpdateDependsOnAsync"/>.
 /// </summary>
 public enum DependsOnUpdateOutcome
@@ -282,6 +295,21 @@ public interface IWorkItemStore
         CancellationToken ct = default) =>
         throw new NotSupportedException(
             "This work item store must implement bounded WaitingForQuotaReset priority queries before quota recovery sweeps can run.");
+
+    /// <summary>
+    /// Returns at most <paramref name="limit"/> quota-parked rows assigned to
+    /// <paramref name="agent"/> in retry sweep order. <paramref name="after"/>
+    /// is an exclusive seek cursor from the prior page, allowing callers to
+    /// drain a recovered agent's parked backlog without repeatedly reading the
+    /// same high-priority rows that remain parked.
+    /// </summary>
+    IAsyncEnumerable<WorkItem> ListWaitingForQuotaResetByAgentPriorityAsync(
+        AgentKind agent,
+        int limit,
+        WaitingForQuotaResetPriorityCursor? after = null,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This work item store must implement bounded agent-scoped WaitingForQuotaReset priority queries before quota recovery sweeps can run.");
 
     /// <summary>
     /// Returns the number of work items currently persisted in

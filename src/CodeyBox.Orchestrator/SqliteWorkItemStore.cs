@@ -233,6 +233,11 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             // then created_at. Speeds up the dispatch loop's per-tick "next eligible item" lookup.
             RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_state_priority ON work_items(state, priority DESC, created_at ASC);");
             RunMigration($"""
+                CREATE INDEX IF NOT EXISTS idx_work_items_waiting_quota_agent_priority
+                ON work_items(state, agent, priority DESC, created_at ASC, id ASC)
+                WHERE state = {(int)WorkItemState.WaitingForQuotaReset};
+                """);
+            RunMigration($"""
                 CREATE INDEX IF NOT EXISTS idx_work_items_due_quota_retry
                 ON work_items(state, next_quota_retry_at, priority DESC, created_at ASC)
                 WHERE state = {(int)WorkItemState.WaitingForQuotaReset};
@@ -1323,6 +1328,65 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     LIMIT $limit;
                     """;
                 cmd.Parameters.AddWithValue("$limit", limit);
+                using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                    rows.Add(Read(reader));
+            }
+            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+
+        foreach (var item in rows)
+            yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
+    }
+
+    public async IAsyncEnumerable<WorkItem> ListWaitingForQuotaResetByAgentPriorityAsync(
+        AgentKind agent,
+        int limit,
+        WaitingForQuotaResetPriorityCursor? after = null,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        if (limit <= 0)
+            yield break;
+
+        var rows = new List<WorkItem>();
+        IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = $"""
+                    SELECT * FROM work_items
+                    WHERE state = {(int)WorkItemState.WaitingForQuotaReset}
+                      AND agent = $agent
+                      AND (
+                          $after_priority IS NULL
+                          OR priority < $after_priority
+                          OR (priority = $after_priority AND created_at > $after_created_at)
+                          OR (priority = $after_priority AND created_at = $after_created_at AND id > $after_id)
+                      )
+                    ORDER BY priority DESC, created_at ASC, id ASC
+                    LIMIT $limit;
+                    """;
+                cmd.Parameters.AddWithValue("$agent", agent.Value);
+                cmd.Parameters.AddWithValue("$limit", limit);
+                if (after is { } cursor)
+                {
+                    cmd.Parameters.AddWithValue("$after_priority", cursor.Priority);
+                    cmd.Parameters.AddWithValue("$after_created_at", cursor.CreatedAt.ToString("O"));
+                    cmd.Parameters.AddWithValue("$after_id", cursor.Id.ToString());
+                }
+                else
+                {
+                    cmd.Parameters.AddWithValue("$after_priority", DBNull.Value);
+                    cmd.Parameters.AddWithValue("$after_created_at", DBNull.Value);
+                    cmd.Parameters.AddWithValue("$after_id", DBNull.Value);
+                }
+
                 using var reader = await cmd.ExecuteReaderAsync(ct);
                 while (await reader.ReadAsync(ct))
                     rows.Add(Read(reader));

@@ -38,4 +38,12 @@ public interface IAgentQuotaAvailabilitySnapshot
 public interface IAgentQuotaAvailabilitySignal
 {
     event Action? QuotaUsableThresholdCrossed;
+
+    /// <summary>
+    /// Instance-aware quota recovery signal. The legacy no-argument event is
+    /// retained for broad wake-ups; subscribers that can act on a recovered
+    /// member should use this event to avoid being limited by a global priority
+    /// prefix.
+    /// </summary>
+    event Action<AgentQuotaMemberKey>? QuotaMemberUsableThresholdCrossed;
 }

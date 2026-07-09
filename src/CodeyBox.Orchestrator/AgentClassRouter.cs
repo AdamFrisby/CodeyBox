@@ -145,6 +145,24 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         }
     }
 
+    public event Action<AgentQuotaMemberKey>? QuotaMemberUsableThresholdCrossed
+    {
+        add
+        {
+            if (_quotaAvailabilityPublisher is IAgentQuotaAvailabilitySignal signal)
+                signal.QuotaMemberUsableThresholdCrossed += value;
+            else
+                _localQuotaAvailability!.QuotaMemberUsableThresholdCrossed += value;
+        }
+        remove
+        {
+            if (_quotaAvailabilityPublisher is IAgentQuotaAvailabilitySignal signal)
+                signal.QuotaMemberUsableThresholdCrossed -= value;
+            else
+                _localQuotaAvailability!.QuotaMemberUsableThresholdCrossed -= value;
+        }
+    }
+
     /// <summary>
     /// Combines a probe-derived quota with the operator's local budget for the
     /// same (agent, model): takes MIN of the two available percentages so the

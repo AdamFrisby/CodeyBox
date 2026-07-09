@@ -18,6 +18,7 @@ public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilityS
         => _log = log ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance;
 
     public event Action? QuotaUsableThresholdCrossed;
+    public event Action<AgentQuotaMemberKey>? QuotaMemberUsableThresholdCrossed;
     public event Action<AgentQuotaUsabilityObservation>? QuotaUsabilityObserved;
 
     public bool RecordQuotaUsability(
@@ -44,7 +45,7 @@ public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilityS
             "Quota availability for {Agent}/{Model} crossed from unusable to usable; triggering parked-item recovery sweep",
             member.Agent.Value,
             member.ModelId ?? "(default)");
-        var delivered = NotifyQuotaUsableThresholdCrossed();
+        var delivered = NotifyQuotaUsableThresholdCrossed(key);
         if (!delivered)
         {
             RollBackTransition(key, transition);
@@ -82,11 +83,18 @@ public sealed class AgentQuotaAvailabilityBroadcaster : IAgentQuotaAvailabilityS
             handler => handler(observation),
             ex => _log.LogWarning(ex, "Quota usability-observation subscriber threw; continuing"));
 
-    private bool NotifyQuotaUsableThresholdCrossed()
-        => NotifySubscribers(
+    private bool NotifyQuotaUsableThresholdCrossed(AgentQuotaMemberKey key)
+    {
+        var memberDelivered = NotifySubscribers(
+            QuotaMemberUsableThresholdCrossed,
+            handler => handler(key),
+            ex => _log.LogWarning(ex, "Quota member usable-threshold subscriber threw; continuing"));
+        var legacyDelivered = NotifySubscribers(
             QuotaUsableThresholdCrossed,
             handler => handler(),
             ex => _log.LogWarning(ex, "Quota usable threshold subscriber threw; continuing"));
+        return memberDelivered && legacyDelivered;
+    }
 
     private void RollBackTransition(AgentQuotaMemberKey key, QuotaUsabilityTransitionRecord transition)
     {

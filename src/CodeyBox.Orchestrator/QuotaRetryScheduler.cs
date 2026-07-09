@@ -30,13 +30,15 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
     private readonly TimeProvider _time;
     private readonly IBaselineImageResolver _baselineResolver;
     private readonly ILogger<QuotaRetryScheduler> _log;
-    // A single wake-up sweep machinery serves every signal that can make a
-    // parked item routable again (quota refill, operator pause/resume, etc.).
-    // The sweep is class-agnostic by design: it re-evaluates every parked item
-    // against the FULL current class availability via the router, so a peer
-    // becoming usable reroutes items parked against the original agent.
+    // A single wake-up task serves every signal that can make a parked item
+    // routable again (quota refill, operator pause/resume, etc.). Generic
+    // signals use the bounded global priority batch; member/agent recovery
+    // signals also queue an agent-scoped paged scan so a recovered agent's
+    // lower-priority rows are not hidden behind a global prefix for peers that
+    // remain exhausted.
     private readonly CancellationTokenSource _wakeUpSweepCts = new();
     private readonly object _wakeUpSweepLock = new();
+    private readonly ConcurrentDictionary<AgentKind, bool> _wakeUpSweepAgents = new();
     private readonly ConcurrentDictionary<string, bool> _invalidIntervalWarnings = new(StringComparer.Ordinal);
     private Task? _wakeUpSweepTask;
     private int _wakeUpSweepScheduled;
@@ -94,7 +96,10 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         _baselineResolver = baselineResolver ?? NullBaselineImageResolver.Instance;
         _quotaAvailabilitySignal = quotaAvailabilitySignal;
         if (_quotaAvailabilitySignal is not null)
+        {
             _quotaAvailabilitySignal.QuotaUsableThresholdCrossed += OnClassAvailabilityChanged;
+            _quotaAvailabilitySignal.QuotaMemberUsableThresholdCrossed += OnQuotaMemberAvailabilityChanged;
+        }
         _agentAvailabilityRecoverySignal = agentAvailabilityRecoverySignal;
         if (_agentAvailabilityRecoverySignal is not null)
             _agentAvailabilityRecoverySignal.AgentRecovered += OnAgentAvailabilityRecovered;
@@ -303,12 +308,13 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             else
             {
                 // Startup is the escape hatch for persisted WaitingForQuotaReset rows:
-                // every parked item is put back on the queue so dispatch evaluates
-                // current agent availability from scratch, even when the row is
-                // already at the periodic auto-retry cap. The router preflight is
-                // advisory: it records the short-lived quota-retry admission that
-                // lets the subsequent dispatch bypass stale local quota suppression,
-                // but it does not block the unconditional startup requeue.
+                // the priority-batched startup scan puts parked items back on the
+                // queue so dispatch evaluates current agent availability from
+                // scratch, even when a row is already at the periodic auto-retry
+                // cap. The router preflight is advisory: it records the short-lived
+                // quota-retry admission that lets the subsequent dispatch bypass
+                // stale local quota suppression, but it does not block the
+                // unconditional startup requeue for rows included in the batch.
                 item = await PrepareStartupQuotaRetryAdmissionAsync(item, ct);
                 // Preserve the saved phase rather than forcing from=work.
                 outcome = await PerformRetryAsync(item, "startup", ct);
@@ -359,12 +365,11 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
     }
 
     // The periodic sweep is the safety net: it walks every Failed/quota item
-    // and asks the router whether it could run now, ignoring NextQuotaRetryAt
-    // entirely. NextQuotaRetryAt is an *optimisation* (drives the targeted
-    // timer), not a "don't even try" gate — probe caches can be stale, the
-    // park-time estimate can be wrong, and class members can refill earlier
-    // than predicted. Keeping the sweep router-driven means we recover even
-    // when those estimates miss.
+    // plus a bounded priority batch of WaitingForQuotaReset rows, then asks the
+    // router whether each could run now while ignoring NextQuotaRetryAt entirely.
+    // NextQuotaRetryAt is an optimisation (drives the targeted timer), not a
+    // "don't even try" gate. Agent-scoped recovery events use a paged variant
+    // below when they need coverage beyond the global batch prefix.
     private async Task RunPeriodicSweepAsync(CancellationToken ct)
     {
         _log.LogDebug("Starting periodic quota retry sweep");
@@ -528,7 +533,18 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             timer.Dispose();
     }
 
-    private void OnClassAvailabilityChanged()
+    private void OnClassAvailabilityChanged() => ScheduleClassAvailabilityWakeUpSweep(recoveredAgent: null);
+
+    private void OnQuotaMemberAvailabilityChanged(AgentQuotaMemberKey member) =>
+        ScheduleClassAvailabilityWakeUpSweep(member.Agent);
+
+    private void OnAgentAvailabilityRecovered(AgentKind agent)
+    {
+        ScheduleClassAvailabilityWakeUpSweep(agent);
+        ScheduleClassAvailabilityWakeUpSweep(recoveredAgent: null);
+    }
+
+    private void ScheduleClassAvailabilityWakeUpSweep(AgentKind? recoveredAgent)
     {
         if (!CurrentRetryOptions.Enabled)
             return;
@@ -536,14 +552,15 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             return;
         if (_wakeUpSweepCts.IsCancellationRequested)
             return;
-        Interlocked.Exchange(ref _wakeUpSweepPending, 1);
+        if (recoveredAgent is { } agent)
+            _wakeUpSweepAgents[agent] = true;
+        else
+            Interlocked.Exchange(ref _wakeUpSweepPending, 1);
         if (Interlocked.CompareExchange(ref _wakeUpSweepScheduled, 1, 0) == 1)
             return;
 
         StartClassAvailabilityWakeUpSweep();
     }
-
-    private void OnAgentAvailabilityRecovered(AgentKind _) => OnClassAvailabilityChanged();
 
     private void StartClassAvailabilityWakeUpSweep()
     {
@@ -558,9 +575,13 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
     {
         try
         {
-            while (Interlocked.Exchange(ref _wakeUpSweepPending, 0) == 1)
+            while (TryConsumeWakeUpSweep(out var recoveredAgents, out var runGlobalSweep))
             {
-                await RunPeriodicSweepAsync(ct);
+                foreach (var agent in recoveredAgents)
+                    await RunAgentRecoverySweepAsync(agent, ct);
+
+                if (runGlobalSweep)
+                    await RunPeriodicSweepAsync(ct);
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -573,13 +594,51 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         finally
         {
             Interlocked.Exchange(ref _wakeUpSweepScheduled, 0);
-            if (Volatile.Read(ref _wakeUpSweepPending) == 1
+            if ((Volatile.Read(ref _wakeUpSweepPending) == 1 || !_wakeUpSweepAgents.IsEmpty)
                 && Volatile.Read(ref _disposed) == 0
                 && !_wakeUpSweepCts.IsCancellationRequested
                 && Interlocked.CompareExchange(ref _wakeUpSweepScheduled, 1, 0) == 0)
             {
                 StartClassAvailabilityWakeUpSweep();
             }
+        }
+    }
+
+    private bool TryConsumeWakeUpSweep(out List<AgentKind> recoveredAgents, out bool runGlobalSweep)
+    {
+        runGlobalSweep = Interlocked.Exchange(ref _wakeUpSweepPending, 0) == 1;
+        recoveredAgents = [];
+        foreach (var entry in _wakeUpSweepAgents.ToArray())
+        {
+            if (_wakeUpSweepAgents.TryRemove(entry.Key, out _))
+                recoveredAgents.Add(entry.Key);
+        }
+        recoveredAgents.Sort(static (left, right) =>
+            string.CompareOrdinal(left.Value, right.Value));
+        return runGlobalSweep || recoveredAgents.Count > 0;
+    }
+
+    private async Task RunAgentRecoverySweepAsync(AgentKind agent, CancellationToken ct)
+    {
+        _log.LogDebug("Starting quota recovery wake-up sweep for agent {Agent}", agent.Value);
+        var batchSize = ResolveWaitingForQuotaResetSweepBatchSize();
+        WaitingForQuotaResetPriorityCursor? after = null;
+
+        while (true)
+        {
+            var count = 0;
+            WaitingForQuotaResetPriorityCursor? lastCursor = null;
+            await foreach (var item in _store.ListWaitingForQuotaResetByAgentPriorityAsync(agent, batchSize, after, ct))
+            {
+                count++;
+                lastCursor = WaitingForQuotaResetPriorityCursor.From(item);
+                await TryPeriodicRetryAsync(item, ct);
+            }
+
+            if (count < batchSize || lastCursor is null)
+                break;
+
+            after = lastCursor.Value;
         }
     }
 
@@ -1031,7 +1090,10 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         }
 
         if (_quotaAvailabilitySignal is not null)
+        {
             _quotaAvailabilitySignal.QuotaUsableThresholdCrossed -= OnClassAvailabilityChanged;
+            _quotaAvailabilitySignal.QuotaMemberUsableThresholdCrossed -= OnQuotaMemberAvailabilityChanged;
+        }
         if (_agentAvailabilityRecoverySignal is not null)
             _agentAvailabilityRecoverySignal.AgentRecovered -= OnAgentAvailabilityRecovered;
         if (_pauseSignal is not null)

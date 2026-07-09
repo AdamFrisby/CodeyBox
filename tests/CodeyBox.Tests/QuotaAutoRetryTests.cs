@@ -1161,7 +1161,9 @@ public sealed class QuotaAutoRetryTests : IDisposable
     private sealed class ManualQuotaAvailabilitySignal : IAgentQuotaAvailabilitySignal
     {
         public event Action? QuotaUsableThresholdCrossed;
+        public event Action<AgentQuotaMemberKey>? QuotaMemberUsableThresholdCrossed;
         public void Fire() => QuotaUsableThresholdCrossed?.Invoke();
+        public void Fire(AgentQuotaMemberKey member) => QuotaMemberUsableThresholdCrossed?.Invoke(member);
     }
 
     private sealed class SignalDuringFirstRetryRouter : IQuotaRetryRouter
@@ -2466,6 +2468,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
                     Enabled = true,
                     PeriodicCheckInterval = TimeSpan.FromHours(6),
                     MaxAutoRetriesPerWorkItem = 3,
+                    MaxWaitingForQuotaResetSweepBatchSize = 2,
                 },
             },
             NullLogger<QuotaRetryScheduler>.Instance,
@@ -2486,25 +2489,38 @@ public sealed class QuotaAutoRetryTests : IDisposable
             FailureKind = "quota",
             QuotaRetryAttempts = 0,
             Agent = AgentKind.Codex,
+            Priority = 1,
             NextQuotaRetryAt = _time.Now.AddDays(7),
         };
-        var claudeParked = codexParked with
+        var firstClaudeParked = codexParked with
         {
             Id = WorkItemId.New(),
-            Title = "claude parked",
+            Title = "claude parked 1",
             Agent = AgentKind.Claude,
+            Priority = 100,
+        };
+        var secondClaudeParked = codexParked with
+        {
+            Id = WorkItemId.New(),
+            Title = "claude parked 2",
+            Agent = AgentKind.Claude,
+            Priority = 90,
         };
         await store.CreateAsync(codexParked);
-        await store.CreateAsync(claudeParked);
+        await store.CreateAsync(firstClaudeParked);
+        await store.CreateAsync(secondClaudeParked);
 
         quotaSignal.RecordQuotaUsability(codexMember, isUsable: false);
         Assert.Equal(0, await monitor.ProbeTrackedMembersOnceAsync(CancellationToken.None));
 
         var stillCodexParked = await store.GetAsync(codexParked.Id);
-        var stillClaudeParked = await store.GetAsync(claudeParked.Id);
+        var stillFirstClaudeParked = await store.GetAsync(firstClaudeParked.Id);
+        var stillSecondClaudeParked = await store.GetAsync(secondClaudeParked.Id);
         Assert.Equal(WorkItemState.WaitingForQuotaReset, stillCodexParked!.State);
-        Assert.Equal(WorkItemState.WaitingForQuotaReset, stillClaudeParked!.State);
-        Assert.Equal(0, stillClaudeParked.QuotaRetryAttempts);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, stillFirstClaudeParked!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, stillSecondClaudeParked!.State);
+        Assert.Equal(0, stillFirstClaudeParked.QuotaRetryAttempts);
+        Assert.Equal(0, stillSecondClaudeParked.QuotaRetryAttempts);
 
         codexProbe.AvailablePct = 80;
         _time.Now = _time.Now.Add(routerOptions.QuotaRecoveryProbeInterval);
@@ -2514,9 +2530,12 @@ public sealed class QuotaAutoRetryTests : IDisposable
         Assert.Equal(WorkItemState.Queued, retried.State);
         Assert.Equal(1, retried.QuotaRetryAttempts);
 
-        stillClaudeParked = await store.GetAsync(claudeParked.Id);
-        Assert.Equal(WorkItemState.WaitingForQuotaReset, stillClaudeParked!.State);
-        Assert.Equal(0, stillClaudeParked.QuotaRetryAttempts);
+        stillFirstClaudeParked = await store.GetAsync(firstClaudeParked.Id);
+        stillSecondClaudeParked = await store.GetAsync(secondClaudeParked.Id);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, stillFirstClaudeParked!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, stillSecondClaudeParked!.State);
+        Assert.Equal(0, stillFirstClaudeParked.QuotaRetryAttempts);
+        Assert.Equal(0, stillSecondClaudeParked.QuotaRetryAttempts);
     }
 
     [Fact]
