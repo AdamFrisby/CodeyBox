@@ -1267,6 +1267,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("mv -f \"$stdout_tmp\" \"${marker}.stdout\"", script);
         Assert.Contains("mv -f \"$stderr_tmp\" \"${marker}.stderr\"", script);
         Assert.Contains("codeybox_detached_pgid=$(codeybox_read_child_pgid)", script);
+        Assert.Contains("codeybox_launch_deadline=$((SECONDS + codeybox_marker_wait_seconds))", script);
+        Assert.Contains("if [ -z \"$codeybox_marker_deadline\" ] && [ -s \"$codeybox_child_pgid_file\" ]; then", script);
+        Assert.Contains("if [ ! -s \"$codeybox_child_pgid_file\" ] && [ \"$SECONDS\" -lt \"$codeybox_launch_deadline\" ]; then", script);
         Assert.Contains("kill -TERM \"-$codeybox_detached_pgid\"", script);
         Assert.Contains("while kill -0 \"-$codeybox_detached_pgid\"", script);
         Assert.Contains("kill -KILL \"-$codeybox_detached_pgid\"", script);
