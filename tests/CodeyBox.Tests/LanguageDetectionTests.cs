@@ -1,4 +1,5 @@
 using CodeyBox.Audit.Presets;
+using CodeyBox.Audit.Presets.Presets;
 using CodeyBox.Core;
 
 namespace CodeyBox.Tests;
@@ -202,26 +203,11 @@ public sealed class LanguageDetectionTests
             await File.WriteAllTextAsync(Path.Combine(root, "solution", "App.sln"), "");
             await File.WriteAllTextAsync(Path.Combine(root, "standalone", "Tool.csproj"), "<Project />");
 
-            using var process = new System.Diagnostics.Process
-            {
-                StartInfo = new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = "sh",
-                    WorkingDirectory = root,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                },
-            };
-            process.StartInfo.ArgumentList.Add("-c");
-            process.StartInfo.ArgumentList.Add(LanguageProjectDiscovery.CSharpDiscoveryScript);
+            var (exitCode, stdout, stderr) = await RunShellScriptAsync(
+                root,
+                LanguageProjectDiscovery.CSharpDiscoveryScript);
 
-            process.Start();
-            var stdout = await process.StandardOutput.ReadToEndAsync();
-            var stderr = await process.StandardError.ReadToEndAsync();
-            await process.WaitForExitAsync();
-
-            Assert.Equal(0, process.ExitCode);
+            Assert.Equal(0, exitCode);
             Assert.Equal("", stderr);
             var directories = stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
             Assert.Contains("./solution", directories);
@@ -286,6 +272,63 @@ public sealed class LanguageDetectionTests
     }
 
     [Fact]
+    public async Task CSharpRootMarkerScript_EmitsOnlyRootWhenRootSolutionAndManyNestedProjects()
+    {
+        var catalog = new PresetCatalog();
+        var auditor = catalog.ResolveLanguage("csharp", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "csharp:test-pass");
+        var languageContext = Assert.IsAssignableFrom<IAuditorLanguageContext>(auditor);
+
+        var root = Path.Combine(Path.GetTempPath(), $"cb-csharp-root-marker-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(root, "Root.slnx"), "");
+            for (var i = 0; i < LanguageProjectDiscovery.MaxProjectDirectoriesToRun + 5; i++)
+            {
+                var projectDirectory = Path.Combine(root, $"project-{i:00}");
+                Directory.CreateDirectory(projectDirectory);
+                await File.WriteAllTextAsync(Path.Combine(projectDirectory, $"Project{i:00}.csproj"), "<Project />");
+            }
+
+            var (exitCode, stdout, stderr) = await RunShellScriptAsync(root, languageContext.MarkerScript);
+
+            Assert.Equal(0, exitCode);
+            Assert.Equal("", stderr);
+            Assert.Equal(".\n", stdout.Replace("\r\n", "\n", StringComparison.Ordinal));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task CSharpCurrentRepositoryRootMarker_DoesNotHitProjectDirectoryLimit()
+    {
+        var catalog = new PresetCatalog();
+        var auditor = catalog.ResolveLanguage("csharp", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "csharp:test-pass");
+        var languageContext = Assert.IsAssignableFrom<IAuditorLanguageContext>(auditor);
+        var repoRoot = FindRepoRoot();
+
+        var (exitCode, stdout, stderr) = await RunShellScriptAsync(repoRoot, languageContext.MarkerScript);
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal("", stderr);
+        var projectDirectories = LanguagePresetProjectDiscovery.ParseProjectDirectories(stdout);
+        Assert.Contains(".", projectDirectories);
+
+        var selected = LanguageProjectDiscovery.SelectProjectDirectoriesToRun(
+            languageContext.Language,
+            projectDirectories,
+            out var skippedDueToLimit);
+
+        Assert.Equal(0, skippedDueToLimit);
+        Assert.Equal(new[] { "." }, selected);
+    }
+
+    [Fact]
     public async Task CSharpTestPass_MixedProjectEvidenceReportsUnverified()
     {
         var catalog = new PresetCatalog();
@@ -305,23 +348,63 @@ public sealed class LanguageDetectionTests
         new(WorkItemId.New(), "feature", "main", 1, "do x");
 
     private static string MultiLanguageFixturePath()
+        => FindAncestorPath(
+            root =>
+            {
+                var candidate = Path.Combine(
+                    root,
+                    "tests",
+                    "CodeyBox.Tests",
+                    "Fixtures",
+                    "multi-language-repo");
+                return Directory.Exists(candidate) ? candidate : null;
+            },
+            "Could not locate multi-language fixture.");
+
+    private static string FindRepoRoot()
+        => FindAncestorPath(
+            root => File.Exists(Path.Combine(root, "CodeyBox.slnx")) ? root : null,
+            "Could not locate repo root.");
+
+    private static string FindAncestorPath(Func<string, string?> probe, string missingPathMessage)
     {
         var current = new DirectoryInfo(AppContext.BaseDirectory);
         while (current is not null)
         {
-            var candidate = Path.Combine(
-                current.FullName,
-                "tests",
-                "CodeyBox.Tests",
-                "Fixtures",
-                "multi-language-repo");
-            if (Directory.Exists(candidate))
+            var candidate = probe(current.FullName);
+            if (!string.IsNullOrWhiteSpace(candidate))
                 return candidate;
 
             current = current.Parent;
         }
 
-        throw new DirectoryNotFoundException("Could not locate multi-language fixture.");
+        throw new DirectoryNotFoundException(missingPathMessage);
+    }
+
+    private static async Task<(int ExitCode, string Stdout, string Stderr)> RunShellScriptAsync(
+        string workingDirectory,
+        string script)
+    {
+        using var process = new System.Diagnostics.Process
+        {
+            StartInfo = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "sh",
+                WorkingDirectory = workingDirectory,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            },
+        };
+        process.StartInfo.ArgumentList.Add("-c");
+        process.StartInfo.ArgumentList.Add(script);
+
+        process.Start();
+        var stdout = await process.StandardOutput.ReadToEndAsync();
+        var stderr = await process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+
+        return (process.ExitCode, stdout, stderr);
     }
 
     private sealed class MarkerlessSandbox : ISandbox

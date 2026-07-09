@@ -19,6 +19,13 @@ public sealed class SecurityAuditToolProvisioningConfigTests
             .ToArray();
 
         Assert.Contains(runcmd, cmd =>
+            cmd.Contains("DOTNET_SDK_VERSION=10.0.301", StringComparison.Ordinal) &&
+            cmd.Contains("https://dot.net/v1/dotnet-install.sh", StringComparison.Ordinal) &&
+            cmd.Contains("--version \"$DOTNET_SDK_VERSION\"", StringComparison.Ordinal) &&
+            cmd.Contains("--install-dir /usr/share/dotnet", StringComparison.Ordinal) &&
+            cmd.Contains("ln -sf /usr/share/dotnet/dotnet /usr/local/bin/dotnet", StringComparison.Ordinal) &&
+            cmd.Contains("dotnet --version | grep -Fx \"$DOTNET_SDK_VERSION\"", StringComparison.Ordinal));
+        Assert.Contains(runcmd, cmd =>
             cmd.Contains("GITLEAKS_VERSION=8.29.0", StringComparison.Ordinal) &&
             cmd.Contains("sha256sum -c -", StringComparison.Ordinal) &&
             cmd.Contains("gitleaks_${GITLEAKS_VERSION}_linux_${GITLEAKS_ARCH}.tar.gz", StringComparison.Ordinal));

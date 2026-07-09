@@ -13,6 +13,7 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Claude.AcpBridge;
 
 namespace CodeyBox.Tests;
@@ -43,6 +44,9 @@ namespace CodeyBox.Tests;
 [Collection("Process environment")]
 public sealed class AcpBridgeUnitTests
 {
+    private const int SignalCleanupPollAttempts = 100;
+    private static readonly TimeSpan SignalCleanupPollDelay = TimeSpan.FromMilliseconds(50);
+    private static readonly TimeSpan TimedOutProcessKillWait = TimeSpan.FromSeconds(5);
     private static readonly SemaphoreSlim EnvironmentVariableGate = new(1, 1);
 
     // ── BridgeConfig.FromHello ─────────────────────────────────────────────────
@@ -2194,7 +2198,7 @@ public sealed class AcpBridgeUnitTests
     // AcceptHandshakeAsync admits two auth header shapes the dedicated handshake
     // fixtures don't cover: (1) the lowercase `authorization` header used as a
     // fallback when `x-claude-code-ide-authorization` is absent, and (2) the
-    // `Bearer <token>` prefixed form admitted via the EndsWith fallback. Both
+    // `Bearer <token>` prefixed form admitted by explicit Bearer parsing. Both
     // are claimed as "drop-in JS parity" but neither was pinned. A regression
     // that drops either path would silently break claude --ide releases that
     // pick the other header shape (releases have been observed using both).
@@ -2258,7 +2262,7 @@ public sealed class AcpBridgeUnitTests
         using var client = new TcpClient();
         await client.ConnectAsync(IPAddress.Loopback, port);
         var s = client.GetStream();
-        // `Bearer <token>` — admitted by the EndsWith branch.
+        // `Bearer <token>` — accepted only after parsing the Bearer scheme.
         var req = Encoding.ASCII.GetBytes(
             "GET / HTTP/1.1\r\n" +
             "Host: 127.0.0.1\r\n" +
@@ -2276,6 +2280,44 @@ public sealed class AcpBridgeUnitTests
         var resp = Encoding.ASCII.GetString(respBuf, 0, n);
         Assert.StartsWith("HTTP/1.1 101 Switching Protocols", resp);
         Assert.True(await acceptTask);
+        listener.Stop();
+    }
+
+    [Fact]
+    public async Task WebSocketConnection_AcceptHandshake_RejectsSuffixAuthTokenMatch()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        const string authToken = "suffix-token-deadbeef";
+        var acceptTask = Task.Run(async () =>
+        {
+            using var server = await listener.AcceptTcpClientAsync();
+            var ws = new WebSocketConnection(server.GetStream());
+            return await ws.AcceptHandshakeAsync(authToken, CancellationToken.None);
+        });
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, port);
+        var s = client.GetStream();
+        var req = Encoding.ASCII.GetBytes(
+            "GET / HTTP/1.1\r\n" +
+            "Host: 127.0.0.1\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+            "Sec-WebSocket-Version: 13\r\n" +
+            "x-claude-code-ide-authorization: attacker-prefix-" + authToken + "\r\n" +
+            "\r\n");
+        await s.WriteAsync(req);
+        await s.FlushAsync();
+
+        var respBuf = new byte[1024];
+        var n = await s.ReadAsync(respBuf.AsMemory());
+        var resp = Encoding.ASCII.GetString(respBuf, 0, n);
+        Assert.StartsWith("HTTP/1.1 401 Unauthorized", resp);
+        Assert.False(await acceptTask);
         listener.Stop();
     }
 
@@ -2754,118 +2796,534 @@ public sealed class AcpBridgeUnitTests
     // 130, SIGHUP → 129) OR leave a leaked lockfile in place — both are
     // failure modes this fixture catches.
 
+    [Fact]
+    public void SignalBootstrap_ReexecsOnceAndSetsGuardWhenNeeded()
+    {
+        var needsCalled = 0;
+        string? guardValue = null;
+        string[]? execArgv = null;
+        var argv = new[] { "dotnet", "exec", "/tmp/bridge.dll" };
+
+        var ran = SignalBootstrap.RunSignalBootstrapIfNeeded(
+            isLinux: true,
+            guardValue: null,
+            needsBootstrap: () =>
+            {
+                needsCalled++;
+                return true;
+            },
+            readArgv: () => argv,
+            setGuard: value => guardValue = value,
+            exec: value =>
+            {
+                Assert.Equal(SignalBootstrap.SignalBootstrapGuardSetValue, guardValue);
+                execArgv = value;
+            });
+
+        Assert.True(ran);
+        Assert.Equal(1, needsCalled);
+        Assert.Equal(SignalBootstrap.SignalBootstrapGuardSetValue, guardValue);
+        Assert.Same(argv, execArgv);
+    }
+
     [Theory]
-    [InlineData(15, "SIGTERM")] // sandbox provider's normal stop signal
-    [InlineData(2, "SIGINT")]  // Ctrl+C
-    [InlineData(1, "SIGHUP")]  // controlling-terminal hangup
-    public async Task Bridge_PosixSignalHandlers_TriggerCleanShutdownAndLockfileCleanup(int signo, string signalName)
-        => await AssertBridgeSignalTriggersCleanShutdownAsync(signo, signalName);
+    [InlineData("needsBootstrap")]
+    [InlineData("readArgv")]
+    [InlineData("setGuard")]
+    [InlineData("exec")]
+    public void SignalBootstrap_NullDelegatesThrowArgumentNullException(string paramName)
+    {
+        Func<bool> needsBootstrap = () => true;
+        Func<string[]?> readArgv = () => ["dotnet", "exec", "/tmp/bridge.dll"];
+        Action<string?> setGuard = _ => { };
+        Action<string[]> exec = _ => { };
+
+        if (paramName == "needsBootstrap")
+            needsBootstrap = null!;
+        if (paramName == "readArgv")
+            readArgv = null!;
+        if (paramName == "setGuard")
+            setGuard = null!;
+        if (paramName == "exec")
+            exec = null!;
+
+        var ex = Assert.Throws<ArgumentNullException>(() => SignalBootstrap.RunSignalBootstrapIfNeeded(
+            isLinux: true,
+            guardValue: null,
+            needsBootstrap: needsBootstrap,
+            readArgv: readArgv,
+            setGuard: setGuard,
+            exec: exec));
+
+        Assert.Equal(paramName, ex.ParamName);
+    }
 
     [Fact]
-    public async Task Bridge_SighupHandler_ResetsInheritedIgnoredDisposition()
-        => await AssertBridgeSignalTriggersCleanShutdownAsync(
-            1,
-            "SIGHUP-inherited-ignore",
-            inheritIgnoredSighup: true);
-
-    private static async Task AssertBridgeSignalTriggersCleanShutdownAsync(
-        int signo,
-        string signalName,
-        bool inheritIgnoredSighup = false)
+    public void SignalBootstrap_OneShotGuardSkipsNeedCheckArgvReadAndExec()
     {
-        if (!File.Exists("/bin/bash"))
-            return; // honour Skippable shape without taking the dependency
+        var ran = SignalBootstrap.RunSignalBootstrapIfNeeded(
+            isLinux: true,
+            guardValue: SignalBootstrap.SignalBootstrapGuardSetValue,
+            needsBootstrap: () => throw new InvalidOperationException("guard should skip needs check"),
+            readArgv: () => throw new InvalidOperationException("guard should skip argv read"),
+            setGuard: _ => throw new InvalidOperationException("guard should not be rewritten"),
+            exec: _ => throw new InvalidOperationException("guard should skip exec"));
 
+        Assert.False(ran);
+    }
+
+    [Fact]
+    public void SignalBootstrap_NonLinuxSkipsNeedCheckArgvReadAndExec()
+    {
+        var ran = SignalBootstrap.RunSignalBootstrapIfNeeded(
+            isLinux: false,
+            guardValue: null,
+            needsBootstrap: () => throw new InvalidOperationException("non-Linux should skip needs check"),
+            readArgv: () => throw new InvalidOperationException("non-Linux should skip argv read"),
+            setGuard: _ => throw new InvalidOperationException("non-Linux should not set guard"),
+            exec: _ => throw new InvalidOperationException("non-Linux should skip exec"));
+
+        Assert.False(ran);
+    }
+
+    [Fact]
+    public void SignalBootstrap_NoBootstrapNeededDoesNotReadArgvSetGuardOrExec()
+    {
+        var needsCalled = 0;
+
+        var ran = SignalBootstrap.RunSignalBootstrapIfNeeded(
+            isLinux: true,
+            guardValue: null,
+            needsBootstrap: () =>
+            {
+                needsCalled++;
+                return false;
+            },
+            readArgv: () => throw new InvalidOperationException("no-bootstrap branch should skip argv read"),
+            setGuard: _ => throw new InvalidOperationException("no-bootstrap branch should not set guard"),
+            exec: _ => throw new InvalidOperationException("no-bootstrap branch should skip exec"));
+
+        Assert.False(ran);
+        Assert.Equal(1, needsCalled);
+    }
+
+    [Fact]
+    public void SignalBootstrap_NoArgvFallbackDoesNotSetGuardOrExec()
+    {
+        AssertNoArgvFallback(null);
+        AssertNoArgvFallback(Array.Empty<string>());
+
+        static void AssertNoArgvFallback(string[]? argv)
+        {
+            var guardWasSet = false;
+            var execWasCalled = false;
+
+            var ran = SignalBootstrap.RunSignalBootstrapIfNeeded(
+                isLinux: true,
+                guardValue: null,
+                needsBootstrap: () => true,
+                readArgv: () => argv,
+                setGuard: _ => guardWasSet = true,
+                exec: _ => execWasCalled = true);
+
+            Assert.False(ran);
+            Assert.False(guardWasSet);
+            Assert.False(execWasCalled);
+        }
+    }
+
+    [Fact]
+    public void SignalBootstrap_ProcCmdlineParserHandlesNullDelimitedArgv()
+    {
+        Assert.Equal(
+            new[] { "dotnet", "exec", "/tmp/bridge.dll" },
+            SignalBootstrap.ParseProcCmdlineArgv(Encoding.UTF8.GetBytes("dotnet\0exec\0/tmp/bridge.dll\0")));
+        Assert.Equal(
+            new[] { "dotnet", "exec" },
+            SignalBootstrap.ParseProcCmdlineArgv(Encoding.UTF8.GetBytes("dotnet\0exec")));
+        Assert.Equal(
+            new[] { "dotnet", "", "/tmp/bridge.dll" },
+            SignalBootstrap.ParseProcCmdlineArgv(Encoding.UTF8.GetBytes("dotnet\0\0/tmp/bridge.dll\0")));
+        Assert.Null(SignalBootstrap.ParseProcCmdlineArgv(Array.Empty<byte>()));
+        Assert.Equal(new[] { "" }, SignalBootstrap.ParseProcCmdlineArgv(new byte[] { 0 }));
+        Assert.Equal(new[] { "", "" }, SignalBootstrap.ParseProcCmdlineArgv(new byte[] { 0, 0 }));
+    }
+
+    [Fact]
+    public async Task Bridge_SignalBootstrap_ProductionReexecPreservesCurrentArgv()
+    {
+        if (!CommandExists("dotnet"))
+            return;
+
+        var marker = "marker-" + Guid.NewGuid().ToString("N");
+        var run = await RunSignalBootstrapProductionReexecAsync(["alpha", "", marker], hostileArgv0: null);
+
+        AssertSignalBootstrapReexecSucceeded(run);
+        Assert.Equal(new[] { "alpha", "", marker }, run.Before.Args.TakeLast(3).ToArray());
+        Assert.Equal(new[] { "alpha", "", marker }, run.After.Args.TakeLast(3).ToArray());
+    }
+
+    [Fact]
+    public async Task Bridge_SignalBootstrap_ProductionReexecIgnoresHostileArgv0()
+    {
+        if (!CommandExists("dotnet") || !CommandExists("python3"))
+            return;
+
+        const string hostileArgv0 = "codeybox-hostile-argv0";
+        var marker = "marker-" + Guid.NewGuid().ToString("N");
+        var run = await RunSignalBootstrapProductionReexecAsync(["alpha", marker], hostileArgv0);
+
+        AssertSignalBootstrapReexecSucceeded(run);
+        Assert.True(run.Before.ProcArgv.Length >= 3, "before re-exec /proc/self/cmdline was shorter than dotnet exec argv.");
+        Assert.True(run.After.ProcArgv.Length >= 3, "after re-exec /proc/self/cmdline was shorter than dotnet exec argv.");
+        Assert.Equal(hostileArgv0, run.Before.ProcArgv[0]);
+        Assert.Equal("exec", run.Before.ProcArgv[1]);
+        Assert.EndsWith("CodeyBox.Tests.dll", run.Before.ProcArgv[2], StringComparison.Ordinal);
+        Assert.NotEqual(hostileArgv0, run.After.ProcArgv[0]);
+        Assert.True(
+            Path.IsPathFullyQualified(run.After.ProcArgv[0]),
+            "SignalBootstrap must re-exec through the trusted /proc/self/exe target, not the untrusted argv[0].");
+        Assert.Equal(run.Before.ProcArgv.Skip(1).ToArray(), run.After.ProcArgv.Skip(1).ToArray());
+        Assert.Equal(new[] { "alpha", marker }, run.After.Args.TakeLast(2).ToArray());
+    }
+
+    private static async Task<SignalBootstrapReexecRun> RunSignalBootstrapProductionReexecAsync(
+        IReadOnlyList<string> appArgs,
+        string? hostileArgv0)
+    {
         var bridgeDllPath = typeof(Bridge).Assembly.Location;
         Assert.True(File.Exists(bridgeDllPath),
             "AcpBridge dll missing at " + bridgeDllPath +
             " — the test project should ProjectReference the AcpBridge assembly.");
 
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-signal-bootstrap-").FullName;
+        try
+        {
+            var helperProjectPath = Path.Combine(tmpDir, "SignalBootstrapHelper.csproj");
+            var helperProgramPath = Path.Combine(tmpDir, "Program.cs");
+            var outputDir = Path.Combine(tmpDir, "out");
+            Directory.CreateDirectory(outputDir);
+
+            await File.WriteAllTextAsync(helperProjectPath, $$"""
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>CodeyBox.Tests</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="CodeyBox.Agents.Claude.AcpBridge">
+      <HintPath>{{XmlEscape(bridgeDllPath)}}</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>
+""");
+
+            await File.WriteAllTextAsync(helperProgramPath, """
+using System.Text.Json;
+using CodeyBox.Agents.Claude.AcpBridge;
+
+var reexeced = Environment.GetEnvironmentVariable(SignalBootstrap.SignalBootstrapReexecEnv)
+    == SignalBootstrap.SignalBootstrapGuardSetValue;
+Console.WriteLine(JsonSerializer.Serialize(new
+{
+    phase = reexeced ? "after" : "before",
+    pid = Environment.ProcessId,
+    guard = Environment.GetEnvironmentVariable(SignalBootstrap.SignalBootstrapReexecEnv),
+    args = Environment.GetCommandLineArgs(),
+    procArgv = SignalBootstrap.ParseProcCmdlineArgv(File.ReadAllBytes("/proc/self/cmdline")) ?? Array.Empty<string>()
+}));
+Console.Out.Flush();
+
+if (reexeced)
+    return 0;
+
+var ran = SignalBootstrap.RunSignalBootstrapIfNeeded(() => true);
+Console.WriteLine(JsonSerializer.Serialize(new
+{
+    phase = "returned",
+    pid = Environment.ProcessId,
+    ran
+}));
+return ran ? 90 : 91;
+""");
+
+            var dotnetEnv = new Dictionary<string, string?>
+            {
+                ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1",
+                ["DOTNET_NOLOGO"] = "1",
+                [SignalBootstrap.SignalBootstrapReexecEnv] = null,
+            };
+            var build = await RunProcessAsync(
+                "dotnet",
+                ["build", helperProjectPath, "-c", "Debug", "-o", outputDir, "--nologo", "-v:minimal"],
+                dotnetEnv);
+            Assert.True(build.ExitCode == 0,
+                "helper build failed with exit " + build.ExitCode +
+                "\nstdout:\n" + build.Stdout +
+                "\nstderr:\n" + build.Stderr);
+
+            var helperDllPath = Path.Combine(outputDir, "CodeyBox.Tests.dll");
+            Assert.True(File.Exists(helperDllPath), "helper dll missing at " + helperDllPath);
+
+            var run = hostileArgv0 is null
+                ? await RunProcessWithTimeoutAsync(
+                    "dotnet",
+                    BuildDotnetExecArgs(helperDllPath, appArgs),
+                    dotnetEnv,
+                    TimeSpan.FromSeconds(15))
+                : await RunProcessWithTimeoutAsync(
+                    "python3",
+                    BuildHostileArgv0LauncherArgs(helperDllPath, hostileArgv0, appArgs),
+                    dotnetEnv,
+                    TimeSpan.FromSeconds(15));
+            Assert.True(run.ExitCode == 0,
+                "bootstrap helper failed with exit " + run.ExitCode +
+                "\nstdout:\n" + run.Stdout +
+                "\nstderr:\n" + run.Stderr);
+
+            return ParseSignalBootstrapReexecRun(run.Stdout);
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    private static string[] BuildDotnetExecArgs(string helperDllPath, IReadOnlyList<string> appArgs)
+    {
+        var args = new List<string> { "exec", helperDllPath };
+        args.AddRange(appArgs);
+        return args.ToArray();
+    }
+
+    private static string[] BuildHostileArgv0LauncherArgs(
+        string helperDllPath,
+        string hostileArgv0,
+        IReadOnlyList<string> appArgs)
+    {
+        var args = new List<string>
+        {
+            "-c",
+            """
+import os
+import shutil
+import sys
+
+target = sys.argv[1]
+hostile_argv0 = sys.argv[2]
+dotnet = shutil.which("dotnet")
+if dotnet is None:
+    sys.exit(86)
+
+os.execv(dotnet, [hostile_argv0, "exec", target, *sys.argv[3:]])
+""",
+            helperDllPath,
+            hostileArgv0,
+        };
+        args.AddRange(appArgs);
+        return args.ToArray();
+    }
+
+    private static SignalBootstrapReexecRun ParseSignalBootstrapReexecRun(string stdout)
+    {
+        var lines = stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        Assert.Equal(2, lines.Length);
+        return new SignalBootstrapReexecRun(
+            ParseSignalBootstrapReexecSnapshot(lines[0]),
+            ParseSignalBootstrapReexecSnapshot(lines[1]));
+    }
+
+    private static SignalBootstrapReexecSnapshot ParseSignalBootstrapReexecSnapshot(string json)
+    {
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+        var guard = root.GetProperty("guard");
+        return new SignalBootstrapReexecSnapshot(
+            root.GetProperty("phase").GetString() ?? "",
+            root.GetProperty("pid").GetInt32(),
+            guard.ValueKind == JsonValueKind.Null ? null : guard.GetString(),
+            ReadStringArray(root.GetProperty("args")),
+            ReadStringArray(root.GetProperty("procArgv")));
+    }
+
+    private static string[] ReadStringArray(JsonElement element) =>
+        element
+            .EnumerateArray()
+            .Select(value => value.GetString() ?? "")
+            .ToArray();
+
+    private static void AssertSignalBootstrapReexecSucceeded(SignalBootstrapReexecRun run)
+    {
+        Assert.Equal("before", run.Before.Phase);
+        Assert.Equal("after", run.After.Phase);
+        Assert.Equal(run.Before.Pid, run.After.Pid);
+        Assert.Equal(SignalBootstrap.SignalBootstrapGuardSetValue, run.After.Guard);
+    }
+
+    private sealed record SignalBootstrapReexecRun(
+        SignalBootstrapReexecSnapshot Before,
+        SignalBootstrapReexecSnapshot After);
+
+    private sealed record SignalBootstrapReexecSnapshot(
+        string Phase,
+        int Pid,
+        string? Guard,
+        string[] Args,
+        string[] ProcArgv);
+
+    [Fact]
+    public void SignalBootstrap_ResetInheritedIgnoredSignalToDefault_PreservesExistingCatchableHandler()
+    {
+        const int sighup = 1;
+        var sigIgn = new IntPtr(1);
+        var original = SignalBootstrap.ReadSignalHandlerOrNull(sighup);
+        var restoreOriginal = original is { } originalValue
+            && (originalValue == IntPtr.Zero || originalValue == sigIgn);
+
+        if (original == sigIgn)
+            _ = LibcSignal(sighup, IntPtr.Zero);
+
+        try
+        {
+            using var registration = PosixSignalRegistration.Create(
+                PosixSignal.SIGHUP,
+                ctx => ctx.Cancel = true);
+            var before = SignalBootstrap.ReadSignalHandlerOrNull(sighup);
+            Assert.NotNull(before);
+            Assert.NotEqual(IntPtr.Zero, before.Value);
+            Assert.NotEqual(sigIgn, before.Value);
+
+            SignalBootstrap.ResetInheritedIgnoredSignalToDefault(sighup);
+
+            var after = SignalBootstrap.ReadSignalHandlerOrNull(sighup);
+            Assert.Equal(before, after);
+        }
+        finally
+        {
+            if (restoreOriginal)
+                _ = LibcSignal(sighup, original!.Value);
+        }
+    }
+
+    [Fact]
+    public void SignalBootstrap_ResetInheritedIgnoredSignalToDefault_ThrowsOnInvalidSignal()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        Assert.Throws<InvalidOperationException>(() =>
+            SignalBootstrap.ResetInheritedIgnoredSignalToDefault(-999));
+    }
+
+    [Fact]
+    public void SignalBootstrap_RunSignalBootstrapIfNeeded_ThrowsWhenExecThrows()
+    {
+        var argv = new[] { "dotnet", "exec", "/tmp/bridge.dll" };
+        string? guardValue = null;
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            SignalBootstrap.RunSignalBootstrapIfNeeded(
+                isLinux: true,
+                guardValue: null,
+                needsBootstrap: () => true,
+                readArgv: () => argv,
+                setGuard: value => guardValue = value,
+                exec: _ => throw new InvalidOperationException("Simulated execv failure")));
+
+        Assert.Contains("Failed to re-exec signal bootstrap", ex.Message);
+        Assert.Null(guardValue);
+    }
+
+    [Theory]
+    [InlineData(15, "SIGTERM")] // sandbox provider's normal stop signal
+    [InlineData(2, "SIGINT")]  // Ctrl+C
+    [InlineData(1, "SIGHUP")]  // controlling-terminal hangup
+    public Task Bridge_PosixSignalHandlers_TriggerCleanShutdownAndLockfileCleanup(int signo, string signalName) =>
+        RunBridgeSignalCleanupScenarioAsync(signo, signalName, inheritIgnoredSignal: false);
+
+    [Theory]
+    [InlineData(15, "SIGTERM")] // sandbox provider's normal stop signal
+    [InlineData(2, "SIGINT")]  // Ctrl+C
+    [InlineData(1, "SIGHUP")]  // controlling-terminal hangup
+    public Task Bridge_PosixSignalHandlers_ResetInheritedIgnoredDispositionAndCleanUp(int signo, string signalName) =>
+        RunBridgeSignalCleanupScenarioAsync(signo, signalName, inheritIgnoredSignal: true);
+
+    [Theory]
+    [InlineData(15, "SIGTERM")] // sandbox provider's normal stop signal
+    [InlineData(2, "SIGINT")]  // Ctrl+C
+    [InlineData(1, "SIGHUP")]  // controlling-terminal hangup
+    public Task Bridge_NativeResource_PosixSignalHandlers_ResetInheritedIgnoredDispositionAndCleanUp(int signo, string signalName)
+    {
+        if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
+            return Task.CompletedTask; // Resources/acp-bridge is published as linux-musl-x64.
+        if (AcpBridgeBinary.IsPlaceholderBuild)
+            return Task.CompletedTask; // honour dev builds that intentionally embed the placeholder.
+
+        return RunBridgeSignalCleanupScenarioAsync(
+            signo,
+            signalName,
+            inheritIgnoredSignal: true,
+            useNativeResource: true);
+    }
+
+    private static async Task RunBridgeSignalCleanupScenarioAsync(
+        int signo,
+        string signalName,
+        bool inheritIgnoredSignal,
+        bool useNativeResource = false)
+    {
+        if (!File.Exists("/bin/bash"))
+            return; // honour Skippable shape without taking the dependency
+        if (inheritIgnoredSignal && !CommandExists("python3"))
+            return; // honour Skippable shape without taking the dependency
+
+        var ignoredMarkerPath = inheritIgnoredSignal ? Path.Combine(
+            Path.GetTempPath(),
+            "cb-acp-posixsig-ignore-" + signalName + "-" + Guid.NewGuid().ToString("N") + ".txt") : null;
         var tmpDir = Directory.CreateTempSubdirectory("cb-acp-posixsig-" + signalName + "-").FullName;
         try
         {
+            var bridgeTarget = useNativeResource
+                ? CreateNativeResourceSignalTestTarget(tmpDir)
+                : CreateDotnetAssemblySignalTestTarget();
             var workDir = Path.Combine(tmpDir, "work");
             var lockDir = Path.Combine(tmpDir, "locks");
             Directory.CreateDirectory(workDir);
-            // Long-running stub so the bridge stays alive until we signal it.
-            var stubPath = Path.Combine(tmpDir, "claude-longsleep-stub.sh");
-            File.WriteAllText(stubPath,
-                "#!/bin/bash\n" +
-                "exec sleep 60\n");
-            File.SetUnixFileMode(stubPath,
-                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            var rootPidPath = Path.Combine(tmpDir, "claude-root.pid");
+            var childPidPath = Path.Combine(tmpDir, "claude-child.pid");
+            var stubPath = WriteSignalCleanupClaudeStub(tmpDir, rootPidPath, childPidPath);
 
-            var psi = new ProcessStartInfo(inheritIgnoredSighup ? "/bin/bash" : "dotnet")
-            {
-                RedirectStandardInput = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WorkingDirectory = tmpDir,
-            };
-            if (inheritIgnoredSighup)
-            {
-                psi.ArgumentList.Add("-c");
-                psi.ArgumentList.Add("trap '' HUP; exec \"$@\"");
-                psi.ArgumentList.Add("cb-acp-bridge");
-                psi.ArgumentList.Add("dotnet");
-                psi.ArgumentList.Add("exec");
-                psi.ArgumentList.Add(bridgeDllPath);
-            }
-            else
-            {
-                psi.ArgumentList.Add("exec");
-                psi.ArgumentList.Add(bridgeDllPath);
-            }
+            var psi = CreateBridgeSignalTestStartInfo(
+                bridgeTarget,
+                tmpDir,
+                signo,
+                inheritIgnoredSignal,
+                ignoredMarkerPath);
 
             using var proc = Process.Start(psi)
-                ?? throw new InvalidOperationException("Process.Start returned null for dotnet exec.");
+                ?? throw new InvalidOperationException("Process.Start returned null for bridge signal fixture.");
 
             try
             {
-                var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
-                    + "\",\"workingDirectory\":\"" + workDir
-                    + "\",\"lockDir\":\"" + lockDir
-                    + "\",\"turnTimeoutSeconds\":60}";
-                await proc.StandardInput.WriteLineAsync(hello);
-                await proc.StandardInput.FlushAsync();
+                await SendBridgeHelloAsync(proc, stubPath, workDir, lockDir);
+                var lockPath = await WaitForReadyEnvelopeAsync(proc);
 
-                // Read stdout line-by-line until we see the `ready` envelope —
-                // confirms the bridge is up, the lockfile is written, and the
-                // signal handlers have been registered (HandleHello completes
-                // before `ready` fires, but PosixSignalRegistration.Create
-                // happens at the top of RunAsync which runs first).
-                string? lockPath = null;
-                var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
-                while (DateTime.UtcNow < deadline)
-                {
-                    var line = await proc.StandardOutput.ReadLineAsync().WaitAsync(
-                        TimeSpan.FromSeconds(5));
-                    if (line is null) break;
-                    if (string.IsNullOrEmpty(line)) continue;
-                    using var doc = JsonDocument.Parse(line);
-                    if (!doc.RootElement.TryGetProperty("type", out var typeEl)) continue;
-                    if (typeEl.GetString() == "ready")
-                    {
-                        lockPath = doc.RootElement.GetProperty("lockPath").GetString();
-                        break;
-                    }
-                }
-                Assert.NotNull(lockPath);
                 Assert.True(File.Exists(lockPath),
                     "Lockfile must exist after `ready` envelope — pre-signal state.");
+                var (rootPid, childPid) = await WaitForSignalCleanupStubPidsAsync(rootPidPath, childPidPath);
+
+                if (inheritIgnoredSignal)
+                {
+                    Assert.NotNull(ignoredMarkerPath);
+                    Assert.Equal("ignored", File.ReadAllText(ignoredMarkerPath).Trim());
+                }
 
                 // Drain remaining stdout in the background so the pipe doesn't
                 // fill up and block the bridge while we wait for the signal.
-                var drainTask = Task.Run(async () =>
-                {
-                    try
-                    {
-                        while (await proc.StandardOutput.ReadLineAsync() is not null) { }
-                    }
-                    catch { }
-                });
+                var drainTask = DrainStandardOutputAsync(proc);
 
                 // Send the signal directly via libc.kill(2). The bridge's
                 // PosixSignalRegistration handler runs, sets ctx.Cancel=true
@@ -2891,6 +3349,8 @@ public sealed class AcpBridgeUnitTests
                     "Lockfile leaked after " + signalName +
                     " — Shutdown(0) ran but the per-turn lockfile cleanup was skipped.");
 
+                await AssertClaudeStubExitedAsync(rootPid, childPid, signalName);
+
                 await drainTask.WaitAsync(TimeSpan.FromSeconds(5));
             }
             finally
@@ -2900,12 +3360,250 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
+            if (ignoredMarkerPath is not null)
+            {
+                try { File.Delete(ignoredMarkerPath); } catch { }
+            }
             try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    private static BridgeSignalTestTarget CreateDotnetAssemblySignalTestTarget()
+    {
+        var bridgeDllPath = typeof(Bridge).Assembly.Location;
+        Assert.True(File.Exists(bridgeDllPath),
+            "AcpBridge dll missing at " + bridgeDllPath +
+            " — the test project should ProjectReference the AcpBridge assembly.");
+
+        return new BridgeSignalTestTarget("dotnet", bridgeDllPath);
+    }
+
+    private static BridgeSignalTestTarget CreateNativeResourceSignalTestTarget(string tmpDir)
+    {
+        var bytes = AcpBridgeBinary.LoadBinary();
+        Assert.False(
+            AcpBridgeBinary.IsPlaceholderPayload(bytes),
+            "AcpBridge native resource is a placeholder; run scripts/publish-acp-bridge.sh before this fixture.");
+
+        var path = Path.Combine(tmpDir, "acp-bridge-resource");
+        File.WriteAllBytes(path, bytes);
+        File.SetUnixFileMode(
+            path,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        return new BridgeSignalTestTarget(path, null);
+    }
+
+    private static string WriteSignalCleanupClaudeStub(string tmpDir, string rootPidPath, string childPidPath)
+    {
+        var stubPath = Path.Combine(tmpDir, "claude-longsleep-stub.sh");
+        File.WriteAllText(stubPath,
+            "#!/bin/bash\n" +
+            "ROOT_PID_FILE=\"" + rootPidPath + "\"\n" +
+            "CHILD_PID_FILE=\"" + childPidPath + "\"\n" +
+            "sleep 60 &\n" +
+            "child=$!\n" +
+            "trap 'kill \"$child\" 2>/dev/null || true; wait \"$child\" 2>/dev/null || true; exit 0' TERM INT HUP\n" +
+            "echo $$ > \"$ROOT_PID_FILE\"\n" +
+            "echo \"$child\" > \"$CHILD_PID_FILE\"\n" +
+            "wait \"$child\"\n");
+        File.SetUnixFileMode(stubPath,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        return stubPath;
+    }
+
+    private static async Task SendBridgeHelloAsync(
+        Process proc,
+        string stubPath,
+        string workDir,
+        string lockDir)
+    {
+        var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
+            + "\",\"workingDirectory\":\"" + workDir
+            + "\",\"lockDir\":\"" + lockDir
+            + "\",\"turnTimeoutSeconds\":60}";
+        await proc.StandardInput.WriteLineAsync(hello);
+        await proc.StandardInput.FlushAsync();
+    }
+
+    private static async Task<string> WaitForReadyEnvelopeAsync(Process proc)
+    {
+        // Read stdout line-by-line until we see the `ready` envelope —
+        // confirms the bridge is up, the lockfile is written, and the signal
+        // handlers have been registered before the test sends a real signal.
+        string? lockPath = null;
+        var envelopes = new List<JsonDocument>();
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
+        try
+        {
+            while (DateTime.UtcNow < deadline)
+            {
+                var line = await proc.StandardOutput.ReadLineAsync().WaitAsync(
+                    TimeSpan.FromSeconds(5));
+                if (line is null) break;
+                if (string.IsNullOrEmpty(line)) continue;
+                var doc = JsonDocument.Parse(line);
+                envelopes.Add(doc);
+                if (doc.RootElement.TryGetProperty("type", out var typeEl) && typeEl.GetString() == "ready")
+                {
+                    lockPath = doc.RootElement.GetProperty("lockPath").GetString();
+                    break;
+                }
+            }
+
+            Assert.NotNull(lockPath);
+            AssertBridgeReadyEnvelopeOrdering(envelopes);
+            return lockPath!;
+        }
+        finally
+        {
+            foreach (var doc in envelopes)
+                doc.Dispose();
+        }
+    }
+
+    private static void AssertBridgeReadyEnvelopeOrdering(IReadOnlyList<JsonDocument> envelopes)
+    {
+        Assert.True(envelopes.Count >= 2, "Expected at least 2 envelopes (bridge_started and ready)");
+
+        var firstEnvelope = envelopes[0].RootElement;
+        Assert.True(
+            firstEnvelope.TryGetProperty("type", out var firstType) && firstType.GetString() == "bridge_started",
+            $"First envelope must be 'bridge_started', but got '{firstEnvelope.GetRawText()}'");
+
+        var secondEnvelope = envelopes[1].RootElement;
+        Assert.True(
+            secondEnvelope.TryGetProperty("type", out var secondType) && secondType.GetString() == "ready",
+            $"Second envelope must be 'ready', but got '{secondEnvelope.GetRawText()}'");
+    }
+
+    private static async Task<(int RootPid, int ChildPid)> WaitForSignalCleanupStubPidsAsync(
+        string rootPidPath,
+        string childPidPath)
+    {
+        for (int i = 0; i < SignalCleanupPollAttempts && (!File.Exists(rootPidPath) || !File.Exists(childPidPath)); i++)
+            await Task.Delay(SignalCleanupPollDelay);
+
+        Assert.True(File.Exists(rootPidPath), "Signal cleanup fixture did not record the claude root pid.");
+        Assert.True(File.Exists(childPidPath), "Signal cleanup fixture did not record the claude child pid.");
+
+        var rootPid = int.Parse(File.ReadAllText(rootPidPath).Trim(), CultureInfo.InvariantCulture);
+        var childPid = int.Parse(File.ReadAllText(childPidPath).Trim(), CultureInfo.InvariantCulture);
+        return (rootPid, childPid);
+    }
+
+    private static Task DrainStandardOutputAsync(Process proc)
+    {
+        return Task.Run(async () =>
+        {
+            try
+            {
+                while (await proc.StandardOutput.ReadLineAsync() is not null) { }
+            }
+            catch (IOException) { }
+            catch (ObjectDisposedException) { }
+        });
+    }
+
+    private static async Task AssertClaudeStubExitedAsync(int rootPid, int childPid, string signalName)
+    {
+        await AssertProcessExitedAsync(rootPid, "claude root process leaked after " + signalName + ".");
+        await AssertProcessExitedAsync(childPid, "claude child process leaked after " + signalName + ".");
+    }
+
+    private static ProcessStartInfo CreateBridgeSignalTestStartInfo(
+        BridgeSignalTestTarget bridgeTarget,
+        string workingDirectory,
+        int signo,
+        bool inheritIgnoredSignal,
+        string? ignoredMarkerPath)
+    {
+        var psi = new ProcessStartInfo(inheritIgnoredSignal ? "python3" : bridgeTarget.ExecutablePath)
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WorkingDirectory = workingDirectory,
+        };
+
+        if (!inheritIgnoredSignal)
+        {
+            bridgeTarget.AddArguments(psi.ArgumentList);
+            return psi;
+        }
+
+        if (ignoredMarkerPath is null)
+            throw new ArgumentNullException(nameof(ignoredMarkerPath));
+
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("""
+import os
+import signal
+import sys
+
+signo = int(sys.argv[1])
+mode = sys.argv[2]
+target = sys.argv[3]
+marker = sys.argv[4]
+
+signal.signal(signo, signal.SIG_IGN)
+
+ignored = False
+with open("/proc/self/status", encoding="utf-8") as status:
+    for line in status:
+        if line.startswith("SigIgn:"):
+            ignored = bool(int(line.split()[1], 16) & (1 << (signo - 1)))
+            break
+if not ignored:
+    sys.exit(86)
+
+with open(marker, "w", encoding="utf-8") as handle:
+    handle.write("ignored\n")
+
+if mode == "dotnet":
+    os.execvp("dotnet", ["dotnet", "exec", target])
+if mode == "native":
+    os.execv(target, [target])
+
+sys.exit(87)
+""");
+        psi.ArgumentList.Add(signo.ToString(CultureInfo.InvariantCulture));
+        psi.ArgumentList.Add(bridgeTarget.Mode);
+        psi.ArgumentList.Add(bridgeTarget.TargetPath);
+        psi.ArgumentList.Add(ignoredMarkerPath);
+        return psi;
+    }
+
+    private readonly record struct BridgeSignalTestTarget(string ExecutablePath, string? DotnetAssemblyPath)
+    {
+        public string Mode => DotnetAssemblyPath is null ? "native" : "dotnet";
+
+        public string TargetPath => DotnetAssemblyPath ?? ExecutablePath;
+
+        public void AddArguments(IList<string> arguments)
+        {
+            if (DotnetAssemblyPath is null)
+                return;
+
+            arguments.Add("exec");
+            arguments.Add(DotnetAssemblyPath);
         }
     }
 
     [DllImport("libc", EntryPoint = "kill", SetLastError = true)]
     private static extern int LibcKill(int pid, int sig);
+
+    [DllImport("libc", EntryPoint = "signal", SetLastError = true)]
+    private static extern IntPtr LibcSignal(int sig, IntPtr handler);
+
+    private static async Task AssertProcessExitedAsync(int pid, string message)
+    {
+        for (int i = 0; i < SignalCleanupPollAttempts && Directory.Exists("/proc/" + pid); i++)
+            await Task.Delay(SignalCleanupPollDelay);
+
+        Assert.False(Directory.Exists("/proc/" + pid), message);
+    }
 
     // ── Helpers for the new orchestration / regression fixtures above ───────────
 
@@ -3016,6 +3714,13 @@ wait "$child"
         }
         return false;
     }
+
+    private static string XmlEscape(string value) =>
+        value
+            .Replace("&", "&amp;", StringComparison.Ordinal)
+            .Replace("\"", "&quot;", StringComparison.Ordinal)
+            .Replace("<", "&lt;", StringComparison.Ordinal)
+            .Replace(">", "&gt;", StringComparison.Ordinal);
 
     private static async Task<TcpClient> ConnectAuthenticatedWebSocketClientAsync(
         int port,
@@ -3708,7 +4413,7 @@ exit 9
             UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
     }
 
-    private static async Task<(int ExitCode, string Stdout, string Stderr)> RunProcessAsync(
+    private static ProcessStartInfo CreateProcessStartInfo(
         string fileName,
         IReadOnlyList<string> args,
         IReadOnlyDictionary<string, string?> env)
@@ -3732,11 +4437,61 @@ exit 9
                 psi.Environment[key] = value;
         }
 
+        return psi;
+    }
+
+    private static async Task<(int ExitCode, string Stdout, string Stderr)> RunProcessAsync(
+        string fileName,
+        IReadOnlyList<string> args,
+        IReadOnlyDictionary<string, string?> env)
+    {
+        var psi = CreateProcessStartInfo(fileName, args, env);
+
         using var process = Process.Start(psi)
             ?? throw new InvalidOperationException("Failed to start " + fileName);
         var stdout = await process.StandardOutput.ReadToEndAsync();
         var stderr = await process.StandardError.ReadToEndAsync();
         await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(30));
+        return (process.ExitCode, stdout, stderr);
+    }
+
+    private static async Task<(int ExitCode, string Stdout, string Stderr)> RunProcessWithTimeoutAsync(
+        string fileName,
+        IReadOnlyList<string> args,
+        IReadOnlyDictionary<string, string?> env,
+        TimeSpan timeout)
+    {
+        var psi = CreateProcessStartInfo(fileName, args, env);
+
+        using var process = Process.Start(psi)
+            ?? throw new InvalidOperationException("Failed to start " + fileName);
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        var waitTask = process.WaitForExitAsync();
+
+        if (await Task.WhenAny(waitTask, Task.Delay(timeout)).ConfigureAwait(false) != waitTask)
+        {
+            try
+            {
+                if (!process.HasExited)
+                    process.Kill(entireProcessTree: true);
+            }
+            catch (InvalidOperationException) when (process.HasExited)
+            {
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException("Timed out process could not be killed: " + fileName, ex);
+            }
+
+            await waitTask.WaitAsync(TimedOutProcessKillWait).ConfigureAwait(false);
+            var timedOutStdout = await stdoutTask.WaitAsync(TimedOutProcessKillWait).ConfigureAwait(false);
+            var timedOutStderr = await stderrTask.WaitAsync(TimedOutProcessKillWait).ConfigureAwait(false);
+            return (-1, timedOutStdout, timedOutStderr);
+        }
+
+        var stdout = await stdoutTask.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        var stderr = await stderrTask.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
         return (process.ExitCode, stdout, stderr);
     }
 
@@ -3755,13 +4510,15 @@ exit 9
     /// linked ELF with NO <c>dlopen</c> support at runtime. The default
     /// NativeAOT PInvoke resolver falls back to <c>dlopen("libc.so")</c> on
     /// first call which throws <see cref="DllNotFoundException"/> in a fully-
-    /// static binary. <c>Bridge.NativeMethods.Kill</c> P/Invokes libc's
-    /// <c>kill(2)</c> for the polite SIGTERM-then-grace-then-SIGKILL teardown
-    /// of <c>claude --ide</c> — the exception is caught silently by
-    /// <c>TerminateClaudeProcess</c> and the SIGTERM-grace path regresses to
-    /// bare SIGKILL, re-introducing the half-written-JSONL → thinking-block
-    /// immutability 400 cluster the polite signal was specifically added to
-    /// prevent.
+    /// static binary. <c>Bridge.NativeMethods</c> P/Invokes libc for
+    /// <c>kill(2)</c>, and <c>SignalBootstrap.NativeMethods</c> P/Invokes libc
+    /// for signal-disposition inspection/reset, setenv/unsetenv guard
+    /// propagation, and execv. On the polite
+    /// SIGTERM-then-grace-then-SIGKILL teardown of <c>claude --ide</c>, that
+    /// exception is caught silently by <c>TerminateClaudeProcess</c> and the
+    /// SIGTERM-grace path regresses to bare SIGKILL, re-introducing the
+    /// half-written-JSONL → thinking-block immutability 400 cluster the
+    /// polite signal was specifically added to prevent.
     ///
     /// The fix is <c>&lt;DirectPInvoke Include="libc" /&gt;</c> in
     /// <c>CodeyBox.Agents.Claude.AcpBridge.csproj</c>, which resolves the

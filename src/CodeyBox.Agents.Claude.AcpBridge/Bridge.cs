@@ -51,9 +51,7 @@ internal sealed class Bridge : IAsyncDisposable
     private Task? _claudeMonitorTask;
     private Task? _claudeStdoutPumpTask;
     private Task? _claudeStderrPumpTask;
-    private PosixSignalRegistration? _sigterm;
-    private PosixSignalRegistration? _sigint;
-    private PosixSignalRegistration? _sighup;
+    private PosixSignalRegistration[] _shutdownSignalRegistrations = Array.Empty<PosixSignalRegistration>();
 
     private bool ShutdownStarted => Volatile.Read(ref _shutdownState) != 0;
 
@@ -92,8 +90,6 @@ internal sealed class Bridge : IAsyncDisposable
 
     public async Task<int> RunAsync()
     {
-        Emitter.Emit("bridge_started", w => w.WriteNumber("pid", Environment.ProcessId));
-
         // Posix signal handling — stop politely on SIGTERM/SIGINT/SIGHUP.
         // .NET's Console.CancelKeyPress only catches Ctrl+C (SIGINT); SIGTERM
         // (the sandbox provider's normal stop signal) and SIGHUP need
@@ -110,18 +106,24 @@ internal sealed class Bridge : IAsyncDisposable
         // process once the grace window expires. RunAsync still gets a chance
         // to return cooperatively first; the watchdog is the backstop.
         //
-        // Reset inherited SIGHUP SIG_IGN to SIG_DFL first. .NET's
-        // PosixSignalRegistration deliberately preserves an inherited SIG_IGN
-        // (POSIX "parent ignored it, keep ignoring" / nohup semantics), so a
-        // bridge launched under an ancestor that ignores SIGHUP would otherwise
-        // discard kill(SIGHUP) silently and leak the lockfile/subtree. SIGTERM
-        // and SIGINT are left to the runtime's startup handlers; see
-        // ResetSignalDispositionsToDefault for the narrow reset rationale.
-        ResetSignalDispositionsToDefault();
-        _sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
-        _sigint = PosixSignalRegistration.Create(PosixSignal.SIGINT, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
-        _sighup = PosixSignalRegistration.Create(PosixSignal.SIGHUP, ctx => { ctx.Cancel = true; Shutdown(0); ScheduleForceExitAfterSignal(); });
+        // Detached launchers can start the bridge with SIGTERM/SIGINT/SIGHUP
+        // ignored. PosixSignalRegistration deliberately preserves inherited
+        // SIG_IGN dispositions (POSIX "parent ignored it, keep ignoring"
+        // semantics), so reset inherited ignores before registering. If
+        // CoreCLR remembered an ignored startup disposition before RunAsync
+        // got control, re-exec once before publishing stdout envelopes so the
+        // runtime starts from the now-default dispositions.
+        _shutdownSignalRegistrations = SignalBootstrap.RegisterShutdownHandlers(
+            ctx =>
+            {
+                ctx.Cancel = true;
+                Shutdown(0);
+                ScheduleForceExitAfterSignal();
+            },
+            enableReexec: _stdinOverride is null);
         AppDomain.CurrentDomain.ProcessExit += (_, _) => Shutdown(0);
+
+        Emitter.Emit("bridge_started", w => w.WriteNumber("pid", Environment.ProcessId));
 
         try
         {
@@ -139,9 +141,8 @@ internal sealed class Bridge : IAsyncDisposable
         await WaitForBackgroundTasksAsync().ConfigureAwait(false);
         _cts.Dispose();
         _turnDeadline?.Dispose();
-        _sigterm?.Dispose();
-        _sigint?.Dispose();
-        _sighup?.Dispose();
+        foreach (var registration in _shutdownSignalRegistrations)
+            registration.Dispose();
     }
 
     private async Task ReadStdinAsync(CancellationToken ct)
@@ -855,38 +856,15 @@ internal sealed class Bridge : IAsyncDisposable
     }
 
     /// <summary>
-    /// Clears an inherited SIG_IGN disposition on SIGHUP, restoring SIG_DFL so
-    /// that the subsequent <see cref="PosixSignalRegistration.Create"/> call
-    /// installs a catchable handler. Without this, a bridge launched under an
-    /// ancestor that ignores SIGHUP (e.g. nohup) inherits SIG_IGN, the runtime
-    /// honours the POSIX "keep ignoring" convention, and signal-driven shutdown
-    /// never runs — leaking the lockfile and the claude subtree.
-    ///
-    /// Only SIGHUP is reset. SIGINT and SIGTERM are handled by the .NET runtime
-    /// from process startup (for Console.CancelKeyPress / graceful ProcessExit),
-    /// so their catchable handlers are installed unconditionally and survive an
-    /// inherited SIG_IGN; a raw signal(2) reset on those would instead clobber
-    /// the runtime's already-installed handler (PosixSignalRegistration.Create
-    /// would not re-install it), regressing them to the default terminate. SIGHUP
-    /// has no runtime-startup handler, so PosixSignalRegistration.Create below is
-    /// its first installer and honours whatever disposition it observes now.
-    ///
-    /// No-op on Windows, which has no such dispositions; the shipped bridge only
-    /// ever runs on linux-musl-x64.
-    /// </summary>
-    private static void ResetSignalDispositionsToDefault()
-    {
-        if (OperatingSystem.IsWindows()) return;
-        // SIG_DFL == 0. signal(2) returns SIG_ERR (-1) on failure, which we
-        // ignore: an un-resettable disposition just means we fall back to the
-        // pre-existing behaviour rather than crashing the bridge at startup.
-        try { NativeMethods.Signal(NativeMethods.SIGHUP, IntPtr.Zero); } catch { }
-    }
-
-    /// <summary>
     /// Belt-and-braces watchdog the SIGTERM/SIGINT/SIGHUP handlers schedule
-    /// after running <see cref="Shutdown(int)"/>. Cooperative exit is preferred;
-    /// this only fires if stdin stays parked past the grace window.
+    /// after running <see cref="Shutdown(int)"/>. Cooperative exit (RunAsync
+    /// returning normally after <c>_cts.Cancel()</c> unblocks the stdin read)
+    /// is preferred and happens first when the read does unblock; the
+    /// watchdog only fires if the read stayed parked past the grace window —
+    /// the regression mode this guards against. By the time this delay
+    /// elapses Shutdown has already attempted lockfile deletion, claude
+    /// termination, listener shutdown and CTS cancellation, so force-exit is
+    /// a last-resort escape from a wedged bridge process.
     /// </summary>
     private void ScheduleForceExitAfterSignal()
     {
@@ -1067,28 +1045,16 @@ internal sealed class Bridge : IAsyncDisposable
         // strips runtime dlopen support. Without the DirectPInvoke item in
         // CodeyBox.Agents.Claude.AcpBridge.csproj
         // the NativeAOT PInvoke resolver would fall back to dlopen("libc.so")
-        // and throw DllNotFoundException — which TerminateClaudeProcess
-        // catches silently and degrades the SIGTERM-grace path to bare
-        // SIGKILL, re-introducing the half-written-JSONL → thinking-block
-        // immutability 400 cluster the polite signal was added to prevent.
+        // and throw DllNotFoundException from the signal bootstrap or the
+        // polite SIGTERM-grace path. Losing the latter degrades teardown to
+        // bare SIGKILL, re-introducing the half-written-JSONL →
+        // thinking-block immutability 400 cluster the polite signal was
+        // added to prevent.
         // The musl C runtime is linked by the NativeAOT toolchain; do not add
         // a NativeLibrary Include="libc" item, because Unix NativeLibrary items
         // are passed to the linker as file paths rather than -l names.
         [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "kill", SetLastError = true)]
         internal static extern int Kill(int pid, int sig);
-
-        // Linux signal number (stable across glibc/musl on the x64 ABI the
-        // bridge ships on). Only SIGHUP needs an explicit disposition reset;
-        // see ResetSignalDispositionsToDefault.
-        internal const int SIGHUP = 1;
-
-        // signal(2): reset a signal's disposition. The handler argument is a
-        // function pointer; SIG_DFL is (void*)0. We only ever pass SIG_DFL so
-        // marshalling it as IntPtr.Zero is sufficient and stays NativeAOT-safe
-        // (primitive-pointer marshalling, no delegate reverse-marshal). The
-        // returned previous handler is discarded.
-        [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "signal", SetLastError = true)]
-        internal static extern IntPtr Signal(int signum, IntPtr handler);
     }
 
     private async Task WaitForBackgroundTasksAsync()
