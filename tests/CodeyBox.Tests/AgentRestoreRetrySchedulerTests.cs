@@ -168,7 +168,8 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             UpdatedAt = evt.RestoredAt.AddMinutes(1),
         });
 
-        var duplicateAfterRefailure = await scheduler.SweepForTestAsync(evt);
+        var duplicateAfterRefailure = await scheduler.SweepForTestAsync(
+            evt with { RestoredAt = evt.RestoredAt.AddSeconds(30) });
         Assert.Equal(0, duplicateAfterRefailure.Requeued);
         Assert.Equal(1, queue.Count);
         Assert.Equal(WorkItemState.Failed, (await store.GetAsync(item.Id))!.State);

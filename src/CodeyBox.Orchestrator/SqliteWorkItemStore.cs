@@ -1484,12 +1484,18 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     restored_at,
                     claimed_at
                 )
-                VALUES (
+                SELECT
                     $work_item_id,
                     $restored_agent,
                     $outage_started_at,
                     $restored_at,
                     $claimed_at
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM agent_restore_retry_claims
+                    WHERE work_item_id = $work_item_id
+                      AND restored_agent = $restored_agent
+                      AND outage_started_at = $outage_started_at
                 );
                 """;
             cmd.Parameters.AddWithValue("$work_item_id", id.ToString());
@@ -1606,33 +1612,31 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         await _writeLock.WaitAsync(ct);
         try
         {
-            var skipFilter = string.Empty;
-            if (skipIds.Count > 0)
-            {
-                await PopulateDispatchSkipTableAsync(skipIds, ct);
-                skipFilter = DispatchSkipFilterSql;
-            }
+            await PopulateDispatchSkipTableAsync(skipIds, ct);
 
             using (var cmd = _conn.CreateCommand())
             {
-                // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- interpolation is limited to enum integer constants and an exact internal skip-filter constant; all runtime values are parameters
-                cmd.CommandText = $"""
+                cmd.CommandText = """
                     SELECT * FROM (
                         SELECT wi.*, wi.state AS dispatch_ordering_state, 0 AS dispatch_source_order
                         FROM work_items wi
                         WHERE wi.state NOT IN (
-                            {(int)WorkItemState.Done},
-                            {(int)WorkItemState.Failed},
-                            {(int)WorkItemState.Cancelled},
-                            {(int)WorkItemState.AuditFailed},
-                            {(int)WorkItemState.MergeConflictResolutionFailed},
-                            {(int)WorkItemState.AbandonedAfterRecoveryAttempts},
-                            {(int)WorkItemState.NeedsOperatorInput},
-                            {(int)WorkItemState.WaitingForQuotaReset},
-                            {(int)WorkItemState.WaitingForAgentResume},
-                            {(int)WorkItemState.WaitingForTransientRetry}
+                            $state_done,
+                            $state_failed,
+                            $state_cancelled,
+                            $state_audit_failed,
+                            $state_merge_conflict_resolution_failed,
+                            $state_abandoned_after_recovery_attempts,
+                            $state_needs_operator_input,
+                            $state_waiting_for_quota_reset,
+                            $state_waiting_for_agent_resume,
+                            $state_waiting_for_transient_retry
                         )
-                        {skipFilter}
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM temp.codeybox_dispatch_skip_ids skipped
+                            WHERE skipped.id = wi.id
+                        )
 
                         UNION ALL
 
@@ -1644,21 +1648,25 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                             ) AS dispatch_ordering_state,
                             1 AS dispatch_source_order
                         FROM work_items wi
-                        WHERE wi.state = {(int)WorkItemState.WaitingForQuotaReset}
+                        WHERE wi.state = $state_waiting_for_quota_reset
                           AND (
                               $include_future_quota_retries = 1
                               OR wi.next_quota_retry_at IS NULL
                               OR julianday(wi.next_quota_retry_at) <= julianday($now)
                           )
-                        {skipFilter}
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM temp.codeybox_dispatch_skip_ids skipped
+                              WHERE skipped.id = wi.id
+                          )
                     )
                     ORDER BY
                         CASE
                             WHEN dispatch_ordering_state IN (
-                                {(int)WorkItemState.AuditPassed},
-                                {(int)WorkItemState.Merging},
-                                {(int)WorkItemState.Merged},
-                                {(int)WorkItemState.UpstreamPushing}
+                                $state_audit_passed,
+                                $state_merging,
+                                $state_merged,
+                                $state_upstream_pushing
                             ) THEN 0
                             ELSE 1
                         END ASC,
@@ -1667,6 +1675,20 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         dispatch_source_order ASC
                     LIMIT $limit;
                     """;
+                cmd.Parameters.AddWithValue("$state_done", (int)WorkItemState.Done);
+                cmd.Parameters.AddWithValue("$state_failed", (int)WorkItemState.Failed);
+                cmd.Parameters.AddWithValue("$state_cancelled", (int)WorkItemState.Cancelled);
+                cmd.Parameters.AddWithValue("$state_audit_failed", (int)WorkItemState.AuditFailed);
+                cmd.Parameters.AddWithValue("$state_merge_conflict_resolution_failed", (int)WorkItemState.MergeConflictResolutionFailed);
+                cmd.Parameters.AddWithValue("$state_abandoned_after_recovery_attempts", (int)WorkItemState.AbandonedAfterRecoveryAttempts);
+                cmd.Parameters.AddWithValue("$state_needs_operator_input", (int)WorkItemState.NeedsOperatorInput);
+                cmd.Parameters.AddWithValue("$state_waiting_for_quota_reset", (int)WorkItemState.WaitingForQuotaReset);
+                cmd.Parameters.AddWithValue("$state_waiting_for_agent_resume", (int)WorkItemState.WaitingForAgentResume);
+                cmd.Parameters.AddWithValue("$state_waiting_for_transient_retry", (int)WorkItemState.WaitingForTransientRetry);
+                cmd.Parameters.AddWithValue("$state_audit_passed", (int)WorkItemState.AuditPassed);
+                cmd.Parameters.AddWithValue("$state_merging", (int)WorkItemState.Merging);
+                cmd.Parameters.AddWithValue("$state_merged", (int)WorkItemState.Merged);
+                cmd.Parameters.AddWithValue("$state_upstream_pushing", (int)WorkItemState.UpstreamPushing);
                 cmd.Parameters.AddWithValue("$now", now.ToString("O"));
                 cmd.Parameters.AddWithValue(
                     "$include_future_quota_retries",
@@ -1686,9 +1708,6 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
-
-    private const string DispatchSkipFilterSql =
-        "AND NOT EXISTS (SELECT 1 FROM temp.codeybox_dispatch_skip_ids skipped WHERE skipped.id = wi.id)";
 
     private async Task PopulateDispatchSkipTableAsync(
         IReadOnlySet<WorkItemId> skipIds,
