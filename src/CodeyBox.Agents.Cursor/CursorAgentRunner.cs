@@ -23,10 +23,12 @@ namespace CodeyBox.Agents.Cursor;
 /// the XDG path current Cursor CLI versions read — <c>~/.config/cursor/auth.json</c>
 /// (the legacy <c>~/.cursor/credentials.json</c> path is no longer read by the
 /// binary; materialising to it was the PR #138 cascade). The file's contents are
-/// shipped to the sandbox via <c>CODEYBOX_CURSOR_AUTH_JSON</c> and re-materialised
-/// at sandbox-prepare time to the matching in-VM path
-/// (<see cref="AuthMaterialiseScript"/> / <see cref="PrepareSandboxAsync"/> both
-/// write <c>~/.config/cursor/auth.json</c>); the host's credential directory is
+/// shipped to the sandbox via the credential bundle and re-materialised at
+/// sandbox-prepare time to the matching in-VM path
+/// (<see cref="PrepareSandboxAsync"/> writes <c>~/.config/cursor/auth.json</c>
+/// from the candidate credential; <see cref="AuthMaterialiseScript"/> preserves
+/// the older create-time sandbox env path used by smoke probes and image-baked
+/// auth checks); the host's credential directory is
 /// never bind-mounted into untrusted agent sandboxes. When the env var is absent,
 /// this is a no-op and the in-sandbox CLI is expected to use whatever auth path
 /// the operator provisioned in the image. The in-VM smoke probe execs this exact
@@ -35,6 +37,7 @@ namespace CodeyBox.Agents.Cursor;
 /// </summary>
 public sealed class CursorAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
+    private const string AuthJsonEnvironmentVariable = "CODEYBOX_CURSOR_AUTH_JSON";
     private readonly AgentDefaultsSnapshot? _defaults;
 
     public CursorAgentRunner() : this(defaults: null) { }
@@ -86,11 +89,14 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     /// sandbox at <c>~/.config/cursor/auth.json</c> from
     /// <c>CODEYBOX_CURSOR_AUTH_JSON</c>. Shared verbatim with
     /// <c>CursorInVmSmokeProbe</c> so the smoke probe exercises the exact same
-    /// destination path as a real dispatch — path drift here is the PR #138
-    /// failure this probe is meant to catch.
+    /// destination path as a real dispatch's credential-stdin path — path drift
+    /// here is the PR #138 failure this probe is meant to catch.
     /// </summary>
     public const string AuthMaterialiseScript =
-        "set -eu; if [ -s \"$HOME/.config/cursor/auth.json\" ]; then exit 0; fi; if [ -n \"${CODEYBOX_CURSOR_AUTH_JSON:-}\" ]; then mkdir -p \"$HOME/.config/cursor\"; umask 077; printf '%s' \"$CODEYBOX_CURSOR_AUTH_JSON\" > \"$HOME/.config/cursor/auth.json\"; fi";
+        "set -eu; if [ -s \"$HOME/.config/cursor/auth.json\" ]; then exit 0; fi; if [ -n \"${CODEYBOX_CURSOR_AUTH_JSON:-}\" ]; then mkdir -p \"$HOME/.config/cursor\"; umask 077; printf '%s' \"$CODEYBOX_CURSOR_AUTH_JSON\" > \"$HOME/.config/cursor/auth.json\"; chmod 600 \"$HOME/.config/cursor/auth.json\"; fi";
+
+    private const string AuthMaterialiseFromStdinScript =
+        "set -eu; if [ -s \"$HOME/.config/cursor/auth.json\" ]; then exit 0; fi; mkdir -p \"$HOME/.config/cursor\"; umask 077; cat > \"$HOME/.config/cursor/auth.json\"; chmod 600 \"$HOME/.config/cursor/auth.json\"";
 
     /// <summary>
     /// Path to the Cursor CLI inside the sandbox. The binary is <c>agent</c>,
@@ -122,18 +128,19 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".cursor/sessions", ".cursor/history"];
 
-    protected override IReadOnlyList<string> FileBackedCredentialEnvironmentVariables => ["CODEYBOX_CURSOR_AUTH_JSON"];
+    protected override IReadOnlyList<string> FileBackedCredentialEnvironmentVariables => [AuthJsonEnvironmentVariable];
 
     protected override string PreemptProcessPattern => Binary;
 
     /// <summary>
     /// Materialises Cursor's subscription credentials into the sandbox at
-    /// <c>~/.config/cursor/auth.json</c> when <c>CODEYBOX_CURSOR_AUTH_JSON</c>
-    /// is present in the credential bundle. Mirrors
-    /// <c>CodexAgentRunner.PrepareSandboxAsync</c>: preserves any pre-existing
-    /// non-empty file (e.g. restored from a checkpoint scratchpad), short-
-    /// circuits when the env var is absent (no-op), and writes the file
-    /// 0600 via <c>umask 077</c>.
+    /// <c>~/.config/cursor/auth.json</c> from the candidate credential bundle.
+    /// This is intentionally credential-stdin based, not per-exec environment
+    /// injection, so a fallback Cursor can authenticate in a sandbox that was
+    /// created for another primary runner. When no credential bundle is present,
+    /// it falls back to <see cref="AuthMaterialiseScript"/> for create-time
+    /// sandbox env or image-baked auth. Existing non-empty auth files are
+    /// preserved in both paths.
     /// </summary>
     protected override async Task<AgentResult?> PrepareSandboxAsync(
         ISandbox sandbox,
@@ -142,10 +149,17 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         AgentResumeContext? resume,
         CancellationToken ct = default)
     {
-        var write = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["bash", "-c", AuthMaterialiseScript],
-        }, ct);
+        var write = credential?.EnvironmentVariables.TryGetValue(AuthJsonEnvironmentVariable, out var authJson) == true
+            && !string.IsNullOrEmpty(authJson)
+            ? await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["bash", "-c", AuthMaterialiseFromStdinScript],
+                Stdin = authJson,
+            }, ct)
+            : await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["bash", "-c", AuthMaterialiseScript],
+            }, ct);
         if (!write.Success)
         {
             return new AgentResult(
@@ -243,7 +257,7 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
         => GetSandboxSubscriptionTextOnlyUnavailabilityReason(
             credential,
-            "CODEYBOX_CURSOR_AUTH_JSON");
+            AuthJsonEnvironmentVariable);
 
     // The Cursor CLI runs inside the work-item sandbox; a host-side text-only
     // call with no sandbox returns failure (see RunTextOnlyAsync below).

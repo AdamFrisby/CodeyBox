@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Projects;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -31,6 +32,8 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     private const string MarkerEnvKey = "CODEYBOX_TEST_MARKER";
     private const string MarkerEnvValue = "marker-credential-present";
     private const string MarkerHost = "agent.example.invalid";
+    private const string CursorAuthEnvKey = "CODEYBOX_CURSOR_AUTH_JSON";
+    private const string CursorAuthJson = """{"token":"cursor-fallback-token"}""";
     private const string AuditDotnetShimDir = AuditReviewDotnetShim.Directory;
     private const string AuditDotnetShimNotice = AuditReviewDotnetShim.Notice;
 
@@ -91,6 +94,74 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
 
         var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
         AssertCredentialAndOpenNetwork(pickupSpec, "pickup-rebase");
+    }
+
+    [Fact]
+    public async Task PickupRebaseResolver_CodexPrimaryCursorFallback_MaterialisesCursorCredential()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var primary = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+        primary.AgenticConflictResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "codex resolver failed before editing",
+            Stdout: null,
+            Stderr: "ordinary resolver failure"));
+        var cursor = new CursorCredentialMaterialisingResolverAgent(
+            "README.md",
+            "main branch change\nwork branch change\n");
+        var classRouter = BuildResolverClassRouter(primary, cursor);
+        var project = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test Project",
+            RepositoryUrl = seed,
+            DefaultBaseBranch = "main",
+            DefaultAgent = AgentKind.Codex,
+            DefaultAgentClass = "frontier",
+            Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+        };
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            projectRepository: new InMemoryProjectRepository(project),
+            classRouter: classRouter,
+            credentials: new ResolverCredentialProvider(),
+            agentOverride: primary,
+            extraAgentRunners: [cursor],
+            pipelineOptions: new PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                AgentAllowedHosts = [],
+            });
+
+        var itemId = WorkItemId.New();
+        var item = NewItem($"codeybox/{itemId.ToString()[..8]}") with
+        {
+            Id = itemId,
+            Agent = AgentKind.Codex,
+            AgentClassId = "frontier",
+            State = WorkItemState.WorkComplete,
+        };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(
+            barePath,
+            item.WorkBranch!,
+            "README.md",
+            "work branch change\n",
+            "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.DoesNotContain("Authentication required", final.LastError ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        Assert.Single(primary.AgenticConflictInvocations);
+        Assert.Equal(1, cursor.ResolverInvocationCount);
+        Assert.Equal(CursorAuthJson, cursor.MaterialisedAuthJson?.TrimEnd('\r', '\n'));
     }
 
     [Fact]
@@ -653,6 +724,29 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         Assert.NotEmpty(spec.Network.AllowedHosts);
     }
 
+    private static AgentClassRouter BuildResolverClassRouter(params IAgentRunner[] runners)
+    {
+        var agentClass = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members = runners
+                .Select((runner, index) => new AgentMembership
+                {
+                    Agent = runner.Kind,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 100 - index,
+                })
+                .ToList(),
+        };
+
+        return new AgentClassRouter(
+            [agentClass],
+            probes: [],
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance);
+    }
+
     private static async Task InstallFakeDotnetAsync(ISandbox sandbox, string fakeBin, CancellationToken ct)
     {
         const string script = """
@@ -732,6 +826,15 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         await TestSupport.RunGit(clone, "push", "origin", $"{branch}:{branch}");
     }
 
+    private async Task CommitToSeedAsync(string repoPath, string path, string content, string message)
+    {
+        await TestSupport.RunGit(repoPath, "config", "user.email", "t@l");
+        await TestSupport.RunGit(repoPath, "config", "user.name", "T");
+        await File.WriteAllTextAsync(Path.Combine(repoPath, path), content);
+        await TestSupport.RunGit(repoPath, "add", path);
+        await TestSupport.RunGit(repoPath, "commit", "-m", message);
+    }
+
     private static WorkItem NewItem(string workBranch) => new()
     {
         Id = WorkItemId.New(),
@@ -799,6 +902,98 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
                 agent,
                 EnvironmentVariables: new Dictionary<string, string> { [MarkerEnvKey] = MarkerEnvValue },
                 Files: new Dictionary<string, string>()));
+    }
+
+    private sealed class ResolverCredentialProvider : ICredentialProvider
+    {
+        public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+        {
+            AgentCredential? credential = agent == AgentKind.Codex
+                ? new AgentCredential(
+                    AgentKind.Codex,
+                    EnvironmentVariables: new Dictionary<string, string>(),
+                    Files: new Dictionary<string, string>
+                    {
+                        ["codex/auth.json"] = """{"tokens":{"access_token":"codex-token"}}""",
+                    })
+                : agent == AgentKind.Cursor
+                    ? new AgentCredential(
+                        AgentKind.Cursor,
+                        EnvironmentVariables: new Dictionary<string, string> { [CursorAuthEnvKey] = CursorAuthJson },
+                        Files: new Dictionary<string, string>())
+                    : null;
+            return Task.FromResult(credential);
+        }
+    }
+
+    private sealed class CursorCredentialMaterialisingResolverAgent(
+        string resolvedPath,
+        string resolvedContent) : IAgentRunner
+    {
+        public AgentKind Kind => AgentKind.Cursor;
+        public int ResolverInvocationCount { get; private set; }
+        public string? MaterialisedAuthJson { get; private set; }
+
+        public async Task<AgentResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            Action<string>? stdoutChunkCallback = null,
+            bool captureStructuredStream = false)
+        {
+            _ = modelId;
+            _ = reasoningMode;
+            _ = stdoutChunkCallback;
+            _ = captureStructuredStream;
+
+            if (!prompt.StartsWith("# Conflict-resolution mode (in-sandbox agentic resolver)", StringComparison.Ordinal))
+                return new AgentResult(false, "unsupported prompt", null, "unsupported prompt");
+
+            ResolverInvocationCount++;
+            if (credential?.EnvironmentVariables.TryGetValue(CursorAuthEnvKey, out var authJson) != true
+                || string.IsNullOrWhiteSpace(authJson))
+            {
+                const string authRequired = "Authentication required. Please run 'agent login' first, or set CURSOR_API_KEY";
+                return new AgentResult(false, authRequired, null, authRequired);
+            }
+
+            var authWrite = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "bash",
+                    "-c",
+                    "set -eu; mkdir -p \"$HOME/.config/cursor\"; umask 077; cat > \"$HOME/.config/cursor/auth.json\"; chmod 600 \"$HOME/.config/cursor/auth.json\"; cat \"$HOME/.config/cursor/auth.json\"",
+                ],
+                Stdin = authJson,
+            }, ct);
+            if (!authWrite.Success)
+                return new AgentResult(false, "failed to materialise cursor auth", authWrite.Stdout, authWrite.Stderr);
+            MaterialisedAuthJson = authWrite.Stdout;
+
+            if (!prompt.Contains($"\"{resolvedPath}\"", StringComparison.Ordinal))
+                return new AgentResult(false, $"resolver prompt did not list {resolvedPath}", null, null);
+
+            var write = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/{resolvedPath}"],
+                Stdin = resolvedContent,
+            }, ct);
+            if (!write.Success)
+                return new AgentResult(false, $"failed to write {resolvedPath}", write.Stdout, write.Stderr);
+
+            var add = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", workingDirectory, "add", "--", resolvedPath],
+            }, ct);
+            return add.Success
+                ? new AgentResult(true, "cursor resolved", null, null)
+                : new AgentResult(false, $"failed to stage {resolvedPath}", add.Stdout, add.Stderr);
+        }
     }
 
     /// <summary>

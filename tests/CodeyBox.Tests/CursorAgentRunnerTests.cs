@@ -164,6 +164,30 @@ public sealed class CursorAgentRunnerTests
     }
 
     [Fact]
+    public async Task RunAsync_WithCredentialMaterialisesAuthFromCredentialStdin()
+    {
+        const string authJson = """{"token":"cursor-fallback-token"}""";
+        var sandbox = new RecordingSandbox();
+        var runner = new CursorAgentRunner();
+        var credential = new AgentCredential(
+            AgentKind.Cursor,
+            new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = authJson },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunAsync(sandbox, "/work", "p", credential);
+
+        Assert.True(result.Success);
+        var authExec = Assert.Single(sandbox.Execs, e =>
+            e.Argv.Count >= 3
+            && e.Argv[0] == "bash"
+            && e.Argv[2].Contains("$HOME/.config/cursor/auth.json", StringComparison.Ordinal));
+        Assert.Equal(authJson, authExec.Stdin);
+        Assert.Null(authExec.ExtraEnvironment);
+        Assert.DoesNotContain(authJson, authExec.Argv[2]);
+        Assert.DoesNotContain("CODEYBOX_CURSOR_AUTH_JSON", authExec.Argv[2]);
+    }
+
+    [Fact]
     public async Task PrepareSandboxScript_PreservesExistingSandboxCredentialsJson()
     {
         // The materialisation script must short-circuit when credentials.json
@@ -411,8 +435,9 @@ public sealed class CursorAgentRunnerTests
             Execs.Add(exec);
             if (exec.Argv.Count >= 3
                 && exec.Argv[0] == "bash"
-                && exec.Argv[2].Contains("CODEYBOX_CURSOR_AUTH_JSON", StringComparison.Ordinal)
-                && exec.Argv[2].Contains(".config/cursor/auth.json", StringComparison.Ordinal))
+                && exec.Argv[2].Contains(".config/cursor/auth.json", StringComparison.Ordinal)
+                && (exec.Argv[2].Contains("CODEYBOX_CURSOR_AUTH_JSON", StringComparison.Ordinal)
+                    || exec.Stdin is not null))
             {
                 return Task.FromResult(new SandboxExecResult(_authWriteExitCode, "", "auth stderr"));
             }
