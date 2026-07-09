@@ -199,8 +199,9 @@ public sealed class ClaudeAgentRunnerTests
         Assert.Equal("bash", prep.Argv[0]);
         Assert.Equal("-c", prep.Argv[1]);
         var script = prep.Argv[2];
-        Assert.Contains("$HOME/.claude/.credentials.json", script);
-        Assert.Contains("CODEYBOX_CLAUDE_OAUTH_JSON", script);
+        Assert.Equal(".claude/.credentials.json", prep.Argv[4]);
+        Assert.Equal(credential.EnvironmentVariables[ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar], prep.Stdin);
+        Assert.DoesNotContain("CODEYBOX_CLAUDE_OAUTH_JSON", script);
         Assert.Contains("chmod 600", script);
     }
 

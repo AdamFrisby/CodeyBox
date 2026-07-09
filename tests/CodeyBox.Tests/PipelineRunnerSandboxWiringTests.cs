@@ -1,3 +1,4 @@
+using CodeyBox.Agents.Cursor;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
@@ -106,9 +107,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
             Summary: "codex resolver failed before editing",
             Stdout: null,
             Stderr: "ordinary resolver failure"));
-        var cursor = new CursorCredentialMaterialisingResolverAgent(
-            "README.md",
-            "main branch change\nwork branch change\n");
+        var cursor = new CursorAgentRunner { Binary = await InstallFakeCursorAgentAsync("cursor-fallback") };
         var classRouter = BuildResolverClassRouter(primary, cursor);
         var project = new Project
         {
@@ -160,8 +159,130 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.DoesNotContain("Authentication required", final.LastError ?? string.Empty, StringComparison.OrdinalIgnoreCase);
         Assert.Single(primary.AgenticConflictInvocations);
-        Assert.Equal(1, cursor.ResolverInvocationCount);
-        Assert.Equal(CursorAuthJson, cursor.MaterialisedAuthJson?.TrimEnd('\r', '\n'));
+        Assert.Equal(
+            CursorAuthJson,
+            (await ReadBareBranchFileAsync(barePath, item.WorkBranch!, "cursor-auth-observed.json")).TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
+    public async Task PickupRebaseResolver_CursorPrimary_MaterialisesCursorCredential()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var cursor = new CursorAgentRunner { Binary = await InstallFakeCursorAgentAsync("cursor-primary") };
+        var project = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test Project",
+            RepositoryUrl = seed,
+            DefaultBaseBranch = "main",
+            DefaultAgent = AgentKind.Cursor,
+            Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+        };
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            projectRepository: new InMemoryProjectRepository(project),
+            credentials: new ResolverCredentialProvider(),
+            extraAgentRunners: [cursor],
+            pipelineOptions: new PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                AgentAllowedHosts = [],
+            });
+
+        var itemId = WorkItemId.New();
+        var item = NewItem($"codeybox/{itemId.ToString()[..8]}") with
+        {
+            Id = itemId,
+            Agent = AgentKind.Cursor,
+            State = WorkItemState.WorkComplete,
+        };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(
+            barePath,
+            item.WorkBranch!,
+            "README.md",
+            "work branch change\n",
+            "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.DoesNotContain("Authentication required", final.LastError ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(
+            CursorAuthJson,
+            (await ReadBareBranchFileAsync(barePath, item.WorkBranch!, "cursor-auth-observed.json")).TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
+    public async Task PickupRebaseResolver_CodexPrimaryClaudeFileFallback_MaterialisesFallbackFileCredential()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var primary = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+        primary.AgenticConflictResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "codex resolver failed before editing",
+            Stdout: null,
+            Stderr: "ordinary resolver failure"));
+        var fallback = new FileCredentialAssertingResolverAgent();
+        var classRouter = BuildResolverClassRouter(primary, fallback);
+        var project = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test Project",
+            RepositoryUrl = seed,
+            DefaultBaseBranch = "main",
+            DefaultAgent = AgentKind.Codex,
+            DefaultAgentClass = "frontier",
+            Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+        };
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            projectRepository: new InMemoryProjectRepository(project),
+            classRouter: classRouter,
+            credentials: new ResolverCredentialProvider(),
+            agentOverride: primary,
+            extraAgentRunners: [fallback],
+            pipelineOptions: new PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                AgentAllowedHosts = [],
+            });
+
+        var itemId = WorkItemId.New();
+        var item = NewItem($"codeybox/{itemId.ToString()[..8]}") with
+        {
+            Id = itemId,
+            Agent = AgentKind.Codex,
+            AgentClassId = "frontier",
+            State = WorkItemState.WorkComplete,
+        };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(
+            barePath,
+            item.WorkBranch!,
+            "README.md",
+            "work branch change\n",
+            "work changes readme");
+        await CommitToSeedAsync(seed, "README.md", "main branch change\n", "main changes readme");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Single(primary.AgenticConflictInvocations);
+        Assert.Equal(
+            ResolverCredentialProvider.ClaudeCredentialJson,
+            (await ReadBareBranchFileAsync(barePath, item.WorkBranch!, "file-credential-observed.json")).TrimEnd('\r', '\n'));
     }
 
     [Fact]
@@ -835,6 +956,42 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         await TestSupport.RunGit(repoPath, "commit", "-m", message);
     }
 
+    private static async Task<string> ReadBareBranchFileAsync(string barePath, string branch, string path)
+    {
+        var (_, stdout, _) = await TestSupport.RunGit(barePath, "show", $"{branch}:{path}");
+        return stdout;
+    }
+
+    private async Task<string> InstallFakeCursorAgentAsync(string name)
+    {
+        var dir = Path.Combine(_workspace, "fake-cursor-" + name + "-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, "agent");
+        const string script = """
+            #!/bin/sh
+            set -eu
+            auth="$HOME/.config/cursor/auth.json"
+            if [ ! -s "$auth" ]; then
+              printf '%s\n' 'Authentication required. Please run '"'"'agent login'"'"' first, or set CURSOR_API_KEY' >&2
+              exit 1
+            fi
+            cat "$auth" > cursor-auth-observed.json
+            cat >/dev/null
+            printf '%s\n%s\n' 'main branch change' 'work branch change' > README.md
+            git add -- README.md cursor-auth-observed.json
+            """;
+        await File.WriteAllTextAsync(path, script);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                path,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+                UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+        }
+        return path;
+    }
+
     private static WorkItem NewItem(string workBranch) => new()
     {
         Id = WorkItemId.New(),
@@ -906,6 +1063,8 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
 
     private sealed class ResolverCredentialProvider : ICredentialProvider
     {
+        public const string ClaudeCredentialJson = """{"claudeAiOauth":{"accessToken":"claude-token"}}""";
+
         public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
         {
             AgentCredential? credential = agent == AgentKind.Codex
@@ -921,18 +1080,22 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
                         AgentKind.Cursor,
                         EnvironmentVariables: new Dictionary<string, string> { [CursorAuthEnvKey] = CursorAuthJson },
                         Files: new Dictionary<string, string>())
+                    : agent == AgentKind.Claude
+                        ? new AgentCredential(
+                            AgentKind.Claude,
+                            EnvironmentVariables: new Dictionary<string, string>(),
+                            Files: new Dictionary<string, string>
+                            {
+                                ["claude/credentials.json"] = ClaudeCredentialJson,
+                            })
                     : null;
             return Task.FromResult(credential);
         }
     }
 
-    private sealed class CursorCredentialMaterialisingResolverAgent(
-        string resolvedPath,
-        string resolvedContent) : IAgentRunner
+    private sealed class FileCredentialAssertingResolverAgent : IAgentRunner
     {
-        public AgentKind Kind => AgentKind.Cursor;
-        public int ResolverInvocationCount { get; private set; }
-        public string? MaterialisedAuthJson { get; private set; }
+        public AgentKind Kind => AgentKind.Claude;
 
         public async Task<AgentResult> RunAsync(
             ISandbox sandbox,
@@ -953,46 +1116,39 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
             if (!prompt.StartsWith("# Conflict-resolution mode (in-sandbox agentic resolver)", StringComparison.Ordinal))
                 return new AgentResult(false, "unsupported prompt", null, "unsupported prompt");
 
-            ResolverInvocationCount++;
-            if (credential?.EnvironmentVariables.TryGetValue(CursorAuthEnvKey, out var authJson) != true
-                || string.IsNullOrWhiteSpace(authJson))
+            var readCredential = await sandbox.ExecAsync(new SandboxExec
             {
-                const string authRequired = "Authentication required. Please run 'agent login' first, or set CURSOR_API_KEY";
-                return new AgentResult(false, authRequired, null, authRequired);
-            }
-
-            var authWrite = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv =
-                [
-                    "bash",
-                    "-c",
-                    "set -eu; mkdir -p \"$HOME/.config/cursor\"; umask 077; cat > \"$HOME/.config/cursor/auth.json\"; chmod 600 \"$HOME/.config/cursor/auth.json\"; cat \"$HOME/.config/cursor/auth.json\"",
-                ],
-                Stdin = authJson,
+                Argv = ["cat", $"{SandboxConventions.CredentialsDir}/claude/credentials.json"],
             }, ct);
-            if (!authWrite.Success)
-                return new AgentResult(false, "failed to materialise cursor auth", authWrite.Stdout, authWrite.Stderr);
-            MaterialisedAuthJson = authWrite.Stdout;
+            if (!readCredential.Success)
+                return new AgentResult(false, "missing claude credential file", readCredential.Stdout, readCredential.Stderr);
 
-            if (!prompt.Contains($"\"{resolvedPath}\"", StringComparison.Ordinal))
-                return new AgentResult(false, $"resolver prompt did not list {resolvedPath}", null, null);
+            if (!prompt.Contains("\"README.md\"", StringComparison.Ordinal))
+                return new AgentResult(false, "resolver prompt did not list README.md", null, null);
+
+            var writeCredentialObservation = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/file-credential-observed.json"],
+                Stdin = readCredential.Stdout,
+            }, ct);
+            if (!writeCredentialObservation.Success)
+                return new AgentResult(false, "failed to write credential observation", writeCredentialObservation.Stdout, writeCredentialObservation.Stderr);
 
             var write = await sandbox.ExecAsync(new SandboxExec
             {
-                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/{resolvedPath}"],
-                Stdin = resolvedContent,
+                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/README.md"],
+                Stdin = "main branch change\nwork branch change\n",
             }, ct);
             if (!write.Success)
-                return new AgentResult(false, $"failed to write {resolvedPath}", write.Stdout, write.Stderr);
+                return new AgentResult(false, "failed to write README.md", write.Stdout, write.Stderr);
 
             var add = await sandbox.ExecAsync(new SandboxExec
             {
-                Argv = ["git", "-C", workingDirectory, "add", "--", resolvedPath],
+                Argv = ["git", "-C", workingDirectory, "add", "--", "README.md", "file-credential-observed.json"],
             }, ct);
             return add.Success
-                ? new AgentResult(true, "cursor resolved", null, null)
-                : new AgentResult(false, $"failed to stage {resolvedPath}", add.Stdout, add.Stderr);
+                ? new AgentResult(true, "claude resolved", null, null)
+                : new AgentResult(false, "failed to stage README.md", add.Stdout, add.Stderr);
         }
     }
 

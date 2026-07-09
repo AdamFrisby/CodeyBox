@@ -14,6 +14,9 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 {
     private const string AgentRunIdEnvironmentVariable = "CODEYBOX_AGENT_RUN_ID";
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> ActiveAgentRunIds = new();
+    private const string CredentialStdinMaterialiseScript =
+        SafeCredentialFileWriterScript +
+        "codeybox_write_credential_file \"$1\" \"${2:-}\" 0\n";
 
     public abstract AgentKind Kind { get; }
 
@@ -69,12 +72,33 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     protected virtual IReadOnlyList<string> ScratchpadHomeDirectories => [];
 
     /// <summary>
+    /// A credential payload carried in <see cref="AgentCredential.EnvironmentVariables"/>
+    /// that must be materialised to a regular file under <c>$HOME</c> before
+    /// invoking the CLI.
+    /// </summary>
+    protected sealed record EnvBackedCredentialFile(
+        string EnvironmentVariable,
+        string HomeRelativePath,
+        string FailureDescription,
+        string? DestinationEnvironmentVariable = null,
+        bool MaterialiseFromSandboxEnvironmentWhenCredentialMissing = false);
+
+    /// <summary>
+    /// Env-var-backed credential files this runner writes before executing the
+    /// agent CLI. Values supplied by a concrete <see cref="AgentCredential"/> are
+    /// passed via stdin, not per-exec environment, so fallback candidates can
+    /// authenticate without exposing candidate secrets to argv or process env.
+    /// </summary>
+    protected virtual IReadOnlyList<EnvBackedCredentialFile> EnvBackedCredentialFiles => [];
+
+    /// <summary>
     /// Credential environment variables that this runner materialises as files
     /// inside the sandbox before invoking the CLI. Sandboxes that reject
     /// file-backed credentials use this list to fail before secrets are written
     /// to persistent storage.
     /// </summary>
-    protected virtual IReadOnlyList<string> FileBackedCredentialEnvironmentVariables => [];
+    protected virtual IReadOnlyList<string> FileBackedCredentialEnvironmentVariables =>
+        EnvBackedCredentialFiles.Select(static file => file.EnvironmentVariable).ToArray();
 
     /// <summary>
     /// Pattern used to ask the running CLI to stop before scratchpad capture.
@@ -115,13 +139,202 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     /// immediately before invoking the binary. Returning a result short-circuits
     /// the run with that failure.
     /// </summary>
-    protected virtual Task<AgentResult?> PrepareSandboxAsync(
+    protected virtual async Task<AgentResult?> PrepareSandboxAsync(
         ISandbox sandbox,
         string workingDirectory,
         AgentCredential? credential,
         AgentResumeContext? resume,
         CancellationToken ct)
-        => Task.FromResult<AgentResult?>(null);
+        => await MaterialiseEnvBackedCredentialFilesAsync(sandbox, credential, ct).ConfigureAwait(false);
+
+    protected async Task<AgentResult?> MaterialiseEnvBackedCredentialFilesAsync(
+        ISandbox sandbox,
+        AgentCredential? credential,
+        CancellationToken ct)
+    {
+        if (EnvBackedCredentialFiles.Count == 0)
+            return null;
+
+        foreach (var file in EnvBackedCredentialFiles)
+        {
+            ValidateEnvBackedCredentialFile(file);
+
+            SandboxExec? exec = null;
+            if (credential?.EnvironmentVariables.TryGetValue(file.EnvironmentVariable, out var contents) == true
+                && !string.IsNullOrEmpty(contents))
+            {
+                exec = new SandboxExec
+                {
+                    Argv =
+                    [
+                        "bash",
+                        "-c",
+                        CredentialStdinMaterialiseScript,
+                        "codeybox-credential-materialise",
+                        file.HomeRelativePath,
+                        ResolveCredentialDestinationOverride(file, credential.EnvironmentVariables),
+                    ],
+                    Stdin = contents,
+                };
+            }
+            else if (credential is null && file.MaterialiseFromSandboxEnvironmentWhenCredentialMissing)
+            {
+                exec = new SandboxExec
+                {
+                    Argv = ["bash", "-c", BuildEnvBackedCredentialScript(file)],
+                };
+            }
+
+            if (exec is null)
+                continue;
+
+            var write = await sandbox.ExecAsync(exec, ct).ConfigureAwait(false);
+            if (!write.Success)
+            {
+                return new AgentResult(
+                    Success: false,
+                    Summary: $"failed to materialise {file.FailureDescription}: exit {write.ExitCode}",
+                    Stdout: write.Stdout,
+                    Stderr: write.Stderr);
+            }
+        }
+
+        return null;
+    }
+
+    protected static string BuildEnvBackedCredentialScript(EnvBackedCredentialFile file)
+    {
+        ValidateEnvBackedCredentialFile(file);
+        var script = SafeCredentialFileWriterScript +
+            "value=\"${" + file.EnvironmentVariable + ":-}\"\n" +
+            "if [ -z \"$value\" ]; then exit 0; fi\n";
+
+        script += file.DestinationEnvironmentVariable is null
+            ? "dest_override=\"\"\n"
+            : "dest_override=\"${" + file.DestinationEnvironmentVariable + ":-}\"\n";
+
+        return script +
+            "printf '%s' \"$value\" | codeybox_write_credential_file " +
+            ShellSingleQuote(file.HomeRelativePath) +
+            " \"$dest_override\" 1\n";
+    }
+
+    private static string ResolveCredentialDestinationOverride(
+        EnvBackedCredentialFile file,
+        IReadOnlyDictionary<string, string> environment)
+    {
+        if (file.DestinationEnvironmentVariable is null)
+            return string.Empty;
+
+        return environment.TryGetValue(file.DestinationEnvironmentVariable, out var destination)
+            ? destination
+            : string.Empty;
+    }
+
+    private static void ValidateEnvBackedCredentialFile(EnvBackedCredentialFile file)
+    {
+        ValidateEnvironmentVariableName(file.EnvironmentVariable, nameof(file.EnvironmentVariable));
+        if (file.DestinationEnvironmentVariable is not null)
+            ValidateEnvironmentVariableName(file.DestinationEnvironmentVariable, nameof(file.DestinationEnvironmentVariable));
+        ValidateHomeRelativeCredentialPath(file.HomeRelativePath);
+        if (string.IsNullOrWhiteSpace(file.FailureDescription))
+            throw new ArgumentException("Credential file failure description must be non-empty.", nameof(file));
+    }
+
+    private static void ValidateEnvironmentVariableName(string value, string fieldName)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            throw new ArgumentException("Environment variable name must be non-empty.", fieldName);
+        foreach (var c in value)
+        {
+            if (c is >= 'A' and <= 'Z'
+                || c is >= 'a' and <= 'z'
+                || c is >= '0' and <= '9'
+                || c == '_')
+                continue;
+            throw new ArgumentException($"Environment variable name contains an invalid character: {value}", fieldName);
+        }
+    }
+
+    private static void ValidateHomeRelativeCredentialPath(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            throw new ArgumentException("Credential home-relative path must be non-empty.", nameof(value));
+        if (value.StartsWith('/'))
+            throw new ArgumentException($"Credential path must be relative to HOME: {value}", nameof(value));
+
+        foreach (var segment in value.Split('/', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (segment is "." or "..")
+                throw new ArgumentException($"Credential path must not contain traversal segments: {value}", nameof(value));
+        }
+    }
+
+    private static string ShellSingleQuote(string value) =>
+        "'" + value.Replace("'", "'\"'\"'", StringComparison.Ordinal) + "'";
+
+    private const string SafeCredentialFileWriterScript =
+        "set -eu\n" +
+        "codeybox_fail() { printf '%s\\n' \"$1\" >&2; exit 2; }\n" +
+        "codeybox_home=$(CDPATH= cd -- \"$HOME\" 2>/dev/null && pwd -P) || codeybox_fail 'credential HOME is not accessible'\n" +
+        "codeybox_write_credential_file() {\n" +
+        "  rel=$1\n" +
+        "  override=${2:-}\n" +
+        "  preserve_existing=${3:-0}\n" +
+        "  case \"$rel\" in ''|/*) codeybox_fail 'credential path must be HOME-relative' ;; esac\n" +
+        "  case \"/$rel/\" in */../*|*/./*) codeybox_fail 'credential path contains traversal' ;; esac\n" +
+        "  if [ -n \"$override\" ]; then\n" +
+        "    case \"$override\" in\n" +
+        "      \\$HOME/*) dest=\"$codeybox_home/${override#\\$HOME/}\" ;;\n" +
+        "      ~/*) dest=\"$codeybox_home/${override#~/}\" ;;\n" +
+        "      /*) dest=\"$override\" ;;\n" +
+        "      *) dest=\"$codeybox_home/$override\" ;;\n" +
+        "    esac\n" +
+        "  else\n" +
+        "    dest=\"$codeybox_home/$rel\"\n" +
+        "  fi\n" +
+        "  case \"$dest\" in \"$codeybox_home\"/*) ;; *) codeybox_fail 'credential destination escapes HOME' ;; esac\n" +
+        "  dest_dir=${dest%/*}\n" +
+        "  dest_name=${dest##*/}\n" +
+        "  [ -n \"$dest_name\" ] || codeybox_fail 'credential destination file name is empty'\n" +
+        "  case \"$dest_name\" in .|..) codeybox_fail 'credential destination file name is invalid' ;; esac\n" +
+        "  if [ \"$dest_dir\" = \"$codeybox_home\" ]; then\n" +
+        "    rel_dir=\n" +
+        "  else\n" +
+        "    rel_dir=${dest_dir#\"$codeybox_home\"/}\n" +
+        "    [ \"$rel_dir\" != \"$dest_dir\" ] || codeybox_fail 'credential destination escapes HOME'\n" +
+        "  fi\n" +
+        "  case \"/$rel_dir/\" in */../*|*/./*) codeybox_fail 'credential destination contains traversal' ;; esac\n" +
+        "  current=$codeybox_home\n" +
+        "  old_ifs=$IFS\n" +
+        "  IFS=/\n" +
+        "  set -- $rel_dir\n" +
+        "  IFS=$old_ifs\n" +
+        "  for part do\n" +
+        "    [ -n \"$part\" ] || continue\n" +
+        "    case \"$part\" in .|..) codeybox_fail 'credential destination contains traversal' ;; esac\n" +
+        "    current=\"$current/$part\"\n" +
+        "    [ ! -L \"$current\" ] || codeybox_fail 'credential destination parent is a symlink'\n" +
+        "    if [ -e \"$current\" ] && [ ! -d \"$current\" ]; then codeybox_fail 'credential destination parent is not a directory'; fi\n" +
+        "    if [ ! -e \"$current\" ]; then mkdir -m 700 -- \"$current\"; fi\n" +
+        "    [ ! -L \"$current\" ] || codeybox_fail 'credential destination parent is a symlink'\n" +
+        "    [ -d \"$current\" ] || codeybox_fail 'credential destination parent is not a directory'\n" +
+        "    chmod 700 -- \"$current\"\n" +
+        "  done\n" +
+        "  if [ \"$preserve_existing\" = 1 ] && [ -e \"$dest\" ]; then\n" +
+        "    [ ! -L \"$dest\" ] || codeybox_fail 'credential destination file is a symlink'\n" +
+        "    if [ -f \"$dest\" ] && [ -s \"$dest\" ]; then return 0; fi\n" +
+        "  fi\n" +
+        "  if [ -L \"$dest\" ]; then rm -f -- \"$dest\"; fi\n" +
+        "  if [ -e \"$dest\" ] && [ ! -f \"$dest\" ]; then codeybox_fail 'credential destination exists and is not a regular file'; fi\n" +
+        "  tmp=$(mktemp \"$dest_dir/.$dest_name.tmp.XXXXXX\")\n" +
+        "  trap 'rm -f -- \"$tmp\"' EXIT\n" +
+        "  cat > \"$tmp\"\n" +
+        "  chmod 600 -- \"$tmp\"\n" +
+        "  mv -f -T -- \"$tmp\" \"$dest\"\n" +
+        "  trap - EXIT\n" +
+        "  chmod 600 -- \"$dest\"\n" +
+        "}\n";
 
     public virtual async Task<AgentResult> RunAsync(
         ISandbox sandbox,

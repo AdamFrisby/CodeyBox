@@ -152,7 +152,7 @@ public sealed class OpencodeAgentRunnerTests
     // the sandbox from the OPENCODE_AUTH_JSON credential env var. These
     // tests pin:
     //   - the materialisation script runs BEFORE the opencode CLI invocation;
-    //   - it references the correct env-var names and default destination;
+    //   - it references the correct default destination;
     //   - it honours OPENCODE_AUTH_DEST_PATH for non-XDG destinations;
     //   - it is skipped entirely when no credential is supplied;
     //   - a failed write fails the run with a meaningful summary and
@@ -186,7 +186,8 @@ public sealed class OpencodeAgentRunnerTests
             if (argv.Count >= 3
                 && argv[0] == "bash"
                 && argv[1] == "-c"
-                && argv[2].Contains("OPENCODE_AUTH_JSON", StringComparison.Ordinal))
+                && (argv[2].Contains("OPENCODE_AUTH_JSON", StringComparison.Ordinal)
+                    || (argv.Count >= 5 && argv[4] == ".local/share/opencode/auth.json")))
                 return i;
         }
         return -1;
@@ -263,18 +264,34 @@ public sealed class OpencodeAgentRunnerTests
 
         var matIdx = FindMaterialisationScriptIndex(sandbox.Execs);
         Assert.True(matIdx >= 0);
-        var script = sandbox.Execs[matIdx].Argv[2];
-        Assert.Contains("$HOME/.local/share/opencode/auth.json", script);
-        Assert.Contains("OPENCODE_AUTH_DEST_PATH", script);
+        var exec = sandbox.Execs[matIdx];
+        Assert.Equal(".local/share/opencode/auth.json", exec.Argv[4]);
+        Assert.Equal("", exec.Argv[5]);
     }
 
     [Fact]
-    public async Task RunAsync_MaterialisationScript_HasUmask077_BeforeMkdirAndWrite()
+    public async Task RunAsync_MaterialisationScript_UsesCredentialDestinationOverride()
     {
-        // Auth file (and parent dir) must end up at 0700/0600. Order:
-        // umask 077 must precede BOTH mkdir -p (so the dir inherits 0700,
-        // not the typical 0755) AND the printf that writes the file (so
-        // newly created files inherit 0600, not 0644).
+        var sandbox = new RecordingSandbox();
+        var runner = new OpencodeAgentRunner();
+        var cred = OpencodeCred("""{"x":1}""", "$HOME/.config/opencode/auth.json");
+
+        await runner.RunAsync(sandbox, "/work", "x", credential: cred);
+
+        var matIdx = FindMaterialisationScriptIndex(sandbox.Execs);
+        Assert.True(matIdx >= 0);
+        var exec = sandbox.Execs[matIdx];
+        Assert.Equal(".local/share/opencode/auth.json", exec.Argv[4]);
+        Assert.Equal("$HOME/.config/opencode/auth.json", exec.Argv[5]);
+    }
+
+    [Fact]
+    public async Task RunAsync_MaterialisationScript_WritesViaPrivateTempFile()
+    {
+        // Auth file (and parent dir) must end up at 0700/0600 without
+        // following a pre-created symlink. The shared writer creates parents
+        // with mode 0700, writes stdin to a private temp file, then renames it
+        // over the destination.
         var sandbox = new RecordingSandbox();
         var runner = new OpencodeAgentRunner();
         var cred = OpencodeCred("""{"x":1}""");
@@ -282,23 +299,19 @@ public sealed class OpencodeAgentRunnerTests
         await runner.RunAsync(sandbox, "/work", "x", credential: cred);
 
         var script = sandbox.Execs[FindMaterialisationScriptIndex(sandbox.Execs)].Argv[2];
-        var umaskIdx = script.IndexOf("umask 077", StringComparison.Ordinal);
-        var mkdirIdx = script.IndexOf("mkdir -p", StringComparison.Ordinal);
-        var printfIdx = script.IndexOf("printf", StringComparison.Ordinal);
-        Assert.True(umaskIdx >= 0, "script must set umask 077");
-        Assert.True(mkdirIdx >= 0, "script must mkdir the parent directory");
-        Assert.True(printfIdx >= 0, "script must write the auth file via printf");
-        Assert.True(umaskIdx < mkdirIdx, "umask 077 must come before mkdir so the parent dir is 0700");
-        Assert.True(umaskIdx < printfIdx, "umask 077 must come before the printf write");
+        Assert.Contains("mkdir -m 700", script, StringComparison.Ordinal);
+        Assert.Contains("mktemp", script, StringComparison.Ordinal);
+        Assert.Contains("cat > \"$tmp\"", script, StringComparison.Ordinal);
+        Assert.Contains("mv -f -T", script, StringComparison.Ordinal);
+        Assert.Contains("credential destination parent is a symlink", script, StringComparison.Ordinal);
     }
 
     [Fact]
     public async Task RunAsync_MaterialisationScript_ChmodsAuthFileTo600()
     {
-        // chmod 600 is a defense-in-depth backstop: umask only affects newly
-        // created files, so a pre-existing auth.json with looser modes
-        // would keep them after a truncate-rewrite. Explicit chmod pins the
-        // mode regardless of pre-existing state.
+        // chmod 600 is a defense-in-depth backstop after the temp-file write
+        // and atomic rename. It pins the final mode regardless of filesystem
+        // defaults or a pre-existing destination.
         var sandbox = new RecordingSandbox();
         var runner = new OpencodeAgentRunner();
         var cred = OpencodeCred("""{"x":1}""");
@@ -306,10 +319,11 @@ public sealed class OpencodeAgentRunnerTests
         await runner.RunAsync(sandbox, "/work", "x", credential: cred);
 
         var script = sandbox.Execs[FindMaterialisationScriptIndex(sandbox.Execs)].Argv[2];
-        var printfIdx = script.IndexOf("printf", StringComparison.Ordinal);
+        var catIdx = script.IndexOf("cat > \"$tmp\"", StringComparison.Ordinal);
         var chmodIdx = script.IndexOf("chmod 600", StringComparison.Ordinal);
         Assert.True(chmodIdx >= 0, "script must chmod the auth file to 0600");
-        Assert.True(printfIdx < chmodIdx, "chmod must run after the printf write");
+        Assert.True(catIdx >= 0, "script must write stdin into the private temp file");
+        Assert.True(catIdx < chmodIdx, "chmod must run after the stdin write");
     }
 
     [Fact]
@@ -333,8 +347,8 @@ public sealed class OpencodeAgentRunnerTests
     [Fact]
     public async Task RunAsync_MaterialisationScript_DoesNotEmbedCredentialBytesInArgv()
     {
-        // The credential bytes must flow via the env-var, NOT be interpolated
-        // into the bash heredoc — otherwise the secret would appear in any
+        // The credential bytes must flow via stdin, NOT be interpolated into
+        // the bash heredoc or argv — otherwise the secret would appear in any
         // command-line audit log the orchestrator captures.
         var sandbox = new RecordingSandbox();
         var runner = new OpencodeAgentRunner();
@@ -345,8 +359,10 @@ public sealed class OpencodeAgentRunnerTests
 
         var script = sandbox.Execs[FindMaterialisationScriptIndex(sandbox.Execs)].Argv[2];
         Assert.DoesNotContain(secret, script);
-        // It should reference the env-var name instead.
-        Assert.Contains("OPENCODE_AUTH_JSON", script);
+        var authExec = sandbox.Execs[FindMaterialisationScriptIndex(sandbox.Execs)];
+        Assert.DoesNotContain(secret, authExec.Argv);
+        Assert.Equal(cred.EnvironmentVariables["OPENCODE_AUTH_JSON"], authExec.Stdin);
+        Assert.DoesNotContain("OPENCODE_AUTH_JSON", script);
     }
 
     [Fact]
@@ -474,7 +490,8 @@ public sealed class OpencodeAgentRunnerTests
             if (exec.Argv.Count >= 3
                 && exec.Argv[0] == "bash"
                 && exec.Argv[1] == "-c"
-                && exec.Argv[2].Contains("OPENCODE_AUTH_JSON", StringComparison.Ordinal))
+                && (exec.Argv[2].Contains("OPENCODE_AUTH_JSON", StringComparison.Ordinal)
+                    || (exec.Argv.Count >= 5 && exec.Argv[4] == ".local/share/opencode/auth.json")))
             {
                 return Task.FromResult(new SandboxExecResult(_authWriteExitCode, "", "auth stderr"));
             }
@@ -501,7 +518,8 @@ public sealed class OpencodeAgentRunnerTests
             if (exec.Argv.Count >= 3
                 && exec.Argv[0] == "bash"
                 && exec.Argv[1] == "-c"
-                && exec.Argv[2].Contains("OPENCODE_AUTH_JSON", StringComparison.Ordinal))
+                && (exec.Argv[2].Contains("OPENCODE_AUTH_JSON", StringComparison.Ordinal)
+                    || (exec.Argv.Count >= 5 && exec.Argv[4] == ".local/share/opencode/auth.json")))
             {
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
             }

@@ -57,6 +57,11 @@ namespace CodeyBox.Agents.Crock;
 /// </summary>
 public sealed class CrockAgentRunner : CliAgentRunnerBase
 {
+    private static readonly EnvBackedCredentialFile ConfigCredentialFile = new(
+        ConfigEnvVar,
+        ".crockcode/config.json",
+        "crock config");
+
     /// <summary>Default crock CLI binary name inside the sandbox.</summary>
     public const string DefaultBinary = "crock";
 
@@ -90,20 +95,12 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
     /// name via the interpolation site below; a rename of
     /// <see cref="ConfigEnvVar"/> updates both at once.
     /// </summary>
-    public static readonly string ConfigMaterialiseScript =
-        "set -eu\n" +
-        "dest=\"$HOME/.crockcode/config.json\"\n" +
-        "umask 077\n" +
-        "mkdir -p \"$(dirname \"$dest\")\"\n" +
-        $"if [ -n \"${{{ConfigEnvVar}:-}}\" ]; then\n" +
-        $"  printf '%s' \"${ConfigEnvVar}\" > \"$dest\"\n" +
-        "  chmod 600 \"$dest\"\n" +
-        "fi\n";
+    public static readonly string ConfigMaterialiseScript = BuildEnvBackedCredentialScript(ConfigCredentialFile);
 
     /// <summary>Path to the crock binary inside the sandbox.</summary>
     public string Binary { get; init; } = DefaultBinary;
 
-    protected override IReadOnlyList<string> FileBackedCredentialEnvironmentVariables => [ConfigEnvVar];
+    protected override IReadOnlyList<EnvBackedCredentialFile> EnvBackedCredentialFiles => [ConfigCredentialFile];
 
     /// <summary>
     /// Initial delay before the first <c>crock status</c> poll, and the floor
@@ -175,19 +172,7 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
                 Stderr: MissingCredentialMarker);
         }
 
-        var write = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["bash", "-c", ConfigMaterialiseScript],
-        }, ct);
-        if (!write.Success)
-        {
-            return new AgentResult(
-                Success: false,
-                Summary: $"failed to materialise crock config: exit {write.ExitCode}",
-                Stdout: write.Stdout,
-                Stderr: write.Stderr);
-        }
-        return null;
+        return await MaterialiseEnvBackedCredentialFilesAsync(sandbox, credential, ct).ConfigureAwait(false);
     }
 
     /// <summary>

@@ -156,8 +156,9 @@ public sealed class AntigravityAgentRunnerTests
         Assert.Equal("bash", prep.Argv[0]);
         Assert.Equal("-c", prep.Argv[1]);
         var script = prep.Argv[2];
-        Assert.Contains("$HOME/.gemini/antigravity-cli/antigravity-oauth-token", script);
-        Assert.Contains(AntigravityConstants.OAuthCredsEnvVar, script);
+        Assert.Equal(".gemini/antigravity-cli/antigravity-oauth-token", prep.Argv[4]);
+        Assert.Equal(credential.EnvironmentVariables[AntigravityConstants.OAuthCredsEnvVar], prep.Stdin);
+        Assert.DoesNotContain(AntigravityConstants.OAuthCredsEnvVar, script);
         Assert.Contains("chmod 600", script);
         // Second exec is the agy CLI invocation, not the prep hook.
         Assert.Equal("agy", prepAndAgyExecs[1].Argv[0]);

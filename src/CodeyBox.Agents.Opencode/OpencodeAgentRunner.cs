@@ -23,6 +23,13 @@ namespace CodeyBox.Agents.Opencode;
 /// </summary>
 public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
+    private const string AuthJsonEnvironmentVariable = "OPENCODE_AUTH_JSON";
+    private const string AuthDestinationEnvironmentVariable = "OPENCODE_AUTH_DEST_PATH";
+    private static readonly EnvBackedCredentialFile AuthCredentialFile = new(
+        AuthJsonEnvironmentVariable,
+        ".local/share/opencode/auth.json",
+        "opencode auth",
+        DestinationEnvironmentVariable: AuthDestinationEnvironmentVariable);
     private readonly AgentDefaultsSnapshot? _defaults;
 
     public OpencodeAgentRunner() : this(defaults: null) { }
@@ -48,15 +55,7 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
     /// <c>OpencodeInVmSmokeProbe</c> so the smoke probe writes to the exact
     /// same path as a real dispatch.
     /// </summary>
-    public const string AuthMaterialiseScript =
-        "set -eu\n" +
-        "dest=\"${OPENCODE_AUTH_DEST_PATH:-$HOME/.local/share/opencode/auth.json}\"\n" +
-        "umask 077\n" +
-        "mkdir -p \"$(dirname \"$dest\")\"\n" +
-        "if [ -n \"${OPENCODE_AUTH_JSON:-}\" ]; then\n" +
-        "  printf '%s' \"$OPENCODE_AUTH_JSON\" > \"$dest\"\n" +
-        "  chmod 600 \"$dest\"\n" +
-        "fi\n";
+    public static readonly string AuthMaterialiseScript = BuildEnvBackedCredentialScript(AuthCredentialFile);
 
     /// <summary>Path to the opencode binary inside the sandbox. Defaults to <see cref="DefaultBinary"/>.</summary>
     public string Binary { get; init; } = DefaultBinary;
@@ -69,60 +68,9 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".local/share/opencode", ".config/opencode"];
 
-    protected override IReadOnlyList<string> FileBackedCredentialEnvironmentVariables => ["OPENCODE_AUTH_JSON"];
+    protected override IReadOnlyList<EnvBackedCredentialFile> EnvBackedCredentialFiles => [AuthCredentialFile];
 
     protected override string PreemptProcessPattern => Binary;
-
-    /// <summary>
-    /// Materialises the opencode credentials file from
-    /// <c>OPENCODE_AUTH_JSON</c> if present, mirroring Codex's
-    /// <c>~/.codex/auth.json</c> pattern. The destination path inside the
-    /// sandbox is supplied by the credential bundle as
-    /// <c>OPENCODE_AUTH_DEST_PATH</c>; if unset the runner falls back to
-    /// <c>~/.local/share/opencode/auth.json</c>, which matches opencode's
-    /// XDG-default location at the time of writing. Operators verify the
-    /// real path via <c>opencode auth login</c> and override
-    /// <c>CODEYBOX_OPENCODE_AUTH_DEST</c> on the host if needed.
-    /// </summary>
-    protected override async Task<AgentResult?> PrepareSandboxAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        AgentCredential? credential,
-        AgentResumeContext? resume,
-        CancellationToken ct = default)
-    {
-        if (credential is null
-            || !credential.EnvironmentVariables.ContainsKey("OPENCODE_AUTH_JSON"))
-            return null;
-
-        // Defensive: write under XDG default unless the caller supplied an
-        // explicit destination via the credential bundle (set by the
-        // credential provider on the host from CODEYBOX_OPENCODE_AUTH_DEST).
-        // The runner does not parse the JSON; opencode owns its schema and
-        // any drift there is the operator's to verify with `opencode auth`.
-        //
-        // Order matters:
-        //   1. umask 077 BEFORE mkdir -p, so the parent directory is 0700
-        //      (not 0755 inherited from the system umask).
-        //   2. printf truncate-rewrite, then explicit chmod 600 — umask
-        //      only affects NEWLY created files; if a destination auth.json
-        //      already exists with looser modes (e.g. 0644 from a prior
-        //      `opencode auth login`), the truncate does not change the
-        //      mode. chmod pins 0600 regardless of pre-existing state.
-        var write = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["bash", "-c", AuthMaterialiseScript],
-        }, ct);
-        if (!write.Success)
-        {
-            return new AgentResult(
-                Success: false,
-                Summary: $"failed to materialise opencode auth: exit {write.ExitCode}",
-                Stdout: write.Stdout,
-                Stderr: write.Stderr);
-        }
-        return null;
-    }
 
     /// <summary>
     /// Builds the <c>opencode run</c> argv. The <paramref name="captureStructuredStream"/>

@@ -143,7 +143,7 @@ public sealed class CursorAgentRunnerTests
             e.Argv.Count >= 3
             && e.Argv[0] == "bash"
             && e.Argv[2].Contains("CODEYBOX_CURSOR_AUTH_JSON", StringComparison.Ordinal)
-            && e.Argv[2].Contains("$HOME/.config/cursor/auth.json", StringComparison.Ordinal));
+            && e.Argv[2].Contains(".config/cursor/auth.json", StringComparison.Ordinal));
         var agentIdx = sandbox.Execs.FindIndex(e => e.Argv.Count > 0 && e.Argv[0] == "agent");
         Assert.True(authIdx >= 0, "auth materialisation bash command was not invoked");
         Assert.True(agentIdx >= 0, "agent CLI was not invoked");
@@ -178,12 +178,13 @@ public sealed class CursorAgentRunnerTests
 
         Assert.True(result.Success);
         var authExec = Assert.Single(sandbox.Execs, e =>
-            e.Argv.Count >= 3
+            e.Argv.Count >= 5
             && e.Argv[0] == "bash"
-            && e.Argv[2].Contains("$HOME/.config/cursor/auth.json", StringComparison.Ordinal));
+            && e.Argv[4] == ".config/cursor/auth.json");
         Assert.Equal(authJson, authExec.Stdin);
         Assert.Null(authExec.ExtraEnvironment);
         Assert.DoesNotContain(authJson, authExec.Argv[2]);
+        Assert.DoesNotContain(authJson, authExec.Argv);
         Assert.DoesNotContain("CODEYBOX_CURSOR_AUTH_JSON", authExec.Argv[2]);
     }
 
@@ -205,14 +206,10 @@ public sealed class CursorAgentRunnerTests
         Assert.NotNull(prepExec);
         var script = prepExec!.Argv[2];
 
-        var existenceCheckIdx = script.IndexOf("$HOME/.config/cursor/auth.json", StringComparison.Ordinal);
-        var earlyExitIdx = script.IndexOf("exit 0", StringComparison.Ordinal);
-        var writeIdx = script.IndexOf("printf", StringComparison.Ordinal);
-        Assert.True(existenceCheckIdx >= 0, "script must reference $HOME/.config/cursor/auth.json");
-        Assert.True(earlyExitIdx >= 0, "script must short-circuit when file is present (exit 0)");
-        Assert.True(writeIdx >= 0, "script must still have a printf-from-env fallback");
-        Assert.True(earlyExitIdx < writeIdx,
-            "early-exit guard must come before the env-var write so an existing credentials.json is preserved");
+        Assert.Contains(".config/cursor/auth.json", script, StringComparison.Ordinal);
+        Assert.Contains("CODEYBOX_CURSOR_AUTH_JSON", script, StringComparison.Ordinal);
+        Assert.Contains("credential destination file is a symlink", script, StringComparison.Ordinal);
+        Assert.Contains("if [ -f \"$dest\" ] && [ -s \"$dest\" ]; then return 0; fi", script, StringComparison.Ordinal);
     }
 
     // ── Resume path ───────────────────────────────────────────────────────────
@@ -435,7 +432,8 @@ public sealed class CursorAgentRunnerTests
             Execs.Add(exec);
             if (exec.Argv.Count >= 3
                 && exec.Argv[0] == "bash"
-                && exec.Argv[2].Contains(".config/cursor/auth.json", StringComparison.Ordinal)
+                && (exec.Argv[2].Contains(".config/cursor/auth.json", StringComparison.Ordinal)
+                    || exec.Argv.Contains(".config/cursor/auth.json", StringComparer.Ordinal))
                 && (exec.Argv[2].Contains("CODEYBOX_CURSOR_AUTH_JSON", StringComparison.Ordinal)
                     || exec.Stdin is not null))
             {

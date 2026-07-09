@@ -127,12 +127,12 @@ public sealed class CodexAgentRunnerTests
 
         Assert.True(result.Success);
         // The codex CLI invocation must be preceded by the in-sandbox auth
-        // materialisation bash command that references CODEX_AUTH_JSON.
+        // materialisation bash command for ~/.codex/auth.json.
         var authIdx = sandbox.Execs.FindIndex(e =>
             e.Argv.Count >= 3
             && e.Argv[0] == "bash"
-            && e.Argv[2].Contains("CODEX_AUTH_JSON", StringComparison.Ordinal)
-            && e.Argv[2].Contains("$HOME/.codex/auth.json", StringComparison.Ordinal));
+            && (e.Argv[2].Contains("CODEX_AUTH_JSON", StringComparison.Ordinal)
+                || (e.Argv.Count >= 5 && e.Argv[4] == ".codex/auth.json")));
         var codexIdx = sandbox.Execs.FindIndex(e => e.Argv.Count > 0 && e.Argv[0] == "codex");
         Assert.True(authIdx >= 0, "auth materialisation bash command was not invoked");
         Assert.True(codexIdx >= 0, "codex CLI was not invoked");
@@ -182,16 +182,10 @@ public sealed class CodexAgentRunnerTests
         Assert.NotNull(prepExec);
         var script = prepExec!.Argv[2];
 
-        // Guard must check existence (or non-empty) of auth.json BEFORE the
-        // env-var write block, and exit early when present.
-        var stillExistsIdx = script.IndexOf("$HOME/.codex/auth.json", StringComparison.Ordinal);
-        var earlyExitIdx = script.IndexOf("exit 0", StringComparison.Ordinal);
-        var writeIdx = script.IndexOf("printf", StringComparison.Ordinal);
-        Assert.True(stillExistsIdx >= 0, "script must reference $HOME/.codex/auth.json");
-        Assert.True(earlyExitIdx >= 0, "script must short-circuit when file is present (exit 0)");
-        Assert.True(writeIdx >= 0, "script must still have a printf-from-env fallback");
-        Assert.True(earlyExitIdx < writeIdx,
-            "early-exit guard must come before the env-var write so an existing auth.json is preserved");
+        Assert.Contains(".codex/auth.json", script, StringComparison.Ordinal);
+        Assert.Contains("CODEX_AUTH_JSON", script, StringComparison.Ordinal);
+        Assert.Contains("credential destination file is a symlink", script, StringComparison.Ordinal);
+        Assert.Contains("if [ -f \"$dest\" ] && [ -s \"$dest\" ]; then return 0; fi", script, StringComparison.Ordinal);
     }
 
     // ── Default model from config ─────────────────────────────────────────────
@@ -434,13 +428,10 @@ public sealed class CodexAgentRunnerTests
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             Execs.Add(exec);
-            // The auth materialisation script is a single-arg bash -c invocation
-            // referencing CODEX_AUTH_JSON; surface the configured exit code so we
-            // can simulate a failed write.
             if (exec.Argv.Count >= 3
                 && exec.Argv[0] == "bash"
-                && exec.Argv[2].Contains("CODEX_AUTH_JSON", StringComparison.Ordinal)
-                && exec.Argv[2].Contains(".codex/auth.json", StringComparison.Ordinal))
+                && (exec.Argv[2].Contains("CODEX_AUTH_JSON", StringComparison.Ordinal)
+                    || (exec.Argv.Count >= 5 && exec.Argv[4] == ".codex/auth.json")))
             {
                 return Task.FromResult(new SandboxExecResult(_authWriteExitCode, "", "auth stderr"));
             }

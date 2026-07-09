@@ -527,15 +527,16 @@ public sealed class CrockAgentRunnerTests
     {
         // The bash script must reference ConfigEnvVar's current value; a
         // rename of the constant must propagate without a separate edit.
-        // Also pins the chmod/umask security pattern so a regression to a
-        // looser mode is caught.
+        // Also pins the chmod/temp-file security pattern so a regression to a
+        // looser mode or symlink-following write is caught.
         Assert.Contains(
             CrockAgentRunner.ConfigEnvVar,
             CrockAgentRunner.ConfigMaterialiseScript,
             StringComparison.Ordinal);
-        Assert.Contains("umask 077", CrockAgentRunner.ConfigMaterialiseScript, StringComparison.Ordinal);
         Assert.Contains("chmod 600", CrockAgentRunner.ConfigMaterialiseScript, StringComparison.Ordinal);
         Assert.Contains(".crockcode/config.json", CrockAgentRunner.ConfigMaterialiseScript, StringComparison.Ordinal);
+        Assert.Contains("mktemp", CrockAgentRunner.ConfigMaterialiseScript, StringComparison.Ordinal);
+        Assert.Contains("credential destination parent is a symlink", CrockAgentRunner.ConfigMaterialiseScript, StringComparison.Ordinal);
     }
 
     // --- In-VM smoke probe step shape -----------------------------------
@@ -657,7 +658,8 @@ public sealed class CrockAgentRunnerTests
             if (argv.Count >= 3
                 && argv[0] == "bash"
                 && argv[1] == "-c"
-                && argv[2].Contains(CrockAgentRunner.ConfigEnvVar, StringComparison.Ordinal))
+                && (argv[2].Contains(CrockAgentRunner.ConfigEnvVar, StringComparison.Ordinal)
+                    || (argv.Count >= 5 && argv[4] == ".crockcode/config.json")))
             {
                 return Task.FromResult(new SandboxExecResult(
                     _authExit.Exit, _authExit.Stdout, _authExit.Stderr));

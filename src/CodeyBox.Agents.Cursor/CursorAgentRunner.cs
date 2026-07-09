@@ -38,6 +38,11 @@ namespace CodeyBox.Agents.Cursor;
 public sealed class CursorAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner
 {
     private const string AuthJsonEnvironmentVariable = "CODEYBOX_CURSOR_AUTH_JSON";
+    private static readonly EnvBackedCredentialFile AuthCredentialFile = new(
+        AuthJsonEnvironmentVariable,
+        ".config/cursor/auth.json",
+        "cursor auth",
+        MaterialiseFromSandboxEnvironmentWhenCredentialMissing: true);
     private readonly AgentDefaultsSnapshot? _defaults;
 
     public CursorAgentRunner() : this(defaults: null) { }
@@ -92,11 +97,7 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     /// destination path as a real dispatch's credential-stdin path — path drift
     /// here is the PR #138 failure this probe is meant to catch.
     /// </summary>
-    public const string AuthMaterialiseScript =
-        "set -eu; if [ -s \"$HOME/.config/cursor/auth.json\" ]; then exit 0; fi; if [ -n \"${CODEYBOX_CURSOR_AUTH_JSON:-}\" ]; then mkdir -p \"$HOME/.config/cursor\"; umask 077; printf '%s' \"$CODEYBOX_CURSOR_AUTH_JSON\" > \"$HOME/.config/cursor/auth.json\"; chmod 600 \"$HOME/.config/cursor/auth.json\"; fi";
-
-    private const string AuthMaterialiseFromStdinScript =
-        "set -eu; if [ -s \"$HOME/.config/cursor/auth.json\" ]; then exit 0; fi; mkdir -p \"$HOME/.config/cursor\"; umask 077; cat > \"$HOME/.config/cursor/auth.json\"; chmod 600 \"$HOME/.config/cursor/auth.json\"";
+    public static readonly string AuthMaterialiseScript = BuildEnvBackedCredentialScript(AuthCredentialFile);
 
     /// <summary>
     /// Path to the Cursor CLI inside the sandbox. The binary is <c>agent</c>,
@@ -128,48 +129,9 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".cursor/sessions", ".cursor/history"];
 
-    protected override IReadOnlyList<string> FileBackedCredentialEnvironmentVariables => [AuthJsonEnvironmentVariable];
+    protected override IReadOnlyList<EnvBackedCredentialFile> EnvBackedCredentialFiles => [AuthCredentialFile];
 
     protected override string PreemptProcessPattern => Binary;
-
-    /// <summary>
-    /// Materialises Cursor's subscription credentials into the sandbox at
-    /// <c>~/.config/cursor/auth.json</c> from the candidate credential bundle.
-    /// This is intentionally credential-stdin based, not per-exec environment
-    /// injection, so a fallback Cursor can authenticate in a sandbox that was
-    /// created for another primary runner. When no credential bundle is present,
-    /// it falls back to <see cref="AuthMaterialiseScript"/> for create-time
-    /// sandbox env or image-baked auth. Existing non-empty auth files are
-    /// preserved in both paths.
-    /// </summary>
-    protected override async Task<AgentResult?> PrepareSandboxAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        AgentCredential? credential,
-        AgentResumeContext? resume,
-        CancellationToken ct = default)
-    {
-        var write = credential?.EnvironmentVariables.TryGetValue(AuthJsonEnvironmentVariable, out var authJson) == true
-            && !string.IsNullOrEmpty(authJson)
-            ? await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["bash", "-c", AuthMaterialiseFromStdinScript],
-                Stdin = authJson,
-            }, ct)
-            : await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["bash", "-c", AuthMaterialiseScript],
-            }, ct);
-        if (!write.Success)
-        {
-            return new AgentResult(
-                Success: false,
-                Summary: $"failed to materialise cursor auth: exit {write.ExitCode}",
-                Stdout: write.Stdout,
-                Stderr: write.Stderr);
-        }
-        return null;
-    }
 
     protected override AgentInvocation BuildInvocation(
         string prompt,

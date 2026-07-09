@@ -240,7 +240,8 @@ public sealed class WorkSandboxContextTests
             if (exec.Argv.Count >= 3
                 && exec.Argv[0] == "bash"
                 && exec.Argv[1] == "-c"
-                && exec.Argv[2].Contains("CODEYBOX_CURSOR_AUTH_JSON", StringComparison.Ordinal))
+                && (exec.Argv[2].Contains("CODEYBOX_CURSOR_AUTH_JSON", StringComparison.Ordinal)
+                    || (exec.Argv.Count >= 5 && exec.Argv[4] == ".config/cursor/auth.json")))
             {
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
             }

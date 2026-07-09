@@ -213,12 +213,10 @@ public sealed class AgenticConflictResolver
         _options = options ?? new AgenticConflictResolverOptionsSnapshot();
         _log = log ?? (ILogger)Microsoft.Extensions.Logging.Abstractions.NullLogger<AgenticConflictResolver>.Instance;
         // Optional hook the orchestrator wires in so a cross-kind candidate's
-        // file-based credentials (e.g. ~/.claude/.credentials.json) land in the
-        // sandbox before the candidate's CLI runs. The sandbox's env-var
-        // credentials are baked at create time (CliAgentRunnerBase.RunAsync
-        // documents this) and remain pinned to whichever runner the sandbox
-        // was originally provisioned for; this hook covers file-based auth
-        // which most agent CLIs also accept.
+        // AgentCredential.Files land in the sandbox before the candidate's CLI
+        // runs. Env-var-backed auth files are intentionally not injected as
+        // per-exec environment; CliAgentRunnerBase materialises them from the
+        // candidate credential via stdin inside the runner's prepare step.
         _credentialFileMaterialiser = credentialFileMaterialiser;
         _agentSupervision = agentSupervision;
         _authFailureClassifier = authFailureClassifier ?? new AgentAuthFailureClassifier();
@@ -404,10 +402,10 @@ public sealed class AgenticConflictResolver
 
             // Cross-kind fallback: the sandbox was provisioned for whichever
             // runner the orchestrator pre-baked at create time. Writing this
-            // candidate's file-based credentials (e.g. ~/.claude/.credentials.json)
-            // before invoking it lets a fallback CLI authenticate even when the
-            // sandbox env vars are still pinned to the primary. No-op when the
-            // candidate has no file creds or the host did not wire the hook.
+            // candidate's explicit file credentials before invoking it lets a
+            // fallback CLI authenticate even when the sandbox env vars are still
+            // pinned to the primary. Env-backed auth files are handled by the
+            // candidate runner from candidate.Credential during RunAsync.
             if (_credentialFileMaterialiser is not null
                 && candidate.Credential is { Files.Count: > 0 })
             {
