@@ -211,11 +211,13 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                     count++;
             }
         }
-        await foreach (var item in ListWaitingForQuotaResetByPriorityAsync(ct))
-        {
-            if (await TryStartupRequeueWaitingItemAsync(item, ct))
-                count++;
-        }
+        await SweepWaitingForQuotaResetByPriorityAsync(
+            async (item, token) =>
+            {
+                if (await TryStartupRequeueWaitingItemAsync(item, token))
+                    count++;
+            },
+            ct);
         _log.LogInformation("Re-armed or re-evaluated {Count} quota retry item(s)", count);
     }
 
@@ -365,11 +367,10 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
     }
 
     // The periodic sweep is the safety net: it walks every Failed/quota item
-    // plus a bounded priority batch of WaitingForQuotaReset rows, then asks the
-    // router whether each could run now while ignoring NextQuotaRetryAt entirely.
-    // NextQuotaRetryAt is an optimisation (drives the targeted timer), not a
-    // "don't even try" gate. Agent-scoped recovery events use a paged variant
-    // below when they need coverage beyond the global batch prefix.
+    // plus every WaitingForQuotaReset row through bounded priority pages, then
+    // asks the router whether each could run now while ignoring NextQuotaRetryAt
+    // entirely. NextQuotaRetryAt is an optimisation (drives the targeted timer),
+    // not a "don't even try" gate.
     private async Task RunPeriodicSweepAsync(CancellationToken ct)
     {
         _log.LogDebug("Starting periodic quota retry sweep");
@@ -380,29 +381,33 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                 await TryPeriodicRetryAsync(item, ct);
             }
         }
-        await foreach (var item in ListWaitingForQuotaResetByPriorityAsync(ct))
-        {
-            await TryPeriodicRetryAsync(item, ct);
-        }
+        await SweepWaitingForQuotaResetByPriorityAsync(TryPeriodicRetryAsync, ct);
     }
 
     public async Task RunWatchdogRecoverySweepAsync(CancellationToken ct)
     {
         _log.LogWarning("Worker-pool health watchdog triggered quota retry recovery sweep");
-        await foreach (var item in ListWaitingForQuotaResetByPriorityAsync(ct))
-        {
-            await TryWatchdogRecoveryRetryAsync(item, ct);
-        }
+        await SweepWaitingForQuotaResetByPriorityAsync(TryWatchdogRecoveryRetryAsync, ct);
     }
 
     private async Task TryPeriodicRetryAsync(WorkItem item, CancellationToken ct)
+        => await TryLoggedQuotaRetryAsync(item, "periodic", "periodic sweep", ct);
+
+    private async Task TryQuotaRecoveryRetryAsync(WorkItem item, CancellationToken ct)
+        => await TryLoggedQuotaRetryAsync(item, "quota-recovery", "quota recovery wake-up sweep", ct);
+
+    private async Task TryLoggedQuotaRetryAsync(
+        WorkItem item,
+        string source,
+        string sweepName,
+        CancellationToken ct)
     {
         try
         {
-            var outcome = await TryRetryAsync(item, "periodic", ct);
+            var outcome = await TryRetryAsync(item, source, ct);
             _log.LogInformation(
-                "Quota retry periodic sweep walked work item {Id} in state {State}: outcome={Outcome} reason={Reason}",
-                item.Id, item.State, outcome.Outcome, outcome.Reason);
+                "Quota retry {SweepName} walked work item {Id} in state {State}: outcome={Outcome} reason={Reason}",
+                sweepName, item.Id, item.State, outcome.Outcome, outcome.Reason);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -410,7 +415,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         }
         catch (Exception ex)
         {
-            _log.LogError(ex, "Error during periodic quota retry for work item {Id}; continuing sweep", item.Id);
+            _log.LogError(ex, "Error during {SweepName} quota retry for work item {Id}; continuing sweep", sweepName, item.Id);
         }
     }
 
@@ -621,25 +626,14 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
     private async Task RunAgentRecoverySweepAsync(AgentKind agent, CancellationToken ct)
     {
         _log.LogDebug("Starting quota recovery wake-up sweep for agent {Agent}", agent.Value);
-        var batchSize = ResolveWaitingForQuotaResetSweepBatchSize();
-        WaitingForQuotaResetPriorityCursor? after = null;
-
-        while (true)
-        {
-            var count = 0;
-            WaitingForQuotaResetPriorityCursor? lastCursor = null;
-            await foreach (var item in _store.ListWaitingForQuotaResetByAgentPriorityAsync(agent, batchSize, after, ct))
+        var projectsById = new Dictionary<ProjectId, Project?>();
+        await SweepWaitingForQuotaResetByPriorityAsync(
+            async (item, token) =>
             {
-                count++;
-                lastCursor = WaitingForQuotaResetPriorityCursor.From(item);
-                await TryPeriodicRetryAsync(item, ct);
-            }
-
-            if (count < batchSize || lastCursor is null)
-                break;
-
-            after = lastCursor.Value;
-        }
+                if (await IsAssignedToRecoveredAgentAsync(item, agent, projectsById, token))
+                    await TryQuotaRecoveryRetryAsync(item, token);
+            },
+            ct);
     }
 
     private void OnTargetedTimerFired(object? state)
@@ -956,10 +950,71 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             retry.ActualFrom == retryFrom ? $"from={retryFrom}" : $"from={retryFrom}; actualFrom={retry.ActualFrom}");
     }
 
-    private IAsyncEnumerable<WorkItem> ListWaitingForQuotaResetByPriorityAsync(CancellationToken ct) =>
-        _store.ListWaitingForQuotaResetByPriorityAsync(
-            ResolveWaitingForQuotaResetSweepBatchSize(),
-            ct);
+    private async Task SweepWaitingForQuotaResetByPriorityAsync(
+        Func<WorkItem, CancellationToken, Task> visitAsync,
+        CancellationToken ct)
+    {
+        var batchSize = ResolveWaitingForQuotaResetSweepBatchSize();
+        WaitingForQuotaResetPriorityCursor? after = null;
+
+        while (true)
+        {
+            var count = 0;
+            WaitingForQuotaResetPriorityCursor? lastCursor = null;
+            await foreach (var item in _store.ListWaitingForQuotaResetByPriorityAsync(
+                               batchSize,
+                               after,
+                               ct))
+            {
+                count++;
+                lastCursor = WaitingForQuotaResetPriorityCursor.From(item);
+                await visitAsync(item, ct);
+            }
+
+            if (count < batchSize || lastCursor is null)
+                break;
+
+            after = lastCursor.Value;
+        }
+    }
+
+    private async Task<bool> IsAssignedToRecoveredAgentAsync(
+        WorkItem item,
+        AgentKind recoveredAgent,
+        Dictionary<ProjectId, Project?> projectsById,
+        CancellationToken ct)
+    {
+        var project = await GetProjectForRecoveredAgentFilterAsync(item.ProjectId, projectsById, ct);
+        if (DirectAgentMembership.IsDirectRoute(item, project))
+            return DirectAgentMembership.TryCreate(item, project)?.Agent == recoveredAgent;
+
+        if (item.Agent == recoveredAgent)
+            return true;
+
+        if (_router is not IQuotaRetryAdmissionRouter admissionRouter)
+            return false;
+
+        var requiredCapability = QuotaRetryPhasePolicy.RequiredCapabilityForQuotaRetryCandidate(item);
+        return admissionRouter
+            .GetQuotaRetryAdmissionPool(item, project, requiredCapability)
+            .Any(pool => pool.Agent == recoveredAgent);
+    }
+
+    private async Task<Project?> GetProjectForRecoveredAgentFilterAsync(
+        ProjectId projectId,
+        Dictionary<ProjectId, Project?> projectsById,
+        CancellationToken ct)
+    {
+        if (projectsById.TryGetValue(projectId, out var cached))
+            return cached;
+
+        Project? project = null;
+        if (_projects is not null)
+            project = await _projects.GetAsync(projectId, ct);
+
+        projectsById[projectId] = project;
+        return project;
+    }
 
     private int ResolveWaitingForQuotaResetSweepBatchSize()
     {

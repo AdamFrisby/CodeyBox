@@ -1145,6 +1145,171 @@ public sealed class QuotaAutoRetryTests : IDisposable
         Assert.Contains(webhooks.Events, e => e.Event == "work_item.auto_retry");
     }
 
+    [Fact]
+    public async Task PeriodicSweep_PagesPastStillExhaustedPriorityPrefix()
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var projectId = new ProjectId("periodic-backstop-project");
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = projectId,
+            DisplayName = "Periodic backstop",
+            RepositoryUrl = "http://fake",
+            DefaultAgent = AgentKind.Claude,
+        });
+        var router = new AgentClassRouter(
+            [],
+            [
+                new StaticProbe(AgentKind.Claude, new AgentQuotaSnapshot { AvailablePct = 0 }),
+                new StaticProbe(AgentKind.Codex, new AgentQuotaSnapshot { AvailablePct = 80 }),
+            ],
+            new QuotaRouterOptions { MinQuotaPct = 10 },
+            NullLogger<AgentClassRouter>.Instance,
+            _time);
+        var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = TimeSpan.FromHours(1),
+                    MaxAutoRetriesPerWorkItem = 3,
+                    MaxWaitingForQuotaResetSweepBatchSize = 2,
+                },
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            projects,
+            timeProvider: _time);
+
+        var firstExhausted = NewWaitingQuotaItem(projectId, "exhausted high 1", AgentKind.Claude, priority: 100, createdAt: _time.Now.AddMinutes(-3));
+        var secondExhausted = NewWaitingQuotaItem(projectId, "exhausted high 2", AgentKind.Claude, priority: 90, createdAt: _time.Now.AddMinutes(-2));
+        var recoveredLower = NewWaitingQuotaItem(projectId, "recovered low", AgentKind.Codex, priority: 1, createdAt: _time.Now.AddMinutes(-1));
+        await store.CreateAsync(firstExhausted);
+        await store.CreateAsync(secondExhausted);
+        await store.CreateAsync(recoveredLower);
+
+        var sweepMethod = typeof(QuotaRetryScheduler).GetMethod(
+            "RunPeriodicSweepAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        await (Task)sweepMethod!.Invoke(scheduler, [CancellationToken.None])!;
+
+        var first = await store.GetAsync(firstExhausted.Id);
+        var second = await store.GetAsync(secondExhausted.Id);
+        var retried = await store.GetAsync(recoveredLower.Id);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, first!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, second!.State);
+        Assert.Equal(0, first.QuotaRetryAttempts);
+        Assert.Equal(0, second.QuotaRetryAttempts);
+        Assert.Equal(WorkItemState.Queued, retried!.State);
+        Assert.Equal(1, retried.QuotaRetryAttempts);
+    }
+
+    [Fact]
+    public async Task Scheduler_QuotaUsableSignal_RequeuesDirectDefaultAgentPastPriorityPrefix()
+    {
+        var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
+        using var store = new SqliteWorkItemStore(stateDb);
+        var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
+        var taskQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(store, taskQueue, gitHost, NullLogger<WorkItemRetrier>.Instance);
+        var projectId = new ProjectId("default-agent-recovery-project");
+        var projects = new InMemoryProjectRepository(new Project
+        {
+            Id = projectId,
+            DisplayName = "Default agent recovery",
+            RepositoryUrl = "http://fake",
+            DefaultAgent = AgentKind.Codex,
+        });
+        var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
+            NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
+        var codexMember = new AgentMembership
+        {
+            Agent = AgentKind.Codex,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+        var router = new AgentClassRouter(
+            [],
+            [
+                new StaticProbe(AgentKind.Claude, new AgentQuotaSnapshot { AvailablePct = 0 }),
+                new StaticProbe(AgentKind.Codex, new AgentQuotaSnapshot { AvailablePct = 80 }),
+            ],
+            new QuotaRouterOptions { MinQuotaPct = 10 },
+            NullLogger<AgentClassRouter>.Instance,
+            _time,
+            quotaAvailabilityPublisher: quotaSignal);
+        using var scheduler = new QuotaRetryScheduler(
+            store,
+            retrier,
+            new OrchestratorOptions
+            {
+                AutoRetryOnQuotaFailure = new AutoRetryOnQuotaFailureOptions
+                {
+                    Enabled = true,
+                    PeriodicCheckInterval = TimeSpan.FromHours(6),
+                    MaxAutoRetriesPerWorkItem = 3,
+                    MaxWaitingForQuotaResetSweepBatchSize = 2,
+                },
+            },
+            NullLogger<QuotaRetryScheduler>.Instance,
+            router,
+            projects,
+            null,
+            null,
+            _time,
+            quotaAvailabilitySignal: quotaSignal);
+
+        var firstOtherAgent = NewWaitingQuotaItem(projectId, "other high 1", AgentKind.Claude, priority: 100, createdAt: _time.Now.AddMinutes(-3));
+        var secondOtherAgent = NewWaitingQuotaItem(projectId, "other high 2", AgentKind.Claude, priority: 90, createdAt: _time.Now.AddMinutes(-2));
+        var defaultAgentItem = NewWaitingQuotaItem(projectId, "default codex low", agent: null, priority: 1, createdAt: _time.Now.AddMinutes(-1));
+        await store.CreateAsync(firstOtherAgent);
+        await store.CreateAsync(secondOtherAgent);
+        await store.CreateAsync(defaultAgentItem);
+
+        quotaSignal.RecordQuotaUsability(codexMember, isUsable: false, resetAt: _time.Now.AddDays(7));
+        quotaSignal.RecordQuotaUsability(codexMember, isUsable: true);
+
+        var retried = await WaitForAttemptsAsync(store, defaultAgentItem.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));
+        Assert.Equal(WorkItemState.Queued, retried.State);
+
+        var first = await store.GetAsync(firstOtherAgent.Id);
+        var second = await store.GetAsync(secondOtherAgent.Id);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, first!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, second!.State);
+        Assert.Equal(0, first.QuotaRetryAttempts);
+        Assert.Equal(0, second.QuotaRetryAttempts);
+    }
+
+    private WorkItem NewWaitingQuotaItem(
+        ProjectId projectId,
+        string title,
+        AgentKind? agent,
+        int priority,
+        DateTimeOffset createdAt) =>
+        new()
+        {
+            Id = WorkItemId.New(),
+            ProjectId = projectId,
+            Title = title,
+            Prompt = "do thing",
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            QuotaRetryAttempts = 0,
+            Agent = agent,
+            Priority = priority,
+            CreatedAt = createdAt,
+            NextQuotaRetryAt = _time.Now.AddDays(7),
+        };
+
     private sealed class StaticProbe : IAgentQuotaProbe
     {
         private readonly AgentQuotaSnapshot _snapshot;

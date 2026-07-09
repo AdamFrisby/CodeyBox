@@ -289,27 +289,14 @@ public interface IWorkItemStore
     /// sweep order: highest priority first, then oldest created time. Persistent
     /// stores should apply the limit inside the storage query so recovery paths
     /// cannot buffer an unbounded parked backlog before retrying anything.
+    /// <paramref name="after"/> is an exclusive seek cursor from the prior page.
     /// </summary>
     IAsyncEnumerable<WorkItem> ListWaitingForQuotaResetByPriorityAsync(
-        int limit,
-        CancellationToken ct = default) =>
-        throw new NotSupportedException(
-            "This work item store must implement bounded WaitingForQuotaReset priority queries before quota recovery sweeps can run.");
-
-    /// <summary>
-    /// Returns at most <paramref name="limit"/> quota-parked rows assigned to
-    /// <paramref name="agent"/> in retry sweep order. <paramref name="after"/>
-    /// is an exclusive seek cursor from the prior page, allowing callers to
-    /// drain a recovered agent's parked backlog without repeatedly reading the
-    /// same high-priority rows that remain parked.
-    /// </summary>
-    IAsyncEnumerable<WorkItem> ListWaitingForQuotaResetByAgentPriorityAsync(
-        AgentKind agent,
         int limit,
         WaitingForQuotaResetPriorityCursor? after = null,
         CancellationToken ct = default) =>
         throw new NotSupportedException(
-            "This work item store must implement bounded agent-scoped WaitingForQuotaReset priority queries before quota recovery sweeps can run.");
+            "This work item store must implement bounded WaitingForQuotaReset priority queries before quota recovery sweeps can run.");
 
     /// <summary>
     /// Returns the number of work items currently persisted in

@@ -1309,43 +1309,6 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
 
     public async IAsyncEnumerable<WorkItem> ListWaitingForQuotaResetByPriorityAsync(
         int limit,
-        [EnumeratorCancellation] CancellationToken ct = default)
-    {
-        if (limit <= 0)
-            yield break;
-
-        var rows = new List<WorkItem>();
-        IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
-        await _writeLock.WaitAsync(ct);
-        try
-        {
-            using (var cmd = _conn.CreateCommand())
-            {
-                cmd.CommandText = $"""
-                    SELECT * FROM work_items
-                    WHERE state = {(int)WorkItemState.WaitingForQuotaReset}
-                    ORDER BY priority DESC, created_at ASC, id ASC
-                    LIMIT $limit;
-                    """;
-                cmd.Parameters.AddWithValue("$limit", limit);
-                using var reader = await cmd.ExecuteReaderAsync(ct);
-                while (await reader.ReadAsync(ct))
-                    rows.Add(Read(reader));
-            }
-            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
-        }
-        finally
-        {
-            _writeLock.Release();
-        }
-
-        foreach (var item in rows)
-            yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
-    }
-
-    public async IAsyncEnumerable<WorkItem> ListWaitingForQuotaResetByAgentPriorityAsync(
-        AgentKind agent,
-        int limit,
         WaitingForQuotaResetPriorityCursor? after = null,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
@@ -1362,7 +1325,6 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 cmd.CommandText = $"""
                     SELECT * FROM work_items
                     WHERE state = {(int)WorkItemState.WaitingForQuotaReset}
-                      AND agent = $agent
                       AND (
                           $after_priority IS NULL
                           OR priority < $after_priority
@@ -1372,7 +1334,6 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     ORDER BY priority DESC, created_at ASC, id ASC
                     LIMIT $limit;
                     """;
-                cmd.Parameters.AddWithValue("$agent", agent.Value);
                 cmd.Parameters.AddWithValue("$limit", limit);
                 if (after is { } cursor)
                 {

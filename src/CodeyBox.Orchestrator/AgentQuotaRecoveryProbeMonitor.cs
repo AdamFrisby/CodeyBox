@@ -279,7 +279,7 @@ public sealed class AgentQuotaRecoveryProbeMonitor : BackgroundService
         var projects = new Dictionary<ProjectId, Project?>();
         var scanLimit = ResolveEligibilityScanLimit();
         var scanned = 0;
-        await foreach (var item in _store.ListWaitingForQuotaResetByPriorityAsync(scanLimit, ct))
+        await foreach (var item in _store.ListWaitingForQuotaResetByPriorityAsync(scanLimit, ct: ct))
         {
             scanned++;
             var project = await GetProjectForEligibilityAsync(item.ProjectId, projects, ct).ConfigureAwait(false);

@@ -225,7 +225,7 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     }
 
     [Fact]
-    public async Task ListWaitingForQuotaResetByAgentPriorityAsync_PagesOnlyMatchingAgentInPriorityOrder()
+    public async Task ListWaitingForQuotaResetByPriorityAsync_PagesInPriorityOrder()
     {
         var now = DateTimeOffset.UtcNow;
         var highCodex = Sample() with
@@ -262,23 +262,20 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         await _store.CreateAsync(highCodex);
 
         var firstPage = new List<WorkItem>();
-        await foreach (var item in _store.ListWaitingForQuotaResetByAgentPriorityAsync(
-            AgentKind.Codex,
-            limit: 1))
+        await foreach (var item in _store.ListWaitingForQuotaResetByPriorityAsync(limit: 2))
         {
             firstPage.Add(item);
         }
 
         var secondPage = new List<WorkItem>();
-        await foreach (var item in _store.ListWaitingForQuotaResetByAgentPriorityAsync(
-            AgentKind.Codex,
+        await foreach (var item in _store.ListWaitingForQuotaResetByPriorityAsync(
             limit: 1,
-            after: WaitingForQuotaResetPriorityCursor.From(firstPage.Single())))
+            after: WaitingForQuotaResetPriorityCursor.From(firstPage.Last())))
         {
             secondPage.Add(item);
         }
 
-        Assert.Equal([highCodex.Id], firstPage.Select(item => item.Id));
+        Assert.Equal([skippedClaude.Id, highCodex.Id], firstPage.Select(item => item.Id));
         Assert.Equal([lowCodex.Id], secondPage.Select(item => item.Id));
     }
 
