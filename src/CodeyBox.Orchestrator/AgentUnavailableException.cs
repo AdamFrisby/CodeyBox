@@ -3,16 +3,15 @@ using CodeyBox.Core;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// Raised when an internal sub-phase (currently: the pickup-time rebase
-/// conflict resolver) needs a text-only agent invocation but no registered
-/// runner has a viable credential for it. Distinct from
-/// <see cref="MergeConflictResolutionFailedException"/>: the resolver never
-/// got to run, so the work item is parked at the failure with
-/// <c>failureKind=agent_unavailable</c> for a single rejected runner or
-/// <c>failureKind=agent_routing_unavailable</c> for aggregate no-candidate
-/// misses rather than
-/// <see cref="WorkItemState.MergeConflictResolutionFailed"/> — the latter
-/// implies the resolver ran but couldn't reconcile the conflict.
+/// Raised when a work item cannot be dispatched to an agent because
+/// pre-dispatch availability, credential, smoke-gate, or routing checks
+/// rejected the available candidates. The pickup-time rebase resolver is one
+/// caller, but normal work/audit/merge phase dispatch can raise the same
+/// exception before any agent reasoning loop starts.
+///
+/// <para>A single rejected runner is recorded as
+/// <c>failureKind=agent_unavailable</c>; aggregate no-candidate routing misses
+/// are recorded as <c>failureKind=agent_routing_unavailable</c>.</para>
 /// </summary>
 public sealed class AgentUnavailableException : Exception
 {
@@ -27,7 +26,7 @@ public sealed class AgentUnavailableException : Exception
     /// Comma-separated short reasons explaining which candidates were
     /// considered and why each was rejected (e.g.
     /// <c>"gemini: GEMINI_API_KEY is required; claude: CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY is required"</c>).
-    /// Surfaced verbatim in <c>WorkItem.LastError</c>.
+    /// Diagnostic context for callers to embed in the exception message or logs.
     /// </summary>
     public string CandidateReasons { get; }
 

@@ -3057,12 +3057,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
         catch (AgentUnavailableException ex)
         {
-            // Distinct from MergeConflictResolutionFailed: the resolver never
-            // ran because no candidate passed the pre-dispatch resolver gates
-            // (for example quota/budget exhaustion or missing routing support).
-            // Failure is structured so operators can distinguish a concrete
-            // unavailable agent from an aggregate routing/capacity miss rather
-            // than chasing a phantom merge bug.
+            // Pre-dispatch availability/routing failed before an agent reasoning
+            // loop could start. Structure the failure so operators can distinguish
+            // a concrete unavailable runner from aggregate routing/capacity misses.
             _log.LogWarning("Work item {Id} agent unavailable: {Error}", item.Id, ex.Message);
             var failureKind = ex.Agent is null
                 ? WorkItemFailureKinds.AgentRoutingUnavailable

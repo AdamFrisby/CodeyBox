@@ -174,33 +174,22 @@ public static class OrchestratorOptionsFactory
         if (!enabled)
             return new AgentRestoreRetryOptions { Enabled = false };
 
-        if (!TimeSpan.TryParse(lookbackGrace, out TimeSpan lookback))
-            throw new InvalidOperationException(
-                "CodeyBox:AutoRequeueOnAgentRestore:LookbackGrace must be a valid TimeSpan (e.g. '00:30:00')");
-        if (lookback < TimeSpan.Zero)
-            throw new InvalidOperationException(
-                "CodeyBox:AutoRequeueOnAgentRestore:LookbackGrace must be non-negative");
-
-        if (!TimeSpan.TryParse(postRestoreMargin, out TimeSpan margin))
-            throw new InvalidOperationException(
-                "CodeyBox:AutoRequeueOnAgentRestore:PostRestoreMargin must be a valid TimeSpan (e.g. '00:05:00')");
-        if (margin < TimeSpan.Zero)
-            throw new InvalidOperationException(
-                "CodeyBox:AutoRequeueOnAgentRestore:PostRestoreMargin must be non-negative");
-
-        if (!TimeSpan.TryParse(involvementTerminalLookback, out TimeSpan terminalLookback))
-            throw new InvalidOperationException(
-                "CodeyBox:AutoRequeueOnAgentRestore:InvolvementTerminalLookback must be a valid TimeSpan (e.g. '00:15:00')");
-        if (terminalLookback < TimeSpan.Zero)
-            throw new InvalidOperationException(
-                "CodeyBox:AutoRequeueOnAgentRestore:InvolvementTerminalLookback must be non-negative");
-
-        if (!TimeSpan.TryParse(involvementTerminalClockSkew, out TimeSpan terminalClockSkew))
-            throw new InvalidOperationException(
-                "CodeyBox:AutoRequeueOnAgentRestore:InvolvementTerminalClockSkew must be a valid TimeSpan (e.g. '00:01:00')");
-        if (terminalClockSkew < TimeSpan.Zero)
-            throw new InvalidOperationException(
-                "CodeyBox:AutoRequeueOnAgentRestore:InvolvementTerminalClockSkew must be non-negative");
+        var lookback = ParseNonNegativeTimeSpan(
+            "CodeyBox:AutoRequeueOnAgentRestore:LookbackGrace",
+            lookbackGrace,
+            "00:30:00");
+        var margin = ParseNonNegativeTimeSpan(
+            "CodeyBox:AutoRequeueOnAgentRestore:PostRestoreMargin",
+            postRestoreMargin,
+            "00:05:00");
+        var terminalLookback = ParseNonNegativeTimeSpan(
+            "CodeyBox:AutoRequeueOnAgentRestore:InvolvementTerminalLookback",
+            involvementTerminalLookback,
+            "00:15:00");
+        var terminalClockSkew = ParseNonNegativeTimeSpan(
+            "CodeyBox:AutoRequeueOnAgentRestore:InvolvementTerminalClockSkew",
+            involvementTerminalClockSkew,
+            "00:01:00");
 
         if (maxCandidatesPerSweep <= 0)
             throw new InvalidOperationException(
@@ -220,6 +209,20 @@ public static class OrchestratorOptionsFactory
             MaxCandidatesPerSweep = maxCandidatesPerSweep,
             EventQueueCapacity = eventQueueCapacity,
         };
+    }
+
+    private static TimeSpan ParseNonNegativeTimeSpan(
+        string configPath,
+        string rawValue,
+        string exampleValue)
+    {
+        if (!TimeSpan.TryParse(rawValue, out TimeSpan value))
+            throw new InvalidOperationException(
+                $"{configPath} must be a valid TimeSpan (e.g. '{exampleValue}')");
+        if (value < TimeSpan.Zero)
+            throw new InvalidOperationException(
+                $"{configPath} must be non-negative");
+        return value;
     }
 
     public static AutoRetryOnQuotaFailureOptions BuildAutoRetryOptions(

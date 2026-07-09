@@ -50,6 +50,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             lockHeld = true;
             _conn.Open();
             RegisterQuotaRetryPhaseFunctions(_conn);
+            RegisterRestoreRetryEligibilityFunction(_conn);
 
             // WAL mode allows concurrent readers; SqliteDatabaseWriteGate serializes writers in-process.
             // busy_timeout is per-connection and gives external lock holders a retry window.
@@ -467,6 +468,56 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$table_name", tableName);
         return cmd.ExecuteScalar() is not null;
     }
+
+    private static void RegisterRestoreRetryEligibilityFunction(SqliteConnection conn)
+    {
+        conn.CreateFunction<long, string?, string?, string?, string, string?, int>(
+            "codeybox_restore_retry_is_eligible",
+            static (stateValue, failureKind, authScopeValue, itemAgentValue, restoredAgentValue, latestFailedAgentValue) =>
+                IsRestoreRetryEligibleForSqlite(
+                    stateValue,
+                    failureKind,
+                    authScopeValue,
+                    itemAgentValue,
+                    restoredAgentValue,
+                    latestFailedAgentValue),
+            isDeterministic: true);
+    }
+
+    private static int IsRestoreRetryEligibleForSqlite(
+        long stateValue,
+        string? failureKind,
+        string? authScopeValue,
+        string? itemAgentValue,
+        string restoredAgentValue,
+        string? latestFailedAgentValue)
+    {
+        if (stateValue < int.MinValue || stateValue > int.MaxValue)
+            return 0;
+
+        var authScope = TryParseAuthFailureScope(authScopeValue);
+        var itemAgent = string.IsNullOrEmpty(itemAgentValue)
+            ? (AgentKind?)null
+            : new AgentKind(itemAgentValue);
+        var latestFailedAgent = string.IsNullOrEmpty(latestFailedAgentValue)
+            ? (AgentKind?)null
+            : new AgentKind(latestFailedAgentValue);
+
+        return AgentRestoreRetryCandidatePolicy.IsEligible(
+            (WorkItemState)stateValue,
+            failureKind,
+            authScope,
+            itemAgent,
+            new AgentKind(restoredAgentValue),
+            latestFailedAgent)
+            ? 1
+            : 0;
+    }
+
+    private static WorkItemAuthFailureScope? TryParseAuthFailureScope(string? value) =>
+        Enum.TryParse<WorkItemAuthFailureScope>(value, ignoreCase: true, out var scope)
+            ? scope
+            : null;
 
     private static void AddFailedInvolvementOutcomeParameters(SqliteCommand cmd)
     {
@@ -1424,6 +1475,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         AgentKind restoredAgent,
         DateTimeOffset windowStart,
         DateTimeOffset windowEnd,
+        TimeSpan involvementTerminalLookback,
+        TimeSpan involvementTerminalClockSkew,
         int limit,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
@@ -1440,88 +1493,61 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 var involvementTableExists = TableExists("agent_involvement");
                 cmd.CommandText = involvementTableExists
                     ? """
-                        SELECT *
-                        FROM work_items
-                        WHERE state IN ($failed, $merge_conflict_failed)
-                          AND updated_at >= $window_start
-                          AND updated_at <= $window_end
-                          AND (
-                              (
+                        WITH terminal_items AS (
+                            SELECT *
+                            FROM work_items
+                            WHERE state IN ($failed, $merge_conflict_failed)
+                              AND updated_at >= $window_start
+                              AND updated_at <= $window_end
+                              AND (
                                   failure_kind COLLATE NOCASE = $infrastructure
-                                  AND (
-                                      agent COLLATE NOCASE = $restored_agent
-                                      OR EXISTS (
-                                          SELECT 1
-                                          FROM agent_involvement ai
-                                          WHERE ai.work_item_id = work_items.id
-                                            AND ai.agent_kind COLLATE NOCASE = $restored_agent
-                                            AND COALESCE(ai.ended_at, ai.started_at) >= $window_start
-                                            AND COALESCE(ai.ended_at, ai.started_at) <= $window_end
-                                            AND ai.outcome IN (
-                                                $failure_quota,
-                                                $failure_timeout,
-                                                $failure_transient,
-                                                $failure_infrastructure,
-                                                $failure_auth,
-                                                $failure_agent,
-                                                $failure_cancelled,
-                                                $failure_semantic_incompatible
-                                            )
-                                      )
-                                  )
+                                  OR failure_kind COLLATE NOCASE = $agent_unavailable
+                                  OR failure_kind COLLATE NOCASE = $auth_required
                               )
-                              OR (
-                                  failure_kind COLLATE NOCASE = $agent_unavailable
-                                  AND agent COLLATE NOCASE = $restored_agent
-                              )
-                              OR (
-                                  failure_kind COLLATE NOCASE = $auth_required
-                                  AND auth_failure_scope COLLATE NOCASE = $fleet_auth_scope
-                                  AND (
-                                      agent COLLATE NOCASE = $restored_agent
-                                      OR EXISTS (
-                                          SELECT 1
-                                          FROM agent_involvement ai
-                                          WHERE ai.work_item_id = work_items.id
-                                            AND ai.agent_kind COLLATE NOCASE = $restored_agent
-                                            AND COALESCE(ai.ended_at, ai.started_at) >= $window_start
-                                            AND COALESCE(ai.ended_at, ai.started_at) <= $window_end
-                                            AND ai.outcome IN (
-                                                $failure_quota,
-                                                $failure_timeout,
-                                                $failure_transient,
-                                                $failure_infrastructure,
-                                                $failure_auth,
-                                                $failure_agent,
-                                                $failure_cancelled,
-                                                $failure_semantic_incompatible
-                                            )
-                                      )
-                                  )
-                              )
-                          )
+                        ),
+                        ranked_failed_involvement AS (
+                            SELECT
+                                ai.work_item_id,
+                                ai.agent_kind,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY ai.work_item_id
+                                    ORDER BY COALESCE(ai.ended_at, ai.started_at) DESC, ai.started_at DESC, ai.id DESC
+                                ) AS rank
+                            FROM agent_involvement ai
+                            JOIN terminal_items wi ON wi.id = ai.work_item_id
+                            WHERE ai.outcome IN (
+                                $failure_quota,
+                                $failure_timeout,
+                                $failure_transient,
+                                $failure_infrastructure,
+                                $failure_auth,
+                                $failure_agent,
+                                $failure_cancelled,
+                                $failure_semantic_incompatible
+                            )
+                              AND julianday(COALESCE(ai.ended_at, ai.started_at)) >= julianday(wi.updated_at) - $terminal_lookback_days
+                              AND julianday(COALESCE(ai.ended_at, ai.started_at)) <= julianday(wi.updated_at) + $terminal_clock_skew_days
+                        ),
+                        latest_failed_involvement AS (
+                            SELECT work_item_id, agent_kind
+                            FROM ranked_failed_involvement
+                            WHERE rank = 1
+                        )
+                        SELECT terminal_items.*
+                        FROM terminal_items
+                        LEFT JOIN latest_failed_involvement lfi ON lfi.work_item_id = terminal_items.id
+                        WHERE codeybox_restore_retry_is_eligible(
+                            terminal_items.state,
+                            terminal_items.failure_kind,
+                            terminal_items.auth_failure_scope,
+                            terminal_items.agent,
+                            $restored_agent,
+                            lfi.agent_kind
+                        ) = 1
                         ORDER BY CASE
-                            WHEN agent COLLATE NOCASE = $restored_agent THEN 0
-                            WHEN EXISTS (
-                                SELECT 1
-                                FROM agent_involvement ai
-                                WHERE ai.work_item_id = work_items.id
-                                  AND ai.agent_kind COLLATE NOCASE = $restored_agent
-                                  AND COALESCE(ai.ended_at, ai.started_at) >= $window_start
-                                  AND COALESCE(ai.ended_at, ai.started_at) <= $window_end
-                                  AND ai.outcome IN (
-                                      $failure_quota,
-                                      $failure_timeout,
-                                      $failure_transient,
-                                      $failure_infrastructure,
-                                      $failure_auth,
-                                      $failure_agent,
-                                      $failure_cancelled,
-                                      $failure_semantic_incompatible
-                                  )
-                            ) THEN 1
-                            ELSE 2
-                        END, updated_at ASC, created_at ASC
+                            WHEN lfi.agent_kind COLLATE NOCASE = $restored_agent THEN 0
+                            ELSE 1
+                        END, terminal_items.updated_at ASC, terminal_items.created_at ASC
                         LIMIT $limit;
                         """
                     : """
@@ -1531,20 +1557,18 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                           AND updated_at >= $window_start
                           AND updated_at <= $window_end
                           AND (
-                              (
-                                  failure_kind COLLATE NOCASE = $infrastructure
-                                  AND agent COLLATE NOCASE = $restored_agent
-                              )
-                              OR (
-                                  failure_kind COLLATE NOCASE = $agent_unavailable
-                                  AND agent COLLATE NOCASE = $restored_agent
-                              )
-                              OR (
-                                  failure_kind COLLATE NOCASE = $auth_required
-                                  AND auth_failure_scope COLLATE NOCASE = $fleet_auth_scope
-                                  AND agent COLLATE NOCASE = $restored_agent
-                              )
+                              failure_kind COLLATE NOCASE = $infrastructure
+                              OR failure_kind COLLATE NOCASE = $agent_unavailable
+                              OR failure_kind COLLATE NOCASE = $auth_required
                           )
+                          AND codeybox_restore_retry_is_eligible(
+                              state,
+                              failure_kind,
+                              auth_failure_scope,
+                              agent,
+                              $restored_agent,
+                              NULL
+                          ) = 1
                         ORDER BY updated_at ASC, created_at ASC
                         LIMIT $limit;
                         """;
@@ -1556,10 +1580,13 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 cmd.Parameters.AddWithValue("$agent_unavailable", WorkItemFailureKinds.AgentUnavailable);
                 cmd.Parameters.AddWithValue("$auth_required", WorkItemFailureKinds.AuthRequired);
                 cmd.Parameters.AddWithValue("$restored_agent", restoredAgent.Value);
-                cmd.Parameters.AddWithValue("$fleet_auth_scope", WorkItemAuthFailureScope.Fleet.ToString());
                 cmd.Parameters.AddWithValue("$limit", limit);
                 if (involvementTableExists)
+                {
+                    cmd.Parameters.AddWithValue("$terminal_lookback_days", involvementTerminalLookback.TotalDays);
+                    cmd.Parameters.AddWithValue("$terminal_clock_skew_days", involvementTerminalClockSkew.TotalDays);
                     AddFailedInvolvementOutcomeParameters(cmd);
+                }
                 using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
                 while (await reader.ReadAsync(ct).ConfigureAwait(false))
                     rows.Add(Read(reader));

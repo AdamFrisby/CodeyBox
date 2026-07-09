@@ -302,16 +302,18 @@ public interface IWorkItemStore
 
     /// <summary>
     /// Returns at most <paramref name="limit"/> terminal rows eligible for the
-    /// agent-restore retry sweep's heavier attribution checks. Implementations
-    /// should push the state, window, failure-kind, ordering, and limit into the
-    /// backing store so a restore event cannot buffer all historical failures.
-    /// The cheap restored-agent filter must also happen before the limit so
-    /// unrelated agents' failures cannot consume the sweep cap.
+    /// agent-restore retry sweep. Implementations should push the state,
+    /// outage window, <see cref="AgentRestoreRetryCandidatePolicy"/>, ordering,
+    /// and limit into the backing store so a restore event cannot buffer all
+    /// historical failures or consume the sweep cap with unrelated agents'
+    /// failures.
     /// </summary>
     async IAsyncEnumerable<WorkItem> ListRestoreRetryCandidatesAsync(
         AgentKind restoredAgent,
         DateTimeOffset windowStart,
         DateTimeOffset windowEnd,
+        TimeSpan involvementTerminalLookback,
+        TimeSpan involvementTerminalClockSkew,
         int limit,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
@@ -327,9 +329,7 @@ public interface IWorkItemStore
                     yield break;
                 if (item.UpdatedAt < windowStart || item.UpdatedAt > windowEnd)
                     continue;
-                if (!WorkItemFailureKinds.IsInfraShaped(item.FailureKind))
-                    continue;
-                if (!MayBelongToRestoredAgent(item, restoredAgent))
+                if (!AgentRestoreRetryCandidatePolicy.IsEligible(item, restoredAgent, latestFailedInvolvementAgent: null))
                     continue;
 
                 yielded++;
@@ -351,17 +351,6 @@ public interface IWorkItemStore
         CancellationToken ct = default)
         => throw new NotSupportedException(
             "This work item store does not implement agent-restore retry claims.");
-
-    private static bool MayBelongToRestoredAgent(WorkItem item, AgentKind restoredAgent)
-    {
-        if (string.Equals(item.FailureKind, WorkItemFailureKinds.AuthRequired, StringComparison.OrdinalIgnoreCase))
-            return item.AuthFailureScope == WorkItemAuthFailureScope.Fleet;
-
-        if (string.Equals(item.FailureKind, WorkItemFailureKinds.Infrastructure, StringComparison.OrdinalIgnoreCase))
-            return item.Agent is null || item.Agent == restoredAgent;
-
-        return item.Agent == restoredAgent;
-    }
 
     /// <summary>
     /// Returns the number of work items currently persisted in

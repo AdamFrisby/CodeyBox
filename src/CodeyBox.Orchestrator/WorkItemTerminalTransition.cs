@@ -29,6 +29,11 @@ public sealed record WorkItemTerminalFailureTransitionCommand
     /// a different agent.
     /// </summary>
     public AgentKind? Agent { get; init; }
+
+    /// <summary>
+    /// Clears <see cref="WorkItem.Agent"/> and <see cref="WorkItem.AgentInstanceId"/>.
+    /// Takes precedence over <see cref="Agent"/> when both are set.
+    /// </summary>
     public bool ClearAgent { get; init; }
     public DateTimeOffset? QuotaResetAt { get; init; }
     public string? CancellationSource { get; init; }

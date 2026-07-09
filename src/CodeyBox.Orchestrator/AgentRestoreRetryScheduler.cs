@@ -80,7 +80,12 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
         _webhooks = webhooks;
         _projects = projects;
         _involvement = involvement;
-        var queueCapacity = Math.Max(1, _optionsAccessor().EventQueueCapacity);
+        var queueCapacity = _optionsAccessor().EventQueueCapacity;
+        if (queueCapacity <= 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(AgentRestoreRetryOptions.EventQueueCapacity),
+                queueCapacity,
+                "Agent restore retry event queue capacity must be positive.");
         _events = Channel.CreateBounded<AgentRestoredEvent>(
             new BoundedChannelOptions(queueCapacity)
             {
@@ -203,6 +208,8 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
             evt.Agent,
             windowStart,
             windowEnd,
+            opts.InvolvementTerminalLookback,
+            opts.InvolvementTerminalClockSkew,
             opts.MaxCandidatesPerSweep,
             ct).ConfigureAwait(false))
         {
@@ -273,17 +280,9 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
         AgentRestoreRetryOptions opts,
         CancellationToken ct)
     {
-        if (!IsRestoreSweepEligibleFailure(item))
-            return false;
-
-        if (await TryResolveLastFailedInvolvementAgentAsync(item.Id, item.UpdatedAt, opts, ct).ConfigureAwait(false) is { } failedAgent)
-            return failedAgent == restoredAgent;
-
-        if (item.Agent is not { } itemAgent || itemAgent != restoredAgent)
-            return false;
-
-        return string.Equals(item.FailureKind, WorkItemFailureKinds.AgentUnavailable, StringComparison.OrdinalIgnoreCase)
-            || string.Equals(item.FailureKind, WorkItemFailureKinds.AuthRequired, StringComparison.OrdinalIgnoreCase);
+        var failedAgent = await TryResolveLastFailedInvolvementAgentAsync(item.Id, item.UpdatedAt, opts, ct)
+            .ConfigureAwait(false);
+        return AgentRestoreRetryCandidatePolicy.IsEligible(item, restoredAgent, failedAgent);
     }
 
     private async Task<AgentKind?> TryResolveLastFailedInvolvementAgentAsync(
@@ -297,12 +296,12 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
         try
         {
             var rows = await _involvement.ListByWorkItemAsync(id, ct).ConfigureAwait(false);
-            return rows
-                .Where(row => AgentInvolvementOutcomes.IsFailure(row.Outcome)
-                    && IsNearTerminalUpdate(row.EndedAt ?? row.StartedAt, terminalUpdatedAt, opts))
-                .OrderByDescending(static row => row.EndedAt ?? row.StartedAt)
-                .FirstOrDefault()
-                ?.AgentKind;
+            return AgentRestoreRetryCandidatePolicy.LatestFailedInvolvementAgent(
+                rows,
+                terminalUpdatedAt,
+                opts.InvolvementTerminalLookback,
+                opts.InvolvementTerminalClockSkew,
+                AgentInvolvementOutcomes.IsFailure);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -315,24 +314,6 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
                 id);
             return null;
         }
-    }
-
-    private static bool IsNearTerminalUpdate(
-        DateTimeOffset involvementAt,
-        DateTimeOffset terminalUpdatedAt,
-        AgentRestoreRetryOptions opts) =>
-        involvementAt >= terminalUpdatedAt - opts.InvolvementTerminalLookback
-        && involvementAt <= terminalUpdatedAt + opts.InvolvementTerminalClockSkew;
-
-    private static bool IsRestoreSweepEligibleFailure(WorkItem item)
-    {
-        if (!WorkItemFailureKinds.IsInfraShaped(item.FailureKind))
-            return false;
-
-        if (!string.Equals(item.FailureKind, WorkItemFailureKinds.AuthRequired, StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        return item.AuthFailureScope == WorkItemAuthFailureScope.Fleet;
     }
 
     private async Task EmitSweepWebhookAsync(

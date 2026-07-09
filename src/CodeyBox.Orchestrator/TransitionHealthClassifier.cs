@@ -222,8 +222,8 @@ public static class TransitionHealthClassifier
             "quota" => Infra("quota"),
             "timeout" => Infra("timeout"),
             "agent" => Infra("agent"),
-            "agent_unavailable" => Infra("agent_unavailable"),
-            "agent_routing_unavailable" => Infra("agent_routing_unavailable"),
+            WorkItemFailureKinds.AgentUnavailable => Infra(WorkItemFailureKinds.AgentUnavailable),
+            WorkItemFailureKinds.AgentRoutingUnavailable => Infra(WorkItemFailureKinds.AgentRoutingUnavailable),
             "infrastructure" => Infra("infrastructure"),
             "configuration" => Infra("configuration"),
             // "build", "cancelled", and "other" are intentionally not scored:

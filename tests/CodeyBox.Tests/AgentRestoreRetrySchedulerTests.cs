@@ -40,7 +40,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     {
         using var store = new SqliteWorkItemStore(_dbPath);
         var queue = new InMemoryTaskQueue();
-        var involvement = new InMemoryAgentInvolvementStore();
+        using var involvement = new SqliteAgentInvolvementStore(_dbPath);
         var scheduler = NewScheduler(store, queue, enabled: true, involvement: involvement);
 
         var outageStart = DateTimeOffset.UtcNow.AddMinutes(-15);
@@ -70,7 +70,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     {
         using var store = new SqliteWorkItemStore(_dbPath);
         var queue = new InMemoryTaskQueue();
-        var involvement = new InMemoryAgentInvolvementStore();
+        using var involvement = new SqliteAgentInvolvementStore(_dbPath);
         var scheduler = NewScheduler(store, queue, enabled: true, involvement: involvement);
 
         var outageStart = DateTimeOffset.UtcNow.AddMinutes(-30);
@@ -297,6 +297,47 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     }
 
     [Fact]
+    public async Task Sweep_CandidateCapAppliesAfterLatestInvolvementAttribution()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        using var involvement = new SqliteAgentInvolvementStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var scheduler = NewScheduler(
+            store,
+            queue,
+            enabled: true,
+            involvement: involvement,
+            maxCandidatesPerSweep: 1);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-20);
+        var attributedToOtherAgent = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
+            updatedAt: outageStart.AddMinutes(1));
+        var restoredAgentItem = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
+            updatedAt: outageStart.AddMinutes(2));
+        await store.CreateAsync(attributedToOtherAgent);
+        await store.CreateAsync(restoredAgentItem);
+        await RecordFailedInvolvementAsync(
+            involvement,
+            attributedToOtherAgent.Id,
+            AgentKind.Codex,
+            outageStart.AddMinutes(1),
+            AgentInvolvementOutcomes.FailureAuth);
+
+        var summary = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
+
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(WorkItemState.Failed, (await store.GetAsync(attributedToOtherAgent.Id))!.State);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(restoredAgentItem.Id))!.State);
+    }
+
+    [Fact]
     public async Task Sweep_TreatsInfraFailureKindCaseInsensitivelyInSqliteStore()
     {
         using var store = new SqliteWorkItemStore(_dbPath);
@@ -350,7 +391,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     {
         using var store = new SqliteWorkItemStore(_dbPath);
         var queue = new InMemoryTaskQueue();
-        var involvement = new InMemoryAgentInvolvementStore();
+        using var involvement = new SqliteAgentInvolvementStore(_dbPath);
         var scheduler = NewScheduler(store, queue, enabled: true, involvement: involvement);
 
         var outageStart = DateTimeOffset.UtcNow.AddMinutes(-15);
@@ -607,6 +648,54 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
             Assert.Equal(item.Id, await queue.DequeueAsync(timeout.Token));
             Assert.Equal(WorkItemState.Queued, (await store.GetAsync(item.Id))!.State);
+        }
+        finally
+        {
+            await scheduler.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task RestoreSignal_BackgroundService_Disabled_DropsEventWithoutRequeueOrSweepAlert()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+        var registry = NewRegistry();
+        var webhooks = new CapturingWebhookDispatcher();
+        var logger = new CapturingLogger<AgentRestoreRetryScheduler>();
+        var scheduler = NewScheduler(
+            store,
+            queue,
+            enabled: false,
+            schedulerLogger: logger,
+            signal: registry,
+            webhooks: webhooks);
+
+        await scheduler.StartAsync(CancellationToken.None);
+        try
+        {
+            registry.MarkSmokeResult(
+                AgentKind.Claude,
+                new AgentSmokeResult(false, "missing binary", TimeSpan.Zero, SmokeFailureCategory.Persistent));
+
+            var item = NewItem(
+                agent: AgentKind.Claude,
+                state: WorkItemState.Failed,
+                failureKind: WorkItemFailureKinds.AgentUnavailable,
+                updatedAt: DateTimeOffset.UtcNow);
+            await store.CreateAsync(item);
+
+            registry.MarkSmokeResult(
+                AgentKind.Claude,
+                new AgentSmokeResult(true, null, TimeSpan.FromMilliseconds(10), SmokeFailureCategory.None));
+
+            await logger.WaitForEntryAsync(
+                e => e.Level == LogLevel.Debug && e.Message.Contains("feature disabled", StringComparison.Ordinal),
+                TimeSpan.FromSeconds(5));
+
+            Assert.Equal(WorkItemState.Failed, (await store.GetAsync(item.Id))!.State);
+            Assert.Equal(0, queue.Count);
+            Assert.DoesNotContain(webhooks.Events, e => e.Event == "agent.restore_requeue_swept");
         }
         finally
         {

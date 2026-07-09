@@ -66,6 +66,7 @@ internal static class AgentInvolvementOutcomes
             case FailureAgent:
                 category = AgentInvolvementFailureCategory.Agent;
                 return true;
+            case Cancelled:
             case FailureCancelled:
                 category = AgentInvolvementFailureCategory.Cancelled;
                 return true;
