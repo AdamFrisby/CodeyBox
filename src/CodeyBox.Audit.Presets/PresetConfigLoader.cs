@@ -657,9 +657,7 @@ internal sealed class PresetConfigLoader
         var markerDescription = marker.Globs.Count > 0
             ? string.Join("/", marker.Globs)
             : definition.DisplayName ?? definition.Id;
-        var markerScript = !string.IsNullOrWhiteSpace(marker.Script)
-            ? marker.Script
-            : BuildMarkerScript(marker.Globs);
+        var markerScript = ResolveMarkerScript(definition, marker);
 
         return definition.Auditors.Select(a =>
         {
@@ -704,6 +702,17 @@ internal sealed class PresetConfigLoader
                     missingToolSeverity,
                     required);
         }).ToList();
+    }
+
+    private static string ResolveMarkerScript(LanguagePresetDefinition definition, MarkerDefinition marker)
+    {
+        if (!string.IsNullOrWhiteSpace(marker.Script))
+            return marker.Script;
+
+        if (string.Equals(definition.Id, "csharp", StringComparison.OrdinalIgnoreCase))
+            return LanguageProjectDiscovery.CSharpDiscoveryScript;
+
+        return BuildMarkerScript(marker.Globs);
     }
 
     private static string BuildMarkerScript(IReadOnlyList<string> globs)

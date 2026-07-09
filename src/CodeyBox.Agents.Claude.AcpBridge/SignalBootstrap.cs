@@ -11,6 +11,7 @@ internal static class SignalBootstrap
     private const int SigHup = 1;
     private const int SigInt = 2;
     private const int SigTerm = 15;
+    private const int SyscallFailure = -1;
 
     internal const string SignalBootstrapReexecEnv = "CODEYBOX_ACPBRIDGE_SIGNAL_BOOTSTRAP_REEXECED";
     internal const string SignalBootstrapGuardSetValue = "1";
@@ -136,7 +137,7 @@ internal static class SignalBootstrap
             needsBootstrap: needsBootstrap,
             readArgv: ReadCurrentArgv,
             setGuard: SetSignalBootstrapGuard,
-            exec: NativeMethods.ExecVp);
+            exec: NativeMethods.ExecSelf);
     }
 
     internal static string[]? ParseProcCmdlineArgv(byte[] bytes)
@@ -195,7 +196,7 @@ internal static class SignalBootstrap
             throw new InvalidOperationException($"Failed to invoke signal P/Invoke for {signal.Name}.", ex);
         }
 
-        if (prev == new IntPtr(-1))
+        if (prev == NativeMethods.SigErr)
         {
             var errno = Marshal.GetLastWin32Error();
             throw new InvalidOperationException(
@@ -258,8 +259,10 @@ internal static class SignalBootstrap
     {
         internal static readonly IntPtr SigDfl = IntPtr.Zero;
         internal static readonly IntPtr SigIgn = new(1);
+        internal static readonly IntPtr SigErr = new(-1);
 
         private const int SigActionBufferBytes = 256;
+        private const string ProcSelfExePath = "/proc/self/exe";
 
         [DllImport("libc", EntryPoint = "sigaction", SetLastError = true)]
         private static extern int SigAction(int sig, IntPtr act, IntPtr oldact);
@@ -267,8 +270,8 @@ internal static class SignalBootstrap
         [DllImport("libc", EntryPoint = "signal", SetLastError = true)]
         internal static extern IntPtr Signal(int sig, IntPtr handler);
 
-        [DllImport("libc", EntryPoint = "execvp", SetLastError = true)]
-        private static extern int ExecVp(IntPtr file, IntPtr argv);
+        [DllImport("libc", EntryPoint = "execv", SetLastError = true)]
+        private static extern int ExecV(IntPtr path, IntPtr argv);
 
         [DllImport("libc", EntryPoint = "setenv", SetLastError = true)]
         private static extern int SetEnv(IntPtr name, IntPtr value, int overwrite);
@@ -346,28 +349,37 @@ internal static class SignalBootstrap
             }
         }
 
-        internal static void ExecVp(string[] argv)
+        internal static void ExecSelf(string[] argv)
         {
+            ValidateArgv(argv);
+
+            var executablePath = ReadTrustedSelfExecutablePath();
             var argPointers = new IntPtr[argv.Length];
             var argvBlock = IntPtr.Zero;
             try
             {
                 for (var i = 0; i < argv.Length; i++)
-                    argPointers[i] = Marshal.StringToHGlobalAnsi(argv[i]);
+                {
+                    // argv[0] is controlled by the process that execve'd us;
+                    // select the executable from the kernel-owned self link
+                    // and pass that trusted path as argv[0] too.
+                    var arg = i == 0 ? executablePath : argv[i];
+                    argPointers[i] = Marshal.StringToHGlobalAnsi(arg);
+                }
 
                 argvBlock = Marshal.AllocHGlobal(IntPtr.Size * (argv.Length + 1));
                 for (var i = 0; i < argPointers.Length; i++)
                     Marshal.WriteIntPtr(argvBlock, i * IntPtr.Size, argPointers[i]);
                 Marshal.WriteIntPtr(argvBlock, argPointers.Length * IntPtr.Size, IntPtr.Zero);
 
-                var res = ExecVp(argPointers[0], argvBlock);
-                if (res == -1)
+                var res = ExecV(argPointers[0], argvBlock);
+                if (res == SyscallFailure)
                 {
                     var errno = Marshal.GetLastWin32Error();
-                    throw new InvalidOperationException($"execvp failed with error code: {errno}");
+                    throw new InvalidOperationException($"execv failed with error code: {errno}");
                 }
 
-                throw new InvalidOperationException($"execvp returned unexpectedly with code: {res}");
+                throw new InvalidOperationException($"execv returned unexpectedly with code: {res}");
             }
             finally
             {
@@ -379,6 +391,40 @@ internal static class SignalBootstrap
                         Marshal.FreeHGlobal(argPointer);
                 }
             }
+        }
+
+        private static void ValidateArgv(string[] argv)
+        {
+            ArgumentNullException.ThrowIfNull(argv);
+            if (argv.Length == 0)
+                throw new ArgumentException("Signal bootstrap re-exec requires at least one argv entry.", nameof(argv));
+            if (string.IsNullOrEmpty(argv[0]))
+                throw new ArgumentException("Signal bootstrap re-exec requires a non-empty argv[0].", nameof(argv));
+
+            for (var i = 1; i < argv.Length; i++)
+            {
+                if (argv[i] is null)
+                    throw new ArgumentException($"Signal bootstrap re-exec argv[{i}] must not be null.", nameof(argv));
+            }
+        }
+
+        private static string ReadTrustedSelfExecutablePath()
+        {
+            FileSystemInfo target;
+            try
+            {
+                target = File.ResolveLinkTarget(ProcSelfExePath, returnFinalTarget: true)
+                    ?? throw new InvalidOperationException($"{ProcSelfExePath} did not resolve to an executable path.");
+            }
+            catch (Exception ex) when (ex is not InvalidOperationException)
+            {
+                throw new InvalidOperationException($"Failed to resolve {ProcSelfExePath} for signal bootstrap re-exec.", ex);
+            }
+
+            if (string.IsNullOrWhiteSpace(target.FullName) || !Path.IsPathFullyQualified(target.FullName))
+                throw new InvalidOperationException($"{ProcSelfExePath} resolved to an invalid executable path.");
+
+            return target.FullName;
         }
     }
 }

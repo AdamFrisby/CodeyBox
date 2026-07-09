@@ -43,6 +43,9 @@ namespace CodeyBox.Tests;
 [Collection("Process environment")]
 public sealed class AcpBridgeUnitTests
 {
+    private const int SignalCleanupPollAttempts = 100;
+    private static readonly TimeSpan SignalCleanupPollDelay = TimeSpan.FromMilliseconds(50);
+    private static readonly TimeSpan TimedOutProcessKillWait = TimeSpan.FromSeconds(5);
     private static readonly SemaphoreSlim EnvironmentVariableGate = new(1, 1);
 
     // ── BridgeConfig.FromHello ─────────────────────────────────────────────────
@@ -3331,8 +3334,8 @@ return ran ? 90 : 91;
         string rootPidPath,
         string childPidPath)
     {
-        for (int i = 0; i < 100 && (!File.Exists(rootPidPath) || !File.Exists(childPidPath)); i++)
-            await Task.Delay(50);
+        for (int i = 0; i < SignalCleanupPollAttempts && (!File.Exists(rootPidPath) || !File.Exists(childPidPath)); i++)
+            await Task.Delay(SignalCleanupPollDelay);
 
         Assert.True(File.Exists(rootPidPath), "Signal cleanup fixture did not record the claude root pid.");
         Assert.True(File.Exists(childPidPath), "Signal cleanup fixture did not record the claude child pid.");
@@ -3350,7 +3353,8 @@ return ran ? 90 : 91;
             {
                 while (await proc.StandardOutput.ReadLineAsync() is not null) { }
             }
-            catch { }
+            catch (IOException) { }
+            catch (ObjectDisposedException) { }
         });
     }
 
@@ -3427,8 +3431,8 @@ os.execvp("dotnet", ["dotnet", "exec", bridge_dll])
 
     private static async Task AssertProcessExitedAsync(int pid, string message)
     {
-        for (int i = 0; i < 100 && Directory.Exists("/proc/" + pid); i++)
-            await Task.Delay(50);
+        for (int i = 0; i < SignalCleanupPollAttempts && Directory.Exists("/proc/" + pid); i++)
+            await Task.Delay(SignalCleanupPollDelay);
 
         Assert.False(Directory.Exists("/proc/" + pid), message);
     }
@@ -4299,10 +4303,22 @@ exit 9
 
         if (await Task.WhenAny(waitTask, Task.Delay(timeout)).ConfigureAwait(false) != waitTask)
         {
-            try { process.Kill(entireProcessTree: true); } catch { }
-            await waitTask.ConfigureAwait(false);
-            var timedOutStdout = await stdoutTask.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
-            var timedOutStderr = await stderrTask.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            try
+            {
+                if (!process.HasExited)
+                    process.Kill(entireProcessTree: true);
+            }
+            catch (InvalidOperationException) when (process.HasExited)
+            {
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException("Timed out process could not be killed: " + fileName, ex);
+            }
+
+            await waitTask.WaitAsync(TimedOutProcessKillWait).ConfigureAwait(false);
+            var timedOutStdout = await stdoutTask.WaitAsync(TimedOutProcessKillWait).ConfigureAwait(false);
+            var timedOutStderr = await stderrTask.WaitAsync(TimedOutProcessKillWait).ConfigureAwait(false);
             return (-1, timedOutStdout, timedOutStderr);
         }
 

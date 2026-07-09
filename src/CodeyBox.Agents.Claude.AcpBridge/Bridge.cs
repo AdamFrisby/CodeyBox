@@ -862,9 +862,9 @@ internal sealed class Bridge : IAsyncDisposable
     /// is preferred and happens first when the read does unblock; the
     /// watchdog only fires if the read stayed parked past the grace window —
     /// the regression mode this guards against. By the time this delay
-    /// elapses Shutdown has already deleted the lockfile, SIGTERM'd claude,
-    /// stopped the TCP listener and cancelled the CTS, so force-exit is
-    /// safe — the process simply leaves no half-cleaned state behind.
+    /// elapses Shutdown has already attempted lockfile deletion, claude
+    /// termination, listener shutdown and CTS cancellation, so force-exit is
+    /// a last-resort escape from a wedged bridge process.
     /// </summary>
     private void ScheduleForceExitAfterSignal()
     {
