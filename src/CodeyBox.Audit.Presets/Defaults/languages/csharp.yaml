@@ -3,7 +3,11 @@ displayName: "C#"
 marker:
   globs: ["**/*.csproj", "**/*.sln", "**/*.slnx"]
   script: |
-    find . -type d \( -name '.git' -o -name 'node_modules' -o -name 'bin' -o -name 'obj' \) -prune -o \( -name '*.csproj' -o -name '*.sln' -o -name '*.slnx' \) -exec dirname {} \; | sort -u
+    if find . -maxdepth 1 \( -name '*.csproj' -o -name '*.sln' -o -name '*.slnx' \) -print -quit | grep -q .; then
+      printf '.\n'
+    else
+      find . -type d \( -name '.git' -o -name 'node_modules' -o -name 'bin' -o -name 'obj' \) -prune -o \( -name '*.csproj' -o -name '*.sln' -o -name '*.slnx' \) -exec dirname {} \; | sort -u
+    fi
 auditors:
   - name: csharp:format-check
     argv: ["dotnet", "format", "--verify-no-changes", "--verbosity", "diagnostic"]

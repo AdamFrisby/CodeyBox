@@ -8,12 +8,11 @@ public sealed class DotnetFormatMechanicalFixerInputProvider : IMechanicalFixerI
     /// <summary>
     /// Fallback marker discovery for custom <c>csharp:format-check</c>
     /// auditors that do not expose an <see cref="IAuditorLanguageContext"/>.
-    /// Lists every directory that contains a top-level <c>*.csproj</c>,
+    /// Lists the repository root when it has a C# marker; otherwise lists every
+    /// directory that contains a top-level <c>*.csproj</c>,
     /// preserving the behaviour of the bundled csharp preset's marker globs.
     /// </summary>
-    internal const string DefaultCsharpMarkerScript =
-        "find . -type f \\( -name '*.csproj' -o -name '*.sln' -o -name '*.slnx' \\) " +
-        "-not -path './.git/*' -printf '%h\\n' | sort -u";
+    internal static string DefaultCsharpMarkerScript => LanguageProjectDiscovery.CSharpDiscoveryScript;
 
     public IReadOnlyList<IMechanicalFixerInput> BuildInputs(IReadOnlyList<IAuditor> auditors)
     {

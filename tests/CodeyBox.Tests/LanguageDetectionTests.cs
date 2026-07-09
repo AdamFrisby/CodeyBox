@@ -1,4 +1,5 @@
 using CodeyBox.Audit.Presets;
+using CodeyBox.Audit.Presets.Presets;
 using CodeyBox.Core;
 
 namespace CodeyBox.Tests;
@@ -286,6 +287,48 @@ public sealed class LanguageDetectionTests
     }
 
     [Fact]
+    public async Task CSharpCurrentRepositoryRootMarker_DoesNotHitProjectDirectoryLimit()
+    {
+        var catalog = new PresetCatalog();
+        var auditor = catalog.ResolveLanguage("csharp", new PresetContext(new FakeAgent()))
+            .Single(a => a.Name == "csharp:test-pass");
+        var languageContext = Assert.IsAssignableFrom<IAuditorLanguageContext>(auditor);
+        var repoRoot = FindRepoRoot();
+
+        using var process = new System.Diagnostics.Process
+        {
+            StartInfo = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "sh",
+                WorkingDirectory = repoRoot,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            },
+        };
+        process.StartInfo.ArgumentList.Add("-c");
+        process.StartInfo.ArgumentList.Add(languageContext.MarkerScript);
+
+        process.Start();
+        var stdout = await process.StandardOutput.ReadToEndAsync();
+        var stderr = await process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+
+        Assert.Equal(0, process.ExitCode);
+        Assert.Equal("", stderr);
+        var projectDirectories = LanguagePresetProjectDiscovery.ParseProjectDirectories(stdout);
+        Assert.Contains(".", projectDirectories);
+
+        var selected = LanguageProjectDiscovery.SelectProjectDirectoriesToRun(
+            languageContext.Language,
+            projectDirectories,
+            out var skippedDueToLimit);
+
+        Assert.Equal(0, skippedDueToLimit);
+        Assert.Equal(new[] { "." }, selected);
+    }
+
+    [Fact]
     public async Task CSharpTestPass_MixedProjectEvidenceReportsUnverified()
     {
         var catalog = new PresetCatalog();
@@ -322,6 +365,20 @@ public sealed class LanguageDetectionTests
         }
 
         throw new DirectoryNotFoundException("Could not locate multi-language fixture.");
+    }
+
+    private static string FindRepoRoot()
+    {
+        var current = new DirectoryInfo(AppContext.BaseDirectory);
+        while (current is not null)
+        {
+            if (File.Exists(Path.Combine(current.FullName, "CodeyBox.slnx")))
+                return current.FullName;
+
+            current = current.Parent;
+        }
+
+        throw new DirectoryNotFoundException("Could not locate repo root.");
     }
 
     private sealed class MarkerlessSandbox : ISandbox
