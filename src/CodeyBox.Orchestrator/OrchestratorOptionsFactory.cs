@@ -166,8 +166,8 @@ public static class OrchestratorOptionsFactory
         bool enabled,
         string lookbackGrace,
         string postRestoreMargin,
-        string involvementTerminalLookback = "00:15:00",
-        string involvementTerminalClockSkew = "00:01:00",
+        string? involvementTerminalLookback = null,
+        string? involvementTerminalClockSkew = null,
         int maxCandidatesPerSweep = AgentRestoreRetryOptions.DefaultMaxCandidatesPerSweep,
         int eventQueueCapacity = AgentRestoreRetryOptions.DefaultEventQueueCapacity)
     {
@@ -177,19 +177,19 @@ public static class OrchestratorOptionsFactory
         var lookback = ParseNonNegativeTimeSpan(
             "CodeyBox:AutoRequeueOnAgentRestore:LookbackGrace",
             lookbackGrace,
-            "00:30:00");
+            AgentRestoreRetryOptions.DefaultLookbackGraceConfigValue);
         var margin = ParseNonNegativeTimeSpan(
             "CodeyBox:AutoRequeueOnAgentRestore:PostRestoreMargin",
             postRestoreMargin,
-            "00:05:00");
+            AgentRestoreRetryOptions.DefaultPostRestoreMarginConfigValue);
         var terminalLookback = ParseNonNegativeTimeSpan(
             "CodeyBox:AutoRequeueOnAgentRestore:InvolvementTerminalLookback",
-            involvementTerminalLookback,
-            "00:15:00");
+            involvementTerminalLookback ?? AgentRestoreRetryOptions.DefaultInvolvementTerminalLookbackConfigValue,
+            AgentRestoreRetryOptions.DefaultInvolvementTerminalLookbackConfigValue);
         var terminalClockSkew = ParseNonNegativeTimeSpan(
             "CodeyBox:AutoRequeueOnAgentRestore:InvolvementTerminalClockSkew",
-            involvementTerminalClockSkew,
-            "00:01:00");
+            involvementTerminalClockSkew ?? AgentRestoreRetryOptions.DefaultInvolvementTerminalClockSkewConfigValue,
+            AgentRestoreRetryOptions.DefaultInvolvementTerminalClockSkewConfigValue);
 
         if (maxCandidatesPerSweep <= 0)
             throw new InvalidOperationException(
@@ -213,10 +213,10 @@ public static class OrchestratorOptionsFactory
 
     private static TimeSpan ParseNonNegativeTimeSpan(
         string configPath,
-        string rawValue,
+        string? rawValue,
         string exampleValue)
     {
-        if (!TimeSpan.TryParse(rawValue, out TimeSpan value))
+        if (!TimeSpan.TryParse(rawValue, System.Globalization.CultureInfo.InvariantCulture, out TimeSpan value))
             throw new InvalidOperationException(
                 $"{configPath} must be a valid TimeSpan (e.g. '{exampleValue}')");
         if (value < TimeSpan.Zero)

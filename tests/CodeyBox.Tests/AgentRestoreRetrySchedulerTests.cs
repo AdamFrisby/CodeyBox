@@ -261,7 +261,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             updatedAt: outageStart.AddMinutes(2));
         await inner.CreateAsync(item);
 
-        var store = new ThrowingClaimWorkItemStore(inner);
+        var store = new ClaimControllingWorkItemStore(inner, throwOnClaim: true, hideClaims: false);
         var scheduler = NewScheduler(store, queue, enabled: true);
 
         var summary = await scheduler.SweepForTestAsync(
@@ -297,6 +297,69 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         Assert.Equal(1, sweeps.Sum(static sweep => sweep.Requeued));
         Assert.Equal(1, queue.Count);
         Assert.Equal(WorkItemState.Queued, (await store.GetAsync(item.Id))!.State);
+    }
+
+    [Fact]
+    public async Task Sweep_ConcurrentClaimConflict_DoesNotReleaseWinnerClaim()
+    {
+        using var inner = new SqliteWorkItemStore(_dbPath);
+        var queue = new InMemoryTaskQueue();
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var item = NewItem(
+            agent: AgentKind.Claude,
+            state: WorkItemState.Failed,
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
+            updatedAt: outageStart.AddMinutes(2));
+        await inner.CreateAsync(item);
+
+        var restoredAt = DateTimeOffset.UtcNow;
+        Assert.True(await inner.TryClaimAgentRestoreRetryAsync(
+            item.Id,
+            AgentKind.Claude,
+            outageStart,
+            restoredAt,
+            CancellationToken.None));
+
+        var current = await inner.GetAsync(item.Id);
+        Assert.NotNull(current);
+        var refailedAfterClaim = current! with
+        {
+            State = WorkItemState.Failed,
+            FailureKind = WorkItemFailureKinds.AgentUnavailable,
+            LastError = "agent failed again inside the restore window",
+            UpdatedAt = DateTimeOffset.UtcNow.AddSeconds(1),
+        };
+        await inner.UpdateAsync(refailedAfterClaim);
+        Assert.True(await inner.HasAgentRestoreRetryClaimAsync(
+            item.Id,
+            AgentKind.Claude,
+            outageStart,
+            CancellationToken.None));
+
+        var staleLookupStore = new ClaimControllingWorkItemStore(
+            inner,
+            throwOnClaim: false,
+            hideClaims: true);
+        var scheduler = NewScheduler(staleLookupStore, queue, enabled: true);
+
+        var conflictedSweep = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Claude, outageStart, restoredAt));
+
+        Assert.Equal(0, conflictedSweep.Requeued);
+        Assert.Equal(1, conflictedSweep.Skipped);
+        Assert.True(await inner.HasAgentRestoreRetryClaimAsync(
+            item.Id,
+            AgentKind.Claude,
+            outageStart,
+            CancellationToken.None));
+
+        var duplicateSweep = await NewScheduler(inner, queue, enabled: true).SweepForTestAsync(
+            new AgentRestoredEvent(AgentKind.Claude, outageStart, restoredAt));
+
+        Assert.Equal(0, duplicateSweep.Requeued);
+        Assert.Equal(0, queue.Count);
+        Assert.Equal(WorkItemState.Failed, (await inner.GetAsync(item.Id))!.State);
     }
 
     [Fact]
@@ -510,7 +573,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     }
 
     [Fact]
-    public async Task Sweep_DrainsMultipleBoundedCandidatePages()
+    public async Task Sweep_CandidateCapLimitsTotalCandidatesPerSweep()
     {
         using var store = new SqliteWorkItemStore(_dbPath);
         var queue = new InMemoryTaskQueue();
@@ -532,7 +595,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         var summary = await scheduler.SweepForTestAsync(
             new AgentRestoredEvent(AgentKind.Claude, outageStart, DateTimeOffset.UtcNow));
 
-        Assert.Equal(5, summary.Requeued);
+        Assert.Equal(3, summary.Requeued);
         Assert.Equal(0, summary.Skipped);
         var queuedCount = 0;
         foreach (var item in items)
@@ -540,7 +603,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             var state = (await store.GetAsync(item.Id))!.State;
             if (state == WorkItemState.Queued) queuedCount++;
         }
-        Assert.Equal(5, queuedCount);
+        Assert.Equal(3, queuedCount);
     }
 
     [Fact]
@@ -1586,11 +1649,22 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
         return default;
     }
 
-    private sealed class ThrowingClaimWorkItemStore : IWorkItemStore
+    private sealed class ClaimControllingWorkItemStore : IWorkItemStore
     {
         private readonly IWorkItemStore _inner;
+        private readonly bool _throwOnClaim;
+        private readonly bool _hideClaims;
 
-        public ThrowingClaimWorkItemStore(IWorkItemStore inner) => _inner = inner;
+        public ClaimControllingWorkItemStore(
+            IWorkItemStore inner,
+            bool throwOnClaim,
+            bool hideClaims)
+        {
+            _inner = inner;
+            _throwOnClaim = throwOnClaim;
+            _hideClaims = hideClaims;
+        }
+
         public int ClaimAttempts { get; private set; }
 
         public Task CreateAsync(WorkItem item, CancellationToken ct = default) =>
@@ -1659,7 +1733,9 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             AgentKind restoredAgent,
             DateTimeOffset outageStartedAt,
             CancellationToken ct = default) =>
-            _inner.HasAgentRestoreRetryClaimAsync(id, restoredAgent, outageStartedAt, ct);
+            _hideClaims
+                ? Task.FromResult(false)
+                : _inner.HasAgentRestoreRetryClaimAsync(id, restoredAgent, outageStartedAt, ct);
 
         public Task<bool> TryClaimAgentRestoreRetryAsync(
             WorkItemId id,
@@ -1669,7 +1745,9 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
             CancellationToken ct = default)
         {
             ClaimAttempts++;
-            throw new InvalidOperationException("claim persistence failed");
+            return _throwOnClaim
+                ? throw new InvalidOperationException("claim persistence failed")
+                : _inner.TryClaimAgentRestoreRetryAsync(id, restoredAgent, outageStartedAt, restoredAt, ct);
         }
 
         public Task ReleaseAgentRestoreRetryClaimAsync(

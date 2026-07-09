@@ -369,24 +369,27 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
         var windowEnd = evt.RestoredAt + opts.PostRestoreMargin;
         var requeued = 0;
         var skipped = 0;
+        var candidatesEvaluated = 0;
         DateTimeOffset? afterUpdatedAt = null;
         WorkItemId? afterId = null;
 
-        while (true)
+        while (candidatesEvaluated < opts.MaxCandidatesPerSweep)
         {
             var pageCount = 0;
+            var remainingCandidateBudget = opts.MaxCandidatesPerSweep - candidatesEvaluated;
             await foreach (var item in _store.ListRestoreRetryCandidatesAsync(
                 evt.Agent,
                 windowStart,
                 windowEnd,
                 opts.InvolvementTerminalLookback,
                 opts.InvolvementTerminalClockSkew,
-                opts.MaxCandidatesPerSweep,
+                remainingCandidateBudget,
                 afterUpdatedAt,
                 afterId,
                 ct).ConfigureAwait(false))
             {
                 pageCount++;
+                candidatesEvaluated++;
                 afterUpdatedAt = item.UpdatedAt;
                 afterId = item.Id;
 
@@ -414,10 +417,10 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
                     continue;
                 }
 
-                bool success; string? error; string? actualFrom;
+                WorkItemRetryResult retry;
                 try
                 {
-                    (success, error, _, actualFrom, _) = await _retrier.RetryAgentRestoreAsync(
+                    retry = await _retrier.RetryAgentRestoreDetailedAsync(
                         item,
                         from: null,
                         trigger: "agent-restore",
@@ -428,39 +431,38 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
-                    await ReleaseClaimAfterRetryFailureAsync(item.Id, evt, "retry was cancelled", CancellationToken.None)
-                        .ConfigureAwait(false);
                     throw;
                 }
                 catch (Exception ex)
                 {
                     skipped++;
-                    await ReleaseClaimAfterRetryFailureAsync(item.Id, evt, "retry threw", ct)
-                        .ConfigureAwait(false);
                     _log.LogWarning(ex,
                         "AgentRestoreRetryScheduler: retry threw for {Id}; skipping and continuing sweep",
                         item.Id);
                     continue;
                 }
 
-                if (!success)
+                if (!retry.Success)
                 {
                     skipped++;
-                    await ReleaseClaimAfterRetryFailureAsync(item.Id, evt, "retry did not requeue", ct)
-                        .ConfigureAwait(false);
+                    if (retry.FailureKind != WorkItemRetryFailureKind.StateChangedConcurrently)
+                    {
+                        await ReleaseClaimAfterRetryFailureAsync(item.Id, evt, "retry did not requeue", ct)
+                            .ConfigureAwait(false);
+                    }
                     _log.LogDebug(
                         "AgentRestoreRetryScheduler: skipped {Id}: {Error}",
-                        item.Id, error);
+                        item.Id, retry.Error);
                     continue;
                 }
 
                 requeued++;
                 AuditLog.AgentRestoreRequeueItem(
-                    item.Id, evt.Agent, item.FailureKind, actualFrom ?? "work");
-                await EmitAgentRestoreRetryWebhookAsync(item, evt, actualFrom, ct).ConfigureAwait(false);
+                    item.Id, evt.Agent, item.FailureKind, retry.ActualFrom ?? "work");
+                await EmitAgentRestoreRetryWebhookAsync(item, evt, retry.ActualFrom, ct).ConfigureAwait(false);
             }
 
-            if (pageCount < opts.MaxCandidatesPerSweep)
+            if (pageCount < remainingCandidateBudget)
                 break;
         }
 
@@ -639,6 +641,16 @@ public sealed class AgentRestoreRetryScheduler : BackgroundService
 /// </summary>
 public sealed record AgentRestoreRetryOptions
 {
+    public static readonly TimeSpan DefaultLookbackGrace = TimeSpan.FromMinutes(30);
+    public static readonly TimeSpan DefaultPostRestoreMargin = TimeSpan.FromMinutes(5);
+    public static readonly TimeSpan DefaultInvolvementTerminalLookback = TimeSpan.FromMinutes(15);
+    public static readonly TimeSpan DefaultInvolvementTerminalClockSkew = TimeSpan.FromMinutes(1);
+
+    public static string DefaultLookbackGraceConfigValue => ToConfigString(DefaultLookbackGrace);
+    public static string DefaultPostRestoreMarginConfigValue => ToConfigString(DefaultPostRestoreMargin);
+    public static string DefaultInvolvementTerminalLookbackConfigValue => ToConfigString(DefaultInvolvementTerminalLookback);
+    public static string DefaultInvolvementTerminalClockSkewConfigValue => ToConfigString(DefaultInvolvementTerminalClockSkew);
+
     public const int DefaultMaxCandidatesPerSweep = 500;
     public const int DefaultEventQueueCapacity = 128;
 
@@ -652,17 +664,17 @@ public sealed record AgentRestoreRetryOptions
     /// How far back from <see cref="AgentRestoredEvent.OutageStartedAt"/> the
     /// sweep looks for candidates. Work items can fail several minutes
     /// before the smoke probe notices the outage — this lookback catches
-    /// them. Default 30 minutes.
+    /// them. Defaults to <see cref="DefaultLookbackGrace"/>.
     /// </summary>
-    public TimeSpan LookbackGrace { get; init; } = TimeSpan.FromMinutes(30);
+    public TimeSpan LookbackGrace { get; init; } = DefaultLookbackGrace;
 
     /// <summary>
     /// How far past <see cref="AgentRestoredEvent.RestoredAt"/> the sweep
-    /// also considers as part of the outage window. Default 5 minutes —
-    /// guards against ordering races where a failed write outlives the
-    /// restore notification by milliseconds.
+    /// also considers as part of the outage window. Defaults to
+    /// <see cref="DefaultPostRestoreMargin"/> and guards against ordering races
+    /// where a failed write outlives the restore notification by milliseconds.
     /// </summary>
-    public TimeSpan PostRestoreMargin { get; init; } = TimeSpan.FromMinutes(5);
+    public TimeSpan PostRestoreMargin { get; init; } = DefaultPostRestoreMargin;
 
     /// <summary>
     /// Maximum number of store-filtered terminal candidates evaluated during one
@@ -680,16 +692,20 @@ public sealed record AgentRestoreRetryOptions
 
     /// <summary>
     /// How far before a terminal work-item update a failed involvement row can
-    /// still attribute the failed agent. Default 15 minutes.
+    /// still attribute the failed agent. Defaults to
+    /// <see cref="DefaultInvolvementTerminalLookback"/>.
     /// </summary>
-    public TimeSpan InvolvementTerminalLookback { get; init; } = TimeSpan.FromMinutes(15);
+    public TimeSpan InvolvementTerminalLookback { get; init; } = DefaultInvolvementTerminalLookback;
 
     /// <summary>
     /// How far after a terminal work-item update a failed involvement row can
     /// still attribute the failed agent, absorbing write-order clock skew.
-    /// Default 1 minute.
+    /// Defaults to <see cref="DefaultInvolvementTerminalClockSkew"/>.
     /// </summary>
-    public TimeSpan InvolvementTerminalClockSkew { get; init; } = TimeSpan.FromMinutes(1);
+    public TimeSpan InvolvementTerminalClockSkew { get; init; } = DefaultInvolvementTerminalClockSkew;
+
+    private static string ToConfigString(TimeSpan value) =>
+        value.ToString("c", System.Globalization.CultureInfo.InvariantCulture);
 }
 
 /// <summary>

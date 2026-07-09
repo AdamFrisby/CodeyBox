@@ -5026,32 +5026,30 @@ namespace CodeyBox.Api
         public bool Enabled { get; set; } = true;
 
         /// <summary>
-        /// Non-negative <see cref="TimeSpan"/> string (for example
-        /// <c>"00:30:00"</c>) subtracted from the restore event's outage start
-        /// when selecting failed candidates.
+        /// Non-negative <see cref="TimeSpan"/> string subtracted from the
+        /// restore event's outage start when selecting failed candidates.
         /// </summary>
-        public string LookbackGrace { get; set; } = "00:30:00";
+        public string LookbackGrace { get; set; } = AgentRestoreRetryOptions.DefaultLookbackGraceConfigValue;
 
         /// <summary>
-        /// Non-negative <see cref="TimeSpan"/> string (for example
-        /// <c>"00:05:00"</c>) added after the restore timestamp to absorb
-        /// ordering races between terminal writes and the restore signal.
+        /// Non-negative <see cref="TimeSpan"/> string added after the restore
+        /// timestamp to absorb ordering races between terminal writes and the
+        /// restore signal.
         /// </summary>
-        public string PostRestoreMargin { get; set; } = "00:05:00";
+        public string PostRestoreMargin { get; set; } = AgentRestoreRetryOptions.DefaultPostRestoreMarginConfigValue;
 
         /// <summary>
-        /// Non-negative <see cref="TimeSpan"/> string (for example
-        /// <c>"00:15:00"</c>) used to match a failed agent-involvement row to a
-        /// nearby terminal work-item write.
+        /// Non-negative <see cref="TimeSpan"/> string used to match a failed
+        /// agent-involvement row to a nearby terminal work-item write.
         /// </summary>
-        public string InvolvementTerminalLookback { get; set; } = "00:15:00";
+        public string InvolvementTerminalLookback { get; set; } = AgentRestoreRetryOptions.DefaultInvolvementTerminalLookbackConfigValue;
 
         /// <summary>
-        /// Non-negative <see cref="TimeSpan"/> string (for example
-        /// <c>"00:01:00"</c>) allowing failed involvement rows to land slightly
-        /// after the terminal work-item update they explain.
+        /// Non-negative <see cref="TimeSpan"/> string allowing failed involvement
+        /// rows to land slightly after the terminal work-item update they
+        /// explain.
         /// </summary>
-        public string InvolvementTerminalClockSkew { get; set; } = "00:01:00";
+        public string InvolvementTerminalClockSkew { get; set; } = AgentRestoreRetryOptions.DefaultInvolvementTerminalClockSkewConfigValue;
 
         /// <summary>
         /// Positive cap applied inside the work-item store before buffering

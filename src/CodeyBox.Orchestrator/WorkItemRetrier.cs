@@ -123,6 +123,22 @@ public sealed class WorkItemRetrier
             new AgentRestoreRetryClaim(restoredAgent, outageStartedAt, restoredAt),
             ct));
 
+    internal async Task<WorkItemRetryResult> RetryAgentRestoreDetailedAsync(
+        WorkItem item,
+        string? from,
+        string trigger,
+        AgentKind restoredAgent,
+        DateTimeOffset outageStartedAt,
+        DateTimeOffset restoredAt,
+        CancellationToken ct = default)
+        => await RetryCoreAsync(
+            item,
+            from,
+            trigger,
+            RetryAccounting.AgentRestoreAutoRetry,
+            new AgentRestoreRetryClaim(restoredAgent, outageStartedAt, restoredAt),
+            ct);
+
     internal async Task<WorkItemRetryResult> RetryQuotaAutoDetailedAsync(
         WorkItem item,
         string? from,
