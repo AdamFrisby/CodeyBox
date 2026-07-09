@@ -7319,17 +7319,18 @@ while True:
 
         try
         {
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            cts.CancelAfter(ResolveResourceMetricsCaptureTimeout(_opts));
+            var timeout = ResolveResourceMetricsCaptureTimeout(_opts);
+            using var captureCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            captureCts.CancelAfter(timeout);
 
             await using var captureScope = await TimingScope.BeginAsync(
                 _timings, _timingItemId, _timingPhase, "vm.resource_capture", log: _log);
-            var metrics = await CaptureResourceMetricsAsync(cts.Token).ConfigureAwait(false);
+            var metrics = await CaptureResourceMetricsAsync(captureCts.Token).ConfigureAwait(false);
             if (metrics is null)
                 return null;
 
             _resourceMetrics = metrics;
-            await TryPersistResourceMetricsAsync(metrics, cts.Token).ConfigureAwait(false);
+            await TryPersistResourceMetricsAsync(metrics, timeout, ct).ConfigureAwait(false);
             RecordResourceMetricInstruments(metrics);
             return metrics;
         }
@@ -7453,11 +7454,13 @@ while True:
         return HasRequiredResourceMetrics(metrics) ? metrics : null;
     }
 
-    private async Task TryPersistResourceMetricsAsync(SandboxResourceMetrics metrics, CancellationToken ct)
+    private async Task TryPersistResourceMetricsAsync(SandboxResourceMetrics metrics, TimeSpan timeout, CancellationToken ct)
     {
         try
         {
-            await PersistResourceMetricsAsync(metrics, ct).WaitAsync(ct).ConfigureAwait(false);
+            using var persistCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            persistCts.CancelAfter(timeout);
+            await PersistResourceMetricsAsync(metrics, persistCts.Token).WaitAsync(persistCts.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
