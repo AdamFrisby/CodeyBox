@@ -11,15 +11,16 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// When the configured <see cref="AgentMembership.ModelId"/> is not present in
-/// a quota probe response, each probe applies its own resolution policy:
-/// Claude and Cursor fall back to the overall/binding-window reading (a KNOWN
-/// snapshot) so the floor is enforced normally rather than degrading to
-/// Unknown (which would fail open past an explicit reserve); Codex still
-/// reports <c>AvailablePct = -1</c> with a diagnostic <c>Notes</c> string so
-/// the router falls onto its <c>QuotaUnknownPolicy</c>. The per-probe split
-/// exists because Claude's usage API keys its per-model buckets by family
-/// names (not by the full configured model id), making Unknown the DEFAULT
-/// state — which would silently bypass an operator's FloorByAgent reserve.
+/// a quota probe response, every probe (Claude, Cursor, Codex) falls back to
+/// the overall/binding-window reading (a KNOWN snapshot) so the floor is
+/// enforced normally rather than degrading to Unknown (which would fail open
+/// past an explicit reserve, or — under MostQuotaFirst — sort the class below
+/// its known-quota peers and starve it). The fallback matters most for a newly
+/// released model the backend has not yet minted a dedicated bucket for
+/// (e.g. gpt-5.6-sol on launch day, where the WHAM response only lists
+/// gpt-5.5 / GPT-5.3-Codex-Spark): OpenAI's rate limits are account-wide 5h /
+/// weekly windows that cap every per-model bucket, so the overall reading IS
+/// the binding quota for any configured codex model.
 /// </summary>
 public sealed class QuotaProbeConfiguredModelMissingTests
 {
@@ -207,10 +208,12 @@ public sealed class QuotaProbeConfiguredModelMissingTests
     // ── Codex ─────────────────────────────────────────────────────────────────
 
     [Fact]
-    public async Task Codex_ConfiguredModelMissingFromResponse_ReportsUnknownWithDiagnosticNotes()
+    public async Task Codex_ConfiguredModelMissingFromResponse_NoPerModel_FallsBackToOverall()
     {
         // Overall account quota only — no additional_rate_limits, so perModel
-        // is empty. A configured ModelId yields -1 with a diagnostic note.
+        // is empty. A configured ModelId that isn't surfaced resolves to the
+        // overall reading (a KNOWN snapshot) so the floor is enforced normally
+        // rather than degrading to Unknown. used_percent=20 → 80% available.
         var body = """{"rate_limit":{"primary_window":{"used_percent":20}}}""";
         var probe = BuildCodexProbe(body);
 
@@ -223,9 +226,46 @@ public sealed class QuotaProbeConfiguredModelMissingTests
         };
         var snapshot = await probe.GetAvailabilityAsync(member, CancellationToken.None);
 
-        Assert.Equal(-1, snapshot.AvailablePct);
-        Assert.Contains("gpt-typo-5.5", snapshot.Notes ?? "");
-        Assert.Contains("not in quota response", snapshot.Notes ?? "");
+        Assert.Equal(80, snapshot.AvailablePct);
+        Assert.True(snapshot.PerModel.ContainsKey("gpt-typo-5.5"));
+        Assert.Equal(80, snapshot.PerModel["gpt-typo-5.5"].AvailablePct);
+    }
+
+    [Fact]
+    public async Task Codex_NewModelAbsentFromPerModelBuckets_ResolvesToOverall()
+    {
+        // Regression for the gpt-5.6-sol launch-day gap: the WHAM response
+        // enumerates only the previous-generation buckets (gpt-5.5,
+        // GPT-5.3-Codex-Spark), NOT the newly released gpt-5.6-sol. Before the
+        // overall fallback, the codex-xhigh class read AvailablePct=-1/Unknown
+        // and — under MostQuotaFirst — sorted below claude/opencode, so Sol
+        // never won a pickup despite ample headroom. It must now resolve to the
+        // overall account reading and stay KNOWN. Overall primary_window
+        // used_percent=29 → 71% available; per-model buckets are capped to it.
+        var body = """
+        {
+          "rate_limit": {"primary_window":{"used_percent":29}},
+          "additional_rate_limits": [
+            {"limit_name":"gpt-5.5","rate_limit":{"primary_window":{"used_percent":0}}},
+            {"limit_name":"GPT-5.3-Codex-Spark","rate_limit":{"primary_window":{"used_percent":0}}}
+          ]
+        }
+        """;
+        var probe = BuildCodexProbe(body);
+
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Codex,
+            Billing = AgentBilling.Subscription,
+            ModelId = "gpt-5.6-sol",
+            QualityScore = 120,
+        };
+        var snapshot = await probe.GetAvailabilityAsync(member, CancellationToken.None);
+
+        Assert.True(snapshot.AvailablePct >= 0, "Sol must not degrade to Unknown");
+        Assert.Equal(71, snapshot.AvailablePct);
+        Assert.True(snapshot.PerModel.ContainsKey("gpt-5.6-sol"));
+        Assert.Equal(71, snapshot.PerModel["gpt-5.6-sol"].AvailablePct);
     }
 
     [Fact]

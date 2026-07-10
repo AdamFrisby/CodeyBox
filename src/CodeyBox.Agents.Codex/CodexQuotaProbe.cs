@@ -114,11 +114,23 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
 
     /// <summary>
     /// When the configured <see cref="AgentMembership.ModelId"/> is not present
-    /// in the parsed response's per-model buckets, return
-    /// <c>AvailablePct = -1</c> so the router falls onto its
-    /// <c>QuotaUnknownPolicy</c> rather than fail-opening on the global
-    /// availability. Logs once per (token, modelId) so operators can spot
-    /// typos in configured model ids without grepping for log lines.
+    /// in the parsed response's per-model buckets, fall back to the overall
+    /// account reading before degrading to unknown. The WHAM usage endpoint caps
+    /// every per-model bucket by the account-wide 5h/weekly windows ("capped by
+    /// overall" in <see cref="ParseResponse"/>), so those windows ARE the binding
+    /// quota for any configured model — including a newly released one the backend
+    /// has not yet minted a dedicated bucket for (e.g. gpt-5.6-sol on launch day,
+    /// where the response only lists gpt-5.5 / GPT-5.3-Codex-Spark). Resolving to
+    /// the overall reading keeps the snapshot KNOWN (with the reading added to
+    /// <see cref="AgentQuotaSnapshot.PerModel"/> under the configured id so
+    /// <c>QuotaGatePolicy.ResolveMemberQuota</c> finds it) rather than reporting
+    /// -1, which would drop the class below its known-quota peers under
+    /// MostQuotaFirst and starve it despite ample headroom. Only degrade to
+    /// Unknown when there is no overall reading at all (guarded above). Logs once
+    /// per (token, modelId) so operators can still spot typos in configured ids.
+    /// Mirrors <c>ClaudeQuotaProbe.ApplyMemberGate</c>; codex has no family-bucket
+    /// layer (OpenAI rate limits are account-wide windows, not per-model), so the
+    /// overall reading is the only resolution step.
     /// </summary>
     private AgentQuotaSnapshot ApplyMemberGate(AgentQuotaSnapshot snapshot, AgentMembership member, string token)
     {
@@ -126,28 +138,42 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
         if (string.IsNullOrWhiteSpace(member.ModelId)) return snapshot;
         if (snapshot.PerModel.ContainsKey(member.ModelId)) return snapshot;
 
-        var modelList = snapshot.PerModel.Count == 0
-            ? "(none)"
-            : string.Join(", ", snapshot.PerModel.Keys.OrderBy(k => k, StringComparer.Ordinal));
-        var notes = $"configured model '{member.ModelId}' not in quota response (have: {modelList})";
+        // The configured model is not individually enumerated, but the overall
+        // reading is known (guarded above) and is the binding constraint for
+        // every codex model. Resolve to it under the configured model id so the
+        // floor is enforced on a KNOWN reading rather than degrading to Unknown.
+        var perModel = new Dictionary<string, ModelQuota>(snapshot.PerModel, StringComparer.OrdinalIgnoreCase)
+        {
+            [member.ModelId] = new ModelQuota
+            {
+                AvailablePct = snapshot.AvailablePct,
+                ResetAt = snapshot.ResetAt,
+                Window = "overall (model-specific bucket unavailable)",
+                Windows = snapshot.Windows,
+            },
+        };
 
         bool firstTime;
         lock (_loggedMissingModelsLock)
             firstTime = _loggedMissingModels.Add((token, member.ModelId));
         if (firstTime)
         {
+            var modelList = snapshot.PerModel.Count == 0
+                ? "(none)"
+                : string.Join(", ", snapshot.PerModel.Keys.OrderBy(k => k, StringComparer.Ordinal));
             _log.LogInformation(
-                "Codex quota probe: configured model {ModelId} not in response buckets ({BucketList}); reporting unknown so the router can apply its unknown policy",
-                member.ModelId, modelList);
+                "Codex quota probe: configured model {ModelId} not in response buckets ({BucketList}); resolving to overall account reading ({AvailablePct}%)",
+                member.ModelId, modelList, snapshot.AvailablePct);
         }
 
         return new AgentQuotaSnapshot
         {
-            AvailablePct = -1,
-            Unknown = QuotaUnknownReason.Permanent,
+            AvailablePct = snapshot.AvailablePct,
             ResetAt = snapshot.ResetAt,
-            Notes = notes,
-            PerModel = snapshot.PerModel,
+            Notes = snapshot.Notes,
+            PerModel = perModel,
+            Windows = snapshot.Windows,
+            ResetCreditsAvailable = snapshot.ResetCreditsAvailable,
         };
     }
 
