@@ -140,7 +140,14 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
             }
             catch (Exception ex) when (IsTransientHeartbeatStorageFailure(ex))
             {
-                throw new SqliteHeartbeatPersistenceException(workerId, attempt, ex);
+                // Fail-soft: transient writer contention is expected under load.
+                // The heartbeat is a best-effort, idempotent liveness signal; the
+                // caller re-issues it on the next interval, and the dead-worker
+                // threshold provides the safety net. Swallowing here (after
+                // bounded, backed-off retries) avoids surfacing routine SQLITE_BUSY
+                // as a hard failure. Non-transient storage errors still propagate.
+                _logger?.LogWarning(ex, "Heartbeat failed for worker {WorkerId} after {Attempts} attempts; will retry on next interval", workerId, attempt);
+                return;
             }
         }
     }
@@ -306,17 +313,4 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
     private static bool IsTransientHeartbeatStorageFailure(Exception ex) =>
         ex is SqliteWriteGateAcquisitionTimeoutException
         || ex is SqliteException { SqliteErrorCode: SqliteBusy or SqliteLocked };
-}
-
-internal sealed class SqliteHeartbeatPersistenceException : InvalidOperationException
-{
-    public SqliteHeartbeatPersistenceException(string workerId, int attempts, Exception innerException)
-        : base($"Failed to persist heartbeat for worker '{workerId}' after {attempts} attempts.", innerException)
-    {
-        WorkerId = workerId;
-        Attempts = attempts;
-    }
-
-    public string WorkerId { get; }
-    public int Attempts { get; }
 }
