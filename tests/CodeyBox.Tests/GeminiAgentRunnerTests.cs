@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http;
 using System.Text.Json;
+using CodeyBox.Agents.Antigravity;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -845,7 +846,7 @@ internal sealed class CapturingSandbox : ISandbox
         }
         if (StructuredProbeOutput is not null
             && exec.Argv.Contains("--output-format")
-            && string.Equals(exec.Stdin, "Reply with exactly CODEYBOX_STRUCTURED_STREAM_PROBE. Do not inspect or modify files.", StringComparison.Ordinal))
+            && string.Equals(exec.Stdin, AntigravityAgentRunner.StructuredStreamProbePrompt, StringComparison.Ordinal))
         {
             return Task.FromResult(new SandboxExecResult(
                 StructuredProbeExitCode,

@@ -355,6 +355,102 @@ public sealed class AntigravityAgentRunnerTests
         Assert.Contains("work_stdin=create /tmp/x containing BANANA", events);
     }
 
+    [SkippableFact]
+    public async Task RunAsync_WithRealSandboxAndSupportedPrintProbe_UsesStructuredStreamInvocation()
+    {
+        Skip.If(OperatingSystem.IsWindows(), "ProcessSandbox shell-script probe test requires Unix executable permissions.");
+
+        using var temp = new TemporaryTestDirectory("codeybox-agy-probe-");
+        var binDir = Path.Combine(temp.Path, "bin");
+        var recordDir = Path.Combine(temp.Path, "records");
+        Directory.CreateDirectory(binDir);
+        Directory.CreateDirectory(recordDir);
+
+        var agyPath = Path.Combine(binDir, "agy");
+        File.WriteAllText(agyPath, $$"""
+            #!/usr/bin/env bash
+            set -eu
+            record_dir="${AGY_RECORD_DIR:?}"
+            mkdir -p "$record_dir"
+            args="$*"
+
+            case " $args " in
+              *" --version "*)
+                printf '%s\n' 'agy version process-supported'
+                exit 0
+                ;;
+              *" --help "*)
+                printf '%s\n' 'Usage: agy --output-format stream-json'
+                exit 0
+                ;;
+            esac
+
+            stdin="$(cat)"
+            if [[ "$stdin" == "{{AntigravityAgentRunner.StructuredStreamProbePrompt}}" ]]; then
+              {
+                printf 'probe_argv=%s\n' "$args"
+                printf 'probe_stdin=%s\n' "$stdin"
+                printf 'probe_cwd=%s\n' "$(pwd)"
+              } >> "$record_dir/events.txt"
+              printf '%s\n' '{"type":"result","result":"CODEYBOX_STRUCTURED_STREAM_PROBE"}'
+              exit 0
+            fi
+
+            {
+              printf 'work_argv=%s\n' "$args"
+              printf 'work_stdin=%s\n' "$stdin"
+              printf 'work_cwd=%s\n' "$(pwd)"
+            } >> "$record_dir/events.txt"
+            printf '%s\n' '{"type":"result","result":"work-ok"}'
+            """);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                agyPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
+                | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+        }
+
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Mounts =
+            [
+                new SandboxMount { SandboxPath = "/tools", HostPath = binDir, ReadOnly = false },
+                new SandboxMount { SandboxPath = SandboxConventions.WorkDir, Tmpfs = true },
+            ],
+            Environment = new Dictionary<string, string>
+            {
+                ["PATH"] = "/tools:/usr/bin:/bin",
+                ["AGY_RECORD_DIR"] = recordDir,
+            },
+            WorkingDirectory = SandboxConventions.WorkDir,
+        });
+        var runner = new AntigravityAgentRunner { Binary = "/tools/agy" };
+
+        var result = await runner.RunAsync(
+            sandbox,
+            SandboxConventions.WorkDir,
+            "create /tmp/x containing BANANA",
+            credential: null,
+            captureStructuredStream: true);
+
+        Assert.True(result.Success, result.Stderr);
+        Assert.Contains("\"work-ok\"", result.Stdout);
+        Assert.DoesNotContain("structured stream capture was disabled", result.Stderr);
+
+        var events = File.ReadAllLines(Path.Combine(recordDir, "events.txt"));
+        Assert.Contains(events, line => line.StartsWith("probe_argv=", StringComparison.Ordinal));
+        Assert.Contains(events, line => line.StartsWith("probe_cwd=", StringComparison.Ordinal));
+        Assert.Contains($"probe_stdin={AntigravityAgentRunner.StructuredStreamProbePrompt}", events);
+        var workArgv = Assert.Single(events, line => line.StartsWith("work_argv=", StringComparison.Ordinal));
+        Assert.Contains("--output-format stream-json", workArgv);
+        Assert.Contains("work_stdin=create /tmp/x containing BANANA", events);
+        Assert.Contains(events, line => line.StartsWith("work_cwd=", StringComparison.Ordinal));
+    }
+
     [Fact]
     public async Task RunAsync_WhenHelpDoesNotAdvertiseStreamJson_OmitsOutputFormatStreamJson()
     {
