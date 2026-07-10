@@ -152,7 +152,7 @@ public sealed class AuditReportDiagnosticsUatTests : IDisposable
         Assert.Equal(1, reportJson.GetProperty("iterations")[0].GetProperty("blockingCount").GetInt32());
         Assert.True(reportJson.GetProperty("iterations")[0].GetProperty("auditors")[0].GetProperty("rawOutputAvailable").GetBoolean());
 
-        var raw = await _client.GetAsync($"/workitems/{item.Id}/audit-reports/2/security%3Asemgrep/raw");
+        var raw = await _client.GetAsync($"/workitems/{item.Id}/audit-reports/code/2/security%3Asemgrep/raw");
         raw.EnsureSuccessStatusCode();
         Assert.Contains("text/plain", raw.Content.Headers.ContentType?.MediaType);
         Assert.Equal("semgrep raw output\n", await raw.Content.ReadAsStringAsync());

@@ -665,6 +665,7 @@ public sealed class WorkItemRetrier
             PlanGeneratedAt = resumingFromPlanning ? null : item.PlanGeneratedAt,
             PlanReviewedAt = resumingFromPlanning ? null : item.PlanReviewedAt,
             PlanReviewSummary = resumingFromPlanning ? null : item.PlanReviewSummary,
+            PlanReviewAttempts = resumingFromPlanning ? 0 : item.PlanReviewAttempts,
             PreserveWorkBranchOnQueuedPickup = resumeState == WorkItemState.Queued && !resumingFromPlanning,
         };
 

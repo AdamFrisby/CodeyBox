@@ -461,6 +461,7 @@ internal sealed class ScriptedAuditorCatalog : IPresetCatalog
     public IReadOnlyList<string> KnownLanguages => [];
     public IReadOnlyList<string> KnownAuditTypes => _auditors.Count == 0 ? [] : ["scripted"];
     public string LlmPromptFrameTemplate => "{{reviewFocus}}\n{{originalPrompt}}\n{{resultFile}}";
+    public string LlmPlanPromptFrameTemplate => CodeyBox.Audit.Llm.LlmPromptFrameTemplate.DefaultPlanFrameTemplate;
 }
 
 internal enum MergeStrategy

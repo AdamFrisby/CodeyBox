@@ -1031,6 +1031,7 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
             PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
             PlanReviewedAt = approvedAt,
             PlanReviewSummary = "approved",
+            PlanReviewAttempts = 2,
         };
         await _store.CreateAsync(item);
         var stalePickupSnapshot = await _store.GetAsync(item.Id);
@@ -1057,6 +1058,7 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         Assert.Null(read.PlanGeneratedAt);
         Assert.Null(read.PlanReviewedAt);
         Assert.Null(read.PlanReviewSummary);
+        Assert.Equal(0, read.PlanReviewAttempts);
         Assert.Equal("abc123", read.LocalSquashSha);
     }
 

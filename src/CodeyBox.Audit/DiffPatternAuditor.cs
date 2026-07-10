@@ -4,10 +4,10 @@ using CodeyBox.Core;
 namespace CodeyBox.Audit;
 
 /// <summary>
-/// Audits the diff between <see cref="AuditContext.BaseBranch"/> and
-/// <see cref="AuditContext.WorkBranch"/> against a list of regex patterns.
-/// Each match on an added line (a <c>+</c>-prefixed line in unified diff)
-/// emits one <see cref="AuditFinding"/>.
+/// Applies regex patterns according to the current review target. Code-target
+/// invocations inspect only added unified-diff lines. Plan-target invocations
+/// inspect every line of <see cref="AuditContext.PlanArtifact"/> and report
+/// locations as <c>PLAN:&lt;line&gt;</c>.
 ///
 /// Used by the "cheating" preset to spot suppression markers
 /// (@ts-ignore, eslint-disable, # noqa, #pragma warning disable, etc.) and
@@ -28,11 +28,17 @@ public sealed partial class DiffPatternAuditor : IAuditor
     public string Name => _opts.Name;
     public string Kind => "diff-pattern";
     public AuditCapabilities Required => AuditCapabilities.None;
+    public IReadOnlySet<AuditTarget> Targets => _opts.Targets;
 
     public IReadOnlyList<DiffPattern> Patterns => _opts.Patterns;
 
     public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
     {
+        // Dispatch on the explicit review strategy: an unhandled future target is
+        // rejected in Classify rather than silently treated as a code diff.
+        if (AuditTargetSemantics.Classify(context.EffectiveTarget) == AuditReviewStrategy.PlanReview)
+            return AuditPlanArtifact(context);
+
         // Diff workBranch against baseBranch (three-dot: "the changes on
         // workBranch since it diverged from baseBranch"). --unified=0 keeps
         // only added/removed lines, no surrounding context, so our line-
@@ -117,6 +123,39 @@ public sealed partial class DiffPatternAuditor : IAuditor
         return new AuditResult(findings.Count == 0, findings, RawOutput: diff.Stdout);
     }
 
+    private AuditResult AuditPlanArtifact(AuditContext context)
+    {
+        if (string.IsNullOrWhiteSpace(context.PlanArtifact))
+        {
+            return new AuditResult(false, [new AuditFinding(
+                Name,
+                AuditSeverity.Error,
+                "no plan artifact to review",
+                "The plan-review context carried no PLAN artifact.")]);
+        }
+
+        var findings = new List<AuditFinding>();
+        var lines = context.PlanArtifact.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
+        for (var i = 0; i < lines.Length; i++)
+        {
+            var line = lines[i];
+            foreach (var pattern in _opts.Patterns)
+            {
+                if (pattern.Regex.IsMatch(line))
+                {
+                    findings.Add(new AuditFinding(
+                        AuditorName: Name,
+                        Severity: pattern.Severity,
+                        Title: pattern.Description,
+                        Description: line.Trim(),
+                        Location: $"PLAN:{i + 1}"));
+                }
+            }
+        }
+
+        return new AuditResult(findings.Count == 0, findings, RawOutput: context.PlanArtifact);
+    }
+
     [GeneratedRegex(@"\+(\d+)(?:,(\d+))? @@", RegexOptions.CultureInvariant)]
     private static partial Regex HunkHeader();
 }
@@ -125,6 +164,7 @@ public sealed record DiffPatternAuditorOptions
 {
     public required string Name { get; init; }
     public required IReadOnlyList<DiffPattern> Patterns { get; init; }
+    public IReadOnlySet<AuditTarget> Targets { get; init; } = AuditTargets.CodeOnly;
 }
 
 public sealed record DiffPattern

@@ -80,6 +80,36 @@ public interface ITextOnlyAgentRunner : IAgentRunner
         string? workingDirectory = null);
 
     /// <summary>
+    /// Whether this runner can send trusted instructions and untrusted user
+    /// data through distinct provider-level system and user channels. Callers
+    /// that make an authorization or approval decision from model output must
+    /// require this capability; concatenating both values into one prompt is
+    /// not an equivalent isolation boundary.
+    /// </summary>
+    bool SupportsSeparateSystemPrompt => false;
+
+    /// <summary>
+    /// Runs a text-only model call with trusted instructions isolated in the
+    /// provider's system channel and untrusted data in its user channel.
+    /// Implementations that advertise <see cref="SupportsSeparateSystemPrompt"/>
+    /// must preserve that separation in the provider request.
+    /// </summary>
+    Task<TextOnlyAgentResult> RunTextOnlyWithSystemPromptAsync(
+        string systemPrompt,
+        string userPrompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
+        => Task.FromResult(new TextOnlyAgentResult(
+            false,
+            "separate system prompt is unsupported",
+            null,
+            $"Agent '{Kind}' does not support provider-level system/user prompt separation."));
+
+    /// <summary>
     /// Cheap, credential-only viability probe. Returns <c>null</c> when the
     /// supplied credential is sufficient for this runner's text-only path to
     /// reach the provider; otherwise returns a short human-readable reason
@@ -91,6 +121,22 @@ public interface ITextOnlyAgentRunner : IAgentRunner
     /// rather than hard-failing the work item.
     /// </summary>
     string? GetTextOnlyUnavailabilityReason(AgentCredential? credential) => null;
+
+    /// <summary>
+    /// <c>true</c> when this runner's text-only path can only execute inside a
+    /// work-item sandbox (i.e. <see cref="RunTextOnlyAsync"/> fails when invoked
+    /// with a <c>null</c> sandbox). Subscription CLIs such as Cursor and Opencode
+    /// shell out inside the VM and set this; host-side HTTP runners (API-key
+    /// Claude, Gemini, Codex) leave it <c>false</c>.
+    ///
+    /// <para>The default is <c>false</c>. Callers that have no sandbox to offer
+    /// consult this to surface an explicit infrastructure failure rather than
+    /// issue a call that is guaranteed to fail.
+    /// This is distinct from <see cref="GetTextOnlyUnavailabilityReason"/>, which
+    /// is a credential-only probe and returns <c>null</c> for these CLIs whenever
+    /// the auth bundle is present.</para>
+    /// </summary>
+    bool TextOnlyRequiresSandbox => false;
 }
 
 public sealed record TextOnlyAgentResult(bool Success, string Summary, string? Output, string? Error);

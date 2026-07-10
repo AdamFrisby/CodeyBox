@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http;
+using System.Text.Json;
 using CodeyBox.Agents.Codex;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
@@ -349,6 +350,32 @@ public sealed class CodexAgentRunnerTests
         Assert.DoesNotContain("no default configured", result.Error);
         Assert.NotNull(handler.LastRequestBody);
         Assert.Contains("\"model\":\"gpt-5.5\"", handler.LastRequestBody);
+    }
+
+    [Fact]
+    public async Task RunTextOnlyWithSystemPromptAsync_UsesDistinctInstructionsAndInputFields()
+    {
+        var defaults = new AgentDefaultsSnapshot(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["codex"] = "gpt-5.5",
+        });
+        var handler = new CapturingCodexHandler(
+            HttpStatusCode.Unauthorized,
+            """{"error":{"message":"placeholder rejected"}}""");
+        var runner = new CodexAgentRunner(defaults, networkTolerance: null, textOnlyHttp: new HttpClient(handler));
+        var credential = new AgentCredential(
+            AgentKind.Codex,
+            new Dictionary<string, string> { ["OPENAI_API_KEY"] = "sk-test" },
+            new Dictionary<string, string>());
+
+        _ = await runner.RunTextOnlyWithSystemPromptAsync(
+            "trusted review contract",
+            "untrusted plan artifact",
+            credential);
+
+        using var body = JsonDocument.Parse(handler.LastRequestBody!);
+        Assert.Equal("trusted review contract", body.RootElement.GetProperty("instructions").GetString());
+        Assert.Equal("untrusted plan artifact", body.RootElement.GetProperty("input").GetString());
     }
 
     private sealed class CapturingCodexHandler : HttpMessageHandler

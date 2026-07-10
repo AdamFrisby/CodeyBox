@@ -79,7 +79,7 @@ public sealed class FindingsAcrossIterationsTableTests : TestContext
 
         // All iteration columns appear in the table header
         for (var i = 3; i <= 8; i++)
-            Assert.Contains($"<th title=\"Iteration {i}\">{i}</th>", cut.Markup);
+            Assert.Contains($"<th title=\"code iteration {i}\">code:{i}</th>", cut.Markup);
     }
 
     [Fact]

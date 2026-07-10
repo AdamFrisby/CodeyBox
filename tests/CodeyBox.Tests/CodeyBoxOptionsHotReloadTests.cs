@@ -160,7 +160,7 @@ public sealed class CodeyBoxOptionsHotReloadTests
             throw new NotImplementedException();
         public Task<IReadOnlyList<AuditReport>> GetByWorkItemAsync(string workItemId, CancellationToken ct = default) =>
             throw new NotImplementedException();
-        public Task<string?> GetRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default) =>
+        public Task<string?> GetRawOutputAsync(string workItemId, AuditTarget target, int iteration, string auditorName, CancellationToken ct = default) =>
             throw new NotImplementedException();
     }
 

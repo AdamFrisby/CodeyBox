@@ -123,6 +123,7 @@ public sealed class SqliteTransitionHealthDataSource : ITransitionHealthDataSour
             FROM audit_reports
             WHERE ended_at >= $start
               AND ended_at <= $end
+              AND audit_target = 'code'
             ORDER BY ended_at DESC
             LIMIT $lim;
             """;

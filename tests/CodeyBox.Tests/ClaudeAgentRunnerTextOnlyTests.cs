@@ -256,6 +256,28 @@ public sealed class ClaudeAgentRunnerTextOnlyTests
     }
 
     [Fact]
+    public async Task RunTextOnlyWithSystemPromptAsync_UsesSystemFieldAndUserMessage()
+    {
+        var handler = new FakeAnthropicHandler(
+            modelsResponse: (HttpStatusCode.OK, ModelsJson),
+            messagesResponder: _ => (HttpStatusCode.OK, """{"content":[{"type":"text","text":"{}"}]}"""));
+        var runner = BuildRunner(handler);
+
+        var result = await runner.RunTextOnlyWithSystemPromptAsync(
+            "trusted review contract",
+            "untrusted plan artifact",
+            ApiKeyCredential(),
+            modelId: "claude-opus-4-7");
+
+        Assert.True(result.Success);
+        using var body = JsonDocument.Parse(handler.Calls[1].Body!);
+        Assert.Equal("trusted review contract", body.RootElement.GetProperty("system").GetString());
+        var message = Assert.Single(body.RootElement.GetProperty("messages").EnumerateArray());
+        Assert.Equal("user", message.GetProperty("role").GetString());
+        Assert.Equal("untrusted plan artifact", message.GetProperty("content").GetString());
+    }
+
+    [Fact]
     public async Task RunTextOnlyAsync_ModelListFails_FallsBackToRequestedIdWithoutFailingTheCall()
     {
         // The /v1/models probe is best-effort: a 500 there must not degrade

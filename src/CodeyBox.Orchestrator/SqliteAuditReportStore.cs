@@ -36,12 +36,14 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
                 pragmaCmd.ExecuteNonQuery();
             }
 
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = """
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = $"""
                 CREATE TABLE IF NOT EXISTS audit_reports (
                     id              TEXT PRIMARY KEY,
                     work_item_id    TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
                     iteration       INTEGER NOT NULL,
+                    audit_target    TEXT NOT NULL DEFAULT '{AuditTarget.Code.Value}',
                     auditor_name    TEXT NOT NULL,
                     auditor_kind    TEXT NOT NULL,
                     worst_severity  TEXT NOT NULL,
@@ -51,10 +53,19 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
                     findings_json   TEXT NOT NULL,
                     raw_output      TEXT
                 );
-                CREATE INDEX IF NOT EXISTS idx_audit_reports_workitem_iter
-                    ON audit_reports(work_item_id, iteration, auditor_name);
                 """;
-            cmd.ExecuteNonQuery();
+                cmd.ExecuteNonQuery();
+            }
+
+            EnsureAuditTargetColumn();
+
+            using var indexCmd = _conn.CreateCommand();
+            indexCmd.CommandText = """
+                DROP INDEX IF EXISTS idx_audit_reports_workitem_iter;
+                CREATE INDEX idx_audit_reports_workitem_iter
+                    ON audit_reports(work_item_id, audit_target, iteration, auditor_name);
+                """;
+            indexCmd.ExecuteNonQuery();
         }
         finally
         {
@@ -64,18 +75,22 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
 
     public async Task CreateAsync(AuditReport report, CancellationToken ct = default)
     {
+        if (report.Target.IsDefault)
+            throw new ArgumentException("Audit report target must be non-empty.", nameof(report));
+
         await _writeLock.WaitAsync(ct);
         try
         {
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = """
-                INSERT INTO audit_reports (id, work_item_id, iteration, auditor_name, auditor_kind,
-                    worst_severity, started_at, ended_at, duration_ms, findings_json, raw_output)
-                VALUES ($id, $wi, $iter, $name, $kind, $sev, $started, $ended, $dur, $findings, $raw);
+                INSERT INTO audit_reports (id, work_item_id, iteration, audit_target, auditor_name,
+                    auditor_kind, worst_severity, started_at, ended_at, duration_ms, findings_json, raw_output)
+                VALUES ($id, $wi, $iter, $target, $name, $kind, $sev, $started, $ended, $dur, $findings, $raw);
                 """;
             cmd.Parameters.AddWithValue("$id", report.Id);
             cmd.Parameters.AddWithValue("$wi", report.WorkItemId);
             cmd.Parameters.AddWithValue("$iter", report.Iteration);
+            cmd.Parameters.AddWithValue("$target", report.Target.Value);
             cmd.Parameters.AddWithValue("$name", report.AuditorName);
             cmd.Parameters.AddWithValue("$kind", report.AuditorKind);
             cmd.Parameters.AddWithValue("$sev", report.WorstSeverity);
@@ -89,17 +104,45 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
         finally { _writeLock.Release(); }
     }
 
-    public async Task<IReadOnlyList<AuditReport>> GetByWorkItemAsync(string workItemId, CancellationToken ct = default)
+    public Task<IReadOnlyList<AuditReport>> GetByWorkItemAsync(
+        string workItemId,
+        CancellationToken ct = default)
+        => GetByWorkItemCoreAsync(workItemId, target: null, ct);
+
+    public Task<IReadOnlyList<AuditReport>> GetByWorkItemAsync(
+        string workItemId,
+        AuditTarget target,
+        CancellationToken ct = default)
+    {
+        if (target.IsDefault)
+            throw new ArgumentException("Audit report target must be non-empty.", nameof(target));
+        return GetByWorkItemCoreAsync(workItemId, target, ct);
+    }
+
+    private async Task<IReadOnlyList<AuditReport>> GetByWorkItemCoreAsync(
+        string workItemId,
+        AuditTarget? target,
+        CancellationToken ct)
     {
         using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            SELECT id, work_item_id, iteration, auditor_name, auditor_kind, worst_severity,
-                   started_at, ended_at, duration_ms, findings_json, raw_output
-            FROM audit_reports
-            WHERE work_item_id = $wi
-            ORDER BY iteration ASC, auditor_name ASC;
-            """;
+        cmd.CommandText = target is null
+            ? """
+              SELECT id, work_item_id, iteration, audit_target, auditor_name, auditor_kind, worst_severity,
+                     started_at, ended_at, duration_ms, findings_json, raw_output
+              FROM audit_reports
+              WHERE work_item_id = $wi
+              ORDER BY audit_target ASC, iteration ASC, auditor_name ASC;
+              """
+            : """
+              SELECT id, work_item_id, iteration, audit_target, auditor_name, auditor_kind, worst_severity,
+                     started_at, ended_at, duration_ms, findings_json, raw_output
+              FROM audit_reports
+              WHERE work_item_id = $wi AND audit_target = $target
+              ORDER BY iteration ASC, auditor_name ASC;
+              """;
         cmd.Parameters.AddWithValue("$wi", workItemId);
+        if (target is { } scopedTarget)
+            cmd.Parameters.AddWithValue("$target", scopedTarget.Value);
         using var reader = await cmd.ExecuteReaderAsync(ct);
         var results = new List<AuditReport>();
         while (await reader.ReadAsync(ct))
@@ -107,15 +150,25 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
         return results;
     }
 
-    public async Task<string?> GetRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default)
+    public async Task<string?> GetRawOutputAsync(
+        string workItemId,
+        AuditTarget target,
+        int iteration,
+        string auditorName,
+        CancellationToken ct = default)
     {
+        if (target.IsDefault)
+            throw new ArgumentException("Audit report target must be non-empty.", nameof(target));
+
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
             SELECT raw_output FROM audit_reports
-            WHERE work_item_id = $wi AND iteration = $iter AND auditor_name = $name
+            WHERE work_item_id = $wi AND audit_target = $target
+              AND iteration = $iter AND auditor_name = $name
             LIMIT 1;
             """;
         cmd.Parameters.AddWithValue("$wi", workItemId);
+        cmd.Parameters.AddWithValue("$target", target.Value);
         cmd.Parameters.AddWithValue("$iter", iteration);
         cmd.Parameters.AddWithValue("$name", auditorName);
         var result = await cmd.ExecuteScalarAsync(ct);
@@ -174,6 +227,7 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
             Id = r.GetString(r.GetOrdinal("id")),
             WorkItemId = r.GetString(r.GetOrdinal("work_item_id")),
             Iteration = r.GetInt32(r.GetOrdinal("iteration")),
+            Target = new AuditTarget(r.GetString(r.GetOrdinal("audit_target"))),
             AuditorName = r.GetString(r.GetOrdinal("auditor_name")),
             AuditorKind = r.GetString(r.GetOrdinal("auditor_kind")),
             WorstSeverity = r.GetString(r.GetOrdinal("worst_severity")),
@@ -185,6 +239,30 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
             Findings = findings,
             RawOutput = r.IsDBNull(rawOrd) ? null : r.GetString(rawOrd),
         };
+    }
+
+    private void EnsureAuditTargetColumn()
+    {
+        var exists = false;
+        using (var columns = _conn.CreateCommand())
+        {
+            columns.CommandText = "PRAGMA table_info(audit_reports);";
+            using var reader = columns.ExecuteReader();
+            while (reader.Read())
+            {
+                if (string.Equals(reader.GetString(1), "audit_target", StringComparison.Ordinal))
+                {
+                    exists = true;
+                    break;
+                }
+            }
+        }
+        if (exists)
+            return;
+
+        using var alter = _conn.CreateCommand();
+        alter.CommandText = $"ALTER TABLE audit_reports ADD COLUMN audit_target TEXT NOT NULL DEFAULT '{AuditTarget.Code.Value}';";
+        alter.ExecuteNonQuery();
     }
 
     private static IReadOnlyList<AuditReportFinding> DeserializeFindings(string json)

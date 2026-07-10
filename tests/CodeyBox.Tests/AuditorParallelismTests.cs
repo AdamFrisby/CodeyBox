@@ -147,7 +147,7 @@ file sealed class CapturingAuditReportStore : IAuditReportStore
     public Task<IReadOnlyList<AuditReport>> GetByWorkItemAsync(string workItemId, CancellationToken ct = default)
         => Task.FromResult<IReadOnlyList<AuditReport>>(Reports.Where(r => r.WorkItemId == workItemId).ToList());
 
-    public Task<string?> GetRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default)
+    public Task<string?> GetRawOutputAsync(string workItemId, AuditTarget target, int iteration, string auditorName, CancellationToken ct = default)
         => Task.FromResult<string?>(null);
 
     public Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)

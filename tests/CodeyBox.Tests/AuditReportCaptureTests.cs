@@ -39,6 +39,7 @@ public sealed class AuditReportCaptureTests : IDisposable
         var report = captureStore.Reports[0];
         Assert.Equal(item.Id.ToString(), report.WorkItemId);
         Assert.Equal(1, report.Iteration);
+        Assert.Equal(AuditTarget.Code, report.Target);
         Assert.Equal("KnownOutput", report.AuditorName);
         Assert.Equal("tool", report.AuditorKind);
         Assert.Equal("Error", report.WorstSeverity);
@@ -137,7 +138,7 @@ public sealed class AuditReportCaptureTests : IDisposable
         public Task<IReadOnlyList<AuditReport>> GetByWorkItemAsync(string workItemId, CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<AuditReport>>(Reports.Where(r => r.WorkItemId == workItemId).ToList());
 
-        public Task<string?> GetRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default)
+        public Task<string?> GetRawOutputAsync(string workItemId, AuditTarget target, int iteration, string auditorName, CancellationToken ct = default)
             => Task.FromResult<string?>(null);
 
         public Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)

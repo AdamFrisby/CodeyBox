@@ -622,7 +622,9 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         return MissingApiKeyReason;
     }
 
-    public async Task<TextOnlyAgentResult> RunTextOnlyAsync(
+    public bool SupportsSeparateSystemPrompt => true;
+
+    public Task<TextOnlyAgentResult> RunTextOnlyAsync(
         string prompt,
         AgentCredential? credential,
         string? modelId = null,
@@ -630,6 +632,28 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         CancellationToken ct = default,
         ISandbox? sandbox = null,
         string? workingDirectory = null)
+        => RunTextOnlyCoreAsync(null, prompt, credential, modelId, reasoningMode, ct, sandbox, workingDirectory);
+
+    public Task<TextOnlyAgentResult> RunTextOnlyWithSystemPromptAsync(
+        string systemPrompt,
+        string userPrompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
+        => RunTextOnlyCoreAsync(systemPrompt, userPrompt, credential, modelId, reasoningMode, ct, sandbox, workingDirectory);
+
+    private async Task<TextOnlyAgentResult> RunTextOnlyCoreAsync(
+        string? systemPrompt,
+        string userPrompt,
+        AgentCredential? credential,
+        string? modelId,
+        string? reasoningMode,
+        CancellationToken ct,
+        ISandbox? sandbox,
+        string? workingDirectory)
     {
         _ = sandbox;
         _ = workingDirectory;
@@ -658,15 +682,18 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
         try
         {
-            var body = JsonSerializer.Serialize(new
+            var bodyFields = new Dictionary<string, object?>
             {
-                model = canonicalModel,
-                max_tokens = TextOnlyMaxTokens,
-                messages = new[]
+                ["model"] = canonicalModel,
+                ["max_tokens"] = TextOnlyMaxTokens,
+                ["messages"] = new[]
                 {
-                    new { role = "user", content = prompt },
+                    new { role = "user", content = userPrompt },
                 },
-            });
+            };
+            if (systemPrompt is not null)
+                bodyFields["system"] = systemPrompt;
+            var body = JsonSerializer.Serialize(bodyFields);
 
             using var request = new HttpRequestMessage(HttpMethod.Post, MessagesEndpoint)
             {
@@ -675,9 +702,8 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             request.Headers.Add("x-api-key", apiKey);
             request.Headers.Add("anthropic-version", AnthropicVersion);
 
-            using var response = await _textOnlyHttp.SendAsync(request, ct).ConfigureAwait(false);
-            var responseText = await ClaudeModelListProbe.ReadCappedAsync(response.Content, ct).ConfigureAwait(false);
-            if (responseText is null)
+            var response = await BoundedHttpResponseReader.SendAsync(_textOnlyHttp, request, ct: ct).ConfigureAwait(false);
+            if (response.BodyTooLarge)
             {
                 return new TextOnlyAgentResult(
                     false,
@@ -685,6 +711,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
                     null,
                     "Response size exceeded 256 KiB limit.");
             }
+            var responseText = response.Body ?? string.Empty;
             if (!response.IsSuccessStatusCode)
             {
                 var summary = canonicalModel == requestedModel
@@ -716,14 +743,13 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             request.Headers.Add("x-api-key", apiKey);
             request.Headers.Add("anthropic-version", AnthropicVersion);
 
-            using var response = await _textOnlyHttp.SendAsync(request, ct).ConfigureAwait(false);
+            var response = await BoundedHttpResponseReader.SendAsync(_textOnlyHttp, request, ct: ct).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
                 return requested;
 
-            var body = await ClaudeModelListProbe.ReadCappedAsync(response.Content, ct).ConfigureAwait(false);
-            if (body is null)
+            if (response.BodyTooLarge || response.Body is null)
                 return requested;
-            var ids = ParseModelIds(body);
+            var ids = ParseModelIds(response.Body);
             return ResolveCanonicalModelId(requested, ids);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)

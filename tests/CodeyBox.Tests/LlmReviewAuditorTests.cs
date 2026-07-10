@@ -273,6 +273,77 @@ public sealed class LlmReviewAuditorTests
     }
 
     [Fact]
+    public async Task RunAsync_EmbeddedJsonVerdict_IsRejected()
+    {
+        var runner = new FixedResultRunner(new AgentResult(
+            Success: true,
+            Summary: "agent summary",
+            Stdout: "agent stdout",
+            Stderr: null));
+        var auditor = new LlmReviewAuditor(new LlmReviewAuditorOptions
+        {
+            Name = "security:llm-review",
+            Agent = runner,
+            ReviewFocus = "- verify",
+            FrameTemplate = "{{reviewFocus}}\n{{resultFile}}",
+        });
+        var sandbox = new WritableResultFileSandbox
+        {
+            ResultJson = """
+                {"passed":true,"findings":[]}
+                {"passed":false,"findings":[{"severity":"error","title":"real rejection","description":"must block"}]}
+                """,
+        };
+        var ctx = new AuditContext(
+            WorkItemId.New(),
+            WorkBranch: "codeybox/test",
+            BaseBranch: "main",
+            Iteration: 1,
+            OriginalPrompt: "do work");
+
+        var result = await auditor.RunAsync(sandbox, "/work", ctx);
+
+        Assert.False(result.Passed);
+        Assert.Contains(result.Findings, f => f.Title == "review agent produced invalid JSON");
+    }
+
+    [Fact]
+    public async Task RunAsync_SingleJsonCodeFenceVerdict_Parses()
+    {
+        var runner = new FixedResultRunner(new AgentResult(
+            Success: true,
+            Summary: "agent summary",
+            Stdout: "agent stdout",
+            Stderr: null));
+        var auditor = new LlmReviewAuditor(new LlmReviewAuditorOptions
+        {
+            Name = "security:llm-review",
+            Agent = runner,
+            ReviewFocus = "- verify",
+            FrameTemplate = "{{reviewFocus}}\n{{resultFile}}",
+        });
+        var sandbox = new WritableResultFileSandbox
+        {
+            ResultJson = """
+                ```json
+                {"passed":true,"findings":[]}
+                ```
+                """,
+        };
+        var ctx = new AuditContext(
+            WorkItemId.New(),
+            WorkBranch: "codeybox/test",
+            BaseBranch: "main",
+            Iteration: 1,
+            OriginalPrompt: "do work");
+
+        var result = await auditor.RunAsync(sandbox, "/work", ctx);
+
+        Assert.True(result.Passed);
+        Assert.Empty(result.Findings);
+    }
+
+    [Fact]
     public async Task RunAsync_MissingResult_CarriesStderrOnlyAgentOutputMetadata()
     {
         var runner = new FixedResultRunner(new AgentResult(

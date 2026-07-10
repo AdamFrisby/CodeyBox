@@ -245,6 +245,10 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             credential,
             "CODEYBOX_CURSOR_AUTH_JSON");
 
+    // The Cursor CLI runs inside the work-item sandbox; a host-side text-only
+    // call with no sandbox returns failure (see RunTextOnlyAsync below).
+    public bool TextOnlyRequiresSandbox => true;
+
     public Task<TextOnlyAgentResult> RunTextOnlyAsync(
         string prompt,
         AgentCredential? credential,

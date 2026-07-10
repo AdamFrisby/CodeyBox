@@ -3302,7 +3302,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
             }
         }
 
-        public Task<string?> GetRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default)
+        public Task<string?> GetRawOutputAsync(string workItemId, AuditTarget target, int iteration, string auditorName, CancellationToken ct = default)
             => Task.FromResult<string?>(null);
 
         public Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)
@@ -3316,7 +3316,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         public Task<IReadOnlyList<AuditReport>> GetByWorkItemAsync(string workItemId, CancellationToken ct = default)
             => throw new InvalidOperationException("audit report store unavailable");
 
-        public Task<string?> GetRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default)
+        public Task<string?> GetRawOutputAsync(string workItemId, AuditTarget target, int iteration, string auditorName, CancellationToken ct = default)
             => Task.FromResult<string?>(null);
 
         public Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)
@@ -3331,7 +3331,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         public Task<IReadOnlyList<AuditReport>> GetByWorkItemAsync(string workItemId, CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<AuditReport>>([]);
 
-        public Task<string?> GetRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default)
+        public Task<string?> GetRawOutputAsync(string workItemId, AuditTarget target, int iteration, string auditorName, CancellationToken ct = default)
             => Task.FromResult<string?>(null);
 
         public Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)
@@ -3464,6 +3464,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         public IReadOnlyList<string> KnownLanguages => ["csharp"];
         public IReadOnlyList<string> KnownAuditTypes => ["security", "cheating"];
         public string LlmPromptFrameTemplate => "{{reviewFocus}}\n{{resultFile}}";
+        public string LlmPlanPromptFrameTemplate => CodeyBox.Audit.Llm.LlmPromptFrameTemplate.DefaultPlanFrameTemplate;
     }
 
     private sealed class PassingAuditor(string name) : IAuditor

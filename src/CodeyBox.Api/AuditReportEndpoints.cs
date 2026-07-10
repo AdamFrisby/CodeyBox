@@ -8,12 +8,12 @@ internal static class AuditReportEndpoints
     {
         var group = app.MapGroup("/workitems/{id}/audit-reports");
         group.MapGet("/", GetAuditReportsAsync);
-        group.MapGet("/{iteration}/{auditor}/raw", GetRawOutputAsync);
+        group.MapGet("/{target}/{iteration}/{auditor}/raw", GetRawOutputAsync);
     }
 
     /// <summary>
     /// GET /workitems/{id}/audit-reports
-    /// Returns all stored auditor reports for a work item, grouped by iteration.
+    /// Returns all stored auditor reports for a work item, grouped by target and iteration.
     /// findings are included inline; raw_output is omitted (fetch separately via /raw).
     /// </summary>
     private static async Task<IResult> GetAuditReportsAsync(
@@ -28,10 +28,12 @@ internal static class AuditReportEndpoints
 
         var reports = await reportStore.GetByWorkItemAsync(id, ct);
 
-        // Group by iteration and build response shape.
+        // Plan and code iteration numbers are independent counters, so target
+        // is part of the grouping key rather than display-only metadata.
         var iterationGroups = reports
-            .GroupBy(r => r.Iteration)
-            .OrderBy(g => g.Key)
+            .GroupBy(r => (r.Target, r.Iteration))
+            .OrderBy(g => g.Key.Target.Value, StringComparer.Ordinal)
+            .ThenBy(g => g.Key.Iteration)
             .Select(g =>
             {
                 var auditors = g.OrderBy(r => r.AuditorName).Select(r => new AuditReportAuditorDto(
@@ -48,7 +50,12 @@ internal static class AuditReportEndpoints
                     string.Equals(f.Severity, "Error", StringComparison.OrdinalIgnoreCase));
                 var nonBlockingCount = allFindings.Count - blockingCount;
 
-                return new AuditReportIterationDto(g.Key, blockingCount, nonBlockingCount, auditors);
+                return new AuditReportIterationDto(
+                    g.Key.Target.Value,
+                    g.Key.Iteration,
+                    blockingCount,
+                    nonBlockingCount,
+                    auditors);
             })
             .ToList();
 
@@ -56,11 +63,12 @@ internal static class AuditReportEndpoints
     }
 
     /// <summary>
-    /// GET /workitems/{id}/audit-reports/{iteration}/{auditor}/raw
+    /// GET /workitems/{id}/audit-reports/{target}/{iteration}/{auditor}/raw
     /// Returns the raw_output for a single auditor invocation as plain text.
     /// </summary>
     private static async Task<IResult> GetRawOutputAsync(
         string id,
+        string target,
         int iteration,
         string auditor,
         IWorkItemStore store,
@@ -71,8 +79,18 @@ internal static class AuditReportEndpoints
         var item = await store.GetAsync(new WorkItemId(Guid.Parse(id)), ct);
         if (item is null) return Results.NotFound();
 
+        AuditTarget auditTarget;
+        try
+        {
+            auditTarget = new AuditTarget(Uri.UnescapeDataString(target));
+        }
+        catch (ArgumentException)
+        {
+            return Results.BadRequest(new { error = "invalid audit target" });
+        }
+
         var decodedAuditor = Uri.UnescapeDataString(auditor);
-        var raw = await reportStore.GetRawOutputAsync(id, iteration, decodedAuditor, ct);
+        var raw = await reportStore.GetRawOutputAsync(id, auditTarget, iteration, decodedAuditor, ct);
         if (raw is null) return Results.NotFound();
 
         return Results.Text(raw, contentType: "text/plain; charset=utf-8");
@@ -86,6 +104,7 @@ public sealed record AuditReportsResponse(
     IReadOnlyList<AuditReportIterationDto> Iterations);
 
 public sealed record AuditReportIterationDto(
+    string Target,
     int Iteration,
     int BlockingCount,
     int NonBlockingCount,

@@ -50,6 +50,36 @@ public sealed class WorkItemRetrierAutoPickTests : IDisposable
     }
 
     [Fact]
+    public async Task ExplicitFromWork_ClearsPlanReviewAttemptsForFreshPlanningLifecycle()
+    {
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var gitHost = new RecordingGitHost { Ahead = true };
+        var item = NewFailedItem(baseBranch: "main") with
+        {
+            PlanArtifact = """{"approach":"a","files":["f"],"testStrategy":["t"],"risks":["r"],"satisfiesTask":"s"}""",
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            PlanReviewedAt = DateTimeOffset.UtcNow.AddMinutes(-4),
+            PlanReviewSummary = "old plan approved",
+            PlanReviewAttempts = 2,
+        };
+        await store.CreateAsync(item);
+        var retrier = NewRetrier(store, queue, gitHost);
+
+        var result = await retrier.RetryAsync(item, from: "work");
+
+        Assert.True(result.Success, result.Error);
+        var persisted = await store.GetAsync(item.Id);
+        Assert.NotNull(persisted);
+        Assert.Equal(WorkItemState.Queued, persisted!.State);
+        Assert.Null(persisted.PlanArtifact);
+        Assert.Null(persisted.PlanGeneratedAt);
+        Assert.Null(persisted.PlanReviewedAt);
+        Assert.Null(persisted.PlanReviewSummary);
+        Assert.Equal(0, persisted.PlanReviewAttempts);
+    }
+
+    [Fact]
     public async Task AutoPickAudit_LogsPickedPhaseAndReason()
     {
         using var store = NewStore();

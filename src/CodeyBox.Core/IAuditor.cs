@@ -1,11 +1,13 @@
 namespace CodeyBox.Core;
 
 /// <summary>
-/// An audit pass run against the work-phase output before merge. Auditors
-/// can be tool-driven (linters, SAST, custom shell scripts) or LLM-driven
-/// (a review-style agent prompt). The pipeline runs all registered auditors,
-/// collects findings, and either proceeds to merge or hands findings back
-/// to the agent for rework.
+/// A target-specific review pass. The code-audit target runs against the
+/// work-phase output before merge; the plan-review target runs against the
+/// structured PLAN artifact before implementation. Auditors can be tool-driven
+/// (linters, SAST, custom shell scripts) or LLM-driven (a review-style prompt).
+/// The pipeline composes auditors by <see cref="Targets"/>, collects findings,
+/// and either proceeds to the next phase or sends the relevant artifact back
+/// for rework.
 ///
 /// Auditors declare their <see cref="Required"/> capabilities so the
 /// pipeline can group them into separate sandboxes — a tool auditor that
@@ -26,6 +28,21 @@ public interface IAuditor
 
     /// <summary>What the auditor needs to do its job.</summary>
     AuditCapabilities Required { get; }
+
+    /// <summary>
+    /// Declares WHICH review targets this auditor runs on. Multi-valued: an
+    /// auditor may target several (e.g. <c>{ Plan, Code }</c>). The composer
+    /// selects auditors per phase by target — the plan-review phase composes
+    /// auditors whose <see cref="Targets"/> contains <see cref="AuditTarget.Plan"/>;
+    /// the code-audit phase composes those containing <see cref="AuditTarget.Code"/>.
+    ///
+    /// <para>The default is <see cref="AuditTargets.CodeOnly"/>, so every
+    /// existing and external auditor reviews code and is unaffected by the
+    /// introduction of plan review. Auditors that review plans opt in by
+    /// returning <see cref="AuditTargets.PlanOnly"/> or
+    /// <see cref="AuditTargets.PlanAndCode"/>.</para>
+    /// </summary>
+    IReadOnlySet<AuditTarget> Targets => AuditTargets.CodeOnly;
 
     /// <summary>
     /// Declares that a blocking result from this auditor can skip the
@@ -60,7 +77,12 @@ public interface IAuditor
     BuildTestGateEvidence BuildTestGateEvidence => BuildTestGateEvidence.None;
 
     /// <summary>
-    /// Runs the auditor against the working tree at <paramref name="workingDirectory"/>.
+    /// Runs the auditor for the target described by <paramref name="context"/>.
+    /// Code-target auditors inspect the working tree at
+    /// <paramref name="workingDirectory"/>. Plan-target auditors receive the
+    /// structured plan text on <see cref="AuditContext.PlanArtifact"/> and run
+    /// through the same sandbox, credential, quota, and post-processing path as
+    /// code auditors.
     /// </summary>
     Task<AuditResult> RunAsync(
         ISandbox sandbox,
@@ -204,7 +226,33 @@ public sealed record AuditContext(
     /// shape from before this field existed; auditors that consume it must
     /// fall back gracefully (typically to a base-branch-only key).
     /// </summary>
-    string? ProjectId = null);
+    string? ProjectId = null,
+    /// <summary>
+    /// The review target this invocation runs under. Null means the legacy
+    /// call shape from before plan review existed and is interpreted as
+    /// <see cref="AuditTarget.Code"/> (see <see cref="EffectiveTarget"/>). A
+    /// multi-target auditor reads this to adapt its review focus — reviewing a
+    /// PLAN artifact versus a code diff.
+    /// </summary>
+    AuditTarget? Target = null,
+    /// <summary>
+    /// The structured PLAN artifact under review when
+    /// <see cref="EffectiveTarget"/> is <see cref="AuditTarget.Plan"/>. Null
+    /// for code audits; a plan reviewer treats a null/blank value as "no plan
+    /// to review".
+    /// </summary>
+    string? PlanArtifact = null)
+{
+    /// <summary>
+    /// The effective review target: <see cref="Target"/> when set, otherwise
+    /// <see cref="AuditTarget.Code"/>. Auditors branch on this so a null Target
+    /// (legacy call sites) or a CLR-default <see cref="AuditTarget"/> behaves
+    /// exactly as a code audit.
+    /// </summary>
+    public AuditTarget EffectiveTarget => Target is { } target && !target.IsDefault
+        ? target
+        : AuditTarget.Code;
+}
 
 /// <summary>Result from a single auditor invocation.</summary>
 public sealed record AuditResult

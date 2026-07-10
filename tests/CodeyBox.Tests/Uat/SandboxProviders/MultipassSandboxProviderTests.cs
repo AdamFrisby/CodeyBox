@@ -1434,7 +1434,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         {
             var (exit, _, stderr) = await RunLocalProcessAsync(
                 "/bin/bash",
-                ["-c", "exec 3>&1\nexec \"$1\"", "codeybox-launch-with-extra-fd", launchScript],
+                // Keep fd 3 inherited by the launcher without requiring the
+                // temp workspace to allow direct script execution.
+                ["-c", "exec 3>&1\nexec /bin/bash \"$1\"", "codeybox-launch-with-extra-fd", launchScript],
                 ct: launchCts.Token,
                 environmentOverrides: FakeSudoPathEnvironment());
 

@@ -26,6 +26,11 @@ public sealed record AuditReport
     public required string Id { get; init; }
     public required string WorkItemId { get; init; }
     public required int Iteration { get; init; }
+    /// <summary>
+    /// Artifact reviewed by this invocation. Defaults to code for reports
+    /// created by legacy callers and rows written before target persistence.
+    /// </summary>
+    public AuditTarget Target { get; init; } = AuditTarget.Code;
     public required string AuditorName { get; init; }
     public required string AuditorKind { get; init; }
     public required string WorstSeverity { get; init; }
@@ -49,11 +54,25 @@ public interface IAuditReportStore
 {
     Task CreateAsync(AuditReport report, CancellationToken ct = default);
 
-    /// <summary>Returns all reports for a work item ordered by (iteration, auditor_name).</summary>
+    /// <summary>Returns all reports for a work item ordered by (target, iteration, auditor_name).</summary>
     Task<IReadOnlyList<AuditReport>> GetByWorkItemAsync(string workItemId, CancellationToken ct = default);
 
-    /// <summary>Returns only the raw_output column for one specific auditor call.</summary>
-    Task<string?> GetRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default);
+    /// <summary>Returns reports for one target ordered by (iteration, auditor_name).</summary>
+    async Task<IReadOnlyList<AuditReport>> GetByWorkItemAsync(
+        string workItemId,
+        AuditTarget target,
+        CancellationToken ct = default)
+        => (await GetByWorkItemAsync(workItemId, ct).ConfigureAwait(false))
+            .Where(report => report.Target == target)
+            .ToList();
+
+    /// <summary>Returns only the raw_output column for one target-specific auditor call.</summary>
+    Task<string?> GetRawOutputAsync(
+        string workItemId,
+        AuditTarget target,
+        int iteration,
+        string auditorName,
+        CancellationToken ct = default);
 
     /// <summary>Deletes rows whose started_at is strictly before <paramref name="cutoff"/>.</summary>
     Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default);
