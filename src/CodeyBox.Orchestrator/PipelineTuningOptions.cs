@@ -17,6 +17,16 @@ public sealed class PipelineTuningOptions
     public int MaxPlanReviewIterations { get; set; } = PlanReviewIterationLimit.DefaultValue;
 
     /// <summary>
+    /// Fraction (0, 1] of the operator task's distinctive terms the canonical
+    /// PLAN must reproduce for the deterministic <see cref="PlanApprovalPolicy"/>
+    /// task-binding gate to approve it. Higher values demand the plan cover more
+    /// of the task before the pipeline persists <c>PlanApproved</c>, tightening
+    /// the independent (non-LLM) check against a forged reviewer pass. Default
+    /// <see cref="PlanApprovalPolicy.DefaultTaskBindingCoverage"/>.
+    /// </summary>
+    public double PlanTaskBindingCoverageRatio { get; set; } = PlanApprovalPolicy.DefaultTaskBindingCoverage;
+
+    /// <summary>
     /// Last-resort pause applied when a quota-shaped terminal failure occurs and
     /// neither the agent output nor quota probes expose a reset window.
     /// Default 5 minutes.
@@ -180,6 +190,15 @@ public sealed class PipelineTuningOptions
     public void Validate()
     {
         _ = PlanReviewIterationLimit.Create(MaxPlanReviewIterations);
+        if (!double.IsFinite(PlanTaskBindingCoverageRatio)
+            || PlanTaskBindingCoverageRatio <= 0.0
+            || PlanTaskBindingCoverageRatio > 1.0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(PlanTaskBindingCoverageRatio),
+                PlanTaskBindingCoverageRatio,
+                "PlanTaskBindingCoverageRatio must be in the interval (0, 1].");
+        }
         if (MaxSandboxReuses < 1)
         {
             throw new ArgumentOutOfRangeException(nameof(MaxSandboxReuses), "MaxSandboxReuses must be >= 1");

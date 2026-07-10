@@ -10,6 +10,7 @@ using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
 using Json.Schema;
 using YamlDotNet.Core;
+using YamlDotNet.Core.Events;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
@@ -19,11 +20,22 @@ internal sealed class PresetConfigLoader
 {
     private const string ResourcePrefix = "CodeyBox.Audit.Presets.Defaults.";
     private const string UnrunnableTestsRule = "Tests which cannot be run in this environment are not part of the scoring or auditing criteria.";
-    private const int MaxRepositoryAuditTypeFiles = 64;
+    // Aggregate (across all project roots) and per-directory hard cap on
+    // repository preset YAML files, applied identically to the languages and
+    // audit-types directories. The per-directory cap is enforced during
+    // enumeration, before any sort/accumulation, so an attacker-controlled repo
+    // cannot exhaust host memory/CPU by dropping a huge number of YAML files.
+    private const int MaxRepositoryPresetFiles = 64;
     private const int MaxRepositoryPresetBytes = 256 * 1024;
     private const int MaxRepositoryAuditorsPerFile = 16;
     private const int MaxRepositoryPatternsPerFile = 64;
     private const int MaxRepositoryAuditEntries = 128;
+    // Maximum YAML mapping/sequence nesting accepted from any preset document.
+    // A small deeply-nested document could otherwise overflow the process stack
+    // in the normalizer/serializer before schema validation runs.
+    private const int MaxYamlDepth = 64;
+    private const int StreamReadBufferBytes = 4096;
+    private static readonly byte[] Utf8ByteOrderMark = [0xEF, 0xBB, 0xBF];
     private static readonly IReadOnlySet<string> AuditTypesWithUnrunnableTestsRule =
         new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -63,11 +75,12 @@ internal sealed class PresetConfigLoader
         var frame = LoadEmbeddedFrame(assembly);
         var planFrame = LoadEmbeddedPlanFrame(assembly);
 
+        var repositoryLanguageFiles = 0;
         var repositoryAuditTypeFiles = 0;
         var repositoryAuditEntries = 0;
         foreach (var projectRoot in ProjectRoots(options))
         {
-            LoadUserLanguageFiles(projectRoot, languages);
+            LoadUserLanguageFiles(projectRoot, languages, ref repositoryLanguageFiles);
             LoadUserAuditTypeFiles(
                 projectRoot,
                 auditTypes,
@@ -121,10 +134,20 @@ internal sealed class PresetConfigLoader
         return frame;
     }
 
-    private static void LoadUserLanguageFiles(string? projectRoot, Dictionary<string, LanguagePresetDefinition> languages)
+    private static void LoadUserLanguageFiles(
+        string? projectRoot,
+        Dictionary<string, LanguagePresetDefinition> languages,
+        ref int repositoryFileCount)
     {
         foreach (var file in PresetFiles(projectRoot, "languages"))
         {
+            repositoryFileCount++;
+            if (repositoryFileCount > MaxRepositoryPresetFiles)
+            {
+                throw new PresetConfigurationException(
+                    $"Repository language configuration exceeds the {MaxRepositoryPresetFiles}-file limit.");
+            }
+
             var definition = ReadYamlFile<LanguagePresetDefinition>(file, "language", MaxRepositoryPresetBytes);
             if (definition.Marker?.Script != null)
                 throw new PresetConfigurationException($"{file}: /marker/script is not allowed in repository-provided configuration for security reasons. Use /marker/globs instead.");
@@ -143,10 +166,10 @@ internal sealed class PresetConfigLoader
         foreach (var file in PresetFiles(projectRoot, "audit-types"))
         {
             repositoryFileCount++;
-            if (repositoryFileCount > MaxRepositoryAuditTypeFiles)
+            if (repositoryFileCount > MaxRepositoryPresetFiles)
             {
                 throw new PresetConfigurationException(
-                    $"Repository audit-type configuration exceeds the {MaxRepositoryAuditTypeFiles}-file limit.");
+                    $"Repository audit-type configuration exceeds the {MaxRepositoryPresetFiles}-file limit.");
             }
 
             var definition = ReadYamlFile<AuditTypePresetDefinition>(file, "audit-type", MaxRepositoryPresetBytes);
@@ -352,15 +375,86 @@ internal sealed class PresetConfigLoader
             !string.IsNullOrWhiteSpace(a.Role) ||
             !string.IsNullOrWhiteSpace(a.GateEvidence));
 
-    private static IEnumerable<string> PresetFiles(string? projectRoot, string childDirectory)
+    private static IReadOnlyList<string> PresetFiles(string? projectRoot, string childDirectory)
     {
         if (string.IsNullOrWhiteSpace(projectRoot))
             return [];
 
         var directory = Path.Combine(projectRoot, "codeybox", childDirectory);
-        return Directory.Exists(directory)
-            ? Directory.EnumerateFiles(directory, "*.yaml").Order(StringComparer.Ordinal)
-            : [];
+        if (!Directory.Exists(directory))
+            return [];
+
+        var canonicalDirectory = Path.GetFullPath(directory);
+        EnsurePresetDirectoryChainNotLinked(projectRoot, canonicalDirectory);
+
+        // Bound enumeration BEFORE sorting/accumulating so an attacker-controlled
+        // repository with an arbitrarily large number of YAML files cannot exhaust
+        // host memory/CPU via Order() before the advertised file cap runs.
+        var files = new List<string>();
+        foreach (var file in Directory.EnumerateFiles(directory, "*.yaml"))
+        {
+            if (files.Count >= MaxRepositoryPresetFiles)
+            {
+                throw new PresetConfigurationException(
+                    $"Repository preset directory '{directory}' exceeds the {MaxRepositoryPresetFiles}-file limit.");
+            }
+
+            EnsurePresetFileContained(file, canonicalDirectory);
+            files.Add(file);
+        }
+
+        files.Sort(StringComparer.Ordinal);
+        return files;
+    }
+
+    // Reject a symlinked preset-directory chain (codeybox/<child>): a linked
+    // component would relocate the whole enumeration outside the project root and
+    // let a malicious repository point preset loading at arbitrary host paths.
+    // projectRoot itself is orchestrator-supplied and treated as the trusted base.
+    private static void EnsurePresetDirectoryChainNotLinked(string projectRoot, string canonicalDirectory)
+    {
+        var root = Path.GetFullPath(projectRoot);
+        var current = canonicalDirectory;
+        while (!string.Equals(current, root, StringComparison.Ordinal))
+        {
+            var info = new DirectoryInfo(current);
+            if (info.LinkTarget is not null)
+            {
+                throw new PresetConfigurationException(
+                    $"{canonicalDirectory}: repository preset path component '{info.Name}' must not be a symbolic link.");
+            }
+
+            var parent = info.Parent?.FullName;
+            if (parent is null || string.Equals(parent, current, StringComparison.Ordinal))
+                break;
+            current = parent;
+        }
+    }
+
+    private static void EnsurePresetFileContained(string path, string canonicalDirectory)
+    {
+        // No-follow intent: a symbolic-link / reparse-point file is rejected before
+        // it is ever opened, so following it can never read an arbitrary host file
+        // or special device accessible to the service account. The byte cap does
+        // not establish path containment; this does.
+        var info = new FileInfo(path);
+        if (info.LinkTarget is not null)
+        {
+            throw new PresetConfigurationException(
+                $"{path}: repository preset files must be regular files, not symbolic links.");
+        }
+
+        // Canonicalise-then-contain (defence in depth against '..' components):
+        // the resolved file path must remain beneath the canonical preset directory.
+        var fullPath = Path.GetFullPath(path);
+        var containedPrefix = canonicalDirectory.EndsWith(Path.DirectorySeparatorChar)
+            ? canonicalDirectory
+            : canonicalDirectory + Path.DirectorySeparatorChar;
+        if (!fullPath.StartsWith(containedPrefix, StringComparison.Ordinal))
+        {
+            throw new PresetConfigurationException(
+                $"{path}: repository preset files must reside within '{canonicalDirectory}'.");
+        }
     }
 
     private static IEnumerable<string> ProjectRoots(PresetCatalogOptions options)
@@ -396,7 +490,7 @@ internal sealed class PresetConfigLoader
             FileMode.Open,
             FileAccess.Read,
             FileShare.Read,
-            bufferSize: 4096,
+            StreamReadBufferBytes,
             FileOptions.SequentialScan);
         if (stream.Length > maxBytes)
             throw new PresetConfigurationException($"{path}: preset exceeds the {maxBytes}-byte limit.");
@@ -414,11 +508,9 @@ internal sealed class PresetConfigLoader
             throw new PresetConfigurationException($"{path}: preset exceeds the {maxBytes}-byte limit.");
 
         var content = bytes.AsSpan(0, totalRead);
-        if (content.Length >= 3
-            && content[0] == 0xEF
-            && content[1] == 0xBB
-            && content[2] == 0xBF)
-            content = content[3..];
+        if (content.Length >= Utf8ByteOrderMark.Length
+            && content[..Utf8ByteOrderMark.Length].SequenceEqual(Utf8ByteOrderMark))
+            content = content[Utf8ByteOrderMark.Length..];
         try
         {
             return ReadYamlText<T>(new UTF8Encoding(false, true).GetString(content), path, schemaName);
@@ -431,9 +523,44 @@ internal sealed class PresetConfigLoader
 
     private static T ReadYamlText<T>(string yaml, string source, string schemaName)
     {
+        // Enforce a conservative nesting bound while streaming parser events (no
+        // object graph is built), so a deeply nested document is rejected before
+        // the recursive normalizer/serializer can consume the process stack.
+        EnsureYamlDepthWithinLimit(yaml);
         var json = ReadYamlJson(yaml, source);
         ValidateJsonSchema(typeof(PresetConfigLoader).Assembly, schemaName, source, json);
         return ReadYaml<T>(yaml, source);
+    }
+
+    private static void EnsureYamlDepthWithinLimit(string yaml)
+    {
+        try
+        {
+            var parser = new Parser(new StringReader(yaml));
+            var depth = 0;
+            while (parser.MoveNext())
+            {
+                switch (parser.Current)
+                {
+                    case MappingStart:
+                    case SequenceStart:
+                        depth++;
+                        if (depth > MaxYamlDepth)
+                            throw new PresetConfigurationException(
+                                $"YAML nesting exceeds the maximum depth of {MaxYamlDepth}.");
+                        break;
+                    case MappingEnd:
+                    case SequenceEnd:
+                        depth--;
+                        break;
+                }
+            }
+        }
+        catch (YamlException)
+        {
+            // Malformed YAML surfaces a consistent, located error from the
+            // downstream document parser; the depth pre-scan only guards nesting.
+        }
     }
 
     private static T ReadYaml<T>(string yaml, string source)
@@ -516,8 +643,16 @@ internal sealed class PresetConfigLoader
         }
     }
 
-    private static object? NormalizeYamlValue(object? value)
+    private static object? NormalizeYamlValue(object? value) => NormalizeYamlValue(value, depth: 0);
+
+    private static object? NormalizeYamlValue(object? value, int depth)
     {
+        // Belt-and-suspenders alongside the parser-event pre-scan: bound recursion
+        // here too so a deeply nested value can never overflow the process stack.
+        if (depth > MaxYamlDepth)
+            throw new PresetConfigurationException(
+                $"YAML nesting exceeds the maximum depth of {MaxYamlDepth}.");
+
         if (value is IDictionary dictionary)
         {
             var normalized = new Dictionary<string, object?>(StringComparer.Ordinal);
@@ -526,7 +661,7 @@ internal sealed class PresetConfigLoader
                 var key = entry.Key?.ToString();
                 if (string.IsNullOrWhiteSpace(key))
                     continue;
-                normalized[key] = NormalizeYamlValue(entry.Value);
+                normalized[key] = NormalizeYamlValue(entry.Value, depth + 1);
             }
             return normalized;
         }
@@ -535,7 +670,7 @@ internal sealed class PresetConfigLoader
         {
             var normalized = new List<object?>();
             foreach (var item in enumerable)
-                normalized.Add(NormalizeYamlValue(item));
+                normalized.Add(NormalizeYamlValue(item, depth + 1));
             return normalized;
         }
 

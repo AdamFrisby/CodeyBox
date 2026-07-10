@@ -220,7 +220,8 @@ public sealed class AuditTests
 
         Assert.True(result.Passed);
         var write = Assert.Single(execs, exec => exec.Stdin == context.PlanArtifact);
-        var expectedPath = $"/tmp/codeybox-plan-artifact-{context.WorkItemId}-{context.Iteration}.json";
+        // Path is unique per work item, iteration, and (sanitised) auditor name.
+        var expectedPath = $"/tmp/codeybox-plan-artifact-{context.WorkItemId}-{context.Iteration}-plan-shell.json";
         Assert.Equal(["sh", "-c", "umask 077; rm -f -- \"$1\"; cat > \"$1\"; chmod 400 \"$1\"", "sh", expectedPath], write.Argv);
         var command = Assert.Single(execs, exec => exec.Argv.SequenceEqual(auditor.Argv));
         Assert.NotNull(command.ExtraEnvironment);
@@ -291,13 +292,21 @@ public sealed class AuditTests
             PlanArtifact = $"{{\"workItem\":\"{secondId}\"}}",
         };
 
-        var results = await Task.WhenAll(
-            auditor.RunAsync(sandbox, "/work", first),
-            auditor.RunAsync(sandbox, "/work", second));
+        try
+        {
+            var results = await Task.WhenAll(
+                auditor.RunAsync(sandbox, "/work", first),
+                auditor.RunAsync(sandbox, "/work", second));
 
-        Assert.All(results, result => Assert.True(result.Passed, result.RawOutput));
-        foreach (var path in Directory.GetFiles("/tmp", Path.GetFileName(barrierPrefix) + "-*"))
-            File.Delete(path);
+            Assert.All(results, result => Assert.True(result.Passed, result.RawOutput));
+        }
+        finally
+        {
+            // Delete the per-test barrier files even if a task or assertion throws,
+            // so a failing run does not leak /tmp synchronization files.
+            foreach (var path in Directory.GetFiles("/tmp", Path.GetFileName(barrierPrefix) + "-*"))
+                File.Delete(path);
+        }
     }
 
     [Fact]

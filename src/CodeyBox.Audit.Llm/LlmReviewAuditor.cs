@@ -131,7 +131,10 @@ public sealed class LlmReviewAuditor : IAuditor, IRequiresPassedBuildTestGate
 
     public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
     {
-        if (context.EffectiveTarget == AuditTarget.Plan)
+        // Dispatch on the explicit review strategy rather than a Plan-vs-everything
+        // fallback, so an unhandled future target is rejected here instead of being
+        // silently reviewed as a code diff.
+        if (AuditTargetSemantics.Classify(context.EffectiveTarget) == AuditReviewStrategy.PlanReview)
         {
             if (string.IsNullOrWhiteSpace(context.PlanArtifact))
             {

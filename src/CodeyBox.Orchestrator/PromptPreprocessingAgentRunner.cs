@@ -5,11 +5,24 @@ namespace CodeyBox.Orchestrator;
 
 /// <summary>
 /// Wraps an inner <see cref="IAgentRunner"/> so the
-/// <see cref="AgentPromptPreprocessorChain"/> runs against every prompt
-/// immediately before the agent is invoked. Use <see cref="Wrap"/> to
-/// construct one — the factory returns subclasses that mirror optional
-/// runner capabilities, so <c>is</c> checks on the returned instance reflect
-/// the inner runner's true capability instead of the wrapper's claim.
+/// <see cref="AgentPromptPreprocessorChain"/> runs immediately before the agent
+/// is invoked. Use <see cref="Wrap"/> to construct one — the factory returns
+/// subclasses that mirror optional runner capabilities, so <c>is</c> checks on
+/// the returned instance reflect the inner runner's true capability instead of
+/// the wrapper's claim.
+///
+/// <para><b>Exception — separated-channel plan review.</b> The chain runs
+/// against every prompt EXCEPT the separated system/user plan-review path
+/// (<see cref="RunTextOnlyWithSystemPromptInnerAsync"/> when
+/// <see cref="AgentPromptPhase.PlanReview"/> is active). That path deliberately
+/// keeps its user message as the exact bounded JSON envelope the trusted system
+/// prompt promises ("exactly two string fields"); running arbitrary
+/// preprocessors would let them inject text into the untrusted-data user
+/// channel and break the system/user separation the plan reviewer relies on.
+/// The one built-in preprocessor that would otherwise apply
+/// (<see cref="ProjectRulesPromptPreprocessor"/>) already no-ops for this phase.
+/// Every other invocation path — including the planning/plan-rework agent turn,
+/// which goes through <see cref="RunAsync"/> — is preprocessed normally.</para>
 /// </summary>
 internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModelProvider
 {
@@ -145,6 +158,9 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
         ISandbox? sandbox = null,
         string? workingDirectory = null)
     {
+        // Plan review is the documented exception (see class summary): its user
+        // channel must stay the exact bounded JSON envelope, so the preprocessor
+        // chain is intentionally NOT run for this separated-prompt path.
         if (sandbox is not null && Phase != AgentPromptPhase.PlanReview)
         {
             var resolvedWorkingDirectory = string.IsNullOrWhiteSpace(workingDirectory)

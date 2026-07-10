@@ -323,19 +323,17 @@ public sealed class ProjectAuditorComposer
 
     private static IReadOnlySet<AuditTarget> ParseCustomAuditorTargets(CustomAuditorDescriptor descriptor)
     {
-        if (descriptor.Targets.Count == 0)
-            return AuditTargets.CodeOnly;
-
-        var targets = new List<AuditTarget>(descriptor.Targets.Count);
-        foreach (var raw in descriptor.Targets)
+        try
         {
-            var value = raw.Trim();
-            if (string.IsNullOrWhiteSpace(value))
-                throw new InvalidOperationException($"Custom auditor '{descriptor.Name}' has an empty target value");
-            targets.Add(new AuditTarget(value.ToLowerInvariant()));
+            // Single source of truth for empty-means-CodeOnly plus the
+            // string-to-target canonicalisation shared with preset loading.
+            return AuditTargets.ParseOrCodeOnly(descriptor.Targets);
         }
-
-        return AuditTargets.Of(targets.ToArray());
+        catch (ArgumentException ex)
+        {
+            throw new InvalidOperationException(
+                $"Custom auditor '{descriptor.Name}' has an invalid target value: {ex.Message}", ex);
+        }
     }
 
     private static bool TryParseCustomAuditorTargetNarrowing(

@@ -34,7 +34,9 @@ public sealed partial class DiffPatternAuditor : IAuditor
 
     public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
     {
-        if (context.EffectiveTarget == AuditTarget.Plan)
+        // Dispatch on the explicit review strategy: an unhandled future target is
+        // rejected in Classify rather than silently treated as a code diff.
+        if (AuditTargetSemantics.Classify(context.EffectiveTarget) == AuditReviewStrategy.PlanReview)
             return AuditPlanArtifact(context);
 
         // Diff workBranch against baseBranch (three-dot: "the changes on

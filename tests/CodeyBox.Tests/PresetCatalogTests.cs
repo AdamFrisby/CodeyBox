@@ -1004,6 +1004,81 @@ public sealed class PresetCatalogTests
         Assert.Equal(expected, auditor.BuildTestGateEvidence);
     }
 
+    [Fact]
+    public void RepositoryAuditTypeFiles_RejectFileCountAboveLimit()
+    {
+        using var temp = TempProject();
+        var directory = Path.Combine(temp.Path, "codeybox", "audit-types");
+        Directory.CreateDirectory(directory);
+        for (var fileIndex = 0; fileIndex < 65; fileIndex++)
+        {
+            File.WriteAllText(
+                Path.Combine(directory, $"repo-{fileIndex}.yaml"),
+                $"id: repo-{fileIndex}\n");
+        }
+
+        var ex = Assert.Throws<PresetConfigurationException>(() =>
+            new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
+
+        Assert.Contains("64-file limit", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RepositoryLanguageFiles_RejectFileCountAboveLimit()
+    {
+        using var temp = TempProject();
+        var directory = Path.Combine(temp.Path, "codeybox", "languages");
+        Directory.CreateDirectory(directory);
+        for (var fileIndex = 0; fileIndex < 65; fileIndex++)
+        {
+            File.WriteAllText(
+                Path.Combine(directory, $"lang-{fileIndex}.yaml"),
+                $"id: lang-{fileIndex}\nmarker:\n  globs: [\"**/*.lang{fileIndex}\"]\nauditors:\n  - name: lang-{fileIndex}:check\n    argv: [\"dotnet\", \"--info\"]\n");
+        }
+
+        var ex = Assert.Throws<PresetConfigurationException>(() =>
+            new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
+
+        Assert.Contains("64-file limit", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RepositoryPresetFile_RejectsSymbolicLink()
+    {
+        using var temp = TempProject();
+        var directory = Path.Combine(temp.Path, "codeybox", "audit-types");
+        Directory.CreateDirectory(directory);
+
+        var target = Path.Combine(temp.Path, "outside-target.yaml");
+        File.WriteAllText(target, "id: architecture\n");
+        var link = Path.Combine(directory, "architecture.yaml");
+        File.CreateSymbolicLink(link, target);
+
+        var ex = Assert.Throws<PresetConfigurationException>(() =>
+            new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
+
+        Assert.Contains("symbolic link", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RepositoryPresetFile_RejectsExcessiveYamlNesting()
+    {
+        using var temp = TempProject();
+        var directory = Path.Combine(temp.Path, "codeybox", "audit-types");
+        Directory.CreateDirectory(directory);
+
+        // A small but deeply nested flow-sequence document.
+        var nested = new string('[', 200) + new string(']', 200);
+        File.WriteAllText(
+            Path.Combine(directory, "architecture.yaml"),
+            $"id: architecture\ndeep: {nested}\n");
+
+        var ex = Assert.Throws<PresetConfigurationException>(() =>
+            new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
+
+        Assert.Contains("nesting exceeds the maximum depth", ex.Message, StringComparison.Ordinal);
+    }
+
     private static TempDirectory TempProject() => new();
 
     private sealed class TempDirectory : IDisposable

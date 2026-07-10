@@ -1004,18 +1004,19 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal(2, auditor.Calls);
         Assert.Equal(1, agent.WorkCalls);
         Assert.NotNull(final.PlanReviewedAt);
-        // The rework turn carries a bounded, JSON-encoded sample of the
-        // actionable finding rather than an opaque identifier alone.
+        // The rework turn carries only trusted, enumerated metadata (category,
+        // severity, stable finding id) — never the model-authored reviewer prose,
+        // which must not cross into the tool-bearing planning prompt.
         Assert.Contains("was REJECTED by plan review", agent.LastPlanningPrompt, StringComparison.Ordinal);
         Assert.Contains("PLAN_REVIEW_REWORK_FEEDBACK_JSON", agent.LastPlanningPrompt, StringComparison.Ordinal);
         Assert.Contains("\"Category\":\"architecture\"", agent.LastPlanningPrompt, StringComparison.Ordinal);
         Assert.Contains("\"FindingId\":\"f-", agent.LastPlanningPrompt, StringComparison.Ordinal);
-        Assert.Contains("different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
-        Assert.Contains("data flow is backward", agent.LastPlanningPrompt, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("different approach", agent.LastPlanningPrompt, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("data flow is backward", agent.LastPlanningPrompt, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
-    public async Task PlanReworkFeedback_BoundsReviewerProseBeforeToolBearingPrompt()
+    public async Task PlanReworkFeedback_DoesNotForwardReviewerProseToToolBearingPrompt()
     {
         const string TruncatedTail = "REVIEWER_TAIL_MUST_NOT_CROSS_BOUNDARY";
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -1044,8 +1045,14 @@ public sealed class PlanningPipelineTests : IDisposable
         var final = await setup.Store.GetAsync(item.Id);
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.Done, final!.State);
+        // No reviewer prose — title, description, or location text — reaches the
+        // planning prompt; only enumerated metadata (category + finding id) does.
         Assert.DoesNotContain(TruncatedTail, agent.LastPlanningPrompt, StringComparison.Ordinal);
-        Assert.Contains(new string('d', 1000), agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('d', 30), agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('t', 30), agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('l', 30), agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("PLAN_REVIEW_REWORK_FEEDBACK_JSON", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("\"FindingId\":\"f-", agent.LastPlanningPrompt, StringComparison.Ordinal);
         Assert.True(agent.LastPlanningPrompt.Length < 10_000, $"bounded prompt length was {agent.LastPlanningPrompt.Length}");
     }
 
@@ -1089,8 +1096,8 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Contains("PLAN_REVIEW_REWORK_FEEDBACK_JSON", agent.LastPlanningPrompt, StringComparison.Ordinal);
         Assert.Contains("\"Category\":\"review\"", agent.LastPlanningPrompt, StringComparison.Ordinal);
         Assert.Contains("\"FindingId\":\"f-", agent.LastPlanningPrompt, StringComparison.Ordinal);
-        Assert.Contains("needs a different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
-        Assert.Contains("The data flow is backward", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("needs a different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("The data flow is backward", agent.LastPlanningPrompt, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1232,7 +1239,7 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal(1, agent.WorkCalls);
         Assert.Contains("PLAN_REVIEW_REWORK_FEEDBACK_JSON", agent.LastPlanningPrompt, StringComparison.Ordinal);
         Assert.Contains("\"Category\":\"architecture\"", agent.LastPlanningPrompt, StringComparison.Ordinal);
-        Assert.Contains("needs a different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("needs a different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
     }
 
     [Fact]

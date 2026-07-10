@@ -24,10 +24,7 @@ public readonly record struct AuditTarget
     /// boundaries and reject it in declared target sets so a default struct
     /// cannot silently publish a non-runnable target.
     /// </summary>
-    public bool IsUnset => string.IsNullOrWhiteSpace(_value);
-
-    /// <summary>Compatibility alias for <see cref="IsUnset"/>.</summary>
-    public bool IsDefault => IsUnset;
+    public bool IsDefault => string.IsNullOrWhiteSpace(_value);
 
     public AuditTarget(string value)
     {
@@ -82,4 +79,78 @@ public static class AuditTargets
             throw new ArgumentException("Audit target values must be non-empty.", nameof(targets));
         return targets.ToFrozenSet();
     }
+
+    /// <summary>
+    /// The single source of truth for turning a raw configured target-string
+    /// list into a typed target set: an empty/absent list means the default
+    /// <see cref="CodeOnly"/>, otherwise each string is canonicalised through
+    /// <see cref="AuditTarget(string)"/>. Preset loading and custom-auditor
+    /// composition both route through here so the empty-means-code default and
+    /// the string-to-target conversion cannot drift apart.
+    /// </summary>
+    public static IReadOnlySet<AuditTarget> ParseOrCodeOnly(IReadOnlyList<string>? values)
+    {
+        if (values is null || values.Count == 0)
+            return CodeOnly;
+
+        var targets = new AuditTarget[values.Count];
+        for (var i = 0; i < values.Count; i++)
+        {
+            // AuditTarget's constructor trims and lower-cases; it throws on an
+            // empty/whitespace value, which is exactly the rejection we want.
+            targets[i] = new AuditTarget(values[i]);
+        }
+
+        return Of(targets);
+    }
+}
+
+/// <summary>
+/// The concrete review strategy the pipeline and auditors implement for a given
+/// <see cref="AuditTarget"/>. Every module that must branch on a target routes
+/// through <see cref="AuditTargetSemantics"/> so the Plan/Code strategy cannot
+/// fork across modules, and an as-yet-unhandled future target fails loudly
+/// instead of being silently treated as code.
+/// </summary>
+public enum AuditReviewStrategy
+{
+    /// <summary>Review the structured PLAN artifact before implementation.</summary>
+    PlanReview,
+
+    /// <summary>Review the work-phase diff and enforce build/test gates.</summary>
+    CodeReview,
+}
+
+/// <summary>
+/// Maps an <see cref="AuditTarget"/> to its <see cref="AuditReviewStrategy"/>.
+/// This is the single decision point that keeps every auditor and the pipeline
+/// agreeing on what a target means; adding a new <see cref="AuditTarget"/>
+/// deliberately breaks here until an explicit strategy is defined for it, so no
+/// module silently mis-classifies an unhandled target as code.
+/// </summary>
+public static class AuditTargetSemantics
+{
+    public static AuditReviewStrategy Classify(AuditTarget target)
+    {
+        if (target == AuditTarget.Plan)
+            return AuditReviewStrategy.PlanReview;
+        if (target == AuditTarget.Code)
+            return AuditReviewStrategy.CodeReview;
+
+        throw new NotSupportedException(
+            $"No audit review strategy is defined for target '{target.Value}'. Add an " +
+            "explicit case in AuditTargetSemantics (and every auditor/pipeline branch it " +
+            "drives) before composing auditors for it.");
+    }
+
+    /// <summary>True when the target reviews the PLAN artifact.</summary>
+    public static bool IsPlanReview(AuditTarget target) =>
+        Classify(target) == AuditReviewStrategy.PlanReview;
+
+    /// <summary>
+    /// True when the target reviews the work-phase diff, which is also the phase
+    /// that enforces deterministic build/test gates before dependent auditors.
+    /// </summary>
+    public static bool IsCodeReview(AuditTarget target) =>
+        Classify(target) == AuditReviewStrategy.CodeReview;
 }

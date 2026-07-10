@@ -1017,6 +1017,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             new
             {
                 opts.MaxPlanReviewIterations,
+                opts.PlanTaskBindingCoverageRatio,
                 DefaultQuotaFailurePauseSeconds = opts.DefaultQuotaFailurePause.TotalSeconds,
                 QuotaExhaustionFallbackTtlSeconds = opts.QuotaExhaustionFallbackTtl.TotalSeconds,
                 MaxParsedQuotaResetWindowSeconds = opts.MaxParsedQuotaResetWindow.TotalSeconds,

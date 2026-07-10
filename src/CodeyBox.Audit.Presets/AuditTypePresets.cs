@@ -146,9 +146,7 @@ internal static class AuditTypePresets
         });
 
     private static IReadOnlySet<AuditTarget> ParseTargets(IReadOnlyList<string> targets)
-        => targets.Count == 0
-            ? AuditTargets.CodeOnly
-            : AuditTargets.Of(targets.Select(t => new AuditTarget(t)).ToArray());
+        => AuditTargets.ParseOrCodeOnly(targets);
 
     private static IAuditor Shell(
         string name,

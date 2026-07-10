@@ -1,3 +1,4 @@
+using System.Text;
 using CodeyBox.Core;
 
 namespace CodeyBox.Audit.Shell;
@@ -21,12 +22,16 @@ namespace CodeyBox.Audit.Shell;
 /// package-registry network access; do not request agent credentials for
 /// repository-controlled commands unless that exposure is intentional.
 ///
-/// <para>Every invocation receives <c>CODEYBOX_AUDIT_TARGET</c>. Plan-target
-/// invocations additionally receive <c>CODEYBOX_PLAN_ARTIFACT_PATH</c>, which
-/// names an invocation-specific read-only-by-contract JSON snapshot, and
-/// <c>CODEYBOX_WORK_ITEM_ID</c>. The snapshot exists only for the command's
-/// duration and is removed before <see cref="RunAsync"/> returns. Code-target
-/// invocations do not receive the artifact-path variable.</para>
+/// <para>Every invocation receives <c>CODEYBOX_AUDIT_TARGET</c> and
+/// <c>CODEYBOX_WORK_ITEM_ID</c>. Plan-target invocations additionally receive
+/// <c>CODEYBOX_PLAN_ARTIFACT_PATH</c>, which names a read-only-by-contract JSON
+/// snapshot whose path is unique per work item, review iteration, and auditor
+/// name — so concurrent plan-target auditors never share a path. The snapshot
+/// exists only for the command's duration and is removed in a <c>finally</c>
+/// before <see cref="RunAsync"/> returns, on every exit path (success, a
+/// failed/partial materialisation, a classified failure, an exception, or
+/// cancellation of the auditor command). Code-target invocations do not receive
+/// the artifact-path variable.</para>
 /// </summary>
 public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
 {
@@ -75,24 +80,70 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         if (await IsDirectToolMissingAsync(sandbox, workingDirectory, toolName, ct))
             return MissingToolResult(toolName, string.Empty);
 
-        var extraEnvironment = await PrepareAuditEnvironmentAsync(sandbox, workingDirectory, context, ct);
-        if (extraEnvironment.Failure is not null)
-            return extraEnvironment.Failure;
-
-        var result = await sandbox.ExecAsync(new SandboxExec
+        var environment = new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            Argv = _opts.Argv,
-            WorkingDirectory = workingDirectory,
-            ExtraEnvironment = extraEnvironment.Environment,
-        }, ct);
+            ["CODEYBOX_AUDIT_TARGET"] = context.EffectiveTarget.Value,
+            ["CODEYBOX_WORK_ITEM_ID"] = context.WorkItemId.ToString(),
+        };
 
-        if (extraEnvironment.Environment.TryGetValue("CODEYBOX_PLAN_ARTIFACT_PATH", out var planArtifactPath))
+        // Dispatch on the explicit review strategy; an unhandled future target is
+        // rejected in Classify rather than silently run as a code audit.
+        return AuditTargetSemantics.Classify(context.EffectiveTarget) == AuditReviewStrategy.PlanReview
+            ? await RunPlanTargetAsync(sandbox, workingDirectory, context, environment, toolName, ct)
+            : await ExecAndClassifyAsync(sandbox, workingDirectory, environment, toolName, ct);
+    }
+
+    private async Task<AuditResult> RunPlanTargetAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        Dictionary<string, string> environment,
+        string toolName,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(context.PlanArtifact))
         {
+            return new AuditResult(false, [new AuditFinding(
+                Name,
+                AuditSeverity.Error,
+                "no plan artifact to review",
+                "The plan-review context carried no PLAN artifact.")]);
+        }
+
+        var planArtifactPath = BuildPlanArtifactPath(context);
+        // Set before the write starts so the finally still removes a partially
+        // written snapshot if the write exec throws mid-stream.
+        var mustRemove = true;
+        try
+        {
+            var write = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "umask 077; rm -f -- \"$1\"; cat > \"$1\"; chmod 400 \"$1\"", "sh", planArtifactPath],
+                WorkingDirectory = workingDirectory,
+                Stdin = context.PlanArtifact,
+            }, ct);
+
+            if (!write.Success)
+            {
+                return new AuditResult(false, [new AuditFinding(
+                    Name,
+                    AuditSeverity.Error,
+                    "failed to materialise plan artifact",
+                    DescriptionOutput(write).TrimEnd())],
+                    RawOutput: CombinedOutput(write));
+            }
+
+            environment["CODEYBOX_PLAN_ARTIFACT_PATH"] = planArtifactPath;
+            var result = await ExecAndClassifyAsync(sandbox, workingDirectory, environment, toolName, ct);
+
+            // Explicit in-band cleanup so a removal failure on the happy path is
+            // surfaced as a blocking finding (the snapshot must not outlive the run).
             var cleanup = await sandbox.ExecAsync(new SandboxExec
             {
                 Argv = ["rm", "-f", "--", planArtifactPath],
                 WorkingDirectory = workingDirectory,
             }, ct);
+            mustRemove = false;
             if (!cleanup.Success)
             {
                 return new AuditResult(false, [new AuditFinding(
@@ -102,7 +153,32 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
                     DescriptionOutput(cleanup).TrimEnd())],
                     RawOutput: CombinedOutput(cleanup));
             }
+
+            return result;
         }
+        finally
+        {
+            // Guarantee removal on every abnormal exit (failed/partial write,
+            // exception, or cancellation). rm -f is idempotent, and mustRemove is
+            // cleared once the happy-path removal succeeds so it is not repeated.
+            if (mustRemove)
+                await TryRemovePlanArtifactAsync(sandbox, workingDirectory, planArtifactPath);
+        }
+    }
+
+    private async Task<AuditResult> ExecAndClassifyAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        IReadOnlyDictionary<string, string> environment,
+        string toolName,
+        CancellationToken ct)
+    {
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = _opts.Argv,
+            WorkingDirectory = workingDirectory,
+            ExtraEnvironment = environment,
+        }, ct);
 
         var combinedOutput = CombinedOutput(result);
 
@@ -125,50 +201,40 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         return new AuditResult(false, [finding], RawOutput: combinedOutput);
     }
 
-    private async Task<(IReadOnlyDictionary<string, string> Environment, AuditResult? Failure)> PrepareAuditEnvironmentAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        AuditContext context,
-        CancellationToken ct)
+    private string BuildPlanArtifactPath(AuditContext context)
     {
-        var environment = new Dictionary<string, string>(StringComparer.Ordinal)
-        {
-            ["CODEYBOX_AUDIT_TARGET"] = context.EffectiveTarget.Value,
-            ["CODEYBOX_WORK_ITEM_ID"] = context.WorkItemId.ToString(),
-        };
+        // Unique per work item, review iteration, AND auditor name so concurrent
+        // plan-target auditors sharing an item/iteration never collide on one path.
+        var safeName = SanitizePathToken(Name);
+        return $"/tmp/codeybox-plan-artifact-{context.WorkItemId}-{context.Iteration}-{safeName}.json";
+    }
 
-        if (context.EffectiveTarget != AuditTarget.Plan)
-            return (environment, null);
+    private static string SanitizePathToken(string value)
+    {
+        var sb = new StringBuilder(value.Length);
+        foreach (var ch in value)
+            sb.Append(char.IsAsciiLetterOrDigit(ch) || ch is '-' or '_' ? ch : '_');
+        return sb.Length == 0 ? "auditor" : sb.ToString();
+    }
 
-        if (string.IsNullOrWhiteSpace(context.PlanArtifact))
+    private static async Task TryRemovePlanArtifactAsync(ISandbox sandbox, string workingDirectory, string path)
+    {
+        try
         {
-            return (environment, new AuditResult(false, [new AuditFinding(
-                Name,
-                AuditSeverity.Error,
-                "no plan artifact to review",
-                "The plan-review context carried no PLAN artifact.")]));
+            // Detached from the request token so a cancelled auditor still removes
+            // its snapshot. Best-effort: this runs on the exceptional unwind where
+            // there is no AuditResult to attach a cleanup-failure finding to, so a
+            // removal failure must not mask the original outcome.
+            await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["rm", "-f", "--", path],
+                WorkingDirectory = workingDirectory,
+            }, CancellationToken.None);
         }
-
-        var planArtifactPath = $"/tmp/codeybox-plan-artifact-{context.WorkItemId}-{context.Iteration}.json";
-        var write = await sandbox.ExecAsync(new SandboxExec
+        catch
         {
-            Argv = ["sh", "-c", "umask 077; rm -f -- \"$1\"; cat > \"$1\"; chmod 400 \"$1\"", "sh", planArtifactPath],
-            WorkingDirectory = workingDirectory,
-            Stdin = context.PlanArtifact,
-        }, ct);
-
-        if (!write.Success)
-        {
-            return (environment, new AuditResult(false, [new AuditFinding(
-                Name,
-                AuditSeverity.Error,
-                "failed to materialise plan artifact",
-                DescriptionOutput(write).TrimEnd())],
-                RawOutput: CombinedOutput(write)));
+            // Intentionally swallowed on the abnormal-exit cleanup path (see above).
         }
-
-        environment["CODEYBOX_PLAN_ARTIFACT_PATH"] = planArtifactPath;
-        return (environment, null);
     }
 
     private AuditFinding BuildCommandFinding(SandboxExecResult result, string toolName)
@@ -259,9 +325,9 @@ public sealed record ShellCommandAuditorOptions
     /// <summary>
     /// Review targets for this command. Empty configuration is materialised as
     /// Code-only by composers. Plan commands read their artifact through
-    /// <c>CODEYBOX_PLAN_ARTIFACT_PATH</c>; the path is unique per work item and
-    /// review iteration, is removed after the command, and is absent for Code
-    /// runs.
+    /// <c>CODEYBOX_PLAN_ARTIFACT_PATH</c>; the path is unique per work item,
+    /// review iteration, and auditor name, is removed in a <c>finally</c> after
+    /// the command on every exit path, and is absent for Code runs.
     /// </summary>
     public IReadOnlySet<AuditTarget> Targets { get; init; } = AuditTargets.CodeOnly;
     public bool CanShortCircuitOnBlockingFinding { get; init; }

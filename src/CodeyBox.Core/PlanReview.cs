@@ -10,23 +10,30 @@ public sealed record PlanReviewDecision(
     PlanReviewFeedback? ReworkFeedback = null);
 
 /// <summary>
-/// Structured, bounded feedback that may be shown to a later planning-agent
-/// turn. <see cref="BlockingIssueCount"/> is the total blocker count while
-/// <see cref="Issues"/> is a bounded sample. Each prose field is length-capped
-/// and JSON-encoded at the prompt boundary; raw reviewer output is never
-/// forwarded.
+/// Structured, bounded feedback shown to a later planning-agent turn. That
+/// turn drives a tool-bearing, credentialed agent, so the payload carries only
+/// orchestrator-authored enumerated metadata — never model-authored reviewer
+/// prose (title/description/location), which could smuggle instructions into
+/// the planning prompt. <see cref="BlockingIssueCount"/> is the total blocker
+/// count; <see cref="Issues"/> is a bounded sample identifying each blocker by
+/// its trusted category, severity, and stable finding id so the agent can
+/// locate the full finding out-of-band without the prose crossing the prompt
+/// boundary.
 /// </summary>
 public sealed record PlanReviewFeedback(
     int BlockingIssueCount,
     IReadOnlyList<PlanReviewFeedbackIssue> Issues);
 
+/// <summary>
+/// A single blocking plan-review issue reduced to trusted, enumerated metadata.
+/// <see cref="Category"/> is derived from the auditor name by the orchestrator,
+/// <see cref="Severity"/> is an enum, and <see cref="FindingId"/> is a stable
+/// opaque digest — none of which carries free-form reviewer text.
+/// </summary>
 public sealed record PlanReviewFeedbackIssue(
     AuditSeverity Severity,
     string Category,
-    string FindingId,
-    string? Title,
-    string? Description,
-    string? Location);
+    string FindingId);
 
 public sealed record PlanArtifactDocument(
     string Approach,
