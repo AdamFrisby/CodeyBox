@@ -864,14 +864,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     /// </summary>
     private WorkItemStoreDiskFullException HandleDiskFull(string operation, SqliteException sqlex)
     {
-        ThreadPool.QueueUserWorkItem<DiskFullAudit>(
-            static state => AuditLog.StoreDiskFull(state.Logger, state.Operation),
-            new DiskFullAudit(_auditLogger, operation),
-            preferLocal: false);
+        AuditLog.StoreDiskFull(_auditLogger, operation);
         return new WorkItemStoreDiskFullException(operation, sqlex);
     }
-
-    private sealed record DiskFullAudit(Serilog.ILogger Logger, string Operation);
 
     /// <summary>
     /// Test hook: clamps the underlying database's <c>max_page_count</c> on
@@ -3027,6 +3022,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
 
     private async Task<SqliteConnection> OpenReadConnectionAsync(CancellationToken ct)
     {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         var conn = new SqliteConnection(_connectionString);
         await conn.OpenAsync(ct);
 
