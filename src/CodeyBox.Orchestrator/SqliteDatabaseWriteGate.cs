@@ -56,7 +56,7 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
     {
         var entry = Current;
         var holderIdentity = FormatHolderIdentity(sourceFilePath, memberName);
-        ThrowIfReentrant(entry, holderIdentity);
+        ThrowIfReentrant(entry, holderIdentity, _factory.Logger);
 
         var settings = _factory.GetSettings();
         if (!entry.Semaphore.Wait(settings.AcquisitionTimeout, ct))
@@ -72,7 +72,7 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
     {
         var entry = Current;
         var holderIdentity = FormatHolderIdentity(sourceFilePath, memberName);
-        ThrowIfReentrant(entry, holderIdentity);
+        ThrowIfReentrant(entry, holderIdentity, _factory.Logger);
         return new WaitOperation(WaitCoreAsync(entry, holderIdentity, ct));
     }
 
@@ -163,12 +163,19 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
             timeout);
     }
 
-    private static void ThrowIfReentrant(Entry entry, string waitingHolderIdentity)
+    private static void ThrowIfReentrant(
+        Entry entry,
+        string waitingHolderIdentity,
+        ILogger logger)
     {
         for (var scope = Ownership.Value; scope is not null; scope = scope.Previous)
         {
             if (scope.IsActive && ReferenceEquals(scope.Entry, entry))
             {
+                logger.LogError(
+                    "Rejected reentrant SQLite write gate acquisition for {WaitingHolder}; current holder: {CurrentHolder}",
+                    waitingHolderIdentity,
+                    scope.Identity);
                 throw new SqliteWriteGateReentrancyException(
                     waitingHolderIdentity,
                     scope.Identity);

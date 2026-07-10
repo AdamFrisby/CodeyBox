@@ -67,7 +67,8 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
     [Fact]
     public async Task StoreOperation_ReenteringGateHeldByAnotherStore_IsRejectedImmediately()
     {
-        var factory = CreateGateFactory();
+        var loggerFactory = new RecordingLoggerFactory();
+        var factory = CreateGateFactory(loggerFactory);
         using var workItems = new SqliteWorkItemStore(
             _dbPath,
             writeGateFactory: factory);
@@ -82,6 +83,11 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
 
         Assert.Contains(nameof(SqliteWorkItemStore.AcquireConnectionGateForTesting), exception.CurrentHolder);
         Assert.Contains(nameof(SqliteQueueController.PauseAsync), exception.WaitingHolder);
+        Assert.Contains(
+            loggerFactory.Messages,
+            message => message.Contains("Rejected reentrant SQLite write gate acquisition", StringComparison.Ordinal)
+                && message.Contains(nameof(SqliteQueueController.PauseAsync), StringComparison.Ordinal)
+                && message.Contains(nameof(SqliteWorkItemStore.AcquireConnectionGateForTesting), StringComparison.Ordinal));
     }
 
     [Fact]
@@ -298,14 +304,14 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
             "done"),
         DateTimeOffset.UtcNow);
 
-    private static SqliteDatabaseWriteGateFactory CreateGateFactory()
+    private static SqliteDatabaseWriteGateFactory CreateGateFactory(ILoggerFactory? loggerFactory = null)
         => new(
             static () => new SqliteWriteGateOptions
             {
                 AcquisitionTimeout = TimeSpan.FromSeconds(5),
                 MaxHoldDuration = TimeSpan.FromSeconds(5),
             },
-            NullLoggerFactory.Instance);
+            loggerFactory ?? NullLoggerFactory.Instance);
 
     private static async Task HoldGateAcrossBlockedAwaitAsync(
         SqliteDatabaseWriteGate gate,
