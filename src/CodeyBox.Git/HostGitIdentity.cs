@@ -44,7 +44,15 @@ public static class HostGitIdentityReader
                 CreateNoWindow = true,
             };
             psi.ArgumentList.Add("config");
-            psi.ArgumentList.Add("--global");
+            if (homeDir is null)
+            {
+                psi.ArgumentList.Add("--global");
+            }
+            else
+            {
+                psi.ArgumentList.Add("--file");
+                psi.ArgumentList.Add(Path.Combine(homeDir, ".gitconfig"));
+            }
             psi.ArgumentList.Add(key);
             if (homeDir is not null)
                 psi.EnvironmentVariables["HOME"] = homeDir;
