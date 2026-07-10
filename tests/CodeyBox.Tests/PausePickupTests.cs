@@ -10,6 +10,8 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class PausePickupTests : IDisposable
 {
+    private static readonly TimeSpan FullSuiteSchedulingTimeout = TimeSpan.FromSeconds(30);
+
     private readonly string _dbPath =
         Path.Combine(Path.GetTempPath(), $"codeybox-pausepickup-{Guid.NewGuid():N}.db");
     private readonly SqliteWorkItemStore _store;
@@ -67,7 +69,7 @@ public sealed class PausePickupTests : IDisposable
         // rather than polling a wall-clock deadline that races ThreadPool
         // starvation under the capped full-suite load.
         await controller.ResumeAsync();
-        await pipeline.ReachedTargetCount.WaitAsync(TimeSpan.FromSeconds(30));
+        await pipeline.ReachedTargetCount.WaitAsync(FullSuiteSchedulingTimeout);
 
         await svc.StopAsync(CancellationToken.None);
 
@@ -100,7 +102,7 @@ public sealed class PausePickupTests : IDisposable
         // Await all three pickups via the event signal rather than polling a
         // wall-clock deadline that races ThreadPool starvation under the capped
         // full-suite load.
-        await pipeline.ReachedTargetCount.WaitAsync(TimeSpan.FromSeconds(30));
+        await pipeline.ReachedTargetCount.WaitAsync(FullSuiteSchedulingTimeout);
 
         await svc.StopAsync(CancellationToken.None);
         Assert.Equal(3, pipeline.RunCount);
@@ -135,8 +137,10 @@ public sealed class PausePickupTests : IDisposable
 
         await svc.StartAsync(CancellationToken.None);
 
-        // Wait until item is in-flight.
-        await itemStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        // Wait until the item is in-flight. Under capped full-suite load the
+        // dispatcher can experience the same ThreadPool starvation as the
+        // other event-driven waits in this class.
+        await itemStarted.Task.WaitAsync(FullSuiteSchedulingTimeout);
 
         // Pause while the item is running — must not cancel it.
         await controller.PauseAsync("in-flight continuity test");
@@ -151,7 +155,7 @@ public sealed class PausePickupTests : IDisposable
         // very starvation it is waiting out. The completion signal fires only
         // after the worker has committed the Done state (see
         // BlockingPipelineRunner), so observing it guarantees Done is durable.
-        await itemCompletedTcs.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        await itemCompletedTcs.Task.WaitAsync(FullSuiteSchedulingTimeout);
 
         await svc.StopAsync(CancellationToken.None);
 
