@@ -288,12 +288,13 @@ public sealed class OpencodeAgentRunnerTests
     }
 
     [Fact]
-    public async Task RunAsync_MaterialisationScript_WritesViaPrivateTempFile()
+    public async Task RunAsync_MaterialisationScript_WritesThroughNoFollowDirectoryFds()
     {
         // Auth file (and parent dir) must end up at 0700/0600 without
-        // following a pre-created symlink. The shared writer creates parents
-        // with mode 0700, writes stdin to a private temp file, then renames it
-        // over the destination.
+        // following a pre-created symlink. The shared writer opens parent
+        // directories with O_NOFOLLOW, writes stdin to a private file through
+        // the held directory fd, atomically replaces the destination, and then
+        // verifies the HOME-relative path still points to the file it wrote.
         var sandbox = new RecordingSandbox();
         var runner = new OpencodeAgentRunner();
         var cred = OpencodeCred("""{"x":1}""");
@@ -301,19 +302,20 @@ public sealed class OpencodeAgentRunnerTests
         await runner.RunAsync(sandbox, "/work", "x", credential: cred);
 
         var script = sandbox.Execs[FindMaterialisationScriptIndex(sandbox.Execs)].Argv[2];
-        Assert.Contains("mkdir -m 700", script, StringComparison.Ordinal);
-        Assert.Contains("mktemp", script, StringComparison.Ordinal);
-        Assert.Contains("cat > \"$tmp\"", script, StringComparison.Ordinal);
-        Assert.Contains("mv -f -T", script, StringComparison.Ordinal);
+        Assert.Contains("O_NOFOLLOW", script, StringComparison.Ordinal);
+        Assert.Contains("os.mkdir(part, 0o700", script, StringComparison.Ordinal);
+        Assert.Contains("os.replace(tmp_name, file_name", script, StringComparison.Ordinal);
+        Assert.Contains("open_existing_parent_directory", script, StringComparison.Ordinal);
+        Assert.Contains("credential destination parent path changed during write", script, StringComparison.Ordinal);
         Assert.Contains("credential destination parent is a symlink", script, StringComparison.Ordinal);
     }
 
     [Fact]
     public async Task RunAsync_MaterialisationScript_ChmodsAuthFileTo600()
     {
-        // chmod 600 is a defense-in-depth backstop after the temp-file write
-        // and atomic rename. It pins the final mode regardless of filesystem
-        // defaults or a pre-existing destination.
+        // fchmod(0600) is a defense-in-depth backstop after the temp-file write
+        // and before the atomic replace. It pins the final mode regardless of
+        // filesystem defaults or a pre-existing destination.
         var sandbox = new RecordingSandbox();
         var runner = new OpencodeAgentRunner();
         var cred = OpencodeCred("""{"x":1}""");
@@ -321,11 +323,14 @@ public sealed class OpencodeAgentRunnerTests
         await runner.RunAsync(sandbox, "/work", "x", credential: cred);
 
         var script = sandbox.Execs[FindMaterialisationScriptIndex(sandbox.Execs)].Argv[2];
-        var catIdx = script.IndexOf("cat > \"$tmp\"", StringComparison.Ordinal);
-        var chmodIdx = script.IndexOf("chmod 600", StringComparison.Ordinal);
-        Assert.True(chmodIdx >= 0, "script must chmod the auth file to 0600");
-        Assert.True(catIdx >= 0, "script must write stdin into the private temp file");
-        Assert.True(catIdx < chmodIdx, "chmod must run after the stdin write");
+        var writeIdx = script.IndexOf("handle.write(data)", StringComparison.Ordinal);
+        var chmodIdx = script.IndexOf("os.fchmod(handle.fileno(), 0o600)", StringComparison.Ordinal);
+        var replaceIdx = script.IndexOf("os.replace(tmp_name, file_name", StringComparison.Ordinal);
+        Assert.True(chmodIdx >= 0, "script must set the auth file mode to 0600");
+        Assert.True(writeIdx >= 0, "script must write stdin into the private temp file");
+        Assert.True(replaceIdx >= 0, "script must atomically replace the destination");
+        Assert.True(writeIdx < chmodIdx, "mode hardening must run after the stdin write");
+        Assert.True(chmodIdx < replaceIdx, "mode hardening must run before the destination replace");
     }
 
     [Fact]

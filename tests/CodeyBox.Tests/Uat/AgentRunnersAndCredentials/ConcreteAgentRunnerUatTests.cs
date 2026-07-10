@@ -44,7 +44,7 @@ public sealed class ConcreteAgentRunnerUatTests
         Assert.Equal(".claude/.credentials.json", sandbox.Execs[1].Argv[4]);
         Assert.Equal(credential.EnvironmentVariables[ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar], sandbox.Execs[1].Stdin);
         Assert.DoesNotContain(ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar, sandbox.Execs[1].Argv[2]);
-        Assert.Contains("chmod 600", sandbox.Execs[1].Argv[2]);
+        Assert.Contains("0o600", sandbox.Execs[1].Argv[2]);
 
         var argv = sandbox.Execs[2].Argv.ToList();
         Assert.Equal("claude", argv[0]);

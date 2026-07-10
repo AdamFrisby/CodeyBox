@@ -87,13 +87,10 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
 
     /// <summary>
     /// Bash that materialises crock's <c>~/.crockcode/config.json</c> from
-    /// <see cref="ConfigEnvVar"/>. Mirrors the umask-077 / chmod-600 pattern
-    /// used by <see cref="OpencodeAgentRunner"/> and the Codex runner so the
-    /// credential never sits at world-readable modes inside the VM. Exposed
-    /// as a constant so an in-VM smoke probe can run it verbatim and stay in
-    /// lock-step with the runner. The bash literal references the env-var
-    /// name via the interpolation site below; a rename of
-    /// <see cref="ConfigEnvVar"/> updates both at once.
+    /// <see cref="ConfigEnvVar"/> using the shared env-backed credential-file
+    /// writer. Exposed so an in-VM smoke probe can run the env-reading
+    /// smoke/create-time path against the same destination the runner uses
+    /// when it materialises the credential bundle via stdin before dispatch.
     /// </summary>
     public static readonly string ConfigMaterialiseScript = BuildEnvBackedCredentialScript(ConfigCredentialFile);
 

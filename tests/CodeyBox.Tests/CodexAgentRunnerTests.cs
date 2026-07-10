@@ -185,7 +185,8 @@ public sealed class CodexAgentRunnerTests
         Assert.Contains(".codex/auth.json", script, StringComparison.Ordinal);
         Assert.Contains("CODEX_AUTH_JSON", script, StringComparison.Ordinal);
         Assert.Contains("credential destination file is a symlink", script, StringComparison.Ordinal);
-        Assert.Contains("if [ -f \"$dest\" ] && [ -s \"$dest\" ]; then return 0; fi", script, StringComparison.Ordinal);
+        Assert.Contains("existing_destination_is_nonempty_regular", script, StringComparison.Ordinal);
+        Assert.Contains("return st.st_size > 0", script, StringComparison.Ordinal);
     }
 
     // ── Default model from config ─────────────────────────────────────────────

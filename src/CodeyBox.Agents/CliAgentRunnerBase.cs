@@ -14,9 +14,12 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 {
     private const string AgentRunIdEnvironmentVariable = "CODEYBOX_AGENT_RUN_ID";
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> ActiveAgentRunIds = new();
+    private const string OverwriteExistingCredentialFileFlag = "0";
+    private const string PreserveExistingCredentialFileFlag = "1";
     private const string CredentialStdinMaterialiseScript =
         SafeCredentialFileWriterScript +
-        "codeybox_write_credential_file \"$1\" \"${2:-}\" 0\n";
+        "\n" +
+        "codeybox_write_credential_file \"$1\" \"${2:-}\" " + OverwriteExistingCredentialFileFlag + "\n";
 
     public abstract AgentKind Kind { get; }
 
@@ -206,6 +209,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     {
         ValidateEnvBackedCredentialFile(file);
         var script = SafeCredentialFileWriterScript +
+            "\n" +
             "value=\"${" + file.EnvironmentVariable + ":-}\"\n" +
             "if [ -z \"$value\" ]; then exit 0; fi\n";
 
@@ -216,7 +220,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         return script +
             "printf '%s' \"$value\" | codeybox_write_credential_file " +
             ShellSingleQuote(file.HomeRelativePath) +
-            " \"$dest_override\" 1\n";
+            " \"$dest_override\" " + PreserveExistingCredentialFileFlag + "\n";
     }
 
     private static string ResolveCredentialDestinationOverride(
@@ -274,67 +278,235 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         "'" + value.Replace("'", "'\"'\"'", StringComparison.Ordinal) + "'";
 
     private const string SafeCredentialFileWriterScript =
-        "set -eu\n" +
-        "codeybox_fail() { printf '%s\\n' \"$1\" >&2; exit 2; }\n" +
-        "codeybox_home=$(CDPATH= cd -- \"$HOME\" 2>/dev/null && pwd -P) || codeybox_fail 'credential HOME is not accessible'\n" +
-        "codeybox_write_credential_file() {\n" +
-        "  rel=$1\n" +
-        "  override=${2:-}\n" +
-        "  preserve_existing=${3:-0}\n" +
-        "  case \"$rel\" in ''|/*) codeybox_fail 'credential path must be HOME-relative' ;; esac\n" +
-        "  case \"/$rel/\" in */../*|*/./*) codeybox_fail 'credential path contains traversal' ;; esac\n" +
-        "  if [ -n \"$override\" ]; then\n" +
-        "    case \"$override\" in\n" +
-        "      \\$HOME/*) dest=\"$codeybox_home/${override#\\$HOME/}\" ;;\n" +
-        "      ~/*) dest=\"$codeybox_home/${override#~/}\" ;;\n" +
-        "      /*) dest=\"$override\" ;;\n" +
-        "      *) dest=\"$codeybox_home/$override\" ;;\n" +
-        "    esac\n" +
-        "  else\n" +
-        "    dest=\"$codeybox_home/$rel\"\n" +
-        "  fi\n" +
-        "  case \"$dest\" in \"$codeybox_home\"/*) ;; *) codeybox_fail 'credential destination escapes HOME' ;; esac\n" +
-        "  dest_dir=${dest%/*}\n" +
-        "  dest_name=${dest##*/}\n" +
-        "  [ -n \"$dest_name\" ] || codeybox_fail 'credential destination file name is empty'\n" +
-        "  case \"$dest_name\" in .|..) codeybox_fail 'credential destination file name is invalid' ;; esac\n" +
-        "  if [ \"$dest_dir\" = \"$codeybox_home\" ]; then\n" +
-        "    rel_dir=\n" +
-        "  else\n" +
-        "    rel_dir=${dest_dir#\"$codeybox_home\"/}\n" +
-        "    [ \"$rel_dir\" != \"$dest_dir\" ] || codeybox_fail 'credential destination escapes HOME'\n" +
-        "  fi\n" +
-        "  case \"/$rel_dir/\" in */../*|*/./*) codeybox_fail 'credential destination contains traversal' ;; esac\n" +
-        "  current=$codeybox_home\n" +
-        "  old_ifs=$IFS\n" +
-        "  IFS=/\n" +
-        "  set -- $rel_dir\n" +
-        "  IFS=$old_ifs\n" +
-        "  for part do\n" +
-        "    [ -n \"$part\" ] || continue\n" +
-        "    case \"$part\" in .|..) codeybox_fail 'credential destination contains traversal' ;; esac\n" +
-        "    current=\"$current/$part\"\n" +
-        "    [ ! -L \"$current\" ] || codeybox_fail 'credential destination parent is a symlink'\n" +
-        "    if [ -e \"$current\" ] && [ ! -d \"$current\" ]; then codeybox_fail 'credential destination parent is not a directory'; fi\n" +
-        "    if [ ! -e \"$current\" ]; then mkdir -m 700 -- \"$current\"; fi\n" +
-        "    [ ! -L \"$current\" ] || codeybox_fail 'credential destination parent is a symlink'\n" +
-        "    [ -d \"$current\" ] || codeybox_fail 'credential destination parent is not a directory'\n" +
-        "    chmod 700 -- \"$current\"\n" +
-        "  done\n" +
-        "  if [ \"$preserve_existing\" = 1 ] && [ -e \"$dest\" ]; then\n" +
-        "    [ ! -L \"$dest\" ] || codeybox_fail 'credential destination file is a symlink'\n" +
-        "    if [ -f \"$dest\" ] && [ -s \"$dest\" ]; then return 0; fi\n" +
-        "  fi\n" +
-        "  if [ -L \"$dest\" ]; then rm -f -- \"$dest\"; fi\n" +
-        "  if [ -e \"$dest\" ] && [ ! -f \"$dest\" ]; then codeybox_fail 'credential destination exists and is not a regular file'; fi\n" +
-        "  tmp=$(mktemp \"$dest_dir/.$dest_name.tmp.XXXXXX\")\n" +
-        "  trap 'rm -f -- \"$tmp\"' EXIT\n" +
-        "  cat > \"$tmp\"\n" +
-        "  chmod 600 -- \"$tmp\"\n" +
-        "  mv -f -T -- \"$tmp\" \"$dest\"\n" +
-        "  trap - EXIT\n" +
-        "  chmod 600 -- \"$dest\"\n" +
-        "}\n";
+        """
+        set -eu
+        codeybox_fail() { printf '%s\n' "$1" >&2; exit 2; }
+        codeybox_credential_writer_py=$(cat <<'PY'
+        import errno
+        import os
+        import secrets
+        import stat
+        import sys
+
+        OVERWRITE = "0"
+        PRESERVE = "1"
+        O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+        O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+        O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+
+        def fail(message):
+            print(message, file=sys.stderr)
+            raise SystemExit(2)
+
+        def reject_dot_segments(label, value):
+            for segment in value.split("/"):
+                if segment in (".", ".."):
+                    fail(f"credential {label} contains traversal")
+
+        def split_relative(value):
+            parts = [part for part in value.split(os.sep) if part]
+            for part in parts:
+                if part in (".", ".."):
+                    fail("credential destination contains traversal")
+            return parts
+
+        def open_directory(parent_fd, name):
+            try:
+                return os.open(
+                    name,
+                    os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+                    dir_fd=parent_fd)
+            except OSError as ex:
+                if ex.errno == errno.ELOOP:
+                    fail("credential destination parent is a symlink")
+                if ex.errno == errno.ENOTDIR:
+                    fail("credential destination parent is not a directory")
+                raise
+
+        def ensure_parent_directory(home_fd, parent_parts):
+            current_fd = os.dup(home_fd)
+            for part in parent_parts:
+                try:
+                    next_fd = open_directory(current_fd, part)
+                except FileNotFoundError:
+                    os.mkdir(part, 0o700, dir_fd=current_fd)
+                    next_fd = open_directory(current_fd, part)
+
+                try:
+                    mode = os.fstat(next_fd).st_mode
+                    if not stat.S_ISDIR(mode):
+                        fail("credential destination parent is not a directory")
+                    os.fchmod(next_fd, 0o700)
+                finally:
+                    os.close(current_fd)
+                current_fd = next_fd
+            return current_fd
+
+        def open_existing_parent_directory(home_fd, parent_parts):
+            current_fd = os.dup(home_fd)
+            for part in parent_parts:
+                next_fd = open_directory(current_fd, part)
+                os.close(current_fd)
+                current_fd = next_fd
+            return current_fd
+
+        def same_file(left_fd, right_fd):
+            left = os.fstat(left_fd)
+            right = os.fstat(right_fd)
+            return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+        def resolve_destination(home, rel, override):
+            if not rel or rel.startswith("/"):
+                fail("credential path must be HOME-relative")
+            reject_dot_segments("path", rel)
+
+            if override:
+                reject_dot_segments("destination", override)
+                if override.startswith("$HOME/"):
+                    candidate = os.path.join(home, override[len("$HOME/"):])
+                elif override.startswith("~/"):
+                    candidate = os.path.join(home, override[2:])
+                elif os.path.isabs(override):
+                    candidate = override
+                else:
+                    candidate = os.path.join(home, override)
+            else:
+                candidate = os.path.join(home, rel)
+
+            destination = os.path.normpath(candidate)
+            try:
+                common = os.path.commonpath([home, destination])
+            except ValueError:
+                fail("credential destination escapes HOME")
+            if common != home:
+                fail("credential destination escapes HOME")
+            return os.path.relpath(destination, home)
+
+        def existing_destination_is_nonempty_regular(parent_fd, file_name):
+            try:
+                fd = os.open(file_name, os.O_RDONLY | O_NOFOLLOW | O_CLOEXEC, dir_fd=parent_fd)
+            except FileNotFoundError:
+                return False
+            except OSError as ex:
+                if ex.errno == errno.ELOOP:
+                    fail("credential destination file is a symlink")
+                if ex.errno == errno.ENOTDIR:
+                    fail("credential destination exists and is not a regular file")
+                raise
+
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    fail("credential destination exists and is not a regular file")
+                return st.st_size > 0
+            finally:
+                os.close(fd)
+
+        def reject_non_regular_destination(parent_fd, file_name):
+            try:
+                st = os.stat(file_name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            if stat.S_ISLNK(st.st_mode):
+                return
+            if not stat.S_ISREG(st.st_mode):
+                fail("credential destination exists and is not a regular file")
+
+        def write_file(parent_fd, file_name, data):
+            tmp_name = None
+            tmp_fd = None
+            for _ in range(16):
+                candidate = f".{file_name}.tmp.{secrets.token_hex(8)}"
+                try:
+                    tmp_fd = os.open(
+                        candidate,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                        0o600,
+                        dir_fd=parent_fd)
+                    tmp_name = candidate
+                    break
+                except FileExistsError:
+                    continue
+            if tmp_fd is None or tmp_name is None:
+                fail("credential temporary file name could not be allocated")
+
+            try:
+                with os.fdopen(tmp_fd, "wb", closefd=True) as handle:
+                    handle.write(data)
+                    handle.flush()
+                    os.fchmod(handle.fileno(), 0o600)
+                os.replace(tmp_name, file_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                written = os.stat(file_name, dir_fd=parent_fd, follow_symlinks=False)
+                return written.st_dev, written.st_ino
+            finally:
+                try:
+                    os.unlink(tmp_name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+
+        def main():
+            if len(sys.argv) != 4:
+                fail("credential writer invoked with invalid arguments")
+            rel, override, preserve_existing = sys.argv[1:]
+            if preserve_existing not in (OVERWRITE, PRESERVE):
+                fail("credential preserve flag is invalid")
+
+            home_env = os.environ.get("HOME")
+            if not home_env:
+                fail("credential HOME is not accessible")
+            home = os.path.realpath(home_env)
+            if not os.path.isdir(home):
+                fail("credential HOME is not accessible")
+
+            rel_destination = resolve_destination(home, rel, override)
+            parts = split_relative(rel_destination)
+            if not parts:
+                fail("credential destination file name is empty")
+            file_name = parts[-1]
+            if file_name in (".", ".."):
+                fail("credential destination file name is invalid")
+            parent_parts = parts[:-1]
+
+            home_fd = os.open(home, os.O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+            parent_fd = None
+            try:
+                parent_fd = ensure_parent_directory(home_fd, parent_parts)
+                if preserve_existing == PRESERVE and existing_destination_is_nonempty_regular(parent_fd, file_name):
+                    return
+                reject_non_regular_destination(parent_fd, file_name)
+                written_identity = write_file(parent_fd, file_name, sys.stdin.buffer.read())
+
+                verified_parent_fd = open_existing_parent_directory(home_fd, parent_parts)
+                try:
+                    if not same_file(parent_fd, verified_parent_fd):
+                        fail("credential destination parent path changed during write")
+                    verified_fd = os.open(file_name, os.O_RDONLY | O_NOFOLLOW | O_CLOEXEC, dir_fd=verified_parent_fd)
+                    try:
+                        verified = os.fstat(verified_fd)
+                        if (verified.st_dev, verified.st_ino) != written_identity:
+                            fail("credential destination changed during write")
+                    finally:
+                        os.close(verified_fd)
+                finally:
+                    os.close(verified_parent_fd)
+            finally:
+                if parent_fd is not None:
+                    os.close(parent_fd)
+                os.close(home_fd)
+
+        try:
+            main()
+        except SystemExit:
+            raise
+        except Exception as ex:
+            fail(f"credential materialisation failed: {ex.__class__.__name__}: {ex}")
+        PY
+        )
+        codeybox_write_credential_file() {
+          command -v python3 >/dev/null 2>&1 || codeybox_fail 'python3 is required to materialise credential files'
+          python3 -c "$codeybox_credential_writer_py" "$1" "${2:-}" "${3:-0}"
+        }
+        """;
 
     public virtual async Task<AgentResult> RunAsync(
         ISandbox sandbox,
@@ -347,9 +519,11 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         Action<string>? stdoutChunkCallback = null,
         bool captureStructuredStream = false)
     {
-        // The credential env is set on the container at boot via SandboxSpec.Environment
-        // so secrets don't land on per-exec argv. We deliberately do NOT merge
-        // credential.EnvironmentVariables into the per-exec ExtraEnvironment.
+        // Direct CLI env credentials that truly must be process environment
+        // belong in SandboxSpec.Environment at sandbox creation time. Env-backed
+        // credential files are materialised below from credential.EnvironmentVariables
+        // via stdin. We deliberately do NOT merge credential.EnvironmentVariables
+        // into the per-exec ExtraEnvironment here.
         if (RejectUnsupportedFileBackedCredentials(sandbox, credential) is { } unsupported)
             return unsupported;
 

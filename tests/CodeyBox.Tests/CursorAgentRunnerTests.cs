@@ -209,7 +209,8 @@ public sealed class CursorAgentRunnerTests
         Assert.Contains(".config/cursor/auth.json", script, StringComparison.Ordinal);
         Assert.Contains("CODEYBOX_CURSOR_AUTH_JSON", script, StringComparison.Ordinal);
         Assert.Contains("credential destination file is a symlink", script, StringComparison.Ordinal);
-        Assert.Contains("if [ -f \"$dest\" ] && [ -s \"$dest\" ]; then return 0; fi", script, StringComparison.Ordinal);
+        Assert.Contains("existing_destination_is_nonempty_regular", script, StringComparison.Ordinal);
+        Assert.Contains("return st.st_size > 0", script, StringComparison.Ordinal);
     }
 
     // ── Resume path ───────────────────────────────────────────────────────────

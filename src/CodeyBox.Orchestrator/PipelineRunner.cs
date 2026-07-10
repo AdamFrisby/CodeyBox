@@ -3580,17 +3580,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
             lockEntered = true;
 
             var access = _gitHost.GetSandboxAccess(repoId);
-            // Pre-resolve the actual resolver candidates and bake their
-            // environment/mount credential scope into the sandbox. The vast
-            // majority of pickup-rebases are conflict-free and will not invoke
-            // the agent CLI at all, so candidate pre-resolution failures are
-            // deferred until a conflict actually needs the resolver. When a
-            // conflict does trigger AgenticConflictResolver, the agent runs in
-            // THIS sandbox via IAgentRunner.RunAsync, and fileless env
-            // credentials are available only from SandboxSpec.Environment
-            // (CliAgentRunnerBase.RunAsync deliberately does not merge
-            // credential env per exec). File contents are still materialised
-            // immediately before each candidate runs.
+            // Pre-resolve the actual resolver candidates so the same ordered
+            // set is used if a conflict needs the in-sandbox resolver. The
+            // vast majority of pickup-rebases are conflict-free and will not
+            // invoke the agent CLI at all, so candidate pre-resolution failures
+            // are deferred until a conflict actually needs the resolver.
+            // Candidate credential env is intentionally NOT baked into the
+            // shared sandbox environment: earlier candidates run against
+            // untrusted conflicted repository content and must not see fallback
+            // secrets. Env-backed credential files are materialised from each
+            // selected candidate's credential via stdin immediately before that
+            // candidate runs; file credentials are still materialised through
+            // AgenticConflictResolver's per-candidate hook.
             //
             // Network profile prefers the agent profile (Work) so AllowedHosts
             // includes the agent's API endpoints. We fall back through the
@@ -3598,20 +3599,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // unconfigured.
             var (precomputedCandidates, precomputedCandidateFailure) =
                 await TryBuildPickupRebaseResolverCandidatesAsync(item, project, runner, ct);
-            AgentCredential? credential = null;
-            if (precomputedCandidates is not null)
-            {
-                try
-                {
-                    credential = BuildSandboxScopedAgentCredential(
-                        runner.Kind,
-                        precomputedCandidates.Candidates.Select(static c => c.Credential));
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    precomputedCandidateFailure = ExceptionDispatchInfo.Capture(ex);
-                }
-            }
+            precomputedCandidateFailure ??= ValidatePickupRebaseResolverCredentialScope(precomputedCandidates);
+            var credential = CreateEmptySandboxCredentialScope(runner.Kind);
             var rebaseProfile = project.NetworkProfiles.Work
                 ?? project.NetworkProfiles.AuditAgent
                 ?? project.NetworkProfiles.AuditTool;
@@ -3998,42 +3987,25 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
     }
 
-    private static AgentCredential? BuildSandboxScopedAgentCredential(
-        AgentKind scopeAgent,
-        IEnumerable<AgentCredential?> credentials)
+    private static AgentCredential CreateEmptySandboxCredentialScope(AgentKind scopeAgent)
+        => new(scopeAgent, new Dictionary<string, string>(), new Dictionary<string, string>());
+
+    private static ExceptionDispatchInfo? ValidatePickupRebaseResolverCredentialScope(
+        AgenticConflictCandidatesResult? candidates)
     {
-        var env = new Dictionary<string, string>(StringComparer.Ordinal);
-        var mounts = new List<SandboxMount>();
-        var hasCredential = false;
+        if (candidates is null)
+            return null;
 
-        foreach (var credential in credentials)
+        foreach (var candidate in candidates.Candidates)
         {
-            if (credential is null)
-                continue;
-
-            hasCredential = true;
-            foreach (var (key, value) in credential.EnvironmentVariables)
+            if (candidate.Credential?.Mounts.Count > 0)
             {
-                if (env.TryGetValue(key, out var existing))
-                {
-                    if (!string.Equals(existing, value, StringComparison.Ordinal))
-                    {
-                        throw new InvalidOperationException(
-                            $"Resolver candidate credentials contain conflicting values for environment variable '{key}'.");
-                    }
-                    continue;
-                }
-
-                env.Add(key, value);
+                return ExceptionDispatchInfo.Capture(new NotSupportedException(
+                    "Pickup-time rebase resolver candidate credentials with sandbox mounts are not supported in the shared resolver sandbox; use file or env-backed credential materialisation instead."));
             }
-
-            foreach (var mount in credential.Mounts)
-                mounts.Add(mount);
         }
 
-        return hasCredential
-            ? new AgentCredential(scopeAgent, env, new Dictionary<string, string>()) { Mounts = mounts }
-            : null;
+        return null;
     }
 
     private async Task<PickupRebaseResolutionResult> RebaseCheckedOutBranchWithScopeFenceAsync(
@@ -4056,9 +4028,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
         var selectedResolverLogged = false;
         IAgentRunner? chosenResolver = null;
         AgentCredential? chosenCredential = null;
-        // The candidate list is pre-resolved before sandbox creation so candidate
-        // env credentials can be baked into the sandbox. The wrapped list is still
-        // built lazily on first conflict so clean rebases avoid prompt-preprocessor
+        // The candidate list is pre-resolved before sandbox creation so routing,
+        // quota, and credential-provider failures are captured while the known
+        // candidate set is still available. The wrapped list is still built
+        // lazily on first conflict so clean rebases avoid prompt-preprocessor
         // work and any pre-resolution failure is ignored unless a resolver is
         // actually needed.
         IReadOnlyList<AgenticConflictResolverCandidate>? candidates = null;

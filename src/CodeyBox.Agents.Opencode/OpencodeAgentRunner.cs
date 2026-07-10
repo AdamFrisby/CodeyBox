@@ -52,8 +52,9 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
     /// Bash that materialises opencode's credentials file from
     /// <c>OPENCODE_AUTH_JSON</c> into the XDG-default location (overridable via
     /// <c>OPENCODE_AUTH_DEST_PATH</c>). Shared verbatim with
-    /// <c>OpencodeInVmSmokeProbe</c> so the smoke probe writes to the exact
-    /// same path as a real dispatch.
+    /// <c>OpencodeInVmSmokeProbe</c> so the env-reading smoke/create-time path
+    /// writes to the same destination as a real dispatch's credential-stdin
+    /// materialisation path.
     /// </summary>
     public static readonly string AuthMaterialiseScript = BuildEnvBackedCredentialScript(AuthCredentialFile);
 

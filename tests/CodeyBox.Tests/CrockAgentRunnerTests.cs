@@ -527,15 +527,16 @@ public sealed class CrockAgentRunnerTests
     {
         // The bash script must reference ConfigEnvVar's current value; a
         // rename of the constant must propagate without a separate edit.
-        // Also pins the chmod/temp-file security pattern so a regression to a
-        // looser mode or symlink-following write is caught.
+        // Also pins the fd-based no-follow security pattern so a regression
+        // to a looser mode or symlink-following write is caught.
         Assert.Contains(
             CrockAgentRunner.ConfigEnvVar,
             CrockAgentRunner.ConfigMaterialiseScript,
             StringComparison.Ordinal);
-        Assert.Contains("chmod 600", CrockAgentRunner.ConfigMaterialiseScript, StringComparison.Ordinal);
+        Assert.Contains("0o600", CrockAgentRunner.ConfigMaterialiseScript, StringComparison.Ordinal);
         Assert.Contains(".crockcode/config.json", CrockAgentRunner.ConfigMaterialiseScript, StringComparison.Ordinal);
-        Assert.Contains("mktemp", CrockAgentRunner.ConfigMaterialiseScript, StringComparison.Ordinal);
+        Assert.Contains("O_NOFOLLOW", CrockAgentRunner.ConfigMaterialiseScript, StringComparison.Ordinal);
+        Assert.Contains("os.replace(tmp_name, file_name", CrockAgentRunner.ConfigMaterialiseScript, StringComparison.Ordinal);
         Assert.Contains("credential destination parent is a symlink", CrockAgentRunner.ConfigMaterialiseScript, StringComparison.Ordinal);
     }
 

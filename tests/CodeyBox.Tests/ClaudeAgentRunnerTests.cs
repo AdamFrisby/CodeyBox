@@ -202,7 +202,7 @@ public sealed class ClaudeAgentRunnerTests
         Assert.Equal(".claude/.credentials.json", prep.Argv[4]);
         Assert.Equal(credential.EnvironmentVariables[ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar], prep.Stdin);
         Assert.DoesNotContain("CODEYBOX_CLAUDE_OAUTH_JSON", script);
-        Assert.Contains("chmod 600", script);
+        Assert.Contains("0o600", script);
     }
 
     [Fact]
