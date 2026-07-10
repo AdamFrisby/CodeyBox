@@ -379,11 +379,12 @@ public interface IWorkItemStore
 
     /// <summary>
     /// Atomically claims an agent-restore retry key and applies the guarded
-    /// retry update. Persistent stores should commit the claim and state
-    /// transition together so a process crash cannot leave a terminal item
-    /// permanently skipped by an idempotency row that never requeued it.
+    /// retry update. Stores used by the restore-retry scheduler must override
+    /// this operation and commit the claim and state transition together so a
+    /// process crash cannot leave a terminal item permanently skipped by an
+    /// idempotency row that never requeued it.
     /// </summary>
-    async Task<bool> TryUpdateIfStateAndUpdatedAtWithAgentRestoreRetryClaimAsync(
+    Task<bool> TryUpdateIfStateAndUpdatedAtWithAgentRestoreRetryClaimAsync(
         WorkItem item,
         WorkItemState onlyIfState,
         DateTimeOffset onlyIfUpdatedAt,
@@ -391,34 +392,8 @@ public interface IWorkItemStore
         DateTimeOffset outageStartedAt,
         DateTimeOffset restoredAt,
         CancellationToken ct = default)
-    {
-        if (!await TryClaimAgentRestoreRetryAsync(
-                item.Id,
-                restoredAgent,
-                outageStartedAt,
-                restoredAt,
-                ct).ConfigureAwait(false))
-        {
-            return false;
-        }
-
-        var updated = await TryUpdateIfStateAndUpdatedAtAsync(
-                item,
-                onlyIfState,
-                onlyIfUpdatedAt,
-                ct)
-            .ConfigureAwait(false);
-        if (updated)
-            return true;
-
-        await ReleaseAgentRestoreRetryClaimAsync(
-                item.Id,
-                restoredAgent,
-                outageStartedAt,
-                ct)
-            .ConfigureAwait(false);
-        return false;
-    }
+        => throw new NotSupportedException(
+            "This work item store does not implement atomic agent-restore retry claim updates.");
 
     /// <summary>
     /// Releases a previously created agent-restore retry claim when the retry

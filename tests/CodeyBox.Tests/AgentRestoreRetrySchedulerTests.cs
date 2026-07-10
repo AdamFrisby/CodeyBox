@@ -1750,6 +1750,28 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
                 : _inner.TryClaimAgentRestoreRetryAsync(id, restoredAgent, outageStartedAt, restoredAt, ct);
         }
 
+        public Task<bool> TryUpdateIfStateAndUpdatedAtWithAgentRestoreRetryClaimAsync(
+            WorkItem item,
+            WorkItemState onlyIfState,
+            DateTimeOffset onlyIfUpdatedAt,
+            AgentKind restoredAgent,
+            DateTimeOffset outageStartedAt,
+            DateTimeOffset restoredAt,
+            CancellationToken ct = default)
+        {
+            ClaimAttempts++;
+            return _throwOnClaim
+                ? throw new InvalidOperationException("claim persistence failed")
+                : _inner.TryUpdateIfStateAndUpdatedAtWithAgentRestoreRetryClaimAsync(
+                    item,
+                    onlyIfState,
+                    onlyIfUpdatedAt,
+                    restoredAgent,
+                    outageStartedAt,
+                    restoredAt,
+                    ct);
+        }
+
         public Task ReleaseAgentRestoreRetryClaimAsync(
             WorkItemId id,
             AgentKind restoredAgent,

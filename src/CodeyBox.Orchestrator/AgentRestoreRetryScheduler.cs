@@ -711,7 +711,7 @@ public sealed record AgentRestoreRetryOptions
 /// <summary>
 /// Outcome of one restore-driven sweep. <see cref="Requeued"/> is the count
 /// of items the sweep actually transitioned back to Queued; <see cref="Skipped"/>
-/// is the count of candidates that matched the filter but were not retried
-/// (concurrent state change, retrier-internal reject like an open operator question).
+/// is the count of evaluated candidate rows left unrequeued by attribution,
+/// idempotency, retry-guard, or retry-exception handling.
 /// </summary>
 public readonly record struct AgentRestoreSweepSummary(int Requeued, int Skipped);

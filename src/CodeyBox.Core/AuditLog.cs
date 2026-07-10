@@ -935,14 +935,13 @@ public static class AuditLog
     /// transitioned from excluded to routable and the sweep evaluated
     /// candidate infra-failed work items. <paramref name="requeued"/> counts
     /// items the sweep actually transitioned back to Queued.
-    /// <paramref name="skipped"/> counts candidates that matched the
-    /// IsCandidate filter (right agent, infra-shaped failure, inside window)
-    /// but were not requeued because the underlying retrier returned
-    /// success=false (e.g. concurrent state change, open operator question),
-    /// or because the retrier threw and the item was skipped to keep the
-    /// sweep going. Candidates outside the configured store-level cap, or
-    /// rejected by IsCandidate (wrong agent, wrong failureKind, outside
-    /// window), are NOT counted. Also emitted (with zeros) when
+    /// <paramref name="skipped"/> counts evaluated candidate rows that were not
+    /// requeued: final attribution rejects, duplicate idempotency claims,
+    /// retrier guard rejects (for example concurrent state change or an open
+    /// operator question), and retrier exceptions caught so the sweep can keep
+    /// going. Candidates outside the configured store-level cap or never
+    /// returned by the store candidate query are NOT counted. Also emitted
+    /// (with zeros) when
     /// the sweep is skipped because <c>outageStartedAt</c> is null, so
     /// operators can tell "feature disabled" (no event) from "no window
     /// known" (event with outageStartedAt=(unknown)) from "no candidates
