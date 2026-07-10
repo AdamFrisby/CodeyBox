@@ -106,7 +106,7 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
 
     public async Task PauseAsync(string reason, CancellationToken ct = default)
     {
-        Task audit;
+        Action auditEvent;
         await _lock.WaitAsync(ct);
         try
         {
@@ -125,19 +125,19 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
             _state = QueueState.Paused;
             Interlocked.Exchange(ref _pausedAtUtcTicks, now.UtcTicks);
             _pausedReason = reason;
-            audit = EnqueueAudit(() => AuditLog.QueuePaused(reason));
+            auditEvent = () => AuditLog.QueuePaused(reason);
         }
         finally
         {
             _lock.Release();
         }
 
-        await audit.ConfigureAwait(false);
+        await EnqueueAudit(auditEvent).ConfigureAwait(false);
     }
 
     public async Task ResumeAsync(CancellationToken ct = default)
     {
-        Task? audit = null;
+        Action? auditEvent = null;
         await _lock.WaitAsync(ct);
         try
         {
@@ -157,20 +157,20 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
             _state = QueueState.Running;
             Interlocked.Exchange(ref _pausedAtUtcTicks, 0);
             _pausedReason = null;
-            audit = EnqueueAudit(AuditLog.QueueResumed);
+            auditEvent = AuditLog.QueueResumed;
         }
         finally
         {
             _lock.Release();
         }
 
-        if (audit is not null)
-            await audit.ConfigureAwait(false);
+        if (auditEvent is not null)
+            await EnqueueAudit(auditEvent).ConfigureAwait(false);
     }
 
     public async Task PauseProjectAsync(ProjectId projectId, string reason, CancellationToken ct = default)
     {
-        Task audit;
+        Action auditEvent;
         await _lock.WaitAsync(ct);
         try
         {
@@ -191,19 +191,19 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
             cmd.Parameters.AddWithValue("$reason", reason);
             cmd.Parameters.AddWithValue("$ua", now.ToString("O"));
             await cmd.ExecuteNonQueryAsync(ct);
-            audit = EnqueueAudit(() => AuditLog.ProjectQueuePaused(projectId, reason));
+            auditEvent = () => AuditLog.ProjectQueuePaused(projectId, reason);
         }
         finally
         {
             _lock.Release();
         }
 
-        await audit.ConfigureAwait(false);
+        await EnqueueAudit(auditEvent).ConfigureAwait(false);
     }
 
     public async Task ResumeProjectAsync(ProjectId projectId, CancellationToken ct = default)
     {
-        Task audit;
+        Action auditEvent;
         await _lock.WaitAsync(ct);
         try
         {
@@ -221,14 +221,14 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
             cmd.Parameters.AddWithValue("$pid", projectId.Value);
             cmd.Parameters.AddWithValue("$ua", now.ToString("O"));
             await cmd.ExecuteNonQueryAsync(ct);
-            audit = EnqueueAudit(() => AuditLog.ProjectQueueResumed(projectId));
+            auditEvent = () => AuditLog.ProjectQueueResumed(projectId);
         }
         finally
         {
             _lock.Release();
         }
 
-        await audit.ConfigureAwait(false);
+        await EnqueueAudit(auditEvent).ConfigureAwait(false);
     }
 
     public async Task<ProjectQueueState?> GetProjectStateAsync(ProjectId projectId, CancellationToken ct = default)

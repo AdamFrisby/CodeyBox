@@ -1286,6 +1286,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     {
         ArgumentOutOfRangeException.ThrowIfNegative(offset);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
+        if (limit > IWorkItemStore.MaximumPageSize)
+            throw new ArgumentOutOfRangeException(nameof(limit), limit, $"Page size cannot exceed {IWorkItemStore.MaximumPageSize}.");
 
         var rows = new List<WorkItem>(limit);
         using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);

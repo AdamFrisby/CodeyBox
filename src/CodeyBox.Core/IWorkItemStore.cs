@@ -116,6 +116,8 @@ public sealed record WorkItemIteration(
 /// </summary>
 public interface IWorkItemStore
 {
+    /// <summary>Largest page accepted by storage-backed paging operations.</summary>
+    const int MaximumPageSize = 250;
     Task CreateAsync(WorkItem item, CancellationToken ct = default);
     /// <summary>
     /// Updates persisted work-item fields except <see cref="WorkItem.Priority"/>,
@@ -282,10 +284,18 @@ public interface IWorkItemStore
 
     Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default);
     IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default);
+    /// <summary>
+    /// Returns work items in newest-created-first order. <paramref name="offset"/>
+    /// is zero-based and <paramref name="limit"/> must be between 1 and
+    /// <see cref="MaximumPageSize"/>. Cancellation stops the database read and
+    /// no partial page is returned.
+    /// </summary>
     async Task<IReadOnlyList<WorkItem>> ListPageAsync(int offset, int limit, CancellationToken ct = default)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(offset);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
+        if (limit > MaximumPageSize)
+            throw new ArgumentOutOfRangeException(nameof(limit), limit, $"Page size cannot exceed {MaximumPageSize}.");
         var page = new List<WorkItem>(limit);
         var skipped = 0;
         await foreach (var item in ListAsync(ct).ConfigureAwait(false))
