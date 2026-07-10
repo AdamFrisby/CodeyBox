@@ -411,10 +411,9 @@ public sealed class AgenticConflictResolver
 
             try
             {
-                // A runner must observe only its own direct environment. Kill
-                // any process left by the prior candidate before changing the
-                // credential scope, then materialise this candidate's file
-                // bundle through the shared atomic writer.
+                // Kill any process left by the prior candidate before changing
+                // staged credential files, then materialise this candidate's
+                // file bundle through the shared atomic writer.
                 if (previousScopedCandidate is not null)
                 {
                     await sandbox.KillActiveExecsAsync(ct).ConfigureAwait(false);
@@ -424,10 +423,17 @@ public sealed class AgenticConflictResolver
                         ct).ConfigureAwait(false);
                     previousScopedCandidate = null;
                 }
-                if (CandidateHasMaterialisableCredentialFiles(candidate))
+                if (_credentialFileMaterialiser is not null
+                    && candidate.Credential is { Files.Count: > 0 })
                 {
                     previousScopedCandidate = candidate;
-                    await MaterialiseCandidateCredentialFilesAsync(sandbox, candidate, ct);
+                    if (candidate.Credential.Agent != candidate.Runner.Kind)
+                    {
+                        throw new AgentCredentialScopeException(
+                            candidate.Runner.Kind,
+                            $"credential belongs to agent '{candidate.Credential.Agent.Value}'");
+                    }
+                    await _credentialFileMaterialiser(sandbox, candidate.Credential, ct).ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException)
@@ -437,17 +443,6 @@ public sealed class AgenticConflictResolver
             catch (Exception ex)
             {
                 RecordCredentialSetupFailure("file materialisation", ex);
-                continue;
-            }
-
-            ISandbox candidateSandbox;
-            try
-            {
-                candidateSandbox = CandidateCredentialSandbox.Create(sandbox, candidate);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                RecordCredentialSetupFailure("environment scoping", ex);
                 continue;
             }
 
@@ -492,7 +487,7 @@ public sealed class AgenticConflictResolver
                     context,
                     runner,
                     candidate,
-                    candidateSandbox,
+                    sandbox,
                     workingDirectory,
                     attempt,
                     ct);
@@ -502,7 +497,7 @@ public sealed class AgenticConflictResolver
                 {
                     agentResult = supervision is null
                         ? await runner.RunAsync(
-                            candidateSandbox,
+                            sandbox,
                             workingDirectory,
                             prompt,
                             candidate.Credential,
@@ -513,7 +508,7 @@ public sealed class AgenticConflictResolver
                             captureStructuredStream: captureStructuredStream)
                         : await AgentSupervisionTurnRunner.RunAutonomousAndQueuedInjectionsAsync(
                             runner,
-                            candidateSandbox,
+                            sandbox,
                             workingDirectory,
                             prompt,
                             candidate.Credential,
@@ -804,84 +799,6 @@ public sealed class AgenticConflictResolver
                     destination.HomeRelativePath,
                     destinationOverride),
                 string.Empty,
-                SandboxCredentialOverwritePolicy.Overwrite,
-                ct).ConfigureAwait(false);
-        }
-    }
-
-    private static bool CandidateHasMaterialisableCredentialFiles(AgenticConflictResolverCandidate candidate)
-    {
-        if (candidate.Credential is not { } credential)
-            return false;
-        if (credential.Files.Count > 0)
-            return true;
-        if (candidate.Runner is not IAgentCredentialEnvironmentPolicy policy)
-            return false;
-
-        return policy.CredentialFileDestinations.Any(destination =>
-            credential.EnvironmentVariables.TryGetValue(destination.PayloadEnvironmentVariable, out var payload)
-            && !string.IsNullOrEmpty(payload));
-    }
-
-    private async Task MaterialiseCandidateCredentialFilesAsync(
-        ISandbox sandbox,
-        AgenticConflictResolverCandidate candidate,
-        CancellationToken ct)
-    {
-        var credential = candidate.Credential
-            ?? throw new InvalidOperationException("Resolver candidate has no credential to materialise.");
-        if (credential.Agent != candidate.Runner.Kind)
-        {
-            throw new AgentCredentialScopeException(
-                candidate.Runner.Kind,
-                $"credential belongs to agent '{credential.Agent.Value}'");
-        }
-
-        if (_credentialFileMaterialiser is not null && credential.Files.Count > 0)
-            await _credentialFileMaterialiser(sandbox, credential, ct).ConfigureAwait(false);
-
-        if (candidate.Runner is not IAgentCredentialEnvironmentPolicy policy)
-            return;
-
-        foreach (var destination in policy.CredentialFileDestinations)
-        {
-            if (!policy.FileBackedCredentialEnvironmentVariables.Contains(destination.PayloadEnvironmentVariable))
-            {
-                throw new AgentCredentialScopeException(
-                    candidate.Runner.Kind,
-                    $"credential destination payload variable '{destination.PayloadEnvironmentVariable}' is not file-backed allowlisted for this agent");
-            }
-            if (destination.DestinationEnvironmentVariable is not null
-                && !policy.FileBackedCredentialEnvironmentVariables.Contains(destination.DestinationEnvironmentVariable))
-            {
-                throw new AgentCredentialScopeException(
-                    candidate.Runner.Kind,
-                    $"credential destination override variable '{destination.DestinationEnvironmentVariable}' is not file-backed allowlisted for this agent");
-            }
-
-            if (!credential.EnvironmentVariables.TryGetValue(
-                    destination.PayloadEnvironmentVariable,
-                    out var payload)
-                || string.IsNullOrEmpty(payload))
-            {
-                continue;
-            }
-
-            string? destinationOverride = null;
-            if (destination.DestinationEnvironmentVariable is not null)
-            {
-                credential.EnvironmentVariables.TryGetValue(
-                    destination.DestinationEnvironmentVariable,
-                    out destinationOverride);
-            }
-
-            await SandboxCredentialFileWriter.WriteAsync(
-                sandbox,
-                new SandboxCredentialFileTarget(
-                    SandboxCredentialFileRoot.Home,
-                    destination.HomeRelativePath,
-                    destinationOverride),
-                payload,
                 SandboxCredentialOverwritePolicy.Overwrite,
                 ct).ConfigureAwait(false);
         }

@@ -11,11 +11,10 @@ namespace CodeyBox.Tests;
 /// <summary>
 /// Pins the wiring fix that broke the in-VM agentic conflict resolver. The
 /// pickup-rebase sandbox must have agent network and credential tmpfs scope,
-/// while its creation-time environment contains no resolver credentials.
-/// Direct API keys are scoped to only the active candidate process and file
-/// payloads are materialised via stdin immediately before that candidate. The
-/// agent-merge sandbox still carries the chosen agent credential at creation
-/// time.
+/// and its creation-time environment must contain only the pre-resolved
+/// resolver candidates' environment credentials. File payloads are materialised
+/// via stdin immediately before that candidate. The agent-merge sandbox still
+/// carries the chosen agent credential at creation time.
 ///
 /// The new resolver-side integration tests in
 /// <c>AgenticConflictResolverIntegrationTests</c> assert the resolver's own
@@ -100,8 +99,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
 
         var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
         AssertCredentialTmpfsAndOpenNetwork(pickupSpec, "pickup-rebase");
-        Assert.False(pickupSpec.Environment.ContainsKey(MarkerEnvKey),
-            "pickup-rebase creation environment must not expose a resolver credential globally");
+        Assert.Equal(MarkerEnvValue, pickupSpec.Environment[MarkerEnvKey]);
     }
 
     [Fact]
@@ -132,35 +130,6 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         Assert.Equal(
             CursorAuthJson,
             (await ReadBareBranchFileAsync(run.BarePath, run.WorkBranch, "cursor-auth-observed.json")).TrimEnd('\r', '\n'));
-    }
-
-    [Fact]
-    public async Task PickupRebaseResolver_CursorFallbackCredentialHook_MaterialisesEnvBackedFileBeforeRunner()
-    {
-        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        var primary = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
-        primary.AgenticConflictResults.Enqueue(new AgentResult(
-            Success: false,
-            Summary: "codex resolver failed before editing",
-            Stdout: null,
-            Stderr: "ordinary resolver failure"));
-        var fallback = new EnvBackedCredentialFileAssertingResolverAgent();
-        var classRouter = BuildResolverClassRouter(primary, fallback);
-        var project = NewResolverProject(seed, AgentKind.Codex);
-
-        var run = await RunPickupRebaseConflictAsync(
-            seed,
-            project,
-            new ResolverCredentialProvider(),
-            primary,
-            [fallback],
-            classRouter);
-
-        Assert.Equal(WorkItemState.Done, run.Final.State);
-        Assert.Single(primary.AgenticConflictInvocations);
-        Assert.Equal(
-            CursorAuthJson,
-            (await ReadBareBranchFileAsync(run.BarePath, run.WorkBranch, "env-backed-credential-observed.json")).TrimEnd('\r', '\n'));
     }
 
     [Fact]
@@ -196,7 +165,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task PickupRebaseResolver_CreationEnvironmentExcludesAllCandidateCredentials()
+    public async Task PickupRebaseResolver_CreationEnvironmentIncludesOnlyCandidateCredentials()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var recorder = new RecordingSandboxProvider(
@@ -226,8 +195,8 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         Assert.DoesNotContain(AgentKind.Opencode, credentials.RequestedAgents);
 
         var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
-        Assert.False(pickupSpec.Environment.ContainsKey(CodexApiKeyEnvKey));
-        Assert.False(pickupSpec.Environment.ContainsKey(CursorAuthEnvKey));
+        Assert.Equal(CodexApiKeyValue, pickupSpec.Environment[CodexApiKeyEnvKey]);
+        Assert.Equal(CursorAuthJson, pickupSpec.Environment[CursorAuthEnvKey]);
         Assert.False(pickupSpec.Environment.ContainsKey(NonCandidateEnvKey),
             "non-candidate opencode credential must not enter the resolver sandbox");
         Assert.Equal(
@@ -318,10 +287,12 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task PickupRebaseResolver_CleanRebase_DoesNotExposeApiKeyOnlyPrimary()
+    public async Task PickupRebaseResolver_CleanRebase_BakesPreResolvedCandidateEnvironment()
     {
-        // A clean rebase never starts a resolver CLI, so even the viable
-        // primary's API key must remain absent from the sandbox-wide env.
+        // Candidate credentials are resolved before sandbox creation because
+        // env-var-backed fallbacks need their values available at create time.
+        // A clean rebase therefore still carries the viable candidate env, but
+        // does not invoke the resolver.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var recorder = new RecordingSandboxProvider(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
@@ -345,7 +316,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
 
         Assert.Equal(WorkItemState.Done, run.Final.State);
         var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
-        Assert.False(pickupSpec.Environment.ContainsKey(ClaudeApiKeyEnvKey));
+        Assert.Equal(ClaudeApiKeyValue, pickupSpec.Environment[ClaudeApiKeyEnvKey]);
     }
 
     [Fact]
@@ -1312,8 +1283,8 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     /// <summary>
     /// Returns a credential with a single marker env var. Merge/audit call-site
     /// tests assert the marker is present when a chosen agent credential is in
-    /// scope; pickup-rebase asserts candidate credentials are pre-resolved but
-    /// this marker is not baked into the shared resolver sandbox environment.
+    /// scope; pickup-rebase asserts candidate credentials are pre-resolved and
+    /// baked into the shared resolver sandbox environment.
     /// </summary>
     private sealed class MarkerCredentialProvider : ICredentialProvider
     {
@@ -1552,75 +1523,6 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
             }, ct);
             return add.Success
                 ? new AgentResult(true, $"{_kind.Value} resolved", null, null)
-                : new AgentResult(false, "failed to stage README.md", add.Stdout, add.Stderr);
-        }
-    }
-
-    private sealed class EnvBackedCredentialFileAssertingResolverAgent : IAgentRunner, IAgentCredentialEnvironmentPolicy
-    {
-        public AgentKind Kind => AgentKind.Cursor;
-        public IReadOnlySet<string> DirectCredentialEnvironmentVariables { get; } =
-            new HashSet<string>(StringComparer.Ordinal);
-        public IReadOnlySet<string> FileBackedCredentialEnvironmentVariables { get; } =
-            new HashSet<string>(StringComparer.Ordinal) { CursorAuthEnvKey };
-        public IReadOnlyList<AgentCredentialFileDestination> CredentialFileDestinations { get; } =
-        [
-            new AgentCredentialFileDestination(CursorAuthEnvKey, ".config/cursor/auth.json"),
-        ];
-
-        public async Task<AgentResult> RunAsync(
-            ISandbox sandbox,
-            string workingDirectory,
-            string prompt,
-            AgentCredential? credential,
-            string? modelId = null,
-            string? reasoningMode = null,
-            CancellationToken ct = default,
-            Action<string>? stdoutChunkCallback = null,
-            bool captureStructuredStream = false)
-        {
-            _ = prompt;
-            _ = credential;
-            _ = modelId;
-            _ = reasoningMode;
-            _ = stdoutChunkCallback;
-            _ = captureStructuredStream;
-
-            var readCredential = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["sh", "-c", "cat \"$HOME/.config/cursor/auth.json\""],
-            }, ct);
-            if (!readCredential.Success)
-                return new AgentResult(false, "missing cursor auth file", readCredential.Stdout, readCredential.Stderr);
-
-            var writeCredentialObservation = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/env-backed-credential-observed.json"],
-                Stdin = readCredential.Stdout,
-            }, ct);
-            if (!writeCredentialObservation.Success)
-            {
-                return new AgentResult(
-                    false,
-                    "failed to write env-backed credential observation",
-                    writeCredentialObservation.Stdout,
-                    writeCredentialObservation.Stderr);
-            }
-
-            var write = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/README.md"],
-                Stdin = "main branch change\nwork branch change\n",
-            }, ct);
-            if (!write.Success)
-                return new AgentResult(false, "failed to write README.md", write.Stdout, write.Stderr);
-
-            var add = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["git", "-C", workingDirectory, "add", "--", "README.md", "env-backed-credential-observed.json"],
-            }, ct);
-            return add.Success
-                ? new AgentResult(true, "cursor resolved", null, null)
                 : new AgentResult(false, "failed to stage README.md", add.Stdout, add.Stderr);
         }
     }

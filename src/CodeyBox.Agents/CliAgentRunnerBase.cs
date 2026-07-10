@@ -307,11 +307,11 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         Action<string>? stdoutChunkCallback = null,
         bool captureStructuredStream = false)
     {
-        // Direct CLI env credentials are provisioned by the sandbox owner: in
-        // SandboxSpec for a normal single-agent sandbox, or through the active
-        // candidate scope in the conflict resolver. Env-backed credential files
-        // are materialised below via stdin. This runner deliberately does NOT
-        // merge credential.EnvironmentVariables into per-exec ExtraEnvironment.
+        // Direct CLI env credentials are provisioned by the sandbox owner in
+        // SandboxSpec, including resolver sandboxes whose candidates are known
+        // before creation. Env-backed credential files are materialised below
+        // via stdin. This runner deliberately does NOT merge
+        // credential.EnvironmentVariables into per-exec ExtraEnvironment.
         if (RejectUnsupportedFileBackedCredentials(sandbox, credential) is { } unsupported)
             return unsupported;
 
