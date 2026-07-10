@@ -441,8 +441,22 @@ public sealed class QuotaRetrySchedulerProgramWiringTests
             });
             builder.ConfigureTestServices(services =>
             {
-                if (!_startHostedServices)
-                    services.RemoveAll<IHostedService>();
+                // This test's subject is the quota-recovery probe monitor's
+                // periodic loop (and the QuotaRetryScheduler subscription it
+                // drives). Always strip the full hosted-service set so the
+                // OrchestratorService dispatcher never runs: it would otherwise
+                // pull the just-requeued Queued item and — because the codex CLI
+                // is absent in-test — drive it to Failed, racing the assertion
+                // under load. When exercising the hosted loop, re-add only the
+                // two quota-recovery hosted services the requeue actually needs
+                // (the monitor's background probe loop and the scheduler whose
+                // constructor subscribes to the recovery signal).
+                services.RemoveAll<IHostedService>();
+                if (_startHostedServices)
+                {
+                    services.AddHostedService(sp => sp.GetRequiredService<AgentQuotaRecoveryProbeMonitor>());
+                    services.AddHostedService(sp => sp.GetRequiredService<QuotaRetryScheduler>());
+                }
                 services.RemoveAll<IAgentQuotaProbe>();
                 services.AddSingleton(Probe);
                 services.AddSingleton<IAgentQuotaProbe>(sp => sp.GetRequiredService<MutableProgramQuotaProbe>());
