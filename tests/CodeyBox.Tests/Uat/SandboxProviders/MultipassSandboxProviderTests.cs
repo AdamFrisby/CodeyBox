@@ -1266,7 +1266,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("kill -KILL \"-$codeybox_detached_pgid\"", script);
         Assert.Contains("wait \"$codeybox_detached_pid\" 2>/dev/null", script);
         var termIndex = script.IndexOf("kill -TERM \"-$codeybox_detached_pgid\"", StringComparison.Ordinal);
-        var sleepIndex = script.IndexOf("sleep 0.05", termIndex, StringComparison.Ordinal);
+        var delayIndex = script.IndexOf("codeybox_delay 0.05", termIndex, StringComparison.Ordinal);
         var killIndex = script.IndexOf("kill -KILL \"-$codeybox_detached_pgid\"", termIndex, StringComparison.Ordinal);
         var waitIndex = script.IndexOf("wait \"$codeybox_detached_pid\" 2>/dev/null", termIndex, StringComparison.Ordinal);
         var timeoutExitIndex = script.IndexOf(
@@ -1274,8 +1274,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             waitIndex,
             StringComparison.Ordinal);
         Assert.True(termIndex >= 0, "TERM not emitted");
-        Assert.True(sleepIndex > termIndex, "sleep must follow TERM");
-        Assert.True(killIndex > sleepIndex, "KILL must follow the post-TERM sleep");
+        Assert.True(delayIndex > termIndex, "delay must follow TERM");
+        Assert.True(killIndex > delayIndex, "KILL must follow the post-TERM delay");
         Assert.True(waitIndex > killIndex, "wait must follow KILL");
         Assert.True(timeoutExitIndex > waitIndex, "timeout path must report supervisor-setup exit code");
         Assert.Contains("if ! kill -0 \"$codeybox_detached_pid\" 2>/dev/null; then", script);
@@ -1296,6 +1296,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             ["/bin/sh", "-c", "printf should-run"]);
 
         Assert.Contains("codeybox_marker_wait_seconds=30\n", script, StringComparison.Ordinal);
+        Assert.Contains("codeybox_virtual_elapsed_seconds_file=''\n", script, StringComparison.Ordinal);
+        Assert.Contains("printf '%s\\n' \"$SECONDS\"", script, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1337,8 +1339,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             stdoutChunkCallback: null,
             stderrChunkCallback: null,
             CancellationToken.None);
-        if (session is null)
-            return;
+        Assert.NotNull(session);
 
         var envFile = Path.Combine(_workspace, "detached-env-scrub");
         var commandScript = Path.Combine(_workspace, "detached-command-scrub.sh");
@@ -1380,14 +1381,13 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             "/bin/bash",
             [launchScript],
             environmentOverrides: MergeEnvironment(poisonedEnvironment, FakeSudoPathEnvironment()));
-        await WaitForFileAsync(doneFile, TimeSpan.FromSeconds(3));
+        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(30));
 
         Assert.Equal(0, exit);
         Assert.Equal("", stdout);
         Assert.Equal("", stderr);
         Assert.Equal("", await File.ReadAllTextAsync(visibleEnvironmentFile));
         Assert.Equal("poison-agent-run-id", await File.ReadAllTextAsync(visibleRunIdFile));
-        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
     }
 
     [Fact]
@@ -1403,67 +1403,75 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             stdoutChunkCallback: null,
             stderrChunkCallback: null,
             CancellationToken.None);
-        if (session is null)
-            return;
+        Assert.NotNull(session);
 
         var envFile = Path.Combine(_workspace, "detached-env");
         var commandScript = Path.Combine(_workspace, "detached-command.sh");
         var launchScript = Path.Combine(_workspace, "detached-launch.sh");
         var processGroupMarker = Path.Combine(_workspace, "detached.pgid");
         var doneFile = Path.Combine(_workspace, "detached.done");
-        var releaseFile = Path.Combine(_workspace, "detached.release");
+        var commandStartedFile = Path.Combine(_workspace, "detached.started");
+        var releasePipePath = Path.Combine(_workspace, "detached.release");
+        await using var releasePipe = await CreateBlockingPipeAsync(releasePipePath);
         await File.WriteAllTextAsync(envFile, MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment()));
-        // The detached command blocks on a release gate the test controls
-        // rather than a fixed sleep. This lets us assert the launch returned
-        // WHILE the command was still running (a relative check that is
-        // immune to CI load) instead of an absolute wall-clock threshold,
-        // which flakes when the supervisor's sudo/http-probe spawns are slow
-        // under heavy parallel test load.
-        await File.WriteAllTextAsync(commandScript, "while [ ! -f \"$2\" ]; do sleep 0.05; done\nprintf done > \"$1\"\n");
+        await File.WriteAllTextAsync(
+            commandScript,
+            "printf started > \"$2\"\nIFS= read -r _ < \"$3\"\nprintf done > \"$1\"\n");
         File.SetUnixFileMode(commandScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         await File.WriteAllTextAsync(
             launchScript,
-            MultipassSandbox.BuildDetachedLaunchScript(envFile, processGroupMarker, null, ["/bin/sh", commandScript, doneFile, releaseFile]));
+            MultipassSandbox.BuildDetachedLaunchScript(
+                envFile,
+                processGroupMarker,
+                null,
+                ["/bin/sh", commandScript, doneFile, commandStartedFile, releasePipePath]));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         // Cap the launch so a genuine "stayed attached" regression surfaces as
         // a clean failure instead of an indefinite hang (the gated command
         // never completes until this test releases it).
         using var launchCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        Task<(int Exit, string Stdout, string Stderr)>? launchTask = null;
         try
         {
-            var (exit, _, stderr) = await RunLocalProcessAsync(
+            launchTask = RunLocalProcessAsync(
                 "/bin/bash",
                 // Keep fd 3 inherited by the launcher without requiring the
                 // temp workspace to allow direct script execution.
                 ["-c", "exec 3>&1\nexec /bin/bash \"$1\"", "codeybox-launch-with-extra-fd", launchScript],
                 ct: launchCts.Token,
                 environmentOverrides: FakeSudoPathEnvironment());
+            await WaitForFileAsync(commandStartedFile, TimeSpan.FromSeconds(30));
+            var (exit, _, stderr) = await launchTask;
 
             Assert.Equal(0, exit);
             Assert.Equal("", stderr);
-            // The command cannot finish until we create the release file below, so
+            // The command cannot finish until we signal the release pipe below, so
             // its absence here proves the launch detached the command rather than
             // running it inline.
             Assert.False(File.Exists(doneFile), "detached launch returned only after the command completed");
             Assert.True(File.Exists(processGroupMarker));
-            await File.WriteAllTextAsync(releaseFile, "go");
-            await WaitForFileAsync(doneFile, TimeSpan.FromSeconds(6));
-            await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
+            releasePipe.WriteByte((byte)'\n');
+            await releasePipe.FlushAsync();
+            await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(30));
+            Assert.True(File.Exists(doneFile));
         }
         finally
         {
             // Always release the gated command AND reap its process group, even
             // if an assertion above fails or the launch times out. Otherwise the
-            // detached command blocks forever on the (never-written) release file
+            // detached command blocks forever on the (never-signalled) release pipe
             // and the leaked process keeps `dotnet test` from exiting — hanging
             // the whole runner (and any agent that runs the suite) for ~78min
             // until a stale-watchdog kills it, instead of failing cleanly/fast.
             // Best-effort; must never throw and mask the real assertion failure.
             try
             {
-                if (!File.Exists(releaseFile))
-                    await File.WriteAllTextAsync(releaseFile, "go");
+                if (!File.Exists(doneFile))
+                {
+                    releasePipe.WriteByte((byte)'\n');
+                    await releasePipe.FlushAsync();
+                }
             }
             catch { /* best-effort release */ }
             try
@@ -1478,6 +1486,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 }
             }
             catch { /* best-effort reap */ }
+            launchCts.Cancel();
+            if (launchTask is not null)
+            {
+                try { await launchTask; }
+                catch (OperationCanceledException) when (launchCts.IsCancellationRequested) { }
+            }
         }
     }
 
@@ -1490,14 +1504,15 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         using var acceptCts = new CancellationTokenSource();
-        var accepted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var listenerAccepted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseListener = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var acceptTask = Task.Run(async () =>
         {
             try
             {
                 using var client = await listener.AcceptTcpClientAsync(acceptCts.Token);
-                accepted.TrySetResult();
-                await Task.Delay(TimeSpan.FromMinutes(1), acceptCts.Token);
+                listenerAccepted.TrySetResult();
+                await releaseListener.Task.WaitAsync(acceptCts.Token);
             }
             catch (OperationCanceledException)
             {
@@ -1513,6 +1528,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var launchScript = Path.Combine(_workspace, "detached-slow-ready-launch.sh");
         var processGroupMarker = Path.Combine(_workspace, "detached-slow-ready.pgid");
         var doneFile = Path.Combine(_workspace, "detached-slow-ready.done");
+        using var virtualTime = new DetachedLaunchVirtualTime(_workspace);
         await File.WriteAllTextAsync(
             envFile,
             MultipassSandboxProvider.BuildEnvironmentFileContent(new Dictionary<string, string>(StringComparer.Ordinal)
@@ -1526,37 +1542,44 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         File.SetUnixFileMode(commandScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         await File.WriteAllTextAsync(
             launchScript,
-            MultipassSandbox.BuildDetachedLaunchScript(envFile, processGroupMarker, null, ["/bin/sh", commandScript, doneFile]));
+            MultipassSandbox.BuildDetachedLaunchScript(
+                envFile,
+                processGroupMarker,
+                null,
+                ["/bin/sh", commandScript, doneFile],
+                virtualElapsedSecondsFile: virtualTime.ElapsedSecondsFile));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        Task<(int Exit, string Stdout, string Stderr)>? launchTask = null;
         try
         {
-            // Keep the outer cap comfortably below the fake listener's hold-open
-            // delay. This still proves the preflight has its own timeout, while
-            // leaving enough room for bash + sudo shim + python startup under the
-            // parallel audit suite.
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-            var (exit, _, stderr) = await RunLocalProcessAsync(
+            launchTask = RunLocalProcessAsync(
                 "/bin/bash",
                 [launchScript],
                 timeout.Token,
                 environmentOverrides: FakeSudoPathEnvironment());
+            await listenerAccepted.Task.WaitAsync(timeout.Token);
+            virtualTime.AdvanceTo(2);
+            var (exit, _, stderr) = await launchTask;
 
             Assert.Equal(86, exit);
             Assert.Contains("agent output HTTP ingest unavailable before launch", stderr, StringComparison.Ordinal);
-            Assert.True(
-                ReferenceEquals(
-                    await Task.WhenAny(accepted.Task, Task.Delay(TimeSpan.FromSeconds(10))),
-                    accepted.Task),
-                "detached preflight did not connect to the listener");
             Assert.False(File.Exists(doneFile));
             Assert.False(File.Exists(processGroupMarker));
         }
         finally
         {
+            releaseListener.TrySetResult();
             acceptCts.Cancel();
             listener.Stop();
             await acceptTask;
+            timeout.Cancel();
+            if (launchTask is not null)
+            {
+                try { await launchTask; }
+                catch (OperationCanceledException) when (timeout.IsCancellationRequested) { }
+            }
         }
     }
 
@@ -1661,8 +1684,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             Assert.Equal("", stderr);
             Assert.Equal(1, Volatile.Read(ref targetRequests));
             Assert.Equal(0, Volatile.Read(ref proxyRequests));
-            await WaitForFileAsync(doneFile, TimeSpan.FromSeconds(6));
-            await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
+            await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(30));
+            Assert.True(File.Exists(doneFile));
         }
         finally
         {
@@ -1724,8 +1747,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             stdoutChunkCallback: null,
             stderrChunkCallback: null,
             CancellationToken.None);
-        if (session is null)
-            return;
+        Assert.NotNull(session);
 
         var envFile = Path.Combine(_workspace, "detached-env-idempotent");
         var commandScript = Path.Combine(_workspace, "detached-command-idempotent.sh");
@@ -1744,14 +1766,14 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             "/bin/bash",
             [launchScript],
             environmentOverrides: FakeSudoPathEnvironment());
-        await WaitForFileAsync(countFile, TimeSpan.FromSeconds(3));
         // The first invocation's parent exits once the marker is written, but the
         // detached child keeps running: it posts the authenticated exit code and
         // then writes the stdout/stderr/exit sidecars into the same workspace dir.
         // Wait for the child's process group to fully exit before launching the
         // second invocation so its supervisor-dir prep and marker re-check never
         // race the trailing sidecar writes.
-        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
+        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(30));
+        Assert.Equal("run", await File.ReadAllTextAsync(countFile));
         var second = await RunLocalProcessAsync(
             "/bin/bash",
             [launchScript],
@@ -1780,8 +1802,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             stdoutChunkCallback: null,
             stderrChunkCallback: null,
             CancellationToken.None);
-        if (session is null)
-            return;
+        Assert.NotNull(session);
 
         var envFile = Path.Combine(_workspace, "detached-env-existing-exit-token");
         var launchScript = Path.Combine(_workspace, "detached-launch-existing-exit-token.sh");
@@ -1813,9 +1834,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal(0, exit);
         Assert.Equal("", stdout);
         Assert.Equal("", stderr);
-        await WaitForFileAsync(capturedPromptFile, TimeSpan.FromSeconds(30));
-        await WaitForExitCodeAsync(session, 0, TimeSpan.FromSeconds(30));
         await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(30));
+        AssertExitCode(session, 0);
         Assert.Equal("agent prompt\n", await File.ReadAllTextAsync(capturedPromptFile));
         Assert.False(File.Exists(exitTokenFile));
     }
@@ -1938,8 +1958,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             stdoutChunkCallback: null,
             stderrChunkCallback: null,
             CancellationToken.None);
-        if (session is null)
-            return;
+        Assert.NotNull(session);
 
         var envFile = Path.Combine(_workspace, "detached-stdin-read-fails.env");
         var launchScript = Path.Combine(_workspace, "detached-stdin-read-fails.sh");
@@ -1982,8 +2001,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal(0, exit);
         Assert.Equal("", stdout);
         Assert.Equal("", stderr);
-        await WaitForExitCodeAsync(session, 88, TimeSpan.FromSeconds(6));
-        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
+        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(30));
+        AssertExitCode(session, 88);
         Assert.True(File.Exists(stdinFile));
         Assert.Contains(
             "codeybox-detached: failed to read stdin sidecar (exit 23)",
@@ -2049,8 +2068,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             stdoutChunkCallback: null,
             stderrChunkCallback: null,
             CancellationToken.None);
-        if (session is null)
-            return;
+        Assert.NotNull(session);
 
         var envFile = Path.Combine(_workspace, "detached-marker-publication-fails.env");
         var launchScript = Path.Combine(_workspace, "detached-marker-publication-fails.sh");
@@ -2101,12 +2119,15 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             stdoutChunkCallback: null,
             stderrChunkCallback: null,
             CancellationToken.None);
-        if (session is null)
-            return;
+        Assert.NotNull(session);
 
         var envFile = Path.Combine(_workspace, "detached-marker-timeout.env");
         var launchScript = Path.Combine(_workspace, "detached-marker-timeout.sh");
         var processGroupMarker = Path.Combine(_workspace, "detached-marker-timeout.pgid");
+        var markerPublicationEntered = Path.Combine(_workspace, "detached-marker-timeout.entered");
+        var markerPublicationBlockPipe = Path.Combine(_workspace, "detached-marker-timeout.block");
+        await using var markerPublicationBlock = await CreateBlockingPipeAsync(markerPublicationBlockPipe);
+        using var virtualTime = new DetachedLaunchVirtualTime(_workspace);
         await File.WriteAllTextAsync(envFile, MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment()));
         await File.WriteAllTextAsync(
             launchScript,
@@ -2115,20 +2136,28 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 processGroupMarker,
                 null,
                 ["/bin/sh", "-c", "printf should-not-run"],
-                markerWaitSeconds: 5));
+                markerWaitSeconds: 5,
+                virtualElapsedSecondsFile: virtualTime.ElapsedSecondsFile));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
-        var fakeSudo = CreateFakeSudoBin(
-            """
+        var fakeSudo = CreateFakeSudoBin($$"""
             #!/bin/sh
             if [ "$1" = "-n" ]; then shift; fi
             if [ "$1" = "sh" ] && [ "$2" = "-c" ]; then
-                case "$3" in *'pgid=$2'*) sleep 10; exit 1 ;; esac
+                case "$3" in *'pgid=$2'*)
+                    pgid=$(ps -o pgid= -p "$$" | tr -d ' ')
+                    entered_tmp={{MultipassSandboxProvider.ShellSingleQuote(markerPublicationEntered)}}.tmp.$$
+                    printf '%s\n' "$pgid" > "$entered_tmp"
+                    mv -f "$entered_tmp" {{MultipassSandboxProvider.ShellSingleQuote(markerPublicationEntered)}}
+                    IFS= read -r _ < {{MultipassSandboxProvider.ShellSingleQuote(markerPublicationBlockPipe)}}
+                    exit 1
+                    ;;
+                esac
             fi
             exec "$@"
             """);
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-        var (exit, stdout, stderr) = await RunLocalProcessAsync(
+        var launchTask = RunLocalProcessAsync(
             "/bin/bash",
             [launchScript],
             timeout.Token,
@@ -2136,11 +2165,30 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             {
                 ["PATH"] = fakeSudo + Path.PathSeparator + (Environment.GetEnvironmentVariable("PATH") ?? ""),
             });
+        try
+        {
+            await WaitForFileAsync(markerPublicationEntered, TimeSpan.FromSeconds(30));
+            virtualTime.AdvanceTo(5);
+            var (exit, stdout, stderr) = await launchTask;
 
-        Assert.Equal(88, exit);
-        Assert.Equal("", stdout);
-        Assert.Contains("codeybox-detached: timed out waiting for process group marker", stderr, StringComparison.Ordinal);
-        Assert.False(File.Exists(processGroupMarker));
+            Assert.Equal(88, exit);
+            Assert.Equal("", stdout);
+            Assert.Contains("codeybox-detached: timed out waiting for process group marker", stderr, StringComparison.Ordinal);
+            Assert.False(File.Exists(processGroupMarker));
+            var pgid = (await File.ReadAllTextAsync(markerPublicationEntered)).Trim();
+            await WaitForProcessGroupIdGoneAsync(pgid, TimeSpan.FromSeconds(30));
+        }
+        finally
+        {
+            timeout.Cancel();
+            if (File.Exists(markerPublicationEntered))
+            {
+                var pgid = (await File.ReadAllTextAsync(markerPublicationEntered)).Trim();
+                await KillProcessGroupAsync(pgid);
+            }
+            try { await launchTask; }
+            catch (OperationCanceledException) when (timeout.IsCancellationRequested) { }
+        }
     }
 
     [Fact]
@@ -2150,8 +2198,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             return;
 
         const string realSetsid = "/usr/bin/setsid";
-        if (!File.Exists(realSetsid))
-            return;
+        Assert.True(File.Exists(realSetsid), $"Expected setsid at {realSetsid}");
 
         await using var session = await MultipassAgentOutputHttpIngestSession.TryStartAsync(
             System.Net.IPAddress.Loopback,
@@ -2160,13 +2207,15 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             stdoutChunkCallback: null,
             stderrChunkCallback: null,
             CancellationToken.None);
-        if (session is null)
-            return;
+        Assert.NotNull(session);
 
         var envFile = Path.Combine(_workspace, "detached-marker-timeout-launcher-exits.env");
         var launchScript = Path.Combine(_workspace, "detached-marker-timeout-launcher-exits.sh");
         var processGroupMarker = Path.Combine(_workspace, "detached-marker-timeout-launcher-exits.pgid");
         var sudoProcessGroupFile = Path.Combine(_workspace, "detached-marker-timeout-launcher-exits.sudo-pgid");
+        var markerPublicationBlockPipe = Path.Combine(_workspace, "detached-marker-timeout-launcher-exits.block");
+        await using var markerPublicationBlock = await CreateBlockingPipeAsync(markerPublicationBlockPipe);
+        using var virtualTime = new DetachedLaunchVirtualTime(_workspace);
         await File.WriteAllTextAsync(envFile, MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment()));
         await File.WriteAllTextAsync(
             launchScript,
@@ -2175,7 +2224,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 processGroupMarker,
                 null,
                 ["/bin/sh", "-c", "printf should-not-run"],
-                markerWaitSeconds: 10));
+                markerWaitSeconds: 5,
+                virtualElapsedSecondsFile: virtualTime.ElapsedSecondsFile));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var fakeBin = CreateFakeSudoBin($$"""
@@ -2184,9 +2234,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if [ "$1" = "sh" ] && [ "$2" = "-c" ]; then
                 case "$3" in *'pgid=$2'*)
                     pgid=$(ps -o pgid= -p "$$" | tr -d ' ')
-                    printf '%s\n' "$pgid" > {{MultipassSandboxProvider.ShellSingleQuote(sudoProcessGroupFile)}}
+                    pgid_tmp={{MultipassSandboxProvider.ShellSingleQuote(sudoProcessGroupFile)}}.tmp.$$
+                    printf '%s\n' "$pgid" > "$pgid_tmp"
+                    mv -f "$pgid_tmp" {{MultipassSandboxProvider.ShellSingleQuote(sudoProcessGroupFile)}}
                     trap '' TERM
-                    while :; do sleep 1; done
+                    IFS= read -r _ < {{MultipassSandboxProvider.ShellSingleQuote(markerPublicationBlockPipe)}}
                     ;;
                 esac
             fi
@@ -2202,37 +2254,39 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             """);
         File.SetUnixFileMode(fakeSetsid, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var launchTask = RunLocalProcessAsync(
+            "/bin/bash",
+            [launchScript],
+            timeout.Token,
+            environmentOverrides: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["PATH"] = fakeBin + Path.PathSeparator + (Environment.GetEnvironmentVariable("PATH") ?? ""),
+            });
         try
         {
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-            var (exit, stdout, stderr) = await RunLocalProcessAsync(
-                "/bin/bash",
-                [launchScript],
-                timeout.Token,
-                environmentOverrides: new Dictionary<string, string>(StringComparer.Ordinal)
-                {
-                    ["PATH"] = fakeBin + Path.PathSeparator + (Environment.GetEnvironmentVariable("PATH") ?? ""),
-                });
+            await WaitForFileAsync(sudoProcessGroupFile, TimeSpan.FromSeconds(30));
+            virtualTime.AdvanceTo(5);
+            var (exit, stdout, stderr) = await launchTask;
 
             Assert.Equal(88, exit);
             Assert.Equal("", stdout);
             Assert.Contains("codeybox-detached: timed out waiting for process group marker", stderr, StringComparison.Ordinal);
             Assert.False(File.Exists(processGroupMarker));
 
-            await WaitForFileAsync(sudoProcessGroupFile, TimeSpan.FromSeconds(5));
             var pgid = (await File.ReadAllTextAsync(sudoProcessGroupFile)).Trim();
-            await WaitForProcessGroupIdGoneAsync(pgid, TimeSpan.FromSeconds(3));
+            await WaitForProcessGroupIdGoneAsync(pgid, TimeSpan.FromSeconds(30));
         }
         finally
         {
-            for (var i = 0; i < 100 && !File.Exists(sudoProcessGroupFile); i++)
-                await Task.Delay(50);
-
+            timeout.Cancel();
             if (File.Exists(sudoProcessGroupFile))
             {
                 var pgid = (await File.ReadAllTextAsync(sudoProcessGroupFile)).Trim();
                 await KillProcessGroupAsync(pgid);
             }
+            try { await launchTask; }
+            catch (OperationCanceledException) when (timeout.IsCancellationRequested) { }
         }
     }
 
@@ -2249,13 +2303,15 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             stdoutChunkCallback: null,
             stderrChunkCallback: null,
             CancellationToken.None);
-        if (session is null)
-            return;
+        Assert.NotNull(session);
 
         var envFile = Path.Combine(_workspace, "detached-marker-timeout-sigkill.env");
         var launchScript = Path.Combine(_workspace, "detached-marker-timeout-sigkill.sh");
         var processGroupMarker = Path.Combine(_workspace, "detached-marker-timeout-sigkill.pgid");
         var sudoProcessGroupFile = Path.Combine(_workspace, "detached-marker-timeout-sigkill.sudo-pgid");
+        var markerPublicationBlockPipe = Path.Combine(_workspace, "detached-marker-timeout-sigkill.block");
+        await using var markerPublicationBlock = await CreateBlockingPipeAsync(markerPublicationBlockPipe);
+        using var virtualTime = new DetachedLaunchVirtualTime(_workspace);
         await File.WriteAllTextAsync(envFile, MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment()));
         await File.WriteAllTextAsync(
             launchScript,
@@ -2264,7 +2320,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 processGroupMarker,
                 null,
                 ["/bin/sh", "-c", "printf should-not-run"],
-                markerWaitSeconds: 10));
+                markerWaitSeconds: 5,
+                virtualElapsedSecondsFile: virtualTime.ElapsedSecondsFile));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var fakeSudo = CreateFakeSudoBin($$"""
@@ -2273,46 +2330,50 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if [ "$1" = "sh" ] && [ "$2" = "-c" ]; then
                 case "$3" in *'pgid=$2'*)
                     pgid=$(ps -o pgid= -p "$$" | tr -d ' ')
-                    printf '%s\n' "$pgid" > {{MultipassSandboxProvider.ShellSingleQuote(sudoProcessGroupFile)}}
+                    pgid_tmp={{MultipassSandboxProvider.ShellSingleQuote(sudoProcessGroupFile)}}.tmp.$$
+                    printf '%s\n' "$pgid" > "$pgid_tmp"
+                    mv -f "$pgid_tmp" {{MultipassSandboxProvider.ShellSingleQuote(sudoProcessGroupFile)}}
                     trap '' TERM
-                    while :; do sleep 1; done
+                    IFS= read -r _ < {{MultipassSandboxProvider.ShellSingleQuote(markerPublicationBlockPipe)}}
                     ;;
                 esac
             fi
             exec "$@"
             """);
 
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var launchTask = RunLocalProcessAsync(
+            "/bin/bash",
+            [launchScript],
+            timeout.Token,
+            environmentOverrides: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["PATH"] = fakeSudo + Path.PathSeparator + (Environment.GetEnvironmentVariable("PATH") ?? ""),
+            });
         try
         {
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-            var (exit, stdout, stderr) = await RunLocalProcessAsync(
-                "/bin/bash",
-                [launchScript],
-                timeout.Token,
-                environmentOverrides: new Dictionary<string, string>(StringComparer.Ordinal)
-                {
-                    ["PATH"] = fakeSudo + Path.PathSeparator + (Environment.GetEnvironmentVariable("PATH") ?? ""),
-                });
+            await WaitForFileAsync(sudoProcessGroupFile, TimeSpan.FromSeconds(30));
+            virtualTime.AdvanceTo(5);
+            var (exit, stdout, stderr) = await launchTask;
 
             Assert.Equal(88, exit);
             Assert.Equal("", stdout);
             Assert.Contains("codeybox-detached: timed out waiting for process group marker", stderr, StringComparison.Ordinal);
             Assert.False(File.Exists(processGroupMarker));
 
-            await WaitForFileAsync(sudoProcessGroupFile, TimeSpan.FromSeconds(5));
             var pgid = (await File.ReadAllTextAsync(sudoProcessGroupFile)).Trim();
-            await WaitForProcessGroupIdGoneAsync(pgid, TimeSpan.FromSeconds(3));
+            await WaitForProcessGroupIdGoneAsync(pgid, TimeSpan.FromSeconds(30));
         }
         finally
         {
-            for (var i = 0; i < 100 && !File.Exists(sudoProcessGroupFile); i++)
-                await Task.Delay(50);
-
+            timeout.Cancel();
             if (File.Exists(sudoProcessGroupFile))
             {
                 var pgid = (await File.ReadAllTextAsync(sudoProcessGroupFile)).Trim();
                 await KillProcessGroupAsync(pgid);
             }
+            try { await launchTask; }
+            catch (OperationCanceledException) when (timeout.IsCancellationRequested) { }
         }
     }
 
@@ -2329,8 +2390,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             stdoutChunkCallback: null,
             stderrChunkCallback: null,
             CancellationToken.None);
-        if (session is null)
-            return;
+        Assert.NotNull(session);
 
         var envFile = Path.Combine(_workspace, "detached-sidecar-publication-fails.env");
         var exitTokenFile = Path.Combine(_workspace, "detached-sidecar-publication-fails.token");
@@ -2364,15 +2424,14 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             {
                 ["PATH"] = fakeSudo + Path.PathSeparator + (Environment.GetEnvironmentVariable("PATH") ?? ""),
             });
-        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
-        await WaitForExitCodeAsync(session, 3, TimeSpan.FromSeconds(6));
-
         Assert.Equal(0, exit);
         Assert.Equal("", stdout);
         Assert.Equal("", stderr);
         Assert.True(File.Exists(processGroupMarker));
         Assert.False(File.Exists(processGroupMarker + ".exit"));
         Assert.False(File.Exists(exitTokenFile));
+        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(30));
+        AssertExitCode(session, 3);
         Assert.Contains("codeybox-detached: failed to publish output sidecars", session.Stderr, StringComparison.Ordinal);
     }
 
@@ -6002,32 +6061,41 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
     private static async Task WaitForFileAsync(string path, TimeSpan timeout)
     {
-        var deadline = DateTimeOffset.UtcNow + timeout;
-        while (DateTimeOffset.UtcNow < deadline)
-        {
-            if (File.Exists(path))
-                return;
-            await Task.Delay(50);
-        }
+        if (File.Exists(path))
+            return;
 
-        Assert.True(File.Exists(path), $"Expected file to be written: {path}");
+        var directory = Path.GetDirectoryName(path);
+        var fileName = Path.GetFileName(path);
+        Assert.False(string.IsNullOrEmpty(directory));
+        var written = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var watcher = new FileSystemWatcher(directory, fileName)
+        {
+            NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite,
+        };
+        FileSystemEventHandler onFileEvent = (_, _) => written.TrySetResult();
+        RenamedEventHandler onRenamed = (_, _) => written.TrySetResult();
+        watcher.Created += onFileEvent;
+        watcher.Changed += onFileEvent;
+        watcher.Renamed += onRenamed;
+        watcher.EnableRaisingEvents = true;
+
+        if (File.Exists(path))
+            return;
+
+        try
+        {
+            await written.Task.WaitAsync(timeout);
+        }
+        catch (TimeoutException)
+        {
+            Assert.True(File.Exists(path), $"Expected file to be written: {path}");
+        }
     }
 
-    private static async Task WaitForExitCodeAsync(
-        MultipassAgentOutputHttpIngestSession session,
-        int expectedExitCode,
-        TimeSpan timeout)
+    private static void AssertExitCode(MultipassAgentOutputHttpIngestSession session, int expectedExitCode)
     {
-        var deadline = DateTimeOffset.UtcNow + timeout;
-        while (DateTimeOffset.UtcNow < deadline)
-        {
-            if (session.TryGetExitCode(out var exitCode) && exitCode == expectedExitCode)
-                return;
-            await Task.Delay(50);
-        }
-
         Assert.True(
-            session.TryGetExitCode(out var finalExitCode) && finalExitCode == expectedExitCode,
+            session.TryGetExitCode(out var exitCode) && exitCode == expectedExitCode,
             $"Expected authenticated exit code {expectedExitCode}.");
     }
 
@@ -6040,18 +6108,79 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
     private static async Task WaitForProcessGroupIdGoneAsync(string pgid, TimeSpan timeout)
     {
-        var deadline = DateTimeOffset.UtcNow + timeout;
-        while (DateTimeOffset.UtcNow < deadline)
+        Assert.True(
+            int.TryParse(pgid, NumberStyles.None, CultureInfo.InvariantCulture, out var processGroupId)
+                && processGroupId > 0,
+            $"Invalid process group id: {pgid}");
+
+        var alive = await RunLocalProcessAsync(
+            "/bin/sh",
+            ["-c", "kill -0 \"-$1\" 2>/dev/null", "codeybox-pgid-alive", pgid]);
+        if (alive.Exit != 0)
+            return;
+
+        try
         {
-            var (exit, _, _) = await RunLocalProcessAsync(
-                "/bin/sh",
-                ["-c", "kill -0 \"-$1\" 2>/dev/null", "codeybox-pgid-gone", pgid]);
-            if (exit != 0)
-                return;
-            await Task.Delay(50);
+            using var processGroupLeader = Process.GetProcessById(processGroupId);
+            await processGroupLeader.WaitForExitAsync().WaitAsync(timeout);
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+        {
+            // The leader exited between the group probe and opening its process
+            // handle. The group-level assertion below still detects survivors.
+        }
+        catch (TimeoutException)
+        {
+            Assert.Fail($"Expected process group {pgid} to exit.");
         }
 
-        Assert.Fail($"Expected process group {pgid} to exit.");
+        var afterExit = await RunLocalProcessAsync(
+            "/bin/sh",
+            ["-c", "kill -0 \"-$1\" 2>/dev/null", "codeybox-pgid-gone", pgid]);
+        Assert.NotEqual(0, afterExit.Exit);
+    }
+
+    private static async Task<FileStream> CreateBlockingPipeAsync(string path)
+    {
+        var (exit, stdout, stderr) = await RunLocalProcessAsync("/usr/bin/mkfifo", ["--", path]);
+        Assert.True(exit == 0, $"mkfifo failed with exit {exit}; stdout=<{stdout}>; stderr=<{stderr}>");
+        return new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.ReadWrite,
+            FileShare.ReadWrite,
+            bufferSize: 1,
+            FileOptions.Asynchronous);
+    }
+
+    private sealed class DetachedLaunchVirtualTime : IDisposable
+    {
+        private readonly string _directory;
+        private int _elapsedSeconds;
+
+        public DetachedLaunchVirtualTime(string directory)
+        {
+            _directory = directory;
+            ElapsedSecondsFile = Path.Combine(directory, $"detached-clock-{Guid.NewGuid():N}");
+            File.WriteAllText(ElapsedSecondsFile, "0\n");
+        }
+
+        public string ElapsedSecondsFile { get; }
+
+        public void AdvanceTo(int elapsedSeconds)
+        {
+            Assert.True(elapsedSeconds >= _elapsedSeconds);
+            var temporaryPath = Path.Combine(_directory, $"detached-clock-{Guid.NewGuid():N}.tmp");
+            File.WriteAllText(temporaryPath, elapsedSeconds.ToString(CultureInfo.InvariantCulture) + "\n");
+            File.Move(temporaryPath, ElapsedSecondsFile, overwrite: true);
+            _elapsedSeconds = elapsedSeconds;
+        }
+
+        public void Dispose()
+        {
+            if (File.Exists(ElapsedSecondsFile))
+                File.Delete(ElapsedSecondsFile);
+        }
     }
 
     private static async Task KillProcessGroupAsync(string pgid)
@@ -8088,9 +8217,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 "CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN",
             ],
             environmentOverrides: FakeSudoPathEnvironment());
-        await WaitForFileAsync(exitFile, TimeSpan.FromSeconds(6));
-        await WaitForExitCodeAsync(session, 2, TimeSpan.FromSeconds(6));
-        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6));
+        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(30));
+        AssertExitCode(session, 2);
 
         Assert.Equal(0, exit);
         Assert.Equal("", stdout);
