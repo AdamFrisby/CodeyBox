@@ -18,15 +18,8 @@ public sealed class GeminiStreamParser : FlexibleAgentStreamParser
     /// <c>functionCall</c>/<c>function_call</c>. Owning this recognition here
     /// keeps the orchestrator's sniffer free of Gemini-specific vocabulary.
     /// </summary>
-    public override bool TryClaim(JsonElement line)
-    {
-        if (line.ValueKind != JsonValueKind.Object) return false;
-        return line.TryGetProperty("usageMetadata", out _)
-            || line.TryGetProperty("usage_metadata", out _)
-            || line.TryGetProperty("candidates", out _)
-            || line.TryGetProperty("functionCall", out _)
-            || line.TryGetProperty("function_call", out _);
-    }
+    public override bool TryClaim(JsonElement line) =>
+        AgentStreamEventShapes.IsGeminiStreamJsonEvent(line);
 
     protected override ParsedEvent ParseEvent(JsonElement root)
     {

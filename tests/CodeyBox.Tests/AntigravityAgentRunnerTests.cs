@@ -216,7 +216,6 @@ public sealed class AntigravityAgentRunnerTests
     [Fact]
     public async Task RunAsync_WhenCaptureStructuredStreamTrue_AppendsOutputFormatStreamJson()
     {
-        AntigravityAgentRunner.ClearStructuredStreamSupportCacheForTests();
         // The runner enables structured capture only after a real print-mode
         // probe emits NDJSON. Help text alone is not enough because agy 1.0.x
         // can mention stream-json in unrelated help text while rejecting the
@@ -242,7 +241,6 @@ public sealed class AntigravityAgentRunnerTests
     [Fact]
     public async Task RunAsync_WhenHelpMentionsStreamJsonButPrintModeEmitsUsage_OmitsOutputFormatStreamJson()
     {
-        AntigravityAgentRunner.ClearStructuredStreamSupportCacheForTests();
         var sandbox = new AntigravityCapturingSandbox(stdout: "plain output", stderr: "")
         {
             VersionOutput = "agy version test-broken-help",
@@ -268,7 +266,6 @@ public sealed class AntigravityAgentRunnerTests
     [Fact]
     public async Task RunAsync_WhenHelpDoesNotAdvertiseStreamJson_OmitsOutputFormatStreamJson()
     {
-        AntigravityAgentRunner.ClearStructuredStreamSupportCacheForTests();
         var sandbox = new AntigravityCapturingSandbox
         {
             VersionOutput = "agy version test-no-flag",
@@ -620,7 +617,6 @@ public sealed class AntigravityAgentRunnerTests
         // Structured-stream transport: the glog is folded into the NDJSON stream
         // as codeybox.stderr envelopes. Failed run so the archive path is
         // exercised alongside a non-zero agy exit.
-        AntigravityAgentRunner.ClearStructuredStreamSupportCacheForTests();
         var sandbox = new AntigravityLogCapturingSandbox(
             logFileContent: "Line 1\nLine 2",
             agyExitCode: 1
@@ -656,7 +652,6 @@ public sealed class AntigravityAgentRunnerTests
         // codeybox.stderr envelopes to the stream while leaving result.Stderr
         // untouched (agy exited 0, empty stderr). Covers the success/structured
         // combination the failed-run test above does not.
-        AntigravityAgentRunner.ClearStructuredStreamSupportCacheForTests();
         var sandbox = new AntigravityLogCapturingSandbox(
             logFileContent: "applyAuthResult: authMethod=consumer\nModel resolved: gemini-3.5-flash",
             agyExitCode: 0
@@ -807,7 +802,40 @@ public sealed class AntigravityAgentRunnerTests
         Assert.DoesNotContain(string.Empty, streamedChunks);  // no empty chunk
     }
 
-    private sealed class AntigravityLogCapturingSandbox : ISandbox
+    private abstract class AntigravityStructuredProbeSandbox : ISandbox
+    {
+        public abstract string Id { get; }
+        public string? HelpOutput { get; init; }
+        public string? VersionOutput { get; init; }
+        public string? StructuredProbeOutput { get; init; }
+        public string? StructuredProbeStderr { get; init; }
+        public int StructuredProbeExitCode { get; init; }
+
+        public abstract Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default);
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+        protected SandboxExecResult? TryHandleStructuredStreamProbe(SandboxExec exec)
+        {
+            if (VersionOutput is not null && exec.Argv.Contains("--version"))
+                return new SandboxExecResult(0, VersionOutput, string.Empty);
+
+            if (HelpOutput is not null && exec.Argv.Contains("--help"))
+                return new SandboxExecResult(0, HelpOutput, string.Empty);
+
+            if (StructuredProbeOutput is not null && IsStructuredStreamProbe(exec))
+            {
+                return new SandboxExecResult(
+                    StructuredProbeExitCode,
+                    StructuredProbeOutput,
+                    StructuredProbeStderr ?? string.Empty);
+            }
+
+            return null;
+        }
+    }
+
+    private sealed class AntigravityLogCapturingSandbox : AntigravityStructuredProbeSandbox
     {
         private readonly string _logFileContent;
         private readonly int _agyExitCode;
@@ -820,33 +848,16 @@ public sealed class AntigravityAgentRunnerTests
             _tailExitCode = tailExitCode;
         }
 
-        public string Id => "fake-antigravity-log-sandbox";
+        public override string Id => "fake-antigravity-log-sandbox";
         public List<SandboxExec> AllExecs { get; } = new();
         public SandboxExec? CapturedAgyExec => AllExecs.LastOrDefault(IsAgyWorkInvocation);
-        public string? HelpOutput { get; init; }
-        public string? VersionOutput { get; init; }
-        public string? StructuredProbeOutput { get; init; }
-        public string? StructuredProbeStderr { get; init; }
-        public int StructuredProbeExitCode { get; init; }
 
-        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        public override Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             AllExecs.Add(exec);
-            if (VersionOutput is not null && exec.Argv.Contains("--version"))
-            {
-                return Task.FromResult(new SandboxExecResult(0, VersionOutput, string.Empty));
-            }
-            if (HelpOutput is not null && exec.Argv.Contains("--help"))
-            {
-                return Task.FromResult(new SandboxExecResult(0, HelpOutput, string.Empty));
-            }
-            if (StructuredProbeOutput is not null && IsStructuredStreamProbe(exec))
-            {
-                return Task.FromResult(new SandboxExecResult(
-                    StructuredProbeExitCode,
-                    StructuredProbeOutput,
-                    StructuredProbeStderr ?? string.Empty));
-            }
+            if (TryHandleStructuredStreamProbe(exec) is { } probeResult)
+                return Task.FromResult(probeResult);
+
             if (exec.Argv.Count > 0 && exec.Argv[0] == "tail")
             {
                 return Task.FromResult(new SandboxExecResult(_tailExitCode, _logFileContent, string.Empty));
@@ -857,11 +868,9 @@ public sealed class AntigravityAgentRunnerTests
             }
             return Task.FromResult(new SandboxExecResult(_agyExitCode, "stdout-response", _agyExitCode == 0 ? string.Empty : "agy failed"));
         }
-
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
-    private sealed class AntigravityCapturingSandbox : ISandbox
+    private sealed class AntigravityCapturingSandbox : AntigravityStructuredProbeSandbox
     {
         private readonly int _prepExitCode;
         private readonly string _prepStderr;
@@ -886,33 +895,16 @@ public sealed class AntigravityAgentRunnerTests
             _logFileContent = logFileContent;
         }
 
-        public string Id => "fake-antigravity";
+        public override string Id => "fake-antigravity";
         public List<SandboxExec> AllExecs { get; } = new();
         public SandboxExec? CapturedExec => AllExecs.LastOrDefault(IsAgyWorkInvocation);
-        public string? HelpOutput { get; init; }
-        public string? VersionOutput { get; init; }
-        public string? StructuredProbeOutput { get; init; }
-        public string? StructuredProbeStderr { get; init; }
-        public int StructuredProbeExitCode { get; init; }
 
-        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        public override Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             AllExecs.Add(exec);
-            if (VersionOutput is not null && exec.Argv.Contains("--version"))
-            {
-                return Task.FromResult(new SandboxExecResult(0, VersionOutput, string.Empty));
-            }
-            if (HelpOutput is not null && exec.Argv.Contains("--help"))
-            {
-                return Task.FromResult(new SandboxExecResult(0, HelpOutput, string.Empty));
-            }
-            if (StructuredProbeOutput is not null && IsStructuredStreamProbe(exec))
-            {
-                return Task.FromResult(new SandboxExecResult(
-                    StructuredProbeExitCode,
-                    StructuredProbeOutput,
-                    StructuredProbeStderr ?? string.Empty));
-            }
+            if (TryHandleStructuredStreamProbe(exec) is { } probeResult)
+                return Task.FromResult(probeResult);
+
             if (exec.Argv.Count > 0 && exec.Argv[0] == "bash")
             {
                 return Task.FromResult(new SandboxExecResult(_prepExitCode, string.Empty, _prepStderr));
@@ -927,8 +919,6 @@ public sealed class AntigravityAgentRunnerTests
             }
             return Task.FromResult(new SandboxExecResult(_exitCode, _stdout, _stderr));
         }
-
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private static bool IsAgyWorkInvocation(SandboxExec exec) =>

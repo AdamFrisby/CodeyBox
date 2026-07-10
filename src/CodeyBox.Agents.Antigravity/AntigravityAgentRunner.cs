@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text.Json;
 using System.Threading;
@@ -36,13 +35,25 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
     /// </summary>
     private const int MaxLogTailBytes = 256 * 1024;
 
+    private const string StructuredStreamOutputFormatFlag = "--output-format";
+    private const string StructuredStreamOutputFormatValue = "stream-json";
+    private const int StructuredStreamProbeJsonMaxDepth = 64;
+    private const int StructuredStreamVersionMaxChars = 256;
+    private const int StructuredStreamBinaryMaxChars = 256;
+    private const int StructuredStreamSupportCacheMaxEntries = 64;
+    private const long MinStructuredStreamProbeTimeoutSeconds = 1;
+    private const long MaxStructuredStreamProbeTimeoutSeconds = 60;
+
+    internal const int StructuredStreamProbeMaxStdoutBytes = 64 * 1024;
+    internal const int StructuredStreamProbeMaxStderrBytes = 16 * 1024;
+
     // Threads the per-invocation agy log path into BuildAgyInvocation (whose
     // signature is fixed by the base class) without a new IAgentRunner
     // parameter. Set for the duration of a single run and cleared in finally.
     private readonly AsyncLocal<string?> _currentLogPath = new();
-
-    private static readonly ConcurrentDictionary<string, bool> StructuredStreamSupportByVersion =
-        new(StringComparer.Ordinal);
+    private readonly object _structuredStreamSupportCacheLock = new();
+    private readonly Dictionary<string, bool> _structuredStreamSupportByVersion = new(StringComparer.Ordinal);
+    private readonly Queue<string> _structuredStreamSupportCacheOrder = new();
 
     public override AgentKind Kind => AgentKind.Antigravity;
 
@@ -80,32 +91,37 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
             var version = await sandbox.ExecAsync(new SandboxExec
             {
                 Argv = [Binary, "--version"],
+                MaxStdoutBytes = StructuredStreamProbeMaxStdoutBytes,
+                MaxStderrBytes = StructuredStreamProbeMaxStderrBytes,
             }, ct).ConfigureAwait(false);
 
-            if (!version.Success)
+            if (!ProbeExecSucceeded(version))
                 return false;
 
-            var versionText = CombinedOutput(version).Trim();
-            if (string.IsNullOrWhiteSpace(versionText))
+            if (!TryBuildStructuredStreamCacheKey(Binary, CombinedOutput(version), out var cacheKey))
                 return false;
 
-            var cacheKey = $"{Binary}\n{versionText}";
-            if (StructuredStreamSupportByVersion.TryGetValue(cacheKey, out var cached))
+            if (TryGetCachedStructuredStreamSupport(cacheKey, out var cached))
                 return cached;
 
             var help = await sandbox.ExecAsync(new SandboxExec
             {
                 Argv = [Binary, "--help"],
+                MaxStdoutBytes = StructuredStreamProbeMaxStdoutBytes,
+                MaxStderrBytes = StructuredStreamProbeMaxStderrBytes,
             }, ct).ConfigureAwait(false);
 
-            if (!help.Success)
+            if (!ProbeExecSucceeded(help))
+            {
+                CacheStructuredStreamSupport(cacheKey, supported: false);
                 return false;
+            }
 
             var helpOutput = CombinedOutput(help);
-            if (!helpOutput.Contains("--output-format", StringComparison.Ordinal)
-                || !helpOutput.Contains("stream-json", StringComparison.Ordinal))
+            if (!helpOutput.Contains(StructuredStreamOutputFormatFlag, StringComparison.Ordinal)
+                || !helpOutput.Contains(StructuredStreamOutputFormatValue, StringComparison.Ordinal))
             {
-                StructuredStreamSupportByVersion.TryAdd(cacheKey, false);
+                CacheStructuredStreamSupport(cacheKey, supported: false);
                 return false;
             }
 
@@ -117,21 +133,21 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
                 Argv = BuildStructuredStreamProbeArgv(),
                 WorkingDirectory = "/tmp",
                 Stdin = "Reply with exactly CODEYBOX_STRUCTURED_STREAM_PROBE. Do not inspect or modify files.",
+                MaxStdoutBytes = StructuredStreamProbeMaxStdoutBytes,
+                MaxStderrBytes = StructuredStreamProbeMaxStderrBytes,
             }, ct).ConfigureAwait(false);
 
-            if (!probe.Success)
-                return false;
-
-            var supported = IsStructuredNdjson(probe.Stdout);
-            StructuredStreamSupportByVersion.TryAdd(cacheKey, supported);
+            var supported = ProbeExecSucceeded(probe) && IsStructuredNdjson(probe.Stdout);
+            CacheStructuredStreamSupport(cacheKey, supported);
             return supported;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             throw;
         }
-        catch
+        catch (Exception ex)
         {
+            AuditLog.AgentStructuredStreamProbeFailed(Kind, ex.GetType().Name, ex.Message);
             return false;
         }
     }
@@ -217,7 +233,7 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         if (!captureStructuredStream || structuredStreamSupported)
             return result;
 
-        var warning = $"Warning: Antigravity CLI at '{Binary}' does not support --output-format stream-json in --print mode; structured stream capture was disabled.";
+        var warning = $"Warning: Antigravity CLI at '{Binary}' does not support {StructuredStreamOutputFormatFlag} {StructuredStreamOutputFormatValue} in --print mode; structured stream capture was disabled.";
         var stderr = string.IsNullOrEmpty(result.Stderr) ? warning : $"{warning}\n{result.Stderr}";
         return result with { Stderr = stderr };
     }
@@ -589,8 +605,8 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         // plaintext-fallback summariser takes over.
         if (captureStructuredStream)
         {
-            argv.Add("--output-format");
-            argv.Add("stream-json");
+            argv.Add(StructuredStreamOutputFormatFlag);
+            argv.Add(StructuredStreamOutputFormatValue);
         }
 
         // Reasoning level is encoded in the model id for Antigravity (each
@@ -611,13 +627,16 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         var argv = new List<string> { Binary, "--print", "--dangerously-skip-permissions" };
         if (PrintTimeout > TimeSpan.Zero)
         {
-            var probeTimeoutSeconds = Math.Max(1, Math.Min((long)PrintTimeout.TotalSeconds, 60));
+            var probeTimeoutSeconds = Math.Clamp(
+                (long)PrintTimeout.TotalSeconds,
+                MinStructuredStreamProbeTimeoutSeconds,
+                MaxStructuredStreamProbeTimeoutSeconds);
             argv.Add("--print-timeout");
             argv.Add($"{probeTimeoutSeconds}s");
         }
 
-        argv.Add("--output-format");
-        argv.Add("stream-json");
+        argv.Add(StructuredStreamOutputFormatFlag);
+        argv.Add(StructuredStreamOutputFormatValue);
         return argv;
     }
 
@@ -626,8 +645,10 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         var write = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["bash", "-c", AuthMaterialisationScript],
+            MaxStdoutBytes = StructuredStreamProbeMaxStdoutBytes,
+            MaxStderrBytes = StructuredStreamProbeMaxStderrBytes,
         }, ct).ConfigureAwait(false);
-        return write.Success;
+        return ProbeExecSucceeded(write);
     }
 
     private const string AuthMaterialisationScript =
@@ -654,12 +675,15 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
 
             try
             {
-                using var document = JsonDocument.Parse(line);
+                using var document = JsonDocument.Parse(
+                    line,
+                    new JsonDocumentOptions { MaxDepth = StructuredStreamProbeJsonMaxDepth });
                 var root = document.RootElement;
                 if (root.ValueKind != JsonValueKind.Object)
                     return false;
 
-                sawStructuredEvent |= LooksLikeAgyStructuredEvent(root);
+                sawStructuredEvent |= AgentStreamEventShapes.IsClaudeStreamJsonEvent(root)
+                    || AgentStreamEventShapes.IsGeminiStreamJsonEvent(root);
             }
             catch (JsonException)
             {
@@ -670,22 +694,73 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         return sawStructuredEvent;
     }
 
-    private static bool LooksLikeAgyStructuredEvent(JsonElement root)
-    {
-        if (root.TryGetProperty("type", out var type)
-            && type.ValueKind == JsonValueKind.String
-            && !string.IsNullOrWhiteSpace(type.GetString()))
-            return true;
+    private static bool ProbeExecSucceeded(SandboxExecResult result) =>
+        result.Success && !result.OutputLimitExceeded;
 
-        return root.TryGetProperty("usageMetadata", out _)
-            || root.TryGetProperty("usage_metadata", out _)
-            || root.TryGetProperty("candidates", out _)
-            || root.TryGetProperty("functionCall", out _)
-            || root.TryGetProperty("function_call", out _);
+    private static bool TryBuildStructuredStreamCacheKey(
+        string binary,
+        string versionOutput,
+        out string cacheKey)
+    {
+        cacheKey = string.Empty;
+        var normalizedBinary = NormalizeCacheComponent(binary, StructuredStreamBinaryMaxChars);
+        var normalizedVersion = NormalizeVersionOutput(versionOutput);
+        if (normalizedBinary is null || normalizedVersion is null)
+            return false;
+
+        cacheKey = $"{normalizedBinary}\n{normalizedVersion}";
+        return true;
     }
 
-    internal static void ClearStructuredStreamSupportCacheForTests() =>
-        StructuredStreamSupportByVersion.Clear();
+    private static string? NormalizeVersionOutput(string versionOutput)
+    {
+        var parts = versionOutput.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        return NormalizeCacheComponent(string.Join(' ', parts), StructuredStreamVersionMaxChars);
+    }
+
+    private static string? NormalizeCacheComponent(string value, int maxChars)
+    {
+        var trimmed = value.Trim();
+        if (trimmed.Length == 0 || trimmed.Length > maxChars)
+            return null;
+
+        return trimmed;
+    }
+
+    private bool TryGetCachedStructuredStreamSupport(string cacheKey, out bool supported)
+    {
+        lock (_structuredStreamSupportCacheLock)
+        {
+            return _structuredStreamSupportByVersion.TryGetValue(cacheKey, out supported);
+        }
+    }
+
+    private void CacheStructuredStreamSupport(string cacheKey, bool supported)
+    {
+        lock (_structuredStreamSupportCacheLock)
+        {
+            if (_structuredStreamSupportByVersion.ContainsKey(cacheKey))
+            {
+                _structuredStreamSupportByVersion[cacheKey] = supported;
+                return;
+            }
+
+            while (_structuredStreamSupportByVersion.Count >= StructuredStreamSupportCacheMaxEntries
+                && _structuredStreamSupportCacheOrder.TryDequeue(out var oldestKey))
+            {
+                _structuredStreamSupportByVersion.Remove(oldestKey);
+            }
+
+            if (_structuredStreamSupportByVersion.Count >= StructuredStreamSupportCacheMaxEntries)
+            {
+                _structuredStreamSupportByVersion.Clear();
+                _structuredStreamSupportCacheOrder.Clear();
+            }
+
+            _structuredStreamSupportByVersion.Add(cacheKey, supported);
+            _structuredStreamSupportCacheOrder.Enqueue(cacheKey);
+        }
+    }
 
     internal const string ConversationCheckpointPrefix = "agy-conversation:";
 

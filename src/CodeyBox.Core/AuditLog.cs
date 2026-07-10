@@ -261,6 +261,17 @@ public static class AuditLog
                 agent.Value, exceptionType, message);
 
     /// <summary>
+    /// The live structured-stream capability probe failed due to sandbox/provider
+    /// infrastructure rather than a clean unsupported result from the agent CLI.
+    /// The runner still fails closed to plaintext capture; this event preserves
+    /// enough context to distinguish those cases operationally.
+    /// </summary>
+    public static void AgentStructuredStreamProbeFailed(AgentKind agent, string exceptionType, string message) =>
+        Audit("agent.structured_stream_probe_failed")
+            .Warning("Agent {Agent} structured-stream probe failed ({ExceptionType}): {Message}",
+                agent.Value, exceptionType, message);
+
+    /// <summary>
     /// Per-attempt failure of the in-VM agentic conflict resolver. Carries the
     /// full stdout/stderr tail (truncated to <see cref="TruncateAuditTail"/>'s
     /// 2 KiB window) plus the runner kind, sandbox id, working directory, and
