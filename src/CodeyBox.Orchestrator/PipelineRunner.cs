@@ -16511,7 +16511,8 @@ Original merge-phase failure (JSON string, for context only):
     private async Task HandleOperatorCancelAsync(WorkItem item, Project? project)
     {
         var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
-        if (current.State is WorkItemState.Done or WorkItemState.Failed
+        if (current.State is WorkItemState.Queued
+            or WorkItemState.Done or WorkItemState.Failed
             or WorkItemState.MergeConflictResolutionFailed
             or WorkItemState.AbandonedAfterRecoveryAttempts)
             return;
