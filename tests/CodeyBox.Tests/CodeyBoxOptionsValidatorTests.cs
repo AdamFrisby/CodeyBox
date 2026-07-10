@@ -11,7 +11,11 @@ public sealed class CodeyBoxOptionsValidatorTests
 {
     [Theory]
     [InlineData("acquisition", "CodeyBox:SqliteWriteGate:AcquisitionTimeout must be positive")]
+    [InlineData("acquisition-max", "CodeyBox:SqliteWriteGate:AcquisitionTimeout must be <=")]
     [InlineData("hold", "CodeyBox:SqliteWriteGate:MaxHoldDuration must be positive")]
+    [InlineData("hold-max", "CodeyBox:SqliteWriteGate:MaxHoldDuration must be <=")]
+    [InlineData("waiters", "CodeyBox:SqliteWriteGate:MaxQueuedWaiters must be positive")]
+    [InlineData("reads", "CodeyBox:SqliteWriteGate:MaxConcurrentReadConnections must be positive")]
     public void Validate_RejectsInvalidSqliteWriteGateOptions(
         string scenario,
         string expectedFailure)
@@ -22,8 +26,20 @@ public sealed class CodeyBoxOptionsValidatorTests
             case "acquisition":
                 options.SqliteWriteGate.AcquisitionTimeout = TimeSpan.Zero;
                 break;
+            case "acquisition-max":
+                options.SqliteWriteGate.AcquisitionTimeout = TimeSpan.FromMilliseconds(int.MaxValue).Add(TimeSpan.FromMilliseconds(1));
+                break;
             case "hold":
                 options.SqliteWriteGate.MaxHoldDuration = TimeSpan.Zero;
+                break;
+            case "hold-max":
+                options.SqliteWriteGate.MaxHoldDuration = TimeSpan.FromMilliseconds(int.MaxValue).Add(TimeSpan.FromMilliseconds(1));
+                break;
+            case "waiters":
+                options.SqliteWriteGate.MaxQueuedWaiters = 0;
+                break;
+            case "reads":
+                options.SqliteWriteGate.MaxConcurrentReadConnections = 0;
                 break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null);

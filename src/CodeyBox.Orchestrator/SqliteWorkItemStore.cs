@@ -19,7 +19,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     };
     private readonly SqliteConnection _conn;
     private readonly string _connectionString;
+    private readonly string _dbPath;
     private readonly Serilog.ILogger _auditLogger;
+    private readonly SqliteDatabaseWriteGateFactory _writeGateFactory;
     // Also guards buffered reads on this store instance: Microsoft.Data.Sqlite
     // connections are not safe for overlapping commands from dispatcher and
     // worker tasks, even when WAL permits file-level read/write concurrency.
@@ -34,13 +36,18 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
+        _dbPath = path;
         _connectionString = $"Data Source={path}";
         _conn = new SqliteConnection(_connectionString);
         _auditLogger = auditLogger ?? Serilog.Log.Logger;
-        _writeLock = (writeGateFactory ?? SqliteDatabaseWriteGateFactory.Default).ForPath(path);
-        _writeLock.Wait();
+        _writeGateFactory = writeGateFactory ?? SqliteDatabaseWriteGateFactory.Default;
+        _writeLock = _writeGateFactory.ForPath(path);
+        var lockHeld = false;
+        var initialized = false;
         try
         {
+            _writeLock.Wait();
+            lockHeld = true;
             _conn.Open();
             RegisterQuotaRetryPhaseFunctions(_conn);
 
@@ -390,13 +397,20 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     SELECT id, project_id, 'legacy', external_id
                     FROM work_items
                     WHERE external_id IS NOT NULL;
-                    """;
+                """;
                 backfill.ExecuteNonQuery();
             }
+            initialized = true;
         }
         finally
         {
-            _writeLock.Release();
+            if (lockHeld)
+                _writeLock.Release();
+            if (!initialized)
+            {
+                _conn.Dispose();
+                _writeLock.Dispose();
+            }
         }
     }
 
@@ -850,7 +864,14 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     /// </summary>
     private WorkItemStoreDiskFullException HandleDiskFull(string operation, SqliteException sqlex)
     {
-        AuditLog.StoreDiskFull(_auditLogger, operation);
+        ThreadPool.QueueUserWorkItem(
+            static state =>
+            {
+                var (logger, op) = ((Serilog.ILogger, string))state!;
+                AuditLog.StoreDiskFull(logger, op);
+            },
+            (_auditLogger, operation),
+            preferLocal: false);
         return new WorkItemStoreDiskFullException(operation, sqlex);
     }
 
@@ -2949,6 +2970,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         if (ids.Count == 0) return result;
 
         var idSet = ids as HashSet<WorkItemId> ?? new HashSet<WorkItemId>(ids);
+        using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
         using var readConn = await OpenReadConnectionAsync(ct);
         using var cmd = readConn.CreateCommand();
         if (ids.Count > 256)
@@ -3003,6 +3025,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     private async Task<WorkItem?> EnrichOneAsync(WorkItem? item, CancellationToken ct)
     {
         if (item is null) return null;
+        using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
         using var readConnection = await OpenReadConnectionAsync(ct);
         var extIds = await LoadExternalIdsForAsync(item.Id, readConnection, ct);
         return item with { ExternalIds = extIds };

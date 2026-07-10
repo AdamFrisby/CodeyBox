@@ -56,24 +56,38 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
     {
         var entry = Current;
         var holderIdentity = FormatHolderIdentity(sourceFilePath, memberName);
-        ThrowIfReentrant(entry, holderIdentity, _factory.Logger);
+        ThrowIfReentrant(entry, holderIdentity);
 
         var settings = _factory.GetSettings();
-        if (!entry.Semaphore.Wait(settings.AcquisitionTimeout, ct))
+        var acquired = entry.Semaphore.Wait(0, ct);
+        if (!acquired)
+        {
+            EnterWaitQueue(entry, settings.MaxQueuedWaiters, holderIdentity);
+            try
+            {
+                acquired = entry.Semaphore.Wait(settings.AcquisitionTimeout, ct);
+            }
+            finally
+            {
+                LeaveWaitQueue(entry);
+            }
+        }
+
+        if (!acquired)
             throw CreateAcquisitionTimeout(entry, holderIdentity, settings.AcquisitionTimeout);
 
-        CreateLease(entry, holderIdentity, settings).Activate();
+        CreateLeaseFailureAtomic(entry, holderIdentity, settings).Activate();
     }
 
-    public WaitOperation WaitAsync(
+    public WriteGateAcquisition WaitAsync(
         CancellationToken ct = default,
         [CallerMemberName] string memberName = "",
         [CallerFilePath] string sourceFilePath = "")
     {
         var entry = Current;
         var holderIdentity = FormatHolderIdentity(sourceFilePath, memberName);
-        ThrowIfReentrant(entry, holderIdentity, _factory.Logger);
-        return new WaitOperation(WaitCoreAsync(entry, holderIdentity, ct));
+        ThrowIfReentrant(entry, holderIdentity);
+        return new WriteGateAcquisition(WaitCoreAsync(entry, holderIdentity, ct));
     }
 
     public void Release()
@@ -112,38 +126,97 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
         CancellationToken ct)
     {
         var settings = _factory.GetSettings();
-        using var timeout = new CancellationTokenSource(settings.AcquisitionTimeout, _factory.TimeProvider);
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
-        try
+        var acquired = entry.Semaphore.Wait(0);
+        if (!acquired)
         {
-            await entry.Semaphore.WaitAsync(linked.Token).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested && timeout.IsCancellationRequested)
-        {
-            throw CreateAcquisitionTimeout(entry, holderIdentity, settings.AcquisitionTimeout);
+            EnterWaitQueue(entry, settings.MaxQueuedWaiters, holderIdentity);
+            try
+            {
+                using var timeout = new CancellationTokenSource(settings.AcquisitionTimeout, _factory.TimeProvider);
+                using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
+                try
+                {
+                    await entry.Semaphore.WaitAsync(linked.Token).ConfigureAwait(false);
+                    acquired = true;
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested && timeout.IsCancellationRequested)
+                {
+                    throw CreateAcquisitionTimeout(entry, holderIdentity, settings.AcquisitionTimeout);
+                }
+            }
+            finally
+            {
+                LeaveWaitQueue(entry);
+            }
         }
 
-        return CreateLease(entry, holderIdentity, settings);
+        if (!acquired)
+            throw CreateAcquisitionTimeout(entry, holderIdentity, settings.AcquisitionTimeout);
+
+        return CreateLeaseFailureAtomic(entry, holderIdentity, settings);
     }
 
-    private HolderLease CreateLease(
+    private HolderLease CreateLeaseFailureAtomic(
         Entry entry,
         string holderIdentity,
         SqliteWriteGateSettings settings)
     {
-        var lease = new HolderLease(
-            entry,
-            holderIdentity,
-            settings.MaxHoldDuration,
-            _factory.TimeProvider,
-            _factory.Logger);
-        var prior = Interlocked.CompareExchange(ref entry.Holder, lease, null);
-        if (prior is null)
-            return lease;
+        HolderLease? lease = null;
+        try
+        {
+            lease = new HolderLease(
+                entry,
+                holderIdentity,
+                settings.MaxHoldDuration,
+                _factory.TimeProvider,
+                _factory.Logger);
+            var prior = Interlocked.CompareExchange(ref entry.Holder, lease, null);
+            if (prior is null)
+            {
+                lease.ArmWatchdog();
+                return lease;
+            }
 
-        entry.Semaphore.Release();
-        lease.DisposeWithoutRelease();
-        throw new InvalidOperationException("The SQLite write gate recorded multiple simultaneous holders.");
+            throw new InvalidOperationException("The SQLite write gate recorded multiple simultaneous holders.");
+        }
+        catch
+        {
+            if (lease is not null)
+                lease.DisposeWithoutRelease();
+            Interlocked.CompareExchange(ref entry.Holder, null, lease);
+            entry.Semaphore.Release();
+            throw;
+        }
+    }
+
+    private static void EnterWaitQueue(Entry entry, int maxQueuedWaiters, string holderIdentity)
+    {
+        var waiters = Interlocked.Increment(ref entry.WaiterCount);
+        if (waiters <= maxQueuedWaiters)
+            return;
+
+        Interlocked.Decrement(ref entry.WaiterCount);
+        throw new SqliteWriteGateWaitQueueFullException(holderIdentity, maxQueuedWaiters);
+    }
+
+    private static void LeaveWaitQueue(Entry entry) => Interlocked.Decrement(ref entry.WaiterCount);
+
+    private void TryLogAcquisitionTimeout(
+        string waitingHolderIdentity,
+        string? currentHolder,
+        TimeSpan timeout)
+    {
+        try
+        {
+            _factory.Logger.LogError(
+                "Timed out after {AcquisitionTimeout} acquiring the SQLite write gate for {WaitingHolder}; current holder: {CurrentHolder}",
+                timeout,
+                waitingHolderIdentity,
+                currentHolder ?? "unknown");
+        }
+        catch
+        {
+        }
     }
 
     private SqliteWriteGateAcquisitionTimeoutException CreateAcquisitionTimeout(
@@ -152,11 +225,14 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
         TimeSpan timeout)
     {
         var currentHolder = Volatile.Read(ref entry.Holder)?.Identity;
-        _factory.Logger.LogError(
-            "Timed out after {AcquisitionTimeout} acquiring the SQLite write gate for {WaitingHolder}; current holder: {CurrentHolder}",
-            timeout,
-            waitingHolderIdentity,
-            currentHolder ?? "unknown");
+        ThreadPool.QueueUserWorkItem(
+            static state =>
+            {
+                var (gate, waiting, holder, elapsed) = ((SqliteDatabaseWriteGate, string, string?, TimeSpan))state!;
+                gate.TryLogAcquisitionTimeout(waiting, holder, elapsed);
+            },
+            (this, waitingHolderIdentity, currentHolder, timeout),
+            preferLocal: false);
         return new SqliteWriteGateAcquisitionTimeoutException(
             waitingHolderIdentity,
             currentHolder,
@@ -165,17 +241,12 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
 
     private static void ThrowIfReentrant(
         Entry entry,
-        string waitingHolderIdentity,
-        ILogger logger)
+        string waitingHolderIdentity)
     {
         for (var scope = Ownership.Value; scope is not null; scope = scope.Previous)
         {
             if (scope.IsActive && ReferenceEquals(scope.Entry, entry))
             {
-                logger.LogError(
-                    "Rejected reentrant SQLite write gate acquisition for {WaitingHolder}; current holder: {CurrentHolder}",
-                    waitingHolderIdentity,
-                    scope.Identity);
                 throw new SqliteWriteGateReentrancyException(
                     waitingHolderIdentity,
                     scope.Identity);
@@ -191,11 +262,15 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
 
     private Entry Current => _entry ?? throw new ObjectDisposedException(nameof(SqliteDatabaseWriteGate));
 
-    internal readonly struct WaitOperation
+    /// <summary>
+    /// Activates AsyncLocal ownership in GetResult so the caller's continuation,
+    /// including ConfigureAwait(false) continuations, carries the re-entry guard.
+    /// </summary>
+    internal readonly struct WriteGateAcquisition
     {
         private readonly Task<HolderLease> _task;
 
-        internal WaitOperation(Task<HolderLease> task) => _task = task;
+        internal WriteGateAcquisition(Task<HolderLease> task) => _task = task;
 
         public Awaiter GetAwaiter() => new(_task.GetAwaiter());
 
@@ -239,9 +314,10 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
         private readonly ILogger _logger;
         private readonly TimeSpan _maxHoldDuration;
         private readonly DateTimeOffset _acquiredAt;
-        private readonly ITimer _watchdog;
+        private ITimer? _watchdog;
         private OwnershipScope? _scope;
         private int _released;
+        private int _overlongReported;
 
         internal HolderLease(
             Entry entry,
@@ -256,14 +332,18 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
             _timeProvider = timeProvider;
             _logger = logger;
             _acquiredAt = timeProvider.GetUtcNow();
-            _watchdog = timeProvider.CreateTimer(
-                static state => ((HolderLease)state!).ReportOverlongHold(),
-                this,
-                maxHoldDuration,
-                Timeout.InfiniteTimeSpan);
         }
 
         public string Identity { get; }
+
+        public void ArmWatchdog()
+        {
+            _watchdog = _timeProvider.CreateTimer(
+                static state => ((HolderLease)state!).ReportOverlongHold(),
+                this,
+                _maxHoldDuration,
+                Timeout.InfiniteTimeSpan);
+        }
 
         public void Activate()
         {
@@ -282,7 +362,8 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
             if (Interlocked.Exchange(ref _released, 1) != 0)
                 throw new SynchronizationLockException("The SQLite write gate lease was released more than once.");
 
-            _watchdog.Dispose();
+            ReportOverlongHoldIfNeeded();
+            _watchdog?.Dispose();
             var scope = _scope;
             if (scope is not null)
             {
@@ -299,7 +380,7 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
         public void DisposeWithoutRelease()
         {
             Interlocked.Exchange(ref _released, 1);
-            _watchdog.Dispose();
+            _watchdog?.Dispose();
         }
 
         private void ReportOverlongHold()
@@ -307,7 +388,15 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
             if (Volatile.Read(ref _released) != 0 || !ReferenceEquals(Volatile.Read(ref _entry.Holder), this))
                 return;
 
+            ReportOverlongHoldIfNeeded();
+        }
+
+        private void ReportOverlongHoldIfNeeded()
+        {
             var elapsed = _timeProvider.GetUtcNow() - _acquiredAt;
+            if (elapsed < _maxHoldDuration || Interlocked.Exchange(ref _overlongReported, 1) != 0)
+                return;
+
             _logger.LogError(
                 "SQLite write gate holder {HolderIdentity} exceeded the configured maximum hold duration {MaxHoldDuration}; held for {Elapsed}",
                 Identity,
@@ -333,7 +422,21 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
         public readonly SemaphoreSlim Semaphore = new(1, 1);
         public HolderLease? Holder;
         public int RefCount;
+        public int WaiterCount;
     }
+}
+
+internal sealed class SqliteWriteGateWaitQueueFullException : InvalidOperationException
+{
+    public SqliteWriteGateWaitQueueFullException(string waitingHolder, int maxQueuedWaiters)
+        : base($"SQLite write gate acquisition by '{waitingHolder}' was rejected because {maxQueuedWaiters} waiters are already queued.")
+    {
+        WaitingHolder = waitingHolder;
+        MaxQueuedWaiters = maxQueuedWaiters;
+    }
+
+    public string WaitingHolder { get; }
+    public int MaxQueuedWaiters { get; }
 }
 
 internal sealed class SqliteWriteGateAcquisitionTimeoutException : TimeoutException

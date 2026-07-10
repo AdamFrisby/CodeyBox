@@ -67,8 +67,7 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
     [Fact]
     public async Task StoreOperation_ReenteringGateHeldByAnotherStore_IsRejectedImmediately()
     {
-        var loggerFactory = new RecordingLoggerFactory();
-        var factory = CreateGateFactory(loggerFactory);
+        var factory = CreateGateFactory();
         using var workItems = new SqliteWorkItemStore(
             _dbPath,
             writeGateFactory: factory);
@@ -83,11 +82,25 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
 
         Assert.Contains(nameof(SqliteWorkItemStore.AcquireConnectionGateForTesting), exception.CurrentHolder);
         Assert.Contains(nameof(SqliteQueueController.PauseAsync), exception.WaitingHolder);
-        Assert.Contains(
-            loggerFactory.Messages,
-            message => message.Contains("Rejected reentrant SQLite write gate acquisition", StringComparison.Ordinal)
-                && message.Contains(nameof(SqliteQueueController.PauseAsync), StringComparison.Ordinal)
-                && message.Contains(nameof(SqliteWorkItemStore.AcquireConnectionGateForTesting), StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task AsyncStoreOperation_ReenteringGateHeldByAnotherStore_IsRejectedImmediately(
+        bool continueOnCapturedContext)
+    {
+        var factory = CreateGateFactory();
+        using var queue = new SqliteQueueController(
+            _dbPath,
+            NullLogger<SqliteQueueController>.Instance,
+            factory);
+        using var gate = factory.ForPath(_dbPath);
+
+        var exception = await ReenterAfterAsyncAcquireAsync(gate, queue, continueOnCapturedContext);
+
+        Assert.Contains(nameof(ReenterAfterAsyncAcquireAsync), exception.CurrentHolder);
+        Assert.Contains(nameof(SqliteQueueController.PauseAsync), exception.WaitingHolder);
     }
 
     [Fact]
@@ -125,6 +138,76 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
             factory);
         Assert.Equal(QueueState.Paused, reopenedQueue.State);
         Assert.Equal("concurrent write", reopenedQueue.PausedReason);
+    }
+
+    [Fact]
+    public async Task WriteGate_WhenWaitQueueIsFull_FailsFastWithoutJoiningSemaphoreQueue()
+    {
+        var options = new SqliteWriteGateOptions
+        {
+            AcquisitionTimeout = TimeSpan.FromSeconds(30),
+            MaxHoldDuration = TimeSpan.FromSeconds(30),
+            MaxQueuedWaiters = 1,
+        };
+        var factory = new SqliteDatabaseWriteGateFactory(
+            () => options,
+            NullLoggerFactory.Instance);
+        using var holderGate = factory.ForPath(_dbPath);
+        using var firstWaiterGate = factory.ForPath(_dbPath);
+        using var rejectedWaiterGate = factory.ForPath(_dbPath);
+        var holderEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseHolder = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var holder = Task.Run(async () =>
+        {
+            holderGate.Wait();
+            holderEntered.SetResult();
+            try
+            {
+                await releaseHolder.Task;
+            }
+            finally
+            {
+                holderGate.Release();
+            }
+        });
+        await holderEntered.Task;
+        var firstWaiter = Task.Run(() => WaitAndReleaseAsync(firstWaiterGate));
+        try
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(100));
+
+            var exception = await Assert.ThrowsAsync<SqliteWriteGateWaitQueueFullException>(
+                () => Task.Run(() => WaitAndReleaseAsync(rejectedWaiterGate)));
+            Assert.Equal(1, exception.MaxQueuedWaiters);
+        }
+        finally
+        {
+            releaseHolder.SetResult();
+        }
+
+        await firstWaiter.WaitAsync(TimeSpan.FromSeconds(5));
+        await holder.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task ReadConnectionSlots_WhenLimitIsFull_FailFast()
+    {
+        var options = new SqliteWriteGateOptions
+        {
+            AcquisitionTimeout = TimeSpan.FromSeconds(5),
+            MaxHoldDuration = TimeSpan.FromSeconds(5),
+            MaxConcurrentReadConnections = 1,
+        };
+        var factory = new SqliteDatabaseWriteGateFactory(
+            () => options,
+            NullLoggerFactory.Instance);
+        using var firstSlot = await factory.AcquireReadConnectionSlotAsync(_dbPath, CancellationToken.None);
+
+        var exception = await Assert.ThrowsAsync<SqliteReadConcurrencyLimitExceededException>(
+            async () => await factory.AcquireReadConnectionSlotAsync(_dbPath, CancellationToken.None));
+
+        Assert.Equal(1, exception.MaxConcurrentReads);
     }
 
     [Fact]
@@ -334,6 +417,27 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
     {
         await gate.WaitAsync();
         gate.Release();
+    }
+
+    private static async Task<SqliteWriteGateReentrancyException> ReenterAfterAsyncAcquireAsync(
+        SqliteDatabaseWriteGate gate,
+        SqliteQueueController queue,
+        bool continueOnCapturedContext)
+    {
+        if (continueOnCapturedContext)
+            await gate.WaitAsync();
+        else
+            await gate.WaitAsync().ConfigureAwait(false);
+
+        try
+        {
+            return await Assert.ThrowsAsync<SqliteWriteGateReentrancyException>(
+                () => queue.PauseAsync("maintenance"));
+        }
+        finally
+        {
+            gate.Release();
+        }
     }
 
     private static async Task AssertUngatedWriterBlockedBySqliteLockAsync(string dbPath)

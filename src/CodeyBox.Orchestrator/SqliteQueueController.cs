@@ -112,16 +112,18 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
             _state = QueueState.Paused;
             Interlocked.Exchange(ref _pausedAtUtcTicks, now.UtcTicks);
             _pausedReason = reason;
-            AuditLog.QueuePaused(reason);
         }
         finally
         {
             _lock.Release();
         }
+
+        AuditLog.QueuePaused(reason);
     }
 
     public async Task ResumeAsync(CancellationToken ct = default)
     {
+        var resumed = false;
         await _lock.WaitAsync(ct);
         try
         {
@@ -141,12 +143,15 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
             _state = QueueState.Running;
             Interlocked.Exchange(ref _pausedAtUtcTicks, 0);
             _pausedReason = null;
-            AuditLog.QueueResumed();
+            resumed = true;
         }
         finally
         {
             _lock.Release();
         }
+
+        if (resumed)
+            AuditLog.QueueResumed();
     }
 
     public async Task PauseProjectAsync(ProjectId projectId, string reason, CancellationToken ct = default)
@@ -171,12 +176,13 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
             cmd.Parameters.AddWithValue("$reason", reason);
             cmd.Parameters.AddWithValue("$ua", now.ToString("O"));
             await cmd.ExecuteNonQueryAsync(ct);
-            AuditLog.ProjectQueuePaused(projectId, reason);
         }
         finally
         {
             _lock.Release();
         }
+
+        AuditLog.ProjectQueuePaused(projectId, reason);
     }
 
     public async Task ResumeProjectAsync(ProjectId projectId, CancellationToken ct = default)
@@ -198,12 +204,13 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
             cmd.Parameters.AddWithValue("$pid", projectId.Value);
             cmd.Parameters.AddWithValue("$ua", now.ToString("O"));
             await cmd.ExecuteNonQueryAsync(ct);
-            AuditLog.ProjectQueueResumed(projectId);
         }
         finally
         {
             _lock.Release();
         }
+
+        AuditLog.ProjectQueueResumed(projectId);
     }
 
     public async Task<ProjectQueueState?> GetProjectStateAsync(ProjectId projectId, CancellationToken ct = default)
