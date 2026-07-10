@@ -512,14 +512,14 @@ public sealed class FakeApiClient : ICodeyBoxApiClient
         => Task.FromResult<string?>("fake-work-item-id");
 
     public AuditReportsDto? AuditReportsOverride { get; set; }
-    public Dictionary<(int, string), string?> RawOutputOverrides { get; set; } = [];
+    public Dictionary<(string, int, string), string?> RawOutputOverrides { get; set; } = [];
 
     public Task<AuditReportsDto?> GetAuditReportsAsync(string workItemId, CancellationToken ct = default)
         => Task.FromResult(AuditReportsOverride);
 
     public Task<string?> GetAuditReportRawOutputAsync(
-        string workItemId, int iteration, string auditorName, CancellationToken ct = default)
-        => Task.FromResult(RawOutputOverrides.TryGetValue((iteration, auditorName), out var r) ? r : null);
+        string workItemId, string target, int iteration, string auditorName, CancellationToken ct = default)
+        => Task.FromResult(RawOutputOverrides.TryGetValue((target, iteration, auditorName), out var r) ? r : null);
 
     public Dictionary<string, WorkItemTimingsDto> TimingsOverride { get; } = [];
     public AggregateTimingsDto? AggregateTimingsOverride { get; set; }

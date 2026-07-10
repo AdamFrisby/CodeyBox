@@ -4,48 +4,24 @@ using System.Text.Json.Serialization;
 
 namespace CodeyBox.Core;
 
-public interface IPlanReviewGate
-{
-    ValueTask<PlanReviewDecision> ReviewAsync(
-        PlanReviewRequest request,
-        CancellationToken ct = default);
-}
-
-public sealed record PlanReviewRequest(
-    WorkItemId WorkItemId,
-    ProjectId ProjectId,
-    string Title,
-    string Prompt,
-    int PromptRevision,
-    string PlanArtifact,
-    AgentKind? Agent,
-    string? AgentInstanceId,
-    string? ModelId,
-    string? ReasoningMode,
-    string? AuditorProfile = null);
-
 public sealed record PlanReviewDecision(
     bool Approved,
     string Summary,
-    string? RejectionReason = null,
     PlanReviewFeedback? ReworkFeedback = null);
 
 /// <summary>
-/// Structured, bounded feedback that may be shown to a later planning-agent turn.
-/// Free-form reviewer prose stays on <see cref="PlanReviewDecision.RejectionReason"/>
-/// and persisted audit reports for operator diagnostics; the planner receives
-/// only locally generated metadata and stable finding ids.
+/// Structured, bounded feedback that may be shown to a later planning-agent
+/// turn. It intentionally contains no model-authored prose: reviewer titles,
+/// descriptions, locations, and raw output remain diagnostic data and must not
+/// cross into a tool-enabled planning prompt.
 /// </summary>
 public sealed record PlanReviewFeedback(
     int BlockingIssueCount,
     IReadOnlyList<PlanReviewFeedbackIssue> Issues);
 
 public sealed record PlanReviewFeedbackIssue(
-    string Auditor,
     string Severity,
     string Category,
-    string Summary,
-    string Evidence,
     string FindingId);
 
 public sealed record PlanArtifactDocument(

@@ -328,7 +328,7 @@ first request. In-flight items are re-read from disk on every call.
 ### `GET /workitems/{id}/audit-reports`
 
 Returns all stored per-auditor reports for a work item, grouped by
-iteration. See [`audit-reports.md`](audit-reports.md) for the full
+review target and iteration. See [`audit-reports.md`](audit-reports.md) for the full
 schema and semantics.
 
 ```json
@@ -336,6 +336,7 @@ schema and semantics.
   "workItemId": "...",
   "iterations": [
     {
+      "target": "code",
       "iteration": 1,
       "blockingCount": 2,
       "nonBlockingCount": 1,
@@ -372,7 +373,7 @@ is stored; fetch it via the `/raw` endpoint below.
 * Returns an empty `iterations` array when no reports have been
   persisted yet (e.g. the work item has not yet entered the audit phase).
 
-### `GET /workitems/{id}/audit-reports/{iteration}/{auditor}/raw`
+### `GET /workitems/{id}/audit-reports/{target}/{iteration}/{auditor}/raw`
 
 Returns the raw stdout/stderr captured from a single auditor invocation
 as `text/plain; charset=utf-8`.
@@ -381,7 +382,10 @@ The output is pre-redacted (GitHub PATs, Anthropic API keys, and Google
 API keys replaced with `***`) and capped at 256 KB. A `[...truncated]`
 suffix is appended when the original exceeded the cap.
 
-* Returns `404 Not Found` when the work item, iteration, or auditor row
+`target` is the open audit-target value persisted for the invocation,
+such as `plan` or `code`.
+
+* Returns `404 Not Found` when the work item, target, iteration, or auditor row
   does not exist, or when `raw_output` is `NULL` for that row.
 
 ### Agent Streams

@@ -107,6 +107,23 @@ public sealed class SqliteTransitionHealthDataSourceTests : IDisposable
         {
             Id = Guid.NewGuid().ToString(),
             WorkItemId = workItemId.ToString(),
+            Iteration = 1,
+            Target = AuditTarget.Plan,
+            AuditorName = "review:quality",
+            AuditorKind = "llm",
+            WorstSeverity = "Error",
+            StartedAt = now.AddMinutes(-4),
+            EndedAt = now.AddMinutes(-3),
+            DurationMs = 5_000,
+            Findings = [new AuditReportFinding(
+                Id: "f-plan", Severity: "Error", Title: "plan-only finding",
+                Message: "not a code-audit health transition", Files: [], LineHints: [])],
+            RawOutput = null,
+        });
+        await auditReports.CreateAsync(new AuditReport
+        {
+            Id = Guid.NewGuid().ToString(),
+            WorkItemId = workItemId.ToString(),
             Iteration = 2,
             AuditorName = "review:quality",
             AuditorKind = "llm",
@@ -130,6 +147,8 @@ public sealed class SqliteTransitionHealthDataSourceTests : IDisposable
         Assert.Contains(snapshot.Involvements, r => r.Phase == "rework" && r.Outcome == "failure:agent");
 
         Assert.Equal(2, snapshot.AuditReports.Count);
+        Assert.DoesNotContain(snapshot.AuditReports, report =>
+            report.FindingTitles.Contains("plan-only finding", StringComparer.Ordinal));
         var infraReport = snapshot.AuditReports.First(r => r.Iteration == 2);
         Assert.Contains("review agent failed to run", infraReport.FindingTitles);
 

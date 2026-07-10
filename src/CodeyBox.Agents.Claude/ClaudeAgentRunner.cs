@@ -622,7 +622,9 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         return MissingApiKeyReason;
     }
 
-    public async Task<TextOnlyAgentResult> RunTextOnlyAsync(
+    public bool SupportsSeparateSystemPrompt => true;
+
+    public Task<TextOnlyAgentResult> RunTextOnlyAsync(
         string prompt,
         AgentCredential? credential,
         string? modelId = null,
@@ -630,6 +632,28 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         CancellationToken ct = default,
         ISandbox? sandbox = null,
         string? workingDirectory = null)
+        => RunTextOnlyCoreAsync(null, prompt, credential, modelId, reasoningMode, ct, sandbox, workingDirectory);
+
+    public Task<TextOnlyAgentResult> RunTextOnlyWithSystemPromptAsync(
+        string systemPrompt,
+        string userPrompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
+        => RunTextOnlyCoreAsync(systemPrompt, userPrompt, credential, modelId, reasoningMode, ct, sandbox, workingDirectory);
+
+    private async Task<TextOnlyAgentResult> RunTextOnlyCoreAsync(
+        string? systemPrompt,
+        string userPrompt,
+        AgentCredential? credential,
+        string? modelId,
+        string? reasoningMode,
+        CancellationToken ct,
+        ISandbox? sandbox,
+        string? workingDirectory)
     {
         _ = sandbox;
         _ = workingDirectory;
@@ -658,15 +682,18 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
         try
         {
-            var body = JsonSerializer.Serialize(new
+            var bodyFields = new Dictionary<string, object?>
             {
-                model = canonicalModel,
-                max_tokens = TextOnlyMaxTokens,
-                messages = new[]
+                ["model"] = canonicalModel,
+                ["max_tokens"] = TextOnlyMaxTokens,
+                ["messages"] = new[]
                 {
-                    new { role = "user", content = prompt },
+                    new { role = "user", content = userPrompt },
                 },
-            });
+            };
+            if (systemPrompt is not null)
+                bodyFields["system"] = systemPrompt;
+            var body = JsonSerializer.Serialize(bodyFields);
 
             using var request = new HttpRequestMessage(HttpMethod.Post, MessagesEndpoint)
             {

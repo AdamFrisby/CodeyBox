@@ -185,7 +185,9 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         return "GEMINI_API_KEY or Gemini OAuth credentials are required";
     }
 
-    public async Task<TextOnlyAgentResult> RunTextOnlyAsync(
+    public bool SupportsSeparateSystemPrompt => true;
+
+    public Task<TextOnlyAgentResult> RunTextOnlyAsync(
         string prompt,
         AgentCredential? credential,
         string? modelId = null,
@@ -193,6 +195,28 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         CancellationToken ct = default,
         ISandbox? sandbox = null,
         string? workingDirectory = null)
+        => RunTextOnlyCoreAsync(null, prompt, credential, modelId, reasoningMode, ct, sandbox, workingDirectory);
+
+    public Task<TextOnlyAgentResult> RunTextOnlyWithSystemPromptAsync(
+        string systemPrompt,
+        string userPrompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
+        => RunTextOnlyCoreAsync(systemPrompt, userPrompt, credential, modelId, reasoningMode, ct, sandbox, workingDirectory);
+
+    private async Task<TextOnlyAgentResult> RunTextOnlyCoreAsync(
+        string? systemPrompt,
+        string userPrompt,
+        AgentCredential? credential,
+        string? modelId,
+        string? reasoningMode,
+        CancellationToken ct,
+        ISandbox? sandbox,
+        string? workingDirectory)
     {
         _ = sandbox;
         _ = workingDirectory;
@@ -201,14 +225,14 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         // API-key first preference: pay-per-use callers explicitly configured
         // GEMINI_API_KEY and expect that quota to be spent, not the OAuth one.
         if (TryGetApiKey(credential, out var apiKey))
-            return await SendApiKeyAsync(_textOnlyHttp, prompt, apiKey, modelId, ct).ConfigureAwait(false);
+            return await SendApiKeyAsync(_textOnlyHttp, systemPrompt, userPrompt, apiKey, modelId, ct).ConfigureAwait(false);
 
         // OAuth subscription fallback: authorized for Gemini specifically (the
         // operator note explicitly permits subscription-OAuth usage against
         // Gemini's API directly; this is the resolver-cascade workaround until
         // the agentic in-VM resolver lands).
         if (TryGetOAuthAccessToken(credential, out var oauthToken))
-            return await SendOAuthAsync(_textOnlyHttp, prompt, oauthToken, modelId, ct).ConfigureAwait(false);
+            return await SendOAuthAsync(_textOnlyHttp, systemPrompt, userPrompt, oauthToken, modelId, ct).ConfigureAwait(false);
 
         return new TextOnlyAgentResult(
             false,
@@ -218,23 +242,31 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     }
 
     private static async Task<TextOnlyAgentResult> SendApiKeyAsync(
-        HttpClient http, string prompt, string apiKey, string? modelId, CancellationToken ct)
+        HttpClient http,
+        string? systemPrompt,
+        string userPrompt,
+        string apiKey,
+        string? modelId,
+        CancellationToken ct)
     {
         try
         {
             var effectiveModel = string.IsNullOrWhiteSpace(modelId) ? "gemini-2.5-pro" : modelId;
-            var body = JsonSerializer.Serialize(new
+            var requestBody = new Dictionary<string, object?>
             {
-                contents = new[]
+                ["contents"] = new[]
                 {
                     new
                     {
                         role = "user",
-                        parts = new[] { new { text = prompt } },
+                        parts = new[] { new { text = userPrompt } },
                     },
                 },
-                generationConfig = new { maxOutputTokens = 8192 },
-            });
+                ["generationConfig"] = new { maxOutputTokens = 8192 },
+            };
+            if (systemPrompt is not null)
+                requestBody["systemInstruction"] = new { parts = new[] { new { text = systemPrompt } } };
+            var body = JsonSerializer.Serialize(requestBody);
             var endpoint = $"https://generativelanguage.googleapis.com/v1beta/models/{Uri.EscapeDataString(effectiveModel)}:generateContent";
             using var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
             {
@@ -256,28 +288,36 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     }
 
     private static async Task<TextOnlyAgentResult> SendOAuthAsync(
-        HttpClient http, string prompt, string accessToken, string? modelId, CancellationToken ct)
+        HttpClient http,
+        string? systemPrompt,
+        string userPrompt,
+        string accessToken,
+        string? modelId,
+        CancellationToken ct)
     {
         try
         {
             var effectiveModel = string.IsNullOrWhiteSpace(modelId) ? "gemini-2.5-pro" : modelId;
             // Code Assist wraps the GenerateContent body in {model, request}
             // (see GeminiQuotaProbe.ProbeOneAsync for the canonical shape).
-            var body = JsonSerializer.Serialize(new
+            var generateContentRequest = new Dictionary<string, object?>
             {
-                model = $"models/{effectiveModel}",
-                request = new
+                ["contents"] = new[]
                 {
-                    contents = new[]
+                    new
                     {
-                        new
-                        {
-                            role = "user",
-                            parts = new[] { new { text = prompt } },
-                        },
+                        role = "user",
+                        parts = new[] { new { text = userPrompt } },
                     },
-                    generationConfig = new { maxOutputTokens = 8192 },
                 },
+                ["generationConfig"] = new { maxOutputTokens = 8192 },
+            };
+            if (systemPrompt is not null)
+                generateContentRequest["systemInstruction"] = new { parts = new[] { new { text = systemPrompt } } };
+            var body = JsonSerializer.Serialize(new Dictionary<string, object?>
+            {
+                ["model"] = $"models/{effectiveModel}",
+                ["request"] = generateContentRequest,
             });
             using var request = new HttpRequestMessage(HttpMethod.Post, OAuthGenerateContentEndpoint)
             {

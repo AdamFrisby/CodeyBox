@@ -571,7 +571,8 @@ internal static class WorkItemEndpoints
 
             var dto = ToDto(item, proj, depStates, depExtIds);
 
-            var reports = await reportStore.GetByWorkItemAsync(item.Id.ToString(), ct);
+            var reports = await reportStore.GetByWorkItemAsync(
+                item.Id.ToString(), AuditTarget.Code, ct);
             if (reports.Count > 0)
             {
                 var maxIter = reports.Max(r => r.Iteration);

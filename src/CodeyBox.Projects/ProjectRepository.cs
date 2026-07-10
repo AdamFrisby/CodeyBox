@@ -744,6 +744,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             PluginId = auditor.PluginId,
             Argv = [.. auditor.Argv],
             ReviewFocus = auditor.ReviewFocus,
+            Targets = [.. auditor.Targets],
             Role = auditor.Role,
             GateEvidence = auditor.GateEvidence,
             Patterns = auditor.Patterns.Select(p => new DiffPatternConfig

@@ -80,6 +80,36 @@ public interface ITextOnlyAgentRunner : IAgentRunner
         string? workingDirectory = null);
 
     /// <summary>
+    /// Whether this runner can send trusted instructions and untrusted user
+    /// data through distinct provider-level system and user channels. Callers
+    /// that make an authorization or approval decision from model output must
+    /// require this capability; concatenating both values into one prompt is
+    /// not an equivalent isolation boundary.
+    /// </summary>
+    bool SupportsSeparateSystemPrompt => false;
+
+    /// <summary>
+    /// Runs a text-only model call with trusted instructions isolated in the
+    /// provider's system channel and untrusted data in its user channel.
+    /// Implementations that advertise <see cref="SupportsSeparateSystemPrompt"/>
+    /// must preserve that separation in the provider request.
+    /// </summary>
+    Task<TextOnlyAgentResult> RunTextOnlyWithSystemPromptAsync(
+        string systemPrompt,
+        string userPrompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
+        => Task.FromResult(new TextOnlyAgentResult(
+            false,
+            "separate system prompt is unsupported",
+            null,
+            $"Agent '{Kind}' does not support provider-level system/user prompt separation."));
+
+    /// <summary>
     /// Cheap, credential-only viability probe. Returns <c>null</c> when the
     /// supplied credential is sufficient for this runner's text-only path to
     /// reach the provider; otherwise returns a short human-readable reason

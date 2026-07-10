@@ -179,7 +179,9 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
             ? "OPENAI_API_KEY is required for text-only calls"
             : null;
 
-    public async Task<TextOnlyAgentResult> RunTextOnlyAsync(
+    public bool SupportsSeparateSystemPrompt => true;
+
+    public Task<TextOnlyAgentResult> RunTextOnlyAsync(
         string prompt,
         AgentCredential? credential,
         string? modelId = null,
@@ -187,6 +189,28 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         CancellationToken ct = default,
         ISandbox? sandbox = null,
         string? workingDirectory = null)
+        => RunTextOnlyCoreAsync(null, prompt, credential, modelId, reasoningMode, ct, sandbox, workingDirectory);
+
+    public Task<TextOnlyAgentResult> RunTextOnlyWithSystemPromptAsync(
+        string systemPrompt,
+        string userPrompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
+        => RunTextOnlyCoreAsync(systemPrompt, userPrompt, credential, modelId, reasoningMode, ct, sandbox, workingDirectory);
+
+    private async Task<TextOnlyAgentResult> RunTextOnlyCoreAsync(
+        string? systemPrompt,
+        string userPrompt,
+        AgentCredential? credential,
+        string? modelId,
+        string? reasoningMode,
+        CancellationToken ct,
+        ISandbox? sandbox,
+        string? workingDirectory)
     {
         _ = sandbox;
         _ = workingDirectory;
@@ -203,9 +227,11 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
             var body = new Dictionary<string, object?>
             {
                 ["model"] = effectiveModel,
-                ["input"] = prompt,
+                ["input"] = userPrompt,
                 ["max_output_tokens"] = 8192,
             };
+            if (systemPrompt is not null)
+                body["instructions"] = systemPrompt;
             if (!string.IsNullOrWhiteSpace(reasoningMode))
                 body["reasoning"] = new Dictionary<string, string> { ["effort"] = reasoningMode };
 

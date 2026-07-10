@@ -2803,11 +2803,6 @@ builder.Services.AddSingleton<IWorkItemTerminalTransition>(sp =>
     sp.GetRequiredService<WorkItemTerminalTransition>());
 builder.Services.AddSingleton<IWorkItemTerminalRevisionBuilder>(sp =>
     sp.GetRequiredService<WorkItemTerminalTransition>());
-// Plan-review gate. The pipeline always composes and runs AuditTarget.Plan
-// auditors before implementation; this registered gate is retained as the
-// compatibility structural-review hook.
-builder.Services.AddSingleton<IPlanReviewGate, PlanArtifactValidationGate>();
-
 builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IGitHost>(),
@@ -2885,7 +2880,6 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     inVmSmokeGate: sp.GetService<IInVmSmokeGate>(),
     authRequiredHandler: sp.GetRequiredService<IAgentAuthRequiredHandler>(),
     authRequiredReader: sp.GetRequiredService<IAgentAuthRequiredAvailabilityReader>(),
-    planReviewGate: sp.GetRequiredService<IPlanReviewGate>(),
     testCaseStore: sp.GetService<ITestCaseStore>(),
     mergeScopeResolver: sp.GetRequiredService<IMergeScopeResolver>(),
     quotaAvailabilityPublisher: sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>()));

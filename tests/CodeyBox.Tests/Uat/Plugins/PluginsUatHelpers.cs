@@ -162,11 +162,13 @@ internal sealed class CapturingAuditReportStore : IAuditReportStore
 
     public Task<string?> GetRawOutputAsync(
         string workItemId,
+        AuditTarget target,
         int iteration,
         string auditorName,
         CancellationToken ct = default)
         => Task.FromResult(Reports.FirstOrDefault(r =>
             r.WorkItemId == workItemId &&
+            r.Target == target &&
             r.Iteration == iteration &&
             r.AuditorName == auditorName)?.RawOutput);
 

@@ -135,6 +135,38 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
             workingDirectory).ConfigureAwait(false);
     }
 
+    protected async Task<TextOnlyAgentResult> RunTextOnlyWithSystemPromptInnerAsync(
+        string systemPrompt,
+        string userPrompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
+    {
+        if (sandbox is not null)
+        {
+            var resolvedWorkingDirectory = string.IsNullOrWhiteSpace(workingDirectory)
+                ? SandboxConventions.WorkDir
+                : workingDirectory;
+            userPrompt = await Chain.ProcessAsync(
+                new PromptContext(ItemId, Inner.Kind, Phase, Iteration, Project, sandbox, resolvedWorkingDirectory, AuditTarget),
+                userPrompt,
+                ct).ConfigureAwait(false);
+        }
+
+        return await ((ITextOnlyAgentRunner)Inner).RunTextOnlyWithSystemPromptAsync(
+            systemPrompt,
+            userPrompt,
+            credential,
+            modelId,
+            reasoningMode,
+            ct,
+            sandbox,
+            workingDirectory).ConfigureAwait(false);
+    }
+
     private class CliSessionResumablePromptPreprocessingAgentRunner
         : PromptPreprocessingAgentRunner, ICliSessionResumableAgentRunner
     {
@@ -184,6 +216,9 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
         public bool TextOnlyRequiresSandbox =>
             ((ITextOnlyAgentRunner)Inner).TextOnlyRequiresSandbox;
 
+        public bool SupportsSeparateSystemPrompt =>
+            ((ITextOnlyAgentRunner)Inner).SupportsSeparateSystemPrompt;
+
         public Task<TextOnlyAgentResult> RunTextOnlyAsync(
             string prompt,
             AgentCredential? credential,
@@ -193,6 +228,25 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
             ISandbox? sandbox = null,
             string? workingDirectory = null)
             => RunTextOnlyInnerAsync(prompt, credential, modelId, reasoningMode, ct, sandbox, workingDirectory);
+
+        public Task<TextOnlyAgentResult> RunTextOnlyWithSystemPromptAsync(
+            string systemPrompt,
+            string userPrompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            ISandbox? sandbox = null,
+            string? workingDirectory = null)
+            => RunTextOnlyWithSystemPromptInnerAsync(
+                systemPrompt,
+                userPrompt,
+                credential,
+                modelId,
+                reasoningMode,
+                ct,
+                sandbox,
+                workingDirectory);
     }
 
     private sealed class TextOnlyCliSessionResumablePromptPreprocessingAgentRunner
@@ -216,6 +270,9 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
         public bool TextOnlyRequiresSandbox =>
             ((ITextOnlyAgentRunner)Inner).TextOnlyRequiresSandbox;
 
+        public bool SupportsSeparateSystemPrompt =>
+            ((ITextOnlyAgentRunner)Inner).SupportsSeparateSystemPrompt;
+
         public Task<TextOnlyAgentResult> RunTextOnlyAsync(
             string prompt,
             AgentCredential? credential,
@@ -225,5 +282,24 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
             ISandbox? sandbox = null,
             string? workingDirectory = null)
             => RunTextOnlyInnerAsync(prompt, credential, modelId, reasoningMode, ct, sandbox, workingDirectory);
+
+        public Task<TextOnlyAgentResult> RunTextOnlyWithSystemPromptAsync(
+            string systemPrompt,
+            string userPrompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            ISandbox? sandbox = null,
+            string? workingDirectory = null)
+            => RunTextOnlyWithSystemPromptInnerAsync(
+                systemPrompt,
+                userPrompt,
+                credential,
+                modelId,
+                reasoningMode,
+                ct,
+                sandbox,
+                workingDirectory);
     }
 }

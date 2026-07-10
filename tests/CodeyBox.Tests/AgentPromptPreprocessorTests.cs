@@ -276,6 +276,36 @@ public sealed class AgentPromptPreprocessorTests
     }
 
     [Fact]
+    public async Task PromptPreprocessingAgentRunner_PreservesSeparatedSystemPromptAndProcessesOnlyUserData()
+    {
+        var recorder = new RecordingPreprocessor();
+        var chain = new AgentPromptPreprocessorChain([recorder]);
+        var inner = new RecordingTextOnlyRunner();
+        var sandbox = new FileBackedSandbox(new Dictionary<string, string>());
+        var wrapper = PromptPreprocessingAgentRunner.Wrap(
+            inner,
+            chain,
+            WorkItemId.New(),
+            AgentPromptPhase.PlanReview,
+            2,
+            NewProject(),
+            AuditTarget.Plan);
+
+        var textOnly = Assert.IsAssignableFrom<ITextOnlyAgentRunner>(wrapper);
+        var result = await textOnly.RunTextOnlyWithSystemPromptAsync(
+            "trusted system contract",
+            "untrusted plan data",
+            credential: null,
+            sandbox: sandbox,
+            workingDirectory: "/work");
+
+        Assert.True(result.Success);
+        Assert.True(textOnly.SupportsSeparateSystemPrompt);
+        Assert.Equal("trusted system contract", Assert.Single(inner.SystemPrompts));
+        Assert.Equal("untrusted plan data|processed", Assert.Single(inner.SeparatedUserPrompts));
+    }
+
+    [Fact]
     public async Task PromptPreprocessingAgentRunner_SkipsChainWhenSandboxIsNull()
     {
         var recorder = new RecordingPreprocessor();
@@ -673,10 +703,13 @@ public sealed class AgentPromptPreprocessorTests
     {
         public List<string> RunPrompts { get; } = [];
         public List<string> TextOnlyPrompts { get; } = [];
+        public List<string> SystemPrompts { get; } = [];
+        public List<string> SeparatedUserPrompts { get; } = [];
 
         public AgentKind Kind => AgentKind.Codex;
 
         public bool TextOnlyRequiresSandbox { get; init; }
+        public bool SupportsSeparateSystemPrompt => true;
 
         public Task<AgentResult> RunAsync(
             ISandbox sandbox,
@@ -717,6 +750,27 @@ public sealed class AgentPromptPreprocessorTests
             _ = sandbox;
             _ = workingDirectory;
             TextOnlyPrompts.Add(prompt);
+            return Task.FromResult(new TextOnlyAgentResult(true, "ok", "{}", null));
+        }
+
+        public Task<TextOnlyAgentResult> RunTextOnlyWithSystemPromptAsync(
+            string systemPrompt,
+            string userPrompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            ISandbox? sandbox = null,
+            string? workingDirectory = null)
+        {
+            _ = credential;
+            _ = modelId;
+            _ = reasoningMode;
+            _ = sandbox;
+            _ = workingDirectory;
+            ct.ThrowIfCancellationRequested();
+            SystemPrompts.Add(systemPrompt);
+            SeparatedUserPrompts.Add(userPrompt);
             return Task.FromResult(new TextOnlyAgentResult(true, "ok", "{}", null));
         }
     }

@@ -284,6 +284,58 @@ public sealed class ProjectRepositoryTests
     }
 
     [Fact]
+    public async Task NamedAuditProfile_InheritsCustomAuditorTargets()
+    {
+        var options = new ProjectsOptions
+        {
+            Defaults = new ProjectDefaultsConfig
+            {
+                Audit = new ProjectAuditConfig
+                {
+                    Profiles = new Dictionary<string, ProjectAuditConfig>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        ["review"] = new()
+                        {
+                            Custom =
+                            [
+                                new CustomAuditorConfig
+                                {
+                                    Name = "custom:plan-review",
+                                    Kind = "shell",
+                                    Argv = ["review-plan"],
+                                    Targets = ["plan"],
+                                },
+                            ],
+                        },
+                    },
+                },
+            },
+            Projects =
+            [
+                new ProjectConfig
+                {
+                    Id = "alpha",
+                    RepositoryUrl = "https://example.com/x.git",
+                    Audit = new ProjectAuditConfig
+                    {
+                        Profile = "review",
+                        Profiles = new Dictionary<string, ProjectAuditConfig>(StringComparer.OrdinalIgnoreCase)
+                        {
+                            ["review"] = new() { MaxIterations = 5 },
+                        },
+                    },
+                },
+            ],
+        };
+        var repository = new ProjectRepository(Options.Create(options));
+
+        var project = await repository.GetAsync(new ProjectId("alpha"));
+        var inherited = Assert.Single(project!.Audit.ResolveProfile().Custom);
+
+        Assert.Equal(["plan"], inherited.Targets);
+    }
+
+    [Fact]
     public async Task ProjectAuditComplexityIterationBudgets_BindAndOverrideDefaults()
     {
         var config = new ConfigurationBuilder()
