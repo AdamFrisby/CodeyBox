@@ -135,6 +135,35 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     }
 
     [Fact]
+    public async Task PickupRebaseResolver_CursorFallbackCredentialHook_MaterialisesEnvBackedFileBeforeRunner()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var primary = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+        primary.AgenticConflictResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "codex resolver failed before editing",
+            Stdout: null,
+            Stderr: "ordinary resolver failure"));
+        var fallback = new EnvBackedCredentialFileAssertingResolverAgent();
+        var classRouter = BuildResolverClassRouter(primary, fallback);
+        var project = NewResolverProject(seed, AgentKind.Codex);
+
+        var run = await RunPickupRebaseConflictAsync(
+            seed,
+            project,
+            new ResolverCredentialProvider(),
+            primary,
+            [fallback],
+            classRouter);
+
+        Assert.Equal(WorkItemState.Done, run.Final.State);
+        Assert.Single(primary.AgenticConflictInvocations);
+        Assert.Equal(
+            CursorAuthJson,
+            (await ReadBareBranchFileAsync(run.BarePath, run.WorkBranch, "env-backed-credential-observed.json")).TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
     public async Task PickupRebaseResolver_MaterialisesCandidateCredentialMounts()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -1523,6 +1552,75 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
             }, ct);
             return add.Success
                 ? new AgentResult(true, $"{_kind.Value} resolved", null, null)
+                : new AgentResult(false, "failed to stage README.md", add.Stdout, add.Stderr);
+        }
+    }
+
+    private sealed class EnvBackedCredentialFileAssertingResolverAgent : IAgentRunner, IAgentCredentialEnvironmentPolicy
+    {
+        public AgentKind Kind => AgentKind.Cursor;
+        public IReadOnlySet<string> DirectCredentialEnvironmentVariables { get; } =
+            new HashSet<string>(StringComparer.Ordinal);
+        public IReadOnlySet<string> FileBackedCredentialEnvironmentVariables { get; } =
+            new HashSet<string>(StringComparer.Ordinal) { CursorAuthEnvKey };
+        public IReadOnlyList<AgentCredentialFileDestination> CredentialFileDestinations { get; } =
+        [
+            new AgentCredentialFileDestination(CursorAuthEnvKey, ".config/cursor/auth.json"),
+        ];
+
+        public async Task<AgentResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            Action<string>? stdoutChunkCallback = null,
+            bool captureStructuredStream = false)
+        {
+            _ = prompt;
+            _ = credential;
+            _ = modelId;
+            _ = reasoningMode;
+            _ = stdoutChunkCallback;
+            _ = captureStructuredStream;
+
+            var readCredential = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat \"$HOME/.config/cursor/auth.json\""],
+            }, ct);
+            if (!readCredential.Success)
+                return new AgentResult(false, "missing cursor auth file", readCredential.Stdout, readCredential.Stderr);
+
+            var writeCredentialObservation = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/env-backed-credential-observed.json"],
+                Stdin = readCredential.Stdout,
+            }, ct);
+            if (!writeCredentialObservation.Success)
+            {
+                return new AgentResult(
+                    false,
+                    "failed to write env-backed credential observation",
+                    writeCredentialObservation.Stdout,
+                    writeCredentialObservation.Stderr);
+            }
+
+            var write = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/README.md"],
+                Stdin = "main branch change\nwork branch change\n",
+            }, ct);
+            if (!write.Success)
+                return new AgentResult(false, "failed to write README.md", write.Stdout, write.Stderr);
+
+            var add = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", workingDirectory, "add", "--", "README.md", "env-backed-credential-observed.json"],
+            }, ct);
+            return add.Success
+                ? new AgentResult(true, "cursor resolved", null, null)
                 : new AgentResult(false, "failed to stage README.md", add.Stdout, add.Stderr);
         }
     }
