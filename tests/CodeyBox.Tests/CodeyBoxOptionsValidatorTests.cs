@@ -15,7 +15,9 @@ public sealed class CodeyBoxOptionsValidatorTests
     [InlineData("hold", "CodeyBox:SqliteWriteGate:MaxHoldDuration must be positive")]
     [InlineData("hold-max", "CodeyBox:SqliteWriteGate:MaxHoldDuration must be <=")]
     [InlineData("waiters", "CodeyBox:SqliteWriteGate:MaxQueuedWaiters must be positive")]
+    [InlineData("waiters-max", "CodeyBox:SqliteWriteGate:MaxQueuedWaiters must be <=")]
     [InlineData("reads", "CodeyBox:SqliteWriteGate:MaxConcurrentReadConnections must be positive")]
+    [InlineData("reads-max", "CodeyBox:SqliteWriteGate:MaxConcurrentReadConnections must be <=")]
     public void Validate_RejectsInvalidSqliteWriteGateOptions(
         string scenario,
         string expectedFailure)
@@ -27,19 +29,25 @@ public sealed class CodeyBoxOptionsValidatorTests
                 options.SqliteWriteGate.AcquisitionTimeout = TimeSpan.Zero;
                 break;
             case "acquisition-max":
-                options.SqliteWriteGate.AcquisitionTimeout = TimeSpan.FromMilliseconds(int.MaxValue).Add(TimeSpan.FromMilliseconds(1));
+                options.SqliteWriteGate.AcquisitionTimeout = SqliteWriteGateOptions.MaximumAcquisitionTimeout.Add(TimeSpan.FromMilliseconds(1));
                 break;
             case "hold":
                 options.SqliteWriteGate.MaxHoldDuration = TimeSpan.Zero;
                 break;
             case "hold-max":
-                options.SqliteWriteGate.MaxHoldDuration = TimeSpan.FromMilliseconds(int.MaxValue).Add(TimeSpan.FromMilliseconds(1));
+                options.SqliteWriteGate.MaxHoldDuration = SqliteWriteGateOptions.MaximumAllowedHoldDuration.Add(TimeSpan.FromMilliseconds(1));
                 break;
             case "waiters":
                 options.SqliteWriteGate.MaxQueuedWaiters = 0;
                 break;
+            case "waiters-max":
+                options.SqliteWriteGate.MaxQueuedWaiters = SqliteWriteGateOptions.MaximumQueuedWaiters + 1;
+                break;
             case "reads":
                 options.SqliteWriteGate.MaxConcurrentReadConnections = 0;
+                break;
+            case "reads-max":
+                options.SqliteWriteGate.MaxConcurrentReadConnections = SqliteWriteGateOptions.MaximumConcurrentReadConnections + 1;
                 break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null);

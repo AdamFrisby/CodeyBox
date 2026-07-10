@@ -4195,7 +4195,8 @@ namespace CodeyBox.Api
     ///   <see cref="IOptionsMonitor{T}"/> on each consumer access (or
     ///   re-applied via the <c>AgentConfigHotReload</c> bridge). Today:
     ///   <c>TemplateDirectory</c>, <c>MaxTemplateChecks</c>, <c>AgentConcurrency</c>, <c>AgentClasses</c>, <c>AgentScoreModifiers</c>,
-    ///   <c>AgentBurnEstimator</c>, <c>AgentPauses</c>, <c>AgentPricing</c>, <c>Smoke.Enabled</c>, <c>DeadWorker</c>
+    ///   <c>AgentBurnEstimator</c>, <c>AgentPauses</c>, <c>AgentPricing</c>, <c>SqliteWriteGate</c>,
+    ///   <c>Smoke.Enabled</c>, <c>DeadWorker</c>
     ///   (per-sweep), <c>Shutdown.SandboxResumeMode</c>,
     ///   <c>Shutdown.SandboxResumeTimeout</c>,
     ///   <c>Shutdown.SandboxAdoptionDeadlineSeconds</c>, <c>SandboxLeak</c>

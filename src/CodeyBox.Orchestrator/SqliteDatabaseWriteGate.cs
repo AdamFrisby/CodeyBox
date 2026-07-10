@@ -45,7 +45,7 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
             return new SqliteDatabaseWriteGate(
                 fullPath,
                 entry,
-                factory ?? SqliteDatabaseWriteGateFactory.Default);
+                SqliteDatabaseWriteGateFactory.Resolve(factory));
         }
     }
 
@@ -126,7 +126,8 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
         CancellationToken ct)
     {
         var settings = _factory.GetSettings();
-        var acquired = entry.Semaphore.Wait(0);
+        ct.ThrowIfCancellationRequested();
+        var acquired = entry.Semaphore.Wait(0, ct);
         if (!acquired)
         {
             EnterWaitQueue(entry, settings.MaxQueuedWaiters, holderIdentity);
@@ -137,7 +138,7 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
                 try
                 {
                     await entry.Semaphore.WaitAsync(linked.Token).ConfigureAwait(false);
-                    acquired = true;
+                    return CreateLeaseFailureAtomic(entry, holderIdentity, settings);
                 }
                 catch (OperationCanceledException) when (!ct.IsCancellationRequested && timeout.IsCancellationRequested)
                 {
@@ -149,9 +150,6 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
                 LeaveWaitQueue(entry);
             }
         }
-
-        if (!acquired)
-            throw CreateAcquisitionTimeout(entry, holderIdentity, settings.AcquisitionTimeout);
 
         return CreateLeaseFailureAtomic(entry, holderIdentity, settings);
     }
@@ -225,14 +223,23 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
         TimeSpan timeout)
     {
         var currentHolder = Volatile.Read(ref entry.Holder)?.Identity;
-        ThreadPool.QueueUserWorkItem(
-            static state =>
-            {
-                var (gate, waiting, holder, elapsed) = ((SqliteDatabaseWriteGate, string, string?, TimeSpan))state!;
-                gate.TryLogAcquisitionTimeout(waiting, holder, elapsed);
-            },
-            (this, waitingHolderIdentity, currentHolder, timeout),
-            preferLocal: false);
+        if (Interlocked.Exchange(ref entry.TimeoutDiagnosticQueued, 1) == 0)
+        {
+            ThreadPool.QueueUserWorkItem<TimeoutDiagnostic>(
+                static state =>
+                {
+                    try
+                    {
+                        state.Gate.TryLogAcquisitionTimeout(state.WaitingHolder, state.CurrentHolder, state.Timeout);
+                    }
+                    finally
+                    {
+                        Volatile.Write(ref state.Entry.TimeoutDiagnosticQueued, 0);
+                    }
+                },
+                new TimeoutDiagnostic(this, entry, waitingHolderIdentity, currentHolder, timeout),
+                preferLocal: false);
+        }
         return new SqliteWriteGateAcquisitionTimeoutException(
             waitingHolderIdentity,
             currentHolder,
@@ -362,8 +369,7 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
             if (Interlocked.Exchange(ref _released, 1) != 0)
                 throw new SynchronizationLockException("The SQLite write gate lease was released more than once.");
 
-            ReportOverlongHoldIfNeeded();
-            _watchdog?.Dispose();
+            Exception? releaseFailure = null;
             var scope = _scope;
             if (scope is not null)
             {
@@ -373,22 +379,47 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
             }
 
             if (!ReferenceEquals(Interlocked.CompareExchange(ref _entry.Holder, null, this), this))
-                throw new SynchronizationLockException("The SQLite write gate holder changed before release.");
-            _entry.Semaphore.Release();
+                releaseFailure = new SynchronizationLockException("The SQLite write gate holder changed before release.");
+            else
+                _entry.Semaphore.Release();
+
+            try
+            {
+                _watchdog?.Dispose();
+            }
+            catch
+            {
+            }
+
+            ReportOverlongHoldIfNeeded();
+            if (releaseFailure is not null)
+                throw releaseFailure;
         }
 
         public void DisposeWithoutRelease()
         {
             Interlocked.Exchange(ref _released, 1);
-            _watchdog?.Dispose();
+            try
+            {
+                _watchdog?.Dispose();
+            }
+            catch
+            {
+            }
         }
 
         private void ReportOverlongHold()
         {
-            if (Volatile.Read(ref _released) != 0 || !ReferenceEquals(Volatile.Read(ref _entry.Holder), this))
-                return;
+            try
+            {
+                if (Volatile.Read(ref _released) != 0 || !ReferenceEquals(Volatile.Read(ref _entry.Holder), this))
+                    return;
 
-            ReportOverlongHoldIfNeeded();
+                ReportOverlongHoldIfNeeded();
+            }
+            catch
+            {
+            }
         }
 
         private void ReportOverlongHoldIfNeeded()
@@ -397,13 +428,26 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
             if (elapsed < _maxHoldDuration || Interlocked.Exchange(ref _overlongReported, 1) != 0)
                 return;
 
-            _logger.LogError(
-                "SQLite write gate holder {HolderIdentity} exceeded the configured maximum hold duration {MaxHoldDuration}; held for {Elapsed}",
-                Identity,
-                _maxHoldDuration,
-                elapsed);
+            try
+            {
+                _logger.LogError(
+                    "SQLite write gate holder {HolderIdentity} exceeded the configured maximum hold duration {MaxHoldDuration}; held for {Elapsed}",
+                    Identity,
+                    _maxHoldDuration,
+                    elapsed);
+            }
+            catch
+            {
+            }
         }
     }
+
+    private sealed record TimeoutDiagnostic(
+        SqliteDatabaseWriteGate Gate,
+        Entry Entry,
+        string WaitingHolder,
+        string? CurrentHolder,
+        TimeSpan Timeout);
 
     private sealed class OwnershipScope(Entry entry, string identity, OwnershipScope? previous)
     {
@@ -423,6 +467,7 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
         public HolderLease? Holder;
         public int RefCount;
         public int WaiterCount;
+        public int TimeoutDiagnosticQueued;
     }
 }
 

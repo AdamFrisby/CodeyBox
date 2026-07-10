@@ -23,7 +23,7 @@ public sealed class SqliteAgentInvolvementStore : IAgentInvolvementStore, IDispo
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _lock = (writeGateFactory ?? SqliteDatabaseWriteGateFactory.Default).ForPath(path);
+        _lock = SqliteDatabaseWriteGateFactory.Resolve(writeGateFactory).ForPath(path);
         _lock.Wait();
         try
         {

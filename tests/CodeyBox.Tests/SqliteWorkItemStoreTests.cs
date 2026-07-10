@@ -321,11 +321,17 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
             now);
 
         using var gate = _store.AcquireConnectionGateForTesting();
+        var independentGet = await RunWithoutHeldGateContext(() => _store.GetAsync(queued.Id))
+            .WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(queued.Id, independentGet!.Id);
+        await RunWithoutHeldGateContext(() => DrainAsync(_store.ListAsync())).WaitAsync(TimeSpan.FromSeconds(5));
+        await RunWithoutHeldGateContext(() => DrainAsync(_store.ListByStateAsync(WorkItemState.Working))).WaitAsync(TimeSpan.FromSeconds(5));
+        await RunWithoutHeldGateContext(() => DrainAsync(_store.ListSuspendedAsync())).WaitAsync(TimeSpan.FromSeconds(5));
+        await RunWithoutHeldGateContext(() => DrainAsync(_store.ListByReplaySourceAsync(source.Id))).WaitAsync(TimeSpan.FromSeconds(5));
+        await RunWithoutHeldGateContext(() => DrainAsync(_store.ListByReleaseAsync(releaseId))).WaitAsync(TimeSpan.FromSeconds(5));
+
         var reads = new Dictionary<string, Task>(StringComparer.Ordinal)
         {
-            ["GetAsync"] = RunWithoutHeldGateContext(() => _store.GetAsync(queued.Id)),
-            ["ListAsync"] = RunWithoutHeldGateContext(() => DrainAsync(_store.ListAsync())),
-            ["ListByStateAsync"] = RunWithoutHeldGateContext(() => DrainAsync(_store.ListByStateAsync(WorkItemState.Working))),
             ["CountByStateAsync"] = RunWithoutHeldGateContext(() => _store.CountByStateAsync(WorkItemState.Queued)),
             ["ListDispatchEligibleByPriorityAsync"] = RunWithoutHeldGateContext(() => DrainAsync(
                 _store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId>()))),
@@ -337,11 +343,8 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
             ["GetFleetStateCountsAsync"] = RunWithoutHeldGateContext(() => _store.GetFleetStateCountsAsync()),
             ["GetFleetRecentOutcomesAsync"] = RunWithoutHeldGateContext(() => _store.GetFleetRecentOutcomesAsync()),
             ["GetFleetPauseStatesAsync"] = RunWithoutHeldGateContext(() => _store.GetFleetPauseStatesAsync()),
-            ["ListSuspendedAsync"] = RunWithoutHeldGateContext(() => DrainAsync(_store.ListSuspendedAsync())),
             ["GetActiveBaselineImageRefsAsync"] = RunWithoutHeldGateContext(() => _store.GetActiveBaselineImageRefsAsync()),
             ["ListWorkItemsForBaselineAsync"] = RunWithoutHeldGateContext(() => _store.ListWorkItemsForBaselineAsync("cb-baseline-gated-read")),
-            ["ListByReplaySourceAsync"] = RunWithoutHeldGateContext(() => DrainAsync(_store.ListByReplaySourceAsync(source.Id))),
-            ["ListByReleaseAsync"] = RunWithoutHeldGateContext(() => DrainAsync(_store.ListByReleaseAsync(releaseId))),
             ["GetIterationsAsync"] = RunWithoutHeldGateContext(() => _store.GetIterationsAsync(working.Id)),
             ["GetAuditProgressAsync"] = RunWithoutHeldGateContext(() => _store.GetAuditProgressAsync(working.Id, attemptStartedAt)),
         };

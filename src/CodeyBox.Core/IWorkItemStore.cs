@@ -282,6 +282,22 @@ public interface IWorkItemStore
 
     Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default);
     IAsyncEnumerable<WorkItem> ListAsync(CancellationToken ct = default);
+    async Task<IReadOnlyList<WorkItem>> ListPageAsync(int offset, int limit, CancellationToken ct = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
+        var page = new List<WorkItem>(limit);
+        var skipped = 0;
+        await foreach (var item in ListAsync(ct).ConfigureAwait(false))
+        {
+            if (skipped++ < offset)
+                continue;
+            page.Add(item);
+            if (page.Count == limit)
+                break;
+        }
+        return page;
+    }
     IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, CancellationToken ct = default);
 
     /// <summary>

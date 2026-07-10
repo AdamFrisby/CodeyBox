@@ -19,7 +19,7 @@ public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _lock = (writeGateFactory ?? SqliteDatabaseWriteGateFactory.Default).ForPath(path);
+        _lock = SqliteDatabaseWriteGateFactory.Resolve(writeGateFactory).ForPath(path);
         _lock.Wait();
         try
         {

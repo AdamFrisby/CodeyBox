@@ -35,7 +35,7 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={dbPath}");
-        _lock = (writeGateFactory ?? SqliteDatabaseWriteGateFactory.Default).ForPath(dbPath);
+        _lock = SqliteDatabaseWriteGateFactory.Resolve(writeGateFactory).ForPath(dbPath);
         _lock.Wait();
         try
         {
