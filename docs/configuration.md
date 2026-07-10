@@ -704,9 +704,53 @@ Rolling file log configuration.
 
 ---
 
+## `Attachments`
+
+Work-item attachment storage and lifecycle configuration. These values are
+hot-reloadable; uploads, blob-root resolution, and cleanup sweeps read the
+current `CodeyBox:Attachments` options at use time.
+
+```json
+"Attachments": {
+  "RootDirectory": "~/.codeybox/attachments",
+  "MaxFileSizeBytes": 104857600,
+  "MaxAttachmentsPerWorkItem": 32,
+  "MaxTotalBytesPerWorkItem": 536870912,
+  "MaxCaptionChars": 2000,
+  "MaxFileNameChars": 255,
+  "MaxContentTypeChars": 255,
+  "MultipartHeadersCountLimit": 256,
+  "MultipartHeadersLengthLimitBytes": 8192,
+  "MaxMultipartErrorMessageChars": 240,
+  "TerminalCleanupTtl": "7.00:00:00",
+  "CleanupSweepInterval": "01:00:00",
+  "OrphanSweepInterval": "06:00:00",
+  "OrphanGracePeriod": "00:10:00"
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `RootDirectory` | `~/.codeybox/attachments` | Host content-addressed blob root. |
+| `MaxFileSizeBytes` | `104857600` | Per-file streaming cap (100 MiB). |
+| `MaxAttachmentsPerWorkItem` | `32` | Max attachments per work item. |
+| `MaxTotalBytesPerWorkItem` | `536870912` | Max total attachment bytes per work item (512 MiB). |
+| `MaxCaptionChars` | `2000` | Max UTF-16 code units for one caption field. |
+| `MaxFileNameChars` | `255` | Max UTF-16 code units for a sanitized display filename. |
+| `MaxContentTypeChars` | `255` | Max characters for a stored multipart file `Content-Type`. |
+| `MultipartHeadersCountLimit` | `256` | Max headers per multipart section. |
+| `MultipartHeadersLengthLimitBytes` | `8192` | Max aggregate header bytes per multipart section. |
+| `MaxMultipartErrorMessageChars` | `240` | Max parser-error text included in 400 responses. |
+| `TerminalCleanupTtl` | `7.00:00:00` | TTL cutoff for non-terminal stale attachment cleanup. Terminal work items are cleaned on the next sweep. |
+| `CleanupSweepInterval` | `01:00:00` | Period between terminal/TTL cleanup sweeps. |
+| `OrphanSweepInterval` | `06:00:00` | Period between orphan-blob sweeps. |
+| `OrphanGracePeriod` | `00:10:00` | Grace window before unreferenced blobs/temp files are removed. |
+
+---
+
 ## `PromptPreprocessing`
 
-Agent prompt preprocessing configuration. CodeyBox ships three built-in
+Agent prompt preprocessing configuration. CodeyBox ships built-in
 preprocessors that run in order before every agent invocation:
 
 1. **`ProjectRulesPromptPreprocessor`** — prepends the project rules file
@@ -714,12 +758,10 @@ preprocessors that run in order before every agent invocation:
    path for house rules across Codex, Claude, Cursor, opencode, and any
    future runner; root-level agent file discovery is a compatibility aid,
    not the enforcement mechanism.
-2. **`AttachmentManifestPromptPreprocessor`** — injects an `## Attachments`
-   manifest listing every blob the attachments foundation has staged into
-   the sandbox for the work item (in-VM path, filename, MIME type, caption).
-   No-op until `IWorkItemAttachmentSource` is wired and the work item carries
-   attachments. The preprocessor never reads files — blob staging is the
-   foundation's responsibility.
+2. **`AttachmentManifestPromptPreprocessor`** — reserved no-op for the future
+   in-VM attachment delivery task. The current attachment foundation exposes
+   files through storage and REST APIs only; it does not place attachment
+   metadata or bytes in tool-bearing agent prompts.
 3. **`CrossAgentHandoffPromptPreprocessor`** — injects a `## Cross-agent
    handoff` brief whenever the current invocation runs under a different
    `AgentKind` than the most recent agent-involvement entry (the orchestrator

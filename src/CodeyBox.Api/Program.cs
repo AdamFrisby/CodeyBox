@@ -979,9 +979,9 @@ builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 builder.Services.AddOptions<AgentPromptPreprocessingOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox:PromptPreprocessing"));
 builder.Services.AddSingleton<IAgentPromptPreprocessor, ProjectRulesPromptPreprocessor>();
-// Attachment-manifest injection: routed through the preprocessor chain so the
-// pipeline never grew a bespoke "inject ATTACHMENTS section" branch. No-op
-// until IWorkItemAttachmentSource is wired by the attachments foundation.
+// Attachment support is API/storage-only in this foundation task. The
+// reserved preprocessor remains no-op until a future in-VM delivery task
+// defines a safe, non-prompt-injection delivery contract.
 builder.Services.AddSingleton<IAgentPromptPreprocessor, AttachmentManifestPromptPreprocessor>();
 // Cross-agent handoff brief injection: fires only when the involvement store
 // shows a prior phase ran under a different AgentKind. Gated end-to-end by
@@ -2409,6 +2409,32 @@ builder.Services.AddSingleton<ISuggestionStore>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteSuggestionStore(opts.StateDatabasePath);
 });
+// --- Work-item attachments ---------------------------------------------------
+// Metadata index lives next to the work-item rows in state.db; blobs live on
+// disk under a content-addressed root (default ~/.codeybox/attachments).
+builder.Services.AddSingleton<SqliteWorkItemAttachmentStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteWorkItemAttachmentStore(opts.StateDatabasePath);
+});
+builder.Services.AddSingleton<IWorkItemAttachmentStore>(sp =>
+    sp.GetRequiredService<SqliteWorkItemAttachmentStore>());
+builder.Services.AddSingleton<HostWorkItemAttachmentBlobStore>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    return new HostWorkItemAttachmentBlobStore(
+        () => AttachmentsOptions.ResolveRoot(monitor.CurrentValue.Attachments.RootDirectory),
+        sp.GetService<ILogger<HostWorkItemAttachmentBlobStore>>());
+});
+builder.Services.AddSingleton<IWorkItemAttachmentBlobStore>(sp =>
+    sp.GetRequiredService<HostWorkItemAttachmentBlobStore>());
+builder.Services.AddSingleton<IWorkItemAttachmentBlobStoreAdmin>(sp =>
+    sp.GetRequiredService<HostWorkItemAttachmentBlobStore>());
+builder.Services.AddHostedService(sp => new AttachmentCleanupService(
+    sp.GetRequiredService<IWorkItemAttachmentStore>(),
+    sp.GetRequiredService<IWorkItemAttachmentBlobStoreAdmin>(),
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Attachments,
+    sp.GetRequiredService<ILogger<AttachmentCleanupService>>()));
 builder.Services.AddSingleton<IWorkItemQuestionStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -3397,6 +3423,7 @@ IdempotencyMiddleware.Use(app);
 WorkItemEndpoints.Map(app);
 TestCaseEndpoints.Map(app);
 E2eRunEndpoints.Map(app);
+WorkItemAttachmentEndpoints.Map(app);
 TaskTemplateEndpoints.Map(app);
 WorkItemTimingsEndpoints.Map(app);
 WorkItemCostsEndpoints.Map(app);
@@ -4628,6 +4655,13 @@ namespace CodeyBox.Api
         /// deployment.
         /// </summary>
         public E2eExecutionOptions E2eExecution { get; set; } = new();
+
+        /// <summary>
+        /// Work-item attachments storage configuration. Hot-reloadable: the
+        /// root directory, limits, and TTL are read on every upload, sweep,
+        /// and orphan scan.
+        /// </summary>
+        public AttachmentsOptions Attachments { get; set; } = new();
     }
 
     /// <summary>
