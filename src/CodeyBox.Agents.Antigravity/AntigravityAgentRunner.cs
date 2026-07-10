@@ -44,6 +44,8 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
     private const long MinStructuredStreamProbeTimeoutSeconds = 1;
     private const long MaxStructuredStreamProbeTimeoutSeconds = 60;
 
+    internal const string StructuredStreamProbePrompt =
+        "Reply with exactly CODEYBOX_STRUCTURED_STREAM_PROBE. Do not inspect or modify files.";
     internal const int StructuredStreamProbeMaxStdoutBytes = 64 * 1024;
     internal const int StructuredStreamProbeMaxStderrBytes = 16 * 1024;
 
@@ -82,12 +84,17 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
     /// invocation. Some agy builds can mention <c>--output-format stream-json</c>
     /// in help text without accepting the flag in <c>--print</c>; only a
     /// successful NDJSON probe enables structured capture. Ambiguous failures
-    /// fall back to plaintext capture.
+    /// fall back to plaintext capture. This method executes agy in the supplied
+    /// sandbox and may materialise Antigravity CLI auth/session state before the
+    /// probe; callers must not treat it as a side-effect-free query.
     /// </summary>
     public async Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default)
     {
         try
         {
+            if (SandboxRejectsFileBackedCredentials(sandbox))
+                return false;
+
             var version = await sandbox.ExecAsync(new SandboxExec
             {
                 Argv = [Binary, "--version"],
@@ -132,7 +139,7 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
             {
                 Argv = BuildStructuredStreamProbeArgv(),
                 WorkingDirectory = "/tmp",
-                Stdin = "Reply with exactly CODEYBOX_STRUCTURED_STREAM_PROBE. Do not inspect or modify files.",
+                Stdin = StructuredStreamProbePrompt,
                 MaxStdoutBytes = StructuredStreamProbeMaxStdoutBytes,
                 MaxStderrBytes = StructuredStreamProbeMaxStderrBytes,
             }, ct).ConfigureAwait(false);
@@ -210,6 +217,9 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         Action<string>? stdoutChunkCallback = null,
         bool captureStructuredStream = false)
     {
+        if (RejectUnsupportedFileBackedCredentials(sandbox, credential) is { } unsupported)
+            return unsupported;
+
         var structuredStreamSupported = !captureStructuredStream
             || await SupportsStructuredStreamAsync(sandbox, ct).ConfigureAwait(false);
         var effectiveCaptureStructuredStream = captureStructuredStream && structuredStreamSupported;
@@ -233,7 +243,7 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         if (!captureStructuredStream || structuredStreamSupported)
             return result;
 
-        var warning = $"Warning: Antigravity CLI at '{Binary}' does not support {StructuredStreamOutputFormatFlag} {StructuredStreamOutputFormatValue} in --print mode; structured stream capture was disabled.";
+        var warning = $"Warning: Antigravity CLI at '{Binary}' could not verify {StructuredStreamOutputFormatFlag} {StructuredStreamOutputFormatValue} support in --print mode; structured stream capture was disabled.";
         var stderr = string.IsNullOrEmpty(result.Stderr) ? warning : $"{warning}\n{result.Stderr}";
         return result with { Stderr = stderr };
     }
@@ -564,7 +574,7 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         // agy --print --dangerously-skip-permissions [...]: one-shot prompt
         // that auto-approves tool calls. The sandbox boundary is the real
         // permission boundary — same shape we use for Claude.
-        var argv = new List<string> { Binary, "--print", "--dangerously-skip-permissions" };
+        var argv = BuildAgyPrintModePrefix();
 
         if (_currentLogPath.Value is { } logPath)
         {
@@ -624,7 +634,7 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
 
     private IReadOnlyList<string> BuildStructuredStreamProbeArgv()
     {
-        var argv = new List<string> { Binary, "--print", "--dangerously-skip-permissions" };
+        var argv = BuildAgyPrintModePrefix();
         if (PrintTimeout > TimeSpan.Zero)
         {
             var probeTimeoutSeconds = Math.Clamp(
@@ -639,6 +649,9 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         argv.Add(StructuredStreamOutputFormatValue);
         return argv;
     }
+
+    private List<string> BuildAgyPrintModePrefix() =>
+        [Binary, "--print", "--dangerously-skip-permissions"];
 
     private async Task<bool> TryMaterialiseAuthForProbeAsync(ISandbox sandbox, CancellationToken ct)
     {
@@ -682,8 +695,7 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
                 if (root.ValueKind != JsonValueKind.Object)
                     return false;
 
-                sawStructuredEvent |= AgentStreamEventShapes.IsClaudeStreamJsonEvent(root)
-                    || AgentStreamEventShapes.IsGeminiStreamJsonEvent(root);
+                sawStructuredEvent |= AntigravityStreamParser.IsStructuredStreamJsonEvent(root);
             }
             catch (JsonException)
             {
@@ -695,7 +707,7 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
     }
 
     private static bool ProbeExecSucceeded(SandboxExecResult result) =>
-        result.Success && !result.OutputLimitExceeded;
+        result.Success;
 
     private static bool TryBuildStructuredStreamCacheKey(
         string binary,

@@ -17,5 +17,16 @@ public sealed class ClaudeStreamParser : FlexibleAgentStreamParser
     /// the orchestrator's sniffer free of Claude-specific vocabulary.
     /// </summary>
     public override bool TryClaim(JsonElement line) =>
-        AgentStreamEventShapes.IsClaudeStreamJsonEvent(line);
+        IsClaudeStreamJsonEvent(line);
+
+    internal static bool IsClaudeStreamJsonEvent(JsonElement line)
+    {
+        if (line.ValueKind != JsonValueKind.Object) return false;
+        if (!line.TryGetProperty("type", out var typeProp)
+            || typeProp.ValueKind != JsonValueKind.String)
+            return false;
+
+        var type = typeProp.GetString();
+        return type is "assistant" or "user" or "result" or "tool_use" or "tool_result";
+    }
 }

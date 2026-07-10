@@ -46,7 +46,10 @@ public interface IAgentRunner
 
 /// <summary>
 /// Optional runner capability for CLIs that can emit structured stdout
-/// streams suitable for persistent capture.
+/// streams suitable for persistent capture. Implementations may verify this by
+/// executing provider CLI probes inside the supplied sandbox, and those probes
+/// can create provider-specific auth/session state; callers must treat this as
+/// a command with sandbox side effects rather than a pure metadata query.
 /// </summary>
 public interface IStructuredStreamAgentRunner : IAgentRunner
 {

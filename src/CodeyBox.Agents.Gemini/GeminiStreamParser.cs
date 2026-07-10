@@ -15,11 +15,18 @@ public sealed class GeminiStreamParser : FlexibleAgentStreamParser
     /// Gemini CLI emits payloads carrying the GenAI response shape: usage
     /// metadata under <c>usageMetadata</c>/<c>usage_metadata</c>, generation
     /// branches under <c>candidates</c>, and tool invocations under
-    /// <c>functionCall</c>/<c>function_call</c>. Owning this recognition here
-    /// keeps the orchestrator's sniffer free of Gemini-specific vocabulary.
+    /// <c>functionCall</c>/<c>function_call</c> and
+    /// <c>toolCall</c>/<c>tool_call</c>. Owning this recognition here keeps
+    /// the orchestrator's sniffer free of Gemini-specific vocabulary.
     /// </summary>
     public override bool TryClaim(JsonElement line) =>
-        AgentStreamEventShapes.IsGeminiStreamJsonEvent(line);
+        IsGeminiStreamJsonEvent(line);
+
+    internal static bool IsGeminiStreamJsonEvent(JsonElement line)
+    {
+        if (line.ValueKind != JsonValueKind.Object) return false;
+        return TryGet(line, out _, "usageMetadata", "usage_metadata", "candidates", "functionCall", "function_call", "toolCall", "tool_call");
+    }
 
     protected override ParsedEvent ParseEvent(JsonElement root)
     {

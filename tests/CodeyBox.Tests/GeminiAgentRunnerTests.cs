@@ -782,8 +782,9 @@ public sealed class GeminiAgentRunnerTests
 }
 
 /// <summary>
-/// Fake sandbox that records the most recent <see cref="SandboxExec"/> it
-/// received and returns configurable exit code, stdout, and stderr.
+/// Fake sandbox that records every <see cref="SandboxExec"/>, exposes the most
+/// recent one, and can return canned version/help/structured-probe responses
+/// before falling back to configurable exit code, stdout, stderr, and chunks.
 /// </summary>
 internal sealed class CapturingSandbox : ISandbox
 {

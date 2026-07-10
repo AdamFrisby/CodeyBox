@@ -274,6 +274,20 @@ public sealed class AgentRunnerStructuredStreamFlagTests
         Assert.True(await runner.SupportsStructuredStreamAsync(secondSandbox));
         Assert.Single(secondSandbox.Execs);
         Assert.Equal(["agy", "--version"], secondSandbox.Execs[0].Argv);
+
+        var thirdSandbox = new CapturingSandbox
+        {
+            VersionOutput = "agy version cached-unsupported",
+            HelpOutput = "Usage: agy --output-format stream-json",
+            StructuredProbeOutput = """
+                Available subcommands:
+                  install   Configure environment paths and shell settings
+                """,
+        };
+
+        Assert.False(await runner.SupportsStructuredStreamAsync(thirdSandbox));
+        Assert.Contains(thirdSandbox.Execs, e => e.Argv.Contains("--help"));
+        Assert.Contains(thirdSandbox.Execs, e => e.Argv.Contains("--output-format") && e.Argv.Contains("stream-json"));
     }
 
     [Fact]
