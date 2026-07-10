@@ -20,11 +20,16 @@ namespace CodeyBox.Audit.Shell;
 /// opt into additional sandbox capabilities for tool-specific needs such as
 /// package-registry network access; do not request agent credentials for
 /// repository-controlled commands unless that exposure is intentional.
+///
+/// <para>Every invocation receives <c>CODEYBOX_AUDIT_TARGET</c>. Plan-target
+/// invocations additionally receive <c>CODEYBOX_PLAN_ARTIFACT_PATH</c>, which
+/// names an invocation-specific read-only-by-contract JSON snapshot, and
+/// <c>CODEYBOX_WORK_ITEM_ID</c>. The snapshot exists only for the command's
+/// duration and is removed before <see cref="RunAsync"/> returns. Code-target
+/// invocations do not receive the artifact-path variable.</para>
 /// </summary>
 public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
 {
-    private const string PlanArtifactPath = "/tmp/codeybox-plan-artifact.json";
-
     private readonly ShellCommandAuditorOptions _opts;
 
     public ShellCommandAuditor(ShellCommandAuditorOptions opts)
@@ -81,6 +86,24 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
             ExtraEnvironment = extraEnvironment.Environment,
         }, ct);
 
+        if (extraEnvironment.Environment.TryGetValue("CODEYBOX_PLAN_ARTIFACT_PATH", out var planArtifactPath))
+        {
+            var cleanup = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["rm", "-f", "--", planArtifactPath],
+                WorkingDirectory = workingDirectory,
+            }, ct);
+            if (!cleanup.Success)
+            {
+                return new AuditResult(false, [new AuditFinding(
+                    Name,
+                    AuditSeverity.Error,
+                    "failed to clean up plan artifact",
+                    DescriptionOutput(cleanup).TrimEnd())],
+                    RawOutput: CombinedOutput(cleanup));
+            }
+        }
+
         var combinedOutput = CombinedOutput(result);
 
         if (result.ExitCode == 0 && !result.ExecutionUnavailable)
@@ -111,6 +134,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         var environment = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["CODEYBOX_AUDIT_TARGET"] = context.EffectiveTarget.Value,
+            ["CODEYBOX_WORK_ITEM_ID"] = context.WorkItemId.ToString(),
         };
 
         if (context.EffectiveTarget != AuditTarget.Plan)
@@ -125,9 +149,10 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
                 "The plan-review context carried no PLAN artifact.")]));
         }
 
+        var planArtifactPath = $"/tmp/codeybox-plan-artifact-{context.WorkItemId}-{context.Iteration}.json";
         var write = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["sh", "-c", "cat > \"$1\"", "sh", PlanArtifactPath],
+            Argv = ["sh", "-c", "umask 077; rm -f -- \"$1\"; cat > \"$1\"; chmod 400 \"$1\"", "sh", planArtifactPath],
             WorkingDirectory = workingDirectory,
             Stdin = context.PlanArtifact,
         }, ct);
@@ -142,7 +167,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
                 RawOutput: CombinedOutput(write)));
         }
 
-        environment["CODEYBOX_PLAN_ARTIFACT_PATH"] = PlanArtifactPath;
+        environment["CODEYBOX_PLAN_ARTIFACT_PATH"] = planArtifactPath;
         return (environment, null);
     }
 
@@ -231,6 +256,13 @@ public sealed record ShellCommandAuditorOptions
     public IAuditResultClassifier? ResultClassifier { get; init; }
     public AuditCapabilities Required { get; init; } = AuditCapabilities.None;
     public AuditSeverity? MissingToolSeverity { get; init; }
+    /// <summary>
+    /// Review targets for this command. Empty configuration is materialised as
+    /// Code-only by composers. Plan commands read their artifact through
+    /// <c>CODEYBOX_PLAN_ARTIFACT_PATH</c>; the path is unique per work item and
+    /// review iteration, is removed after the command, and is absent for Code
+    /// runs.
+    /// </summary>
     public IReadOnlySet<AuditTarget> Targets { get; init; } = AuditTargets.CodeOnly;
     public bool CanShortCircuitOnBlockingFinding { get; init; }
     public AuditorRole Role { get; init; } = AuditorRole.None;

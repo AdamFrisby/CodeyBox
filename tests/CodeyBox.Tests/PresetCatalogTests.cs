@@ -698,6 +698,85 @@ public sealed class PresetCatalogTests
     }
 
     [Fact]
+    public void RepositoryAuditTypeAdditions_RemainCodeOnlyWhenBuiltInTargetsPlan()
+    {
+        using var temp = TempProject();
+        Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "audit-types"));
+        File.WriteAllText(Path.Combine(temp.Path, "codeybox", "audit-types", "architecture.yaml"), """
+            id: architecture
+            auditors:
+              - name: architecture:repo-check
+                argv: ["dotnet", "--info"]
+            patterns:
+              - regex: "REPO_ONLY_PATTERN"
+                description: "repository-only pattern"
+            """);
+
+        var auditors = new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path })
+            .ResolveAuditType("architecture", new PresetContext(new FakeAgent()));
+
+        var repoShell = Assert.Single(auditors, auditor => auditor.Name == "architecture:repo-check");
+        var repoPatterns = Assert.Single(auditors, auditor => auditor.Name == "architecture:repository-patterns");
+        Assert.Equal(AuditTargets.CodeOnly, repoShell.Targets);
+        Assert.Equal(AuditTargets.CodeOnly, repoPatterns.Targets);
+        Assert.Contains(auditors, auditor =>
+            auditor.Name == "architecture:llm-review" && auditor.Targets.Contains(AuditTarget.Plan));
+    }
+
+    [Fact]
+    public void RepositoryAuditTypeAdditions_RejectExcessiveAuditorCount()
+    {
+        using var temp = TempProject();
+        Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "audit-types"));
+        var auditors = string.Join('\n', Enumerable.Range(1, 17).Select(index =>
+            $"  - name: architecture:repo-{index}\n    argv: [\"dotnet\", \"--info\"]"));
+        File.WriteAllText(
+            Path.Combine(temp.Path, "codeybox", "audit-types", "architecture.yaml"),
+            $"id: architecture\nauditors:\n{auditors}\n");
+
+        var ex = Assert.Throws<PresetConfigurationException>(() =>
+            new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
+
+        Assert.Contains("/auditors exceeds the repository limit", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RepositoryAuditTypeAdditions_RejectOversizedPresetBeforeParsing()
+    {
+        using var temp = TempProject();
+        Directory.CreateDirectory(Path.Combine(temp.Path, "codeybox", "audit-types"));
+        File.WriteAllText(
+            Path.Combine(temp.Path, "codeybox", "audit-types", "architecture.yaml"),
+            "id: architecture\n# " + new string('x', 300 * 1024));
+
+        var ex = Assert.Throws<PresetConfigurationException>(() =>
+            new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
+
+        Assert.Contains("preset exceeds the 262144-byte limit", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RepositoryAuditTypeAdditions_RejectTotalPhaseWorkAboveCap()
+    {
+        using var temp = TempProject();
+        var directory = Path.Combine(temp.Path, "codeybox", "audit-types");
+        Directory.CreateDirectory(directory);
+        for (var fileIndex = 0; fileIndex < 3; fileIndex++)
+        {
+            var patterns = string.Join('\n', Enumerable.Range(0, 50).Select(patternIndex =>
+                $"  - regex: \"P{fileIndex}_{patternIndex}\"\n    description: \"pattern {fileIndex}_{patternIndex}\""));
+            File.WriteAllText(
+                Path.Combine(directory, $"repo-{fileIndex}.yaml"),
+                $"id: repo-{fileIndex}\npatterns:\n{patterns}\n");
+        }
+
+        var ex = Assert.Throws<PresetConfigurationException>(() =>
+            new PresetCatalog(new PresetCatalogOptions { ProjectRoot = temp.Path }));
+
+        Assert.Contains("exceeds the total 128-entry work limit", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void UserOverride_AdditiveAuditors_AppendsInOrder()
     {
         using var temp = TempProject();

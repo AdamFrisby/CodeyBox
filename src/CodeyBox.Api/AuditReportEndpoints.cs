@@ -13,7 +13,7 @@ internal static class AuditReportEndpoints
 
     /// <summary>
     /// GET /workitems/{id}/audit-reports
-    /// Returns all stored auditor reports for a work item, grouped by iteration.
+    /// Returns all stored auditor reports for a work item, grouped by target and iteration.
     /// findings are included inline; raw_output is omitted (fetch separately via /raw).
     /// </summary>
     private static async Task<IResult> GetAuditReportsAsync(

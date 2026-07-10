@@ -3,6 +3,7 @@ using System.Collections;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using System.Text;
 using CodeyBox.Audit.Llm;
 using CodeyBox.Audit.Presets.Presets;
 using CodeyBox.Audit.Shell;
@@ -18,6 +19,11 @@ internal sealed class PresetConfigLoader
 {
     private const string ResourcePrefix = "CodeyBox.Audit.Presets.Defaults.";
     private const string UnrunnableTestsRule = "Tests which cannot be run in this environment are not part of the scoring or auditing criteria.";
+    private const int MaxRepositoryAuditTypeFiles = 64;
+    private const int MaxRepositoryPresetBytes = 256 * 1024;
+    private const int MaxRepositoryAuditorsPerFile = 16;
+    private const int MaxRepositoryPatternsPerFile = 64;
+    private const int MaxRepositoryAuditEntries = 128;
     private static readonly IReadOnlySet<string> AuditTypesWithUnrunnableTestsRule =
         new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -57,10 +63,16 @@ internal sealed class PresetConfigLoader
         var frame = LoadEmbeddedFrame(assembly);
         var planFrame = LoadEmbeddedPlanFrame(assembly);
 
+        var repositoryAuditTypeFiles = 0;
+        var repositoryAuditEntries = 0;
         foreach (var projectRoot in ProjectRoots(options))
         {
             LoadUserLanguageFiles(projectRoot, languages);
-            LoadUserAuditTypeFiles(projectRoot, auditTypes);
+            LoadUserAuditTypeFiles(
+                projectRoot,
+                auditTypes,
+                ref repositoryAuditTypeFiles,
+                ref repositoryAuditEntries);
         }
 
         ApplyProjectConfigOverrides(options, languages, auditTypes, ref frame, ref planFrame);
@@ -113,7 +125,7 @@ internal sealed class PresetConfigLoader
     {
         foreach (var file in PresetFiles(projectRoot, "languages"))
         {
-            var definition = ReadYamlFile<LanguagePresetDefinition>(file, "language");
+            var definition = ReadYamlFile<LanguagePresetDefinition>(file, "language", MaxRepositoryPresetBytes);
             if (definition.Marker?.Script != null)
                 throw new PresetConfigurationException($"{file}: /marker/script is not allowed in repository-provided configuration for security reasons. Use /marker/globs instead.");
 
@@ -122,11 +134,22 @@ internal sealed class PresetConfigLoader
         }
     }
 
-    private static void LoadUserAuditTypeFiles(string? projectRoot, Dictionary<string, AuditTypePresetDefinition> auditTypes)
+    private static void LoadUserAuditTypeFiles(
+        string? projectRoot,
+        Dictionary<string, AuditTypePresetDefinition> auditTypes,
+        ref int repositoryFileCount,
+        ref int repositoryEntryCount)
     {
         foreach (var file in PresetFiles(projectRoot, "audit-types"))
         {
-            var definition = ReadYamlFile<AuditTypePresetDefinition>(file, "audit-type");
+            repositoryFileCount++;
+            if (repositoryFileCount > MaxRepositoryAuditTypeFiles)
+            {
+                throw new PresetConfigurationException(
+                    $"Repository audit-type configuration exceeds the {MaxRepositoryAuditTypeFiles}-file limit.");
+            }
+
+            var definition = ReadYamlFile<AuditTypePresetDefinition>(file, "audit-type", MaxRepositoryPresetBytes);
             if (!string.IsNullOrWhiteSpace(definition.LlmAuditorName))
                 throw new PresetConfigurationException($"{file}: /llmAuditorName is not allowed in repository-provided configuration for security reasons.");
             if (!string.IsNullOrWhiteSpace(definition.ReviewFocus))
@@ -135,6 +158,23 @@ internal sealed class PresetConfigLoader
                 throw new PresetConfigurationException($"{file}: /planReviewFocus is not allowed in repository-provided configuration for security reasons.");
             if (definition.Targets.Count > 0)
                 throw new PresetConfigurationException($"{file}: /targets is not allowed in repository-provided configuration for security reasons.");
+            if (definition.Auditors.Count > MaxRepositoryAuditorsPerFile)
+            {
+                throw new PresetConfigurationException(
+                    $"{file}: /auditors exceeds the repository limit of {MaxRepositoryAuditorsPerFile}.");
+            }
+            if (definition.Patterns.Count > MaxRepositoryPatternsPerFile)
+            {
+                throw new PresetConfigurationException(
+                    $"{file}: /patterns exceeds the repository limit of {MaxRepositoryPatternsPerFile}.");
+            }
+
+            repositoryEntryCount = checked(repositoryEntryCount + definition.Auditors.Count + definition.Patterns.Count);
+            if (repositoryEntryCount > MaxRepositoryAuditEntries)
+            {
+                throw new PresetConfigurationException(
+                    $"Repository audit-type configuration exceeds the total {MaxRepositoryAuditEntries}-entry work limit.");
+            }
 
             ValidateAuditType(file, definition, isTrusted: false);
             ComposeAuditType(auditTypes, definition, isTrusted: false);
@@ -223,6 +263,14 @@ internal sealed class PresetConfigLoader
         AuditTypePresetDefinition incoming,
         bool isTrusted)
     {
+        if (!isTrusted)
+        {
+            incoming.CodeOnlyAuditors.AddRange(incoming.Auditors);
+            incoming.CodeOnlyPatterns.AddRange(incoming.Patterns);
+            incoming.Auditors = [];
+            incoming.Patterns = [];
+        }
+
         var shouldReplace = incoming.Replace && isTrusted;
         if (!auditTypes.TryGetValue(incoming.Id, out var existing) || shouldReplace)
         {
@@ -243,6 +291,8 @@ internal sealed class PresetConfigLoader
 
         existing.Auditors.AddRange(incoming.Auditors);
         existing.Patterns.AddRange(incoming.Patterns);
+        existing.CodeOnlyAuditors.AddRange(incoming.CodeOnlyAuditors);
+        existing.CodeOnlyPatterns.AddRange(incoming.CodeOnlyPatterns);
     }
 
     private static void ApplyMandatoryReviewFocusRules(Dictionary<string, AuditTypePresetDefinition> auditTypes)
@@ -339,8 +389,45 @@ internal sealed class PresetConfigLoader
         return ReadYamlText<T>(reader.ReadToEnd(), resourceName, schemaName);
     }
 
-    private static T ReadYamlFile<T>(string path, string schemaName)
-        => ReadYamlText<T>(File.ReadAllText(path), path, schemaName);
+    private static T ReadYamlFile<T>(string path, string schemaName, int maxBytes)
+    {
+        using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            bufferSize: 4096,
+            FileOptions.SequentialScan);
+        if (stream.Length > maxBytes)
+            throw new PresetConfigurationException($"{path}: preset exceeds the {maxBytes}-byte limit.");
+
+        var bytes = new byte[maxBytes + 1];
+        var totalRead = 0;
+        while (totalRead < bytes.Length)
+        {
+            var read = stream.Read(bytes, totalRead, bytes.Length - totalRead);
+            if (read == 0)
+                break;
+            totalRead += read;
+        }
+        if (totalRead > maxBytes)
+            throw new PresetConfigurationException($"{path}: preset exceeds the {maxBytes}-byte limit.");
+
+        var content = bytes.AsSpan(0, totalRead);
+        if (content.Length >= 3
+            && content[0] == 0xEF
+            && content[1] == 0xBB
+            && content[2] == 0xBF)
+            content = content[3..];
+        try
+        {
+            return ReadYamlText<T>(new UTF8Encoding(false, true).GetString(content), path, schemaName);
+        }
+        catch (DecoderFallbackException ex)
+        {
+            throw new PresetConfigurationException($"{path}: preset is not valid UTF-8.", ex);
+        }
+    }
 
     private static T ReadYamlText<T>(string yaml, string source, string schemaName)
     {
@@ -842,6 +929,12 @@ internal sealed class AuditTypePresetDefinition
     public bool Replace { get; set; }
     public List<AuditorDefinition> Auditors { get; set; } = [];
     public List<DiffPatternDefinition> Patterns { get; set; } = [];
+
+    // Repository-provided additions retain their untrusted origin here so a
+    // trusted built-in or operator override cannot make them inherit Plan.
+    // They are always materialised with AuditTargets.CodeOnly.
+    public List<AuditorDefinition> CodeOnlyAuditors { get; } = [];
+    public List<DiffPatternDefinition> CodeOnlyPatterns { get; } = [];
 }
 
 internal sealed class DiffPatternDefinition

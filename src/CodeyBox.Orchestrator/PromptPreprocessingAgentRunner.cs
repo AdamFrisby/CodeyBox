@@ -145,7 +145,7 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
         ISandbox? sandbox = null,
         string? workingDirectory = null)
     {
-        if (sandbox is not null)
+        if (sandbox is not null && Phase != AgentPromptPhase.PlanReview)
         {
             var resolvedWorkingDirectory = string.IsNullOrWhiteSpace(workingDirectory)
                 ? SandboxConventions.WorkDir

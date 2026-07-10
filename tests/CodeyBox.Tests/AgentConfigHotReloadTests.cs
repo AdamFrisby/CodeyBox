@@ -1872,6 +1872,7 @@ public sealed class AgentConfigHotReloadTests
                 QuotaExhaustionFallbackTtl = TimeSpan.FromHours(1),
                 MaxParsedQuotaResetWindow = TimeSpan.FromHours(24),
                 MergeSandboxStagingRestoreAttempts = 2,
+                MaxPlanReviewIterations = 2,
             },
         };
         var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
@@ -1882,6 +1883,7 @@ public sealed class AgentConfigHotReloadTests
                 QuotaExhaustionFallbackTtl = initial.PipelineTuning.QuotaExhaustionFallbackTtl,
                 MaxParsedQuotaResetWindow = initial.PipelineTuning.MaxParsedQuotaResetWindow,
                 MergeSandboxStagingRestoreAttempts = initial.PipelineTuning.MergeSandboxStagingRestoreAttempts,
+                MaxPlanReviewIterations = initial.PipelineTuning.MaxPlanReviewIterations,
             });
 
         var router = new AgentClassRouter(
@@ -1902,6 +1904,7 @@ public sealed class AgentConfigHotReloadTests
 
         Assert.Equal(TimeSpan.FromMinutes(5), snapshot.Current.DefaultQuotaFailurePause);
         Assert.Equal(2, snapshot.Current.MergeSandboxStagingRestoreAttempts);
+        Assert.Equal(2, snapshot.Current.MaxPlanReviewIterations);
 
         // Hot-reload: shorten the quota pause and bump retry attempts.
         monitor.Fire(new CodeyBoxOptions
@@ -1910,10 +1913,12 @@ public sealed class AgentConfigHotReloadTests
             {
                 DefaultQuotaFailurePause = TimeSpan.FromMinutes(1),
                 MergeSandboxStagingRestoreAttempts = 3,
+                MaxPlanReviewIterations = 4,
             },
         });
         Assert.Equal(TimeSpan.FromMinutes(1), snapshot.Current.DefaultQuotaFailurePause);
         Assert.Equal(3, snapshot.Current.MergeSandboxStagingRestoreAttempts);
+        Assert.Equal(4, snapshot.Current.MaxPlanReviewIterations);
 
         // Same-value fire should be a no-op.
         monitor.Fire(new CodeyBoxOptions
@@ -1922,6 +1927,7 @@ public sealed class AgentConfigHotReloadTests
             {
                 DefaultQuotaFailurePause = TimeSpan.FromMinutes(1),
                 MergeSandboxStagingRestoreAttempts = 3,
+                MaxPlanReviewIterations = 4,
             },
         });
         Assert.Equal(3, snapshot.Current.MergeSandboxStagingRestoreAttempts);

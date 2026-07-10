@@ -9,6 +9,14 @@ namespace CodeyBox.Orchestrator;
 public sealed class PipelineTuningOptions
 {
     /// <summary>
+    /// Maximum PLAN-review attempts for one planning lifecycle. The pipeline
+    /// snapshots this hot-reloadable value when a review lifecycle starts, so
+    /// an in-flight loop has a stable cap while the next lifecycle observes a
+    /// configuration edit.
+    /// </summary>
+    public int MaxPlanReviewIterations { get; set; } = PlanReviewIterationLimit.DefaultValue;
+
+    /// <summary>
     /// Last-resort pause applied when a quota-shaped terminal failure occurs and
     /// neither the agent output nor quota probes expose a reset window.
     /// Default 5 minutes.
@@ -171,6 +179,7 @@ public sealed class PipelineTuningOptions
 
     public void Validate()
     {
+        _ = PlanReviewIterationLimit.Create(MaxPlanReviewIterations);
         if (MaxSandboxReuses < 1)
         {
             throw new ArgumentOutOfRangeException(nameof(MaxSandboxReuses), "MaxSandboxReuses must be >= 1");
@@ -198,6 +207,46 @@ public sealed class PipelineTuningOptions
         {
             throw new ArgumentOutOfRangeException(nameof(CSharpTestPassBlameHangTimeout), "CSharpTestPassBlameHangTimeout must be positive when set");
         }
+    }
+}
+
+/// <summary>
+/// Validated PLAN-review iteration cap. Configuration validation and the
+/// orchestration loop share this value object so zero cannot acquire a second,
+/// silently-clamped meaning inside the loop.
+/// </summary>
+public readonly record struct PlanReviewIterationLimit
+{
+    public const int MinimumValue = 1;
+    public const int DefaultValue = 3;
+
+    private PlanReviewIterationLimit(int value) => Value = value;
+
+    public int Value { get; }
+
+    public static bool TryCreate(int value, out PlanReviewIterationLimit limit)
+    {
+        if (value < MinimumValue)
+        {
+            limit = default;
+            return false;
+        }
+
+        limit = new PlanReviewIterationLimit(value);
+        return true;
+    }
+
+    public static PlanReviewIterationLimit Create(int value)
+    {
+        if (!TryCreate(value, out var limit))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(value),
+                value,
+                $"MaxPlanReviewIterations must be >= {MinimumValue}");
+        }
+
+        return limit;
     }
 }
 

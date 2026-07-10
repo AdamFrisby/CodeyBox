@@ -11,18 +11,22 @@ public sealed record PlanReviewDecision(
 
 /// <summary>
 /// Structured, bounded feedback that may be shown to a later planning-agent
-/// turn. It intentionally contains no model-authored prose: reviewer titles,
-/// descriptions, locations, and raw output remain diagnostic data and must not
-/// cross into a tool-enabled planning prompt.
+/// turn. <see cref="BlockingIssueCount"/> is the total blocker count while
+/// <see cref="Issues"/> is a bounded sample. Each prose field is length-capped
+/// and JSON-encoded at the prompt boundary; raw reviewer output is never
+/// forwarded.
 /// </summary>
 public sealed record PlanReviewFeedback(
     int BlockingIssueCount,
     IReadOnlyList<PlanReviewFeedbackIssue> Issues);
 
 public sealed record PlanReviewFeedbackIssue(
-    string Severity,
+    AuditSeverity Severity,
     string Category,
-    string FindingId);
+    string FindingId,
+    string? Title,
+    string? Description,
+    string? Location);
 
 public sealed record PlanArtifactDocument(
     string Approach,

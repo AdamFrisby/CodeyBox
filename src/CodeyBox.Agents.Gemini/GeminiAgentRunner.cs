@@ -16,6 +16,8 @@ namespace CodeyBox.Agents.Gemini;
 public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, ITextOnlyAgentRunner
 {
     private static readonly HttpClient SharedTextOnlyHttp = new();
+    private const string DefaultTextOnlyModel = "gemini-2.5-pro";
+    private const int TextOnlyMaxOutputTokens = 8192;
 
     private readonly HttpClient _textOnlyHttp;
 
@@ -251,21 +253,8 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     {
         try
         {
-            var effectiveModel = string.IsNullOrWhiteSpace(modelId) ? "gemini-2.5-pro" : modelId;
-            var requestBody = new Dictionary<string, object?>
-            {
-                ["contents"] = new[]
-                {
-                    new
-                    {
-                        role = "user",
-                        parts = new[] { new { text = userPrompt } },
-                    },
-                },
-                ["generationConfig"] = new { maxOutputTokens = 8192 },
-            };
-            if (systemPrompt is not null)
-                requestBody["systemInstruction"] = new { parts = new[] { new { text = systemPrompt } } };
+            var effectiveModel = string.IsNullOrWhiteSpace(modelId) ? DefaultTextOnlyModel : modelId;
+            var requestBody = BuildGenerateContentRequest(systemPrompt, userPrompt);
             var body = JsonSerializer.Serialize(requestBody);
             var endpoint = $"https://generativelanguage.googleapis.com/v1beta/models/{Uri.EscapeDataString(effectiveModel)}:generateContent";
             using var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
@@ -274,8 +263,10 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             };
             request.Headers.Add("x-goog-api-key", apiKey);
 
-            using var response = await http.SendAsync(request, ct).ConfigureAwait(false);
-            var responseText = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            var response = await BoundedHttpResponseReader.SendAsync(http, request, ct: ct).ConfigureAwait(false);
+            if (response.BodyTooLarge)
+                return new TextOnlyAgentResult(false, "Gemini text-only call failed: response too large", null, "Response size exceeded 256 KiB limit.");
+            var responseText = response.Body ?? string.Empty;
             if (!response.IsSuccessStatusCode)
                 return new TextOnlyAgentResult(false, $"Gemini text-only call failed: HTTP {(int)response.StatusCode}", null, responseText);
 
@@ -297,23 +288,10 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     {
         try
         {
-            var effectiveModel = string.IsNullOrWhiteSpace(modelId) ? "gemini-2.5-pro" : modelId;
+            var effectiveModel = string.IsNullOrWhiteSpace(modelId) ? DefaultTextOnlyModel : modelId;
             // Code Assist wraps the GenerateContent body in {model, request}
             // (see GeminiQuotaProbe.ProbeOneAsync for the canonical shape).
-            var generateContentRequest = new Dictionary<string, object?>
-            {
-                ["contents"] = new[]
-                {
-                    new
-                    {
-                        role = "user",
-                        parts = new[] { new { text = userPrompt } },
-                    },
-                },
-                ["generationConfig"] = new { maxOutputTokens = 8192 },
-            };
-            if (systemPrompt is not null)
-                generateContentRequest["systemInstruction"] = new { parts = new[] { new { text = systemPrompt } } };
+            var generateContentRequest = BuildGenerateContentRequest(systemPrompt, userPrompt);
             var body = JsonSerializer.Serialize(new Dictionary<string, object?>
             {
                 ["model"] = $"models/{effectiveModel}",
@@ -325,8 +303,10 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             };
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
 
-            using var response = await http.SendAsync(request, ct).ConfigureAwait(false);
-            var responseText = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            var response = await BoundedHttpResponseReader.SendAsync(http, request, ct: ct).ConfigureAwait(false);
+            if (response.BodyTooLarge)
+                return new TextOnlyAgentResult(false, "Gemini text-only call failed: response too large", null, "Response size exceeded 256 KiB limit.");
+            var responseText = response.Body ?? string.Empty;
             if (!response.IsSuccessStatusCode)
                 return new TextOnlyAgentResult(false, $"Gemini text-only call failed: HTTP {(int)response.StatusCode}", null, responseText);
 
@@ -336,6 +316,27 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         {
             return new TextOnlyAgentResult(false, "Gemini text-only call failed", null, ex.Message);
         }
+    }
+
+    private static Dictionary<string, object?> BuildGenerateContentRequest(
+        string? systemPrompt,
+        string userPrompt)
+    {
+        var request = new Dictionary<string, object?>
+        {
+            ["contents"] = new[]
+            {
+                new
+                {
+                    role = "user",
+                    parts = new[] { new { text = userPrompt } },
+                },
+            },
+            ["generationConfig"] = new { maxOutputTokens = TextOnlyMaxOutputTokens },
+        };
+        if (systemPrompt is not null)
+            request["systemInstruction"] = new { parts = new[] { new { text = systemPrompt } } };
+        return request;
     }
 
     private static bool TryGetApiKey(AgentCredential? credential, out string apiKey)

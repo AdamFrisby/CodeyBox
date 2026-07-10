@@ -6,6 +6,8 @@ namespace CodeyBox.Core;
 /// Identifies WHAT an auditor reviews. Treated as an opaque string so new
 /// review targets can be added later without recompiling consumers — the same
 /// extensibility ethos as <see cref="AgentKind"/> and the knob framework.
+/// Construction trims whitespace and canonicalises to lower-case invariant;
+/// that canonical value is the persisted identity.
 ///
 /// <para>The framework ships with <see cref="Plan"/> (the reviewable planning
 /// artifact) and <see cref="Code"/> (the work-phase diff), but the set is
@@ -15,21 +17,30 @@ namespace CodeyBox.Core;
 /// </summary>
 public readonly record struct AuditTarget
 {
+    private readonly string? _value;
+
     /// <summary>
     /// The CLR default has no target value. Treat it as unset at nullable
     /// boundaries and reject it in declared target sets so a default struct
     /// cannot silently publish a non-runnable target.
     /// </summary>
-    public bool IsDefault => string.IsNullOrWhiteSpace(Value);
+    public bool IsUnset => string.IsNullOrWhiteSpace(_value);
+
+    /// <summary>Compatibility alias for <see cref="IsUnset"/>.</summary>
+    public bool IsDefault => IsUnset;
 
     public AuditTarget(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
             throw new ArgumentException("Audit target value must be non-empty.", nameof(value));
-        Value = value.Trim().ToLowerInvariant();
+        _value = value.Trim().ToLowerInvariant();
     }
 
-    public string Value { get; }
+    /// <summary>
+    /// Canonical lower-case value, or an empty string for the CLR-default
+    /// (unset) struct.
+    /// </summary>
+    public string Value => _value ?? string.Empty;
 
     /// <summary>Reviews the structured PLAN artifact before implementation.</summary>
     public static AuditTarget Plan { get; } = new("plan");
@@ -37,7 +48,7 @@ public readonly record struct AuditTarget
     /// <summary>Reviews the work-phase diff (the default target).</summary>
     public static AuditTarget Code { get; } = new("code");
 
-    public override string ToString() => Value ?? string.Empty;
+    public override string ToString() => Value;
 }
 
 /// <summary>

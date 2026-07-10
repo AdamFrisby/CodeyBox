@@ -230,39 +230,26 @@ public sealed class LlmReviewAuditor : IAuditor, IRequiresPassedBuildTestGate
         var agent = context.AuditRunner ?? _opts.Agent;
         if (agent is not ITextOnlyAgentRunner textOnlyAgent)
         {
-            return new AuditResult(false, [new AuditFinding(
-                AuditorName: Name,
-                Severity: AuditSeverity.Error,
-                Title: "plan review agent is not text-only capable",
-                Description: $"LLM plan reviews require ITextOnlyAgentRunner so the untrusted PLAN artifact is not sent to a tool-capable agent prompt. Agent '{agent.Kind}' does not expose that capability.")]);
+            return PlanReviewAgentUnavailable(
+                $"LLM plan reviews require ITextOnlyAgentRunner so the untrusted PLAN artifact is not sent to a tool-capable agent prompt. Agent '{agent.Kind}' does not expose that capability.");
         }
 
         if (textOnlyAgent.TextOnlyRequiresSandbox)
         {
-            return new AuditResult(false, [new AuditFinding(
-                AuditorName: Name,
-                Severity: AuditSeverity.Error,
-                Title: "plan review agent requires sandboxed tool runtime",
-                Description: $"LLM plan reviews require a verified host-side text-only runner. Agent '{agent.Kind}' exposes text-only review only by executing inside the repository sandbox, so the untrusted PLAN artifact was not sent to it.")]);
+            return PlanReviewAgentUnavailable(
+                $"LLM plan reviews require a verified host-side text-only runner. Agent '{agent.Kind}' exposes text-only review only by executing inside the repository sandbox, so the untrusted PLAN artifact was not sent to it.");
         }
 
         if (!textOnlyAgent.SupportsSeparateSystemPrompt)
         {
-            return new AuditResult(false, [new AuditFinding(
-                AuditorName: Name,
-                Severity: AuditSeverity.Error,
-                Title: "plan review agent cannot isolate trusted instructions",
-                Description: $"Agent '{agent.Kind}' cannot put trusted review instructions and untrusted PLAN data in separate provider-level system and user channels.")]);
+            return PlanReviewAgentUnavailable(
+                $"Agent '{agent.Kind}' cannot put trusted review instructions and untrusted PLAN data in separate provider-level system and user channels.");
         }
 
         var unavailable = textOnlyAgent.GetTextOnlyUnavailabilityReason(context.AuditCredential);
         if (!string.IsNullOrWhiteSpace(unavailable))
         {
-            return new AuditResult(false, [new AuditFinding(
-                AuditorName: Name,
-                Severity: AuditSeverity.Error,
-                Title: "plan review agent text-only path is unavailable",
-                Description: unavailable)]);
+            return PlanReviewAgentUnavailable(unavailable);
         }
 
         var prompts = BuildPlanReviewPrompts(context);
@@ -296,6 +283,17 @@ public sealed class LlmReviewAuditor : IAuditor, IRequiresPassedBuildTestGate
             result.Summary,
             result.Output);
     }
+
+    private AuditResult PlanReviewAgentUnavailable(string description)
+        => new(
+            false,
+            [new AuditFinding(
+                AuditorName: Name,
+                Severity: AuditSeverity.Error,
+                Title: "review agent failed to run",
+                Description: description)],
+            AgentStderr: description,
+            AgentSummary: "plan review agent capability or credential is unavailable");
 
     private AuditResult ParseVerdict(
         string verdictJson,

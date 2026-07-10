@@ -702,9 +702,8 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             request.Headers.Add("x-api-key", apiKey);
             request.Headers.Add("anthropic-version", AnthropicVersion);
 
-            using var response = await _textOnlyHttp.SendAsync(request, ct).ConfigureAwait(false);
-            var responseText = await ClaudeModelListProbe.ReadCappedAsync(response.Content, ct).ConfigureAwait(false);
-            if (responseText is null)
+            var response = await BoundedHttpResponseReader.SendAsync(_textOnlyHttp, request, ct: ct).ConfigureAwait(false);
+            if (response.BodyTooLarge)
             {
                 return new TextOnlyAgentResult(
                     false,
@@ -712,6 +711,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
                     null,
                     "Response size exceeded 256 KiB limit.");
             }
+            var responseText = response.Body ?? string.Empty;
             if (!response.IsSuccessStatusCode)
             {
                 var summary = canonicalModel == requestedModel
@@ -743,14 +743,13 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             request.Headers.Add("x-api-key", apiKey);
             request.Headers.Add("anthropic-version", AnthropicVersion);
 
-            using var response = await _textOnlyHttp.SendAsync(request, ct).ConfigureAwait(false);
+            var response = await BoundedHttpResponseReader.SendAsync(_textOnlyHttp, request, ct: ct).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
                 return requested;
 
-            var body = await ClaudeModelListProbe.ReadCappedAsync(response.Content, ct).ConfigureAwait(false);
-            if (body is null)
+            if (response.BodyTooLarge || response.Body is null)
                 return requested;
-            var ids = ParseModelIds(body);
+            var ids = ParseModelIds(response.Body);
             return ResolveCanonicalModelId(requested, ids);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)

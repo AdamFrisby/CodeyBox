@@ -38,12 +38,12 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
 
             using (var cmd = _conn.CreateCommand())
             {
-                cmd.CommandText = """
+                cmd.CommandText = $"""
                 CREATE TABLE IF NOT EXISTS audit_reports (
                     id              TEXT PRIMARY KEY,
                     work_item_id    TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
                     iteration       INTEGER NOT NULL,
-                    audit_target    TEXT NOT NULL DEFAULT 'code',
+                    audit_target    TEXT NOT NULL DEFAULT '{AuditTarget.Code.Value}',
                     auditor_name    TEXT NOT NULL,
                     auditor_kind    TEXT NOT NULL,
                     worst_severity  TEXT NOT NULL,
@@ -261,7 +261,7 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
             return;
 
         using var alter = _conn.CreateCommand();
-        alter.CommandText = "ALTER TABLE audit_reports ADD COLUMN audit_target TEXT NOT NULL DEFAULT 'code';";
+        alter.CommandText = $"ALTER TABLE audit_reports ADD COLUMN audit_target TEXT NOT NULL DEFAULT '{AuditTarget.Code.Value}';";
         alter.ExecuteNonQuery();
     }
 

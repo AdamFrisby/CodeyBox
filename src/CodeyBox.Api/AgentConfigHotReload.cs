@@ -1016,6 +1016,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         JsonSerializer.Serialize(
             new
             {
+                opts.MaxPlanReviewIterations,
                 DefaultQuotaFailurePauseSeconds = opts.DefaultQuotaFailurePause.TotalSeconds,
                 QuotaExhaustionFallbackTtlSeconds = opts.QuotaExhaustionFallbackTtl.TotalSeconds,
                 MaxParsedQuotaResetWindowSeconds = opts.MaxParsedQuotaResetWindow.TotalSeconds,

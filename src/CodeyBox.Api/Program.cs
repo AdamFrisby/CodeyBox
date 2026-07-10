@@ -2765,7 +2765,6 @@ builder.Services.AddSingleton<PipelineOptions>(sp =>
         PhaseAbsoluteTimeoutMultiplier = opts.PhaseAbsoluteTimeoutMultiplier,
         RequiredBuildVerificationTimeout = TimeSpan.FromSeconds(Math.Max(60, opts.RequiredBuildVerificationTimeoutSeconds)),
         EmitPlanTestCases = opts.EmitPlanTestCases,
-        MaxPlanReviewIterations = opts.MaxPlanReviewIterations,
         HostGitIdentity = hostIdentity,
     };
 });
@@ -4295,15 +4294,6 @@ namespace CodeyBox.Api
         /// <see cref="PipelineOptions.EmitPlanTestCases"/>; edits require restart.
         /// </summary>
         public bool EmitPlanTestCases { get; set; } = true;
-
-        /// <summary>
-        /// Maximum PLAN-review attempts for one planning lifecycle, including
-        /// revised plan artifacts produced by plan-rework turns, before a
-        /// still-blocked item fails. Captured once at startup into
-        /// <see cref="PipelineOptions.MaxPlanReviewIterations"/>; edits
-        /// require restart.
-        /// </summary>
-        public int MaxPlanReviewIterations { get; set; } = 3;
 
         /// <summary>
         /// Maximum concurrent release deep-audit phases across all releases.

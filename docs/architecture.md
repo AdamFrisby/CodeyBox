@@ -170,7 +170,7 @@ config-driven active set as code audit) and evaluates the PLAN artifact.
 Blocking findings send the plan back for a plan-rework turn (the planning agent
 receives only bounded categories, severities, counts, and stable finding IDs,
 never model-authored reviewer prose) and re-review, up to
-`PipelineOptions.MaxPlanReviewIterations`; the plan must pass before
+the hot-reloadable `CodeyBox:PipelineTuning:MaxPlanReviewIterations`; the plan must pass before
 `PlanApproved` flows into implementation. `CodeyBox:PlanReview:UseAuditors`
 is compatibility-only and ignored; Plan-target auditors are always composed by
 the pipeline, and canonical PLAN parsing occurs at the artifact boundary before

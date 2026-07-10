@@ -9,9 +9,12 @@ using Microsoft.Extensions.Options;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// Built-in preprocessor that prepends the project's house rules file to every
-/// agent prompt. The rules path is read from <see cref="IOptionsMonitor{TOptions}"/>
-/// on each invocation so config edits hot-reload for the next agent run.
+/// Built-in preprocessor that prepends the project's house rules file to agent
+/// prompts, except separated-channel PlanReview verdict calls. Those calls keep
+/// their user message as the exact bounded JSON envelope promised by the trusted
+/// system contract. The rules path is read from
+/// <see cref="IOptionsMonitor{TOptions}"/> on each invocation so config edits
+/// hot-reload for the next agent run.
 /// </summary>
 public sealed class ProjectRulesPromptPreprocessor : IAgentPromptPreprocessor
 {

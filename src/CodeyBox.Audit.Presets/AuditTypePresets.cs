@@ -37,16 +37,38 @@ internal static class AuditTypePresets
         var targets = ParseTargets(definition.Targets);
 
         // 1. Add explicitly configured auditors (usually ShellCommandAuditors).
-        foreach (var a in definition.Auditors)
+        AddConfiguredAuditors(auditors, definition.Id, definition.Auditors, targets);
+        AddConfiguredAuditors(auditors, definition.Id, definition.CodeOnlyAuditors, AuditTargets.CodeOnly);
+
+        // 2. Add DiffPatternAuditor if patterns are configured.
+        AddPatterns(auditors, $"{definition.Id}:deterministic-patterns", definition.Patterns, targets);
+        AddPatterns(auditors, $"{definition.Id}:repository-patterns", definition.CodeOnlyPatterns, AuditTargets.CodeOnly);
+
+        // 3. Add LlmReviewAuditor if a review focus is present.
+        if (!string.IsNullOrWhiteSpace(definition.ReviewFocus))
+        {
+            auditors.Add(Llm(definition, frameTemplate, planFrameTemplate, targets, ctx));
+        }
+
+        return auditors;
+    }
+
+    private static void AddConfiguredAuditors(
+        List<IAuditor> auditors,
+        string auditTypeId,
+        IReadOnlyList<AuditorDefinition> definitions,
+        IReadOnlySet<AuditTarget> targets)
+    {
+        foreach (var a in definitions)
         {
             var role = PresetConfigLoader.ParseAuditorRole(
-                $"audit-type '{definition.Id}'", $"/auditors/{a.Name}/role", a.Role);
+                $"audit-type '{auditTypeId}'", $"/auditors/{a.Name}/role", a.Role);
             var gateEvidence = PresetConfigLoader.ParseBuildTestGateEvidence(
-                $"audit-type '{definition.Id}'", $"/auditors/{a.Name}/gateEvidence", a.Role, a.GateEvidence);
+                $"audit-type '{auditTypeId}'", $"/auditors/{a.Name}/gateEvidence", a.Role, a.GateEvidence);
             var missingToolSeverity = PresetConfigLoader.ParseOptionalAuditSeverity(
-                $"audit-type '{definition.Id}'", $"/auditors/{a.Name}/missingToolSeverity", a.MissingToolSeverity);
+                $"audit-type '{auditTypeId}'", $"/auditors/{a.Name}/missingToolSeverity", a.MissingToolSeverity);
             var required = PresetConfigLoader.ParseAuditCapabilities(
-                $"audit-type '{definition.Id}'", $"/auditors/{a.Name}/requiredCapabilities", a.RequiredCapabilities);
+                $"audit-type '{auditTypeId}'", $"/auditors/{a.Name}/requiredCapabilities", a.RequiredCapabilities);
             if (string.IsNullOrWhiteSpace(a.Script))
             {
                 auditors.Add(Shell(
@@ -79,25 +101,23 @@ internal static class AuditTypePresets
                 }));
             }
         }
+    }
 
-        // 2. Add DiffPatternAuditor if patterns are configured.
-        if (definition.Patterns.Count > 0)
-        {
-            auditors.Add(new DiffPatternAuditor(new DiffPatternAuditorOptions
+    private static void AddPatterns(
+        List<IAuditor> auditors,
+        string name,
+        IReadOnlyList<DiffPatternDefinition> patterns,
+        IReadOnlySet<AuditTarget> targets)
+    {
+        if (patterns.Count == 0)
+            return;
+
+        auditors.Add(new DiffPatternAuditor(new DiffPatternAuditorOptions
             {
-                Name = $"{definition.Id}:deterministic-patterns",
-                Patterns = MaterialisePatterns(definition.Patterns),
+                Name = name,
+                Patterns = MaterialisePatterns(patterns),
                 Targets = targets,
             }));
-        }
-
-        // 3. Add LlmReviewAuditor if a review focus is present.
-        if (!string.IsNullOrWhiteSpace(definition.ReviewFocus))
-        {
-            auditors.Add(Llm(definition, frameTemplate, planFrameTemplate, targets, ctx));
-        }
-
-        return auditors;
     }
 
     private static IReadOnlyList<DiffPattern> MaterialisePatterns(IReadOnlyList<DiffPatternDefinition> definitions)

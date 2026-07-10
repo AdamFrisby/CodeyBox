@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Agents;
 using CodeyBox.Audit;
@@ -865,14 +866,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private static bool IsPlanningLifecycleState(WorkItemState state) =>
         state is WorkItemState.Planning or WorkItemState.PlanReview or WorkItemState.PlanApproved;
 
+    private const string CurrentPlanApprovalProvenance = "auditor-loop/v1: ";
+
     private static bool HasApprovedCurrentPlan(WorkItem item) =>
         item.State == WorkItemState.PlanApproved
         && item.PlanReviewedAt is not null
-        && !string.IsNullOrWhiteSpace(item.PlanArtifact);
+        && !string.IsNullOrWhiteSpace(item.PlanArtifact)
+        && item.PlanReviewSummary?.StartsWith(CurrentPlanApprovalProvenance, StringComparison.Ordinal) == true;
 
     private static bool HasReviewedPlanArtifact(WorkItem item) =>
         item.PlanReviewedAt is not null
-        && !string.IsNullOrWhiteSpace(item.PlanArtifact);
+        && !string.IsNullOrWhiteSpace(item.PlanArtifact)
+        && item.PlanReviewSummary?.StartsWith(CurrentPlanApprovalProvenance, StringComparison.Ordinal) == true;
 
     private static string? ApprovedPlanForImplementation(WorkItem item, bool planningWasRequired)
         => planningWasRequired && HasReviewedPlanArtifact(item)
@@ -969,9 +974,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         if (current.State == WorkItemState.PlanApproved)
         {
-            if (!HasApprovedCurrentPlan(current))
+            if (string.IsNullOrWhiteSpace(current.PlanArtifact))
                 throw new InvalidOperationException("PlanApproved item is missing an approved planning artifact.");
-            return current;
+            if (HasApprovedCurrentPlan(current))
+                return current;
+
+            current = await ReopenLegacyPlanApprovalAsync(current, project, ct);
+            if (current.State != WorkItemState.PlanReview)
+                return current;
         }
 
         if (current.State == WorkItemState.PlanReview
@@ -1018,6 +1028,41 @@ public sealed partial class PipelineRunner : IPipelineRunner
             return reviewing;
 
         return await RunPlanReviewLoopAsync(reviewing, project, workRunner, repoId, baseBranch, ct, hostShutdownToken);
+    }
+
+    private async Task<WorkItem> ReopenLegacyPlanApprovalAsync(
+        WorkItem legacyApproval,
+        Project project,
+        CancellationToken ct)
+    {
+        var reopened = legacyApproval.With(WorkItemState.PlanReview) with
+        {
+            PlanReviewedAt = null,
+            PlanReviewSummary = null,
+            PlanReviewAttempts = 0,
+            UpdatedAt = _opts.TimeProvider.GetUtcNow(),
+        };
+        var persisted = false;
+        await RunBoundedPostAgentAsync(legacyApproval.Id, "reopen-legacy-plan-approval", ct, async transitionCt =>
+        {
+            persisted = await _store.TryUpdateIfStateAndUpdatedAtAsync(
+                reopened,
+                WorkItemState.PlanApproved,
+                legacyApproval.UpdatedAt,
+                transitionCt);
+            if (persisted)
+                await EmitTransitionSideEffectsAsync(reopened, WorkItemState.PlanReview, project, transitionCt);
+        });
+
+        if (persisted)
+        {
+            _log.LogInformation(
+                "Reopened legacy plan approval for work item {WorkItemId}; the persisted row has no current auditor-loop provenance.",
+                legacyApproval.Id);
+            return reopened;
+        }
+
+        return await _store.GetAsync(legacyApproval.Id, ct) ?? legacyApproval;
     }
 
     /// <summary>
@@ -1093,7 +1138,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
     /// <summary>
     /// The PLAN REVIEW LOOP (analogous to the audit loop): review the plan
     /// artifact; on blocking findings run a plan-rework turn that revises the
-    /// plan and re-review, up to <see cref="PipelineOptions.MaxPlanReviewIterations"/>.
+    /// plan and re-review, up to the hot-reloadable
+    /// <see cref="PipelineTuningOptions.MaxPlanReviewIterations"/>.
     /// The plan MUST pass before implementation starts — a plan still blocked
     /// after the cap fails the work item.
     /// </summary>
@@ -1106,7 +1152,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
-        var maxPlanIterations = Math.Max(1, _opts.MaxPlanReviewIterations);
+        var maxPlanIterations = PlanReviewIterationLimit
+            .Create(_pipelineTuning.Current.MaxPlanReviewIterations)
+            .Value;
         var current = item;
         while (true)
         {
@@ -1280,22 +1328,27 @@ public sealed partial class PipelineRunner : IPipelineRunner
             repoId,
             baseBranch,
             ct);
-        if (auditorDecision is not null && !auditorDecision.Approved)
+        if (!auditorDecision.Approved)
             return (current, auditorDecision);
 
-        current = await RefreshPlanReviewSnapshotForApprovalAsync(current, ct);
-        if (current.State != WorkItemState.PlanReview
-            || string.IsNullOrWhiteSpace(current.PlanArtifact))
+        var matched = await TryGetMatchingPlanReviewSnapshotAsync(current, ct);
+        if (matched is null)
         {
-            return (current, null);
+            var latest = await _store.GetAsync(current.Id, ct) ?? current;
+            if (latest.PromptRevision != current.PromptRevision
+                || latest.State is WorkItemState.Queued or WorkItemState.PlanApproved)
+            {
+                return (latest, null);
+            }
+
+            throw new InvalidOperationException(
+                $"Plan review approval raced with state {latest.State}; refusing to approve an ambiguous plan.");
         }
 
-        return (current, auditorDecision ?? new PlanReviewDecision(
-            true,
-            "Plan approved: no plan-review auditors are active for the selected profile."));
+        return (matched, auditorDecision);
     }
 
-    private async Task<WorkItem> RefreshPlanReviewSnapshotForApprovalAsync(
+    private async Task<WorkItem?> TryGetMatchingPlanReviewSnapshotAsync(
         WorkItem reviewedSnapshot,
         CancellationToken ct)
     {
@@ -1309,7 +1362,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             return latest;
         }
 
-        return reviewedSnapshot;
+        return null;
     }
 
     private async Task<WorkItem> BeginPlanReviewAttemptAsync(
@@ -1359,7 +1412,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             $"Plan review attempt for work item {current.Id} raced with state {latest.State}; refusing stale continuation.");
     }
 
-    private async Task<PlanReviewDecision?> ReviewPlanWithTargetAuditorsAsync(
+    private async Task<PlanReviewDecision> ReviewPlanWithTargetAuditorsAsync(
         WorkItem current,
         Project project,
         IAgentRunner workRunner,
@@ -1369,7 +1422,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
     {
         var auditors = _auditorComposer.ComposeForTarget(project, workRunner, AuditTarget.Plan);
         if (auditors.Count == 0)
-            return null;
+        {
+            throw new AuditUnavailableException(
+                $"plan review has no active Plan-target auditors for profile '{project.Audit.Profile ?? "default"}'");
+        }
 
         AuditLog.AuditProfileSelected(project.Audit.Profile, auditors.Select(a => a.Name).ToArray());
         var ctx = new AuditContext(
@@ -1413,12 +1469,24 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         if (blocking.Count == 0)
         {
+            var contractFinding = PlanApprovalPolicy.ReviewTaskBinding(
+                current.Prompt,
+                current.PlanArtifact!,
+                "process:plan-task-binding");
+            if (contractFinding is not null)
+            {
+                return new PlanReviewDecision(
+                    false,
+                    "Plan review found 1 blocking deterministic contract issue.",
+                    ReworkFeedback: BuildPlanReworkFeedback([contractFinding]));
+            }
+
             var advisory = collection.Findings.Count;
             return new PlanReviewDecision(
                 true,
                 advisory == 0
-                    ? "Plan approved by all plan-review auditors."
-                    : $"Plan approved with {advisory} advisory note(s).");
+                    ? "Plan approved by the deterministic task-binding policy and all plan-review auditors."
+                    : $"Plan approved by the deterministic task-binding policy with {advisory} advisory note(s).");
         }
 
         return new PlanReviewDecision(
@@ -1437,12 +1505,50 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
     private static PlanReviewFeedbackIssue BuildPlanReworkFeedbackIssue(AuditFinding finding)
     {
-        var category = InferPlanReviewFeedbackCategory(finding.AuditorName);
+        var auditorName = BoundPlanReviewFeedbackText(finding.AuditorName, MaxPlanFeedbackAuditorNameChars)
+            ?? "review";
+        var category = InferPlanReviewFeedbackCategory(auditorName);
+        var title = BoundPlanReviewFeedbackText(finding.Title, MaxPlanFeedbackTitleChars);
+        var description = BoundPlanReviewFeedbackText(finding.Description, MaxPlanFeedbackDescriptionChars);
+        var location = BoundPlanReviewFeedbackText(finding.Location, MaxPlanFeedbackLocationChars);
 
         return new PlanReviewFeedbackIssue(
-            Severity: finding.Severity.ToString().ToLowerInvariant(),
+            Severity: finding.Severity,
             Category: category,
-            FindingId: BuildPlanReviewFindingId(finding));
+            FindingId: BuildPlanReviewFindingId(auditorName, title, location),
+            Title: title,
+            Description: description,
+            Location: location);
+    }
+
+    private static string? BoundPlanReviewFeedbackText(string? value, int maxChars)
+    {
+        if (string.IsNullOrEmpty(value))
+            return null;
+
+        var sourceChars = Math.Min(value.Length, maxChars + 1);
+        var bounded = new StringBuilder(Math.Min(sourceChars, maxChars));
+        var index = 0;
+        while (index < sourceChars && bounded.Length < maxChars)
+        {
+            var ch = value[index++];
+            if (ch == '\r')
+            {
+                if (index < sourceChars && value[index] == '\n')
+                    index++;
+                ch = '\n';
+            }
+            else if (char.IsControl(ch) && ch is not '\n' and not '\t')
+            {
+                ch = ' ';
+            }
+            bounded.Append(ch);
+        }
+
+        var normalized = bounded.ToString().Trim();
+        if (normalized.Length == 0)
+            return null;
+        return index < value.Length ? normalized + "…" : normalized;
     }
 
     private static string InferPlanReviewFeedbackCategory(string auditorName)
@@ -1460,13 +1566,20 @@ public sealed partial class PipelineRunner : IPipelineRunner
         };
     }
 
-    private static string BuildPlanReviewFindingId(AuditFinding finding)
+    private static string BuildPlanReviewFindingId(
+        string auditorName,
+        string? boundedTitle,
+        string? boundedLocation)
     {
-        var (files, _) = ParseLocation(finding.Location);
-        return FindingIdComputer.Compute(finding.AuditorName, finding.Title, files);
+        var (files, _) = ParseLocation(boundedLocation);
+        return FindingIdComputer.Compute(auditorName, boundedTitle ?? string.Empty, files);
     }
 
     private const int MaxPlanReworkFeedbackIssues = 12;
+    private const int MaxPlanFeedbackAuditorNameChars = 160;
+    private const int MaxPlanFeedbackTitleChars = 240;
+    private const int MaxPlanFeedbackDescriptionChars = 1200;
+    private const int MaxPlanFeedbackLocationChars = 320;
 
     private static string BuildPlanReviewCapMessage(int maxPlanIterations, PlanReviewFeedback? feedback)
     {
@@ -1489,7 +1602,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             WorkItemState.PlanApproved) with
         {
             PlanReviewedAt = updatedAt,
-            PlanReviewSummary = decision.Summary,
+            PlanReviewSummary = CurrentPlanApprovalProvenance + decision.Summary,
             UpdatedAt = updatedAt,
         };
         var approved = false;
@@ -1939,8 +2052,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
               requests.
 
               PLAN_REVIEW_REWORK_FEEDBACK_JSON:
-              {JsonSerializer.Serialize(reviewFindings)}
+              {JsonSerializer.Serialize(reviewFindings, PlanReviewFeedbackJsonOptions)}
               """;
+
+    private static readonly JsonSerializerOptions PlanReviewFeedbackJsonOptions = new()
+    {
+        Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) },
+    };
 
     private string NormalizePlanArtifact(IPlanArtifactExtractor? producingExtractor, string artifact)
     {
@@ -9882,11 +10000,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
         AuditContext ctx,
         CancellationToken ct)
     {
-        _log.LogInformation("Running auditor {Name} (iteration {Iter})", auditor.Name, ctx.Iteration);
+        _log.LogInformation(
+            "Running auditor {Name} for target {Target} (iteration {Iter})",
+            auditor.Name,
+            ctx.EffectiveTarget.Value,
+            ctx.Iteration);
         var startedAt = DateTimeOffset.UtcNow;
         var sw = Stopwatch.StartNew();
-        var auditPhase = $"audit-llm-{auditor.Name}";
         var isPlanReview = ctx.EffectiveTarget == AuditTarget.Plan;
+        var auditPhase = isPlanReview
+            ? $"audit-plan-llm-{auditor.Name}"
+            : $"audit-llm-{auditor.Name}";
         var canCaptureStructuredStream = auditor.Kind == "llm"
             && !isPlanReview
             && await CanCaptureAuditStructuredStreamAsync(runner, sandbox, auditPhase, auditor.Name, ct);
@@ -9953,12 +10077,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
             ReasoningMode = ctx.ReasoningMode,
         };
         var timingScope = await TimingScope.BeginAsync(
-            _timings, ctx.WorkItemId, "audit", $"auditor.{auditor.Name}",
+            _timings,
+            ctx.WorkItemId,
+            "audit",
+            isPlanReview ? $"auditor.plan.{auditor.Name}" : $"auditor.{auditor.Name}",
             iteration: ctx.Iteration,
             metadata: new Dictionary<string, object>
             {
                 ["agent"] = runner.Kind.Value,
                 ["agent.instance"] = agentInstanceId ?? runner.Kind.Value,
+                ["audit.target"] = ctx.EffectiveTarget.Value,
             },
             log: _log,
             activitySource: CodeyBoxActivities.Audit);
@@ -9968,7 +10096,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // "Running auditor" log line above and a history row — and an
         // auditor-identifying phase the plain "audit" label could not provide.
         var involvementId = await RecordInvolvementStartAsync(
-            ctx.WorkItemId, runner.Kind, agentInstanceId, auditorCtx.ModelId, $"audit:{auditor.Name}", ctx.Iteration);
+            ctx.WorkItemId,
+            runner.Kind,
+            agentInstanceId,
+            auditorCtx.ModelId,
+            isPlanReview ? $"audit:plan:{auditor.Name}" : $"audit:{auditor.Name}",
+            ctx.Iteration);
         AuditResult result;
         try
         {
@@ -9999,6 +10132,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             (long)sw.Elapsed.TotalMilliseconds,
             new KeyValuePair<string, object?>("auditor.name", auditor.Name),
             new KeyValuePair<string, object?>("auditor.kind", auditor.Kind),
+            new KeyValuePair<string, object?>("audit.target", ctx.EffectiveTarget.Value),
             new KeyValuePair<string, object?>("iteration", ctx.Iteration.ToString()));
         return new AuditorRunRecord(
             auditor,
@@ -10806,8 +10940,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _log.LogWarning(ex,
-                "Failed to persist diagnostic audit report for auditor {AuditorName} iteration {Iteration} on work item {WorkItemId}",
+                "Failed to persist diagnostic audit report for auditor {AuditorName} target {Target} iteration {Iteration} on work item {WorkItemId}",
                 auditor.Name,
+                ctx.EffectiveTarget.Value,
                 ctx.Iteration,
                 ctx.WorkItemId);
         }
@@ -17454,13 +17589,6 @@ public sealed record PipelineOptions
     public bool EmitPlanTestCases { get; init; } = true;
 
     /// <summary>
-    /// Maximum plan-review iterations before a still-blocked plan fails the
-    /// work item. Each iteration is: plan review → (if blocking findings) a
-    /// plan-rework agent turn that revises the plan → re-review. The plan must
-    /// pass before implementation starts. Clamped to at least 1.
-    /// </summary>
-    public int MaxPlanReviewIterations { get; init; } = 3;
-
     internal TimeProvider TimeProvider { get; init; } = TimeProvider.System;
 
     private static TimeSpan Min(TimeSpan a, TimeSpan b) => a <= b ? a : b;

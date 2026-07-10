@@ -637,12 +637,19 @@ public sealed record WorkItem
     public DateTimeOffset? PlanGeneratedAt { get; init; }
 
     /// <summary>
-    /// UTC timestamp when Plan-target auditors and the compatibility
-    /// plan-review gate approved the current <see cref="PlanArtifact"/>.
+    /// UTC timestamp when the configured Plan-target auditor panel and the
+    /// deterministic task-binding policy approved the current
+    /// <see cref="PlanArtifact"/>. Rows approved by older placeholder flows are
+    /// reopened for current review before implementation.
     /// </summary>
     public DateTimeOffset? PlanReviewedAt { get; init; }
 
-    /// <summary>Short operator-facing summary of the plan-review decision.</summary>
+    /// <summary>
+    /// Short operator-facing summary of the plan-review decision. Current
+    /// approvals carry an <c>auditor-loop/v1:</c> provenance prefix so durable
+    /// placeholder approvals from older deployments can be distinguished and
+    /// reopened safely.
+    /// </summary>
     public string? PlanReviewSummary { get; init; }
 
     /// <summary>

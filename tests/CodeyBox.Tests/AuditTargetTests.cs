@@ -191,7 +191,9 @@ public sealed class AuditTargetTests
         Assert.False(result.Passed);
         var finding = Assert.Single(result.Findings);
         Assert.Equal(AuditSeverity.Error, finding.Severity);
-        Assert.Contains("not text-only capable", finding.Title, StringComparison.Ordinal);
+        Assert.Equal("review agent failed to run", finding.Title);
+        Assert.Contains("does not expose that capability", finding.Description, StringComparison.Ordinal);
+        Assert.NotNull(result.AgentSummary);
         Assert.Equal(0, runner.RunCalls);
     }
 
@@ -206,7 +208,9 @@ public sealed class AuditTargetTests
         Assert.False(result.Passed);
         var finding = Assert.Single(result.Findings);
         Assert.Equal(AuditSeverity.Error, finding.Severity);
-        Assert.Contains("requires sandboxed tool runtime", finding.Title, StringComparison.Ordinal);
+        Assert.Equal("review agent failed to run", finding.Title);
+        Assert.Contains("executing inside the repository sandbox", finding.Description, StringComparison.Ordinal);
+        Assert.NotNull(result.AgentSummary);
         Assert.Equal(0, runner.TextOnlyCalls);
     }
 
@@ -222,8 +226,10 @@ public sealed class AuditTargetTests
             PlanContext());
 
         Assert.False(result.Passed);
-        Assert.Contains(result.Findings, finding =>
-            finding.Title.Contains("cannot isolate trusted instructions", StringComparison.Ordinal));
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("review agent failed to run", finding.Title);
+        Assert.Contains("separate provider-level system and user channels", finding.Description, StringComparison.Ordinal);
+        Assert.NotNull(result.AgentSummary);
         Assert.Equal(0, runner.TextOnlyCalls);
     }
 

@@ -4,10 +4,10 @@ using CodeyBox.Core;
 namespace CodeyBox.Audit;
 
 /// <summary>
-/// Audits the diff between <see cref="AuditContext.BaseBranch"/> and
-/// <see cref="AuditContext.WorkBranch"/> against a list of regex patterns.
-/// Each match on an added line (a <c>+</c>-prefixed line in unified diff)
-/// emits one <see cref="AuditFinding"/>.
+/// Applies regex patterns according to the current review target. Code-target
+/// invocations inspect only added unified-diff lines. Plan-target invocations
+/// inspect every line of <see cref="AuditContext.PlanArtifact"/> and report
+/// locations as <c>PLAN:&lt;line&gt;</c>.
 ///
 /// Used by the "cheating" preset to spot suppression markers
 /// (@ts-ignore, eslint-disable, # noqa, #pragma warning disable, etc.) and

@@ -239,8 +239,10 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
             request.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
 
-            using var response = await _textOnlyHttp.SendAsync(request, ct).ConfigureAwait(false);
-            var responseText = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            var response = await BoundedHttpResponseReader.SendAsync(_textOnlyHttp, request, ct: ct).ConfigureAwait(false);
+            if (response.BodyTooLarge)
+                return new TextOnlyAgentResult(false, "Codex text-only call failed: response too large", null, "Response size exceeded 256 KiB limit.");
+            var responseText = response.Body ?? string.Empty;
             if (!response.IsSuccessStatusCode)
                 return new TextOnlyAgentResult(false, $"Codex text-only call failed: HTTP {(int)response.StatusCode}", null, responseText);
 

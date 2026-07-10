@@ -276,7 +276,7 @@ public sealed class AgentPromptPreprocessorTests
     }
 
     [Fact]
-    public async Task PromptPreprocessingAgentRunner_PreservesSeparatedSystemPromptAndProcessesOnlyUserData()
+    public async Task PromptPreprocessingAgentRunner_PlanReviewPreservesExactSeparatedJsonEnvelope()
     {
         var recorder = new RecordingPreprocessor();
         var chain = new AgentPromptPreprocessorChain([recorder]);
@@ -302,7 +302,8 @@ public sealed class AgentPromptPreprocessorTests
         Assert.True(result.Success);
         Assert.True(textOnly.SupportsSeparateSystemPrompt);
         Assert.Equal("trusted system contract", Assert.Single(inner.SystemPrompts));
-        Assert.Equal("untrusted plan data|processed", Assert.Single(inner.SeparatedUserPrompts));
+        Assert.Equal("untrusted plan data", Assert.Single(inner.SeparatedUserPrompts));
+        Assert.Empty(recorder.Contexts);
     }
 
     [Fact]

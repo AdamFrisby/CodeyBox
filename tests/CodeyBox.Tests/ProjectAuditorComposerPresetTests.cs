@@ -197,6 +197,52 @@ public sealed class ProjectAuditorComposerPresetTests
     }
 
     [Fact]
+    public void ComposeForTarget_LegacyConfigBackedCustomAuditorsDefaultToCodeOnly()
+    {
+        var composer = new ProjectAuditorComposer(new PresetCatalog());
+        var project = ProjectWithCustom(
+            new CustomAuditorDescriptor
+            {
+                Name = "custom:legacy-shell",
+                Kind = "shell",
+                Argv = ["dotnet", "--info"],
+            },
+            new CustomAuditorDescriptor
+            {
+                Name = "custom:legacy-pattern",
+                Kind = "diff-pattern",
+                Patterns =
+                [
+                    new DiffPatternDescriptor
+                    {
+                        Regex = "TODO",
+                        Description = "No TODO markers",
+                    },
+                ],
+            },
+            new CustomAuditorDescriptor
+            {
+                Name = "custom:legacy-llm",
+                Kind = "llm",
+                ReviewFocus = "Review code quality.",
+            });
+
+        var codeNames = composer.ComposeForTarget(project, new CapturingAgent(), AuditTarget.Code)
+            .Select(auditor => auditor.Name)
+            .ToArray();
+        var planNames = composer.ComposeForTarget(project, new CapturingAgent(), AuditTarget.Plan)
+            .Select(auditor => auditor.Name)
+            .ToArray();
+
+        Assert.Contains("custom:legacy-shell", codeNames);
+        Assert.Contains("custom:legacy-pattern", codeNames);
+        Assert.Contains("custom:legacy-llm", codeNames);
+        Assert.DoesNotContain("custom:legacy-shell", planNames);
+        Assert.DoesNotContain("custom:legacy-pattern", planNames);
+        Assert.DoesNotContain("custom:legacy-llm", planNames);
+    }
+
+    [Fact]
     public void ComposeForTarget_AuditTypeTargetsApplyToShellPatternsAndLlmAuditors()
     {
         var catalog = new PresetCatalog(new PresetCatalogOptions

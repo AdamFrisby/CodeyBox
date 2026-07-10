@@ -123,14 +123,14 @@ public sealed class PipelineOptionsWiringTests
     }
 
     [Fact]
-    public void ProgramMapsConfiguredMaxPlanReviewIterationsIntoPipelineOptions()
+    public void ProgramBindsConfiguredMaxPlanReviewIterationsIntoHotReloadableSnapshot()
     {
         using var factory = new PipelineOptionsWiringFactory(new Dictionary<string, string?>
         {
-            ["CodeyBox:MaxPlanReviewIterations"] = "7",
+            ["CodeyBox:PipelineTuning:MaxPlanReviewIterations"] = "7",
         });
 
-        var options = factory.Services.GetRequiredService<PipelineOptions>();
+        var options = factory.Services.GetRequiredService<PipelineTuningSnapshot>().Current;
 
         Assert.Equal(7, options.MaxPlanReviewIterations);
     }
@@ -140,7 +140,7 @@ public sealed class PipelineOptionsWiringTests
     {
         using var factory = new PipelineOptionsWiringFactory(new Dictionary<string, string?>
         {
-            ["CodeyBox:MaxPlanReviewIterations"] = "0",
+            ["CodeyBox:PipelineTuning:MaxPlanReviewIterations"] = "0",
         });
 
         var ex = Assert.Throws<OptionsValidationException>(() =>
