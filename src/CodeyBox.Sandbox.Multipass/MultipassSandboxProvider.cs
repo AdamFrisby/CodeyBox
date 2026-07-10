@@ -6297,9 +6297,16 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         return sb.ToString();
     }
 
-    // The optional elapsed-time file is a cross-process clock seam for the
-    // generated shell: tests atomically advance it after observing child
-    // signals. Production omits it and retains Bash's monotonic SECONDS clock.
+    // The optional elapsed-time file is a cross-process clock seam that drives
+    // ONLY the process-group marker deadline (codeybox_now_seconds). Tests
+    // atomically rename it to advance virtual time after observing a child
+    // signal, so the timeout branch fires deterministically instead of racing a
+    // real wall-clock deadline under parallel load. Production omits it and
+    // retains Bash's monotonic SECONDS clock. It is deliberately the single
+    // reader of this file — the HTTP-readiness probe keeps its own real timeout
+    // so no second component reimplements clock parsing. Poll/grace delays stay
+    // real `sleep`s regardless of mode: they are short, bounded latency, not
+    // deadlines, so they never flake and keep the SIGTERM→SIGKILL grace genuine.
     internal static string BuildDetachedLaunchScript(
         string envFile,
         string processGroupMarker,
@@ -6365,6 +6372,10 @@ while True:
             .Append('\n');
         sb.AppendLine("codeybox_supervisor_dir=$(dirname \"$codeybox_pgid_marker\")");
         sb.AppendLine("codeybox_lock_dir=\"$codeybox_pgid_marker.lock\"");
+        // Elapsed-seconds clock for the marker deadline. Reads $SECONDS in
+        // production; in test/virtual mode reads the atomically-renamed clock
+        // file. The value is capped at 10 digits so the later $((...)) deadline
+        // arithmetic can never overflow bash's signed 64-bit integer range.
         sb.AppendLine("codeybox_now_seconds() {");
         sb.AppendLine("    if [ -z \"$codeybox_virtual_elapsed_seconds_file\" ]; then");
         sb.AppendLine("        printf '%s\\n' \"$SECONDS\"");
@@ -6377,11 +6388,6 @@ while True:
         sb.AppendLine("    esac");
         sb.AppendLine("    if [ \"${#codeybox_virtual_now}\" -gt 10 ]; then return 1; fi");
         sb.AppendLine("    printf '%s\\n' \"$codeybox_virtual_now\"");
-        sb.AppendLine("}");
-        sb.AppendLine("codeybox_delay() {");
-        sb.AppendLine("    if [ -z \"$codeybox_virtual_elapsed_seconds_file\" ]; then");
-        sb.AppendLine("        sleep \"$1\"");
-        sb.AppendLine("    fi");
         sb.AppendLine("}");
         sb.AppendLine("codeybox_root_sh() {");
         sb.AppendLine("    local codeybox_script=\"$1\"");
@@ -6418,7 +6424,7 @@ while True:
         sb.AppendLine("        codeybox_drain_stdin");
         sb.AppendLine($"        exit {DetachedSupervisorSetupFailedExitCode}");
         sb.AppendLine("    fi");
-        sb.AppendLine("    codeybox_delay 0.1");
+        sb.AppendLine("    sleep 0.1");
         sb.AppendLine("    codeybox_lock_i=$((codeybox_lock_i + 1))");
         sb.AppendLine("done");
         sb.AppendLine("trap codeybox_cleanup_launcher EXIT");
@@ -6459,22 +6465,26 @@ while True:
         // environment, is a separate work-item preemption hint and is left
         // untouched by this output-transport scrub.
         sb.AppendLine("unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID");
+        // HTTP-readiness preflight. This owns its OWN real timeout (socket
+        // timeout + SIGALRM backstop) and never reads the virtual clock, so the
+        // marker-deadline clock has a single reader. Its outcome is already
+        // deterministic under test: a listener that accepts but never sends a
+        // ready response makes opener.open time out at exactly `timeout=1.0`
+        // regardless of host load, so tests assert exit 86 off that internal
+        // deadline, not a host-scheduling race.
         sb.AppendLine("codeybox_http_ready() {");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_URL=\"$codeybox_output_url\" \\");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_TOKEN=\"$codeybox_output_token\" \\");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_RUN_ID=\"$codeybox_output_run_id\" \\");
-        sb.AppendLine("CODEYBOX_VIRTUAL_ELAPSED_SECONDS_FILE=\"$codeybox_virtual_elapsed_seconds_file\" \\");
         sb.AppendLine("python3 - <<'PY'");
-        sb.AppendLine("import os, queue, signal, sys, threading, time, urllib.error, urllib.parse, urllib.request");
+        sb.AppendLine("import os, signal, sys, urllib.error, urllib.parse, urllib.request");
+        sb.AppendLine("def codeybox_timeout(_signum, _frame):");
+        sb.AppendLine("    raise TimeoutError('ready probe timed out')");
+        sb.AppendLine("signal.signal(signal.SIGALRM, codeybox_timeout)");
+        sb.AppendLine("signal.alarm(2)");
         sb.AppendLine("base = os.environ.get('CODEYBOX_AGENT_OUTPUT_URL', '').rstrip('/')");
         sb.AppendLine("run_id = os.environ.get('CODEYBOX_AGENT_OUTPUT_RUN_ID', '')");
         sb.AppendLine("token = os.environ.get('CODEYBOX_AGENT_OUTPUT_TOKEN', '')");
-        sb.AppendLine("virtual_elapsed_seconds_file = os.environ.get('CODEYBOX_VIRTUAL_ELAPSED_SECONDS_FILE', '')");
-        sb.AppendLine("def codeybox_timeout(_signum, _frame):");
-        sb.AppendLine("    raise TimeoutError('ready probe timed out')");
-        sb.AppendLine("if not virtual_elapsed_seconds_file:");
-        sb.AppendLine("    signal.signal(signal.SIGALRM, codeybox_timeout)");
-        sb.AppendLine("    signal.alarm(2)");
         sb.AppendLine("if not base or not run_id or not token:");
         sb.AppendLine("    sys.exit(1)");
         sb.AppendLine("opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))");
@@ -6484,37 +6494,14 @@ while True:
         sb.AppendLine("    data=b'',");
         sb.AppendLine("    method='POST',");
         sb.AppendLine("    headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/octet-stream'})");
-        sb.AppendLine("def probe(timeout):");
-        sb.AppendLine("    try:");
-        sb.AppendLine("        with opener.open(req, timeout=timeout) as resp:");
-        sb.AppendLine("            code = resp.getcode()");
-        sb.AppendLine("            return 200 <= code < 300");
-        sb.AppendLine("    except urllib.error.HTTPError:");
-        sb.AppendLine("        return False");
-        sb.AppendLine("    except Exception:");
-        sb.AppendLine("        return False");
-        sb.AppendLine("if not virtual_elapsed_seconds_file:");
-        sb.AppendLine("    sys.exit(0 if probe(1.0) else 1)");
-        sb.AppendLine("def virtual_now():");
-        sb.AppendLine("    try:");
-        sb.AppendLine("        with open(virtual_elapsed_seconds_file, encoding='ascii') as clock:");
-        sb.AppendLine("            value = clock.read(11).strip()");
-        sb.AppendLine("    except (OSError, UnicodeError):");
-        sb.AppendLine("        return -1");
-        sb.AppendLine("    return int(value) if 0 < len(value) <= 10 and value.isascii() and value.isdecimal() else -1");
-        sb.AppendLine("started_at = virtual_now()");
-        sb.AppendLine("if started_at < 0:");
+        sb.AppendLine("try:");
+        sb.AppendLine("    with opener.open(req, timeout=1.0) as resp:");
+        sb.AppendLine("        code = resp.getcode()");
+        sb.AppendLine("        sys.exit(0 if 200 <= code < 300 else 1)");
+        sb.AppendLine("except urllib.error.HTTPError:");
         sb.AppendLine("    sys.exit(1)");
-        sb.AppendLine("deadline = started_at + 2");
-        sb.AppendLine("result = queue.SimpleQueue()");
-        sb.AppendLine("probe_thread = threading.Thread(target=lambda: result.put(probe(300.0)), daemon=True)");
-        sb.AppendLine("probe_thread.start()");
-        sb.AppendLine("while probe_thread.is_alive():");
-        sb.AppendLine("    now = virtual_now()");
-        sb.AppendLine("    if now < 0 or now >= deadline:");
-        sb.AppendLine("        sys.exit(1)");
-        sb.AppendLine("    time.sleep(0)");
-        sb.AppendLine("sys.exit(0 if result.get() else 1)");
+        sb.AppendLine("except Exception:");
+        sb.AppendLine("    sys.exit(1)");
         sb.AppendLine("PY");
         sb.AppendLine("}");
         sb.AppendLine("if [ -z \"$codeybox_output_url\" ] || [ -z \"$codeybox_output_token\" ] || [ -z \"$codeybox_output_run_id\" ]; then");
@@ -6714,7 +6701,7 @@ while True:
         sb.AppendLine("        kill -TERM \"$codeybox_detached_pid\" 2>/dev/null || true");
         sb.AppendLine("        codeybox_term_i=0");
         sb.AppendLine("        while kill -0 \"-$codeybox_detached_pgid\" 2>/dev/null && [ \"$codeybox_term_i\" -lt 20 ]; do");
-        sb.AppendLine("            codeybox_delay 0.05");
+        sb.AppendLine("            sleep 0.05");
         sb.AppendLine("            codeybox_term_i=$((codeybox_term_i + 1))");
         sb.AppendLine("        done");
         sb.AppendLine("        if kill -0 \"-$codeybox_detached_pgid\" 2>/dev/null; then");
@@ -6757,11 +6744,11 @@ while True:
         sb.AppendLine("            break");
         sb.AppendLine("        fi");
         sb.AppendLine("        if [ ! -s \"$codeybox_child_pgid_file\" ] && [ \"$(codeybox_now_seconds)\" -lt \"$codeybox_marker_deadline\" ]; then");
-        sb.AppendLine("            codeybox_delay 0.1");
+        sb.AppendLine("            sleep 0.1");
         sb.AppendLine("            continue");
         sb.AppendLine("        fi");
         sb.AppendLine("        if codeybox_child_group_alive; then");
-        sb.AppendLine("            codeybox_delay 0.1");
+        sb.AppendLine("            sleep 0.1");
         sb.AppendLine("            continue");
         sb.AppendLine("        fi");
         sb.AppendLine("        if codeybox_report_child_status_if_present; then");
@@ -6782,7 +6769,7 @@ while True:
         sb.AppendLine("            if codeybox_report_child_status_if_present; then");
         sb.AppendLine("                :");
         sb.AppendLine("            fi");
-        sb.AppendLine("            codeybox_delay 0.1");
+        sb.AppendLine("            sleep 0.1");
         sb.AppendLine("            continue");
         sb.AppendLine("        fi");
         sb.AppendLine("        if [ -n \"$codeybox_wait_stderr_file\" ]; then");
@@ -6792,7 +6779,7 @@ while True:
         sb.AppendLine("        echo \"codeybox-detached: detached child exited before publishing process group marker (exit $codeybox_child_rc)\" >&2");
         sb.AppendLine("        exit \"$codeybox_child_rc\"");
         sb.AppendLine("    fi");
-        sb.AppendLine("    codeybox_delay 0.1");
+        sb.AppendLine("    sleep 0.1");
         sb.AppendLine("done");
         sb.AppendLine("disown \"$codeybox_detached_pid\" 2>/dev/null || true");
         sb.AppendLine("exit 0");

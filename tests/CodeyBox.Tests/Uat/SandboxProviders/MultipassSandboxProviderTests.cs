@@ -26,6 +26,17 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     private static readonly byte[] TinyPng = Convert.FromBase64String(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAAB9Wl9WAAAAC0lEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==");
 
+    // Watchdog cap for detached-launch integration tests. The behavioral outcome
+    // of each test is driven by a deterministic signal (a virtual-clock advance,
+    // a real filesystem/connection event, or a probe's own internal timeout), so
+    // this cap only fires when a broken SUT hangs — it never determines a passing
+    // assertion. It is intentionally generous so ordinary parallel-load latency
+    // never trips it.
+    private static readonly TimeSpan DetachedLaunchWatchdog = TimeSpan.FromSeconds(30);
+
+    // Poll cadence for the whole-process-group liveness watchdog.
+    private static readonly TimeSpan ProcessGroupPollInterval = TimeSpan.FromMilliseconds(25);
+
     private readonly string _workspace = Directory.CreateTempSubdirectory("codeybox-uat-multipass-").FullName;
 
     public void Dispose()
@@ -1266,7 +1277,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Contains("kill -KILL \"-$codeybox_detached_pgid\"", script);
         Assert.Contains("wait \"$codeybox_detached_pid\" 2>/dev/null", script);
         var termIndex = script.IndexOf("kill -TERM \"-$codeybox_detached_pgid\"", StringComparison.Ordinal);
-        var delayIndex = script.IndexOf("codeybox_delay 0.05", termIndex, StringComparison.Ordinal);
+        var sleepIndex = script.IndexOf("sleep 0.05", termIndex, StringComparison.Ordinal);
         var killIndex = script.IndexOf("kill -KILL \"-$codeybox_detached_pgid\"", termIndex, StringComparison.Ordinal);
         var waitIndex = script.IndexOf("wait \"$codeybox_detached_pid\" 2>/dev/null", termIndex, StringComparison.Ordinal);
         var timeoutExitIndex = script.IndexOf(
@@ -1274,8 +1285,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             waitIndex,
             StringComparison.Ordinal);
         Assert.True(termIndex >= 0, "TERM not emitted");
-        Assert.True(delayIndex > termIndex, "delay must follow TERM");
-        Assert.True(killIndex > delayIndex, "KILL must follow the post-TERM delay");
+        Assert.True(sleepIndex > termIndex, "sleep must follow TERM");
+        Assert.True(killIndex > sleepIndex, "KILL must follow the post-TERM sleep");
         Assert.True(waitIndex > killIndex, "wait must follow KILL");
         Assert.True(timeoutExitIndex > waitIndex, "timeout path must report supervisor-setup exit code");
         Assert.Contains("if ! kill -0 \"$codeybox_detached_pid\" 2>/dev/null; then", script);
@@ -1348,6 +1359,10 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var visibleEnvironmentFile = Path.Combine(_workspace, "detached-visible-env");
         var visibleRunIdFile = Path.Combine(_workspace, "detached-visible-run-id");
         var doneFile = Path.Combine(_workspace, "detached-scrub.done");
+        // Success path: pin the SUT marker deadline to virtual time and never
+        // advance it, so a correct child that is slow to publish under parallel
+        // load can never spuriously hit the timeout branch on a real clock.
+        using var virtualTime = new DetachedLaunchVirtualTime(_workspace);
         await File.WriteAllTextAsync(envFile, MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment()));
         await File.WriteAllTextAsync(
             commandScript,
@@ -1365,7 +1380,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 envFile,
                 processGroupMarker,
                 null,
-                ["/bin/sh", commandScript, visibleEnvironmentFile, visibleRunIdFile, doneFile]));
+                ["/bin/sh", commandScript, visibleEnvironmentFile, visibleRunIdFile, doneFile],
+                virtualElapsedSecondsFile: virtualTime.ElapsedSecondsFile));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var poisonedEnvironment = new Dictionary<string, string>(StringComparer.Ordinal)
@@ -1381,7 +1397,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             "/bin/bash",
             [launchScript],
             environmentOverrides: MergeEnvironment(poisonedEnvironment, FakeSudoPathEnvironment()));
-        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(30));
+        await WaitForProcessGroupGoneAsync(processGroupMarker, DetachedLaunchWatchdog);
 
         Assert.Equal(0, exit);
         Assert.Equal("", stdout);
@@ -1413,6 +1429,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var commandStartedFile = Path.Combine(_workspace, "detached.started");
         var releasePipePath = Path.Combine(_workspace, "detached.release");
         await using var releasePipe = await CreateBlockingPipeAsync(releasePipePath);
+        // Success path: pin the SUT marker deadline to virtual time and never
+        // advance it, so the marker wait cannot race a real wall-clock deadline.
+        using var virtualTime = new DetachedLaunchVirtualTime(_workspace);
         await File.WriteAllTextAsync(envFile, MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment()));
         await File.WriteAllTextAsync(
             commandScript,
@@ -1424,13 +1443,14 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 envFile,
                 processGroupMarker,
                 null,
-                ["/bin/sh", commandScript, doneFile, commandStartedFile, releasePipePath]));
+                ["/bin/sh", commandScript, doneFile, commandStartedFile, releasePipePath],
+                virtualElapsedSecondsFile: virtualTime.ElapsedSecondsFile));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         // Cap the launch so a genuine "stayed attached" regression surfaces as
         // a clean failure instead of an indefinite hang (the gated command
         // never completes until this test releases it).
-        using var launchCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var launchCts = new CancellationTokenSource(DetachedLaunchWatchdog);
         Task<(int Exit, string Stdout, string Stderr)>? launchTask = null;
         try
         {
@@ -1441,7 +1461,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 ["-c", "exec 3>&1\nexec /bin/bash \"$1\"", "codeybox-launch-with-extra-fd", launchScript],
                 ct: launchCts.Token,
                 environmentOverrides: FakeSudoPathEnvironment());
-            await WaitForFileAsync(commandStartedFile, TimeSpan.FromSeconds(30));
+            await WaitForFileAsync(commandStartedFile, DetachedLaunchWatchdog);
             var (exit, _, stderr) = await launchTask;
 
             Assert.Equal(0, exit);
@@ -1453,7 +1473,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             Assert.True(File.Exists(processGroupMarker));
             releasePipe.WriteByte((byte)'\n');
             await releasePipe.FlushAsync();
-            await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(30));
+            await WaitForProcessGroupGoneAsync(processGroupMarker, DetachedLaunchWatchdog);
             Assert.True(File.Exists(doneFile));
         }
         finally
@@ -1528,7 +1548,6 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var launchScript = Path.Combine(_workspace, "detached-slow-ready-launch.sh");
         var processGroupMarker = Path.Combine(_workspace, "detached-slow-ready.pgid");
         var doneFile = Path.Combine(_workspace, "detached-slow-ready.done");
-        using var virtualTime = new DetachedLaunchVirtualTime(_workspace);
         await File.WriteAllTextAsync(
             envFile,
             MultipassSandboxProvider.BuildEnvironmentFileContent(new Dictionary<string, string>(StringComparer.Ordinal)
@@ -1546,11 +1565,16 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 envFile,
                 processGroupMarker,
                 null,
-                ["/bin/sh", commandScript, doneFile],
-                virtualElapsedSecondsFile: virtualTime.ElapsedSecondsFile));
+                ["/bin/sh", commandScript, doneFile]));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        // The preflight rejection is deterministic without a virtual clock: the
+        // fake listener accepts the connection but never sends a ready response,
+        // so the probe's own `timeout=1.0` socket deadline fires regardless of
+        // host load and the launch exits 86. We drive the assertion off the
+        // real connection signal (listenerAccepted) plus the probe's internal
+        // timeout; DetachedLaunchWatchdog is only a cleanup cap for a hang.
+        using var timeout = new CancellationTokenSource(DetachedLaunchWatchdog);
         Task<(int Exit, string Stdout, string Stderr)>? launchTask = null;
         try
         {
@@ -1560,7 +1584,6 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 timeout.Token,
                 environmentOverrides: FakeSudoPathEnvironment());
             await listenerAccepted.Task.WaitAsync(timeout.Token);
-            virtualTime.AdvanceTo(2);
             var (exit, _, stderr) = await launchTask;
 
             Assert.Equal(86, exit);
@@ -1638,6 +1661,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var launchScript = Path.Combine(_workspace, "detached-proxy-ready-launch.sh");
         var processGroupMarker = Path.Combine(_workspace, "detached-proxy-ready.pgid");
         var doneFile = Path.Combine(_workspace, "detached-proxy-ready.done");
+        // Success path: pin the SUT marker deadline to virtual time and never
+        // advance it, so the marker wait cannot race a real wall-clock deadline.
+        using var virtualTime = new DetachedLaunchVirtualTime(_workspace);
         await File.WriteAllTextAsync(
             envFile,
             MultipassSandboxProvider.BuildEnvironmentFileContent(new Dictionary<string, string>(StringComparer.Ordinal)
@@ -1651,7 +1677,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         File.SetUnixFileMode(commandScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         await File.WriteAllTextAsync(
             launchScript,
-            MultipassSandbox.BuildDetachedLaunchScript(envFile, processGroupMarker, null, ["/bin/sh", commandScript, doneFile]));
+            MultipassSandbox.BuildDetachedLaunchScript(
+                envFile,
+                processGroupMarker,
+                null,
+                ["/bin/sh", commandScript, doneFile],
+                virtualElapsedSecondsFile: virtualTime.ElapsedSecondsFile));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         try
@@ -1663,7 +1694,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             // calls + a python3 preflight) can take longer than 10s to appear. A
             // 10s cap here cancels `WaitForExitAsync` mid-launch and flakes with
             // TaskCanceledException even though nothing is actually wrong.
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            using var timeout = new CancellationTokenSource(DetachedLaunchWatchdog);
             var (exit, _, stderr) = await RunLocalProcessAsync(
                 "/bin/bash",
                 [launchScript],
@@ -1684,7 +1715,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             Assert.Equal("", stderr);
             Assert.Equal(1, Volatile.Read(ref targetRequests));
             Assert.Equal(0, Volatile.Read(ref proxyRequests));
-            await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(30));
+            await WaitForProcessGroupGoneAsync(processGroupMarker, DetachedLaunchWatchdog);
             Assert.True(File.Exists(doneFile));
         }
         finally
@@ -1754,12 +1785,22 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var launchScript = Path.Combine(_workspace, "detached-launch-idempotent.sh");
         var processGroupMarker = Path.Combine(_workspace, "detached-idempotent.pgid");
         var countFile = Path.Combine(_workspace, "detached.count");
+        // Success path: pin the SUT marker deadline to virtual time and never
+        // advance it, so the first launch's marker wait cannot race a real
+        // wall-clock deadline. The second launch short-circuits on the existing
+        // marker and never reaches the clock.
+        using var virtualTime = new DetachedLaunchVirtualTime(_workspace);
         await File.WriteAllTextAsync(envFile, MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment()));
         await File.WriteAllTextAsync(commandScript, "printf run >> \"$1\"\n");
         File.SetUnixFileMode(commandScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         await File.WriteAllTextAsync(
             launchScript,
-            MultipassSandbox.BuildDetachedLaunchScript(envFile, processGroupMarker, null, ["/bin/sh", commandScript, countFile]));
+            MultipassSandbox.BuildDetachedLaunchScript(
+                envFile,
+                processGroupMarker,
+                null,
+                ["/bin/sh", commandScript, countFile],
+                virtualElapsedSecondsFile: virtualTime.ElapsedSecondsFile));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var first = await RunLocalProcessAsync(
@@ -1772,7 +1813,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         // Wait for the child's process group to fully exit before launching the
         // second invocation so its supervisor-dir prep and marker re-check never
         // race the trailing sidecar writes.
-        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(30));
+        await WaitForProcessGroupGoneAsync(processGroupMarker, DetachedLaunchWatchdog);
         Assert.Equal("run", await File.ReadAllTextAsync(countFile));
         var second = await RunLocalProcessAsync(
             "/bin/bash",
@@ -1810,6 +1851,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var stdinFile = processGroupMarker + ".stdin";
         var exitTokenFile = processGroupMarker + ".exit-token";
         var capturedPromptFile = Path.Combine(_workspace, "detached-existing-exit-token.prompt");
+        // Success path: pin the SUT marker deadline to virtual time and never
+        // advance it, so the marker wait cannot race a real wall-clock deadline.
+        using var virtualTime = new DetachedLaunchVirtualTime(_workspace);
 
         await File.WriteAllTextAsync(
             envFile,
@@ -1822,7 +1866,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 processGroupMarker,
                 stdinFile,
                 ["/bin/sh", "-c", "cat > \"$1\"", "codeybox-capture-stdin", capturedPromptFile],
-                exitTokenFile: exitTokenFile));
+                exitTokenFile: exitTokenFile,
+                virtualElapsedSecondsFile: virtualTime.ElapsedSecondsFile));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var (exit, stdout, stderr) = await RunLocalProcessAsync(
@@ -1834,7 +1879,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal(0, exit);
         Assert.Equal("", stdout);
         Assert.Equal("", stderr);
-        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(30));
+        await WaitForProcessGroupGoneAsync(processGroupMarker, DetachedLaunchWatchdog);
         AssertExitCode(session, 0);
         Assert.Equal("agent prompt\n", await File.ReadAllTextAsync(capturedPromptFile));
         Assert.False(File.Exists(exitTokenFile));
@@ -1966,6 +2011,10 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var stdinFile = processGroupMarker + ".stdin";
         var exitTokenFile = processGroupMarker + ".exit-token";
         var sentinel = Path.Combine(_workspace, "detached-stdin-read-fails.started");
+        // The child publishes its marker before the sidecar read fails, so this
+        // reaches the marker wait loop: pin its deadline to virtual time and
+        // never advance it so the wait cannot race a real wall-clock deadline.
+        using var virtualTime = new DetachedLaunchVirtualTime(_workspace);
         await File.WriteAllTextAsync(envFile, MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment(includeExitToken: false)));
         await File.WriteAllTextAsync(
             launchScript,
@@ -1974,7 +2023,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 processGroupMarker,
                 stdinFile,
                 ["/bin/sh", "-c", "cat >/dev/null; printf should-not-run > \"$1\"", "codeybox-stdin-read-fail", sentinel],
-                exitTokenFile: exitTokenFile));
+                exitTokenFile: exitTokenFile,
+                virtualElapsedSecondsFile: virtualTime.ElapsedSecondsFile));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var fakeSudo = CreateFakeSudoBin(
@@ -2001,7 +2051,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal(0, exit);
         Assert.Equal("", stdout);
         Assert.Equal("", stderr);
-        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(30));
+        await WaitForProcessGroupGoneAsync(processGroupMarker, DetachedLaunchWatchdog);
         AssertExitCode(session, 88);
         Assert.True(File.Exists(stdinFile));
         Assert.Contains(
@@ -2156,7 +2206,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             fi
             exec "$@"
             """);
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var timeout = new CancellationTokenSource(DetachedLaunchWatchdog);
         var launchTask = RunLocalProcessAsync(
             "/bin/bash",
             [launchScript],
@@ -2167,7 +2217,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             });
         try
         {
-            await WaitForFileAsync(markerPublicationEntered, TimeSpan.FromSeconds(30));
+            await WaitForFileAsync(markerPublicationEntered, DetachedLaunchWatchdog);
             virtualTime.AdvanceTo(5);
             var (exit, stdout, stderr) = await launchTask;
 
@@ -2176,7 +2226,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             Assert.Contains("codeybox-detached: timed out waiting for process group marker", stderr, StringComparison.Ordinal);
             Assert.False(File.Exists(processGroupMarker));
             var pgid = (await File.ReadAllTextAsync(markerPublicationEntered)).Trim();
-            await WaitForProcessGroupIdGoneAsync(pgid, TimeSpan.FromSeconds(30));
+            await WaitForProcessGroupIdGoneAsync(pgid, DetachedLaunchWatchdog);
         }
         finally
         {
@@ -2233,11 +2283,17 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if [ "$1" = "-n" ]; then shift; fi
             if [ "$1" = "sh" ] && [ "$2" = "-c" ]; then
                 case "$3" in *'pgid=$2'*)
+                    # Ignore TERM BEFORE publishing the readiness file so that,
+                    # once the test observes the file and advances virtual time,
+                    # the supervisor's SIGTERM is provably ineffective and only
+                    # its SIGKILL escalation can reap this group. This keeps the
+                    # SIGKILL assertion regression-sensitive: deleting the SUT's
+                    # kill -KILL leaves the group alive and fails the test.
+                    trap '' TERM
                     pgid=$(ps -o pgid= -p "$$" | tr -d ' ')
                     pgid_tmp={{MultipassSandboxProvider.ShellSingleQuote(sudoProcessGroupFile)}}.tmp.$$
                     printf '%s\n' "$pgid" > "$pgid_tmp"
                     mv -f "$pgid_tmp" {{MultipassSandboxProvider.ShellSingleQuote(sudoProcessGroupFile)}}
-                    trap '' TERM
                     IFS= read -r _ < {{MultipassSandboxProvider.ShellSingleQuote(markerPublicationBlockPipe)}}
                     ;;
                 esac
@@ -2254,7 +2310,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             """);
         File.SetUnixFileMode(fakeSetsid, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var timeout = new CancellationTokenSource(DetachedLaunchWatchdog);
         var launchTask = RunLocalProcessAsync(
             "/bin/bash",
             [launchScript],
@@ -2265,7 +2321,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             });
         try
         {
-            await WaitForFileAsync(sudoProcessGroupFile, TimeSpan.FromSeconds(30));
+            await WaitForFileAsync(sudoProcessGroupFile, DetachedLaunchWatchdog);
             virtualTime.AdvanceTo(5);
             var (exit, stdout, stderr) = await launchTask;
 
@@ -2275,7 +2331,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             Assert.False(File.Exists(processGroupMarker));
 
             var pgid = (await File.ReadAllTextAsync(sudoProcessGroupFile)).Trim();
-            await WaitForProcessGroupIdGoneAsync(pgid, TimeSpan.FromSeconds(30));
+            await WaitForProcessGroupIdGoneAsync(pgid, DetachedLaunchWatchdog);
         }
         finally
         {
@@ -2329,11 +2385,17 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if [ "$1" = "-n" ]; then shift; fi
             if [ "$1" = "sh" ] && [ "$2" = "-c" ]; then
                 case "$3" in *'pgid=$2'*)
+                    # Ignore TERM BEFORE publishing the readiness file so that,
+                    # once the test observes the file and advances virtual time,
+                    # the supervisor's SIGTERM is provably ineffective and only
+                    # its SIGKILL escalation can reap this group. This keeps the
+                    # SIGKILL assertion regression-sensitive: deleting the SUT's
+                    # kill -KILL leaves the group alive and fails the test.
+                    trap '' TERM
                     pgid=$(ps -o pgid= -p "$$" | tr -d ' ')
                     pgid_tmp={{MultipassSandboxProvider.ShellSingleQuote(sudoProcessGroupFile)}}.tmp.$$
                     printf '%s\n' "$pgid" > "$pgid_tmp"
                     mv -f "$pgid_tmp" {{MultipassSandboxProvider.ShellSingleQuote(sudoProcessGroupFile)}}
-                    trap '' TERM
                     IFS= read -r _ < {{MultipassSandboxProvider.ShellSingleQuote(markerPublicationBlockPipe)}}
                     ;;
                 esac
@@ -2341,7 +2403,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             exec "$@"
             """);
 
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var timeout = new CancellationTokenSource(DetachedLaunchWatchdog);
         var launchTask = RunLocalProcessAsync(
             "/bin/bash",
             [launchScript],
@@ -2352,7 +2414,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             });
         try
         {
-            await WaitForFileAsync(sudoProcessGroupFile, TimeSpan.FromSeconds(30));
+            await WaitForFileAsync(sudoProcessGroupFile, DetachedLaunchWatchdog);
             virtualTime.AdvanceTo(5);
             var (exit, stdout, stderr) = await launchTask;
 
@@ -2362,7 +2424,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             Assert.False(File.Exists(processGroupMarker));
 
             var pgid = (await File.ReadAllTextAsync(sudoProcessGroupFile)).Trim();
-            await WaitForProcessGroupIdGoneAsync(pgid, TimeSpan.FromSeconds(30));
+            await WaitForProcessGroupIdGoneAsync(pgid, DetachedLaunchWatchdog);
         }
         finally
         {
@@ -2396,6 +2458,10 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var exitTokenFile = Path.Combine(_workspace, "detached-sidecar-publication-fails.token");
         var launchScript = Path.Combine(_workspace, "detached-sidecar-publication-fails.sh");
         var processGroupMarker = Path.Combine(_workspace, "detached-sidecar-publication-fails.pgid");
+        // The child publishes its marker before the sidecar publication fails,
+        // so this reaches the marker wait loop: pin its deadline to virtual time
+        // and never advance it so the wait cannot race a real wall-clock deadline.
+        using var virtualTime = new DetachedLaunchVirtualTime(_workspace);
         await File.WriteAllTextAsync(envFile, MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment(includeExitToken: false)));
         await File.WriteAllTextAsync(exitTokenFile, session.ExitToken);
         await File.WriteAllTextAsync(
@@ -2405,7 +2471,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 processGroupMarker,
                 null,
                 ["/bin/sh", "-c", "exit 3"],
-                exitTokenFile: exitTokenFile));
+                exitTokenFile: exitTokenFile,
+                virtualElapsedSecondsFile: virtualTime.ElapsedSecondsFile));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var fakeSudo = CreateFakeSudoBin(
@@ -2430,7 +2497,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.True(File.Exists(processGroupMarker));
         Assert.False(File.Exists(processGroupMarker + ".exit"));
         Assert.False(File.Exists(exitTokenFile));
-        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(30));
+        await WaitForProcessGroupGoneAsync(processGroupMarker, DetachedLaunchWatchdog);
         AssertExitCode(session, 3);
         Assert.Contains("codeybox-detached: failed to publish output sidecars", session.Stderr, StringComparison.Ordinal);
     }
@@ -6059,6 +6126,13 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         return (process.ExitCode, await stdoutTask, await stderrTask);
     }
 
+    // Waits for a file to appear, driven by the real filesystem event
+    // (FileSystemWatcher) rather than by polling a wall clock. `timeout` is a
+    // watchdog only: a correct SUT writes the file within milliseconds, so the
+    // event completes long before it; the timer path just converts a genuine
+    // never-written hang into a clean assertion failure. The re-checks bracket
+    // the watcher-arming race, and the final File.Exists check covers a missed
+    // inotify event, so the timer never determines a passing assertion.
     private static async Task WaitForFileAsync(string path, TimeSpan timeout)
     {
         if (File.Exists(path))
@@ -6106,6 +6180,16 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         await WaitForProcessGroupIdGoneAsync(pgid, timeout);
     }
 
+    // Waits until the ENTIRE process group is gone (`kill -0 -pgid` fails), not
+    // just its leader. Signal delivery and reaping are per-process, so equating
+    // leader exit with group exit races surviving members/zombies; polling the
+    // group-level condition is the only correct whole-group check and never
+    // false-fails a correct SUT (a SIGKILL'd group dies within a poll or two).
+    // `timeout` is purely a watchdog: it fires only when a broken SUT (e.g. a
+    // deleted SIGKILL escalation) leaves the group alive forever, so it does not
+    // determine the assertion for correct code. It is measured in real time
+    // because a real OS process group's death is an inherently real-time event
+    // with no virtual clock to inject.
     private static async Task WaitForProcessGroupIdGoneAsync(string pgid, TimeSpan timeout)
     {
         Assert.True(
@@ -6113,31 +6197,18 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 && processGroupId > 0,
             $"Invalid process group id: {pgid}");
 
-        var alive = await RunLocalProcessAsync(
-            "/bin/sh",
-            ["-c", "kill -0 \"-$1\" 2>/dev/null", "codeybox-pgid-alive", pgid]);
-        if (alive.Exit != 0)
-            return;
-
-        try
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        while (true)
         {
-            using var processGroupLeader = Process.GetProcessById(processGroupId);
-            await processGroupLeader.WaitForExitAsync().WaitAsync(timeout);
+            var probe = await RunLocalProcessAsync(
+                "/bin/sh",
+                ["-c", "kill -0 \"-$1\" 2>/dev/null", "codeybox-pgid-gone", pgid]);
+            if (probe.Exit != 0)
+                return;
+            if (DateTimeOffset.UtcNow >= deadline)
+                Assert.Fail($"Expected process group {pgid} to exit.");
+            await Task.Delay(ProcessGroupPollInterval);
         }
-        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
-        {
-            // The leader exited between the group probe and opening its process
-            // handle. The group-level assertion below still detects survivors.
-        }
-        catch (TimeoutException)
-        {
-            Assert.Fail($"Expected process group {pgid} to exit.");
-        }
-
-        var afterExit = await RunLocalProcessAsync(
-            "/bin/sh",
-            ["-c", "kill -0 \"-$1\" 2>/dev/null", "codeybox-pgid-gone", pgid]);
-        Assert.NotEqual(0, afterExit.Exit);
     }
 
     private static async Task<FileStream> CreateBlockingPipeAsync(string path)
@@ -6153,6 +6224,15 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             FileOptions.Asynchronous);
     }
 
+    // Cross-process virtual clock for the generated launch script's marker
+    // deadline (codeybox_now_seconds reads this file instead of $SECONDS). It
+    // starts at 0. Success-path tests never advance it, which pins the SUT
+    // deadline unreachable so a correct-but-slow child can never spuriously hit
+    // the timeout branch under parallel load. Timeout-path tests advance it past
+    // the marker-wait budget only AFTER observing a deterministic child signal,
+    // so the timeout branch fires exactly once, on demand, with no wall-clock
+    // race. Advances are atomic (write-then-rename) so a concurrent reader never
+    // observes a torn value. Each instance uses a unique filename for isolation.
     private sealed class DetachedLaunchVirtualTime : IDisposable
     {
         private readonly string _directory;
@@ -8198,6 +8278,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         lines.Add("");
         await File.WriteAllTextAsync(envFile, string.Join('\n', lines));
         await File.WriteAllTextAsync(exitTokenFile, session.ExitToken);
+        // Success path: pin the SUT marker deadline to virtual time and never
+        // advance it, so the marker wait cannot race a real wall-clock deadline.
+        using var virtualTime = new DetachedLaunchVirtualTime(_workspace);
 
         await File.WriteAllTextAsync(
             launchScript,
@@ -8206,7 +8289,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 processGroupMarker,
                 null,
                 [wrapper, _workspace, "/bin/sh", "-c", "printf launched > \"$1\"; exit 2", "codeybox-detached-no-exit-token", sentinel],
-                exitTokenFile: exitTokenFile));
+                exitTokenFile: exitTokenFile,
+                virtualElapsedSecondsFile: virtualTime.ElapsedSecondsFile));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var (exit, stdout, _) = await RunLocalProcessAsync(
@@ -8217,7 +8301,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 "CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN",
             ],
             environmentOverrides: FakeSudoPathEnvironment());
-        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(30));
+        await WaitForProcessGroupGoneAsync(processGroupMarker, DetachedLaunchWatchdog);
         AssertExitCode(session, 2);
 
         Assert.Equal(0, exit);
