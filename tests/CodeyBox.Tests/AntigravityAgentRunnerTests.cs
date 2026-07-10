@@ -156,7 +156,7 @@ public sealed class AntigravityAgentRunnerTests
         Assert.Equal("bash", prep.Argv[0]);
         Assert.Equal("-c", prep.Argv[1]);
         var script = prep.Argv[2];
-        Assert.Equal(".gemini/antigravity-cli/antigravity-oauth-token", prep.Argv[4]);
+        Assert.Equal(".gemini/antigravity-cli/antigravity-oauth-token", prep.Argv[5]);
         Assert.Equal(credential.EnvironmentVariables[AntigravityConstants.OAuthCredsEnvVar], prep.Stdin);
         Assert.DoesNotContain(AntigravityConstants.OAuthCredsEnvVar, script);
         Assert.Contains("0o600", script);

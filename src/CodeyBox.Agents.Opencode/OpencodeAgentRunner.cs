@@ -49,7 +49,7 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
     public const string DefaultBinary = "opencode";
 
     /// <summary>
-    /// Bash that materialises opencode's credentials file from
+    /// Bash/Python 3 materialiser for opencode's credentials file from
     /// <c>OPENCODE_AUTH_JSON</c> into the XDG-default location (overridable via
     /// <c>OPENCODE_AUTH_DEST_PATH</c>). Shared verbatim with
     /// <c>OpencodeInVmSmokeProbe</c> so the env-reading smoke/create-time path

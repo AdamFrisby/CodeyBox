@@ -82,6 +82,8 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
 
     protected override IReadOnlyList<EnvBackedCredentialFile> EnvBackedCredentialFiles => [AuthCredentialFile];
 
+    protected override IReadOnlyList<string> DirectCredentialEnvironmentVariables => ["OPENAI_API_KEY"];
+
     protected override string PreemptProcessPattern => Binary;
 
     /// <summary>

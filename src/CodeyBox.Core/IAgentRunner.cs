@@ -45,6 +45,26 @@ public interface IAgentRunner
 }
 
 /// <summary>
+/// Declares the exact credential environment names a runner supports. Direct
+/// variables must be present in the CLI process environment; file-backed
+/// variables are payload or destination metadata consumed by the runner's
+/// stdin-based credential staging and must not be exposed to the CLI process.
+/// Resolver sandboxes use this capability as the allowlist at the process
+/// environment sink.
+/// </summary>
+public interface IAgentCredentialEnvironmentPolicy
+{
+    IReadOnlySet<string> DirectCredentialEnvironmentVariables { get; }
+    IReadOnlySet<string> FileBackedCredentialEnvironmentVariables { get; }
+    IReadOnlyList<AgentCredentialFileDestination> CredentialFileDestinations { get; }
+}
+
+public sealed record AgentCredentialFileDestination(
+    string PayloadEnvironmentVariable,
+    string HomeRelativePath,
+    string? DestinationEnvironmentVariable = null);
+
+/// <summary>
 /// Optional runner capability for CLIs that can emit structured stdout
 /// streams suitable for persistent capture.
 /// </summary>

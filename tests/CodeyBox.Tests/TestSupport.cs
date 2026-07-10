@@ -481,7 +481,7 @@ internal enum MergeStrategy
 /// File-write contents are consumed in order; provide one entry per
 /// expected work-phase (or rework-phase) invocation.
 /// </summary>
-internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunner, ITextOnlyAgentRunner
+internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunner, ITextOnlyAgentRunner, IAgentCredentialEnvironmentPolicy
 {
     private readonly Queue<MergeStrategy> _mergeStrategies;
     public Queue<FileWrite> WorkPlan { get; } = new();
@@ -527,6 +527,23 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
     public int StructuredStreamSupportProbeCount { get; private set; }
     public string? ResultStdout { get; set; }
     public AgentKind Kind { get; init; } = AgentKind.Claude;
+    public IReadOnlySet<string> DirectCredentialEnvironmentVariables { get; } =
+        new HashSet<string>(StringComparer.Ordinal)
+        {
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "CURSOR_API_KEY",
+            "GH_TOKEN",
+            "CODEYBOX_TEST_MARKER",
+        };
+    public IReadOnlySet<string> FileBackedCredentialEnvironmentVariables { get; } =
+        new HashSet<string>(StringComparer.Ordinal)
+        {
+            "CODEYBOX_CURSOR_AUTH_JSON",
+        };
+    public IReadOnlyList<AgentCredentialFileDestination> CredentialFileDestinations { get; } = [];
     /// <summary>
     /// When non-null, <see cref="GetTextOnlyUnavailabilityReason"/> returns this
     /// value (simulating a missing text-only credential), and

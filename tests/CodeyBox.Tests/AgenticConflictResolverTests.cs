@@ -272,6 +272,7 @@ public sealed class AgenticConflictResolverTests
         Assert.Equal("second", result.ChosenRunner?.Kind.Value);
         Assert.Equal(1, first.InvocationCount);
         Assert.Equal(1, second.InvocationCount);
+        Assert.Equal(1, sandbox.KillActiveExecsCallCount);
     }
 
     [Fact]
@@ -308,8 +309,11 @@ public sealed class AgenticConflictResolverTests
         Assert.Same(runner, result.FailureRunner);
         Assert.Same(credential, result.FailureCredential);
         var classificationResult = Assert.IsType<AgentResult>(result.FailureClassificationResult);
-        Assert.Contains("failed to materialise file credentials", classificationResult.Summary, StringComparison.Ordinal);
-        Assert.Contains("credential materialisation failed", result.Summary, StringComparison.Ordinal);
+        Assert.Contains("credential file materialisation failed", classificationResult.Summary, StringComparison.Ordinal);
+        Assert.Contains("credential file materialisation failed", result.Summary, StringComparison.Ordinal);
+        var infrastructureFailure = Assert.Single(result.InfrastructureFailures);
+        Assert.Equal("file materialisation", infrastructureFailure.Stage);
+        Assert.IsType<InvalidOperationException>(infrastructureFailure.Cause.SourceException);
     }
 
     [Fact]
@@ -1512,6 +1516,7 @@ public sealed class AgenticConflictResolverTests
         public int DiffCallCount { get; private set; }
         public int GrepCallCount { get; private set; }
         public int LsFilesCallCount { get; private set; }
+        public int KillActiveExecsCallCount { get; private set; }
 
         public void AddConflictedFile(string relativePath, string content)
         {
@@ -1614,6 +1619,12 @@ public sealed class AgenticConflictResolverTests
                 return Task.FromResult(canned);
 
             return Task.FromResult(new SandboxExecResult(0, "", ""));
+        }
+
+        public Task KillActiveExecsAsync(CancellationToken ct = default)
+        {
+            KillActiveExecsCallCount++;
+            return Task.CompletedTask;
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;

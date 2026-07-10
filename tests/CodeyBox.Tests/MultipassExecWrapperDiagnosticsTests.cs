@@ -34,6 +34,19 @@ public sealed class MultipassExecWrapperDiagnosticsTests
     }
 
     [Theory]
+    [InlineData("1INVALID")]
+    [InlineData("X; touch /work/pwn #")]
+    [InlineData("HOME")]
+    [InlineData("PATH")]
+    [InlineData("LD_PRELOAD")]
+    public void BuildEnvironmentFileContent_RejectsInvalidOrReservedKey(string key)
+    {
+        var env = new Dictionary<string, string> { [key] = "value" };
+        Assert.Throws<ArgumentException>(
+            () => MultipassSandboxProvider.BuildEnvironmentFileContent(env));
+    }
+
+    [Theory]
     [InlineData("EMBED_NEWLINE", "line1\nline2\nline3")]
     [InlineData("EMBED_SQUOTE", "it's a 'quote' party")]
     [InlineData("EMBED_BACKSLASH", "a\\b\\c\\")]

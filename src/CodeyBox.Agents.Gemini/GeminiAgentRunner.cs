@@ -75,6 +75,8 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     protected override IReadOnlyList<EnvBackedCredentialFile> EnvBackedCredentialFiles =>
         [OAuthCredentialFile, SettingsCredentialFile];
 
+    protected override IReadOnlyList<string> DirectCredentialEnvironmentVariables => ["GEMINI_API_KEY"];
+
     protected override string PreemptProcessPattern => Binary;
 
     public async Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default)

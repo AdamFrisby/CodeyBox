@@ -41,7 +41,7 @@ public sealed class ConcreteAgentRunnerUatTests
 
         Assert.True(result.Success);
         Assert.Equal(["claude", "--help"], sandbox.Execs[0].Argv);
-        Assert.Equal(".claude/.credentials.json", sandbox.Execs[1].Argv[4]);
+        Assert.Equal(".claude/.credentials.json", sandbox.Execs[1].Argv[5]);
         Assert.Equal(credential.EnvironmentVariables[ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar], sandbox.Execs[1].Stdin);
         Assert.DoesNotContain(ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar, sandbox.Execs[1].Argv[2]);
         Assert.Contains("0o600", sandbox.Execs[1].Argv[2]);
@@ -115,9 +115,9 @@ public sealed class ConcreteAgentRunnerUatTests
 
         Assert.True(result.Success);
         Assert.Equal(["gemini", "--help"], sandbox.Execs[0].Argv);
-        Assert.Equal(".gemini/oauth_creds.json", sandbox.Execs[1].Argv[4]);
+        Assert.Equal(".gemini/oauth_creds.json", sandbox.Execs[1].Argv[5]);
         Assert.Equal(credential.EnvironmentVariables[GeminiOAuthFileCredentialProvider.OAuthCredsEnvVar], sandbox.Execs[1].Stdin);
-        Assert.Equal(".gemini/settings.json", sandbox.Execs[2].Argv[4]);
+        Assert.Equal(".gemini/settings.json", sandbox.Execs[2].Argv[5]);
         Assert.Equal(credential.EnvironmentVariables[GeminiOAuthFileCredentialProvider.SettingsEnvVar], sandbox.Execs[2].Stdin);
 
         var argv = sandbox.Execs[3].Argv.ToList();

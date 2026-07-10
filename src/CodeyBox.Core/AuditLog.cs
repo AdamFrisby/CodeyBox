@@ -1380,7 +1380,7 @@ public static class AuditLog
 
     /// <summary>
     /// Emitted when the preventive Claude thinking-block transcript sanitizer
-    /// fails inside <c>PrepareSandboxAsync</c>. The run continues — the
+    /// fails inside the runner's sandbox-preparation lifecycle. The run continues — the
     /// failure detail surfaces later via the reactive retry path if the CLI
     /// call subsequently 400s. This event gives operators an early signal
     /// that the primary prevention mechanism is unhealthy.

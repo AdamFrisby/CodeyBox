@@ -41,7 +41,7 @@ namespace CodeyBox.Agents.Crock;
 ///     ephemeral tunnel — and authorising the callback path without
 ///     widening the sandbox's network policy beyond what its
 ///     internet-only profile already allows — is the harder half of the
-///     follow-up. <see cref="PrepareSandboxAsync"/> here only materialises
+///     follow-up. The shared preparation lifecycle here only materialises
 ///     the credential file; the tunnel side is intentionally NOT wired.
 ///   </item>
 ///   <item>
@@ -86,7 +86,7 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
         "crock: credentials are invalid (CROCK_CONFIG_JSON not set)";
 
     /// <summary>
-    /// Bash that materialises crock's <c>~/.crockcode/config.json</c> from
+    /// Bash/Python 3 materialiser for crock's <c>~/.crockcode/config.json</c> from
     /// <see cref="ConfigEnvVar"/> using the shared env-backed credential-file
     /// writer. Exposed so an in-VM smoke probe can run the env-reading
     /// smoke/create-time path against the same destination the runner uses
@@ -151,7 +151,7 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
     /// than letting the CLI crash on its own missing-config error — keeps the
     /// failure shape consistent with the other subscription runners.
     /// </summary>
-    protected override async Task<AgentResult?> PrepareSandboxAsync(
+    protected override Task<AgentResult?> PrepareAgentSandboxAsync(
         ISandbox sandbox,
         string workingDirectory,
         AgentCredential? credential,
@@ -162,14 +162,14 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
             || !credential.EnvironmentVariables.TryGetValue(ConfigEnvVar, out var json)
             || string.IsNullOrWhiteSpace(json))
         {
-            return new AgentResult(
+            return Task.FromResult<AgentResult?>(new AgentResult(
                 Success: false,
                 Summary: MissingCredentialMarker,
                 Stdout: null,
-                Stderr: MissingCredentialMarker);
+                Stderr: MissingCredentialMarker));
         }
 
-        return await MaterialiseEnvBackedCredentialFilesAsync(sandbox, credential, ct).ConfigureAwait(false);
+        return Task.FromResult<AgentResult?>(null);
     }
 
     /// <summary>
@@ -256,7 +256,7 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
         Action<string>? stdoutChunkCallback = null,
         bool captureStructuredStream = false)
     {
-        var preparation = await PrepareSandboxAsync(sandbox, workingDirectory, credential, resume: null, ct);
+        var preparation = await PrepareSandboxForRunAsync(sandbox, workingDirectory, credential, resume: null, ct);
         if (preparation is not null)
             return preparation;
 

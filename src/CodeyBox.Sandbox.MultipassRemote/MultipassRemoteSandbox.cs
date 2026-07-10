@@ -101,28 +101,61 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
         var opts = _opts;
         var workdir = exec.WorkingDirectory ?? _spec.WorkingDirectory ?? SandboxConventions.WorkDir;
 
-        // Build the in-VM command: `cd <wd> && <argv...>` so subsequent execs
-        // honour the requested working directory without depending on a
-        // multipass --working-directory flag (versions differ).
-        var quotedArgv = QuoteArgvForShell(exec.Argv);
-        var inVmScript = new StringBuilder();
-        inVmScript.Append("cd ").Append(QuoteShellWord(workdir)).Append(" && ");
-
-        if (exec.ExtraEnvironment is not null && exec.ExtraEnvironment.Count > 0)
+        IReadOnlyList<string> remoteArgv;
+        string? transportStdin;
+        if (exec.EnvironmentContainsSecrets && exec.ExtraEnvironment is { Count: > 0 } secretEnvironment)
         {
-            foreach (var (k, v) in exec.ExtraEnvironment)
-            {
-                ValidateEnvKey(k);
-                inVmScript.Append(k).Append('=').Append(QuoteShellWord(v)).Append(' ');
-            }
+            var environmentFile = SandboxEnvironmentVariablePolicy.BuildShellEnvironmentFileContent(secretEnvironment);
+            var commandStdin = exec.Stdin ?? string.Empty;
+            remoteArgv =
+            [
+                opts.RemoteMultipassPath,
+                "exec",
+                Id,
+                "--",
+                "bash",
+                "-c",
+                SecretEnvironmentBootstrapScript,
+                "codeybox-secret-environment",
+                Encoding.UTF8.GetByteCount(environmentFile).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                Encoding.UTF8.GetByteCount(commandStdin).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                workdir,
+                .. exec.Argv,
+            ];
+            transportStdin = environmentFile + commandStdin;
         }
-        inVmScript.Append(quotedArgv);
-
-        // multipass exec <vm> -- bash -lc 'cd ... && ...'
-        var remoteArgv = new List<string>(8)
+        else
         {
-            opts.RemoteMultipassPath, "exec", Id, "--", "bash", "-lc", inVmScript.ToString(),
-        };
+            // Build the in-VM command: `cd <wd> && <argv...>` so subsequent execs
+            // honour the requested working directory without depending on a
+            // multipass --working-directory flag (versions differ).
+            var quotedArgv = QuoteArgvForShell(exec.Argv);
+            var inVmScript = new StringBuilder();
+            inVmScript.Append("cd ").Append(QuoteShellWord(workdir)).Append(" && ");
+
+            if (exec.ExtraEnvironment is not null && exec.ExtraEnvironment.Count > 0)
+            {
+                foreach (var (k, v) in exec.ExtraEnvironment)
+                {
+                    ValidateEnvKey(k);
+                    inVmScript.Append(k).Append('=').Append(QuoteShellWord(v)).Append(' ');
+                }
+            }
+            inVmScript.Append(quotedArgv);
+
+            // multipass exec <vm> -- bash -lc 'cd ... && ...'
+            remoteArgv =
+            [
+                opts.RemoteMultipassPath,
+                "exec",
+                Id,
+                "--",
+                "bash",
+                "-lc",
+                inVmScript.ToString(),
+            ];
+            transportStdin = exec.Stdin;
+        }
 
         // Chunk callbacks are pure live-update side channels; the transport's
         // ProcessRunResult.Stdout / Stderr remain authoritative for the final
@@ -173,7 +206,7 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
             {
                 var run = await _transport.RunAsync(
                     remoteArgv,
-                    stdin: exec.Stdin,
+                    stdin: transportStdin,
                     linkedCts.Token,
                     stdoutChunkCallback: OnStdout,
                     stderrChunkCallback: OnStderr,
@@ -223,6 +256,24 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
             _activeExecCts.TryRemove(linkedCts, out _);
         }
     }
+
+    private const string SecretEnvironmentBootstrapScript =
+        """
+        set -eu
+        umask 077
+        codeybox_env_file=$(mktemp)
+        codeybox_stdin_file=$(mktemp)
+        trap 'rm -f "$codeybox_env_file" "$codeybox_stdin_file"' EXIT
+        dd if=/dev/stdin of="$codeybox_env_file" bs=1 count="$1" status=none
+        dd if=/dev/stdin of="$codeybox_stdin_file" bs=1 count="$2" status=none
+        codeybox_workdir=$3
+        shift 3
+        set -a
+        . "$codeybox_env_file"
+        set +a
+        cd "$codeybox_workdir"
+        "$@" < "$codeybox_stdin_file"
+        """;
 
     public async Task KillActiveExecsAsync(CancellationToken ct = default)
     {

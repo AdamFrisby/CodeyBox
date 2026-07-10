@@ -195,7 +195,7 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
     /// <summary>
     /// agy's <c>--log-file</c> open fails if the parent directory is missing.
     /// The exec wrapper only creates the log dir when <c>CODEYBOX_AGENT_LOG_FILE</c>
-    /// is set, and <see cref="PrepareSandboxAsync"/> only creates
+    /// is set, and the shared credential preparation step only creates
     /// <c>~/.gemini/…</c> on the OAuth-creds branch — so create the directory
     /// unconditionally here, before agy runs, independent of the credential path.
     /// </summary>

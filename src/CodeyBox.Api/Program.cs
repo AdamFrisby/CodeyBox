@@ -1264,7 +1264,7 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
     // Gemini (Google AI Studio / Code Assist) OAuth files. The CLI hard-reads
     // ~/.gemini/{oauth_creds,settings}.json — there's no env-var alternative
     // for OAuth-personal — so the orchestrator ships their contents to the
-    // sandbox via env vars and GeminiAgentRunner.PrepareSandboxAsync writes
+        // sandbox via env vars and GeminiAgentRunner's shared credential lifecycle writes
     // them back to ~/.gemini/ inside the VM.
     builtInFirst.Add(new GeminiOAuthFileCredentialProvider(
         sp.GetRequiredService<GeminiOAuthCredentialFileSource>(),

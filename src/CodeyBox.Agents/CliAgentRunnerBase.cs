@@ -10,32 +10,10 @@ namespace CodeyBox.Agents;
 /// inside the sandbox. Subclasses describe how to invoke their CLI; this base
 /// handles credential staging and result wrapping uniformly.
 /// </summary>
-public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAgentRunner
+public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAgentRunner, IAgentCredentialEnvironmentPolicy
 {
     private const string AgentRunIdEnvironmentVariable = "CODEYBOX_AGENT_RUN_ID";
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> ActiveAgentRunIds = new();
-
-    // Overwrite = write the credential regardless of any pre-existing file.
-    // Chosen for the credential-stdin (candidate) path because a resolver
-    // fallback candidate's credential MUST land at the destination even when
-    // an earlier candidate wrote a different account's auth blob there;
-    // deferring to the existing file would silently keep the wrong account.
-    //
-    // Preserve = leave a pre-existing non-empty regular file in place.
-    // Chosen for the env-from-sandbox (create-time env / smoke probe) path
-    // because a resumed run restores a scratchpad-captured auth file that
-    // may hold a refreshed token minted DURING the crashed run. The stale
-    // credential snapshot in SandboxSpec.Environment must not clobber it.
-    private const string OverwriteExistingCredentialFileFlag = "0";
-    private const string PreserveExistingCredentialFileFlag = "1";
-    // Third argument is passed by the caller (0 = overwrite, 1 = preserve) so
-    // the same script serves both the initial-run (overwrite) and resumed-run
-    // (preserve — leave a scratchpad-restored refreshed token in place)
-    // shapes without maintaining two divergent shell wrappers.
-    private const string CredentialStdinMaterialiseScript =
-        SafeCredentialFileWriterScript +
-        "\n" +
-        "codeybox_write_credential_file \"$1\" \"${2:-}\" \"${3:-" + OverwriteExistingCredentialFileFlag + "}\"\n";
 
     public abstract AgentKind Kind { get; }
 
@@ -104,20 +82,44 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 
     /// <summary>
     /// Env-var-backed credential files this runner writes before executing the
-    /// agent CLI. Values supplied by a concrete <see cref="AgentCredential"/> are
-    /// passed via stdin, not per-exec environment, so fallback candidates can
-    /// authenticate without exposing candidate secrets to argv or process env.
+    /// agent CLI. The shared writer requires Python 3 in the sandbox image.
+    /// Values supplied by a concrete <see cref="AgentCredential"/> are passed
+    /// via stdin, not per-exec environment, so fallback candidates can
+    /// authenticate without exposing file payloads to argv or the CLI process.
     /// </summary>
     protected virtual IReadOnlyList<EnvBackedCredentialFile> EnvBackedCredentialFiles => [];
 
     /// <summary>
-    /// Credential environment variables that this runner materialises as files
-    /// inside the sandbox before invoking the CLI. Sandboxes that reject
-    /// file-backed credentials use this list to fail before secrets are written
-    /// to persistent storage.
+    /// Credential environment variables the CLI reads directly from its
+    /// process environment. Resolver candidate scoping uses this exact list as
+    /// the allowlist at the process-environment sink.
+    /// </summary>
+    protected virtual IReadOnlyList<string> DirectCredentialEnvironmentVariables => [];
+
+    /// <summary>
+    /// Credential payload and destination-metadata variables consumed by the
+    /// staging lifecycle rather than exposed to the agent CLI process.
     /// </summary>
     protected virtual IReadOnlyList<string> FileBackedCredentialEnvironmentVariables =>
-        EnvBackedCredentialFiles.Select(static file => file.EnvironmentVariable).ToArray();
+        EnvBackedCredentialFiles
+            .SelectMany(static file => file.DestinationEnvironmentVariable is null
+                ? [file.EnvironmentVariable]
+                : new[] { file.EnvironmentVariable, file.DestinationEnvironmentVariable })
+            .ToArray();
+
+    IReadOnlySet<string> IAgentCredentialEnvironmentPolicy.DirectCredentialEnvironmentVariables =>
+        DirectCredentialEnvironmentVariables.ToHashSet(StringComparer.Ordinal);
+
+    IReadOnlySet<string> IAgentCredentialEnvironmentPolicy.FileBackedCredentialEnvironmentVariables =>
+        FileBackedCredentialEnvironmentVariables.ToHashSet(StringComparer.Ordinal);
+
+    IReadOnlyList<AgentCredentialFileDestination> IAgentCredentialEnvironmentPolicy.CredentialFileDestinations =>
+        EnvBackedCredentialFiles
+            .Select(static file => new AgentCredentialFileDestination(
+                file.EnvironmentVariable,
+                file.HomeRelativePath,
+                file.DestinationEnvironmentVariable))
+            .ToArray();
 
     /// <summary>
     /// Pattern used to ask the running CLI to stop before scratchpad capture.
@@ -154,31 +156,37 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             $"{Kind} declares CLI session resume but does not implement {nameof(BuildSessionResumeInvocation)}.");
 
     /// <summary>
-    /// Gives subclasses a chance to materialise non-argv CLI prerequisites
-    /// immediately before invoking the binary. Returning a result short-circuits
-    /// the run with that failure. Passing <paramref name="resume"/> through to
-    /// the shared credential materialiser switches its stdin (candidate) path
-    /// to preserve-existing semantics so a scratchpad-restored auth file whose
-    /// token was refreshed during the crashed run is not clobbered by the
-    /// stale credential snapshot the caller passed in.
+    /// Gives subclasses a chance to prepare agent-specific, non-credential
+    /// prerequisites immediately before credential staging and CLI invocation.
+    /// Returning a result short-circuits the run with that failure. Credential
+    /// staging itself is a non-overridable lifecycle step so subclasses cannot
+    /// accidentally bypass fresh-run or resume preservation semantics.
     /// </summary>
-    protected virtual async Task<AgentResult?> PrepareSandboxAsync(
+    protected virtual Task<AgentResult?> PrepareAgentSandboxAsync(
         ISandbox sandbox,
         string workingDirectory,
         AgentCredential? credential,
         AgentResumeContext? resume,
         CancellationToken ct)
-        => await MaterialiseEnvBackedCredentialFilesAsync(
-                sandbox, credential, preserveExistingCredentialFile: resume is not null, ct)
-            .ConfigureAwait(false);
+        => Task.FromResult<AgentResult?>(null);
 
-    protected Task<AgentResult?> MaterialiseEnvBackedCredentialFilesAsync(
+    protected async Task<AgentResult?> PrepareSandboxForRunAsync(
         ISandbox sandbox,
+        string workingDirectory,
         AgentCredential? credential,
+        AgentResumeContext? resume,
         CancellationToken ct)
-        => MaterialiseEnvBackedCredentialFilesAsync(sandbox, credential, preserveExistingCredentialFile: false, ct);
+    {
+        var agentPreparation = await PrepareAgentSandboxAsync(
+            sandbox, workingDirectory, credential, resume, ct).ConfigureAwait(false);
+        if (agentPreparation is not null)
+            return agentPreparation;
 
-    protected async Task<AgentResult?> MaterialiseEnvBackedCredentialFilesAsync(
+        return await MaterialiseEnvBackedCredentialFilesAsync(
+            sandbox, credential, preserveExistingCredentialFile: resume is not null, ct).ConfigureAwait(false);
+    }
+
+    private async Task<AgentResult?> MaterialiseEnvBackedCredentialFilesAsync(
         ISandbox sandbox,
         AgentCredential? credential,
         bool preserveExistingCredentialFile,
@@ -187,52 +195,52 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         if (EnvBackedCredentialFiles.Count == 0)
             return null;
 
-        var preserveFlag = preserveExistingCredentialFile
-            ? PreserveExistingCredentialFileFlag
-            : OverwriteExistingCredentialFileFlag;
+        var overwritePolicy = preserveExistingCredentialFile
+            ? SandboxCredentialOverwritePolicy.PreserveNonEmpty
+            : SandboxCredentialOverwritePolicy.Overwrite;
 
         foreach (var file in EnvBackedCredentialFiles)
         {
             ValidateEnvBackedCredentialFile(file);
 
-            SandboxExec? exec = null;
             if (credential?.EnvironmentVariables.TryGetValue(file.EnvironmentVariable, out var contents) == true
                 && !string.IsNullOrEmpty(contents))
             {
-                exec = new SandboxExec
+                try
                 {
-                    Argv =
-                    [
-                        "bash",
-                        "-c",
-                        CredentialStdinMaterialiseScript,
-                        "codeybox-credential-materialise",
-                        file.HomeRelativePath,
-                        ResolveCredentialDestinationOverride(file, credential.EnvironmentVariables),
-                        preserveFlag,
-                    ],
-                    Stdin = contents,
-                };
+                    await SandboxCredentialFileWriter.WriteAsync(
+                        sandbox,
+                        new SandboxCredentialFileTarget(
+                            SandboxCredentialFileRoot.Home,
+                            file.HomeRelativePath,
+                            ResolveCredentialDestinationOverride(file, credential.EnvironmentVariables)),
+                        contents,
+                        overwritePolicy,
+                        ct).ConfigureAwait(false);
+                }
+                catch (SandboxCredentialFileWriteException ex)
+                {
+                    return new AgentResult(
+                        Success: false,
+                        Summary: $"failed to materialise {file.FailureDescription}: exit {ex.ExitCode}",
+                        Stdout: ex.Stdout,
+                        Stderr: ex.Stderr);
+                }
             }
             else if (credential is null && file.MaterialiseFromSandboxEnvironmentWhenCredentialMissing)
             {
-                exec = new SandboxExec
+                var write = await sandbox.ExecAsync(new SandboxExec
                 {
                     Argv = ["bash", "-c", BuildEnvBackedCredentialScript(file)],
-                };
-            }
-
-            if (exec is null)
-                continue;
-
-            var write = await sandbox.ExecAsync(exec, ct).ConfigureAwait(false);
-            if (!write.Success)
-            {
-                return new AgentResult(
-                    Success: false,
-                    Summary: $"failed to materialise {file.FailureDescription}: exit {write.ExitCode}",
-                    Stdout: write.Stdout,
-                    Stderr: write.Stderr);
+                }, ct).ConfigureAwait(false);
+                if (!write.Success)
+                {
+                    return new AgentResult(
+                        Success: false,
+                        Summary: $"failed to materialise {file.FailureDescription}: exit {write.ExitCode}",
+                        Stdout: write.Stdout,
+                        Stderr: write.Stderr);
+                }
             }
         }
 
@@ -242,19 +250,11 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     protected static string BuildEnvBackedCredentialScript(EnvBackedCredentialFile file)
     {
         ValidateEnvBackedCredentialFile(file);
-        var script = SafeCredentialFileWriterScript +
-            "\n" +
-            "value=\"${" + file.EnvironmentVariable + ":-}\"\n" +
-            "if [ -z \"$value\" ]; then exit 0; fi\n";
-
-        script += file.DestinationEnvironmentVariable is null
-            ? "dest_override=\"\"\n"
-            : "dest_override=\"${" + file.DestinationEnvironmentVariable + ":-}\"\n";
-
-        return script +
-            "printf '%s' \"$value\" | codeybox_write_credential_file " +
-            ShellSingleQuote(file.HomeRelativePath) +
-            " \"$dest_override\" " + PreserveExistingCredentialFileFlag + "\n";
+        return SandboxCredentialFileWriter.BuildEnvironmentMaterialisationScript(
+            file.EnvironmentVariable,
+            file.HomeRelativePath,
+            file.DestinationEnvironmentVariable,
+            SandboxCredentialOverwritePolicy.PreserveNonEmpty);
     }
 
     private static string ResolveCredentialDestinationOverride(
@@ -280,19 +280,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     }
 
     private static void ValidateEnvironmentVariableName(string value, string fieldName)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            throw new ArgumentException("Environment variable name must be non-empty.", fieldName);
-        foreach (var c in value)
-        {
-            if (c is >= 'A' and <= 'Z'
-                || c is >= 'a' and <= 'z'
-                || c is >= '0' and <= '9'
-                || c == '_')
-                continue;
-            throw new ArgumentException($"Environment variable name contains an invalid character: {value}", fieldName);
-        }
-    }
+        => SandboxCredentialFileWriter.ValidateEnvironmentVariableName(value, fieldName);
 
     private static void ValidateHomeRelativeCredentialPath(string value)
     {
@@ -308,240 +296,6 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         }
     }
 
-    private static string ShellSingleQuote(string value) =>
-        "'" + value.Replace("'", "'\"'\"'", StringComparison.Ordinal) + "'";
-
-    private const string SafeCredentialFileWriterScript =
-        """
-        set -eu
-        codeybox_fail() { printf '%s\n' "$1" >&2; exit 2; }
-        codeybox_credential_writer_py=$(cat <<'PY'
-        import errno
-        import os
-        import secrets
-        import stat
-        import sys
-
-        OVERWRITE = "0"
-        PRESERVE = "1"
-        O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
-        O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
-        O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
-
-        def fail(message):
-            print(message, file=sys.stderr)
-            raise SystemExit(2)
-
-        def reject_dot_segments(label, value):
-            for segment in value.split("/"):
-                if segment in (".", ".."):
-                    fail(f"credential {label} contains traversal")
-
-        def split_relative(value):
-            parts = [part for part in value.split(os.sep) if part]
-            for part in parts:
-                if part in (".", ".."):
-                    fail("credential destination contains traversal")
-            return parts
-
-        def open_directory(parent_fd, name):
-            try:
-                return os.open(
-                    name,
-                    os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
-                    dir_fd=parent_fd)
-            except OSError as ex:
-                if ex.errno == errno.ELOOP:
-                    fail("credential destination parent is a symlink")
-                if ex.errno == errno.ENOTDIR:
-                    fail("credential destination parent is not a directory")
-                raise
-
-        def ensure_parent_directory(home_fd, parent_parts):
-            current_fd = os.dup(home_fd)
-            for part in parent_parts:
-                try:
-                    next_fd = open_directory(current_fd, part)
-                except FileNotFoundError:
-                    os.mkdir(part, 0o700, dir_fd=current_fd)
-                    next_fd = open_directory(current_fd, part)
-
-                try:
-                    mode = os.fstat(next_fd).st_mode
-                    if not stat.S_ISDIR(mode):
-                        fail("credential destination parent is not a directory")
-                    os.fchmod(next_fd, 0o700)
-                finally:
-                    os.close(current_fd)
-                current_fd = next_fd
-            return current_fd
-
-        def open_existing_parent_directory(home_fd, parent_parts):
-            current_fd = os.dup(home_fd)
-            for part in parent_parts:
-                next_fd = open_directory(current_fd, part)
-                os.close(current_fd)
-                current_fd = next_fd
-            return current_fd
-
-        def same_file(left_fd, right_fd):
-            left = os.fstat(left_fd)
-            right = os.fstat(right_fd)
-            return left.st_dev == right.st_dev and left.st_ino == right.st_ino
-
-        def resolve_destination(home, rel, override):
-            if not rel or rel.startswith("/"):
-                fail("credential path must be HOME-relative")
-            reject_dot_segments("path", rel)
-
-            if override:
-                reject_dot_segments("destination", override)
-                if override.startswith("$HOME/"):
-                    candidate = os.path.join(home, override[len("$HOME/"):])
-                elif override.startswith("~/"):
-                    candidate = os.path.join(home, override[2:])
-                elif os.path.isabs(override):
-                    candidate = override
-                else:
-                    candidate = os.path.join(home, override)
-            else:
-                candidate = os.path.join(home, rel)
-
-            destination = os.path.normpath(candidate)
-            try:
-                common = os.path.commonpath([home, destination])
-            except ValueError:
-                fail("credential destination escapes HOME")
-            if common != home:
-                fail("credential destination escapes HOME")
-            return os.path.relpath(destination, home)
-
-        def existing_destination_is_nonempty_regular(parent_fd, file_name):
-            try:
-                fd = os.open(file_name, os.O_RDONLY | O_NOFOLLOW | O_CLOEXEC, dir_fd=parent_fd)
-            except FileNotFoundError:
-                return False
-            except OSError as ex:
-                if ex.errno == errno.ELOOP:
-                    fail("credential destination file is a symlink")
-                if ex.errno == errno.ENOTDIR:
-                    fail("credential destination exists and is not a regular file")
-                raise
-
-            try:
-                st = os.fstat(fd)
-                if not stat.S_ISREG(st.st_mode):
-                    fail("credential destination exists and is not a regular file")
-                return st.st_size > 0
-            finally:
-                os.close(fd)
-
-        def reject_non_regular_destination(parent_fd, file_name):
-            try:
-                st = os.stat(file_name, dir_fd=parent_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                return
-            if stat.S_ISLNK(st.st_mode):
-                return
-            if not stat.S_ISREG(st.st_mode):
-                fail("credential destination exists and is not a regular file")
-
-        def write_file(parent_fd, file_name, data):
-            tmp_name = None
-            tmp_fd = None
-            for _ in range(16):
-                candidate = f".{file_name}.tmp.{secrets.token_hex(8)}"
-                try:
-                    tmp_fd = os.open(
-                        candidate,
-                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW | O_CLOEXEC,
-                        0o600,
-                        dir_fd=parent_fd)
-                    tmp_name = candidate
-                    break
-                except FileExistsError:
-                    continue
-            if tmp_fd is None or tmp_name is None:
-                fail("credential temporary file name could not be allocated")
-
-            try:
-                with os.fdopen(tmp_fd, "wb", closefd=True) as handle:
-                    handle.write(data)
-                    handle.flush()
-                    os.fchmod(handle.fileno(), 0o600)
-                os.replace(tmp_name, file_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-                written = os.stat(file_name, dir_fd=parent_fd, follow_symlinks=False)
-                return written.st_dev, written.st_ino
-            finally:
-                try:
-                    os.unlink(tmp_name, dir_fd=parent_fd)
-                except FileNotFoundError:
-                    pass
-
-        def main():
-            if len(sys.argv) != 4:
-                fail("credential writer invoked with invalid arguments")
-            rel, override, preserve_existing = sys.argv[1:]
-            if preserve_existing not in (OVERWRITE, PRESERVE):
-                fail("credential preserve flag is invalid")
-
-            home_env = os.environ.get("HOME")
-            if not home_env:
-                fail("credential HOME is not accessible")
-            home = os.path.realpath(home_env)
-            if not os.path.isdir(home):
-                fail("credential HOME is not accessible")
-
-            rel_destination = resolve_destination(home, rel, override)
-            parts = split_relative(rel_destination)
-            if not parts:
-                fail("credential destination file name is empty")
-            file_name = parts[-1]
-            if file_name in (".", ".."):
-                fail("credential destination file name is invalid")
-            parent_parts = parts[:-1]
-
-            home_fd = os.open(home, os.O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-            parent_fd = None
-            try:
-                parent_fd = ensure_parent_directory(home_fd, parent_parts)
-                if preserve_existing == PRESERVE and existing_destination_is_nonempty_regular(parent_fd, file_name):
-                    return
-                reject_non_regular_destination(parent_fd, file_name)
-                written_identity = write_file(parent_fd, file_name, sys.stdin.buffer.read())
-
-                verified_parent_fd = open_existing_parent_directory(home_fd, parent_parts)
-                try:
-                    if not same_file(parent_fd, verified_parent_fd):
-                        fail("credential destination parent path changed during write")
-                    verified_fd = os.open(file_name, os.O_RDONLY | O_NOFOLLOW | O_CLOEXEC, dir_fd=verified_parent_fd)
-                    try:
-                        verified = os.fstat(verified_fd)
-                        if (verified.st_dev, verified.st_ino) != written_identity:
-                            fail("credential destination changed during write")
-                    finally:
-                        os.close(verified_fd)
-                finally:
-                    os.close(verified_parent_fd)
-            finally:
-                if parent_fd is not None:
-                    os.close(parent_fd)
-                os.close(home_fd)
-
-        try:
-            main()
-        except SystemExit:
-            raise
-        except Exception as ex:
-            fail(f"credential materialisation failed: {ex.__class__.__name__}: {ex}")
-        PY
-        )
-        codeybox_write_credential_file() {
-          command -v python3 >/dev/null 2>&1 || codeybox_fail 'python3 is required to materialise credential files'
-          python3 -c "$codeybox_credential_writer_py" "$1" "${2:-}" "${3:-0}"
-        }
-        """;
-
     public virtual async Task<AgentResult> RunAsync(
         ISandbox sandbox,
         string workingDirectory,
@@ -553,15 +307,15 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         Action<string>? stdoutChunkCallback = null,
         bool captureStructuredStream = false)
     {
-        // Direct CLI env credentials that truly must be process environment
-        // belong in SandboxSpec.Environment at sandbox creation time. Env-backed
-        // credential files are materialised below from credential.EnvironmentVariables
-        // via stdin. We deliberately do NOT merge credential.EnvironmentVariables
-        // into the per-exec ExtraEnvironment here.
+        // Direct CLI env credentials are provisioned by the sandbox owner: in
+        // SandboxSpec for a normal single-agent sandbox, or through the active
+        // candidate scope in the conflict resolver. Env-backed credential files
+        // are materialised below via stdin. This runner deliberately does NOT
+        // merge credential.EnvironmentVariables into per-exec ExtraEnvironment.
         if (RejectUnsupportedFileBackedCredentials(sandbox, credential) is { } unsupported)
             return unsupported;
 
-        var preparation = await PrepareSandboxAsync(sandbox, workingDirectory, credential, resume: null, ct);
+        var preparation = await PrepareSandboxForRunAsync(sandbox, workingDirectory, credential, resume: null, ct);
         if (preparation is not null)
             return preparation;
 
@@ -623,7 +377,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 
         await RestoreScratchpadAsync(sandbox, workingDirectory, resume, ct);
 
-        var preparation = await PrepareSandboxAsync(sandbox, workingDirectory, credential, resume, ct);
+        var preparation = await PrepareSandboxForRunAsync(sandbox, workingDirectory, credential, resume, ct);
         if (preparation is not null)
             return preparation;
 
@@ -1131,7 +885,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             && !string.IsNullOrWhiteSpace(json))
             return null;
 
-        // Bundle present but auth JSON absent — PrepareSandboxAsync no-ops; image auth may suffice.
+        // Bundle present but auth JSON absent — credential staging no-ops; image auth may suffice.
         return null;
     }
 
@@ -1149,21 +903,6 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             null));
     }
 
-    protected static IReadOnlyDictionary<string, string>? MergeCredentialEnvironment(
-        IReadOnlyDictionary<string, string>? baseEnvironment,
-        AgentCredential? credential)
-    {
-        if (credential?.EnvironmentVariables is not { Count: > 0 } env)
-            return baseEnvironment;
-
-        var merged = baseEnvironment is null
-            ? new Dictionary<string, string>(StringComparer.Ordinal)
-            : new Dictionary<string, string>(baseEnvironment, StringComparer.Ordinal);
-        foreach (var (key, value) in env)
-            merged[key] = value;
-        return merged;
-    }
-
     protected async Task<TextOnlyAgentResult> ExecuteTextOnlyInSandboxAsync(
         ISandbox sandbox,
         string workingDirectory,
@@ -1176,7 +915,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         if (RejectUnsupportedFileBackedCredentials(sandbox, credential) is { } unsupported)
             return new TextOnlyAgentResult(false, unsupported.Summary, unsupported.Stdout, unsupported.Stderr);
 
-        var preparation = await PrepareSandboxAsync(sandbox, workingDirectory, credential, resume: null, ct);
+        var preparation = await PrepareSandboxForRunAsync(sandbox, workingDirectory, credential, resume: null, ct);
         if (preparation is not null)
             return new TextOnlyAgentResult(false, preparation.Summary, preparation.Stdout, preparation.Stderr);
 

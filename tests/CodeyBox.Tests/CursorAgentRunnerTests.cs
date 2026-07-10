@@ -1,6 +1,8 @@
 using CodeyBox.Agents.Cursor;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
+using CodeyBox.Sandbox.Process;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
@@ -178,14 +180,39 @@ public sealed class CursorAgentRunnerTests
 
         Assert.True(result.Success);
         var authExec = Assert.Single(sandbox.Execs, e =>
-            e.Argv.Count >= 5
-            && e.Argv[0] == "bash"
-            && e.Argv[4] == ".config/cursor/auth.json");
+            CredentialMaterialisationTestHelper.IsStdinMaterialisation(
+                e, ".config/cursor/auth.json"));
         Assert.Equal(authJson, authExec.Stdin);
         Assert.Null(authExec.ExtraEnvironment);
         Assert.DoesNotContain(authJson, authExec.Argv[2]);
         Assert.DoesNotContain(authJson, authExec.Argv);
         Assert.DoesNotContain("CODEYBOX_CURSOR_AUTH_JSON", authExec.Argv[2]);
+    }
+
+    [Fact]
+    public async Task RunAsync_ProcessSandbox_MaterialisesAuthFromSandboxEnvironment()
+    {
+        const string authJson = """{"token":"sandbox-environment-token"}""";
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Environment = new Dictionary<string, string>
+            {
+                ["CODEYBOX_CURSOR_AUTH_JSON"] = authJson,
+            },
+        });
+        var runner = new CursorAgentRunner { Binary = "/bin/true" };
+
+        var result = await runner.RunAsync(sandbox, "/work", "prompt", credential: null);
+
+        Assert.True(result.Success, result.Stderr);
+        var read = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat \"$HOME/.config/cursor/auth.json\""],
+        });
+        Assert.True(read.Success, read.Stderr);
+        Assert.Equal(authJson, read.Stdout.TrimEnd('\r', '\n'));
     }
 
     [Fact]
@@ -431,12 +458,10 @@ public sealed class CursorAgentRunnerTests
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             Execs.Add(exec);
-            if (exec.Argv.Count >= 3
-                && exec.Argv[0] == "bash"
-                && (exec.Argv[2].Contains(".config/cursor/auth.json", StringComparison.Ordinal)
-                    || exec.Argv.Contains(".config/cursor/auth.json", StringComparer.Ordinal))
-                && (exec.Argv[2].Contains("CODEYBOX_CURSOR_AUTH_JSON", StringComparison.Ordinal)
-                    || exec.Stdin is not null))
+            if (CredentialMaterialisationTestHelper.IsStdinMaterialisation(
+                    exec, ".config/cursor/auth.json")
+                || CredentialMaterialisationTestHelper.IsEnvironmentMaterialisation(
+                    exec, "CODEYBOX_CURSOR_AUTH_JSON", ".config/cursor/auth.json"))
             {
                 return Task.FromResult(new SandboxExecResult(_authWriteExitCode, "", "auth stderr"));
             }

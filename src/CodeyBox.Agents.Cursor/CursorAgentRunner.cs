@@ -25,7 +25,7 @@ namespace CodeyBox.Agents.Cursor;
 /// binary; materialising to it was the PR #138 cascade). The file's contents are
 /// shipped to the sandbox via the credential bundle and re-materialised at
 /// sandbox-prepare time to the matching in-VM path
-/// (<see cref="PrepareSandboxAsync"/> writes <c>~/.config/cursor/auth.json</c>
+/// (the shared credential lifecycle writes <c>~/.config/cursor/auth.json</c>
 /// from the candidate credential; <see cref="AuthMaterialiseScript"/> preserves
 /// the older create-time sandbox env path used by smoke probes and image-baked
 /// auth checks); the host's credential directory is
@@ -90,7 +90,7 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         [binary, "--print", WorkspaceTrustFlag, "--force"];
 
     /// <summary>
-    /// Bash that materialises Cursor's subscription credentials into the
+    /// Bash/Python 3 materialiser for Cursor's subscription credentials in the
     /// sandbox at <c>~/.config/cursor/auth.json</c> from
     /// <c>CODEYBOX_CURSOR_AUTH_JSON</c>. Shared verbatim with
     /// <c>CursorInVmSmokeProbe</c> so the smoke probe exercises the exact same
@@ -130,6 +130,8 @@ public sealed class CursorAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".cursor/sessions", ".cursor/history"];
 
     protected override IReadOnlyList<EnvBackedCredentialFile> EnvBackedCredentialFiles => [AuthCredentialFile];
+
+    protected override IReadOnlyList<string> DirectCredentialEnvironmentVariables => ["CURSOR_API_KEY"];
 
     protected override string PreemptProcessPattern => Binary;
 

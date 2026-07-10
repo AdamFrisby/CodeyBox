@@ -137,6 +137,9 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
     protected override IReadOnlyList<EnvBackedCredentialFile> EnvBackedCredentialFiles => [OAuthCredentialFile];
 
+    protected override IReadOnlyList<string> DirectCredentialEnvironmentVariables =>
+        ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"];
+
     protected override string PreemptProcessPattern => Binary;
 
     /// <summary>
@@ -165,7 +168,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     /// <see cref="ClaudeThinkingBlockSanitizerConfig.Enabled"/>.
     /// </para>
     /// </summary>
-    protected override async Task<AgentResult?> PrepareSandboxAsync(
+    protected override async Task<AgentResult?> PrepareAgentSandboxAsync(
         ISandbox sandbox,
         string workingDirectory,
         AgentCredential? credential,
@@ -186,7 +189,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             }
         }
 
-        return await MaterialiseEnvBackedCredentialFilesAsync(sandbox, credential, ct).ConfigureAwait(false);
+        return null;
     }
 
     public async Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default)
@@ -513,18 +516,13 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         var fakeResume = cliResumeSessionId is null
             ? null
             : new AgentResumeContext(CheckpointRef: $"claude-session:{cliResumeSessionId}");
-        var preparation = await PrepareSandboxAsync(sandbox, workingDirectory, credential, fakeResume, ct)
+        var preparation = await PrepareSandboxForRunAsync(sandbox, workingDirectory, credential, fakeResume, ct)
             .ConfigureAwait(false);
         if (preparation is not null)
             return preparation;
 
         var invocation = BuildClaudeSessionInvocation(
             prompt, modelId, reasoningMode, cliResumeSessionId, captureStructuredStream);
-        invocation = invocation with
-        {
-            ExtraEnvironment = MergeCredentialEnvironment(invocation.ExtraEnvironment, credential),
-        };
-
         var result = await ExecOnceAsync(sandbox, workingDirectory, invocation, stdoutChunkCallback, ct)
             .ConfigureAwait(false);
 

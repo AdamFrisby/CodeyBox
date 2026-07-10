@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Runtime.ExceptionServices;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
@@ -140,7 +141,13 @@ public sealed record AgenticConflictResolverResult(
     public IAgentRunner? FailureRunner { get; init; }
     public AgentCredential? FailureCredential { get; init; }
     public AgentResult? FailureClassificationResult { get; init; }
+    public IReadOnlyList<AgenticConflictResolverInfrastructureFailure> InfrastructureFailures { get; init; } = [];
 }
+
+public sealed record AgenticConflictResolverInfrastructureFailure(
+    AgentKind Agent,
+    string Stage,
+    ExceptionDispatchInfo Cause);
 
 /// <summary>
 /// A single agent candidate the resolver may invoke. The orchestrator builds
@@ -288,7 +295,9 @@ public sealed class AgenticConflictResolver
         IAgentRunner? transientFailureRunner = null;
         AgentCredential? transientFailureCredential = null;
         AgentResult? transientFailureClassificationResult = null;
+        var infrastructureFailures = new List<AgenticConflictResolverInfrastructureFailure>();
         string? lastVerificationError = null;
+        AgenticConflictResolverCandidate? previousScopedCandidate = null;
 
         void RecordFailureForClassification(
             IAgentRunner failureRunner,
@@ -400,40 +409,50 @@ public sealed class AgenticConflictResolver
             var runner = candidate.Runner;
             var isStrongest = candidate.QualityScore == maxQuality;
 
-            // Cross-kind fallback: file credentials are materialised immediately
-            // before this candidate's CLI runs. If the write fails, this candidate
-            // is not invoked; running it without the requested credential would
-            // turn an infrastructure failure into a misleading auth failure.
-            if (_credentialFileMaterialiser is not null
-                && candidate.Credential is { Files.Count: > 0 })
+            try
             {
-                try
+                // A runner must observe only its own direct environment. Kill
+                // any process left by the prior candidate before changing the
+                // credential scope, then materialise this candidate's file
+                // bundle through the shared atomic writer.
+                if (previousScopedCandidate is not null)
                 {
+                    await sandbox.KillActiveExecsAsync(ct).ConfigureAwait(false);
+                    await ClearCandidateCredentialFilesAsync(
+                        sandbox,
+                        previousScopedCandidate,
+                        ct).ConfigureAwait(false);
+                    previousScopedCandidate = null;
+                }
+                if (_credentialFileMaterialiser is not null
+                    && candidate.Credential is { Files.Count: > 0 })
+                {
+                    previousScopedCandidate = candidate;
                     await _credentialFileMaterialiser(sandbox, candidate.Credential, ct);
                 }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    _log.LogWarning(ex,
-                        "Agentic conflict resolver: failed to materialise file credentials for agent '{Agent}' on {WorkItemId} (sandbox {Sandbox}); skipping this candidate",
-                        runner.Kind.Value, workItemId, sandbox.Id);
-                    var materialisationFailure = new AgentResult(
-                        false,
-                        $"failed to materialise file credentials: {ex.Message}",
-                        Stdout: null,
-                        Stderr: ex.Message);
-                    lastAgentResult = materialisationFailure;
-                    lastFailureRunner = runner;
-                    lastFailureCredential = candidate.Credential;
-                    lastFailureClassificationResult = materialisationFailure;
-                    attemptTrail.Add(
-                        $"{runner.Kind.Value}#0(credential materialisation failed: {RedactAndTruncate(ex.Message, 200)})");
-                    continue;
-                }
             }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                RecordCredentialSetupFailure("file materialisation", ex);
+                continue;
+            }
+
+            ISandbox candidateSandbox;
+            try
+            {
+                candidateSandbox = CandidateCredentialSandbox.Create(sandbox, candidate);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                RecordCredentialSetupFailure("environment scoping", ex);
+                continue;
+            }
+
+            previousScopedCandidate = candidate;
 
             for (var attempt = 1; attempt <= maxAttemptsPerAgent; attempt++)
             {
@@ -474,7 +493,7 @@ public sealed class AgenticConflictResolver
                     context,
                     runner,
                     candidate,
-                    sandbox,
+                    candidateSandbox,
                     workingDirectory,
                     attempt,
                     ct);
@@ -484,7 +503,7 @@ public sealed class AgenticConflictResolver
                 {
                     agentResult = supervision is null
                         ? await runner.RunAsync(
-                            sandbox,
+                            candidateSandbox,
                             workingDirectory,
                             prompt,
                             candidate.Credential,
@@ -495,7 +514,7 @@ public sealed class AgenticConflictResolver
                             captureStructuredStream: captureStructuredStream)
                         : await AgentSupervisionTurnRunner.RunAutonomousAndQueuedInjectionsAsync(
                             runner,
-                            sandbox,
+                            candidateSandbox,
                             workingDirectory,
                             prompt,
                             candidate.Credential,
@@ -652,7 +671,10 @@ public sealed class AgenticConflictResolver
                         Stdout: agentResult.Stdout,
                         Stderr: agentResult.Stderr,
                         LastAttemptedRunner: runner,
-                        AuthFailures: authFailures.ToArray());
+                        AuthFailures: authFailures.ToArray())
+                    {
+                        InfrastructureFailures = infrastructureFailures.ToArray(),
+                    };
                 }
 
                 lastVerificationError = verification.Reason;
@@ -689,6 +711,28 @@ public sealed class AgenticConflictResolver
                     "Agentic conflict resolver: verification failed for agent '{Agent}' attempt {Attempt}/{Max} on {WorkItemId} (sandbox {Sandbox}): {Reason}",
                     runner.Kind.Value, attempt, maxAttemptsPerAgent, workItemId, sandbox.Id, redactedVerificationReason);
             }
+
+            void RecordCredentialSetupFailure(string stage, Exception ex)
+            {
+                _log.LogWarning(ex,
+                    "Agentic conflict resolver: credential {Stage} failed for agent '{Agent}' on {WorkItemId} (sandbox {Sandbox}); skipping this candidate",
+                    stage, runner.Kind.Value, workItemId, sandbox.Id);
+                var materialisationFailure = new AgentResult(
+                    false,
+                    $"credential {stage} failed: {ex.Message}",
+                    Stdout: null,
+                    Stderr: ex.Message);
+                lastAgentResult = materialisationFailure;
+                lastFailureRunner = runner;
+                lastFailureCredential = candidate.Credential;
+                lastFailureClassificationResult = materialisationFailure;
+                infrastructureFailures.Add(new AgenticConflictResolverInfrastructureFailure(
+                    runner.Kind,
+                    stage,
+                    ExceptionDispatchInfo.Capture(ex)));
+                attemptTrail.Add(
+                    $"{runner.Kind.Value}#0(credential {stage} failed: {RedactAndTruncate(ex.Message, 200)})");
+            }
         }
 
         var summary = RedactText(lastVerificationError
@@ -710,7 +754,60 @@ public sealed class AgenticConflictResolver
             FailureRunner = transientFailureRunner ?? lastFailureRunner,
             FailureCredential = transientFailureCredential ?? lastFailureCredential,
             FailureClassificationResult = transientFailureClassificationResult ?? lastFailureClassificationResult,
+            InfrastructureFailures = infrastructureFailures.ToArray(),
         };
+    }
+
+    private static async Task ClearCandidateCredentialFilesAsync(
+        ISandbox sandbox,
+        AgenticConflictResolverCandidate candidate,
+        CancellationToken ct)
+    {
+        if (candidate.Credential is not { } credential)
+            return;
+
+        foreach (var relativePath in credential.Files.Keys)
+        {
+            var normalizedPath = relativePath.Replace('\\', '/').TrimStart('/');
+            await SandboxCredentialFileWriter.WriteAsync(
+                sandbox,
+                new SandboxCredentialFileTarget(
+                    SandboxCredentialFileRoot.CredentialsDirectory,
+                    normalizedPath),
+                string.Empty,
+                SandboxCredentialOverwritePolicy.Overwrite,
+                ct).ConfigureAwait(false);
+        }
+
+        if (candidate.Runner is not IAgentCredentialEnvironmentPolicy policy)
+            return;
+        foreach (var destination in policy.CredentialFileDestinations)
+        {
+            if (!credential.EnvironmentVariables.TryGetValue(
+                    destination.PayloadEnvironmentVariable,
+                    out var payload)
+                || string.IsNullOrEmpty(payload))
+            {
+                continue;
+            }
+
+            string? destinationOverride = null;
+            if (destination.DestinationEnvironmentVariable is not null)
+            {
+                credential.EnvironmentVariables.TryGetValue(
+                    destination.DestinationEnvironmentVariable,
+                    out destinationOverride);
+            }
+            await SandboxCredentialFileWriter.WriteAsync(
+                sandbox,
+                new SandboxCredentialFileTarget(
+                    SandboxCredentialFileRoot.Home,
+                    destination.HomeRelativePath,
+                    destinationOverride),
+                string.Empty,
+                SandboxCredentialOverwritePolicy.Overwrite,
+                ct).ConfigureAwait(false);
+        }
     }
 
     private Task<IAgentSupervisionSession?> StartSupervisionSessionAsync(

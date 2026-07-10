@@ -129,10 +129,9 @@ public sealed class CodexAgentRunnerTests
         // The codex CLI invocation must be preceded by the in-sandbox auth
         // materialisation bash command for ~/.codex/auth.json.
         var authIdx = sandbox.Execs.FindIndex(e =>
-            e.Argv.Count >= 3
-            && e.Argv[0] == "bash"
-            && (e.Argv[2].Contains("CODEX_AUTH_JSON", StringComparison.Ordinal)
-                || (e.Argv.Count >= 5 && e.Argv[4] == ".codex/auth.json")));
+            CredentialMaterialisationTestHelper.IsStdinMaterialisation(e, ".codex/auth.json")
+            || CredentialMaterialisationTestHelper.IsEnvironmentMaterialisation(
+                e, "CODEX_AUTH_JSON", ".codex/auth.json"));
         var codexIdx = sandbox.Execs.FindIndex(e => e.Argv.Count > 0 && e.Argv[0] == "codex");
         Assert.True(authIdx >= 0, "auth materialisation bash command was not invoked");
         Assert.True(codexIdx >= 0, "codex CLI was not invoked");
@@ -429,10 +428,9 @@ public sealed class CodexAgentRunnerTests
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             Execs.Add(exec);
-            if (exec.Argv.Count >= 3
-                && exec.Argv[0] == "bash"
-                && (exec.Argv[2].Contains("CODEX_AUTH_JSON", StringComparison.Ordinal)
-                    || (exec.Argv.Count >= 5 && exec.Argv[4] == ".codex/auth.json")))
+            if (CredentialMaterialisationTestHelper.IsStdinMaterialisation(exec, ".codex/auth.json")
+                || CredentialMaterialisationTestHelper.IsEnvironmentMaterialisation(
+                    exec, "CODEX_AUTH_JSON", ".codex/auth.json"))
             {
                 return Task.FromResult(new SandboxExecResult(_authWriteExitCode, "", "auth stderr"));
             }

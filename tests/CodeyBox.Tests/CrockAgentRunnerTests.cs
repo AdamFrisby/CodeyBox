@@ -656,11 +656,10 @@ public sealed class CrockAgentRunnerTests
             ct.ThrowIfCancellationRequested();
             var argv = exec.Argv;
             // Auth materialisation bash script — pass through with configured exit.
-            if (argv.Count >= 3
-                && argv[0] == "bash"
-                && argv[1] == "-c"
-                && (argv[2].Contains(CrockAgentRunner.ConfigEnvVar, StringComparison.Ordinal)
-                    || (argv.Count >= 5 && argv[4] == ".crockcode/config.json")))
+            if (CredentialMaterialisationTestHelper.IsStdinMaterialisation(
+                    exec, ".crockcode/config.json")
+                || CredentialMaterialisationTestHelper.IsEnvironmentMaterialisation(
+                    exec, CrockAgentRunner.ConfigEnvVar, ".crockcode/config.json"))
             {
                 return Task.FromResult(new SandboxExecResult(
                     _authExit.Exit, _authExit.Stdout, _authExit.Stderr));

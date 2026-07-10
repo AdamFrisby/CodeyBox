@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Orchestrator;
@@ -42,17 +43,6 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class ClaudeTokenRotationPusher : IClaudeTokenRotationPusher, IDisposable
 {
-    // The same bash hook the Claude runner's prepare path uses to
-    // materialise the credentials file on sandbox launch — but reads the
-    // bundle from stdin rather than from an env var, so the token never lands
-    // on the multipass exec argv during a runtime push.
-    private const string PushScript =
-        "set -eu\n" +
-        "umask 077\n" +
-        "mkdir -p \"$HOME/.claude\"\n" +
-        "cat > \"$HOME/.claude/.credentials.json\"\n" +
-        "chmod 600 \"$HOME/.claude/.credentials.json\"\n";
-
     private readonly ClaudeCredentialFileSource _source;
     private readonly ILogger<ClaudeTokenRotationPusher>? _log;
     private readonly ConcurrentDictionary<string, ISandbox> _active = new(StringComparer.Ordinal);
@@ -121,26 +111,15 @@ public sealed class ClaudeTokenRotationPusher : IClaudeTokenRotationPusher, IDis
     {
         try
         {
-            var result = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["bash", "-c", PushScript],
-                Stdin = bundle,
-            }, ct).ConfigureAwait(false);
-
-            if (result.Success)
-            {
-                AuditLog.ClaudeTokenPushedToVm(sandbox.Id);
-            }
-            else
-            {
-                var reason = string.IsNullOrEmpty(result.Stderr)
-                    ? $"exit {result.ExitCode}"
-                    : $"exit {result.ExitCode}: {result.Stderr.Trim()}";
-                AuditLog.ClaudeTokenPushFailed(sandbox.Id, reason);
-                _log?.LogWarning(
-                    "Failed to push rotated Claude token into sandbox {Sandbox}: {Reason}",
-                    sandbox.Id, reason);
-            }
+            await SandboxCredentialFileWriter.WriteAsync(
+                sandbox,
+                new SandboxCredentialFileTarget(
+                    SandboxCredentialFileRoot.Home,
+                    ".claude/.credentials.json"),
+                bundle,
+                SandboxCredentialOverwritePolicy.Overwrite,
+                ct).ConfigureAwait(false);
+            AuditLog.ClaudeTokenPushedToVm(sandbox.Id);
         }
         catch (OperationCanceledException)
         {
