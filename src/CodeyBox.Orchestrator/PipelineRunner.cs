@@ -6462,8 +6462,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     result,
                     "check",
                     $"Check-and-act agent {agentRunner.Kind} reported failure");
-                var stderrTail = string.IsNullOrEmpty(result.Stderr) ? "" : $" — stderr: {result.Stderr}";
-                throw new InvalidOperationException($"check-and-act agent failed: {result.Summary}{stderrTail}");
+                var detail = BuildAgentFailureDetail("check-and-act agent failed", result);
+                throw new InvalidOperationException(detail);
             }
 
             await FinalizeInvolvementAsync(involvementId, AgentInvolvementOutcomes.Success);
@@ -7024,8 +7024,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (!result.Success)
         {
             ThrowIfTransientAgentFailure(agentRunner, result, "post-act-recheck");
-            var stderrTail = string.IsNullOrEmpty(result.Stderr) ? "" : $" — stderr: {result.Stderr}";
-            throw new InvalidOperationException($"post-act re-check agent failed: {result.Summary}{stderrTail}");
+            var detail = BuildAgentFailureDetail("post-act re-check agent failed", result);
+            throw new InvalidOperationException(detail);
         }
 
         return aggregatedStdout;

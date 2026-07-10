@@ -340,15 +340,19 @@ public sealed class CheckAndActPipelineTests : IDisposable
         // RunCheckAndActAgentAsync throws InvalidOperationException when the
         // scripted agent returns Success=false; the outer catch in
         // RunCheckAndActAsync must convert that into TransitionFailed with
-        // failureKind="other" and the agent stderr surfaced in LastError —
-        // without persisting a verdict and without enqueuing the on-yes
-        // follow-up. The scripted agent has CheckPlan empty here so its
-        // HandleCheckAsync returns AgentResult(false, ...).
+        // failureKind="other" and the scrubbed agent diagnostics surfaced in
+        // LastError without persisting a verdict and without enqueuing the
+        // on-yes follow-up.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
 
-        // CheckPlan intentionally empty — scripted agent returns Success=false.
-        Assert.Empty(tp.Agent.CheckPlan);
+        var secret = "sk-ant-api03-AABBCCDDEEFFGGHHIIJJKKLLMMNNOOPPQQRRSSTT-0123456";
+        var escape = (char)0x1B;
+        tp.Agent.CheckResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: $"agent leaked summary {secret}",
+            Stdout: $"stdout leaked {secret}",
+            Stderr: $"stderr leaked {escape}[31m{secret}{escape}[0m"));
 
         var check = new WorkItem
         {
@@ -377,6 +381,11 @@ public sealed class CheckAndActPipelineTests : IDisposable
         // "check-and-act agent failed" — pin that so a regression that
         // swallows the agent's failure summary or stderr is caught.
         Assert.Contains("check-and-act agent failed", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("stderr:", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("stdout:", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("***", final.LastError, StringComparison.Ordinal);
+        Assert.DoesNotContain(secret, final.LastError, StringComparison.Ordinal);
+        Assert.DoesNotContain(escape.ToString(), final.LastError, StringComparison.Ordinal);
         Assert.Null(final.Verdict);
 
         // No follow-up was enqueued.
