@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Sandbox.Incus;
 using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Api;
@@ -21,6 +22,17 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
     public ValidateOptionsResult Validate(string? name, CodeyBoxOptions options)
     {
         var failures = new List<string>();
+
+        var selectedProvider = options.SandboxProvider?.Trim();
+        if (string.Equals(selectedProvider, HotSwappableSandboxProvider.IncusProviderId, StringComparison.OrdinalIgnoreCase))
+        {
+            // Dormant cutover providers are constructed lazily. Validate Incus
+            // only when it is selected; a later selector switch validates the
+            // candidate before the options monitor publishes it.
+            failures.AddRange(
+                IncusSandboxOptions.Validate(IncusSandboxConfigMapper.Build(options))
+                    .Select(static error => $"CodeyBox:Incus:{error}"));
+        }
 
         if (double.IsNaN(options.PhaseAbsoluteTimeoutMultiplier)
             || double.IsInfinity(options.PhaseAbsoluteTimeoutMultiplier)

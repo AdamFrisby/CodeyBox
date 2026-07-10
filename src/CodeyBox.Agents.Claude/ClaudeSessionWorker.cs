@@ -104,6 +104,7 @@ public sealed class ClaudeSessionWorker : IScopedSessionAgentRunner, ICredential
     private readonly Func<ISandbox, AgentSessionSandboxRef> _sandboxRefFactory;
     private readonly Func<AgentSessionSandboxRef, CancellationToken, Task<ISandbox>>? _sandboxReattacher;
     private readonly Func<AgentSessionSandboxRef, CancellationToken, Task>? _sandboxResumeHook;
+    private readonly Func<AgentSessionSandboxRef, string?>? _sandboxResumeUnsupportedReason;
     private readonly ICredentialProvider? _credentialProvider;
     private readonly IClaudeSessionMetricsSink _metricsSink;
     private readonly ClaudeSessionWorkerOptions _options;
@@ -123,6 +124,13 @@ public sealed class ClaudeSessionWorker : IScopedSessionAgentRunner, ICredential
     /// <c>ISuspendingSandboxProvider.ResumeSandboxAsync</c> when the registered
     /// provider implements the suspend contract; null otherwise. On any
     /// failure the worker degrades to fresh-one-shot mode.
+    /// </param>
+    /// <param name="sandboxResumeUnsupportedReason">
+    /// Optional provider-aware stop/resume guard. Return null when the durable
+    /// sandbox reference can be resumed, or a user-facing reason when it cannot.
+    /// The worker evaluates this before stopping a preemptible sandbox and again
+    /// before invoking the resume hook, so an unsupported sandbox stays running
+    /// instead of being stranded or routed to another provider.
     /// </param>
     /// <param name="credentialProvider">Restart-time credential provider. The persisted handle never stores secret material.</param>
     /// <param name="sandboxRefFactory">Maps a live sandbox to its durable provider-specific reference.</param>
@@ -160,11 +168,13 @@ public sealed class ClaudeSessionWorker : IScopedSessionAgentRunner, ICredential
         ClaudeSessionWorkerOptions? options = null,
         IClaudeTransport? acpTransport = null,
         IClaudeTransport? printTransport = null,
-        Action<string, string>? onTransportDegraded = null)
+        Action<string, string>? onTransportDegraded = null,
+        Func<AgentSessionSandboxRef, string?>? sandboxResumeUnsupportedReason = null)
     {
         _runner = runner ?? throw new ArgumentNullException(nameof(runner));
         _sandboxReattacher = sandboxReattacher;
         _sandboxResumeHook = sandboxResumeHook;
+        _sandboxResumeUnsupportedReason = sandboxResumeUnsupportedReason;
         _credentialProvider = credentialProvider;
         _sandboxRefFactory = sandboxRefFactory ?? (static sandbox => new AgentSessionSandboxRef(sandbox.Id));
         _metricsSink = metricsSink ?? NullClaudeSessionMetricsSink.Instance;
@@ -405,6 +415,8 @@ public sealed class ClaudeSessionWorker : IScopedSessionAgentRunner, ICredential
         try
         {
             ThrowIfClosed(state);
+            if (state.Sandbox is IPreemptibleSandbox)
+                ThrowIfSandboxResumeUnsupported(sessionHandle.Sandbox);
             try
             {
                 await state.TransportSession.SuspendAsync(ct).ConfigureAwait(false);
@@ -436,6 +448,8 @@ public sealed class ClaudeSessionWorker : IScopedSessionAgentRunner, ICredential
         try
         {
             ThrowIfClosed(state);
+            if (state.Sandbox is IPreemptibleSandbox)
+                ThrowIfSandboxResumeUnsupported(sessionHandle.Sandbox);
 
             if (_sandboxResumeHook is not null)
             {
@@ -706,6 +720,16 @@ public sealed class ClaudeSessionWorker : IScopedSessionAgentRunner, ICredential
                 $"Session handle belongs to runner '{sessionHandle.RunnerKind}', not '{Kind}'.",
                 nameof(sessionHandle));
         }
+    }
+
+    private void ThrowIfSandboxResumeUnsupported(AgentSessionSandboxRef sandbox)
+    {
+        var reason = _sandboxResumeUnsupportedReason?.Invoke(sandbox);
+        if (reason is null)
+            return;
+        if (string.IsNullOrWhiteSpace(reason))
+            reason = "The sandbox provider does not support stopped-session resume.";
+        throw new NotSupportedException(reason);
     }
 
     private void ThrowIfClosed(AgentSessionHandle sessionHandle)

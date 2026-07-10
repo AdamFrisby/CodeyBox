@@ -424,7 +424,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
 
     // The sandbox-side env var that AuditReviewDotnetShim.Apply injects to arm
     // the absolute-path hardening script. It is the ONLY defense on the
-    // production (multipass) provider against an auditor bypassing the PATH
+    // production VM providers against an auditor bypassing the PATH
     // shim via an absolute dotnet path (e.g. /usr/bin/dotnet test). The branch
     // that sets it is environment-independent, so it is unit-tested directly
     // here rather than only through the ProcessSandboxProvider integration path
@@ -436,7 +436,8 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     [Theory]
     [InlineData("multipass")]
     [InlineData("multipass-remote")]
-    public void AuditDotnetShim_ArmsAbsolutePathHardening_OnMultipassProviders(string providerName)
+    [InlineData("incus")]
+    public void AuditDotnetShim_ArmsAbsolutePathHardening_OnVmProviders(string providerName)
     {
         var shim = AuditReviewDotnetShim.From(new PipelineTuningOptions(), providerName);
         var applied = shim.Apply(BaseAuditSpec());

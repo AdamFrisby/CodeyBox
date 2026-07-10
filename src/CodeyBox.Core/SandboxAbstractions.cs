@@ -9,19 +9,20 @@ namespace CodeyBox.Core;
 /// </summary>
 public interface IManagedSandboxLifecycle
 {
-    /// <summary>Stable identifier for diagnostics ("process", "bubblewrap", "multipass").</summary>
+    /// <summary>Stable identifier for diagnostics (for example, "process", "multipass", or "incus").</summary>
     string Name { get; }
 
     /// <summary>
-    /// Returns all sandboxes on the host that belong to this provider
-    /// (i.e. match the <c>codeybox-*</c> naming prefix). Used by the
+    /// Returns all sandboxes on the host that this provider verifies as owned,
+    /// using its configured namespace and/or durable ownership metadata. Used by the
     /// <see cref="CodeyBox.Orchestrator.SandboxLeakReaper"/> to detect
     /// sandboxes that outlived their work item.
     ///
     /// <para>Implementations that have no persistent sandbox lifecycle
     /// (bubblewrap, process) return an empty list.</para>
     ///
-    /// <para>Implementations that shell out to an external tool (multipass)
+    /// <para>Implementations that shell out to an external tool (for example,
+    /// Multipass or Incus)
     /// cache results for a short TTL to avoid hammering the daemon on
     /// repeated API calls.</para>
     /// </summary>
@@ -52,9 +53,10 @@ public interface IManagedSandboxLifecycle
 /// <summary>
 /// Builds and starts isolated execution sandboxes. Implementations include a
 /// plain-process dev runner (UNSAFE; for local testing only), bubblewrap
-/// (namespace isolation, shared kernel), and Multipass (KVM-backed VMs with
-/// a separate guest kernel — recommended for production). The orchestrator
-/// picks one provider per deployment.
+/// (namespace isolation, shared kernel), Multipass, and Incus (KVM-backed VMs
+/// with separate guest kernels). The orchestrator selects one provider for new
+/// work; the guarded Multipass/Incus cutover selector can change that choice
+/// without rerouting existing sandbox handles.
 /// </summary>
 public interface ISandboxProvider : IManagedSandboxLifecycle
 {
@@ -82,8 +84,8 @@ public interface ISandboxProvider : IManagedSandboxLifecycle
 
 /// <summary>
 /// Optional <see cref="ISandboxProvider"/> capability that reports whether the
-/// provider captures per-VM resource metrics at teardown (the multipass
-/// <c>CaptureResourceMetrics</c> toggle). When true, each work-item timing
+/// provider captures per-VM resource metrics at teardown. When true, each
+/// work-item timing
 /// phase must be kept on its own VM so a persisted per-phase resource record is
 /// attributable to a single phase; when false (the default), a warm reusable VM
 /// is shared across phases as before, incurring no extra teardown/rebuild churn.
@@ -102,7 +104,7 @@ public interface IResourceMetricsCapturingProvider
 
 /// <summary>
 /// Snapshot of a sandbox that exists on the host, returned by
-/// <see cref="ISandboxProvider.ListAllManagedAsync"/>.
+/// <see cref="IManagedSandboxLifecycle.ListAllManagedAsync"/>.
 /// </summary>
 /// <param name="Name">VM name / namespace ID.</param>
 /// <param name="CreatedAt">Best-effort creation timestamp; null if not derivable.</param>
@@ -286,6 +288,17 @@ public interface IShutdownTeardownSandbox : ISandbox
 public interface IRejectsFileBackedAgentCredentials : ISandbox
 {
     string FileBackedAgentCredentialsUnsupportedReason { get; }
+}
+
+/// <summary>
+/// Optional capability exposing the stable provider identifier that owns a
+/// sandbox. Durable session references use this value to route lifecycle
+/// operations back to the provider that created the sandbox, even after the
+/// live provider selector changes.
+/// </summary>
+public interface IProviderOwnedSandbox : ISandbox
+{
+    string ProviderId { get; }
 }
 
 /// <summary>
@@ -696,7 +709,7 @@ public interface IBaselineImageResolver
     /// Lists every baseline image currently present on the host that this
     /// provider considers a baseline. Used by the
     /// <see cref="CodeyBox.Orchestrator.BaselineImageReaper"/> to compute the
-    /// orphan set (multipass baselines minus the live-ref set from the work
+    /// orphan set (provider baselines minus the live-ref set from the work
     /// store). Returns an empty list when the provider has no baselines or
     /// cannot enumerate them.
     /// </summary>
@@ -708,6 +721,24 @@ public interface IBaselineImageResolver
     /// on failure; callers wrap in try/catch.
     /// </summary>
     Task DisposeBaselineImageAsync(string name, CancellationToken ct);
+}
+
+/// <summary>
+/// Optional companion to <see cref="IBaselineImageResolver"/> that identifies
+/// refs in a provider's own validated baseline-name namespace without touching
+/// the host. Cutover routers use this to distinguish a ref created by the other
+/// backend from an arbitrary or malformed stale ref; ownership of an actual
+/// host instance is still re-verified by the provider at every destructive
+/// sink.
+/// </summary>
+public interface IBaselineRefNamespace
+{
+    /// <summary>
+    /// Returns true only when <paramref name="baselineRef"/> has the exact
+    /// bounded shape produced under this provider's live baseline prefix.
+    /// This is namespace classification, not proof that the instance exists.
+    /// </summary>
+    bool OwnsBaselineRef(string baselineRef);
 }
 
 /// <summary>

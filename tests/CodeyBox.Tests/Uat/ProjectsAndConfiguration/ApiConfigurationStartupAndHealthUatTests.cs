@@ -188,6 +188,32 @@ public sealed class SandboxStartupConfigurationUatTests
     }
 
     [Fact]
+    public void IncusSandboxResolvesAdmissionControlledCutoverProvider()
+    {
+        using var factory = new ProjectsAndConfigurationApiFactory(
+            configuration: new Dictionary<string, string?>
+            {
+                ["CodeyBox:SandboxProvider"] = "incus",
+                ["CodeyBox:WorkerPool:MaxConcurrentSandboxes"] = "3",
+            },
+            projects: new InMemoryProjectRepository());
+
+        var provider = factory.Services.GetRequiredService<ISandboxProvider>();
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+
+        Assert.IsAssignableFrom<SandboxAdmissionControlledProvider>(provider);
+        Assert.Equal("incus", provider.Name);
+        Assert.Equal(3, admission.MaxConcurrentSandboxes);
+        Assert.IsAssignableFrom<IBaselineImageProvisioner>(provider);
+        Assert.IsAssignableFrom<IActiveSandboxProvider>(provider);
+        Assert.IsAssignableFrom<IDiskGuardedSandboxProvider>(provider);
+        // The cutover wrapper keeps this provider-level capability so it can
+        // resume persisted Multipass mappings; Incus sandbox handles themselves
+        // do not claim RAM-suspend support.
+        Assert.IsAssignableFrom<ISuspendingSandboxProvider>(provider);
+    }
+
+    [Fact]
     public void SpritesSandboxResolvesAdmissionControlledProvider()
     {
         using var factory = new ProjectsAndConfigurationApiFactory(

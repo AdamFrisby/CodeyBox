@@ -9,8 +9,10 @@ the end.
 > gVisor, and crun-vm provider scaffolds. Those were removed because
 > they were code-reviewed but never runtime-tested. Findings below that
 > reference `PodmanDriver` or those providers describe historical state;
-> the corresponding code is gone. Multipass is now the recommended
-> kernel-isolated path and is integration-tested end-to-end.
+> the corresponding code is gone. Multipass remains the default
+> kernel-isolated path and is integration-tested end-to-end; Incus is an
+> independent, opt-in VM provider with its own `requires_incus` integration
+> coverage.
 
 Each finding lists:
 - **Where**: file paths.
@@ -35,7 +37,7 @@ Each finding lists:
 
 ### V — Egress enforcement is host-side, not in-VM  &nbsp; *MEDIUM-impact, FIXED*
 
-**Where:** Multipass provider + `scripts/setup-host-networks.sh` +
+**Where:** Multipass and Incus providers + `scripts/setup-host-networks.sh` +
 `docs/host-firewall.md`.
 
 Earlier iterations relied on iptables rules running INSIDE the VM via
@@ -50,17 +52,19 @@ are gone. In-VM enforcement against an in-VM root user is theatre.
    via systemd-networkd, each with its own subnet under 10.99.0.0/16
    and DHCP server. It writes nftables rules that:
    - Drop ALL forward traffic on Multipass's default `mpqemubr0` bridge.
-     The default NIC every Multipass VM gets has no path to the
-     internet.
+     The default NIC every Multipass VM gets has no path to the internet.
+     Incus VMs are initialized with `--no-profiles` and have no default NAT
+     NIC to block.
    - Per cb-bridge: accept loopback, established/related, DNS, and the
      resolved IPs of the configured allowed hosts. Default-deny end of
      chain.
 
-2. The orchestrator launches each VM with `--network <bridge>` based on
-   the project's per-phase `NetworkProfiles`. The VM's only viable path
-   to the internet is via the chosen bridge.
+2. The orchestrator attaches the bridge selected by the project's per-phase
+   `NetworkProfiles`. Multipass uses `--network <bridge>` as a filtered second
+   NIC. Incus adds one `nictype=bridged` NIC to an otherwise profileless VM, so
+   the chosen bridge is its only network path.
 
-3. The orchestrator's cloud-init runs a one-shot route swap at first
+3. Multipass cloud-init runs a one-shot route swap at first
    boot that points the default route at the secondary NIC. Without
    this, Linux picks the primary NIC (mpqemubr0 → blocked) by default.
 
@@ -74,14 +78,15 @@ are gone. In-VM enforcement against an in-VM root user is theatre.
 **Why this works against a hostile agent:**
 - Anything `sudo` inside the VM: doesn't touch host nftables — there's
   no in-guest firewall to flush in the first place.
-- `sudo ip route ...` to revert the route swap: traffic returns to
-  mpqemubr0, where the host's drop rule kills it. Self-DOS, not bypass.
+- `sudo ip route ...` to revert the Multipass route swap: traffic returns to
+  `mpqemubr0`, where the host's drop rule kills it. An Incus VM has no
+  alternate NAT NIC. Self-DOS, not bypass.
 - VM kernel exploit: the VM has its own kernel (separate from host),
-  this is the entire reason we use Multipass / kernel isolation.
+  this is the reason we use Multipass or Incus kernel isolation.
 - Compromised orchestrator process: this is a trust boundary we can't
   defend against; same assumption as elsewhere.
 
-**Verified end-to-end on a real Ubuntu 25.10 host**: launching a VM
+**Multipass was verified end-to-end on a real Ubuntu 25.10 host**: launching a VM
 on the `cb-claude` profile and curling `1.1.1.1` (not allowlisted) →
 times out (blocked); curling `api.anthropic.com` (allowlisted) →
 succeeds. Captured in `local/verify-host-firewall.sh` for
@@ -157,6 +162,47 @@ are no longer visible inside the sandbox.
 asserts that the mount source is the per-item path, not the bare-repos
 root, and that another item's repo path is *not* contained in the mount
 source.
+
+The Incus provider adds a second guard at its virtiofs sink: it resolves the
+real source path (including symlinks) and requires containment beneath the
+canonical Git root, an enabled shared-mirror root, or an explicit
+`Incus:AllowedHostMountRoots` entry. Individual read-only files and
+`SnapshotForIsolation` trees are copied into a private, bounded staging tree;
+writable individual-file devices are rejected. Incus administration remains a
+root-equivalent host privilege, so `incus-admin` membership and explicit mount
+roots are operator trust boundaries.
+
+The dedicated non-default Incus project is also restricted to the exact
+canonical host roots plus private staging. Incus applies that policy at the
+daemon sink: on kernel 5.6 or newer it opens the source relative to the matched
+allowed-parent descriptor with `openat2(RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)`
+and passes the resulting descriptor onward. CodeyBox sets every project
+restriction in one operation and accepts it only after an exact read-back, so a
+path rename/symlink race cannot turn the provider-side allowlist check into an
+outside-root virtiofs attachment. The provider creates a missing project with
+exact `user.codeybox.managed=true` and `user.codeybox.project-schema=1`
+ownership markers, but will not claim an existing project unless those markers
+and `features.images=false`/`features.profiles=true` already match. Incus requires
+restricted projects to own profiles, while every CodeyBox VM uses `--no-profiles`
+and exact pre-start topology verification. Its verified
+policy also blocks `restricted.virtual-machines.lowlevel` and
+pre-start rejection of VM nesting rather than leaving those VM escape
+surfaces available.
+
+Private staging has its own adoption guard: the canonical non-symlink parent
+must already exist, while a missing staging root is created exclusively with
+service ownership and mode `0700`. An existing root is accepted only with that
+exact ownership/mode and CodeyBox's mode-`0600`
+`.codeybox-incus-staging-v1` marker, so the provider never recursively deletes
+an arbitrary operator-created directory merely because its configured path
+matches.
+
+Incus VM virtiofs preserves numeric IDs; it does not offer the container-only
+`shift` mapping. For every host-backed mount the provider requires
+`GuestUserId`/`GuestGroupId` to exactly match the CodeyBox process's effective
+host identity. This avoids accidental cross-identity writes but does not stop
+guest root from writing within an intentionally attached writable path. Broadening repository
+permissions to compensate would undermine the per-item mount containment.
 
 ### B — `workBranch == baseBranch` bypass of merge-phase containment  &nbsp; *HIGH, FIXED*
 
@@ -376,7 +422,7 @@ provider is repeatedly labelled UNSAFE and is intended only for
 developing the orchestrator pipeline.
 
 **Status:** By design. The README and security docs say "do not use in
-production." Production deployments must select Multipass.
+production." Production deployments must select Multipass or Incus.
 
 ### O — Network egress allowlist is documented, not enforced by driver  &nbsp; *RESOLVED — provider removed*
 
@@ -387,10 +433,11 @@ scaffolds. It attached containers to a podman CNI network but did not
 add nftables rules itself, so the documented allowlist was effectively
 trust-the-operator. That code was removed alongside its providers.
 
-**Status:** Resolved. The current Multipass provider relies on
+**Status:** Resolved. The current Multipass and Incus providers rely on
 host-side nftables on per-profile bridges, configured once via
-`scripts/setup-host-networks.sh`. See [`host-firewall.md`](host-firewall.md)
-— this is real enforcement, not advisory.
+`scripts/setup-host-networks.sh`. Incus adds only the selected bridged NIC and
+does not inherit a NAT profile. See [`host-firewall.md`](host-firewall.md) —
+this is real enforcement, not advisory.
 
 ### P — InMemoryPullRequestService has unbounded growth  &nbsp; *LOW, ACCEPTED*
 

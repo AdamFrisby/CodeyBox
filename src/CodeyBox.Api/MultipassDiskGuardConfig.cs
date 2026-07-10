@@ -23,40 +23,70 @@ internal static class MultipassDiskGuardConfig
     /// </summary>
     public static MultipassDiskGuardOptions? Build(CodeyBoxOptions opts, ILogger startupLog)
     {
-        var cfg = opts.DiskGuard;
-        if (cfg is null || !cfg.Enabled) return null;
-        if (cfg.MinFreeBytes <= 0)
+        var resolved = SharedDiskGuardConfig.Resolve(opts, startupLog);
+        if (resolved is null) return null;
+
+        return new MultipassDiskGuardOptions
         {
-            startupLog.LogWarning(
+            MinFreeBytes = resolved.MinFreeBytes,
+            MultipassDataPath = opts.DiskGuard.MultipassDataPath,
+            RecheckIn = resolved.RecheckIn,
+            AdditionalPaths = resolved.AdditionalPaths,
+        };
+    }
+}
+
+/// <summary>
+/// Provider-neutral parsing for the shared <c>CodeyBox:DiskGuard</c> policy.
+/// Provider adapters add their own storage targets while consuming the same
+/// enablement, threshold, recheck delay, and host-path set.
+/// </summary>
+internal static class SharedDiskGuardConfig
+{
+    internal static ResolvedDiskGuardConfig? Resolve(CodeyBoxOptions options, ILogger log)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(log);
+
+        var config = options.DiskGuard;
+        if (config is null || !config.Enabled) return null;
+        if (config.MinFreeBytes <= 0)
+        {
+            log.LogWarning(
                 "CodeyBox:DiskGuard:MinFreeBytes={MinFreeBytes} is non-positive; disabling disk-guard preflight",
-                cfg.MinFreeBytes);
+                config.MinFreeBytes);
             return null;
         }
 
-        TimeSpan recheck = TimeSpan.FromMinutes(5);
-        if (!string.IsNullOrWhiteSpace(cfg.RecheckIn))
+        var recheck = TimeSpan.FromMinutes(5);
+        if (!string.IsNullOrWhiteSpace(config.RecheckIn)
+            && (!TimeSpan.TryParse(config.RecheckIn, out recheck) || recheck <= TimeSpan.Zero))
         {
-            if (!TimeSpan.TryParse(cfg.RecheckIn, out recheck) || recheck <= TimeSpan.Zero)
-                throw new InvalidOperationException(
-                    $"CodeyBox:DiskGuard:RecheckIn '{cfg.RecheckIn}' must be a positive TimeSpan (e.g. '00:05:00').");
+            throw new InvalidOperationException(
+                $"CodeyBox:DiskGuard:RecheckIn '{config.RecheckIn}' must be a positive TimeSpan (e.g. '00:05:00').");
         }
 
         // Auto-include the state-database directory so a write-side ENOSPC is
         // caught by the preflight before it surfaces as SQLITE_FULL.
-        var extras = new List<string>(cfg.AdditionalPaths);
-        if (!string.IsNullOrWhiteSpace(opts.StateDatabasePath))
+        var paths = new List<string>(config.AdditionalPaths ?? []);
+        if (!string.IsNullOrWhiteSpace(options.StateDatabasePath))
         {
-            var dbDir = Path.GetDirectoryName(opts.StateDatabasePath);
-            if (!string.IsNullOrEmpty(dbDir) && !extras.Contains(dbDir, StringComparer.Ordinal))
-                extras.Add(dbDir);
+            var databaseDirectory = Path.GetDirectoryName(options.StateDatabasePath);
+            if (!string.IsNullOrEmpty(databaseDirectory)
+                && !paths.Contains(databaseDirectory, StringComparer.Ordinal))
+            {
+                paths.Add(databaseDirectory);
+            }
         }
 
-        return new MultipassDiskGuardOptions
-        {
-            MinFreeBytes = cfg.MinFreeBytes,
-            MultipassDataPath = cfg.MultipassDataPath,
-            RecheckIn = recheck,
-            AdditionalPaths = extras,
-        };
+        return new ResolvedDiskGuardConfig(
+            config.MinFreeBytes,
+            recheck,
+            Array.AsReadOnly(paths.ToArray()));
     }
 }
+
+internal sealed record ResolvedDiskGuardConfig(
+    long MinFreeBytes,
+    TimeSpan RecheckIn,
+    IReadOnlyList<string> AdditionalPaths);

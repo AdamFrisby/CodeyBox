@@ -25,6 +25,7 @@ using CodeyBox.Git;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox.Bubblewrap;
+using CodeyBox.Sandbox.Incus;
 using CodeyBox.Sandbox.Multipass;
 using CodeyBox.Sandbox.MultipassRemote;
 using CodeyBox.Sandbox.Process;
@@ -367,6 +368,9 @@ ApiKeyAuth.Configure(builder);
 //   multipass   — Real Ubuntu VMs via Canonical's snap. Separate guest
 //                 kernel. Single 'snap install multipass' on Ubuntu, no
 //                 podman / OCI runtime / /etc edits. ~10-30s VM launch.
+//   incus       — Real VMs backed by a snapshot-capable Incus storage pool.
+//                 Baseline clones are copy-on-write and host directories are
+//                 shared through explicitly selected virtiofs devices.
 //   sprites     — Fly.io hosted Firecracker microVMs via sprites.dev. Requires
 //                 SPRITES_TOKEN (or configured token env var).
 builder.Services.AddSingleton<ISandboxProvider>(SelectSandboxProvider);
@@ -433,12 +437,15 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         {
             throw new InvalidOperationException(
                 "CodeyBox:SandboxProvider must be set in non-Development environments. " +
-                "Choose one of: multipass, multipass-remote, sprites, bubblewrap, process " +
+                "Choose one of: incus, multipass, multipass-remote, sprites, bubblewrap, process " +
                 "(see docs/sandbox-providers.md for trade-offs).");
         }
     }
 
-    var inner = BuildSandboxProviderInner(sp, opts, environment, startupLog, loggerFactory, kind);
+    var inner = kind is HotSwappableSandboxProvider.MultipassProviderId
+        or HotSwappableSandboxProvider.IncusProviderId
+        ? BuildMultipassIncusCutoverProvider(sp, opts, loggerFactory, startupLog)
+        : BuildSandboxProviderInner(sp, opts, environment, startupLog, loggerFactory, kind);
     var orchestratorOptions = sp.GetRequiredService<OrchestratorOptions>();
     startupLog.LogInformation(
         "Sandbox admission control: provider={Provider}, MaxConcurrentSandboxes={MaxConcurrentSandboxes}",
@@ -448,6 +455,35 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         inner,
         orchestratorOptions.MaxConcurrentSandboxes,
         loggerFactory.CreateLogger<SandboxAdmissionControlledProvider>());
+}
+
+static HotSwappableSandboxProvider BuildMultipassIncusCutoverProvider(
+    IServiceProvider sp,
+    CodeyBoxOptions startupOptions,
+    ILoggerFactory loggerFactory,
+    ILogger startupLog)
+{
+    // Each independent provider is constructed lazily on first activation.
+    // The routing wrapper reads IOptionsMonitor for every new operation, so a
+    // live selector change affects only future work; handles and lifecycle
+    // state created before the cutover stay owned by their original backend.
+    // It deliberately never retries a selected-provider failure through the
+    // other provider.
+    return new HotSwappableSandboxProvider(
+        sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>(),
+        () => BuildMultipass(
+            startupOptions,
+            sp,
+            loggerFactory,
+            startupLog,
+            sp.GetService<ITimingStore>(),
+            sp.GetService<ISandboxResourceUsageStore>()),
+        () => BuildIncus(
+            sp,
+            loggerFactory,
+            sp.GetService<ITimingStore>(),
+            sp.GetService<ISandboxResourceUsageStore>()),
+        loggerFactory.CreateLogger<HotSwappableSandboxProvider>());
 }
 
 static ISandboxProvider BuildSandboxProviderInner(
@@ -472,10 +508,15 @@ static ISandboxProvider BuildSandboxProviderInner(
             startupLog,
             sp.GetService<ITimingStore>(),
             sp.GetService<ISandboxResourceUsageStore>()),
+        "incus" => BuildIncus(
+            sp,
+            loggerFactory,
+            sp.GetService<ITimingStore>(),
+            sp.GetService<ISandboxResourceUsageStore>()),
         "multipass-remote" => BuildMultipassRemote(sp, loggerFactory),
         "sprites" => BuildSprites(sp, loggerFactory, startupLog),
         _ => throw new InvalidOperationException(
-            $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: multipass, multipass-remote, sprites, bubblewrap, process"),
+            $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: incus, multipass, multipass-remote, sprites, bubblewrap, process"),
     };
 }
 
@@ -672,6 +713,32 @@ static ISandboxProvider BuildProcess(CodeyBoxOptions opts, IHostEnvironment env,
     }
     startupLog.LogWarning("Using Process sandbox provider — NO ISOLATION. Dev only.");
     return new ProcessSandboxProvider(loggerFactory.CreateLogger<ProcessSandboxProvider>());
+}
+
+static IncusSandboxProvider BuildIncus(
+    IServiceProvider sp,
+    ILoggerFactory loggerFactory,
+    ITimingStore? timings,
+    ISandboxResourceUsageStore? resourceUsageStore)
+{
+    var configLog = loggerFactory.CreateLogger("CodeyBox.Incus.Config");
+    var provider = new IncusSandboxProvider(
+        // The cutover wrapper may route future work between Multipass and
+        // Incus, while each Incus operation resolves the latest allowed
+        // settings. A live sandbox keeps the immutable IncusSandboxOptions
+        // snapshot captured when it was created, so a reload cannot change its
+        // project, pool, or device map halfway through teardown.
+        () =>
+        {
+            var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
+            return IncusSandboxConfigMapper.Build(live, configLog);
+        },
+        loggerFactory.CreateLogger<IncusSandboxProvider>(),
+        timings,
+        resourceUsageStore);
+
+    LogDiskGuardBanner(provider, configLog);
+    return provider;
 }
 
 static MultipassSandboxProvider BuildMultipass(
@@ -1047,24 +1114,28 @@ builder.Services.AddSingleton<CodeyBox.Agents.Claude.ClaudeSessionWorker>(sp =>
         .OfType<ClaudeAgentRunner>()
         .First();
 
-    // Resume hook: when the registered provider exposes the suspend/resume
-    // contract (multipass; not process / bubblewrap), bring the VM back up by
-    // delegating to its ResumeSandboxAsync. The AgentSessionSandboxRef.Id IS
-    // the multipass VM name (default sandboxRefFactory derives it from
-    // ISandbox.Id, which MultipassSandbox sets to the VM name). Non-suspending
-    // providers leave the hook unwired so a stop/resume cycle isn't attempted
-    // against them — ResumeSessionAsync then short-circuits the resume step.
+    // Resume hook: provider identity is persisted with the sandbox reference so
+    // the live Multipass/Incus selector cannot redirect an existing session.
+    // Legacy references with no provider predate Incus and remain Multipass-
+    // resumable. Incus does not yet support stopped-session resume, so the
+    // worker receives a fail-before-stop guard as well as a guarded resume sink.
     var provider = sp.GetService<ISandboxProvider>();
     Func<AgentSessionSandboxRef, CancellationToken, Task>? resumeHook = null;
+    Func<AgentSessionSandboxRef, string?>? resumeUnsupportedReason = null;
     if (provider is ISuspendingSandboxProvider suspending)
-        resumeHook = (sandboxRef, ct) => suspending.ResumeSandboxAsync(sandboxRef.Id, ct);
+    {
+        resumeHook = (sandboxRef, ct) =>
+            AgentSessionSandboxRouting.ResumeWithMultipassAsync(suspending, sandboxRef, ct);
+        resumeUnsupportedReason = AgentSessionSandboxRouting.GetMultipassResumeUnsupportedReason;
+    }
 
     return new CodeyBox.Agents.Claude.ClaudeSessionWorker(
         runner,
         sandboxReattacher: null,
         sandboxResumeHook: resumeHook,
+        sandboxResumeUnsupportedReason: resumeUnsupportedReason,
         credentialProvider: sp.GetService<ICredentialProvider>(),
-        sandboxRefFactory: null,
+        sandboxRefFactory: AgentSessionSandboxRouting.CreateReference,
         metricsSink: sp.GetRequiredService<CodeyBox.Agents.Claude.IClaudeSessionMetricsSink>(),
         options: sp.GetRequiredService<CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions>(),
         acpTransport: sp.GetRequiredService<CodeyBox.Agents.Claude.AcpClaudeTransport>(),
@@ -3855,6 +3926,150 @@ finally
 
 namespace CodeyBox.Api
 {
+    /// <summary>
+    /// Hot-reloadable settings for
+    /// <c>CodeyBox:SandboxProvider=incus</c>. A process started with Incus or
+    /// Multipass may switch between those providers on hot reload; changes
+    /// under <c>CodeyBox:Incus</c> (except the restart-only project and staging
+    /// identities) are captured by the next provider operation and do not
+    /// mutate already-created sandboxes.
+    ///
+    /// The configured storage pool must already exist and use the ZFS or Btrfs
+    /// driver; ZFS is strongly recommended for VM workloads.
+    /// See <c>docs/sandbox-providers.md</c> for the host setup and security
+    /// requirements.
+    /// </summary>
+    public sealed class IncusSandboxConfig
+    {
+        private static readonly IncusSandboxOptions Defaults = new();
+
+        /// <summary>Incus CLI executable name or absolute path.</summary>
+        public string BinaryPath { get; set; } = Defaults.BinaryPath;
+
+        /// <summary>Restart-only dedicated non-default restricted Incus project that owns all CodeyBox instances; created and verified idempotently when absent.</summary>
+        public string ProjectName { get; set; } = Defaults.ProjectName;
+
+        /// <summary>Name of the pre-created ZFS or Btrfs storage pool used for VM roots and COW clones.</summary>
+        public string StoragePoolName { get; set; } = Defaults.StoragePoolName;
+
+        /// <summary>Incus VM image used when a sandbox spec has no explicit image reference.</summary>
+        public string DefaultImage { get; set; } = Defaults.DefaultImage;
+
+        /// <summary>Prefix for ordinary provider-owned VM instance names.</summary>
+        public string InstanceNamePrefix { get; set; } = Defaults.InstanceNamePrefix;
+
+        /// <summary>Prefix for content-addressed baked baseline VM names.</summary>
+        public string BaselineNamePrefix { get; set; } = Defaults.BaselineNamePrefix;
+
+        /// <summary>Use lazily baked baselines and COW <c>incus copy</c> clones for sandbox creation.</summary>
+        public bool UseBaselineImages { get; set; } = Defaults.UseBaselineImages;
+
+        /// <summary>
+        /// Also inventory Multipass resources after a restart that begins on
+        /// Incus. Enable during a cross-restart cutover; leave false on an
+        /// Incus-only host so no Multipass CLI is required.
+        /// </summary>
+        public bool IncludeMultipassCutoverInventory { get; set; }
+
+        /// <summary>
+        /// Shell commands run once while baking a baseline or during a full
+        /// launch.
+        /// </summary>
+        public List<string> ExtraRuncmd { get; set; } = [.. Defaults.ExtraRuncmd];
+
+        /// <summary>
+        /// Additional top-level cloud-init YAML merged into generated user
+        /// data. This is operator-visible configuration and must not contain
+        /// secrets.
+        /// </summary>
+        public string? ExtraCloudInit { get; set; } = Defaults.ExtraCloudInit;
+
+        /// <summary>Restart-only host directory for isolated mount snapshots and provider staging.</summary>
+        public string? StagingDirectory { get; set; } = Defaults.StagingDirectory;
+
+        /// <summary>
+        /// Additional canonical host-directory roots that Incus may expose
+        /// through virtiofs. <c>GitRootDirectory</c> and the enabled shared
+        /// upstream mirror directory are always included.
+        /// </summary>
+        public List<string> AllowedHostMountRoots { get; set; } = [.. Defaults.AllowedHostMountRoots];
+
+        /// <summary>Numeric non-root guest user ID; must match the effective host UID when attaching any host path.</summary>
+        public uint GuestUserId { get; set; } = Defaults.GuestUserId;
+
+        /// <summary>Numeric non-root guest group ID; must match the effective host GID when attaching any host path.</summary>
+        public uint GuestGroupId { get; set; } = Defaults.GuestGroupId;
+
+        /// <summary>Absolute home directory of the configured guest user.</summary>
+        public string GuestHome { get; set; } = Defaults.GuestHome;
+
+        /// <summary>Default deadline for a single Incus CLI lifecycle operation.</summary>
+        public TimeSpan OperationTimeout { get; set; } = Defaults.OperationTimeout;
+
+        /// <summary>Provider-side upper bound for one guest command; caller and sandbox wall-clock limits may be shorter.</summary>
+        public TimeSpan ExecTimeout { get; set; } = Defaults.ExecTimeout;
+
+        /// <summary>Deadline for cold image download/import and VM root initialization.</summary>
+        public TimeSpan ImageProvisioningTimeout { get; set; } = Defaults.ImageProvisioningTimeout;
+
+        /// <summary>Deadline for VM boot and guest readiness.</summary>
+        public TimeSpan VmStartTimeout { get; set; } = Defaults.VmStartTimeout;
+
+        /// <summary>Deadline for a graceful VM stop.</summary>
+        public TimeSpan VmStopTimeout { get; set; } = Defaults.VmStopTimeout;
+
+        /// <summary>Deadline for cloud-init to finish inside a newly booted VM.</summary>
+        public TimeSpan CloudInitTimeout { get; set; } = Defaults.CloudInitTimeout;
+
+        /// <summary>Deadline for a virtiofs mount to become usable in the guest.</summary>
+        public TimeSpan MountReadyTimeout { get; set; } = Defaults.MountReadyTimeout;
+
+        /// <summary>Delay between VM/agent readiness probes.</summary>
+        public TimeSpan ReadinessPollInterval { get; set; } = Defaults.ReadinessPollInterval;
+
+        /// <summary>Maximum number of concurrent heavy Incus lifecycle/device operations.</summary>
+        public int MaxConcurrentOperations { get; set; } = Defaults.MaxConcurrentOperations;
+
+        /// <summary>Maximum stdout bytes retained from one Incus CLI invocation.</summary>
+        public int MaxCliStdoutBytes { get; set; } = Defaults.MaxCliStdoutBytes;
+
+        /// <summary>Maximum stderr bytes retained from one Incus CLI invocation.</summary>
+        public int MaxCliStderrBytes { get; set; } = Defaults.MaxCliStderrBytes;
+
+        /// <summary>Capture best-effort guest resource metrics before sandbox teardown.</summary>
+        public bool CaptureResourceMetrics { get; set; } = Defaults.CaptureResourceMetrics;
+
+        /// <summary>Deadline for the best-effort resource metrics capture during teardown.</summary>
+        public TimeSpan ResourceMetricsCaptureTimeout { get; set; } = Defaults.ResourceMetricsCaptureTimeout;
+
+        /// <summary>Interval used by the guest peak-memory sampler.</summary>
+        public TimeSpan ResourceMetricsSampleInterval { get; set; } = Defaults.ResourceMetricsSampleInterval;
+
+        /// <summary>Default vCPU allocation baked into baseline VMs.</summary>
+        public int BaselineCpus { get; set; } = Defaults.BaselineCpus;
+
+        /// <summary>Default baseline VM memory allocation in bytes.</summary>
+        public long BaselineMemoryBytes { get; set; } = Defaults.BaselineMemoryBytes;
+
+        /// <summary>Default baseline root-disk size in bytes.</summary>
+        public long BaselineDiskBytes { get; set; } = Defaults.BaselineDiskBytes;
+
+        /// <summary>Maximum aggregate bytes copied into private host staging for one sandbox.</summary>
+        public long MaxSnapshotBytes { get; set; } = Defaults.MaxSnapshotBytes;
+
+        /// <summary>Maximum files, directories, and links copied into private host staging for one sandbox.</summary>
+        public int MaxSnapshotEntries { get; set; } = Defaults.MaxSnapshotEntries;
+
+        /// <summary>Maximum direct-mount entries inspected while choosing a host-to-guest identity probe.</summary>
+        public int MaxReadinessProbeEntries { get; set; } = Defaults.MaxReadinessProbeEntries;
+
+        /// <summary>Maximum logical size of one guest tmpfs device.</summary>
+        public long MaxTmpfsDeviceBytes { get; set; } = Defaults.MaxTmpfsDeviceBytes;
+
+        /// <summary>Maximum aggregate logical size of all guest tmpfs devices in one sandbox.</summary>
+        public long MaxAggregateTmpfsBytes { get; set; } = Defaults.MaxAggregateTmpfsBytes;
+    }
+
     public sealed class MultipassSandboxConfig
     {
         /// <summary>
@@ -4130,13 +4345,18 @@ namespace CodeyBox.Api
     ///   <c>Shutdown.SandboxAdoptionDeadlineSeconds</c>, <c>SandboxLeak</c>
     ///   (thresholds, per-sweep),
     ///   <c>AuditLog.RetainedDays</c> (DB retention, per-sweep), and the
-    ///   sandbox launch fields (<c>Multipass*</c>, <c>SandboxNetworkProfiles</c>,
+    ///   sandbox launch fields (<c>Multipass*</c>, <c>Incus.*</c> except
+    ///   <c>Incus.ProjectName</c> and effective <c>Incus.StagingDirectory</c>, the guarded
+    ///   <c>multipass</c>↔<c>incus</c> <c>SandboxProvider</c> switch,
+    ///   <c>SandboxNetworkProfiles</c>,
     ///   per-launch), and <c>Shutdown.SandboxTeardownMode</c> (next graceful
     ///   shutdown).</item>
     /// <item><b>Startup-only and rejected</b> on reload by
     ///   <see cref="ImmutableCodeyBoxOptionsValidator"/>:
-    ///   <c>SandboxProvider</c>, <c>StateDatabasePath</c>,
-    ///   <c>GitRootDirectory</c>, <c>AgentStreams.Path</c>,
+    ///   <c>SandboxProvider</c> changes other than the guarded
+    ///   <c>multipass</c>↔<c>incus</c> switch, <c>StateDatabasePath</c>,
+    ///   <c>GitRootDirectory</c>, <c>Incus.ProjectName</c>, effective
+    ///   <c>Incus.StagingDirectory</c>, <c>AgentStreams.Path</c>,
     ///   <c>WorkerPool.MaxConcurrentSandboxes</c>,
     ///   <c>EnableSharedUpstreamMirror</c>, and
     ///   <c>SharedUpstreamMirrorDirectory</c>. The retaining
@@ -4311,11 +4531,14 @@ namespace CodeyBox.Api
         public BudgetDeferralRecheckOptions BudgetDeferralRecheck { get; set; } = new();
 
         /// <summary>
-        /// Which sandbox provider to use. One of: <c>multipass</c>,
+        /// Which sandbox provider to use. One of: <c>incus</c>, <c>multipass</c>,
         /// <c>multipass-remote</c>, <c>sprites</c>, <c>bubblewrap</c>,
         /// <c>process</c>.
         /// Default is empty — startup defaults to 'process' in Development
         /// and refuses to start in other environments.
+        /// A process that starts with <c>multipass</c> or <c>incus</c> may
+        /// hot-switch between those two providers. All other changes require
+        /// a restart and are rejected during reload.
         /// </summary>
         public string? SandboxProvider { get; set; }
 
@@ -4324,6 +4547,14 @@ namespace CodeyBox.Api
         /// Don't.
         /// </summary>
         public bool DangerouslyAllowProcessSandbox { get; set; }
+
+        /// <summary>
+        /// Incus VM, baseline, storage, and CLI settings. Consumed only when
+        /// <c>SandboxProvider=incus</c>; fields other than
+        /// <c>ProjectName</c> and the effective <c>StagingDirectory</c> are
+        /// hot-reloaded for the next provider operation.
+        /// </summary>
+        public IncusSandboxConfig Incus { get; set; } = new();
 
         /// <summary>
         /// Extra cloud-init YAML appended to the auto-generated network policy
@@ -4372,10 +4603,10 @@ namespace CodeyBox.Api
         /// the orchestrator then attaches each VM to the matching bridge,
         /// where host-side nftables rules enforce egress.
         ///
-        /// Empty → no host-enforced profile is selectable; sandboxes
-        /// fall back to Multipass's default bridge, which
-        /// setup-host-networks.sh blocks at the host. For functional
-        /// egress, populate this and run setup-host-networks.sh.
+        /// Empty → no host-enforced profile is selectable. Multipass then
+        /// has only its blocked default bridge; Incus instances are created
+        /// without a NIC. For functional egress, populate this and run
+        /// setup-host-networks.sh.
         ///
         /// Example:
         /// <code>
@@ -4387,7 +4618,9 @@ namespace CodeyBox.Api
         /// }
         /// </code>
         /// Bridge names are limited to 15 characters by Linux IFNAMSIZ.
-        /// Profile names (the keys) have no such limit.
+        /// Profile names (the keys) have no such limit. Multipass attaches
+        /// the selected bridge as a second NIC; Incus uses it as the VM's
+        /// only NIC and does not inherit an Incus NAT profile.
         /// </summary>
         public Dictionary<string, string> SandboxNetworkProfiles { get; set; } = new(StringComparer.OrdinalIgnoreCase)
         {
@@ -4435,9 +4668,11 @@ namespace CodeyBox.Api
         /// Disk-guard preflight configuration. Enabled by default
         /// (<see cref="DiskGuardOptions.Enabled"/>=<c>true</c>,
         /// <see cref="DiskGuardOptions.MinFreeBytes"/>=10 GiB); every
-        /// <c>MultipassSandboxProvider.CreateAsync</c> call checks free space
-        /// on the configured mounts and defers the work item (same machinery
-        /// as the budget cap) when any mount is below the threshold. Set
+        /// sandbox creation checks the provider's backing storage and defers
+        /// the work item (same machinery as the budget cap) when it is below
+        /// the threshold. Multipass additionally checks its configured host
+        /// paths; Incus checks the selected storage pool, shared additional
+        /// paths, and its effective staging directory. Set
         /// <c>CodeyBox:DiskGuard:Enabled=false</c> to disable.
         /// </summary>
         public DiskGuardOptions DiskGuard { get; set; } = new();
@@ -4885,10 +5120,10 @@ namespace CodeyBox.Api
         public string RecheckIn { get; set; } = "00:05:00";
 
         /// <summary>
-        /// Extra paths to check in addition to <see cref="MultipassDataPath"/>.
-        /// The wiring code automatically adds the state-database directory so
-        /// SQLite writes won't be the first thing to ENOSPC on a host whose
-        /// /var/lib/codeybox lives on a different volume.
+        /// Extra host paths checked by VM providers in addition to their
+        /// provider-owned backing storage. The wiring automatically adds the
+        /// state-database directory, and Incus also adds its effective staging
+        /// directory, so those writes are not the first to hit ENOSPC.
         /// </summary>
         public List<string> AdditionalPaths { get; set; } = [];
     }

@@ -145,7 +145,8 @@ internal sealed class AuditReviewDotnetShim
     public static AuditReviewDotnetShim From(PipelineTuningOptions tuning, string sandboxProviderName)
     {
         var hardenAbsolutePaths = string.Equals(sandboxProviderName, "multipass", StringComparison.Ordinal)
-                                  || string.Equals(sandboxProviderName, "multipass-remote", StringComparison.Ordinal);
+                                  || string.Equals(sandboxProviderName, "multipass-remote", StringComparison.Ordinal)
+                                  || string.Equals(sandboxProviderName, "incus", StringComparison.Ordinal);
         return new AuditReviewDotnetShim(
             tuning.BlockRedundantDotnetBuildTestInAuditSandbox,
             hardenAbsolutePaths);

@@ -25,10 +25,12 @@ public sealed class CodeyBoxOptionsStartupSnapshot
 /// OptionsValidationException naming the field that requires a restart.
 ///
 /// Fields guarded here are the ones whose value is captured by open file
-/// handles, long-lived listeners, or singleton constructors elsewhere in the
-/// service graph — re-binding them mid-flight would either leak the prior
-/// resource or quietly continue using the stale value, which is worse than
-/// rejecting the change outright.
+/// handles, long-lived listeners, provider identity, or singleton constructors
+/// elsewhere in the service graph — re-binding them mid-flight would either
+/// leak the prior resource or quietly continue using the stale value, which is
+/// worse than rejecting the change outright. The one provider-selector
+/// exception is a process that starts with Multipass or Incus: it can lazily
+/// activate both providers and may switch only between those two at runtime.
 ///
 /// Production passes an eager startup snapshot into the constructor after all
 /// layered configuration sources are registered. The parameterless constructor
@@ -65,13 +67,32 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
             }
 
             var failures = new List<string>();
-            Check("CodeyBox:SandboxProvider", _snapshot.SandboxProvider, NormalizeString(options.SandboxProvider), failures);
+            var candidateSandboxProvider = NormalizeSandboxProvider(options.SandboxProvider);
+            CheckSandboxProvider(
+                _snapshot.SandboxProvider,
+                candidateSandboxProvider,
+                failures);
             Check("CodeyBox:StateDatabasePath", _snapshot.StateDatabasePath, NormalizePath(options.StateDatabasePath), failures);
             Check("CodeyBox:GitRootDirectory", _snapshot.GitRootDirectory, NormalizePath(options.GitRootDirectory), failures);
             Check("CodeyBox:AgentStreams:Path", _snapshot.AgentStreamsPath, NormalizePath(options.AgentStreams.Path), failures);
             Check("CodeyBox:WorkerPool:MaxConcurrentSandboxes", _snapshot.MaxConcurrentSandboxes, options.WorkerPool.MaxConcurrentSandboxes, failures);
             Check("CodeyBox:EnableSharedUpstreamMirror", _snapshot.EnableSharedUpstreamMirror, options.EnableSharedUpstreamMirror, failures);
             Check("CodeyBox:SharedUpstreamMirrorDirectory", _snapshot.SharedUpstreamMirrorDirectory, NormalizePath(options.SharedUpstreamMirrorDirectory), failures);
+            if (IsMultipassIncus(_snapshot.SandboxProvider) || IsMultipassIncus(candidateSandboxProvider))
+            {
+                Check(
+                    "CodeyBox:Incus:ProjectName",
+                    _snapshot.IncusProjectName,
+                    NormalizeString((options.Incus ?? new IncusSandboxConfig()).ProjectName),
+                    failures);
+                Check(
+                    "CodeyBox:Incus:StagingDirectory",
+                    _snapshot.IncusStagingDirectory,
+                    NormalizePath(IncusSandboxConfigMapper.ResolveStagingDirectory(
+                        options,
+                        options.Incus?.StagingDirectory)),
+                    failures);
+            }
 
             return failures.Count == 0
                 ? ValidateOptionsResult.Success
@@ -79,21 +100,53 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
         }
     }
 
-    private static Snapshot Capture(CodeyBoxOptions options) => new(
-        NormalizeString(options.SandboxProvider),
-        NormalizePath(options.StateDatabasePath),
-        NormalizePath(options.GitRootDirectory),
-        NormalizePath(options.AgentStreams.Path),
-        options.WorkerPool.MaxConcurrentSandboxes,
-        options.EnableSharedUpstreamMirror,
-        NormalizePath(options.SharedUpstreamMirrorDirectory));
+    private static Snapshot Capture(CodeyBoxOptions options)
+    {
+        var sandboxProvider = NormalizeSandboxProvider(options.SandboxProvider);
+        var captureIncusIdentity = IsMultipassIncus(sandboxProvider);
+        return new Snapshot(
+            sandboxProvider,
+            NormalizePath(options.StateDatabasePath),
+            NormalizePath(options.GitRootDirectory),
+            NormalizePath(options.AgentStreams.Path),
+            options.WorkerPool.MaxConcurrentSandboxes,
+            options.EnableSharedUpstreamMirror,
+            NormalizePath(options.SharedUpstreamMirrorDirectory),
+            captureIncusIdentity
+                ? NormalizeString((options.Incus ?? new IncusSandboxConfig()).ProjectName)
+                : string.Empty,
+            captureIncusIdentity
+                ? NormalizePath(IncusSandboxConfigMapper.ResolveStagingDirectory(
+                    options,
+                    options.Incus?.StagingDirectory))
+                : string.Empty);
+    }
+
+    private static void CheckSandboxProvider(
+        string startup,
+        string candidate,
+        List<string> failures)
+    {
+        if (string.Equals(startup, candidate, StringComparison.Ordinal))
+            return;
+
+        if (IsMultipassIncus(startup) && IsMultipassIncus(candidate))
+            return;
+
+        failures.Add(
+            "CodeyBox:SandboxProvider only supports a hot multipass <-> incus cutover when the process " +
+            "started with one of those providers; restart CodeyBox for every other provider change.");
+    }
+
+    private static bool IsMultipassIncus(string value) =>
+        value is HotSwappableSandboxProvider.MultipassProviderId
+            or HotSwappableSandboxProvider.IncusProviderId;
 
     private static void Check(string field, string startup, string candidate, List<string> failures)
     {
         if (!string.Equals(startup, candidate, StringComparison.Ordinal))
             failures.Add(
-                $"{field} cannot be changed at runtime (startup='{startup}', requested='{candidate}'). " +
-                "Restart CodeyBox to apply this change.");
+                $"{field} cannot be changed at runtime. Restart CodeyBox to apply this change.");
     }
 
     private static void Check(string field, int? startup, int? candidate, List<string> failures)
@@ -116,6 +169,9 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
 
     private static string NormalizeString(string? value) => value?.Trim() ?? string.Empty;
 
+    private static string NormalizeSandboxProvider(string? value) =>
+        NormalizeString(value).ToLowerInvariant();
+
     private static string NormalizePath(string? value)
     {
         if (string.IsNullOrWhiteSpace(value)) return string.Empty;
@@ -130,7 +186,9 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
         string AgentStreamsPath,
         int? MaxConcurrentSandboxes,
         bool EnableSharedUpstreamMirror,
-        string SharedUpstreamMirrorDirectory);
+        string SharedUpstreamMirrorDirectory,
+        string IncusProjectName,
+        string IncusStagingDirectory);
 }
 
 /// <summary>

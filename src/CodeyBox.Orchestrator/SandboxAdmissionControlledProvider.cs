@@ -159,6 +159,18 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     public async Task DisposeLeakedAsync(string name, CancellationToken ct)
     {
         await _inner.DisposeLeakedAsync(name, ct).ConfigureAwait(false);
+        ReleaseDisposedSandboxAdmission(name);
+    }
+
+    public async Task DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(sandbox);
+        await _inner.DisposeLeakedAsync(sandbox, ct).ConfigureAwait(false);
+        ReleaseDisposedSandboxAdmission(sandbox.Name);
+    }
+
+    private void ReleaseDisposedSandboxAdmission(string name)
+    {
         _preservedLiveSandboxes.TryRemove(name, out _);
         _resumeAdmissions?.Release(name);
         _disposedSandboxAdmissions.Release(name);

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using CodeyBox.Agents.Claude;
+using CodeyBox.Api;
 using CodeyBox.Core;
 
 namespace CodeyBox.Tests;
@@ -128,7 +129,11 @@ public sealed class ClaudeSessionWorkerTests
             {
                 Interlocked.Increment(ref resumeHookCalled);
                 return Task.CompletedTask;
-            });
+            },
+            sandboxRefFactory: static sandbox => new AgentSessionSandboxRef(
+                sandbox.Id,
+                HotSwappableSandboxProvider.MultipassProviderId),
+            sandboxResumeUnsupportedReason: AgentSessionSandboxRouting.GetMultipassResumeUnsupportedReason);
 
         var handle = await worker.OpenSessionAsync(sandbox, "/work", credential: null);
         await worker.SendTurnAsync(handle, "first");
@@ -145,6 +150,46 @@ public sealed class ClaudeSessionWorkerTests
         Assert.Equal(2, sandbox.AllAgentExecs.Count);
         var secondArgv = sandbox.AllAgentExecs[1].Argv.ToList();
         Assert.Equal("cli-sess-stop", secondArgv[secondArgv.IndexOf("--resume") + 1]);
+    }
+
+    [Fact]
+    public async Task IncusSession_ResumeUnsupported_FailsBeforeStopOrMultipassHook()
+    {
+        var sandbox = new PreemptibleScriptedSandbox(
+            StreamJsonFirstTurn("cli-incus-running"),
+            StreamJsonSecondTurn("cli-incus-running"));
+        var multipassResumeCalls = 0;
+        var worker = new ClaudeSessionWorker(
+            BuildRunner(),
+            sandboxResumeHook: (_, _) =>
+            {
+                Interlocked.Increment(ref multipassResumeCalls);
+                return Task.CompletedTask;
+            },
+            sandboxRefFactory: static current => new AgentSessionSandboxRef(
+                current.Id,
+                HotSwappableSandboxProvider.IncusProviderId),
+            sandboxResumeUnsupportedReason: AgentSessionSandboxRouting.GetMultipassResumeUnsupportedReason);
+
+        var handle = await worker.OpenSessionAsync(sandbox, "/work", credential: null);
+        await worker.SendTurnAsync(handle, "first");
+
+        var suspendFailure = await Assert.ThrowsAsync<NotSupportedException>(
+            () => worker.SuspendSessionAsync(handle));
+        Assert.Contains("Incus", suspendFailure.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, sandbox.StopCallCount);
+
+        await Assert.ThrowsAsync<NotSupportedException>(
+            () => worker.ResumeSessionAsync(handle));
+        Assert.Equal(0, multipassResumeCalls);
+
+        // The failed suspension made no transport or sandbox state transition;
+        // the still-running session remains usable until the caller chooses a
+        // fresh-sandbox fallback policy.
+        var second = await worker.SendTurnAsync(handle, "second");
+        Assert.True(second.Success);
+        Assert.Equal(2, sandbox.AllAgentExecs.Count);
+        await worker.CloseSessionAsync(handle);
     }
 
     [Fact]

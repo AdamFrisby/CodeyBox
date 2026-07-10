@@ -1,7 +1,7 @@
-# Host-side egress enforcement (Multipass + nftables)
+# Host-side egress enforcement (Multipass/Incus + nftables)
 
-For a sandbox provider that gives kernel isolation (Multipass), egress
-filtering belongs on the **host**, not inside the VM. An agent in the VM
+For sandbox providers that give kernel isolation (Multipass and Incus), egress
+filtering belongs on the **host**, not inside the VM. An agent in a VM
 with sudo could flush any in-guest iptables rule, so the orchestrator
 deliberately installs **no** in-VM firewall — egress enforcement lives
 entirely in the host kernel via nftables on per-profile bridges, where
@@ -16,22 +16,36 @@ This document describes how to set up the host-side enforcement.
    its own subnet with a built-in DHCP server (via systemd-networkd), and
    writes nftables rules that:
    - Drop all forward traffic on Multipass's default bridge (`mpqemubr0`),
-     so the default NIC every VM gets has no path to the internet.
+     so Multipass's control-plane NIC has no path to the internet. Incus VMs
+     are created with `--no-profiles` and never receive a default NAT NIC.
    - Apply per-bridge allowlists: loopback + ESTABLISHED/RELATED + DNS +
      the resolved IPs of the configured allowed hosts. Everything else
      dropped.
 2. **CodeyBox is configured with a profile→bridge map** in
    `appsettings.json` (`SandboxNetworkProfiles`).
-3. **At sandbox creation**, the orchestrator passes
+3. **At Multipass sandbox creation**, the orchestrator passes
    `--network <bridge>` to `multipass launch` based on the profile the
-   work-item phase needs. The VM ends up with two NICs:
+   work-item phase needs. That VM ends up with two NICs:
    - First NIC on `mpqemubr0` — used by Multipass's control plane
      (host → guest agent for `exec`, `mount`, `transfer`). Forward
      traffic on this bridge is dropped by host nftables, so it can't
      reach the internet.
    - Second NIC on the chosen `cb-*` bridge — the only viable path
      out, with the bridge's host-side filtering applied.
-4. **The orchestrator's cloud-init runs a one-shot route swap at first
+4. **At Incus sandbox creation**, the provider uses `--no-profiles`, then adds
+   exactly one bridged NIC. It does not attach Incus's default profile or NAT
+   network. The equivalent CLI operation is:
+
+   ```bash
+   incus --project codeybox config device add <vm> codeybox-net nic \
+     nictype=bridged parent=<cb-profile-bridge> name=eth0
+   ```
+
+   The selected `cb-*` bridge is therefore the VM's only network path; no
+   in-guest route swap is needed. This command documents what CodeyBox runs—an
+   operator does not add the device manually. Replace `codeybox` when a
+   different restart-only `Incus:ProjectName` is configured.
+5. **Multipass cloud-init runs a one-shot route swap at first
    boot** that detects which interface has an IP in the `10.99.0.0/16`
    profile-bridge range and sets it as the default route. Without this,
    Linux defaults to the first NIC (mpqemubr0 → blocked) and the agent's
@@ -39,9 +53,9 @@ This document describes how to set up the host-side enforcement.
 
 There is nothing in the VM for a compromised agent to flush — the
 drops happen in the host kernel, on bridges the agent has no view
-into. A compromised agent restoring the default route to mpqemubr0
-(`sudo ip route ...`) just self-DOSes — that traffic still hits the
-host nftables drop and times out.
+into. A compromised Multipass agent restoring the default route to `mpqemubr0`
+(`sudo ip route ...`) just self-DOSes because that traffic still hits the host
+nftables drop. An Incus agent has no alternate NAT NIC to select.
 
 ### IPv4 only
 
@@ -84,8 +98,8 @@ reach LAN hosts via the host's other interfaces.
 Once per host:
 
 ```bash
-# 1. Install Multipass.
-sudo snap install multipass
+# 1. Install the selected VM provider first. See docs/sandbox-providers.md;
+#    Incus also requires its pre-created ZFS/Btrfs pool.
 
 # 2. Create the network profile config.
 sudo mkdir -p /etc/codeybox
@@ -102,10 +116,27 @@ EOF
 # 3. Run the setup script (creates bridges, applies nftables, persists rules).
 sudo /path/to/codeybox/scripts/setup-host-networks.sh
 
-# 4. Verify.
-multipass networks                   # bridges should appear
-nft list table inet codeybox        # rules should be loaded
+# 4. Verify provider-independent host state.
+ip link show cb-iso                  # each configured bridge should exist
+nft list table inet codeybox         # rules should be loaded
 ```
+
+For Multipass, `multipass networks` should list the bridges. For a running
+Incus sandbox, verify the one-NIC invariant directly:
+
+```bash
+incus --project codeybox config show <vm> --expanded
+# In the expanded devices: stanza, the only type: nic entry must be:
+#   codeybox-net:
+#     name: eth0
+#     nictype: bridged
+#     parent: cb-claude
+#     type: nic
+```
+
+There must be no inherited `eth0`/NAT device in the output. CodeyBox enforces
+this by creating every Incus VM with `--no-profiles` before adding
+`codeybox-net`.
 
 Re-run the script after editing the config or to refresh resolved IPs
 (useful when CDN endpoints rotate; the script re-resolves and rewrites
@@ -120,7 +151,7 @@ Two layers of config:
 ```json
 {
   "CodeyBox": {
-    "SandboxProvider": "multipass",
+    "SandboxProvider": "incus",
     "SandboxNetworkProfiles": {
       "isolated":  "cb-iso",
       "claude":    "cb-claude",
@@ -133,7 +164,9 @@ Two layers of config:
 ```
 
 These keys are *logical profile names* — labels the orchestrator uses
-internally. The values are the host bridge names from `networks.conf`.
+internally. The values are the host bridge names from `networks.conf`. The same
+mapping is used by Multipass and Incus; changing the example provider to
+`multipass` does not change the map.
 
 **2. Per-project, per-phase profile selection** in each project's config
 (see [`projects.md`](projects.md)):
@@ -182,6 +215,8 @@ to the guest bridge VNC listener.
 
 ## Sandbox staging directory hardening
 
+### Multipass
+
 Multipass-snap reads cloud-init files and bind-mount sources from
 `~/snap/multipass/common/codeybox-staging/`. Each sandbox gets its own
 subdirectory under there. To prevent cross-sandbox visibility at the
@@ -199,6 +234,35 @@ host filesystem level:
 
 A regression test (`MultipassStagingPermsTests`) verifies the staging
 root's permissions don't drift back to default 0755.
+
+### Incus
+
+Incus mount snapshots and grouped read-only file mounts are staged under
+`CodeyBox:Incus:StagingDirectory`. When it is unset, CodeyBox uses the
+persistent `incus-staging` directory beside `StateDatabasePath`; it never
+defaults API-created providers to a shared `/tmp` path. The root and each
+per-sandbox directory are mode `0700`. The staging root's canonical parent must
+already exist without symlink traversal. Prefer leaving the root absent so
+CodeyBox can create it exclusively. An existing root is accepted only when it
+has the service UID/GID, exact mode `0700`, and the provider-owned
+`.codeybox-incus-staging-v1` marker with exact mode `0600` and expected content.
+
+Direct virtiofs sources must resolve beneath `GitRootDirectory`, the enabled
+shared upstream mirror directory, or one of the explicit canonical
+`Incus:AllowedHostMountRoots`. CodeyBox resolves symlinks at
+the attachment boundary and rejects sources that escape those roots. Keep the
+explicit list narrow: membership in `incus-admin` is root-equivalent, and each
+allowed root is data the daemon may expose to a VM when CodeyBox requests it.
+`SnapshotForIsolation` sources are authorized first and then copied with the
+configured byte bound into the private staging tree.
+
+Incus VM virtiofs does not support the container-only `shift` mapping. The
+configured `Incus:GuestUserId`/`GuestGroupId` therefore reaches the host as the
+same numeric identity. Whenever a host path is mounted, the provider requires
+those IDs to exactly match the CodeyBox process's effective host UID/GID. That
+identity must be able to traverse and access each allowed root and owns the
+mode-`0700` staging root. Use narrow ACLs only to grant any additional required
+read access, never as a substitute for the identity match.
 
 ## What this does not protect against
 
@@ -239,6 +303,11 @@ root's permissions don't drift back to default 0755.
   `networkctl status <bridge>` — it should be "configured" and "routable".
   If not, `sudo systemctl restart systemd-networkd` and
   `sudo networkctl reconfigure <bridge>`.
+- **An Incus VM has a default NAT NIC or more than one NIC.** It was not
+  created through the CodeyBox Incus provider's `--no-profiles` path. Inspect
+  `incus --project codeybox config show <vm> --expanded` and treat the instance as
+  unmanaged; do not rely on the `cb-*` bridge policy until the extra device is
+  removed or the VM is recreated.
 - **VM's secondary NIC has no IP.** The bridge's DHCP server (in
   systemd-networkd) needs to be up. Confirm with
   `journalctl -u systemd-networkd | grep DHCP`.
@@ -254,8 +323,10 @@ root's permissions don't drift back to default 0755.
 
 ## Tests
 
-`MultipassNetworkProfileTests` (fast, unit-level) verifies the
-profile→bridge mapping turns into the correct `multipass launch
---network <bridge>` argv. The actual host-side enforcement is verified
+`MultipassNetworkProfileTests` and `IncusCommandBuilderTests` (fast,
+unit-level) verify that the shared profile→bridge mapping becomes the expected
+provider-specific argv, including Incus's `nictype=bridged`, selected parent,
+and `--no-profiles`. The Incus integration path separately verifies virtiofs
+devices and the absence of 9p. Actual host-side packet enforcement is verified
 by configuring real bridges and running the orchestrator end-to-end
 (operator-side verification, not in CI).

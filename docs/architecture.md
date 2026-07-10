@@ -72,10 +72,10 @@ cycles tend to plateau quickly.
 | Component                    | Lives in           | Trusts             | Holds upstream creds? | Holds agent API keys? |
 |------------------------------|--------------------|--------------------|-----------------------|-----------------------|
 | Orchestrator (REST + workers)| Host               | Host OS only       | **Yes**               | Yes (to inject)       |
-| Work / Rework sandbox        | VM (Multipass/KVM) | Nothing            | No                    | Yes (only its own)    |
-| Mechanical-edit sandbox      | VM (Multipass/KVM) | Nothing            | No                    | **No**                |
-| Audit-tool sandbox           | VM (Multipass/KVM) | Nothing            | No                    | **No**                |
-| Audit-LLM / clean-merge sandbox | VM (Multipass/KVM) | Nothing         | No                    | Yes (only its own)    |
+| Work / Rework sandbox        | VM (Multipass or Incus/KVM) | Nothing    | No                    | Yes (only its own)    |
+| Mechanical-edit sandbox      | VM (Multipass or Incus/KVM) | Nothing    | No                    | **No**                |
+| Audit-tool sandbox           | VM (Multipass or Incus/KVM) | Nothing    | No                    | **No**                |
+| Audit-LLM / clean-merge sandbox | VM (Multipass or Incus/KVM) | Nothing | No                    | Yes (only its own)    |
 | Conflict resolver            | Work-item sandbox    | In-sandbox repo CLI | Yes (resolver only) | Yes (resolver only) |
 | Host git server              | Host (or sidecar)  | Sandbox network    | No                    | No                    |
 | Upstream remote (e.g. GitHub)| External           | —                  | —                     | —                     |
@@ -180,7 +180,7 @@ intent is that you can swap any of these without touching the orchestrator:
 
 | Interface                | Default impl                         | Replace when…                          |
 |--------------------------|--------------------------------------|----------------------------------------|
-| `ISandboxProvider`       | `ProcessSandboxProvider` (UNSAFE)    | Going to production → Multipass        |
+| `ISandboxProvider`       | Configured provider (`process` is UNSAFE) | Production VM isolation → Multipass or Incus |
 | `IGitHost`               | `LocalGitHost`                       | You need a remote git daemon model     |
 | `IAgentRunner`           | `Claude` / `Copilot` / `Codex`       | Adding a new agent (Aider, Goose, …)   |
 | `IAgentRegistry`         | `AgentRegistry`                      | Multi-tenant routing                   |

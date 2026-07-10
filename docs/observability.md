@@ -132,10 +132,10 @@ Outbound HTTP calls (GitHub API, agent quota probes, webhooks) automatically rec
 | `codeybox.agent.duration_ms` | `ms` | `agent.kind`, `phase` | Agent execution time per phase. |
 | `codeybox.phase.duration_ms` | `ms` | `phase` (`pickup` \| `work` \| `rework` \| `audit` \| `merge` \| `upstream`) | Whole-phase wall-clock duration. |
 | `codeybox.sandbox.lifecycle.duration_ms` | `ms` | `step` (`start` \| `clone`) | Sandbox step durations. |
-| `codeybox.sandbox.resource.peak_ram_mb` | `MB` | `phase`, `network_profile` | Peak guest RAM captured at Multipass teardown. |
-| `codeybox.sandbox.resource.avg_cpu_pct` | `%` | `phase`, `network_profile` | Lifetime-average guest CPU utilisation captured at Multipass teardown. |
-| `codeybox.sandbox.resource.net_rx_mb` | `MB` | `phase`, `network_profile` | Cumulative guest receive traffic on the data interface captured at Multipass teardown. |
-| `codeybox.sandbox.resource.net_tx_mb` | `MB` | `phase`, `network_profile` | Cumulative guest transmit traffic on the data interface captured at Multipass teardown. |
+| `codeybox.sandbox.resource.peak_ram_mb` | `MB` | `phase`, `network_profile` | Peak guest RAM captured at VM-provider teardown. |
+| `codeybox.sandbox.resource.avg_cpu_pct` | `%` | `phase`, `network_profile` | Lifetime-average guest CPU utilisation captured at VM-provider teardown. |
+| `codeybox.sandbox.resource.net_rx_mb` | `MB` | `phase`, `network_profile` | Cumulative guest receive traffic on the data interface captured at VM-provider teardown. |
+| `codeybox.sandbox.resource.net_tx_mb` | `MB` | `phase`, `network_profile` | Cumulative guest transmit traffic on the data interface captured at VM-provider teardown. |
 | `codeybox.upstream.api_call.duration_ms` | `ms` | `endpoint`, `status_code` | Upstream forge API call durations. |
 
 ### Observable gauges
@@ -157,11 +157,12 @@ In addition, `.NET` runtime metrics (GC, thread pool, memory) are emitted automa
 
 ## Sandbox Resource Usage
 
-When `CodeyBox:MultipassSandbox:CaptureResourceMetrics=true`, Multipass
-teardown performs one best-effort in-VM read before stop/delete and persists a
+When `CodeyBox:MultipassSandbox:CaptureResourceMetrics=true` or
+`CodeyBox:Incus:CaptureResourceMetrics=true`, the selected VM provider performs
+one bounded, best-effort in-guest read before stop/delete and persists a
 per-work-item row with phase, VM lifetime, average CPU, peak RAM, rx/tx MB,
-baseline ref, network profile, loadavg, and capture time. The admin read
-surface is:
+baseline ref, network profile, load average, and capture time. Incus uses
+`Incus:ResourceMetricsCaptureTimeout` for this read. The admin read surface is:
 
 ```text
 GET /admin/sandbox-resource-usage?n=100
@@ -170,12 +171,14 @@ GET /admin/sandbox-resource-usage?n=100
 It returns recent p50/p95 peak RAM, average/p95 CPU, and rx/tx/total network
 planning stats from the SQLite-backed `sandbox_resource_usage` table.
 
-Peak RAM comes from a boot-time systemd sampler baked into the Multipass
-cloud-init baseline. The sampler reads `/proc/meminfo` every 10 seconds and
-updates one small file under `/run` when `MemTotal - MemAvailable` exceeds the
-previous maximum. Measured command cost on the Ubuntu baseline is a single
-`/proc/meminfo` read plus one shell loop wakeup per tick; steady-state storage
-is one integer file and no per-process history.
+Peak RAM comes from a boot-time systemd sampler baked into each provider's
+cloud-init baseline. The sampler reads `/proc/meminfo` periodically and updates
+one small file under `/run` when `MemTotal - MemAvailable` exceeds the previous
+maximum. Incus's interval is configured with
+`Incus:ResourceMetricsSampleInterval` (10 seconds by default). Measured command
+cost on the Ubuntu baseline is a single `/proc/meminfo` read plus one shell loop
+wakeup per tick; steady-state storage is one integer file and no per-process
+history.
 
 ---
 
@@ -220,7 +223,7 @@ codeybox_workers_max 16
 
 # HELP codeybox_sandbox_active Currently admitted live or provisioning sandboxes/VMs.
 # TYPE codeybox_sandbox_active gauge
-codeybox_sandbox_active{provider="multipass"} 4
+codeybox_sandbox_active{provider="incus"} 4
 
 # HELP codeybox_agent_quota_available_pct Most-recent subscription quota headroom...
 # TYPE codeybox_agent_quota_available_pct gauge

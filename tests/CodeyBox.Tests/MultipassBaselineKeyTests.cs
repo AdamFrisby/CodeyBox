@@ -85,4 +85,19 @@ public sealed class MultipassBaselineKeyTests
         Assert.StartsWith(opts.BaselineNamePrefix, name);
         Assert.True(name.Length <= 24, $"Baseline name '{name}' exceeds 24-char multipass instance-name limit");
     }
+
+    [Fact]
+    public void BaselineNamespace_AcceptsProducedRefsAndRejectsLookalikes()
+    {
+        var opts = Opts();
+        var produced = MultipassSandboxProvider.ComposeBaselineNameFromLiveConfig(
+            opts,
+            "work",
+            SandboxProfileFlavor.Headless);
+
+        Assert.True(MultipassSandboxProvider.IsOwnedBaselineRef(opts, produced));
+        Assert.False(MultipassSandboxProvider.IsOwnedBaselineRef(opts, "cb-baseline-not-hex"));
+        Assert.False(MultipassSandboxProvider.IsOwnedBaselineRef(opts, produced[..^1] + "g"));
+        Assert.False(MultipassSandboxProvider.IsOwnedBaselineRef(opts, produced + "0"));
+    }
 }

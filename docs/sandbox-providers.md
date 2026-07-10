@@ -1,6 +1,6 @@
 # Sandbox providers
 
-CodeyBox ships three providers. Pick one with `CodeyBox.SandboxProvider`
+CodeyBox ships several additive providers. Pick one with `CodeyBox.SandboxProvider`
 in `appsettings.json` (or `CodeyBox__SandboxProvider` env). Setup ranges
 from "single package" to nothing — pick the one whose security and
 operational trade-off matches your deployment.
@@ -12,12 +12,15 @@ operational trade-off matches your deployment.
 | `process`         | None (UNSAFE)                                | nothing                                                          | Working — dev only              |
 | `bubblewrap`      | Linux namespaces + seccomp; shared kernel    | `apt install bubblewrap` — no daemon, no /etc edits              | **Working, integration-tested** |
 | **`multipass`**   | **Real Ubuntu VM (separate guest kernel)**   | **`snap install multipass` — single command, no /etc edits**     | **Working, integration-tested** |
+| `incus`           | Real VM with COW ZFS/Btrfs roots and virtiofs | Incus 7.0 LTS, `incus-admin`, and a ZFS or Btrfs storage pool    | Opt-in; `requires_incus` tested |
+| `multipass-remote`| Real Multipass VM on a dedicated SSH host    | Multipass host plus SSH                                          | Working                         |
+| `sprites`         | Hosted Firecracker microVM                   | sprites.dev account and token                                    | Working                         |
 
 CodeyBox previously shipped Kata, gVisor, and crun-vm provider scaffolds.
 Those were code-reviewed but never runtime-validated, so they were
 removed — running unverified isolation code is worse than acknowledging
-the gap. Multipass is the recommended kernel-isolated path; the others
-can be re-added later if a real deployment needs them.
+the gap. Multipass remains available throughout the Incus cutover; selecting
+Incus is explicit and does not inherit Multipass configuration or lifecycle.
 
 ## `process` (dev only — refuses to load in production)
 
@@ -50,7 +53,7 @@ UTS, user, cgroup, optionally network) plus a tmpfs `/tmp`.
 - Separate guest kernel — a Linux LPE in the agent reaches the host kernel
 - Hostname allowlisting on egress — when network is allowed, the sandbox
   shares the host's network namespace. Per-host filtering would require
-  host nftables rules or a userspace proxy. Pick Multipass for that.
+  host nftables rules or a userspace proxy. Pick Multipass or Incus for that.
 - Resource caps — bubblewrap doesn't enforce CPU / memory limits. Wrap
   with `systemd-run` for that, or pick a different provider.
 
@@ -63,6 +66,186 @@ Then in `appsettings.json`:
 { "CodeyBox": { "SandboxProvider": "bubblewrap" } }
 ```
 That's it. No daemon to start, no config to edit.
+
+## `incus` — COW VMs with virtiofs
+
+Incus runs each sandbox as a VM with a separate guest kernel. A lazily baked,
+content-addressed baseline is stopped and snapshotted; ordinary sandboxes are
+created from that immutable snapshot with `incus copy`. On a snapshot-capable
+ZFS or Btrfs pool, those copies share unchanged blocks and write only their
+deltas. ZFS is strongly recommended for VM workloads. Host
+directories are attached as Incus `disk` devices with
+`io.bus=virtiofs` explicitly selected—`auto` is not used, so the provider never
+falls back to 9p.
+
+Only host-backed paths use virtiofs. Incus 7.0's `source=tmpfs:` disk-device
+form is container-only, so `SandboxMount.Tmpfs` paths such as `/work` and the
+credential directory are mounted after VM boot with the guest kernel's real
+`tmpfs`. Per-device and aggregate logical sizes are bounded by
+`MaxTmpfsDeviceBytes` and `MaxAggregateTmpfsBytes`.
+
+Generated cloud-init is sent to Incus through `user.user-data` over stdin.
+`ExtraRuncmd` is likewise executed as a bounded stdin script after cloud-init;
+it is never placed in process argv. Before the immutable `ready` snapshot is
+created, the provider replaces user-data with an empty cloud config and runs
+`cloud-init clean --logs --machine-id`, preventing bake logs and first-boot
+state from entering every clone. `ExtraCloudInit` is still operator-visible
+configuration and may be retained on a full-launch instance: never put secrets
+in it.
+
+Incus settings and provisioning are independent from Multipass. Switching the
+provider does not reuse `MultipassExtraRuncmd`, `MultipassExtraCloudInit`,
+or Multipass binaries. Incus lifecycle actions go only to Incus; the cutover
+wrapper merely aggregates the two providers' separately owned inventories.
+
+The current Incus provider covers headless work, audit, and merge sandboxes.
+A graphical request fails explicitly; it is never rerouted to Multipass.
+
+### Host prerequisites
+
+- Incus 6.3 or newer on Linux kernel 5.6 or newer; Incus 7.0 LTS is
+  recommended. The native filesystem `io.bus=virtiofs` selector was added in
+  6.3, and kernel 5.6 supplies the `openat2` confinement used by Incus for
+  restricted-project disk paths. Preflight rejects a server that does not
+  report both capabilities.
+- The CodeyBox service identity in the `incus-admin` group. This group is
+  effectively host-root-equivalent because Incus can attach host paths and
+  devices; restrict membership accordingly and restart the service after
+  changing it.
+- Numeric host/guest ownership aligned for virtiofs. Incus VM disk devices do
+  not support the container-only `shift` mapping. If a sandbox has any
+  host-backed mount, `Incus:GuestUserId` and `GuestGroupId` must exactly match
+  the CodeyBox process's effective host UID/GID; creation otherwise fails
+  closed. The provider never writes an identity marker into a caller-owned
+  source: it pins and rechecks the directory's Linux device/inode identity
+  before and after device attachment and after VM start, and additionally
+  hashes an existing bounded regular file through the guest when one is
+  available. Empty and host-read-only directories therefore remain valid mount
+  sources. Do not make repository roots world-writable.
+- A dedicated non-default Incus project. When absent, the provider creates it
+  with `features.images=false`, Incus-required `features.profiles=true`, exact ownership
+  markers `user.codeybox.managed=true` and
+  `user.codeybox.project-schema=1`, and with `restricted=true`,
+  `restricted.devices.disk=allow`, a nonempty exact
+  `restricted.devices.disk.paths` list, `restricted.devices.nic=allow`, and
+  `restricted.snapshots=allow`. It also sets
+  `restricted.virtual-machines.lowlevel=block` and
+  and rejects per-instance VM nesting before start. CodeyBox refuses to claim or
+  mutate an existing project unless both ownership/schema markers and both
+  feature flags already match exactly. Every VM still uses `--no-profiles`, and
+  effective profiles/devices are verified before start. After that adoption check, it
+  applies all restriction keys in one operation and reads them back before
+  creating a VM. Prefer leaving the configured project absent and allowing
+  CodeyBox to create it; do not add the markers to a shared project merely to
+  bypass the guard. Incus then opens
+  each local disk source beneath the matched allowed parent with
+  `openat2(RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)` and passes the resulting
+  descriptor to virtiofsd. This is the daemon-side atomic containment guard;
+  CodeyBox's canonical allowlist and device/inode checks remain narrower
+  defense in depth. The default project is rejected.
+- The canonical parent of `Incus:StagingDirectory` must already exist and must
+  not traverse a symbolic link. Normally leave the staging root itself absent;
+  CodeyBox creates it exclusively with service ownership, mode `0700`, and a
+  mode-`0600` `.codeybox-incus-staging-v1` ownership marker. To adopt an
+  existing root, it must already have that exact ownership/mode/marker shape;
+  an ordinary pre-created empty directory is intentionally rejected.
+- KVM, QEMU, `virtiofsd`, host `setsid` from util-linux, and the
+  userspace/kernel support for the selected storage driver. CodeyBox uses a
+  dedicated host process group to make Incus CLI cancellation tear down every
+  descendant. The Incus packages supply the VM runtime on supported Ubuntu
+  installations.
+- A cloud-init-enabled VM image with the Incus guest agent, systemd,
+  `/usr/bin/setpriv`, and `/usr/bin/setsid` (both from util-linux). The default
+  Ubuntu cloud image provides these; the provider verifies both executables
+  before admitting a sandbox. Its root-owned control wrapper starts each agent
+  command in a separate session and drops it to the configured numeric UID/GID.
+- An existing ZFS or Btrfs Incus storage pool. The provider validates the
+  snapshot-capable driver and, for ZFS, rejects any explicitly configured
+  `zfs.clone_copy` mode other than `true`; it never creates, reformats, or
+  destroys storage. Btrfs is supported but emits an
+  operator warning because ZFS has stronger VM-volume isolation and is the
+  recommended production choice.
+- The `cb-*` Linux bridges and nftables policy described in
+  [`host-firewall.md`](host-firewall.md). Incus's default NAT bridge is not a
+  substitute for CodeyBox's host-enforced profile policy.
+
+Follow the official [Incus installation guide](https://linuxcontainers.org/incus/docs/main/installing/)
+and the [ZFS](https://linuxcontainers.org/incus/docs/main/reference/storage_zfs/)
+or [Btrfs](https://linuxcontainers.org/incus/docs/main/reference/storage_btrfs/)
+storage-driver documentation.
+For a non-destructive development pool backed by a loop file:
+
+```bash
+incus storage create codeybox-zfs zfs size=50GiB
+```
+
+That demonstrates genuine ZFS snapshots and COW clones, but its I/O still
+lands on the filesystem containing `/var/lib/incus`. For production, give the
+pool a dedicated empty fast device or an existing dedicated ZFS dataset so VM
+scratch I/O can avoid the encrypted system disk. Selecting a block device for
+pool creation is destructive; verify it independently before running any
+storage-create command.
+
+### Configuration
+
+```json
+{
+  "CodeyBox": {
+    "SandboxProvider": "incus",
+    "Incus": {
+      "BinaryPath": "incus",
+      "ProjectName": "codeybox",
+      "StoragePoolName": "codeybox-zfs",
+      "DefaultImage": "images:ubuntu/24.04/cloud",
+      "InstanceNamePrefix": "codeybox-",
+      "BaselineNamePrefix": "cb-incus-baseline-",
+      "UseBaselineImages": true,
+      "IncludeMultipassCutoverInventory": false,
+      "ExtraRuncmd": []
+    },
+    "SandboxNetworkProfiles": {
+      "isolated": "cb-iso",
+      "claude": "cb-claude"
+    }
+  }
+}
+```
+
+Incus operational settings other than the restart-only `ProjectName` and
+effective `StagingDirectory`, plus the shared network-profile map, are read for
+subsequent provider operations. Existing sandbox handles retain the option
+snapshot with which they were created. A process started with `multipass` or
+`incus` may hot-switch between those two providers: in-progress creations
+continue on their original provider and existing handles keep their owner.
+Each new creation invokes only the currently selected backend; a failure is
+propagated and never retried through the other provider. Selecting any other
+provider still requires a restart. See
+[`configuration.md`](configuration.md#incus) for every key and bound.
+
+If a cutover spans a process restart and preserved/leaked Multipass resources
+still exist after Incus becomes the startup selection, set
+`Incus:IncludeMultipassCutoverInventory=true` until those resources are gone.
+Leave it false on an Incus-only host; dormant Multipass is then neither invoked
+nor required. Once both providers have been activated, inventory fails closed
+rather than reporting a partial list if either backend becomes unavailable.
+
+The default baseline root is 8 GiB, matching CodeyBox's default sandbox disk
+limit. Keeping the baseline at the smallest supported root matters because a
+ZFS clone volume can be grown but cannot be shrunk after copying. CodeyBox
+verifies virtiofs readiness, cloud-init, snapshot/COW preconditions, and bounded
+CLI output before admitting the sandbox.
+
+Virtiofs preserves numeric ownership. The defaults use guest UID/GID `1000`,
+but those values are not translated to the host. For any host-backed mount,
+the provider requires an exact match with the CodeyBox process's effective
+UID/GID before it attaches the path. Provider staging remains mode `0700` and
+is owned by that same service identity.
+
+A VM's root user can still access the contents of every path intentionally
+attached read-write through virtiofs; numeric identity matching is not a root
+containment boundary. Keep `AllowedHostMountRoots` narrow, attach only
+per-sandbox repositories/work directories read-write, and never attach host
+system or executable-search paths.
 
 ## `multipass` — recommended for kernel isolation
 
@@ -345,7 +528,10 @@ varies by provider:**
 | process      | None (dev only)                                                                        |
 | bubblewrap   | Binary on/off (`--unshare-net` or `--share-net`); no per-host filtering                |
 | multipass    | Host-side nftables on per-profile Linux bridges; agent inside the VM cannot bypass it  |
+| incus        | Host-side nftables on the same per-profile bridges; one filtered NIC and no NAT NIC    |
 
-The Multipass path is the only one with real per-host enforcement —
-configured once via `scripts/setup-host-networks.sh` and described in
-[`host-firewall.md`](host-firewall.md).
+The Multipass and Incus paths provide real per-host enforcement, configured
+once via `scripts/setup-host-networks.sh` and described in
+[`host-firewall.md`](host-firewall.md). Incus instances are created with
+`--no-profiles` and receive only the selected `cb-*` bridge NIC, so they cannot
+route around that host policy through an Incus NAT network.

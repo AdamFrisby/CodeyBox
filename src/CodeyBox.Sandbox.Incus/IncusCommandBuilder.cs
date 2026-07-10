@@ -1,0 +1,339 @@
+using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using CodeyBox.Core;
+
+namespace CodeyBox.Sandbox.Incus;
+
+internal enum IncusProvisioningPath
+{
+    FullLaunch,
+    CowCopy,
+}
+
+internal static class IncusProvisioningDecision
+{
+    internal static IncusProvisioningPath Decide(
+        IncusSandboxOptions options,
+        SandboxSpec spec,
+        bool baselineExists)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(spec);
+        return options.UseBaselineImages
+            && !string.IsNullOrWhiteSpace(spec.Network.ProfileName)
+            && (!string.IsNullOrWhiteSpace(spec.BaselineImageRef)
+                || string.IsNullOrWhiteSpace(spec.ImageReference)
+                || string.Equals(spec.ImageReference, "ignored", StringComparison.Ordinal)
+                || string.Equals(spec.ImageReference, options.DefaultImage, StringComparison.Ordinal))
+            && baselineExists
+                ? IncusProvisioningPath.CowCopy
+                : IncusProvisioningPath.FullLaunch;
+    }
+}
+
+internal static class IncusBaselineNaming
+{
+    private const int MaxInstanceNameLength = 63;
+
+    internal static string DeriveBaselineName(
+        IncusSandboxOptions options,
+        string profileName,
+        SandboxProfileFlavor flavor)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        var hash = ComputeConfigHash(options, profileName, flavor);
+        var profile = NormalizeNamePart(profileName);
+        var flavorPart = flavor == SandboxProfileFlavor.Graphical ? "gui" : "headless";
+        var prefix = NormalizeEffectivePrefix(options);
+        var fixedSuffix = $"-{flavorPart}-{hash[..12]}";
+        var maximumProfileLength = MaxInstanceNameLength - prefix.Length - fixedSuffix.Length;
+        if (maximumProfileLength < 1)
+            throw new InvalidOperationException("The Incus baseline prefix leaves no room for a profile component.");
+        if (profile.Length > maximumProfileLength)
+            profile = profile[..maximumProfileLength].TrimEnd('-');
+        return prefix + profile + fixedSuffix;
+    }
+
+    internal static string NormalizeEffectivePrefix(IncusSandboxOptions options)
+    {
+        var prefix = NormalizePrefix(options.BaselineNamePrefix);
+        const int maximumPrefixLength = 20;
+        return prefix.Length > maximumPrefixLength
+            ? prefix[..maximumPrefixLength].TrimEnd('-') + "-"
+            : prefix;
+    }
+
+    internal static string ComputeConfigHash(
+        IncusSandboxOptions options,
+        string profileName,
+        SandboxProfileFlavor flavor)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentException.ThrowIfNullOrWhiteSpace(profileName);
+        var canonical = new
+        {
+            version = 2,
+            profile = profileName,
+            flavor = flavor.ToString(),
+            image = options.DefaultImage,
+            pool = options.StoragePoolName,
+            cpus = options.BaselineCpus,
+            memory = options.BaselineMemoryBytes,
+            disk = options.BaselineDiskBytes,
+            bridge = options.NetworkProfiles.TryGetValue(profileName, out var bridge) ? bridge : null,
+            runcmd = options.ExtraRuncmd.ToArray(),
+            generatedCloudInit = IncusCloudInit.Build(options, flavor),
+            captureMetrics = options.CaptureResourceMetrics,
+            resourceSampleInterval = options.ResourceMetricsSampleInterval,
+            guestUserId = options.GuestUserId,
+            guestGroupId = options.GuestGroupId,
+            guestHome = options.GuestHome,
+        };
+        var json = JsonSerializer.Serialize(canonical);
+        return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(json)));
+    }
+
+    private static string NormalizePrefix(string value)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(value);
+        var normalized = NormalizeNamePart(value);
+        return normalized.EndsWith("-", StringComparison.Ordinal) ? normalized : normalized + "-";
+    }
+
+    private static string NormalizeNamePart(string value)
+    {
+        var result = new StringBuilder(value.Length);
+        foreach (var c in value.ToLowerInvariant())
+        {
+            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')
+                result.Append(c);
+            else if (result.Length == 0 || result[^1] != '-')
+                result.Append('-');
+        }
+        var normalized = result.ToString().Trim('-');
+        if (normalized.Length == 0)
+            throw new ArgumentException("The value does not contain an Incus-compatible name character.", nameof(value));
+        return normalized;
+    }
+}
+
+internal static class IncusCommandBuilder
+{
+    internal static IReadOnlyList<string> BuildInit(
+        IncusSandboxOptions options,
+        string image,
+        string name,
+        SandboxResourceLimits limits)
+    {
+        IncusInputValidation.ValidateOptionsIdentity(options);
+        IncusInputValidation.ValidateOpaqueArgument(image, nameof(image));
+        IncusInputValidation.ValidateInstanceName(name, nameof(name));
+        if (limits.CpuCount is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(limits), "CPU count must be positive.");
+        if (limits.MemoryBytes is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(limits), "Memory bytes must be positive.");
+        if (limits.DiskBytes is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(limits), "Disk bytes must be positive.");
+        var result = Prefix(options, "init");
+        result.Add(image);
+        result.Add(name);
+        result.Add("--vm");
+        result.Add("--storage");
+        result.Add(options.StoragePoolName);
+        result.Add("--no-profiles");
+        if (limits.CpuCount is { } cpus)
+        {
+            result.Add("--config");
+            result.Add($"limits.cpu={cpus.ToString(CultureInfo.InvariantCulture)}");
+        }
+        if (limits.MemoryBytes is { } memory)
+        {
+            result.Add("--config");
+            result.Add($"limits.memory={memory.ToString(CultureInfo.InvariantCulture)}B");
+        }
+        if (limits.DiskBytes is { } disk)
+        {
+            result.Add("--device");
+            result.Add($"root,size={disk.ToString(CultureInfo.InvariantCulture)}B");
+        }
+        return result;
+    }
+
+    internal static IReadOnlyList<string> BuildCopy(
+        IncusSandboxOptions options,
+        string source,
+        string destination)
+    {
+        IncusInputValidation.ValidateOptionsIdentity(options);
+        IncusInputValidation.ValidateSnapshotSource(source, nameof(source));
+        IncusInputValidation.ValidateInstanceName(destination, nameof(destination));
+        var result = Prefix(options, "copy");
+        result.Add(source);
+        result.Add(destination);
+        result.Add("--storage");
+        result.Add(options.StoragePoolName);
+        result.Add("--no-profiles");
+        return result;
+    }
+
+    internal static IReadOnlyList<string> BuildDeviceAdd(
+        IncusSandboxOptions options,
+        string instance,
+        string deviceName,
+        string hostSource,
+        string guestPath,
+        bool readOnly)
+    {
+        IncusInputValidation.ValidateOptionsIdentity(options);
+        IncusInputValidation.ValidateInstanceName(instance, nameof(instance));
+        IncusInputValidation.ValidateDeviceName(deviceName, nameof(deviceName));
+        IncusInputValidation.ValidateAbsoluteHostPath(hostSource, nameof(hostSource));
+        IncusInputValidation.ValidateAbsoluteGuestPath(guestPath, nameof(guestPath));
+        var result = Prefix(options, "config", "device", "add", instance, deviceName, "disk");
+        result.Add($"source={hostSource}");
+        result.Add($"path={guestPath}");
+        result.Add("io.bus=virtiofs");
+        if (readOnly)
+            result.Add("readonly=true");
+        return result;
+    }
+
+    internal static IReadOnlyList<string> BuildNicAdd(
+        IncusSandboxOptions options,
+        string instance,
+        string bridge)
+    {
+        IncusInputValidation.ValidateOptionsIdentity(options);
+        IncusInputValidation.ValidateInstanceName(instance, nameof(instance));
+        IncusInputValidation.ValidateBridgeName(bridge, nameof(bridge));
+        var result = Prefix(options, "config", "device", "add", instance, "codeybox-net", "nic");
+        result.Add("nictype=bridged");
+        result.Add($"parent={bridge}");
+        result.Add("name=eth0");
+        return result;
+    }
+
+    internal static IReadOnlyList<string> BuildExec(
+        IncusSandboxOptions options,
+        string instance,
+        IReadOnlyList<string> command,
+        string? workingDirectory = null)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        if (command.Count == 0)
+            throw new ArgumentException("An Incus exec command must not be empty.", nameof(command));
+        IncusInputValidation.ValidateOptionsIdentity(options);
+        IncusInputValidation.ValidateInstanceName(instance, nameof(instance));
+        if (workingDirectory is not null)
+            IncusInputValidation.ValidateAbsoluteGuestPath(workingDirectory, nameof(workingDirectory));
+        for (var i = 0; i < command.Count; i++)
+        {
+            if (command[i].Contains('\0'))
+                throw new ArgumentException($"Command argument {i} contains NUL.", nameof(command));
+        }
+        if (string.IsNullOrEmpty(command[0]))
+            throw new ArgumentException("The executable argument must not be empty.", nameof(command));
+        var result = Prefix(options, "exec", instance);
+        if (!string.IsNullOrWhiteSpace(workingDirectory))
+        {
+            result.Add("--cwd");
+            result.Add(workingDirectory);
+        }
+        result.Add("--user");
+        result.Add(options.GuestUserId.ToString(CultureInfo.InvariantCulture));
+        result.Add("--group");
+        result.Add(options.GuestGroupId.ToString(CultureInfo.InvariantCulture));
+        result.Add("--");
+        result.AddRange(command);
+        return result;
+    }
+
+    internal static List<string> Prefix(IncusSandboxOptions options, params string[] command)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        IncusInputValidation.ValidateOptionsIdentity(options);
+        var result = new List<string>(command.Length + 4)
+        {
+            options.BinaryPath,
+            "--project",
+            options.ProjectName,
+        };
+        result.AddRange(command);
+        return result;
+    }
+}
+
+internal static class IncusInputValidation
+{
+    internal static void ValidateOptionsIdentity(IncusSandboxOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ValidateOpaqueArgument(options.BinaryPath, nameof(options.BinaryPath));
+        ValidateIdentifier(options.ProjectName, nameof(options.ProjectName), 63, allowDotAndUnderscore: true);
+        ValidateIdentifier(options.StoragePoolName, nameof(options.StoragePoolName), 63, allowDotAndUnderscore: true);
+    }
+
+    internal static void ValidateInstanceName(string value, string parameterName) =>
+        ValidateIdentifier(value, parameterName, 63, allowDotAndUnderscore: false);
+
+    internal static void ValidateSnapshotSource(string value, string parameterName)
+    {
+        const string snapshotSuffix = "/ready";
+        if (!value.EndsWith(snapshotSuffix, StringComparison.Ordinal))
+            throw new ArgumentException("The COW source must be the provider-owned 'ready' baseline snapshot.", parameterName);
+        ValidateInstanceName(value[..^snapshotSuffix.Length], parameterName);
+    }
+
+    internal static void ValidateDeviceName(string value, string parameterName) =>
+        ValidateIdentifier(value, parameterName, 63, allowDotAndUnderscore: true);
+
+    internal static void ValidateBridgeName(string value, string parameterName)
+    {
+        if (string.IsNullOrWhiteSpace(value)
+            || value.Length > 15
+            || value.Any(c => !(char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.')))
+            throw new ArgumentException("The bridge must be a valid Linux interface name of at most 15 characters.", parameterName);
+    }
+
+    internal static void ValidateAbsoluteHostPath(string value, string parameterName)
+    {
+        if (string.IsNullOrWhiteSpace(value)
+            || value.Length > 4096
+            || value.Any(char.IsControl)
+            || !Path.IsPathFullyQualified(value))
+            throw new ArgumentException("The host source must be a fully-qualified path without NUL.", parameterName);
+    }
+
+    internal static void ValidateAbsoluteGuestPath(string value, string parameterName)
+    {
+        if (!IncusSandboxOptions.IsAbsoluteGuestPath(value))
+            throw new ArgumentException("The guest path must be a normalized absolute Unix path.", parameterName);
+    }
+
+    internal static void ValidateOpaqueArgument(string value, string parameterName)
+    {
+        if (string.IsNullOrWhiteSpace(value)
+            || value.StartsWith("-", StringComparison.Ordinal)
+            || value.Contains('\0')
+            || value.Any(c => char.IsControl(c)))
+            throw new ArgumentException("The argument must be non-empty, must not start with '-', and must contain no control characters.", parameterName);
+    }
+
+    private static void ValidateIdentifier(
+        string value,
+        string parameterName,
+        int maxLength,
+        bool allowDotAndUnderscore)
+    {
+        if (string.IsNullOrWhiteSpace(value)
+            || value.Length > maxLength
+            || !char.IsAsciiLetterOrDigit(value[0])
+            || !char.IsAsciiLetterOrDigit(value[^1])
+            || value.Any(c => !(char.IsAsciiLetterOrDigit(c)
+                || c == '-'
+                || (allowDotAndUnderscore && c is '.' or '_'))))
+            throw new ArgumentException("The identifier contains unsupported characters or has an invalid length.", parameterName);
+    }
+}

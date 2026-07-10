@@ -8,6 +8,7 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
 {
+    private const string NestedProviderIdPrefix = "nested:";
     private readonly IReadOnlyList<ProviderEntry> _providers;
     private readonly IReadOnlyDictionary<string, ProviderEntry> _providersById;
     private readonly object _lastListLock = new();
@@ -50,7 +51,15 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
                 var listed = await provider.Lifecycle.ListAllManagedAsync(ct).ConfigureAwait(false);
                 foreach (var info in listed)
                 {
-                    var scoped = info with { LifecycleProviderId = provider.Id };
+                    // A lifecycle can itself be a composite (the production
+                    // admission wrapper around the Multipass/Incus cutover
+                    // router is one). Preserve that inner route in the opaque
+                    // provider ID instead of flattening both backends to the
+                    // same outer provider.
+                    var scopedProviderId = info.LifecycleProviderId is null
+                        ? provider.Id
+                        : EncodeNestedProviderId(provider.Id, info.LifecycleProviderId);
+                    var scoped = info with { LifecycleProviderId = scopedProviderId };
                     result.Add(scoped);
                     if (!reportedByName.TryGetValue(scoped.Name, out var entries))
                     {
@@ -108,16 +117,68 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
 
     public async Task DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
     {
+        ArgumentNullException.ThrowIfNull(sandbox);
         if (sandbox.LifecycleProviderId is null)
         {
             await DisposeLeakedAsync(sandbox.Name, ct).ConfigureAwait(false);
             return;
         }
 
-        if (!_providersById.TryGetValue(sandbox.LifecycleProviderId, out var provider))
+        var outerProviderId = sandbox.LifecycleProviderId;
+        string? innerProviderId = null;
+        if (TryDecodeNestedProviderId(
+                sandbox.LifecycleProviderId,
+                out var decodedOuterProviderId,
+                out var decodedInnerProviderId))
+        {
+            outerProviderId = decodedOuterProviderId;
+            innerProviderId = decodedInnerProviderId;
+        }
+
+        if (!_providersById.TryGetValue(outerProviderId, out var provider))
             throw new InvalidOperationException($"Unknown managed sandbox provider '{sandbox.LifecycleProviderId}' for leaked sandbox '{sandbox.Name}'.");
 
-        await provider.Lifecycle.DisposeLeakedAsync(sandbox.Name, ct).ConfigureAwait(false);
+        // Strip this composite's scope and pass the inner snapshot through.
+        // Calling the name-only overload here would make a nested composite
+        // rediscover ownership and become ambiguous when two backends use the
+        // same configured instance name.
+        await provider.Lifecycle.DisposeLeakedAsync(
+            sandbox with { LifecycleProviderId = innerProviderId },
+            ct).ConfigureAwait(false);
+    }
+
+    private static string EncodeNestedProviderId(string outerProviderId, string innerProviderId) =>
+        $"{NestedProviderIdPrefix}{outerProviderId.Length}:{outerProviderId}{innerProviderId}";
+
+    private static bool TryDecodeNestedProviderId(
+        string providerId,
+        out string outerProviderId,
+        out string innerProviderId)
+    {
+        outerProviderId = string.Empty;
+        innerProviderId = string.Empty;
+        if (!providerId.StartsWith(NestedProviderIdPrefix, StringComparison.Ordinal))
+            return false;
+
+        var lengthStart = NestedProviderIdPrefix.Length;
+        var lengthEnd = providerId.IndexOf(':', lengthStart);
+        if (lengthEnd <= lengthStart
+            || !int.TryParse(providerId.AsSpan(lengthStart, lengthEnd - lengthStart), out var outerLength)
+            || outerLength <= 0)
+        {
+            return false;
+        }
+
+        var outerStart = lengthEnd + 1;
+        if (outerStart > providerId.Length - outerLength
+            || outerStart + outerLength == providerId.Length)
+        {
+            return false;
+        }
+
+        outerProviderId = providerId.Substring(outerStart, outerLength);
+        innerProviderId = providerId[(outerStart + outerLength)..];
+        return true;
     }
 
     private sealed record ProviderEntry(string Id, IManagedSandboxLifecycle Lifecycle);

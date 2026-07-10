@@ -44,11 +44,12 @@ internal static class SandboxEndpoints
     /// <summary>
     /// Operator-triggered dispose of a specific leaked sandbox by name. The sandbox
     /// must be present in the reaper's latest leaked list — this prevents accidental
-    /// deletion of an active codeybox-* VM mid-run. Use GET /sandboxes/leaked first
+    /// deletion of an active provider-managed sandbox mid-run. Use GET /sandboxes/leaked first
     /// to confirm the sandbox is detected as leaked.
     /// </summary>
     private static async Task<IResult> DisposeLeakedAsync(
         string name,
+        string? providerId,
         IManagedSandboxLifecycle provider,
         SandboxLeakReaper reaper,
         IWebhookDispatcher webhooks,
@@ -57,16 +58,23 @@ internal static class SandboxEndpoints
     {
         if (string.IsNullOrWhiteSpace(name))
             return Results.BadRequest(new { error = "name is required" });
-
-        // Strict prefix check: only touch VMs we own.
-        if (!name.StartsWith("codeybox-", StringComparison.Ordinal))
-            return Results.BadRequest(new { error = "name must start with 'codeybox-'" });
+        if (providerId is { Length: > 128 } || providerId?.Any(char.IsControl) == true)
+            return Results.BadRequest(new { error = "providerId is invalid" });
 
         // Cross-check against the latest leak list so that active sandboxes (those
-        // tied to a running work item) cannot be purged via this endpoint.
-        var leak = reaper.GetLatestLeaks().FirstOrDefault(l => l.Name == name);
-        if (leak is null)
+        // tied to a running work item) cannot be purged via this endpoint. The
+        // provider-scoped snapshot and concrete provider both re-verify ownership
+        // at their destructive sink, so configurable provider prefixes remain safe.
+        var matches = reaper.GetLatestLeaks()
+            .Where(leak => string.Equals(leak.Name, name, StringComparison.Ordinal)
+                && (providerId is null
+                    || string.Equals(leak.LifecycleProviderId, providerId, StringComparison.Ordinal)))
+            .ToArray();
+        if (matches.Length == 0)
             return Results.NotFound(new { error = "sandbox not found in latest leaked list; verify via GET /sandboxes/leaked" });
+        if (matches.Length != 1)
+            return Results.Conflict(new { error = "multiple providers report this sandbox name; retry with providerId from GET /sandboxes/leaked" });
+        var leak = matches[0];
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         cts.CancelAfter(TimeSpan.FromMinutes(5));
@@ -76,7 +84,7 @@ internal static class SandboxEndpoints
         {
             await provider.DisposeLeakedAsync(ToManagedSandboxInfo(leak), cts.Token);
             // Remove from the in-memory list immediately so a repeated call returns 404
-            // instead of attempting a redundant multipass delete and returning 500.
+            // instead of attempting a redundant provider delete and returning 500.
             reaper.RemoveFromLatestLeaks(leak);
             var disposedAt = DateTimeOffset.UtcNow;
             AuditLog.SandboxLeakDisposed(name,
@@ -139,7 +147,7 @@ internal static class SandboxEndpoints
                 },
             }, ct);
             log.LogWarning(ex, "SandboxEndpoints: failed to dispose leaked sandbox {Name}", name);
-            // Return a generic message; full details (including multipass stderr) are in the server log.
+            // Return a generic message; provider diagnostics remain in the server log.
             return Results.Problem("Dispose failed; see server logs for details", statusCode: 500);
         }
     }
@@ -151,6 +159,7 @@ internal static class SandboxEndpoints
         ageMinutes = Math.Round(l.Age.TotalMinutes, 1),
         diskMb = l.DiskBytes.HasValue ? l.DiskBytes.Value / (1024 * 1024) : (long?)null,
         reason = l.Reason,
+        providerId = l.LifecycleProviderId,
     };
 
     private static ManagedSandboxInfo ToManagedSandboxInfo(LeakedSandboxInfo leak)

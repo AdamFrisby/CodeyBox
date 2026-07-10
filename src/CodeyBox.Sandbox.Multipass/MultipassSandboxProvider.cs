@@ -47,8 +47,9 @@ namespace CodeyBox.Sandbox.Multipass;
 /// on first boot, OR build a Multipass image with agents pre-installed
 /// and reference it via <see cref="SandboxSpec.ImageReference"/>.</para>
 /// </summary>
-public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IActiveSandboxProgressProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner, IResourceMetricsCapturingProvider
+public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IActiveSandboxProgressProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineRefNamespace, IBaselineImageProvisioner, IResourceMetricsCapturingProvider
 {
+    internal const string ProviderId = "multipass";
     // Options are resolved through a delegate once per public operation so an
     // operator can edit ExtraRuncmd / ExtraCloudInit / NetworkProfiles /
     // UseBaselineImages in appsettings.json and have the change land on the next
@@ -201,7 +202,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         return Path.Combine(Path.GetTempPath(), "codeybox-mp-staging");
     }
 
-    public string Name => "multipass";
+    public string Name => ProviderId;
     // HTTP ingest and detached launch are spec-dependent: the concrete sandbox
     // advertises them only when its network profile resolves to a host bridge.
     public SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.ExecPipe;
@@ -1502,6 +1503,29 @@ git push origin HEAD:{refName}";
         var baselineName = ComposeBaselineNameFromLiveConfig(opts, profileName, flavor);
         RememberBaselineTarget(baselineName, profileName, flavor);
         return baselineName;
+    }
+
+    /// <inheritdoc/>
+    public bool OwnsBaselineRef(string baselineRef) =>
+        IsOwnedBaselineRef(ReadOptions(), baselineRef);
+
+    internal static bool IsOwnedBaselineRef(MultipassSandboxOptions options, string baselineRef)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        if (string.IsNullOrEmpty(baselineRef) || baselineRef.Length > 24)
+            return false;
+
+        var prefix = options.BaselineNamePrefix;
+        if (string.IsNullOrEmpty(prefix) || prefix.Length >= 24 || !IsValidSandboxName(prefix))
+            return false;
+        if (!baselineRef.StartsWith(prefix, StringComparison.Ordinal))
+            return false;
+
+        var expectedLength = Math.Min(prefix.Length + 12, 24);
+        if (baselineRef.Length != expectedLength)
+            return false;
+
+        return baselineRef.AsSpan(prefix.Length).IndexOfAnyExcept("0123456789abcdef") < 0;
     }
 
     /// <inheritdoc/>
@@ -5236,7 +5260,7 @@ public sealed record MultipassDiskGuardOptions
     public TimeSpan RecheckIn { get; init; } = TimeSpan.FromMinutes(5);
 }
 
-internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDisposeSandbox, ISuspendableSandbox, IShutdownTeardownSandbox
+internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDisposeSandbox, ISuspendableSandbox, IShutdownTeardownSandbox, IProviderOwnedSandbox
 {
     internal const int ArgvBytesWarningThreshold = 64 * 1024;
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
@@ -5388,6 +5412,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     }
 
     public string Id { get; }
+    public string ProviderId => MultipassSandboxProvider.ProviderId;
 
     internal ActiveSandboxProgress SnapshotActiveProgress(WorkItemId workItemId)
     {
@@ -7313,7 +7338,7 @@ while True:
 
             _resourceMetrics = metrics;
             await TryPersistResourceMetricsAsync(metrics, cts.Token).ConfigureAwait(false);
-            RecordResourceMetricInstruments(metrics);
+            SandboxResourceMetricsTelemetry.Record(metrics);
             return metrics;
         }
         catch (OperationCanceledException)
@@ -7477,20 +7502,6 @@ while True:
         {
             _log.LogWarning(ex, "Failed to persist resource metrics for multipass VM {Name}", _name);
         }
-    }
-
-    private static void RecordResourceMetricInstruments(SandboxResourceMetrics metrics)
-    {
-        var phaseTag = new KeyValuePair<string, object?>("phase", metrics.Phase);
-        var networkTag = new KeyValuePair<string, object?>("network_profile", metrics.NetworkProfile ?? "");
-        if (BytesToMb(metrics.PeakRamBytes) is { } peak)
-            CodeyBoxMeters.SandboxPeakRamMb.Record(peak, phaseTag, networkTag);
-        if (metrics.AvgCpuPercent is { } cpu)
-            CodeyBoxMeters.SandboxAvgCpuPercent.Record(cpu, phaseTag, networkTag);
-        if (BytesToMb(metrics.NetRxBytes) is { } rx)
-            CodeyBoxMeters.SandboxNetRxMb.Record(rx, phaseTag, networkTag);
-        if (BytesToMb(metrics.NetTxBytes) is { } tx)
-            CodeyBoxMeters.SandboxNetTxMb.Record(tx, phaseTag, networkTag);
     }
 
     private static bool HasRequiredResourceMetrics(SandboxResourceMetrics metrics) =>
