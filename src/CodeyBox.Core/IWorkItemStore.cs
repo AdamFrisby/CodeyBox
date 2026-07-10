@@ -197,12 +197,7 @@ public interface IWorkItemStore
         var current = await GetAsync(id, ct).ConfigureAwait(false);
         if (current is null)
             return new PriorityUpdateResult(PriorityUpdateOutcome.NotFound, null, null);
-        if (current.State is WorkItemState.Done
-            or WorkItemState.Failed
-            or WorkItemState.AuditFailed
-            or WorkItemState.Cancelled
-            or WorkItemState.MergeConflictResolutionFailed
-            or WorkItemState.AbandonedAfterRecoveryAttempts)
+        if (WorkItemStates.IsTerminal(current.State))
             return new PriorityUpdateResult(PriorityUpdateOutcome.TerminalState, current, current.Priority);
         if (current.State != onlyIfState)
             return new PriorityUpdateResult(PriorityUpdateOutcome.StateMismatch, current, current.Priority);
@@ -603,6 +598,62 @@ public interface IWorkItemStore
     /// </summary>
     Task<IReadOnlyList<(WorkItemId Id, string Title, WorkItemState State)>> ListWorkItemsForBaselineAsync(
         string baselineImageRef, CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns at most <paramref name="limit"/> non-terminal work items that
+    /// currently pin a baseline image ref, optionally scoped to
+    /// <paramref name="projectId"/> and/or a specific
+    /// <paramref name="baselineImageRef"/>. Ordered by <c>created_at</c> then
+    /// <c>id</c> for a stable, resumable scan. Callers that need to detect
+    /// truncation should request <c>limit + 1</c>. This is the candidate set
+    /// for operator-initiated baseline migration; persistent stores should
+    /// serve it from the partial index on <c>baseline_image_ref</c> so the cost
+    /// scales with the number of pinned items, not the full table.
+    /// The default implementation streams <see cref="ListAsync"/> and filters
+    /// in-process so in-memory stores work without modification.
+    /// </summary>
+    async Task<IReadOnlyList<BaselinePinnedWorkItem>> ListNonTerminalBaselinePinnedAsync(
+        ProjectId? projectId,
+        string? baselineImageRef,
+        int limit,
+        CancellationToken ct = default)
+    {
+        var result = new List<BaselinePinnedWorkItem>();
+        if (limit <= 0)
+            return result;
+        await foreach (var item in ListAsync(ct).ConfigureAwait(false))
+        {
+            if (item.BaselineImageRef is not { Length: > 0 } pin)
+                continue;
+            if (WorkItemStates.IsTerminal(item.State))
+                continue;
+            if (projectId is { } pid && item.ProjectId != pid)
+                continue;
+            if (baselineImageRef is { } oldRef && !string.Equals(pin, oldRef, StringComparison.Ordinal))
+                continue;
+            result.Add(new BaselinePinnedWorkItem(item.Id, item.ProjectId, item.State, pin));
+            if (result.Count >= limit)
+                break;
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Clears (sets null) <see cref="WorkItem.BaselineImageRef"/> for the listed
+    /// items in a single bounded transaction, skipping any row that is in a
+    /// terminal state or whose pin is already null. Returns the number of rows
+    /// actually cleared. Idempotent: re-running with already-cleared ids is a
+    /// no-op. The state/non-null guards live in the write so a concurrent worker
+    /// that finished an item between the caller's read and this write cannot be
+    /// disturbed. Clearing an actively-running item's pin does not affect its
+    /// current run — the new baseline takes effect at the next pickup.
+    /// </summary>
+    Task<int> ClearBaselinePinsAsync(
+        IReadOnlyCollection<WorkItemId> ids,
+        DateTimeOffset updatedAt,
+        CancellationToken ct = default)
+        => throw new NotSupportedException(
+            "This work item store must implement atomic baseline-pin clearing before baseline migration can run.");
 
     /// <summary>
     /// Clears <c>replay_of_work_item_id</c> for every work item that was a replay of

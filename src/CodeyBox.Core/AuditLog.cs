@@ -1507,6 +1507,22 @@ public static class AuditLog
                 success);
     }
 
+    /// <summary>
+    /// Emitted when an operator triggers a baseline migration
+    /// (<c>POST /baselines/migrate</c>). Records the scope filter, how many
+    /// pinned items were inspected, how many had their pin cleared (and will
+    /// recompute onto the current-config baseline at next pickup), and whether
+    /// the per-scan cap truncated the pass. <paramref name="projectFilter"/> and
+    /// <paramref name="baselineFilter"/> are forced through an empty-string
+    /// sentinel because Serilog drops null properties.
+    /// </summary>
+    public static void BaselineMigrated(
+        string? projectFilter, string? baselineFilter, int scanned, int migrated, bool truncated) =>
+        Audit("baseline.migrated")
+            .Information(
+                "Operator baseline migration: scanned={Scanned} migrated={Migrated} truncated={Truncated} projectFilter={ProjectFilter} baselineFilter={BaselineFilter}",
+                scanned, migrated, truncated, projectFilter ?? "", baselineFilter ?? "");
+
     // ── Internal helper ──────────────────────────────────────────────────────
 
     private static Serilog.ILogger Audit(string eventName) =>
