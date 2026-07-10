@@ -60,8 +60,10 @@ public sealed class MultipassRemoteSandboxProviderTests
         Assert.StartsWith(opts.VmNamePrefix, sb.Id);
         Assert.Contains(transport.RecordedCalls, c =>
             c.Argv.Contains("launch") && c.Argv.Contains("--name") && c.Argv.Contains(sb.Id));
-        Assert.Contains(transport.RecordedCalls, c =>
+        var infoCall = Assert.Single(transport.RecordedCalls, c =>
             c.Argv.Contains("info") && c.Argv.Contains(sb.Id));
+        Assert.Equal(opts.RemoteInventoryMaxOutputBytes, infoCall.MaxStdoutBytes);
+        Assert.Equal(opts.RemoteInventoryMaxOutputBytes, infoCall.MaxStderrBytes);
         await sb.DisposeAsync();
     }
 
@@ -978,7 +980,80 @@ public sealed class MultipassRemoteSandboxProviderTests
         await sb.DisposeAsync();
 
         Assert.Contains(transport.RecordedCalls, c => c.Argv.Count >= 2 && c.Argv[0] == "rm" && c.Argv[1] == "-rf");
+        var rmCall = transport.RecordedCalls.Last(c => c.Argv.Count >= 2 && c.Argv[0] == "rm" && c.Argv[1] == "-rf");
+        Assert.Equal(opts.RemoteInventoryMaxOutputBytes, rmCall.MaxStdoutBytes);
+        Assert.Equal(opts.RemoteInventoryMaxOutputBytes, rmCall.MaxStderrBytes);
+        var listCall = transport.RecordedCalls.Last(c => c.Argv.Contains("list"));
+        Assert.Equal(opts.RemoteInventoryMaxOutputBytes, listCall.MaxStdoutBytes);
+        Assert.Equal(opts.RemoteInventoryMaxOutputBytes, listCall.MaxStderrBytes);
         Assert.Equal(0, Assert.Single(provider.SnapshotHostPool()).Reserved);
+    }
+
+    [Fact]
+    public async Task DeleteRemoteStateOrThrowAsync_does_not_trust_not_found_stderr_when_inventory_still_contains_vm()
+    {
+        var opts = DefaultOptions();
+        var vmName = "codeybox-r-still-there";
+        var remoteRoot = RemoteMultipassVmNames.BuildRemoteSandboxRoot(opts.RemoteStagingRoot, vmName);
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "delete"))
+                return new ProcessRunResult(1, "", "instance not found");
+            if (Contains(argv, "list"))
+                return new ProcessRunResult(
+                    0,
+                    $$"""{"list":[{"name":"{{vmName}}","state":"Running"}]}""",
+                    "");
+            return ProcessRunOk();
+        };
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var ex = await Assert.ThrowsAsync<RemoteHostProvisioningException>(() =>
+            provider.DeleteRemoteStateOrThrowAsync(opts, transport, vmName, remoteRoot, CancellationToken.None));
+
+        Assert.Equal("delete", ex.Operation);
+        Assert.DoesNotContain(transport.RecordedCalls, c => c.Argv.Count >= 2 && c.Argv[0] == "rm" && c.Argv[1] == "-rf");
+    }
+
+    public static IEnumerable<object[]> InvalidCleanupRoots()
+    {
+        yield return ["relative/path"];
+        yield return ["/"];
+        yield return ["/home/codeybox/snap/multipass/common/codeybox-remote-staging/other-vm"];
+        yield return ["/home/codeybox/snap/multipass/common/codeybox-remote-staging/codeybox-r-safe1/../evil"];
+        yield return ["/home/codeybox/snap/multipass/common/codeybox-remote-staging/codeybox-r-safe1\n"];
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidCleanupRoots))]
+    public async Task Remote_cleanup_refuses_invalid_staging_root_before_filesystem_sink(string remoteSandboxRoot)
+    {
+        var opts = DefaultOptions();
+        var remoteCallCount = 0;
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (_, _) =>
+        {
+            remoteCallCount++;
+            return ProcessRunOk();
+        };
+        var cleanup = new RemoteMultipassCleanup(
+            opts,
+            transport,
+            (_, _) =>
+            {
+                remoteCallCount++;
+                return Task.FromResult(new ProcessRunResultLike(0, "", ""));
+            },
+            _ => { },
+            NullLogger.Instance);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            cleanup.DeleteVmAndStagingOrThrowAsync("codeybox-r-safe1", remoteSandboxRoot, CancellationToken.None));
+
+        Assert.Equal(0, remoteCallCount);
+        Assert.Empty(transport.RecordedCalls);
     }
 
     [Fact]
@@ -1565,6 +1640,40 @@ public sealed class MultipassRemoteSandboxProviderTests
             Assert.Equal(RemoteSshTransportFailureKind.RemoteCommand, ex.Kind);
             Assert.False(ex.IsHostTransportFailure);
             Assert.Contains("Remote tar-extract failed", ex.Message);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task OpenSshCliTransport_RunAsync_sanitizes_transport_stderr_in_exception()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var root = Directory.CreateTempSubdirectory("codeybox-ssh-stderr-sanitize-").FullName;
+        try
+        {
+            var fakeSsh = Path.Combine(root, "fake-ssh");
+            await WriteExecutableScriptAsync(
+                fakeSsh,
+                "#!/usr/bin/env bash\nprintf 'first\\r\\n\\033[31mred\\033[0m' >&2\nexit 255\n");
+            var opts = DefaultOptions() with { SshBinary = fakeSsh, SshTarget = "ignored" };
+            var transport = new OpenSshCliTransport(
+                () => opts,
+                new DefaultProcessRunner(),
+                NullLogger<OpenSshCliTransport>.Instance);
+
+            var ex = await Assert.ThrowsAsync<RemoteSshTransportException>(() =>
+                transport.RunAsync(["true"], stdin: null, ct: CancellationToken.None));
+
+            Assert.DoesNotContain('\r', ex.Message);
+            Assert.DoesNotContain('\n', ex.Message);
+            Assert.DoesNotContain('\u001b', ex.Message);
+            Assert.Contains("\\r\\n", ex.Message);
+            Assert.Contains("\\u001B", ex.Message);
         }
         finally
         {

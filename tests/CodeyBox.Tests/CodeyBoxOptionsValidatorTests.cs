@@ -977,6 +977,18 @@ public sealed class CodeyBoxOptionsValidatorTests
     }
 
     [Fact]
+    public void Validate_RejectsNonPositiveGitCommandOutputCap()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.GitCommandMaxOutputBytes = 0;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:GitCommandMaxOutputBytes must be > 0", result.FailureMessage);
+    }
+
+    [Fact]
     public void Validate_AcceptsValidAgentPauseEntry()
     {
         var options = ValidCodeyBoxOptions();

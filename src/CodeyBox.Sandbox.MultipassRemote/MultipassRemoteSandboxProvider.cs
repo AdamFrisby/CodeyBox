@@ -723,13 +723,13 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         CancellationToken ct)
     {
         if (!IsHeavyRemoteMultipassOperation(opts, argv))
-            return await RunRemoteAsync(transport, argv, ct).ConfigureAwait(false);
+            return await RunRemoteControlAsync(opts, transport, argv, ct).ConfigureAwait(false);
 
         var gate = _heavyMultipassGates.GetOrAdd(opts.HostId, static _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            return await RunRemoteAsync(transport, argv, ct).ConfigureAwait(false);
+            return await RunRemoteControlAsync(opts, transport, argv, ct).ConfigureAwait(false);
         }
         finally
         {
@@ -758,6 +758,40 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             maxStderrBytes: maxStderrBytes,
             killOnOutputLimit: killOnOutputLimit).ConfigureAwait(false);
         return new ProcessRunResultLike(native.ExitCode, native.Stdout, native.Stderr, native.StdoutLimitExceeded, native.StderrLimitExceeded);
+    }
+
+    private async Task<ProcessRunResultLike> RunRemoteControlAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        IReadOnlyList<string> argv,
+        CancellationToken ct,
+        string? stdin = null)
+    {
+        var maxOutputBytes = opts.RemoteInventoryMaxOutputBytes;
+        var result = await RunRemoteAsync(
+            transport,
+            argv,
+            stdin,
+            stdoutChunkCallback: null,
+            stderrChunkCallback: null,
+            ct,
+            maxStdoutBytes: maxOutputBytes,
+            maxStderrBytes: maxOutputBytes,
+            killOnOutputLimit: true).ConfigureAwait(false);
+
+        if (!result.StdoutLimitExceeded && !result.StderrLimitExceeded)
+            return result;
+
+        var streams = result.StdoutLimitExceeded && result.StderrLimitExceeded
+            ? "stdout/stderr"
+            : result.StdoutLimitExceeded
+                ? "stdout"
+                : "stderr";
+        throw new RemoteHostProvisioningException(
+            opts.HostId,
+            CommandName(argv),
+            $"Remote control command exceeded {maxOutputBytes.ToString(CultureInfo.InvariantCulture)} byte {streams} cap: argv=[{string.Join(' ', argv)}]",
+            isHostRuntimeFailure: IsHostRuntimeCommand(argv));
     }
 
     private async Task<ProcessRunResultLike> RunRemoteInventoryAsync(
@@ -854,7 +888,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         // 0700 on the per-sandbox dir: only the SSH user can list its
         // contents. Per-staged-source subdirs sit under here.
         var mkdirCmd = $"mkdir -p {OpenSshCliTransport.QuoteShellWord(remoteSandboxRoot)} && chmod 0700 {OpenSshCliTransport.QuoteShellWord(remoteSandboxRoot)}";
-        var r = await transport.RunAsync(["sh", "-c", mkdirCmd], stdin: null, ct).ConfigureAwait(false);
+        var r = await RunRemoteControlAsync(opts, transport, ["sh", "-c", mkdirCmd], ct).ConfigureAwait(false);
         if (r.ExitCode != 0)
             throw new RemoteHostProvisioningException(
                 opts.HostId,
@@ -886,7 +920,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         var timestamp = createdAt.ToString("O", CultureInfo.InvariantCulture);
         var script =
             $"printf '%s\\n' {OpenSshCliTransport.QuoteShellWord(timestamp)} > {OpenSshCliTransport.QuoteShellWord(metadataPath)}";
-        var r = await transport.RunAsync(["sh", "-c", script], stdin: null, ct).ConfigureAwait(false);
+        var r = await RunRemoteControlAsync(opts, transport, ["sh", "-c", script], ct).ConfigureAwait(false);
         if (r.ExitCode != 0)
             throw new RemoteHostProvisioningException(
                 opts.HostId,
@@ -913,7 +947,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         }
         var script = "cat >> /etc/environment";
         var argv = new[] { opts.RemoteMultipassPath, "exec", vmName, "--", "sudo", "sh", "-c", script };
-        var r = await transport.RunAsync(argv, stdin: lines.ToString(), ct).ConfigureAwait(false);
+        var r = await RunRemoteControlAsync(opts, transport, argv, ct, stdin: lines.ToString()).ConfigureAwait(false);
         if (r.ExitCode != 0)
             throw new RemoteHostProvisioningException(
                 opts.HostId,
@@ -940,7 +974,8 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         while (true)
         {
             ct.ThrowIfCancellationRequested();
-            var r = await RunRemoteAsync(
+            var r = await RunRemoteInventoryAsync(
+                opts,
                 transport,
                 [opts.RemoteMultipassPath, "info", vmName, "--format", "json"],
                 ct).ConfigureAwait(false);

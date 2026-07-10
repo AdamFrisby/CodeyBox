@@ -165,27 +165,32 @@ public sealed record ManagedSandboxInfo(
 
 public sealed class ManagedSandboxInventory : IReadOnlyList<ManagedSandboxInfo>
 {
-    private readonly IReadOnlyList<ManagedSandboxInfo> _items;
+    private readonly ManagedSandboxInfo[] _items;
 
     public ManagedSandboxInventory(
         IReadOnlyList<ManagedSandboxInfo> items,
         bool isComplete,
         IReadOnlySet<string>? inventoriedHostIds = null)
     {
-        _items = items;
+        ArgumentNullException.ThrowIfNull(items);
+
+        _items = items.ToArray();
         IsComplete = isComplete;
-        InventoriedHostIds = inventoriedHostIds ?? new HashSet<string>(StringComparer.Ordinal);
+        InventoriedHostIds = inventoriedHostIds is null
+            ? new HashSet<string>(StringComparer.Ordinal)
+            : new HashSet<string>(inventoriedHostIds, StringComparer.Ordinal);
     }
 
     public bool IsComplete { get; }
     public IReadOnlySet<string> InventoriedHostIds { get; }
-    public int Count => _items.Count;
+    public int Count => _items.Length;
     public ManagedSandboxInfo this[int index] => _items[index];
 
     public static ManagedSandboxInventory Complete(IReadOnlyList<ManagedSandboxInfo> items) =>
         new(items, isComplete: true);
 
-    public IEnumerator<ManagedSandboxInfo> GetEnumerator() => _items.GetEnumerator();
+    public IEnumerator<ManagedSandboxInfo> GetEnumerator() =>
+        ((IEnumerable<ManagedSandboxInfo>)_items).GetEnumerator();
     System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
 }
 

@@ -31,6 +31,7 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
 
     private LocalGitHost CreateGitHost(
         string? gitExecutable = null,
+        int? gitCommandMaxOutputBytes = null,
         Func<ProcessStartInfo, ILocalGitProcess>? processFactory = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
@@ -38,6 +39,7 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
         {
             RootDirectory = gitRoot,
             GitExecutable = gitExecutable ?? "git",
+            GitCommandMaxOutputBytes = gitCommandMaxOutputBytes ?? LocalGitHostOptions.DefaultGitCommandMaxOutputBytes,
         };
         return processFactory is null
             ? new LocalGitHost(opts, NullLogger<LocalGitHost>.Instance)
@@ -354,6 +356,51 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
     }
 
     [Fact]
+    public async Task RunGitAsync_CapsProcessOutputAndRecordsOutputLimitMetric()
+    {
+        var measurements = new ConcurrentQueue<(string? Operation, string? Outcome)>();
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "CodeyBox.Coordinator"
+                && instrument.Name == "codeybox.coordinator.git.command.duration_ms")
+            {
+                l.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            string? operation = null;
+            string? outcome = null;
+            for (var i = 0; i < tags.Length; i++)
+            {
+                if (tags[i].Key == "operation")
+                    operation = tags[i].Value?.ToString();
+                if (tags[i].Key == "outcome")
+                    outcome = tags[i].Value?.ToString();
+            }
+            measurements.Enqueue((operation, outcome));
+        });
+        listener.Start();
+        var killed = false;
+        var gitHost = CreateGitHost(
+            gitCommandMaxOutputBytes: 8,
+            processFactory: _ => new FakeLocalGitProcess(
+                stdout: new string('x', 64),
+                exitCode: 0,
+                onKill: () => killed = true));
+        var repoId = WorkItemId.New().ToString();
+        Directory.CreateDirectory(gitHost.GetRepoPath(repoId));
+
+        var exists = await gitHost.BranchExistsAsync(repoId, "main");
+
+        Assert.False(exists);
+        Assert.True(killed);
+        Assert.Contains(measurements, m => m.Operation == "rev-parse" && m.Outcome == "output_limit");
+    }
+
+
+    [Fact]
     public async Task RunGitAsync_RetriesTextFileBusyProcessStartByMessageWhenErrnoDiffers()
     {
         var starts = 0;
@@ -426,6 +473,7 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
         var gitExecutable = Path.Combine(_workspace, "custom-git");
         var gitHost = CreateGitHost(
             gitExecutable,
+            gitCommandMaxOutputBytes: null,
             processFactory: psi =>
             {
                 starts++;
@@ -527,6 +575,7 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
         string stdout = "",
         string stderr = "",
         Win32Exception? startException = null,
+        Action? onKill = null,
         Action? onDispose = null) : ILocalGitProcess
     {
         private readonly StringReader _stdout = new(stdout);
@@ -544,7 +593,11 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
 
         public Task WaitForExitAsync(CancellationToken ct) => Task.CompletedTask;
 
-        public void Kill(bool entireProcessTree) { }
+        public void Kill(bool entireProcessTree)
+        {
+            _ = entireProcessTree;
+            onKill?.Invoke();
+        }
 
         public void Dispose()
         {

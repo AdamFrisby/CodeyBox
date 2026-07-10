@@ -27,6 +27,7 @@ public sealed class LocalGitHost : IGitHost
     private const string GitNullObjectId = "0000000000000000000000000000000000000000";
     private const int GitStartTextFileBusyMaxAttempts = 8;
     private const int GitStartTextFileBusyDelayStepMilliseconds = 25;
+    private const int GitOutputLimitExitCode = 137;
     // POSIX ETXTBSY. On Linux, Process.Start surfaces this as Win32Exception(26)
     // when another process briefly has the executable open for writing.
     private const int PosixTextFileBusyErrno = 26;
@@ -925,6 +926,8 @@ public sealed class LocalGitHost : IGitHost
             throw new ArgumentException("at least one filename suffix is required", nameof(filenameSuffixes));
         if (maxResults <= 0)
             throw new ArgumentOutOfRangeException(nameof(maxResults), maxResults, "must be positive");
+        if (_opts.GitCommandMaxOutputBytes <= 0)
+            throw new InvalidOperationException("LocalGitHostOptions.GitCommandMaxOutputBytes must be > 0.");
 
         var suffixes = new string[filenameSuffixes.Count];
         for (var i = 0; i < filenameSuffixes.Count; i++)
@@ -983,6 +986,7 @@ public sealed class LocalGitHost : IGitHost
         var scannedCapExceeded = false;
         var scanned = 0;
         var stderr = string.Empty;
+        var stderrLimitExceeded = false;
         try
         {
             while (true)
@@ -1026,10 +1030,28 @@ public sealed class LocalGitHost : IGitHost
             }
             // Always reap stderr + exit with CancellationToken.None so a
             // cancelled caller does not skip the wait and leak the child.
-            try { stderr = await p.StandardError.ReadToEndAsync(CancellationToken.None); }
+            try
+            {
+                var stderrRead = await ReadGitOutputToLimitAsync(
+                    p.StandardError,
+                    _opts.GitCommandMaxOutputBytes,
+                    () =>
+                    {
+                        try { p.Kill(entireProcessTree: true); } catch { /* best-effort */ }
+                    },
+                    CancellationToken.None).ConfigureAwait(false);
+                stderr = stderrRead.Text;
+                stderrLimitExceeded = stderrRead.LimitExceeded;
+            }
             catch { /* best-effort */ }
             try { await p.WaitForExitAsync(CancellationToken.None); }
             catch { /* best-effort */ }
+        }
+
+        if (stderrLimitExceeded)
+        {
+            throw new InvalidOperationException(
+                $"git ls-tree '{treeish}' stderr exceeded LocalGitHostOptions.GitCommandMaxOutputBytes={_opts.GitCommandMaxOutputBytes.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
         }
 
         if (scannedCapExceeded)
@@ -1396,6 +1418,9 @@ public sealed class LocalGitHost : IGitHost
         var operation = ResolveGitOperation(args);
         var sw = Stopwatch.StartNew();
         SanitizeAlternates(workdir);
+        if (_opts.GitCommandMaxOutputBytes <= 0)
+            throw new InvalidOperationException("LocalGitHostOptions.GitCommandMaxOutputBytes must be > 0.");
+
         var psi = new ProcessStartInfo
         {
             FileName = _opts.GitExecutable,
@@ -1439,10 +1464,42 @@ public sealed class LocalGitHost : IGitHost
 
             try
             {
-                var stdout = await p.StandardOutput.ReadToEndAsync(ct);
-                var stderr = await p.StandardError.ReadToEndAsync(ct);
+                void KillForOutputLimit()
+                {
+                    try { p.Kill(entireProcessTree: true); } catch { }
+                }
+
+                var stdoutTask = ReadGitOutputToLimitAsync(
+                    p.StandardOutput,
+                    _opts.GitCommandMaxOutputBytes,
+                    KillForOutputLimit,
+                    ct);
+                var stderrTask = ReadGitOutputToLimitAsync(
+                    p.StandardError,
+                    _opts.GitCommandMaxOutputBytes,
+                    KillForOutputLimit,
+                    ct);
                 await p.WaitForExitAsync(ct);
-                var result = (p.ExitCode, stdout, stderr);
+                var stdout = await stdoutTask.ConfigureAwait(false);
+                var stderr = await stderrTask.ConfigureAwait(false);
+                if (stdout.LimitExceeded || stderr.LimitExceeded)
+                {
+                    var streams = stdout.LimitExceeded && stderr.LimitExceeded
+                        ? "stdout/stderr"
+                        : stdout.LimitExceeded
+                            ? "stdout"
+                            : "stderr";
+                    var message =
+                        $"git {operation} exceeded LocalGitHostOptions.GitCommandMaxOutputBytes={_opts.GitCommandMaxOutputBytes.ToString(System.Globalization.CultureInfo.InvariantCulture)} on {streams}";
+                    var cappedStderr = string.IsNullOrEmpty(stderr.Text)
+                        ? message
+                        : stderr.Text + Environment.NewLine + message;
+                    var limitResult = (GitOutputLimitExitCode, stdout.Text, cappedStderr);
+                    RecordGitCommandDuration(operation, sw, "output_limit");
+                    return limitResult;
+                }
+
+                var result = (p.ExitCode, stdout.Text, stderr.Text);
                 RecordGitCommandDuration(operation, sw, result.ExitCode == 0 ? "success" : "exit_nonzero");
                 return result;
             }
@@ -1458,6 +1515,61 @@ public sealed class LocalGitHost : IGitHost
             }
         }
     }
+
+    private static async Task<GitOutputReadResult> ReadGitOutputToLimitAsync(
+        TextReader reader,
+        int maxBytes,
+        Action onLimitExceeded,
+        CancellationToken ct)
+    {
+        var output = new StringBuilder();
+        var buffer = new char[4096];
+        var totalBytes = 0;
+
+        while (true)
+        {
+            var read = await reader.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
+            if (read == 0)
+                return new GitOutputReadResult(output.ToString(), LimitExceeded: false);
+
+            var chunk = new string(buffer, 0, read);
+            var chunkBytes = Encoding.UTF8.GetByteCount(chunk);
+            if (totalBytes + chunkBytes > maxBytes)
+            {
+                var remaining = Math.Max(0, maxBytes - totalBytes);
+                if (remaining > 0)
+                    output.Append(TakeUtf8Prefix(chunk, remaining));
+
+                onLimitExceeded();
+                return new GitOutputReadResult(output.ToString(), LimitExceeded: true);
+            }
+
+            totalBytes += chunkBytes;
+            output.Append(chunk);
+        }
+    }
+
+    private static string TakeUtf8Prefix(string value, int maxBytes)
+    {
+        var used = 0;
+        for (var i = 0; i < value.Length;)
+        {
+            var charCount = char.IsHighSurrogate(value[i])
+                && i + 1 < value.Length
+                && char.IsLowSurrogate(value[i + 1])
+                    ? 2
+                    : 1;
+            var charBytes = Encoding.UTF8.GetByteCount(value.AsSpan(i, charCount));
+            if (used + charBytes > maxBytes)
+                return value[..i];
+            used += charBytes;
+            i += charCount;
+        }
+
+        return value;
+    }
+
+    private readonly record struct GitOutputReadResult(string Text, bool LimitExceeded);
 
     private static void RecordGitCommandDuration(string operation, Stopwatch sw, string outcome) =>
         CodeyBoxMeters.CoordinatorGitCommandDuration.Record(
@@ -1899,9 +2011,12 @@ internal interface ILocalGitProcess : IDisposable
 
 public sealed record LocalGitHostOptions
 {
+    public const int DefaultGitCommandMaxOutputBytes = 16 * 1024 * 1024;
+
     public required string RootDirectory { get; init; }
     public string GitExecutable { get; init; } = "git";
     public string FallbackDefaultBranch { get; init; } = "main";
+    public int GitCommandMaxOutputBytes { get; init; } = DefaultGitCommandMaxOutputBytes;
 
     /// <summary>
     /// Hard ceiling on the TOTAL number of paths the streamed

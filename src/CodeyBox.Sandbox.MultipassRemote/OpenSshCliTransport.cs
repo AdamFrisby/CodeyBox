@@ -935,9 +935,8 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
     private static string TailFor(string s, int max = 240)
     {
         if (string.IsNullOrEmpty(s)) return "(no stderr)";
-        var trimmed = s.Trim();
-        if (trimmed.Length <= max) return trimmed;
-        return "…" + trimmed[^max..];
+        var sanitized = RemoteMultipassText.TruncateForLog(s, max);
+        return sanitized.Length == 0 ? "(no stderr)" : sanitized;
     }
 
     /// <summary>

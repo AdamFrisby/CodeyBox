@@ -906,6 +906,7 @@ builder.Services.AddSingleton<LocalGitHost>(sp =>
         new LocalGitHostOptions
         {
             RootDirectory = opts.GitRootDirectory,
+            GitCommandMaxOutputBytes = opts.GitCommandMaxOutputBytes,
             EnableSharedUpstreamMirror = opts.EnableSharedUpstreamMirror,
             SharedUpstreamMirrorDirectory = opts.SharedUpstreamMirrorDirectory
         },
@@ -4344,7 +4345,8 @@ namespace CodeyBox.Api
     /// <item><b>Startup-only and rejected</b> on reload by
     ///   <see cref="ImmutableCodeyBoxOptionsValidator"/>:
     ///   <c>SandboxProvider</c>, <c>StateDatabasePath</c>,
-    ///   <c>GitRootDirectory</c>, <c>AgentStreams.Path</c>,
+    ///   <c>GitRootDirectory</c>, <c>GitCommandMaxOutputBytes</c>,
+    ///   <c>AgentStreams.Path</c>,
     ///   <c>WorkerPool.MaxConcurrentSandboxes</c>,
     ///   <c>EnableSharedUpstreamMirror</c>, and
     ///   <c>SharedUpstreamMirrorDirectory</c>. The retaining
@@ -4363,6 +4365,7 @@ namespace CodeyBox.Api
     public sealed class CodeyBoxOptions
     {
         public string GitRootDirectory { get; set; } = "/var/lib/codeybox/repos";
+        public int GitCommandMaxOutputBytes { get; set; } = LocalGitHostOptions.DefaultGitCommandMaxOutputBytes;
         public bool EnableSharedUpstreamMirror { get; set; } = false;
         public string SharedUpstreamMirrorDirectory { get; set; } = "_upstream-mirror";
         public string StateDatabasePath { get; set; } = "/var/lib/codeybox/state.db";

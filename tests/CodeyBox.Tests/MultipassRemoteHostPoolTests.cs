@@ -197,6 +197,7 @@ public sealed class MultipassRemoteHostPoolTests
         var transports = new HostTransportSet();
         transports["a"].ThrowTransportOnLaunch = true;
         transports["a"].DeleteExitCode = 1;
+        transports["a"].ListLaunchedNames = true;
         var provider = Provider(() => opts, transports);
 
         var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
@@ -712,6 +713,7 @@ public sealed class MultipassRemoteHostPoolTests
         var transports = new HostTransportSet();
         transports["a"].LaunchExitCode = 1;
         transports["a"].DeleteExitCode = 1;
+        transports["a"].ListLaunchedNames = true;
         var provider = Provider(() => opts, transports);
 
         await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
@@ -727,6 +729,7 @@ public sealed class MultipassRemoteHostPoolTests
         var transports = new HostTransportSet();
         transports["a"].LaunchExitCode = 1;
         transports["a"].DeleteExitCode = 1;
+        transports["a"].ListLaunchedNames = true;
         var provider = Provider(() => opts, transports);
 
         var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
@@ -735,20 +738,19 @@ public sealed class MultipassRemoteHostPoolTests
         Assert.NotNull(ex.RetainedSandboxName);
         Assert.Equal(1, Assert.Single(provider.SnapshotHostPool()).Reserved);
 
+        transports["a"].ListLaunchedNames = false;
         await provider.ListAllManagedAsync(CancellationToken.None);
 
         Assert.Equal(0, Assert.Single(provider.SnapshotHostPool()).Reserved);
     }
 
     [Fact]
-    public async Task CreateAsync_failed_delete_does_not_retain_capacity_when_info_proves_vm_absent()
+    public async Task CreateAsync_failed_delete_does_not_retain_capacity_when_inventory_proves_vm_absent()
     {
         var opts = Options(Host("a", cap: 1));
         var transports = new HostTransportSet();
         transports["a"].LaunchExitCode = 1;
         transports["a"].DeleteExitCode = 1;
-        transports["a"].InfoExitCode = 1;
-        transports["a"].InfoStderr = "instance not found";
         var provider = Provider(() => opts, transports);
 
         var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
@@ -757,7 +759,8 @@ public sealed class MultipassRemoteHostPoolTests
         Assert.Equal("all-hosts-unavailable", ex.ErrorClass);
         Assert.Equal(0, Assert.Single(provider.SnapshotHostPool()).Reserved);
         Assert.Equal(1, transports["a"].DeleteCount);
-        Assert.Equal(1, transports["a"].InfoCount);
+        Assert.Equal(0, transports["a"].InfoCount);
+        Assert.True(transports["a"].ListCount >= 1);
         Assert.Equal(1, transports["a"].RmCount);
     }
 
@@ -1189,7 +1192,9 @@ public sealed class MultipassRemoteHostPoolTests
         public string? ListStdoutOverride { get; set; }
         public string InfoStderr { get; set; } = "";
         public List<string> ManagedNames { get; } = [];
+        public bool ListLaunchedNames { get; set; }
         public ConcurrentQueue<int?> ListStdoutCaps { get; } = new();
+        private readonly ConcurrentQueue<string> _launchedNames = new();
         public int LaunchCount => _calls.Count(argv => argv.Contains("launch"));
         public int DeleteCount => _calls.Count(argv => argv.Contains("delete"));
         public int RmCount => _calls.Count(argv => argv.Count >= 2 && argv[0] == "rm" && argv[1] == "-rf");
@@ -1212,6 +1217,8 @@ public sealed class MultipassRemoteHostPoolTests
             _calls.Enqueue(argv.ToArray());
             if (ThrowTransportOnRun)
                 throw new RemoteSshTransportException($"{hostId}: simulated transport drop");
+            if (argv.Contains("launch"))
+                _launchedNames.Enqueue(VmNameFromLaunch(argv));
             if (ThrowTransportOnLaunch && argv.Contains("launch"))
                 throw new RemoteSshTransportException($"{hostId}: simulated transport drop during launch");
             if (IsStagingDirectorySetup(argv) && StagingGate is { } stagingGate)
@@ -1249,8 +1256,11 @@ public sealed class MultipassRemoteHostPoolTests
                 ListStdoutCaps.Enqueue(maxStdoutBytes);
                 if (ListExitCode != 0)
                     return new ProcessRunResult(ListExitCode, "", "list failed");
+                var names = ListLaunchedNames
+                    ? ManagedNames.Concat(_launchedNames).Distinct(StringComparer.Ordinal)
+                    : ManagedNames;
                 var stdout = ListStdoutOverride
-                    ?? $"{{\"list\":[{string.Join(",", ManagedNames.Select(name => $"{{\"name\":\"{name}\",\"state\":\"Running\"}}"))}]}}";
+                    ?? $"{{\"list\":[{string.Join(",", names.Select(name => $"{{\"name\":\"{name}\",\"state\":\"Running\"}}"))}]}}";
                 if (maxStdoutBytes is { } cap && System.Text.Encoding.UTF8.GetByteCount(stdout) > cap)
                     return new ProcessRunResult(137, stdout[..Math.Min(stdout.Length, cap)], "", StdoutLimitExceeded: true);
                 return new ProcessRunResult(0, stdout, "");
@@ -1274,6 +1284,12 @@ public sealed class MultipassRemoteHostPoolTests
             && argv[1] == "-c"
             && argv[2].Contains("mkdir -p", StringComparison.Ordinal)
             && argv[2].Contains("chmod 0700", StringComparison.Ordinal);
+
+        private static string VmNameFromLaunch(IReadOnlyList<string> argv)
+        {
+            var index = argv.ToList().IndexOf("--name");
+            return index >= 0 && index + 1 < argv.Count ? argv[index + 1] : "unknown";
+        }
     }
 
     private sealed class AsyncGate(int expectedWaiters)

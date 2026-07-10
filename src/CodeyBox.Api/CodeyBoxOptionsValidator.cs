@@ -281,6 +281,10 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         {
             failures.Add("CodeyBox:SharedUpstreamMirrorDirectory must not be empty if EnableSharedUpstreamMirror is true");
         }
+        if (options.GitCommandMaxOutputBytes <= 0)
+        {
+            failures.Add("CodeyBox:GitCommandMaxOutputBytes must be > 0");
+        }
 
         if (options.AutoRequeueOnAgentRestore.Enabled)
         {
