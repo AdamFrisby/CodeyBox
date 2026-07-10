@@ -17,6 +17,7 @@ CREATE TABLE audit_reports (
     id              TEXT PRIMARY KEY,
     work_item_id    TEXT NOT NULL,
     iteration       INTEGER NOT NULL,
+    audit_target    TEXT NOT NULL DEFAULT 'code', -- "plan", "code", or a future target
     auditor_name    TEXT NOT NULL,
     auditor_kind    TEXT NOT NULL,   -- "diff-pattern", "shell", "llm"
     worst_severity  TEXT NOT NULL,   -- "none", "Warning", "Error", etc.
@@ -28,8 +29,8 @@ CREATE TABLE audit_reports (
 );
 ```
 
-One row is written per auditor per iteration. A work item with 8
-auditors and 3 audit iterations produces up to 24 rows.
+One row is written per auditor per target-specific iteration. Rows
+created before target persistence are migrated to `code`.
 
 ### Write overhead
 
@@ -102,12 +103,12 @@ The retention window is controlled by `CodeyBox:AuditLog:RetainedDays`
 
 ### `GET /workitems/{id}/audit-reports`
 
-Returns all stored reports grouped by iteration, with findings inline.
+Returns all stored reports grouped by target and iteration, with findings inline.
 `rawOutputAvailable` indicates whether a `/raw` fetch will succeed.
 
 See [`api.md`](api.md) for the full response shape.
 
-### `GET /workitems/{id}/audit-reports/{iteration}/{auditor}/raw`
+### `GET /workitems/{id}/audit-reports/{target}/{iteration}/{auditor}/raw`
 
 Returns the redacted, capped raw output as `text/plain; charset=utf-8`.
 Returns `404` when the work item, row, or `raw_output` column is absent.
@@ -117,7 +118,7 @@ Returns `404` when the work item, row, or `raw_output` column is absent.
 The **Audit Reports** page (`/work-items/{id}/audit-reports`) provides:
 
 - **Findings across iterations table** — rows are stable finding IDs,
-  columns are iteration numbers. `✓` = present, `·` = absent. Helps
+  columns are target/iteration pairs. `✓` = present, `·` = absent. Helps
   operators see which defects persisted, resolved, or re-appeared.
 - **Per-iteration expandable sections** — each auditor is a `<details>`
   block showing severity, duration, and individual findings with

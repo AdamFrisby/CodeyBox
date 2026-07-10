@@ -9,6 +9,7 @@ public sealed class PresetCatalogOptions
     public Dictionary<string, AuditTypePresetOverride> AuditTypeOverrides { get; set; } =
         new Dictionary<string, AuditTypePresetOverride>(StringComparer.OrdinalIgnoreCase);
     public string? LlmPromptFrameTemplate { get; set; }
+    public string? LlmPlanPromptFrameTemplate { get; set; }
 
     public PresetCatalogOptions Clone()
         => new()
@@ -24,6 +25,7 @@ public sealed class PresetCatalogOptions
                 kvp => kvp.Value.Clone(),
                 StringComparer.OrdinalIgnoreCase),
             LlmPromptFrameTemplate = LlmPromptFrameTemplate,
+            LlmPlanPromptFrameTemplate = LlmPlanPromptFrameTemplate,
         };
 }
 
@@ -44,6 +46,8 @@ public sealed class AuditTypePresetOverride
 {
     public string? DisplayName { get; set; }
     public string? ReviewFocus { get; set; }
+    public string? PlanReviewFocus { get; set; }
+    public List<string> Targets { get; set; } = [];
     public List<ConfiguredAuditor> Auditors { get; set; } = [];
     public List<ConfiguredDiffPattern> Patterns { get; set; } = [];
     public bool Replace { get; set; }
@@ -53,6 +57,8 @@ public sealed class AuditTypePresetOverride
         {
             DisplayName = DisplayName,
             ReviewFocus = ReviewFocus,
+            PlanReviewFocus = PlanReviewFocus,
+            Targets = [.. Targets],
             Auditors = Auditors.Select(a => a.Clone()).ToList(),
             Patterns = Patterns.Select(p => p.Clone()).ToList(),
             Replace = Replace,

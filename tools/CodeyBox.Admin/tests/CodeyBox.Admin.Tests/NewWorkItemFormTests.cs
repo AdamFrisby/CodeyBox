@@ -268,7 +268,7 @@ public sealed class CapturingApiClient : ICodeyBoxApiClient
         => Task.FromResult<AuditReportsDto?>(null);
 
     public Task<string?> GetAuditReportRawOutputAsync(
-        string workItemId, int iteration, string auditorName, CancellationToken ct = default)
+        string workItemId, string target, int iteration, string auditorName, CancellationToken ct = default)
         => Task.FromResult<string?>(null);
 
     public Task<WorkItemTimingsDto?> GetWorkItemTimingsAsync(string id, CancellationToken ct = default)

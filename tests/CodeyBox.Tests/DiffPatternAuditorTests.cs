@@ -97,4 +97,54 @@ public sealed class DiffPatternAuditorTests
         Assert.NotEmpty(result.Findings);
         Assert.Equal(AuditSeverity.Warning, result.Findings[0].Severity);
     }
+
+    [Fact]
+    public async Task PlanTarget_FailsWithPlanLineLocationWhenPatternMatches()
+    {
+        var auditor = new DiffPatternAuditor(new DiffPatternAuditorOptions
+        {
+            Name = "plan-pattern",
+            Patterns = [new DiffPattern { Regex = new Regex("forbidden"), Description = "forbidden plan text" }],
+            Targets = AuditTargets.PlanOnly,
+        });
+        var context = new AuditContext(
+            WorkItemId.New(),
+            "feature",
+            "main",
+            1,
+            "do x",
+            Target: AuditTarget.Plan,
+            PlanArtifact: "first line\ncontains forbidden text\nlast line");
+
+        var result = await auditor.RunAsync(new StubSandbox(), "/work", context);
+
+        var finding = Assert.Single(result.Findings);
+        Assert.False(result.Passed);
+        Assert.Equal("PLAN:2", finding.Location);
+        Assert.Equal("contains forbidden text", finding.Description);
+    }
+
+    [Fact]
+    public async Task PlanTarget_PassesWhenPatternDoesNotMatch()
+    {
+        var auditor = new DiffPatternAuditor(new DiffPatternAuditorOptions
+        {
+            Name = "plan-pattern",
+            Patterns = [new DiffPattern { Regex = new Regex("forbidden"), Description = "forbidden plan text" }],
+            Targets = AuditTargets.PlanOnly,
+        });
+        var context = new AuditContext(
+            WorkItemId.New(),
+            "feature",
+            "main",
+            1,
+            "do x",
+            Target: AuditTarget.Plan,
+            PlanArtifact: "a clean plan");
+
+        var result = await auditor.RunAsync(new StubSandbox(), "/work", context);
+
+        Assert.True(result.Passed);
+        Assert.Empty(result.Findings);
+    }
 }

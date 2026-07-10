@@ -53,7 +53,12 @@ public interface ICodeyBoxApiClient
 
     // ── Audit reports ─────────────────────────────────────────────────────────
     Task<AuditReportsDto?> GetAuditReportsAsync(string workItemId, CancellationToken ct = default);
-    Task<string?> GetAuditReportRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default);
+    Task<string?> GetAuditReportRawOutputAsync(
+        string workItemId,
+        string target,
+        int iteration,
+        string auditorName,
+        CancellationToken ct = default);
 
     // ── Timings ───────────────────────────────────────────────────────────────
     Task<WorkItemTimingsDto?> GetWorkItemTimingsAsync(string id, CancellationToken ct = default);

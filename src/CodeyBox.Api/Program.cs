@@ -2828,8 +2828,6 @@ builder.Services.AddSingleton<IWorkItemTerminalTransition>(sp =>
     sp.GetRequiredService<WorkItemTerminalTransition>());
 builder.Services.AddSingleton<IWorkItemTerminalRevisionBuilder>(sp =>
     sp.GetRequiredService<WorkItemTerminalTransition>());
-builder.Services.AddSingleton<IPlanReviewGate, AlwaysPassPlanReviewGate>();
-
 builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IGitHost>(),
@@ -2907,7 +2905,6 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     inVmSmokeGate: sp.GetService<IInVmSmokeGate>(),
     authRequiredHandler: sp.GetRequiredService<IAgentAuthRequiredHandler>(),
     authRequiredReader: sp.GetRequiredService<IAgentAuthRequiredAvailabilityReader>(),
-    planReviewGate: sp.GetRequiredService<IPlanReviewGate>(),
     testCaseStore: sp.GetService<ITestCaseStore>(),
     mergeScopeResolver: sp.GetRequiredService<IMergeScopeResolver>(),
     quotaAvailabilityPublisher: sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>()));
@@ -4267,6 +4264,14 @@ namespace CodeyBox.Api
         /// <summary>Graceful shutdown drain and preemption timing.</summary>
         public ShutdownOptions Shutdown { get; set; } = new();
 
+        /// <summary>
+        /// Deprecated compatibility section for older configs that set
+        /// <c>CodeyBox:PlanReview:UseAuditors</c>. Auditor-backed plan review
+        /// is always enabled by the pipeline; this option is accepted only so
+        /// strict unbound-key validation does not reject existing deployments.
+        /// </summary>
+        public PlanReviewOptions PlanReview { get; set; } = new();
+
         /// <summary>Heartbeat and dead-worker reaper configuration.</summary>
         public DeadWorkerOptions DeadWorker { get; set; } = new();
 
@@ -4662,6 +4667,15 @@ namespace CodeyBox.Api
         /// and orphan scan.
         /// </summary>
         public AttachmentsOptions Attachments { get; set; } = new();
+    }
+
+    /// <summary>
+    /// Deprecated compatibility plan-review options. The review loop is always
+    /// auditor-backed; <see cref="UseAuditors"/> is ignored.
+    /// </summary>
+    public sealed class PlanReviewOptions
+    {
+        public bool UseAuditors { get; set; } = true;
     }
 
     /// <summary>

@@ -134,8 +134,8 @@ public sealed class AuditReportsPageTests : TestContext
 
         Assert.Contains("audit-matrix-table", cut.Markup);
         // Both iteration columns should appear in the table header
-        Assert.Contains("<th title=\"Iteration 1\">1</th>", cut.Markup);
-        Assert.Contains("<th title=\"Iteration 2\">2</th>", cut.Markup);
+        Assert.Contains("<th title=\"code iteration 1\">code:1</th>", cut.Markup);
+        Assert.Contains("<th title=\"code iteration 2\">code:2</th>", cut.Markup);
     }
 
     // ── Iteration/auditor expansion tests ──────────────────────────────────────

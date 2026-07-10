@@ -405,7 +405,9 @@ else
     private IReadOnlyList<AuditReportFindingDto>? GetFindings(int iteration, string auditorName)
     {
         if (_auditReports is null) return null;
-        var iter = _auditReports.Iterations.FirstOrDefault(i => i.Iteration == iteration);
+        var iter = _auditReports.Iterations.FirstOrDefault(i =>
+            string.Equals(i.Target, "code", StringComparison.OrdinalIgnoreCase)
+            && i.Iteration == iteration);
         if (iter is null) return [];
         var aud = iter.Auditors.FirstOrDefault(a => a.Name == auditorName);
         return aud?.Findings ?? [];
@@ -430,7 +432,7 @@ else
         StateHasChanged();
         try
         {
-            var raw = await ApiClient.GetAuditReportRawOutputAsync(Id, iteration, auditorName);
+            var raw = await ApiClient.GetAuditReportRawOutputAsync(Id, "code", iteration, auditorName);
             _rawOutputVisible[key] = raw ?? "(no raw output)";
         }
         catch (Exception ex)

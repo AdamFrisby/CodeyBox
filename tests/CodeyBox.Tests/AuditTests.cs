@@ -3,6 +3,8 @@ using CodeyBox.Audit;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
+using CodeyBox.Sandbox.Process;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
@@ -188,6 +190,152 @@ public sealed class AuditTests
         Assert.NotNull(commandExec);
         Assert.Null(commandExec!.MaxStdoutBytes);
         Assert.Null(commandExec.MaxStderrBytes);
+    }
+
+    [Fact]
+    public async Task ShellCommandAuditor_PlanTargetMaterialisesArtifactAndEnvironment()
+    {
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "plan-shell",
+            Argv = ["review-plan"],
+            Targets = AuditTargets.PlanOnly,
+        });
+        var execs = new List<SandboxExec>();
+        var sandbox = new FakeSandbox(exec =>
+        {
+            execs.Add(exec);
+            if (IsToolProbe(exec))
+                return new SandboxExecResult(0, "/usr/bin/review-plan\n", "");
+
+            return new SandboxExecResult(0, "ok", "");
+        });
+        var context = FakeContext() with
+        {
+            Target = AuditTarget.Plan,
+            PlanArtifact = "{\"summary\":\"check this plan\"}",
+        };
+
+        var result = await auditor.RunAsync(sandbox, "/work", context, CancellationToken.None);
+
+        Assert.True(result.Passed);
+        var write = Assert.Single(execs, exec => exec.Stdin == context.PlanArtifact);
+        // Path is unique per work item, iteration, and (sanitised) auditor name.
+        var expectedPath = $"/tmp/codeybox-plan-artifact-{context.WorkItemId}-{context.Iteration}-plan-shell.json";
+        Assert.Equal(["sh", "-c", "umask 077; rm -f -- \"$1\"; cat > \"$1\"; chmod 400 \"$1\"", "sh", expectedPath], write.Argv);
+        var command = Assert.Single(execs, exec => exec.Argv.SequenceEqual(auditor.Argv));
+        Assert.NotNull(command.ExtraEnvironment);
+        Assert.Equal("plan", command.ExtraEnvironment!["CODEYBOX_AUDIT_TARGET"]);
+        Assert.Equal(context.WorkItemId.ToString(), command.ExtraEnvironment["CODEYBOX_WORK_ITEM_ID"]);
+        Assert.Equal(expectedPath, command.ExtraEnvironment["CODEYBOX_PLAN_ARTIFACT_PATH"]);
+        Assert.Contains(execs, exec => exec.Argv.SequenceEqual(["rm", "-f", "--", expectedPath]));
+    }
+
+    [Fact]
+    public async Task ShellCommandAuditor_PlanTargetProcessSandbox_ReadsMaterialisedPlanAndEnvironment()
+    {
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "plan-shell-real",
+            Argv =
+            [
+                "sh",
+                "-c",
+                "test \"$CODEYBOX_AUDIT_TARGET\" = plan && test -n \"$CODEYBOX_PLAN_ARTIFACT_PATH\" && grep -F 'process sandbox plan' \"$CODEYBOX_PLAN_ARTIFACT_PATH\"",
+            ],
+            Targets = AuditTargets.PlanOnly,
+        });
+        var context = FakeContext() with
+        {
+            Target = AuditTarget.Plan,
+            PlanArtifact = "{\"summary\":\"process sandbox plan\"}",
+        };
+
+        var result = await auditor.RunAsync(sandbox, "/work", context, CancellationToken.None);
+
+        Assert.True(result.Passed, result.RawOutput);
+        Assert.Empty(result.Findings);
+    }
+
+    [Fact]
+    public async Task ShellCommandAuditor_ConcurrentPlanTargetsKeepArtifactsIsolated()
+    {
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        var barrierPrefix = "/tmp/codeybox-plan-barrier-" + Guid.NewGuid().ToString("N");
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "plan-shell-concurrent",
+            Argv =
+            [
+                "sh",
+                "-c",
+                "touch \"$1-$CODEYBOX_WORK_ITEM_ID\"; i=0; while [ \"$(find /tmp -maxdepth 1 -name \"$(basename \"$1\")-*\" -print | wc -l)\" -lt 2 ] && [ $i -lt 200 ]; do i=$((i+1)); sleep 0.01; done; grep -F \"$CODEYBOX_WORK_ITEM_ID\" \"$CODEYBOX_PLAN_ARTIFACT_PATH\"",
+                "sh",
+                barrierPrefix,
+            ],
+            Targets = AuditTargets.PlanOnly,
+        });
+        var firstId = WorkItemId.New();
+        var secondId = WorkItemId.New();
+        var first = FakeContext() with
+        {
+            WorkItemId = firstId,
+            Target = AuditTarget.Plan,
+            PlanArtifact = $"{{\"workItem\":\"{firstId}\"}}",
+        };
+        var second = first with
+        {
+            WorkItemId = secondId,
+            PlanArtifact = $"{{\"workItem\":\"{secondId}\"}}",
+        };
+
+        try
+        {
+            var results = await Task.WhenAll(
+                auditor.RunAsync(sandbox, "/work", first),
+                auditor.RunAsync(sandbox, "/work", second));
+
+            Assert.All(results, result => Assert.True(result.Passed, result.RawOutput));
+        }
+        finally
+        {
+            // Delete the per-test barrier files even if a task or assertion throws,
+            // so a failing run does not leak /tmp synchronization files.
+            foreach (var path in Directory.GetFiles("/tmp", Path.GetFileName(barrierPrefix) + "-*"))
+                File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task ShellCommandAuditor_PlanTargetFailsWhenArtifactMissing()
+    {
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "plan-shell",
+            Argv = ["review-plan"],
+            Targets = AuditTargets.PlanOnly,
+        });
+        var commandRan = false;
+        var sandbox = new FakeSandbox(exec =>
+        {
+            if (IsToolProbe(exec))
+                return new SandboxExecResult(0, "/usr/bin/review-plan\n", "");
+
+            commandRan = true;
+            return new SandboxExecResult(0, "ok", "");
+        });
+        var context = FakeContext() with { Target = AuditTarget.Plan };
+
+        var result = await auditor.RunAsync(sandbox, "/work", context, CancellationToken.None);
+
+        Assert.False(result.Passed);
+        Assert.False(commandRan);
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.Equal("no plan artifact to review", finding.Title);
     }
 
     [Fact]

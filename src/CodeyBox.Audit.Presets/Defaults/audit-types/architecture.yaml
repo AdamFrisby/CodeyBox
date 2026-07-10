@@ -1,6 +1,17 @@
 id: architecture
 displayName: "Architecture review"
 llmAuditorName: architecture:llm-review
+targets: [plan, code]
+planReviewFocus: |-
+  You are reviewing ARCHITECTURE at the PLAN stage, before code exists. Judge the proposed
+  approach, boundaries, dependency direction, public contracts, and sequencing described in
+  the plan. Block only when the plan itself commits to an architectural problem: a layer
+  inversion, a public/API shape that will leak internals or invalid states, a new dependency
+  cycle, a policy fork, a missing seam that makes the requested change hard to test or
+  evolve, or a large responsibility accretion onto the wrong component. Cite the plan field
+  or task requirement that creates the risk, and name the plan edit that would fix it.
+  Advisory uncertainty is a warning; do not invent implementation defects that the plan has
+  not committed to.
 reviewFocus: |-
   You are reviewing ARCHITECTURE: the dependency structure, coupling, contracts, and cohesion
   of this change — does it keep the codebase loosely coupled, layered in one direction, and

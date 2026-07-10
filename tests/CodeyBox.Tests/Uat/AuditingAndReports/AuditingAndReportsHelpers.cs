@@ -117,9 +117,10 @@ internal sealed class CapturingAuditReportStore : IAuditReportStore
                 .ThenBy(r => r.AuditorName, StringComparer.Ordinal)
                 .ToList());
 
-    public Task<string?> GetRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default)
+    public Task<string?> GetRawOutputAsync(string workItemId, AuditTarget target, int iteration, string auditorName, CancellationToken ct = default)
         => Task.FromResult(Reports.FirstOrDefault(r =>
             r.WorkItemId == workItemId &&
+            r.Target == target &&
             r.Iteration == iteration &&
             r.AuditorName == auditorName)?.RawOutput);
 
@@ -172,7 +173,7 @@ internal sealed class StartupSweepStore : IAuditReportStore
     public Task CreateAsync(AuditReport report, CancellationToken ct = default) => Task.CompletedTask;
     public Task<IReadOnlyList<AuditReport>> GetByWorkItemAsync(string workItemId, CancellationToken ct = default)
         => Task.FromResult<IReadOnlyList<AuditReport>>([]);
-    public Task<string?> GetRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default)
+    public Task<string?> GetRawOutputAsync(string workItemId, AuditTarget target, int iteration, string auditorName, CancellationToken ct = default)
         => Task.FromResult<string?>(null);
 
     public Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)

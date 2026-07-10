@@ -330,6 +330,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             RunMigration("ALTER TABLE work_items ADD COLUMN plan_generated_at TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN plan_reviewed_at TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN plan_review_summary TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN plan_review_attempts INTEGER NOT NULL DEFAULT 0;");
 
             // Per-iteration dispatch record. One row per (work_item_id, iteration);
             // most-recent-dispatch-wins — a re-dispatch (e.g. orchestrator
@@ -479,7 +480,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         re_check_verdicts_json, template_name, template_entry_index,
                         preserve_work_branch_on_queued_pickup,
                         terminal_retry_attempts, next_terminal_retry_at,
-                        knobs_json, plan_artifact, plan_generated_at, plan_reviewed_at, plan_review_summary)
+                        knobs_json, plan_artifact, plan_generated_at, plan_reviewed_at, plan_review_summary, plan_review_attempts)
                     VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $agent_instance_id, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                         $local_squash_sha, $merged_pr_number, $merged_pr_url,
@@ -496,7 +497,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         $re_check_verdicts, $template_name, $template_entry_index,
                         $preserve_work_branch_on_queued_pickup,
                         $terminal_retry_attempts, $next_terminal_retry_at,
-                        $knobs, $plan_artifact, $plan_generated_at, $plan_reviewed_at, $plan_review_summary);
+                        $knobs, $plan_artifact, $plan_generated_at, $plan_reviewed_at, $plan_review_summary, $plan_review_attempts);
                     """;
                 Bind(cmd, item);
                 await cmd.ExecuteNonQueryAsync(ct);
@@ -651,7 +652,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     plan_artifact = CASE WHEN prompt_revision = $prompt_revision THEN $plan_artifact ELSE plan_artifact END,
                     plan_generated_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_generated_at ELSE plan_generated_at END,
                     plan_reviewed_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_reviewed_at ELSE plan_reviewed_at END,
-                    plan_review_summary = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_summary ELSE plan_review_summary END
+                    plan_review_summary = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_summary ELSE plan_review_summary END,
+                    plan_review_attempts = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_attempts ELSE plan_review_attempts END
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -735,7 +737,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     plan_artifact = CASE WHEN prompt_revision = $prompt_revision THEN $plan_artifact ELSE plan_artifact END,
                     plan_generated_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_generated_at ELSE plan_generated_at END,
                     plan_reviewed_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_reviewed_at ELSE plan_reviewed_at END,
-                    plan_review_summary = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_summary ELSE plan_review_summary END
+                    plan_review_summary = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_summary ELSE plan_review_summary END,
+                    plan_review_attempts = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_attempts ELSE plan_review_attempts END
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -820,7 +823,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     plan_artifact = CASE WHEN prompt_revision = $prompt_revision THEN $plan_artifact ELSE plan_artifact END,
                     plan_generated_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_generated_at ELSE plan_generated_at END,
                     plan_reviewed_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_reviewed_at ELSE plan_reviewed_at END,
-                    plan_review_summary = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_summary ELSE plan_review_summary END
+                    plan_review_summary = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_summary ELSE plan_review_summary END,
+                    plan_review_attempts = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_attempts ELSE plan_review_attempts END
                 WHERE id = $id AND state = $only_if_state AND updated_at = $only_if_updated_at;
                 """;
             Bind(cmd, item);
@@ -1224,7 +1228,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     plan_artifact = $plan_artifact,
                     plan_generated_at = $plan_generated_at,
                     plan_reviewed_at = $plan_reviewed_at,
-                    plan_review_summary = $plan_review_summary
+                    plan_review_summary = $plan_review_summary,
+                    plan_review_attempts = $plan_review_attempts
                 WHERE id = $id
                   AND state = $only_if_state
                   AND updated_at = $only_if_updated_at;
@@ -2188,7 +2193,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     plan_artifact = NULL,
                     plan_generated_at = NULL,
                     plan_reviewed_at = NULL,
-                    plan_review_summary = NULL
+                    plan_review_summary = NULL,
+                    plan_review_attempts = 0
                 WHERE id = $id;
                 """;
             cmd.Parameters.AddWithValue("$prompt", newPrompt);
@@ -2619,6 +2625,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$plan_generated_at", (object?)item.PlanGeneratedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$plan_reviewed_at", (object?)item.PlanReviewedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$plan_review_summary", (object?)item.PlanReviewSummary ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$plan_review_attempts", item.PlanReviewAttempts);
     }
 
     private static string SerialiseKnobs(IReadOnlyDictionary<string, string>? knobs)
@@ -2738,6 +2745,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         PlanGeneratedAt = ReadNullableDateTimeOffset(r, "plan_generated_at"),
         PlanReviewedAt = ReadNullableDateTimeOffset(r, "plan_reviewed_at"),
         PlanReviewSummary = ReadNullableString(r, "plan_review_summary"),
+        PlanReviewAttempts = ReadInt32OrDefault(r, "plan_review_attempts", defaultValue: 0),
     };
 
     private static IReadOnlyList<CheckVerdict> ReadReCheckVerdicts(SqliteDataReader r)

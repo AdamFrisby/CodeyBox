@@ -57,6 +57,7 @@ internal static class WorkItemRecoveryPolicy
             PlanGeneratedAt = null,
             PlanReviewedAt = null,
             PlanReviewSummary = null,
+            PlanReviewAttempts = 0,
         };
     }
 

@@ -84,4 +84,15 @@ public sealed class PipelineTuningOptionsValidationTests
         Assert.Null(opts.CSharpTestPassAuditorIdleTimeout);
         Assert.Null(opts.CSharpTestPassBlameHangTimeout);
     }
+
+    [Fact]
+    public void Validate_ZeroMaxPlanReviewIterations_ThrowsSharedLimitError()
+    {
+        var opts = new PipelineTuningOptions { MaxPlanReviewIterations = 0 };
+
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(opts.Validate);
+
+        Assert.Equal("value", ex.ParamName);
+        Assert.Contains("MaxPlanReviewIterations must be >= 1", ex.Message, StringComparison.Ordinal);
+    }
 }

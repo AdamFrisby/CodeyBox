@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http;
+using System.Text.Json;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -598,6 +599,69 @@ public sealed class GeminiAgentRunnerTests
         Assert.NotNull(handler.LastRequest);
         Assert.Equal(GeminiAgentRunner.OAuthGenerateContentEndpoint,
             handler.LastRequest!.RequestUri!.ToString());
+    }
+
+    [Fact]
+    public async Task RunTextOnlyWithSystemPromptAsync_UsesSystemInstructionAndUserContent()
+    {
+        var handler = new CapturingGeminiHandler(
+            HttpStatusCode.Unauthorized,
+            """{"error":{"message":"placeholder rejected"}}""");
+        var runner = new GeminiAgentRunner(new HttpClient(handler));
+        var credential = new AgentCredential(
+            AgentKind.Gemini,
+            new Dictionary<string, string> { ["GEMINI_API_KEY"] = "test-key" },
+            new Dictionary<string, string>());
+
+        _ = await runner.RunTextOnlyWithSystemPromptAsync(
+            "trusted review contract",
+            "untrusted plan artifact",
+            credential,
+            modelId: "gemini-test");
+
+        using var body = JsonDocument.Parse(handler.LastRequestBody!);
+        var systemPart = Assert.Single(body.RootElement
+            .GetProperty("systemInstruction")
+            .GetProperty("parts")
+            .EnumerateArray());
+        Assert.Equal("trusted review contract", systemPart.GetProperty("text").GetString());
+        var userContent = Assert.Single(body.RootElement.GetProperty("contents").EnumerateArray());
+        Assert.Equal("user", userContent.GetProperty("role").GetString());
+        var userPart = Assert.Single(userContent.GetProperty("parts").EnumerateArray());
+        Assert.Equal("untrusted plan artifact", userPart.GetProperty("text").GetString());
+    }
+
+    [Fact]
+    public async Task RunTextOnlyWithSystemPromptAsync_OAuthUsesSeparatedWrappedRequest()
+    {
+        var handler = new CapturingGeminiHandler(
+            HttpStatusCode.Unauthorized,
+            """{"error":{"message":"placeholder rejected"}}""");
+        var runner = new GeminiAgentRunner(new HttpClient(handler));
+        var credential = new AgentCredential(
+            AgentKind.Gemini,
+            new Dictionary<string, string>
+            {
+                [GeminiConstants.OAuthCredsEnvVar] = """{"access_token":"oauth-test-token"}""",
+            },
+            new Dictionary<string, string>());
+
+        _ = await runner.RunTextOnlyWithSystemPromptAsync(
+            "trusted review contract",
+            "untrusted plan artifact",
+            credential,
+            modelId: "gemini-test");
+
+        using var body = JsonDocument.Parse(handler.LastRequestBody!);
+        var wrapped = body.RootElement.GetProperty("request");
+        var systemPart = Assert.Single(wrapped
+            .GetProperty("systemInstruction")
+            .GetProperty("parts")
+            .EnumerateArray());
+        Assert.Equal("trusted review contract", systemPart.GetProperty("text").GetString());
+        var userContent = Assert.Single(wrapped.GetProperty("contents").EnumerateArray());
+        var userPart = Assert.Single(userContent.GetProperty("parts").EnumerateArray());
+        Assert.Equal("untrusted plan artifact", userPart.GetProperty("text").GetString());
     }
 
     private sealed class CapturingGeminiHandler : HttpMessageHandler

@@ -247,10 +247,14 @@ public sealed class CodeyBoxApiClient : ICodeyBoxApiClient
     }
 
     public async Task<string?> GetAuditReportRawOutputAsync(
-        string workItemId, int iteration, string auditorName, CancellationToken ct = default)
+        string workItemId,
+        string target,
+        int iteration,
+        string auditorName,
+        CancellationToken ct = default)
     {
         var url = $"/workitems/{Uri.EscapeDataString(workItemId)}/audit-reports" +
-                  $"/{iteration}/{Uri.EscapeDataString(auditorName)}/raw";
+                  $"/{Uri.EscapeDataString(target)}/{iteration}/{Uri.EscapeDataString(auditorName)}/raw";
         var resp = await _http.GetAsync(url, ct);
         if (resp.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
         resp.EnsureSuccessStatusCode();

@@ -208,6 +208,11 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         {
             failures.Add("CodeyBox:PipelineTuning:MaxSandboxReuses must be >= 1");
         }
+        if (!PlanReviewIterationLimit.TryCreate(options.PipelineTuning.MaxPlanReviewIterations, out _))
+        {
+            failures.Add(
+                $"CodeyBox:PipelineTuning:MaxPlanReviewIterations must be >= {PlanReviewIterationLimit.MinimumValue}");
+        }
         if (options.PipelineTuning.MaxSandboxLifetime <= TimeSpan.Zero)
         {
             failures.Add("CodeyBox:PipelineTuning:MaxSandboxLifetime must be a positive TimeSpan");

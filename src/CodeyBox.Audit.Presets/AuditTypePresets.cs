@@ -17,33 +17,58 @@ internal static class AuditTypePresets
     public static void Register(
         PresetCatalog catalog,
         IReadOnlyDictionary<string, AuditTypePresetDefinition> auditTypes,
-        string frameTemplate)
+        string frameTemplate,
+        string planFrameTemplate)
     {
         foreach (var (id, definition) in auditTypes)
         {
             var captured = definition;
-            catalog.RegisterAuditType(id, ctx => BuildAuditType(captured, frameTemplate, ctx));
+            catalog.RegisterAuditType(id, ctx => BuildAuditType(captured, frameTemplate, planFrameTemplate, ctx));
         }
     }
 
     private static IReadOnlyList<IAuditor> BuildAuditType(
         AuditTypePresetDefinition definition,
         string frameTemplate,
+        string planFrameTemplate,
         PresetContext ctx)
     {
         var auditors = new List<IAuditor>();
+        var targets = ParseTargets(definition.Targets);
 
         // 1. Add explicitly configured auditors (usually ShellCommandAuditors).
-        foreach (var a in definition.Auditors)
+        AddConfiguredAuditors(auditors, definition.Id, definition.Auditors, targets);
+        AddConfiguredAuditors(auditors, definition.Id, definition.CodeOnlyAuditors, AuditTargets.CodeOnly);
+
+        // 2. Add DiffPatternAuditor if patterns are configured.
+        AddPatterns(auditors, $"{definition.Id}:deterministic-patterns", definition.Patterns, targets);
+        AddPatterns(auditors, $"{definition.Id}:repository-patterns", definition.CodeOnlyPatterns, AuditTargets.CodeOnly);
+
+        // 3. Add LlmReviewAuditor if a review focus is present.
+        if (!string.IsNullOrWhiteSpace(definition.ReviewFocus))
+        {
+            auditors.Add(Llm(definition, frameTemplate, planFrameTemplate, targets, ctx));
+        }
+
+        return auditors;
+    }
+
+    private static void AddConfiguredAuditors(
+        List<IAuditor> auditors,
+        string auditTypeId,
+        IReadOnlyList<AuditorDefinition> definitions,
+        IReadOnlySet<AuditTarget> targets)
+    {
+        foreach (var a in definitions)
         {
             var role = PresetConfigLoader.ParseAuditorRole(
-                $"audit-type '{definition.Id}'", $"/auditors/{a.Name}/role", a.Role);
+                $"audit-type '{auditTypeId}'", $"/auditors/{a.Name}/role", a.Role);
             var gateEvidence = PresetConfigLoader.ParseBuildTestGateEvidence(
-                $"audit-type '{definition.Id}'", $"/auditors/{a.Name}/gateEvidence", a.Role, a.GateEvidence);
+                $"audit-type '{auditTypeId}'", $"/auditors/{a.Name}/gateEvidence", a.Role, a.GateEvidence);
             var missingToolSeverity = PresetConfigLoader.ParseOptionalAuditSeverity(
-                $"audit-type '{definition.Id}'", $"/auditors/{a.Name}/missingToolSeverity", a.MissingToolSeverity);
+                $"audit-type '{auditTypeId}'", $"/auditors/{a.Name}/missingToolSeverity", a.MissingToolSeverity);
             var required = PresetConfigLoader.ParseAuditCapabilities(
-                $"audit-type '{definition.Id}'", $"/auditors/{a.Name}/requiredCapabilities", a.RequiredCapabilities);
+                $"audit-type '{auditTypeId}'", $"/auditors/{a.Name}/requiredCapabilities", a.RequiredCapabilities);
             if (string.IsNullOrWhiteSpace(a.Script))
             {
                 auditors.Add(Shell(
@@ -53,6 +78,7 @@ internal static class AuditTypePresets
                     gateEvidence,
                     missingToolSeverity,
                     required,
+                    targets,
                     [.. a.Argv]));
             }
             else
@@ -68,30 +94,30 @@ internal static class AuditTypePresets
                     TreatExit127AsMissingTool = a.TreatExit127AsMissingTool,
                     MissingToolSeverity = missingToolSeverity,
                     Required = required,
+                    Targets = targets,
                     CanShortCircuitOnBlockingFinding = a.CanShortCircuitOnBlockingFinding,
                     Role = role,
                     BuildTestGateEvidence = gateEvidence,
                 }));
             }
         }
+    }
 
-        // 2. Add DiffPatternAuditor if patterns are configured.
-        if (definition.Patterns.Count > 0)
-        {
-            auditors.Add(new DiffPatternAuditor(new DiffPatternAuditorOptions
+    private static void AddPatterns(
+        List<IAuditor> auditors,
+        string name,
+        IReadOnlyList<DiffPatternDefinition> patterns,
+        IReadOnlySet<AuditTarget> targets)
+    {
+        if (patterns.Count == 0)
+            return;
+
+        auditors.Add(new DiffPatternAuditor(new DiffPatternAuditorOptions
             {
-                Name = $"{definition.Id}:deterministic-patterns",
-                Patterns = MaterialisePatterns(definition.Patterns),
+                Name = name,
+                Patterns = MaterialisePatterns(patterns),
+                Targets = targets,
             }));
-        }
-
-        // 3. Add LlmReviewAuditor if a review focus is present.
-        if (!string.IsNullOrWhiteSpace(definition.ReviewFocus))
-        {
-            auditors.Add(Llm(definition, frameTemplate, ctx));
-        }
-
-        return auditors;
     }
 
     private static IReadOnlyList<DiffPattern> MaterialisePatterns(IReadOnlyList<DiffPatternDefinition> definitions)
@@ -102,14 +128,25 @@ internal static class AuditTypePresets
             Severity = AuditSeverityParser.Parse(d.Severity),
         }).ToList();
 
-    private static IAuditor Llm(AuditTypePresetDefinition definition, string frameTemplate, PresetContext ctx)
+    private static IAuditor Llm(
+        AuditTypePresetDefinition definition,
+        string frameTemplate,
+        string planFrameTemplate,
+        IReadOnlySet<AuditTarget> targets,
+        PresetContext ctx)
         => new LlmReviewAuditor(new LlmReviewAuditorOptions
         {
             Name = definition.LlmAuditorName ?? $"{definition.Id}:llm-review",
             Agent = ctx.Agent,
             ReviewFocus = definition.ReviewFocus,
+            PlanReviewFocus = definition.PlanReviewFocus,
             FrameTemplate = frameTemplate,
+            PlanFrameTemplate = planFrameTemplate,
+            Targets = targets,
         });
+
+    private static IReadOnlySet<AuditTarget> ParseTargets(IReadOnlyList<string> targets)
+        => AuditTargets.ParseOrCodeOnly(targets);
 
     private static IAuditor Shell(
         string name,
@@ -118,6 +155,7 @@ internal static class AuditTypePresets
         BuildTestGateEvidence gateEvidence,
         AuditSeverity? missingToolSeverity,
         AuditCapabilities required,
+        IReadOnlySet<AuditTarget> targets,
         params string[] argv)
         => new ShellCommandAuditor(new ShellCommandAuditorOptions
         {
@@ -125,6 +163,7 @@ internal static class AuditTypePresets
             Argv = argv,
             MissingToolSeverity = missingToolSeverity,
             Required = required,
+            Targets = targets,
             CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding,
             Role = role,
             BuildTestGateEvidence = gateEvidence,

@@ -232,6 +232,8 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             {
                 DisplayName = ov.DisplayName,
                 ReviewFocus = ov.ReviewFocus,
+                PlanReviewFocus = ov.PlanReviewFocus,
+                Targets = [.. ov.Targets],
                 Replace = ov.Replace,
                 Auditors = ov.Auditors.Select(a => new ConfiguredAuditor
                 {
@@ -257,6 +259,8 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
 
         if (project.Audit.LlmPromptFrameTemplate is not null)
             options.LlmPromptFrameTemplate = project.Audit.LlmPromptFrameTemplate;
+        if (project.Audit.LlmPlanPromptFrameTemplate is not null)
+            options.LlmPlanPromptFrameTemplate = project.Audit.LlmPlanPromptFrameTemplate;
     }
 
     internal static bool ApplyRepositoryPresetRoot(Project project, PresetCatalogOptions options)
@@ -521,6 +525,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         var mergedAuditTypes = project?.AuditTypes ?? defaults?.AuditTypes ?? [];
         var mergedAuditTypeOverrides = MergeAuditTypeOverrides(defaults?.AuditTypeOverrides, project?.AuditTypeOverrides);
         var mergedFrameTemplate = project?.LlmPromptFrameTemplate ?? defaults?.LlmPromptFrameTemplate;
+        var mergedPlanFrameTemplate = project?.LlmPlanPromptFrameTemplate ?? defaults?.LlmPlanPromptFrameTemplate;
         var mergedCustom = (project?.Custom ?? defaults?.Custom ?? []).Select(ResolveCustom).ToList();
         var mergedExcludedAuditors = project?.ExcludedAuditors ?? defaults?.ExcludedAuditors ?? [];
         var mergedMechanicalFixers = ResolveMechanicalFixers(project, defaults, mergedLanguages);
@@ -567,6 +572,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             AuditTypes = mergedAuditTypes,
             AuditTypeOverrides = mergedAuditTypeOverrides,
             LlmPromptFrameTemplate = mergedFrameTemplate,
+            LlmPlanPromptFrameTemplate = mergedPlanFrameTemplate,
             Custom = mergedCustom,
             ExcludedAuditors = mergedExcludedAuditors,
             MechanicalFixers = mergedMechanicalFixers,
@@ -691,6 +697,8 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
                 {
                     DisplayName = kvp.Value.DisplayName,
                     ReviewFocus = kvp.Value.ReviewFocus,
+                    PlanReviewFocus = kvp.Value.PlanReviewFocus,
+                    Targets = [.. kvp.Value.Targets],
                     Replace = kvp.Value.Replace,
                     Auditors = kvp.Value.Auditors.Select(ProjectConfiguredAuditorToConfig).ToList(),
                     Patterns = kvp.Value.Patterns.Select(p => new DiffPatternConfig
@@ -702,6 +710,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
                 },
                 StringComparer.OrdinalIgnoreCase),
             LlmPromptFrameTemplate = audit.LlmPromptFrameTemplate,
+            LlmPlanPromptFrameTemplate = audit.LlmPlanPromptFrameTemplate,
             Custom = audit.Custom.Select(CustomAuditorToConfig).ToList(),
             ExcludedAuditors = [.. audit.ExcludedAuditors],
             MechanicalFixers = preserveMechanicalFixers
@@ -735,6 +744,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             PluginId = auditor.PluginId,
             Argv = [.. auditor.Argv],
             ReviewFocus = auditor.ReviewFocus,
+            Targets = [.. auditor.Targets],
             Role = auditor.Role,
             GateEvidence = auditor.GateEvidence,
             Patterns = auditor.Patterns.Select(p => new DiffPatternConfig
@@ -855,6 +865,8 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         {
             DisplayName = config.DisplayName,
             ReviewFocus = config.ReviewFocus,
+            PlanReviewFocus = config.PlanReviewFocus,
+            Targets = config.Targets ?? [],
             Replace = config.Replace,
             Auditors = (config.Auditors ?? []).Select(ResolveConfiguredAuditor).ToList(),
             Patterns = (config.Patterns ?? []).Select(p => new DiffPatternDescriptor
@@ -925,6 +937,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             PluginId = c.PluginId,
             Argv = c.Argv ?? [],
             ReviewFocus = c.ReviewFocus,
+            Targets = c.Targets ?? [],
             Role = c.Role,
             GateEvidence = c.GateEvidence,
             Patterns = (c.Patterns ?? []).Select(p => new DiffPatternDescriptor
