@@ -11,5 +11,7 @@ public sealed record AgentAuthFailureDetection(
     bool MatchedConfiguredStdoutPattern = false,
     bool MatchedDefaultStdoutPattern = false)
 {
+    public bool MatchedConfiguredStderrPattern { get; init; }
+
     public bool IsStdoutOnly => MatchedStdout && !MatchedStderr;
 }

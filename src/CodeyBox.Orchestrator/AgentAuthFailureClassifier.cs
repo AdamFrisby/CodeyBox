@@ -95,7 +95,15 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
         if (AgentFailureClassifier.ContainsAuthRequiredFragmentInStdout(stdout))
             return true;
 
-        if (string.IsNullOrEmpty(stdout)
+        return ContainsConfiguredPattern(kind, stdout, static pattern => pattern.MatchesStdout);
+    }
+
+    private bool ContainsConfiguredPattern(
+        AgentKind kind,
+        string? text,
+        Func<AuthFailurePattern, bool> matchesStream)
+    {
+        if (string.IsNullOrEmpty(text)
             || string.IsNullOrWhiteSpace(kind.Value)
             || !_additionalPatternsByAgent.TryGetValue(kind.Value, out var patterns))
         {
@@ -104,11 +112,12 @@ public sealed class AgentAuthFailureClassifier : IAgentAuthFailureClassifier
 
         foreach (var pattern in patterns)
         {
-            if (!pattern.MatchesStdout || string.IsNullOrWhiteSpace(pattern.Pattern))
+            if (!matchesStream(pattern) || string.IsNullOrWhiteSpace(pattern.Pattern))
                 continue;
-            if (stdout.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
+            if (text.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
                 return true;
         }
+
         return false;
     }
 }
@@ -124,7 +133,10 @@ public sealed class AgentAuthRequiredException : Exception
     public AgentKind Agent { get; }
     public string Phase { get; }
 
-    public AgentAuthRequiredException(AgentKind agent, string phase, string message)
+    public AgentAuthRequiredException(
+        AgentKind agent,
+        string phase,
+        string message)
         : base(message)
     {
         Agent = agent;

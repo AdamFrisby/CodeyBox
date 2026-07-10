@@ -114,6 +114,18 @@ public sealed class MetricsEmissionTests
         }
     }
 
+    [Fact]
+    public void ReworkEmptyEvents_Counter_EmitsParkedOutcome()
+    {
+        var (listener, measurements) = CreateLongListener("CodeyBox.Audit", "codeybox.audit.rework_empty.events", "outcome");
+        using (listener)
+        {
+            CodeyBoxMeters.ReworkEmptyEvents.Add(1, new KeyValuePair<string, object?>("outcome", "parked"));
+            AssertEventuallyContains(measurements, measurement =>
+                measurement.Value == 1L && measurement.TagValue == "parked");
+        }
+    }
+
     // ── AuditBlockingFindings ─────────────────────────────────────────────────
 
     [Fact]

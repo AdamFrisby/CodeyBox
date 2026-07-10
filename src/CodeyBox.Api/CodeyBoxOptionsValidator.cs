@@ -223,6 +223,10 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         {
             failures.Add("CodeyBox:PipelineTuning:AuditorIdleTimeout must be non-negative");
         }
+        if (options.PipelineTuning.EmptyReworkEscalationRetries < 0)
+        {
+            failures.Add("CodeyBox:PipelineTuning:EmptyReworkEscalationRetries must be non-negative");
+        }
 
         if (options.PipelineTuning.CSharpTestPassAuditorIdleTimeout is { } cSharpTestIdle && cSharpTestIdle < TimeSpan.Zero)
         {

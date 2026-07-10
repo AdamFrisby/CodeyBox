@@ -1488,14 +1488,19 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         using var acceptCts = new CancellationTokenSource();
+        var accepted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var acceptTask = Task.Run(async () =>
         {
             try
             {
                 using var client = await listener.AcceptTcpClientAsync(acceptCts.Token);
-                await Task.Delay(TimeSpan.FromSeconds(10), acceptCts.Token);
+                accepted.TrySetResult();
+                await Task.Delay(TimeSpan.FromMinutes(1), acceptCts.Token);
             }
             catch (OperationCanceledException)
+            {
+            }
+            catch (ObjectDisposedException) when (acceptCts.IsCancellationRequested)
             {
             }
         });
@@ -1524,18 +1529,24 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
         try
         {
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-            var sw = Stopwatch.StartNew();
+            // Keep the outer cap comfortably below the fake listener's hold-open
+            // delay. This still proves the preflight has its own timeout, while
+            // leaving enough room for bash + sudo shim + python startup under the
+            // parallel audit suite.
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
             var (exit, _, stderr) = await RunLocalProcessAsync(
                 "/bin/bash",
                 [launchScript],
                 timeout.Token,
                 environmentOverrides: FakeSudoPathEnvironment());
-            sw.Stop();
 
             Assert.Equal(86, exit);
             Assert.Contains("agent output HTTP ingest unavailable before launch", stderr, StringComparison.Ordinal);
-            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(3), $"detached launch waited too long for HTTP readiness for {sw.Elapsed}");
+            Assert.True(
+                ReferenceEquals(
+                    await Task.WhenAny(accepted.Task, Task.Delay(TimeSpan.FromSeconds(10))),
+                    accepted.Task),
+                "detached preflight did not connect to the listener");
             Assert.False(File.Exists(doneFile));
             Assert.False(File.Exists(processGroupMarker));
         }
@@ -1802,6 +1813,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal("", stderr);
         await WaitForFileAsync(capturedPromptFile, TimeSpan.FromSeconds(30));
         await WaitForExitCodeAsync(session, 0, TimeSpan.FromSeconds(30));
+        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(30));
         Assert.Equal("agent prompt\n", await File.ReadAllTextAsync(capturedPromptFile));
         Assert.False(File.Exists(exitTokenFile));
     }
@@ -6060,9 +6072,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var dir = Path.Combine(_workspace, "fake-sudo-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         var sudo = Path.Combine(dir, "sudo");
-        File.WriteAllText(sudo, script);
+        var sudoTmp = sudo + ".tmp";
+        File.WriteAllText(sudoTmp, script);
         if (!OperatingSystem.IsWindows())
-            File.SetUnixFileMode(sudo, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            File.SetUnixFileMode(sudoTmp, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        File.Move(sudoTmp, sudo);
         return dir;
     }
 

@@ -94,6 +94,7 @@ public static class AgentFailureClassifier
         "401 Unauthorized",
         "API Error: 401",
         "403 Forbidden",
+        "API Error: 403",
         "invalid_api_key",
         "authentication failed",
         "credentials are invalid",
@@ -364,6 +365,7 @@ public static class AgentFailureClassifier
         var matchedDefaultStdout = matchedTrustedStdoutTranscript
             || ContainsShortAuthRequiredStdout(stdout);
         var matchedStdoutFragment = ContainsAuthRequiredFragmentInStdout(stdout);
+        var matchedConfiguredStderr = false;
         var matchedConfiguredStdout = false;
 
         foreach (var pattern in AdditionalAuthPatternsFor(kind, additionalPatternsByAgent))
@@ -375,6 +377,7 @@ public static class AgentFailureClassifier
                 && !string.IsNullOrEmpty(stderr)
                 && stderr.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
             {
+                matchedConfiguredStderr = true;
                 matchedStderr = true;
             }
 
@@ -405,7 +408,10 @@ public static class AgentFailureClassifier
             matchedStdout,
             matchedTrustedStdoutTranscript,
             matchedConfiguredStdout,
-            matchedDefaultStdout);
+            matchedDefaultStdout)
+        {
+            MatchedConfiguredStderrPattern = matchedConfiguredStderr,
+        };
     }
 
     private static IEnumerable<AuthFailurePattern> AdditionalAuthPatternsFor(

@@ -106,6 +106,19 @@ public sealed class PipelineTuningOptions
     public bool AuditShortCircuitEnabled { get; set; } = true;
 
     /// <summary>
+    /// Maximum re-dispatch attempts the audit/rework loop performs when a rework
+    /// agent returns with no committed changes AND the audit history shows
+    /// convergence progress AND no infra (auth / quota) signature explains the
+    /// empty result. Each escalation re-runs the rework with an explicit
+    /// instruction telling the agent its previous pass committed nothing and it
+    /// MUST either modify files or justify each finding as already satisfied /
+    /// invalid. Default <c>1</c>. Set to <c>0</c> to disable escalation entirely
+    /// (an empty non-infra rework parks straight away). Hot-reloaded with the
+    /// rest of <c>PipelineTuning</c>.
+    /// </summary>
+    public int EmptyReworkEscalationRetries { get; set; } = 1;
+
+    /// <summary>
     /// Maximum time a single auditor may run without completing or emitting
     /// an LLM stdout chunk. A value of zero disables the per-auditor idle
     /// guard. Default 5 minutes.
@@ -197,6 +210,12 @@ public sealed class PipelineTuningOptions
         if (CSharpTestPassBlameHangTimeout is { } hang && hang <= TimeSpan.Zero)
         {
             throw new ArgumentOutOfRangeException(nameof(CSharpTestPassBlameHangTimeout), "CSharpTestPassBlameHangTimeout must be positive when set");
+        }
+        if (EmptyReworkEscalationRetries < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(EmptyReworkEscalationRetries),
+                "EmptyReworkEscalationRetries must be non-negative");
         }
     }
 }

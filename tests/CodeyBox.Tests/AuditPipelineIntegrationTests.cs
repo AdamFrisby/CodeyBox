@@ -1706,15 +1706,29 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task ReworkProducesNoChanges_FailsFast()
+    public async Task ReworkProducesNoChanges_ParksForOperator()
     {
+        // Behavior change: a rework that exits cleanly with no committed
+        // changes no longer terminal-fails on the FIRST occurrence. The
+        // audit/rework loop now disambiguates the empty result — auth /
+        // quota signatures route through their own infra paths, and
+        // genuinely-empty rework parks via the operator-input flow (or
+        // escalates first when audit history shows convergence). See
+        // <see cref="EmptyReworkDisambiguationTests"/> for the full policy
+        // matrix. This test pins the simplest case: no convergence
+        // (history.Count==1 when the empty rework hits), escalation
+        // disabled → straight to park.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var auditor = new ScriptedAuditor(
         [
             new AuditOutcome(false, [new AuditFinding("Lint", AuditSeverity.Error, "fix me", "x")]),
             new AuditOutcome(true, []),
         ]);
-        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor]);
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            EmptyReworkEscalationRetries = 0,
+        });
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, auditors: [auditor], pipelineTuning: tuning);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "same-content"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "same-content"));
 
@@ -1723,8 +1737,9 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Contains("no changes", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
+        Assert.Contains("produced no changes", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Audit reached max iteration budget", final.LastError, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -687,14 +687,14 @@ public sealed class ReleaseService
         // prompt match fails the release but does not bench the agent globally —
         // override the handler's default stdout-only annotation to record that
         // distinction in the reason string.
-        var stdoutOnlyNote = detection.IsStdoutOnly
+        var evidenceTrustNote = detection.IsStdoutOnly
             ? "stdout accepted for release failure only because deep-audit stdout is model-controlled"
             : null;
         var reason = _authRequiredHandler.BuildReason(
             phase,
             detection.Classification,
             detection.IsStdoutOnly,
-            stdoutOnlyNote,
+            evidenceTrustNote,
             release);
 
         if (!detection.IsStdoutOnly)

@@ -2481,6 +2481,7 @@ public sealed class AgentConfigHotReloadTests
                 AgentSuspendMaxRetries = 1,
                 AgentSessionResumeMaxAttempts = 4,
                 AuditShortCircuitEnabled = true,
+                EmptyReworkEscalationRetries = 1,
                 AuditorIdleTimeout = TimeSpan.FromMinutes(5),
                 BlockRedundantDotnetBuildTestInAuditSandbox = true,
             },
@@ -2493,6 +2494,7 @@ public sealed class AgentConfigHotReloadTests
             AgentSuspendMaxRetries = initial.PipelineTuning.AgentSuspendMaxRetries,
             AgentSessionResumeMaxAttempts = initial.PipelineTuning.AgentSessionResumeMaxAttempts,
             AuditShortCircuitEnabled = initial.PipelineTuning.AuditShortCircuitEnabled,
+            EmptyReworkEscalationRetries = initial.PipelineTuning.EmptyReworkEscalationRetries,
             AuditorIdleTimeout = initial.PipelineTuning.AuditorIdleTimeout,
             BlockRedundantDotnetBuildTestInAuditSandbox = initial.PipelineTuning.BlockRedundantDotnetBuildTestInAuditSandbox,
         });
@@ -2524,6 +2526,7 @@ public sealed class AgentConfigHotReloadTests
             Assert.Equal(1, snapshot.Current.AgentSuspendMaxRetries);
             Assert.Equal(4, snapshot.Current.AgentSessionResumeMaxAttempts);
             Assert.True(snapshot.Current.AuditShortCircuitEnabled);
+            Assert.Equal(1, snapshot.Current.EmptyReworkEscalationRetries);
             Assert.Equal(TimeSpan.FromMinutes(5), snapshot.Current.AuditorIdleTimeout);
             Assert.True(snapshot.Current.BlockRedundantDotnetBuildTestInAuditSandbox);
 
@@ -2541,6 +2544,7 @@ public sealed class AgentConfigHotReloadTests
                     AgentSuspendMaxRetries = 3,
                     AgentSessionResumeMaxAttempts = 6,
                     AuditShortCircuitEnabled = false,
+                    EmptyReworkEscalationRetries = 3,
                     AuditorIdleTimeout = TimeSpan.Zero,
                     BlockRedundantDotnetBuildTestInAuditSandbox = false,
                 },
@@ -2549,6 +2553,7 @@ public sealed class AgentConfigHotReloadTests
             Assert.Equal(3, snapshot.Current.AgentSuspendMaxRetries);
             Assert.Equal(6, snapshot.Current.AgentSessionResumeMaxAttempts);
             Assert.False(snapshot.Current.AuditShortCircuitEnabled);
+            Assert.Equal(3, snapshot.Current.EmptyReworkEscalationRetries);
             Assert.Equal(TimeSpan.Zero, snapshot.Current.AuditorIdleTimeout);
             Assert.False(snapshot.Current.BlockRedundantDotnetBuildTestInAuditSandbox);
             Assert.Equal(3, AgentSuspendResilience.MaxRetries);
@@ -2756,6 +2761,93 @@ public sealed class AgentConfigHotReloadTests
             Assert.Equal(6, snapshot.Current.AgentSessionResumeMaxAttempts);
             Assert.Equal(1, AgentSuspendResilience.MaxRetries);
             Assert.Equal(6, SessionResumeOptions.MaxResumeAttempts);
+
+            await coordinator.StopAsync(CancellationToken.None);
+            coordinator = null;
+        }
+        finally
+        {
+            if (coordinator is not null)
+                await coordinator.StopAsync(CancellationToken.None);
+            AgentSuspendResilience.SetMaxRetries(originalMaxRetries);
+            SessionResumeOptions.SetMaxResumeAttempts(originalMaxResumeAttempts);
+        }
+    }
+
+    [Fact]
+    public async Task Coordinator_OnChange_PipelineTuningDetectsOnlyEmptyReworkEscalationRetriesChange()
+    {
+        var initialTuning = new PipelineTuningOptions
+        {
+            DefaultQuotaFailurePause = TimeSpan.FromMinutes(5),
+            QuotaExhaustionFallbackTtl = TimeSpan.FromHours(1),
+            MaxParsedQuotaResetWindow = TimeSpan.FromHours(24),
+            MergeSandboxStagingRestoreAttempts = 2,
+            MaxQuestionsPerWorkItem = 10,
+            AgentSuspendMaxRetries = 1,
+            AgentSessionResumeMaxAttempts = 4,
+            AutoMergeRaceRecoveryMaxAttempts = 3,
+            AuditShortCircuitEnabled = true,
+            EmptyReworkEscalationRetries = 1,
+        };
+        var initial = new CodeyBoxOptions { PipelineTuning = initialTuning };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var snapshot = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            DefaultQuotaFailurePause = initialTuning.DefaultQuotaFailurePause,
+            QuotaExhaustionFallbackTtl = initialTuning.QuotaExhaustionFallbackTtl,
+            MaxParsedQuotaResetWindow = initialTuning.MaxParsedQuotaResetWindow,
+            MergeSandboxStagingRestoreAttempts = initialTuning.MergeSandboxStagingRestoreAttempts,
+            MaxQuestionsPerWorkItem = initialTuning.MaxQuestionsPerWorkItem,
+            AgentSuspendMaxRetries = initialTuning.AgentSuspendMaxRetries,
+            AgentSessionResumeMaxAttempts = initialTuning.AgentSessionResumeMaxAttempts,
+            AutoMergeRaceRecoveryMaxAttempts = initialTuning.AutoMergeRaceRecoveryMaxAttempts,
+            AuditShortCircuitEnabled = initialTuning.AuditShortCircuitEnabled,
+            EmptyReworkEscalationRetries = initialTuning.EmptyReworkEscalationRetries,
+        });
+
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var originalMaxRetries = AgentSuspendResilience.MaxRetries;
+        var originalMaxResumeAttempts = SessionResumeOptions.MaxResumeAttempts;
+        AgentConfigHotReload? coordinator = null;
+
+        try
+        {
+            coordinator = new AgentConfigHotReload(
+                monitor, orchFixture.Orchestrator, router, burnEstimator,
+                NullLogger<AgentConfigHotReload>.Instance,
+                pipelineTuning: snapshot);
+            await coordinator.StartAsync(CancellationToken.None);
+
+            monitor.Fire(new CodeyBoxOptions
+            {
+                PipelineTuning = new PipelineTuningOptions
+                {
+                    DefaultQuotaFailurePause = initialTuning.DefaultQuotaFailurePause,
+                    QuotaExhaustionFallbackTtl = initialTuning.QuotaExhaustionFallbackTtl,
+                    MaxParsedQuotaResetWindow = initialTuning.MaxParsedQuotaResetWindow,
+                    MergeSandboxStagingRestoreAttempts = initialTuning.MergeSandboxStagingRestoreAttempts,
+                    MaxQuestionsPerWorkItem = initialTuning.MaxQuestionsPerWorkItem,
+                    AgentSuspendMaxRetries = initialTuning.AgentSuspendMaxRetries,
+                    AgentSessionResumeMaxAttempts = initialTuning.AgentSessionResumeMaxAttempts,
+                    AutoMergeRaceRecoveryMaxAttempts = initialTuning.AutoMergeRaceRecoveryMaxAttempts,
+                    AuditShortCircuitEnabled = initialTuning.AuditShortCircuitEnabled,
+                    EmptyReworkEscalationRetries = 4,
+                },
+            });
+
+            Assert.Equal(4, snapshot.Current.EmptyReworkEscalationRetries);
+            Assert.Equal(10, snapshot.Current.MaxQuestionsPerWorkItem);
+            Assert.Equal(4, snapshot.Current.AgentSessionResumeMaxAttempts);
 
             await coordinator.StopAsync(CancellationToken.None);
             coordinator = null;

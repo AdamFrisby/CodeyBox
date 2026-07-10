@@ -24,6 +24,14 @@ public static class CodeyBoxMeters
         AuditMeter.CreateCounter<long>("codeybox.audit.iterations");
 
     /// <summary>
+    /// Incremented for empty-rework handling sub-events. Tag:
+    /// <c>outcome</c> (<c>detected</c> | <c>escalation_succeeded</c> |
+    /// <c>parked</c> | <c>failed</c>).
+    /// </summary>
+    public static readonly Counter<long> ReworkEmptyEvents =
+        AuditMeter.CreateCounter<long>("codeybox.audit.rework_empty.events", unit: "{event}");
+
+    /// <summary>
     /// One increment per pre-emptive self-review turn outcome on a session-
     /// mode work item. Tag: <c>outcome</c> (<c>committed_changes</c> |
     /// <c>no_changes</c> | <c>failed</c> | <c>skipped_empty_guidance</c>).
@@ -105,7 +113,8 @@ public static class CodeyBoxMeters
     /// One increment per agent fallback event (the routed member was swapped for
     /// another, or the class was fully exhausted). Tags: <c>from_agent</c>,
     /// <c>to_agent</c> (<c>(none)</c> when the class exhausted), <c>kind</c>
-    /// (<c>quota</c> | <c>timeout</c>), <c>phase</c>.
+    /// (<c>quota</c> | <c>auth</c> | <c>timeout</c> |
+    /// <c>resume_exhausted</c>), <c>phase</c>.
     /// </summary>
     public static readonly Counter<long> AgentFallbacks =
         PipelineMeter.CreateCounter<long>("codeybox.agent.fallbacks", unit: "{fallback}");

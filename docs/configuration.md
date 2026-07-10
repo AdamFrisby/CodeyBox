@@ -208,6 +208,7 @@ Hot-reloadable retry and recovery bounds used by pipeline execution.
 "PipelineTuning": {
   "AgentSuspendMaxRetries": 1,
   "AgentSessionResumeMaxAttempts": 2,
+  "EmptyReworkEscalationRetries": 1,
   "BlockRedundantDotnetBuildTestInAuditSandbox": true
 }
 ```
@@ -216,6 +217,7 @@ Hot-reloadable retry and recovery bounds used by pipeline execution.
 |-----|---------|-------------|
 | `AgentSuspendMaxRetries` | `1` | Legacy same-command retry count for unknown failures with suspend-related exit codes. Classified transient-network failures use the durable scheduler instead. |
 | `AgentSessionResumeMaxAttempts` | `2` | CLI-native same-session resume attempts after a transient non-zero agent crash with a captured session id and a live sandbox including `/repo`. Set to `0` to disable session resume. |
+| `EmptyReworkEscalationRetries` | `1` | Extra rework dispatches after a genuine no-diff audit rework when audit history shows convergence. Set to `0` to park immediately for operator review. |
 | `BlockRedundantDotnetBuildTestInAuditSandbox` | `true` | Prepends an audit-sandbox-only `dotnet` shim that immediately succeeds `dotnet build` and `dotnet test` with a notice because the deterministic build/test gate already ran. Other `dotnet` subcommands pass through unchanged; work, merge, and conflict-resolution sandboxes are unaffected. |
 | `CSharpTestPassAuditorIdleTimeout` | unset | Test-runner-specific idle guard for the `csharp:test-pass` (dotnet test) auditor, applied in place of `AuditorIdleTimeout`. Sourced through `DotnetTestAuditor` (an `ITestRunnerAuditor`). Unset means the generic `AuditorIdleTimeout` applies. |
 | `CSharpTestPassBlameHangTimeout` | unset | Per-test hang-dump timeout injected into the `csharp:test-pass` command as `--blame-hang --blame-hang-timeout`. Unset omits blame-hang, keeping the command byte-identical to the legacy path. |
