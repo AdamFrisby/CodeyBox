@@ -302,13 +302,14 @@ public interface IWorkItemStore
 
     /// <summary>
     /// Returns at most <paramref name="limit"/> terminal rows eligible for the
-    /// agent-restore retry sweep. Implementations should push the state,
-    /// outage window, <see cref="AgentRestoreRetryCandidatePolicy"/>, ordering,
-    /// and limit into the backing store so a restore event cannot buffer all
-    /// historical failures or consume the sweep cap with unrelated agents'
-    /// failures.
+    /// agent-restore retry sweep. Implementations must push the state, outage
+    /// window, <see cref="AgentRestoreRetryCandidatePolicy"/>, latest failed
+    /// involvement attribution, ordering, and limit into the backing store so a
+    /// restore event cannot buffer all historical failures, consume the sweep
+    /// cap with unrelated agents' failures, or reject infrastructure failures
+    /// before the scheduler can apply the same involvement-aware policy.
     /// </summary>
-    async IAsyncEnumerable<WorkItem> ListRestoreRetryCandidatesAsync(
+    IAsyncEnumerable<WorkItem> ListRestoreRetryCandidatesAsync(
         AgentKind restoredAgent,
         DateTimeOffset windowStart,
         DateTimeOffset windowEnd,
@@ -317,36 +318,9 @@ public interface IWorkItemStore
         int limit,
         DateTimeOffset? afterUpdatedAt = null,
         WorkItemId? afterId = null,
-        [EnumeratorCancellation] CancellationToken ct = default)
-    {
-        if (limit <= 0)
-            yield break;
-
-        var yielded = 0;
-        foreach (var state in new[] { WorkItemState.Failed, WorkItemState.MergeConflictResolutionFailed })
-        {
-            await foreach (var item in ListByStateAsync(state, ct).ConfigureAwait(false))
-            {
-                if (yielded >= limit)
-                    yield break;
-                if (item.UpdatedAt < windowStart || item.UpdatedAt > windowEnd)
-                    continue;
-                if (afterUpdatedAt is { } cursorUpdatedAt
-                    && (item.UpdatedAt < cursorUpdatedAt
-                        || item.UpdatedAt == cursorUpdatedAt
-                        && afterId is { } cursorId
-                        && item.Id.Value.CompareTo(cursorId.Value) <= 0))
-                {
-                    continue;
-                }
-                if (!AgentRestoreRetryCandidatePolicy.IsEligible(item, restoredAgent, latestFailedInvolvementAgent: null))
-                    continue;
-
-                yielded++;
-                yield return item;
-            }
-        }
-    }
+        CancellationToken ct = default)
+        => throw new NotSupportedException(
+            "This work item store must implement involvement-aware agent-restore retry candidate listing.");
 
     /// <summary>
     /// Returns true when an agent-restore retry was already claimed for the
@@ -457,7 +431,7 @@ public interface IWorkItemStore
         DateTimeOffset now,
         int limit,
         QuotaRetryDispatchEligibility quotaRetryEligibility = QuotaRetryDispatchEligibility.DueOnly,
-        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<(WorkItem Item, WorkItemState OrderingState, int Sequence)>();
         var sequence = 0;

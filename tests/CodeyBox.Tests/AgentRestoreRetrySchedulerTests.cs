@@ -66,6 +66,27 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     }
 
     [Fact]
+    public async Task RestoreRetryCandidateListing_DefaultStoreFailsClosedWithoutInvolvementQuery()
+    {
+        IWorkItemStore store = new StubWorkItemStore();
+
+        var ex = await Assert.ThrowsAsync<NotSupportedException>(async () =>
+        {
+            await foreach (var _ in store.ListRestoreRetryCandidatesAsync(
+                AgentKind.Claude,
+                DateTimeOffset.UtcNow.AddMinutes(-10),
+                DateTimeOffset.UtcNow,
+                TimeSpan.FromMinutes(5),
+                TimeSpan.FromSeconds(30),
+                limit: 10))
+            {
+            }
+        });
+
+        Assert.Contains("involvement-aware", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Sweep_SkipsGenuineWorkFailures_OnlyInfraShapedAreRequeued()
     {
         using var store = new SqliteWorkItemStore(_dbPath);
