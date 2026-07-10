@@ -277,16 +277,56 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
 
     public async Task KillActiveExecsAsync(CancellationToken ct = default)
     {
-        // Best-effort: cancel every in-flight exec's linked token. The
-        // OpenSSH child observing cancellation will tear down the SSH
-        // session, which kills the remote command.
+        // Best-effort: cancel every in-flight exec's linked token. The SSH
+        // child observing cancellation tears down the current remote command.
         foreach (var (cts, _) in _activeExecCts)
         {
             try { cts.Cancel(); } catch { }
         }
-        _ = ct;
-        await Task.CompletedTask.ConfigureAwait(false);
+
+        var opts = _opts();
+        var kill = await _runRemoteMaybeGated(
+            [
+                opts.RemoteMultipassPath,
+                "exec",
+                Id,
+                "--",
+                "bash",
+                "-lc",
+                KillSameUserProcessesScript,
+            ],
+            ct).ConfigureAwait(false);
+        if (kill.ExitCode != 0)
+        {
+            _log.LogWarning(
+                "Best-effort process cleanup for remote multipass sandbox {Name} returned exit {ExitCode}: {Stderr}",
+                Id,
+                kill.ExitCode,
+                kill.Stderr);
+        }
     }
+
+    private const string KillSameUserProcessesScript =
+        """
+        set -eu
+        self=$$
+        parent=$PPID
+        uid=$(id -u)
+        list_pids() {
+          ps -eo pid=,ppid=,uid= |
+            awk -v uid="$uid" -v self="$self" -v parent="$parent" \
+              '$3 == uid && $1 != self && $1 != parent { print $1 }'
+        }
+        pids=$(list_pids || true)
+        if [ -n "$pids" ]; then
+          kill -TERM $pids 2>/dev/null || true
+          sleep 1
+          pids=$(list_pids || true)
+          if [ -n "$pids" ]; then
+            kill -KILL $pids 2>/dev/null || true
+          fi
+        fi
+        """;
 
     public bool IsOwnedByShutdownHandler { get; private set; }
     public void MarkOwnedByShutdownHandler() => IsOwnedByShutdownHandler = true;

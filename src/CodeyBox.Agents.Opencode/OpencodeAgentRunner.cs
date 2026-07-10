@@ -67,7 +67,7 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
     /// </summary>
     public string? DefaultModelId => _defaults?.GetDefault(Kind.Value);
 
-    protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".local/share/opencode", ".config/opencode"];
+    protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".local/share/opencode/session", ".local/share/opencode/sessions", ".config/opencode"];
 
     protected override IReadOnlyList<EnvBackedCredentialFile> EnvBackedCredentialFiles => [AuthCredentialFile];
 

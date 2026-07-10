@@ -4,6 +4,8 @@ using System.Text.Json;
 using CodeyBox.Agents.Codex;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
+using CodeyBox.Sandbox.Process;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
@@ -158,34 +160,46 @@ public sealed class CodexAgentRunnerTests
     }
 
     [Fact]
-    public async Task PrepareSandboxScript_PreservesExistingSandboxAuthJson()
+    public async Task RunAsync_ProcessSandbox_PreservesExistingSandboxAuthJson()
     {
-        // The materialisation script must short-circuit when auth.json is
-        // already non-empty inside the sandbox. That preserves restored
-        // sandbox home state while still avoiding host credential mounts.
-        var sandbox = new RecordingSandbox();
-        var runner = new CodexAgentRunner();
+        const string preserved = """{"token":"preserved"}""";
+        const string replacement = """{"token":"replacement"}""";
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Environment = new Dictionary<string, string>
+            {
+                ["CODEX_AUTH_JSON"] = replacement,
+            },
+        });
+        var seed = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh",
+                "-c",
+                "mkdir -p \"$HOME/.codex\" && printf '%s' \"$1\" > \"$HOME/.codex/auth.json\"",
+                "seed-codex-auth",
+                preserved,
+            ],
+        });
+        Assert.True(seed.Success, seed.Stderr);
+        var runner = new CodexAgentRunner { Binary = "/bin/true" };
 
-        // RunResumedAsync drives PrepareSandboxAsync as a side effect.
-        _ = await runner.RunResumedAsync(
+        var result = await runner.RunAsync(
             sandbox,
             "/work",
             "p",
-            credential: null,
-            new AgentResumeContext("refs/heads/codeybox/preempt/wi"));
+            credential: null);
 
-        var prepExec = sandbox.Execs.FirstOrDefault(e =>
-            e.Argv.Count >= 3
-            && e.Argv[0] == "bash"
-            && e.Argv[2].Contains("CODEX_AUTH_JSON", StringComparison.Ordinal));
-        Assert.NotNull(prepExec);
-        var script = prepExec!.Argv[2];
-
-        Assert.Contains(".codex/auth.json", script, StringComparison.Ordinal);
-        Assert.Contains("CODEX_AUTH_JSON", script, StringComparison.Ordinal);
-        Assert.Contains("credential destination file is a symlink", script, StringComparison.Ordinal);
-        Assert.Contains("existing_destination_is_nonempty_regular", script, StringComparison.Ordinal);
-        Assert.Contains("return st.st_size > 0", script, StringComparison.Ordinal);
+        Assert.True(result.Success, result.Stderr);
+        var read = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat \"$HOME/.codex/auth.json\""],
+        });
+        Assert.True(read.Success, read.Stderr);
+        Assert.Equal(preserved, read.Stdout.TrimEnd('\r', '\n'));
     }
 
     // ── Default model from config ─────────────────────────────────────────────

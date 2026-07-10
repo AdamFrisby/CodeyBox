@@ -3581,13 +3581,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
             var access = _gitHost.GetSandboxAccess(repoId);
             // Pre-resolve the exact resolver candidate set before sandbox
-            // creation. Candidate environment credentials are deliberately
-            // absent from SandboxSpec: AgenticConflictResolver gives only the
-            // active candidate's allowlisted direct variables to its CLI and
-            // stages file payloads via stdin. Non-secret credential adjunct
-            // mounts must still be present at creation time, so the typed plan
-            // below unions only compatible mounts and requests an ephemeral
-            // credential tmpfs whenever the resolver has a credential scope.
+            // creation. Candidate environment credentials are scoped to this
+            // resolver sandbox at creation time; they are not copied into
+            // per-exec environment. Non-secret credential adjunct mounts must
+            // also be present at creation time, so the typed plan below unions
+            // only compatible mounts and requests an ephemeral credential tmpfs
+            // whenever the resolver has a credential scope.
             //
             // Candidate/routing or mount-plan failures are captured and raised
             // only if a conflict actually needs the resolver. A clean rebase
@@ -3623,7 +3622,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 hostNetworkProfile: rebaseProfile,
                 timingWorkItemId: item.Id,
                 timingPhase: timingPhase,
-                extraEnvironment: null,
+                extraEnvironment: credentialPlan.Environment,
                 additionalCredentialMounts: credentialPlan.Mounts,
                 includeCredentialsTmpfs: credentialPlan.RequiresCredentialsTmpfs,
                 agentCredentialScope: true,
@@ -4004,9 +4003,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
     private sealed record PickupRebaseCredentialPlan(
         IReadOnlyList<SandboxMount> Mounts,
+        IReadOnlyDictionary<string, string> Environment,
         bool RequiresCredentialsTmpfs)
     {
-        public static PickupRebaseCredentialPlan Empty { get; } = new([], false);
+        public static PickupRebaseCredentialPlan Empty { get; } =
+            new([], new Dictionary<string, string>(StringComparer.Ordinal), false);
     }
 
     private static PickupRebaseCredentialPlan BuildPickupRebaseCredentialPlan(
@@ -4014,6 +4015,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         SandboxRepositoryAccess repositoryAccess)
     {
         var mountsByDestination = new Dictionary<string, SandboxMount>(StringComparer.Ordinal);
+        var environment = new Dictionary<string, string>(StringComparer.Ordinal);
         var reservedDestinations = repositoryAccess.Mounts
             .Select(static mount => mount.SandboxPath)
             .Append(SandboxConventions.WorkDir)
@@ -4030,8 +4032,27 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     candidate.Runner.Kind,
                     $"credential belongs to agent '{credential.Agent.Value}'");
             }
+            ValidateResolverCandidateCredentialEnvironment(candidate);
 
             requiresCredentialsTmpfs = true;
+            foreach (var (name, value) in credential.EnvironmentVariables)
+            {
+                SandboxEnvironmentVariablePolicy.ValidateCredentialEnvironmentVariable(
+                    name,
+                    nameof(credential.EnvironmentVariables));
+                if (value.Contains('\0'))
+                    throw new ArgumentException("Resolver candidate credential environment contains a NUL byte.");
+                if (value.Length > SandboxConventions.CredentialsTmpfsBytes)
+                    throw new ArgumentException("Resolver candidate credential environment exceeds the size limit.");
+                if (environment.TryGetValue(name, out var existing)
+                    && !string.Equals(existing, value, StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        "Resolver candidate credentials declare conflicting values for the same sandbox environment variable.");
+                }
+                environment[name] = value;
+            }
+
             foreach (var mount in credential.Mounts)
             {
                 if (!mount.SandboxPath.StartsWith("/", StringComparison.Ordinal)
@@ -4061,7 +4082,31 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         return new PickupRebaseCredentialPlan(
             mountsByDestination.Values.ToArray(),
+            environment,
             requiresCredentialsTmpfs);
+    }
+
+    private static void ValidateResolverCandidateCredentialEnvironment(
+        AgenticConflictResolverCandidate candidate)
+    {
+        if (candidate.Credential?.EnvironmentVariables is not { Count: > 0 } env)
+            return;
+        if (candidate.Runner is not IAgentCredentialEnvironmentPolicy policy)
+        {
+            throw new InvalidOperationException(
+                $"Resolver candidate '{candidate.Runner.Kind.Value}' has environment credentials but does not declare a credential environment policy.");
+        }
+
+        foreach (var name in env.Keys)
+        {
+            if (policy.DirectCredentialEnvironmentVariables.Contains(name)
+                || policy.FileBackedCredentialEnvironmentVariables.Contains(name))
+            {
+                continue;
+            }
+            throw new InvalidOperationException(
+                $"Resolver candidate '{candidate.Runner.Kind.Value}' credential environment variable '{name}' is not supported by the runner.");
+        }
     }
 
     private async Task<PickupRebaseResolutionResult> RebaseCheckedOutBranchWithScopeFenceAsync(

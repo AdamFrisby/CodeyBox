@@ -99,7 +99,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
 
         var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
         AssertCredentialTmpfsAndOpenNetwork(pickupSpec, "pickup-rebase");
-        Assert.False(pickupSpec.Environment.ContainsKey(MarkerEnvKey));
+        Assert.Equal(MarkerEnvValue, pickupSpec.Environment[MarkerEnvKey]);
     }
 
     [Fact]
@@ -165,7 +165,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task PickupRebaseResolver_CreationEnvironmentExcludesCandidateCredentials()
+    public async Task PickupRebaseResolver_CreationEnvironmentIncludesOnlyCandidateCredentials()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var recorder = new RecordingSandboxProvider(
@@ -195,8 +195,8 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         Assert.DoesNotContain(AgentKind.Opencode, credentials.RequestedAgents);
 
         var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
-        Assert.False(pickupSpec.Environment.ContainsKey(CodexApiKeyEnvKey));
-        Assert.False(pickupSpec.Environment.ContainsKey(CursorAuthEnvKey));
+        Assert.Equal(CodexApiKeyValue, pickupSpec.Environment[CodexApiKeyEnvKey]);
+        Assert.Equal(CursorAuthJson, pickupSpec.Environment[CursorAuthEnvKey]);
         Assert.False(pickupSpec.Environment.ContainsKey(NonCandidateEnvKey),
             "non-candidate opencode credential must not enter the resolver sandbox");
         Assert.Equal(
@@ -315,11 +315,11 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
 
         Assert.Equal(WorkItemState.Done, run.Final.State);
         var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
-        Assert.False(pickupSpec.Environment.ContainsKey(ClaudeApiKeyEnvKey));
+        Assert.Equal(ClaudeApiKeyValue, pickupSpec.Environment[ClaudeApiKeyEnvKey]);
     }
 
     [Fact]
-    public async Task PickupRebaseResolver_ApiKeyOnlyCandidate_ReceivesDirectEnvironmentWhenInvoked()
+    public async Task PickupRebaseResolver_ApiKeyOnlyCandidate_ReceivesSandboxEnvironment()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var primary = new DirectEnvironmentAssertingResolverAgent();

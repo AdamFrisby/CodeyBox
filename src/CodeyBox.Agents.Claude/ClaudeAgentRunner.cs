@@ -143,30 +143,12 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     protected override string PreemptProcessPattern => Binary;
 
     /// <summary>
-    /// Materialises the host's <c>~/.claude/.credentials.json</c> inside the
-    /// sandbox if the env-var bundle is present (set by
-    /// <c>ClaudeOAuthFileCredentialProvider</c>). The bundle is sanitised — it
-    /// carries the access_token (plus the expires_at hint when available) but
-    /// <em>omits</em> the refresh_token, so the in-VM <c>claude</c> CLI cannot
-    /// initiate its own refresh. This is deliberate: Anthropic's refresh tokens
-    /// are single-use, and the host CLI is the sole party allowed to refresh
-    /// (see <c>ClaudeOAuthFileCredentialProvider</c>'s class summary for the
-    /// race rationale). An in-VM iteration that outlives the access_token's
-    /// expiry surfaces as a 401, which is treated as transient/auth (not a
-    /// quota event) and audit-logged via
-    /// <c>AuditLog.ClaudeUnauthorizedObserved</c>; the next iteration picks up
-    /// the host's currently-fresh token. The legacy
-    /// <c>CLAUDE_CODE_OAUTH_TOKEN</c> env var remains the primary auth path;
-    /// this hook is purely additive.
-    ///
-    /// <para>
     /// When a <paramref name="resume"/> context is supplied (preempt-recovery
     /// path), this method also sanitises the restored session JSONL transcripts
     /// under <c>~/.claude/projects/**/*.jsonl</c> so a replayed conversation
     /// cannot 400 with "thinking blocks cannot be modified"
     /// (anthropics/claude-code #63335). Gated by
     /// <see cref="ClaudeThinkingBlockSanitizerConfig.Enabled"/>.
-    /// </para>
     /// </summary>
     protected override async Task<AgentResult?> PrepareAgentSandboxAsync(
         ISandbox sandbox,
@@ -568,8 +550,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         {
             Argv = invocation.Argv,
             WorkingDirectory = workingDirectory,
-            ExtraEnvironment = BuildExecEnvironment(invocation.ExtraEnvironment, credential),
-            EnvironmentContainsSecrets = HasDirectCredentialEnvironment(credential),
+            ExtraEnvironment = BuildExecEnvironment(invocation.ExtraEnvironment),
             Stdin = invocation.Stdin,
             StdoutChunkCallback = stdoutChunkCallback,
             AgentOutputTransport = SelectBatchAgentOutputTransport(sandbox),

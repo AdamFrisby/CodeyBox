@@ -8,7 +8,9 @@ namespace CodeyBox.Agents;
 /// <summary>
 /// Shared scaffolding for agent runners that drive a one-shot CLI binary
 /// inside the sandbox. Subclasses describe how to invoke their CLI; this base
-/// handles credential staging and result wrapping uniformly.
+/// handles credential staging and result wrapping uniformly. Subclasses that
+/// override <see cref="RunAsync"/> or <see cref="RunResumedAsync"/> must call
+/// <see cref="PrepareSandboxForRunAsync"/> before invoking their CLI.
 /// </summary>
 public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAgentRunner, IAgentCredentialEnvironmentPolicy
 {
@@ -91,8 +93,8 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 
     /// <summary>
     /// Credential environment variables the CLI reads directly from its
-    /// process environment. The shared exec path uses this exact list as the
-    /// allowlist at the process-environment sink.
+    /// sandbox environment. The shared exec path deliberately does not copy
+    /// these values into per-exec environment.
     /// </summary>
     protected virtual IReadOnlyList<string> DirectCredentialEnvironmentVariables => [];
 
@@ -158,9 +160,9 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     /// <summary>
     /// Gives subclasses a chance to prepare agent-specific, non-credential
     /// prerequisites immediately before credential staging and CLI invocation.
-    /// Returning a result short-circuits the run with that failure. Credential
-    /// staging itself is a non-overridable lifecycle step so subclasses cannot
-    /// accidentally bypass fresh-run or resume preservation semantics.
+    /// Returning a result short-circuits the run with that failure. Overrides
+    /// of the public run methods must still call <see cref="PrepareSandboxForRunAsync"/>
+    /// so credential staging and resume preservation semantics remain intact.
     /// </summary>
     protected virtual Task<AgentResult?> PrepareAgentSandboxAsync(
         ISandbox sandbox,
@@ -298,9 +300,8 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         bool captureStructuredStream = false)
     {
         // File-backed credential payloads are materialised below via stdin.
-        // Only allowlisted direct CLI env credentials are added to the
-        // per-exec environment, and that exec is marked secret-bearing so
-        // providers use their protected environment transport.
+        // Direct CLI env credentials are provisioned with the sandbox, not
+        // copied into per-exec environment.
         if (RejectUnsupportedFileBackedCredentials(sandbox, credential) is { } unsupported)
             return unsupported;
 
@@ -709,8 +710,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         {
             Argv = invocation.Argv,
             WorkingDirectory = workingDirectory,
-            ExtraEnvironment = BuildExecEnvironment(invocation.ExtraEnvironment, credential, runId),
-            EnvironmentContainsSecrets = HasDirectCredentialEnvironment(credential),
+            ExtraEnvironment = BuildExecEnvironment(invocation.ExtraEnvironment, runId),
             Stdin = invocation.Stdin,
             StdoutChunkCallback = stdoutChunkCallback,
             StderrChunkCallback = stderrChunkCallback,
@@ -1475,23 +1475,11 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 
     protected IReadOnlyDictionary<string, string>? BuildExecEnvironment(
         IReadOnlyDictionary<string, string>? environment,
-        AgentCredential? credential,
         string? runId = null)
     {
         var merged = environment is null
             ? new Dictionary<string, string>(StringComparer.Ordinal)
             : new Dictionary<string, string>(environment, StringComparer.Ordinal);
-
-        foreach (var (name, value) in GetDirectCredentialEnvironment(credential))
-        {
-            if (merged.TryGetValue(name, out var existing)
-                && !string.Equals(existing, value, StringComparison.Ordinal))
-            {
-                throw new InvalidOperationException(
-                    $"Invocation environment conflicts with direct credential variable '{name}'.");
-            }
-            merged[name] = value;
-        }
 
         if (runId is not null)
             merged[AgentRunIdEnvironmentVariable] = runId;
@@ -1504,37 +1492,6 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         if (!string.IsNullOrEmpty(logPath))
             merged[SandboxConventions.AgentLogFileEnv] = logPath;
         return merged.Count == 0 ? null : merged;
-    }
-
-    protected bool HasDirectCredentialEnvironment(AgentCredential? credential)
-        => GetDirectCredentialEnvironment(credential).Any();
-
-    private IEnumerable<KeyValuePair<string, string>> GetDirectCredentialEnvironment(AgentCredential? credential)
-    {
-        if (credential is null || DirectCredentialEnvironmentVariables.Count == 0)
-            yield break;
-
-        foreach (var name in DirectCredentialEnvironmentVariables)
-        {
-            SandboxEnvironmentVariablePolicy.ValidateCredentialEnvironmentVariable(
-                name,
-                nameof(DirectCredentialEnvironmentVariables));
-            if (!credential.EnvironmentVariables.TryGetValue(name, out var value)
-                || string.IsNullOrEmpty(value))
-            {
-                continue;
-            }
-            if (value.Contains('\0'))
-                throw new ArgumentException(
-                    $"Credential environment variable '{name}' contains a NUL byte.",
-                    nameof(credential));
-            if (value.Length > SandboxConventions.CredentialsTmpfsBytes)
-                throw new ArgumentException(
-                    $"Credential environment variable '{name}' exceeds the size limit.",
-                    nameof(credential));
-
-            yield return new KeyValuePair<string, string>(name, value);
-        }
     }
 
     private static void RemoveActiveAgentRunId(string runKey, string runId)

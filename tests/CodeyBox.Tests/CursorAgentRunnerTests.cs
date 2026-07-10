@@ -216,28 +216,42 @@ public sealed class CursorAgentRunnerTests
     }
 
     [Fact]
-    public async Task PrepareSandboxScript_PreservesExistingSandboxCredentialsJson()
+    public async Task RunAsync_ProcessSandbox_PreservesExistingSandboxAuthJson()
     {
-        // The materialisation script must short-circuit when credentials.json
-        // is already non-empty inside the sandbox (restored from a checkpoint
-        // scratchpad). Mirrors the Codex pattern.
-        var sandbox = new RecordingSandbox();
-        var runner = new CursorAgentRunner();
+        const string preserved = """{"token":"preserved"}""";
+        const string replacement = """{"token":"replacement"}""";
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Environment = new Dictionary<string, string>
+            {
+                ["CODEYBOX_CURSOR_AUTH_JSON"] = replacement,
+            },
+        });
+        var seed = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh",
+                "-c",
+                "mkdir -p \"$HOME/.config/cursor\" && printf '%s' \"$1\" > \"$HOME/.config/cursor/auth.json\"",
+                "seed-cursor-auth",
+                preserved,
+            ],
+        });
+        Assert.True(seed.Success, seed.Stderr);
+        var runner = new CursorAgentRunner { Binary = "/bin/true" };
 
-        _ = await runner.RunAsync(sandbox, "/work", "p", credential: null);
+        var result = await runner.RunAsync(sandbox, "/work", "p", credential: null);
 
-        var prepExec = sandbox.Execs.FirstOrDefault(e =>
-            e.Argv.Count >= 3
-            && e.Argv[0] == "bash"
-            && e.Argv[2].Contains("CODEYBOX_CURSOR_AUTH_JSON", StringComparison.Ordinal));
-        Assert.NotNull(prepExec);
-        var script = prepExec!.Argv[2];
-
-        Assert.Contains(".config/cursor/auth.json", script, StringComparison.Ordinal);
-        Assert.Contains("CODEYBOX_CURSOR_AUTH_JSON", script, StringComparison.Ordinal);
-        Assert.Contains("credential destination file is a symlink", script, StringComparison.Ordinal);
-        Assert.Contains("existing_destination_is_nonempty_regular", script, StringComparison.Ordinal);
-        Assert.Contains("return st.st_size > 0", script, StringComparison.Ordinal);
+        Assert.True(result.Success, result.Stderr);
+        var read = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat \"$HOME/.config/cursor/auth.json\""],
+        });
+        Assert.True(read.Success, read.Stderr);
+        Assert.Equal(preserved, read.Stdout.TrimEnd('\r', '\n'));
     }
 
     // ── Resume path ───────────────────────────────────────────────────────────

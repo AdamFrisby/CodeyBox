@@ -24,7 +24,7 @@ namespace CodeyBox.Orchestrator;
 /// Every other invocation path — including the planning/plan-rework agent turn,
 /// which goes through <see cref="RunAsync"/> — is preprocessed normally.</para>
 /// </summary>
-internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModelProvider, IAgentCredentialEnvironmentPolicy
+internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModelProvider
 {
     protected readonly IAgentRunner Inner;
     protected readonly AgentPromptPreprocessorChain Chain;
@@ -64,6 +64,17 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
         var textOnly = inner is ITextOnlyAgentRunner;
         var cliSessionResumable = inner is ICliSessionResumableAgentRunner;
 
+        var credentialPolicy = inner is IAgentCredentialEnvironmentPolicy;
+
+        if (textOnly && cliSessionResumable && credentialPolicy)
+            return new CredentialPolicyTextOnlyCliSessionResumablePromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project);
+        if (textOnly && credentialPolicy)
+            return new CredentialPolicyTextOnlyPromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project);
+        if (cliSessionResumable && credentialPolicy)
+            return new CredentialPolicyCliSessionResumablePromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project);
+        if (credentialPolicy)
+            return new CredentialPolicyPromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project);
+
         if (textOnly && cliSessionResumable)
             return new TextOnlyCliSessionResumablePromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project, auditTarget);
         if (textOnly)
@@ -78,21 +89,6 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
 
     string? IAgentDefaultModelProvider.DefaultModelId =>
         (Inner as IAgentDefaultModelProvider)?.DefaultModelId;
-
-    private IAgentCredentialEnvironmentPolicy? InnerCredentialEnvironmentPolicy =>
-        Inner as IAgentCredentialEnvironmentPolicy;
-
-    IReadOnlySet<string> IAgentCredentialEnvironmentPolicy.DirectCredentialEnvironmentVariables =>
-        InnerCredentialEnvironmentPolicy?.DirectCredentialEnvironmentVariables
-        ?? new HashSet<string>(StringComparer.Ordinal);
-
-    IReadOnlySet<string> IAgentCredentialEnvironmentPolicy.FileBackedCredentialEnvironmentVariables =>
-        InnerCredentialEnvironmentPolicy?.FileBackedCredentialEnvironmentVariables
-        ?? new HashSet<string>(StringComparer.Ordinal);
-
-    IReadOnlyList<AgentCredentialFileDestination> IAgentCredentialEnvironmentPolicy.CredentialFileDestinations =>
-        InnerCredentialEnvironmentPolicy?.CredentialFileDestinations
-        ?? [];
 
     public AgentFailureClassification ClassifyFailure(AgentResult result) =>
         Inner.ClassifyFailure(result);
@@ -226,6 +222,60 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
             InnerCliSessionResumable.TryExtractSessionId(stdout);
     }
 
+    private class CredentialPolicyPromptPreprocessingAgentRunner
+        : PromptPreprocessingAgentRunner, IAgentCredentialEnvironmentPolicy
+    {
+        public CredentialPolicyPromptPreprocessingAgentRunner(
+            IAgentRunner inner,
+            AgentPromptPreprocessorChain chain,
+            WorkItemId itemId,
+            AgentPromptPhase phase,
+            int iteration,
+            Project project)
+            : base(inner, chain, itemId, phase, iteration, project)
+        {
+        }
+
+        private IAgentCredentialEnvironmentPolicy InnerCredentialEnvironmentPolicy =>
+            (IAgentCredentialEnvironmentPolicy)Inner;
+
+        public IReadOnlySet<string> DirectCredentialEnvironmentVariables =>
+            InnerCredentialEnvironmentPolicy.DirectCredentialEnvironmentVariables;
+
+        public IReadOnlySet<string> FileBackedCredentialEnvironmentVariables =>
+            InnerCredentialEnvironmentPolicy.FileBackedCredentialEnvironmentVariables;
+
+        public IReadOnlyList<AgentCredentialFileDestination> CredentialFileDestinations =>
+            InnerCredentialEnvironmentPolicy.CredentialFileDestinations;
+    }
+
+    private sealed class CredentialPolicyCliSessionResumablePromptPreprocessingAgentRunner
+        : CliSessionResumablePromptPreprocessingAgentRunner, IAgentCredentialEnvironmentPolicy
+    {
+        public CredentialPolicyCliSessionResumablePromptPreprocessingAgentRunner(
+            IAgentRunner inner,
+            AgentPromptPreprocessorChain chain,
+            WorkItemId itemId,
+            AgentPromptPhase phase,
+            int iteration,
+            Project project)
+            : base(inner, chain, itemId, phase, iteration, project)
+        {
+        }
+
+        private IAgentCredentialEnvironmentPolicy InnerCredentialEnvironmentPolicy =>
+            (IAgentCredentialEnvironmentPolicy)Inner;
+
+        public IReadOnlySet<string> DirectCredentialEnvironmentVariables =>
+            InnerCredentialEnvironmentPolicy.DirectCredentialEnvironmentVariables;
+
+        public IReadOnlySet<string> FileBackedCredentialEnvironmentVariables =>
+            InnerCredentialEnvironmentPolicy.FileBackedCredentialEnvironmentVariables;
+
+        public IReadOnlyList<AgentCredentialFileDestination> CredentialFileDestinations =>
+            InnerCredentialEnvironmentPolicy.CredentialFileDestinations;
+    }
+
     private class TextOnlyPromptPreprocessingAgentRunner
         : PromptPreprocessingAgentRunner, ITextOnlyAgentRunner
     {
@@ -280,7 +330,7 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
                 workingDirectory);
     }
 
-    private sealed class TextOnlyCliSessionResumablePromptPreprocessingAgentRunner
+    private class TextOnlyCliSessionResumablePromptPreprocessingAgentRunner
         : CliSessionResumablePromptPreprocessingAgentRunner, ITextOnlyAgentRunner
     {
         public TextOnlyCliSessionResumablePromptPreprocessingAgentRunner(
@@ -332,5 +382,59 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
                 ct,
                 sandbox,
                 workingDirectory);
+    }
+
+    private sealed class CredentialPolicyTextOnlyPromptPreprocessingAgentRunner
+        : TextOnlyPromptPreprocessingAgentRunner, IAgentCredentialEnvironmentPolicy
+    {
+        public CredentialPolicyTextOnlyPromptPreprocessingAgentRunner(
+            IAgentRunner inner,
+            AgentPromptPreprocessorChain chain,
+            WorkItemId itemId,
+            AgentPromptPhase phase,
+            int iteration,
+            Project project)
+            : base(inner, chain, itemId, phase, iteration, project)
+        {
+        }
+
+        private IAgentCredentialEnvironmentPolicy InnerCredentialEnvironmentPolicy =>
+            (IAgentCredentialEnvironmentPolicy)Inner;
+
+        public IReadOnlySet<string> DirectCredentialEnvironmentVariables =>
+            InnerCredentialEnvironmentPolicy.DirectCredentialEnvironmentVariables;
+
+        public IReadOnlySet<string> FileBackedCredentialEnvironmentVariables =>
+            InnerCredentialEnvironmentPolicy.FileBackedCredentialEnvironmentVariables;
+
+        public IReadOnlyList<AgentCredentialFileDestination> CredentialFileDestinations =>
+            InnerCredentialEnvironmentPolicy.CredentialFileDestinations;
+    }
+
+    private sealed class CredentialPolicyTextOnlyCliSessionResumablePromptPreprocessingAgentRunner
+        : TextOnlyCliSessionResumablePromptPreprocessingAgentRunner, IAgentCredentialEnvironmentPolicy
+    {
+        public CredentialPolicyTextOnlyCliSessionResumablePromptPreprocessingAgentRunner(
+            IAgentRunner inner,
+            AgentPromptPreprocessorChain chain,
+            WorkItemId itemId,
+            AgentPromptPhase phase,
+            int iteration,
+            Project project)
+            : base(inner, chain, itemId, phase, iteration, project)
+        {
+        }
+
+        private IAgentCredentialEnvironmentPolicy InnerCredentialEnvironmentPolicy =>
+            (IAgentCredentialEnvironmentPolicy)Inner;
+
+        public IReadOnlySet<string> DirectCredentialEnvironmentVariables =>
+            InnerCredentialEnvironmentPolicy.DirectCredentialEnvironmentVariables;
+
+        public IReadOnlySet<string> FileBackedCredentialEnvironmentVariables =>
+            InnerCredentialEnvironmentPolicy.FileBackedCredentialEnvironmentVariables;
+
+        public IReadOnlyList<AgentCredentialFileDestination> CredentialFileDestinations =>
+            InnerCredentialEnvironmentPolicy.CredentialFileDestinations;
     }
 }
