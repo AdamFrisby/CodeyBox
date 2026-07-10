@@ -169,6 +169,8 @@ public sealed class ProjectAuditorComposerPresetTests
         Assert.Contains("before implementation", runner.Prompt, StringComparison.Ordinal);
         Assert.DoesNotContain("this diff", runner.Prompt, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("Read the task text and the diff together", runner.Prompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("add migration support", runner.Prompt, StringComparison.Ordinal);
+        Assert.Contains("add migration support", runner.UserPrompt, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -744,6 +746,8 @@ public sealed class ProjectAuditorComposerPresetTests
     {
         public AgentKind Kind => AgentKind.Claude;
         public string Prompt { get; private set; } = string.Empty;
+        public string UserPrompt { get; private set; } = string.Empty;
+        public bool SupportsSeparateSystemPrompt => true;
 
         public Task<AgentResult> RunAsync(
             ISandbox sandbox,
@@ -776,6 +780,27 @@ public sealed class ProjectAuditorComposerPresetTests
             _ = workingDirectory;
             ct.ThrowIfCancellationRequested();
             Prompt = prompt;
+            return Task.FromResult(new TextOnlyAgentResult(true, "ok", """{"passed":true,"findings":[]}""", null));
+        }
+
+        public Task<TextOnlyAgentResult> RunTextOnlyWithSystemPromptAsync(
+            string systemPrompt,
+            string userPrompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            ISandbox? sandbox = null,
+            string? workingDirectory = null)
+        {
+            _ = credential;
+            _ = modelId;
+            _ = reasoningMode;
+            _ = sandbox;
+            _ = workingDirectory;
+            ct.ThrowIfCancellationRequested();
+            Prompt = systemPrompt;
+            UserPrompt = userPrompt;
             return Task.FromResult(new TextOnlyAgentResult(true, "ok", """{"passed":true,"findings":[]}""", null));
         }
     }
