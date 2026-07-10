@@ -1813,6 +1813,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal("", stderr);
         await WaitForFileAsync(capturedPromptFile, TimeSpan.FromSeconds(30));
         await WaitForExitCodeAsync(session, 0, TimeSpan.FromSeconds(30));
+        await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(30));
         Assert.Equal("agent prompt\n", await File.ReadAllTextAsync(capturedPromptFile));
         Assert.False(File.Exists(exitTokenFile));
     }
