@@ -14,12 +14,28 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 {
     private const string AgentRunIdEnvironmentVariable = "CODEYBOX_AGENT_RUN_ID";
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> ActiveAgentRunIds = new();
+
+    // Overwrite = write the credential regardless of any pre-existing file.
+    // Chosen for the credential-stdin (candidate) path because a resolver
+    // fallback candidate's credential MUST land at the destination even when
+    // an earlier candidate wrote a different account's auth blob there;
+    // deferring to the existing file would silently keep the wrong account.
+    //
+    // Preserve = leave a pre-existing non-empty regular file in place.
+    // Chosen for the env-from-sandbox (create-time env / smoke probe) path
+    // because a resumed run restores a scratchpad-captured auth file that
+    // may hold a refreshed token minted DURING the crashed run. The stale
+    // credential snapshot in SandboxSpec.Environment must not clobber it.
     private const string OverwriteExistingCredentialFileFlag = "0";
     private const string PreserveExistingCredentialFileFlag = "1";
+    // Third argument is passed by the caller (0 = overwrite, 1 = preserve) so
+    // the same script serves both the initial-run (overwrite) and resumed-run
+    // (preserve — leave a scratchpad-restored refreshed token in place)
+    // shapes without maintaining two divergent shell wrappers.
     private const string CredentialStdinMaterialiseScript =
         SafeCredentialFileWriterScript +
         "\n" +
-        "codeybox_write_credential_file \"$1\" \"${2:-}\" " + OverwriteExistingCredentialFileFlag + "\n";
+        "codeybox_write_credential_file \"$1\" \"${2:-}\" \"${3:-" + OverwriteExistingCredentialFileFlag + "}\"\n";
 
     public abstract AgentKind Kind { get; }
 
@@ -140,7 +156,11 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     /// <summary>
     /// Gives subclasses a chance to materialise non-argv CLI prerequisites
     /// immediately before invoking the binary. Returning a result short-circuits
-    /// the run with that failure.
+    /// the run with that failure. Passing <paramref name="resume"/> through to
+    /// the shared credential materialiser switches its stdin (candidate) path
+    /// to preserve-existing semantics so a scratchpad-restored auth file whose
+    /// token was refreshed during the crashed run is not clobbered by the
+    /// stale credential snapshot the caller passed in.
     /// </summary>
     protected virtual async Task<AgentResult?> PrepareSandboxAsync(
         ISandbox sandbox,
@@ -148,15 +168,28 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         AgentCredential? credential,
         AgentResumeContext? resume,
         CancellationToken ct)
-        => await MaterialiseEnvBackedCredentialFilesAsync(sandbox, credential, ct).ConfigureAwait(false);
+        => await MaterialiseEnvBackedCredentialFilesAsync(
+                sandbox, credential, preserveExistingCredentialFile: resume is not null, ct)
+            .ConfigureAwait(false);
+
+    protected Task<AgentResult?> MaterialiseEnvBackedCredentialFilesAsync(
+        ISandbox sandbox,
+        AgentCredential? credential,
+        CancellationToken ct)
+        => MaterialiseEnvBackedCredentialFilesAsync(sandbox, credential, preserveExistingCredentialFile: false, ct);
 
     protected async Task<AgentResult?> MaterialiseEnvBackedCredentialFilesAsync(
         ISandbox sandbox,
         AgentCredential? credential,
+        bool preserveExistingCredentialFile,
         CancellationToken ct)
     {
         if (EnvBackedCredentialFiles.Count == 0)
             return null;
+
+        var preserveFlag = preserveExistingCredentialFile
+            ? PreserveExistingCredentialFileFlag
+            : OverwriteExistingCredentialFileFlag;
 
         foreach (var file in EnvBackedCredentialFiles)
         {
@@ -176,6 +209,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                         "codeybox-credential-materialise",
                         file.HomeRelativePath,
                         ResolveCredentialDestinationOverride(file, credential.EnvironmentVariables),
+                        preserveFlag,
                     ],
                     Stdin = contents,
                 };

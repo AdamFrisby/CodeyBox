@@ -3580,18 +3580,33 @@ public sealed partial class PipelineRunner : IPipelineRunner
             lockEntered = true;
 
             var access = _gitHost.GetSandboxAccess(repoId);
-            // Pre-resolve the actual resolver candidates so the same ordered
-            // set is used if a conflict needs the in-sandbox resolver. The
-            // vast majority of pickup-rebases are conflict-free and will not
-            // invoke the agent CLI at all, so candidate pre-resolution failures
-            // are deferred until a conflict actually needs the resolver.
-            // Candidate credential env is intentionally NOT baked into the
-            // shared sandbox environment: earlier candidates run against
-            // untrusted conflicted repository content and must not see fallback
-            // secrets. Env-backed credential files are materialised from each
-            // selected candidate's credential via stdin immediately before that
-            // candidate runs; file credentials are still materialised through
-            // AgenticConflictResolver's per-candidate hook.
+            // Pre-resolve the resolver candidate set so the same ordered set
+            // (and its credentials) are used both for baking the sandbox
+            // environment and for driving the resolver on a conflict. Every
+            // candidate's credential EnvironmentVariables — including plain
+            // env-var API keys (ANTHROPIC_API_KEY, OPENAI_API_KEY,
+            // GEMINI_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, CURSOR_API_KEY) that
+            // the CLI reads directly from process env — must reach this
+            // shared sandbox at create time because CliAgentRunnerBase.RunAsync
+            // deliberately does not merge credential env into per-exec
+            // ExtraEnvironment (secret hygiene). Env-carried FILE credentials
+            // (e.g. CODEYBOX_CURSOR_AUTH_JSON) are additionally materialised
+            // to their target files via the runner's stdin-based prepare hook
+            // — the env-var baking here is what unlocks the plain-API-key
+            // shape without changing the per-exec no-credential-env policy.
+            //
+            // Cross-candidate env-var exposure inside this sandbox is
+            // accepted per the task constraint ("only resolver-candidate
+            // agents' credentials belong here — do not broaden beyond
+            // candidates that can actually run"). Non-candidate agents'
+            // credentials are never resolved or baked here.
+            //
+            // Pre-resolution is best-effort: transient credential-provider or
+            // routing failures capture the exception and defer until a
+            // conflict actually needs the resolver, so a clean/no-op rebase
+            // still succeeds. When pre-resolution failed we fall back to
+            // baking only the primary work runner's credential, preserving
+            // the pre-diff primary-auth guarantee.
             //
             // Network profile prefers the agent profile (Work) so AllowedHosts
             // includes the agent's API endpoints. We fall back through the
@@ -3600,7 +3615,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             var (precomputedCandidates, precomputedCandidateFailure) =
                 await TryBuildPickupRebaseResolverCandidatesAsync(item, project, runner, ct);
             precomputedCandidateFailure ??= ValidatePickupRebaseResolverCredentialScope(precomputedCandidates);
-            var credential = CreateEmptySandboxCredentialScope(runner.Kind);
+            var credential = await BuildPickupRebaseSandboxCredentialAsync(
+                item, project, runner, precomputedCandidates, ct).ConfigureAwait(false);
             var rebaseProfile = project.NetworkProfiles.Work
                 ?? project.NetworkProfiles.AuditAgent
                 ?? project.NetworkProfiles.AuditTool;
@@ -3987,8 +4003,67 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
     }
 
-    private static AgentCredential CreateEmptySandboxCredentialScope(AgentKind scopeAgent)
-        => new(scopeAgent, new Dictionary<string, string>(), new Dictionary<string, string>());
+    /// <summary>
+    /// Builds the shared pickup-rebase sandbox credential from the pre-resolved
+    /// resolver candidate set. The returned credential carries only
+    /// <see cref="AgentCredential.EnvironmentVariables"/> — the union across
+    /// every candidate's env-var-carried credential, keyed by variable name —
+    /// so plain env-var API keys (which the CLI reads directly from process
+    /// env) reach the resolver sandbox for both the primary and every fallback
+    /// candidate. <see cref="AgentCredential.Files"/> and
+    /// <see cref="AgentCredential.Mounts"/> are intentionally empty here:
+    /// file-backed creds are materialised per-candidate by the resolver's
+    /// materialiser hook, and mounts are forbidden (see
+    /// <see cref="ValidatePickupRebaseResolverCredentialScope"/>).
+    /// <para>
+    /// When pre-resolution failed we still resolve the primary work runner's
+    /// credential and bake that so a clean primary-auth path is never worse
+    /// than the pre-diff behaviour. Later env keys overwrite earlier ones on
+    /// collision (last-write wins) — this matches the pre-diff single-primary
+    /// bake and, on the multi-candidate path, prefers the fallback ordering
+    /// established by <see cref="BuildAgenticConflictCandidatesAsync"/>
+    /// (primary first, fallbacks after) which yields the fallback's value on
+    /// collision. In practice colliding keys are same-account creds; the
+    /// resolver walks candidates in that same order, so a collision reflects
+    /// the fallback candidate the resolver would actually reach.
+    /// </para>
+    /// </summary>
+    private async Task<AgentCredential> BuildPickupRebaseSandboxCredentialAsync(
+        WorkItem item,
+        Project project,
+        IAgentRunner runner,
+        AgenticConflictCandidatesResult? candidates,
+        CancellationToken ct)
+    {
+        var env = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        if (candidates is null)
+        {
+            // Pre-resolution failed above (captured for later throw once a
+            // conflict actually needs the candidate list). Restore the
+            // pre-diff primary bake so at least the primary's env creds reach
+            // the sandbox — a subsequent conflict-free rebase then finishes
+            // without ever raising the deferred failure.
+            var primaryCredential = await ResolveAgentCredentialAsync(runner.Kind, project, item, ct)
+                .ConfigureAwait(false);
+            if (primaryCredential is not null)
+            {
+                foreach (var (key, value) in primaryCredential.EnvironmentVariables)
+                    env[key] = value;
+            }
+            return new AgentCredential(runner.Kind, env, new Dictionary<string, string>());
+        }
+
+        foreach (var candidate in candidates.Candidates)
+        {
+            if (candidate.Credential is not { } candidateCredential)
+                continue;
+            foreach (var (key, value) in candidateCredential.EnvironmentVariables)
+                env[key] = value;
+        }
+
+        return new AgentCredential(runner.Kind, env, new Dictionary<string, string>());
+    }
 
     private static ExceptionDispatchInfo? ValidatePickupRebaseResolverCredentialScope(
         AgenticConflictCandidatesResult? candidates)

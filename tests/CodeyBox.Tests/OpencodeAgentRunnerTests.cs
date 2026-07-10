@@ -455,6 +455,82 @@ public sealed class OpencodeAgentRunnerTests
     }
 
     [Fact]
+    public async Task RunResumedAsync_ProcessSandbox_PreservesExistingRefreshedAuthFile()
+    {
+        // The old per-runner PrepareSandboxAsync body short-circuited when a
+        // non-empty auth file already existed, explicitly to protect an in-VM
+        // token refresh captured by the scratchpad checkpoint. The new
+        // shared credential-stdin path must honour the same PRESERVE contract
+        // on the RunResumedAsync path (resume context non-null) — otherwise a
+        // resumed run overwrites the refreshed token with the stale snapshot
+        // in the credential bundle.
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        var runner = new OpencodeAgentRunner { Binary = "/bin/true" };
+        const string refreshedInVm = """{"providers":{"deepseek":{"apiKey":"refreshed-in-vm-token"}}}""";
+        const string staleSnapshot = """{"providers":{"deepseek":{"apiKey":"stale-snapshot-token"}}}""";
+
+        // Seed the scratchpad-restored file the resume path would normally
+        // produce by writing directly to the expected destination.
+        var seed = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c",
+                "mkdir -p \"$HOME/.local/share/opencode\" && umask 077 && printf '%s' \"$1\" > \"$HOME/.local/share/opencode/auth.json\"",
+                "seed-refreshed", refreshedInVm],
+        });
+        Assert.True(seed.Success, seed.Stderr);
+
+        var credential = OpencodeCred(staleSnapshot);
+        var result = await runner.RunResumedAsync(
+            sandbox,
+            "/work",
+            "resume prompt",
+            credential,
+            new AgentResumeContext("refs/heads/codeybox/preempt/wi"));
+
+        Assert.True(result.Success, result.Stderr);
+        var read = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat \"$HOME/.local/share/opencode/auth.json\""],
+        });
+        Assert.True(read.Success, read.Stderr);
+        Assert.Equal(refreshedInVm, read.Stdout.TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
+    public async Task RunAsync_ProcessSandbox_OverwritesExistingCredentialFileOnFreshRun()
+    {
+        // The non-resume path (RunAsync) must overwrite a pre-existing file so
+        // a resolver-fallback candidate replaces whatever an earlier candidate
+        // wrote. Complement of PreservesExistingRefreshedAuthFile: same file,
+        // same conditions, but RunAsync (no resume context) instead of
+        // RunResumedAsync.
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        var runner = new OpencodeAgentRunner { Binary = "/bin/true" };
+        const string earlierCandidate = """{"providers":{"deepseek":{"apiKey":"earlier-candidate"}}}""";
+        const string fallbackCandidate = """{"providers":{"deepseek":{"apiKey":"fallback-candidate"}}}""";
+
+        var seed = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c",
+                "mkdir -p \"$HOME/.local/share/opencode\" && umask 077 && printf '%s' \"$1\" > \"$HOME/.local/share/opencode/auth.json\"",
+                "seed-earlier", earlierCandidate],
+        });
+        Assert.True(seed.Success, seed.Stderr);
+
+        var result = await runner.RunAsync(sandbox, "/work", "prompt", OpencodeCred(fallbackCandidate));
+
+        Assert.True(result.Success, result.Stderr);
+        var read = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat \"$HOME/.local/share/opencode/auth.json\""],
+        });
+        Assert.True(read.Success, read.Stderr);
+        Assert.Equal(fallbackCandidate, read.Stdout.TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
     public void GetTextOnlyUnavailabilityReason_MissingAuth_ReturnsNull()
     {
         var runner = new OpencodeAgentRunner();

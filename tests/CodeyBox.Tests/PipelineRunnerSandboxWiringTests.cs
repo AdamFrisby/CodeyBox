@@ -11,9 +11,15 @@ namespace CodeyBox.Tests;
 /// <summary>
 /// Pins the wiring fix that broke the in-VM agentic conflict resolver. The
 /// pickup-rebase sandbox must have agent network and credential tmpfs scope,
-/// while candidate secrets stay out of the sandbox-global environment and are
-/// materialised per candidate. The agent-merge sandbox still carries the
-/// chosen agent credential at creation time.
+/// carry every resolver candidate's env-var-carried credential at creation
+/// time (so plain-env-var API keys the CLI reads directly from process env —
+/// <c>ANTHROPIC_API_KEY</c>, <c>OPENAI_API_KEY</c>, <c>GEMINI_API_KEY</c>,
+/// <c>CURSOR_API_KEY</c>, <c>CLAUDE_CODE_OAUTH_TOKEN</c> — reach both the
+/// primary and every fallback resolver candidate), while non-candidate agents'
+/// creds stay out. File-backed credentials are still materialised per
+/// candidate through <c>AgenticConflictResolver</c>'s materialise hook. The
+/// agent-merge sandbox still carries the chosen agent credential at creation
+/// time.
 ///
 /// The new resolver-side integration tests in
 /// <c>AgenticConflictResolverIntegrationTests</c> assert the resolver's own
@@ -35,6 +41,8 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     private const string CursorAuthJson = """{"token":"cursor-fallback-token"}""";
     private const string CodexApiKeyEnvKey = "OPENAI_API_KEY";
     private const string CodexApiKeyValue = "codex-candidate-api-key";
+    private const string ClaudeApiKeyEnvKey = "ANTHROPIC_API_KEY";
+    private const string ClaudeApiKeyValue = "claude-primary-api-key";
     private const string NonCandidateEnvKey = "CODEYBOX_NON_CANDIDATE_SECRET";
     private const string NonCandidateEnvValue = "must-not-enter-resolver-sandbox";
     private const string AuditDotnetShimDir = AuditReviewDotnetShim.Directory;
@@ -49,7 +57,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task PickupRebaseSandbox_IsCreatedWithAgentNetworkAndCredentialTmpfsWithoutBakingCandidateEnv()
+    public async Task PickupRebaseSandbox_IsCreatedWithAgentNetworkAndCredentialTmpfsBakingCandidateEnv()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var recorder = new RecordingSandboxProvider(
@@ -96,7 +104,15 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
 
         var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
         AssertCredentialTmpfsAndOpenNetwork(pickupSpec, "pickup-rebase");
-        Assert.False(pickupSpec.Environment.ContainsKey(MarkerEnvKey));
+        // The primary work runner's env-var-backed credential is baked into
+        // the shared resolver sandbox at create time — this is the plain
+        // env-var API-key auth path (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY,
+        // GEMINI_API_KEY) that would otherwise leave the primary CLI with no
+        // key visible in process env, because CliAgentRunnerBase deliberately
+        // does not merge credential env per-exec.
+        Assert.True(pickupSpec.Environment.TryGetValue(MarkerEnvKey, out var markerValue),
+            "pickup-rebase sandbox should carry the primary work runner's env-backed credential so plain-env-var API keys reach the CLI");
+        Assert.Equal(MarkerEnvValue, markerValue);
     }
 
     [Fact]
@@ -130,7 +146,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task PickupRebaseResolver_DoesNotResolveOrBakeRegisteredNonCandidateCredential()
+    public async Task PickupRebaseResolver_BakesCandidateEnvAndExcludesNonCandidateCredential()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var recorder = new RecordingSandboxProvider(
@@ -160,9 +176,23 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         Assert.DoesNotContain(AgentKind.Opencode, credentials.RequestedAgents);
 
         var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
-        Assert.False(pickupSpec.Environment.ContainsKey(CodexApiKeyEnvKey));
-        Assert.False(pickupSpec.Environment.ContainsKey(CursorAuthEnvKey));
-        Assert.False(pickupSpec.Environment.ContainsKey(NonCandidateEnvKey));
+        // Every resolver candidate's env-carried credential must reach the
+        // shared sandbox at create time — plain-env-var API keys (codex's
+        // OPENAI_API_KEY here) are read directly from process env by the CLI,
+        // and env-carried file blobs (cursor's CODEYBOX_CURSOR_AUTH_JSON) must
+        // also be present so a fallback candidate authenticates identically to
+        // when it is the primary.
+        Assert.True(pickupSpec.Environment.TryGetValue(CodexApiKeyEnvKey, out var codexKey),
+            "codex primary's OPENAI_API_KEY must be baked so a plain-env-var API-key primary authenticates");
+        Assert.Equal(CodexApiKeyValue, codexKey);
+        Assert.True(pickupSpec.Environment.TryGetValue(CursorAuthEnvKey, out var cursorAuth),
+            "cursor fallback candidate's env-carried auth blob must be baked so its PrepareSandboxAsync can materialise ~/.config/cursor/auth.json");
+        Assert.Equal(CursorAuthJson, cursorAuth);
+        // Non-candidate agent (opencode is registered but not in the
+        // resolver class router) must NOT have its credentials in the shared
+        // resolver sandbox.
+        Assert.False(pickupSpec.Environment.ContainsKey(NonCandidateEnvKey),
+            "non-candidate opencode credential must not enter the resolver sandbox");
         Assert.Equal(
             CursorAuthJson,
             (await ReadBareBranchFileAsync(run.BarePath, run.WorkBranch, "cursor-auth-observed.json")).TrimEnd('\r', '\n'));
@@ -248,6 +278,43 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         Assert.Equal(
             ResolverCredentialProvider.CodexCredentialJson,
             (await ReadBareBranchFileAsync(run.BarePath, run.WorkBranch, "codex-file-credential-observed.json")).TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
+    public async Task PickupRebaseResolver_ApiKeyOnlyPrimary_BakesEnvVarApiKey()
+    {
+        // Regression: a primary work runner whose credential is an env-var API
+        // key with no Files (the ANTHROPIC_API_KEY / OPENAI_API_KEY /
+        // GEMINI_API_KEY shape) must still authenticate the resolver sandbox.
+        // The prior no-bake behaviour left the primary CLI with no key visible
+        // in process env because CliAgentRunnerBase deliberately does not merge
+        // credential env per-exec (secret hygiene).
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var recorder = new RecordingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        var primary = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Claude };
+        var credentials = new ApiKeyOnlyPrimaryCredentialProvider(
+            AgentKind.Claude, ClaudeApiKeyEnvKey, ClaudeApiKeyValue);
+        var project = NewResolverProject(seed, AgentKind.Claude, defaultAgentClass: null);
+
+        var run = await RunPickupRebaseAsync(
+            seed,
+            project,
+            credentials,
+            primary,
+            [],
+            classRouter: null,
+            sandboxProvider: recorder,
+            workPath: "work-only.txt",
+            workContents: "work branch change\n",
+            mainPath: "main-only.txt",
+            mainContents: "main branch change\n");
+
+        Assert.Equal(WorkItemState.Done, run.Final.State);
+        var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
+        Assert.True(pickupSpec.Environment.TryGetValue(ClaudeApiKeyEnvKey, out var key),
+            "an env-var-only primary credential must bake its API key into the resolver sandbox — a clean rebase must not lose access to plain API keys");
+        Assert.Equal(ClaudeApiKeyValue, key);
     }
 
     [Fact]
@@ -1222,6 +1289,37 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
             }
 
             return _inner.GetAsync(agent, ct);
+        }
+    }
+
+    /// <summary>
+    /// Returns an env-var-only API-key credential (Files empty) for one agent
+    /// kind and null for all others. This mirrors the ANTHROPIC_API_KEY /
+    /// OPENAI_API_KEY / GEMINI_API_KEY shape a real credential provider yields
+    /// when the operator configured a plain API key rather than a subscription
+    /// auth file.
+    /// </summary>
+    private sealed class ApiKeyOnlyPrimaryCredentialProvider : ICredentialProvider
+    {
+        private readonly AgentKind _target;
+        private readonly string _apiKeyEnvVar;
+        private readonly string _apiKeyValue;
+
+        public ApiKeyOnlyPrimaryCredentialProvider(AgentKind target, string apiKeyEnvVar, string apiKeyValue)
+        {
+            _target = target;
+            _apiKeyEnvVar = apiKeyEnvVar;
+            _apiKeyValue = apiKeyValue;
+        }
+
+        public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+        {
+            if (agent != _target)
+                return Task.FromResult<AgentCredential?>(null);
+            return Task.FromResult<AgentCredential?>(new AgentCredential(
+                agent,
+                EnvironmentVariables: new Dictionary<string, string> { [_apiKeyEnvVar] = _apiKeyValue },
+                Files: new Dictionary<string, string>()));
         }
     }
 
