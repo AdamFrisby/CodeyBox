@@ -864,14 +864,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     /// </summary>
     private WorkItemStoreDiskFullException HandleDiskFull(string operation, SqliteException sqlex)
     {
-        ThreadPool.QueueUserWorkItem(
-            static state =>
-            {
-                var (logger, op) = ((Serilog.ILogger, string))state!;
-                AuditLog.StoreDiskFull(logger, op);
-            },
-            (_auditLogger, operation),
-            preferLocal: false);
+        AuditLog.StoreDiskFull(_auditLogger, operation);
         return new WorkItemStoreDiskFullException(operation, sqlex);
     }
 
