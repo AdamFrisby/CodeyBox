@@ -20,13 +20,15 @@ public sealed class SqliteTestCaseStore : ITestCaseStore, IDisposable
     private readonly SqliteDatabaseWriteGate _writeLock;
     private int _disposed;
 
-    public SqliteTestCaseStore(string path)
+    public SqliteTestCaseStore(
+        string path,
+        SqliteDatabaseWriteGateFactory? writeGateFactory = null)
     {
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock = (writeGateFactory ?? SqliteDatabaseWriteGateFactory.Default).ForPath(path);
         _writeLock.Wait();
         try
         {

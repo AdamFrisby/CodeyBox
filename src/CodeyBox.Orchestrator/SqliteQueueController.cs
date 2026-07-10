@@ -35,7 +35,10 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
     }
     public string? PausedReason => _pausedReason;
 
-    public SqliteQueueController(string dbPath, ILogger<SqliteQueueController> log)
+    public SqliteQueueController(
+        string dbPath,
+        ILogger<SqliteQueueController> log,
+        SqliteDatabaseWriteGateFactory? writeGateFactory = null)
     {
         _dbPath = dbPath;
         _log = log;
@@ -43,7 +46,7 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={dbPath}");
-        _lock = SqliteDatabaseWriteGate.ForPath(dbPath);
+        _lock = (writeGateFactory ?? SqliteDatabaseWriteGateFactory.Default).ForPath(dbPath);
         _lock.Wait();
         try
         {

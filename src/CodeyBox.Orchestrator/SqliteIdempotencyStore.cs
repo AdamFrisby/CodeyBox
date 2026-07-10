@@ -15,13 +15,15 @@ public sealed class SqliteIdempotencyStore : IIdempotencyStore, IDisposable
     private readonly SqliteConnection _conn;
     private readonly SqliteDatabaseWriteGate _writeLock;
 
-    public SqliteIdempotencyStore(string path)
+    public SqliteIdempotencyStore(
+        string path,
+        SqliteDatabaseWriteGateFactory? writeGateFactory = null)
     {
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock = (writeGateFactory ?? SqliteDatabaseWriteGateFactory.Default).ForPath(path);
         _writeLock.Wait();
         try
         {

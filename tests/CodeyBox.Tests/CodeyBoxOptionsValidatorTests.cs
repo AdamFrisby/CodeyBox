@@ -10,6 +10,32 @@ namespace CodeyBox.Tests;
 public sealed class CodeyBoxOptionsValidatorTests
 {
     [Theory]
+    [InlineData("acquisition", "CodeyBox:SqliteWriteGate:AcquisitionTimeout must be positive")]
+    [InlineData("hold", "CodeyBox:SqliteWriteGate:MaxHoldDuration must be positive")]
+    public void Validate_RejectsInvalidSqliteWriteGateOptions(
+        string scenario,
+        string expectedFailure)
+    {
+        var options = ValidCodeyBoxOptions();
+        switch (scenario)
+        {
+            case "acquisition":
+                options.SqliteWriteGate.AcquisitionTimeout = TimeSpan.Zero;
+                break;
+            case "hold":
+                options.SqliteWriteGate.MaxHoldDuration = TimeSpan.Zero;
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null);
+        }
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(expectedFailure, result.FailureMessage);
+    }
+
+    [Theory]
     [InlineData("retention", "CodeyBox:AuditLog:RetainedDays must be >= 1")]
     [InlineData("path", "CodeyBox:AuditLog:Path must be non-empty")]
     [InlineData("audit-path", "CodeyBox:AuditLog:AuditPath must be non-empty")]

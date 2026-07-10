@@ -26,7 +26,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     private readonly SqliteDatabaseWriteGate _writeLock;
     private int _disposed;
 
-    public SqliteWorkItemStore(string path, Serilog.ILogger? auditLogger = null)
+    public SqliteWorkItemStore(
+        string path,
+        Serilog.ILogger? auditLogger = null,
+        SqliteDatabaseWriteGateFactory? writeGateFactory = null)
     {
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
@@ -34,7 +37,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         _connectionString = $"Data Source={path}";
         _conn = new SqliteConnection(_connectionString);
         _auditLogger = auditLogger ?? Serilog.Log.Logger;
-        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock = (writeGateFactory ?? SqliteDatabaseWriteGateFactory.Default).ForPath(path);
         _writeLock.Wait();
         try
         {
@@ -897,10 +900,10 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
 
     public async Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default)
     {
+        WorkItem? row;
         await _writeLock.WaitAsync(ct);
         try
         {
-            WorkItem? row;
             using (var cmd = _conn.CreateCommand())
             {
                 cmd.CommandText = "SELECT * FROM work_items WHERE id = $id;";
@@ -908,12 +911,13 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 using var reader = await cmd.ExecuteReaderAsync(ct);
                 row = await reader.ReadAsync(ct) ? Read(reader) : null;
             }
-            return await EnrichOneAsync(row, ct);
         }
         finally
         {
             _writeLock.Release();
         }
+
+        return await EnrichOneAsync(row, ct);
     }
 
     public async Task<PriorityUpdateResult> UpdatePriorityAsync(
@@ -955,7 +959,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             if (current is null)
                 return new PriorityUpdateResult(PriorityUpdateOutcome.NotFound, null, null);
 
-            current = current with { ExternalIds = await LoadExternalIdsForAsync(current.Id, tx: null, ct) };
+            current = current with { ExternalIds = await LoadExternalIdsForAsync(current.Id, _conn, ct) };
 
             if (WorkItemDependencies.TerminalStates.Contains(current.State))
                 return new PriorityUpdateResult(PriorityUpdateOutcome.TerminalState, current, current.Priority);
@@ -1022,7 +1026,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             if (current is null)
                 return new DependsOnUpdateResult(DependsOnUpdateOutcome.NotFound, null, null);
 
-            current = current with { ExternalIds = await LoadExternalIdsForAsync(current.Id, tx: null, ct) };
+            current = current with { ExternalIds = await LoadExternalIdsForAsync(current.Id, _conn, ct) };
 
             if (WorkItemDependencies.TerminalStates.Contains(current.State))
                 return new DependsOnUpdateResult(DependsOnUpdateOutcome.TerminalState, current, current.DependsOn);
@@ -1076,7 +1080,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             if (current is null)
                 return new AuditBudgetUpdateResult(AuditBudgetUpdateOutcome.NotFound, null);
 
-            current = current with { ExternalIds = await LoadExternalIdsForAsync(current.Id, tx: null, ct) };
+            current = current with { ExternalIds = await LoadExternalIdsForAsync(current.Id, _conn, ct) };
 
             if (WorkItemDependencies.TerminalStates.Contains(current.State))
                 return new AuditBudgetUpdateResult(AuditBudgetUpdateOutcome.TerminalState, current);
@@ -1257,12 +1261,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 using var reader = await cmd.ExecuteReaderAsync(ct);
                 while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
             }
-            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         }
         finally
         {
             _writeLock.Release();
         }
+        extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
@@ -1297,12 +1301,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 using var reader = await cmd.ExecuteReaderAsync(ct);
                 while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
             }
-            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         }
         finally
         {
             _writeLock.Release();
         }
+        extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
@@ -1352,12 +1356,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 while (await reader.ReadAsync(ct))
                     rows.Add(Read(reader));
             }
-            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         }
         finally
         {
             _writeLock.Release();
         }
+        extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
 
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
@@ -1435,12 +1439,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     rows.Add(item);
                 }
             }
-            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         }
         finally
         {
             _writeLock.Release();
         }
+        extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
@@ -1469,6 +1473,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
 
             using (var cmd = _conn.CreateCommand())
             {
+                // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- interpolation is limited to enum integer constants and an exact internal skip-filter constant; all runtime values are parameters
                 cmd.CommandText = $"""
                     SELECT * FROM (
                         SELECT wi.*, wi.state AS dispatch_ordering_state, 0 AS dispatch_source_order
@@ -1529,12 +1534,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 while (await reader.ReadAsync(ct))
                     rows.Add(Read(reader));
             }
-            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         }
         finally
         {
             _writeLock.Release();
         }
+        extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
 
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
@@ -1991,12 +1996,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 using var reader = await cmd.ExecuteReaderAsync(ct);
                 while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
             }
-            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         }
         finally
         {
             _writeLock.Release();
         }
+        extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
@@ -2088,12 +2093,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 using var reader = await cmd.ExecuteReaderAsync(ct);
                 while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
             }
-            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         }
         finally
         {
             _writeLock.Release();
         }
+        extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
@@ -2136,12 +2141,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 using var reader = await cmd.ExecuteReaderAsync(ct);
                 while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
             }
-            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         }
         finally
         {
             _writeLock.Release();
         }
+        extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
@@ -2913,23 +2918,15 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
 
     /// <summary>
     /// Loads the namespaced external IDs for a single work item. Returns an
-    /// empty dictionary when the item has none. Caller-supplied
-    /// <paramref name="tx"/> is reused so reads see writes from the same
-    /// transaction; pass null for a no-transaction read.
+    /// empty dictionary when the item has none, using the caller-supplied
+    /// connection.
     /// </summary>
     private async Task<IReadOnlyDictionary<string, string>> LoadExternalIdsForAsync(
         WorkItemId id,
-        SqliteTransaction? tx,
+        SqliteConnection connection,
         CancellationToken ct)
     {
-        // The store has one long-lived connection for writes and legacy reads.
-        // External-id enrichment happens after those readers are disposed and
-        // can be triggered concurrently by polling/dispatch paths, so use a
-        // short-lived read connection unless the caller needs same-transaction
-        // visibility.
-        using var readConn = tx is null ? await OpenReadConnectionAsync(ct) : null;
-        using var cmd = tx is null ? readConn!.CreateCommand() : _conn.CreateCommand();
-        if (tx is not null) cmd.Transaction = tx;
+        using var cmd = connection.CreateCommand();
         cmd.CommandText = "SELECT namespace, external_id FROM work_item_external_ids WHERE work_item_id = $id;";
         cmd.Parameters.AddWithValue("$id", id.ToString());
         using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -3006,7 +3003,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     private async Task<WorkItem?> EnrichOneAsync(WorkItem? item, CancellationToken ct)
     {
         if (item is null) return null;
-        var extIds = await LoadExternalIdsForAsync(item.Id, tx: null, ct);
+        using var readConnection = await OpenReadConnectionAsync(ct);
+        var extIds = await LoadExternalIdsForAsync(item.Id, readConnection, ct);
         return item with { ExternalIds = extIds };
     }
 

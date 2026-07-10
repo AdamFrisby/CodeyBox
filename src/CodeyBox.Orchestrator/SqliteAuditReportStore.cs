@@ -18,13 +18,15 @@ public sealed class SqliteAuditReportStore : IAuditReportStore, IDisposable
 
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
 
-    public SqliteAuditReportStore(string path)
+    public SqliteAuditReportStore(
+        string path,
+        SqliteDatabaseWriteGateFactory? writeGateFactory = null)
     {
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock = (writeGateFactory ?? SqliteDatabaseWriteGateFactory.Default).ForPath(path);
         _writeLock.Wait();
         try
         {

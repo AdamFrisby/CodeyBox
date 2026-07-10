@@ -24,7 +24,8 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
     public SqliteWorkerRegistry(
         string path,
         ILogger<SqliteWorkerRegistry>? logger = null,
-        int busyTimeoutMilliseconds = 30000)
+        int busyTimeoutMilliseconds = 30000,
+        SqliteDatabaseWriteGateFactory? writeGateFactory = null)
     {
         _logger = logger;
         _commandTimeoutSeconds = Math.Max(1, (int)Math.Ceiling(Math.Max(1, busyTimeoutMilliseconds) / 1000.0));
@@ -32,7 +33,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock = (writeGateFactory ?? SqliteDatabaseWriteGateFactory.Default).ForPath(path);
         var initialized = false;
         _writeLock.Wait();
         try

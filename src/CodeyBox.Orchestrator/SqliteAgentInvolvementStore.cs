@@ -15,13 +15,15 @@ public sealed class SqliteAgentInvolvementStore : IAgentInvolvementStore, IDispo
     private readonly SemaphoreSlim _connectionLock = new(1, 1);
     private readonly SqliteDatabaseWriteGate _lock;
 
-    public SqliteAgentInvolvementStore(string path)
+    public SqliteAgentInvolvementStore(
+        string path,
+        SqliteDatabaseWriteGateFactory? writeGateFactory = null)
     {
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _lock = SqliteDatabaseWriteGate.ForPath(path);
+        _lock = (writeGateFactory ?? SqliteDatabaseWriteGateFactory.Default).ForPath(path);
         _lock.Wait();
         try
         {

@@ -269,6 +269,10 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
 builder.Services.AddOptions<CodeyBoxOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox"))
     .PostConfigure(opts => AgentClassesOverrideResolver.ApplyTo(opts, builder.Configuration));
+builder.Services.AddSingleton(sp => new SqliteDatabaseWriteGateFactory(
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SqliteWriteGate,
+    sp.GetRequiredService<ILoggerFactory>(),
+    TimeProvider.System));
 builder.Services.Configure<BuildScriptAuditorOptions>(builder.Configuration.GetSection("CodeyBox:BuildScriptAudit"));
 builder.Services.Configure<NotificationsOptions>(builder.Configuration.GetSection("CodeyBox:Notifications"));
 // E2eExecutionOptions binds as a standalone section so the pool / dispatcher can
@@ -1417,7 +1421,9 @@ builder.Services.AddSingleton<IAgentQuotaGate>(sp => new QuotaGateAvailability(
 builder.Services.AddSingleton<IQuotaFailureStore>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteQuotaFailureStore(cbOpts.StateDatabasePath);
+    return new SqliteQuotaFailureStore(
+        cbOpts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<AgentQuotaAvailabilityBroadcaster>();
 builder.Services.AddSingleton<IAgentQuotaAvailabilityPublisher>(sp =>
@@ -1427,12 +1433,16 @@ builder.Services.AddSingleton<IAgentQuotaAvailabilityObservationSource>(sp =>
 builder.Services.AddSingleton<IAgentFallbackHistoryStore>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteAgentFallbackHistoryStore(cbOpts.StateDatabasePath);
+    return new SqliteAgentFallbackHistoryStore(
+        cbOpts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<IAgentInvolvementStore>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteAgentInvolvementStore(cbOpts.StateDatabasePath);
+    return new SqliteAgentInvolvementStore(
+        cbOpts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 // OAuth-refreshing quota-token sources. These wrap the raw credential file
 // sources with provider-specific refresh logic so an expired access_token is
@@ -2389,25 +2399,33 @@ builder.Services.AddSingleton(sp =>
 builder.Services.AddSingleton<IReleaseStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteReleaseStore(opts.StateDatabasePath);
+    return new SqliteReleaseStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<Func<IReleaseStore?>>(sp => () => sp.GetService<IReleaseStore>());
 builder.Services.AddSingleton<SqliteWorkItemStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteWorkItemStore(opts.StateDatabasePath);
+    return new SqliteWorkItemStore(
+        opts.StateDatabasePath,
+        writeGateFactory: sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<IWorkItemStore>(sp => sp.GetRequiredService<SqliteWorkItemStore>());
 builder.Services.AddSingleton<IAuditProgressStore>(sp => sp.GetRequiredService<SqliteWorkItemStore>());
 builder.Services.AddSingleton<IIdempotencyStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteIdempotencyStore(opts.StateDatabasePath);
+    return new SqliteIdempotencyStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<ISuggestionStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteSuggestionStore(opts.StateDatabasePath);
+    return new SqliteSuggestionStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 // --- Work-item attachments ---------------------------------------------------
 // Metadata index lives next to the work-item rows in state.db; blobs live on
@@ -2438,17 +2456,23 @@ builder.Services.AddHostedService(sp => new AttachmentCleanupService(
 builder.Services.AddSingleton<IWorkItemQuestionStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteWorkItemQuestionStore(opts.StateDatabasePath);
+    return new SqliteWorkItemQuestionStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<ITestCaseStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteTestCaseStore(opts.StateDatabasePath);
+    return new SqliteTestCaseStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<IE2eRunStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteE2eRunStore(opts.StateDatabasePath);
+    return new SqliteE2eRunStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<IE2eReplayRuntime, E2eReplayRuntime>();
 builder.Services.AddSingleton<E2eReplayArtifactAdmissionValidator>();
@@ -2462,37 +2486,53 @@ builder.Services.AddHostedService<E2eRunDispatcher>();
 builder.Services.AddSingleton<IAuditReportStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteAuditReportStore(opts.StateDatabasePath);
+    return new SqliteAuditReportStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<ITimingStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteTimingStore(opts.StateDatabasePath);
+    return new SqliteTimingStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<ISandboxResourceUsageStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteSandboxResourceUsageStore(opts.StateDatabasePath);
+    return new SqliteSandboxResourceUsageStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<IWorkItemCostStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteWorkItemCostStore(opts.StateDatabasePath, sp.GetRequiredService<AgentCostCalculator>());
+    return new SqliteWorkItemCostStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<AgentCostCalculator>(),
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<IAgentUsageStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteAgentUsageStore(opts.StateDatabasePath);
+    return new SqliteAgentUsageStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<IAgentStreamSummaryStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteAgentStreamSummaryStore(opts.StateDatabasePath);
+    return new SqliteAgentStreamSummaryStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<IQueueController>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteQueueController(opts.StateDatabasePath, sp.GetRequiredService<ILogger<SqliteQueueController>>());
+    return new SqliteQueueController(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<ILogger<SqliteQueueController>>(),
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<SqliteAgentPauseController>(sp =>
 {
@@ -2500,7 +2540,8 @@ builder.Services.AddSingleton<SqliteAgentPauseController>(sp =>
     return new SqliteAgentPauseController(
         opts.StateDatabasePath,
         sp.GetRequiredService<ILogger<SqliteAgentPauseController>>(),
-        TimeProvider.System);
+        TimeProvider.System,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<IAgentPauseController>(sp =>
     sp.GetRequiredService<SqliteAgentPauseController>());
@@ -2515,7 +2556,10 @@ builder.Services.AddSingleton<ITaskTemplateRegistry, FileTaskTemplateRegistry>()
 builder.Services.AddSingleton<IWorkerRegistry>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteWorkerRegistry(opts.StateDatabasePath, sp.GetRequiredService<ILogger<SqliteWorkerRegistry>>());
+    return new SqliteWorkerRegistry(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<ILogger<SqliteWorkerRegistry>>(),
+        writeGateFactory: sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<DeadWorkerOptions>(sp =>
 {
@@ -4185,6 +4229,7 @@ namespace CodeyBox.Api
         public bool EnableSharedUpstreamMirror { get; set; } = false;
         public string SharedUpstreamMirrorDirectory { get; set; } = "_upstream-mirror";
         public string StateDatabasePath { get; set; } = "/var/lib/codeybox/state.db";
+        public SqliteWriteGateOptions SqliteWriteGate { get; set; } = new();
         public string TemplateDirectory { get; set; } = "templates";
         public const int DefaultMaxTemplateChecks = 256;
         public const int MaximumMaxTemplateChecks = 1000;

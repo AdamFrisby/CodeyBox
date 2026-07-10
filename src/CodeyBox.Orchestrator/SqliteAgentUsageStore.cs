@@ -20,14 +20,16 @@ public sealed class SqliteAgentUsageStore : IAgentUsageStore, IDisposable
     private readonly SqliteCommand _insertCmd;
     private const int PruneBatchSize = 500;
 
-    public SqliteAgentUsageStore(string path)
+    public SqliteAgentUsageStore(
+        string path,
+        SqliteDatabaseWriteGateFactory? writeGateFactory = null)
     {
         _path = path;
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock = (writeGateFactory ?? SqliteDatabaseWriteGateFactory.Default).ForPath(path);
         _writeLock.Wait();
         try
         {
