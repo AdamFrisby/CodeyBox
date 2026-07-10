@@ -351,12 +351,12 @@ and runtime health transitions. Coordinator pinch-points are also timed:
 SQLite write-gate wait, host-side git commands, and agent-stream capture
 I/O. See [`observability.md`](observability.md).
 
-**Scope.** This provider deliberately does NOT implement baseline image
-bake/clone, suspend/resume, host-shutdown teardown, disk-guard preflight,
-or package-cache seeding. Those host-side concerns either don't translate
-cleanly to a remote host without further design (suspend/resume needs
-network-stable VM identity across orchestrator restarts; baselines need a
-per-remote-host cache) or remain operator-tuning concerns.
+**Scope.** This provider supports cloning from an operator-baked remote
+Multipass baseline when `SandboxSpec.BaselineImageRef` is set. It deliberately
+does NOT implement baseline image bake, suspend/resume, host-shutdown teardown,
+disk-guard preflight, or package-cache seeding. Baseline baking and cache
+population remain per-executor operator duties; the remote provider only
+consumes an already-present baseline on the selected host.
 
 ## Choosing
 

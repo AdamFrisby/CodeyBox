@@ -822,6 +822,27 @@ public sealed class MultipassRemoteHostPoolTests
     }
 
     [Fact]
+    public async Task ListAllManagedAsync_ignores_unsafe_inventory_names()
+    {
+        var opts = Options(Host("a", cap: 1));
+        var transports = new HostTransportSet();
+        transports["a"].ListStdoutOverride = """
+            {
+              "list": [
+                { "name": "codeybox-r-../../escape", "state": "Running" },
+                { "name": "codeybox-r-valid", "state": "Running" }
+              ]
+            }
+            """;
+        var provider = Provider(() => opts, transports);
+
+        var info = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
+
+        Assert.Equal("codeybox-r-valid", info.Name);
+        Assert.Equal("a", info.HostId);
+    }
+
+    [Fact]
     public async Task ListAllManagedAsync_returns_healthy_hosts_when_one_host_metadata_scan_fails()
     {
         var opts = Options(
@@ -859,6 +880,23 @@ public sealed class MultipassRemoteHostPoolTests
         Assert.Equal(0, transports["a"].DeleteCount);
         Assert.Equal(1, transports["b"].DeleteCount);
         Assert.Equal(1, transports["b"].RmCount);
+    }
+
+    [Fact]
+    public async Task DisposeLeakedAsync_refuses_unsafe_managed_name_before_cleanup()
+    {
+        var opts = Options(Host("a", cap: 1));
+        var transports = new HostTransportSet();
+        var provider = Provider(() => opts, transports);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.DisposeLeakedAsync(
+                new ManagedSandboxInfo("codeybox-r-../../escape", null, null, IsTrackedActive: false, HostId: "a"),
+                CancellationToken.None));
+
+        Assert.Contains("safe managed VM name", ex.Message);
+        Assert.Equal(0, transports["a"].DeleteCount);
+        Assert.Equal(0, transports["a"].RmCount);
     }
 
     [Fact]
