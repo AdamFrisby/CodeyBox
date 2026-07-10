@@ -2,8 +2,7 @@ namespace CodeyBox.Sandbox;
 
 /// <summary>
 /// Guards environment names before they reach sandbox process or shell-file
-/// sinks. Reserved loader, shell-startup, and path variables are rejected so
-/// credentials cannot redirect command execution or inject startup code.
+/// sinks.
 /// </summary>
 public static class SandboxEnvironmentVariablePolicy
 {
@@ -27,16 +26,24 @@ public static class SandboxEnvironmentVariablePolicy
         "SHELL",
     };
 
-    public static void ValidateForSandboxEnvironment(string name, string parameterName)
+    public static void ValidateCredentialEnvironmentVariable(string name, string parameterName)
     {
         SandboxCredentialFileWriter.ValidateEnvironmentVariableName(name, parameterName);
         if (ReservedNames.Contains(name))
-            throw new ArgumentException($"Sandbox environment variable is reserved: {name}", parameterName);
+            throw new ArgumentException($"Credential environment variable is reserved: {name}", parameterName);
+    }
+
+    public static void ValidateForSandboxEnvironment(string name, string parameterName)
+    {
+        SandboxCredentialFileWriter.ValidateEnvironmentVariableName(name, parameterName);
     }
 
     /// <summary>
-    /// Serialises a validated environment for dot-sourcing by a POSIX shell.
-    /// Values are single-quoted and NUL is rejected before any file is written.
+    /// Serialises a general sandbox environment for dot-sourcing by a POSIX
+    /// shell. Values are single-quoted and NUL is rejected before any file is
+    /// written. Credential-specific reserved-name checks are intentionally not
+    /// applied here because trusted sandbox specs may set variables such as
+    /// PATH.
     /// </summary>
     public static string BuildShellEnvironmentFileContent(IReadOnlyDictionary<string, string> environment)
     {

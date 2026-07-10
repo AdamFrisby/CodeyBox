@@ -24,7 +24,7 @@ namespace CodeyBox.Orchestrator;
 /// Every other invocation path — including the planning/plan-rework agent turn,
 /// which goes through <see cref="RunAsync"/> — is preprocessed normally.</para>
 /// </summary>
-internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModelProvider
+internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModelProvider, IAgentCredentialEnvironmentPolicy
 {
     protected readonly IAgentRunner Inner;
     protected readonly AgentPromptPreprocessorChain Chain;
@@ -78,6 +78,21 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
 
     string? IAgentDefaultModelProvider.DefaultModelId =>
         (Inner as IAgentDefaultModelProvider)?.DefaultModelId;
+
+    private IAgentCredentialEnvironmentPolicy? InnerCredentialEnvironmentPolicy =>
+        Inner as IAgentCredentialEnvironmentPolicy;
+
+    IReadOnlySet<string> IAgentCredentialEnvironmentPolicy.DirectCredentialEnvironmentVariables =>
+        InnerCredentialEnvironmentPolicy?.DirectCredentialEnvironmentVariables
+        ?? new HashSet<string>(StringComparer.Ordinal);
+
+    IReadOnlySet<string> IAgentCredentialEnvironmentPolicy.FileBackedCredentialEnvironmentVariables =>
+        InnerCredentialEnvironmentPolicy?.FileBackedCredentialEnvironmentVariables
+        ?? new HashSet<string>(StringComparer.Ordinal);
+
+    IReadOnlyList<AgentCredentialFileDestination> IAgentCredentialEnvironmentPolicy.CredentialFileDestinations =>
+        InnerCredentialEnvironmentPolicy?.CredentialFileDestinations
+        ?? [];
 
     public AgentFailureClassification ClassifyFailure(AgentResult result) =>
         Inner.ClassifyFailure(result);

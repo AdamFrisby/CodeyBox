@@ -3623,7 +3623,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 hostNetworkProfile: rebaseProfile,
                 timingWorkItemId: item.Id,
                 timingPhase: timingPhase,
-                extraEnvironment: credentialPlan.Environment,
+                extraEnvironment: null,
                 additionalCredentialMounts: credentialPlan.Mounts,
                 includeCredentialsTmpfs: credentialPlan.RequiresCredentialsTmpfs,
                 agentCredentialScope: true,
@@ -4004,10 +4004,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
     private sealed record PickupRebaseCredentialPlan(
         IReadOnlyList<SandboxMount> Mounts,
-        IReadOnlyDictionary<string, string> Environment,
         bool RequiresCredentialsTmpfs)
     {
-        public static PickupRebaseCredentialPlan Empty { get; } = new([], new Dictionary<string, string>(), false);
+        public static PickupRebaseCredentialPlan Empty { get; } = new([], false);
     }
 
     private static PickupRebaseCredentialPlan BuildPickupRebaseCredentialPlan(
@@ -4015,7 +4014,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
         SandboxRepositoryAccess repositoryAccess)
     {
         var mountsByDestination = new Dictionary<string, SandboxMount>(StringComparer.Ordinal);
-        var environment = new Dictionary<string, string>(StringComparer.Ordinal);
         var reservedDestinations = repositoryAccess.Mounts
             .Select(static mount => mount.SandboxPath)
             .Append(SandboxConventions.WorkDir)
@@ -4034,33 +4032,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
 
             requiresCredentialsTmpfs = true;
-            foreach (var (name, value) in credential.EnvironmentVariables)
-            {
-                SandboxEnvironmentVariablePolicy.ValidateForSandboxEnvironment(name, nameof(credential));
-                if (value.Contains('\0'))
-                {
-                    throw new AgentCredentialScopeException(
-                        candidate.Runner.Kind,
-                        $"credential environment variable '{name}' contains a NUL byte");
-                }
-                if (value.Length > SandboxConventions.CredentialsTmpfsBytes)
-                {
-                    throw new AgentCredentialScopeException(
-                        candidate.Runner.Kind,
-                        $"credential environment variable '{name}' exceeds the size limit");
-                }
-                if (environment.TryGetValue(name, out var existing))
-                {
-                    if (!string.Equals(existing, value, StringComparison.Ordinal))
-                    {
-                        throw new InvalidOperationException(
-                            $"Resolver candidate credentials contain conflicting values for environment variable '{name}'.");
-                    }
-                    continue;
-                }
-                environment.Add(name, value);
-            }
-
             foreach (var mount in credential.Mounts)
             {
                 if (!mount.SandboxPath.StartsWith("/", StringComparison.Ordinal)
@@ -4090,7 +4061,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         return new PickupRebaseCredentialPlan(
             mountsByDestination.Values.ToArray(),
-            environment,
             requiresCredentialsTmpfs);
     }
 
@@ -17104,12 +17074,8 @@ Original merge-phase failure (JSON string, for context only):
 
     private static string SanitiseCredentialFileName(string path)
     {
-        if (string.IsNullOrEmpty(path)) throw new ArgumentException("Empty credential file name");
-        var trimmed = path.Replace('\\', '/').TrimStart('/');
-        if (trimmed.Split('/', StringSplitOptions.RemoveEmptyEntries).Any(static segment => segment is "." or ".."))
-            throw new ArgumentException($"Credential file path must not contain '..': {path}");
-        if (trimmed.Length == 0) throw new ArgumentException("Credential file name resolves empty");
-        return trimmed;
+        SandboxCredentialFileWriter.ValidateRelativePath(path, nameof(path));
+        return path;
     }
 
     // ── Stuck-probe integration ──────────────────────────────────────────────

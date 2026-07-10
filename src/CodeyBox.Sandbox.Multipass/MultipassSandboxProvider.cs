@@ -6198,22 +6198,32 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         MultipassSandboxProvider.TryChmod0700(hostDir);
         var hostPath = Path.Combine(hostDir, fileName);
         await File.WriteAllTextAsync(hostPath, MultipassSandboxProvider.BuildEnvironmentFileContent(env), ct);
-        if (!OperatingSystem.IsWindows())
-            File.SetUnixFileMode(hostPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-
-        const string vmDir = "/home/ubuntu/.codeybox-exec-env";
-        await RunVmCommandAsync(["mkdir", "-p", vmDir], ct);
         try
         {
+            if (!OperatingSystem.IsWindows())
+                File.SetUnixFileMode(hostPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+
+            const string vmDir = "/home/ubuntu/.codeybox-exec-env";
+            await RunVmCommandAsync(["mkdir", "-p", vmDir], ct);
             await TransferFileToVmAsync(hostPath, $".codeybox-exec-env/{fileName}", "multipass transfer exec env file", ct);
+            var vmPath = $"{vmDir}/{fileName}";
+            await RunVmCommandAsync(["chmod", "0600", vmPath], ct);
+            return vmPath;
         }
         finally
         {
-            try { File.Delete(hostPath); } catch { }
+            try
+            {
+                File.Delete(hostPath);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                _log.LogWarning(
+                    ex,
+                    "Failed to delete host-side sandbox exec environment file {FileName} from protected sandbox directory",
+                    fileName);
+            }
         }
-        var vmPath = $"{vmDir}/{fileName}";
-        await RunVmCommandAsync(["chmod", "0600", vmPath], ct);
-        return vmPath;
     }
 
     private async Task<string> TransferExecScriptAsync(IReadOnlyList<string> wrapped, CancellationToken ct)

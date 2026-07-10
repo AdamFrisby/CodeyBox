@@ -516,14 +516,20 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         var fakeResume = cliResumeSessionId is null
             ? null
             : new AgentResumeContext(CheckpointRef: $"claude-session:{cliResumeSessionId}");
-        var preparation = await PrepareSandboxForRunAsync(sandbox, workingDirectory, credential, fakeResume, ct)
+        var preparation = await PrepareSandboxForRunAsync(
+                sandbox,
+                workingDirectory,
+                credential,
+                fakeResume,
+                ct,
+                preserveExistingCredentialFiles: false)
             .ConfigureAwait(false);
         if (preparation is not null)
             return preparation;
 
         var invocation = BuildClaudeSessionInvocation(
             prompt, modelId, reasoningMode, cliResumeSessionId, captureStructuredStream);
-        var result = await ExecOnceAsync(sandbox, workingDirectory, invocation, stdoutChunkCallback, ct)
+        var result = await ExecOnceAsync(sandbox, workingDirectory, invocation, credential, stdoutChunkCallback, ct)
             .ConfigureAwait(false);
 
         if (!result.Success
@@ -534,7 +540,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
                 .ConfigureAwait(false);
             if (sanitized is null)
             {
-                result = await ExecOnceAsync(sandbox, workingDirectory, invocation, stdoutChunkCallback, ct)
+                result = await ExecOnceAsync(sandbox, workingDirectory, invocation, credential, stdoutChunkCallback, ct)
                     .ConfigureAwait(false);
             }
             else
@@ -554,6 +560,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         ISandbox sandbox,
         string workingDirectory,
         AgentInvocation invocation,
+        AgentCredential? credential,
         Action<string>? stdoutChunkCallback,
         CancellationToken ct)
     {
@@ -561,7 +568,8 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         {
             Argv = invocation.Argv,
             WorkingDirectory = workingDirectory,
-            ExtraEnvironment = invocation.ExtraEnvironment,
+            ExtraEnvironment = BuildExecEnvironment(invocation.ExtraEnvironment, credential),
+            EnvironmentContainsSecrets = HasDirectCredentialEnvironment(credential),
             Stdin = invocation.Stdin,
             StdoutChunkCallback = stdoutChunkCallback,
             AgentOutputTransport = SelectBatchAgentOutputTransport(sandbox),

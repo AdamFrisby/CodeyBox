@@ -301,7 +301,8 @@ public sealed class OpencodeAgentRunnerTests
 
         var script = sandbox.Execs[FindMaterialisationScriptIndex(sandbox.Execs)].Argv[2];
         Assert.Contains("O_NOFOLLOW", script, StringComparison.Ordinal);
-        Assert.Contains("os.mkdir(part, 0o700", script, StringComparison.Ordinal);
+        Assert.Contains("DIRECTORY_MODE = 0o700", script, StringComparison.Ordinal);
+        Assert.Contains("os.mkdir(part, DIRECTORY_MODE", script, StringComparison.Ordinal);
         Assert.Contains("os.replace(tmp_name, file_name", script, StringComparison.Ordinal);
         Assert.Contains("open_existing_parent_directory", script, StringComparison.Ordinal);
         Assert.Contains("credential destination parent path changed during write", script, StringComparison.Ordinal);
@@ -322,7 +323,8 @@ public sealed class OpencodeAgentRunnerTests
 
         var script = sandbox.Execs[FindMaterialisationScriptIndex(sandbox.Execs)].Argv[2];
         var writeIdx = script.IndexOf("handle.write(data)", StringComparison.Ordinal);
-        var chmodIdx = script.IndexOf("os.fchmod(handle.fileno(), 0o600)", StringComparison.Ordinal);
+        Assert.Contains("FILE_MODE = 0o600", script, StringComparison.Ordinal);
+        var chmodIdx = script.IndexOf("os.fchmod(handle.fileno(), FILE_MODE)", StringComparison.Ordinal);
         var replaceIdx = script.IndexOf("os.replace(tmp_name, file_name", StringComparison.Ordinal);
         Assert.True(chmodIdx >= 0, "script must set the auth file mode to 0600");
         Assert.True(writeIdx >= 0, "script must write stdin into the private temp file");

@@ -91,8 +91,8 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 
     /// <summary>
     /// Credential environment variables the CLI reads directly from its
-    /// process environment. Resolver candidate scoping uses this exact list as
-    /// the allowlist at the process-environment sink.
+    /// process environment. The shared exec path uses this exact list as the
+    /// allowlist at the process-environment sink.
     /// </summary>
     protected virtual IReadOnlyList<string> DirectCredentialEnvironmentVariables => [];
 
@@ -175,7 +175,8 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         string workingDirectory,
         AgentCredential? credential,
         AgentResumeContext? resume,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool preserveExistingCredentialFiles = true)
     {
         var agentPreparation = await PrepareAgentSandboxAsync(
             sandbox, workingDirectory, credential, resume, ct).ConfigureAwait(false);
@@ -183,7 +184,10 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             return agentPreparation;
 
         return await MaterialiseEnvBackedCredentialFilesAsync(
-            sandbox, credential, preserveExistingCredentialFile: resume is not null, ct).ConfigureAwait(false);
+            sandbox,
+            credential,
+            preserveExistingCredentialFile: preserveExistingCredentialFiles && resume is not null,
+            ct).ConfigureAwait(false);
     }
 
     private async Task<AgentResult?> MaterialiseEnvBackedCredentialFilesAsync(
@@ -274,27 +278,13 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         ValidateEnvironmentVariableName(file.EnvironmentVariable, nameof(file.EnvironmentVariable));
         if (file.DestinationEnvironmentVariable is not null)
             ValidateEnvironmentVariableName(file.DestinationEnvironmentVariable, nameof(file.DestinationEnvironmentVariable));
-        ValidateHomeRelativeCredentialPath(file.HomeRelativePath);
+        SandboxCredentialFileWriter.ValidateRelativePath(file.HomeRelativePath, nameof(file.HomeRelativePath));
         if (string.IsNullOrWhiteSpace(file.FailureDescription))
             throw new ArgumentException("Credential file failure description must be non-empty.", nameof(file));
     }
 
     private static void ValidateEnvironmentVariableName(string value, string fieldName)
         => SandboxCredentialFileWriter.ValidateEnvironmentVariableName(value, fieldName);
-
-    private static void ValidateHomeRelativeCredentialPath(string value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-            throw new ArgumentException("Credential home-relative path must be non-empty.", nameof(value));
-        if (value.StartsWith('/'))
-            throw new ArgumentException($"Credential path must be relative to HOME: {value}", nameof(value));
-
-        foreach (var segment in value.Split('/', StringSplitOptions.RemoveEmptyEntries))
-        {
-            if (segment is "." or "..")
-                throw new ArgumentException($"Credential path must not contain traversal segments: {value}", nameof(value));
-        }
-    }
 
     public virtual async Task<AgentResult> RunAsync(
         ISandbox sandbox,
@@ -307,11 +297,10 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         Action<string>? stdoutChunkCallback = null,
         bool captureStructuredStream = false)
     {
-        // Direct CLI env credentials are provisioned by the sandbox owner in
-        // SandboxSpec, including resolver sandboxes whose candidates are known
-        // before creation. Env-backed credential files are materialised below
-        // via stdin. This runner deliberately does NOT merge
-        // credential.EnvironmentVariables into per-exec ExtraEnvironment.
+        // File-backed credential payloads are materialised below via stdin.
+        // Only allowlisted direct CLI env credentials are added to the
+        // per-exec environment, and that exec is marked secret-bearing so
+        // providers use their protected environment transport.
         if (RejectUnsupportedFileBackedCredentials(sandbox, credential) is { } unsupported)
             return unsupported;
 
@@ -324,6 +313,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             sandbox,
             workingDirectory,
             invocation,
+            credential,
             stdoutChunkCallback,
             captureStructuredStream,
             ct,
@@ -392,6 +382,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             sandbox,
             workingDirectory,
             invocation,
+            credential,
             stdoutChunkCallback,
             captureStructuredStream,
             ct,
@@ -407,6 +398,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         ISandbox sandbox,
         string workingDirectory,
         AgentInvocation invocation,
+        AgentCredential? credential,
         Action<string>? stdoutChunkCallback,
         bool captureStructuredStream,
         CancellationToken ct,
@@ -426,6 +418,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 sandbox,
                 workingDirectory,
                 current,
+                sessionResumeContext?.Credential ?? credential,
                 stdoutChunkCallback,
                 captureStructuredStream,
                 ct);
@@ -679,6 +672,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         ISandbox sandbox,
         string workingDirectory,
         AgentInvocation invocation,
+        AgentCredential? credential,
         Action<string>? stdoutChunkCallback,
         bool captureStructuredStream,
         CancellationToken ct)
@@ -715,7 +709,8 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         {
             Argv = invocation.Argv,
             WorkingDirectory = workingDirectory,
-            ExtraEnvironment = WithAgentRunId(invocation.ExtraEnvironment, runId),
+            ExtraEnvironment = BuildExecEnvironment(invocation.ExtraEnvironment, credential, runId),
+            EnvironmentContainsSecrets = HasDirectCredentialEnvironment(credential),
             Stdin = invocation.Stdin,
             StdoutChunkCallback = stdoutChunkCallback,
             StderrChunkCallback = stderrChunkCallback,
@@ -1478,14 +1473,28 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     private string AgentRunKey(ISandbox sandbox, string workingDirectory) =>
         $"{Kind.Value}\n{sandbox.Id}\n{workingDirectory}";
 
-    private static IReadOnlyDictionary<string, string> WithAgentRunId(
+    protected IReadOnlyDictionary<string, string>? BuildExecEnvironment(
         IReadOnlyDictionary<string, string>? environment,
-        string runId)
+        AgentCredential? credential,
+        string? runId = null)
     {
         var merged = environment is null
             ? new Dictionary<string, string>(StringComparer.Ordinal)
             : new Dictionary<string, string>(environment, StringComparer.Ordinal);
-        merged[AgentRunIdEnvironmentVariable] = runId;
+
+        foreach (var (name, value) in GetDirectCredentialEnvironment(credential))
+        {
+            if (merged.TryGetValue(name, out var existing)
+                && !string.Equals(existing, value, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"Invocation environment conflicts with direct credential variable '{name}'.");
+            }
+            merged[name] = value;
+        }
+
+        if (runId is not null)
+            merged[AgentRunIdEnvironmentVariable] = runId;
         // R8-core: the orchestrator-controlled invocation context optionally
         // requests tee'd capture of the agent CLI's stdout/stderr into an in-VM
         // log file. The codeybox-exec wrapper honours this env var; without it
@@ -1494,7 +1503,38 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         var logPath = AgentInvocationLogContext.CurrentLogPath;
         if (!string.IsNullOrEmpty(logPath))
             merged[SandboxConventions.AgentLogFileEnv] = logPath;
-        return merged;
+        return merged.Count == 0 ? null : merged;
+    }
+
+    protected bool HasDirectCredentialEnvironment(AgentCredential? credential)
+        => GetDirectCredentialEnvironment(credential).Any();
+
+    private IEnumerable<KeyValuePair<string, string>> GetDirectCredentialEnvironment(AgentCredential? credential)
+    {
+        if (credential is null || DirectCredentialEnvironmentVariables.Count == 0)
+            yield break;
+
+        foreach (var name in DirectCredentialEnvironmentVariables)
+        {
+            SandboxEnvironmentVariablePolicy.ValidateCredentialEnvironmentVariable(
+                name,
+                nameof(DirectCredentialEnvironmentVariables));
+            if (!credential.EnvironmentVariables.TryGetValue(name, out var value)
+                || string.IsNullOrEmpty(value))
+            {
+                continue;
+            }
+            if (value.Contains('\0'))
+                throw new ArgumentException(
+                    $"Credential environment variable '{name}' contains a NUL byte.",
+                    nameof(credential));
+            if (value.Length > SandboxConventions.CredentialsTmpfsBytes)
+                throw new ArgumentException(
+                    $"Credential environment variable '{name}' exceeds the size limit.",
+                    nameof(credential));
+
+            yield return new KeyValuePair<string, string>(name, value);
+        }
     }
 
     private static void RemoveActiveAgentRunId(string runKey, string runId)

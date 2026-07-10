@@ -31,7 +31,9 @@ public static class SandboxCredentialFileWriter
         ArgumentNullException.ThrowIfNull(sandbox);
         ArgumentNullException.ThrowIfNull(target);
         ArgumentNullException.ThrowIfNull(contents);
-        ValidateRelativePath(target.RelativePath);
+        ValidateRelativePath(target.RelativePath, nameof(target));
+        if (System.Text.Encoding.UTF8.GetByteCount(contents) > SandboxConventions.CredentialsTmpfsBytes)
+            throw new ArgumentException("Credential payload exceeds the size limit.", nameof(contents));
 
         var result = await sandbox.ExecAsync(new SandboxExec
         {
@@ -75,7 +77,7 @@ public static class SandboxCredentialFileWriter
         ValidateEnvironmentVariableName(payloadEnvironmentVariable, nameof(payloadEnvironmentVariable));
         if (destinationEnvironmentVariable is not null)
             ValidateEnvironmentVariableName(destinationEnvironmentVariable, nameof(destinationEnvironmentVariable));
-        ValidateRelativePath(homeRelativePath);
+        ValidateRelativePath(homeRelativePath, nameof(homeRelativePath));
 
         var script = WriterFunctionScript +
             "\nvalue=\"${" + payloadEnvironmentVariable + ":-}\"\n" +
@@ -125,26 +127,22 @@ public static class SandboxCredentialFileWriter
         _ => throw new ArgumentOutOfRangeException(nameof(overwritePolicy), overwritePolicy, "Unsupported credential overwrite policy."),
     };
 
-    private static void ValidateRelativePath(string value)
+    public static void ValidateRelativePath(string value, string fieldName)
     {
         if (string.IsNullOrWhiteSpace(value))
-            throw new ArgumentException("Credential relative path must be non-empty.", nameof(value));
+            throw new ArgumentException("Credential relative path must be non-empty.", fieldName);
         if (value.StartsWith('/'))
-            throw new ArgumentException($"Credential path must be relative to its allowed root: {value}", nameof(value));
+            throw new ArgumentException($"Credential path must be relative to its allowed root: {value}", fieldName);
 
         foreach (var segment in value.Split('/', StringSplitOptions.RemoveEmptyEntries))
         {
             if (segment is "." or "..")
-                throw new ArgumentException($"Credential path must not contain traversal segments: {value}", nameof(value));
+                throw new ArgumentException($"Credential path must not contain traversal segments: {value}", fieldName);
         }
     }
 
     private static string ShellQuote(string value) =>
         "'" + value.Replace("'", "'\"'\"'", StringComparison.Ordinal) + "'";
-
-    private static string StdinWriterScript =>
-        WriterFunctionScript +
-        "\ncodeybox_write_credential_file \"$1\" \"$2\" \"${3:-}\" \"$4\" \"$5\"\n";
 
     private static readonly string WriterFunctionScript =
         $$"""
@@ -167,6 +165,8 @@ public static class SandboxCredentialFileWriter
         O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
         O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
         O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+        DIRECTORY_MODE = 0o700
+        FILE_MODE = 0o600
 
         def fail(message):
             print(message, file=sys.stderr)
@@ -203,14 +203,14 @@ public static class SandboxCredentialFileWriter
                 try:
                     next_fd = open_directory(current_fd, part)
                 except FileNotFoundError:
-                    os.mkdir(part, 0o700, dir_fd=current_fd)
+                    os.mkdir(part, DIRECTORY_MODE, dir_fd=current_fd)
                     next_fd = open_directory(current_fd, part)
 
                 try:
                     mode = os.fstat(next_fd).st_mode
                     if not stat.S_ISDIR(mode):
                         fail("credential destination parent is not a directory")
-                    os.fchmod(next_fd, 0o700)
+                    os.fchmod(next_fd, DIRECTORY_MODE)
                 finally:
                     os.close(current_fd)
                 current_fd = next_fd
@@ -307,7 +307,7 @@ public static class SandboxCredentialFileWriter
                     tmp_fd = os.open(
                         candidate,
                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW | O_CLOEXEC,
-                        0o600,
+                        FILE_MODE,
                         dir_fd=parent_fd)
                     tmp_name = candidate
                     break
@@ -320,7 +320,7 @@ public static class SandboxCredentialFileWriter
                 with os.fdopen(tmp_fd, "wb", closefd=True) as handle:
                     handle.write(data)
                     handle.flush()
-                    os.fchmod(handle.fileno(), 0o600)
+                    os.fchmod(handle.fileno(), FILE_MODE)
                 os.replace(tmp_name, file_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
                 written = os.stat(file_name, dir_fd=parent_fd, follow_symlinks=False)
                 return written.st_dev, written.st_ino
@@ -397,6 +397,10 @@ public static class SandboxCredentialFileWriter
           python3 -c "$codeybox_credential_writer_py" "$1" "$2" "${3:-}" "$4" "$5"
         }
         """;
+
+    private static readonly string StdinWriterScript =
+        WriterFunctionScript +
+        "\ncodeybox_write_credential_file \"$1\" \"$2\" \"${3:-}\" \"$4\" \"$5\"\n";
 }
 
 public enum SandboxCredentialFileRoot
@@ -411,6 +415,16 @@ public enum SandboxCredentialOverwritePolicy
     PreserveNonEmpty,
 }
 
+/// <summary>
+/// Describes one credential file write inside a sandbox. <paramref name="RelativePath"/>
+/// must be non-empty and relative to <paramref name="Root"/> with no traversal
+/// segments. <paramref name="DestinationOverride"/> may be absolute, relative,
+/// <c>~/...</c>, or <c>$HOME/...</c> when <paramref name="Root"/> is
+/// <see cref="SandboxCredentialFileRoot.Home"/>; the in-sandbox writer
+/// normalizes it and rejects any destination outside the selected root.
+/// Writes atomically replace the destination in overwrite mode, or leave an
+/// existing non-empty regular file unchanged in preserve-nonempty mode.
+/// </summary>
 public sealed record SandboxCredentialFileTarget(
     SandboxCredentialFileRoot Root,
     string RelativePath,

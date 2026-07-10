@@ -59,6 +59,16 @@ public interface IAgentCredentialEnvironmentPolicy
     IReadOnlyList<AgentCredentialFileDestination> CredentialFileDestinations { get; }
 }
 
+/// <summary>
+/// Runner-declared HOME credential destination for a payload carried in an
+/// environment variable. <paramref name="HomeRelativePath"/> must be a
+/// non-empty path relative to HOME with no traversal segments. When
+/// <paramref name="DestinationEnvironmentVariable"/> is present, its value may
+/// override the destination with an absolute path, relative path, <c>~/...</c>,
+/// or <c>$HOME/...</c>; materialisation must normalize and reject overrides
+/// that escape HOME. Existing non-empty files are preserved only when the
+/// caller explicitly selects preserve-nonempty staging.
+/// </summary>
 public sealed record AgentCredentialFileDestination(
     string PayloadEnvironmentVariable,
     string HomeRelativePath,

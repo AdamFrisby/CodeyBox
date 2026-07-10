@@ -10,10 +10,10 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// Pins the wiring fix that broke the in-VM agentic conflict resolver. The
-/// pickup-rebase sandbox must have agent network and credential tmpfs scope,
-/// and its creation-time environment must contain only the pre-resolved
-/// resolver candidates' environment credentials. File payloads are materialised
-/// via stdin immediately before that candidate. The agent-merge sandbox still
+/// pickup-rebase sandbox must have agent network and credential tmpfs scope.
+/// Candidate credential payloads are materialised immediately before that
+/// candidate runs instead of being installed in the shared sandbox environment.
+/// The agent-merge sandbox still
 /// carries the chosen agent credential at creation time.
 ///
 /// The new resolver-side integration tests in
@@ -52,7 +52,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task PickupRebaseSandbox_IsCreatedWithAgentNetworkAndCredentialTmpfsBakingCandidateEnv()
+    public async Task PickupRebaseSandbox_IsCreatedWithAgentNetworkAndCredentialTmpfsWithoutCandidateEnv()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var recorder = new RecordingSandboxProvider(
@@ -99,7 +99,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
 
         var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
         AssertCredentialTmpfsAndOpenNetwork(pickupSpec, "pickup-rebase");
-        Assert.Equal(MarkerEnvValue, pickupSpec.Environment[MarkerEnvKey]);
+        Assert.False(pickupSpec.Environment.ContainsKey(MarkerEnvKey));
     }
 
     [Fact]
@@ -165,7 +165,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task PickupRebaseResolver_CreationEnvironmentIncludesOnlyCandidateCredentials()
+    public async Task PickupRebaseResolver_CreationEnvironmentExcludesCandidateCredentials()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var recorder = new RecordingSandboxProvider(
@@ -195,8 +195,8 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         Assert.DoesNotContain(AgentKind.Opencode, credentials.RequestedAgents);
 
         var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
-        Assert.Equal(CodexApiKeyValue, pickupSpec.Environment[CodexApiKeyEnvKey]);
-        Assert.Equal(CursorAuthJson, pickupSpec.Environment[CursorAuthEnvKey]);
+        Assert.False(pickupSpec.Environment.ContainsKey(CodexApiKeyEnvKey));
+        Assert.False(pickupSpec.Environment.ContainsKey(CursorAuthEnvKey));
         Assert.False(pickupSpec.Environment.ContainsKey(NonCandidateEnvKey),
             "non-candidate opencode credential must not enter the resolver sandbox");
         Assert.Equal(
@@ -287,12 +287,11 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task PickupRebaseResolver_CleanRebase_BakesPreResolvedCandidateEnvironment()
+    public async Task PickupRebaseResolver_CleanRebase_DoesNotExposeCandidateEnvironment()
     {
-        // Candidate credentials are resolved before sandbox creation because
-        // env-var-backed fallbacks need their values available at create time.
-        // A clean rebase therefore still carries the viable candidate env, but
-        // does not invoke the resolver.
+        // Candidate credentials are resolved before sandbox creation to plan
+        // mounts/tmpfs, but env values stay out of the shared sandbox
+        // environment. A clean rebase therefore carries no candidate secret.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var recorder = new RecordingSandboxProvider(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
@@ -316,7 +315,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
 
         Assert.Equal(WorkItemState.Done, run.Final.State);
         var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
-        Assert.Equal(ClaudeApiKeyValue, pickupSpec.Environment[ClaudeApiKeyEnvKey]);
+        Assert.False(pickupSpec.Environment.ContainsKey(ClaudeApiKeyEnvKey));
     }
 
     [Fact]
@@ -957,7 +956,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     private static void AssertCredentialAndOpenNetwork(SandboxSpec spec, string phaseName)
     {
         Assert.True(spec.Environment.TryGetValue(MarkerEnvKey, out var marker),
-            $"{phaseName} sandbox was created without baked credential env vars — credential argument was nulled or the credential's env was not propagated");
+            $"{phaseName} sandbox was created without the chosen runner's credential env vars — credential argument was nulled or the credential's env was not propagated");
         Assert.Equal(MarkerEnvValue, marker);
         Assert.Contains(MarkerHost, spec.Network.AllowedHosts);
         // When allowAgentNetwork is false, BuildSandboxSpec sets AllowedHosts
@@ -1283,8 +1282,8 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     /// <summary>
     /// Returns a credential with a single marker env var. Merge/audit call-site
     /// tests assert the marker is present when a chosen agent credential is in
-    /// scope; pickup-rebase asserts candidate credentials are pre-resolved and
-    /// baked into the shared resolver sandbox environment.
+    /// scope; pickup-rebase asserts candidate credentials are pre-resolved
+    /// without being exposed through the shared resolver sandbox environment.
     /// </summary>
     private sealed class MarkerCredentialProvider : ICredentialProvider
     {
@@ -1548,6 +1547,9 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
             bool captureStructuredStream = false)
         {
             var observationPath = $"{workingDirectory}/direct-credential-observed.txt";
+            var directEnvironment = credential?.EnvironmentVariables
+                .Where(pair => DirectCredentialEnvironmentVariables.Contains(pair.Key))
+                .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
             var observe = await sandbox.ExecAsync(new SandboxExec
             {
                 Argv =
@@ -1558,6 +1560,8 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
                     "sh",
                     observationPath,
                 ],
+                ExtraEnvironment = directEnvironment,
+                EnvironmentContainsSecrets = directEnvironment is { Count: > 0 },
             }, ct);
             if (!observe.Success)
                 return new AgentResult(false, "direct credential missing", observe.Stdout, observe.Stderr);

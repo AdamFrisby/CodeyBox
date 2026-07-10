@@ -426,7 +426,6 @@ public sealed class AgenticConflictResolver
                 if (_credentialFileMaterialiser is not null
                     && candidate.Credential is { Files.Count: > 0 })
                 {
-                    previousScopedCandidate = candidate;
                     if (candidate.Credential.Agent != candidate.Runner.Kind)
                     {
                         throw new AgentCredentialScopeException(
