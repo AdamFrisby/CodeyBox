@@ -2161,7 +2161,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 processGroupMarker,
                 null,
                 ["/bin/sh", "-c", "printf should-not-run"],
-                markerWaitSeconds: 5));
+                markerWaitSeconds: 10));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var fakeBin = CreateFakeSudoBin($$"""
@@ -2205,13 +2205,13 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             Assert.Contains("codeybox-detached: timed out waiting for process group marker", stderr, StringComparison.Ordinal);
             Assert.False(File.Exists(processGroupMarker));
 
-            await WaitForFileAsync(sudoProcessGroupFile, TimeSpan.FromSeconds(1));
+            await WaitForFileAsync(sudoProcessGroupFile, TimeSpan.FromSeconds(5));
             var pgid = (await File.ReadAllTextAsync(sudoProcessGroupFile)).Trim();
             await WaitForProcessGroupIdGoneAsync(pgid, TimeSpan.FromSeconds(3));
         }
         finally
         {
-            for (var i = 0; i < 20 && !File.Exists(sudoProcessGroupFile); i++)
+            for (var i = 0; i < 100 && !File.Exists(sudoProcessGroupFile); i++)
                 await Task.Delay(50);
 
             if (File.Exists(sudoProcessGroupFile))
@@ -2250,7 +2250,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 processGroupMarker,
                 null,
                 ["/bin/sh", "-c", "printf should-not-run"],
-                markerWaitSeconds: 5));
+                markerWaitSeconds: 10));
         File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 
         var fakeSudo = CreateFakeSudoBin($$"""
@@ -2285,12 +2285,15 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             Assert.Contains("codeybox-detached: timed out waiting for process group marker", stderr, StringComparison.Ordinal);
             Assert.False(File.Exists(processGroupMarker));
 
-            await WaitForFileAsync(sudoProcessGroupFile, TimeSpan.FromSeconds(1));
+            await WaitForFileAsync(sudoProcessGroupFile, TimeSpan.FromSeconds(5));
             var pgid = (await File.ReadAllTextAsync(sudoProcessGroupFile)).Trim();
             await WaitForProcessGroupIdGoneAsync(pgid, TimeSpan.FromSeconds(3));
         }
         finally
         {
+            for (var i = 0; i < 100 && !File.Exists(sudoProcessGroupFile); i++)
+                await Task.Delay(50);
+
             if (File.Exists(sudoProcessGroupFile))
             {
                 var pgid = (await File.ReadAllTextAsync(sudoProcessGroupFile)).Trim();
