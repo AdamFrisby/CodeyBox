@@ -19,19 +19,22 @@ namespace CodeyBox.Agents.Codex;
 public sealed class CodexQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalidator
 {
     internal const string UsageEndpoint = "https://chatgpt.com/backend-api/wham/usage";
-    internal const string DefaultRoutedModelId = "gpt-5.5";
+
+    /// <summary>
+    /// Provider-side WHAM display-bucket name under which a Codex subscription's
+    /// usage is reported. This is an identifier in the upstream response, NOT a
+    /// routing default: the model the CLI actually routes to is sourced from
+    /// config (<see cref="AgentDefaultsSnapshot"/> / the class member's ModelId),
+    /// and <see cref="ApplyMemberGate"/> aliases this bucket's reading onto that
+    /// configured model. (Deferred follow-up: fold this into a config-driven
+    /// known-bucket list alongside the other provider model lists.)
+    /// </summary>
+    internal const string SubscriptionUsageBucketName = "GPT-5.3-Codex-Spark";
 
     private const int MaxResponseChars = 64 * 1024; // 64 KiB
-    private static readonly IReadOnlyDictionary<string, string[]> RoutedModelAliases =
-        new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
-        {
-            // Captured WHAM usage names the Codex subscription bucket by its
-            // product/display limit, while the CLI route configured in the
-            // default frontier class is gpt-5.5.
-            ["GPT-5.3-Codex-Spark"] = [DefaultRoutedModelId],
-        };
 
     private readonly IHttpClientFactory _httpClientFactory;
+    private readonly AgentDefaultsSnapshot? _defaults;
     private readonly Func<AgentMembership, AgentQuotaCredentials> _credentialsProvider;
     private readonly TimeSpan _cacheTtl;
     private readonly ILogger<CodexQuotaProbe> _log;
@@ -70,12 +73,14 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
         IHttpClientFactory httpClientFactory,
         Func<AgentMembership, AgentQuotaCredentials> credentialsProvider,
         TimeSpan cacheTtl,
-        ILogger<CodexQuotaProbe> log)
+        ILogger<CodexQuotaProbe> log,
+        AgentDefaultsSnapshot? defaults = null)
     {
         _httpClientFactory = httpClientFactory;
         _credentialsProvider = credentialsProvider;
         _cacheTtl = cacheTtl;
         _log = log;
+        _defaults = defaults;
     }
 
     public async Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
@@ -137,6 +142,38 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
         if (snapshot.AvailablePct < 0) return snapshot;
         if (string.IsNullOrWhiteSpace(member.ModelId)) return snapshot;
         if (snapshot.PerModel.ContainsKey(member.ModelId)) return snapshot;
+
+        // Config-driven subscription-bucket alias (replaces the former hardcoded
+        // gpt-5.5 alias target). The WHAM response reports a Codex subscription's
+        // usage under a provider display-bucket name (SubscriptionUsageBucketName),
+        // not the model id the CLI routes to. When the member being gated IS the
+        // configured codex routed-default model (CodeyBox:AgentDefaults[codex]) and
+        // that display bucket is present, alias its already-overall-capped reading
+        // onto the member so the floor is enforced on the subscription's own bucket
+        // rather than the looser account-wide overall. Sourcing the routed-model
+        // identity from config (not a source literal) makes a model rev a config
+        // edit, not a code change. Any other configured model (e.g. a newly
+        // released id the backend has not minted a bucket for) falls through to the
+        // overall reading below, unchanged.
+        var routedDefault = _defaults?.GetDefault(Kind.Value);
+        if (!string.IsNullOrWhiteSpace(routedDefault)
+            && string.Equals(routedDefault, member.ModelId, StringComparison.OrdinalIgnoreCase)
+            && snapshot.PerModel.TryGetValue(SubscriptionUsageBucketName, out var subscriptionQuota))
+        {
+            var aliasedPerModel = new Dictionary<string, ModelQuota>(snapshot.PerModel, StringComparer.OrdinalIgnoreCase)
+            {
+                [member.ModelId] = subscriptionQuota,
+            };
+            return new AgentQuotaSnapshot
+            {
+                AvailablePct = snapshot.AvailablePct,
+                ResetAt = snapshot.ResetAt,
+                Notes = snapshot.Notes,
+                PerModel = aliasedPerModel,
+                Windows = snapshot.Windows,
+                ResetCreditsAvailable = snapshot.ResetCreditsAvailable,
+            };
+        }
 
         // The configured model is not individually enumerated, but the overall
         // reading is known (guarded above) and is the binding constraint for
@@ -303,11 +340,6 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
                 continue;
 
             perModel[modelId] = quota;
-            if (RoutedModelAliases.TryGetValue(modelId, out var aliases))
-            {
-                foreach (var alias in aliases)
-                    perModel.TryAdd(alias, quota);
-            }
         }
 
         return perModel;

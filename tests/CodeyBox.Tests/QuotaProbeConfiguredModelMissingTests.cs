@@ -269,10 +269,14 @@ public sealed class QuotaProbeConfiguredModelMissingTests
     }
 
     [Fact]
-    public async Task Codex_ConfiguredModelPresentViaAlias_UsesParsedQuota()
+    public async Task Codex_ConfiguredRoutedDefaultModel_AliasesSubscriptionBucket()
     {
-        // GPT-5.3-Codex-Spark aliases to gpt-5.5 (Codex's DefaultRoutedModelId).
-        // A member configured as gpt-5.5 should resolve via the alias map.
+        // The WHAM response reports the subscription usage under the provider
+        // display bucket "GPT-5.3-Codex-Spark", not the model the CLI routes to.
+        // When the member IS the configured codex routed default
+        // (AgentDefaults[codex]) and that bucket is present, its parsed reading is
+        // aliased onto the member — the routed-model identity is sourced from
+        // config, not a hardcoded id.
         var body = """
         {
           "rate_limit": {"primary_window":{"used_percent":30}},
@@ -281,20 +285,56 @@ public sealed class QuotaProbeConfiguredModelMissingTests
           ]
         }
         """;
-        var probe = BuildCodexProbe(body);
+        var probe = BuildCodexProbe(body, defaults: CodexDefault("gpt-5.5"));
 
         var member = new AgentMembership
         {
             Agent = AgentKind.Codex,
             Billing = AgentBilling.Subscription,
-            ModelId = CodexQuotaProbe.DefaultRoutedModelId,
+            ModelId = "gpt-5.5",
             QualityScore = 100,
         };
         var snapshot = await probe.GetAvailabilityAsync(member, CancellationToken.None);
 
         Assert.True(snapshot.AvailablePct >= 0);
-        Assert.True(snapshot.PerModel.ContainsKey(CodexQuotaProbe.DefaultRoutedModelId));
+        Assert.True(snapshot.PerModel.ContainsKey("gpt-5.5"));
+        // Aliased to the Spark bucket's parsed reading (50%), not the overall 70%.
+        Assert.Equal(50, snapshot.PerModel["gpt-5.5"].AvailablePct);
         Assert.Null(snapshot.Notes);
+    }
+
+    [Fact]
+    public async Task Codex_SubscriptionBucketAliasTarget_FollowsConfiguredDefault()
+    {
+        // Single-source proof: the alias target follows CodeyBox:AgentDefaults[codex];
+        // changing the configured default moves which model the subscription bucket
+        // aliases to, with no code change and no hardcoded routing literal. When the
+        // member is NOT the configured default it rides the account-wide overall.
+        var body = """
+        {
+          "rate_limit": {"primary_window":{"used_percent":30}},
+          "additional_rate_limits": [
+            {"limit_name":"GPT-5.3-Codex-Spark","rate_limit":{"primary_window":{"used_percent":50}}}
+          ]
+        }
+        """;
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Codex,
+            Billing = AgentBilling.Subscription,
+            ModelId = "gpt-5.6-sol",
+            QualityScore = 120,
+        };
+
+        // Default configured as gpt-5.6-sol → the subscription bucket aliases to it (50%).
+        var aliased = await BuildCodexProbe(body, defaults: CodexDefault("gpt-5.6-sol"))
+            .GetAvailabilityAsync(member, CancellationToken.None);
+        Assert.Equal(50, aliased.PerModel["gpt-5.6-sol"].AvailablePct);
+
+        // Default configured as a different model → gpt-5.6-sol rides overall (70%).
+        var overall = await BuildCodexProbe(body, defaults: CodexDefault("gpt-5.5"))
+            .GetAvailabilityAsync(member, CancellationToken.None);
+        Assert.Equal(70, overall.PerModel["gpt-5.6-sol"].AvailablePct);
     }
 
     // ── Cursor ────────────────────────────────────────────────────────────────
@@ -334,10 +374,11 @@ public sealed class QuotaProbeConfiguredModelMissingTests
     public async Task Cursor_ConfiguredModelPresentInPerModel_UsesParsedQuota()
     {
         // max(total=30, auto=25, api=0) = 30 -> 70% overall available.
-        // autoBucketModels lists composer-2.5 (DefaultRoutedModelId), and
-        // autoPercentUsed=25 -> auto bucket at 75% which is then capped by
-        // overall to 70%. Configured ModelId matches a populated perModel key,
-        // so ApplyMemberGate leaves the snapshot intact.
+        // autoBucketModels lists composer-2.5, and autoPercentUsed=25 -> auto
+        // bucket at 75% which is then capped by overall to 70%. Configured ModelId
+        // matches a populated perModel key, so ApplyMemberGate leaves the snapshot
+        // intact. The model id is a plain response value here, sourced from the
+        // configured member — not a probe-side routing constant.
         var body = """
         {
           "planUsage": { "totalPercentUsed": 30, "autoPercentUsed": 25, "apiPercentUsed": 0 },
@@ -350,13 +391,13 @@ public sealed class QuotaProbeConfiguredModelMissingTests
         {
             Agent = AgentKind.Cursor,
             Billing = AgentBilling.Subscription,
-            ModelId = CursorQuotaProbe.DefaultRoutedModelId,
+            ModelId = "composer-2.5",
             QualityScore = 98,
         };
         var snapshot = await probe.GetAvailabilityAsync(member, CancellationToken.None);
 
         Assert.True(snapshot.AvailablePct >= 0);
-        Assert.True(snapshot.PerModel.ContainsKey(CursorQuotaProbe.DefaultRoutedModelId));
+        Assert.True(snapshot.PerModel.ContainsKey("composer-2.5"));
         Assert.Null(snapshot.Notes);
     }
 
@@ -402,16 +443,20 @@ public sealed class QuotaProbeConfiguredModelMissingTests
             NullLogger<ClaudeQuotaProbe>.Instance);
     }
 
-    private static CodexQuotaProbe BuildCodexProbe(string body)
+    private static CodexQuotaProbe BuildCodexProbe(string body, AgentDefaultsSnapshot? defaults = null)
     {
         var handler = new QuotaCapturingHandler(HttpStatusCode.OK, body, _ => { });
         var factory = new QuotaFakeHttpClientFactory("agent-quota", handler);
         return new CodexQuotaProbe(
             factory,
-            token: "test-token",
+            (AgentMembership _) => new AgentQuotaCredentials("test-token"),
             cacheTtl: TimeSpan.FromMinutes(1),
-            NullLogger<CodexQuotaProbe>.Instance);
+            NullLogger<CodexQuotaProbe>.Instance,
+            defaults);
     }
+
+    private static AgentDefaultsSnapshot CodexDefault(string modelId) =>
+        new(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase) { ["codex"] = modelId });
 
     private static CursorQuotaProbe BuildCursorProbe(string body)
     {
