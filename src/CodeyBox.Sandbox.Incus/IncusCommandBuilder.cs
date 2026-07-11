@@ -41,10 +41,32 @@ internal static class IncusBaselineNaming
     internal static string DeriveBaselineName(
         IncusSandboxOptions options,
         string profileName,
-        SandboxProfileFlavor flavor)
+        SandboxProfileFlavor flavor,
+        Func<string, string?>? environmentVariableReader = null,
+        CancellationToken ct = default,
+        IReadOnlyList<string>? executableContentSha256 = null)
     {
         ArgumentNullException.ThrowIfNull(options);
-        var hash = ComputeConfigHash(options, profileName, flavor);
+        var hash = ComputeConfigHash(
+            options,
+            profileName,
+            flavor,
+            environmentVariableReader,
+            ct,
+            executableContentSha256);
+        return DeriveBaselineNameFromHash(options, profileName, flavor, hash);
+    }
+
+    internal static string DeriveBaselineNameFromHash(
+        IncusSandboxOptions options,
+        string profileName,
+        SandboxProfileFlavor flavor,
+        string hash)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentException.ThrowIfNullOrWhiteSpace(profileName);
+        if (hash.Length != 64 || !hash.All(static c => c is >= '0' and <= '9' or >= 'a' and <= 'f'))
+            throw new ArgumentException("An Incus baseline hash must be 64 lowercase hexadecimal characters.", nameof(hash));
         var profile = NormalizeNamePart(profileName);
         var flavorPart = flavor == SandboxProfileFlavor.Graphical ? "gui" : "headless";
         var prefix = NormalizeEffectivePrefix(options);
@@ -96,13 +118,39 @@ internal static class IncusBaselineNaming
     internal static string ComputeConfigHash(
         IncusSandboxOptions options,
         string profileName,
-        SandboxProfileFlavor flavor)
+        SandboxProfileFlavor flavor,
+        Func<string, string?>? environmentVariableReader = null,
+        CancellationToken ct = default,
+        IReadOnlyList<string>? executableContentSha256 = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentException.ThrowIfNullOrWhiteSpace(profileName);
+        executableContentSha256 ??= options.ExecutableProvisions.Count == 0
+            ? []
+            : IncusBaselineProvisioning.FingerprintExecutables(
+                options,
+                environmentVariableReader
+                    ?? throw new InvalidOperationException(
+                        "An environment reader is required to fingerprint configured Incus executable provisions."),
+                ct);
+        if (executableContentSha256.Count != options.ExecutableProvisions.Count)
+            throw new ArgumentException("Executable fingerprint count does not match the Incus provisioning configuration.", nameof(executableContentSha256));
+        for (var i = 0; i < executableContentSha256.Count; i++)
+        {
+            var digest = executableContentSha256[i];
+            if (digest is null
+                || digest.Length != 71
+                || !digest.StartsWith("sha256:", StringComparison.Ordinal)
+                || !IsLowerHex(digest.AsSpan(7)))
+            {
+                throw new ArgumentException(
+                    $"Executable fingerprint {i} must be 'sha256:' followed by 64 lowercase hexadecimal characters.",
+                    nameof(executableContentSha256));
+            }
+        }
         var canonical = new
         {
-            version = 2,
+            version = 3,
             profile = profileName,
             flavor = flavor.ToString(),
             image = options.DefaultImage,
@@ -118,9 +166,44 @@ internal static class IncusBaselineNaming
             guestUserId = options.GuestUserId,
             guestGroupId = options.GuestGroupId,
             guestHome = options.GuestHome,
+            packageCacheSeeds = options.PackageCacheSeeds.Select(static seed => new
+            {
+                seed.HostSourcePath,
+                seed.VmDestPath,
+                seed.MaxSizeMB,
+            }).ToArray(),
+            executableProvisions = options.ExecutableProvisions.Select((provision, index) => new
+            {
+                provision.HostSourcePath,
+                provision.VmDestPath,
+                VmSymlinks = provision.VmSymlinks.ToArray(),
+                provision.Label,
+                ContentSha256 = executableContentSha256[index],
+            }).ToArray(),
+            baselineVerificationCommands = options.BaselineVerificationCommands.Select(static command => new
+            {
+                command.Label,
+                Argv = command.Argv.ToArray(),
+                command.FailureHint,
+            }).ToArray(),
+            options.MaxExecutableProvisionBytes,
+            options.MaxAggregateExecutableProvisionBytes,
+            options.MaxPackageCacheSeedBytes,
+            options.MaxAggregatePackageCacheSeedBytes,
+            options.MaxPackageCacheSeedEntries,
         };
         var json = JsonSerializer.Serialize(canonical);
         return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(json)));
+    }
+
+    private static bool IsLowerHex(ReadOnlySpan<char> value)
+    {
+        foreach (var c in value)
+        {
+            if (c is not (>= '0' and <= '9' or >= 'a' and <= 'f'))
+                return false;
+        }
+        return true;
     }
 
     private static string NormalizePrefix(string value)

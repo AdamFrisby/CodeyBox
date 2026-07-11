@@ -33,7 +33,7 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
             UseBaselineImages = true,
             PackageCacheSeeds = new[]
             {
-                new PackageCacheSeedOptions { HostSourcePath = "~/path1", VmDestPath = "/dest1", MaxSizeMB = 100 }
+                new BaselinePackageCacheSeed { HostSourcePath = "~/path1", VmDestPath = "/dest1", MaxSizeMB = 100 }
             }
         };
 
@@ -42,7 +42,7 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
             UseBaselineImages = true,
             PackageCacheSeeds = new[]
             {
-                new PackageCacheSeedOptions { HostSourcePath = "~/path1", VmDestPath = "/dest1", MaxSizeMB = 200 }
+                new BaselinePackageCacheSeed { HostSourcePath = "~/path1", VmDestPath = "/dest1", MaxSizeMB = 200 }
             }
         };
 
@@ -68,7 +68,7 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
             UseBaselineImages = true,
             ExecutableProvisions = new[]
             {
-                new ExecutableProvisionOptions
+                new BaselineExecutableProvision
                 {
                     HostSourcePath = hostBin,
                     VmDestPath = "/home/ubuntu/.local/bin/agy",
@@ -76,7 +76,7 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
                 },
             },
         };
-        string HashFor(ExecutableProvisionOptions provision) =>
+        string HashFor(BaselineExecutableProvision provision) =>
             MultipassSandboxProvider.ComputeBaselineHash(
                 opts1 with { ExecutableProvisions = new[] { provision } },
                 "isolated",
@@ -109,7 +109,7 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
             UseBaselineImages = true,
             ExecutableProvisions = new[]
             {
-                new ExecutableProvisionOptions
+                new BaselineExecutableProvision
                 {
                     HostSourcePath = hostBin,
                     VmDestPath = "/home/ubuntu/.local/bin/agy",
@@ -119,7 +119,7 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
             },
             BaselineVerificationCommands = new[]
             {
-                new MultipassBaselineVerificationCommand(
+                new BaselineVerificationCommand(
                     "antigravity",
                     ["agy", "--version"],
                     "agy must be present after executable provisioning"),
@@ -183,7 +183,7 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
             UseBaselineImages = true,
             PackageCacheSeeds = new[]
             {
-                new PackageCacheSeedOptions
+                new BaselinePackageCacheSeed
                 {
                     HostSourcePath = dummyCacheDir,
                     VmDestPath = "/home/ubuntu/.nuget/packages",
@@ -285,7 +285,7 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
             UseBaselineImages = true,
             ExecutableProvisions = new[]
             {
-                new ExecutableProvisionOptions
+                new BaselineExecutableProvision
                 {
                     HostSourcePath = hostBin,
                     VmDestPath = "/home/ubuntu/.local/bin/ag y's",
@@ -378,7 +378,7 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
             UseBaselineImages = true,
             ExecutableProvisions = new[]
             {
-                new ExecutableProvisionOptions
+                new BaselineExecutableProvision
                 {
                     HostSourcePath = Path.Combine(_workspace, "does-not-exist"),
                     VmDestPath = "/home/ubuntu/.local/bin/agy",
@@ -421,7 +421,7 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
     {
         yield return
         [
-            new Func<string, ExecutableProvisionOptions>(hostBin => new ExecutableProvisionOptions
+            new Func<string, BaselineExecutableProvision>(hostBin => new BaselineExecutableProvision
             {
                 HostSourcePath = " ",
                 VmDestPath = "/home/ubuntu/.local/bin/agy",
@@ -431,7 +431,7 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
         ];
         yield return
         [
-            new Func<string, ExecutableProvisionOptions>(hostBin => new ExecutableProvisionOptions
+            new Func<string, BaselineExecutableProvision>(hostBin => new BaselineExecutableProvision
             {
                 HostSourcePath = hostBin,
                 VmDestPath = " ",
@@ -441,7 +441,7 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
         ];
         yield return
         [
-            new Func<string, ExecutableProvisionOptions>(hostBin => new ExecutableProvisionOptions
+            new Func<string, BaselineExecutableProvision>(hostBin => new BaselineExecutableProvision
             {
                 HostSourcePath = hostBin,
                 VmDestPath = "agy",
@@ -451,7 +451,7 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
         ];
         yield return
         [
-            new Func<string, ExecutableProvisionOptions>(hostBin => new ExecutableProvisionOptions
+            new Func<string, BaselineExecutableProvision>(hostBin => new BaselineExecutableProvision
             {
                 HostSourcePath = hostBin,
                 VmDestPath = "/",
@@ -461,7 +461,7 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
         ];
         yield return
         [
-            new Func<string, ExecutableProvisionOptions>(hostBin => new ExecutableProvisionOptions
+            new Func<string, BaselineExecutableProvision>(hostBin => new BaselineExecutableProvision
             {
                 HostSourcePath = hostBin,
                 VmDestPath = "/home/ubuntu/.local/bin/agy",
@@ -475,7 +475,7 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
     [Theory]
     [MemberData(nameof(InvalidExecutableProvisionCases))]
     public async Task BakeBaselineAsync_RejectsInvalidExecutableProvisionConfig(
-        Func<string, ExecutableProvisionOptions> makeProvision,
+        Func<string, BaselineExecutableProvision> makeProvision,
         string expectedMessage)
     {
         var hostBin = Path.Combine(_workspace, "agy");
@@ -499,7 +499,7 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
         var hostBin = Path.Combine(_workspace, "agy");
         await File.WriteAllBytesAsync(hostBin, [0x7f, (byte)'E', (byte)'L', (byte)'F']);
 
-        var opts = MakeExecutableProvisionOptions(new ExecutableProvisionOptions
+        var opts = MakeExecutableProvisionOptions(new BaselineExecutableProvision
         {
             HostSourcePath = hostBin,
             VmDestPath = "/home/ubuntu/.local/bin/agy",
@@ -528,7 +528,7 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
         var hostBin = Path.Combine(_workspace, "agy");
         await File.WriteAllBytesAsync(hostBin, [0x7f, (byte)'E', (byte)'L', (byte)'F']);
 
-        var opts = MakeExecutableProvisionOptions(new ExecutableProvisionOptions
+        var opts = MakeExecutableProvisionOptions(new BaselineExecutableProvision
         {
             HostSourcePath = hostBin,
             VmDestPath = "/home/ubuntu/.local/bin/agy",
@@ -552,7 +552,7 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
         Assert.Contains(deleteNames, name => name.StartsWith("cb-baseline-", StringComparison.Ordinal));
     }
 
-    private MultipassSandboxOptions MakeExecutableProvisionOptions(ExecutableProvisionOptions provision) => new()
+    private MultipassSandboxOptions MakeExecutableProvisionOptions(BaselineExecutableProvision provision) => new()
     {
         MultipassBinary = "/bin/multipass-mock",
         StagingDirectory = Path.Combine(_workspace, "staging-" + Guid.NewGuid().ToString("N")),

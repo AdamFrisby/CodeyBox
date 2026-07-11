@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Runtime.ExceptionServices;
 using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.HostProcess;
@@ -84,6 +85,7 @@ public sealed class IncusSandboxProvider :
     private readonly string _lifecycleProjectName;
     private readonly string _lifecycleStagingRootPath;
     private readonly SemaphoreSlim _hostPreflightLock = new(1, 1);
+    private readonly SemaphoreSlim _hostProvisioningInputGate = new(1, 1);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _baselineLocks = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, bool> _activeNames = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, ActiveOwner> _activeOwners = new(StringComparer.Ordinal);
@@ -167,6 +169,7 @@ public sealed class IncusSandboxProvider :
         IncusSandbox.ValidateEnvironment(spec.Environment, nameof(spec));
         var options = ReadOptions();
         IncusHostIdentity.ValidateHostMountIdentity(options, spec.Mounts);
+        ValidateProvisioningMountSeparation(options, spec.Mounts);
         await EnsureHostPreflightAsync(options, ct).ConfigureAwait(false);
         var bridge = ResolveBridge(options, spec.Network.ProfileName);
         var image = ResolveImage(options, spec.ImageReference);
@@ -200,7 +203,13 @@ public sealed class IncusSandboxProvider :
 
             if (canUseBaseline)
             {
-                var expected = IncusBaselineNaming.DeriveBaselineName(options, spec.Network.ProfileName!, spec.Flavor);
+                var expected = spec.BaselineImageRef is null
+                    ? DeriveLiveBaselineName(
+                        options,
+                        spec.Network.ProfileName!,
+                        spec.Flavor,
+                        ct)
+                    : null;
                 baselineRef = await ResolveOrEnsureBaselineAsync(
                     options,
                     spec.Network.ProfileName!,
@@ -243,20 +252,48 @@ public sealed class IncusSandboxProvider :
                 await SetCloudInitAsync(options, name, IncusCloudInit.Build(options, spec.Flavor), ct).ConfigureAwait(false);
             }
 
-            await using (var mountTiming = await TimingScope.BeginAsync(
-                timingStore, timingItem, timingPhase, "vm.mount", log: _log).ConfigureAwait(false))
-            {
-                await ApplyMountDevicesAsync(options, name, mountPlan.Mounts, ct).ConfigureAwait(false);
-                await VerifyDeviceTopologyAsync(options, name, bridge, mountPlan.Mounts, ct).ConfigureAwait(false);
-            }
-
+            var requestedMountPaths = spec.Mounts
+                .Select(static mount => mount.SandboxPath)
+                .ToArray();
+            var hasHostMountDevices = mountPlan.Mounts.Any(static mount => !mount.TmpfsSizeBytes.HasValue);
+            // Resolve guest paths before attaching any host storage. Otherwise
+            // an image symlink such as /opt/alias -> /etc could cause cloud-init
+            // or boot services to mutate a host-backed directory on first boot.
+            await VerifyDeviceTopologyAsync(options, name, bridge, [], ct).ConfigureAwait(false);
             await using (var startTiming = await TimingScope.BeginAsync(
                 timingStore, timingItem, timingPhase, "vm.start", log: _log).ConfigureAwait(false))
             {
                 await StartAndWaitAsync(options, name, runCloudInit: true, ct).ConfigureAwait(false);
             }
+            await ValidateCanonicalProvisioningPathsAsync(
+                options,
+                name,
+                requestedMountPaths,
+                ct).ConfigureAwait(false);
+            if (hasHostMountDevices)
+            {
+                await StopInstanceAsync(options, name, stateful: false, ct).ConfigureAwait(false);
+                await using (var mountTiming = await TimingScope.BeginAsync(
+                    timingStore, timingItem, timingPhase, "vm.mount", log: _log).ConfigureAwait(false))
+                {
+                    await ApplyMountDevicesAsync(options, name, mountPlan.Mounts, ct).ConfigureAwait(false);
+                    await VerifyDeviceTopologyAsync(options, name, bridge, mountPlan.Mounts, ct).ConfigureAwait(false);
+                }
+                await using var restartTiming = await TimingScope.BeginAsync(
+                    timingStore, timingItem, timingPhase, "vm.restart-after-mount", log: _log).ConfigureAwait(false);
+                await StartAndWaitAsync(options, name, runCloudInit: false, ct).ConfigureAwait(false);
+            }
             if (!canUseBaseline)
+            {
                 await RunExtraRuncmdAsync(options, name, ct).ConfigureAwait(false);
+                await RunProvisioningWithPrivateWorkspaceAsync(
+                    options,
+                    name,
+                    expectedExecutableContentSha256: null,
+                    mountGuestPaths: requestedMountPaths,
+                    ct)
+                    .ConfigureAwait(false);
+            }
             await ApplyGuestTmpfsMountsAsync(options, name, mountPlan.Mounts, ct).ConfigureAwait(false);
             await WaitForMountsAsync(options, name, mountPlan.Mounts, ct).ConfigureAwait(false);
             await CreateGuestLinksAsync(options, name, mountPlan.GuestLinks, ct).ConfigureAwait(false);
@@ -337,7 +374,63 @@ public sealed class IncusSandboxProvider :
             return null;
         if (flavor == SandboxProfileFlavor.Graphical)
             return null;
-        return IncusBaselineNaming.DeriveBaselineName(options, profileName, flavor);
+        return DeriveLiveBaselineName(
+            options,
+            profileName,
+            flavor,
+            CancellationToken.None);
+    }
+
+    private string DeriveLiveBaselineName(
+        IncusSandboxOptions options,
+        string profileName,
+        SandboxProfileFlavor flavor,
+        CancellationToken ct)
+    {
+        var fingerprints = FingerprintExecutableInputs(options, ct);
+        return IncusBaselineNaming.DeriveBaselineName(
+            options,
+            profileName,
+            flavor,
+            executableContentSha256: fingerprints);
+    }
+
+    private IReadOnlyList<string> FingerprintExecutableInputs(
+        IncusSandboxOptions options,
+        CancellationToken ct)
+    {
+        if (options.ExecutableProvisions.Count == 0)
+            return [];
+
+        using var timeoutCancellation = new CancellationTokenSource(
+            options.ImageProvisioningTimeout,
+            _timeProvider);
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(
+            ct,
+            timeoutCancellation.Token);
+        var gateHeld = false;
+        try
+        {
+            _hostProvisioningInputGate.Wait(deadline.Token);
+            gateHeld = true;
+            return IncusBaselineProvisioning.FingerprintExecutables(
+                options,
+                _environmentVariableReader,
+                deadline.Token);
+        }
+        catch (OperationCanceledException ex) when (
+            !ct.IsCancellationRequested && timeoutCancellation.IsCancellationRequested)
+        {
+            throw new TimeoutException(
+                $"Incus executable fingerprinting exceeded its " +
+                $"{options.ImageProvisioningTimeout.TotalSeconds:F0}-second deadline.",
+                ex);
+        }
+        finally
+        {
+            if (gateHeld)
+                _hostProvisioningInputGate.Release();
+        }
     }
 
     public static bool IsOwnedBaselineRef(
@@ -441,7 +534,15 @@ public sealed class IncusSandboxProvider :
             return null;
         await EnsureHostPreflightAsync(options, ct).ConfigureAwait(false);
         _ = ResolveBridge(options, profileName);
-        var expected = IncusBaselineNaming.DeriveBaselineName(options, profileName, flavor);
+        if (pinnedBaselineRef is not null && string.IsNullOrWhiteSpace(pinnedBaselineRef))
+            throw new ArgumentException("A pinned Incus baseline reference cannot be blank.", nameof(pinnedBaselineRef));
+        var expected = pinnedBaselineRef is null
+            ? DeriveLiveBaselineName(
+                options,
+                profileName,
+                flavor,
+                ct)
+            : null;
         return await ResolveOrEnsureBaselineAsync(
             options,
             profileName,
@@ -573,13 +674,14 @@ public sealed class IncusSandboxProvider :
         IncusSandboxOptions options,
         string profileName,
         SandboxProfileFlavor flavor,
-        string liveBaselineName,
+        string? liveBaselineName,
         string? pinnedBaselineRef,
         CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(pinnedBaselineRef)
-            || string.Equals(pinnedBaselineRef, liveBaselineName, StringComparison.Ordinal))
+        if (pinnedBaselineRef is null)
         {
+            if (liveBaselineName is null)
+                throw new InvalidOperationException("An unpinned Incus baseline requires a live content-addressed name.");
             return await EnsureBaselineAsync(
                 options,
                 profileName,
@@ -588,6 +690,8 @@ public sealed class IncusSandboxProvider :
                 ct).ConfigureAwait(false);
         }
 
+        if (string.IsNullOrWhiteSpace(pinnedBaselineRef))
+            throw new ArgumentException("A pinned Incus baseline reference cannot be blank.", nameof(pinnedBaselineRef));
         IncusInputValidation.ValidateInstanceName(pinnedBaselineRef, nameof(pinnedBaselineRef));
         var pinned = await FindInstanceAsync(options, pinnedBaselineRef, ct).ConfigureAwait(false);
         if (pinned is null)
@@ -623,7 +727,22 @@ public sealed class IncusSandboxProvider :
         await gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            var baselineHash = IncusBaselineNaming.ComputeConfigHash(options, profileName, flavor);
+            var executableFingerprints = FingerprintExecutableInputs(options, ct);
+            var baselineHash = IncusBaselineNaming.ComputeConfigHash(
+                options,
+                profileName,
+                flavor,
+                _environmentVariableReader,
+                ct,
+                executableFingerprints);
+            if (!string.Equals(
+                    IncusBaselineNaming.DeriveBaselineNameFromHash(options, profileName, flavor, baselineHash),
+                    baselineName,
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "Incus executable provisioning content changed after the baseline reference was resolved; retry with a freshly resolved reference.");
+            }
             var existing = await FindInstanceAsync(options, baselineName, ct).ConfigureAwait(false);
             if (existing is not null)
             {
@@ -672,6 +791,12 @@ public sealed class IncusSandboxProvider :
                 await VerifyDeviceTopologyAsync(options, candidateName, bridge, [], ct).ConfigureAwait(false);
                 await StartAndWaitAsync(options, candidateName, runCloudInit: true, ct).ConfigureAwait(false);
                 await RunExtraRuncmdAsync(options, candidateName, ct).ConfigureAwait(false);
+                await RunProvisioningWithPrivateWorkspaceAsync(
+                    options,
+                    candidateName,
+                    executableFingerprints,
+                    mountGuestPaths: [],
+                    ct).ConfigureAwait(false);
                 // A copied VM receives a fresh cloud-init instance ID. Replacing user-data
                 // and cleaning cloud-init state prevents installer data and logs from
                 // persisting in the shared snapshot or commands re-running on clones.
@@ -754,6 +879,17 @@ public sealed class IncusSandboxProvider :
         await _hostPreflightLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            var stagingRootPath = ResolveStagingRootPath(options);
+            var needsProvisioningStaging = options.ExecutableProvisions.Count > 0
+                || options.PackageCacheSeeds.Count > 0
+                || options.BaselineVerificationCommands.Count > 0;
+            if (needsProvisioningStaging
+                || Directory.Exists(stagingRootPath)
+                || File.Exists(stagingRootPath))
+            {
+                var stagingRoot = ResolveStagingRoot(options);
+                _ = IncusProvisioningWorkspace.RecoverStaleWorkspaces(stagingRoot, ct);
+            }
             var server = await _cli.RunCheckedAsync(
                 "server API probe",
                 options,
@@ -1077,6 +1213,600 @@ public sealed class IncusSandboxProvider :
             heavyOperation: false).ConfigureAwait(false);
     }
 
+    private async Task RunProvisioningWithPrivateWorkspaceAsync(
+        IncusSandboxOptions options,
+        string name,
+        IReadOnlyList<string>? expectedExecutableContentSha256,
+        IReadOnlyList<string> mountGuestPaths,
+        CancellationToken ct)
+    {
+        if (options.ExecutableProvisions.Count == 0
+            && options.BaselineVerificationCommands.Count == 0
+            && options.PackageCacheSeeds.Count == 0)
+        {
+            return;
+        }
+
+        using var timeoutCancellation = new CancellationTokenSource(
+            options.ImageProvisioningTimeout,
+            _timeProvider);
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(
+            ct,
+            timeoutCancellation.Token);
+        var provisioningCt = deadline.Token;
+        var stagingRoot = ResolveStagingRoot(options);
+        IncusProvisioningWorkspace? workspace = null;
+        Exception? primaryFailure = null;
+        try
+        {
+            await _hostProvisioningInputGate.WaitAsync(provisioningCt).ConfigureAwait(false);
+            try
+            {
+                workspace = IncusProvisioningWorkspace.Create(
+                    options,
+                    stagingRoot,
+                    _environmentVariableReader,
+                    _newGuid,
+                    provisioningCt);
+            }
+            finally
+            {
+                _hostProvisioningInputGate.Release();
+            }
+            if (expectedExecutableContentSha256 is not null
+                && !workspace.ExecutableContentSha256.SequenceEqual(
+                    expectedExecutableContentSha256,
+                    StringComparer.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "An Incus executable provisioning source changed after baseline identity derivation; refusing to publish mismatched bytes.");
+            }
+            await ApplyProvisioningAsync(
+                options,
+                name,
+                workspace,
+                mountGuestPaths,
+                provisioningCt).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            primaryFailure = ex;
+        }
+
+        Exception? cleanupFailure = null;
+        try
+        {
+            workspace?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            cleanupFailure = ex;
+            try
+            {
+                workspace?.ReleaseLeaseForRecovery();
+            }
+            catch (Exception releaseFailure)
+            {
+                cleanupFailure = new AggregateException(
+                    "Incus workspace deletion failed and its recovery lease could not be released.",
+                    ex,
+                    releaseFailure);
+            }
+        }
+        try
+        {
+            ThrowProvisioningFailures(
+                primaryFailure,
+                cleanupFailure,
+                "Incus VM provisioning failed and private host workspace cleanup also failed.");
+        }
+        catch (OperationCanceledException ex) when (
+            !ct.IsCancellationRequested && timeoutCancellation.IsCancellationRequested)
+        {
+            throw new TimeoutException(
+                $"Incus VM provisioning exceeded its {options.ImageProvisioningTimeout.TotalSeconds:F0}-second deadline.",
+                ex);
+        }
+    }
+
+    private async Task ApplyProvisioningAsync(
+        IncusSandboxOptions options,
+        string name,
+        IncusProvisioningWorkspace workspace,
+        IReadOnlyList<string> mountGuestPaths,
+        CancellationToken ct)
+    {
+        await ValidateCanonicalProvisioningPathsAsync(
+            options,
+            name,
+            mountGuestPaths,
+            ct).ConfigureAwait(false);
+        var needsGuestStage = workspace.Executables.Count > 0 || options.PackageCacheSeeds.Count > 0;
+        var guestStageRoot = $"{IncusCloudInit.ControlDirectory}/provision-{NextGuid("guest provisioning directory"):N}";
+        var guestStageCreated = false;
+        Exception? primaryFailure = null;
+        try
+        {
+            if (needsGuestStage)
+            {
+                await RunRootCommandAsync(
+                    options,
+                    name,
+                    "prepare guest provisioning directory",
+                    ["install", "-d", "-m", "0700", "-o", "0", "-g", "0", "--", guestStageRoot],
+                    ct).ConfigureAwait(false);
+                guestStageCreated = true;
+            }
+
+            await ProvisionExecutablesAsync(options, name, workspace, guestStageRoot, ct).ConfigureAwait(false);
+            await VerifyProvisioningCommandsAsync(options, name, ct).ConfigureAwait(false);
+            await SeedPackageCachesAsync(options, name, workspace, guestStageRoot, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            primaryFailure = ex;
+        }
+
+        Exception? cleanupFailure = null;
+        if (guestStageCreated)
+        {
+            try
+            {
+                await RunRootCommandAsync(
+                    options,
+                    name,
+                    "clean guest provisioning directory",
+                    ["rm", "-rf", "--", guestStageRoot],
+                    CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                cleanupFailure = ex;
+            }
+        }
+        ThrowProvisioningFailures(
+            primaryFailure,
+            cleanupFailure,
+            "Incus VM provisioning failed and transient guest-file cleanup also failed.");
+    }
+
+    private async Task ProvisionExecutablesAsync(
+        IncusSandboxOptions options,
+        string name,
+        IncusProvisioningWorkspace workspace,
+        string guestStageRoot,
+        CancellationToken ct)
+    {
+        for (var i = 0; i < workspace.Executables.Count; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var executable = workspace.Executables[i];
+            var provision = executable.Provision;
+            EnsureProvisioningDestinationAllowed(provision.VmDestPath);
+            var label = string.IsNullOrWhiteSpace(provision.Label)
+                ? Path.GetFileName(provision.VmDestPath)
+                : provision.Label;
+            var guestStagePath = $"{guestStageRoot}/executable-{i:D3}";
+            _log.LogInformation(
+                "Provisioning Incus VM executable {Label} at {GuestDestination}",
+                label,
+                provision.VmDestPath);
+            await _cli.RunCheckedAsync(
+                "push staged executable",
+                options,
+                BuildFilePush(options, name, executable.StagedPath, guestStagePath),
+                stdin: null,
+                options.ImageProvisioningTimeout,
+                ct).ConfigureAwait(false);
+
+            var destinationParent = GetGuestParent(provision.VmDestPath);
+            await PrepareGuestDirectoryAsync(
+                options,
+                name,
+                destinationParent,
+                "prepare executable destination",
+                ct).ConfigureAwait(false);
+            await RunRootCommandAsync(
+                options,
+                name,
+                "install staged executable",
+                ["install", "-m", "0755", "-o", "0", "-g", "0", "--", guestStagePath, provision.VmDestPath],
+                ct,
+                options.ImageProvisioningTimeout).ConfigureAwait(false);
+
+            foreach (var symlink in provision.VmSymlinks)
+            {
+                EnsureProvisioningDestinationAllowed(symlink);
+                await PrepareGuestDirectoryAsync(
+                    options,
+                    name,
+                    GetGuestParent(symlink),
+                    "prepare executable symlink destination",
+                    ct).ConfigureAwait(false);
+                await RunRootCommandAsync(
+                    options,
+                    name,
+                    "create executable symlink",
+                    ["ln", "-sfnT", "--", provision.VmDestPath, symlink],
+                    ct).ConfigureAwait(false);
+            }
+        }
+    }
+
+    internal async Task ValidateCanonicalProvisioningPathsAsync(
+        IncusSandboxOptions options,
+        string name,
+        IReadOnlyList<string> mountGuestPaths,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(mountGuestPaths);
+        if (mountGuestPaths.Count == 0
+            && options.PackageCacheSeeds.Count == 0
+            && options.ExecutableProvisions.Count == 0)
+        {
+            return;
+        }
+        var canonicalMounts = new List<string>(mountGuestPaths.Count);
+        foreach (var mountPath in mountGuestPaths)
+        {
+            IncusInputValidation.ValidateAbsoluteGuestPath(mountPath, nameof(mountGuestPaths));
+            var canonical = await ResolveCanonicalGuestPathAsync(
+                options,
+                name,
+                mountPath,
+                ct).ConfigureAwait(false);
+            if (!string.Equals(canonical, mountPath, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"Sandbox mount path '{mountPath}' resolves through a guest filesystem alias; " +
+                    "mount destinations must be canonical paths.");
+            }
+            if (canonicalMounts.Any(existing => IncusGuestPaths.Overlap(canonical, existing)))
+            {
+                throw new InvalidOperationException(
+                    "Canonical sandbox mount paths must be distinct and non-overlapping.");
+            }
+            canonicalMounts.Add(canonical);
+        }
+
+        foreach (var target in SnapshotProvisioningTargets(options))
+        {
+            EnsureProvisioningDestinationAllowed(target.Path);
+            var canonical = await ResolveCanonicalGuestPathAsync(
+                options,
+                name,
+                target.Path,
+                ct).ConfigureAwait(false);
+            if (!string.Equals(canonical, target.Path, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"{target.Name} resolves through a guest filesystem alias; " +
+                    "provisioning destinations must be canonical paths.");
+            }
+            EnsureProvisioningDestinationAllowed(canonical);
+            if (canonicalMounts.Any(mount => IncusGuestPaths.Overlap(canonical, mount)))
+            {
+                throw new InvalidOperationException(
+                    $"{target.Name} resolves into a sandbox mount; refusing root provisioning writes.");
+            }
+        }
+    }
+
+    private async Task<string> ResolveCanonicalGuestPathAsync(
+        IncusSandboxOptions options,
+        string name,
+        string guestPath,
+        CancellationToken ct)
+    {
+        var result = await _cli.RunCheckedAsync(
+            "resolve guest provisioning path",
+            options,
+            BuildRootExec(options, name, ["/usr/bin/realpath", "-m", "--", guestPath]),
+            stdin: null,
+            options.OperationTimeout,
+            ct,
+            heavyOperation: false,
+            maxStdoutBytes: 8192,
+            maxStderrBytes: 4096).ConfigureAwait(false);
+        var canonical = result.Stdout.TrimEnd('\r', '\n');
+        if (canonical.Length == 0
+            || canonical.Contains('\r')
+            || canonical.Contains('\n'))
+        {
+            throw new InvalidOperationException(
+                "Guest path canonicalization returned an invalid response.");
+        }
+        IncusInputValidation.ValidateAbsoluteGuestPath(canonical, nameof(guestPath));
+        return canonical;
+    }
+
+    private async Task VerifyProvisioningCommandsAsync(
+        IncusSandboxOptions options,
+        string name,
+        CancellationToken ct)
+    {
+        for (var i = 0; i < options.BaselineVerificationCommands.Count; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var verification = options.BaselineVerificationCommands[i];
+            _log.LogInformation(
+                "Running Incus VM provisioning verification {Step}/{Total}: {Label}",
+                i + 1,
+                options.BaselineVerificationCommands.Count,
+                verification.Label);
+            var result = await _cli.RunAllowFailureAsync(
+                options,
+                BuildUnprivilegedVerificationExec(options, name, verification.Argv),
+                stdin: null,
+                options.OperationTimeout,
+                ct,
+                heavyOperation: false,
+                maxStdoutBytes: 4096,
+                maxStderrBytes: 4096).ConfigureAwait(false);
+            if (result.Success && !result.StdoutLimitExceeded && !result.StderrLimitExceeded)
+                continue;
+            var hint = string.IsNullOrWhiteSpace(verification.FailureHint)
+                ? "the required command is not runnable by the configured sandbox identity on its non-login PATH"
+                : verification.FailureHint;
+            throw new InvalidOperationException(
+                $"Incus VM provisioning verification '{verification.Label}' failed: {hint}.");
+        }
+    }
+
+    private async Task SeedPackageCachesAsync(
+        IncusSandboxOptions options,
+        string name,
+        IncusProvisioningWorkspace workspace,
+        string guestStageRoot,
+        CancellationToken ct)
+    {
+        var aggregateBytes = 0L;
+        for (var i = 0; i < options.PackageCacheSeeds.Count; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var seed = options.PackageCacheSeeds[i];
+            EnsureProvisioningDestinationAllowed(seed.VmDestPath);
+            string archivePath;
+            await _hostProvisioningInputGate.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                archivePath = workspace.CreatePackageArchive(
+                    options,
+                    seed,
+                    i,
+                    _environmentVariableReader,
+                    ref aggregateBytes,
+                    ct);
+            }
+            finally
+            {
+                _hostProvisioningInputGate.Release();
+            }
+            var guestArchivePath = $"{guestStageRoot}/package-cache-{i:D3}.tar";
+            _log.LogInformation(
+                "Seeding Incus VM package cache at {GuestDestination}",
+                seed.VmDestPath);
+            await _cli.RunCheckedAsync(
+                "push staged package cache",
+                options,
+                BuildFilePush(options, name, archivePath, guestArchivePath),
+                stdin: null,
+                options.ImageProvisioningTimeout,
+                ct).ConfigureAwait(false);
+            await PrepareGuestDirectoryAsync(
+                options,
+                name,
+                seed.VmDestPath,
+                "prepare package cache destination",
+                ct).ConfigureAwait(false);
+            await RunRootCommandAsync(
+                options,
+                name,
+                "extract package cache seed",
+                [
+                    "tar",
+                    "--extract",
+                    "--file", guestArchivePath,
+                    "--directory", seed.VmDestPath,
+                    "--no-same-owner",
+                    "--no-same-permissions",
+                ],
+                ct,
+                options.ImageProvisioningTimeout).ConfigureAwait(false);
+            await RunRootCommandAsync(
+                options,
+                name,
+                "assign package cache ownership",
+                [
+                    "chown",
+                    "-R",
+                    $"{options.GuestUserId.ToString(CultureInfo.InvariantCulture)}:{options.GuestGroupId.ToString(CultureInfo.InvariantCulture)}",
+                    "--",
+                    seed.VmDestPath,
+                ],
+                ct,
+                options.ImageProvisioningTimeout).ConfigureAwait(false);
+        }
+    }
+
+    private async Task RunRootCommandAsync(
+        IncusSandboxOptions options,
+        string name,
+        string operation,
+        IReadOnlyList<string> command,
+        CancellationToken ct,
+        TimeSpan? timeout = null) =>
+        await _cli.RunCheckedAsync(
+            operation,
+            options,
+            BuildRootExec(options, name, command),
+            stdin: null,
+            timeout ?? options.OperationTimeout,
+            ct,
+            heavyOperation: false).ConfigureAwait(false);
+
+    private async Task PrepareGuestDirectoryAsync(
+        IncusSandboxOptions options,
+        string name,
+        string guestDirectory,
+        string operation,
+        CancellationToken ct)
+    {
+        IncusInputValidation.ValidateAbsoluteGuestPath(guestDirectory, nameof(guestDirectory));
+        IReadOnlyList<string> command = IsGuestHomePath(options, guestDirectory)
+            ?
+            [
+                "install",
+                "-d",
+                "-m", "0755",
+                "-o", options.GuestUserId.ToString(CultureInfo.InvariantCulture),
+                "-g", options.GuestGroupId.ToString(CultureInfo.InvariantCulture),
+                "--",
+                guestDirectory,
+            ]
+            : ["mkdir", "-p", "--", guestDirectory];
+        await RunRootCommandAsync(options, name, operation, command, ct).ConfigureAwait(false);
+    }
+
+    private static IReadOnlyList<string> BuildFilePush(
+        IncusSandboxOptions options,
+        string name,
+        string hostSource,
+        string guestDestination)
+    {
+        IncusInputValidation.ValidateInstanceName(name, nameof(name));
+        IncusInputValidation.ValidateAbsoluteHostPath(hostSource, nameof(hostSource));
+        IncusInputValidation.ValidateAbsoluteGuestPath(guestDestination, nameof(guestDestination));
+        var argv = IncusCommandBuilder.Prefix(
+            options,
+            "file", "push",
+            "--mode=0600",
+            "--uid=0",
+            "--gid=0",
+            "--");
+        argv.Add(hostSource);
+        argv.Add($"{name}{guestDestination}");
+        return argv;
+    }
+
+    private static IReadOnlyList<string> BuildUnprivilegedVerificationExec(
+        IncusSandboxOptions options,
+        string name,
+        IReadOnlyList<string> command)
+    {
+        if (command.Count == 0)
+            throw new ArgumentException("An Incus baseline verification command cannot have empty argv.", nameof(command));
+        var unprivileged = new List<string>(command.Count + 14)
+        {
+            "setsid",
+            "--",
+            "setpriv",
+            "--no-new-privs",
+            $"--reuid={options.GuestUserId.ToString(CultureInfo.InvariantCulture)}",
+            $"--regid={options.GuestGroupId.ToString(CultureInfo.InvariantCulture)}",
+            "--clear-groups",
+            "--",
+            "env",
+            "-i",
+            "--",
+            $"HOME={options.GuestHome}",
+            $"PATH={IncusCloudInit.NonLoginPath}",
+            "LANG=C.UTF-8",
+        };
+        unprivileged.AddRange(command);
+        return BuildRootExec(options, name, unprivileged, options.GuestHome);
+    }
+
+    private static bool IsGuestHomePath(IncusSandboxOptions options, string path) =>
+        string.Equals(path, options.GuestHome, StringComparison.Ordinal)
+        || path.StartsWith(options.GuestHome + "/", StringComparison.Ordinal);
+
+    internal static void ValidateProvisioningMountSeparation(
+        IncusSandboxOptions options,
+        IReadOnlyList<SandboxMount> mounts)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(mounts);
+
+        var provisioningTargets = SnapshotProvisioningTargets(options);
+
+        for (var mountIndex = 0; mountIndex < mounts.Count; mountIndex++)
+        {
+            var mount = mounts[mountIndex]
+                ?? throw new InvalidOperationException("Incus sandbox mounts cannot contain null entries.");
+            IncusInputValidation.ValidateAbsoluteGuestPath(mount.SandboxPath, nameof(mounts));
+            foreach (var target in provisioningTargets)
+            {
+                if (IncusGuestPaths.Overlap(target.Path, mount.SandboxPath))
+                {
+                    throw new InvalidOperationException(
+                        $"{target.Name} overlaps sandbox mount path '{mount.SandboxPath}'; " +
+                        "refusing to expose host or transient mount storage to root provisioning writes.");
+                }
+            }
+        }
+    }
+
+    private static IReadOnlyList<(string Path, string Name)> SnapshotProvisioningTargets(
+        IncusSandboxOptions options)
+    {
+        var targets = new List<(string Path, string Name)>(
+            options.PackageCacheSeeds.Count
+            + options.ExecutableProvisions.Count * 2);
+        for (var i = 0; i < options.PackageCacheSeeds.Count; i++)
+        {
+            targets.Add((
+                options.PackageCacheSeeds[i].VmDestPath,
+                $"PackageCacheSeeds[{i}].VmDestPath"));
+        }
+        for (var i = 0; i < options.ExecutableProvisions.Count; i++)
+        {
+            var provision = options.ExecutableProvisions[i];
+            targets.Add((
+                provision.VmDestPath,
+                $"ExecutableProvisions[{i}].VmDestPath"));
+            for (var linkIndex = 0; linkIndex < provision.VmSymlinks.Count; linkIndex++)
+            {
+                targets.Add((
+                    provision.VmSymlinks[linkIndex],
+                    $"ExecutableProvisions[{i}].VmSymlinks[{linkIndex}]"));
+            }
+        }
+        return targets;
+    }
+
+    private static void EnsureProvisioningDestinationAllowed(string guestPath)
+    {
+        IncusInputValidation.ValidateAbsoluteGuestPath(guestPath, nameof(guestPath));
+        if (guestPath == "/"
+            || IncusCloudInit.OverlapsProviderOwnedPath(guestPath)
+            || IncusGuestPaths.IsVolatileOrPseudoFilesystemPath(guestPath))
+        {
+            throw new InvalidOperationException(
+                "Incus provisioning destinations cannot be root, volatile/pseudo filesystems, " +
+                "or provider-owned guest control paths.");
+        }
+    }
+
+    private static string GetGuestParent(string guestPath)
+    {
+        var separator = guestPath.LastIndexOf('/');
+        return separator <= 0 ? "/" : guestPath[..separator];
+    }
+
+    private static void ThrowProvisioningFailures(
+        Exception? primaryFailure,
+        Exception? cleanupFailure,
+        string aggregateMessage)
+    {
+        if (primaryFailure is not null && cleanupFailure is not null)
+            throw new AggregateException(aggregateMessage, primaryFailure, cleanupFailure);
+        if (cleanupFailure is not null)
+            ExceptionDispatchInfo.Capture(cleanupFailure).Throw();
+        if (primaryFailure is not null)
+            ExceptionDispatchInfo.Capture(primaryFailure).Throw();
+    }
+
     private async Task CleanCloudInitStateAsync(
         IncusSandboxOptions options,
         string name,
@@ -1151,7 +1881,15 @@ public sealed class IncusSandboxProvider :
         await _cli.RunCheckedAsync(
             "verify guest exec isolation utilities",
             options,
-            BuildRootExec(options, name, ["test", "-x", "/usr/bin/setpriv", "-a", "-x", "/usr/bin/setsid"]),
+            BuildRootExec(
+                options,
+                name,
+                [
+                    "test",
+                    "-x", "/usr/bin/setpriv",
+                    "-a", "-x", "/usr/bin/setsid",
+                    "-a", "-x", "/usr/bin/realpath",
+                ]),
             stdin: null,
             options.OperationTimeout,
             ct,
@@ -1760,12 +2498,21 @@ public sealed class IncusSandboxProvider :
     private static IReadOnlyList<string> BuildRootExec(
         IncusSandboxOptions options,
         string name,
-        IReadOnlyList<string> command)
+        IReadOnlyList<string> command,
+        string? workingDirectory = null)
     {
         IncusInputValidation.ValidateInstanceName(name, nameof(name));
         if (command.Count == 0 || command.Any(item => item.Contains('\0')))
             throw new ArgumentException("Root exec command is empty or contains NUL.", nameof(command));
-        var argv = IncusCommandBuilder.Prefix(options, "exec", name, "--");
+        if (workingDirectory is not null)
+            IncusInputValidation.ValidateAbsoluteGuestPath(workingDirectory, nameof(workingDirectory));
+        var argv = IncusCommandBuilder.Prefix(options, "exec", name);
+        if (workingDirectory is not null)
+        {
+            argv.Add("--cwd");
+            argv.Add(workingDirectory);
+        }
+        argv.Add("--");
         argv.AddRange(command);
         return argv;
     }

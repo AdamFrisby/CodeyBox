@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.HostProcess;
+using CodeyBox.Sandbox;
 
 namespace CodeyBox.Sandbox.Incus;
 
@@ -24,10 +25,26 @@ public sealed record IncusSandboxOptions
     public const int MaximumExtraRuncmdCommandUtf8Bytes = 64 * 1024;
     public const int MaximumAggregateExtraRuncmdUtf8Bytes = 1024 * 1024;
     public const int MaximumExtraCloudInitUtf8Bytes = 1024 * 1024;
+    public const int MaximumPackageCacheSeeds =
+        BaselineProvisioningLimits.MaximumPackageCacheSeeds;
+    public const int MaximumExecutableProvisions =
+        BaselineProvisioningLimits.MaximumExecutableProvisions;
+    public const int MaximumBaselineVerificationCommands =
+        BaselineProvisioningLimits.MaximumVerificationCommands;
+    public const int MaximumExecutableSymlinks =
+        BaselineProvisioningLimits.MaximumExecutableSymlinks;
+    public const int MaximumVerificationArgv =
+        BaselineProvisioningLimits.MaximumVerificationArguments;
+    public const int MaximumProvisioningTextUtf8Bytes =
+        BaselineProvisioningLimits.MaximumProvisioningTextUtf8Bytes;
+    public const int MaximumAggregateVerificationTextUtf8Bytes =
+        BaselineProvisioningLimits.MaximumAggregateVerificationTextUtf8Bytes;
     /// <summary>Maximum operator-supplied entries in either Incus host-path list.</summary>
     public const int MaximumConfiguredHostPathEntries = 64;
     /// <summary>Configured entries plus the two provider-managed paths each list can add.</summary>
     public const int MaximumEffectiveHostPathEntries = MaximumConfiguredHostPathEntries + 2;
+    /// <summary>Every effective mount root plus the provider-owned staging root.</summary>
+    public const int MaximumRestrictedProjectRoots = MaximumEffectiveHostPathEntries + 1;
     public const int MaximumExecRetryAttempts = 100;
 
     /// <summary>
@@ -71,6 +88,18 @@ public sealed record IncusSandboxOptions
     /// <summary>Operator-provided first-boot commands included in the baked baseline.</summary>
     public IReadOnlyList<string> ExtraRuncmd { get; init; } = [];
 
+    /// <summary>Bounded host package-cache trees copied into a baseline or full-launch VM.</summary>
+    public IReadOnlyList<BaselinePackageCacheSeed> PackageCacheSeeds { get; init; } = [];
+
+    /// <summary>Host executable files installed into a baseline or full-launch VM.</summary>
+    public IReadOnlyList<BaselineExecutableProvision> ExecutableProvisions { get; init; } = [];
+
+    /// <summary>
+    /// Unprivileged commands that must pass after command/executable provisioning,
+    /// before package-cache seeding and VM use.
+    /// </summary>
+    public IReadOnlyList<BaselineVerificationCommand> BaselineVerificationCommands { get; init; } = [];
+
     /// <summary>
     /// Optional additional cloud-init top-level configuration. Generated keys such as
     /// <c>write_files</c> and <c>runcmd</c> are rejected to prevent ambiguous merging.
@@ -89,7 +118,11 @@ public sealed record IncusSandboxOptions
     /// wall-clock limit or caller cancellation can end the command sooner.
     /// </summary>
     public TimeSpan ExecTimeout { get; init; } = DefaultExecTimeout;
-    /// <summary>Deadline for a cold image download/import and VM root initialization.</summary>
+    /// <summary>
+    /// Deadline applied to a cold image/root initialization operation and,
+    /// separately, to executable staging/install, verification, and package-cache
+    /// seeding (including host input capture).
+    /// </summary>
     public TimeSpan ImageProvisioningTimeout { get; init; } = DefaultImageProvisioningTimeout;
     public TimeSpan VmStartTimeout { get; init; } = DefaultVmStartTimeout;
     public TimeSpan VmStopTimeout { get; init; } = DefaultVmStopTimeout;
@@ -136,6 +169,16 @@ public sealed record IncusSandboxOptions
     public int MaxReadinessProbeEntries { get; init; } = 4096;
     public long MaxTmpfsDeviceBytes { get; init; } = 16L * 1024 * 1024 * 1024;
     public long MaxAggregateTmpfsBytes { get; init; } = 32L * 1024 * 1024 * 1024;
+    /// <summary>Maximum bytes read from one host executable provision.</summary>
+    public long MaxExecutableProvisionBytes { get; init; } = 512L * 1024 * 1024;
+    /// <summary>Maximum aggregate bytes read from all executable provisions in one bake.</summary>
+    public long MaxAggregateExecutableProvisionBytes { get; init; } = 1024L * 1024 * 1024;
+    /// <summary>Maximum bytes read from one package-cache seed when its own limit is absent.</summary>
+    public long MaxPackageCacheSeedBytes { get; init; } = 4L * 1024 * 1024 * 1024;
+    /// <summary>Maximum aggregate bytes read from all package-cache seeds in one bake.</summary>
+    public long MaxAggregatePackageCacheSeedBytes { get; init; } = 8L * 1024 * 1024 * 1024;
+    /// <summary>Maximum filesystem entries traversed in one package-cache seed.</summary>
+    public int MaxPackageCacheSeedEntries { get; init; } = 100_000;
 
     /// <summary>Validates configuration without accessing the host or Incus daemon.</summary>
     public static IReadOnlyList<string> Validate(IncusSandboxOptions options)
@@ -224,6 +267,18 @@ public sealed record IncusSandboxOptions
         if (options.MaxAggregateTmpfsBytes < options.MaxTmpfsDeviceBytes
             || options.MaxAggregateTmpfsBytes > 4L * 1024 * 1024 * 1024 * 1024)
             errors.Add($"{nameof(MaxAggregateTmpfsBytes)} must be at least MaxTmpfsDeviceBytes and no more than 4 TiB.");
+        if (options.MaxExecutableProvisionBytes is < 1 or > 4L * 1024 * 1024 * 1024)
+            errors.Add($"{nameof(MaxExecutableProvisionBytes)} must be between 1 byte and 4 GiB.");
+        if (options.MaxAggregateExecutableProvisionBytes < options.MaxExecutableProvisionBytes
+            || options.MaxAggregateExecutableProvisionBytes > 64L * 1024 * 1024 * 1024)
+            errors.Add($"{nameof(MaxAggregateExecutableProvisionBytes)} must be at least MaxExecutableProvisionBytes and no more than 64 GiB.");
+        if (options.MaxPackageCacheSeedBytes is < 1 or > 1024L * 1024 * 1024 * 1024)
+            errors.Add($"{nameof(MaxPackageCacheSeedBytes)} must be between 1 byte and 1 TiB.");
+        if (options.MaxAggregatePackageCacheSeedBytes < options.MaxPackageCacheSeedBytes
+            || options.MaxAggregatePackageCacheSeedBytes > 4L * 1024 * 1024 * 1024 * 1024)
+            errors.Add($"{nameof(MaxAggregatePackageCacheSeedBytes)} must be at least MaxPackageCacheSeedBytes and no more than 4 TiB.");
+        if (options.MaxPackageCacheSeedEntries is < 1 or > 1_000_000)
+            errors.Add($"{nameof(MaxPackageCacheSeedEntries)} must be between 1 and 1000000.");
         if (options.DiskGuard is { } diskGuard)
         {
             if (diskGuard.MinFreeBytes < 0)
@@ -301,6 +356,7 @@ public sealed record IncusSandboxOptions
             if (commandBytes > MaximumAggregateExtraRuncmdUtf8Bytes)
                 errors.Add($"{nameof(ExtraRuncmd)} exceeds 1 MiB in aggregate.");
         }
+        ValidateBaselineProvisioning(options, errors);
         var validateExtraCloudInit = true;
         if (options.ExtraCloudInit is { } cloudInit
             && !TryGetBoundedUtf8ByteCount(
@@ -425,6 +481,235 @@ public sealed record IncusSandboxOptions
             errors.Add($"{nameof(ExtraCloudInit)} is invalid: {ex.Message}");
         }
         return errors;
+    }
+
+    private static void ValidateBaselineProvisioning(
+        IncusSandboxOptions options,
+        ICollection<string> errors)
+    {
+        if (options.PackageCacheSeeds.Count > MaximumPackageCacheSeeds)
+        {
+            errors.Add($"{nameof(PackageCacheSeeds)} cannot contain more than {MaximumPackageCacheSeeds} entries.");
+        }
+        else
+        {
+            for (var i = 0; i < options.PackageCacheSeeds.Count; i++)
+            {
+                var seed = options.PackageCacheSeeds[i];
+                ValidateProvisioningText(seed.HostSourcePath, $"{nameof(PackageCacheSeeds)}[{i}].HostSourcePath", errors);
+                ValidateGuestProvisioningPath(
+                    seed.VmDestPath,
+                    $"{nameof(PackageCacheSeeds)}[{i}].VmDestPath",
+                    errors);
+                if (seed.MaxSizeMB is { } maxSizeMb)
+                {
+                    if (!double.IsFinite(maxSizeMb) || maxSizeMb <= 0)
+                    {
+                        errors.Add($"{nameof(PackageCacheSeeds)}[{i}].MaxSizeMB must be finite and greater than zero.");
+                    }
+                    else if (maxSizeMb > options.MaxPackageCacheSeedBytes / (1024d * 1024d))
+                    {
+                        errors.Add($"{nameof(PackageCacheSeeds)}[{i}].MaxSizeMB cannot exceed {nameof(MaxPackageCacheSeedBytes)}.");
+                    }
+                }
+            }
+        }
+
+        ValidateProvisioningDestinationCollisions(options, errors);
+
+        if (options.ExecutableProvisions.Count > MaximumExecutableProvisions)
+        {
+            errors.Add($"{nameof(ExecutableProvisions)} cannot contain more than {MaximumExecutableProvisions} entries.");
+        }
+        else
+        {
+            for (var i = 0; i < options.ExecutableProvisions.Count; i++)
+            {
+                var provision = options.ExecutableProvisions[i];
+                ValidateProvisioningText(provision.HostSourcePath, $"{nameof(ExecutableProvisions)}[{i}].HostSourcePath", errors);
+                ValidateGuestProvisioningPath(
+                    provision.VmDestPath,
+                    $"{nameof(ExecutableProvisions)}[{i}].VmDestPath",
+                    errors);
+                ValidateOptionalProvisioningText(provision.Label, $"{nameof(ExecutableProvisions)}[{i}].Label", errors);
+                if (provision.VmSymlinks.Count > MaximumExecutableSymlinks)
+                {
+                    errors.Add($"{nameof(ExecutableProvisions)}[{i}].VmSymlinks cannot contain more than {MaximumExecutableSymlinks} entries.");
+                }
+                else
+                {
+                    for (var linkIndex = 0; linkIndex < provision.VmSymlinks.Count; linkIndex++)
+                    {
+                        ValidateGuestProvisioningPath(
+                            provision.VmSymlinks[linkIndex],
+                            $"{nameof(ExecutableProvisions)}[{i}].VmSymlinks[{linkIndex}]",
+                            errors);
+                    }
+                }
+            }
+        }
+
+        if (options.BaselineVerificationCommands.Count > MaximumBaselineVerificationCommands)
+        {
+            errors.Add($"{nameof(BaselineVerificationCommands)} cannot contain more than {MaximumBaselineVerificationCommands} entries.");
+        }
+        else
+        {
+            var aggregateBytes = 0L;
+            for (var i = 0; i < options.BaselineVerificationCommands.Count; i++)
+            {
+                var command = options.BaselineVerificationCommands[i];
+                ValidateProvisioningText(command.Label, $"{nameof(BaselineVerificationCommands)}[{i}].Label", errors, ref aggregateBytes);
+                ValidateOptionalProvisioningText(command.FailureHint, $"{nameof(BaselineVerificationCommands)}[{i}].FailureHint", errors, ref aggregateBytes);
+                if (command.Argv.Count is < 1 or > MaximumVerificationArgv)
+                {
+                    errors.Add($"{nameof(BaselineVerificationCommands)}[{i}].Argv must contain between 1 and {MaximumVerificationArgv} entries.");
+                }
+                else
+                {
+                    for (var argIndex = 0; argIndex < command.Argv.Count; argIndex++)
+                    {
+                        ValidateProvisioningText(
+                            command.Argv[argIndex],
+                            $"{nameof(BaselineVerificationCommands)}[{i}].Argv[{argIndex}]",
+                            errors,
+                            ref aggregateBytes,
+                            allowEmpty: argIndex != 0);
+                    }
+                }
+            }
+            if (aggregateBytes > MaximumAggregateVerificationTextUtf8Bytes)
+                errors.Add($"{nameof(BaselineVerificationCommands)} exceeds 256 KiB in aggregate.");
+        }
+    }
+
+    private static void ValidateProvisioningDestinationCollisions(
+        IncusSandboxOptions options,
+        ICollection<string> errors)
+    {
+        var cacheDestinations = new List<(string Path, string Name)>();
+        for (var i = 0; i < options.PackageCacheSeeds.Count; i++)
+        {
+            var path = options.PackageCacheSeeds[i].VmDestPath;
+            if (IsAbsoluteGuestPath(path) && path != "/")
+                AddNonOverlapping(path, $"{nameof(PackageCacheSeeds)}[{i}].VmDestPath", cacheDestinations, errors);
+        }
+
+        var executableTargets = new List<(string Path, string Name)>();
+        for (var i = 0; i < options.ExecutableProvisions.Count; i++)
+        {
+            var provision = options.ExecutableProvisions[i];
+            if (IsAbsoluteGuestPath(provision.VmDestPath) && provision.VmDestPath != "/")
+                AddNonOverlapping(provision.VmDestPath, $"{nameof(ExecutableProvisions)}[{i}].VmDestPath", executableTargets, errors);
+            for (var linkIndex = 0; linkIndex < provision.VmSymlinks.Count; linkIndex++)
+            {
+                var link = provision.VmSymlinks[linkIndex];
+                if (IsAbsoluteGuestPath(link) && link != "/")
+                    AddNonOverlapping(link, $"{nameof(ExecutableProvisions)}[{i}].VmSymlinks[{linkIndex}]", executableTargets, errors);
+            }
+        }
+
+        foreach (var cache in cacheDestinations)
+        {
+            foreach (var executable in executableTargets)
+            {
+                if (IncusGuestPaths.Overlap(cache.Path, executable.Path))
+                {
+                    errors.Add(
+                        $"{cache.Name} overlaps {executable.Name}; package seeding after verification cannot replace executable content.");
+                }
+            }
+        }
+    }
+
+    private static void AddNonOverlapping(
+        string path,
+        string name,
+        ICollection<(string Path, string Name)> existing,
+        ICollection<string> errors)
+    {
+        foreach (var prior in existing)
+        {
+            if (IncusGuestPaths.Overlap(path, prior.Path))
+            {
+                errors.Add($"{name} overlaps {prior.Name}; provisioning destinations must be distinct and non-overlapping.");
+                return;
+            }
+        }
+        existing.Add((path, name));
+    }
+
+    private static void ValidateGuestProvisioningPath(
+        string? path,
+        string name,
+        ICollection<string> errors)
+    {
+        ValidateProvisioningText(path, name, errors);
+        if (path is null || !IsAbsoluteGuestPath(path) || path == "/")
+        {
+            errors.Add($"{name} must be a normalized absolute non-root guest path.");
+            return;
+        }
+        if (IncusCloudInit.OverlapsProviderOwnedPath(path))
+            errors.Add($"{name} overlaps an Incus provider-owned guest control path.");
+        if (IncusGuestPaths.IsVolatileOrPseudoFilesystemPath(path))
+        {
+            errors.Add($"{name} must not use a volatile or pseudo-filesystem guest path.");
+        }
+    }
+
+    private static void ValidateOptionalProvisioningText(
+        string? value,
+        string name,
+        ICollection<string> errors)
+    {
+        var ignored = 0L;
+        ValidateOptionalProvisioningText(value, name, errors, ref ignored);
+    }
+
+    private static void ValidateOptionalProvisioningText(
+        string? value,
+        string name,
+        ICollection<string> errors,
+        ref long aggregateBytes)
+    {
+        if (value is not null)
+            ValidateProvisioningText(value, name, errors, ref aggregateBytes, allowEmpty: true);
+    }
+
+    private static void ValidateProvisioningText(
+        string? value,
+        string name,
+        ICollection<string> errors)
+    {
+        var ignored = 0L;
+        ValidateProvisioningText(value, name, errors, ref ignored);
+    }
+
+    private static void ValidateProvisioningText(
+        string? value,
+        string name,
+        ICollection<string> errors,
+        ref long aggregateBytes,
+        bool allowEmpty = false)
+    {
+        if (value is null || (!allowEmpty && string.IsNullOrWhiteSpace(value)))
+        {
+            errors.Add($"{name} is required.");
+            return;
+        }
+        if (!TryGetBoundedUtf8ByteCount(
+                value,
+                MaximumProvisioningTextUtf8Bytes,
+                name,
+                errors,
+                out var bytes))
+        {
+            return;
+        }
+        aggregateBytes += bytes;
+        if (value.Contains('\0') || value.Any(char.IsControl))
+            errors.Add($"{name} cannot contain control characters.");
     }
 
     private static void RequireRetryAttempts(int value, string name, ICollection<string> errors)

@@ -245,7 +245,9 @@ snapshot before using a pin.
   "DefaultImage": "images:ubuntu/24.04/cloud",
   "InstanceNamePrefix": "codeybox-",
   "BaselineNamePrefix": "cb-incus-baseline-",
-  "UseBaselineImages": true
+  "UseBaselineImages": true,
+  "PackageCacheSeeds": [],
+  "ExecutableProvisions": []
 }
 ```
 
@@ -259,6 +261,8 @@ snapshot before using a pin.
 | `BaselineNamePrefix` | string | `cb-incus-baseline-` | Prefix for content-addressed baked baseline instances. |
 | `UseBaselineImages` | bool | `true` | Lazily bake baselines and create sandboxes with COW `incus copy` clones. Set false to use the full-launch path. |
 | `ExtraRuncmd` | string[] | `[]` | Incus-specific first-boot/baseline provisioning commands. At most 256 commands are accepted; each command is limited to 64 KiB of UTF-8 and the aggregate to 1 MiB. Multipass provisioning settings are never inherited. |
+| `PackageCacheSeeds` | object[] | `[]` | Incus-specific host package-cache files or directories copied while provisioning a baked baseline or a full-launch VM. Each entry has `HostSourcePath`, a normalized absolute non-root canonical guest destination directory in `VmDestPath`, and optional finite positive `MaxSizeMB` in MiB (1,048,576 bytes). Directory contents land beneath that destination; a file lands at `VmDestPath/<source basename>`. Guest aliases and paths under `/dev`, `/proc`, `/run`, or `/sys` are rejected. Maximum 32 entries. Multipass seeds are never inherited. |
+| `ExecutableProvisions` | object[] | `[]` | Incus-specific host executables installed while provisioning a baked baseline or a full-launch VM. Each entry has `HostSourcePath`, normalized absolute non-root canonical guest `VmDestPath`, optional `VmSymlinks` (at most 32 normalized absolute canonical guest paths), and optional `Label`. Guest aliases and paths under `/dev`, `/proc`, `/run`, or `/sys` are rejected. Maximum 64 provisions. Multipass provisions are never inherited. |
 | `ExtraCloudInit` | string or null | null | Incus-specific additional top-level cloud-init YAML sent through `user.user-data`. Multipass cloud-init settings are never inherited. Do not put secrets here. |
 | `StagingDirectory` | string or null | `<StateDatabasePath directory>/incus-staging` | Restart-only persistent absolute host directory for isolation snapshots and mount staging. Its canonical, non-symlink parent must already exist; normally leave the root absent so CodeyBox creates it with mode `0700` and its ownership marker. An existing root is accepted only when owned by the service UID/GID with exact mode `0700` and an exact provider-owned `.codeybox-incus-staging-v1` marker (mode `0600`). Set an explicit path to place staging on a separate filesystem. The filesystem root, commas, and control characters are rejected because this path is included in the project's restricted disk-path list. |
 | `AllowedHostMountRoots` | string[] | `[]` plus managed Git roots | Up to 64 additional canonical host-directory roots that may be attached directly through virtiofs. `GitRootDirectory` and the effective shared upstream mirror directory (when enabled) are included automatically, for at most 66 effective roots. The exact canonical roots plus staging form the dedicated project's nonempty `restricted.devices.disk.paths` value; filesystem root, commas, controls, and paths outside the bounded list are rejected. Mounts outside these roots fail closed; add only narrowly scoped trusted directories. |
@@ -267,7 +271,7 @@ snapshot before using a pin.
 | `GuestHome` | string | `/home/ubuntu` | Normalized absolute home directory for the configured guest identity. |
 | `OperationTimeout` | TimeSpan | `00:02:00` | General deadline for one Incus CLI lifecycle operation. |
 | `ExecTimeout` | TimeSpan | `06:00:00` | Provider-side upper bound for one guest command. A sandbox wall-clock limit or caller cancellation can end it sooner. |
-| `ImageProvisioningTimeout` | TimeSpan | `00:30:00` | Deadline for a cold image download/import and VM-root initialization. This is deliberately longer than the general operation timeout. |
+| `ImageProvisioningTimeout` | TimeSpan | `00:30:00` | Deadline applied to a cold Incus image/root initialization operation and, separately, to executable staging/install, verification, and package-cache seeding (including host input capture). This is deliberately longer than the general operation timeout. |
 | `VmStartTimeout` | TimeSpan | `00:05:00` | Deadline for VM boot and guest-agent readiness. |
 | `VmStopTimeout` | TimeSpan | `00:02:00` | Deadline for graceful VM stop. |
 | `CloudInitTimeout` | TimeSpan | `00:05:00` | Deadline for cloud-init completion. |
@@ -287,6 +291,11 @@ snapshot before using a pin.
 | `BaselineCpus` | int | `6` | Default vCPU allocation for baked baselines. |
 | `BaselineMemoryBytes` | long | `17179869184` | Default baseline memory allocation (16 GiB). |
 | `BaselineDiskBytes` | long | `8589934592` | Default baseline root disk size (8 GiB logical allocation, matching the default sandbox limit). |
+| `MaxExecutableProvisionBytes` | long | `536870912` | Maximum size of one host-staged executable (512 MiB by default; valid range 1 byte–4 GiB). |
+| `MaxAggregateExecutableProvisionBytes` | long | `1073741824` | Maximum aggregate size of executable provisions in one baseline or full-launch provisioning operation (1 GiB); must be at least the per-file limit and at most 64 GiB. |
+| `MaxPackageCacheSeedBytes` | long | `4294967296` | Maximum bytes copied from one package-cache seed (4 GiB by default; valid through 1 TiB). An entry's `MaxSizeMB` may narrow this bound but cannot enlarge it. |
+| `MaxAggregatePackageCacheSeedBytes` | long | `8589934592` | Maximum aggregate bytes copied across package-cache seeds in one baseline or full-launch provisioning operation (8 GiB); must be at least the per-seed limit and at most 4 TiB. |
+| `MaxPackageCacheSeedEntries` | int | `100000` | Maximum filesystem entries (files, directories, and links) traversed while copying one package-cache seed; valid range 1–1000000. |
 | `MaxSnapshotBytes` | long | `17179869184` | Maximum aggregate bytes copied into private staging across all `SnapshotForIsolation` and individual-file mounts in one sandbox. |
 | `MaxSnapshotEntries` | int | `100000` | Maximum aggregate number of files, directories, and links copied into private staging for one sandbox. |
 | `MaxReadinessProbeEntries` | int | `4096` | Maximum direct-mount entries inspected while selecting a bounded host/guest identity probe file. |
@@ -300,6 +309,13 @@ also derives its pool and host-volume preflight from the shared
 settings. The effective Incus staging path is added automatically.
 `CodeyBox:DiskGuard:MultipassDataPath` remains Multipass-only and is never read
 by Incus.
+
+When `UseBaselineImages=true`, the API derives Incus post-bake verification
+commands from the provider-neutral `IInVmSmokeProbe` catalog and the configured
+agent set. These commands are not operator-authored configuration: every
+configured CLI-backed agent must have a credential-independent probe (or an
+explicit no-CLI exemption), and the baseline is published only after those
+commands pass. Disabling Incus baselines leaves this bake-only list empty.
 
 | Shared disk-guard key | Default | Incus behavior |
 |-----------------------|---------|----------------|

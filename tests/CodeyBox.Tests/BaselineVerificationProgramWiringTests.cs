@@ -6,6 +6,7 @@ using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox;
+using CodeyBox.Sandbox.Incus;
 using CodeyBox.Sandbox.Multipass;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -18,7 +19,7 @@ using Microsoft.Extensions.Hosting;
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Pins the real Program.cs wiring of <see cref="MultipassSandboxOptions.BaselineVerificationCommands"/>
+/// Pins the real Program.cs wiring of provider-owned baseline verification commands
 /// to live <c>CodeyBoxOptions</c> + <c>ProjectsOptions</c> + the registered
 /// <see cref="IInVmSmokeProbe"/> services. Unit tests cover the builder and
 /// provider directly, but neither catches a regression where Program.cs
@@ -105,6 +106,35 @@ public sealed class BaselineVerificationProgramWiringTests
         Assert.Equal("antigravity", provision.Label);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Program_RejectsOversizedMultipassProvisioningCollections(bool executableProvisions)
+    {
+        var config = new Dictionary<string, string?>
+        {
+            ["CodeyBox:SandboxProvider"] = "multipass",
+            ["CodeyBox:DangerouslyAllowProcessSandbox"] = "true",
+            ["CodeyBox:MultipassUseBaselineImages"] = "false",
+        };
+        var count = executableProvisions
+            ? BaselineProvisioningLimits.MaximumExecutableProvisions + 1
+            : BaselineProvisioningLimits.MaximumPackageCacheSeeds + 1;
+        var section = executableProvisions
+            ? "MultipassExecutableProvisions"
+            : "MultipassPackageCacheSeeds";
+        for (var index = 0; index < count; index++)
+        {
+            config[$"CodeyBox:{section}:{index}:HostSourcePath"] = $"/srv/source-{index}";
+            config[$"CodeyBox:{section}:{index}:VmDestPath"] = $"/var/lib/codeybox/dest-{index}";
+        }
+        using var factory = new BaselineVerificationFactory(config);
+
+        var error = Assert.Throws<InvalidOperationException>(() => ResolveLiveMultipassOptions(factory));
+
+        Assert.Contains($"CodeyBox:{section}", error.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void Program_PopulatesResourceMetricsOptions_FromMultipassSandboxConfig()
     {
@@ -178,6 +208,117 @@ public sealed class BaselineVerificationProgramWiringTests
         Assert.Empty(opts.BaselineVerificationCommands);
     }
 
+    [Fact]
+    public void Program_PopulatesIncusBaselineVerification_FromRegisteredProbes()
+    {
+        using var factory = new BaselineVerificationFactory(new Dictionary<string, string?>
+        {
+            ["CodeyBox:SandboxProvider"] = "incus",
+            ["CodeyBox:Incus:UseBaselineImages"] = "true",
+            ["CodeyBox:AgentClasses:0:Id"] = "incus-frontier",
+            ["CodeyBox:AgentClasses:0:DisplayName"] = "Incus Frontier",
+            ["CodeyBox:AgentClasses:0:Members:0:Agent"] = "antigravity",
+            ["CodeyBox:AgentClasses:0:Members:0:Billing"] = "Subscription",
+            ["CodeyBox:AgentClasses:0:Members:0:QualityScore"] = "70",
+            ["CodeyBox:AgentClasses:0:Members:1:Agent"] = "claude",
+            ["CodeyBox:AgentClasses:0:Members:1:Billing"] = "PayPerApi",
+            ["CodeyBox:AgentClasses:0:Members:1:QualityScore"] = "100",
+        });
+
+        var options = ResolveLiveIncusOptions(factory);
+        var commands = options.BaselineVerificationCommands
+            .ToDictionary(command => command.Label, StringComparer.OrdinalIgnoreCase);
+
+        Assert.Equal(["agy", "--version"], commands["antigravity"].Argv);
+        Assert.Equal(["claude", "--version"], commands["claude"].Argv);
+    }
+
+    [Fact]
+    public void Program_DoesNotUseMultipassBaselineFlagForIncusVerification()
+    {
+        using var factory = new BaselineVerificationFactory(new Dictionary<string, string?>
+        {
+            ["CodeyBox:SandboxProvider"] = "incus",
+            ["CodeyBox:Incus:UseBaselineImages"] = "false",
+            ["CodeyBox:MultipassUseBaselineImages"] = "true",
+            ["CodeyBox:Incus:ExecutableProvisions:0:HostSourcePath"] = "/srv/tools/agy",
+            ["CodeyBox:Incus:ExecutableProvisions:0:VmDestPath"] = "/home/ubuntu/.local/bin/agy",
+            ["CodeyBox:Incus:ExecutableProvisions:0:VmSymlinks:0"] = "/usr/local/bin/agy",
+            ["CodeyBox:AgentClasses:0:Id"] = "incus-frontier",
+            ["CodeyBox:AgentClasses:0:DisplayName"] = "Incus Frontier",
+            ["CodeyBox:AgentClasses:0:Members:0:Agent"] = "claude",
+            ["CodeyBox:AgentClasses:0:Members:0:Billing"] = "PayPerApi",
+            ["CodeyBox:AgentClasses:0:Members:0:QualityScore"] = "100",
+        });
+
+        var options = ResolveLiveIncusOptions(factory);
+
+        Assert.Empty(options.BaselineVerificationCommands);
+        Assert.Single(options.ExecutableProvisions);
+    }
+
+    [Fact]
+    public void Program_IncusAccessorHotReloadsProvisioningAndVerificationIntoFreshSnapshot()
+    {
+        using var factory = new BaselineVerificationFactory(new Dictionary<string, string?>
+        {
+            ["CodeyBox:SandboxProvider"] = "incus",
+            ["CodeyBox:Incus:UseBaselineImages"] = "true",
+            ["CodeyBox:Incus:PackageCacheSeeds:0:HostSourcePath"] = "/srv/cache/v1",
+            ["CodeyBox:Incus:PackageCacheSeeds:0:VmDestPath"] = "/var/cache/codeybox/v1",
+            ["CodeyBox:Incus:ExecutableProvisions:0:HostSourcePath"] = "/srv/tools/v1",
+            ["CodeyBox:Incus:ExecutableProvisions:0:VmDestPath"] = "/usr/local/lib/codeybox/tool-v1",
+            ["CodeyBox:Incus:ExecutableProvisions:0:VmSymlinks:0"] = "/usr/local/bin/tool-v1",
+            ["CodeyBox:Incus:ExecutableProvisions:0:Label"] = "tool-v1",
+            ["CodeyBox:Defaults:Agent"] = "claude",
+        });
+        var accessor = ResolveLiveIncusOptionsAccessor(factory);
+
+        var before = accessor();
+        var configuration = Assert.IsAssignableFrom<IConfigurationRoot>(
+            factory.Services.GetRequiredService<IConfiguration>());
+        configuration["CodeyBox:Incus:PackageCacheSeeds:0:HostSourcePath"] = "/srv/cache/v2";
+        configuration["CodeyBox:Incus:PackageCacheSeeds:0:VmDestPath"] = "/var/cache/codeybox/v2";
+        configuration["CodeyBox:Incus:ExecutableProvisions:0:HostSourcePath"] = "/srv/tools/v2";
+        configuration["CodeyBox:Incus:ExecutableProvisions:0:VmDestPath"] = "/usr/local/lib/codeybox/tool-v2";
+        configuration["CodeyBox:Incus:ExecutableProvisions:0:VmSymlinks:0"] = "/usr/local/bin/tool-v2";
+        configuration["CodeyBox:Incus:ExecutableProvisions:0:Label"] = "tool-v2";
+        configuration["CodeyBox:Defaults:Agent"] = "antigravity";
+        configuration.Reload();
+
+        var after = accessor();
+
+        var beforeSeed = Assert.Single(before.PackageCacheSeeds);
+        var beforeProvision = Assert.Single(before.ExecutableProvisions);
+        Assert.Equal("/srv/cache/v1", beforeSeed.HostSourcePath);
+        Assert.Equal("/var/cache/codeybox/v1", beforeSeed.VmDestPath);
+        Assert.Equal("/srv/tools/v1", beforeProvision.HostSourcePath);
+        Assert.Equal(["/usr/local/bin/tool-v1"], beforeProvision.VmSymlinks);
+        Assert.Contains(before.BaselineVerificationCommands, command =>
+            string.Equals(command.Label, "claude", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(before.BaselineVerificationCommands, command =>
+            string.Equals(command.Label, "antigravity", StringComparison.OrdinalIgnoreCase));
+
+        var afterSeed = Assert.Single(after.PackageCacheSeeds);
+        var afterProvision = Assert.Single(after.ExecutableProvisions);
+        Assert.Equal("/srv/cache/v2", afterSeed.HostSourcePath);
+        Assert.Equal("/var/cache/codeybox/v2", afterSeed.VmDestPath);
+        Assert.Equal("/srv/tools/v2", afterProvision.HostSourcePath);
+        Assert.Equal("/usr/local/lib/codeybox/tool-v2", afterProvision.VmDestPath);
+        Assert.Equal(["/usr/local/bin/tool-v2"], afterProvision.VmSymlinks);
+        Assert.Equal("tool-v2", afterProvision.Label);
+        var antigravity = Assert.Single(after.BaselineVerificationCommands, command =>
+            string.Equals(command.Label, "antigravity", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(["agy", "--version"], antigravity.Argv);
+        Assert.DoesNotContain(after.BaselineVerificationCommands, command =>
+            string.Equals(command.Label, "claude", StringComparison.OrdinalIgnoreCase));
+
+        Assert.NotSame(before, after);
+        Assert.NotSame(before.PackageCacheSeeds, after.PackageCacheSeeds);
+        Assert.NotSame(before.ExecutableProvisions, after.ExecutableProvisions);
+        Assert.NotSame(before.BaselineVerificationCommands, after.BaselineVerificationCommands);
+    }
+
     /// <summary>
     /// Resolves the registered <see cref="ISandboxProvider"/>, unwraps every
     /// composition wrapper around it (admission-control, disk-guard, …), and
@@ -194,6 +335,21 @@ public sealed class BaselineVerificationProgramWiringTests
         Assert.NotNull(accessorField);
         var accessor = Assert.IsType<Func<MultipassSandboxOptions>>(accessorField!.GetValue(multipass));
         return accessor();
+    }
+
+    private static IncusSandboxOptions ResolveLiveIncusOptions(BaselineVerificationFactory factory)
+        => ResolveLiveIncusOptionsAccessor(factory)();
+
+    private static Func<IncusSandboxOptions> ResolveLiveIncusOptionsAccessor(
+        BaselineVerificationFactory factory)
+    {
+        var registered = factory.Services.GetRequiredService<ISandboxProvider>();
+        var incus = UnwrapToIncus(registered);
+
+        var accessorField = typeof(IncusSandboxProvider).GetField(
+            "_optionsAccessor", BindingFlags.NonPublic | BindingFlags.Instance);
+        Assert.NotNull(accessorField);
+        return Assert.IsType<Func<IncusSandboxOptions>>(accessorField!.GetValue(incus));
     }
 
     private static MultipassSandboxProvider UnwrapToMultipass(ISandboxProvider provider)
@@ -216,6 +372,25 @@ public sealed class BaselineVerificationProgramWiringTests
             current = next;
         }
         return Assert.IsType<MultipassSandboxProvider>(current);
+    }
+
+    private static IncusSandboxProvider UnwrapToIncus(ISandboxProvider provider)
+    {
+        var current = provider;
+        var visited = new HashSet<object>();
+        while (current is not IncusSandboxProvider && visited.Add(current))
+        {
+            if (current is ReloadableSandboxProvider reloadable)
+            {
+                current = reloadable.GetProvider(SandboxProviderKinds.Incus);
+                continue;
+            }
+            var innerField = FindInnerField(current.GetType());
+            if (innerField is null) break;
+            if (innerField.GetValue(current) is not ISandboxProvider next) break;
+            current = next;
+        }
+        return Assert.IsType<IncusSandboxProvider>(current);
     }
 
     private static FieldInfo? FindInnerField(Type type)

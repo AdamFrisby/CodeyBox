@@ -1,5 +1,7 @@
 using CodeyBox.Api;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Incus;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
@@ -13,9 +15,27 @@ public sealed class IncusSandboxConfigMapperTests
         options.MultipassExtraRuncmd = ["install-from-multipass"];
         options.MultipassExtraCloudInit = "packages: [multipass-only]";
         options.MultipassUseBaselineImages = false;
+        options.MultipassPackageCacheSeeds =
+        [
+            new PackageCacheSeedConfig
+            {
+                HostSourcePath = "/multipass/cache",
+                VmDestPath = "/var/cache/multipass",
+            },
+        ];
+        options.MultipassExecutableProvisions =
+        [
+            new ExecutableProvisionConfig
+            {
+                HostSourcePath = "/multipass/tool",
+                VmDestPath = "/usr/local/bin/multipass-tool",
+            },
+        ];
         options.Incus = new IncusSandboxConfig
         {
             ExtraRuncmd = [],
+            PackageCacheSeeds = [],
+            ExecutableProvisions = [],
             ExtraCloudInit = null,
             UseBaselineImages = true,
         };
@@ -23,8 +43,184 @@ public sealed class IncusSandboxConfigMapperTests
         var mapped = IncusSandboxConfigMapper.Build(options);
 
         Assert.Empty(mapped.ExtraRuncmd);
+        Assert.Empty(mapped.PackageCacheSeeds);
+        Assert.Empty(mapped.ExecutableProvisions);
         Assert.Null(mapped.ExtraCloudInit);
         Assert.True(mapped.UseBaselineImages);
+    }
+
+    [Fact]
+    public void Build_MapsAndDeepCopiesIncusBaselineProvisioning()
+    {
+        var seed = new PackageCacheSeedConfig
+        {
+            HostSourcePath = "/srv/cache/nuget.tgz",
+            VmDestPath = "/var/cache/codeybox/nuget",
+            MaxSizeMB = 12.5,
+        };
+        var provision = new ExecutableProvisionConfig
+        {
+            HostSourcePath = "/srv/tools/agy",
+            VmDestPath = "/home/ubuntu/.local/bin/agy",
+            VmSymlinks = ["/usr/local/bin/agy"],
+            Label = "antigravity",
+        };
+        var verificationArgv = new List<string> { "agy", "--version" };
+        var options = CreateOptions();
+        options.Incus = new IncusSandboxConfig
+        {
+            PackageCacheSeeds = [seed],
+            ExecutableProvisions = [provision],
+            MaxExecutableProvisionBytes = 64L * 1024 * 1024,
+            MaxAggregateExecutableProvisionBytes = 128L * 1024 * 1024,
+            MaxPackageCacheSeedBytes = 256L * 1024 * 1024,
+            MaxAggregatePackageCacheSeedBytes = 512L * 1024 * 1024,
+            MaxPackageCacheSeedEntries = 456,
+        };
+
+        var mapped = IncusSandboxConfigMapper.Build(
+            options,
+            NullLogger.Instance,
+            [new BaselineVerificationCommand("antigravity", verificationArgv, "agy missing")]);
+        seed.HostSourcePath = "/changed/cache";
+        provision.VmDestPath = "/changed/tool";
+        provision.VmSymlinks[0] = "/changed/link";
+        verificationArgv[0] = "changed";
+
+        var mappedSeed = Assert.Single(mapped.PackageCacheSeeds);
+        Assert.Equal("/srv/cache/nuget.tgz", mappedSeed.HostSourcePath);
+        Assert.Equal("/var/cache/codeybox/nuget", mappedSeed.VmDestPath);
+        Assert.Equal(12.5, mappedSeed.MaxSizeMB);
+        var mappedProvision = Assert.Single(mapped.ExecutableProvisions);
+        Assert.Equal("/srv/tools/agy", mappedProvision.HostSourcePath);
+        Assert.Equal("/home/ubuntu/.local/bin/agy", mappedProvision.VmDestPath);
+        Assert.Equal(["/usr/local/bin/agy"], mappedProvision.VmSymlinks);
+        Assert.Equal("antigravity", mappedProvision.Label);
+        var verification = Assert.Single(mapped.BaselineVerificationCommands);
+        Assert.Equal("antigravity", verification.Label);
+        Assert.Equal(["agy", "--version"], verification.Argv);
+        Assert.Equal("agy missing", verification.FailureHint);
+        Assert.Equal(64L * 1024 * 1024, mapped.MaxExecutableProvisionBytes);
+        Assert.Equal(128L * 1024 * 1024, mapped.MaxAggregateExecutableProvisionBytes);
+        Assert.Equal(256L * 1024 * 1024, mapped.MaxPackageCacheSeedBytes);
+        Assert.Equal(512L * 1024 * 1024, mapped.MaxAggregatePackageCacheSeedBytes);
+        Assert.Equal(456, mapped.MaxPackageCacheSeedEntries);
+    }
+
+    [Fact]
+    public void BaselineProvisioningSnapshots_EnforceObservedCollectionAndUtf8Bounds()
+    {
+        var tooManySeeds = new DeceptiveReadOnlyCollection<PackageCacheSeedConfig>(
+            reportedCount: 0,
+            Enumerable.Range(0, IncusSandboxOptions.MaximumPackageCacheSeeds + 1)
+                .Select(index => new PackageCacheSeedConfig
+                {
+                    HostSourcePath = $"/cache/{index}",
+                    VmDestPath = $"/var/cache/{index}",
+                }));
+        var tooManyProvisions = new DeceptiveReadOnlyCollection<ExecutableProvisionConfig>(
+            reportedCount: 0,
+            Enumerable.Range(0, IncusSandboxOptions.MaximumExecutableProvisions + 1)
+                .Select(index => new ExecutableProvisionConfig
+                {
+                    HostSourcePath = $"/tools/{index}",
+                    VmDestPath = $"/usr/local/bin/tool-{index}",
+                }));
+        var tooManyCommands = new DeceptiveReadOnlyCollection<BaselineVerificationCommand>(
+            reportedCount: 0,
+            Enumerable.Range(0, IncusSandboxOptions.MaximumBaselineVerificationCommands + 1)
+                .Select(index => new BaselineVerificationCommand($"agent-{index}", ["true"])));
+
+        Assert.Throws<InvalidOperationException>(() =>
+            IncusSandboxConfigMapper.SnapshotPackageCacheSeeds(tooManySeeds));
+        Assert.Throws<InvalidOperationException>(() =>
+            IncusSandboxConfigMapper.SnapshotExecutableProvisions(tooManyProvisions));
+        Assert.Throws<InvalidOperationException>(() =>
+            IncusSandboxConfigMapper.SnapshotBaselineVerificationCommands(tooManyCommands));
+        Assert.Equal(IncusSandboxOptions.MaximumPackageCacheSeeds + 1, tooManySeeds.EnumeratedCount);
+        Assert.Equal(IncusSandboxOptions.MaximumExecutableProvisions + 1, tooManyProvisions.EnumeratedCount);
+        Assert.Equal(IncusSandboxOptions.MaximumBaselineVerificationCommands + 1, tooManyCommands.EnumeratedCount);
+
+        var oversizedUtf8 = new string('\u00e9', IncusSandboxOptions.MaximumProvisioningTextUtf8Bytes);
+        var textFailure = Assert.Throws<InvalidOperationException>(() =>
+            IncusSandboxConfigMapper.SnapshotPackageCacheSeeds(
+            [
+                new PackageCacheSeedConfig
+                {
+                    HostSourcePath = oversizedUtf8,
+                    VmDestPath = "/var/cache/seed",
+                },
+            ]));
+        Assert.Contains("UTF-8 bytes", textFailure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BaselineProvisioningSnapshots_BoundNestedSymlinksAndVerificationArgv()
+    {
+        var symlinks = new DeceptiveReadOnlyCollection<string>(
+            reportedCount: 0,
+            Enumerable.Range(0, IncusSandboxOptions.MaximumExecutableSymlinks + 1)
+                .Select(index => $"/usr/local/bin/tool-{index}"));
+        var arguments = Enumerable
+            .Range(0, IncusSandboxOptions.MaximumVerificationArgv + 1)
+            .Select(index => $"arg-{index}")
+            .ToArray();
+
+        Assert.Throws<InvalidOperationException>(() =>
+            IncusSandboxConfigMapper.SnapshotExecutableProvisions(
+            [
+                new ExecutableProvisionConfig
+                {
+                    HostSourcePath = "/srv/tool",
+                    VmDestPath = "/usr/local/bin/tool",
+                    VmSymlinks = symlinks.ToList(),
+                },
+            ]));
+        Assert.Throws<InvalidOperationException>(() =>
+            IncusSandboxConfigMapper.SnapshotBaselineVerificationCommands(
+            [
+                new BaselineVerificationCommand("tool", arguments),
+            ]));
+    }
+
+    [Fact]
+    public void CodeyBoxOptions_BindsNestedIncusBaselineProvisioning()
+    {
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:Incus:PackageCacheSeeds:0:HostSourcePath"] = "/srv/cache/npm.tgz",
+                ["CodeyBox:Incus:PackageCacheSeeds:0:VmDestPath"] = "/var/cache/codeybox/npm",
+                ["CodeyBox:Incus:PackageCacheSeeds:0:MaxSizeMB"] = "42.5",
+                ["CodeyBox:Incus:ExecutableProvisions:0:HostSourcePath"] = "/srv/tools/agy",
+                ["CodeyBox:Incus:ExecutableProvisions:0:VmDestPath"] = "/home/ubuntu/.local/bin/agy",
+                ["CodeyBox:Incus:ExecutableProvisions:0:VmSymlinks:0"] = "/usr/local/bin/agy",
+                ["CodeyBox:Incus:ExecutableProvisions:0:Label"] = "antigravity",
+                ["CodeyBox:Incus:MaxExecutableProvisionBytes"] = "67108864",
+                ["CodeyBox:Incus:MaxAggregateExecutableProvisionBytes"] = "134217728",
+                ["CodeyBox:Incus:MaxPackageCacheSeedBytes"] = "268435456",
+                ["CodeyBox:Incus:MaxAggregatePackageCacheSeedBytes"] = "536870912",
+                ["CodeyBox:Incus:MaxPackageCacheSeedEntries"] = "456",
+            })
+            .Build();
+
+        var options = config.GetSection("CodeyBox").Get<CodeyBoxOptions>();
+
+        Assert.NotNull(options);
+        var seed = Assert.Single(options.Incus.PackageCacheSeeds);
+        Assert.Equal("/srv/cache/npm.tgz", seed.HostSourcePath);
+        Assert.Equal("/var/cache/codeybox/npm", seed.VmDestPath);
+        Assert.Equal(42.5, seed.MaxSizeMB);
+        var provision = Assert.Single(options.Incus.ExecutableProvisions);
+        Assert.Equal("/srv/tools/agy", provision.HostSourcePath);
+        Assert.Equal("/home/ubuntu/.local/bin/agy", provision.VmDestPath);
+        Assert.Equal(["/usr/local/bin/agy"], provision.VmSymlinks);
+        Assert.Equal("antigravity", provision.Label);
+        Assert.Equal(64L * 1024 * 1024, options.Incus.MaxExecutableProvisionBytes);
+        Assert.Equal(128L * 1024 * 1024, options.Incus.MaxAggregateExecutableProvisionBytes);
+        Assert.Equal(256L * 1024 * 1024, options.Incus.MaxPackageCacheSeedBytes);
+        Assert.Equal(512L * 1024 * 1024, options.Incus.MaxAggregatePackageCacheSeedBytes);
+        Assert.Equal(456, options.Incus.MaxPackageCacheSeedEntries);
     }
 
     [Fact]
@@ -284,6 +480,21 @@ public sealed class IncusSandboxConfigMapperTests
 
         Assert.True(result.Failed);
         Assert.Contains("CodeyBox:Incus:BinaryPath", result.FailureMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void OptionsValidator_ValidatesIncusBaselineProvisioningLimits()
+    {
+        var options = CreateOptions();
+        options.SandboxProvider = "incus";
+        options.Incus.MaxExecutableProvisionBytes = 0;
+        options.Incus.MaxPackageCacheSeedEntries = 0;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:Incus:MaxExecutableProvisionBytes", result.FailureMessage, StringComparison.Ordinal);
+        Assert.Contains("MaxPackageCacheSeedEntries", result.FailureMessage, StringComparison.Ordinal);
     }
 
     [Theory]

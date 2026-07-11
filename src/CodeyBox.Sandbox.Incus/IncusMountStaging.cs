@@ -689,7 +689,7 @@ internal static class IncusMountStaging
             {
                 var first = mounts[i].GuestPath;
                 var second = mounts[j].GuestPath;
-                if (first == second || IsDescendant(first, second) || IsDescendant(second, first))
+                if (IncusGuestPaths.Overlap(first, second))
                     throw new InvalidOperationException($"Incus device mount paths '{first}' and '{second}' overlap.");
             }
         }
@@ -706,13 +706,14 @@ internal static class IncusMountStaging
             IncusInputValidation.ValidateAbsoluteGuestPath(link.LinkPath, nameof(links));
             if (!linkPaths.Add(link.LinkPath))
                 throw new InvalidOperationException($"Duplicate guest link path '{link.LinkPath}'.");
-            if (!mounts.Any(mount => IsDescendant(link.Target, mount.GuestPath)))
+            if (!mounts.Any(mount => IncusGuestPaths.IsDescendant(link.Target, mount.GuestPath)))
                 throw new InvalidOperationException($"Guest link target '{link.Target}' is outside every configured device path.");
             if (mounts.Any(mount =>
                 (link.LinkPath == mount.GuestPath
-                    || IsDescendant(link.LinkPath, mount.GuestPath)
-                    || IsDescendant(mount.GuestPath, link.LinkPath))
-                && !(mount.TmpfsSizeBytes.HasValue && IsDescendant(link.LinkPath, mount.GuestPath))))
+                    || IncusGuestPaths.IsDescendant(link.LinkPath, mount.GuestPath)
+                    || IncusGuestPaths.IsDescendant(mount.GuestPath, link.LinkPath))
+                && !(mount.TmpfsSizeBytes.HasValue
+                    && IncusGuestPaths.IsDescendant(link.LinkPath, mount.GuestPath))))
                 throw new InvalidOperationException($"Guest link '{link.LinkPath}' overlaps an Incus device path.");
         }
     }
@@ -826,11 +827,6 @@ internal static class IncusMountStaging
             || candidate.StartsWith(normalizedRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal);
     }
 
-    private static bool IsDescendant(string candidate, string parent) =>
-        candidate.Length > parent.Length
-        && candidate.StartsWith(parent, StringComparison.Ordinal)
-        && (parent == "/" || candidate[parent.Length] == '/');
-
     /// <summary>
     /// Validates a guest mount path after any host source has passed
     /// canonicalization, existence, and allowed-root authorization. The narrow
@@ -856,14 +852,14 @@ internal static class IncusMountStaging
             hostSourceIsDirectory
             && mount.ReadOnly
             && !mount.Tmpfs
-            && IsDescendant(path, "/var")
+            && IncusGuestPaths.IsDescendant(path, "/var")
             && string.Equals(path, authorizedExistingHostSource, StringComparison.Ordinal);
-        if (protectedRoots.Any(root => path == root || IsDescendant(path, root))
+        if (protectedRoots.Any(root => path == root || IncusGuestPaths.IsDescendant(path, root))
             && !isNarrowReadOnlyVarMirror)
             throw new InvalidOperationException($"Incus mount path '{path}' overlaps a protected guest system path.");
         var isCredentialPath = path == SandboxConventions.CredentialsDir
-            || IsDescendant(path, SandboxConventions.CredentialsDir);
-        if ((path == "/run" || IsDescendant(path, "/run"))
+            || IncusGuestPaths.IsDescendant(path, SandboxConventions.CredentialsDir);
+        if ((path == "/run" || IncusGuestPaths.IsDescendant(path, "/run"))
             && !isCredentialPath)
             throw new InvalidOperationException("Caller-supplied Incus mounts under /run are reserved except for the credentials tmpfs tree.");
     }

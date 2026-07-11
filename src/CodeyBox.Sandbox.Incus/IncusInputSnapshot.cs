@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 
 namespace CodeyBox.Sandbox.Incus;
 
@@ -99,6 +100,43 @@ internal static class IncusInputSnapshot
             nameof(IncusSandboxOptions.ExtraRuncmd),
             static command => command
                 ?? throw new ArgumentException("ExtraRuncmd cannot contain null entries.", nameof(IncusSandboxOptions.ExtraRuncmd)));
+        var packageCacheSeeds = SnapshotList(
+            source.PackageCacheSeeds,
+            IncusSandboxOptions.MaximumPackageCacheSeeds,
+            nameof(IncusSandboxOptions.PackageCacheSeeds),
+            static seed => seed is null
+                ? throw new ArgumentException("PackageCacheSeeds cannot contain null entries.", nameof(IncusSandboxOptions.PackageCacheSeeds))
+                : seed with { });
+        var executableProvisions = SnapshotList(
+            source.ExecutableProvisions,
+            IncusSandboxOptions.MaximumExecutableProvisions,
+            nameof(IncusSandboxOptions.ExecutableProvisions),
+            static provision => provision is null
+                ? throw new ArgumentException("ExecutableProvisions cannot contain null entries.", nameof(IncusSandboxOptions.ExecutableProvisions))
+                : provision with
+                {
+                    VmSymlinks = SnapshotList(
+                        provision.VmSymlinks,
+                        IncusSandboxOptions.MaximumExecutableSymlinks,
+                        "ExecutableProvisions.VmSymlinks",
+                        static symlink => symlink
+                            ?? throw new ArgumentException("Executable provision symlinks cannot contain null entries.", nameof(IncusSandboxOptions.ExecutableProvisions))),
+                });
+        var verificationCommands = SnapshotList(
+            source.BaselineVerificationCommands,
+            IncusSandboxOptions.MaximumBaselineVerificationCommands,
+            nameof(IncusSandboxOptions.BaselineVerificationCommands),
+            static command => command is null
+                ? throw new ArgumentException("BaselineVerificationCommands cannot contain null entries.", nameof(IncusSandboxOptions.BaselineVerificationCommands))
+                : command with
+                {
+                    Argv = SnapshotList(
+                        command.Argv,
+                        IncusSandboxOptions.MaximumVerificationArgv,
+                        "BaselineVerificationCommands.Argv",
+                        static argument => argument
+                            ?? throw new ArgumentException("Baseline verification argv cannot contain null entries.", nameof(IncusSandboxOptions.BaselineVerificationCommands))),
+                });
         var diskGuard = source.DiskGuard;
         var snappedDiskGuard = diskGuard is null
             ? null
@@ -116,6 +154,9 @@ internal static class IncusInputSnapshot
             NetworkProfiles = networkProfiles,
             AllowedHostMountRoots = allowedRoots,
             ExtraRuncmd = extraRuncmd,
+            PackageCacheSeeds = packageCacheSeeds,
+            ExecutableProvisions = executableProvisions,
+            BaselineVerificationCommands = verificationCommands,
             DiskGuard = snappedDiskGuard,
         };
     }

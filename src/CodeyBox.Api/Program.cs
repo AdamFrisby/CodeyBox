@@ -25,6 +25,7 @@ using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Bubblewrap;
 using CodeyBox.Sandbox.Incus;
 using CodeyBox.Sandbox.Multipass;
@@ -743,7 +744,19 @@ static IncusSandboxProvider BuildIncus(
         () =>
         {
             var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
-            return IncusSandboxConfigMapper.Build(live, configLog);
+            var projects = sp.GetRequiredService<IOptionsMonitor<ProjectsOptions>>().CurrentValue;
+            var incus = live.Incus ?? new IncusSandboxConfig();
+            var baselineVerificationCommands = incus.UseBaselineImages
+                ? BaselineVerificationProbeBuilder.Build(
+                    live,
+                    projects,
+                    sp.GetServices<IInVmSmokeProbe>(),
+                    sp.GetService<InVmSmokeOptions>())
+                : Array.Empty<BaselineVerificationCommand>();
+            return IncusSandboxConfigMapper.Build(
+                live,
+                configLog,
+                baselineVerificationCommands);
         },
         loggerFactory.CreateLogger<IncusSandboxProvider>(),
         timings,
@@ -795,7 +808,7 @@ static MultipassSandboxProvider BuildMultipass(
                     projects,
                     sp.GetServices<IInVmSmokeProbe>(),
                     sp.GetService<InVmSmokeOptions>())
-                : Array.Empty<MultipassBaselineVerificationCommand>();
+                : Array.Empty<BaselineVerificationCommand>();
             return new MultipassSandboxOptions
             {
                 ExtraCloudInit = live.MultipassExtraCloudInit,
@@ -814,19 +827,12 @@ static MultipassSandboxProvider BuildMultipass(
                     ? TimeSpan.FromSeconds(multipassSandbox.ResourceMetricsCaptureTimeoutSeconds)
                     : MultipassSandboxOptions.DefaultResourceMetricsCaptureTimeout,
                 DiskGuard = diskGuard,
-                PackageCacheSeeds = live.MultipassPackageCacheSeeds?.Select(s => new PackageCacheSeedOptions
-                {
-                    HostSourcePath = s.HostSourcePath,
-                    VmDestPath = s.VmDestPath,
-                    MaxSizeMB = s.MaxSizeMB
-                }).ToList() ?? [],
-                ExecutableProvisions = live.MultipassExecutableProvisions?.Select(e => new ExecutableProvisionOptions
-                {
-                    HostSourcePath = e.HostSourcePath,
-                    VmDestPath = e.VmDestPath,
-                    VmSymlinks = e.VmSymlinks?.ToList() ?? [],
-                    Label = e.Label,
-                }).ToList() ?? [],
+                PackageCacheSeeds = BaselineProvisioningConfigSnapshot.SnapshotPackageCacheSeeds(
+                    live.MultipassPackageCacheSeeds,
+                    "CodeyBox:MultipassPackageCacheSeeds"),
+                ExecutableProvisions = BaselineProvisioningConfigSnapshot.SnapshotExecutableProvisions(
+                    live.MultipassExecutableProvisions,
+                    "CodeyBox:MultipassExecutableProvisions"),
             };
         },
         loggerFactory.CreateLogger<MultipassSandboxProvider>(),
@@ -4147,6 +4153,12 @@ namespace CodeyBox.Api
         /// </summary>
         public List<string> ExtraRuncmd { get; set; } = [.. Defaults.ExtraRuncmd];
 
+        /// <summary>Host package-cache files or directories copied during Incus baseline or full-launch provisioning.</summary>
+        public List<PackageCacheSeedConfig> PackageCacheSeeds { get; set; } = [];
+
+        /// <summary>Host-staged executables copied during Incus baseline or full-launch provisioning.</summary>
+        public List<ExecutableProvisionConfig> ExecutableProvisions { get; set; } = [];
+
         /// <summary>
         /// Additional top-level cloud-init YAML merged into generated user
         /// data. This is operator-visible configuration and must not contain
@@ -4179,7 +4191,11 @@ namespace CodeyBox.Api
         /// <summary>Provider-side upper bound for one guest command; caller and sandbox wall-clock limits may be shorter.</summary>
         public TimeSpan ExecTimeout { get; set; } = Defaults.ExecTimeout;
 
-        /// <summary>Deadline for cold image download/import and VM root initialization.</summary>
+        /// <summary>
+        /// Deadline applied to a cold Incus image/root initialization operation and,
+        /// separately, to executable staging/install, verification, and package-cache
+        /// seeding (including host input capture).
+        /// </summary>
         public TimeSpan ImageProvisioningTimeout { get; set; } = Defaults.ImageProvisioningTimeout;
 
         /// <summary>Deadline for VM boot and guest readiness.</summary>
@@ -4238,6 +4254,21 @@ namespace CodeyBox.Api
 
         /// <summary>Default baseline root-disk size in bytes.</summary>
         public long BaselineDiskBytes { get; set; } = Defaults.BaselineDiskBytes;
+
+        /// <summary>Maximum bytes accepted for one host-staged executable.</summary>
+        public long MaxExecutableProvisionBytes { get; set; } = Defaults.MaxExecutableProvisionBytes;
+
+        /// <summary>Maximum aggregate bytes accepted across host-staged executables.</summary>
+        public long MaxAggregateExecutableProvisionBytes { get; set; } = Defaults.MaxAggregateExecutableProvisionBytes;
+
+        /// <summary>Maximum bytes accepted for one package-cache seed.</summary>
+        public long MaxPackageCacheSeedBytes { get; set; } = Defaults.MaxPackageCacheSeedBytes;
+
+        /// <summary>Maximum aggregate bytes accepted across package-cache seeds.</summary>
+        public long MaxAggregatePackageCacheSeedBytes { get; set; } = Defaults.MaxAggregatePackageCacheSeedBytes;
+
+        /// <summary>Maximum filesystem entries inspected while copying one package-cache seed.</summary>
+        public int MaxPackageCacheSeedEntries { get; set; } = Defaults.MaxPackageCacheSeedEntries;
 
         /// <summary>Maximum aggregate bytes copied into private host staging for one sandbox.</summary>
         public long MaxSnapshotBytes { get; set; } = Defaults.MaxSnapshotBytes;
@@ -5279,7 +5310,7 @@ namespace CodeyBox.Api
     }
 
     /// <summary>
-    /// Configuration for a package cache seed to be copied into the baseline VM.
+    /// Configuration for a package-cache file or directory copied during VM provisioning.
     /// </summary>
     public sealed class PackageCacheSeedConfig
     {
@@ -5289,7 +5320,7 @@ namespace CodeyBox.Api
     }
 
     /// <summary>
-    /// Config-bound shape of <see cref="ExecutableProvisionOptions"/>.
+    /// Config-bound shape of <see cref="BaselineExecutableProvision"/>.
     /// </summary>
     public sealed class ExecutableProvisionConfig
     {

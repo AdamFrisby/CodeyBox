@@ -39,7 +39,9 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             catch (Exception ex) when (ex is ArgumentException or InvalidOperationException
                 or NotSupportedException or PathTooLongException)
             {
-                failures.Add($"CodeyBox:Incus:{ex.Message}");
+                failures.Add(ex.Message.StartsWith("CodeyBox:", StringComparison.Ordinal)
+                    ? ex.Message
+                    : $"CodeyBox:Incus:{ex.Message}");
             }
         }
 

@@ -4,11 +4,67 @@
 into the sandbox image before work starts. Install the tools your projects
 need; CodeyBox does not assume one privileged language stack.
 
+The examples below use Multipass's historical top-level keys. Incus exposes
+the same explicit bake inputs under its own provider section:
+
+| Bake input | Multipass key | Incus key |
+|------------|---------------|-----------|
+| First-boot commands | `CodeyBox:MultipassExtraRuncmd` | `CodeyBox:Incus:ExtraRuncmd` |
+| Package-cache files or directories | `CodeyBox:MultipassPackageCacheSeeds` | `CodeyBox:Incus:PackageCacheSeeds` |
+| Host-staged executables | `CodeyBox:MultipassExecutableProvisions` | `CodeyBox:Incus:ExecutableProvisions` |
+
+The providers never inherit or fall back to each other's bake configuration.
+When switching backends, copy the intended entries deliberately and review
+guest paths and size limits. Both baseline paths derive their final
+credential-free CLI verification commands from configured agents and the
+shared in-VM probe catalog; a missing required CLI fails the bake before the
+baseline becomes cloneable. Incus applies its explicit cache/executable inputs
+to both a baked baseline and the full-launch path used when baseline images are
+disabled, so the latter does not silently lose required tools.
+
+Ordinary unit tests do not start Incus VMs. The destructive real-host
+`requires_incus` scenario remains opt-in and skips unless
+`CODEYBOX_RUN_INCUS_INTEGRATION=1` is set explicitly; configuration examples in
+this document do not enable it.
+
 If a language auditor is enabled but its tool is missing, the auditor usually
 emits an Info finding and skips instead of blocking the work item. The built-in
 security tool auditors emit Warning on missing tools so lost secret/SAST
 coverage is visible without hard-blocking audits by default. Install the
 missing tool and re-run audit to get enforcement.
+
+## Incus Package-Cache Seed
+
+An Incus seed may be one bounded file or directory. `VmDestPath` is a
+normalized absolute non-root canonical guest directory: directory contents land beneath
+it, while a file lands at `VmDestPath/<source basename>`. The provider stages
+the source privately, assigns the installed tree to the configured guest
+UID/GID, and applies the same input to a baseline bake or a full launch:
+
+```json
+{
+  "CodeyBox": {
+    "Incus": {
+      "PackageCacheSeeds": [
+        {
+          "HostSourcePath": "/srv/codeybox/package-cache/nuget",
+          "VmDestPath": "/var/cache/codeybox/nuget",
+          "MaxSizeMB": 2048
+        }
+      ],
+      "MaxPackageCacheSeedBytes": 4294967296,
+      "MaxAggregatePackageCacheSeedBytes": 8589934592,
+      "MaxPackageCacheSeedEntries": 100000
+    }
+  }
+}
+```
+
+`MaxSizeMB` is measured in MiB (1,048,576 bytes) and narrows the provider-wide
+per-seed byte bound; it cannot enlarge it. Guest filesystem aliases and paths
+under `/dev`, `/proc`, `/run`, or `/sys` are rejected. Missing files, traversal
+beyond the entry limit, and byte-limit breaches
+fail provisioning instead of producing a partially seeded VM.
 
 ## Polyglot Sandbox
 
@@ -147,12 +203,39 @@ first dispatch can actually run.
 }
 ```
 
+The equivalent Incus executable provisioning is provider-local:
+
+```json
+{
+  "CodeyBox": {
+    "SandboxProvider": "incus",
+    "Incus": {
+      "UseBaselineImages": true,
+      "ExtraRuncmd": [
+        "apt-get update",
+        "apt-get install -y curl ca-certificates nodejs npm",
+        "npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
+        "curl -fsSL https://cursor.com/install | bash"
+      ],
+      "ExecutableProvisions": [
+        {
+          "HostSourcePath": "/home/<operator>/.codeybox/agy-seed/agy",
+          "VmDestPath": "/home/ubuntu/.local/bin/agy",
+          "VmSymlinks": ["/usr/local/bin/agy"],
+          "Label": "antigravity"
+        }
+      ]
+    }
+  }
+}
+```
+
 Pick the subset that matches the agents you have registered. For Gemini,
 reasoning level is encoded in the model id (e.g. `gemini-3-flash-preview`),
 not a CLI flag — there is no `--thinking` flag to pin a version against.
 Cursor installs the binary as `agent` (not `cursor-agent`) — verify it lands
-on `$PATH` after the bake. **Antigravity (`agy`) is provisioned via
-`MultipassExecutableProvisions`, NOT a `curl … | bash` runcmd entry**: the
+on `$PATH` after the bake. **Antigravity (`agy`) is provisioned via the selected
+provider's executable-provision list, NOT a `curl … | bash` runcmd entry**: the
 upstream installer URL (`https://antigravity.google/cli/install.sh`) no longer
 returns a shell script — as of 2026-06-17 it serves the Antigravity landing
 HTML, which fails `bash` parsing and would silently slip past a `… || true`
@@ -170,9 +253,10 @@ CLI (binary name
 subcommand and will not satisfy the runner. opencode does not yet ship a
 runner in this repo; operators tracking the integration can pre-stage with
 `curl -fsSL https://opencode.ai/install | bash`, but the orchestrator will
-not dispatch to it until a runner is registered. After changing any entry,
-delete cached `cb-baseline-*` images so the next sandbox launch re-runs the
-bake.
+not dispatch to it until a runner is registered. Changing bake-affecting
+provisioning values changes that provider's content-addressed baseline identity, so the next
+sandbox creation bakes the corresponding new image rather than reusing another
+provider's baseline.
 
 ## Security Tooling
 

@@ -84,6 +84,14 @@ credential directory are mounted after VM boot with the guest kernel's real
 `tmpfs`. Per-device and aggregate logical sizes are bounded by
 `MaxTmpfsDeviceBytes` and `MaxAggregateTmpfsBytes`.
 
+Before any host-backed device is attached, the VM completes an initial boot
+without host storage and resolves every requested guest mount path with
+`realpath`. Aliased, protected, duplicate, or overlapping effective paths fail
+closed. The provider then stops the VM, attaches the verified virtiofs devices,
+checks the effective Incus topology, and restarts it without rerunning
+cloud-init. This two-phase admission prevents an image symlink from redirecting
+first-boot writes into a host directory.
+
 Generated cloud-init is sent to Incus through `user.user-data` over stdin.
 `ExtraRuncmd` is likewise executed as a bounded stdin script after cloud-init;
 it is never placed in process argv. Before the immutable `ready` snapshot is
@@ -159,11 +167,14 @@ A graphical request fails explicitly; it is never rerouted to Multipass.
   descendant. The Incus packages supply the VM runtime on supported Ubuntu
   installations.
 - A cloud-init-enabled VM image with the Incus guest agent, systemd,
-  `/usr/bin/setpriv`, and `/usr/bin/setsid` (both from util-linux). The default
-  Ubuntu cloud image provides these; the provider verifies both executables
-  before admitting a sandbox. Its root-owned control wrapper starts each agent
-  command in a separate session, sets Linux no-new-privileges, and drops it to
-  the configured numeric UID/GID.
+  `/usr/bin/setpriv`, `/usr/bin/setsid` (both from util-linux),
+  `/usr/bin/realpath` (coreutils), and `tar` for
+  package-cache seed extraction. The default Ubuntu cloud image provides these;
+  the provider verifies the control executables before admitting a sandbox.
+  Archive creation uses .NET's `System.Formats.Tar`, so this feature adds no
+  host-side `tar` package prerequisite. The root-owned control wrapper starts
+  each agent command in a separate session, sets Linux no-new-privileges, and
+  drops it to the configured numeric UID/GID.
 - An existing ZFS or Btrfs Incus storage pool. The provider validates the
   snapshot-capable driver and, for ZFS, rejects any explicitly configured
   `zfs.clone_copy` mode other than `true`; it never creates, reformats, or

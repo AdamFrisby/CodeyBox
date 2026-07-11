@@ -1,13 +1,14 @@
+using System.Text;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
-using CodeyBox.Sandbox.Multipass;
+using CodeyBox.Sandbox;
 
 namespace CodeyBox.Api;
 
 /// <summary>
-/// Derives the post-bake binary-verification commands handed to the Multipass
-/// sandbox provider from the configured agent catalog. The bake gate is the
+/// Derives the post-bake binary-verification commands handed to a sandbox
+/// provider from the configured agent catalog. The bake gate is the
 /// durable contract that a freshly cloned VM has every configured agent CLI
 /// on PATH; it MUST run regardless of runtime dispatch-smoke gating, because
 /// disabling smoke at runtime is a routing decision, not a permission to ship
@@ -43,18 +44,28 @@ namespace CodeyBox.Api;
 /// </summary>
 internal static class BaselineVerificationProbeBuilder
 {
-    public static IReadOnlyList<MultipassBaselineVerificationCommand> Build(
+    internal const int MaximumConfigurationEntriesInspected = 4096;
+    internal const int MaximumProbeStepsInspected =
+        BaselineProvisioningLimits.MaximumVerificationCommands;
+    private static readonly UTF8Encoding StrictUtf8 = new(
+        encoderShouldEmitUTF8Identifier: false,
+        throwOnInvalidBytes: true);
+
+    public static IReadOnlyList<BaselineVerificationCommand> Build(
         CodeyBoxOptions codeyBoxOptions,
         ProjectsOptions projectsOptions,
         IEnumerable<IInVmSmokeProbe> probes,
         InVmSmokeOptions? inVmSmokeOptions = null)
     {
-        var probeList = probes.ToList();
+        ArgumentNullException.ThrowIfNull(codeyBoxOptions);
+        ArgumentNullException.ThrowIfNull(projectsOptions);
+        ArgumentNullException.ThrowIfNull(probes);
+
+        var probesByKind = SnapshotProbes(probes);
         var configuredAgents = CollectConfiguredAgents(codeyBoxOptions, projectsOptions);
         if (configuredAgents.Count == 0)
             return [];
 
-        var probesByKind = probeList.ToDictionary(p => p.Kind.Value, StringComparer.OrdinalIgnoreCase);
         // The exempt list is the operator's "this agent has no first-party CLI
         // to verify" hatch. We read it from InVmSmokeOptions because that is
         // where it is already configured, but we do NOT honour the in-VM
@@ -62,11 +73,12 @@ internal static class BaselineVerificationProbeBuilder
         // integrity. When no InVmSmokeOptions is supplied we fall back to its
         // built-in defaults (currently exempts copilot for back-compat) rather
         // than treating no-options as "exempt nothing".
-        var exempt = new HashSet<string>(
-            (inVmSmokeOptions ?? new InVmSmokeOptions()).ExemptAgentsWithoutProbe,
-            StringComparer.OrdinalIgnoreCase);
+        var exempt = SnapshotExemptAgents(
+            (inVmSmokeOptions ?? new InVmSmokeOptions()).ExemptAgentsWithoutProbe);
 
-        var result = new List<MultipassBaselineVerificationCommand>(configuredAgents.Count);
+        var result = new List<BaselineVerificationCommand>(
+            Math.Min(configuredAgents.Count, BaselineProvisioningLimits.MaximumVerificationCommands));
+        long aggregateVerificationTextBytes = 0;
         foreach (var agent in configuredAgents)
         {
             // A registered probe always wins. Checking probe registration BEFORE
@@ -75,27 +87,33 @@ internal static class BaselineVerificationProbeBuilder
             // exemption is only the escape hatch for agents WITHOUT a probe.
             if (probesByKind.TryGetValue(agent, out var probe))
             {
-                var step = probe.BuildSteps(credential: null)
-                    .FirstOrDefault(s => s.Argv.Count > 0 && s.Stdin is null);
-                if (step is null)
+                var command = BuildVerificationCommand(
+                    probe,
+                    agent,
+                    ref aggregateVerificationTextBytes);
+                if (command is null)
                 {
                     throw new InvalidOperationException(
                         $"Baseline verification cannot cover configured agent '{agent}': " +
                         "its IInVmSmokeProbe has no credential-independent command.");
                 }
 
-                // The agent name is used as the verification command's diagnostic label.
-                // The sandbox layer does not interpret the label — it is surfaced in log
-                // lines and error messages so an operator can map a bake failure back to
-                // the agent that contributed the command.
-                result.Add(new MultipassBaselineVerificationCommand(agent, step.Argv, step.FailureHint));
+                // The agent name is the verification command's diagnostic label.
+                // It lets logs and errors identify the contributing agent and remains
+                // part of the immutable command contract a provider may hash.
+                if (result.Count >= BaselineProvisioningLimits.MaximumVerificationCommands)
+                {
+                    throw new InvalidOperationException(
+                        $"Baseline verification cannot contain more than {BaselineProvisioningLimits.MaximumVerificationCommands} commands.");
+                }
+                result.Add(command);
                 continue;
             }
 
             // No probe registered for this agent. The exempt list expresses
             // "the operator confirms no CLI to verify for this agent" — skip
             // without failing the bake. Without the exemption, fail before
-            // Multipass launches a baseline that would otherwise bypass the
+            // a provider launches a baseline that would otherwise bypass the
             // post-bake binary gate entirely.
             if (exempt.Contains(agent))
                 continue;
@@ -106,7 +124,126 @@ internal static class BaselineVerificationProbeBuilder
                 "CodeyBox:Smoke:InVm:ExemptAgentsWithoutProbe if it has no sandbox CLI to verify.");
         }
 
+        return Array.AsReadOnly(result.ToArray());
+    }
+
+    private static IReadOnlyDictionary<string, IInVmSmokeProbe> SnapshotProbes(
+        IEnumerable<IInVmSmokeProbe> probes)
+    {
+        var result = new Dictionary<string, IInVmSmokeProbe>(StringComparer.OrdinalIgnoreCase);
+        var inspected = 0;
+        foreach (var probe in probes)
+        {
+            if (inspected++ >= BaselineProvisioningLimits.MaximumVerificationCommands)
+            {
+                throw new InvalidOperationException(
+                    $"Baseline verification cannot register more than {BaselineProvisioningLimits.MaximumVerificationCommands} in-VM probes.");
+            }
+            if (probe is null)
+                throw new InvalidOperationException("Baseline verification probes cannot contain null entries.");
+
+            var kind = probe.Kind.Value;
+            ValidateAgentIdentifier(kind, "in-VM probe kind");
+            if (!result.TryAdd(kind, probe))
+                throw new InvalidOperationException($"Baseline verification has duplicate in-VM probes for agent '{kind}'.");
+        }
         return result;
+    }
+
+    private static IReadOnlySet<string> SnapshotExemptAgents(IEnumerable<string> agents)
+    {
+        ArgumentNullException.ThrowIfNull(agents);
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var inspected = 0;
+        foreach (var agent in agents)
+        {
+            if (inspected++ >= BaselineProvisioningLimits.MaximumVerificationCommands)
+            {
+                throw new InvalidOperationException(
+                    $"Baseline verification cannot inspect more than {BaselineProvisioningLimits.MaximumVerificationCommands} exempt agents.");
+            }
+            ValidateAgentIdentifier(agent, "baseline verification exemption");
+            result.Add(agent);
+        }
+        return result;
+    }
+
+    private static BaselineVerificationCommand? BuildVerificationCommand(
+        IInVmSmokeProbe probe,
+        string agent,
+        ref long aggregateVerificationTextBytes)
+    {
+        var steps = probe.BuildSteps(credential: null)
+            ?? throw new InvalidOperationException(
+                $"Baseline verification probe for agent '{agent}' returned a null step list.");
+        var inspected = 0;
+        foreach (var step in steps)
+        {
+            if (inspected++ >= MaximumProbeStepsInspected)
+            {
+                throw new InvalidOperationException(
+                    $"Baseline verification probe for agent '{agent}' exposes more than {MaximumProbeStepsInspected} steps.");
+            }
+            if (step is null)
+                throw new InvalidOperationException($"Baseline verification probe for agent '{agent}' returned a null step.");
+            if (step.Stdin is not null)
+                continue;
+
+            var argv = SnapshotVerificationArgv(step.Argv, agent, out var argvTextBytes);
+            if (argv.Count == 0)
+                continue;
+
+            var commandTextBytes = (long)GetVerificationTextByteCount(
+                agent,
+                $"Baseline verification label for agent '{agent}'",
+                allowEmpty: false)
+                + argvTextBytes;
+            if (step.FailureHint is { } failureHint)
+            {
+                commandTextBytes += GetVerificationTextByteCount(
+                    failureHint,
+                    $"Baseline verification failure hint for agent '{agent}'",
+                    allowEmpty: true);
+            }
+            if (commandTextBytes
+                > BaselineProvisioningLimits.MaximumAggregateVerificationTextUtf8Bytes
+                    - aggregateVerificationTextBytes)
+            {
+                throw new InvalidOperationException(
+                    $"Baseline verification commands exceed " +
+                    $"{BaselineProvisioningLimits.MaximumAggregateVerificationTextUtf8Bytes} UTF-8 bytes in aggregate.");
+            }
+            aggregateVerificationTextBytes += commandTextBytes;
+            return new BaselineVerificationCommand(agent, argv, step.FailureHint);
+        }
+        return null;
+    }
+
+    private static IReadOnlyList<string> SnapshotVerificationArgv(
+        IEnumerable<string> arguments,
+        string agent,
+        out long textBytes)
+    {
+        ArgumentNullException.ThrowIfNull(arguments);
+        var result = new List<string>(8);
+        textBytes = 0;
+        foreach (var argument in arguments)
+        {
+            if (result.Count >= BaselineProvisioningLimits.MaximumVerificationArguments)
+            {
+                throw new InvalidOperationException(
+                    $"Baseline verification command for agent '{agent}' cannot contain more than " +
+                    $"{BaselineProvisioningLimits.MaximumVerificationArguments} arguments.");
+            }
+            if (argument is null)
+                throw new InvalidOperationException($"Baseline verification command for agent '{agent}' contains a null argument.");
+            textBytes += GetVerificationTextByteCount(
+                argument,
+                $"Baseline verification argument for agent '{agent}'",
+                allowEmpty: result.Count != 0);
+            result.Add(argument);
+        }
+        return Array.AsReadOnly(result.ToArray());
     }
 
     private static IReadOnlyList<string> CollectConfiguredAgents(
@@ -115,60 +252,148 @@ internal static class BaselineVerificationProbeBuilder
     {
         var result = new List<string>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var visitedAudits = new HashSet<ProjectAuditConfig>(ReferenceEqualityComparer.Instance);
+        var inspectedEntries = 0;
 
         void Add(string? value)
         {
             if (string.IsNullOrWhiteSpace(value))
                 return;
 
+            ValidateAgentIdentifier(value, "configured agent");
+
             var trimmed = value.Trim();
             if (seen.Add(trimmed))
                 result.Add(trimmed);
         }
 
-        foreach (var agent in codeyBoxOptions.AgentClasses
-            .SelectMany(c => c.Members)
-            .Select(m => m.Agent))
+        void Inspect(string source)
         {
-            Add(agent);
+            if (inspectedEntries++ >= MaximumConfigurationEntriesInspected)
+            {
+                throw new InvalidOperationException(
+                    $"Baseline verification cannot inspect more than {MaximumConfigurationEntriesInspected} configured entries while reading {source}.");
+            }
         }
 
-        var defaultAgent = string.IsNullOrWhiteSpace(projectsOptions.Defaults.Agent)
-            ? AgentKind.Claude.Value
-            : projectsOptions.Defaults.Agent;
-        Add(defaultAgent);
-        AddAuditAgents(projectsOptions.Defaults.Audit, Add);
-
-        foreach (var project in projectsOptions.Projects)
+        void AddAuditAgentsIterative(ProjectAuditConfig? root, string source)
         {
+            if (root is null)
+                return;
+
+            var pending = new Stack<ProjectAuditConfig>();
+            pending.Push(root);
+            while (pending.Count != 0)
+            {
+                var audit = pending.Pop();
+                if (!visitedAudits.Add(audit))
+                    continue;
+
+                Inspect(source);
+                Add(audit.AuditAgent);
+                if (audit.PerAuditorAgent is not null)
+                {
+                    foreach (var agent in audit.PerAuditorAgent.Values)
+                    {
+                        Inspect($"{source}.PerAuditorAgent");
+                        Add(agent);
+                    }
+                }
+
+                if (audit.Profiles is null)
+                    continue;
+
+                // Push in reverse enumeration order to preserve the former
+                // recursive depth-first order without recursive call-stack risk.
+                var children = new List<ProjectAuditConfig>();
+                foreach (var profile in audit.Profiles.Values)
+                {
+                    Inspect($"{source}.Profiles");
+                    if (profile is not null)
+                        children.Add(profile);
+                }
+                for (var i = children.Count - 1; i >= 0; i--)
+                    pending.Push(children[i]);
+            }
+        }
+
+        foreach (var agentClass in codeyBoxOptions.AgentClasses
+            ?? throw new InvalidOperationException("CodeyBox:AgentClasses cannot be null."))
+        {
+            Inspect("CodeyBox:AgentClasses");
+            if (agentClass is null)
+                throw new InvalidOperationException("CodeyBox:AgentClasses cannot contain null entries.");
+            foreach (var member in agentClass.Members
+                ?? throw new InvalidOperationException("CodeyBox:AgentClasses members cannot be null."))
+            {
+                Inspect("CodeyBox:AgentClasses members");
+                if (member is null)
+                    throw new InvalidOperationException("CodeyBox:AgentClasses members cannot contain null entries.");
+                Add(member.Agent);
+            }
+        }
+
+        var defaults = projectsOptions.Defaults
+            ?? throw new InvalidOperationException("CodeyBox project defaults cannot be null.");
+        var defaultAgent = string.IsNullOrWhiteSpace(defaults.Agent)
+            ? AgentKind.Claude.Value
+            : defaults.Agent;
+        Add(defaultAgent);
+        AddAuditAgentsIterative(defaults.Audit, "CodeyBox project-default audit config");
+
+        foreach (var project in projectsOptions.Projects
+            ?? throw new InvalidOperationException("CodeyBox projects cannot be null."))
+        {
+            Inspect("CodeyBox projects");
+            if (project is null)
+                throw new InvalidOperationException("CodeyBox projects cannot contain null entries.");
             if (project.Agent is not null)
             {
                 Add(string.IsNullOrWhiteSpace(project.Agent)
                     ? AgentKind.Claude.Value
                     : project.Agent);
             }
-            AddAuditAgents(project.Audit, Add);
+            AddAuditAgentsIterative(project.Audit, "CodeyBox project audit config");
         }
 
-        return result;
+        return Array.AsReadOnly(result.ToArray());
     }
 
-    private static void AddAuditAgents(ProjectAuditConfig? audit, Action<string?> add)
+    private static void ValidateAgentIdentifier(string? value, string fieldName)
     {
-        if (audit is null)
-            return;
+        if (value is null)
+            throw new InvalidOperationException($"{fieldName} cannot be null.");
+        _ = GetVerificationTextByteCount(value, fieldName, allowEmpty: false);
+    }
 
-        add(audit.AuditAgent);
-        if (audit.PerAuditorAgent is not null)
+    private static int GetVerificationTextByteCount(
+        string value,
+        string fieldName,
+        bool allowEmpty)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        if (value.Length > BaselineProvisioningLimits.MaximumVerificationTextUtf8Bytes)
         {
-            foreach (var agent in audit.PerAuditorAgent.Values)
-                add(agent);
+            throw new InvalidOperationException(
+                $"{fieldName} exceeds {BaselineProvisioningLimits.MaximumVerificationTextUtf8Bytes} UTF-8 bytes.");
         }
-
-        if (audit.Profiles is not null)
+        if (!allowEmpty && string.IsNullOrWhiteSpace(value))
+            throw new InvalidOperationException($"{fieldName} cannot be empty.");
+        if (value.Any(char.IsControl))
+            throw new InvalidOperationException($"{fieldName} cannot contain control characters.");
+        try
         {
-            foreach (var profile in audit.Profiles.Values)
-                AddAuditAgents(profile, add);
+            var bytes = StrictUtf8.GetByteCount(value);
+            if (bytes > BaselineProvisioningLimits.MaximumVerificationTextUtf8Bytes)
+            {
+                throw new InvalidOperationException(
+                    $"{fieldName} exceeds {BaselineProvisioningLimits.MaximumVerificationTextUtf8Bytes} UTF-8 bytes.");
+            }
+            return bytes;
+        }
+        catch (EncoderFallbackException ex)
+        {
+            throw new InvalidOperationException($"{fieldName} is not valid Unicode.", ex);
         }
     }
 }
