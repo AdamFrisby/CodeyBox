@@ -9,7 +9,8 @@ namespace CodeyBox.Api;
 /// </summary>
 internal static class SharedDiskGuardConfig
 {
-    private const int MaximumAdditionalPaths = 64;
+    private const int MaximumPathCharacters = 4096;
+    private const int MaximumRecheckInCharacters = 64;
 
     internal static ResolvedDiskGuardConfig? Resolve(CodeyBoxOptions options, ILogger log)
     {
@@ -27,23 +28,47 @@ internal static class SharedDiskGuardConfig
         }
 
         var recheck = TimeSpan.FromMinutes(5);
-        if (!string.IsNullOrWhiteSpace(config.RecheckIn)
-            && (!TimeSpan.TryParse(config.RecheckIn, out recheck) || recheck <= TimeSpan.Zero))
+        var configuredRecheckIn = config.RecheckIn;
+        if (configuredRecheckIn is not null)
+        {
+            ConfigurationInputBounds.EnsureCharacterBound(
+                configuredRecheckIn,
+                MaximumRecheckInCharacters,
+                "CodeyBox:DiskGuard:RecheckIn");
+        }
+        if (!string.IsNullOrWhiteSpace(configuredRecheckIn)
+            && (!TimeSpan.TryParse(configuredRecheckIn, out recheck) || recheck <= TimeSpan.Zero))
         {
             throw new InvalidOperationException(
-                $"CodeyBox:DiskGuard:RecheckIn '{config.RecheckIn}' must be a positive TimeSpan (e.g. '00:05:00').");
+                $"CodeyBox:DiskGuard:RecheckIn '{configuredRecheckIn}' must be a positive TimeSpan (e.g. '00:05:00').");
         }
 
         var configuredPaths = config.AdditionalPaths ?? [];
-        if (configuredPaths.Count > MaximumAdditionalPaths)
+        var paths = new List<string>(Math.Min(DiskGuardOptions.MaximumAdditionalPaths, 16));
+        foreach (var path in configuredPaths)
         {
-            throw new InvalidOperationException(
-                $"CodeyBox:DiskGuard:AdditionalPaths cannot contain more than {MaximumAdditionalPaths} entries.");
+            if (paths.Count >= DiskGuardOptions.MaximumAdditionalPaths)
+            {
+                throw new InvalidOperationException(
+                    $"CodeyBox:DiskGuard:AdditionalPaths cannot contain more than {DiskGuardOptions.MaximumAdditionalPaths} entries.");
+            }
+            ConfigurationInputBounds.EnsureCharacterBound(
+                path,
+                MaximumPathCharacters,
+                "CodeyBox:DiskGuard:AdditionalPaths entry");
+            paths.Add(path);
         }
-        var paths = new List<string>(configuredPaths);
-        if (!string.IsNullOrWhiteSpace(options.StateDatabasePath))
+        var stateDatabasePath = options.StateDatabasePath;
+        if (stateDatabasePath is not null)
         {
-            var databaseDirectory = Path.GetDirectoryName(options.StateDatabasePath);
+            ConfigurationInputBounds.EnsureCharacterBound(
+                stateDatabasePath,
+                MaximumPathCharacters,
+                "CodeyBox:StateDatabasePath");
+        }
+        if (!string.IsNullOrWhiteSpace(stateDatabasePath))
+        {
+            var databaseDirectory = Path.GetDirectoryName(stateDatabasePath);
             if (!string.IsNullOrEmpty(databaseDirectory)
                 && !paths.Contains(databaseDirectory, StringComparer.Ordinal))
             {
@@ -55,6 +80,21 @@ internal static class SharedDiskGuardConfig
             config.MinFreeBytes,
             recheck,
             Array.AsReadOnly(paths.ToArray()));
+    }
+}
+
+/// <summary>Cheap pre-scan guards for untrusted operator configuration text.</summary>
+internal static class ConfigurationInputBounds
+{
+    internal static void EnsureCharacterBound(string? value, int maximumCharacters, string fieldName)
+    {
+        if (value is null)
+            throw new InvalidOperationException($"{fieldName} cannot be null.");
+        if (value.Length > maximumCharacters)
+        {
+            throw new InvalidOperationException(
+                $"{fieldName} exceeds its {maximumCharacters}-character safety bound.");
+        }
     }
 }
 

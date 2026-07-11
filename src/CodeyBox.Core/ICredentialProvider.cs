@@ -20,11 +20,33 @@ public interface ICredentialProvider
 /// host filesystem. Providers must not mount writable host credential
 /// directories into untrusted agent sandboxes.
 /// </summary>
-public sealed record AgentCredential(
-    AgentKind Agent,
-    IReadOnlyDictionary<string, string> EnvironmentVariables,
-    IReadOnlyDictionary<string, string> Files)
+public sealed record AgentCredential
 {
+    private IReadOnlyList<SandboxMount> _mounts = [];
+
+    public AgentCredential(
+        AgentKind Agent,
+        IReadOnlyDictionary<string, string> EnvironmentVariables,
+        IReadOnlyDictionary<string, string> Files)
+    {
+        this.Agent = Agent;
+        AgentCredentialMaterializationPolicy.SnapshotBundle(
+            EnvironmentVariables,
+            Files,
+            out var environmentSnapshot,
+            out var fileSnapshot);
+        this.EnvironmentVariables = environmentSnapshot;
+        this.Files = fileSnapshot;
+    }
+
+    public AgentKind Agent { get; init; }
+
+    /// <summary>Bounded immutable snapshot of sandbox credential environment values.</summary>
+    public IReadOnlyDictionary<string, string> EnvironmentVariables { get; }
+
+    /// <summary>Bounded immutable snapshot of canonical relative file paths and payloads.</summary>
+    public IReadOnlyDictionary<string, string> Files { get; }
+
     /// <summary>
     /// Optional expiry for time-bound credentials issued by vault-style plugins.
     /// When set, the orchestrator caches the credential up to this instant and
@@ -42,5 +64,19 @@ public sealed record AgentCredential(
     /// this to expose writable host credential directories to untrusted agent
     /// sandboxes.
     /// </summary>
-    public IReadOnlyList<SandboxMount> Mounts { get; init; } = [];
+    public IReadOnlyList<SandboxMount> Mounts
+    {
+        get => _mounts;
+        init => _mounts = AgentCredentialMaterializationPolicy.SnapshotMounts(value, nameof(Mounts));
+    }
+
+    public void Deconstruct(
+        out AgentKind Agent,
+        out IReadOnlyDictionary<string, string> EnvironmentVariables,
+        out IReadOnlyDictionary<string, string> Files)
+    {
+        Agent = this.Agent;
+        EnvironmentVariables = this.EnvironmentVariables;
+        Files = this.Files;
+    }
 }

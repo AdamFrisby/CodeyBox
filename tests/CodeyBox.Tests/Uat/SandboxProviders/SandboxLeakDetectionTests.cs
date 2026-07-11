@@ -276,6 +276,21 @@ public sealed class SandboxLeakDetectionTests
     }
 
     [Fact]
+    public async Task LeakedSandboxEndpoint_RejectsWhitespaceProviderIdentity()
+    {
+        using var factory = new SandboxProviderApiFactory(
+            sandboxProvider: new UatSandboxProvider(),
+            reaper: BuildReaper(new UatSandboxProvider(), new CapturingWebhookDispatcher()));
+        using var client = factory.CreateClient();
+
+        var response = await client.PostAsync(
+            "/sandboxes/leaked/primary/dispose?providerId=%20%20",
+            content: null);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
     public async Task LeakedSandboxEndpoint_DisposesLeakWithCustomRemotePrefix()
     {
         var threshold = TimeSpan.FromMinutes(30);

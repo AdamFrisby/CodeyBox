@@ -159,10 +159,22 @@ internal static class IncusCloudInit
 
     internal static void ValidateExtraFragment(string? fragment)
     {
+        if (fragment is null || fragment.Length == 0)
+            return;
+        try
+        {
+            _ = IncusInputValidation.GetBoundedUtf8ByteCount(
+                fragment,
+                IncusSandboxOptions.MaximumExtraCloudInitUtf8Bytes,
+                nameof(fragment),
+                "ExtraCloudInit");
+        }
+        catch (ArgumentException ex)
+        {
+            throw new InvalidOperationException("ExtraCloudInit exceeds 1 MiB or is not valid Unicode.", ex);
+        }
         if (string.IsNullOrWhiteSpace(fragment))
             return;
-        if (Encoding.UTF8.GetByteCount(fragment) > IncusSandboxOptions.MaximumExtraCloudInitUtf8Bytes)
-            throw new InvalidOperationException("ExtraCloudInit exceeds 1 MiB.");
         var normalized = fragment.Replace("\r\n", "\n", StringComparison.Ordinal);
         if (normalized.Any(c => (char.IsControl(c) && c != '\n')
             || c is '\u0085' or '\u2028' or '\u2029'))

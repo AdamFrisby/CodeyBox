@@ -26,6 +26,10 @@ Hot-reloadable today:
 - `Projects[].Audit.PerIterationTimeoutMinutes` — the resolved `Project`
   record is captured once at work-item pickup, so a change mid-iteration
   does not move the goalposts for an item already running.
+- `DeepAuditFailurePersistence.{MaxAttempts,RetryDelay}` — captured as one
+  validated snapshot when an unexpected deep-audit failure must be persisted.
+  A change applies to the next failure reconciliation; an in-progress retry
+  sequence keeps the bounds it started with.
 - `AgentConcurrency` — re-applied via `AgentConfigHotReload`. Reload propagates
   to `OrchestratorService` (dispatch gate) and `PipelineRunner` (rebase-resolver
   cap-aware routing) through a shared snapshot. `MaxConcurrent` values **must
@@ -189,6 +193,8 @@ startup); we add explicit guards as we tighten the contract.
 | `DangerouslyAllowProcessSandbox` | bool | `false` | Allow process sandbox outside Development. Do not use in production. |
 | `UpstreamPushMaxAttempts` | int | `5` | Retry count for upstream push (GitHub PR creation). |
 | `UpstreamPushBackoffSeconds` | int | `15` | Seconds between upstream push retries. |
+| `DeepAuditFailurePersistence.MaxAttempts` | int | `3` | Total attempts to persist an unexpected deep-audit failure, including the initial attempt. Must be between 1 and 10; hot-reloadable for the next reconciliation. |
+| `DeepAuditFailurePersistence.RetryDelay` | TimeSpan | `00:00:00.100` | Delay between terminal-failure persistence attempts. Must be non-negative and no greater than one minute; hot-reloadable for the next reconciliation. |
 | `Shutdown.SandboxTeardownMode` | enum | `Stop` | Graceful-shutdown sandbox teardown mode: `Stop` cleanly stops and preserves the VM without a RAM snapshot; `Suspend` preserves RAM state via `multipass suspend` and is opt-in; `Dispose` purges the VM. |
 | `PhaseAbsoluteTimeoutMultiplier` | number | `3.0` | Multiplier applied to a phase's per-attempt timeout to bound fallback chains. Work/rework attempts each get the full `WorkTimeout`; merge attempts each get the full `MergeTimeout`; the whole fallback chain is capped at this multiplier times that per-attempt timeout. |
 
@@ -224,6 +230,13 @@ provider still requires a restart. Incus consumes the shared
 bridge policy during cutover. All Incus provisioning and lifecycle settings are
 independent: no `Multipass*` value is inherited.
 
+Durable queued Incus baseline pins remain routable after a
+`BaselineNamePrefix` edit or process restart. Cutover routing recognizes the
+stable Incus baseline shape (`-headless-` or `-gui-` followed by 12 lowercase
+hex characters) without treating that shape as proof of ownership; Incus still
+requires exact instance metadata, profile, flavor, pool, and the `ready`
+snapshot before using a pin.
+
 ```json
 "Incus": {
   "BinaryPath": "incus",
@@ -238,17 +251,17 @@ independent: no `Multipass*` value is inherited.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `BinaryPath` | string | `incus` | Incus 6.3-or-newer CLI executable name or absolute path; Incus 7.0 LTS and Linux kernel 5.6 or newer are recommended/required respectively. |
+| `BinaryPath` | string | `incus` | Incus 6.3-or-newer CLI executable name or absolute path. The installed release's upstream requirements also apply: the recommended Incus 7.0 LTS requires Linux 6.12 or newer and QEMU 8.2 or newer. Independently, the provider requires Linux 5.6 or newer for restricted-path `openat2` confinement. |
 | `ProjectName` | string | `codeybox` | Restart-only dedicated non-default project containing CodeyBox-owned instances. When absent, the provider creates it with exact ownership/schema markers `user.codeybox.managed=true` and `user.codeybox.project-schema=1`, `features.images=false`, the Incus-required `features.profiles=true`, and all required restrictions. Every VM is nevertheless created with `--no-profiles` and exact topology read-back. It refuses to adopt or mutate an existing project unless both markers and both feature flags match exactly. Disk paths, NIC/snapshot access, and `restricted.virtual-machines.lowlevel=block` are applied atomically and verified before VM creation; per-instance validation separately rejects nesting. |
 | `StoragePoolName` | string | `codeybox-zfs` | Existing ZFS or Btrfs pool used for VM roots and COW clones. CodeyBox never creates or reformats it; ZFS is strongly recommended for VM workloads. |
 | `DefaultImage` | string | `images:ubuntu/24.04/cloud` | VM image used when a sandbox specification has no explicit image. |
 | `InstanceNamePrefix` | string | `codeybox-` | Prefix identifying provider-owned ordinary VM instances. |
 | `BaselineNamePrefix` | string | `cb-incus-baseline-` | Prefix for content-addressed baked baseline instances. |
 | `UseBaselineImages` | bool | `true` | Lazily bake baselines and create sandboxes with COW `incus copy` clones. Set false to use the full-launch path. |
-| `ExtraRuncmd` | string[] | `[]` | Incus-specific first-boot/baseline provisioning commands. Multipass provisioning settings are never inherited. |
+| `ExtraRuncmd` | string[] | `[]` | Incus-specific first-boot/baseline provisioning commands. At most 256 commands are accepted; each command is limited to 64 KiB of UTF-8 and the aggregate to 1 MiB. Multipass provisioning settings are never inherited. |
 | `ExtraCloudInit` | string or null | null | Incus-specific additional top-level cloud-init YAML sent through `user.user-data`. Multipass cloud-init settings are never inherited. Do not put secrets here. |
 | `StagingDirectory` | string or null | `<StateDatabasePath directory>/incus-staging` | Restart-only persistent absolute host directory for isolation snapshots and mount staging. Its canonical, non-symlink parent must already exist; normally leave the root absent so CodeyBox creates it with mode `0700` and its ownership marker. An existing root is accepted only when owned by the service UID/GID with exact mode `0700` and an exact provider-owned `.codeybox-incus-staging-v1` marker (mode `0600`). Set an explicit path to place staging on a separate filesystem. The filesystem root, commas, and control characters are rejected because this path is included in the project's restricted disk-path list. |
-| `AllowedHostMountRoots` | string[] | `[]` plus managed Git roots | Additional canonical host-directory roots that may be attached directly through virtiofs. `GitRootDirectory` and the effective shared upstream mirror directory (when enabled) are included automatically. The exact canonical roots plus staging form the dedicated project's nonempty `restricted.devices.disk.paths` value; filesystem root, commas, controls, and paths outside the bounded list are rejected. Mounts outside these roots fail closed; add only narrowly scoped trusted directories. |
+| `AllowedHostMountRoots` | string[] | `[]` plus managed Git roots | Up to 64 additional canonical host-directory roots that may be attached directly through virtiofs. `GitRootDirectory` and the effective shared upstream mirror directory (when enabled) are included automatically, for at most 66 effective roots. The exact canonical roots plus staging form the dedicated project's nonempty `restricted.devices.disk.paths` value; filesystem root, commas, controls, and paths outside the bounded list are rejected. Mounts outside these roots fail closed; add only narrowly scoped trusted directories. |
 | `GuestUserId` | uint | `1000` | Non-root guest user ID used for untrusted sandbox commands. Incus VM virtiofs does not shift IDs; when any host-backed mount is present, this must exactly match the CodeyBox process's effective host UID. |
 | `GuestGroupId` | uint | `1000` | Non-root guest group ID used for untrusted sandbox commands. When any host-backed mount is present, this must exactly match the CodeyBox process's effective host GID. |
 | `GuestHome` | string | `/home/ubuntu` | Normalized absolute home directory for the configured guest identity. |
@@ -260,6 +273,11 @@ independent: no `Multipass*` value is inherited.
 | `CloudInitTimeout` | TimeSpan | `00:05:00` | Deadline for cloud-init completion. |
 | `MountReadyTimeout` | TimeSpan | `00:05:00` | Deadline for a configured virtiofs mount to become usable in the guest. |
 | `ReadinessPollInterval` | TimeSpan | `00:00:01` | Delay between bounded readiness probes. |
+| `CliProcessCleanupTimeout` | TimeSpan | `00:00:05` | Independent deadline for terminating an Incus CLI process tree and draining its redirected streams after cancellation or failure; valid through 5 minutes. Read live for each CLI invocation. |
+| `CliProcessGroupExitPollInterval` | TimeSpan | `00:00:00.010` | Delay between Linux process-group absence probes during Incus CLI cleanup; must be positive, at most 1 second, and no greater than `CliProcessCleanupTimeout`. Read live for each CLI invocation. |
+| `ExecPidPollAttempts` | int | `5` | Attempts to obtain an active guest exec process-group ID before forced cleanup; valid range 1–100 and read live. |
+| `ExecControlFileCleanupAttempts` | int | `3` | Attempts to delete and verify absence of each transient guest exec control file; valid range 1–100 and read live. |
+| `ExecCompletionProbeAttempts` | int | `3` | Attempts to read and validate a guest exec completion sentinel; valid range 1–100 and read live. |
 | `MaxConcurrentOperations` | int | `2` | Concurrent heavy Incus lifecycle/device operations; valid range 1–64. |
 | `MaxCliStdoutBytes` | int | `4194304` | Maximum retained stdout from one Incus CLI invocation. |
 | `MaxCliStderrBytes` | int | `4194304` | Maximum retained stderr from one Incus CLI invocation. |
@@ -288,7 +306,7 @@ by Incus.
 | `CodeyBox:DiskGuard:Enabled` | `true` | Enables/disables both the Incus pool-space probe and host-path probes. |
 | `CodeyBox:DiskGuard:MinFreeBytes` | `10737418240` | Defers sandbox creation when the pool or any monitored host filesystem has less than 10 GiB free. |
 | `CodeyBox:DiskGuard:RecheckIn` | `00:05:00` | Delay reported for deferred work. |
-| `CodeyBox:DiskGuard:AdditionalPaths` | `[]` | Extra host paths to probe; the state-database directory and effective Incus staging directory are included automatically. |
+| `CodeyBox:DiskGuard:AdditionalPaths` | `[]` | Up to 64 extra host paths to probe; the state-database directory and effective Incus staging directory are included automatically, for at most 66 effective Incus host paths. |
 
 ---
 

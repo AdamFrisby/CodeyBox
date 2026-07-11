@@ -46,10 +46,10 @@ public interface IAgentRunner
 
 /// <summary>
 /// Declares the exact credential environment names a runner supports. Direct
-/// variables are read by the CLI from the sandbox's provisioned environment;
-/// file-backed variables are payload or destination metadata consumed by the
-/// runner's stdin-based credential staging and must not be exposed through
-/// per-exec process environment.
+/// variables are read by the CLI from its launched process environment and may
+/// be scoped to a single candidate exec; file-backed variables are payload or
+/// destination metadata consumed by the runner's stdin-based credential staging
+/// and must not be exposed through per-exec process environment.
 /// </summary>
 public interface IAgentCredentialEnvironmentPolicy
 {

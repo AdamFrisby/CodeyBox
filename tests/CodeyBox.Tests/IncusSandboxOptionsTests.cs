@@ -42,6 +42,11 @@ public sealed class IncusSandboxOptionsTests
             OperationTimeout = TimeSpan.Zero,
             ExecTimeout = TimeSpan.Zero,
             ImageProvisioningTimeout = TimeSpan.Zero,
+            CliProcessCleanupTimeout = TimeSpan.Zero,
+            CliProcessGroupExitPollInterval = TimeSpan.Zero,
+            ExecPidPollAttempts = 0,
+            ExecControlFileCleanupAttempts = IncusSandboxOptions.MaximumExecRetryAttempts + 1,
+            ExecCompletionProbeAttempts = 0,
             MaxConcurrentOperations = 0,
             MaxCliStdoutBytes = 1,
             MaxCliStderrBytes = int.MaxValue,
@@ -69,6 +74,10 @@ public sealed class IncusSandboxOptionsTests
         Assert.Contains(errors, error => error.StartsWith("OperationTimeout", StringComparison.Ordinal));
         Assert.Contains(errors, error => error.StartsWith("ExecTimeout", StringComparison.Ordinal));
         Assert.Contains(errors, error => error.StartsWith("ImageProvisioningTimeout", StringComparison.Ordinal));
+        Assert.Contains(errors, error => error.StartsWith("CliProcessCleanupTimeout", StringComparison.Ordinal));
+        Assert.Contains(errors, error => error.StartsWith("ExecPidPollAttempts", StringComparison.Ordinal));
+        Assert.Contains(errors, error => error.StartsWith("ExecControlFileCleanupAttempts", StringComparison.Ordinal));
+        Assert.Contains(errors, error => error.StartsWith("ExecCompletionProbeAttempts", StringComparison.Ordinal));
         Assert.Contains(errors, error => error.StartsWith("MaxConcurrentOperations", StringComparison.Ordinal));
         Assert.Contains(errors, error => error.StartsWith("MaxCliStdoutBytes", StringComparison.Ordinal));
         Assert.Contains(errors, error => error.StartsWith("MaxCliStderrBytes", StringComparison.Ordinal));
@@ -113,7 +122,8 @@ public sealed class IncusSandboxOptionsTests
             ExtraCloudInit = new string('x', IncusSandboxOptions.MaximumExtraCloudInitUtf8Bytes + 1),
         });
 
-        Assert.Equal(["ExtraCloudInit exceeds 1 MiB."], errors);
+        var error = Assert.Single(errors);
+        Assert.Contains("1048576-byte UTF-8 safety bound", error, StringComparison.Ordinal);
     }
 
     [Fact]

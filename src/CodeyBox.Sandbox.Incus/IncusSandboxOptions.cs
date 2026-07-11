@@ -1,8 +1,14 @@
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 
 namespace CodeyBox.Sandbox.Incus;
 
-/// <summary>Hot-readable operational settings for <see cref="IncusSandboxProvider"/>.</summary>
+/// <summary>
+/// Hot-readable operational settings for <see cref="IncusSandboxProvider"/>.
+/// <see cref="ProjectName"/> and the effective <see cref="StagingDirectory"/>
+/// are lifecycle identities captured when the provider is constructed and
+/// require a provider restart to change.
+/// </summary>
 public sealed record IncusSandboxOptions
 {
     public static readonly TimeSpan DefaultOperationTimeout = TimeSpan.FromMinutes(2);
@@ -15,10 +21,19 @@ public sealed record IncusSandboxOptions
     public const int MaximumNetworkProfiles = 128;
     public const int MaximumNetworkProfileUtf8Bytes = 64 * 1024;
     public const int MaximumExtraRuncmdCount = 256;
-    public const int MaximumExtraRuncmdUtf8Bytes = 1024 * 1024;
+    public const int MaximumExtraRuncmdCommandUtf8Bytes = 64 * 1024;
+    public const int MaximumAggregateExtraRuncmdUtf8Bytes = 1024 * 1024;
     public const int MaximumExtraCloudInitUtf8Bytes = 1024 * 1024;
+    /// <summary>Maximum operator-supplied entries in either Incus host-path list.</summary>
+    public const int MaximumConfiguredHostPathEntries = 64;
+    /// <summary>Configured entries plus the two provider-managed paths each list can add.</summary>
+    public const int MaximumEffectiveHostPathEntries = MaximumConfiguredHostPathEntries + 2;
+    public const int MaximumExecRetryAttempts = 100;
 
-    /// <summary>Path to an Incus 6.3-or-newer CLI. Incus 7.0 LTS is recommended.</summary>
+    /// <summary>
+    /// Path to an Incus 6.3-or-newer CLI. The recommended Incus 7.0 LTS
+    /// release requires Linux 6.12 or newer and QEMU 8.2 or newer.
+    /// </summary>
     public string BinaryPath { get; init; } = "incus";
 
     /// <summary>
@@ -81,6 +96,16 @@ public sealed record IncusSandboxOptions
     public TimeSpan CloudInitTimeout { get; init; } = DefaultVmStartTimeout;
     public TimeSpan MountReadyTimeout { get; init; } = DefaultVmStartTimeout;
     public TimeSpan ReadinessPollInterval { get; init; } = DefaultReadinessPollInterval;
+    /// <summary>Independent deadline for terminating and draining one Incus CLI process tree.</summary>
+    public TimeSpan CliProcessCleanupTimeout { get; init; } = DefaultProcessRunnerOptions.DefaultCleanupTimeout;
+    /// <summary>Delay between Linux Incus CLI process-group absence probes during cleanup.</summary>
+    public TimeSpan CliProcessGroupExitPollInterval { get; init; } = DefaultProcessRunnerOptions.DefaultProcessGroupExitPollInterval;
+    /// <summary>Attempts to read an active guest exec's process-group ID before forced cleanup.</summary>
+    public int ExecPidPollAttempts { get; init; } = 5;
+    /// <summary>Attempts to delete and verify absence of each transient guest exec control file.</summary>
+    public int ExecControlFileCleanupAttempts { get; init; } = 3;
+    /// <summary>Attempts to read and validate a guest exec completion sentinel.</summary>
+    public int ExecCompletionProbeAttempts { get; init; } = 3;
     public int MaxConcurrentOperations { get; init; } = 2;
     public int MaxCliStdoutBytes { get; init; } = DefaultMaxCliOutputBytes;
     public int MaxCliStderrBytes { get; init; } = DefaultMaxCliOutputBytes;
@@ -116,6 +141,14 @@ public sealed record IncusSandboxOptions
     public static IReadOnlyList<string> Validate(IncusSandboxOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
+        try
+        {
+            options = IncusInputSnapshot.CaptureOptions(options);
+        }
+        catch (ArgumentException ex)
+        {
+            return [ex.Message];
+        }
         var errors = new List<string>();
         RequireText(options.BinaryPath, nameof(BinaryPath), 4096, errors);
         // Incus places virtiofs control sockets beneath
@@ -147,6 +180,23 @@ public sealed record IncusSandboxOptions
         RequirePositiveDuration(options.CloudInitTimeout, nameof(CloudInitTimeout), errors);
         RequirePositiveDuration(options.MountReadyTimeout, nameof(MountReadyTimeout), errors);
         RequirePositiveDuration(options.ReadinessPollInterval, nameof(ReadinessPollInterval), errors);
+        try
+        {
+            DefaultProcessRunnerOptions.Validate(new DefaultProcessRunnerOptions
+            {
+                IsolateLinuxProcessGroup = true,
+                CleanupTimeout = options.CliProcessCleanupTimeout,
+                ProcessGroupExitPollInterval = options.CliProcessGroupExitPollInterval,
+            });
+        }
+        catch (ArgumentException ex)
+        {
+            errors.Add(
+                $"{nameof(CliProcessCleanupTimeout)} and {nameof(CliProcessGroupExitPollInterval)} are invalid: {ex.Message}");
+        }
+        RequireRetryAttempts(options.ExecPidPollAttempts, nameof(ExecPidPollAttempts), errors);
+        RequireRetryAttempts(options.ExecControlFileCleanupAttempts, nameof(ExecControlFileCleanupAttempts), errors);
+        RequireRetryAttempts(options.ExecCompletionProbeAttempts, nameof(ExecCompletionProbeAttempts), errors);
         RequirePositiveDuration(options.ResourceMetricsCaptureTimeout, nameof(ResourceMetricsCaptureTimeout), errors);
         RequirePositiveDuration(options.ResourceMetricsSampleInterval, nameof(ResourceMetricsSampleInterval), errors);
         if (options.MaxConcurrentOperations is < 1 or > 64)
@@ -182,9 +232,10 @@ public sealed record IncusSandboxOptions
                 diskGuard.RecheckIn,
                 $"{nameof(DiskGuard)}.{nameof(IncusDiskGuardOptions.RecheckIn)}",
                 errors);
-            if (diskGuard.HostPaths.Count > 64)
+            if (diskGuard.HostPaths.Count > MaximumEffectiveHostPathEntries)
             {
-                errors.Add($"{nameof(DiskGuard)}.{nameof(IncusDiskGuardOptions.HostPaths)} cannot contain more than 64 paths.");
+                errors.Add(
+                    $"{nameof(DiskGuard)}.{nameof(IncusDiskGuardOptions.HostPaths)} cannot contain more than {MaximumEffectiveHostPathEntries} paths.");
             }
             else
             {
@@ -196,9 +247,17 @@ public sealed record IncusSandboxOptions
                         errors.Add($"{nameof(DiskGuard)}.{nameof(IncusDiskGuardOptions.HostPaths)} cannot contain null paths.");
                         continue;
                     }
-                    hostPathBytes += System.Text.Encoding.UTF8.GetByteCount(path);
+                    if (!TryGetBoundedUtf8ByteCount(
+                            path,
+                            4096,
+                            $"{nameof(DiskGuard)}.{nameof(IncusDiskGuardOptions.HostPaths)} entry",
+                            errors,
+                            out var pathBytes))
+                    {
+                        continue;
+                    }
+                    hostPathBytes += pathBytes;
                     if (string.IsNullOrWhiteSpace(path)
-                        || path.Length > 4096
                         || path.Any(char.IsControl)
                         || !Path.IsPathFullyQualified(path))
                         errors.Add($"Every {nameof(DiskGuard)}.{nameof(IncusDiskGuardOptions.HostPaths)} entry must be an absolute bounded host path.");
@@ -226,21 +285,31 @@ public sealed record IncusSandboxOptions
                     errors.Add($"{nameof(ExtraRuncmd)} cannot contain null commands.");
                     continue;
                 }
-                var bytes = System.Text.Encoding.UTF8.GetByteCount(command);
+                if (!TryGetBoundedUtf8ByteCount(
+                        command,
+                        MaximumExtraRuncmdCommandUtf8Bytes,
+                        $"{nameof(ExtraRuncmd)} command",
+                        errors,
+                        out var bytes))
+                {
+                    continue;
+                }
                 commandBytes += bytes;
                 if (command.Contains('\0'))
                     errors.Add($"An {nameof(ExtraRuncmd)} command contains NUL.");
-                if (bytes > 64 * 1024)
-                    errors.Add($"An {nameof(ExtraRuncmd)} command exceeds 65536 UTF-8 bytes.");
             }
-            if (commandBytes > MaximumExtraRuncmdUtf8Bytes)
+            if (commandBytes > MaximumAggregateExtraRuncmdUtf8Bytes)
                 errors.Add($"{nameof(ExtraRuncmd)} exceeds 1 MiB in aggregate.");
         }
         var validateExtraCloudInit = true;
         if (options.ExtraCloudInit is { } cloudInit
-            && System.Text.Encoding.UTF8.GetByteCount(cloudInit) > MaximumExtraCloudInitUtf8Bytes)
+            && !TryGetBoundedUtf8ByteCount(
+                cloudInit,
+                MaximumExtraCloudInitUtf8Bytes,
+                nameof(ExtraCloudInit),
+                errors,
+                out _))
         {
-            errors.Add($"{nameof(ExtraCloudInit)} exceeds 1 MiB.");
             validateExtraCloudInit = false;
         }
         if (options.NetworkProfiles.Count > MaximumNetworkProfiles)
@@ -258,8 +327,23 @@ public sealed record IncusSandboxOptions
                     errors.Add($"{nameof(NetworkProfiles)} cannot contain null keys or values.");
                     continue;
                 }
-                networkProfileBytes += System.Text.Encoding.UTF8.GetByteCount(profile);
-                networkProfileBytes += System.Text.Encoding.UTF8.GetByteCount(bridge);
+                if (!TryGetBoundedUtf8ByteCount(
+                        profile,
+                        63,
+                        "NetworkProfiles key",
+                        errors,
+                        out var profileBytes)
+                    || !TryGetBoundedUtf8ByteCount(
+                        bridge,
+                        15,
+                        "NetworkProfiles value",
+                        errors,
+                        out var bridgeBytes))
+                {
+                    continue;
+                }
+                networkProfileBytes += profileBytes;
+                networkProfileBytes += bridgeBytes;
                 RequireName(profile, "NetworkProfiles key", 63, errors);
                 if (string.IsNullOrWhiteSpace(bridge)
                     || bridge.Length > 15
@@ -272,9 +356,10 @@ public sealed record IncusSandboxOptions
             if (networkProfileBytes > MaximumNetworkProfileUtf8Bytes)
                 errors.Add($"{nameof(NetworkProfiles)} exceeds 64 KiB in aggregate.");
         }
-        if (options.AllowedHostMountRoots.Count > 64)
+        if (options.AllowedHostMountRoots.Count > MaximumEffectiveHostPathEntries)
         {
-            errors.Add($"{nameof(AllowedHostMountRoots)} cannot contain more than 64 entries.");
+            errors.Add(
+                $"{nameof(AllowedHostMountRoots)} cannot contain more than {MaximumEffectiveHostPathEntries} entries.");
         }
         else
         {
@@ -286,9 +371,17 @@ public sealed record IncusSandboxOptions
                     errors.Add($"{nameof(AllowedHostMountRoots)} cannot contain null roots.");
                     continue;
                 }
-                allowedRootBytes += System.Text.Encoding.UTF8.GetByteCount(root);
+                if (!TryGetBoundedUtf8ByteCount(
+                        root,
+                        4096,
+                        $"{nameof(AllowedHostMountRoots)} entry",
+                        errors,
+                        out var rootBytes))
+                {
+                    continue;
+                }
+                allowedRootBytes += rootBytes;
                 if (string.IsNullOrWhiteSpace(root)
-                    || root.Length > 4096
                     || root.Contains(',')
                     || root.Any(char.IsControl)
                     || !Path.IsPathFullyQualified(root))
@@ -304,12 +397,20 @@ public sealed record IncusSandboxOptions
             if (allowedRootBytes > 256 * 1024)
                 errors.Add($"{nameof(AllowedHostMountRoots)} exceeds 256 KiB in aggregate.");
         }
-        if (!string.IsNullOrWhiteSpace(options.StagingDirectory)
-            && (options.StagingDirectory.Length > 4096
-                || options.StagingDirectory.Contains(',')
-                || options.StagingDirectory.Any(char.IsControl)
-                || !Path.IsPathFullyQualified(options.StagingDirectory)
-                || IsHostFilesystemRoot(options.StagingDirectory)))
+        var stagingDirectoryValid = options.StagingDirectory is null
+            || TryGetBoundedUtf8ByteCount(
+                options.StagingDirectory,
+                4096,
+                nameof(StagingDirectory),
+                errors,
+                out _);
+        if (stagingDirectoryValid
+            && options.StagingDirectory is { Length: > 0 } stagingDirectory
+            && !string.IsNullOrWhiteSpace(stagingDirectory)
+            && (stagingDirectory.Contains(',')
+                || stagingDirectory.Any(char.IsControl)
+                || !Path.IsPathFullyQualified(stagingDirectory)
+                || IsHostFilesystemRoot(stagingDirectory)))
         {
             errors.Add(
                 $"{nameof(StagingDirectory)} must be a bounded non-root absolute host path without commas or control characters when configured.");
@@ -326,10 +427,29 @@ public sealed record IncusSandboxOptions
         return errors;
     }
 
+    private static void RequireRetryAttempts(int value, string name, ICollection<string> errors)
+    {
+        if (value is < 1 or > MaximumExecRetryAttempts)
+            errors.Add($"{name} must be between 1 and {MaximumExecRetryAttempts}.");
+    }
+
     internal static bool IsAbsoluteGuestPath(string value)
     {
+        if (value is null || value.Length is < 1 or > 4096)
+            return false;
+        try
+        {
+            _ = IncusInputValidation.GetBoundedUtf8ByteCount(
+                value,
+                4096,
+                nameof(value),
+                "Guest path");
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
         if (string.IsNullOrWhiteSpace(value)
-            || value.Length > 4096
             || !value.StartsWith("/", StringComparison.Ordinal)
             || value.StartsWith("//", StringComparison.Ordinal)
             || (value.Length > 1 && value.EndsWith("/", StringComparison.Ordinal))
@@ -366,7 +486,14 @@ public sealed record IncusSandboxOptions
 
     private static void RequireText(string value, string name, int maxLength, ICollection<string> errors)
     {
-        if (string.IsNullOrWhiteSpace(value) || value.Length > maxLength || value.Any(char.IsControl))
+        if (value is null || value.Length is < 1 || value.Length > maxLength)
+        {
+            errors.Add($"{name} must be non-empty, contain no control characters, and be at most {maxLength} characters.");
+            return;
+        }
+        if (!TryGetBoundedUtf8ByteCount(value, maxLength, name, errors, out _))
+            return;
+        if (string.IsNullOrWhiteSpace(value) || value.Any(char.IsControl))
             errors.Add($"{name} must be non-empty, contain no control characters, and be at most {maxLength} characters.");
     }
 
@@ -379,8 +506,8 @@ public sealed record IncusSandboxOptions
 
     private static bool IsValidPrefix(string value)
     {
-        return !string.IsNullOrWhiteSpace(value)
-            && value.Length <= 32
+        return value is { Length: > 0 and <= 32 }
+            && !string.IsNullOrWhiteSpace(value)
             && !value.Any(char.IsControl)
             && char.IsAsciiLetterOrDigit(value[0])
             && value.All(c => char.IsAsciiLetterOrDigit(c) || c == '-');
@@ -389,11 +516,37 @@ public sealed record IncusSandboxOptions
     private static void RequireName(string value, string name, int maxLength, ICollection<string> errors)
     {
         RequireText(value, name, maxLength, errors);
+        if (value is null || value.Length is < 1 || value.Length > maxLength)
+            return;
         if (string.IsNullOrWhiteSpace(value)
             || !char.IsAsciiLetterOrDigit(value[0])
             || !char.IsAsciiLetterOrDigit(value[^1])
             || value.Any(c => !(char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.')))
             errors.Add($"{name} has characters unsupported by the Incus provider.");
+    }
+
+    private static bool TryGetBoundedUtf8ByteCount(
+        string value,
+        int maximumUtf8Bytes,
+        string name,
+        ICollection<string> errors,
+        out int bytes)
+    {
+        try
+        {
+            bytes = IncusInputValidation.GetBoundedUtf8ByteCount(
+                value,
+                maximumUtf8Bytes,
+                name,
+                name);
+            return true;
+        }
+        catch (ArgumentException ex)
+        {
+            errors.Add(ex.Message);
+            bytes = 0;
+            return false;
+        }
     }
 }
 

@@ -12,7 +12,7 @@ operational trade-off matches your deployment.
 | `process`         | None (UNSAFE)                                | nothing                                                          | Working — dev only              |
 | `bubblewrap`      | Linux namespaces + seccomp; shared kernel    | `apt install bubblewrap` — no daemon, no /etc edits              | **Working, integration-tested** |
 | **`multipass`**   | **Real Ubuntu VM (separate guest kernel)**   | **`snap install multipass` — single command, no /etc edits**     | **Working, integration-tested** |
-| `incus`           | Real VM with COW ZFS/Btrfs roots and virtiofs | Incus 7.0 LTS, `incus-admin`, and a ZFS or Btrfs storage pool    | Opt-in; `requires_incus` tested |
+| `incus`           | Real VM with COW ZFS/Btrfs roots and virtiofs | Incus 6.3+ (`7.0 LTS`: Linux 6.12+/QEMU 8.2+), `incus-admin`, and a ZFS or Btrfs pool | Opt-in; `requires_incus` tested |
 | `multipass-remote` | Real Ubuntu VM on remote executor hosts     | `ssh` from orchestrator + `snap install multipass` per executor  | Working — distributed executor pool |
 | `sprites`         | Hosted Firecracker microVM                   | sprites.dev account and token                                    | Working                         |
 
@@ -103,11 +103,14 @@ A graphical request fails explicitly; it is never rerouted to Multipass.
 
 ### Host prerequisites
 
-- Incus 6.3 or newer on Linux kernel 5.6 or newer; Incus 7.0 LTS is
-  recommended. The native filesystem `io.bus=virtiofs` selector was added in
-  6.3, and kernel 5.6 supplies the `openat2` confinement used by Incus for
-  restricted-project disk paths. Preflight rejects a server that does not
-  report both capabilities.
+- Incus 6.3 or newer, satisfying the upstream requirements for the installed
+  release. Incus 7.0 LTS is recommended and requires Linux 6.12 or newer and
+  QEMU 8.2 or newer; see the [Incus requirements](https://linuxcontainers.org/incus/docs/main/requirements/).
+  Independently, this provider requires at least Linux 5.6 because that kernel
+  supplies the `openat2` confinement used by Incus for restricted-project disk
+  paths. The native filesystem `io.bus=virtiofs` selector was added in Incus
+  6.3. Preflight rejects a server that does not report both provider-required
+  capabilities.
 - The CodeyBox service identity in the `incus-admin` group. This group is
   effectively host-root-equivalent because Incus can attach host paths and
   devices; restrict membership accordingly and restart the service after
@@ -202,6 +205,11 @@ storage-create command.
       "InstanceNamePrefix": "codeybox-",
       "BaselineNamePrefix": "cb-incus-baseline-",
       "UseBaselineImages": true,
+      "CliProcessCleanupTimeout": "00:00:05",
+      "CliProcessGroupExitPollInterval": "00:00:00.010",
+      "ExecPidPollAttempts": 5,
+      "ExecControlFileCleanupAttempts": 3,
+      "ExecCompletionProbeAttempts": 3,
       "ExtraRuncmd": []
     },
     "SandboxProviderCutover": {
@@ -217,14 +225,23 @@ storage-create command.
 
 Incus operational settings other than the restart-only `ProjectName` and
 effective `StagingDirectory`, plus the shared network-profile map, are read for
-subsequent provider operations. Existing sandbox handles retain the option
-snapshot with which they were created. A process started with `multipass` or
-`incus` may hot-switch between those two providers: in-progress creations
+subsequent provider operations. Existing sandbox handles retain their
+provisioning option snapshot, while the Incus CLI cleanup deadline/poll and
+the bounded guest-exec PID/control-file/completion attempt counts are read
+live at their next use. An attempt count includes the initial attempt. A
+process started with `multipass` or `incus` may hot-switch between those two
+providers: in-progress creations
 continue on their original provider and existing handles keep their owner.
 Each new creation invokes only the currently selected backend; a failure is
 propagated and never retried through the other provider. Selecting any other
 provider still requires a restart. See
 [`configuration.md`](configuration.md#incus) for every key and bound.
+
+Queued Incus baseline pins survive both prefix edits and restarts: the cutover
+router recognizes their stable flavor-plus-12-hex structural suffix, while the
+Incus provider independently verifies exact ownership metadata and the ready
+snapshot before cloning. This classifier only routes a pin; it never authorizes
+an Incus instance mutation.
 
 When Incus is neither selected nor retained, the Incus provider is not
 constructed and its full configuration is not mapped or validated. The

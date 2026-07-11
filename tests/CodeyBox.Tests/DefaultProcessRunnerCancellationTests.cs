@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using System.Collections.Concurrent;
 using CodeyBox.HostProcess;
 using CodeyBox.Sandbox.Incus;
 
@@ -7,6 +8,58 @@ namespace CodeyBox.Tests;
 
 public sealed class DefaultProcessRunnerCancellationTests
 {
+    [Fact]
+    public void Constructor_RejectsInvalidCleanupTimingPolicy()
+    {
+        var invalid = new[]
+        {
+            new DefaultProcessRunnerOptions { CleanupTimeout = TimeSpan.Zero },
+            new DefaultProcessRunnerOptions { CleanupTimeout = TimeSpan.FromMinutes(5) + TimeSpan.FromTicks(1) },
+            new DefaultProcessRunnerOptions { ProcessGroupExitPollInterval = TimeSpan.Zero },
+            new DefaultProcessRunnerOptions { ProcessGroupExitPollInterval = TimeSpan.FromSeconds(1) + TimeSpan.FromTicks(1) },
+            new DefaultProcessRunnerOptions
+            {
+                CleanupTimeout = TimeSpan.FromMilliseconds(5),
+                ProcessGroupExitPollInterval = TimeSpan.FromMilliseconds(6),
+            },
+        };
+
+        foreach (var options in invalid)
+            Assert.Throws<ArgumentOutOfRangeException>(() => new DefaultProcessRunner(options));
+    }
+
+    [Fact]
+    public async Task CancellationCleanupSchedulesConfiguredDeadlineOnInjectedClock()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+        var time = new RecordingTimeProvider();
+        var transcript = new PidTranscript();
+        using var cancellation = new CancellationTokenSource();
+        var runner = new DefaultProcessRunner(
+            new DefaultProcessRunnerOptions
+            {
+                IsolateLinuxProcessGroup = true,
+                CleanupTimeout = TimeSpan.FromSeconds(17),
+                ProcessGroupExitPollInterval = TimeSpan.FromMilliseconds(25),
+            },
+            time);
+        var run = runner.RunAsync(
+            ["/bin/sh", "-c", "printf 'root=%s\\n' $$; sleep 30"],
+            stdin: null,
+            cancellation.Token,
+            stdoutChunkCallback: transcript.Append,
+            maxStdoutBytes: 4096,
+            maxStderrBytes: 4096);
+        _ = await transcript.RootPid.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            run.WaitAsync(TimeSpan.FromSeconds(5)));
+
+        Assert.Contains(TimeSpan.FromSeconds(17), time.TimerDueTimes);
+    }
+
     [Fact]
     public async Task DefaultRunner_DoesNotCreateNewLinuxSession()
     {
@@ -220,6 +273,21 @@ public sealed class DefaultProcessRunnerCancellationTests
                     return index;
             }
             return -1;
+        }
+    }
+
+    private sealed class RecordingTimeProvider : TimeProvider
+    {
+        internal ConcurrentQueue<TimeSpan> TimerDueTimes { get; } = new();
+
+        public override ITimer CreateTimer(
+            TimerCallback callback,
+            object? state,
+            TimeSpan dueTime,
+            TimeSpan period)
+        {
+            TimerDueTimes.Enqueue(dueTime);
+            return TimeProvider.System.CreateTimer(callback, state, dueTime, period);
         }
     }
 }

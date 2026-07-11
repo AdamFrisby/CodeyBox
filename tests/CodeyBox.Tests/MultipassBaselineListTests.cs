@@ -14,7 +14,7 @@ namespace CodeyBox.Tests;
 /// security boundary that bounds <c>multipass delete --purge</c> to baseline
 /// VMs only. Bugs here either expose operator VMs to the reaper's blast
 /// radius (inverted/missing prefix filter) or hide stale baselines from the
-/// GC entirely (swallowed JSON parse failure not returning empty, prefix
+/// GC entirely (swallowed enumeration failure, prefix
 /// captured under a stale config reload). The reaper-side tests substitute
 /// a fake resolver, so this test exercises the real implementation.
 /// </summary>
@@ -67,13 +67,12 @@ public sealed class MultipassBaselineListTests : IDisposable
 
     /// <summary>
     /// When multipass exits non-zero (e.g. daemon down, permission denied),
-    /// the method must return an empty list rather than throw. The reaper
-    /// treats an empty result as "nothing to reap this sweep" — propagating
-    /// a transient multipass failure as an exception would crash the
-    /// background service.
+    /// the method must throw so admission reconciliation cannot mistake an
+    /// unknown inventory for authoritative absence. The background reaper
+    /// already catches enumeration failures at its sweep boundary.
     /// </summary>
     [Fact]
-    public async Task ListBaselineImagesAsync_NonZeroExit_ReturnsEmpty()
+    public async Task ListBaselineImagesAsync_NonZeroExit_ThrowsWithContext()
     {
         var runner = new RecordingMultipassRunner((argv, _, _) =>
             argv is [_, "list", "--format=json"]
@@ -81,18 +80,19 @@ public sealed class MultipassBaselineListTests : IDisposable
                 : Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
         var provider = NewProvider(runner);
 
-        var result = await ((IBaselineImageResolver)provider).ListBaselineImagesAsync(CancellationToken.None);
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IBaselineImageResolver)provider).ListBaselineImagesAsync(CancellationToken.None));
 
-        Assert.Empty(result);
+        Assert.Contains("exited with code 2", error.Message, StringComparison.Ordinal);
     }
 
     /// <summary>
     /// If multipass returns valid JSON without a "list" property (schema
-    /// drift on a future multipass release), the method must return an empty
-    /// list — not throw, not include garbage.
+    /// drift on a future multipass release), completeness is unknown and the
+    /// method must throw.
     /// </summary>
     [Fact]
-    public async Task ListBaselineImagesAsync_JsonMissingListProperty_ReturnsEmpty()
+    public async Task ListBaselineImagesAsync_JsonMissingListProperty_Throws()
     {
         var runner = new RecordingMultipassRunner((argv, _, _) =>
             argv is [_, "list", "--format=json"]
@@ -100,18 +100,18 @@ public sealed class MultipassBaselineListTests : IDisposable
                 : Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
         var provider = NewProvider(runner);
 
-        var result = await ((IBaselineImageResolver)provider).ListBaselineImagesAsync(CancellationToken.None);
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IBaselineImageResolver)provider).ListBaselineImagesAsync(CancellationToken.None));
 
-        Assert.Empty(result);
+        Assert.IsType<JsonException>(error.InnerException);
     }
 
     /// <summary>
     /// Malformed JSON (truncated output, corrupted multipass response) must
-    /// be caught and surface as an empty list — JsonException propagating up
-    /// would crash the reaper background service on every sweep.
+    /// surface as a contextual enumeration failure rather than an empty list.
     /// </summary>
     [Fact]
-    public async Task ListBaselineImagesAsync_InvalidJson_ReturnsEmpty()
+    public async Task ListBaselineImagesAsync_InvalidJson_ThrowsWithParseCause()
     {
         var runner = new RecordingMultipassRunner((argv, _, _) =>
             argv is [_, "list", "--format=json"]
@@ -119,19 +119,18 @@ public sealed class MultipassBaselineListTests : IDisposable
                 : Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
         var provider = NewProvider(runner);
 
-        var result = await ((IBaselineImageResolver)provider).ListBaselineImagesAsync(CancellationToken.None);
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IBaselineImageResolver)provider).ListBaselineImagesAsync(CancellationToken.None));
 
-        Assert.Empty(result);
+        Assert.IsAssignableFrom<JsonException>(error.InnerException);
     }
 
     /// <summary>
-    /// Entries missing a "name" property, or with an empty name, must be
-    /// silently skipped — they are not valid VM identifiers and cannot be a
-    /// baseline. Skipping them keeps a single malformed entry from poisoning
-    /// the entire sweep.
+    /// Entries missing a "name" property, or with an empty name, make the
+    /// inventory incomplete and therefore fail the whole enumeration.
     /// </summary>
     [Fact]
-    public async Task ListBaselineImagesAsync_EntriesWithMissingOrEmptyName_AreSkipped()
+    public async Task ListBaselineImagesAsync_EntryMissingName_Throws()
     {
         var json = """
         {
@@ -148,10 +147,10 @@ public sealed class MultipassBaselineListTests : IDisposable
                 : Task.FromResult(new ProcessRunResult(99, "", "unexpected argv: " + JsonSerializer.Serialize(argv))));
         var provider = NewProvider(runner);
 
-        var result = await ((IBaselineImageResolver)provider).ListBaselineImagesAsync(CancellationToken.None);
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IBaselineImageResolver)provider).ListBaselineImagesAsync(CancellationToken.None));
 
-        var info = Assert.Single(result);
-        Assert.Equal("cb-baseline-realone12345", info.Name);
+        Assert.IsType<JsonException>(error.InnerException);
     }
 
     /// <summary>

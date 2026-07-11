@@ -13,11 +13,11 @@ internal sealed class IncusSandbox :
     IPreserveOnDisposeSandbox,
     IShutdownTeardownSandbox,
     IProviderOwnedSandbox,
-    IPrivilegedGuestFileHardeningSandbox,
     IResourceMetricsCapturingSandbox
 {
-    private const int MaxExecArguments = 4096;
+    internal const int MaxExecArguments = 4096;
     internal const int MaxExecEnvironmentEntries = 512;
+    internal const int MaxExecEnvironmentNameCharacters = 256;
     private const int MaxExecArgvUtf8Bytes = 1024 * 1024;
     private const int MaxExecInputUtf8Bytes = 16 * 1024 * 1024;
     private const string ResourceMetricsScript = """
@@ -53,6 +53,9 @@ internal sealed class IncusSandbox :
     private readonly string? _baselineRef;
     private readonly ISandboxResourceUsageStore? _resourceUsageStore;
     private readonly Action<string> _onDisposed;
+    private readonly TimeProvider _timeProvider;
+    private readonly Func<Guid> _newGuid;
+    private readonly Func<IncusSandboxOptions> _liveOptionsAccessor;
     private readonly ConcurrentDictionary<string, bool> _activeExecs = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
     // 0 running, 1 stopping-to-preserve, 2 preserved, 3 disposing, 4 disposed,
@@ -77,13 +80,17 @@ internal sealed class IncusSandbox :
         string timingPhase,
         string? baselineRef,
         ISandboxResourceUsageStore? resourceUsageStore,
-        Action<string> onDisposed)
+        Action<string> onDisposed,
+        TimeProvider? timeProvider = null,
+        Func<Guid>? newGuid = null,
+        Func<IncusSandboxOptions>? liveOptionsAccessor = null)
     {
+        IncusInputValidation.ValidateInstanceName(id, nameof(id));
         Id = id;
         _sandboxRoot = sandboxRoot;
         _stagingRoot = stagingRoot;
-        _spec = spec;
-        _options = options;
+        _spec = IncusInputSnapshot.CaptureSpec(spec);
+        _options = IncusInputSnapshot.CaptureOptions(options);
         _cli = cli;
         _log = log;
         _timings = timings;
@@ -92,6 +99,9 @@ internal sealed class IncusSandbox :
         _baselineRef = baselineRef;
         _resourceUsageStore = resourceUsageStore;
         _onDisposed = onDisposed;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _newGuid = newGuid ?? Guid.NewGuid;
+        _liveOptionsAccessor = liveOptionsAccessor ?? (() => _options);
     }
 
     public string Id { get; }
@@ -104,12 +114,12 @@ internal sealed class IncusSandbox :
 
     public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
-        ArgumentNullException.ThrowIfNull(exec);
+        exec = IncusInputSnapshot.CaptureExec(exec);
         ValidateExec(exec);
-        var runId = Guid.NewGuid().ToString("N");
+        var runId = NextGuid("exec control files").ToString("N");
         var workingDirectory = exec.WorkingDirectory ?? _spec.WorkingDirectory;
         IncusInputValidation.ValidateAbsoluteGuestPath(workingDirectory, nameof(exec.WorkingDirectory));
-        var environment = MergeEnvironment(_spec.Environment, exec.ExtraEnvironment);
+        var environment = MergeEnvironment(_spec.Environment, exec.ExtraEnvironment, exec);
         var environmentPayload = SerializeEnvironment(environment);
         var environmentPath = $"{IncusCloudInit.ControlDirectory}/env-{runId}";
         var pidPath = $"{IncusCloudInit.ControlDirectory}/pid-{runId}";
@@ -153,11 +163,9 @@ internal sealed class IncusSandbox :
                 _options.GuestGroupId.ToString(CultureInfo.InvariantCulture),
             };
             command.AddRange(exec.Argv);
-            using var wallClock = CancellationTokenSource.CreateLinkedTokenSource(ct);
             var execTimeout = _options.ExecTimeout;
             if (_spec.Limits.WallClock is { } limit)
             {
-                wallClock.CancelAfter(limit);
                 if (limit < execTimeout)
                     execTimeout = limit;
             }
@@ -169,7 +177,7 @@ internal sealed class IncusSandbox :
                     BuildRootExec(command),
                     exec.Stdin,
                     execTimeout,
-                    wallClock.Token,
+                    ct,
                     heavyOperation: false,
                     maxStdoutBytes: exec.MaxStdoutBytes ?? _options.MaxCliStdoutBytes,
                     maxStderrBytes: exec.MaxStderrBytes ?? _options.MaxCliStderrBytes,
@@ -614,7 +622,9 @@ internal sealed class IncusSandbox :
     {
         var pidPath = $"{IncusCloudInit.ControlDirectory}/pid-{runId}";
         int? pid = null;
-        const int maxPidPollAttempts = 5;
+        var maxPidPollAttempts = ReadRetryAttempts(
+            static options => options.ExecPidPollAttempts,
+            nameof(IncusSandboxOptions.ExecPidPollAttempts));
         for (var attempt = 0; attempt < maxPidPollAttempts; attempt++)
         {
             var pull = await _cli.RunAllowFailureAsync(
@@ -635,7 +645,7 @@ internal sealed class IncusSandbox :
                 break;
             }
             if (attempt + 1 < maxPidPollAttempts)
-                await Task.Delay(_options.ReadinessPollInterval, ct).ConfigureAwait(false);
+                await Task.Delay(_options.ReadinessPollInterval, _timeProvider, ct).ConfigureAwait(false);
         }
         if (pid is null)
             return false;
@@ -658,8 +668,8 @@ internal sealed class IncusSandbox :
             heavyOperation: false,
             maxStdoutBytes: 4096,
             maxStderrBytes: 4096).ConfigureAwait(false);
-        using var verificationDeadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        verificationDeadline.CancelAfter(_options.VmStopTimeout);
+        using var timeoutCancellation = new CancellationTokenSource(_options.VmStopTimeout, _timeProvider);
+        using var verificationDeadline = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCancellation.Token);
         try
         {
             while (true)
@@ -677,10 +687,10 @@ internal sealed class IncusSandbox :
                     return false;
                 if (stillRunning.ExitCode != 0)
                     return true;
-                await Task.Delay(_options.ReadinessPollInterval, verificationDeadline.Token).ConfigureAwait(false);
+                await Task.Delay(_options.ReadinessPollInterval, _timeProvider, verificationDeadline.Token).ConfigureAwait(false);
             }
         }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested && verificationDeadline.IsCancellationRequested)
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested && timeoutCancellation.IsCancellationRequested)
         {
             return false;
         }
@@ -741,7 +751,9 @@ internal sealed class IncusSandbox :
 
     private async Task<bool> EnsureGuestControlFileAbsentAsync(string path)
     {
-        const int maximumAttempts = 3;
+        var maximumAttempts = ReadRetryAttempts(
+            static options => options.ExecControlFileCleanupAttempts,
+            nameof(IncusSandboxOptions.ExecControlFileCleanupAttempts));
         for (var attempt = 0; attempt < maximumAttempts; attempt++)
         {
             try
@@ -779,7 +791,7 @@ internal sealed class IncusSandbox :
                     Id);
             }
             if (attempt + 1 < maximumAttempts)
-                await Task.Delay(_options.ReadinessPollInterval).ConfigureAwait(false);
+                await Task.Delay(_options.ReadinessPollInterval, _timeProvider, CancellationToken.None).ConfigureAwait(false);
         }
         _log.LogWarning(
             "Could not verify transient guest-file cleanup for Incus sandbox {SandboxId}",
@@ -789,7 +801,9 @@ internal sealed class IncusSandbox :
 
     private async Task<bool> VerifyGuestExecCompletionAsync(string path, int expectedExitCode)
     {
-        const int maximumAttempts = 3;
+        var maximumAttempts = ReadRetryAttempts(
+            static options => options.ExecCompletionProbeAttempts,
+            nameof(IncusSandboxOptions.ExecCompletionProbeAttempts));
         for (var attempt = 0; attempt < maximumAttempts; attempt++)
         {
             try
@@ -819,7 +833,7 @@ internal sealed class IncusSandbox :
                 _log.LogDebug(ex, "Retrying Incus guest completion verification for sandbox {SandboxId}", Id);
             }
             if (attempt + 1 < maximumAttempts)
-                await Task.Delay(_options.ReadinessPollInterval).ConfigureAwait(false);
+                await Task.Delay(_options.ReadinessPollInterval, _timeProvider, CancellationToken.None).ConfigureAwait(false);
         }
         return false;
     }
@@ -829,14 +843,14 @@ internal sealed class IncusSandbox :
 
     private async Task WaitForInstanceAbsenceAsync(CancellationToken ct)
     {
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        deadline.CancelAfter(_options.OperationTimeout);
+        using var timeoutCancellation = new CancellationTokenSource(_options.OperationTimeout, _timeProvider);
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCancellation.Token);
         try
         {
             while (await VerifyOwnershipOrAbsenceAsync(deadline.Token).ConfigureAwait(false))
-                await Task.Delay(_options.ReadinessPollInterval, deadline.Token).ConfigureAwait(false);
+                await Task.Delay(_options.ReadinessPollInterval, _timeProvider, deadline.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && deadline.IsCancellationRequested)
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && timeoutCancellation.IsCancellationRequested)
         {
             throw new TimeoutException(
                 $"Incus reported deleting sandbox '{Id}', but exact absence was not observed within the configured deadline.",
@@ -956,7 +970,7 @@ internal sealed class IncusSandbox :
                 _baselineRef,
                 _spec.Network.ProfileName,
                 _timingPhase,
-                DateTimeOffset.UtcNow);
+                _timeProvider.GetUtcNow());
             SandboxResourceMetricsTelemetry.Record(ResourceMetrics);
             if (_resourceUsageStore is not null && _timingItemId.Value != Guid.Empty)
             {
@@ -1020,7 +1034,8 @@ internal sealed class IncusSandbox :
 
     private static IReadOnlyDictionary<string, string> MergeEnvironment(
         IReadOnlyDictionary<string, string> baseline,
-        IReadOnlyDictionary<string, string>? extra)
+        IReadOnlyDictionary<string, string>? extra,
+        SandboxExec exec)
     {
         ValidateEnvironment(baseline, nameof(baseline));
         if (extra is not null)
@@ -1030,6 +1045,7 @@ internal sealed class IncusSandbox :
         AddEntries(baseline);
         if (extra is not null)
             AddEntries(extra);
+        exec.ApplyEnvironmentRemovals(name => result.Remove(name));
         return result;
 
         void AddEntries(IReadOnlyDictionary<string, string> source)
@@ -1062,15 +1078,31 @@ internal sealed class IncusSandbox :
         long bytes = 0;
         foreach (var (key, value) in environment)
         {
-            if (key is null || value is null || !IsEnvironmentKey(key) || value.Contains('\0'))
+            if (key is null || value is null || !IsEnvironmentKey(key))
             {
                 throw new ArgumentException(
                     "Exec environment contains an invalid key, null entry, or NUL value.",
                     parameterName);
             }
-            var entryBytes = (long)Encoding.UTF8.GetByteCount(key)
-                + Encoding.UTF8.GetByteCount(value)
-                + 2;
+            var remaining = checked((int)(MaxExecInputUtf8Bytes - bytes));
+            var keyBytes = IncusInputValidation.GetBoundedUtf8ByteCount(
+                key,
+                remaining,
+                parameterName,
+                "Exec environment key");
+            remaining -= keyBytes;
+            var valueBytes = IncusInputValidation.GetBoundedUtf8ByteCount(
+                value,
+                remaining,
+                parameterName,
+                "Exec environment value");
+            if (value.Contains('\0'))
+            {
+                throw new ArgumentException(
+                    "Exec environment contains an invalid key, null entry, or NUL value.",
+                    parameterName);
+            }
+            var entryBytes = (long)keyBytes + valueBytes + 2;
             if (entryBytes > MaxExecInputUtf8Bytes - bytes)
             {
                 throw new ArgumentException(
@@ -1088,9 +1120,19 @@ internal sealed class IncusSandbox :
         long bytes = 0;
         foreach (var (key, value) in environment.OrderBy(pair => pair.Key, StringComparer.Ordinal))
         {
-            var entryBytes = (long)Encoding.UTF8.GetByteCount(key)
-                + Encoding.UTF8.GetByteCount(value)
-                + 2;
+            var remaining = checked((int)(MaxExecInputUtf8Bytes - bytes));
+            var keyBytes = IncusInputValidation.GetBoundedUtf8ByteCount(
+                key,
+                remaining,
+                nameof(environment),
+                "Exec environment key");
+            remaining -= keyBytes;
+            var valueBytes = IncusInputValidation.GetBoundedUtf8ByteCount(
+                value,
+                remaining,
+                nameof(environment),
+                "Exec environment value");
+            var entryBytes = (long)keyBytes + valueBytes + 2;
             if (entryBytes > MaxExecInputUtf8Bytes - bytes)
                 throw new ArgumentException("Exec environment exceeds the 16 MiB safety bound.", nameof(environment));
             bytes += entryBytes;
@@ -1101,7 +1143,8 @@ internal sealed class IncusSandbox :
 
     private static bool IsEnvironmentKey(string key)
     {
-        if (key.Length is < 1 or > 256 || !(key[0] == '_' || char.IsAsciiLetter(key[0])))
+        if (key.Length is < 1 or > MaxExecEnvironmentNameCharacters
+            || !(key[0] == '_' || char.IsAsciiLetter(key[0])))
             return false;
         return key.Skip(1).All(c => c == '_' || char.IsAsciiLetterOrDigit(c));
     }
@@ -1114,17 +1157,25 @@ internal sealed class IncusSandbox :
         for (var index = 0; index < exec.Argv.Count; index++)
         {
             var argument = exec.Argv[index];
-            if (argument is null || argument.Contains('\0'))
-                throw new ArgumentException($"Exec argv argument {index} is null or contains NUL.", nameof(exec));
-            var argumentBytes = Encoding.UTF8.GetByteCount(argument);
-            if (argumentBytes > MaxExecArgvUtf8Bytes - bytes)
-                throw new ArgumentException("Exec argv exceeds the 1 MiB safety bound.", nameof(exec));
+            var argumentBytes = IncusInputValidation.GetBoundedUtf8ByteCount(
+                argument,
+                checked((int)(MaxExecArgvUtf8Bytes - bytes)),
+                nameof(exec),
+                $"Exec argv argument {index}");
+            if (argument.Contains('\0'))
+                throw new ArgumentException($"Exec argv argument {index} contains NUL.", nameof(exec));
             bytes += argumentBytes;
         }
         if (string.IsNullOrEmpty(exec.Argv[0]))
             throw new ArgumentException("Exec executable must not be empty.", nameof(exec));
-        if (exec.Stdin is { } stdin && Encoding.UTF8.GetByteCount(stdin) > MaxExecInputUtf8Bytes)
-            throw new ArgumentException("Exec stdin exceeds the 16 MiB safety bound.", nameof(exec));
+        if (exec.Stdin is { } stdin)
+        {
+            _ = IncusInputValidation.GetBoundedUtf8ByteCount(
+                stdin,
+                MaxExecInputUtf8Bytes,
+                nameof(exec),
+                "Exec stdin");
+        }
         if (exec.ExtraEnvironment is not null)
             ValidateEnvironment(exec.ExtraEnvironment, nameof(exec));
         if (exec.MaxStdoutBytes is <= 0 || exec.MaxStderrBytes is <= 0)
@@ -1138,6 +1189,29 @@ internal sealed class IncusSandbox :
 
     private void DeleteStaging() =>
         IncusMountStaging.DeleteOwnedTreeIfContained(_stagingRoot, _sandboxRoot, Id);
+
+    private Guid NextGuid(string purpose)
+    {
+        var value = _newGuid();
+        if (value == Guid.Empty)
+            throw new InvalidOperationException($"The injected GUID source returned an empty value for {purpose}.");
+        return value;
+    }
+
+    private int ReadRetryAttempts(
+        Func<IncusSandboxOptions, int> selector,
+        string optionName)
+    {
+        var liveOptions = _liveOptionsAccessor()
+            ?? throw new InvalidOperationException("The live Incus options accessor returned null.");
+        var attempts = selector(liveOptions);
+        if (attempts is < 1 or > IncusSandboxOptions.MaximumExecRetryAttempts)
+        {
+            throw new InvalidOperationException(
+                $"Live Incus option {optionName} must be between 1 and {IncusSandboxOptions.MaximumExecRetryAttempts}.");
+        }
+        return attempts;
+    }
 
     private void NotifyNoLongerActive()
     {

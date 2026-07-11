@@ -10,6 +10,102 @@ namespace CodeyBox.Tests;
 public sealed class ReloadableSandboxProviderTests
 {
     [Fact]
+    public async Task ActivatedProviders_SnapshotsRetainedIdsWithoutReadingCollectionCount()
+    {
+        var alpha = new SuspendingTestProvider("alpha", "alpha-");
+        var beta = new TestProvider("beta", "beta-");
+        var retained = new DeceptiveProviderIdCollection(
+            ["beta"],
+            static () => throw new InvalidOperationException("Count must not be read"));
+        var router = new ReloadableSandboxProvider(
+            static () => "alpha",
+            () => retained,
+            [Register(alpha), Register(beta)],
+            NullLogger<ReloadableSandboxProvider>.Instance);
+
+        await router.ListAllManagedAsync(CancellationToken.None);
+
+        Assert.Equal(1, retained.EnumerationCount);
+        Assert.Equal(1, alpha.ManagedListCalls);
+        Assert.Equal(1, beta.ManagedListCalls);
+    }
+
+    [Fact]
+    public async Task ActivatedProviders_RejectsRetainedEnumerationBeyondBoundWhenCountUnderreports()
+    {
+        var providers = Enumerable
+            .Range(0, ReloadableSandboxProvider.MaximumRetainedInventoryProviders + 1)
+            .Select(index => new TestProvider($"provider-{index}", $"provider-{index}-"))
+            .ToArray();
+        var retained = new DeceptiveProviderIdCollection(
+            providers.Select(static provider => provider.Name).ToArray(),
+            static () => 0);
+        var router = new ReloadableSandboxProvider(
+            () => providers[0].Name,
+            () => retained,
+            providers.Select(Register).ToArray(),
+            NullLogger<ReloadableSandboxProvider>.Instance);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => router.ListAllManagedAsync(CancellationToken.None));
+
+        Assert.Contains("safety bound", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(1, retained.EnumerationCount);
+        Assert.All(providers, static provider => Assert.Equal(0, provider.ManagedListCalls));
+    }
+
+    [Fact]
+    public async Task ActivatedProviders_RejectsDuplicateRetainedIdsBeforeProviderInventory()
+    {
+        var alpha = new SuspendingTestProvider("alpha", "alpha-");
+        var beta = new TestProvider("beta", "beta-");
+        var router = new ReloadableSandboxProvider(
+            static () => "alpha",
+            static () => [" BETA ", "beta"],
+            [Register(alpha), Register(beta)],
+            NullLogger<ReloadableSandboxProvider>.Instance);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => router.ListAllManagedAsync(CancellationToken.None));
+
+        Assert.Contains("duplicate", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, alpha.ManagedListCalls);
+        Assert.Equal(0, beta.ManagedListCalls);
+    }
+
+    [Fact]
+    public void NormalizeConfiguredProviderId_RejectsHugeSelectorBeforeNormalization()
+    {
+        var configured = new string(' ', 1_000_000);
+
+        var exception = Assert.Throws<InvalidOperationException>(
+            () => ReloadableSandboxProvider.NormalizeConfiguredProviderId(configured));
+
+        Assert.Contains("safety bound", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ActivatedProviders_RejectsHugeRetainedIdBeforeProviderInventory()
+    {
+        var alpha = new SuspendingTestProvider("alpha", "alpha-");
+        var beta = new TestProvider("beta", "beta-");
+        var retained = new DeceptiveProviderIdCollection(
+            [new string(' ', 1_000_000)],
+            static () => 1);
+        var router = new ReloadableSandboxProvider(
+            static () => "alpha",
+            () => retained,
+            [Register(alpha), Register(beta)],
+            NullLogger<ReloadableSandboxProvider>.Instance);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => router.ListAllManagedAsync(CancellationToken.None));
+
+        Assert.Equal(0, alpha.ManagedListCalls);
+        Assert.Equal(0, beta.ManagedListCalls);
+    }
+
+    [Fact]
     public async Task Constructor_AndUnclassifiedBaselineDoNotConstructDormantProviders()
     {
         var selected = new TestProvider("beta", "beta-");
@@ -87,6 +183,40 @@ public sealed class ReloadableSandboxProviderTests
     }
 
     [Fact]
+    public async Task HistoricalIncusPrefix_TranslatesQueuedPinAfterProviderCutover()
+    {
+        var incus = new TestProvider("incus", "unused-") { CurrentBaselineRef = "new-incus-current" };
+        var multipass = new TestProvider("multipass", "cb-baseline-") { CurrentBaselineRef = "cb-baseline-current" };
+        var router = new ReloadableSandboxProvider(
+            static () => "multipass",
+            static () => [],
+            [
+                new ReloadableSandboxProvider.ProviderRegistration(
+                    "incus",
+                    () => incus,
+                    IncusSandboxProvider.IsRoutableBaselineRef),
+                Register(multipass),
+            ],
+            NullLogger<ReloadableSandboxProvider>.Instance);
+
+        await using var sandbox = await router.CreateAsync(
+            CreateSpec("old-incus-profile-headless-0123456789ab"));
+
+        var translated = Assert.Single(multipass.CreatedSpecs);
+        Assert.Equal("cb-baseline-current", translated.BaselineImageRef);
+        Assert.Equal(0, incus.CreateCalls);
+    }
+
+    [Fact]
+    public void IncusRoutingClassifier_RecognizesHistoricalPrefixesWithoutCollidingWithMultipass()
+    {
+        Assert.True(IncusSandboxProvider.IsRoutableBaselineRef("old-incus-profile-headless-0123456789ab"));
+        Assert.True(IncusSandboxProvider.IsRoutableBaselineRef("new-incus-profile-gui-0123456789ab"));
+        Assert.False(IncusSandboxProvider.IsRoutableBaselineRef("cb-baseline-0123456789ab"));
+        Assert.False(IncusSandboxProvider.IsRoutableBaselineRef("old-incus-profile-headless-0123456789AB"));
+    }
+
+    [Fact]
     public async Task CreateAsync_PropagatesSelectedProviderFailureWithoutFallback()
     {
         var context = CreateDefaultRouter("beta");
@@ -99,6 +229,23 @@ public sealed class ReloadableSandboxProviderTests
         Assert.Same(failure, actual);
         Assert.Equal(1, context.Beta.CreateCalls);
         Assert.Equal(0, context.Alpha.CreateCalls);
+    }
+
+    [Fact]
+    public async Task CreateAsync_ScopesRetainedResourceFailureToSelectedProvider()
+    {
+        var context = CreateDefaultRouter("alpha");
+        var providerFailure = RetainedCreateFailure("shared-sandbox");
+        context.Alpha.CreateFailure = providerFailure;
+
+        var scoped = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(
+            () => context.Router.CreateAsync(CreateSpec()));
+
+        Assert.Equal("shared-sandbox", scoped.RetainedSandboxName);
+        Assert.Equal("alpha", scoped.RetainedSandboxLifecycleProviderId);
+        Assert.Same(providerFailure, scoped.InnerException);
+        Assert.Equal(1, context.Alpha.CreateCalls);
+        Assert.Equal(0, context.Beta.CreateCalls);
     }
 
     [Fact]
@@ -216,6 +363,103 @@ public sealed class ReloadableSandboxProviderTests
 
         Assert.Equal([sharedName], context.Alpha.DisposedSandboxNames);
         Assert.Equal([sharedName], context.Beta.DisposedSandboxNames);
+    }
+
+    [Fact]
+    public async Task Admission_RetainsSameNamedDeferredResourcesPerLifecycleProvider()
+    {
+        const string sharedName = "deferred-shared";
+        var context = CreateDefaultRouter("alpha", "beta");
+        context.Alpha.CreateFailure = RetainedCreateFailure(sharedName);
+        context.Beta.CreateFailure = RetainedCreateFailure(sharedName);
+        var admitted = SandboxAdmissionControlledProvider.Wrap(
+            context.Router,
+            maxConcurrentSandboxes: 2,
+            NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(admitted);
+
+        await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() => admitted.CreateAsync(CreateSpec()));
+        context.Monitor.Set(Options("beta", "alpha"));
+        await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() => admitted.CreateAsync(CreateSpec()));
+
+        Assert.Equal(2, admission.CurrentAdmittedSandboxes);
+        context.Alpha.ManagedSandboxes.Add(Managed(sharedName));
+        context.Beta.ManagedSandboxes.Add(Managed(sharedName));
+        var listed = await admitted.ListAllManagedAsync(CancellationToken.None);
+        Assert.Equal(2, listed.Count);
+        Assert.Equal(2, admission.CurrentAdmittedSandboxes);
+
+        await admitted.DisposeLeakedAsync(
+            Assert.Single(listed, static item => item.LifecycleProviderId == "alpha"),
+            CancellationToken.None);
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+        await admitted.DisposeLeakedAsync(
+            Assert.Single(listed, static item => item.LifecycleProviderId == "beta"),
+            CancellationToken.None);
+        Assert.Equal(0, admission.CurrentAdmittedSandboxes);
+    }
+
+    [Fact]
+    public async Task Admission_UsesDecoratedLiveSandboxOwnerWhenReconcilingDuplicateNames()
+    {
+        const string sharedName = "alpha-1";
+        var context = CreateDefaultRouter("alpha", "beta");
+        context.Alpha.ManagedSandboxes.Add(Managed(sharedName));
+        context.Beta.ManagedSandboxes.Add(Managed(sharedName));
+        var admitted = SandboxAdmissionControlledProvider.Wrap(
+            context.Router,
+            maxConcurrentSandboxes: 1,
+            NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(admitted);
+
+        var sandbox = await admitted.CreateAsync(CreateSpec());
+        await sandbox.DisposeAsync();
+
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+        var listed = await admitted.ListAllManagedAsync(CancellationToken.None);
+        await admitted.DisposeLeakedAsync(
+            Assert.Single(listed, static item => item.LifecycleProviderId == "alpha"),
+            CancellationToken.None);
+        Assert.Equal(0, admission.CurrentAdmittedSandboxes);
+        Assert.Equal([sharedName], context.Alpha.DisposedSandboxNames);
+        Assert.Empty(context.Beta.DisposedSandboxNames);
+    }
+
+    [Fact]
+    public async Task Admission_ReconcilesSameNamedDeferredBaselinesPerLifecycleProvider()
+    {
+        const string sharedName = "shared-baseline";
+        var context = CreateDefaultRouter("alpha", "beta");
+        context.Alpha.EnsureBaselineFailure = RetainedBaselineFailure(sharedName);
+        context.Beta.EnsureBaselineFailure = RetainedBaselineFailure(sharedName);
+        var admitted = SandboxAdmissionControlledProvider.Wrap(
+            context.Router,
+            maxConcurrentSandboxes: 2,
+            NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(admitted);
+        var provisioner = Assert.IsAssignableFrom<IBaselineImageProvisioner>(admitted);
+        var resolver = Assert.IsAssignableFrom<IBaselineImageResolver>(admitted);
+
+        await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
+            provisioner.EnsureBaselineImageAsync(
+                "default", SandboxProfileFlavor.Headless, pinnedBaselineRef: null, CancellationToken.None));
+        context.Monitor.Set(Options("beta", "alpha"));
+        await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
+            provisioner.EnsureBaselineImageAsync(
+                "default", SandboxProfileFlavor.Headless, pinnedBaselineRef: null, CancellationToken.None));
+
+        Assert.Equal(2, admission.CurrentAdmittedSandboxes);
+        context.Alpha.Baselines.Add(new BaselineImageInfo(sharedName, null, null));
+        context.Beta.Baselines.Add(new BaselineImageInfo(sharedName, null, null));
+        Assert.Equal(2, (await resolver.ListBaselineImagesAsync(CancellationToken.None)).Count);
+        Assert.Equal(2, admission.CurrentAdmittedSandboxes);
+
+        context.Alpha.Baselines.Clear();
+        Assert.Single(await resolver.ListBaselineImagesAsync(CancellationToken.None));
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+        context.Beta.Baselines.Clear();
+        Assert.Empty(await resolver.ListBaselineImagesAsync(CancellationToken.None));
+        Assert.Equal(0, admission.CurrentAdmittedSandboxes);
     }
 
     [Fact]
@@ -399,6 +643,9 @@ public sealed class ReloadableSandboxProviderTests
         Assert.Equal(
             ["alpha-old", "beta-current"],
             listed.Select(static item => item.Name).OrderBy(static name => name, StringComparer.Ordinal));
+        Assert.Equal(
+            ["alpha", "beta"],
+            listed.Select(static item => item.LifecycleProviderId).OrderBy(static id => id, StringComparer.Ordinal));
         Assert.Equal(["alpha-old"], context.Alpha.DisposedBaselineNames);
         Assert.Empty(context.Beta.DisposedBaselineNames);
     }
@@ -431,6 +678,24 @@ public sealed class ReloadableSandboxProviderTests
 
     private static ManagedSandboxInfo Managed(string name) =>
         new(name, CreatedAt: null, DiskBytes: null, IsTrackedActive: false);
+
+    private static SandboxProvisioningDeferredException RetainedCreateFailure(string name) =>
+        new(
+            provider: "test-provider",
+            operation: "create-cleanup",
+            errorClass: "delete-unconfirmed",
+            detail: "test retained resource",
+            recheckIn: TimeSpan.FromSeconds(1),
+            retainedSandboxName: name);
+
+    private static SandboxProvisioningDeferredException RetainedBaselineFailure(string name) =>
+        new(
+            provider: "test-provider",
+            operation: "baseline-bake-cleanup",
+            errorClass: "delete-unconfirmed",
+            detail: "test retained baseline",
+            recheckIn: TimeSpan.FromSeconds(1),
+            retainedSandboxName: name);
 
     private static CodeyBoxOptions Options(string selected, params string[] retainedProviderIds) => new()
     {
@@ -507,6 +772,25 @@ public sealed class ReloadableSandboxProviderTests
         }
     }
 
+    private sealed class DeceptiveProviderIdCollection(
+        IReadOnlyList<string> values,
+        Func<int> readCount) : IReadOnlyCollection<string>
+    {
+        private int _enumerationCount;
+
+        public int Count => readCount();
+        public int EnumerationCount => Volatile.Read(ref _enumerationCount);
+
+        public IEnumerator<string> GetEnumerator()
+        {
+            Interlocked.Increment(ref _enumerationCount);
+            return values.GetEnumerator();
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() =>
+            GetEnumerator();
+    }
+
     private class TestProvider(string name, string baselinePrefix) :
         ISandboxProvider,
         IActiveSandboxProvider,
@@ -524,6 +808,7 @@ public sealed class ReloadableSandboxProviderTests
         public Exception? CreateFailure { get; set; }
         public Exception? ManagedListFailure { get; set; }
         public Exception? BaselineListFailure { get; set; }
+        public Exception? EnsureBaselineFailure { get; set; }
         public bool CapturesMetrics { get; set; }
         public bool CapturesResourceMetrics => CapturesMetrics;
         public Func<string, ISandbox>? CreatedSandboxFactory { get; set; }
@@ -593,7 +878,9 @@ public sealed class ReloadableSandboxProviderTests
             SandboxProfileFlavor flavor,
             string? pinnedBaselineRef,
             CancellationToken ct) =>
-            Task.FromResult(CurrentBaselineRef);
+            EnsureBaselineFailure is null
+                ? Task.FromResult(CurrentBaselineRef)
+                : Task.FromException<string?>(EnsureBaselineFailure);
     }
 
     private sealed class SuspendingTestProvider(string name, string baselinePrefix) :

@@ -47,6 +47,24 @@ public sealed record AgenticConflictResolverOptions
 }
 
 /// <summary>
+/// Signals that credential/process cleanup failed and the shared resolver
+/// sandbox can no longer be proven safe for another candidate.
+/// </summary>
+public sealed class AgentCredentialSandboxPoisonedException : Exception
+{
+    public AgentCredentialSandboxPoisonedException(
+        AgentKind candidate,
+        string reason,
+        Exception innerException)
+        : base($"Resolver sandbox is unsafe to reuse after candidate '{candidate.Value}': {reason}.", innerException)
+    {
+        Candidate = candidate;
+    }
+
+    public AgentKind Candidate { get; }
+}
+
+/// <summary>
 /// Mutable hot-reload holder for <see cref="AgenticConflictResolverOptions"/>.
 /// Construction-time DI binds a single instance; operators swap the underlying
 /// options via <see cref="Apply"/>. Mirrors the
@@ -189,6 +207,8 @@ public sealed record AgenticConflictCandidatesResult(
 /// </summary>
 public sealed class AgenticConflictResolver
 {
+    private const int MaximumScopedCredentialEnvironmentVariables =
+        SandboxExec.MaximumEnvironmentVariablesToUnset;
     private readonly AgenticConflictResolverOptionsSnapshot _options;
     private readonly ILogger _log;
     private readonly Func<ISandbox, AgentCredential, CancellationToken, Task>? _credentialFileMaterialiser;
@@ -260,6 +280,8 @@ public sealed class AgenticConflictResolver
 
         foreach (var file in conflictFiles)
             MergeConflictPathInspector.ValidateRelativeWorkPath(file);
+
+        var credentialEnvironmentNames = BuildCredentialEnvironmentScope(candidates);
 
         // Gate the start-of-resolve log on the pipeline-supplied hint. The
         // resolver is generic conflict machinery; it should not know which
@@ -400,8 +422,12 @@ public sealed class AgenticConflictResolver
 
             var runner = candidate.Runner;
             var isStrongest = candidate.QualityScore == maxQuality;
+            var candidateSandbox = CreateCandidateCredentialSandbox(
+                sandbox,
+                candidate,
+                credentialEnvironmentNames);
 
-            if (previousScopedCandidate is not null)
+            if (previousScopedCandidate is { } previousCandidate)
             {
                 try
                 {
@@ -413,15 +439,17 @@ public sealed class AgenticConflictResolver
                 }
                 catch (Exception ex)
                 {
-                    RecordCredentialSetupFailure("process cleanup", ex);
-                    continue;
+                    throw new AgentCredentialSandboxPoisonedException(
+                        previousCandidate.Runner.Kind,
+                        "the previous candidate process could not be terminated before credential cleanup",
+                        ex);
                 }
 
                 try
                 {
                     await ClearCandidateCredentialFilesAsync(
                         sandbox,
-                        previousScopedCandidate,
+                        previousCandidate,
                         ct).ConfigureAwait(false);
                     previousScopedCandidate = null;
                 }
@@ -431,8 +459,10 @@ public sealed class AgenticConflictResolver
                 }
                 catch (Exception ex)
                 {
-                    RecordCredentialSetupFailure("credential cleanup", ex);
-                    continue;
+                    throw new AgentCredentialSandboxPoisonedException(
+                        previousCandidate.Runner.Kind,
+                        "the previous candidate credential files could not be cleared",
+                        ex);
                 }
             }
 
@@ -459,6 +489,10 @@ public sealed class AgenticConflictResolver
                         _log.LogWarning(cleanupEx,
                             "Agentic conflict resolver: rollback cleanup after credential materialisation failure also failed for agent '{Agent}' on {WorkItemId} (sandbox {Sandbox})",
                             runner.Kind.Value, workItemId, sandbox.Id);
+                        throw new AgentCredentialSandboxPoisonedException(
+                            runner.Kind,
+                            "credential materialisation failed and its rollback cleanup could not be verified",
+                            new AggregateException(ex, cleanupEx));
                     }
                     RecordCredentialSetupFailure("file materialisation", ex);
                     continue;
@@ -506,7 +540,7 @@ public sealed class AgenticConflictResolver
                     context,
                     runner,
                     candidate,
-                    sandbox,
+                    candidateSandbox,
                     workingDirectory,
                     attempt,
                     ct);
@@ -516,7 +550,7 @@ public sealed class AgenticConflictResolver
                 {
                     agentResult = supervision is null
                         ? await runner.RunAsync(
-                            sandbox,
+                            candidateSandbox,
                             workingDirectory,
                             prompt,
                             candidate.Credential,
@@ -527,7 +561,7 @@ public sealed class AgenticConflictResolver
                             captureStructuredStream: captureStructuredStream)
                         : await AgentSupervisionTurnRunner.RunAutonomousAndQueuedInjectionsAsync(
                             runner,
-                            sandbox,
+                            candidateSandbox,
                             workingDirectory,
                             prompt,
                             candidate.Credential,
@@ -771,6 +805,142 @@ public sealed class AgenticConflictResolver
                 candidate.Runner.Kind,
                 $"credential belongs to agent '{credential.Agent.Value}'");
         }
+    }
+
+    private static IReadOnlySet<string> BuildCredentialEnvironmentScope(
+        IReadOnlyList<AgenticConflictResolverCandidate> candidates)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var candidate in candidates)
+        {
+            if (candidate is null)
+                throw new ArgumentException("Agent candidates cannot contain null entries.", nameof(candidates));
+            ValidateCandidateCredentialScope(candidate);
+            if (candidate.Credential is not { EnvironmentVariables.Count: > 0 } credential)
+                continue;
+            _ = SandboxEnvironmentVariablePolicy.SelectDirectCredentialEnvironment(
+                credential,
+                candidate.Runner,
+                nameof(AgentCredential.EnvironmentVariables));
+
+            foreach (var name in credential.EnvironmentVariables.Keys)
+            {
+                names.Add(name);
+                if (names.Count > MaximumScopedCredentialEnvironmentVariables)
+                {
+                    throw new ArgumentException(
+                        $"Resolver candidates cannot declare more than {MaximumScopedCredentialEnvironmentVariables} credential environment variables in aggregate.",
+                        nameof(candidates));
+                }
+            }
+        }
+        return names;
+    }
+
+    private static ISandbox CreateCandidateCredentialSandbox(
+        ISandbox sandbox,
+        AgenticConflictResolverCandidate candidate,
+        IReadOnlySet<string> credentialEnvironmentNames)
+    {
+        if (credentialEnvironmentNames.Count == 0)
+            return sandbox;
+
+        var directEnvironment = candidate.Credential is { } credential
+            ? SandboxEnvironmentVariablePolicy.SelectDirectCredentialEnvironment(
+                credential,
+                candidate.Runner,
+                nameof(AgentCredential.EnvironmentVariables))
+            : new Dictionary<string, string>(StringComparer.Ordinal);
+
+        return new CandidateCredentialSandbox(
+            sandbox,
+            credentialEnvironmentNames,
+            directEnvironment);
+    }
+
+    /// <summary>
+    /// Scopes a shared resolver sandbox to one candidate. Every non-current
+    /// credential name is removed from each launched process; only the current
+    /// candidate's declared direct values survive. File-backed values therefore
+    /// remain confined to the stdin materialisation path even when an older
+    /// caller accidentally provisioned them in the sandbox's base environment.
+    /// </summary>
+    private sealed class CandidateCredentialSandbox : ISandboxDecorator
+    {
+        private readonly ISandbox _inner;
+        private readonly IReadOnlySet<string> _credentialEnvironmentNames;
+        private readonly IReadOnlyDictionary<string, string> _directEnvironment;
+
+        public CandidateCredentialSandbox(
+            ISandbox inner,
+            IReadOnlySet<string> credentialEnvironmentNames,
+            IReadOnlyDictionary<string, string> directEnvironment)
+        {
+            _inner = inner;
+            _credentialEnvironmentNames = credentialEnvironmentNames;
+            _directEnvironment = directEnvironment;
+        }
+
+        public ISandbox InnerSandbox => _inner;
+        public string Id => _inner.Id;
+        public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
+        public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
+        public SandboxResourceMetrics? ResourceMetrics => _inner.ResourceMetrics;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            ArgumentNullException.ThrowIfNull(exec);
+            var environment = exec.ExtraEnvironment is null
+                ? new Dictionary<string, string>(StringComparer.Ordinal)
+                : new Dictionary<string, string>(exec.ExtraEnvironment, StringComparer.Ordinal);
+            foreach (var (name, value) in _directEnvironment)
+                environment[name] = value;
+
+            var removals = exec.EnvironmentVariablesToUnset.ToHashSet(StringComparer.Ordinal);
+            foreach (var name in _credentialEnvironmentNames)
+            {
+                if (!_directEnvironment.ContainsKey(name))
+                    removals.Add(name);
+            }
+            if (removals.Count > SandboxExec.MaximumEnvironmentVariablesToUnset)
+            {
+                throw new ArgumentException(
+                    $"Candidate credential scope cannot unset more than {SandboxExec.MaximumEnvironmentVariablesToUnset} environment variables.",
+                    nameof(exec));
+            }
+
+            return _inner.ExecAsync(exec with
+            {
+                ExtraEnvironment = environment.Count == 0 ? null : environment,
+                EnvironmentVariablesToUnset = removals.Order(StringComparer.Ordinal).ToArray(),
+                EnvironmentContainsSecrets = exec.EnvironmentContainsSecrets || _directEnvironment.Count > 0,
+            }, ct);
+        }
+
+        public Task SyncStateToHostAsync(CancellationToken ct = default) =>
+            _inner.SyncStateToHostAsync(ct);
+
+        public Task KillActiveExecsAsync(CancellationToken ct = default) =>
+            _inner.KillActiveExecsAsync(ct);
+
+        public Task<byte[]> GetScreenshotAsync(CancellationToken ct = default) =>
+            _inner.GetScreenshotAsync(ct);
+
+        public Task SynthesizeInputAsync(
+            IReadOnlyList<SandboxInputEvent> events,
+            CancellationToken ct = default) =>
+            _inner.SynthesizeInputAsync(events, ct);
+
+        public Task<SandboxAccessibilitySnapshot?> GetAccessibilityAtPointAsync(
+            int x,
+            int y,
+            CancellationToken ct = default) =>
+            _inner.GetAccessibilityAtPointAsync(x, y, ct);
+
+        public Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default) =>
+            _inner.GetAccessibilityTreeJsonAsync(ct);
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private static async Task ClearCandidateCredentialFilesAsync(

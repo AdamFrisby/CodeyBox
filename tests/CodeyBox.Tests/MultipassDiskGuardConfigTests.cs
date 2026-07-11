@@ -126,6 +126,44 @@ public sealed class MultipassDiskGuardConfigTests
     }
 
     [Fact]
+    public void Build_RejectsOversizedSharedDiskGuardTextBeforeParsingOrPathScanning()
+    {
+        var options = new CodeyBoxOptions
+        {
+            StateDatabasePath = "/tmp/cb-state.db",
+            DiskGuard = new DiskGuardOptions
+            {
+                Enabled = true,
+                MinFreeBytes = 1024,
+                RecheckIn = new string('1', 65),
+            },
+        };
+
+        var recheckFailure = Assert.Throws<InvalidOperationException>(() =>
+            MultipassDiskGuardConfig.Build(options, NullLogger.Instance));
+        Assert.Contains("RecheckIn", recheckFailure.Message, StringComparison.Ordinal);
+
+        options.DiskGuard.RecheckIn = "00:05:00";
+        options.DiskGuard.AdditionalPaths = [new string('p', 4097)];
+        var pathFailure = Assert.Throws<InvalidOperationException>(() =>
+            MultipassDiskGuardConfig.Build(options, NullLogger.Instance));
+        Assert.Contains("AdditionalPaths entry", pathFailure.Message, StringComparison.Ordinal);
+
+        options.DiskGuard.AdditionalPaths = Enumerable.Range(0, 65)
+            .Select(index => $"/srv/path-{index}")
+            .ToList();
+        var countFailure = Assert.Throws<InvalidOperationException>(() =>
+            MultipassDiskGuardConfig.Build(options, NullLogger.Instance));
+        Assert.Contains("more than 64", countFailure.Message, StringComparison.Ordinal);
+
+        options.DiskGuard.AdditionalPaths = [];
+        options.StateDatabasePath = new string('s', 4097);
+        var stateFailure = Assert.Throws<InvalidOperationException>(() =>
+            MultipassDiskGuardConfig.Build(options, NullLogger.Instance));
+        Assert.Contains("StateDatabasePath", stateFailure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Build_AutoIncludesStateDatabaseDirectory_InAdditionalPaths()
     {
         var opts = new CodeyBoxOptions

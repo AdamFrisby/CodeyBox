@@ -56,9 +56,19 @@ public interface IManagedSandboxLifecycle
     /// provider metadata to route disposal back to the lifecycle that reported
     /// the sandbox; multi-host providers use executor metadata to target the
     /// owning host instead of rediscovering by name across a host pool.
+    /// The default implementation delegates only unscoped snapshots; providers
+    /// that understand either scope dimension must override this overload.
     /// </summary>
-    Task DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct) =>
-        DisposeLeakedAsync(sandbox.Name, ct);
+    Task DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(sandbox);
+        if (sandbox.LifecycleProviderId is not null || sandbox.HostId is not null)
+        {
+            throw new NotSupportedException(
+                "This sandbox lifecycle cannot interpret a provider- or host-scoped disposal snapshot.");
+        }
+        return DisposeLeakedAsync(sandbox.Name, ct);
+    }
 }
 
 /// <summary>
@@ -755,18 +765,18 @@ public interface ISuspendingSandboxProvider
     Task ResumeSandboxAsync(string name, CancellationToken ct);
 
     /// <summary>
-    /// Resumes a provider-scoped lifecycle snapshot. Plain providers use the
-    /// name-only implementation; composites override this overload so an
-    /// opaque <see cref="ManagedSandboxInfo.LifecycleProviderId"/> can select
-    /// the exact reporting provider without rediscovering ambiguous ownership.
+    /// Resumes a scoped lifecycle snapshot. Plain providers use the name-only
+    /// implementation only for unscoped snapshots; composites and multi-host
+    /// providers override this overload so opaque provider or host identity can
+    /// select the exact resource without ambiguous ownership rediscovery.
     /// </summary>
     Task ResumeSandboxAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(sandbox);
-        if (sandbox.LifecycleProviderId is not null)
+        if (sandbox.LifecycleProviderId is not null || sandbox.HostId is not null)
         {
             throw new NotSupportedException(
-                "This sandbox provider cannot interpret a provider-scoped resume snapshot.");
+                "This sandbox provider cannot interpret a provider- or host-scoped resume snapshot.");
         }
         return ResumeSandboxAsync(sandbox.Name, ct);
     }
@@ -889,8 +899,10 @@ public interface IBaselineImageResolver
     /// provider considers a baseline. Used by the
     /// <see cref="CodeyBox.Orchestrator.BaselineImageReaper"/> to compute the
     /// orphan set (provider baselines minus the live-ref set from the work
-    /// store). Returns an empty list when the provider has no baselines or
-    /// cannot enumerate them.
+    /// store). An empty list is authoritative evidence that enumeration
+    /// completed and found no baselines. Implementations must throw when the
+    /// inventory cannot be enumerated completely so lifecycle and admission
+    /// callers do not mistake an unknown inventory for proven absence.
     /// </summary>
     Task<IReadOnlyList<BaselineImageInfo>> ListBaselineImagesAsync(CancellationToken ct);
 
@@ -954,7 +966,16 @@ public sealed class NullBaselineImageProvisioner : IBaselineImageProvisioner
 /// <param name="Name">VM / baseline name (e.g. <c>cb-baseline-abc123</c>).</param>
 /// <param name="CreatedAt">Best-effort creation timestamp; null if not derivable.</param>
 /// <param name="DiskBytes">Reported disk usage; null when unavailable.</param>
-public sealed record BaselineImageInfo(string Name, DateTimeOffset? CreatedAt, long? DiskBytes);
+/// <param name="LifecycleProviderId">
+/// Optional opaque identifier for the lifecycle provider that reported this
+/// snapshot. Composite resolvers populate it so same-named baseline resources
+/// remain distinct while admission cleanup is reconciled.
+/// </param>
+public sealed record BaselineImageInfo(
+    string Name,
+    DateTimeOffset? CreatedAt,
+    long? DiskBytes,
+    string? LifecycleProviderId = null);
 
 /// <summary>
 /// Null Object resolver for <see cref="IBaselineImageResolver"/>. Returned by
@@ -1251,11 +1272,58 @@ public sealed record SandboxNetworkPolicy
     public static SandboxNetworkPolicy Denied { get; } = new();
 }
 
+/// <summary>Provider-neutral validation for POSIX environment-variable names.</summary>
+public static class SandboxEnvironmentVariableName
+{
+    /// <summary>Maximum characters accepted in one environment-variable name.</summary>
+    public const int MaximumLength = 128;
+
+    /// <summary>Validates a bounded ASCII POSIX environment-variable identifier.</summary>
+    public static void Validate(string value, string parameterName)
+    {
+        if (value is null || value.Length == 0)
+            throw new ArgumentException("Environment variable name must be non-empty.", parameterName);
+        if (value.Length > MaximumLength)
+            throw new ArgumentException("Environment variable name exceeds the size limit.", parameterName);
+        if (string.IsNullOrWhiteSpace(value))
+            throw new ArgumentException("Environment variable name must be non-empty.", parameterName);
+        if (!IsAsciiLetter(value[0]) && value[0] != '_')
+            throw new ArgumentException("Environment variable name is not a POSIX identifier.", parameterName);
+        for (var index = 1; index < value.Length; index++)
+        {
+            var character = value[index];
+            if (IsAsciiLetter(character) || character is >= '0' and <= '9' || character == '_')
+                continue;
+            throw new ArgumentException("Environment variable name is not a POSIX identifier.", parameterName);
+        }
+    }
+
+    private static bool IsAsciiLetter(char value) =>
+        value is >= 'A' and <= 'Z' or >= 'a' and <= 'z';
+}
+
 public sealed record SandboxExec
 {
+    /// <summary>Maximum distinct environment-variable removals requested by one exec.</summary>
+    public const int MaximumEnvironmentVariablesToUnset = 256;
+
+    private IReadOnlyList<string> _environmentVariablesToUnset = [];
+
     public required IReadOnlyList<string> Argv { get; init; }
     public string? WorkingDirectory { get; init; }
     public IReadOnlyDictionary<string, string>? ExtraEnvironment { get; init; }
+    /// <summary>
+    /// Bounded immutable set of environment variables that must be absent from
+    /// the launched process. Providers apply these removals after merging their
+    /// baseline/spec environment and <see cref="ExtraEnvironment"/>. Removal
+    /// therefore wins deterministically when a name is also present in
+    /// <see cref="ExtraEnvironment"/>.
+    /// </summary>
+    public IReadOnlyList<string> EnvironmentVariablesToUnset
+    {
+        get => _environmentVariablesToUnset;
+        init => _environmentVariablesToUnset = SnapshotEnvironmentVariablesToUnset(value);
+    }
     /// <summary>
     /// Marks <see cref="ExtraEnvironment"/> as secret-bearing. Providers must
     /// deliver it without placing values in host-visible command argv and must
@@ -1278,6 +1346,51 @@ public sealed record SandboxExec
     /// </summary>
     public Action<string>? StdoutChunkCallback { get; init; }
     public Action<string>? StderrChunkCallback { get; init; }
+
+    /// <summary>
+    /// Applies the validated removal request at a provider's final environment
+    /// sink. Call only after every provider/spec/exec environment merge and
+    /// immediately before process launch or guest-environment serialization.
+    /// </summary>
+    public void ApplyEnvironmentRemovals(Action<string> remove)
+    {
+        ArgumentNullException.ThrowIfNull(remove);
+        foreach (var name in _environmentVariablesToUnset)
+            remove(name);
+    }
+
+    private static IReadOnlyList<string> SnapshotEnvironmentVariablesToUnset(
+        IReadOnlyList<string> source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        if (source.Count > MaximumEnvironmentVariablesToUnset)
+        {
+            throw new ArgumentException(
+                $"An exec cannot unset more than {MaximumEnvironmentVariablesToUnset} environment variables.",
+                nameof(EnvironmentVariablesToUnset));
+        }
+
+        var snapshot = new List<string>(source.Count);
+        var distinct = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var name in source)
+        {
+            if (snapshot.Count >= MaximumEnvironmentVariablesToUnset)
+            {
+                throw new ArgumentException(
+                    $"An exec cannot unset more than {MaximumEnvironmentVariablesToUnset} environment variables.",
+                    nameof(EnvironmentVariablesToUnset));
+            }
+            SandboxEnvironmentVariableName.Validate(name, nameof(EnvironmentVariablesToUnset));
+            if (!distinct.Add(name))
+            {
+                throw new ArgumentException(
+                    "Environment variable removal names must be unique.",
+                    nameof(EnvironmentVariablesToUnset));
+            }
+            snapshot.Add(name);
+        }
+        return Array.AsReadOnly(snapshot.ToArray());
+    }
 }
 
 public enum SandboxAgentOutputTransportPreference

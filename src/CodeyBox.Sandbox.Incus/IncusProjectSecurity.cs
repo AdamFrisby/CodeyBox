@@ -1,4 +1,3 @@
-using System.Text;
 using System.Text.Json;
 
 namespace CodeyBox.Sandbox.Incus;
@@ -74,7 +73,11 @@ internal static class IncusProjectSecurity
 
             if (!normalized.Add(full))
                 continue;
-            encodedBytes += Encoding.UTF8.GetByteCount(full);
+            encodedBytes += IncusInputValidation.GetBoundedUtf8ByteCount(
+                full,
+                4096,
+                nameof(roots),
+                "Incus restricted-project disk root");
             if (normalized.Count > MaximumRoots || encodedBytes > MaximumEncodedRootsBytes)
             {
                 throw new InvalidOperationException(
@@ -310,8 +313,16 @@ internal static class IncusProjectSecurity
 
     private static void ValidateRootText(string root)
     {
+        if (root is null || root.Length is < 1 or > 4096)
+            throw new ArgumentException(
+                "Incus restricted-project disk roots must be bounded absolute paths without commas or control characters.",
+                nameof(root));
+        _ = IncusInputValidation.GetBoundedUtf8ByteCount(
+            root,
+            4096,
+            nameof(root),
+            "Incus restricted-project disk root");
         if (string.IsNullOrWhiteSpace(root)
-            || root.Length > 4096
             || root.Contains(',')
             || root.Any(char.IsControl)
             || !Path.IsPathFullyQualified(root))

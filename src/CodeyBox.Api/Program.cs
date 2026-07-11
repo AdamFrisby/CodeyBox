@@ -425,7 +425,7 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     var startupLog = loggerFactory.CreateLogger("CodeyBox.Sandbox");
 
-    var kind = (opts.SandboxProvider ?? "").Trim().ToLowerInvariant();
+    var kind = ReloadableSandboxProvider.NormalizeConfiguredProviderId(opts.SandboxProvider);
     var environment = sp.GetRequiredService<IHostEnvironment>();
 
     if (string.IsNullOrEmpty(kind))
@@ -470,10 +470,9 @@ static ReloadableSandboxProvider BuildReloadableSandboxProvider(
 {
     var options = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
     var multipassBaselineNamespace = new MultipassSandboxOptions();
-    var incusBaselineNamePrefix = new IncusSandboxOptions().BaselineNamePrefix;
     return new ReloadableSandboxProvider(
         () => options.CurrentValue.SandboxProvider ?? string.Empty,
-        () => options.CurrentValue.SandboxProviderCutover?.RetainedInventoryProviders?.ToArray() ?? [],
+        () => options.CurrentValue.SandboxProviderCutover?.RetainedInventoryProviders ?? [],
         [
             new ReloadableSandboxProvider.ProviderRegistration(
                 SandboxProviderKinds.Multipass,
@@ -494,9 +493,7 @@ static ReloadableSandboxProvider BuildReloadableSandboxProvider(
                     loggerFactory,
                     sp.GetService<ITimingStore>(),
                     sp.GetService<ISandboxResourceUsageStore>()),
-                baselineRef => IncusSandboxProvider.IsOwnedBaselineRef(
-                    options.CurrentValue.Incus?.BaselineNamePrefix ?? incusBaselineNamePrefix,
-                    baselineRef)),
+                IncusSandboxProvider.IsRoutableBaselineRef),
         ],
         loggerFactory.CreateLogger<ReloadableSandboxProvider>());
 }
@@ -698,7 +695,7 @@ static ISandboxProvider BuildE2eLocalSandboxProvider(IServiceProvider sp, ILogge
             "CodeyBox:E2eExecution:PoolKind=local is only available in Development.");
     }
 
-    var kind = (opts.SandboxProvider ?? "").Trim().ToLowerInvariant();
+    var kind = ReloadableSandboxProvider.NormalizeConfiguredProviderId(opts.SandboxProvider);
     if (string.IsNullOrEmpty(kind))
     {
         if (environment.IsDevelopment())
@@ -3238,7 +3235,12 @@ builder.Services.AddSingleton<ReleaseService>(sp => new ReleaseService(
     promptPreprocessors: sp.GetRequiredService<AgentPromptPreprocessorChain>(),
     authFailureClassifier: sp.GetRequiredService<IAgentAuthFailureClassifier>(),
     authAvailability: sp.GetRequiredService<IAgentAuthAvailabilityRegistry>(),
-    authRequiredHandler: sp.GetRequiredService<IAgentAuthRequiredHandler>()));
+    authRequiredHandler: sp.GetRequiredService<IAgentAuthRequiredHandler>(),
+    deepAuditFailurePersistenceOptions: () => sp
+        .GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>()
+        .CurrentValue
+        .DeepAuditFailurePersistence,
+    timeProvider: sp.GetService<TimeProvider>() ?? TimeProvider.System));
 
 builder.Services.AddHostedService(sp => new ReleaseMainSyncService(
     sp.GetRequiredService<IReleaseStore>(),
@@ -4105,8 +4107,9 @@ namespace CodeyBox.Api
     /// Hot-reloadable settings for
     /// <c>CodeyBox:SandboxProvider=incus</c>. Changes under
     /// <c>CodeyBox:Incus</c> (except the restart-only project and staging
-    /// identities) are captured by the next provider operation and do not
-    /// mutate already-created sandboxes.
+    /// identities) are captured by the next provider operation. Existing
+    /// sandboxes retain their provisioning topology, while host-process
+    /// cleanup and transient exec retry policies are read live.
     ///
     /// The configured storage pool must already exist and use the ZFS or Btrfs
     /// driver; ZFS is strongly recommended for VM workloads.
@@ -4193,6 +4196,21 @@ namespace CodeyBox.Api
 
         /// <summary>Delay between VM/agent readiness probes.</summary>
         public TimeSpan ReadinessPollInterval { get; set; } = Defaults.ReadinessPollInterval;
+
+        /// <summary>Independent deadline for terminating and draining one Incus CLI process tree.</summary>
+        public TimeSpan CliProcessCleanupTimeout { get; set; } = Defaults.CliProcessCleanupTimeout;
+
+        /// <summary>Delay between Linux Incus CLI process-group absence probes during cleanup.</summary>
+        public TimeSpan CliProcessGroupExitPollInterval { get; set; } = Defaults.CliProcessGroupExitPollInterval;
+
+        /// <summary>Attempts to read an active guest exec process-group ID before forced cleanup.</summary>
+        public int ExecPidPollAttempts { get; set; } = Defaults.ExecPidPollAttempts;
+
+        /// <summary>Attempts to delete and verify each transient guest exec control file.</summary>
+        public int ExecControlFileCleanupAttempts { get; set; } = Defaults.ExecControlFileCleanupAttempts;
+
+        /// <summary>Attempts to read and validate a guest exec completion sentinel.</summary>
+        public int ExecCompletionProbeAttempts { get; set; } = Defaults.ExecCompletionProbeAttempts;
 
         /// <summary>Maximum number of concurrent heavy Incus lifecycle/device operations.</summary>
         public int MaxConcurrentOperations { get; set; } = Defaults.MaxConcurrentOperations;
@@ -4779,6 +4797,12 @@ namespace CodeyBox.Api
         /// Hot-reloadable: read on each remediation dispatch.
         /// </summary>
         public int DeepAuditRemediationItemTimeoutSeconds { get; set; } = 1800;
+
+        /// <summary>
+        /// Bounded retry policy for persisting an unexpected deep-audit failure.
+        /// Hot-reloadable: captured at the start of each failure reconciliation.
+        /// </summary>
+        public DeepAuditFailurePersistenceOptions DeepAuditFailurePersistence { get; set; } = new();
 
         /// <summary>Pipeline-runner quota-fallback and retry tuning. Hot-reloadable.</summary>
         public PipelineTuningOptions PipelineTuning { get; set; } = new();
@@ -5443,6 +5467,8 @@ namespace CodeyBox.Api
     /// </summary>
     public sealed class DiskGuardOptions
     {
+        public const int MaximumAdditionalPaths = 64;
+
         /// <summary>
         /// Master switch. Default true so a stock deployment refuses to launch
         /// new sandboxes when the host is out of disk; set false to disable
@@ -5476,7 +5502,8 @@ namespace CodeyBox.Api
         /// Extra host paths checked by VM providers in addition to their
         /// provider-owned backing storage. The wiring automatically adds the
         /// state-database directory, and Incus also adds its effective staging
-        /// directory, so those writes are not the first to hit ENOSPC.
+        /// directory, so those writes are not the first to hit ENOSPC. At most
+        /// <see cref="MaximumAdditionalPaths"/> paths may be configured.
         /// </summary>
         public List<string> AdditionalPaths { get; set; } = [];
     }

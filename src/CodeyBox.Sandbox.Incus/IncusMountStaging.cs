@@ -245,15 +245,26 @@ internal static class IncusMountStaging
                 if (mount is null)
                     throw new InvalidOperationException("Incus sandbox mounts cannot contain null entries.");
                 IncusInputValidation.ValidateAbsoluteGuestPath(mount.SandboxPath, nameof(mounts));
+                aggregatePathBytes += IncusInputValidation.GetBoundedUtf8ByteCount(
+                    mount.SandboxPath,
+                    4096,
+                    nameof(mounts),
+                    "Sandbox mount guest path");
+                if (mount.HostPath is not null)
+                {
+                    IncusInputValidation.ValidateAbsoluteHostPath(mount.HostPath, nameof(mounts));
+                    aggregatePathBytes += IncusInputValidation.GetBoundedUtf8ByteCount(
+                        mount.HostPath,
+                        4096,
+                        nameof(mounts),
+                        "Sandbox mount host path");
+                }
+                if (aggregatePathBytes > 1024 * 1024)
+                    throw new InvalidOperationException("Sandbox mount paths exceed the 1 MiB aggregate bound.");
                 if (mount.SnapshotForIsolation && !mount.ReadOnly)
                     throw new InvalidOperationException("SnapshotForIsolation requires a read-only sandbox mount.");
                 if (mount.SandboxPath == SandboxConventions.CredentialsDir && !mount.Tmpfs)
                     throw new InvalidOperationException("The reserved credentials mount must be a guest tmpfs.");
-                aggregatePathBytes += Encoding.UTF8.GetByteCount(mount.SandboxPath);
-                if (mount.HostPath is not null)
-                    aggregatePathBytes += Encoding.UTF8.GetByteCount(mount.HostPath);
-                if (aggregatePathBytes > 1024 * 1024)
-                    throw new InvalidOperationException("Sandbox mount paths exceed the 1 MiB aggregate bound.");
                 if (!guestPaths.Add(mount.SandboxPath))
                     throw new InvalidOperationException($"Duplicate sandbox mount path '{mount.SandboxPath}'.");
 
@@ -285,7 +296,6 @@ internal static class IncusMountStaging
                         hostSourceIsDirectory: false);
                     throw new InvalidOperationException($"Mount '{mount.SandboxPath}' has neither Tmpfs nor HostPath.");
                 }
-                IncusInputValidation.ValidateAbsoluteHostPath(mount.HostPath, nameof(mounts));
                 var sourcePath = Path.GetFullPath(mount.HostPath);
                 if (!Directory.Exists(sourcePath) && !File.Exists(sourcePath))
                     throw new SandboxMountSourceMissingException(
@@ -581,9 +591,19 @@ internal static class IncusMountStaging
         ref long aggregateBytes)
     {
         const int maximumLinkTargetBytes = 64 * 1024;
-        var targetBytes = Encoding.UTF8.GetByteCount(linkTarget);
-        if (targetBytes > maximumLinkTargetBytes)
-            throw new IOException("Isolation snapshot symbolic-link target exceeds the 64 KiB safety bound.");
+        int targetBytes;
+        try
+        {
+            targetBytes = IncusInputValidation.GetBoundedUtf8ByteCount(
+                linkTarget,
+                maximumLinkTargetBytes,
+                nameof(linkTarget),
+                "Isolation snapshot symbolic-link target");
+        }
+        catch (ArgumentException ex)
+        {
+            throw new IOException("Isolation snapshot symbolic-link target exceeds the 64 KiB safety bound or is not valid Unicode.", ex);
+        }
         checked { aggregateBytes += targetBytes; }
         if (aggregateBytes > maxBytes)
             throw new IOException($"Isolation snapshot exceeds the configured {maxBytes}-byte limit.");

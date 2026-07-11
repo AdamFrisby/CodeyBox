@@ -223,6 +223,10 @@ public sealed class MultipassRemoteSandboxProviderTests
         {
             ImageReference = "24.04",
             WorkingDirectory = "/work",
+            Environment = new Dictionary<string, string>
+            {
+                ["REMOVE_ME"] = "spec-value",
+            },
         });
 
         var result = await sandbox.ExecAsync(new SandboxExec
@@ -232,7 +236,9 @@ public sealed class MultipassRemoteSandboxProviderTests
             ExtraEnvironment = new Dictionary<string, string>
             {
                 ["OPENAI_API_KEY"] = secret,
+                ["REMOVE_ME"] = "exec-value",
             },
+            EnvironmentVariablesToUnset = ["REMOVE_ME"],
             EnvironmentContainsSecrets = true,
         });
 
@@ -243,10 +249,14 @@ public sealed class MultipassRemoteSandboxProviderTests
         var exec = Assert.Single(transport.RecordedCalls, call =>
             call.Argv.Count > 1
             && call.Argv[0] == opts.RemoteMultipassPath
-            && call.Argv[1] == "exec");
+            && call.Argv[1] == "exec"
+            && call.Argv.Any(argument => argument.Contains("dd if=/dev/stdin", StringComparison.Ordinal)));
         Assert.Equal("OPENAI_API_KEY='remote-candidate-secret'\nuser prompt", exec.Stdin);
         Assert.Contains(exec.Argv, argument =>
             argument.Contains("dd if=/dev/stdin", StringComparison.Ordinal));
+        Assert.Contains("REMOVE_ME", exec.Argv);
+        Assert.Contains(exec.Argv, argument =>
+            argument.Contains("unset --", StringComparison.Ordinal));
         await sandbox.DisposeAsync();
     }
 

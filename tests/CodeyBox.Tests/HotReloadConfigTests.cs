@@ -197,6 +197,33 @@ public sealed class HotReloadConfigTests
     }
 
     [Fact]
+    public void DeepAuditFailurePersistenceOptions_ReloadThroughCodeyBoxOptionsMonitor()
+    {
+        var values = new Dictionary<string, string?>
+        {
+            ["CodeyBox:DeepAuditFailurePersistence:MaxAttempts"] = "2",
+            ["CodeyBox:DeepAuditFailurePersistence:RetryDelay"] = "00:00:01",
+        };
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(values)
+            .Build();
+        var services = new ServiceCollection();
+        services.Configure<CodeyBoxOptions>(config.GetSection("CodeyBox"));
+        using var provider = services.BuildServiceProvider();
+        var monitor = provider.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+
+        Assert.Equal(2, monitor.CurrentValue.DeepAuditFailurePersistence.MaxAttempts);
+        Assert.Equal(TimeSpan.FromSeconds(1), monitor.CurrentValue.DeepAuditFailurePersistence.RetryDelay);
+
+        config["CodeyBox:DeepAuditFailurePersistence:MaxAttempts"] = "4";
+        config["CodeyBox:DeepAuditFailurePersistence:RetryDelay"] = "00:00:02";
+        ((IConfigurationRoot)config).Reload();
+
+        Assert.Equal(4, monitor.CurrentValue.DeepAuditFailurePersistence.MaxAttempts);
+        Assert.Equal(TimeSpan.FromSeconds(2), monitor.CurrentValue.DeepAuditFailurePersistence.RetryDelay);
+    }
+
+    [Fact]
     public void ImmutableCodeyBoxOptionsValidator_RejectsStateDatabasePathChange()
     {
         var startup = new CodeyBoxOptions { StateDatabasePath = "/var/lib/codeybox/state.db" };
@@ -254,6 +281,64 @@ public sealed class HotReloadConfigTests
 
         Assert.True(result.Failed);
         Assert.Contains("SandboxProvider", result.FailureMessage);
+    }
+
+    [Fact]
+    public void ImmutableCodeyBoxOptionsValidator_RejectsIncusProjectIdentityChange()
+    {
+        var startup = new CodeyBoxOptions
+        {
+            SandboxProvider = "incus",
+            Incus = new IncusSandboxConfig
+            {
+                ProjectName = "codeybox",
+                StagingDirectory = "/var/lib/codeybox/incus-staging",
+            },
+        };
+        var validator = new ImmutableCodeyBoxOptionsValidator(startup);
+        var candidate = new CodeyBoxOptions
+        {
+            SandboxProvider = "incus",
+            Incus = new IncusSandboxConfig
+            {
+                ProjectName = "codeybox-reloaded",
+                StagingDirectory = "/var/lib/codeybox/incus-staging",
+            },
+        };
+
+        var result = validator.Validate(name: null, candidate);
+
+        Assert.True(result.Failed);
+        Assert.Contains("Incus:ProjectName", result.FailureMessage);
+    }
+
+    [Fact]
+    public void ImmutableCodeyBoxOptionsValidator_RejectsIncusStagingIdentityChange()
+    {
+        var startup = new CodeyBoxOptions
+        {
+            SandboxProvider = "incus",
+            Incus = new IncusSandboxConfig
+            {
+                ProjectName = "codeybox",
+                StagingDirectory = "/var/lib/codeybox/incus-staging",
+            },
+        };
+        var validator = new ImmutableCodeyBoxOptionsValidator(startup);
+        var candidate = new CodeyBoxOptions
+        {
+            SandboxProvider = "incus",
+            Incus = new IncusSandboxConfig
+            {
+                ProjectName = "codeybox",
+                StagingDirectory = "/srv/codeybox/incus-staging",
+            },
+        };
+
+        var result = validator.Validate(name: null, candidate);
+
+        Assert.True(result.Failed);
+        Assert.Contains("Incus:StagingDirectory", result.FailureMessage);
     }
 
     [Fact]
@@ -399,6 +484,30 @@ public sealed class HotReloadConfigTests
 
         Assert.NotNull(options);
         Assert.Equal(5, options.MultipassSandbox.CloudInitReadyRetryAttempts);
+    }
+
+    [Fact]
+    public void CodeyBoxOptions_BindsIncusProcessCleanupAndExecRetryPolicy()
+    {
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:Incus:CliProcessCleanupTimeout"] = "00:00:17",
+                ["CodeyBox:Incus:CliProcessGroupExitPollInterval"] = "00:00:00.025",
+                ["CodeyBox:Incus:ExecPidPollAttempts"] = "7",
+                ["CodeyBox:Incus:ExecControlFileCleanupAttempts"] = "11",
+                ["CodeyBox:Incus:ExecCompletionProbeAttempts"] = "13",
+            })
+            .Build();
+
+        var options = config.GetSection("CodeyBox").Get<CodeyBoxOptions>();
+
+        Assert.NotNull(options);
+        Assert.Equal(TimeSpan.FromSeconds(17), options.Incus.CliProcessCleanupTimeout);
+        Assert.Equal(TimeSpan.FromMilliseconds(25), options.Incus.CliProcessGroupExitPollInterval);
+        Assert.Equal(7, options.Incus.ExecPidPollAttempts);
+        Assert.Equal(11, options.Incus.ExecControlFileCleanupAttempts);
+        Assert.Equal(13, options.Incus.ExecCompletionProbeAttempts);
     }
 
     [Fact]

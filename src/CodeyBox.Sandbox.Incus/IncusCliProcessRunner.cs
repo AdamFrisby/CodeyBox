@@ -10,8 +10,21 @@ namespace CodeyBox.Sandbox.Incus;
 /// </summary>
 internal sealed class IncusCliProcessRunner : IProcessRunner
 {
-    private readonly DefaultProcessRunner _inner = new(
-        new DefaultProcessRunnerOptions { IsolateLinuxProcessGroup = true });
+    private readonly Func<IncusSandboxOptions> _optionsAccessor;
+    private readonly TimeProvider _timeProvider;
+
+    internal IncusCliProcessRunner()
+        : this(static () => new IncusSandboxOptions(), TimeProvider.System)
+    {
+    }
+
+    internal IncusCliProcessRunner(
+        Func<IncusSandboxOptions> optionsAccessor,
+        TimeProvider? timeProvider = null)
+    {
+        _optionsAccessor = optionsAccessor ?? throw new ArgumentNullException(nameof(optionsAccessor));
+        _timeProvider = timeProvider ?? TimeProvider.System;
+    }
 
     public Task<ProcessRunResult> RunAsync(
         IReadOnlyList<string> argv,
@@ -30,7 +43,17 @@ internal sealed class IncusCliProcessRunner : IProcessRunner
                 "Incus CLI process execution requires explicit stdout and stderr limits.");
         }
 
-        return _inner.RunAsync(
+        var options = _optionsAccessor()
+            ?? throw new InvalidOperationException("The Incus options accessor returned null.");
+        var runner = new DefaultProcessRunner(
+            new DefaultProcessRunnerOptions
+            {
+                IsolateLinuxProcessGroup = true,
+                CleanupTimeout = options.CliProcessCleanupTimeout,
+                ProcessGroupExitPollInterval = options.CliProcessGroupExitPollInterval,
+            },
+            _timeProvider);
+        return runner.RunAsync(
             argv,
             stdin,
             ct,

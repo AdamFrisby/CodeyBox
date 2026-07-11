@@ -16,19 +16,28 @@ public sealed class DefaultProcessRunner : IProcessRunner
     private const int SignalKill = 9;
     private const int SignalProbe = 0;
     private const int NoSuchProcess = 3;
-    private static readonly TimeSpan CleanupTimeout = TimeSpan.FromSeconds(5);
     private readonly DefaultProcessRunnerOptions _options;
+    private readonly TimeProvider _timeProvider;
 
     /// <summary>Creates a direct, unbounded-by-default host process runner.</summary>
     public DefaultProcessRunner()
-        : this(new DefaultProcessRunnerOptions())
+        : this(new DefaultProcessRunnerOptions(), TimeProvider.System)
     {
     }
 
     /// <summary>Creates a host process runner with the supplied isolation policy.</summary>
     public DefaultProcessRunner(DefaultProcessRunnerOptions options)
+        : this(options, TimeProvider.System)
     {
-        _options = options ?? throw new ArgumentNullException(nameof(options));
+    }
+
+    /// <summary>Creates a host process runner with supplied isolation and time policies.</summary>
+    public DefaultProcessRunner(DefaultProcessRunnerOptions options, TimeProvider timeProvider)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        DefaultProcessRunnerOptions.Validate(options);
+        _options = options;
+        _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
     }
 
     public async Task<ProcessRunResult> RunAsync(
@@ -231,7 +240,7 @@ public sealed class DefaultProcessRunner : IProcessRunner
         }
     }
 
-    private static async Task<IReadOnlyList<Exception>> VerifyOutputLimitTerminationAsync(
+    private async Task<IReadOnlyList<Exception>> VerifyOutputLimitTerminationAsync(
         DiagProcess process,
         bool isolatedLinuxProcessGroup,
         Exception? terminationFailure,
@@ -241,7 +250,7 @@ public sealed class DefaultProcessRunner : IProcessRunner
         var errors = new List<Exception>();
         if (terminationFailure is not null)
             errors.Add(terminationFailure);
-        using var deadline = new CancellationTokenSource(CleanupTimeout);
+        using var deadline = new CancellationTokenSource(_options.CleanupTimeout, _timeProvider);
         try
         {
             await Task.WhenAll(stdoutTask, stderrTask).WaitAsync(deadline.Token).ConfigureAwait(false);
@@ -264,7 +273,7 @@ public sealed class DefaultProcessRunner : IProcessRunner
         return errors;
     }
 
-    private static async Task<IReadOnlyList<Exception>> TerminateAndDrainAsync(
+    private async Task<IReadOnlyList<Exception>> TerminateAndDrainAsync(
         DiagProcess process,
         bool isolatedLinuxProcessGroup,
         Task<string>? stdoutTask,
@@ -273,7 +282,7 @@ public sealed class DefaultProcessRunner : IProcessRunner
         Task<LimitedReadResult>? limitedStderrTask)
     {
         var errors = new List<Exception>();
-        using var cleanupDeadline = new CancellationTokenSource(CleanupTimeout);
+        using var cleanupDeadline = new CancellationTokenSource(_options.CleanupTimeout, _timeProvider);
 
         if (isolatedLinuxProcessGroup)
         {
@@ -390,7 +399,7 @@ public sealed class DefaultProcessRunner : IProcessRunner
         }
     }
 
-    private static async Task<bool> WaitForProcessGroupExitAsync(int processGroupId, CancellationToken ct)
+    private async Task<bool> WaitForProcessGroupExitAsync(int processGroupId, CancellationToken ct)
     {
         while (true)
         {
@@ -398,7 +407,7 @@ public sealed class DefaultProcessRunner : IProcessRunner
                 return Marshal.GetLastPInvokeError() == NoSuchProcess;
             try
             {
-                await Task.Delay(TimeSpan.FromMilliseconds(10), ct).ConfigureAwait(false);
+                await Task.Delay(_options.ProcessGroupExitPollInterval, _timeProvider, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {

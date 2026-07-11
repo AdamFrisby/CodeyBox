@@ -12,6 +12,8 @@ namespace CodeyBox.Api;
 /// </summary>
 internal static class IncusSandboxConfigMapper
 {
+    private const int MaximumHostPathCharacters = 4096;
+
     public static IncusSandboxOptions Build(CodeyBoxOptions options) =>
         Build(options, NullLogger.Instance);
 
@@ -50,6 +52,11 @@ internal static class IncusSandboxConfigMapper
             CloudInitTimeout = incus.CloudInitTimeout,
             MountReadyTimeout = incus.MountReadyTimeout,
             ReadinessPollInterval = incus.ReadinessPollInterval,
+            CliProcessCleanupTimeout = incus.CliProcessCleanupTimeout,
+            CliProcessGroupExitPollInterval = incus.CliProcessGroupExitPollInterval,
+            ExecPidPollAttempts = incus.ExecPidPollAttempts,
+            ExecControlFileCleanupAttempts = incus.ExecControlFileCleanupAttempts,
+            ExecCompletionProbeAttempts = incus.ExecCompletionProbeAttempts,
             MaxConcurrentOperations = incus.MaxConcurrentOperations,
             MaxCliStdoutBytes = incus.MaxCliStdoutBytes,
             MaxCliStderrBytes = incus.MaxCliStderrBytes,
@@ -75,23 +82,31 @@ internal static class IncusSandboxConfigMapper
         };
     }
 
-    private static IReadOnlyDictionary<string, string> SnapshotNetworkProfiles(
-        IReadOnlyDictionary<string, string>? profiles)
+    internal static IReadOnlyDictionary<string, string> SnapshotNetworkProfiles(
+        IEnumerable<KeyValuePair<string, string>>? profiles)
     {
         var copy = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         if (profiles is null)
             return new ReadOnlyDictionary<string, string>(copy);
-        if (profiles.Count > IncusSandboxOptions.MaximumNetworkProfiles)
-        {
-            throw new InvalidOperationException(
-                $"SandboxNetworkProfiles cannot contain more than {IncusSandboxOptions.MaximumNetworkProfiles} entries for Incus.");
-        }
 
         long bytes = 0;
         foreach (var (profile, bridge) in profiles)
         {
+            if (copy.Count >= IncusSandboxOptions.MaximumNetworkProfiles)
+            {
+                throw new InvalidOperationException(
+                    $"SandboxNetworkProfiles cannot contain more than {IncusSandboxOptions.MaximumNetworkProfiles} entries for Incus.");
+            }
             if (profile is null || bridge is null)
                 throw new InvalidOperationException("SandboxNetworkProfiles cannot contain null keys or values.");
+            ConfigurationInputBounds.EnsureCharacterBound(
+                profile,
+                IncusSandboxOptions.MaximumNetworkProfileUtf8Bytes,
+                "SandboxNetworkProfiles key");
+            ConfigurationInputBounds.EnsureCharacterBound(
+                bridge,
+                IncusSandboxOptions.MaximumNetworkProfileUtf8Bytes,
+                "SandboxNetworkProfiles value");
             var entryBytes = (long)System.Text.Encoding.UTF8.GetByteCount(profile)
                 + System.Text.Encoding.UTF8.GetByteCount(bridge);
             if (entryBytes > IncusSandboxOptions.MaximumNetworkProfileUtf8Bytes - bytes)
@@ -102,57 +117,78 @@ internal static class IncusSandboxConfigMapper
         return new ReadOnlyDictionary<string, string>(copy);
     }
 
-    private static IReadOnlyList<string> SnapshotExtraRuncmd(IReadOnlyList<string>? commands)
+    internal static IReadOnlyList<string> SnapshotExtraRuncmd(IEnumerable<string>? commands)
     {
-        if (commands is null || commands.Count == 0)
+        if (commands is null)
             return Array.Empty<string>();
-        if (commands.Count > IncusSandboxOptions.MaximumExtraRuncmdCount)
-        {
-            throw new InvalidOperationException(
-                $"Incus:ExtraRuncmd cannot contain more than {IncusSandboxOptions.MaximumExtraRuncmdCount} commands.");
-        }
 
-        var copy = new string[commands.Count];
+        var copy = new List<string>(Math.Min(IncusSandboxOptions.MaximumExtraRuncmdCount, 16));
         long bytes = 0;
-        for (var index = 0; index < commands.Count; index++)
+        foreach (var candidate in commands)
         {
-            var command = commands[index]
+            if (copy.Count >= IncusSandboxOptions.MaximumExtraRuncmdCount)
+            {
+                throw new InvalidOperationException(
+                    $"Incus:ExtraRuncmd cannot contain more than {IncusSandboxOptions.MaximumExtraRuncmdCount} commands.");
+            }
+            var command = candidate
                 ?? throw new InvalidOperationException("Incus:ExtraRuncmd cannot contain null commands.");
+            ConfigurationInputBounds.EnsureCharacterBound(
+                command,
+                IncusSandboxOptions.MaximumExtraRuncmdCommandUtf8Bytes,
+                "Incus:ExtraRuncmd command");
             var commandBytes = System.Text.Encoding.UTF8.GetByteCount(command);
-            if (commandBytes > IncusSandboxOptions.MaximumExtraRuncmdUtf8Bytes - bytes)
+            if (commandBytes > IncusSandboxOptions.MaximumAggregateExtraRuncmdUtf8Bytes - bytes)
                 throw new InvalidOperationException("Incus:ExtraRuncmd exceeds 1 MiB in aggregate.");
             bytes += commandBytes;
-            copy[index] = command;
+            copy.Add(command);
         }
-        return Array.AsReadOnly(copy);
+        return copy.Count == 0
+            ? Array.Empty<string>()
+            : Array.AsReadOnly(copy.ToArray());
     }
 
     private static IReadOnlyList<string> SnapshotAllowedHostMountRoots(CodeyBoxOptions options)
     {
         var configuredRoots = options.Incus?.AllowedHostMountRoots ?? [];
-        if (configuredRoots.Count > 64)
-            throw new InvalidOperationException("Incus:AllowedHostMountRoots cannot contain more than 64 entries.");
         var roots = new List<string>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
 
         Add(options.GitRootDirectory);
         if (options.EnableSharedUpstreamMirror)
         {
-            var mirror = string.IsNullOrWhiteSpace(options.SharedUpstreamMirrorDirectory)
+            var configuredMirror = options.SharedUpstreamMirrorDirectory;
+            ConfigurationInputBounds.EnsureCharacterBound(
+                configuredMirror,
+                MaximumHostPathCharacters,
+                "CodeyBox:SharedUpstreamMirrorDirectory");
+            var mirror = string.IsNullOrWhiteSpace(configuredMirror)
                 ? "_upstream-mirror"
-                : options.SharedUpstreamMirrorDirectory;
+                : configuredMirror;
+            ConfigurationInputBounds.EnsureCharacterBound(
+                options.GitRootDirectory,
+                MaximumHostPathCharacters,
+                "CodeyBox:GitRootDirectory");
             Add(Path.IsPathRooted(mirror) || string.IsNullOrWhiteSpace(options.GitRootDirectory)
                 ? mirror
                 : Path.Combine(options.GitRootDirectory, mirror));
         }
+        var configuredRootCount = 0;
         foreach (var root in configuredRoots)
+        {
+            if (configuredRootCount++ >= IncusSandboxOptions.MaximumConfiguredHostPathEntries)
+            {
+                throw new InvalidOperationException(
+                    $"Incus:AllowedHostMountRoots cannot contain more than {IncusSandboxOptions.MaximumConfiguredHostPathEntries} entries.");
+            }
             Add(root);
+        }
 
         return Array.AsReadOnly(roots.ToArray());
 
         void Add(string root)
         {
-            var normalized = NormalizeHostPath(root);
+            var normalized = NormalizeHostPath(root, "Incus host mount root");
             if (seen.Add(normalized))
                 roots.Add(normalized);
         }
@@ -160,9 +196,20 @@ internal static class IncusSandboxConfigMapper
 
     internal static string ResolveStagingDirectory(CodeyBoxOptions options, string? configured)
     {
-        if (!string.IsNullOrWhiteSpace(configured))
-            return NormalizeHostPath(configured);
+        if (configured is not null)
+        {
+            ConfigurationInputBounds.EnsureCharacterBound(
+                configured,
+                MaximumHostPathCharacters,
+                "Incus:StagingDirectory");
+            if (!string.IsNullOrWhiteSpace(configured))
+                return NormalizeHostPath(configured, "Incus:StagingDirectory");
+        }
 
+        ConfigurationInputBounds.EnsureCharacterBound(
+            options.StateDatabasePath,
+            MaximumHostPathCharacters,
+            "CodeyBox:StateDatabasePath");
         var statePath = Path.GetFullPath(options.StateDatabasePath);
         var stateDirectory = Path.GetDirectoryName(statePath)
             ?? throw new InvalidOperationException(
@@ -176,22 +223,34 @@ internal static class IncusSandboxConfigMapper
     {
         var paths = new List<string>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
+        var observedPathCount = 0;
         foreach (var path in diskGuard.AdditionalPaths)
+        {
+            if (observedPathCount++ >= IncusSandboxOptions.MaximumEffectiveHostPathEntries)
+                throw new InvalidOperationException("Incus disk-guard host paths exceed the bounded entry limit.");
             Add(path);
+        }
         Add(stagingDirectory);
         return Array.AsReadOnly(paths.ToArray());
 
         void Add(string path)
         {
+            ConfigurationInputBounds.EnsureCharacterBound(
+                path,
+                MaximumHostPathCharacters,
+                "Incus disk-guard host path");
             if (string.IsNullOrWhiteSpace(path)) return;
-            var normalized = NormalizeHostPath(path);
-            if (seen.Add(normalized))
-                paths.Add(normalized);
+            var normalized = NormalizeHostPath(path, "Incus disk-guard host path");
+            if (!seen.Add(normalized)) return;
+            if (paths.Count == IncusSandboxOptions.MaximumEffectiveHostPathEntries)
+                throw new InvalidOperationException("Incus disk-guard host paths exceed the bounded entry limit.");
+            paths.Add(normalized);
         }
     }
 
-    private static string NormalizeHostPath(string path)
+    private static string NormalizeHostPath(string path, string fieldName)
     {
+        ConfigurationInputBounds.EnsureCharacterBound(path, MaximumHostPathCharacters, fieldName);
         if (string.IsNullOrWhiteSpace(path)) return path;
         try
         {

@@ -1545,19 +1545,32 @@ git push origin HEAD:{refName}";
         var listRun = await RunAsync(opts, [opts.MultipassBinary, "list", "--format=json"], stdin: null, ct: ct);
         if (listRun.ExitCode != 0)
         {
-            _log.LogWarning("multipass list failed (exit {Exit}): {Stderr}", listRun.ExitCode, listRun.Stderr);
-            return [];
+            throw new InvalidOperationException(
+                $"Could not enumerate Multipass baseline images because 'multipass list --format=json' exited with code {listRun.ExitCode}.");
         }
         var results = new List<BaselineImageInfo>();
         try
         {
             using var doc = JsonDocument.Parse(listRun.Stdout);
-            if (!doc.RootElement.TryGetProperty("list", out var list)) return results;
+            if (doc.RootElement.ValueKind != JsonValueKind.Object
+                || !doc.RootElement.TryGetProperty("list", out var list)
+                || list.ValueKind != JsonValueKind.Array)
+            {
+                throw new JsonException(
+                    "Multipass baseline inventory must contain a JSON array property named 'list'.");
+            }
             foreach (var entry in list.EnumerateArray())
             {
-                if (!entry.TryGetProperty("name", out var nameProp)) continue;
+                if (entry.ValueKind != JsonValueKind.Object
+                    || !entry.TryGetProperty("name", out var nameProp)
+                    || nameProp.ValueKind != JsonValueKind.String)
+                {
+                    throw new JsonException(
+                        "Every Multipass inventory entry must contain a string property named 'name'.");
+                }
                 var name = nameProp.GetString();
-                if (string.IsNullOrEmpty(name)) continue;
+                if (string.IsNullOrEmpty(name))
+                    throw new JsonException("Multipass inventory entry names must be non-empty.");
                 if (!name.StartsWith(prefix, StringComparison.Ordinal)) continue;
                 // multipass list doesn't expose created-at in --format=json;
                 // mtime of the disk image is the next-best signal but is provider-
@@ -1568,8 +1581,9 @@ git push origin HEAD:{refName}";
         }
         catch (JsonException ex)
         {
-            _log.LogWarning(ex, "Failed to parse multipass list JSON output");
-            return [];
+            throw new InvalidOperationException(
+                "Could not enumerate Multipass baseline images because 'multipass list --format=json' returned an invalid inventory document.",
+                ex);
         }
         return results;
     }
@@ -5446,8 +5460,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         var stdoutChunkCallback = exec.StdoutChunkCallback;
         var stderrChunkCallback = exec.StderrChunkCallback;
         var effectiveEnvironment = BuildEffectiveExecEnvironment(exec);
-        var forceEnvironmentFile = exec.EnvironmentContainsSecrets
-            && effectiveEnvironment is { Count: > 0 };
+        var forceEnvironmentFile = exec.EnvironmentVariablesToUnset.Count > 0
+            || (exec.EnvironmentContainsSecrets && effectiveEnvironment is { Count: > 0 });
         var detachedHttpIngest = false;
         string? detachedExitToken = null;
         string? detachedProcessGroupMarker = null;
@@ -5479,9 +5493,11 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 if (agentOutputIngest is not null)
                 {
                     detachedHttpIngest = ShouldDetachAgentOutputHttpIngest(exec);
-                    effectiveEnvironment = MergeExecEnvironment(
-                        RemoveAgentOutputExitToken(effectiveEnvironment),
-                        agentOutputIngest.BuildEnvironment(includeExitToken: false));
+                    effectiveEnvironment = ApplyEnvironmentRemovals(
+                        exec,
+                        MergeExecEnvironment(
+                            RemoveAgentOutputExitToken(effectiveEnvironment),
+                            agentOutputIngest.BuildEnvironment(includeExitToken: false)));
                     if (detachedHttpIngest)
                     {
                         detachedExitToken = agentOutputIngest.ExitToken;
@@ -5509,11 +5525,14 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
         List<string> wrapped;
         IReadOnlyList<string> argv;
-        if (forceEnvironmentFile && effectiveEnvironment is { Count: > 0 })
+        if (forceEnvironmentFile)
         {
             try
             {
-                var envFile = await TransferExecEnvironmentAsync(effectiveEnvironment, ct);
+                var envFile = await TransferExecEnvironmentAsync(
+                    effectiveEnvironment ?? new Dictionary<string, string>(StringComparer.Ordinal),
+                    exec.EnvironmentVariablesToUnset,
+                    ct);
                 transferredVmPaths.Add(envFile);
                 if (detachedHttpIngest)
                 {
@@ -5535,10 +5554,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                if (exec.EnvironmentContainsSecrets)
+                if (exec.EnvironmentContainsSecrets || exec.EnvironmentVariablesToUnset.Count > 0)
                 {
                     throw new InvalidOperationException(
-                        "Secret sandbox environment delivery failed before process launch.",
+                        "Required sandbox environment delivery failed before process launch.",
                         ex);
                 }
                 if (detachedHttpIngest)
@@ -5590,7 +5609,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
             if (effectiveEnvironment is { Count: > 0 })
             {
-                var envFile = await TransferExecEnvironmentAsync(effectiveEnvironment, ct);
+                var envFile = await TransferExecEnvironmentAsync(
+                    effectiveEnvironment,
+                    exec.EnvironmentVariablesToUnset,
+                    ct);
                 transferredVmPaths.Add(envFile);
                 wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, envFile, stdinFile: null);
                 argv = BuildMultipassExecArgv(wrapped);
@@ -6081,25 +6103,15 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
     private IReadOnlyDictionary<string, string>? BuildEffectiveExecEnvironment(SandboxExec exec)
     {
-        if (_spec.Flavor != SandboxProfileFlavor.Graphical)
-            return exec.ExtraEnvironment;
-
-        if (exec.ExtraEnvironment is null || exec.ExtraEnvironment.Count == 0)
+        Dictionary<string, string>? merged = exec.ExtraEnvironment is { Count: > 0 }
+            ? new Dictionary<string, string>(exec.ExtraEnvironment, StringComparer.Ordinal)
+            : null;
+        if (_spec.Flavor == SandboxProfileFlavor.Graphical)
         {
-            return new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["DISPLAY"] = SandboxConventions.GraphicalDisplay,
-            };
+            merged ??= new Dictionary<string, string>(StringComparer.Ordinal);
+            merged.TryAdd("DISPLAY", SandboxConventions.GraphicalDisplay);
         }
-
-        if (exec.ExtraEnvironment.ContainsKey("DISPLAY"))
-            return exec.ExtraEnvironment;
-
-        var merged = new Dictionary<string, string>(exec.ExtraEnvironment, StringComparer.Ordinal)
-        {
-            ["DISPLAY"] = SandboxConventions.GraphicalDisplay,
-        };
-        return merged;
+        return ApplyEnvironmentRemovals(exec, merged);
     }
 
     private bool ShouldUseAgentOutputHttpIngest(
@@ -6146,6 +6158,17 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         return merged;
     }
 
+    private static IReadOnlyDictionary<string, string>? ApplyEnvironmentRemovals(
+        SandboxExec exec,
+        IReadOnlyDictionary<string, string>? environment)
+    {
+        if (environment is null || exec.EnvironmentVariablesToUnset.Count == 0)
+            return environment;
+        var scrubbed = new Dictionary<string, string>(environment, StringComparer.Ordinal);
+        exec.ApplyEnvironmentRemovals(name => scrubbed.Remove(name));
+        return scrubbed.Count == 0 ? null : scrubbed;
+    }
+
     private static IReadOnlyDictionary<string, string>? RemoveAgentOutputExitToken(
         IReadOnlyDictionary<string, string>? environment)
     {
@@ -6189,7 +6212,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         {
             wrapped.AddRange(["--env-file", extraEnvFile]);
         }
-        else if (effectiveEnvironment is { Count: > 0 })
+        if (extraEnvFile is null && effectiveEnvironment is { Count: > 0 })
         {
             // env(1) takes KEY=VALUE pairs followed by the command. This
             // keeps the common case small and preserves historical ordering.
@@ -6212,14 +6235,25 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         return total;
     }
 
-    private async Task<string> TransferExecEnvironmentAsync(IReadOnlyDictionary<string, string> env, CancellationToken ct)
+    private async Task<string> TransferExecEnvironmentAsync(
+        IReadOnlyDictionary<string, string> env,
+        IReadOnlyList<string> environmentVariablesToUnset,
+        CancellationToken ct)
     {
         var fileName = $"env-{Guid.NewGuid():N}";
         var hostDir = Path.Combine(_sandboxRoot, "exec-env");
         Directory.CreateDirectory(hostDir);
         MultipassSandboxProvider.TryChmod0700(hostDir);
         var hostPath = Path.Combine(hostDir, fileName);
-        await File.WriteAllTextAsync(hostPath, MultipassSandboxProvider.BuildEnvironmentFileContent(env), ct);
+        var content = new StringBuilder(MultipassSandboxProvider.BuildEnvironmentFileContent(env));
+        foreach (var name in environmentVariablesToUnset)
+        {
+            SandboxEnvironmentVariableName.Validate(name, nameof(environmentVariablesToUnset));
+            content.Append("unset -- ")
+                .Append(MultipassSandboxProvider.ShellSingleQuote(name))
+                .Append('\n');
+        }
+        await File.WriteAllTextAsync(hostPath, content.ToString(), ct);
         try
         {
             if (!OperatingSystem.IsWindows())

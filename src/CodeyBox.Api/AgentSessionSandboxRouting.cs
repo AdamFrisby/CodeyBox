@@ -51,9 +51,7 @@ internal static class AgentSessionSandboxRouting
 
     private static void ValidateProviderId(string providerId)
     {
-        if (string.IsNullOrWhiteSpace(providerId)
-            || providerId.Length > 128
-            || providerId.Any(char.IsControl))
+        if (!SandboxProviderIdPolicy.IsValidOpaque(providerId))
         {
             throw new InvalidOperationException(
                 "A provider-owned sandbox returned an invalid durable provider identifier.");

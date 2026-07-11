@@ -5,11 +5,13 @@ namespace CodeyBox.Sandbox.Incus;
 internal sealed class IncusCliRunner
 {
     private readonly IProcessRunner _runner;
+    private readonly TimeProvider _timeProvider;
     private readonly AdjustableOperationGate _operationGate = new();
 
-    internal IncusCliRunner(IProcessRunner runner)
+    internal IncusCliRunner(IProcessRunner runner, TimeProvider? timeProvider = null)
     {
         _runner = runner ?? throw new ArgumentNullException(nameof(runner));
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     internal async Task<ProcessRunResult> RunCheckedAsync(
@@ -38,8 +40,9 @@ internal sealed class IncusCliRunner
 
         try
         {
-            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            deadline.CancelAfter(timeout ?? options.OperationTimeout);
+            var operationTimeout = timeout ?? options.OperationTimeout;
+            using var timeoutCancellation = new CancellationTokenSource(operationTimeout, _timeProvider);
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCancellation.Token);
             ProcessRunResult result;
             try
             {
@@ -54,10 +57,10 @@ internal sealed class IncusCliRunner
                     environment: null,
                     killOnOutputLimit).ConfigureAwait(false);
             }
-            catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && deadline.IsCancellationRequested)
+            catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && timeoutCancellation.IsCancellationRequested)
             {
                 throw new TimeoutException(
-                    $"Incus {operation} exceeded its {(timeout ?? options.OperationTimeout).TotalSeconds:F0}-second deadline.",
+                    $"Incus {operation} exceeded its {operationTimeout.TotalSeconds:F0}-second deadline.",
                     ex);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -106,8 +109,9 @@ internal sealed class IncusCliRunner
             gateLease = await _operationGate.EnterAsync(options.MaxConcurrentOperations, ct).ConfigureAwait(false);
         try
         {
-            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            deadline.CancelAfter(timeout ?? options.OperationTimeout);
+            var operationTimeout = timeout ?? options.OperationTimeout;
+            using var timeoutCancellation = new CancellationTokenSource(operationTimeout, _timeProvider);
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCancellation.Token);
             try
             {
                 var result = await _runner.RunAsync(
@@ -122,10 +126,10 @@ internal sealed class IncusCliRunner
                     killOnOutputLimit).ConfigureAwait(false);
                 return result;
             }
-            catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && deadline.IsCancellationRequested)
+            catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && timeoutCancellation.IsCancellationRequested)
             {
                 throw new TimeoutException(
-                    $"Incus CLI operation exceeded its {(timeout ?? options.OperationTimeout).TotalSeconds:F0}-second deadline.",
+                    $"Incus CLI operation exceeded its {operationTimeout.TotalSeconds:F0}-second deadline.",
                     ex);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)

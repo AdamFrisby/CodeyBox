@@ -457,7 +457,8 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
         set -eu
         __codeybox_env_bytes="$1"
         __codeybox_wd="$2"
-        shift 2
+        __codeybox_unset_count="$3"
+        shift 3
         __codeybox_env_payload="$(dd bs=1 count="$__codeybox_env_bytes" 2>/dev/null || true)"
         while IFS= read -r __codeybox_env_line; do
           [ -n "$__codeybox_env_line" ] || continue
@@ -468,6 +469,11 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
         done <<__CODEYBOX_ENV__
         $__codeybox_env_payload
         __CODEYBOX_ENV__
+        while [ "$__codeybox_unset_count" -gt 0 ]; do
+          unset -- "$1"
+          shift
+          __codeybox_unset_count=$((__codeybox_unset_count - 1))
+        done
         if [ -n "$__codeybox_wd" ]; then
           mkdir -p "$__codeybox_wd"
           cd "$__codeybox_wd"
@@ -833,7 +839,7 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
     {
         var envBlock = BuildEnvironmentBlock(effectiveEnvironment);
         var envBlockBytes = Utf8.GetByteCount(envBlock);
-        var argv = new List<string>(exec.Argv.Count + 6)
+        var argv = new List<string>(exec.Argv.Count + 7 + exec.EnvironmentVariablesToUnset.Count)
         {
             "sh",
             "-c",
@@ -841,7 +847,9 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
             "_",
             envBlockBytes.ToString(CultureInfo.InvariantCulture),
             workingDirectory,
+            exec.EnvironmentVariablesToUnset.Count.ToString(CultureInfo.InvariantCulture),
         };
+        argv.AddRange(exec.EnvironmentVariablesToUnset);
         argv.AddRange(exec.Argv);
         return new SpritesWireExec(argv, envBlock + (exec.Stdin ?? ""));
     }
@@ -894,6 +902,7 @@ internal sealed class SpritesSandbox : IShutdownTeardownSandbox, IRejectsFileBac
             foreach (var (key, value) in exec.ExtraEnvironment)
                 env[key] = value;
         }
+        exec.ApplyEnvironmentRemovals(name => env.Remove(name));
         return env;
     }
 

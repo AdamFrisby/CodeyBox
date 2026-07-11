@@ -25,7 +25,6 @@ internal sealed class ReloadableSandboxProvider :
     IBaselineImageProvisioner,
     IResourceMetricsCapturingProvider
 {
-    internal const int MaximumProviderIdLength = 128;
     internal const int MaximumRetainedInventoryProviders = 8;
     private const int MaximumManagedResourceNameLength = 256;
 
@@ -93,9 +92,18 @@ internal sealed class ReloadableSandboxProvider :
     {
         ArgumentNullException.ThrowIfNull(spec);
         var selected = SelectedProvider;
-        var sandbox = await selected.Provider
-            .CreateAsync(TranslateForeignBaselinePin(selected, spec), ct)
-            .ConfigureAwait(false);
+        ISandbox sandbox;
+        try
+        {
+            sandbox = await selected.Provider
+                .CreateAsync(TranslateForeignBaselinePin(selected, spec), ct)
+                .ConfigureAwait(false);
+        }
+        catch (SandboxProvisioningDeferredException ex)
+            when (!string.IsNullOrWhiteSpace(ex.RetainedSandboxName))
+        {
+            throw ScopeRetainedResource(ex, selected.Id);
+        }
         return await RequireCreatedSandboxOwnerAsync(selected, sandbox).ConfigureAwait(false);
     }
 
@@ -255,7 +263,7 @@ internal sealed class ReloadableSandboxProvider :
         await owner.BaselineResolver.DisposeBaselineImageAsync(name, ct).ConfigureAwait(false);
     }
 
-    public Task<string?> EnsureBaselineImageAsync(
+    public async Task<string?> EnsureBaselineImageAsync(
         string profileName,
         SandboxProfileFlavor flavor,
         string? pinnedBaselineRef,
@@ -267,11 +275,19 @@ internal sealed class ReloadableSandboxProvider :
             profileName,
             flavor,
             pinnedBaselineRef);
-        return selected.BaselineProvisioner.EnsureBaselineImageAsync(
-            profileName,
-            flavor,
-            translated,
-            ct);
+        try
+        {
+            return await selected.BaselineProvisioner.EnsureBaselineImageAsync(
+                profileName,
+                flavor,
+                translated,
+                ct).ConfigureAwait(false);
+        }
+        catch (SandboxProvisioningDeferredException ex)
+            when (!string.IsNullOrWhiteSpace(ex.RetainedSandboxName))
+        {
+            throw ScopeRetainedResource(ex, selected.Id);
+        }
     }
 
     private async Task<BaselineInventory> ReadBaselineInventoryAsync(CancellationToken ct)
@@ -290,7 +306,7 @@ internal sealed class ReloadableSandboxProvider :
                     .ConfigureAwait(false);
                 foreach (var baseline in providerBaselines)
                 {
-                    listed.Add(baseline);
+                    listed.Add(baseline with { LifecycleProviderId = provider.Id });
                     AddOwner(owners, baseline.Name, provider);
                 }
             }
@@ -372,29 +388,58 @@ internal sealed class ReloadableSandboxProvider :
         get
         {
             _ = SelectedProvider;
-            var retainedProviderIds = _retainedInventoryProviderIds()
-                ?? throw new InvalidOperationException("The retained sandbox-provider inventory selector returned null.");
-            if (retainedProviderIds.Count > MaximumRetainedInventoryProviders)
-            {
-                throw new InvalidOperationException(
-                    "The retained sandbox-provider inventory exceeds the configured safety bound.");
-            }
-            foreach (var providerId in retainedProviderIds)
-                _ = Activate(ProviderByConfiguredId(providerId));
+            var retainedProviders = SnapshotRetainedProviders();
+            foreach (var provider in retainedProviders)
+                _ = Activate(provider);
             return _providers
                 .Where(provider => _activatedProviders.ContainsKey(provider.Id))
                 .ToArray();
         }
     }
 
+    private ProviderEntry[] SnapshotRetainedProviders()
+    {
+        var configuredProviderIds = _retainedInventoryProviderIds()
+            ?? throw new InvalidOperationException("The retained sandbox-provider inventory selector returned null.");
+        var retainedProviders = new List<ProviderEntry>(MaximumRetainedInventoryProviders);
+        var retainedProviderIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var configuredProviderId in configuredProviderIds)
+        {
+            if (retainedProviders.Count == MaximumRetainedInventoryProviders)
+            {
+                throw new InvalidOperationException(
+                    "The retained sandbox-provider inventory exceeds the configured safety bound.");
+            }
+            var provider = ProviderByConfiguredId(configuredProviderId);
+            if (!retainedProviderIds.Add(provider.Id))
+            {
+                throw new InvalidOperationException(
+                    "The retained sandbox-provider inventory contains a duplicate provider ID.");
+            }
+            retainedProviders.Add(provider);
+        }
+        return retainedProviders.ToArray();
+    }
+
+    internal static string NormalizeConfiguredProviderId(string? providerId)
+    {
+        if (providerId is null || providerId.Length == 0)
+            return string.Empty;
+        if (providerId.Length > SandboxProviderIdPolicy.MaximumLength)
+        {
+            throw new InvalidOperationException(
+                "The sandbox provider selector exceeds the configured safety bound.");
+        }
+        if (string.IsNullOrWhiteSpace(providerId))
+            return string.Empty;
+        return providerId.Trim().ToLowerInvariant();
+    }
+
     private ProviderEntry ProviderByConfiguredId(string? providerId)
     {
-        if (string.IsNullOrWhiteSpace(providerId)
-            || providerId.Length > MaximumProviderIdLength)
-        {
+        var normalized = NormalizeConfiguredProviderId(providerId);
+        if (normalized.Length == 0)
             throw new InvalidOperationException("The live sandbox provider selector is invalid.");
-        }
-        var normalized = providerId.Trim().ToLowerInvariant();
         if (!_providersById.TryGetValue(normalized, out var provider))
             throw new InvalidOperationException("The live sandbox provider selector is outside the registered reloadable set.");
         return provider;
@@ -402,8 +447,7 @@ internal sealed class ReloadableSandboxProvider :
 
     private ProviderEntry ProviderByScopedId(string providerId)
     {
-        if (string.IsNullOrWhiteSpace(providerId)
-            || providerId.Length > MaximumProviderIdLength
+        if (!SandboxProviderIdPolicy.IsValidOpaque(providerId)
             || !_providersById.TryGetValue(providerId, out var provider))
         {
             throw new InvalidOperationException("The managed sandbox snapshot has an unknown lifecycle provider.");
@@ -496,8 +540,7 @@ internal sealed class ReloadableSandboxProvider :
 
     private static void ValidateRegisteredProviderId(string providerId)
     {
-        if (string.IsNullOrWhiteSpace(providerId)
-            || providerId.Length > MaximumProviderIdLength
+        if (!SandboxProviderIdPolicy.IsValidOpaque(providerId)
             || !char.IsAsciiLetterOrDigit(providerId[0])
             || providerId.Any(c => !(char.IsAsciiLetterLower(c) || char.IsAsciiDigit(c) || c == '-')))
         {
@@ -509,8 +552,10 @@ internal sealed class ReloadableSandboxProvider :
 
     private static void ValidateManagedResourceName(string name)
     {
-        if (string.IsNullOrWhiteSpace(name)
+        if (name is null
+            || name.Length == 0
             || name.Length > MaximumManagedResourceNameLength
+            || string.IsNullOrWhiteSpace(name)
             || name.Any(char.IsControl))
         {
             throw new ArgumentException(
@@ -570,6 +615,20 @@ internal sealed class ReloadableSandboxProvider :
         ?? throw new ArgumentException(
             $"The {providerId} provider does not expose required reloadable-provider capability {typeof(T).Name}.",
             nameof(provider));
+
+    private static SandboxProvisioningDeferredException ScopeRetainedResource(
+        SandboxProvisioningDeferredException exception,
+        string lifecycleProviderId) =>
+        new(
+            provider: exception.Provider,
+            operation: exception.Operation,
+            errorClass: exception.ErrorClass,
+            detail: exception.Detail,
+            recheckIn: exception.RecheckIn,
+            retainedSandboxName: exception.RetainedSandboxName,
+            retainedSandboxLifecycleProviderId: lifecycleProviderId,
+            retainedSandboxHostId: exception.RetainedSandboxHostId,
+            innerException: exception);
 
     internal sealed record ProviderRegistration(
         string Id,

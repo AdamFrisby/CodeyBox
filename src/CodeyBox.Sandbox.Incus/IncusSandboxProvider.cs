@@ -15,12 +15,14 @@ namespace CodeyBox.Sandbox.Incus;
 /// <c>io.bus=virtiofs</c> and never permit Incus's 9p fallback.
 ///
 /// <para>
-/// Host prerequisites: Incus 6.3 or newer (7.0 LTS recommended), Linux
-/// kernel 5.6 or newer for openat2-backed restricted disk paths, KVM, Rust
-/// <c>virtiofsd</c>, membership of the CodeyBox service identity in
-/// <c>incus-admin</c>, a dedicated non-default Incus project, and a
-/// pre-created ZFS or Btrfs pool. A missing project is created with exact
-/// CodeyBox ownership/schema markers and restrictions; an existing project is
+/// Host prerequisites: Incus 6.3 or newer, the upstream requirements for the
+/// installed release, Linux kernel 5.6 or newer for openat2-backed restricted
+/// disk paths, KVM, Rust <c>virtiofsd</c>, membership of the CodeyBox service
+/// identity in <c>incus-admin</c>, a dedicated non-default Incus project, and a
+/// pre-created ZFS or Btrfs pool. The recommended Incus 7.0 LTS release itself
+/// requires Linux 6.12 or newer and QEMU 8.2 or newer. A missing project is
+/// created with exact CodeyBox ownership/schema markers and restrictions; an
+/// existing project is
 /// mutated only when those markers, the shared default-project image catalog,
 /// and required
 /// project-owned profile feature already match exactly. Low-level VM
@@ -76,6 +78,11 @@ public sealed class IncusSandboxProvider :
     private readonly ITimingStore? _timings;
     private readonly ISandboxResourceUsageStore? _resourceUsageStore;
     private readonly IDiskSpaceProbe _diskProbe;
+    private readonly TimeProvider _timeProvider;
+    private readonly Func<Guid> _newGuid;
+    private readonly Func<string, string?> _environmentVariableReader;
+    private readonly string _lifecycleProjectName;
+    private readonly string _lifecycleStagingRootPath;
     private readonly SemaphoreSlim _hostPreflightLock = new(1, 1);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _baselineLocks = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, bool> _activeNames = new(StringComparer.Ordinal);
@@ -91,7 +98,7 @@ public sealed class IncusSandboxProvider :
         ILogger<IncusSandboxProvider> log,
         ITimingStore? timings = null,
         ISandboxResourceUsageStore? resourceUsageStore = null)
-        : this(() => options, log, timings, new IncusCliProcessRunner(), resourceUsageStore)
+        : this(() => options, log, timings, new IncusCliProcessRunner(() => options), resourceUsageStore)
     {
     }
 
@@ -100,7 +107,7 @@ public sealed class IncusSandboxProvider :
         ILogger<IncusSandboxProvider> log,
         ITimingStore? timings = null,
         ISandboxResourceUsageStore? resourceUsageStore = null)
-        : this(optionsAccessor, log, timings, new IncusCliProcessRunner(), resourceUsageStore)
+        : this(optionsAccessor, log, timings, new IncusCliProcessRunner(optionsAccessor), resourceUsageStore)
     {
     }
 
@@ -110,15 +117,23 @@ public sealed class IncusSandboxProvider :
         ITimingStore? timings,
         IProcessRunner runner,
         ISandboxResourceUsageStore? resourceUsageStore = null,
-        IDiskSpaceProbe? diskProbe = null)
+        IDiskSpaceProbe? diskProbe = null,
+        TimeProvider? timeProvider = null,
+        Func<Guid>? newGuid = null,
+        Func<string, string?>? environmentVariableReader = null)
     {
         _optionsAccessor = optionsAccessor ?? throw new ArgumentNullException(nameof(optionsAccessor));
         _log = log ?? throw new ArgumentNullException(nameof(log));
         _timings = timings;
         _resourceUsageStore = resourceUsageStore;
         _diskProbe = diskProbe ?? new DefaultDiskSpaceProbe();
-        _cli = new IncusCliRunner(runner);
-        _ = ReadOptions();
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _newGuid = newGuid ?? Guid.NewGuid;
+        _environmentVariableReader = environmentVariableReader ?? Environment.GetEnvironmentVariable;
+        _cli = new IncusCliRunner(runner, _timeProvider);
+        var initialOptions = ReadValidatedOptions();
+        _lifecycleProjectName = initialOptions.ProjectName;
+        _lifecycleStagingRootPath = ResolveStagingRootPath(initialOptions);
     }
 
     public string Name => ProviderId;
@@ -142,7 +157,7 @@ public sealed class IncusSandboxProvider :
 
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {
-        ArgumentNullException.ThrowIfNull(spec);
+        spec = IncusInputSnapshot.CaptureSpec(spec);
         if (spec.Flavor == SandboxProfileFlavor.Graphical)
             throw new NotSupportedException("The Incus provider currently supports headless work/audit/merge sandboxes only.");
         ValidateResourceLimits(spec.Limits);
@@ -169,7 +184,7 @@ public sealed class IncusSandboxProvider :
         try
         {
             CreateSecurePrivateDirectory(sandboxRoot);
-            IncusMountStaging.InitializeOwnedTree(sandboxRoot, name, DateTimeOffset.UtcNow);
+            IncusMountStaging.InitializeOwnedTree(sandboxRoot, name, _timeProvider.GetUtcNow());
             stagingInitialized = true;
             using var mountPlan = IncusMountStaging.Prepare(
                 options,
@@ -259,7 +274,10 @@ public sealed class IncusSandboxProvider :
                 timingPhase,
                 baselineRef,
                 _resourceUsageStore,
-                MarkInactive);
+                MarkInactive,
+                _timeProvider,
+                _newGuid,
+                ReadOptions);
             if (spec.TimingWorkItemId is { } workItemId)
                 _activeOwners[name] = new ActiveOwner(workItemId, sandbox);
             SandboxLiveCounter.Increment();
@@ -308,7 +326,11 @@ public sealed class IncusSandboxProvider :
     public string? ResolveBaselineRef(string? profileName, SandboxProfileFlavor flavor)
     {
         var options = ReadOptions();
-        if (!options.UseBaselineImages || string.IsNullOrWhiteSpace(profileName))
+        if (!options.UseBaselineImages || profileName is null || profileName.Length == 0)
+            return null;
+        if (profileName.Length > 63)
+            throw new ArgumentException("The Incus network profile name exceeds 63 characters.", nameof(profileName));
+        if (string.IsNullOrWhiteSpace(profileName))
             return null;
         IncusInputValidation.ValidateDeviceName(profileName, nameof(profileName));
         if (!options.NetworkProfiles.ContainsKey(profileName))
@@ -335,15 +357,14 @@ public sealed class IncusSandboxProvider :
         string? baselineNamePrefix,
         string baselineRef)
     {
-        if (string.IsNullOrWhiteSpace(baselineRef) || baselineRef.Length > 63)
+        if (baselineRef is null || baselineRef.Length is < 1 or > 63)
+            return false;
+        if (string.IsNullOrWhiteSpace(baselineRef))
             return false;
         try { IncusInputValidation.ValidateInstanceName(baselineRef, nameof(baselineRef)); }
         catch (ArgumentException) { return false; }
-        if (!IncusBaselineNaming.TryNormalizeEffectivePrefix(baselineNamePrefix, out var prefix)
-            || IncusBaselineNaming.OverlapsBakeCandidateNamespace(prefix))
-        {
+        if (!TryNormalizeOwnedBaselinePrefix(baselineNamePrefix, out var prefix))
             return false;
-        }
         if (!baselineRef.StartsWith(prefix, StringComparison.Ordinal))
             return false;
         var tail = baselineRef[prefix.Length..];
@@ -360,6 +381,53 @@ public sealed class IncusSandboxProvider :
         return profileLength > 0
             && hash.Length == 12
             && hash.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f');
+    }
+
+    /// <summary>
+    /// Classifies the stable structural shape of a durable Incus baseline pin
+    /// for cross-provider routing. This deliberately ignores the live prefix so
+    /// pins survive prefix edits and process restarts. It is not proof that an
+    /// instance exists or is owned; the provider verifies exact metadata,
+    /// profile, flavor, pool, and ready snapshot before use.
+    /// </summary>
+    public static bool IsRoutableBaselineRef(string baselineRef)
+    {
+        if (baselineRef is null || baselineRef.Length is < 1 or > 63)
+            return false;
+        if (string.IsNullOrWhiteSpace(baselineRef))
+            return false;
+        try { IncusInputValidation.ValidateInstanceName(baselineRef, nameof(baselineRef)); }
+        catch (ArgumentException) { return false; }
+        var hashSeparator = baselineRef.LastIndexOf('-');
+        if (hashSeparator < 1)
+            return false;
+        var stem = baselineRef[..hashSeparator];
+        var prefixAndProfileLength = stem.EndsWith("-headless", StringComparison.Ordinal)
+            ? stem.Length - "-headless".Length
+            : stem.EndsWith("-gui", StringComparison.Ordinal)
+                ? stem.Length - "-gui".Length
+                : 0;
+        var hash = baselineRef[(hashSeparator + 1)..];
+        return prefixAndProfileLength > 0
+            && hash.Length == 12
+            && hash.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f');
+    }
+
+    /// <summary>
+    /// Normalizes one configured baseline namespace for durable-pin routing.
+    /// Invalid and reserved bake-candidate-overlapping prefixes fail closed.
+    /// </summary>
+    private static bool TryNormalizeOwnedBaselinePrefix(
+        string? baselineNamePrefix,
+        out string effectivePrefix)
+    {
+        if (!IncusBaselineNaming.TryNormalizeEffectivePrefix(baselineNamePrefix, out effectivePrefix)
+            || IncusBaselineNaming.OverlapsBakeCandidateNamespace(effectivePrefix))
+        {
+            effectivePrefix = string.Empty;
+            return false;
+        }
+        return true;
     }
 
     public async Task<string?> EnsureBaselineImageAsync(
@@ -576,7 +644,7 @@ public sealed class IncusSandboxProvider :
                 MemoryBytes = options.BaselineMemoryBytes,
                 DiskBytes = options.BaselineDiskBytes,
             };
-            var bakeToken = Guid.NewGuid().ToString("N");
+            var bakeToken = NextGuid("baseline bake token").ToString("N");
             var candidateName = CreateBakeCandidateName(baselineName, bakeToken);
             var candidateMayExist = false;
             var published = false;
@@ -662,7 +730,7 @@ public sealed class IncusSandboxProvider :
                     var deleted = await TryDeleteBakeCandidateAsync(options, candidateName, bakeToken).ConfigureAwait(false);
                     if (!deleted && bakeFailure is not null)
                     {
-                        _uncertainBaselines.TryAdd(candidateName, DateTimeOffset.UtcNow);
+                        _uncertainBaselines.TryAdd(candidateName, _timeProvider.GetUtcNow());
                         throw new SandboxProvisioningDeferredException(
                             Name,
                             "baseline-cleanup",
@@ -1030,7 +1098,7 @@ public sealed class IncusSandboxProvider :
         TimeSpan timeout,
         CancellationToken ct)
     {
-        var deadline = DateTimeOffset.UtcNow + timeout;
+        var deadline = _timeProvider.GetUtcNow() + timeout;
         while (true)
         {
             ct.ThrowIfCancellationRequested();
@@ -1045,9 +1113,9 @@ public sealed class IncusSandboxProvider :
                 maxStderrBytes: 4096).ConfigureAwait(false);
             if (probe.Success)
                 return;
-            if (DateTimeOffset.UtcNow >= deadline)
+            if (_timeProvider.GetUtcNow() >= deadline)
                 throw new TimeoutException($"Incus VM '{name}' did not expose its guest agent within {timeout.TotalSeconds:F0} seconds.");
-            await Task.Delay(options.ReadinessPollInterval, ct).ConfigureAwait(false);
+            await Task.Delay(options.ReadinessPollInterval, _timeProvider, ct).ConfigureAwait(false);
         }
     }
 
@@ -1100,7 +1168,7 @@ public sealed class IncusSandboxProvider :
         {
             var mount = mounts[index];
             VerifyPinnedMountSource(options, mount);
-            var deadline = DateTimeOffset.UtcNow + options.MountReadyTimeout;
+            var deadline = _timeProvider.GetUtcNow() + options.MountReadyTimeout;
             var lastReadinessStage = "filesystem type";
             while (true)
             {
@@ -1247,10 +1315,10 @@ public sealed class IncusSandboxProvider :
                     VerifyPinnedMountSource(options, mount);
                     break;
                 }
-                if (DateTimeOffset.UtcNow >= deadline)
+                if (_timeProvider.GetUtcNow() >= deadline)
                     throw new TimeoutException(
                         $"Incus mount '{mount.GuestPath}' did not pass its {lastReadinessStage} readiness check within the configured deadline.");
-                await Task.Delay(options.ReadinessPollInterval, ct).ConfigureAwait(false);
+                await Task.Delay(options.ReadinessPollInterval, _timeProvider, ct).ConfigureAwait(false);
             }
         }
     }
@@ -1382,7 +1450,7 @@ public sealed class IncusSandboxProvider :
         IncusDeviceTopology.Verify(query.Stdout, options, bridge, mounts);
     }
 
-    private static void VerifyPinnedMountSource(
+    private void VerifyPinnedMountSource(
         IncusSandboxOptions options,
         IncusPreparedMount mount)
     {
@@ -1448,7 +1516,7 @@ public sealed class IncusSandboxProvider :
             options.OperationTimeout,
             ct).ConfigureAwait(false);
 
-    private static void AppendCreationMetadata(
+    private void AppendCreationMetadata(
         ICollection<string> argv,
         string kind,
         string? baselineRef,
@@ -1456,7 +1524,7 @@ public sealed class IncusSandboxProvider :
     {
         AddConfig(argv, ManagedKey, "true");
         AddConfig(argv, KindKey, kind);
-        AddConfig(argv, CreatedAtKey, DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture));
+        AddConfig(argv, CreatedAtKey, _timeProvider.GetUtcNow().ToString("O", CultureInfo.InvariantCulture));
         if (baselineRef is not null)
             AddConfig(argv, BaselineRefKey, baselineRef);
         if (baselineHash is not null)
@@ -1564,14 +1632,14 @@ public sealed class IncusSandboxProvider :
         string name,
         CancellationToken ct)
     {
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        deadline.CancelAfter(options.OperationTimeout);
+        using var timeoutCancellation = new CancellationTokenSource(options.OperationTimeout, _timeProvider);
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCancellation.Token);
         try
         {
             while (await FindInstanceAsync(options, name, deadline.Token).ConfigureAwait(false) is not null)
-                await Task.Delay(options.ReadinessPollInterval, deadline.Token).ConfigureAwait(false);
+                await Task.Delay(options.ReadinessPollInterval, _timeProvider, deadline.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && deadline.IsCancellationRequested)
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && timeoutCancellation.IsCancellationRequested)
         {
             throw new TimeoutException(
                 $"Incus reported deleting instance '{name}', but exact absence was not observed within the configured deadline.",
@@ -1704,8 +1772,28 @@ public sealed class IncusSandboxProvider :
 
     private IncusSandboxOptions ReadOptions()
     {
-        var options = _optionsAccessor()
+        var options = ReadValidatedOptions();
+        if (!string.Equals(options.ProjectName, _lifecycleProjectName, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "Incus ProjectName is a provider lifecycle identity and cannot change at runtime. Restart CodeyBox to apply this change.");
+        }
+
+        var stagingRootPath = ResolveStagingRootPath(options);
+        if (!string.Equals(stagingRootPath, _lifecycleStagingRootPath, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "The effective Incus StagingDirectory is a provider lifecycle identity and cannot change at runtime. Restart CodeyBox to apply this change.");
+        }
+
+        return options;
+    }
+
+    private IncusSandboxOptions ReadValidatedOptions()
+    {
+        var supplied = _optionsAccessor()
             ?? throw new InvalidOperationException("Incus options accessor returned null.");
+        var options = IncusInputSnapshot.CaptureOptions(supplied);
         var errors = IncusSandboxOptions.Validate(options);
         if (errors.Count > 0)
             throw new InvalidOperationException("Invalid Incus configuration: " + string.Join(" ", errors));
@@ -1715,6 +1803,10 @@ public sealed class IncusSandboxProvider :
 
     private static string? ResolveBridge(IncusSandboxOptions options, string? profileName)
     {
+        if (profileName is null || profileName.Length == 0)
+            return null;
+        if (profileName.Length > 63)
+            throw new ArgumentException("The Incus network profile name exceeds 63 characters.", nameof(profileName));
         if (string.IsNullOrWhiteSpace(profileName))
             return null;
         IncusInputValidation.ValidateDeviceName(profileName, nameof(profileName));
@@ -1740,34 +1832,63 @@ public sealed class IncusSandboxProvider :
             throw new ArgumentOutOfRangeException(nameof(limits), "Wall-clock limit must be positive and at most seven days.");
     }
 
-    internal static string ResolveImage(IncusSandboxOptions options, string imageReference) =>
-        string.IsNullOrWhiteSpace(imageReference)
-        || string.Equals(imageReference, "ignored", StringComparison.Ordinal)
-            ? options.DefaultImage
-            : imageReference;
+    internal static string ResolveImage(IncusSandboxOptions options, string imageReference)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        if (imageReference is null || imageReference.Length == 0)
+            return options.DefaultImage;
+        _ = IncusInputValidation.GetBoundedUtf8ByteCount(
+            imageReference,
+            4096,
+            nameof(imageReference),
+            "Incus image reference");
+        return string.IsNullOrWhiteSpace(imageReference)
+            || string.Equals(imageReference, "ignored", StringComparison.Ordinal)
+                ? options.DefaultImage
+                : imageReference;
+    }
 
-    private static string ResolveStagingRoot(IncusSandboxOptions options)
+    private string ResolveStagingRoot(IncusSandboxOptions options)
     {
         var path = ResolveStagingRootPath(options);
         IncusMountStaging.EnsureOwnedStagingRoot(path);
         return path;
     }
 
-    private static string ResolveStagingRootPath(IncusSandboxOptions options) =>
+    private string ResolveStagingRootPath(IncusSandboxOptions options) =>
         Path.GetFullPath(string.IsNullOrWhiteSpace(options.StagingDirectory)
             ? ResolveDefaultStagingRoot()
             : options.StagingDirectory);
 
-    private static string ResolveDefaultStagingRoot()
+    private string ResolveDefaultStagingRoot()
     {
-        var stateHome = Environment.GetEnvironmentVariable("XDG_STATE_HOME");
-        if (!string.IsNullOrWhiteSpace(stateHome) && Path.IsPathFullyQualified(stateHome))
+        var stateHome = _environmentVariableReader("XDG_STATE_HOME");
+        if (stateHome is not null && IsBoundedAbsoluteEnvironmentPath(stateHome))
             return Path.Combine(stateHome, "codeybox", "incus-staging");
-        var home = Environment.GetEnvironmentVariable("HOME");
-        if (!string.IsNullOrWhiteSpace(home) && Path.IsPathFullyQualified(home))
+        var home = _environmentVariableReader("HOME");
+        if (home is not null && IsBoundedAbsoluteEnvironmentPath(home))
             return Path.Combine(home, ".local", "state", "codeybox", "incus-staging");
         throw new InvalidOperationException(
             "Incus StagingDirectory must be configured when neither XDG_STATE_HOME nor HOME is an absolute path.");
+    }
+
+    private static bool IsBoundedAbsoluteEnvironmentPath(string? value)
+    {
+        if (value is null || value.Length is < 1 or > 4096)
+            return false;
+        try
+        {
+            _ = IncusInputValidation.GetBoundedUtf8ByteCount(
+                value,
+                4096,
+                nameof(value),
+                "Incus staging environment path");
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        return !string.IsNullOrWhiteSpace(value) && Path.IsPathFullyQualified(value);
     }
 
     private static void CreateSecurePrivateDirectory(string path)
@@ -1790,11 +1911,11 @@ public sealed class IncusSandboxProvider :
         }
     }
 
-    private static string CreateInstanceName(IncusSandboxOptions options)
+    private string CreateInstanceName(IncusSandboxOptions options)
     {
         const int virtiofsProjectAndInstanceBudget = 63;
         const int randomSuffixLength = 20;
-        var suffix = Guid.NewGuid().ToString("N")[..randomSuffixLength];
+        var suffix = NextGuid("sandbox instance name").ToString("N")[..randomSuffixLength];
         var normalized = NormalizedPrefix(options.InstanceNamePrefix);
         var maximumInstanceLength = virtiofsProjectAndInstanceBudget - options.ProjectName.Length;
         var maximumPrefixLength = maximumInstanceLength - suffix.Length;
@@ -1802,7 +1923,17 @@ public sealed class IncusSandboxProvider :
             throw new InvalidOperationException("The Incus project name leaves no safe virtiofs socket-path space for an instance name.");
         if (normalized.Length > maximumPrefixLength)
             normalized = normalized[..maximumPrefixLength];
-        return normalized + suffix;
+        var name = normalized + suffix;
+        IncusInputValidation.ValidateInstanceName(name, "generated instance name");
+        return name;
+    }
+
+    private Guid NextGuid(string purpose)
+    {
+        var value = _newGuid();
+        if (value == Guid.Empty)
+            throw new InvalidOperationException($"The injected GUID source returned an empty value for {purpose}.");
+        return value;
     }
 
     private static string BuildMountDeviceName(int index)
@@ -1834,9 +1965,23 @@ public sealed class IncusSandboxProvider :
     private static bool ProjectListContains(string json, string projectName)
     {
         using var document = JsonDocument.Parse(json);
-        return document.RootElement.EnumerateArray().Any(element =>
-            element.TryGetProperty("name", out var name)
-            && string.Equals(name.GetString(), projectName, StringComparison.Ordinal));
+        if (document.RootElement.ValueKind != JsonValueKind.Array)
+            throw new JsonException("Incus project inventory must be a JSON array.");
+
+        foreach (var element in document.RootElement.EnumerateArray())
+        {
+            if (element.ValueKind != JsonValueKind.Object
+                || !element.TryGetProperty("name", out var nameElement)
+                || nameElement.ValueKind != JsonValueKind.String
+                || string.IsNullOrEmpty(nameElement.GetString()))
+            {
+                throw new JsonException(
+                    "Every Incus project inventory entry must contain a non-empty string property named 'name'.");
+            }
+            if (string.Equals(nameElement.GetString(), projectName, StringComparison.Ordinal))
+                return true;
+        }
+        return false;
     }
 
     private static IncusStoragePoolInfo? ParseStoragePool(string json, string poolName)
@@ -1859,17 +2004,33 @@ public sealed class IncusSandboxProvider :
     private static IReadOnlyList<IncusInstanceInfo> ParseInstances(string json)
     {
         using var document = JsonDocument.Parse(json);
+        if (document.RootElement.ValueKind != JsonValueKind.Array)
+            throw new JsonException("Incus instance inventory must be a JSON array.");
+
         var result = new List<IncusInstanceInfo>();
         foreach (var element in document.RootElement.EnumerateArray())
         {
-            if (!element.TryGetProperty("name", out var nameElement) || nameElement.GetString() is not { } name)
-                continue;
+            if (element.ValueKind != JsonValueKind.Object
+                || !element.TryGetProperty("name", out var nameElement)
+                || nameElement.ValueKind != JsonValueKind.String
+                || string.IsNullOrEmpty(nameElement.GetString()))
+            {
+                throw new JsonException(
+                    "Every Incus instance inventory entry must contain a non-empty string property named 'name'.");
+            }
+            if (!element.TryGetProperty("type", out var typeElement)
+                || typeElement.ValueKind != JsonValueKind.String
+                || string.IsNullOrEmpty(typeElement.GetString()))
+            {
+                throw new JsonException(
+                    "Every Incus instance inventory entry must contain a non-empty string property named 'type'.");
+            }
+            var name = nameElement.GetString()!;
             var status = element.TryGetProperty("status", out var statusElement)
+                && statusElement.ValueKind == JsonValueKind.String
                 ? statusElement.GetString() ?? string.Empty
                 : string.Empty;
-            var type = element.TryGetProperty("type", out var typeElement)
-                ? typeElement.GetString() ?? string.Empty
-                : string.Empty;
+            var type = typeElement.GetString()!;
             result.Add(new IncusInstanceInfo(name, status, type, ParseConfig(element)));
         }
         return result;
@@ -1879,11 +2040,12 @@ public sealed class IncusSandboxProvider :
     {
         var result = new Dictionary<string, string>(StringComparer.Ordinal);
         if (!element.TryGetProperty("config", out var config) || config.ValueKind != JsonValueKind.Object)
-            return result;
+            throw new JsonException("Incus inventory entries must contain a JSON object property named 'config'.");
         foreach (var property in config.EnumerateObject())
         {
-            if (property.Value.ValueKind == JsonValueKind.String)
-                result[property.Name] = property.Value.GetString() ?? string.Empty;
+            if (property.Value.ValueKind != JsonValueKind.String)
+                throw new JsonException("Incus inventory config values must be strings.");
+            result[property.Name] = property.Value.GetString() ?? string.Empty;
         }
         return result;
     }

@@ -66,8 +66,9 @@ internal static class IncusBaselineNaming
     internal static bool TryNormalizeEffectivePrefix(string? configuredPrefix, out string prefix)
     {
         prefix = string.Empty;
+        if (configuredPrefix is null || configuredPrefix.Length is < 1 or > 32)
+            return false;
         if (string.IsNullOrWhiteSpace(configuredPrefix)
-            || configuredPrefix.Length > 32
             || configuredPrefix.Any(char.IsControl)
             || !char.IsAsciiLetterOrDigit(configuredPrefix[0])
             || configuredPrefix.Any(c => !(char.IsAsciiLetterOrDigit(c) || c == '-')))
@@ -294,6 +295,48 @@ internal static class IncusCommandBuilder
 
 internal static class IncusInputValidation
 {
+    private static readonly UTF8Encoding StrictUtf8 = new(
+        encoderShouldEmitUTF8Identifier: false,
+        throwOnInvalidBytes: true);
+
+    /// <summary>
+    /// Counts strict UTF-8 only after a constant-time length rejection. Because
+    /// every valid UTF-16 code unit contributes at least one UTF-8 byte, a
+    /// character count above the byte budget can be rejected without scanning
+    /// caller-owned text.
+    /// </summary>
+    internal static int GetBoundedUtf8ByteCount(
+        string value,
+        int maximumUtf8Bytes,
+        string parameterName,
+        string description)
+    {
+        ArgumentNullException.ThrowIfNull(value, parameterName);
+        if (maximumUtf8Bytes < 0)
+            throw new ArgumentOutOfRangeException(nameof(maximumUtf8Bytes));
+        if (value.Length > maximumUtf8Bytes)
+        {
+            throw new ArgumentException(
+                $"{description} exceeds the {maximumUtf8Bytes}-byte UTF-8 safety bound.",
+                parameterName);
+        }
+        try
+        {
+            var bytes = StrictUtf8.GetByteCount(value);
+            if (bytes > maximumUtf8Bytes)
+            {
+                throw new ArgumentException(
+                    $"{description} exceeds the {maximumUtf8Bytes}-byte UTF-8 safety bound.",
+                    parameterName);
+            }
+            return bytes;
+        }
+        catch (EncoderFallbackException ex)
+        {
+            throw new ArgumentException($"{description} is not valid Unicode.", parameterName, ex);
+        }
+    }
+
     internal static void ValidateOptionsIdentity(IncusSandboxOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -318,16 +361,19 @@ internal static class IncusInputValidation
 
     internal static void ValidateBridgeName(string value, string parameterName)
     {
+        if (value is null || value.Length is < 1 or > 15)
+            throw new ArgumentException("The bridge must be a valid Linux interface name of at most 15 characters.", parameterName);
         if (string.IsNullOrWhiteSpace(value)
-            || value.Length > 15
             || value.Any(c => !(char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.')))
             throw new ArgumentException("The bridge must be a valid Linux interface name of at most 15 characters.", parameterName);
     }
 
     internal static void ValidateAbsoluteHostPath(string value, string parameterName)
     {
+        if (value is null || value.Length is < 1 or > 4096)
+            throw new ArgumentException("The host source must be a fully-qualified path without NUL.", parameterName);
+        _ = GetBoundedUtf8ByteCount(value, 4096, parameterName, "Host source path");
         if (string.IsNullOrWhiteSpace(value)
-            || value.Length > 4096
             || value.Any(char.IsControl)
             || !Path.IsPathFullyQualified(value))
             throw new ArgumentException("The host source must be a fully-qualified path without NUL.", parameterName);
@@ -344,8 +390,14 @@ internal static class IncusInputValidation
         string parameterName,
         int maximumLength = 4096)
     {
+        if (value is null || value.Length is < 1 || value.Length > maximumLength)
+        {
+            throw new ArgumentException(
+                $"The argument must be non-empty, at most {maximumLength} characters, must not start with '-', and must contain no control characters.",
+                parameterName);
+        }
+        _ = GetBoundedUtf8ByteCount(value, maximumLength, parameterName, "Opaque argument");
         if (string.IsNullOrWhiteSpace(value)
-            || value.Length > maximumLength
             || value.StartsWith("-", StringComparison.Ordinal)
             || value.Contains('\0')
             || value.Any(c => char.IsControl(c)))
@@ -362,8 +414,9 @@ internal static class IncusInputValidation
         int maxLength,
         bool allowDotAndUnderscore)
     {
+        if (value is null || value.Length is < 1 || value.Length > maxLength)
+            throw new ArgumentException("The identifier contains unsupported characters or has an invalid length.", parameterName);
         if (string.IsNullOrWhiteSpace(value)
-            || value.Length > maxLength
             || !char.IsAsciiLetterOrDigit(value[0])
             || !char.IsAsciiLetterOrDigit(value[^1])
             || value.Any(c => !(char.IsAsciiLetterOrDigit(c)

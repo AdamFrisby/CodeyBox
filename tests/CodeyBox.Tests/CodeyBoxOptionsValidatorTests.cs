@@ -9,6 +9,33 @@ namespace CodeyBox.Tests;
 
 public sealed class CodeyBoxOptionsValidatorTests
 {
+    [Theory]
+    [InlineData(0)]
+    [InlineData(DeepAuditFailurePersistenceOptions.MaximumMaxAttempts + 1)]
+    public void Validate_RejectsOutOfRangeDeepAuditFailurePersistenceAttempts(int maxAttempts)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.DeepAuditFailurePersistence.MaxAttempts = maxAttempts;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:DeepAuditFailurePersistence:MaxAttempts", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsOutOfRangeDeepAuditFailurePersistenceRetryDelay()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.DeepAuditFailurePersistence.RetryDelay =
+            DeepAuditFailurePersistenceOptions.MaximumRetryDelay + TimeSpan.FromMilliseconds(1);
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:DeepAuditFailurePersistence:RetryDelay", result.FailureMessage);
+    }
+
     [Fact]
     public void Validate_AllowsUniqueRegisteredRetainedSandboxProviders()
     {
@@ -37,7 +64,7 @@ public sealed class CodeyBoxOptionsValidatorTests
     }
 
     [Fact]
-    public void Validate_RejectsOversizedRetainedSandboxProviderInventoryBeforeIteration()
+    public void Validate_RejectsOversizedRetainedSandboxProviderInventoryAtEnumerationBound()
     {
         var options = ValidCodeyBoxOptions();
         options.SandboxProviderCutover.RetainedInventoryProviders = Enumerable
@@ -48,6 +75,30 @@ public sealed class CodeyBoxOptionsValidatorTests
 
         Assert.True(result.Failed);
         Assert.Contains("must contain at most", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsHugeSandboxProviderSelectorBeforeNormalization()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.SandboxProvider = new string(' ', 1_000_000);
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:SandboxProvider is invalid", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsHugeRetainedProviderIdAtBoundedEntryGuard()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.SandboxProviderCutover.RetainedInventoryProviders = [new string(' ', 1_000_000)];
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("RetainedInventoryProviders:0", result.FailureMessage);
     }
 
     [Fact]

@@ -219,6 +219,19 @@ public sealed class IncusIntegrationTests
             Assert.True(exec.Success, exec.Stderr);
             Assert.Equal("incus-exec-ok\n", exec.Stdout);
 
+            var secret = $"incus-secret-{token}";
+            var secretEnvironment = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["printenv", "CODEYBOX_INCUS_TEST_SECRET"],
+                ExtraEnvironment = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["CODEYBOX_INCUS_TEST_SECRET"] = secret,
+                },
+                EnvironmentContainsSecrets = true,
+            });
+            Assert.True(secretEnvironment.Success, secretEnvironment.Stderr);
+            Assert.Equal(secret, secretEnvironment.Stdout.Trim());
+
             var identity = await sandbox.ExecAsync(new SandboxExec { Argv = ["id", "-u"] });
             Assert.True(identity.Success, identity.Stderr);
             Assert.Equal(options.GuestUserId.ToString(System.Globalization.CultureInfo.InvariantCulture), identity.Stdout.Trim());

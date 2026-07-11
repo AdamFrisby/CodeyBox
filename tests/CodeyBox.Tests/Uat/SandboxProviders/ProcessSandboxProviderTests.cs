@@ -126,6 +126,27 @@ public sealed class ProcessSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task ExecAsync_EnvironmentRemovalWinsAndSpecVariableIsAbsent()
+    {
+        var provider = new ProcessSandboxProvider(new RecordingLogger<ProcessSandboxProvider>());
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Environment = new Dictionary<string, string> { ["REMOVE_ME"] = "spec-value" },
+        });
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "if [ \"${REMOVE_ME+x}\" = x ]; then printf present; else printf absent; fi"],
+            ExtraEnvironment = new Dictionary<string, string> { ["REMOVE_ME"] = "exec-value" },
+            EnvironmentVariablesToUnset = ["REMOVE_ME"],
+        });
+
+        Assert.True(result.Success, result.Stderr);
+        Assert.Equal("absent", result.Stdout.TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
     public async Task ExecAsync_TranslatesSandboxAbsolutePathEntriesInPathEnvironment()
     {
         var provider = new ProcessSandboxProvider(new RecordingLogger<ProcessSandboxProvider>());

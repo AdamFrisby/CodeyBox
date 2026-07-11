@@ -21,7 +21,7 @@ public sealed class MultipassArgvOverflowTests : IDisposable
     }
 
     [Fact]
-    public async Task ExecAsync_SmallExtraEnvironment_PreservesInlineArgvOrdering()
+    public async Task ExecAsync_EnvironmentRemovalUsesGuestFileAfterEnvironmentMerge()
     {
         var runner = new RecordingProcessRunner();
         var sandbox = NewSandbox(runner);
@@ -34,18 +34,20 @@ public sealed class MultipassArgvOverflowTests : IDisposable
                 ["A"] = "one",
                 ["B"] = "two",
             },
+            EnvironmentVariablesToUnset = ["A"],
         });
 
         Assert.True(result.Success);
-        var exec = Assert.Single(runner.Calls);
-        Assert.Equal(
-            [
-                "multipass", "exec", "codeybox-test", "--",
-                "/usr/local/bin/codeybox-exec", "/work",
-                "env", "A=one", "B=two",
-                "echo", "ok",
-            ],
-            exec.Argv);
+        var exec = runner.Calls.Single(call =>
+            call.Argv is ["multipass", "exec", "codeybox-test", "--", "/usr/local/bin/codeybox-exec", ..]);
+        Assert.Contains("--env-file", exec.Argv);
+        Assert.DoesNotContain(exec.Argv, static argument => argument.StartsWith("A=", StringComparison.Ordinal));
+        var transfer = Assert.Single(
+            runner.Transfers,
+            item => item.Destination.Contains(".codeybox-exec-env/", StringComparison.Ordinal));
+        Assert.DoesNotContain("A='one'", transfer.Content, StringComparison.Ordinal);
+        Assert.Contains("B='two'", transfer.Content, StringComparison.Ordinal);
+        Assert.Contains("unset -- 'A'", transfer.Content, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -77,6 +79,23 @@ public sealed class MultipassArgvOverflowTests : IDisposable
             item => item.Destination.Contains(".codeybox-exec-env/", StringComparison.Ordinal));
         Assert.Contains(secret, transfer.Content, StringComparison.Ordinal);
         Assert.False(File.Exists(transfer.Source));
+    }
+
+    [Fact]
+    public async Task ExecAsync_EnvironmentRemovalTransferFailureFailsClosedBeforeLaunch()
+    {
+        var runner = new RecordingProcessRunner { FailEnvironmentTransfer = true };
+        var sandbox = NewSandbox(runner);
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["printenv", "REMOVE_ME"],
+            EnvironmentVariablesToUnset = ["REMOVE_ME"],
+        }));
+
+        Assert.Contains("environment delivery failed", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(runner.Calls, call =>
+            call.Argv is ["multipass", "exec", "codeybox-test", "--", "/usr/local/bin/codeybox-exec", ..]);
     }
 
     [Fact]
@@ -185,6 +204,7 @@ public sealed class MultipassArgvOverflowTests : IDisposable
     {
         public List<RecordedCall> Calls { get; } = [];
         public List<RecordedTransfer> Transfers { get; } = [];
+        public bool FailEnvironmentTransfer { get; init; }
 
         public Task<ProcessRunResult> RunAsync(
             IReadOnlyList<string> argv,
@@ -202,7 +222,14 @@ public sealed class MultipassArgvOverflowTests : IDisposable
                 stdin,
                 environment is null ? null : new Dictionary<string, string>(environment, StringComparer.Ordinal)));
             if (argv is ["multipass", "transfer", var source, var destination])
+            {
                 Transfers.Add(new RecordedTransfer(source, destination, File.ReadAllText(source)));
+                if (FailEnvironmentTransfer
+                    && destination.Contains(".codeybox-exec-env/", StringComparison.Ordinal))
+                {
+                    return Task.FromResult(new ProcessRunResult(1, "", "synthetic transfer failure"));
+                }
+            }
             stdoutChunkCallback?.Invoke("ok\n");
             return Task.FromResult(new ProcessRunResult(0, "ok\n", ""));
         }

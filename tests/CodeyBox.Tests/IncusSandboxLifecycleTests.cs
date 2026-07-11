@@ -2,11 +2,61 @@ using CodeyBox.Core;
 using CodeyBox.HostProcess;
 using CodeyBox.Sandbox.Incus;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Text.Json;
+using ControllableTimeProvider = Microsoft.Extensions.Time.Testing.FakeTimeProvider;
 
 namespace CodeyBox.Tests;
 
 public sealed class IncusSandboxLifecycleTests
 {
+    [Fact]
+    public void OptionsAccessor_RejectsChangedProjectIdentityBeforeCallingIncus()
+    {
+        var stagingRoot = Path.Combine(Path.GetTempPath(), $"codeybox-incus-identity-{Guid.NewGuid():N}");
+        var options = new IncusSandboxOptions
+        {
+            StagingDirectory = stagingRoot,
+            DiskGuard = null,
+        };
+        var runner = new ScriptedLifecycleRunner((_, _, _) =>
+            throw new InvalidOperationException("Incus must not be called"));
+        var provider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner);
+
+        options = options with { ProjectName = "codeybox-reloaded" };
+
+        var exception = Assert.Throws<InvalidOperationException>(provider.SampleDiskGuardState);
+        Assert.Contains("ProjectName", exception.Message, StringComparison.Ordinal);
+        Assert.Empty(runner.Commands);
+    }
+
+    [Fact]
+    public void OptionsAccessor_RejectsChangedEffectiveStagingIdentityBeforeCallingIncus()
+    {
+        var stagingRoot = Path.Combine(Path.GetTempPath(), $"codeybox-incus-identity-{Guid.NewGuid():N}");
+        var options = new IncusSandboxOptions
+        {
+            StagingDirectory = stagingRoot,
+            DiskGuard = null,
+        };
+        var runner = new ScriptedLifecycleRunner((_, _, _) =>
+            throw new InvalidOperationException("Incus must not be called"));
+        var provider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner);
+
+        options = options with { StagingDirectory = stagingRoot + "-reloaded" };
+
+        var exception = Assert.Throws<InvalidOperationException>(provider.SampleDiskGuardState);
+        Assert.Contains("StagingDirectory", exception.Message, StringComparison.Ordinal);
+        Assert.Empty(runner.Commands);
+    }
+
     [Fact]
     public async Task Create_RejectsOversizedSpecEnvironmentBeforeCallingIncus()
     {
@@ -40,7 +90,7 @@ public sealed class IncusSandboxLifecycleTests
         var exception = Assert.Throws<ArgumentException>(() =>
             IncusSandbox.SerializeEnvironment(environment));
 
-        Assert.Contains("16 MiB safety bound", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("UTF-8 safety bound", exception.Message, StringComparison.Ordinal);
         Assert.Equal(
             "A=x\0",
             IncusSandbox.SerializeEnvironment(
@@ -146,10 +196,12 @@ public sealed class IncusSandboxLifecycleTests
     public async Task Dispose_CapturesAndPersistsResourceMetricsBeforeCheckedCleanup()
     {
         const string sandboxName = "codeybox-metrics-test";
+        var capturedAt = new DateTimeOffset(2026, 7, 12, 1, 2, 3, TimeSpan.Zero);
+        var time = new ControllableTimeProvider(capturedAt);
         var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-metrics-{Guid.NewGuid():N}");
         var sandboxRoot = Path.Combine(root, sandboxName);
         Directory.CreateDirectory(sandboxRoot);
-        IncusMountStaging.InitializeOwnedTree(sandboxRoot, sandboxName, DateTimeOffset.UtcNow);
+        IncusMountStaging.InitializeOwnedTree(sandboxRoot, sandboxName, capturedAt);
         var runner = new MetricsLifecycleRunner(sandboxName);
         var store = new RecordingUsageStore();
         var workItemId = WorkItemId.New();
@@ -169,31 +221,43 @@ public sealed class IncusSandboxLifecycleTests
                 Network = new SandboxNetworkPolicy { ProfileName = "internet-only" },
             },
             options,
-            new IncusCliRunner(runner),
+            new IncusCliRunner(runner, time),
             NullLogger.Instance,
             timings: null,
             workItemId,
             "work",
             "baseline-ref",
             store,
-            _ => Interlocked.Increment(ref disposed));
-        var liveBefore = SandboxLiveCounter.Active;
+            _ => Interlocked.Increment(ref disposed),
+            timeProvider: time);
         SandboxLiveCounter.Increment();
+        try
+        {
+            await sandbox.DisposeAsync();
 
-        await sandbox.DisposeAsync();
-
-        Assert.Equal(liveBefore, SandboxLiveCounter.Active);
-        Assert.Equal(1, disposed);
-        Assert.False(Directory.Exists(sandboxRoot));
-        Assert.Contains(runner.Commands, command => command.Contains("delete", StringComparer.Ordinal));
-        var metrics = Assert.IsType<SandboxResourceMetrics>(sandbox.ResourceMetrics);
-        Assert.Equal(12.5, metrics.UptimeSeconds);
-        Assert.Equal(37.25, metrics.AvgCpuPercent);
-        Assert.Equal(1048576, metrics.PeakRamBytes);
-        var record = Assert.Single(store.Records);
-        Assert.Equal(workItemId, record.WorkItemId);
-        Assert.Equal(1, record.PeakRamMb);
-        Assert.Equal("baseline-ref", record.BaselineRef);
+            Assert.Equal(1, disposed);
+            Assert.False(Directory.Exists(sandboxRoot));
+            Assert.Contains(runner.Commands, command => command.Contains("delete", StringComparer.Ordinal));
+            var metrics = Assert.IsType<SandboxResourceMetrics>(sandbox.ResourceMetrics);
+            Assert.Equal(12.5, metrics.UptimeSeconds);
+            Assert.Equal(37.25, metrics.AvgCpuPercent);
+            Assert.Equal(1048576, metrics.PeakRamBytes);
+            Assert.Equal(capturedAt, metrics.CapturedAt);
+            var record = Assert.Single(store.Records);
+            Assert.Equal(workItemId, record.WorkItemId);
+            Assert.Equal(1, record.PeakRamMb);
+            Assert.Equal("baseline-ref", record.BaselineRef);
+        }
+        finally
+        {
+            // The process-global gauge has dedicated exclusive-collection
+            // coverage. This lifecycle test observes its own transition via
+            // the callback and only balances a failed pre-notification path.
+            if (Volatile.Read(ref disposed) == 0)
+                SandboxLiveCounter.Decrement();
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
     }
 
     [Fact]
@@ -221,24 +285,33 @@ public sealed class IncusSandboxLifecycleTests
             baselineRef: null,
             resourceUsageStore: null,
             _ => Interlocked.Increment(ref inactive));
-        var liveBefore = SandboxLiveCounter.Active;
         SandboxLiveCounter.Increment();
-
-        await Assert.ThrowsAnyAsync<Exception>(() => sandbox.DisposeAsync().AsTask());
-        Assert.Equal(1, inactive);
-        Assert.Equal(liveBefore, SandboxLiveCounter.Active);
-        await Assert.ThrowsAsync<InvalidOperationException>(() => sandbox.ExecAsync(new SandboxExec
+        try
         {
-            Argv = ["true"],
-        }));
+            await Assert.ThrowsAnyAsync<Exception>(() => sandbox.DisposeAsync().AsTask());
+            Assert.Equal(1, inactive);
+            await Assert.ThrowsAsync<InvalidOperationException>(() => sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["true"],
+            }));
 
-        IncusMountStaging.InitializeOwnedTree(sandboxRoot, sandboxName, DateTimeOffset.UtcNow);
-        await sandbox.DisposeAsync();
+            IncusMountStaging.InitializeOwnedTree(sandboxRoot, sandboxName, DateTimeOffset.UtcNow);
+            await sandbox.DisposeAsync();
 
-        Assert.False(Directory.Exists(sandboxRoot));
-        Assert.Equal(1, runner.DeleteCalls);
-        Assert.Equal(1, inactive);
-        Assert.Equal(liveBefore, SandboxLiveCounter.Active);
+            Assert.False(Directory.Exists(sandboxRoot));
+            Assert.Equal(1, runner.DeleteCalls);
+            Assert.Equal(1, inactive);
+        }
+        finally
+        {
+            // NotifyNoLongerActive is asserted through the sandbox-local
+            // callback; do not snapshot the process-global gauge while other
+            // sandbox tests legitimately mutate it in parallel.
+            if (Volatile.Read(ref inactive) == 0)
+                SandboxLiveCounter.Decrement();
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
     }
 
     [Fact]
@@ -364,14 +437,64 @@ public sealed class IncusSandboxLifecycleTests
     }
 
     [Fact]
+    public async Task ListBaselineImagesAsync_MalformedProjectRowThrowsInsteadOfReturningFalseEmpty()
+    {
+        var runner = new ScriptedLifecycleRunner((argv, _, _) =>
+            argv.SequenceEqual(["incus", "project", "list", "--format=json"])
+                ? Task.FromResult(Success("[{}]"))
+                : throw new InvalidOperationException($"Unexpected Incus command: {string.Join(' ', argv)}"));
+        var provider = new IncusSandboxProvider(
+            () => new IncusSandboxOptions { DiskGuard = null },
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner);
+
+        await Assert.ThrowsAsync<JsonException>(() =>
+            provider.ListBaselineImagesAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ListBaselineImagesAsync_MalformedInstanceRowThrowsInsteadOfReturningPartialInventory()
+    {
+        var stagingRoot = Path.Combine(Path.GetTempPath(), $"codeybox-incus-inventory-{Guid.NewGuid():N}");
+        var runner = new ScriptedLifecycleRunner((argv, _, _) =>
+        {
+            if (argv.SequenceEqual(["incus", "project", "list", "--format=json"]))
+                return Task.FromResult(Success("[{\"name\":\"codeybox\"}]"));
+            if (argv.SequenceEqual(["incus", "query", "/1.0/projects/codeybox"]))
+                return Task.FromResult(Success(ManagedProjectQuery(stagingRoot)));
+            if (argv.Contains("list", StringComparer.Ordinal))
+                return Task.FromResult(Success("[{}]"));
+            throw new InvalidOperationException($"Unexpected Incus command: {string.Join(' ', argv)}");
+        });
+        var provider = new IncusSandboxProvider(
+            () => new IncusSandboxOptions
+            {
+                StagingDirectory = stagingRoot,
+                DiskGuard = null,
+            },
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner);
+
+        await Assert.ThrowsAsync<JsonException>(() =>
+            provider.ListBaselineImagesAsync(CancellationToken.None));
+    }
+
+    [Fact]
     public async Task Create_WhenDaemonCompletionIsUncertain_RetainsNamedStagingForReaper()
     {
-        var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-retained-{Guid.NewGuid():N}");
-        IncusMountStaging.EnsureOwnedStagingRoot(root);
+        var stateHome = Path.Combine(Path.GetTempPath(), $"codeybox-incus-state-{Guid.NewGuid():N}");
+        var root = Path.Combine(stateHome, "codeybox", "incus-staging");
+        Directory.CreateDirectory(Path.GetDirectoryName(root)!);
+        var createdAt = new DateTimeOffset(2026, 7, 12, 4, 5, 6, TimeSpan.Zero);
+        var time = new ControllableTimeProvider(createdAt);
+        var generatedId = Guid.Parse("11111111-2222-3333-4444-555555555555");
+        var environmentReads = new List<string>();
         var runner = new UncertainCreateRunner();
         var options = new IncusSandboxOptions
         {
-            StagingDirectory = root,
+            StagingDirectory = null,
             UseBaselineImages = false,
             DiskGuard = null,
         };
@@ -379,22 +502,33 @@ public sealed class IncusSandboxLifecycleTests
             () => options,
             NullLogger<IncusSandboxProvider>.Instance,
             timings: null,
-            runner);
+            runner,
+            timeProvider: time,
+            newGuid: () => generatedId,
+            environmentVariableReader: name =>
+            {
+                environmentReads.Add(name);
+                return string.Equals(name, "XDG_STATE_HOME", StringComparison.Ordinal)
+                    ? stateHome
+                    : null;
+            });
 
         var deferred = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
             provider.CreateAsync(new SandboxSpec { ImageReference = "local-image" }));
 
         Assert.Equal("create-cleanup", deferred.Operation);
-        Assert.False(string.IsNullOrWhiteSpace(deferred.RetainedSandboxName));
+        Assert.Equal("codeybox-11111111222233334444", deferred.RetainedSandboxName);
         var retained = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
         Assert.Equal(deferred.RetainedSandboxName, retained.Name);
-        Assert.NotNull(retained.CreatedAt);
+        Assert.Equal(createdAt, retained.CreatedAt);
+        Assert.Contains("XDG_STATE_HOME", environmentReads);
+        Assert.DoesNotContain("HOME", environmentReads);
         Assert.True(Directory.Exists(Path.Combine(root, retained.Name)));
 
         await provider.DisposeLeakedAsync(retained.Name, CancellationToken.None);
         Assert.Empty(await provider.ListAllManagedAsync(CancellationToken.None));
         Assert.False(Directory.Exists(Path.Combine(root, retained.Name)));
-        Directory.Delete(root, recursive: true);
+        Directory.Delete(stateHome, recursive: true);
     }
 
     [Fact]
@@ -435,10 +569,13 @@ public sealed class IncusSandboxLifecycleTests
     public async Task Exec_UsesExecTimeoutAndCleansVerifiedCompletionSentinel()
     {
         const string sandboxName = "codeybox-exec-timeout";
+        var controlId = Guid.Parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        var generatedIds = 0;
         var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-exec-timeout-{Guid.NewGuid():N}");
         var completionPullCalls = 0;
         var wrapperExecCalls = 0;
         var forcedStopCalls = 0;
+        var environmentAbsenceChecks = 0;
         var runner = new ScriptedLifecycleRunner(async (argv, _, ct) =>
         {
             if (IsFileCommand(argv, "push"))
@@ -459,7 +596,14 @@ public sealed class IncusSandboxLifecycleTests
             if (IsFileCommand(argv, "delete"))
                 return Success();
             if (IsGuestCommand(argv, "test"))
+            {
+                if (argv.Any(argument => argument.Contains("/env-", StringComparison.Ordinal))
+                    && ++environmentAbsenceChecks == 1)
+                {
+                    return Failure();
+                }
                 return Success();
+            }
             if (argv.Contains("stop", StringComparer.Ordinal))
             {
                 forcedStopCalls++;
@@ -473,8 +617,18 @@ public sealed class IncusSandboxLifecycleTests
         {
             OperationTimeout = TimeSpan.FromMilliseconds(25),
             ExecTimeout = TimeSpan.FromSeconds(2),
+            ExecControlFileCleanupAttempts = 2,
         };
-        var sandbox = CreateSandbox(sandboxName, root, options, runner);
+        var sandbox = CreateSandbox(
+            sandboxName,
+            root,
+            options,
+            runner,
+            newGuid: () =>
+            {
+                generatedIds++;
+                return controlId;
+            });
 
         try
         {
@@ -485,14 +639,234 @@ public sealed class IncusSandboxLifecycleTests
             Assert.Equal(1, wrapperExecCalls);
             Assert.Equal(1, completionPullCalls);
             Assert.Equal(0, forcedStopCalls);
+            Assert.Equal(2, environmentAbsenceChecks);
+            Assert.Equal(1, generatedIds);
             var deletedControlFiles = runner.Commands
                 .Where(command => IsFileCommand(command, "delete"))
                 .Select(command => command[^1])
                 .ToArray();
-            Assert.Equal(3, deletedControlFiles.Length);
-            Assert.Contains(deletedControlFiles, path => path.Contains("/env-", StringComparison.Ordinal));
-            Assert.Contains(deletedControlFiles, path => path.Contains("/pid-", StringComparison.Ordinal));
-            Assert.Contains(deletedControlFiles, path => path.Contains("/complete-", StringComparison.Ordinal));
+            Assert.Equal(4, deletedControlFiles.Length);
+            Assert.Contains(deletedControlFiles, path => path.EndsWith("/env-aaaaaaaabbbbccccddddeeeeeeeeeeee", StringComparison.Ordinal));
+            Assert.Contains(deletedControlFiles, path => path.EndsWith("/pid-aaaaaaaabbbbccccddddeeeeeeeeeeee", StringComparison.Ordinal));
+            Assert.Contains(deletedControlFiles, path => path.EndsWith("/complete-aaaaaaaabbbbccccddddeeeeeeeeeeee", StringComparison.Ordinal));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Exec_RejectsEmptyInjectedControlIdBeforeCallingIncus()
+    {
+        const string sandboxName = "codeybox-empty-control-id";
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-empty-id-{Guid.NewGuid():N}");
+        var runner = new ScriptedLifecycleRunner((_, _, _) =>
+            throw new InvalidOperationException("Incus must not be called for an invalid generated ID."));
+        var sandbox = CreateSandbox(
+            sandboxName,
+            root,
+            FastLifecycleOptions(),
+            runner,
+            newGuid: static () => Guid.Empty);
+
+        try
+        {
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                sandbox.ExecAsync(new SandboxExec { Argv = ["true"] }));
+
+            Assert.Contains("empty value for exec control files", exception.Message, StringComparison.Ordinal);
+            Assert.Empty(runner.Commands);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Exec_SnapshotsCallerOwnedSpecArgvAndEnvironmentBeforeFirstCliAwait()
+    {
+        const string sandboxName = "codeybox-exec-snapshot";
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-exec-snapshot-{Guid.NewGuid():N}");
+        var pushStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePush = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        string? pushedEnvironment = null;
+        IReadOnlyList<string>? wrapperCommand = null;
+        var runner = new ScriptedLifecycleRunner(async (argv, stdin, ct) =>
+        {
+            if (IsFileCommand(argv, "push"))
+            {
+                pushedEnvironment = stdin;
+                pushStarted.TrySetResult();
+                await releasePush.Task.WaitAsync(ct);
+                return Success();
+            }
+            if (IsGuestCommand(argv, IncusCloudInit.ExecWrapperPath))
+            {
+                wrapperCommand = argv.ToArray();
+                return Success();
+            }
+            if (IsFileCommand(argv, "pull")
+                && argv.Any(argument => argument.Contains("/complete-", StringComparison.Ordinal)))
+            {
+                return Success("0\n");
+            }
+            if (IsFileCommand(argv, "pull"))
+                return Failure();
+            if (IsFileCommand(argv, "delete") || IsGuestCommand(argv, "test"))
+                return Success();
+            throw new InvalidOperationException($"Unexpected Incus exec snapshot command: {string.Join(' ', argv)}");
+        });
+        var specEnvironment = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["SPEC_VALUE"] = "spec-before",
+        };
+        var spec = new SandboxSpec
+        {
+            ImageReference = "local-image",
+            Environment = specEnvironment,
+        };
+        var sandbox = CreateSandbox(
+            sandboxName,
+            root,
+            FastLifecycleOptions(),
+            runner,
+            spec: spec,
+            newGuid: () => Guid.Parse("99999999-8888-7777-6666-555555555555"));
+        specEnvironment["SPEC_VALUE"] = "spec-after";
+        var argv = new List<string> { "original-command", "original-argument" };
+        var extraEnvironment = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["EXEC_VALUE"] = "exec-before",
+        };
+
+        try
+        {
+            var running = sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = argv,
+                ExtraEnvironment = extraEnvironment,
+                EnvironmentContainsSecrets = true,
+            });
+            await pushStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            argv[0] = "mutated-command";
+            argv.Add("mutated-argument");
+            extraEnvironment["EXEC_VALUE"] = "exec-after";
+            extraEnvironment["LATE_VALUE"] = "late";
+            releasePush.TrySetResult();
+
+            var result = await running.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.True(result.Success, result.Stderr);
+            Assert.NotNull(pushedEnvironment);
+            Assert.Contains("SPEC_VALUE=spec-before\0", pushedEnvironment, StringComparison.Ordinal);
+            Assert.DoesNotContain("spec-after", pushedEnvironment, StringComparison.Ordinal);
+            Assert.Contains("EXEC_VALUE=exec-before\0", pushedEnvironment, StringComparison.Ordinal);
+            Assert.DoesNotContain("exec-after", pushedEnvironment, StringComparison.Ordinal);
+            Assert.DoesNotContain("LATE_VALUE", pushedEnvironment, StringComparison.Ordinal);
+            Assert.NotNull(wrapperCommand);
+            Assert.Contains("original-command", wrapperCommand);
+            Assert.Contains("original-argument", wrapperCommand);
+            Assert.DoesNotContain("mutated-command", wrapperCommand);
+            Assert.DoesNotContain("mutated-argument", wrapperCommand);
+        }
+        finally
+        {
+            releasePush.TrySetResult();
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Exec_SecretEnvironmentUsesFilePushStdinAndNeverFallsBackToArgv(
+        bool failEnvironmentPush)
+    {
+        const string sandboxName = "codeybox-secret-environment";
+        const string specSecret = "incus-spec-secret-sentinel-57cd8db7";
+        const string execSecret = "incus-exec-secret-sentinel-7c30d63d";
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-secret-env-{Guid.NewGuid():N}");
+        var pushedPayloads = new List<string>();
+        var wrapperExecCalls = 0;
+        var runner = new ScriptedLifecycleRunner((argv, stdin, _) =>
+        {
+            if (IsFileCommand(argv, "push"))
+            {
+                pushedPayloads.Add(stdin ?? throw new InvalidOperationException("Environment push had no stdin payload."));
+                return Task.FromResult(failEnvironmentPush
+                    ? Failure("environment push rejected\n")
+                    : Success());
+            }
+            if (IsGuestCommand(argv, IncusCloudInit.ExecWrapperPath))
+            {
+                wrapperExecCalls++;
+                return Task.FromResult(Success("secret-visible\n"));
+            }
+            if (IsFileCommand(argv, "pull")
+                && argv.Any(argument => argument.Contains("/complete-", StringComparison.Ordinal)))
+            {
+                return Task.FromResult(Success("0\n"));
+            }
+            if (IsFileCommand(argv, "pull"))
+                return Task.FromResult(Failure());
+            if (IsFileCommand(argv, "delete") || IsGuestCommand(argv, "test"))
+                return Task.FromResult(Success());
+            throw new InvalidOperationException($"Unexpected Incus secret-environment command: {string.Join(' ', argv)}");
+        });
+        var sandbox = CreateSandbox(
+            sandboxName,
+            root,
+            FastLifecycleOptions(),
+            runner,
+            spec: new SandboxSpec
+            {
+                ImageReference = "local-image",
+                Environment = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["CODEYBOX_SPEC_SECRET"] = specSecret,
+                    ["REMOVE_ME"] = "spec-value",
+                },
+            });
+        var exec = new SandboxExec
+        {
+            Argv = ["printenv", "OPENAI_API_KEY"],
+            ExtraEnvironment = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["OPENAI_API_KEY"] = execSecret,
+                ["REMOVE_ME"] = "exec-value",
+            },
+            EnvironmentVariablesToUnset = ["REMOVE_ME"],
+            EnvironmentContainsSecrets = true,
+        };
+
+        try
+        {
+            if (failEnvironmentPush)
+            {
+                var failure = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                    sandbox.ExecAsync(exec));
+                Assert.Contains("push exec environment", failure.Message, StringComparison.Ordinal);
+            }
+            else
+            {
+                var result = await sandbox.ExecAsync(exec);
+                Assert.True(result.Success, result.Stderr);
+                Assert.Equal("secret-visible\n", result.Stdout);
+            }
+
+            Assert.Equal(
+                $"CODEYBOX_SPEC_SECRET={specSecret}\0OPENAI_API_KEY={execSecret}\0",
+                Assert.Single(pushedPayloads));
+            Assert.DoesNotContain(
+                runner.Commands.SelectMany(static command => command),
+                argument => argument.Contains(specSecret, StringComparison.Ordinal)
+                    || argument.Contains(execSecret, StringComparison.Ordinal));
+            Assert.Equal(failEnvironmentPush ? 0 : 1, wrapperExecCalls);
         }
         finally
         {
@@ -510,6 +884,7 @@ public sealed class IncusSandboxLifecycleTests
         const string sandboxName = "codeybox-exec-sentinel";
         var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-exec-sentinel-{Guid.NewGuid():N}");
         var completionPullCalls = 0;
+        var pidPullCalls = 0;
         var wrapperExecCalls = 0;
         var forcedStopCalls = 0;
         var stopped = false;
@@ -528,7 +903,11 @@ public sealed class IncusSandboxLifecycleTests
                 return Task.FromResult(returnMismatchedSentinel ? Success("0\n") : Failure());
             }
             if (IsFileCommand(argv, "pull"))
+            {
+                if (argv.Any(argument => argument.Contains("/pid-", StringComparison.Ordinal)))
+                    pidPullCalls++;
                 return Task.FromResult(Failure());
+            }
             if (argv.Contains("stop", StringComparer.Ordinal) && argv.Contains("--force", StringComparer.Ordinal))
             {
                 forcedStopCalls++;
@@ -539,7 +918,18 @@ public sealed class IncusSandboxLifecycleTests
                 return Task.FromResult(OwnedInstanceList(sandboxName, stopped ? "STOPPED" : "RUNNING"));
             throw new InvalidOperationException($"Unexpected Incus sentinel test command: {string.Join(' ', argv)}");
         });
-        var sandbox = CreateSandbox(sandboxName, root, FastLifecycleOptions(), runner);
+        var liveOptions = FastLifecycleOptions();
+        var sandbox = CreateSandbox(
+            sandboxName,
+            root,
+            liveOptions,
+            runner,
+            liveOptionsAccessor: () => liveOptions);
+        liveOptions = liveOptions with
+        {
+            ExecCompletionProbeAttempts = 2,
+            ExecPidPollAttempts = 2,
+        };
 
         try
         {
@@ -548,7 +938,8 @@ public sealed class IncusSandboxLifecycleTests
 
             Assert.Contains("completion sentinel", failure.Message, StringComparison.Ordinal);
             Assert.Equal(1, wrapperExecCalls);
-            Assert.Equal(3, completionPullCalls);
+            Assert.Equal(2, completionPullCalls);
+            Assert.Equal(2, pidPullCalls);
             Assert.Equal(1, forcedStopCalls);
             Assert.DoesNotContain(runner.Commands, command => IsFileCommand(command, "delete"));
             var commandCount = runner.Commands.Count;
@@ -721,7 +1112,11 @@ public sealed class IncusSandboxLifecycleTests
         string root,
         IncusSandboxOptions options,
         IProcessRunner runner,
-        Action<string>? onDisposed = null)
+        Action<string>? onDisposed = null,
+        SandboxSpec? spec = null,
+        TimeProvider? timeProvider = null,
+        Func<Guid>? newGuid = null,
+        Func<IncusSandboxOptions>? liveOptionsAccessor = null)
     {
         var sandboxRoot = Path.Combine(root, sandboxName);
         Directory.CreateDirectory(sandboxRoot);
@@ -730,16 +1125,19 @@ public sealed class IncusSandboxLifecycleTests
             sandboxName,
             sandboxRoot,
             root,
-            new SandboxSpec { ImageReference = "local-image" },
+            spec ?? new SandboxSpec { ImageReference = "local-image" },
             options,
-            new IncusCliRunner(runner),
+            new IncusCliRunner(runner, timeProvider),
             NullLogger.Instance,
             timings: null,
             WorkItemId.New(),
             "work",
             baselineRef: null,
             resourceUsageStore: null,
-            onDisposed ?? (_ => { }));
+            onDisposed ?? (_ => { }),
+            timeProvider,
+            newGuid,
+            liveOptionsAccessor);
     }
 
     private static ProcessRunResult Success(string stdout = "") =>

@@ -1,5 +1,6 @@
 using CodeyBox.HostProcess;
 using CodeyBox.Sandbox.Incus;
+using ControllableTimeProvider = Microsoft.Extensions.Time.Testing.FakeTimeProvider;
 
 namespace CodeyBox.Tests;
 
@@ -73,6 +74,32 @@ public sealed class IncusCliRunnerTests
     }
 
     [Fact]
+    public async Task IncusProcessBoundary_RereadsAndValidatesCleanupPolicyPerInvocation()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+        var options = new IncusSandboxOptions();
+        var runner = new IncusCliProcessRunner(() => options);
+
+        var first = await runner.RunAsync(
+            ["/bin/true"],
+            stdin: null,
+            CancellationToken.None,
+            maxStdoutBytes: 1024,
+            maxStderrBytes: 1024);
+        options = options with { CliProcessCleanupTimeout = TimeSpan.Zero };
+
+        Assert.Equal(0, first.ExitCode);
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(async () =>
+            await runner.RunAsync(
+                ["/bin/true"],
+                stdin: null,
+                CancellationToken.None,
+                maxStdoutBytes: 1024,
+                maxStderrBytes: 1024));
+    }
+
+    [Fact]
     public async Task RunCheckedAsync_MapsNonZeroExitToContextualBoundedError()
     {
         var longError = "daemon failed\r\n" + new string('x', 5000);
@@ -101,20 +128,27 @@ public sealed class IncusCliRunnerTests
     [Fact]
     public async Task RunCheckedAsync_MapsDeadlineCancellationToTimeout()
     {
+        var time = new ControllableTimeProvider();
+        var processStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var runner = new IncusCliRunner(new StubProcessRunner(async (_, _, ct) =>
         {
+            processStarted.SetResult();
             await Task.Delay(Timeout.InfiniteTimeSpan, ct);
             return new ProcessRunResult(0, "", "");
-        }));
+        }), time);
 
+        var operation = runner.RunCheckedAsync(
+            "start",
+            Options,
+            ["incus", "start", "codeybox-test"],
+            stdin: null,
+            timeout: TimeSpan.FromSeconds(30),
+            CancellationToken.None);
+        await processStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        time.Advance(TimeSpan.FromSeconds(30));
         var exception = await Assert.ThrowsAsync<TimeoutException>(() =>
-            runner.RunCheckedAsync(
-                "start",
-                Options,
-                ["incus", "start", "codeybox-test"],
-                stdin: null,
-                timeout: TimeSpan.FromMilliseconds(20),
-                CancellationToken.None));
+            operation.WaitAsync(TimeSpan.FromSeconds(5)));
 
         Assert.Contains("Incus start exceeded its", exception.Message, StringComparison.Ordinal);
         Assert.IsAssignableFrom<OperationCanceledException>(exception.InnerException);

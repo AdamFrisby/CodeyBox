@@ -59,7 +59,7 @@ internal static class SandboxEndpoints
     {
         if (string.IsNullOrWhiteSpace(name))
             return Results.BadRequest(new { error = "name is required" });
-        if (providerId is { Length: > 128 } || providerId?.Any(char.IsControl) == true)
+        if (providerId is not null && !SandboxProviderIdPolicy.IsValidOpaque(providerId))
             return Results.BadRequest(new { error = "providerId is invalid" });
 
         // Cross-check against the latest leak list so that active sandboxes (those
