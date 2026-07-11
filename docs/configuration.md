@@ -727,6 +727,8 @@ current `CodeyBox:Attachments` options at use time.
   "MultipartHeadersCountLimit": 256,
   "MultipartHeadersLengthLimitBytes": 8192,
   "MaxMultipartErrorMessageChars": 240,
+  "DeliverToSandbox": true,
+  "DeliverToPhases": [ "work", "rework", "audit" ],
   "TerminalCleanupTtl": "7.00:00:00",
   "CleanupSweepInterval": "01:00:00",
   "OrphanSweepInterval": "06:00:00",
@@ -746,6 +748,8 @@ current `CodeyBox:Attachments` options at use time.
 | `MultipartHeadersCountLimit` | `256` | Max headers per multipart section. |
 | `MultipartHeadersLengthLimitBytes` | `8192` | Max aggregate header bytes per multipart section. |
 | `MaxMultipartErrorMessageChars` | `240` | Max parser-error text included in 400 responses. |
+| `DeliverToSandbox` | `true` | When true, a work item's attachments are staged into its sandbox VM and announced to the agent (via the injected `## Attachments` manifest) for the phases in `DeliverToPhases`. When false, attachments stay host-only (upload/download API) and nothing is staged into any sandbox. |
+| `DeliverToPhases` | `["work","rework","audit"]` | Agent prompt phases whose invocations stage attachments and inject the manifest. Compared case-insensitively; a phase not listed behaves as if the item had no attachments. |
 | `TerminalCleanupTtl` | `7.00:00:00` | TTL cutoff for non-terminal stale attachment cleanup. Terminal work items are cleaned on the next sweep. |
 | `CleanupSweepInterval` | `01:00:00` | Period between terminal/TTL cleanup sweeps. |
 | `OrphanSweepInterval` | `06:00:00` | Period between orphan-blob sweeps. |
@@ -763,10 +767,15 @@ preprocessors that run in order before every agent invocation:
    path for house rules across Codex, Claude, Cursor, opencode, and any
    future runner; root-level agent file discovery is a compatibility aid,
    not the enforcement mechanism.
-2. **`AttachmentManifestPromptPreprocessor`** — reserved no-op for the future
-   in-VM attachment delivery task. The current attachment foundation exposes
-   files through storage and REST APIs only; it does not place attachment
-   metadata or bytes in tool-bearing agent prompts.
+2. **`AttachmentManifestPromptPreprocessor`** — for the delivery phases
+   configured in `Attachments:DeliverToPhases` (default work / rework / audit),
+   stages a work item's attachment blobs into the sandbox (under
+   `/work/.codeybox/attachments`, added to `.git/info/exclude` so a stray
+   `git add -A` can never commit them) and prepends an `## Attachments` manifest
+   listing each staged file's in-VM path, filename, content-type, size, and
+   caption. Filenames and captions are fenced as an untrusted-data section. A
+   no-op when `Attachments:DeliverToSandbox` is false, the phase is not a
+   delivery phase, or the item has no attachments.
 3. **`CrossAgentHandoffPromptPreprocessor`** — injects a `## Cross-agent
    handoff` brief whenever the current invocation runs under a different
    `AgentKind` than the most recent agent-involvement entry (the orchestrator

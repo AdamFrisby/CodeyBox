@@ -30,6 +30,10 @@ public sealed class StoreWorkItemAttachmentSourceTests
         Assert.Equal("spec.txt", att.FileName);
         Assert.Equal("/work/.codeybox/attachments/spec.txt", att.InVmPath);
         Assert.StartsWith(StoreWorkItemAttachmentSource.SandboxStagingDirectory, att.InVmPath);
+        // Size + content hash must propagate so the preprocessor can bound the
+        // staged read and address the blob store.
+        Assert.Equal(100, att.SizeBytes);
+        Assert.Equal(new string('a', 64), att.Sha256);
     }
 
     [Fact]
