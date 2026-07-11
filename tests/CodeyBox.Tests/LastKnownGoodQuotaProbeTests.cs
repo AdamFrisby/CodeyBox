@@ -189,6 +189,20 @@ public sealed class LastKnownGoodQuotaProbeTests
     }
 
     [Fact]
+    public async Task MarkExhausted_ClearsRetainedReading()
+    {
+        var clock = new Clock(new DateTimeOffset(2026, 6, 10, 12, 0, 0, TimeSpan.Zero));
+        var inner = new StubProbe { Next = new AgentQuotaSnapshot { AvailablePct = 71 } };
+        var lkg = Build(inner, clock);
+        await lkg.GetAvailabilityAsync(Member(), default);
+
+        await lkg.MarkExhaustedAsync(Member(), TimeSpan.FromMinutes(10), ct: CancellationToken.None);
+
+        inner.Next = AgentQuotaSnapshot.UnknownSnapshot(QuotaUnknownReason.Transient, "5xx");
+        Assert.False((await lkg.GetAvailabilityAsync(Member(), default)).IsKnown);
+    }
+
+    [Fact]
     public async Task PerModel_RetentionIsIndependent()
     {
         var clock = new Clock(new DateTimeOffset(2026, 6, 10, 12, 0, 0, TimeSpan.Zero));

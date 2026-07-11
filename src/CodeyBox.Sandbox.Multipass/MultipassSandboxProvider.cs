@@ -6652,7 +6652,6 @@ while True:
         sb.AppendLine("    \"$@\" </dev/null >\"$codeybox_stdout_file\" 2>\"$codeybox_stderr_file\"");
         sb.AppendLine("    codeybox_wrapper_rc=$?");
         sb.AppendLine("fi");
-        sb.AppendLine("codeybox_http_exit \"$codeybox_wrapper_rc\" || true");
         sb.AppendLine("if ! codeybox_root_sh 'marker=$1");
         sb.AppendLine("stdout_file=$2");
         sb.AppendLine("stderr_file=$3");
@@ -6675,6 +6674,7 @@ while True:
         sb.AppendLine("    codeybox_http_exit \"$codeybox_wrapper_rc\" \"codeybox-detached: failed to publish output sidecars\" || true");
         sb.AppendLine("    exit \"$codeybox_wrapper_rc\"");
         sb.AppendLine("fi");
+        sb.AppendLine("codeybox_http_exit \"$codeybox_wrapper_rc\" || true");
         sb.AppendLine("rm -f \"$codeybox_stdout_file\" \"$codeybox_stderr_file\"");
         sb.AppendLine("exit \"$codeybox_wrapper_rc\"");
         sb.AppendLine("CODEYBOX_DETACHED_CHILD");

@@ -2339,6 +2339,55 @@ public sealed class AgentConfigHotReloadTests
     }
 
     [Fact]
+    public async Task Coordinator_OnChange_QuotaRouterPausedCadencePropagates()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            QuotaRouter = new QuotaRouterConfig
+            {
+                MinQuotaPct = 10.0,
+                PausedQuotaCacheTtlSeconds = 3600,
+                PausedProbeMaxStalenessSeconds = 5400,
+                PausedQuotaMaxCacheEntries = 128,
+            },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var qro = QuotaRouterConfigMapper.ToOptions(initial.QuotaRouter);
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            qro,
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            quotaRouterOptions: qro);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            QuotaRouter = new QuotaRouterConfig
+            {
+                MinQuotaPct = 10.0,
+                PausedQuotaCacheTtlSeconds = 1800,
+                PausedProbeMaxStalenessSeconds = 2700,
+                PausedQuotaMaxCacheEntries = 256,
+            },
+        });
+
+        Assert.Equal(TimeSpan.FromMinutes(30), qro.PausedQuotaCacheTtl);
+        Assert.Equal(TimeSpan.FromMinutes(45), qro.PausedProbeMaxStaleness);
+        Assert.Equal(256, qro.PausedQuotaMaxCacheEntries);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task Coordinator_OnChange_QuotaRouterDrainDeadlineInputsPropagate()
     {
         var initial = new CodeyBoxOptions

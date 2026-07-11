@@ -27,9 +27,25 @@ public sealed class ClaudeSmokeProbeTests
             new Dictionary<string, string>(),
             new Dictionary<string, string>());
 
-    private static ClaudeSmokeProbe BuildProbe(HttpMessageHandler handler) =>
+    private static ClaudeSmokeProbe BuildProbe(
+        HttpMessageHandler handler,
+        TimeProvider? timeProvider = null,
+        Func<TimeSpan>? maxRetryDelayProvider = null) =>
         new(new SmokeFakeHttpClientFactory("agent-smoke", handler),
-            NullLogger<ClaudeSmokeProbe>.Instance);
+            NullLogger<ClaudeSmokeProbe>.Instance,
+            timeProvider,
+            maxRetryDelayProvider);
+
+    private static void AssertOAuthUsageRetryRequests(RetryAfterSequenceHandler handler, string token)
+    {
+        Assert.Equal(2, handler.Requests.Count);
+        Assert.All(handler.Requests, request =>
+        {
+            Assert.Equal(HttpMethod.Get, request.Method);
+            Assert.Equal(new Uri(ClaudeSmokeProbe.OAuthUsageEndpoint), request.RequestUri);
+            Assert.Equal($"Bearer {token}", request.Authorization);
+        });
+    }
 
     // ── Endpoint URL ─────────────────────────────────────────────────────────
 
@@ -182,6 +198,57 @@ public sealed class ClaudeSmokeProbeTests
         var result = await BuildProbe(handler).SmokeTestAsync(ApiKeyCred("k"), CancellationToken.None);
         Assert.False(result.Ok);
         Assert.Contains("429", result.FailureReason);
+    }
+
+    [Fact]
+    public async Task OAuthUsage429_WithRetryAfter_WaitsAndRetries()
+    {
+        var time = new CapturingDelayTimeProvider(DateTimeOffset.UtcNow);
+        var handler = new RetryAfterSequenceHandler(
+            new RetryAfterResponse(HttpStatusCode.TooManyRequests, "", TimeSpan.FromSeconds(11)),
+            new RetryAfterResponse(HttpStatusCode.OK, "{}", null));
+
+        var result = await BuildProbe(handler, time).SmokeTestAsync(OAuthCred("oauth"), CancellationToken.None);
+
+        Assert.True(result.Ok);
+        Assert.Equal(2, handler.CallCount);
+        AssertOAuthUsageRetryRequests(handler, "oauth");
+        var delay = Assert.Single(time.Delays);
+        Assert.True(delay >= TimeSpan.FromSeconds(11), $"delay was {delay}");
+    }
+
+    [Fact]
+    public async Task OAuthUsage503_WithRetryAfter_WaitsAndRetries()
+    {
+        var time = new CapturingDelayTimeProvider(DateTimeOffset.UtcNow);
+        var handler = new RetryAfterSequenceHandler(
+            new RetryAfterResponse(HttpStatusCode.ServiceUnavailable, "", TimeSpan.FromSeconds(7)),
+            new RetryAfterResponse(HttpStatusCode.OK, "{}", null));
+
+        var result = await BuildProbe(handler, time).SmokeTestAsync(OAuthCred("oauth"), CancellationToken.None);
+
+        Assert.True(result.Ok);
+        Assert.Equal(2, handler.CallCount);
+        Assert.Equal(TimeSpan.FromSeconds(7), Assert.Single(time.Delays));
+    }
+
+    [Fact]
+    public async Task OAuthUsage429_WithLargeRetryAfter_CapsDelayFromOptions()
+    {
+        var time = new CapturingDelayTimeProvider(DateTimeOffset.UtcNow);
+        var handler = new RetryAfterSequenceHandler(
+            new RetryAfterResponse(HttpStatusCode.TooManyRequests, "", TimeSpan.FromMinutes(10)),
+            new RetryAfterResponse(HttpStatusCode.OK, "{}", null));
+
+        var result = await BuildProbe(
+                handler,
+                time,
+                () => TimeSpan.FromSeconds(30))
+            .SmokeTestAsync(OAuthCred("oauth"), CancellationToken.None);
+
+        Assert.True(result.Ok);
+        Assert.Equal(2, handler.CallCount);
+        Assert.Equal(TimeSpan.FromSeconds(30), Assert.Single(time.Delays));
     }
 
     // ── Network error ─────────────────────────────────────────────────────────

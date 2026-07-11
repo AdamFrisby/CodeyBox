@@ -1820,8 +1820,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             [launchScript],
             environmentOverrides: FakeSudoPathEnvironment());
         // The first invocation's parent exits once the marker is written, but the
-        // detached child keeps running: it posts the authenticated exit code and
-        // then writes the stdout/stderr/exit sidecars into the same workspace dir.
+        // detached child keeps running: it publishes stdout/stderr/exit sidecars
+        // and posts the authenticated exit code into the same workspace dir.
         // Wait for the child's process group to fully exit before launching the
         // second invocation so its supervisor-dir prep and marker re-check never
         // race the trailing sidecar writes.
@@ -1895,6 +1895,107 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         AssertExitCode(session, 0);
         Assert.Equal("agent prompt\n", await File.ReadAllTextAsync(capturedPromptFile));
         Assert.False(File.Exists(exitTokenFile));
+    }
+
+    [Fact]
+    public async Task BuildDetachedLaunchScript_PublishesOutputSidecarsBeforeAuthenticatedExit()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        await using var session = await MultipassAgentOutputHttpIngestSession.TryStartAsync(
+            System.Net.IPAddress.Loopback,
+            "detached-sidecars-before-http-exit",
+            NullLogger.Instance,
+            stdoutChunkCallback: null,
+            stderrChunkCallback: null,
+            CancellationToken.None);
+        if (session is null)
+            return;
+
+        var envFile = Path.Combine(_workspace, "detached-sidecars-before-http-exit.env");
+        var exitTokenFile = Path.Combine(_workspace, "detached-sidecars-before-http-exit.token");
+        var launchScript = Path.Combine(_workspace, "detached-sidecars-before-http-exit.sh");
+        var processGroupMarker = Path.Combine(_workspace, "detached-sidecars-before-http-exit.pgid");
+        var sidecarStarted = Path.Combine(_workspace, "detached-sidecars-before-http-exit.sidecar-started");
+        var releaseSidecar = Path.Combine(_workspace, "detached-sidecars-before-http-exit.release");
+
+        await File.WriteAllTextAsync(
+            envFile,
+            MultipassSandboxProvider.BuildEnvironmentFileContent(session.BuildEnvironment(includeExitToken: false)));
+        await File.WriteAllTextAsync(exitTokenFile, session.ExitToken);
+        await File.WriteAllTextAsync(
+            launchScript,
+            MultipassSandbox.BuildDetachedLaunchScript(
+                envFile,
+                processGroupMarker,
+                null,
+                ["/bin/sh", "-c", "printf sidecar-out; printf sidecar-err >&2; exit 7"],
+                exitTokenFile: exitTokenFile));
+        File.SetUnixFileMode(launchScript, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+        var fakeSudo = CreateFakeSudoBin($$"""
+            #!/bin/sh
+            if [ "$1" = "-n" ]; then shift; fi
+            if [ "$1" = "sh" ] && [ "$2" = "-c" ]; then
+                case "$3" in
+                    *'stdout_file=$2'*'exit_code=$4'*)
+                        printf started > {{MultipassSandboxProvider.ShellSingleQuote(sidecarStarted)}}
+                        while [ ! -f {{MultipassSandboxProvider.ShellSingleQuote(releaseSidecar)}} ]; do sleep 0.05; done
+                        ;;
+                esac
+            fi
+            exec "$@"
+            """);
+        var runTask = RunLocalProcessAsync(
+            "/bin/bash",
+            [launchScript],
+            environmentOverrides: new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["PATH"] = fakeSudo + Path.PathSeparator + (Environment.GetEnvironmentVariable("PATH") ?? ""),
+            });
+
+        try
+        {
+            await WaitForFileAsync(sidecarStarted, TimeSpan.FromSeconds(6));
+            Assert.False(
+                session.TryGetExitCode(out var earlyExitCode),
+                $"Authenticated exit {earlyExitCode} was posted before output sidecars were published.");
+
+            await File.WriteAllTextAsync(releaseSidecar, "go");
+            var (exit, stdout, stderr) = await runTask.WaitAsync(TimeSpan.FromSeconds(6));
+            await WaitForExitCodeAsync(session, 7, TimeSpan.FromSeconds(6));
+
+            Assert.Equal(0, exit);
+            Assert.Equal("", stdout);
+            Assert.Equal("", stderr);
+            Assert.True(File.Exists(processGroupMarker + ".stdout"));
+            Assert.True(File.Exists(processGroupMarker + ".stderr"));
+            Assert.True(File.Exists(processGroupMarker + ".exit"));
+            Assert.Equal("sidecar-out", await File.ReadAllTextAsync(processGroupMarker + ".stdout"));
+            Assert.Equal("sidecar-err", await File.ReadAllTextAsync(processGroupMarker + ".stderr"));
+            Assert.Equal("7\n", await File.ReadAllTextAsync(processGroupMarker + ".exit"));
+        }
+        finally
+        {
+            if (!File.Exists(releaseSidecar))
+                await File.WriteAllTextAsync(releaseSidecar, "go");
+
+            try { await runTask.WaitAsync(TimeSpan.FromSeconds(6)); } catch { /* best-effort cleanup */ }
+            if (File.Exists(processGroupMarker))
+            {
+                try { await WaitForProcessGroupGoneAsync(processGroupMarker, TimeSpan.FromSeconds(6)); }
+                catch
+                {
+                    try
+                    {
+                        var pgid = (await File.ReadAllTextAsync(processGroupMarker)).Trim();
+                        await KillProcessGroupAsync(pgid);
+                    }
+                    catch { /* best-effort cleanup */ }
+                }
+            }
+        }
     }
 
     [Fact]
@@ -6200,6 +6301,28 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     {
         Assert.True(
             session.TryGetExitCode(out var exitCode) && exitCode == expectedExitCode,
+            $"Expected authenticated exit code {expectedExitCode}.");
+    }
+
+    // Polls until the authenticated exit code is posted. The detached child
+    // publishes output sidecars first and only then posts the exit code, so a
+    // synchronous read can race the post; this waits (bounded by timeout) so the
+    // assertion is deterministic without a virtual clock.
+    private static async Task WaitForExitCodeAsync(
+        MultipassAgentOutputHttpIngestSession session,
+        int expectedExitCode,
+        TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (session.TryGetExitCode(out var exitCode) && exitCode == expectedExitCode)
+                return;
+            await Task.Delay(50);
+        }
+
+        Assert.True(
+            session.TryGetExitCode(out var finalExitCode) && finalExitCode == expectedExitCode,
             $"Expected authenticated exit code {expectedExitCode}.");
     }
 

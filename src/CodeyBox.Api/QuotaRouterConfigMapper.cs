@@ -4,32 +4,39 @@ namespace CodeyBox.Api;
 
 internal static class QuotaRouterConfigMapper
 {
-    public static QuotaRouterOptions ToOptions(QuotaRouterConfig qr) => new()
+    public static QuotaRouterOptions ToOptions(QuotaRouterConfig qr)
     {
-        MinQuotaPct = qr.MinQuotaPct,
-        MinQuotaPctByWindow = BuildWindowFloorOverrides(qr.MinQuotaPctByWindow),
-        StartFloorPct = qr.StartFloorPct,
-        EndFloorPct = qr.EndFloorPct,
-        FloorByAgent = BuildFloorOverrides(qr.FloorByAgent),
-        RampWindow = TimeSpan.FromSeconds(qr.RampWindowSeconds),
-        RampWindowByAgent = BuildRampWindowOverrides(qr.RampWindowByAgentSeconds),
-        QuotaRecheckInterval = TimeSpan.FromSeconds(qr.QuotaRecheckIntervalSeconds),
-        QuotaRecoveryProbeInterval = BuildPositiveDuration(
-            qr.QuotaRecoveryProbeIntervalSeconds,
-            QuotaRouterDefaults.DefaultQuotaRecoveryProbeInterval),
-        MaxQuotaRecoveryProbeEligibilityScan = BuildPositiveLimit(
-            qr.MaxQuotaRecoveryProbeEligibilityScan,
-            QuotaRouterDefaults.DefaultQuotaRecoveryProbeEligibilityScanLimit),
-        QuotaCacheTtl = TimeSpan.FromSeconds(qr.QuotaCacheTtlSeconds),
-        UnknownPolicy = qr.UnknownPolicy,
-        ObservedFailureWindow = TimeSpan.FromMinutes(qr.ObservedFailureWindowMinutes),
-        ObservedFailureRetention = TimeSpan.FromMinutes(qr.ObservedFailureRetentionMinutes),
-        CapRetryRecheckInterval = TimeSpan.FromSeconds(qr.CapRetryIntervalSeconds),
-        ColdStartFitInWindow = qr.ColdStartFitInWindow,
-        DrainAggressiveness = qr.DrainAggressiveness,
-        ExpectedResets = BuildExpectedResetOverrides(qr.ExpectedResets),
-        IntraKindRoutingPolicy = qr.IntraKindRoutingPolicy,
-    };
+        var paused = BuildPausedQuotaOptions(qr);
+        return new QuotaRouterOptions
+        {
+            MinQuotaPct = qr.MinQuotaPct,
+            MinQuotaPctByWindow = BuildWindowFloorOverrides(qr.MinQuotaPctByWindow),
+            StartFloorPct = qr.StartFloorPct,
+            EndFloorPct = qr.EndFloorPct,
+            FloorByAgent = BuildFloorOverrides(qr.FloorByAgent),
+            RampWindow = TimeSpan.FromSeconds(qr.RampWindowSeconds),
+            RampWindowByAgent = BuildRampWindowOverrides(qr.RampWindowByAgentSeconds),
+            QuotaRecheckInterval = TimeSpan.FromSeconds(qr.QuotaRecheckIntervalSeconds),
+            QuotaRecoveryProbeInterval = BuildPositiveDuration(
+                qr.QuotaRecoveryProbeIntervalSeconds,
+                QuotaRouterDefaults.DefaultQuotaRecoveryProbeInterval),
+            MaxQuotaRecoveryProbeEligibilityScan = BuildPositiveLimit(
+                qr.MaxQuotaRecoveryProbeEligibilityScan,
+                QuotaRouterDefaults.DefaultQuotaRecoveryProbeEligibilityScanLimit),
+            QuotaCacheTtl = TimeSpan.FromSeconds(qr.QuotaCacheTtlSeconds),
+            PausedQuotaCacheTtl = paused.CacheTtl,
+            PausedProbeMaxStaleness = paused.MaxStaleness,
+            PausedQuotaMaxCacheEntries = paused.MaxCacheEntries,
+            UnknownPolicy = qr.UnknownPolicy,
+            ObservedFailureWindow = TimeSpan.FromMinutes(qr.ObservedFailureWindowMinutes),
+            ObservedFailureRetention = TimeSpan.FromMinutes(qr.ObservedFailureRetentionMinutes),
+            CapRetryRecheckInterval = TimeSpan.FromSeconds(qr.CapRetryIntervalSeconds),
+            ColdStartFitInWindow = qr.ColdStartFitInWindow,
+            DrainAggressiveness = qr.DrainAggressiveness,
+            ExpectedResets = BuildExpectedResetOverrides(qr.ExpectedResets),
+            IntraKindRoutingPolicy = qr.IntraKindRoutingPolicy,
+        };
+    }
 
     public static void ApplyHotReload(QuotaRouterOptions dst, QuotaRouterConfig src)
     {
@@ -41,6 +48,7 @@ internal static class QuotaRouterConfigMapper
         if (src.RampWindowSeconds > 0)
             dst.RampWindow = TimeSpan.FromSeconds(src.RampWindowSeconds);
         dst.RampWindowByAgent = BuildRampWindowOverrides(src.RampWindowByAgentSeconds);
+        var paused = BuildPausedQuotaOptions(src);
         dst.QuotaRecheckInterval = TimeSpan.FromSeconds(src.QuotaRecheckIntervalSeconds);
         dst.QuotaRecoveryProbeInterval = BuildPositiveDuration(
             src.QuotaRecoveryProbeIntervalSeconds,
@@ -48,6 +56,9 @@ internal static class QuotaRouterConfigMapper
         dst.MaxQuotaRecoveryProbeEligibilityScan = BuildPositiveLimit(
             src.MaxQuotaRecoveryProbeEligibilityScan,
             QuotaRouterDefaults.DefaultQuotaRecoveryProbeEligibilityScanLimit);
+        dst.PausedQuotaCacheTtl = paused.CacheTtl;
+        dst.PausedProbeMaxStaleness = paused.MaxStaleness;
+        dst.PausedQuotaMaxCacheEntries = paused.MaxCacheEntries;
         dst.UnknownPolicy = src.UnknownPolicy;
         dst.ObservedFailureWindow = TimeSpan.FromMinutes(src.ObservedFailureWindowMinutes);
         dst.ObservedFailureRetention = TimeSpan.FromMinutes(src.ObservedFailureRetentionMinutes);
@@ -56,6 +67,37 @@ internal static class QuotaRouterConfigMapper
         dst.DrainAggressiveness = src.DrainAggressiveness;
         dst.ExpectedResets = BuildExpectedResetOverrides(src.ExpectedResets);
         dst.IntraKindRoutingPolicy = src.IntraKindRoutingPolicy;
+    }
+
+    private static PausedQuotaMapping BuildPausedQuotaOptions(QuotaRouterConfig qr)
+    {
+        if (qr.PausedQuotaCacheTtlSeconds <= 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(qr),
+                qr.PausedQuotaCacheTtlSeconds,
+                "CodeyBox:QuotaRouter:PausedQuotaCacheTtlSeconds must be positive.");
+
+        if (qr.PausedProbeMaxStalenessSeconds <= 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(qr),
+                qr.PausedProbeMaxStalenessSeconds,
+                "CodeyBox:QuotaRouter:PausedProbeMaxStalenessSeconds must be positive.");
+
+        if (qr.PausedProbeMaxStalenessSeconds < qr.PausedQuotaCacheTtlSeconds)
+            throw new ArgumentException(
+                "CodeyBox:QuotaRouter:PausedProbeMaxStalenessSeconds must be greater than or equal to PausedQuotaCacheTtlSeconds.",
+                nameof(qr));
+
+        if (qr.PausedQuotaMaxCacheEntries <= 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(qr),
+                qr.PausedQuotaMaxCacheEntries,
+                "CodeyBox:QuotaRouter:PausedQuotaMaxCacheEntries must be positive.");
+
+        return new PausedQuotaMapping(
+            TimeSpan.FromSeconds(qr.PausedQuotaCacheTtlSeconds),
+            TimeSpan.FromSeconds(qr.PausedProbeMaxStalenessSeconds),
+            qr.PausedQuotaMaxCacheEntries);
     }
 
     private static Dictionary<string, TimeSpan> BuildRampWindowOverrides(IDictionary<string, int>? src)
@@ -149,4 +191,9 @@ internal static class QuotaRouterConfigMapper
         }
         return dst;
     }
+
+    private sealed record PausedQuotaMapping(
+        TimeSpan CacheTtl,
+        TimeSpan MaxStaleness,
+        int MaxCacheEntries);
 }
