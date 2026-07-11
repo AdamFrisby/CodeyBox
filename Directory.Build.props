@@ -28,7 +28,10 @@
     <ResolveAssemblyReferencesFindRelatedSatellites>false</ResolveAssemblyReferencesFindRelatedSatellites>
     <!-- NuGet's settings task otherwise merges the per-user config even when a
          repository config is present. An explicit path keeps project graph
-         evaluation independent of the build account's home directory. -->
+         evaluation independent of the build account's home directory.
+         Sandboxed agents often have a root-owned ~/.nuget parent that blocks
+         creating the user-level NuGet config directory; RestoreConfigFile
+         limits config discovery to this file only. -->
     <RestoreConfigFile>$(MSBuildThisFileDirectory)nuget.config</RestoreConfigFile>
     <!-- The initial target may redirect DOTNET_CLI_HOME solely for NuGet's
          user-config/proxy cache. Keep packages in the caller's original
