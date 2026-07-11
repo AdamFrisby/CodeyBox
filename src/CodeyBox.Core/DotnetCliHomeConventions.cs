@@ -17,6 +17,24 @@ public static class DotnetCliHomeConventions
         return Path.Combine(workingDirectory, DirectoryName);
     }
 
+    /// <summary>
+    /// Stamps <c>DOTNET_CLI_HOME</c> on a sandbox (or exec) environment when
+    /// the caller has not already set it. Use at sandbox creation so every
+    /// child process — shell scripts, <c>build.sh</c>, and direct
+    /// <c>dotnet</c> auditors — inherits a writable CLI home under the work
+    /// tree instead of probing root-owned <c>~/.nuget</c>.
+    /// </summary>
+    public static void ApplyIfAbsent(
+        IDictionary<string, string> environment,
+        string workingDirectory)
+    {
+        ArgumentNullException.ThrowIfNull(environment);
+        if (environment.ContainsKey("DOTNET_CLI_HOME"))
+            return;
+
+        environment["DOTNET_CLI_HOME"] = ResolvePath(workingDirectory);
+    }
+
     public static void ApplyIfDotnetInvocation(
         IReadOnlyList<string> argv,
         string workingDirectory,
@@ -24,10 +42,10 @@ public static class DotnetCliHomeConventions
     {
         ArgumentNullException.ThrowIfNull(argv);
         ArgumentNullException.ThrowIfNull(environment);
-        if (!IsDotnetInvocation(argv) || environment.ContainsKey("DOTNET_CLI_HOME"))
+        if (!IsDotnetInvocation(argv))
             return;
 
-        environment["DOTNET_CLI_HOME"] = ResolvePath(workingDirectory);
+        ApplyIfAbsent(environment, workingDirectory);
     }
 
     public static bool IsDotnetInvocation(IReadOnlyList<string> argv)

@@ -19289,6 +19289,7 @@ Original merge-phase failure (JSON string, for context only):
             foreach (var (k, v) in extraEnvironment)
                 env[k] = v;
         }
+        DotnetCliHomeConventions.ApplyIfAbsent(env, SandboxConventions.WorkDir);
         var allowedHosts = allowAgentNetwork
             ? includeAgentCredential is null && !agentCredentialScope
                 ? _opts.AuditToolAllowedHosts

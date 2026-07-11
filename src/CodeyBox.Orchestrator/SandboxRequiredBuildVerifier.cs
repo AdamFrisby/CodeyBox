@@ -427,6 +427,8 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
             ProfileName = request.SandboxPolicy.NetworkProfile,
         };
 
+        var environment = new Dictionary<string, string>();
+        DotnetCliHomeConventions.ApplyIfAbsent(environment, SandboxConventions.WorkDir);
         return SandboxConventions.WithTimingEnvironment(new SandboxSpec
         {
             ImageReference = _pipelineOptions.SandboxImageReference,
@@ -435,7 +437,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                 .. access.Mounts,
                 new SandboxMount { SandboxPath = SandboxConventions.WorkDir, Tmpfs = true },
             ],
-            Environment = new Dictionary<string, string>(),
+            Environment = environment,
             Network = net,
             Flavor = SandboxProfileFlavor.Headless,
             WorkingDirectory = SandboxConventions.WorkDir,
