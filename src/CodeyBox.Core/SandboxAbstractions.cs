@@ -1234,7 +1234,12 @@ public sealed record SandboxResourceLimits
         // RAM bump matters when multiple VMs are running concurrently. Operators
         // running many concurrent workers on small hosts can override via spec.
         MemoryBytes = 12L * 1024 * 1024 * 1024,
-        DiskBytes = 8L * 1024 * 1024 * 1024,
+        // A COW clone can never be smaller than its baseline, and a baseline that
+        // bakes in a package-cache seed (e.g. a multi-GiB NuGet cache) plus the
+        // agent toolchain runs several GiB before any work lands. 16 GiB keeps
+        // clones comfortably above such baselines with room for build output;
+        // qcow2/ZFS clones stay sparse, so the ceiling is only paid when used.
+        DiskBytes = 16L * 1024 * 1024 * 1024,
         WallClock = TimeSpan.FromMinutes(60),
     };
 }

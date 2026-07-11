@@ -203,6 +203,10 @@ public sealed class IncusSandboxProvider :
 
             if (canUseBaseline)
             {
+                // Derive the live name only when unpinned; a pinned baseline that
+                // still exists must not re-fingerprint executable inputs. The
+                // resolver derives it lazily if the pin is missing, so a
+                // not-yet-baked CURRENT baseline still bakes (pin == live name).
                 var expected = spec.BaselineImageRef is null
                     ? DeriveLiveBaselineName(
                         options,
@@ -536,6 +540,10 @@ public sealed class IncusSandboxProvider :
         _ = ResolveBridge(options, profileName);
         if (pinnedBaselineRef is not null && string.IsNullOrWhiteSpace(pinnedBaselineRef))
             throw new ArgumentException("A pinned Incus baseline reference cannot be blank.", nameof(pinnedBaselineRef));
+        // Only derive the live content-addressed name when unpinned. A pinned ref
+        // that still exists must not re-fingerprint executable inputs; the
+        // resolver derives the live name lazily only if the pin turns out to be
+        // missing (to tell a not-yet-baked CURRENT baseline from a stale pin).
         var expected = pinnedBaselineRef is null
             ? DeriveLiveBaselineName(
                 options,
@@ -696,6 +704,24 @@ public sealed class IncusSandboxProvider :
         var pinned = await FindInstanceAsync(options, pinnedBaselineRef, ct).ConfigureAwait(false);
         if (pinned is null)
         {
+            // A pin that names the CURRENT content-addressed baseline is not
+            // stale — it simply has not been baked yet (fresh cutover, a config
+            // change that produced a new hash, or a deleted baseline). Bake it.
+            // Only a pin that DIFFERS from the live name is a genuinely stale or
+            // foreign ref whose configuration we must not bake under. Derive the
+            // live name lazily (only now, on a missing pin) so a pinned baseline
+            // that still exists never re-fingerprints executable inputs.
+            var live = liveBaselineName ?? DeriveLiveBaselineName(options, profileName, flavor, ct);
+            if (live is not null
+                && string.Equals(pinnedBaselineRef, live, StringComparison.Ordinal))
+            {
+                return await EnsureBaselineAsync(
+                    options,
+                    profileName,
+                    flavor,
+                    live,
+                    ct).ConfigureAwait(false);
+            }
             throw new InvalidOperationException(
                 $"Pinned Incus baseline '{pinnedBaselineRef}' no longer exists; refusing to bake current configuration under a stale ref.");
         }

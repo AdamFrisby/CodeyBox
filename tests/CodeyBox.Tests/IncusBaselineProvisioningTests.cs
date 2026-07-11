@@ -1393,6 +1393,51 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
     }
 
     [Fact]
+    public async Task MissingPinnedBaseline_MatchingLiveName_BakesInsteadOfRefusing()
+    {
+        // A pin that names the CURRENT content-addressed baseline (identical to
+        // the live name) but does not yet exist must be baked, not refused as a
+        // stale ref — otherwise a fresh cutover or a config change that shifts the
+        // baseline hash can never bake its own baseline (dispatch pins to the
+        // computed name, which does not exist until something bakes it).
+        var options = BaseOptions() with { StagingDirectory = Path.Combine(_root, "pin-live-discover") };
+
+        // Discover the live name by baking it unpinned.
+        var discoverRunner = new BaselineBakeRunner(options.StagingDirectory!, verificationExitCode: 0);
+        var discoverProvider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            discoverRunner,
+            environmentVariableReader: EnvironmentReader(_root));
+        var liveName = await discoverProvider.EnsureBaselineImageAsync(
+            "internet-only",
+            SandboxProfileFlavor.Headless,
+            pinnedBaselineRef: null,
+            CancellationToken.None);
+        Assert.NotNull(liveName);
+
+        // A fresh provider with the same config where that baseline does NOT exist
+        // yet, asked for the exact live name as a pin, must bake it.
+        var freshRunner = new BaselineBakeRunner(options.StagingDirectory!, verificationExitCode: 0);
+        var freshProvider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            freshRunner,
+            environmentVariableReader: EnvironmentReader(_root));
+
+        var resolved = await freshProvider.EnsureBaselineImageAsync(
+            "internet-only",
+            SandboxProfileFlavor.Headless,
+            liveName,
+            CancellationToken.None);
+
+        Assert.Equal(liveName, resolved);
+        Assert.Contains(freshRunner.Invocations, invocation => invocation.Argv.Contains("init", StringComparer.Ordinal));
+    }
+
+    [Fact]
     public async Task BaselineBake_RejectsExecutableMutationBetweenNameAndBakeFingerprint()
     {
         var executable = Path.Combine(_root, "name-race-tool");
