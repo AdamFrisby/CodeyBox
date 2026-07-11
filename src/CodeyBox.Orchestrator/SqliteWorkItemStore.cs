@@ -1282,39 +1282,6 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
 
-    public async Task<IReadOnlyList<WorkItem>> ListPageAsync(int offset, int limit, CancellationToken ct = default)
-    {
-        ArgumentOutOfRangeException.ThrowIfNegative(offset);
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
-        if (limit > IWorkItemStore.MaximumPageSize)
-            throw new ArgumentOutOfRangeException(nameof(limit), limit, $"Page size cannot exceed {IWorkItemStore.MaximumPageSize}.");
-
-        var rows = new List<WorkItem>(limit);
-        using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
-        using var readConn = await OpenReadConnectionAsync(ct);
-        using var tx = readConn.BeginTransaction();
-        using (var cmd = readConn.CreateCommand())
-        {
-            cmd.Transaction = tx;
-            cmd.CommandText = """
-                SELECT * FROM work_items
-                ORDER BY created_at DESC
-                LIMIT $limit OFFSET $offset;
-                """;
-            cmd.Parameters.AddWithValue("$limit", limit);
-            cmd.Parameters.AddWithValue("$offset", offset);
-            using var reader = await cmd.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct))
-                rows.Add(Read(reader));
-        }
-
-        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), readConn, ct, tx);
-        tx.Commit();
-        return rows
-            .Select(item => item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) })
-            .ToList();
-    }
-
     public async IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, [EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<WorkItem>();
@@ -3032,19 +2999,6 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         pragma.CommandText = "PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON;";
         await pragma.ExecuteNonQueryAsync(ct);
         return conn;
-    }
-
-    /// <summary>
-    /// Enriches a single in-memory item with its external IDs loaded from the
-    /// side table. No-op when the item is null.
-    /// </summary>
-    private async Task<WorkItem?> EnrichOneAsync(WorkItem? item, CancellationToken ct)
-    {
-        if (item is null) return null;
-        using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
-        using var readConnection = await OpenReadConnectionAsync(ct);
-        var extIds = await LoadExternalIdsForAsync(item.Id, readConnection, ct);
-        return item with { ExternalIds = extIds };
     }
 
     private sealed class ConnectionGateLease(SqliteDatabaseWriteGate gate) : IDisposable

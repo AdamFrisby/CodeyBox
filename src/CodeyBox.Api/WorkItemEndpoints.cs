@@ -8,9 +8,6 @@ namespace CodeyBox.Api;
 
 internal static class WorkItemEndpoints
 {
-    private const int DefaultWorkItemListLimit = 100;
-    private const int MaxWorkItemListLimit = 250;
-
     public static void Map(WebApplication app)
     {
         var group = app.MapGroup("/workitems");
@@ -87,19 +84,11 @@ internal static class WorkItemEndpoints
         ILoggerFactory loggerFactory,
         string? externalId,
         string? projectId,
-        int? offset,
-        int? limit,
         CancellationToken ct)
     {
-        var effectiveOffset = offset.GetValueOrDefault(0);
-        if (effectiveOffset < 0)
-            return Results.BadRequest(new { error = "offset must be non-negative" });
-        var effectiveLimit = limit.GetValueOrDefault(DefaultWorkItemListLimit);
-        if (effectiveLimit <= 0 || effectiveLimit > MaxWorkItemListLimit)
-            return Results.BadRequest(new { error = $"limit must be between 1 and {MaxWorkItemListLimit}" });
-
         var allProjects = (await projects.ListAsync(ct)).ToDictionary(p => p.Id.Value);
-        var allItems = (await store.ListPageAsync(effectiveOffset, effectiveLimit, ct)).ToList();
+        var allItems = new List<WorkItem>();
+        await foreach (var item in store.ListAsync(ct)) allItems.Add(item);
 
         // ?externalId=ns:val filter (matches the namespaced PATCH/POST surface).
         // Also accepts a bare value: returns every item that carries the value
