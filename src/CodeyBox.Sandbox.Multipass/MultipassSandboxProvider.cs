@@ -6297,6 +6297,16 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         return sb.ToString();
     }
 
+    // The optional elapsed-time file is a cross-process clock seam that drives
+    // ONLY the process-group marker deadline (codeybox_now_seconds). Tests
+    // atomically rename it to advance virtual time after observing a child
+    // signal, so the timeout branch fires deterministically instead of racing a
+    // real wall-clock deadline under parallel load. Production omits it and
+    // retains Bash's monotonic SECONDS clock. It is deliberately the single
+    // reader of this file — the HTTP-readiness probe keeps its own real timeout
+    // so no second component reimplements clock parsing. Poll/grace delays stay
+    // real `sleep`s regardless of mode: they are short, bounded latency, not
+    // deadlines, so they never flake and keep the SIGTERM→SIGKILL grace genuine.
     internal static string BuildDetachedLaunchScript(
         string envFile,
         string processGroupMarker,
@@ -6304,7 +6314,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         IReadOnlyList<string> command,
         int launchLockAttempts = 300,
         string? exitTokenFile = null,
-        int markerWaitSeconds = 30)
+        int markerWaitSeconds = 30,
+        string? virtualElapsedSecondsFile = null)
     {
         if (launchLockAttempts < 0)
             throw new ArgumentOutOfRangeException(nameof(launchLockAttempts), "Launch lock attempts must be non-negative.");
@@ -6356,8 +6367,28 @@ while True:
         sb.Append("codeybox_exit_token_file=").Append(MultipassSandboxProvider.ShellSingleQuote(exitTokenFile ?? "")).Append('\n');
         sb.Append("codeybox_lock_max=").Append(launchLockAttempts.ToString(CultureInfo.InvariantCulture)).Append('\n');
         sb.Append("codeybox_marker_wait_seconds=").Append(markerWaitSeconds.ToString(CultureInfo.InvariantCulture)).Append('\n');
+        sb.Append("codeybox_virtual_elapsed_seconds_file=")
+            .Append(MultipassSandboxProvider.ShellSingleQuote(virtualElapsedSecondsFile ?? ""))
+            .Append('\n');
         sb.AppendLine("codeybox_supervisor_dir=$(dirname \"$codeybox_pgid_marker\")");
         sb.AppendLine("codeybox_lock_dir=\"$codeybox_pgid_marker.lock\"");
+        // Elapsed-seconds clock for the marker deadline. Reads $SECONDS in
+        // production; in test/virtual mode reads the atomically-renamed clock
+        // file. The value is capped at 10 digits so the later $((...)) deadline
+        // arithmetic can never overflow bash's signed 64-bit integer range.
+        sb.AppendLine("codeybox_now_seconds() {");
+        sb.AppendLine("    if [ -z \"$codeybox_virtual_elapsed_seconds_file\" ]; then");
+        sb.AppendLine("        printf '%s\\n' \"$SECONDS\"");
+        sb.AppendLine("        return 0");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    local codeybox_virtual_now");
+        sb.AppendLine("    IFS= read -r -n 11 codeybox_virtual_now < \"$codeybox_virtual_elapsed_seconds_file\" || return 1");
+        sb.AppendLine("    case \"$codeybox_virtual_now\" in");
+        sb.AppendLine("        ''|*[!0-9]*) return 1 ;;");
+        sb.AppendLine("    esac");
+        sb.AppendLine("    if [ \"${#codeybox_virtual_now}\" -gt 10 ]; then return 1; fi");
+        sb.AppendLine("    printf '%s\\n' \"$codeybox_virtual_now\"");
+        sb.AppendLine("}");
         sb.AppendLine("codeybox_root_sh() {");
         sb.AppendLine("    local codeybox_script=\"$1\"");
         sb.AppendLine("    shift");
@@ -6434,6 +6465,13 @@ while True:
         // environment, is a separate work-item preemption hint and is left
         // untouched by this output-transport scrub.
         sb.AppendLine("unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID");
+        // HTTP-readiness preflight. This owns its OWN real timeout (socket
+        // timeout + SIGALRM backstop) and never reads the virtual clock, so the
+        // marker-deadline clock has a single reader. Its outcome is already
+        // deterministic under test: a listener that accepts but never sends a
+        // ready response makes opener.open time out at exactly `timeout=1.0`
+        // regardless of host load, so tests assert exit 86 off that internal
+        // deadline, not a host-scheduling race.
         sb.AppendLine("codeybox_http_ready() {");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_URL=\"$codeybox_output_url\" \\");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_TOKEN=\"$codeybox_output_token\" \\");
@@ -6456,7 +6494,6 @@ while True:
         sb.AppendLine("    data=b'',");
         sb.AppendLine("    method='POST',");
         sb.AppendLine("    headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/octet-stream'})");
-        sb.AppendLine("opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))");
         sb.AppendLine("try:");
         sb.AppendLine("    with opener.open(req, timeout=1.0) as resp:");
         sb.AppendLine("        code = resp.getcode()");
@@ -6650,12 +6687,12 @@ while True:
         sb.AppendLine();
         sb.AppendLine(") &");
         sb.AppendLine("codeybox_detached_pid=$!");
-        sb.AppendLine("codeybox_marker_deadline=$((SECONDS + codeybox_marker_wait_seconds))");
+        sb.AppendLine("codeybox_marker_deadline=$(($(codeybox_now_seconds) + codeybox_marker_wait_seconds))");
         sb.AppendLine("while ! codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; do");
         sb.AppendLine("    if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
         sb.AppendLine("        break");
         sb.AppendLine("    fi");
-        sb.AppendLine("    if [ \"$SECONDS\" -ge \"$codeybox_marker_deadline\" ]; then");
+        sb.AppendLine("    if [ \"$(codeybox_now_seconds)\" -ge \"$codeybox_marker_deadline\" ]; then");
         sb.AppendLine("        if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
         sb.AppendLine("            break");
         sb.AppendLine("        fi");
@@ -6706,7 +6743,7 @@ while True:
         sb.AppendLine("        if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
         sb.AppendLine("            break");
         sb.AppendLine("        fi");
-        sb.AppendLine("        if [ ! -s \"$codeybox_child_pgid_file\" ] && [ \"$SECONDS\" -lt \"$codeybox_marker_deadline\" ]; then");
+        sb.AppendLine("        if [ ! -s \"$codeybox_child_pgid_file\" ] && [ \"$(codeybox_now_seconds)\" -lt \"$codeybox_marker_deadline\" ]; then");
         sb.AppendLine("            sleep 0.1");
         sb.AppendLine("            continue");
         sb.AppendLine("        fi");
