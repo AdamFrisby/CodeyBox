@@ -65,7 +65,7 @@ public sealed class StartupResumeApiAvailabilityTests
         HttpResponseMessage? response = null;
         try
         {
-            // Both modes get +30s wall-clock slack to absorb parallel-suite
+            // Both modes get +90s wall-clock slack to absorb parallel-suite
             // host-startup contention; the per-mode elapsed assertions below
             // are what prove the resume contract, not the WaitAsync deadline.
             // Background mode: factory.CreateClient() returns as soon as the
