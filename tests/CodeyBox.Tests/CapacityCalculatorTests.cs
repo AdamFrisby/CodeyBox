@@ -15,28 +15,19 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class CapacityCalculatorTests : IDisposable
 {
-    private readonly string _tempDir;
+    private readonly TestTempDirectory _temp;
     private readonly string _dbPath;
 
     public CapacityCalculatorTests()
     {
-        _tempDir = Path.Combine(Path.GetTempPath(), "codeybox-capacity-tests-" + Guid.NewGuid().ToString("n"));
-        Directory.CreateDirectory(_tempDir);
-        _dbPath = Path.Combine(_tempDir, "stats.db");
+        _temp = TestTempDirectory.Create("codeybox-capacity-tests-");
+        _dbPath = _temp.NewDatabasePath("stats");
     }
 
     public void Dispose()
-    {
-        try
-        {
-            if (Directory.Exists(_tempDir))
-                Directory.Delete(_tempDir, recursive: true);
-        }
-        catch
-        {
-            // Best-effort — the next test creates a unique temp dir.
-        }
-    }
+        => TestTempArtifacts.CleanupAll(
+            () => TestTempArtifacts.DeleteSqliteDatabase(_dbPath),
+            _temp.Dispose);
 
     /// <summary>
     /// Core acceptance test from the task brief: given accumulated quota samples

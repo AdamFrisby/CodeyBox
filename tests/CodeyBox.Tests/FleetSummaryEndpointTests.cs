@@ -273,7 +273,7 @@ public sealed class FleetSummaryEndpointTests : IDisposable
 /// WebApplicationFactory for fleet endpoint tests. Seeds two projects and
 /// exposes helpers to seed work items directly into the SQLite store.
 /// </summary>
-internal sealed class FleetApiFactory : WebApplicationFactory<Program>
+internal sealed class FleetApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-fleet-{Guid.NewGuid():N}.db");
@@ -333,7 +333,7 @@ internal sealed class FleetApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -354,12 +354,5 @@ internal sealed class FleetApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            Store.Dispose();
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath, Store.Dispose);
 }

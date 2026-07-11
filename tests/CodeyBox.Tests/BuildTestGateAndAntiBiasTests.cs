@@ -30,7 +30,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
 {
     private readonly string _workspace;
     public BuildTestGateOrderingTests() => _workspace = Directory.CreateTempSubdirectory("codeybox-gate-").FullName;
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     [Fact]
     public async Task BuildTestGateFails_LlmPanelIsSkippedThisIteration_StopOnFirstFailureOff()
@@ -1219,7 +1219,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(clone, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(clone);
         }
     }
 

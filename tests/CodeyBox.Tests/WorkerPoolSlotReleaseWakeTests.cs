@@ -36,7 +36,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
     public void Dispose()
     {
         _store.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     [Fact]
@@ -367,7 +367,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(gitRoot, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(gitRoot);
         }
     }
 
@@ -444,7 +444,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(gitRoot, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(gitRoot);
         }
     }
 
@@ -1032,7 +1032,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(gitRoot, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(gitRoot);
         }
     }
 
@@ -1060,7 +1060,7 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(gitRoot, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(gitRoot);
         }
     }
 

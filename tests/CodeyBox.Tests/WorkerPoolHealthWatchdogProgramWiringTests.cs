@@ -70,7 +70,7 @@ public sealed class WorkerPoolHealthWatchdogProgramWiringTests
             },
         };
 
-    private sealed class WorkerPoolHealthWatchdogWiringFactory : WebApplicationFactory<Program>
+    private sealed class WorkerPoolHealthWatchdogWiringFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly MutableOptionsMonitor<CodeyBoxOptions> _monitor;
         private readonly string _dbPath = Path.Combine(
@@ -85,7 +85,7 @@ public sealed class WorkerPoolHealthWatchdogProgramWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -106,11 +106,7 @@ public sealed class WorkerPoolHealthWatchdogProgramWiringTests
         }
 
         protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            base.Dispose(disposing);
-        }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
     }
 
     private sealed class MutableOptionsMonitor<T> : IOptionsMonitor<T>

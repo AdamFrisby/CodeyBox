@@ -70,7 +70,7 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(clonedPath, recursive: true); } catch { /* best-effort */ }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(clonedPath);
         }
     }
 
@@ -113,7 +113,7 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         {
             foreach (var path in stagings)
             {
-                try { Directory.Delete(path, recursive: true); } catch { /* best-effort */ }
+                CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(path);
             }
         }
     }
@@ -237,7 +237,7 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         {
             foreach (var path in inflightStagings)
             {
-                try { Directory.Delete(path, recursive: true); } catch { /* best-effort */ }
+                CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(path);
             }
         }
     }
@@ -299,7 +299,7 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(stagingPath, recursive: true); } catch { /* best-effort */ }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(stagingPath);
         }
     }
 
@@ -381,7 +381,7 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(clonedPath, recursive: true); } catch { /* best-effort */ }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(clonedPath);
         }
     }
 
@@ -436,7 +436,7 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(stagingPath, recursive: true); } catch { /* best-effort */ }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(stagingPath);
         }
     }
 
@@ -475,7 +475,7 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(stagingPath, recursive: true); } catch { /* best-effort */ }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(stagingPath);
         }
     }
 
@@ -607,7 +607,7 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(stagingPath, recursive: true); } catch { /* best-effort */ }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(stagingPath);
         }
     }
 
@@ -713,7 +713,7 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(stagingPath, recursive: true); } catch { /* best-effort */ }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(stagingPath);
         }
     }
 
@@ -763,7 +763,7 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(stagingPath, recursive: true); } catch { /* best-effort */ }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(stagingPath);
         }
     }
 
@@ -822,7 +822,7 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(stagingPath, recursive: true); } catch { /* best-effort */ }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(stagingPath);
         }
     }
 
@@ -875,7 +875,7 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(stagingPath, recursive: true); } catch { /* best-effort */ }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(stagingPath);
             try { File.Delete(stagingPath + IGitHost.IsolatedMergeCloneInFlightSiblingSuffix); } catch { /* best-effort */ }
         }
     }
@@ -980,7 +980,7 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(stagingPath, recursive: true); } catch { /* best-effort */ }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(stagingPath);
             try { File.Delete(stagingPath + IGitHost.IsolatedMergeCloneInFlightSiblingSuffix); } catch { /* best-effort */ }
         }
     }
@@ -1037,7 +1037,7 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(stagingPath, recursive: true); } catch { /* best-effort */ }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(stagingPath);
             try { File.Delete(stagingPath + IGitHost.IsolatedMergeCloneInFlightSiblingSuffix); } catch { /* best-effort */ }
         }
     }
@@ -1355,7 +1355,7 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(stagingPath1, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(stagingPath1);
         }
 
         // Hot-reload: bump the retry ceiling to 4.  The snapshot is shared so
@@ -1385,7 +1385,7 @@ public sealed class MergePhaseIsolatedRepoStagingTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(stagingPath2, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(stagingPath2);
         }
     }
 

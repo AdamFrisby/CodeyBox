@@ -22,7 +22,7 @@ public sealed class AgentPricingDefaultsTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_tempDir, recursive: true); } catch { /* best effort */ }
+        TestTempArtifacts.DeleteDirectory(_tempDir);
     }
 
     private void Write(string content) =>

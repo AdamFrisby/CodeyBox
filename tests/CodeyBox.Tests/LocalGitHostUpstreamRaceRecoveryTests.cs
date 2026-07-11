@@ -25,8 +25,7 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_workspace, recursive: true); }
-        catch { }
+        TestTempArtifacts.DeleteDirectory(_workspace);
     }
 
     private LocalGitHost CreateGitHost(

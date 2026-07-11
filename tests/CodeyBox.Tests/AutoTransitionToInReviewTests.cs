@@ -28,7 +28,7 @@ public sealed class AutoTransitionToInReviewTests : IDisposable
     {
         _workItemStore.Dispose();
         _releaseStore.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     [Fact]

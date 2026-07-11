@@ -43,10 +43,11 @@ public sealed class E2eExecutionTests : IDisposable
 
     public void Dispose()
     {
-        _runs.Dispose();
-        _testCases.Dispose();
-        _itemStore.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.CleanupAll(
+            _runs.Dispose,
+            _testCases.Dispose,
+            _itemStore.Dispose,
+            () => TestTempArtifacts.DeleteSqliteDatabase(_dbPath));
     }
 
     // --------------------------------------------------------------------
@@ -2673,7 +2674,7 @@ public sealed class E2eExecutionTests : IDisposable
 
         public ValueTask DisposeAsync()
         {
-            try { Directory.Delete(_root, recursive: true); } catch { }
+            TestTempArtifacts.DeleteDirectory(_root);
             return default;
         }
 

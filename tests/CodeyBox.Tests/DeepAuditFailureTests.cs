@@ -29,7 +29,7 @@ public sealed class DeepAuditFailureTests : IDisposable
     {
         _workItemStore.Dispose();
         _releaseStore.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     [Fact]

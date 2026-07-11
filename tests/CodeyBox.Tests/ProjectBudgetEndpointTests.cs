@@ -135,7 +135,7 @@ public sealed class ProjectBudgetEndpointTests : IClassFixture<BudgetApiFactory>
     }
 }
 
-public sealed class BudgetApiFactory : WebApplicationFactory<Program>
+public sealed class BudgetApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-budget-httptest-{Guid.NewGuid():N}.db");
@@ -154,7 +154,7 @@ public sealed class BudgetApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -196,13 +196,9 @@ public sealed class BudgetApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            CostStore.Dispose();
-            Store.Dispose();
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(
+            disposing,
+            _dbPath,
+            CostStore.Dispose,
+            Store.Dispose);
 }

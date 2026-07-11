@@ -239,7 +239,7 @@ public sealed class AgentSupervisionEndpointTests : IDisposable
             Source: "test");
 }
 
-internal sealed class AgentSupervisionApiFactory : WebApplicationFactory<Program>
+internal sealed class AgentSupervisionApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-supervision-httptest-{Guid.NewGuid():N}.db");
@@ -263,7 +263,7 @@ internal sealed class AgentSupervisionApiFactory : WebApplicationFactory<Program
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
             cfg.Sources.Clear();
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -283,11 +283,7 @@ internal sealed class AgentSupervisionApiFactory : WebApplicationFactory<Program
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-            try { File.Delete(_dbPath); } catch { }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
 }
 
 internal sealed class RecordingEndpointSupervisionNotifier : IAgentSupervisionNotifier

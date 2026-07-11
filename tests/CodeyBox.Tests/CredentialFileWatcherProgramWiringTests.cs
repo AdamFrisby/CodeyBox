@@ -17,7 +17,7 @@ public sealed class CredentialFileWatcherProgramWiringTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_tempDir, recursive: true); } catch { }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_tempDir);
     }
 
     [Theory]
@@ -123,7 +123,7 @@ public sealed class CredentialFileWatcherProgramWiringTests : IDisposable
         Assert.Contains(CredentialFileWatcherSettings.EnvironmentVariable, ex.Message);
     }
 
-    private sealed class CredentialWatcherProgramFactory : WebApplicationFactory<Program>
+    private sealed class CredentialWatcherProgramFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly string _root;
         private readonly string? _credentialFileWatchers;

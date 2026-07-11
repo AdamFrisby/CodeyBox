@@ -165,7 +165,7 @@ public sealed class AuditorParallelismTests : IDisposable
 {
     private readonly string _workspace;
     public AuditorParallelismTests() => _workspace = Directory.CreateTempSubdirectory("codeybox-par-").FullName;
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     [Fact]
     public async Task ThreeSlowLlmAuditors_RunInParallel_WallClockIsNotSumOfDelays()
@@ -239,7 +239,7 @@ public sealed class AuditorParallelismOrderingTests : IDisposable
 {
     private readonly string _workspace;
     public AuditorParallelismOrderingTests() => _workspace = Directory.CreateTempSubdirectory("codeybox-order-").FullName;
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     [Fact]
     public async Task Findings_AggregateInRegistrationOrder_RegardlessOfCompletionOrder()
@@ -340,7 +340,7 @@ public sealed class AuditorShortCircuitTests : IDisposable
 {
     private readonly string _workspace;
     public AuditorShortCircuitTests() => _workspace = Directory.CreateTempSubdirectory("codeybox-short-circuit-").FullName;
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     [Fact]
     public async Task BlockingShortCircuitGate_SkipsSubsequentAuditors()
@@ -537,7 +537,7 @@ public sealed class AuditorParallelismRespectsMaxTests : IDisposable
 {
     private readonly string _workspace;
     public AuditorParallelismRespectsMaxTests() => _workspace = Directory.CreateTempSubdirectory("codeybox-maxpar-").FullName;
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     [Fact]
     public async Task MaxParallelism1_ThreeAuditors_RunSequentially()
@@ -580,7 +580,7 @@ public sealed class AuditorAgentExecutionFailureTests : IDisposable
 {
     private readonly string _workspace;
     public AuditorAgentExecutionFailureTests() => _workspace = Directory.CreateTempSubdirectory("codeybox-llm-agent-fail-").FullName;
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     [Fact]
     public async Task LlmAgentExecutionFailure_IsRetriedOnceInFreshSandbox()
@@ -1425,7 +1425,7 @@ public sealed class AuditorParallelismIsolationTests : IDisposable
 {
     private readonly string _workspace;
     public AuditorParallelismIsolationTests() => _workspace = Directory.CreateTempSubdirectory("codeybox-iso-").FullName;
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     [Fact]
     public async Task TwoLlmAuditors_HaveSeparateSandboxes_FindingsDoNotCrossTaint()
@@ -1475,7 +1475,7 @@ public sealed class AuditorParallelismCancellationTests : IDisposable
 {
     private readonly string _workspace;
     public AuditorParallelismCancellationTests() => _workspace = Directory.CreateTempSubdirectory("codeybox-cancel-par-").FullName;
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     [Fact]
     public async Task CancelDuringAudit_AbortsInFlightAuditors_WorkItemIsCancelled()

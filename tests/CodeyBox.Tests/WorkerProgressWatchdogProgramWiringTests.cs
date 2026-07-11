@@ -64,7 +64,7 @@ public sealed class WorkerProgressWatchdogProgramWiringTests
         return field.GetValue(instance);
     }
 
-    private sealed class WorkerProgressWatchdogWiringFactory(ISandboxProvider provider) : WebApplicationFactory<Program>
+    private sealed class WorkerProgressWatchdogWiringFactory(ISandboxProvider provider) : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly string _dbPath = Path.Combine(
             Path.GetTempPath(), $"codeybox-progress-watchdog-wiring-{Guid.NewGuid():N}.db");
@@ -77,7 +77,7 @@ public sealed class WorkerProgressWatchdogProgramWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -99,11 +99,7 @@ public sealed class WorkerProgressWatchdogProgramWiringTests
         }
 
         protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { }
-            base.Dispose(disposing);
-        }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
     }
 
     public sealed class ProgressProvider : ISandboxProvider, IActiveSandboxProgressProvider

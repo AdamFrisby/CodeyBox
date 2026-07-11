@@ -181,7 +181,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private readonly ITestCaseStore? _testCaseStore;
     private readonly IMergeScopeResolver _mergeScopeResolver;
     private readonly Func<Guid> _dispatchClaimIdFactory;
-    private readonly string _disabledHostHooksPath;
     // Resumable Claude session worker. Null when not registered in DI (the
     // default for tests / minimal compositions). Composed with the global
     // CodeyBox:ClaudeSession:Enabled flag and per-project opt-in
@@ -447,8 +446,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 credentialFileMaterialiser: MaterialiseCredentialFilesAsync,
                 agentSupervision: _agentSupervision,
                 authFailureClassifier: _authFailureClassifier);
-        _disabledHostHooksPath = Path.Combine(Path.GetTempPath(), "codeybox-disabled-host-hooks-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(_disabledHostHooksPath);
         _watchdogOptionsAccessor = watchdogOptionsAccessor;
         // The session-runner abstraction is the single seam: production
         // hands in the per-provider concrete session runner
@@ -17100,8 +17097,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string verificationRef,
         CancellationToken ct)
     {
-        var target = _gitHost.GetRepoPath(repoId);
-        await RunHostGitAsync(target, ct, "fetch", "--no-tags", isolatedRepoPath, $"+{verificationRef}:{verificationRef}");
+        await RunHostGitAsync(repoId, ct, "fetch", "--no-tags", isolatedRepoPath, $"+{verificationRef}:{verificationRef}");
     }
 
     private async Task UpdateHostBaseRefAsync(
@@ -17112,16 +17108,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
         CancellationToken ct)
     {
         Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
-        var target = _gitHost.GetRepoPath(repoId);
-        await RunHostGitAsync(target, ct, "update-ref", $"refs/heads/{baseBranch}", mergeSha, expectedOldSha);
+        await RunHostGitAsync(repoId, ct, "update-ref", $"refs/heads/{baseBranch}", mergeSha, expectedOldSha);
     }
 
     private async Task DeleteHostRefBestEffortAsync(string repoId, string refName, CancellationToken ct)
     {
         try
         {
-            var target = _gitHost.GetRepoPath(repoId);
-            await RunHostGitAsync(target, ct, "update-ref", "-d", refName);
+            await RunHostGitAsync(repoId, ct, "update-ref", "-d", refName);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -17136,10 +17130,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string mergeSha,
         CancellationToken ct)
     {
-        var target = _gitHost.GetRepoPath(repoId);
         try
         {
-            await RunHostGitAsync(target, ct, "merge-base", "--is-ancestor", preMergeSha, mergeSha);
+            await RunHostGitAsync(repoId, ct, "merge-base", "--is-ancestor", preMergeSha, mergeSha);
         }
         catch (InvalidOperationException)
         {
@@ -17149,7 +17142,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         try
         {
-            await RunHostGitAsync(target, ct, "merge-base", "--is-ancestor", workTipSha, mergeSha);
+            await RunHostGitAsync(repoId, ct, "merge-base", "--is-ancestor", workTipSha, mergeSha);
         }
         catch (InvalidOperationException)
         {
@@ -19103,7 +19096,7 @@ Original merge-phase failure (JSON string, for context only):
     private async Task<IReadOnlyList<string>> ListChangedFilesAsync(
         string repoId, string fromTip, string toTip, CancellationToken ct)
     {
-        var (stdout, _) = await RunHostGitCaptureAsync(_gitHost.GetRepoPath(repoId), ct,
+        var (stdout, _) = await RunHostGitCaptureAsync(repoId, ct,
             "diff", "--name-only", fromTip, toTip);
         return stdout
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
@@ -19293,9 +19286,9 @@ Original merge-phase failure (JSON string, for context only):
             throw new InvalidOperationException($"command failed (exit {r.ExitCode}): {string.Join(' ', argv)}\n{r.Stderr}");
     }
 
-    private async Task RunHostGitAsync(string workdir, CancellationToken ct, params string[] args)
+    private async Task RunHostGitAsync(string repositoryId, CancellationToken ct, params string[] args)
     {
-        var (stdout, stderr, exitCode) = await RunHostGitCaptureNoThrowAsync(workdir, ct, args);
+        var (stdout, stderr, exitCode) = await RunHostGitCaptureNoThrowAsync(repositoryId, ct, args);
         if (exitCode != 0)
             throw new InvalidOperationException($"host git command failed (exit {exitCode}): git {string.Join(' ', args)}\n{stderr}{stdout}");
     }
@@ -19306,9 +19299,9 @@ Original merge-phase failure (JSON string, for context only):
     /// this when they need the command's output rather than just success.
     /// </summary>
     private async Task<(string Stdout, string Stderr)> RunHostGitCaptureAsync(
-        string workdir, CancellationToken ct, params string[] args)
+        string repositoryId, CancellationToken ct, params string[] args)
     {
-        var (stdout, stderr, exitCode) = await RunHostGitCaptureNoThrowAsync(workdir, ct, args);
+        var (stdout, stderr, exitCode) = await RunHostGitCaptureNoThrowAsync(repositoryId, ct, args);
         if (exitCode != 0)
             throw new InvalidOperationException($"host git command failed (exit {exitCode}): git {string.Join(' ', args)}\n{stderr}{stdout}");
         return (stdout, stderr);
@@ -19320,8 +19313,9 @@ Original merge-phase failure (JSON string, for context only):
     /// where a non-zero exit is a meaningful answer rather than an error.
     /// </summary>
     private async Task<(string Stdout, string Stderr, int ExitCode)> RunHostGitCaptureNoThrowAsync(
-        string workdir, CancellationToken ct, params string[] args)
+        string repositoryId, CancellationToken ct, params string[] args)
     {
+        var workdir = _gitHost.GetRepoPath(repositoryId);
         SanitizeBareRepositoryConfigIfPresent(workdir);
         var psi = new ProcessStartInfo
         {
@@ -19333,7 +19327,7 @@ Original merge-phase failure (JSON string, for context only):
             CreateNoWindow = true,
         };
         psi.ArgumentList.Add("-c");
-        psi.ArgumentList.Add($"core.hooksPath={_disabledHostHooksPath}");
+        psi.ArgumentList.Add($"core.hooksPath={_gitHost.GetDisabledHooksPath(repositoryId)}");
         foreach (var arg in args)
             psi.ArgumentList.Add(arg);
 

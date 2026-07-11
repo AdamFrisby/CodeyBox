@@ -174,7 +174,7 @@ public sealed class CapacityEndpointTests : IClassFixture<CapacityEndpointTests.
 
     // ── Test fixtures ─────────────────────────────────────────────────────────
 
-    public sealed class CapacityApiFactory : WebApplicationFactory<Program>
+    public sealed class CapacityApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly string _dbPath = Path.Combine(
             Path.GetTempPath(), $"codeybox-capacity-endpoint-{Guid.NewGuid():N}.db");
@@ -186,7 +186,7 @@ public sealed class CapacityEndpointTests : IClassFixture<CapacityEndpointTests.
             builder.UseEnvironment("Development");
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -205,11 +205,7 @@ public sealed class CapacityEndpointTests : IClassFixture<CapacityEndpointTests.
         }
 
         protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            base.Dispose(disposing);
-        }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
     }
 
     /// <summary>
@@ -218,7 +214,7 @@ public sealed class CapacityEndpointTests : IClassFixture<CapacityEndpointTests.
     /// shared factory because Program.cs may register a default itself; this
     /// per-test factory keeps the contract clear.
     /// </summary>
-    public sealed class BareCapacityApiFactory : WebApplicationFactory<Program>
+    public sealed class BareCapacityApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly string _dbPath = Path.Combine(
             Path.GetTempPath(), $"codeybox-capacity-bare-{Guid.NewGuid():N}.db");
@@ -228,7 +224,7 @@ public sealed class CapacityEndpointTests : IClassFixture<CapacityEndpointTests.
             builder.UseEnvironment("Development");
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -247,11 +243,7 @@ public sealed class CapacityEndpointTests : IClassFixture<CapacityEndpointTests.
         }
 
         protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            base.Dispose(disposing);
-        }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
     }
 
     /// <summary>

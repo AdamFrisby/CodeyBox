@@ -21,7 +21,7 @@ public sealed class CheckAndActPipelineTests : IDisposable
 {
     private readonly string _workspace;
     public CheckAndActPipelineTests() => _workspace = Directory.CreateTempSubdirectory("codeybox-checkact-").FullName;
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     [Fact]
     public async Task YesVerdict_EnqueuesParentedFollowupAgainstSameProject()

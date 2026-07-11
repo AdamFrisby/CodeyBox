@@ -12,7 +12,7 @@ public sealed class OptOutTests : IDisposable
     private readonly string _workspace;
     public OptOutTests() =>
         _workspace = Directory.CreateTempSubdirectory("codeybox-optout-").FullName;
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     [Fact]
     public async Task WorkPrompt_WhenOptOut_DoesNotContainQuestionProtocol()

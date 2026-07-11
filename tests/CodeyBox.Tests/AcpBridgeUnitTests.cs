@@ -837,7 +837,7 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 
@@ -890,7 +890,7 @@ public sealed class AcpBridgeUnitTests
         {
             Environment.SetEnvironmentVariable("HOME", oldHome);
             EnvironmentVariableGate.Release();
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 
@@ -930,7 +930,7 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 
@@ -1177,7 +1177,7 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 
@@ -1226,7 +1226,7 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 
@@ -1269,7 +1269,7 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 
@@ -1312,7 +1312,7 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 
@@ -1361,7 +1361,7 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 
@@ -1415,7 +1415,7 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 
@@ -1532,7 +1532,7 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 
@@ -1635,7 +1635,7 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 
@@ -1767,7 +1767,7 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 
@@ -1868,7 +1868,7 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 
@@ -1933,7 +1933,7 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 
@@ -1976,7 +1976,7 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 
@@ -2048,7 +2048,7 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 
@@ -2189,7 +2189,7 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 
@@ -2697,7 +2697,7 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 
@@ -2770,7 +2770,7 @@ public sealed class AcpBridgeUnitTests
         }
         finally
         {
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 
@@ -3459,9 +3459,9 @@ os.execv(dotnet, [hostile_argv0, "exec", target, *sys.argv[3:]])
         {
             if (ignoredMarkerPath is not null)
             {
-                try { File.Delete(ignoredMarkerPath); } catch { }
+                CodeyBox.Tests.TestTempArtifacts.DeleteFile(ignoredMarkerPath);
             }
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 
@@ -4688,7 +4688,7 @@ exit 9
         }
         finally
         {
-            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(fixture.TempRoot);
         }
     }
 
@@ -4715,7 +4715,7 @@ exit 9
         }
         finally
         {
-            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(fixture.TempRoot);
         }
     }
 
@@ -4753,7 +4753,7 @@ exit 9
         }
         finally
         {
-            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(fixture.TempRoot);
         }
     }
 
@@ -4783,7 +4783,7 @@ exit 9
         }
         finally
         {
-            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(fixture.TempRoot);
         }
     }
 
@@ -4809,7 +4809,7 @@ exit 9
         }
         finally
         {
-            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(fixture.TempRoot);
         }
     }
 
@@ -4836,7 +4836,7 @@ exit 9
         }
         finally
         {
-            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(fixture.TempRoot);
         }
     }
 
@@ -4865,7 +4865,7 @@ exit 9
         }
         finally
         {
-            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(fixture.TempRoot);
         }
     }
 
@@ -4889,7 +4889,7 @@ exit 9
         }
         finally
         {
-            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(fixture.TempRoot);
         }
     }
 
@@ -4921,7 +4921,7 @@ exit 9
         }
         finally
         {
-            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(fixture.TempRoot);
         }
     }
 
@@ -4945,7 +4945,7 @@ exit 9
         }
         finally
         {
-            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(fixture.TempRoot);
         }
     }
 
@@ -4968,7 +4968,7 @@ exit 9
         }
         finally
         {
-            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(fixture.TempRoot);
         }
     }
 
@@ -5024,7 +5024,7 @@ exit 9
         }
         finally
         {
-            try { Directory.Delete(fixture.TempRoot, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(fixture.TempRoot);
         }
     }
 
@@ -5117,7 +5117,7 @@ exit 9
         }
         finally
         {
-            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(tmpDir);
         }
     }
 

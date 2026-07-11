@@ -36,7 +36,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_workspace, recursive: true); } catch { }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace);
     }
 
     private static WorkItem NewItem() => new()
@@ -1500,7 +1500,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
 
         Assert.True(Directory.Exists(root));
         Assert.True(File.Exists(Path.Combine(root, ".codeybox-preempt")));
-        try { Directory.Delete(root, recursive: true); } catch { }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(root);
     }
 
     private PipelineRunner BuildResumePipeline(

@@ -179,7 +179,7 @@ public sealed class WorkItemFallbackHistoryEndpointTests : IDisposable
 /// store for the in-memory variant so tests can pre-seed records without
 /// hitting disk.
 /// </summary>
-internal sealed class FallbackHistoryApiFactory : WebApplicationFactory<Program>
+internal sealed class FallbackHistoryApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-fbtest-{Guid.NewGuid():N}.db");
@@ -197,7 +197,7 @@ internal sealed class FallbackHistoryApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -227,12 +227,5 @@ internal sealed class FallbackHistoryApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            Store.Dispose();
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath, Store.Dispose);
 }

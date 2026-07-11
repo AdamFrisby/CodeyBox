@@ -135,7 +135,7 @@ public sealed class AgentPricingStartupOperatorOverrideTests
     }
 }
 
-public sealed class AgentPricingStartupFactory : WebApplicationFactory<Program>
+public sealed class AgentPricingStartupFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-pricing-startup-{Guid.NewGuid():N}.db");
@@ -151,7 +151,7 @@ public sealed class AgentPricingStartupFactory : WebApplicationFactory<Program>
                 .ToList();
             foreach (var s in jsonSources) cfg.Sources.Remove(s);
 
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -169,16 +169,10 @@ public sealed class AgentPricingStartupFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
 }
 
-public sealed class AgentPricingStartupOperatorFactory : WebApplicationFactory<Program>
+public sealed class AgentPricingStartupOperatorFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-pricing-startup-op-{Guid.NewGuid():N}.db");
@@ -194,7 +188,7 @@ public sealed class AgentPricingStartupOperatorFactory : WebApplicationFactory<P
                 .ToList();
             foreach (var s in jsonSources) cfg.Sources.Remove(s);
 
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -215,11 +209,5 @@ public sealed class AgentPricingStartupOperatorFactory : WebApplicationFactory<P
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
 }

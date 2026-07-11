@@ -450,7 +450,7 @@ public sealed class QueueStatusHttpTests : IDisposable
 /// Variant of WorkItemApiFactory that also replaces IQueueController with
 /// a real SqliteQueueController backed by the same temp DB.
 /// </summary>
-internal sealed class QueueApiFactory : WebApplicationFactory<Program>
+internal sealed class QueueApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-queuehttp-{Guid.NewGuid():N}.db");
@@ -469,7 +469,7 @@ internal sealed class QueueApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -511,13 +511,9 @@ internal sealed class QueueApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            QueueController.Dispose();
-            Store.Dispose();
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(
+            disposing,
+            _dbPath,
+            QueueController.Dispose,
+            Store.Dispose);
 }

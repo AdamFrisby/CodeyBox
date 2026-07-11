@@ -18,7 +18,7 @@ public sealed class WorkerRegistryTests : IDisposable
     public void Dispose()
     {
         _registry.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     private static WorkerRegistration MakeReg(string? workItemId = null) => new()
@@ -100,7 +100,7 @@ public sealed class WorkerRegistryTests : IDisposable
         }
         finally
         {
-            try { File.Delete(path); } catch { }
+            TestTempArtifacts.DeleteSqliteDatabase(path);
         }
     }
 
@@ -131,7 +131,7 @@ public sealed class WorkerRegistryTests : IDisposable
         }
         finally
         {
-            try { File.Delete(path); } catch { }
+            TestTempArtifacts.DeleteSqliteDatabase(path);
         }
     }
 

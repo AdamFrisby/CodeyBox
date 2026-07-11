@@ -17,28 +17,19 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class ResetCreditExpiryEstimatorTests : IDisposable
 {
-    private readonly string _tempDir;
+    private readonly TestTempDirectory _temp;
     private readonly string _dbPath;
 
     public ResetCreditExpiryEstimatorTests()
     {
-        _tempDir = Path.Combine(Path.GetTempPath(), "codeybox-resetcredit-tests-" + Guid.NewGuid().ToString("n"));
-        Directory.CreateDirectory(_tempDir);
-        _dbPath = Path.Combine(_tempDir, "stats.db");
+        _temp = TestTempDirectory.Create("codeybox-resetcredit-tests-");
+        _dbPath = _temp.NewDatabasePath("stats");
     }
 
     public void Dispose()
-    {
-        try
-        {
-            if (Directory.Exists(_tempDir))
-                Directory.Delete(_tempDir, recursive: true);
-        }
-        catch
-        {
-            // Best-effort temp cleanup.
-        }
-    }
+        => TestTempArtifacts.CleanupAll(
+            () => TestTempArtifacts.DeleteSqliteDatabase(_dbPath),
+            _temp.Dispose);
 
     [Fact]
     public async Task Estimate_DerivesObservedGrant_PinnedToLastSampleAtLowerCount()

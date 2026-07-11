@@ -49,7 +49,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_workspace, recursive: true); } catch { }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace);
     }
 
     [Fact]
@@ -1041,7 +1041,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         finally
         {
             RestoreFixtureDirectoryForCleanup(shimDir);
-            Directory.Delete(fixture, recursive: true);
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(fixture);
         }
     }
 
@@ -1092,7 +1092,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         finally
         {
             RestoreFixtureDirectoryForCleanup(shimDir);
-            Directory.Delete(fixture, recursive: true);
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(fixture);
         }
     }
 
@@ -1139,7 +1139,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         finally
         {
             RestoreFixtureDirectoryForCleanup(shimDir);
-            Directory.Delete(fixture, recursive: true);
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(fixture);
         }
     }
 
@@ -1189,7 +1189,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         finally
         {
             RestoreFixtureDirectoryForCleanup(shimDir);
-            Directory.Delete(fixture, recursive: true);
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(fixture);
         }
     }
 

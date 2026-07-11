@@ -177,7 +177,7 @@ public sealed class PipelineOptionsWiringTests
         Assert.True(options.PreemptiveSelfReviewEnabled);
     }
 
-    private sealed class PipelineOptionsWiringFactory : WebApplicationFactory<Program>
+    private sealed class PipelineOptionsWiringFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly Dictionary<string, string?> _extraConfig;
         private readonly string _dbPath = Path.Combine(
@@ -194,7 +194,7 @@ public sealed class PipelineOptionsWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 var baseConfig = new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -217,10 +217,6 @@ public sealed class PipelineOptionsWiringTests
         }
 
         protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            base.Dispose(disposing);
-        }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
     }
 }

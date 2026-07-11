@@ -25,7 +25,7 @@ public sealed class MultipassStagingPermsTests : IDisposable
         _customStaging = Path.Combine(Path.GetTempPath(), $"codeybox-test-staging-{Guid.NewGuid():N}");
     }
 
-    public void Dispose() { try { Directory.Delete(_customStaging, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_customStaging); }
 
     [Fact]
     public void StagingRoot_IsCreated_With_OperatorOnlyPerms()

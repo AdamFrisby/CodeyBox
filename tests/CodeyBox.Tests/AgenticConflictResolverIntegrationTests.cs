@@ -377,8 +377,7 @@ public sealed class AgenticConflictResolverIntegrationTests
         public TempWorkspace() => Directory.CreateDirectory(Root);
         public void Dispose()
         {
-            try { Directory.Delete(Root, recursive: true); }
-            catch { /* best-effort */ }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(Root);
         }
     }
 

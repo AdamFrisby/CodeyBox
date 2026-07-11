@@ -21,7 +21,7 @@ public sealed class QuestionPersistenceTests : IDisposable
     {
         _store.Dispose();
         _itemStore.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     private async Task<string> SeedWorkItemAsync()

@@ -196,7 +196,7 @@ public sealed class BaselineEndpointsTests : IDisposable
 /// state. The factory exposes <see cref="SweepAsync"/> so each test can
 /// trigger the in-memory report it expects to assert.
 /// </summary>
-internal sealed class BaselineApiFactory : WebApplicationFactory<Program>
+internal sealed class BaselineApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-baseline-api-{Guid.NewGuid():N}.db");
@@ -221,7 +221,7 @@ internal sealed class BaselineApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -256,14 +256,7 @@ internal sealed class BaselineApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            WorkItemStore.Dispose();
-            try { File.Delete(_dbPath); } catch { }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath, WorkItemStore.Dispose);
 }
 
 /// <summary>

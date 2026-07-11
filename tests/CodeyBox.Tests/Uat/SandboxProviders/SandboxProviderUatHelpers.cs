@@ -12,6 +12,7 @@ using CodeyBox.HostProcess;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox.Multipass;
+using CodeyBox.Tests;
 
 namespace CodeyBox.Tests.Uat.SandboxProviders;
 
@@ -100,7 +101,7 @@ internal sealed record MultipassCall(
     bool HasStderrChunkCallback = false,
     bool KillOnOutputLimit = true);
 
-internal sealed class SandboxProviderApiFactory : WebApplicationFactory<Program>
+internal sealed class SandboxProviderApiFactory : CodeyBoxWebApplicationFactory
 {
     private readonly string _environment;
     private readonly Dictionary<string, string?> _configuration;
@@ -108,8 +109,7 @@ internal sealed class SandboxProviderApiFactory : WebApplicationFactory<Program>
     private readonly IManagedSandboxLifecycle? _managedLifecycle;
     private readonly SandboxLeakReaper? _reaper;
     private readonly IWebhookDispatcher? _webhooks;
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-uat-sandbox-api-{Guid.NewGuid():N}.db");
+    private readonly string _dbPath;
 
     public SandboxProviderApiFactory(
         string environment = "Development",
@@ -125,6 +125,7 @@ internal sealed class SandboxProviderApiFactory : WebApplicationFactory<Program>
         _managedLifecycle = managedLifecycle;
         _reaper = reaper;
         _webhooks = webhooks;
+        _dbPath = TempDatabasePath("codeybox-uat-sandbox-api");
     }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -132,15 +133,14 @@ internal sealed class SandboxProviderApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment(_environment);
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
             var defaults = new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                ["CodeyBox:GitRootDirectory"] = Temp.NewDirectoryPath("test-git-"),
+                ["CodeyBox:AuditLog:Path"] = Temp.NewLogPath("test-log"),
+                ["CodeyBox:AuditLog:AuditPath"] = Temp.NewLogPath("test-audit"),
+                ["CodeyBox:AgentStreams:Path"] = Temp.NewDirectoryPath("test-agent-streams-"),
                 ["CodeyBox:Changelog:Enabled"] = "false",
             };
 
@@ -199,7 +199,7 @@ internal sealed class SandboxProviderApiFactory : WebApplicationFactory<Program>
     {
         base.Dispose(disposing);
         if (disposing)
-            try { File.Delete(_dbPath); } catch { }
+            TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 }
 

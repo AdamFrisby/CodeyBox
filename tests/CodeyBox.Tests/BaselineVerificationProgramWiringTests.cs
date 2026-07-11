@@ -404,7 +404,7 @@ public sealed class BaselineVerificationProgramWiringTests
         return null;
     }
 
-    private sealed class BaselineVerificationFactory : WebApplicationFactory<Program>
+    private sealed class BaselineVerificationFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly Dictionary<string, string?> _extraConfig;
         private readonly string _dbPath = Path.Combine(
@@ -421,7 +421,7 @@ public sealed class BaselineVerificationProgramWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 var baseConfig = new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -446,11 +446,7 @@ public sealed class BaselineVerificationProgramWiringTests
         }
 
         protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            base.Dispose(disposing);
-        }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
     }
 
     private sealed class NoopTimingStore : ITimingStore

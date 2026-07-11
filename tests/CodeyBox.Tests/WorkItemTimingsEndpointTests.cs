@@ -242,7 +242,7 @@ public sealed class AggregateTimingsEndpointTests : IClassFixture<AggregateTimin
 /// Separate factory for AggregateTimingsEndpointTests so its database is
 /// isolated from WorkItemTimingsEndpointTests.
 /// </summary>
-public sealed class AggregateTimingsApiFactory : WebApplicationFactory<Program>
+public sealed class AggregateTimingsApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-timings-aggtest-{Guid.NewGuid():N}.db");
@@ -261,7 +261,7 @@ public sealed class AggregateTimingsApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -284,22 +284,18 @@ public sealed class AggregateTimingsApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            TimingStore.Dispose();
-            Store.Dispose();
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(
+            disposing,
+            _dbPath,
+            TimingStore.Dispose,
+            Store.Dispose);
 }
 
 /// <summary>
 /// Test host that exposes both a work item store and a timing store backed by
 /// the same temp database.
 /// </summary>
-public sealed class TimingsApiFactory : WebApplicationFactory<Program>
+public sealed class TimingsApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-timings-httptest-{Guid.NewGuid():N}.db");
@@ -318,7 +314,7 @@ public sealed class TimingsApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -341,13 +337,9 @@ public sealed class TimingsApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            TimingStore.Dispose();
-            Store.Dispose();
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(
+            disposing,
+            _dbPath,
+            TimingStore.Dispose,
+            Store.Dispose);
 }

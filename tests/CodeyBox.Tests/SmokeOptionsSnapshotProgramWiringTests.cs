@@ -126,7 +126,7 @@ public sealed class SmokeOptionsSnapshotProgramWiringTests
         return field.GetValue(instance);
     }
 
-    private sealed class SmokeOptionsSnapshotWiringFactory : WebApplicationFactory<Program>
+    private sealed class SmokeOptionsSnapshotWiringFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly bool _smokeEnabled;
         private readonly string _dbPath = Path.Combine(
@@ -142,7 +142,7 @@ public sealed class SmokeOptionsSnapshotProgramWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -172,11 +172,7 @@ public sealed class SmokeOptionsSnapshotProgramWiringTests
         }
 
         protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            base.Dispose(disposing);
-        }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
     }
 
     private sealed class RecordingGate : IInVmSmokeGate

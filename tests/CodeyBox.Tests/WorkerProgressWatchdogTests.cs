@@ -15,6 +15,7 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class WorkerProgressWatchdogTests : IDisposable
 {
+    private static readonly TimeSpan BackgroundServiceWaitTimeout = TimeSpan.FromSeconds(120);
     private readonly string _dbPath =
         Path.Combine(Path.GetTempPath(), $"codeybox-watchdog-{Guid.NewGuid():N}.db");
     private readonly SqliteWorkItemStore _store;
@@ -51,7 +52,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
     {
         _store.Dispose();
         _registry.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     [Theory]
@@ -1510,7 +1511,7 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
             {
                 var after = await _store.GetAsync(item.Id);
                 return after?.State == WorkItemState.Queued && _queue.Count == 1;
-            }, TimeSpan.FromSeconds(30));
+            }, BackgroundServiceWaitTimeout);
         }
         finally
         {

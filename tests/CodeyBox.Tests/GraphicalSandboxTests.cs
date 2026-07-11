@@ -609,7 +609,7 @@ public sealed class GraphicalSandboxTests
         }
         finally
         {
-            try { Directory.Delete(workspace, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(workspace);
         }
     }
 
@@ -723,7 +723,7 @@ public sealed class GraphicalSandboxTests
         }
         finally
         {
-            try { Directory.Delete(workspace, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(workspace);
         }
     }
 
@@ -786,7 +786,7 @@ public sealed class GraphicalSandboxTests
         }
         finally
         {
-            try { Directory.Delete(workspace, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(workspace);
         }
     }
 
