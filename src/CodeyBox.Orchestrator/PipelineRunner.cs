@@ -18456,7 +18456,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
             return StaleBaseReworkOutcome.NotEnabled;
 
         var current = await _store.GetAsync(item.Id, ct) ?? item;
-        return await _staleBaseReworkRouter.TryRouteAsync(current, "upstream-push-stale-base", ct);
+        return await _staleBaseReworkRouter.TryRouteAsync(
+            current,
+            "upstream-push-stale-base",
+            StaleBaseConflictReworkRouter.PushPathEligibleSourceStates,
+            ct);
     }
 
     private async Task RunUpstreamPushPhaseAsync(

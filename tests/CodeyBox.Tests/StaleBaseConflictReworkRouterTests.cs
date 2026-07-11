@@ -32,7 +32,7 @@ public sealed class StaleBaseConflictReworkRouterTests : IDisposable
         var item = ShippedItem() with { ConflictReworkAttempts = 0 };
         await store.CreateAsync(item);
 
-        var outcome = await router.TryRouteAsync(item, "test", CancellationToken.None);
+        var outcome = await router.TryRouteAsync(item, "test", StaleBaseConflictReworkRouter.SweeperEligibleSourceStates, CancellationToken.None);
 
         Assert.Equal(StaleBaseReworkOutcome.Routed, outcome);
         var persisted = await store.GetAsync(item.Id);
@@ -55,7 +55,7 @@ public sealed class StaleBaseConflictReworkRouterTests : IDisposable
         var item = ShippedItem() with { ConflictReworkAttempts = 2 };
         await store.CreateAsync(item);
 
-        var outcome = await router.TryRouteAsync(item, "test", CancellationToken.None);
+        var outcome = await router.TryRouteAsync(item, "test", StaleBaseConflictReworkRouter.SweeperEligibleSourceStates, CancellationToken.None);
 
         Assert.Equal(StaleBaseReworkOutcome.CapExhausted, outcome);
         var persisted = await store.GetAsync(item.Id);
@@ -75,7 +75,7 @@ public sealed class StaleBaseConflictReworkRouterTests : IDisposable
         var item = ShippedItem() with { ConflictReworkAttempts = 1 };
         await store.CreateAsync(item);
 
-        var outcome = await router.TryRouteAsync(item, "test", CancellationToken.None);
+        var outcome = await router.TryRouteAsync(item, "test", StaleBaseConflictReworkRouter.SweeperEligibleSourceStates, CancellationToken.None);
 
         Assert.Equal(StaleBaseReworkOutcome.CapExhausted, outcome);
     }
@@ -93,12 +93,45 @@ public sealed class StaleBaseConflictReworkRouterTests : IDisposable
         var item = ShippedItem();
         await store.CreateAsync(item);
 
-        var outcome = await router.TryRouteAsync(item, "test", CancellationToken.None);
+        var outcome = await router.TryRouteAsync(item, "test", StaleBaseConflictReworkRouter.SweeperEligibleSourceStates, CancellationToken.None);
 
         Assert.Equal(StaleBaseReworkOutcome.NotEnabled, outcome);
         var persisted = await store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, persisted!.State);
         Assert.Equal(0, persisted.ConflictReworkAttempts);
+    }
+
+    [Fact]
+    public async Task TryRoute_ItemRacedIntoInFlightStateAfterCallerSnapshot_IsNotRouted()
+    {
+        using var store = NewStore();
+        var queue = new InMemoryTaskQueue();
+        var router = NewRouter(store, queue, options: Enabled(maxAttempts: 2));
+
+        // The caller (e.g. the sweeper) captured a settled snapshot, but the
+        // persisted item has since raced into an in-flight state another worker
+        // now owns. Routing it here would clear StartedAt and let a second worker
+        // pick up the same item — the TOCTOU the router's re-validation closes.
+        var snapshot = ShippedItem() with { ConflictReworkAttempts = 0 };
+        var persistedInFlight = snapshot with
+        {
+            State = WorkItemState.Working,
+            ConflictReworkAttempts = 0,
+        };
+        await store.CreateAsync(persistedInFlight);
+
+        var outcome = await router.TryRouteAsync(
+            snapshot,
+            "test",
+            StaleBaseConflictReworkRouter.SweeperEligibleSourceStates,
+            CancellationToken.None);
+
+        Assert.Equal(StaleBaseReworkOutcome.NotEnabled, outcome);
+        var persisted = await store.GetAsync(snapshot.Id);
+        // Untouched: no transition, no reserved attempt, no re-dispatch kick.
+        Assert.Equal(WorkItemState.Working, persisted!.State);
+        Assert.Equal(0, persisted.ConflictReworkAttempts);
+        Assert.Equal(0, queue.Count);
     }
 
     // -------------------------------------------------------------------------

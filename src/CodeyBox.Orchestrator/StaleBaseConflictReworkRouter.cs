@@ -73,6 +73,32 @@ public sealed class StaleBaseConflictReworkRouter
     }
 
     /// <summary>
+    /// The settled, post-ship work-item states from which the out-of-band
+    /// <see cref="StalePullRequestSweeper"/> may re-dispatch an item into
+    /// stale-base rework. Every in-flight state (work/audit/merge/push in
+    /// progress) is excluded so the sweeper never seizes an item another worker
+    /// actively owns. Single source of truth for both the sweeper's up-front
+    /// eligibility check and the router's atomic re-validation.
+    /// </summary>
+    public static readonly IReadOnlySet<WorkItemState> SweeperEligibleSourceStates =
+        new HashSet<WorkItemState>
+        {
+            WorkItemState.Done,
+            WorkItemState.Merged,
+            WorkItemState.MergeConflictResolutionFailed,
+            WorkItemState.Failed,
+        };
+
+    /// <summary>
+    /// The in-pipeline upstream-push path routes from its own active push state.
+    /// The current worker owns the item there, but the router still re-validates
+    /// against this narrow set so an unexpected concurrent transition is rejected
+    /// rather than clobbered.
+    /// </summary>
+    public static readonly IReadOnlySet<WorkItemState> PushPathEligibleSourceStates =
+        new HashSet<WorkItemState> { WorkItemState.UpstreamPushing };
+
+    /// <summary>
     /// The effective, floored attempt cap. Exposed so callers can decide whether
     /// a park is a cap-exhaustion terminal without duplicating the flooring rule.
     /// </summary>
@@ -93,15 +119,42 @@ public sealed class StaleBaseConflictReworkRouter
     /// Short provenance label recorded on the retry audit trail (e.g.
     /// <c>"stale-pr-sweep"</c> or <c>"upstream-push-stale-base"</c>).
     /// </param>
+    /// <param name="eligibleSourceStates">
+    /// The states from which this caller's surface may legitimately re-dispatch
+    /// (e.g. <see cref="SweeperEligibleSourceStates"/> for the out-of-band sweeper
+    /// or <see cref="PushPathEligibleSourceStates"/> for the in-pipeline push
+    /// path). The router re-validates the authoritative fresh read against this
+    /// set so eligibility travels atomically with the state-changing write — the
+    /// caller's own check was made on a snapshot that may have since raced.
+    /// </param>
     public async Task<StaleBaseReworkOutcome> TryRouteAsync(
         WorkItem item,
         string trigger,
+        IReadOnlySet<WorkItemState> eligibleSourceStates,
         CancellationToken ct)
     {
         if (!_optionsAccessor().RouteToConflictRework)
             return StaleBaseReworkOutcome.NotEnabled;
 
         var current = await _store.GetAsync(item.Id, ct) ?? item;
+
+        // Re-validate eligibility against the authoritative fresh read, not the
+        // caller's (possibly stale) snapshot. The caller checked eligibility on a
+        // snapshot that may have raced a concurrent transition; without re-checking
+        // here the router would re-dispatch an item that has since moved into an
+        // in-flight state another worker owns — clearing StartedAt and enabling a
+        // second concurrent run of the same pipeline. Because the retrier's CAS
+        // below is conditioned on this same current.State, the eligibility decision
+        // travels atomically with the write: if the state changes between here and
+        // the CAS, the CAS fails rather than clobbering the concurrent owner.
+        if (!eligibleSourceStates.Contains(current.State))
+        {
+            _log.LogInformation(
+                "Work item {Id} is in state {State}, no longer eligible for stale-base rework; not routing",
+                current.Id, current.State);
+            return StaleBaseReworkOutcome.NotEnabled;
+        }
+
         var max = MaxReworkAttempts;
         if (current.ConflictReworkAttempts >= max)
         {

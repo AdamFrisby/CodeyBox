@@ -330,7 +330,11 @@ public sealed class StalePullRequestSweeper : BackgroundService
         StaleBaseReworkOutcome outcome;
         try
         {
-            outcome = await _reworkRouter.TryRouteAsync(item, "stale-pr-sweep", ct);
+            outcome = await _reworkRouter.TryRouteAsync(
+                item,
+                "stale-pr-sweep",
+                StaleBaseConflictReworkRouter.SweeperEligibleSourceStates,
+                ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -422,13 +426,12 @@ public sealed class StalePullRequestSweeper : BackgroundService
     /// A work item may be routed into stale-base rework only from a settled
     /// post-push state. In-flight states (work/audit/merge/push in progress)
     /// are excluded so the sweeper never re-dispatches an item another worker
-    /// owns.
+    /// owns. Delegates to <see cref="StaleBaseConflictReworkRouter"/>, which owns
+    /// the eligible-state set and re-checks it atomically at the re-dispatch —
+    /// this up-front check only short-circuits an obviously ineligible snapshot.
     /// </summary>
     private static bool IsEligibleForStaleBaseRework(WorkItemState state) =>
-        state is WorkItemState.Done
-            or WorkItemState.Merged
-            or WorkItemState.MergeConflictResolutionFailed
-            or WorkItemState.Failed;
+        StaleBaseConflictReworkRouter.SweeperEligibleSourceStates.Contains(state);
 
     /// <summary>
     /// Identity tuple for dedup: project, PR number, and the head sha at the
