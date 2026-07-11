@@ -6934,6 +6934,7 @@ while True:
                 // the ingest listener — surface a diagnostic rather than guessing.
                 return new DetachedExitResult(
                     1,
+                    "agent output transport produced nothing / detached run reported no exit: " +
                     $"detached exec process group {state.ProcessGroupId} exited without authenticated exit completion\n");
             }
         }
