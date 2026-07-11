@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -29,6 +31,7 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
 
     private LocalGitHost CreateGitHost(
         string? gitExecutable = null,
+        int? gitCommandMaxOutputBytes = null,
         Func<ProcessStartInfo, ILocalGitProcess>? processFactory = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
@@ -36,6 +39,7 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
         {
             RootDirectory = gitRoot,
             GitExecutable = gitExecutable ?? "git",
+            GitCommandMaxOutputBytes = gitCommandMaxOutputBytes ?? LocalGitHostOptions.DefaultGitCommandMaxOutputBytes,
         };
         return processFactory is null
             ? new LocalGitHost(opts, NullLogger<LocalGitHost>.Instance)
@@ -313,6 +317,90 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
     }
 
     [Fact]
+    public async Task RunGitAsync_RecordsCoordinatorGitCommandDurationMetric()
+    {
+        var measurements = new ConcurrentQueue<(string? Operation, string? Outcome)>();
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "CodeyBox.Coordinator"
+                && instrument.Name == "codeybox.coordinator.git.command.duration_ms")
+            {
+                l.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            string? operation = null;
+            string? outcome = null;
+            for (var i = 0; i < tags.Length; i++)
+            {
+                if (tags[i].Key == "operation")
+                    operation = tags[i].Value?.ToString();
+                if (tags[i].Key == "outcome")
+                    outcome = tags[i].Value?.ToString();
+            }
+            measurements.Enqueue((operation, outcome));
+        });
+        listener.Start();
+        var gitHost = CreateGitHost(processFactory: _ => new FakeLocalGitProcess(exitCode: 0));
+        var repoId = WorkItemId.New().ToString();
+        Directory.CreateDirectory(gitHost.GetRepoPath(repoId));
+
+        Assert.True(await gitHost.BranchExistsAsync(repoId, "main"));
+
+        var observed = SpinWait.SpinUntil(
+            () => measurements.Any(m => m.Operation == "rev-parse" && m.Outcome == "success"),
+            TimeSpan.FromSeconds(2));
+        Assert.True(observed, "Expected LocalGitHost to emit git command duration metric for rev-parse.");
+    }
+
+    [Fact]
+    public async Task RunGitAsync_CapsProcessOutputAndRecordsOutputLimitMetric()
+    {
+        var measurements = new ConcurrentQueue<(string? Operation, string? Outcome)>();
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "CodeyBox.Coordinator"
+                && instrument.Name == "codeybox.coordinator.git.command.duration_ms")
+            {
+                l.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            string? operation = null;
+            string? outcome = null;
+            for (var i = 0; i < tags.Length; i++)
+            {
+                if (tags[i].Key == "operation")
+                    operation = tags[i].Value?.ToString();
+                if (tags[i].Key == "outcome")
+                    outcome = tags[i].Value?.ToString();
+            }
+            measurements.Enqueue((operation, outcome));
+        });
+        listener.Start();
+        var killed = false;
+        var gitHost = CreateGitHost(
+            gitCommandMaxOutputBytes: 8,
+            processFactory: _ => new FakeLocalGitProcess(
+                stdout: new string('x', 64),
+                exitCode: 0,
+                onKill: () => killed = true));
+        var repoId = WorkItemId.New().ToString();
+        Directory.CreateDirectory(gitHost.GetRepoPath(repoId));
+
+        var exists = await gitHost.BranchExistsAsync(repoId, "main");
+
+        Assert.False(exists);
+        Assert.True(killed);
+        Assert.Contains(measurements, m => m.Operation == "rev-parse" && m.Outcome == "output_limit");
+    }
+
+
+    [Fact]
     public async Task RunGitAsync_RetriesTextFileBusyProcessStartByMessageWhenErrnoDiffers()
     {
         var starts = 0;
@@ -335,6 +423,30 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
     [Fact]
     public async Task RunGitAsync_TextFileBusyProcessStartAfterRetryCap_Propagates()
     {
+        var measurements = new ConcurrentQueue<(string? Operation, string? Outcome)>();
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "CodeyBox.Coordinator"
+                && instrument.Name == "codeybox.coordinator.git.command.duration_ms")
+            {
+                l.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            string? operation = null;
+            string? outcome = null;
+            for (var i = 0; i < tags.Length; i++)
+            {
+                if (tags[i].Key == "operation")
+                    operation = tags[i].Value?.ToString();
+                if (tags[i].Key == "outcome")
+                    outcome = tags[i].Value?.ToString();
+            }
+            measurements.Enqueue((operation, outcome));
+        });
+        listener.Start();
         var starts = 0;
         var gitHost = CreateGitHost(processFactory: _ =>
         {
@@ -349,6 +461,7 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
 
         Assert.Equal(26, ex.NativeErrorCode);
         Assert.Equal(8, starts);
+        Assert.Contains(measurements, m => m.Operation == "rev-parse" && m.Outcome == "error");
     }
 
     [Fact]
@@ -360,6 +473,7 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
         var gitExecutable = Path.Combine(_workspace, "custom-git");
         var gitHost = CreateGitHost(
             gitExecutable,
+            gitCommandMaxOutputBytes: null,
             processFactory: psi =>
             {
                 starts++;
@@ -384,6 +498,95 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
         Assert.NotNull(observedStartInfo);
         Assert.Equal(gitExecutable, observedStartInfo.FileName);
         Assert.Contains("ls-tree", observedStartInfo.ArgumentList);
+    }
+
+    [Fact]
+    public async Task ListFilesEndingWithAsync_RecordsCoordinatorGitCommandDurationMetric()
+    {
+        // The streamed ls-tree path launches git directly rather than through
+        // RunGitAsync, so it must record the coordinator git-command metric on
+        // its own — otherwise this host-side git op would be an unmeasured
+        // scaling pinch point (the exact gap the completeness auditor flagged).
+        var measurements = new ConcurrentQueue<(string? Operation, string? Outcome)>();
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "CodeyBox.Coordinator"
+                && instrument.Name == "codeybox.coordinator.git.command.duration_ms")
+            {
+                l.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            string? operation = null;
+            string? outcome = null;
+            for (var i = 0; i < tags.Length; i++)
+            {
+                if (tags[i].Key == "operation")
+                    operation = tags[i].Value?.ToString();
+                if (tags[i].Key == "outcome")
+                    outcome = tags[i].Value?.ToString();
+            }
+            measurements.Enqueue((operation, outcome));
+        });
+        listener.Start();
+        var gitHost = CreateGitHost(processFactory: _ =>
+            new FakeLocalGitProcess(stdout: "src/App.cs\nREADME.md\n", exitCode: 0));
+        var repoId = WorkItemId.New().ToString();
+        Directory.CreateDirectory(gitHost.GetRepoPath(repoId));
+
+        var matches = await gitHost.ListFilesEndingWithAsync(repoId, "main", [".cs"], maxResults: 10);
+
+        Assert.Equal(["src/App.cs"], matches);
+        var observed = SpinWait.SpinUntil(
+            () => measurements.Any(m => m.Operation == "ls-tree" && m.Outcome == "success"),
+            TimeSpan.FromSeconds(2));
+        Assert.True(observed, "Expected ListFilesEndingWithAsync to emit ls-tree git command duration metric.");
+    }
+
+    [Fact]
+    public async Task ListFilesEndingWithAsync_CapExceeded_RecordsOutputLimitOutcome()
+    {
+        // A match-cap breach kills the child and throws; the metric must still
+        // record with the "output_limit" outcome so an operator sees the
+        // ceiling being hit rather than silent degradation.
+        var measurements = new ConcurrentQueue<(string? Operation, string? Outcome)>();
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "CodeyBox.Coordinator"
+                && instrument.Name == "codeybox.coordinator.git.command.duration_ms")
+            {
+                l.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            string? operation = null;
+            string? outcome = null;
+            for (var i = 0; i < tags.Length; i++)
+            {
+                if (tags[i].Key == "operation")
+                    operation = tags[i].Value?.ToString();
+                if (tags[i].Key == "outcome")
+                    outcome = tags[i].Value?.ToString();
+            }
+            measurements.Enqueue((operation, outcome));
+        });
+        listener.Start();
+        var gitHost = CreateGitHost(processFactory: _ =>
+            new FakeLocalGitProcess(stdout: "a.cs\nb.cs\nc.cs\n", exitCode: 0));
+        var repoId = WorkItemId.New().ToString();
+        Directory.CreateDirectory(gitHost.GetRepoPath(repoId));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => gitHost.ListFilesEndingWithAsync(repoId, "main", [".cs"], maxResults: 1));
+
+        var observed = SpinWait.SpinUntil(
+            () => measurements.Any(m => m.Operation == "ls-tree" && m.Outcome == "output_limit"),
+            TimeSpan.FromSeconds(2));
+        Assert.True(observed, "Expected ListFilesEndingWithAsync cap breach to emit output_limit outcome.");
     }
 
     [Fact]
@@ -461,6 +664,7 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
         string stdout = "",
         string stderr = "",
         Win32Exception? startException = null,
+        Action? onKill = null,
         Action? onDispose = null) : ILocalGitProcess
     {
         private readonly StringReader _stdout = new(stdout);
@@ -478,7 +682,11 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
 
         public Task WaitForExitAsync(CancellationToken ct) => Task.CompletedTask;
 
-        public void Kill(bool entireProcessTree) { }
+        public void Kill(bool entireProcessTree)
+        {
+            _ = entireProcessTree;
+            onKill?.Invoke();
+        }
 
         public void Dispose()
         {

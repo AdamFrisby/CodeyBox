@@ -83,13 +83,22 @@ public sealed class DeepAuditFailureTests : IDisposable
 
         var auditor = new ScriptedDeepAuditor(AuditorName, alwaysError);
         var (svc, rel, _) = await SetupAsync(auditor, maxIterations);
+        var releaseFailed = new TaskCompletionSource<WebhookEvent>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        _webhooks.OnPublishAsync = (evt, _) =>
+        {
+            if (evt.Event == "release.failed")
+                releaseFailed.TrySetResult(evt);
+            return Task.CompletedTask;
+        };
 
         await svc.OnWorkItemTerminalAsync(rel.Id, default);
         await PollUntilAsync(rel.Id,
             s => s is ReleaseState.Released or ReleaseState.Failed,
             timeoutSeconds: 10);
 
-        Assert.Contains(_webhooks.Events, e => e.Event == "release.failed");
+        var failedEvent = await releaseFailed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(rel.Id, failedEvent.Release?.Id);
     }
 
     [Fact]

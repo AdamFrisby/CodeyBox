@@ -295,6 +295,20 @@ internal static class WorkItemRecoveryPolicy
         if (target is null)
             return null;
 
+        if (item.State == WorkItemState.Working
+            && target == WorkItemState.Queued
+            && !string.IsNullOrWhiteSpace(item.WorkBranch))
+        {
+            return ClearPlanFieldsIfQueued(ClearInfrastructureDeferralFields(item with
+            {
+                State = WorkItemState.Queued,
+                StartedAt = null,
+                PreserveWorkBranchOnQueuedPickup = true,
+                PreemptedAt = null,
+                PreemptCheckpoint = null,
+            }, now));
+        }
+
         return ClearPlanFieldsIfQueued(ClearInfrastructureDeferralFields(item.With(target.Value), now) with
         {
             StartedAt = null,

@@ -150,6 +150,11 @@ public sealed class WorkSandboxContext : IAsyncDisposable
             {
                 await _activeSandbox.DisposeAsync();
             }
+            catch (SandboxProvisioningDeferredException ex)
+            {
+                _log.LogWarning(ex, "Reusable sandbox disposal deferred infrastructure cleanup.");
+                throw;
+            }
             catch (Exception ex)
             {
                 _log.LogWarning(ex, "Error disposing reusable sandbox.");
@@ -225,6 +230,11 @@ public sealed class WorkSandboxContext : IAsyncDisposable
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             return _inner.ExecAsync(exec, ct);
+        }
+
+        public Task SyncStateToHostAsync(CancellationToken ct = default)
+        {
+            return _inner.SyncStateToHostAsync(ct);
         }
 
         public Task KillActiveExecsAsync(CancellationToken ct = default)

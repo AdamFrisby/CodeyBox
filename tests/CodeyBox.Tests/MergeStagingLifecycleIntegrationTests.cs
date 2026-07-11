@@ -75,8 +75,9 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
         // sandbox is about to mount it.
         var stagingObserver = new StagingMountObservingSandboxProvider(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        var syncObserver = new RemoteGitPushSyncObservingSandboxProvider(stagingObserver);
         using var tp = TestSupport.BuildPipeline(
-            _workspace, seed, auditors: [auditor], sandboxProvider: stagingObserver);
+            _workspace, seed, auditors: [auditor], sandboxProvider: syncObserver);
         auditor.GitRoot = tp.GitRoot;
 
         // Work agent writes the same file as the auditor's main-advance, so
@@ -156,6 +157,8 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
             "merge-phase staging mount was never observed mid-flight — " +
             "either AC#3 setup never produced a staging clone, or the merge " +
             "sandbox bypassed the wrapper");
+        Assert.True(syncObserver.MergeVerificationSyncs > 0,
+            "merge verification pushed into the isolated remote repo without a following host sync");
 
         // After completion, no codeybox-merge-*.git directories remain
         // under GitRoot — the finally-block cleanup in
@@ -477,8 +480,9 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
         // heal path runs and the retry succeeds.
         var healProvider = new ReworkIterationStagingReapingSandboxProvider(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        var syncObserver = new RemoteGitPushSyncObservingSandboxProvider(healProvider);
         using var tp = TestSupport.BuildPipeline(
-            _workspace, seed, auditors: [auditor], sandboxProvider: healProvider);
+            _workspace, seed, auditors: [auditor], sandboxProvider: syncObserver);
         auditor.GitRoot = tp.GitRoot;
 
         // Drive the conflict path. NO ConflictResolutionPlan is queued, so
@@ -520,6 +524,8 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
             "rework-iteration SandboxMountSourceMissingException was never thrown — " +
             "either the rework call site bypassed the heal helper, the merge phase " +
             "never reached rework, or the test setup failed to produce a second staging path");
+        Assert.True(syncObserver.ConflictReworkSyncs > 0,
+            "conflict rework pushed into the isolated remote repo without a following host sync");
 
         // Finally-block cleanup must still have removed both staging clones
         // after the pipeline completed (recovery is orthogonal to cleanup).
@@ -680,6 +686,106 @@ public sealed class MergeStagingLifecycleIntegrationTests : IDisposable
 
         public Task DisposeLeakedAsync(string name, CancellationToken ct)
             => _inner.DisposeLeakedAsync(name, ct);
+    }
+
+    /// <summary>
+    /// Observes isolated-remote git pushes and requires a completed sandbox
+    /// sync after them. This pins the distributed-VM path where a push updates
+    /// a remote writable mount that host-side import code reads immediately.
+    /// </summary>
+    private sealed class RemoteGitPushSyncObservingSandboxProvider : ISandboxProvider
+    {
+        private readonly ISandboxProvider _inner;
+        private int _mergeVerificationSyncs;
+        private int _conflictReworkSyncs;
+
+        public RemoteGitPushSyncObservingSandboxProvider(ISandboxProvider inner) => _inner = inner;
+
+        public string Name => _inner.Name;
+        public int MergeVerificationSyncs => Volatile.Read(ref _mergeVerificationSyncs);
+        public int ConflictReworkSyncs => Volatile.Read(ref _conflictReworkSyncs);
+
+        public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+            => new RemoteGitPushSyncObservingSandbox(await _inner.CreateAsync(spec, ct), this);
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => _inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct)
+            => _inner.DisposeLeakedAsync(name, ct);
+
+        private void RecordMergeVerificationSync() => Interlocked.Increment(ref _mergeVerificationSyncs);
+        private void RecordConflictReworkSync() => Interlocked.Increment(ref _conflictReworkSyncs);
+
+        private sealed class RemoteGitPushSyncObservingSandbox : ISandbox
+        {
+            private readonly ISandbox _inner;
+            private readonly RemoteGitPushSyncObservingSandboxProvider _owner;
+            private int _pendingMergeVerificationPush;
+            private int _pendingConflictReworkPush;
+
+            public RemoteGitPushSyncObservingSandbox(
+                ISandbox inner,
+                RemoteGitPushSyncObservingSandboxProvider owner)
+            {
+                _inner = inner;
+                _owner = owner;
+            }
+
+            public string Id => _inner.Id;
+            public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
+            public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
+
+            public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+            {
+                var result = await _inner.ExecAsync(exec, ct);
+                if (!result.Success) return result;
+
+                if (IsGitPushToRef(exec.Argv, "refs/codeybox/merge-verification/"))
+                    Interlocked.Exchange(ref _pendingMergeVerificationPush, 1);
+                if (IsGitPushToRef(exec.Argv, "refs/codeybox/conflict-rework/"))
+                    Interlocked.Exchange(ref _pendingConflictReworkPush, 1);
+
+                return result;
+            }
+
+            public async Task SyncStateToHostAsync(CancellationToken ct = default)
+            {
+                var mergeVerificationPending = Interlocked.Exchange(ref _pendingMergeVerificationPush, 0) == 1;
+                var conflictReworkPending = Interlocked.Exchange(ref _pendingConflictReworkPush, 0) == 1;
+
+                await _inner.SyncStateToHostAsync(ct);
+
+                if (mergeVerificationPending) _owner.RecordMergeVerificationSync();
+                if (conflictReworkPending) _owner.RecordConflictReworkSync();
+            }
+
+            public Task KillActiveExecsAsync(CancellationToken ct = default)
+                => _inner.KillActiveExecsAsync(ct);
+
+            public Task<byte[]> GetScreenshotAsync(CancellationToken ct = default)
+                => _inner.GetScreenshotAsync(ct);
+
+            public Task SynthesizeInputAsync(IReadOnlyList<SandboxInputEvent> events, CancellationToken ct = default)
+                => _inner.SynthesizeInputAsync(events, ct);
+
+            public Task<SandboxAccessibilitySnapshot?> GetAccessibilityAtPointAsync(
+                int x,
+                int y,
+                CancellationToken ct = default)
+                => _inner.GetAccessibilityAtPointAsync(x, y, ct);
+
+            public Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default)
+                => _inner.GetAccessibilityTreeJsonAsync(ct);
+
+            public ValueTask DisposeAsync()
+                => _inner.DisposeAsync();
+
+            private static bool IsGitPushToRef(IReadOnlyList<string> argv, string refPrefix)
+                => argv.Count >= 5
+                    && argv.Contains("push", StringComparer.Ordinal)
+                    && argv.Any(arg => arg.StartsWith($"HEAD:{refPrefix}", StringComparison.Ordinal));
+        }
     }
 
     /// <summary>

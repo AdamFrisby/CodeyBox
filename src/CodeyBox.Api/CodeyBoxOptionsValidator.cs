@@ -302,6 +302,10 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         {
             failures.Add("CodeyBox:SharedUpstreamMirrorDirectory must not be empty if EnableSharedUpstreamMirror is true");
         }
+        if (options.GitCommandMaxOutputBytes <= 0)
+        {
+            failures.Add("CodeyBox:GitCommandMaxOutputBytes must be > 0");
+        }
 
         if (options.AutoRequeueOnAgentRestore.Enabled)
         {
@@ -321,6 +325,8 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
                 failures.Add(ex.Message);
             }
         }
+
+        ValidateMultipassRemote(options, failures);
 
         failures.AddRange(AuditLogStartup.Validate(options.AuditLog));
 
@@ -397,5 +403,75 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         return options.E2eMultipassRemoteSandbox is null
             ? []
             : [options.E2eMultipassRemoteSandbox];
+    }
+
+    private static void ValidateMultipassRemote(CodeyBoxOptions options, List<string> failures)
+    {
+        var providerIsRemote = string.Equals(
+            options.SandboxProvider?.Trim(),
+            "multipass-remote",
+            StringComparison.OrdinalIgnoreCase);
+        var cfg = options.MultipassRemoteSandbox;
+        if (cfg is null)
+        {
+            if (providerIsRemote)
+                failures.Add("CodeyBox:MultipassRemoteSandbox section is required when SandboxProvider=multipass-remote");
+            return;
+        }
+
+        if (cfg.MaxConcurrentSandboxes is <= 0)
+            failures.Add("CodeyBox:MultipassRemoteSandbox:MaxConcurrentSandboxes must be > 0 when set");
+        if (cfg.PlacementRecheckIn is { } placement && placement <= TimeSpan.Zero)
+            failures.Add("CodeyBox:MultipassRemoteSandbox:PlacementRecheckIn must be positive when set");
+        if (cfg.RuntimeUnhealthyBackoff is { } backoff && backoff <= TimeSpan.Zero)
+            failures.Add("CodeyBox:MultipassRemoteSandbox:RuntimeUnhealthyBackoff must be positive when set");
+        if (cfg.StageOutMaxArchiveBytes is <= 0)
+            failures.Add("CodeyBox:MultipassRemoteSandbox:StageOutMaxArchiveBytes must be > 0 when set");
+        if (cfg.StageOutMaxEntries is <= 0)
+            failures.Add("CodeyBox:MultipassRemoteSandbox:StageOutMaxEntries must be > 0 when set");
+        if (cfg.StageOutMaxExpansionRatio is { } ratio && (double.IsNaN(ratio) || double.IsInfinity(ratio) || ratio < 1.0d))
+            failures.Add("CodeyBox:MultipassRemoteSandbox:StageOutMaxExpansionRatio must be >= 1 when set");
+        if (cfg.RemoteInventoryMaxOutputBytes is <= 0)
+            failures.Add("CodeyBox:MultipassRemoteSandbox:RemoteInventoryMaxOutputBytes must be > 0 when set");
+
+        var hasTopLevelTarget = !string.IsNullOrWhiteSpace(cfg.SshTarget);
+        var hosts = cfg.ExecutorHosts ?? [];
+        if (providerIsRemote && hosts.Count == 0 && !hasTopLevelTarget)
+            failures.Add("CodeyBox:MultipassRemoteSandbox:SshTarget is required when SandboxProvider=multipass-remote and ExecutorHosts is empty");
+
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        for (var i = 0; i < hosts.Count; i++)
+        {
+            var host = hosts[i];
+            var prefix = $"CodeyBox:MultipassRemoteSandbox:ExecutorHosts:{i}";
+            if (string.IsNullOrWhiteSpace(host.Id))
+                failures.Add($"{prefix}:Id is required and must be stable across hot reloads");
+            if (!string.IsNullOrWhiteSpace(host.Id) && !ids.Add(host.Id.Trim()))
+                failures.Add($"{prefix}:Id duplicates another executor host id ('{host.Id.Trim()}')");
+            if (providerIsRemote && !hasTopLevelTarget && string.IsNullOrWhiteSpace(host.SshTarget))
+                failures.Add($"{prefix}:SshTarget is required when no top-level SshTarget default is configured");
+            if (host.MaxConcurrentSandboxes is <= 0)
+                failures.Add($"{prefix}:MaxConcurrentSandboxes must be > 0 when set");
+            if (host.ServerAliveIntervalSeconds is <= 0)
+                failures.Add($"{prefix}:ServerAliveIntervalSeconds must be > 0 when set");
+            if (host.ServerAliveCountMax is <= 0)
+                failures.Add($"{prefix}:ServerAliveCountMax must be > 0 when set");
+            if (host.ConnectTimeoutSeconds is <= 0)
+                failures.Add($"{prefix}:ConnectTimeoutSeconds must be > 0 when set");
+            if (host.StageOutMaxArchiveBytes is <= 0)
+                failures.Add($"{prefix}:StageOutMaxArchiveBytes must be > 0 when set");
+            if (host.StageOutMaxEntries is <= 0)
+                failures.Add($"{prefix}:StageOutMaxEntries must be > 0 when set");
+            if (host.StageOutMaxExpansionRatio is { } hostRatio && (double.IsNaN(hostRatio) || double.IsInfinity(hostRatio) || hostRatio < 1.0d))
+                failures.Add($"{prefix}:StageOutMaxExpansionRatio must be >= 1 when set");
+            if (host.RemoteInventoryMaxOutputBytes is <= 0)
+                failures.Add($"{prefix}:RemoteInventoryMaxOutputBytes must be > 0 when set");
+            if (host.VmStartTimeout is { } start && start <= TimeSpan.Zero)
+                failures.Add($"{prefix}:VmStartTimeout must be positive when set");
+            if (host.VmStopTimeout is { } stop && stop <= TimeSpan.Zero)
+                failures.Add($"{prefix}:VmStopTimeout must be positive when set");
+            if (host.VmStateCheckInterval is { } poll && poll <= TimeSpan.Zero)
+                failures.Add($"{prefix}:VmStateCheckInterval must be positive when set");
+        }
     }
 }

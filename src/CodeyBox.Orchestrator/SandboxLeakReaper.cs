@@ -44,10 +44,11 @@ public sealed class SandboxLeakReaper : BackgroundService
     // from CreatedAt: a long-running in-flight VM has an old CreatedAt, so a
     // CreatedAt-based age gate would purge it on the first sweep after it enters
     // Suspending — mid-snapshot, while the provider may still be writing the RAM
-    // image. Pruned each sweep to the set of names still observed as orphans, so it
-    // does not grow without bound. ConcurrentDictionary because the operator-dispose
-    // endpoint and the sweep can touch reaper state from different threads.
-    private readonly ConcurrentDictionary<string, DateTimeOffset> _suspendOrphanFirstSeen = new();
+    // image. Pruned each sweep to the set of identities still observed as orphans,
+    // so it does not grow without bound. ConcurrentDictionary because the
+    // operator-dispose endpoint and the sweep can touch reaper state from
+    // different threads.
+    private readonly ConcurrentDictionary<LeakIdentity, DateTimeOffset> _suspendOrphanFirstSeen = new();
 
     // Latest detected leaks, snapshotted after each sweep. Thread-safe via
     // Interlocked-style replace; the API endpoint reads this without locking.
@@ -104,9 +105,11 @@ public sealed class SandboxLeakReaper : BackgroundService
     /// endpoint immediately after a successful disposal so that a second POST call for
     /// the same snapshot returns 404 rather than attempting a redundant provider delete.
     /// </summary>
-    public void RemoveFromLatestLeaks(string name)
+    public void RemoveFromLatestLeaks(string name, string? hostId = null)
     {
-        _latestLeaks = _latestLeaks.Where(l => l.Name != name).ToList();
+        _latestLeaks = _latestLeaks
+            .Where(l => l.Name != name || !string.Equals(l.HostId, hostId, StringComparison.Ordinal))
+            .ToList();
     }
 
     public void RemoveFromLatestLeaks(LeakedSandboxInfo leak)
@@ -155,7 +158,7 @@ public sealed class SandboxLeakReaper : BackgroundService
         {
             var allManaged = await _provider.ListAllManagedAsync(ct);
             var now = _clock();
-            var observedSuspendOrphans = new HashSet<string>();
+            var observedSuspendOrphans = new HashSet<LeakIdentity>();
             var duplicateNamesWithActiveSnapshot = allManaged
                 .GroupBy(static info => info.Name, StringComparer.Ordinal)
                 .Where(static group => group.Count() > 1 && group.Any(static info => info.IsTrackedActive))
@@ -197,6 +200,7 @@ public sealed class SandboxLeakReaper : BackgroundService
                 // vocabulary into IsSuspendLifecycleOrFrozen so the reaper does not
                 // depend on any backend's state strings.
                 var isSuspendOrphan = info.IsSuspendLifecycleOrFrozen;
+                var leakIdentity = LeakIdentity.From(info);
 
                 if (isSuspendOrphan)
                 {
@@ -208,8 +212,8 @@ public sealed class SandboxLeakReaper : BackgroundService
                     // would otherwise clear LeakAgeThreshold immediately and we'd
                     // purge mid-snapshot). Only once the grace elapses with still no
                     // live mapping is it a true orphan eligible for delete --purge.
-                    observedSuspendOrphans.Add(info.Name);
-                    var firstSeen = _suspendOrphanFirstSeen.GetOrAdd(info.Name, now);
+                    observedSuspendOrphans.Add(leakIdentity);
+                    var firstSeen = _suspendOrphanFirstSeen.GetOrAdd(leakIdentity, now);
                     if (now - firstSeen < _opts.SuspendOrphanGrace)
                         continue;
                 }
@@ -234,7 +238,14 @@ public sealed class SandboxLeakReaper : BackgroundService
                         : (info.HasPreemptMarker
                             ? SandboxLeakReasons.ExpiredPreemptRetention
                             : SandboxLeakReasons.UntrackedSandbox));
-                leaks.Add(new LeakedSandboxInfo(info.Name, createdAt, age, info.DiskBytes, reason, info.LifecycleProviderId));
+                leaks.Add(new LeakedSandboxInfo(
+                    info.Name,
+                    createdAt,
+                    age,
+                    info.DiskBytes,
+                    reason,
+                    info.LifecycleProviderId,
+                    info.HostId));
                 AuditLog.SandboxLeakDetected(info.Name, age.TotalMinutes, diskMb, reason);
                 _ = _webhooks.PublishAsync(new WebhookEvent
                 {
@@ -253,9 +264,9 @@ public sealed class SandboxLeakReaper : BackgroundService
             // Drop first-seen entries for VMs that are no longer suspend orphans
             // (resumed, reaped, or gone) so the map tracks only currently-orphaned
             // VMs and cannot grow without bound across the process lifetime.
-            foreach (var name in _suspendOrphanFirstSeen.Keys)
-                if (!observedSuspendOrphans.Contains(name))
-                    _suspendOrphanFirstSeen.TryRemove(name, out _);
+            foreach (var identity in _suspendOrphanFirstSeen.Keys)
+                if (!observedSuspendOrphans.Contains(identity))
+                    _suspendOrphanFirstSeen.TryRemove(identity, out _);
 
             _latestLeaks = leaks;
 
@@ -278,7 +289,7 @@ public sealed class SandboxLeakReaper : BackgroundService
 
             // Dispose leaks with bounded host-side pressure; each sandbox still
             // gets its independent timeout and one failure never blocks the batch.
-            var failedLeaks = new ConcurrentBag<LeakedSandboxInfo>();
+            var failedLeaks = new ConcurrentBag<LeakIdentity>();
             await Parallel.ForEachAsync(leaks, new ParallelOptions
             {
                 CancellationToken = ct,
@@ -287,10 +298,10 @@ public sealed class SandboxLeakReaper : BackgroundService
             {
                 var failedLeak = await DisposeSingleAsync(leak, token);
                 if (failedLeak is not null)
-                    failedLeaks.Add(failedLeak);
+                    failedLeaks.Add(failedLeak.Value);
             });
-            var failed = failedLeaks.ToArray();
-            _latestLeaks = leaks.Where(leak => failed.Any(candidate => SameLeak(candidate, leak))).ToList();
+            var failedLeakSet = failedLeaks.ToHashSet();
+            _latestLeaks = leaks.Where(leak => failedLeakSet.Contains(LeakIdentity.From(leak))).ToList();
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
@@ -327,7 +338,7 @@ public sealed class SandboxLeakReaper : BackgroundService
         return set;
     }
 
-    private async Task<LeakedSandboxInfo?> DisposeSingleAsync(LeakedSandboxInfo leak, CancellationToken stoppingToken)
+    private async Task<LeakIdentity?> DisposeSingleAsync(LeakedSandboxInfo leak, CancellationToken stoppingToken)
     {
         using var timeoutCts = new CancellationTokenSource(_opts.DisposeTimeout);
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, timeoutCts.Token);
@@ -381,7 +392,7 @@ public sealed class SandboxLeakReaper : BackgroundService
                 },
             }, stoppingToken);
             _log.LogWarning("SandboxLeakReaper: timed out disposing leaked sandbox {Name}", leak.Name);
-            return leak;
+            return LeakIdentity.From(leak);
         }
         catch (Exception ex)
         {
@@ -399,13 +410,12 @@ public sealed class SandboxLeakReaper : BackgroundService
                 },
             }, stoppingToken);
             _log.LogWarning(ex, "SandboxLeakReaper: failed to dispose leaked sandbox {Name}", leak.Name);
-            return leak;
+            return LeakIdentity.From(leak);
         }
     }
 
     private static bool SameLeak(LeakedSandboxInfo left, LeakedSandboxInfo right) =>
-        string.Equals(left.Name, right.Name, StringComparison.Ordinal)
-        && string.Equals(left.LifecycleProviderId, right.LifecycleProviderId, StringComparison.Ordinal);
+        LeakIdentity.From(left).Equals(LeakIdentity.From(right));
 
     private static ManagedSandboxInfo ToManagedSandboxInfo(LeakedSandboxInfo leak)
         => new(
@@ -413,7 +423,20 @@ public sealed class SandboxLeakReaper : BackgroundService
             leak.CreatedAt,
             leak.DiskBytes,
             IsTrackedActive: false,
-            LifecycleProviderId: leak.LifecycleProviderId);
+            LifecycleProviderId: leak.LifecycleProviderId,
+            HostId: leak.HostId);
+
+    private readonly record struct LeakIdentity(string Name, string? LifecycleProviderId, string? HostId)
+    {
+        public static LeakIdentity From(ManagedSandboxInfo info) =>
+            new(info.Name, NormalizeId(info.LifecycleProviderId), NormalizeId(info.HostId));
+
+        public static LeakIdentity From(LeakedSandboxInfo info) =>
+            new(info.Name, NormalizeId(info.LifecycleProviderId), NormalizeId(info.HostId));
+
+        private static string? NormalizeId(string? value) =>
+            string.IsNullOrWhiteSpace(value) ? null : value;
+    }
 }
 
 /// <summary>

@@ -51,6 +51,7 @@ internal static class SandboxEndpoints
         string name,
         string? providerId,
         IManagedSandboxLifecycle provider,
+        string? hostId,
         SandboxLeakReaper reaper,
         IWebhookDispatcher webhooks,
         ILogger<Program> log,
@@ -64,16 +65,23 @@ internal static class SandboxEndpoints
         // Cross-check against the latest leak list so that active sandboxes (those
         // tied to a running work item) cannot be purged via this endpoint. The
         // provider-scoped snapshot and concrete provider both re-verify ownership
-        // at their destructive sink, so configurable provider prefixes remain safe.
+        // at their destructive sink. Host identity independently disambiguates
+        // duplicate names on remote executor pools.
         var matches = reaper.GetLatestLeaks()
             .Where(leak => string.Equals(leak.Name, name, StringComparison.Ordinal)
                 && (providerId is null
-                    || string.Equals(leak.LifecycleProviderId, providerId, StringComparison.Ordinal)))
+                    || string.Equals(leak.LifecycleProviderId, providerId, StringComparison.Ordinal))
+                && (string.IsNullOrWhiteSpace(hostId)
+                    || string.Equals(leak.HostId, hostId, StringComparison.Ordinal)))
             .ToArray();
         if (matches.Length == 0)
             return Results.NotFound(new { error = "sandbox not found in latest leaked list; verify via GET /sandboxes/leaked" });
+        if (providerId is null && HasMultipleProviderIds(matches))
+            return Results.Conflict(new { error = "multiple providers report this sandbox name; specify providerId" });
+        if (string.IsNullOrWhiteSpace(hostId) && HasMultipleHostIds(matches))
+            return Results.Conflict(new { error = "multiple leaked sandboxes share this name; specify hostId" });
         if (matches.Length != 1)
-            return Results.Conflict(new { error = "multiple providers report this sandbox name; retry with providerId from GET /sandboxes/leaked" });
+            return Results.Conflict(new { error = "multiple leaked sandboxes share this identity; specify providerId and hostId from GET /sandboxes/leaked" });
         var leak = matches[0];
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -160,6 +168,8 @@ internal static class SandboxEndpoints
         diskMb = l.DiskBytes.HasValue ? l.DiskBytes.Value / (1024 * 1024) : (long?)null,
         reason = l.Reason,
         providerId = l.LifecycleProviderId,
+        lifecycleProviderId = l.LifecycleProviderId,
+        hostId = l.HostId,
     };
 
     private static ManagedSandboxInfo ToManagedSandboxInfo(LeakedSandboxInfo leak)
@@ -168,5 +178,47 @@ internal static class SandboxEndpoints
             leak.CreatedAt,
             leak.DiskBytes,
             IsTrackedActive: false,
-            LifecycleProviderId: leak.LifecycleProviderId);
+            LifecycleProviderId: leak.LifecycleProviderId,
+            HostId: leak.HostId);
+
+    private static bool HasMultipleProviderIds(IEnumerable<LeakedSandboxInfo> leaks)
+    {
+        string? firstProviderId = null;
+        var sawProviderId = false;
+        foreach (var leak in leaks)
+        {
+            if (!sawProviderId)
+            {
+                firstProviderId = leak.LifecycleProviderId;
+                sawProviderId = true;
+                continue;
+            }
+
+            if (!string.Equals(firstProviderId, leak.LifecycleProviderId, StringComparison.Ordinal))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool HasMultipleHostIds(IEnumerable<LeakedSandboxInfo> leaks)
+    {
+        string? firstHostId = null;
+        foreach (var leak in leaks)
+        {
+            if (string.IsNullOrWhiteSpace(leak.HostId))
+                continue;
+
+            if (firstHostId is null)
+            {
+                firstHostId = leak.HostId;
+                continue;
+            }
+
+            if (!string.Equals(firstHostId, leak.HostId, StringComparison.Ordinal))
+                return true;
+        }
+
+        return false;
+    }
 }

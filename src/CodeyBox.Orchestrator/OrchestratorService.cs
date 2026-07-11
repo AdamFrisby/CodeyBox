@@ -1059,9 +1059,17 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             _progressClock.Stamp(_time.GetUtcNow());
         }
 
-        _startupRecoveryCompletion?.MarkInitialRecoveryCompleted();
-
         await ReplayPendingAsync(stoppingToken);
+
+        // Signal initial-recovery completion only AFTER ReplayPendingAsync has
+        // finished re-enqueueing pending items. Replaying pending work is part of
+        // startup recovery, and the background watchdogs that gate on this signal
+        // (worker-progress, item-stale-progress, pool-health, dead-worker reaper
+        // loop) must not begin sweeping while replay is still mutating item state.
+        // Firing before replay also let a store scan reset an item that a caller
+        // created immediately after observing this signal, so the barrier now
+        // fences the whole recovery+replay pass rather than just the reaper.
+        _startupRecoveryCompletion?.MarkInitialRecoveryCompleted();
 
         // Collect in-flight item tasks so we can await them all on shutdown.
         // List is safe here: only the dispatch loop (single logical thread) touches it.
@@ -2754,6 +2762,11 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 _noProgressRedispatch.TryRemove(id, out _);
             }
         }
+
+        // The item itself has either progressed or been deferred. Release the
+        // global worker slot before follow-up fan-out so unrelated queued work
+        // is not left waiting behind dependency scans or release callbacks.
+        await ReleaseCompletedWorkerSlotLeaseAsync(slotLease, ct);
 
         // After the pipeline finishes (any outcome), check whether any
         // Queued items were waiting on this item and are now unblocked.

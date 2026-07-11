@@ -13,7 +13,7 @@ operational trade-off matches your deployment.
 | `bubblewrap`      | Linux namespaces + seccomp; shared kernel    | `apt install bubblewrap` — no daemon, no /etc edits              | **Working, integration-tested** |
 | **`multipass`**   | **Real Ubuntu VM (separate guest kernel)**   | **`snap install multipass` — single command, no /etc edits**     | **Working, integration-tested** |
 | `incus`           | Real VM with COW ZFS/Btrfs roots and virtiofs | Incus 7.0 LTS, `incus-admin`, and a ZFS or Btrfs storage pool    | Opt-in; `requires_incus` tested |
-| `multipass-remote`| Real Multipass VM on a dedicated SSH host    | Multipass host plus SSH                                          | Working                         |
+| `multipass-remote` | Real Ubuntu VM on remote executor hosts     | `ssh` from orchestrator + `snap install multipass` per executor  | Working — distributed executor pool |
 | `sprites`         | Hosted Firecracker microVM                   | sprites.dev account and token                                    | Working                         |
 
 CodeyBox previously shipped Kata, gVisor, and crun-vm provider scaffolds.
@@ -123,14 +123,15 @@ A graphical request fails explicitly; it is never rerouted to Multipass.
   available. Empty and host-read-only directories therefore remain valid mount
   sources. Do not make repository roots world-writable.
 - A dedicated non-default Incus project. When absent, the provider creates it
-  with `features.images=false`, Incus-required `features.profiles=true`, exact ownership
-  markers `user.codeybox.managed=true` and
+  with `features.images=false` (the shared default-project image catalog),
+  project-local `features.profiles=true`, exact ownership markers
+  `user.codeybox.managed=true` and
   `user.codeybox.project-schema=1`, and with `restricted=true`,
   `restricted.devices.disk=allow`, a nonempty exact
   `restricted.devices.disk.paths` list, `restricted.devices.nic=allow`, and
   `restricted.snapshots=allow`. It also sets
   `restricted.virtual-machines.lowlevel=block` and
-  and rejects per-instance VM nesting before start. CodeyBox refuses to claim or
+  rejects per-instance VM nesting before start. CodeyBox refuses to claim or
   mutate an existing project unless both ownership/schema markers and both
   feature flags already match exactly. Every VM still uses `--no-profiles`, and
   effective profiles/devices are verified before start. After that adoption check, it
@@ -158,7 +159,8 @@ A graphical request fails explicitly; it is never rerouted to Multipass.
   `/usr/bin/setpriv`, and `/usr/bin/setsid` (both from util-linux). The default
   Ubuntu cloud image provides these; the provider verifies both executables
   before admitting a sandbox. Its root-owned control wrapper starts each agent
-  command in a separate session and drops it to the configured numeric UID/GID.
+  command in a separate session, sets Linux no-new-privileges, and drops it to
+  the configured numeric UID/GID.
 - An existing ZFS or Btrfs Incus storage pool. The provider validates the
   snapshot-capable driver and, for ZFS, rejects any explicitly configured
   `zfs.clone_copy` mode other than `true`; it never creates, reformats, or
@@ -223,6 +225,13 @@ Each new creation invokes only the currently selected backend; a failure is
 propagated and never retried through the other provider. Selecting any other
 provider still requires a restart. See
 [`configuration.md`](configuration.md#incus) for every key and bound.
+
+When Incus is neither selected nor retained, the Incus provider is not
+constructed and its full configuration is not mapped or validated. The
+restart-only identity guard uses non-throwing normalization of the configured
+project and staging strings, while queued-baseline routing reads only the
+bounded baseline-name prefix. Invalid dormant Incus paths therefore cannot
+create staging state, invoke the Incus CLI, or break Multipass creation.
 
 If a cutover spans a process restart and preserved/leaked Multipass resources
 still exist after Incus becomes the startup selection, set
@@ -414,14 +423,35 @@ Three ways to install what your project needs:
 
 ## `multipass-remote` — same kernel isolation, VM execution off-box
 
-Drives `multipass` on a REMOTE host over SSH while the orchestrator
-brain — work-item DB, dispatch loop, agent stream capture — stays local.
-This is "CHEAP-PATH distributed VMs, step 1 of 2": one orchestrator
-process, one SQLite database, sandboxes elsewhere. Lets you scale VM
-throughput by adding a beefy remote host without re-architecting the
-orchestrator into a multi-process service.
+Drives `multipass` on one or more REMOTE executor hosts over SSH while
+the orchestrator brain — work-item DB, dispatch loop, agent stream
+capture — stays local. This is the cheap distributed-VM path: one
+orchestrator process, one SQLite database, sandboxes elsewhere. It lets
+you scale VM throughput by adding executor hosts without re-architecting
+the service into multiple orchestrators or an external database.
 
 **Provider name:** `multipass-remote`.
+
+**Placement.** Configure `ExecutorHosts` to turn the legacy single remote
+into a host pool. Each host has its own SSH target, capacity cap,
+cordon/drain flag, configured health flag, and optional network-profile
+allowlist. New VMs are placed only on hosts that are healthy, not
+cordoned, allowed for the requested network profile, and below their
+`MaxConcurrentSandboxes` cap. Placement picks the lowest load ratio so
+VMs spread across hosts without oversubscribing any host. The normal
+global gates still apply: effective fan-out is bounded by
+`min(MaxConcurrentWorkers, MaxConcurrentSandboxes, sum(host caps))`. When
+configured host capacity exceeds the global cap, startup logs a warning
+instead of silently hiding the bottleneck.
+
+**Cordon/drain and health.** Set `Cordoned=true` on a host to stop new VM
+placements there while existing VMs finish and release their reservations.
+Set `Healthy=false` to route around a known-bad host without deleting it
+from config. If SSH transport to a host drops at runtime, the provider
+marks that host runtime-unhealthy for `RuntimeUnhealthyBackoff` and
+retries placement on another eligible host. A transport drop during
+`exec` is surfaced as infrastructure deferral, so the existing wedge /
+preempt-checkpoint recovery path can reschedule the work item.
 
 **Architecture.** Every `multipass` command (launch / exec / mount /
 stop / delete / info / list) is issued through an `IRemoteHostTransport`
@@ -460,9 +490,8 @@ multipass.
 **Setup.**
 1. Install OpenSSH on the orchestrator host (almost always already
    there).
-2. On the remote host: `snap install multipass`. Same install command as
-   for local multipass, same `MultipassExtraRuncmd` baseline-bake
-   workflow when you switch in step 2.
+2. On each remote executor host: `snap install multipass`. Same install
+   command as for local multipass.
 3. Provision an SSH key for the orchestrator that authorizes a
    non-interactive user on the remote host. Use a key dedicated to
    CodeyBox so revocation has clean blast radius.
@@ -475,29 +504,53 @@ multipass.
      "CodeyBox": {
        "SandboxProvider": "multipass-remote",
        "MultipassRemoteSandbox": {
-         "SshTarget": "codeybox@remote.example.com",
          "SshKeyPath": "/etc/codeybox/ssh/id_ed25519",
          "RemoteMultipassPath": "/snap/bin/multipass",
          "RemoteStagingRoot": "/home/codeybox/snap/multipass/common/codeybox-remote-staging",
-         "DefaultImage": "24.04"
+         "DefaultImage": "24.04",
+         "PlacementRecheckIn": "00:00:15",
+         "RuntimeUnhealthyBackoff": "00:01:00",
+         "ExecutorHosts": [
+           {
+             "Id": "exec-a",
+             "SshTarget": "codeybox@exec-a.example.com",
+             "MaxConcurrentSandboxes": 40,
+             "AllowedNetworkProfiles": [ "claude", "multi-llm", "(default)" ]
+           },
+           {
+             "Id": "exec-b",
+             "SshTarget": "codeybox@exec-b.example.com",
+             "MaxConcurrentSandboxes": 40,
+             "AllowedNetworkProfiles": [ "*" ]
+           }
+         ]
        }
      }
    }
    ```
 
-**Hot reload.** Every field on `MultipassRemoteSandbox` is read fresh on
-each `CreateAsync` via `IOptionsMonitor`, so rotating an SSH key or
-re-pointing at a different remote host takes effect on the next sandbox
-launch without an orchestrator restart.
+   For a legacy single-host setup, omit `ExecutorHosts` and put
+   `SshTarget` / `MaxConcurrentSandboxes` directly under
+   `MultipassRemoteSandbox`; the provider treats that as one host named
+   `default`.
 
-**Scope (step 1 of 2).** This provider deliberately does NOT implement:
-baseline image bake/clone, suspend/resume, host-shutdown teardown,
-disk-guard preflight, package-cache seeding. Those host-side concerns
-either don't translate cleanly to a remote host without further design
-(suspend/resume needs network-stable VM identity across orchestrator
-restarts; baselines need a per-remote-host cache) or are operator-tuning
-concerns deferred until the basic distributed-VM path is working
-end-to-end. Step 2 picks those up.
+**Hot reload.** Every field on `MultipassRemoteSandbox` is read fresh on
+each `CreateAsync` via `IOptionsMonitor`, so rotating an SSH key,
+cordoning a host, changing per-host caps, or adding/removing executors
+takes effect on the next sandbox launch without an orchestrator restart.
+
+**Observability.** Host-pool gauges expose per-host reserved slots and
+capacity; placement counters show reservations, created VMs, deferrals,
+and runtime health transitions. Coordinator pinch-points are also timed:
+SQLite write-gate wait, host-side git commands, and agent-stream capture
+I/O. See [`observability.md`](observability.md).
+
+**Scope.** This provider supports cloning from an operator-baked remote
+Multipass baseline when `SandboxSpec.BaselineImageRef` is set. It deliberately
+does NOT implement baseline image bake, suspend/resume, host-shutdown teardown,
+disk-guard preflight, or package-cache seeding. Baseline baking and cache
+population remain per-executor operator duties; the remote provider only
+consumes an already-present baseline on the selected host.
 
 ## Choosing
 

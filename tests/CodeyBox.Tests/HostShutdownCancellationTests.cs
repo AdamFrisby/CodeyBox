@@ -106,7 +106,13 @@ public sealed class HostShutdownCancellationTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var logger = new CapturingLogger<PipelineRunner>();
-        using var harness = BuildPipeline(seed, new BlockingAgentRunner(), logger: logger);
+        var syncObserver = new PreemptPushSyncObservingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        using var harness = BuildPipeline(
+            seed,
+            new BlockingAgentRunner(),
+            logger: logger,
+            sandboxProvider: syncObserver);
 
         var item = NewItem();
         await harness.Store.CreateAsync(item);
@@ -143,6 +149,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
         var showRef = await TestSupport.RunGit(harness.GitHost.GetRepoPath(item.Id.ToString()),
             "show-ref", "--verify", final.PreemptCheckpoint!);
         Assert.Equal(0, showRef.code);
+        Assert.True(syncObserver.PreemptCheckpointSyncs > 0,
+            "preempt checkpoint push was not followed by a sandbox host sync");
 
         // (a) the structured boundary log fires with Boundary=RunAsync.host-shutdown
         // so post-incident triage can correlate the catch site with the source.
@@ -502,7 +510,9 @@ public sealed class HostShutdownCancellationTests : IDisposable
             new LocalGitHostOptions { RootDirectory = gitRoot },
             NullLogger<LocalGitHost>.Instance);
         var agent = new NoopResumeAgent();
-        var pipeline = BuildResumePipeline(seed, gitHost, store, agent);
+        var syncObserver = new PreemptPushSyncObservingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        var pipeline = BuildResumePipeline(seed, gitHost, store, agent, syncObserver);
 
         var item = NewItem() with
         {
@@ -531,6 +541,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
             "ls-tree", "-r", "--name-only", item.WorkBranch!);
         Assert.Equal(0, tree.code);
         Assert.Contains("partial-rework.txt", tree.stdout);
+        Assert.True(syncObserver.ResumedCheckpointWorkBranchSyncs > 0,
+            "resumed checkpoint work-branch push was not followed by a sandbox host sync");
     }
 
     // ── R8-core regression #2: suspend handler must not race the checkpoint flow ──
@@ -844,7 +856,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
         string seed,
         LocalGitHost gitHost,
         SqliteWorkItemStore store,
-        IAgentRunner agent)
+        IAgentRunner agent,
+        ISandboxProvider? sandboxProvider = null)
     {
         var projects = new InMemoryProjectRepository(new Project
         {
@@ -858,7 +871,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
         var webhooks = new NullWebhookDispatcher();
         var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
         return new PipelineRunner(
-            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            sandboxProvider ?? new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
             gitHost, new AgentRegistry([agent]), new StaticCredentialProvider(),
             new InMemoryPullRequestService(), projects,
             new TestUpstreamFactory(), new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
@@ -1211,6 +1224,89 @@ internal sealed class NoopResumeAgent : IAgentRunner, IResumableAgentRunner
         start += left.Length;
         var end = text.IndexOf(right, start, StringComparison.Ordinal);
         return end < 0 ? text[start..].Trim() : text[start..end];
+    }
+}
+
+internal sealed class PreemptPushSyncObservingSandboxProvider : ISandboxProvider
+{
+    private readonly ISandboxProvider _inner;
+    private int _preemptCheckpointSyncs;
+    private int _resumedCheckpointWorkBranchSyncs;
+
+    public PreemptPushSyncObservingSandboxProvider(ISandboxProvider inner)
+    {
+        _inner = inner;
+    }
+
+    public string Name => _inner.Name;
+    public int PreemptCheckpointSyncs => Volatile.Read(ref _preemptCheckpointSyncs);
+    public int ResumedCheckpointWorkBranchSyncs => Volatile.Read(ref _resumedCheckpointWorkBranchSyncs);
+
+    public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        => new PreemptPushSyncObservingSandbox(await _inner.CreateAsync(spec, ct), this);
+
+    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+        => _inner.ListAllManagedAsync(ct);
+
+    public Task DisposeLeakedAsync(string name, CancellationToken ct)
+        => _inner.DisposeLeakedAsync(name, ct);
+
+    private void RecordPreemptCheckpointSync() => Interlocked.Increment(ref _preemptCheckpointSyncs);
+    private void RecordResumedCheckpointWorkBranchSync() => Interlocked.Increment(ref _resumedCheckpointWorkBranchSyncs);
+
+    private sealed class PreemptPushSyncObservingSandbox : ISandbox
+    {
+        private readonly ISandbox _inner;
+        private readonly PreemptPushSyncObservingSandboxProvider _owner;
+        private int _pendingPreemptCheckpointPush;
+        private int _pendingResumedWorkBranchPush;
+
+        public PreemptPushSyncObservingSandbox(
+            ISandbox inner,
+            PreemptPushSyncObservingSandboxProvider owner)
+        {
+            _inner = inner;
+            _owner = owner;
+        }
+
+        public string Id => _inner.Id;
+        public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
+        public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
+
+        public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            var result = await _inner.ExecAsync(exec, ct);
+            if (!result.Success) return result;
+
+            if (IsGitPushToRef(exec.Argv, "refs/heads/codeybox/preempt/"))
+                Interlocked.Exchange(ref _pendingPreemptCheckpointPush, 1);
+            else if (IsGitPushToWorkBranch(exec.Argv))
+                Interlocked.Exchange(ref _pendingResumedWorkBranchPush, 1);
+
+            return result;
+        }
+
+        public async Task SyncStateToHostAsync(CancellationToken ct = default)
+        {
+            var preemptCheckpointPending = Interlocked.Exchange(ref _pendingPreemptCheckpointPush, 0) == 1;
+            var resumedWorkBranchPending = Interlocked.Exchange(ref _pendingResumedWorkBranchPush, 0) == 1;
+
+            await _inner.SyncStateToHostAsync(ct);
+
+            if (preemptCheckpointPending) _owner.RecordPreemptCheckpointSync();
+            if (resumedWorkBranchPending) _owner.RecordResumedCheckpointWorkBranchSync();
+        }
+
+        public ValueTask DisposeAsync() => _inner.DisposeAsync();
+
+        private static bool IsGitPushToRef(IReadOnlyList<string> argv, string refPrefix)
+            => argv.Contains("push", StringComparer.Ordinal)
+                && argv.Any(arg => arg.StartsWith($"HEAD:{refPrefix}", StringComparison.Ordinal));
+
+        private static bool IsGitPushToWorkBranch(IReadOnlyList<string> argv)
+            => argv.Contains("push", StringComparer.Ordinal)
+                && argv.Any(arg => arg.StartsWith("HEAD:", StringComparison.Ordinal)
+                    && !arg.StartsWith("HEAD:refs/heads/codeybox/preempt/", StringComparison.Ordinal));
     }
 }
 

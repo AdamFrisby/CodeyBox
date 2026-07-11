@@ -27,6 +27,18 @@ public interface IManagedSandboxLifecycle
     Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct);
 
     /// <summary>
+    /// Returns managed sandboxes together with inventory completeness metadata.
+    /// Multi-host providers must override this when a sweep can partially
+    /// succeed, so callers do not infer that a missing sandbox is absent on a
+    /// host that was never inventoried.
+    /// </summary>
+    async Task<ManagedSandboxInventory> ListManagedInventoryAsync(CancellationToken ct)
+    {
+        var managed = await ListAllManagedAsync(ct).ConfigureAwait(false);
+        return ManagedSandboxInventory.Complete(managed);
+    }
+
+    /// <summary>
     /// Best-effort dispose of a sandbox by name. Used by the
     /// <see cref="CodeyBox.Orchestrator.SandboxLeakReaper"/> when
     /// <c>AutoDispose=true</c>, and by the
@@ -40,12 +52,13 @@ public interface IManagedSandboxLifecycle
 
     /// <summary>
     /// Best-effort dispose of the exact sandbox snapshot returned by
-    /// <see cref="ListAllManagedAsync"/>. Composite lifecycle views use the
-    /// snapshot metadata to route disposal back to the lifecycle that reported
-    /// the sandbox instead of broadcasting a name across every provider.
+    /// <see cref="ListAllManagedAsync"/>. Composite lifecycle views use
+    /// provider metadata to route disposal back to the lifecycle that reported
+    /// the sandbox; multi-host providers use executor metadata to target the
+    /// owning host instead of rediscovering by name across a host pool.
     /// </summary>
-    Task DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
-        => DisposeLeakedAsync(sandbox.Name, ct);
+    Task DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct) =>
+        DisposeLeakedAsync(sandbox.Name, ct);
 }
 
 /// <summary>
@@ -146,6 +159,10 @@ public interface IResourceMetricsCapturingSandbox : ISandbox
 /// snapshot. Plain providers leave this null; composite lifecycle views fill it
 /// so later cleanup can target the reporting provider only.
 /// </param>
+/// <param name="HostId">
+/// Provider-specific executor identity for multi-host providers. Null for
+/// providers where the sandbox name alone is sufficient.
+/// </param>
 public sealed record ManagedSandboxInfo(
     string Name,
     DateTimeOffset? CreatedAt,
@@ -153,7 +170,39 @@ public sealed record ManagedSandboxInfo(
     bool IsTrackedActive,
     bool HasPreemptMarker = false,
     bool IsSuspendLifecycleOrFrozen = false,
-    string? LifecycleProviderId = null);
+    string? LifecycleProviderId = null,
+    string? HostId = null);
+
+public sealed class ManagedSandboxInventory : IReadOnlyList<ManagedSandboxInfo>
+{
+    private readonly ManagedSandboxInfo[] _items;
+
+    public ManagedSandboxInventory(
+        IReadOnlyList<ManagedSandboxInfo> items,
+        bool isComplete,
+        IReadOnlySet<string>? inventoriedHostIds = null)
+    {
+        ArgumentNullException.ThrowIfNull(items);
+
+        _items = items.ToArray();
+        IsComplete = isComplete;
+        InventoriedHostIds = inventoriedHostIds is null
+            ? new HashSet<string>(StringComparer.Ordinal)
+            : new HashSet<string>(inventoriedHostIds, StringComparer.Ordinal);
+    }
+
+    public bool IsComplete { get; }
+    public IReadOnlySet<string> InventoriedHostIds { get; }
+    public int Count => _items.Length;
+    public ManagedSandboxInfo this[int index] => _items[index];
+
+    public static ManagedSandboxInventory Complete(IReadOnlyList<ManagedSandboxInfo> items) =>
+        new(items, isComplete: true);
+
+    public IEnumerator<ManagedSandboxInfo> GetEnumerator() =>
+        ((IEnumerable<ManagedSandboxInfo>)_items).GetEnumerator();
+    System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+}
 
 /// <summary>A live sandbox. Disposing destroys it.</summary>
 public interface ISandbox : IAsyncDisposable
@@ -181,6 +230,13 @@ public interface ISandbox : IAsyncDisposable
     /// added later.
     /// </summary>
     Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default);
+
+    /// <summary>
+    /// Flushes provider-specific mutable sandbox state back to the orchestrator
+    /// host without tearing the sandbox down. Providers with remote staging use
+    /// this to make writes visible before later host-side pipeline phases run.
+    /// </summary>
+    Task SyncStateToHostAsync(CancellationToken ct = default) => Task.CompletedTask;
 
     /// <summary>
     /// Best-effort termination for commands currently running through
@@ -238,6 +294,32 @@ public sealed record SandboxResourceMetrics(
         : null;
 }
 
+/// <summary>
+/// Optional identity extension for sandboxes whose <see cref="ISandbox.Id"/> is
+/// only unique within one executor host.
+/// </summary>
+public interface IHostQualifiedSandbox
+{
+    string HostId { get; }
+}
+
+/// <summary>
+/// Optional sandbox capability for providers that can positively identify a
+/// successful dispose as an execution-host loss recovery hand-off. Admission
+/// wrappers may release the global sandbox slot even when a host-scoped
+/// inventory is partial, because the owning work item will be replayed on a new
+/// sandbox and the old host is no longer part of active capacity.
+/// </summary>
+public interface IReleaseAdmissionOnHostLossSandbox : ISandbox
+{
+    /// <summary>
+    /// True after a successful <see cref="IAsyncDisposable.DisposeAsync"/> when
+    /// the provider intentionally abandoned the old host-local sandbox for leak
+    /// reaper cleanup after an execution-time host transport loss. False for
+    /// normal cleanup failures where a live sandbox may still consume capacity.
+    /// </summary>
+    bool ReleaseAdmissionAfterHostLoss { get; }
+}
 
 /// <summary>
 /// Optional sandbox capability used during graceful host shutdown. A provider
@@ -634,6 +716,28 @@ public sealed class NullActiveSandboxProgressProvider : IActiveSandboxProgressPr
 
     public IReadOnlyList<ActiveSandboxProgress> SnapshotActiveSandboxProgress() => [];
 }
+
+/// <summary>
+/// Provider capability exposing the executor-host placement pool behind a
+/// sandbox provider. Local providers return no pool; distributed providers can
+/// surface per-host capacity, cordon, and health so dashboards show fan-out
+/// limits instead of hiding them behind the global sandbox admission count.
+/// </summary>
+public interface ISandboxHostPoolSnapshot
+{
+    IReadOnlyList<SandboxHostPoolEntry> SnapshotHostPool();
+}
+
+public sealed record SandboxHostPoolEntry(
+    string HostId,
+    int Capacity,
+    int Reserved,
+    bool Cordoned,
+    bool ConfiguredHealthy,
+    bool RuntimeHealthy,
+    string? RuntimeUnhealthyReason,
+    DateTimeOffset? RuntimeUnhealthyUntil,
+    IReadOnlyList<string> AllowedNetworkProfiles);
 
 /// <summary>
 /// Optional provider capability paired with <see cref="ISuspendableSandbox"/>.

@@ -38,18 +38,30 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
 
     public IReadOnlyList<IManagedSandboxLifecycle> Providers => _providers.Select(static p => p.Lifecycle).ToArray();
 
-    public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+    public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+        await ListManagedInventoryAsync(ct).ConfigureAwait(false);
+
+    public async Task<ManagedSandboxInventory> ListManagedInventoryAsync(CancellationToken ct)
     {
         var result = new List<ManagedSandboxInfo>();
         var failures = new List<Exception>();
         var reportedByName = new Dictionary<string, List<ProviderEntry>>(StringComparer.Ordinal);
+        var inventoriedHostIds = new HashSet<string>(StringComparer.Ordinal);
+        var completedProviderCount = 0;
+        var allProviderInventoriesComplete = true;
         foreach (var provider in _providers)
         {
             ct.ThrowIfCancellationRequested();
             try
             {
-                var listed = await provider.Lifecycle.ListAllManagedAsync(ct).ConfigureAwait(false);
-                foreach (var info in listed)
+                var inventory = await provider.Lifecycle.ListManagedInventoryAsync(ct).ConfigureAwait(false);
+                completedProviderCount++;
+                if (!inventory.IsComplete)
+                    allProviderInventoriesComplete = false;
+                foreach (var hostId in inventory.InventoriedHostIds)
+                    inventoriedHostIds.Add(hostId);
+
+                foreach (var info in inventory)
                 {
                     // A lifecycle can itself be a composite (the production
                     // admission wrapper around a reloadable provider router is
@@ -87,7 +99,10 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
                 StringComparer.Ordinal);
         }
 
-        return result;
+        return new ManagedSandboxInventory(
+            result,
+            isComplete: completedProviderCount == _providers.Count && allProviderInventoriesComplete,
+            inventoriedHostIds: inventoriedHostIds);
     }
 
     public async Task DisposeLeakedAsync(string name, CancellationToken ct)

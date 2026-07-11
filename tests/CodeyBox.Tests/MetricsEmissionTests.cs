@@ -1,6 +1,8 @@
 using System.Diagnostics.Metrics;
 using System.Collections.Concurrent;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
@@ -205,6 +207,179 @@ public sealed class MetricsEmissionTests
             AssertEventuallyContains(measurements, measurement =>
                 measurement.Value == 200L && measurement.TagValue == "clone");
         }
+    }
+
+    [Fact]
+    public async Task CoordinatorSqliteWriteGateWait_EmitsFromGateWait()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"cb-metrics-{Guid.NewGuid():N}.db");
+        var (listener, measurements) = CreateLongListener(
+            "CodeyBox.Coordinator",
+            "codeybox.coordinator.sqlite.write_gate.wait_ms",
+            "outcome");
+        using (listener)
+        using (var gate1 = SqliteDatabaseWriteGate.ForPath(path))
+        using (var gate2 = SqliteDatabaseWriteGate.ForPath(path))
+        {
+            // Hold gate1 on its own flow: acquiring it here would activate the
+            // gate's AsyncLocal ownership scope in the test's execution context,
+            // which Task.Run would then capture into the waiter and (correctly)
+            // trip the re-entry guard. Independent writers each acquire from their
+            // own flow, so the holder and waiter must live on separate tasks.
+            var holderAcquired = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseHolder = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var holder = Task.Run(async () =>
+            {
+                await gate1.WaitAsync();
+                holderAcquired.SetResult();
+                await releaseHolder.Task;
+                gate1.Release();
+            });
+
+            await holderAcquired.Task;
+
+            var waiter = Task.Run(async () =>
+            {
+                await gate2.WaitAsync();
+                gate2.Release();
+            });
+
+            await Task.Delay(25);
+            releaseHolder.SetResult();
+            await Task.WhenAll(holder, waiter);
+
+            AssertEventuallyContains(measurements, measurement =>
+                measurement.TagValue == "acquired");
+        }
+    }
+
+    [Fact]
+    public async Task CoordinatorSqliteWriteGateWait_EmitsCanceledAndRethrowsWhenSaturated()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"cb-metrics-{Guid.NewGuid():N}.db");
+        var (listener, measurements) = CreateLongListener(
+            "CodeyBox.Coordinator",
+            "codeybox.coordinator.sqlite.write_gate.wait_ms",
+            "outcome");
+        using (listener)
+        using (var gate1 = SqliteDatabaseWriteGate.ForPath(path))
+        using (var gate2 = SqliteDatabaseWriteGate.ForPath(path))
+        {
+            // Saturate the single-writer gate on an independent flow so the waiter
+            // neither inherits the holder's ownership scope (which would trip the
+            // re-entry guard) nor shares its execution context.
+            var holderAcquired = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseHolder = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var holder = Task.Run(async () =>
+            {
+                await gate1.WaitAsync();
+                holderAcquired.SetResult();
+                await releaseHolder.Task;
+                gate1.Release();
+            });
+
+            await holderAcquired.Task;
+
+            using var cts = new CancellationTokenSource();
+            // Await the acquisition inside the task so the waiter genuinely parks
+            // on the semaphore; WaitAsync only returns the awaitable, so failing to
+            // await it would complete the task before the gate is ever acquired.
+            var waiter = Task.Run(async () => await gate2.WaitAsync(cts.Token));
+
+            // The waiter is parked on the semaphore; cancel it while saturated.
+            await Task.Delay(25);
+            Assert.False(waiter.IsCompleted);
+            cts.Cancel();
+
+            // The cancellation must be rethrown (the writer never proceeds
+            // without the lock), and the "canceled" outcome must be emitted.
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => waiter);
+
+            AssertEventuallyContains(measurements, measurement =>
+                measurement.TagValue == "canceled");
+
+            releaseHolder.SetResult();
+            await holder;
+        }
+    }
+
+    [Fact]
+    public async Task CoordinatorAgentStreamCaptureDuration_EmitsFromCaptureDispose()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"cb-stream-metrics-{Guid.NewGuid():N}");
+        var path = Path.Combine(dir, "agent.log");
+        var (listener, measurements) = CreateLongListener(
+            "CodeyBox.Coordinator",
+            "codeybox.coordinator.agent_stream.capture.duration_ms",
+            "phase");
+        using (listener)
+        {
+            var capture = new AgentStreamCapture(path, maxBytes: 1024 * 1024, phase: "work", NullLogger.Instance);
+            capture.WriteChunk("hello\n");
+            await capture.DisposeAsync();
+
+            AssertEventuallyContains(measurements, measurement =>
+                measurement.TagValue == "work");
+        }
+
+        try { Directory.Delete(dir, recursive: true); } catch { }
+    }
+
+    [Fact]
+    public async Task CoordinatorAgentStreamBackpressureWait_Histogram_EmitsWithOutcomeTag()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"cb-stream-backpressure-{Guid.NewGuid():N}");
+        var path = Path.Combine(dir, "agent.log");
+        var workerGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (listener, measurements) = CreateLongListener(
+            "CodeyBox.Coordinator",
+            "codeybox.coordinator.agent_stream.backpressure.wait_ms",
+            "outcome");
+        using (listener)
+        {
+            var capture = new AgentStreamCapture(
+                path,
+                maxBytes: 1024 * 1024,
+                phase: "work",
+                NullLogger.Instance,
+                maxQueuedChunks: 1,
+                workerStartGate: workerGate.Task);
+            capture.WriteChunk("first\n");
+            var blockedWrite = Task.Run(() => capture.WriteChunk("second\n"));
+
+            await Task.Delay(50);
+            Assert.False(blockedWrite.IsCompleted);
+            workerGate.SetResult();
+            await blockedWrite.WaitAsync(TimeSpan.FromSeconds(2));
+            await capture.DisposeAsync();
+
+            AssertEventuallyContains(measurements, measurement =>
+                measurement.TagValue == "ready");
+        }
+
+        try { Directory.Delete(dir, recursive: true); } catch { }
+    }
+
+    [Fact]
+    public async Task CoordinatorAgentStreamDroppedBytes_EmitsFromCaptureSizeCap()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"cb-stream-drop-metrics-{Guid.NewGuid():N}");
+        var path = Path.Combine(dir, "agent.log");
+        var (listener, measurements) = CreateLongListener(
+            "CodeyBox.Coordinator",
+            "codeybox.coordinator.agent_stream.dropped_bytes",
+            "reason");
+        using (listener)
+        {
+            var capture = new AgentStreamCapture(path, maxBytes: 256, phase: "work", NullLogger.Instance);
+            capture.WriteChunk(new string('x', 4096));
+            await capture.DisposeAsync();
+
+            AssertEventuallyContains(measurements, measurement =>
+                measurement.Value > 0 && measurement.TagValue == "size_cap");
+        }
+
+        try { Directory.Delete(dir, recursive: true); } catch { }
     }
 
     // NOTE: codeybox.dispatch.count, codeybox.agent.invocations,

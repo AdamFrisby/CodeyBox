@@ -291,6 +291,19 @@ public sealed class HotReloadConfigTests
     }
 
     [Fact]
+    public void ImmutableCodeyBoxOptionsValidator_RejectsGitCommandOutputCapChange()
+    {
+        var startup = new CodeyBoxOptions { GitCommandMaxOutputBytes = 1024 };
+        var validator = new ImmutableCodeyBoxOptionsValidator(startup);
+
+        var candidate = new CodeyBoxOptions { GitCommandMaxOutputBytes = 2048 };
+        var result = validator.Validate(name: null, candidate);
+
+        Assert.True(result.Failed);
+        Assert.Contains("GitCommandMaxOutputBytes", result.FailureMessage);
+    }
+
+    [Fact]
     public void ImmutableCodeyBoxOptionsValidator_RejectsAgentStreamsPathChange()
     {
         var startup = new CodeyBoxOptions();

@@ -166,8 +166,36 @@ public sealed class ReleaseBranchCreationTests : IDisposable
         Assert.Contains(sandbox.Argv, argv => argv.SequenceEqual(["git", "-C", "/work/repo", "rev-parse", "origin/develop"]));
         Assert.Contains(sandbox.Argv, argv => argv.SequenceEqual(["git", "-C", "/work/repo", "checkout", "-b", branchName, "develop-sha"]));
         Assert.Contains(sandbox.Argv, argv => argv.SequenceEqual(["git", "-C", "/work/repo", "push", "origin", $"{branchName}:{branchName}"]));
+        Assert.Equal(1, sandbox.SyncCalls);
         Assert.DoesNotContain(sandbox.Argv, argv => argv.SequenceEqual(["git", "-C", "/work/repo", "rev-parse", "origin/main"]));
         Assert.DoesNotContain(sandbox.Argv, argv => argv.SequenceEqual(["git", "-C", "/work/repo", "checkout", "-b", branchName]));
+    }
+
+    [Fact]
+    public async Task EnsureReleaseBranch_SyncsPushedBranchBeforePersistingDbState()
+    {
+        var rel = await SeedAsync();
+        var project = ReleaseTestHelper.EnabledProject();
+        var sandbox = new CapturingReleaseSandbox(
+            new SandboxExecResult(0, "", ""),
+            new SandboxExecResult(0, "main-sha\n", ""),
+            new SandboxExecResult(0, "", ""),
+            new SandboxExecResult(0, "", ""))
+        {
+            ThrowOnSync = true,
+        };
+        var svc = BuildBranchService(
+            sandboxes: new SingleSandboxProvider(sandbox),
+            gitHost: new DeepAuditTestGitHost());
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            svc.EnsureReleaseBranchAsync(rel, project, default));
+
+        Assert.Equal(1, sandbox.SyncCalls);
+        var refreshed = await _store.GetAsync(rel.Id);
+        Assert.NotNull(refreshed);
+        Assert.Null(refreshed!.BranchName);
+        Assert.Null(refreshed.BaseCommitSha);
     }
 
     [Fact]
@@ -303,12 +331,22 @@ public sealed class ReleaseBranchCreationTests : IDisposable
 
         public string Id => "capturing-release";
         public List<IReadOnlyList<string>> Argv { get; } = [];
+        public int SyncCalls { get; private set; }
+        public bool ThrowOnSync { get; init; }
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             Argv.Add([.. exec.Argv]);
             var result = _results.Count > 0 ? _results.Dequeue() : new SandboxExecResult(0, "", "");
             return Task.FromResult(result);
+        }
+
+        public Task SyncStateToHostAsync(CancellationToken ct = default)
+        {
+            SyncCalls++;
+            if (ThrowOnSync)
+                throw new InvalidOperationException("sync failed");
+            return Task.CompletedTask;
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
