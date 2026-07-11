@@ -199,9 +199,12 @@ public sealed class MultipassRemoteProgramWiringTests
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { }
+            // Dispose the host first so its SQLite connections close and the
+            // -wal/-shm sidecars are checkpointed away; deleting the .db while
+            // the host is still writing orphans those sidecars on disk.
             base.Dispose(disposing);
+            if (disposing)
+                TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
         }
     }
 

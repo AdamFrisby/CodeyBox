@@ -31,6 +31,39 @@ public sealed class TestTempArtifactsTests
     }
 
     [Fact]
+    public async Task RawHostFactory_DisposesHostBeforeDeletingDatabase_LeavesNoSqliteSidecars()
+    {
+        // Regression: a raw WebApplicationFactory<Program> subclass that hosts a
+        // WAL-mode SQLite store must dispose the host (closing connections)
+        // BEFORE deleting the .db file. Deleting the .db while the connection is
+        // still open orphans the -wal/-shm sidecars, which accumulate on the
+        // test temp disk and can exhaust a small /tmp under the parallel suite.
+        using var temp = TestTempDirectory.Create("codeybox-raw-host-cleanup-");
+        var dbPath = Path.Combine(temp.Root, "state.db");
+
+        var factory = new RawStateDbApiFactory(dbPath, temp.Root);
+        using (var client = factory.CreateClient())
+        {
+            var store = factory.Services.GetRequiredService<IWorkItemStore>();
+            await store.CreateAsync(new WorkItem
+            {
+                Id = WorkItemId.New(),
+                ProjectId = new ProjectId("p"),
+                Title = "t",
+                Prompt = "x",
+                Agent = AgentKind.Claude,
+                State = WorkItemState.Working,
+            });
+        }
+
+        factory.Dispose();
+
+        Assert.False(File.Exists(dbPath));
+        Assert.False(File.Exists(dbPath + "-wal"));
+        Assert.False(File.Exists(dbPath + "-shm"));
+    }
+
+    [Fact]
     public void TestTempDirectory_Dispose_RemovesRecursiveRoot()
     {
         string root;
@@ -445,6 +478,39 @@ public sealed class TestTempArtifactsTests
 
         protected override void Dispose(bool disposing)
             => DisposeHostThenDeleteSqliteDatabase(disposing, StateDbPath, Store.Dispose);
+    }
+
+    // Mirrors the raw WebApplicationFactory<Program> subclasses (e.g. the
+    // Multipass-remote and quota-recovery program-wiring factories) that host a
+    // SQLite-backed store and delete their state database in Dispose.
+    private sealed class RawStateDbApiFactory(string dbPath, string tempRoot)
+        : Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactory<Program>
+    {
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            builder.ConfigureAppConfiguration((_, cfg) =>
+            {
+                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["CodeyBox:DangerouslyDisableAuth"] = "true",
+                    ["CodeyBox:StateDatabasePath"] = dbPath,
+                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tempRoot, "git"),
+                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tempRoot, "log.json"),
+                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tempRoot, "audit.json"),
+                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tempRoot, "streams"),
+                });
+            });
+            builder.ConfigureTestServices(services => services.RemoveAll<IHostedService>());
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            // Dispose the host (closing SQLite connections) BEFORE deleting the
+            // database, so the -wal/-shm sidecars are not orphaned on disk.
+            base.Dispose(disposing);
+            if (disposing)
+                TestTempArtifacts.DeleteSqliteDatabase(dbPath);
+        }
     }
 
     private sealed class CleanupNoopAuditor : IAuditor

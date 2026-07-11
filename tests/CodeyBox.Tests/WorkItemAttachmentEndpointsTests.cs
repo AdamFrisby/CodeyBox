@@ -773,7 +773,7 @@ internal sealed class AttachmentApiFactory : WebApplicationFactory<Program>
         {
             WorkItemStore.Dispose();
             AttachmentStore.Dispose();
-            try { File.Delete(_dbPath); } catch { }
+            TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
             foreach (var root in _attachmentRoots)
             {
                 try { if (Directory.Exists(root)) Directory.Delete(root, recursive: true); } catch { }
