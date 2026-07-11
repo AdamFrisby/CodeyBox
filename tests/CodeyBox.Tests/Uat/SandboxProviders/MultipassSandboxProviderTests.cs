@@ -43,6 +43,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     // Poll cadence for the whole-process-group liveness watchdog.
     private static readonly TimeSpan ProcessGroupPollInterval = TimeSpan.FromMilliseconds(25);
 
+    // Cadence at which a marker-timeout test nudges the virtual clock forward
+    // while waiting for the supervisor to observe the deadline. Comfortably
+    // slower than the supervisor's own ~0.1s poll so it arms (and thus fixes its
+    // deadline) well within a single interval; see AdvancePastMarkerDeadlineAsync.
+    private static readonly TimeSpan MarkerDeadlineAdvanceInterval = TimeSpan.FromMilliseconds(200);
+
     private readonly string _workspace = Directory.CreateTempSubdirectory("codeybox-uat-multipass-").FullName;
 
     public void Dispose()
@@ -2226,8 +2232,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         try
         {
             await WaitForFileAsync(markerPublicationEntered, DetachedLaunchWatchdog);
-            virtualTime.AdvanceTo(5);
-            var (exit, stdout, stderr) = await launchTask;
+            var (exit, stdout, stderr) = await AdvancePastMarkerDeadlineAsync(
+                virtualTime, launchTask, markerWaitSeconds: 5, timeout.Token);
 
             Assert.Equal(88, exit);
             Assert.Equal("", stdout);
@@ -2342,8 +2348,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         try
         {
             await WaitForFileAsync(sudoProcessGroupFile, DetachedLaunchWatchdog);
-            virtualTime.AdvanceTo(5);
-            var (exit, stdout, stderr) = await launchTask;
+            var (exit, stdout, stderr) = await AdvancePastMarkerDeadlineAsync(
+                virtualTime, launchTask, markerWaitSeconds: 5, timeout.Token);
 
             Assert.True(
                 exit == 88,
@@ -2437,8 +2443,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         try
         {
             await WaitForFileAsync(sudoProcessGroupFile, DetachedLaunchWatchdog);
-            virtualTime.AdvanceTo(5);
-            var (exit, stdout, stderr) = await launchTask;
+            var (exit, stdout, stderr) = await AdvancePastMarkerDeadlineAsync(
+                virtualTime, launchTask, markerWaitSeconds: 5, timeout.Token);
 
             Assert.True(
                 exit == 88,
@@ -6233,6 +6239,41 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 Assert.Fail($"Expected process group {pgid} to exit.");
             await Task.Delay(ProcessGroupPollInterval);
         }
+    }
+
+    // Drives a marker-timeout launch to completion without racing the supervisor.
+    //
+    // The generated supervisor arms its marker deadline as `now_seconds() +
+    // markerWaitSeconds`, reading the virtual clock at whatever value it holds
+    // the first time it observes the child pgid file. That arming is internal
+    // bash state — the test cannot observe it — so a single AdvanceTo(N) can lose
+    // a race: if the clock is advanced before the (starved-under-load) supervisor
+    // arms, the supervisor reads the advanced value and its deadline lands beyond
+    // anything the test will ever reach, hanging until the watchdog fires.
+    //
+    // Instead of observing the arm, overtake it: advance the virtual clock in
+    // strictly increasing steps until the launcher exits. The deadline is fixed
+    // once armed, so a monotonically increasing clock is guaranteed to pass it;
+    // the watchdog token bounds a genuine never-arms hang into a clean failure.
+    private static async Task<(int Exit, string Stdout, string Stderr)> AdvancePastMarkerDeadlineAsync(
+        DetachedLaunchVirtualTime virtualTime,
+        Task<(int Exit, string Stdout, string Stderr)> launchTask,
+        int markerWaitSeconds,
+        CancellationToken ct)
+    {
+        var elapsedSeconds = 0;
+        while (!launchTask.IsCompleted)
+        {
+            ct.ThrowIfCancellationRequested();
+            elapsedSeconds += markerWaitSeconds;
+            virtualTime.AdvanceTo(elapsedSeconds);
+            // No ct on the delay: the launch task carries the same watchdog token
+            // and faults on expiry, so WhenAny wakes within one interval anyway —
+            // and an unawaited cancelled delay would leak an unobserved task.
+            await Task.WhenAny(launchTask, Task.Delay(MarkerDeadlineAdvanceInterval))
+                .ConfigureAwait(false);
+        }
+        return await launchTask;
     }
 
     private static async Task<FileStream> CreateBlockingPipeAsync(string path)

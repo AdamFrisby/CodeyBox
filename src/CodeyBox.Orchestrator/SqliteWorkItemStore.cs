@@ -590,6 +590,18 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     // SQLITE_FULL_*  refinement still routes through the disk-full path.
     internal const int SQLITE_FULL = 13;
 
+    // Comma-separated integer literals for the canonical terminal states, built
+    // once from the single source of truth so every "non-terminal" filter here
+    // stays in lockstep with WorkItemStates.Terminal. Values are enum ints, not
+    // untrusted input, so inlining them into SQL is safe.
+    private static readonly string TerminalStatesSqlList =
+        string.Join(", ", WorkItemStates.Terminal.Select(s => (int)s));
+
+    // Chunk size for the baseline-pin clear UPDATE. Keeps each statement's bound
+    // parameter count well under SQLite's default limit (32,766) while still
+    // running every chunk inside one transaction.
+    private const int ClearBaselineBatchSize = 500;
+
     public async Task CreateAsync(WorkItem item, CancellationToken ct = default)
     {
         await _writeLock.WaitAsync(ct);
@@ -2548,14 +2560,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             cmd.CommandText = $"""
                 SELECT DISTINCT baseline_image_ref FROM work_items
                 WHERE baseline_image_ref IS NOT NULL
-                  AND state NOT IN (
-                    {(int)WorkItemState.Done},
-                    {(int)WorkItemState.Failed},
-                    {(int)WorkItemState.Cancelled},
-                    {(int)WorkItemState.AuditFailed},
-                    {(int)WorkItemState.MergeConflictResolutionFailed},
-                    {(int)WorkItemState.AbandonedAfterRecoveryAttempts}
-                  );
+                  AND state NOT IN ({TerminalStatesSqlList});
                 """;
             var set = new HashSet<string>(StringComparer.Ordinal);
             using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -2595,6 +2600,102 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 result.Add((id, title, state));
             }
             return result;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<IReadOnlyList<BaselinePinnedWorkItem>> ListNonTerminalBaselinePinnedAsync(
+        ProjectId? projectId,
+        string? baselineImageRef,
+        int limit,
+        CancellationToken ct = default)
+    {
+        var result = new List<BaselinePinnedWorkItem>();
+        if (limit <= 0)
+            return result;
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            // Served from idx_work_items_baseline_image_ref (partial, WHERE NOT
+            // NULL). The optional project/ref predicates use $param IS NULL to
+            // mean "no constraint" so one prepared statement covers every scope.
+            cmd.CommandText = $"""
+                SELECT id, project_id, state, baseline_image_ref FROM work_items
+                WHERE baseline_image_ref IS NOT NULL
+                  AND state NOT IN ({TerminalStatesSqlList})
+                  AND ($pid IS NULL OR project_id = $pid)
+                  AND ($ref IS NULL OR baseline_image_ref = $ref)
+                ORDER BY created_at ASC, id ASC
+                LIMIT $limit;
+                """;
+            cmd.Parameters.AddWithValue("$pid", (object?)projectId?.Value ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$ref", (object?)baselineImageRef ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$limit", (long)limit);
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                result.Add(new BaselinePinnedWorkItem(
+                    WorkItemId.Parse(reader.GetString(0)),
+                    new ProjectId(reader.GetString(1)),
+                    (WorkItemState)reader.GetInt32(2),
+                    reader.GetString(3)));
+            }
+            return result;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<int> ClearBaselinePinsAsync(
+        IReadOnlyCollection<WorkItemId> ids,
+        DateTimeOffset updatedAt,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(ids);
+        if (ids.Count == 0)
+            return 0;
+
+        var idList = ids as IReadOnlyList<WorkItemId> ?? ids.ToList();
+        var stamp = updatedAt.ToString("O");
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            var affected = 0;
+            using var tx = _conn.BeginTransaction();
+            for (var offset = 0; offset < idList.Count; offset += ClearBaselineBatchSize)
+            {
+                var count = Math.Min(ClearBaselineBatchSize, idList.Count - offset);
+                using var cmd = _conn.CreateCommand();
+                cmd.Transaction = tx;
+                var placeholders = string.Join(", ", Enumerable.Range(0, count).Select(i => $"$id{i}"));
+                // Re-assert the non-terminal + non-null guards in the write so a
+                // worker that completed a candidate between the caller's read and
+                // here is left alone, and a re-run over already-cleared ids is a
+                // no-op (idempotent).
+                cmd.CommandText = $"""
+                    UPDATE work_items
+                    SET baseline_image_ref = NULL, updated_at = $now
+                    WHERE baseline_image_ref IS NOT NULL
+                      AND state NOT IN ({TerminalStatesSqlList})
+                      AND id IN ({placeholders});
+                    """;
+                cmd.Parameters.AddWithValue("$now", stamp);
+                for (var i = 0; i < count; i++)
+                    cmd.Parameters.AddWithValue($"$id{i}", idList[offset + i].ToString());
+                affected += await cmd.ExecuteNonQueryAsync(ct);
+            }
+            tx.Commit();
+            return affected;
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("ClearBaselinePinsAsync", sqlex);
         }
         finally
         {

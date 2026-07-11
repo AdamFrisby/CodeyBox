@@ -21,16 +21,7 @@ public static class WorkItemDependencies
     /// dependent waits until the parent reaches Done.
     /// </para>
     /// </summary>
-    public static readonly IReadOnlySet<WorkItemState> TerminalStates =
-        new HashSet<WorkItemState>
-        {
-            WorkItemState.Done,
-            WorkItemState.Failed,
-            WorkItemState.AuditFailed,
-            WorkItemState.Cancelled,
-            WorkItemState.MergeConflictResolutionFailed,
-            WorkItemState.AbandonedAfterRecoveryAttempts,
-        };
+    public static readonly IReadOnlySet<WorkItemState> TerminalStates = WorkItemStates.Terminal;
 
     /// <summary>
     /// States that count as "satisfied" for the dependsOn gate. A dependent

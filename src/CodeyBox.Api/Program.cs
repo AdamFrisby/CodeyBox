@@ -3435,6 +3435,22 @@ builder.Services.AddSingleton<BaselineImageReaper>(sp =>
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<BaselineImageReaper>());
 
+// Operator-triggered baseline migration (POST /baselines/migrate). Clears the
+// per-item baseline pin for in-flight items through the shared write gate so
+// they recompute the current-config baseline on next pickup. Singleton so the
+// endpoint resolves it via DI; no background loop.
+builder.Services.AddSingleton<BaselineMigrationService>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    return new BaselineMigrationService(
+        sp.GetRequiredService<IWorkItemStore>(),
+        sp.GetRequiredService<IBaselineImageResolver>(),
+        sp.GetRequiredService<IProjectRepository>(),
+        sp.GetService<TimeProvider>() ?? TimeProvider.System,
+        () => monitor.CurrentValue.BaselineMigration,
+        sp.GetRequiredService<ILogger<BaselineMigrationService>>());
+});
+
 // --- Stale-base PR sweeper ---------------------------------------------------
 // Periodically polls open PRs across every github-upstream project, detects
 // the ones whose base branch has moved and produced a conflict the auto-merger
@@ -4807,6 +4823,13 @@ namespace CodeyBox.Api
         /// implement <see cref="IBaselineImageResolver"/>.
         /// </summary>
         public BaselineImageReaperOptions BaselineImageReaper { get; set; } = new();
+
+        /// <summary>
+        /// Operator baseline-migration configuration (POST /baselines/migrate).
+        /// Bounds how many pinned items a single migrate call inspects and
+        /// clears. See <see cref="BaselineMigrationService"/>.
+        /// </summary>
+        public BaselineMigrationOptions BaselineMigration { get; set; } = new();
 
         /// <summary>
         /// Stale-base PR sweeper configuration. Detects open CodeyBox-authored
