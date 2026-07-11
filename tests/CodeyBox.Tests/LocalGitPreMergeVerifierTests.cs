@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Diagnostics.Metrics;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Git;
@@ -538,6 +540,65 @@ public sealed class LocalGitPreMergeVerifierTests : IDisposable
         Assert.Equal(PreMergeVerifyFailureMode.BuildOrTestFailed, result.FailureMode);
         Assert.Contains("could not check out merge sha", result.FailureReason);
         Assert.Contains(unknownSha, result.FailureReason);
+    }
+
+    /// <summary>
+    /// The verifier launches <c>git worktree add/remove</c> directly (not
+    /// through <c>LocalGitHost.RunGitAsync</c>), so those host-side git
+    /// commands must record the coordinator git-command metric themselves.
+    /// Without this the pre-merge worktree ops would be an unmeasured
+    /// scaling pinch point — the gap the completeness auditor flagged. The
+    /// metric fires for the real <c>worktree</c> commands regardless of the
+    /// (non-git) verify argv outcome.
+    /// </summary>
+    [Fact]
+    public async Task RealVerifier_RecordsCoordinatorGitMetricForWorktreeCommands()
+    {
+        var (gitHost, repoId, mergeSha) = await SetupBareRepoWithCommitAsync();
+        var measurements = new ConcurrentQueue<(string? Operation, string? Outcome)>();
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "CodeyBox.Coordinator"
+                && instrument.Name == "codeybox.coordinator.git.command.duration_ms")
+            {
+                l.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            string? operation = null;
+            string? outcome = null;
+            for (var i = 0; i < tags.Length; i++)
+            {
+                if (tags[i].Key == "operation")
+                    operation = tags[i].Value?.ToString();
+                if (tags[i].Key == "outcome")
+                    outcome = tags[i].Value?.ToString();
+            }
+            measurements.Enqueue((operation, outcome));
+        });
+        listener.Start();
+        var verifier = new LocalGitPreMergeVerifier(
+            gitHost,
+            NullLogger<LocalGitPreMergeVerifier>.Instance);
+
+        var result = await verifier.VerifyAsync(new PreMergeVerifyRequest
+        {
+            WorkItemId = WorkItemId.New(),
+            ProjectId = new ProjectId("test"),
+            RepositoryId = repoId,
+            BaseBranch = "main",
+            WorkBranch = "feature/x",
+            MergeSha = mergeSha,
+            Argv = ["/usr/bin/true"],
+        }, CancellationToken.None);
+
+        Assert.True(result.Success);
+        var observed = SpinWait.SpinUntil(
+            () => measurements.Any(m => m.Operation == "worktree" && m.Outcome == "success"),
+            TimeSpan.FromSeconds(2));
+        Assert.True(observed, "Expected pre-merge verifier to record the git worktree command metric.");
     }
 
     private async Task<(IGitHost GitHost, string RepoId, string MergeSha)> SetupBareRepoWithCommitAsync()

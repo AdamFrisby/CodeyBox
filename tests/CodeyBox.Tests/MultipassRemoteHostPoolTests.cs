@@ -168,6 +168,81 @@ public sealed class MultipassRemoteHostPoolTests
         }
     }
 
+    /// <summary>
+    /// Cordon/drain contract: hot-reloading a host to <c>Cordoned</c> must
+    /// stop NEW placement on it while letting the VMs already running there
+    /// finish. This exercises the "let existing active VMs finish" half that
+    /// <see cref="CreateAsync_honors_hot_reloaded_cordon_state"/> does not: an
+    /// active sandbox on the drained host must keep its reservation and still
+    /// exec + sync-back + dispose successfully, while concurrent creates route
+    /// to the open host. A regression that treated cordon as an immediate
+    /// eviction (dropping the reservation, refusing exec, or forcing the new
+    /// create onto the cordoned host) flips one of these assertions red.
+    /// </summary>
+    [Fact]
+    public async Task CordonedHost_lets_active_sandbox_finish_while_new_creates_route_away()
+    {
+        // Both hosts open so the first create lands on whichever host placement
+        // picks; we then cordon THAT host so the test does not depend on the
+        // placement ordering.
+        var current = Options(
+            Host("a", cap: 2),
+            Host("b", cap: 2));
+        var transports = new HostTransportSet();
+        var provider = Provider(() => current, transports);
+
+        var hostTemp = Path.Combine(Path.GetTempPath(), "codeybox-remote-drain-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(hostTemp);
+        try
+        {
+            var active = await provider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = "24.04",
+                WorkingDirectory = "/work",
+                Mounts = [new SandboxMount { SandboxPath = "/repo", HostPath = hostTemp, ReadOnly = false }],
+            });
+            var activeHost = ((MultipassRemoteSandbox)active).HostId;
+            var otherHost = activeHost == "a" ? "b" : "a";
+            Assert.Equal(1, ReservedFor(provider, activeHost));
+
+            // Hot-reload: cordon the host the active VM runs on for maintenance.
+            current = Options(
+                Host("a", cap: 2, cordoned: activeHost == "a"),
+                Host("b", cap: 2, cordoned: activeHost == "b"));
+
+            // The already-placed sandbox keeps working against the cordoned
+            // host: exec succeeds and sync-back runs (stage-out) without error.
+            var exec = await active.ExecAsync(new SandboxExec { Argv = ["echo", "hello"] });
+            Assert.Equal(0, exec.ExitCode);
+            await active.SyncStateToHostAsync();
+            // Reservation is retained while the drained VM is still active.
+            Assert.Equal(1, ReservedFor(provider, activeHost));
+
+            // New creates route around the cordoned host to the open one.
+            await using (var next = await provider.CreateAsync(Spec()))
+            {
+                Assert.Equal(otherHost, ((MultipassRemoteSandbox)next).HostId);
+            }
+
+            // The cordoned host launched exactly the one original VM — the new
+            // create did not land there and its reservation is unchanged.
+            Assert.Equal(1, transports[activeHost].LaunchCount);
+            Assert.Equal(1, ReservedFor(provider, activeHost));
+
+            // When the drained VM finishes, its reservation frees even though
+            // the host stays cordoned — the drain completes.
+            await active.DisposeAsync();
+            Assert.Equal(0, ReservedFor(provider, activeHost));
+        }
+        finally
+        {
+            try { Directory.Delete(hostTemp, recursive: true); } catch { }
+        }
+    }
+
+    private static int ReservedFor(MultipassRemoteSandboxProvider provider, string hostId) =>
+        Assert.Single(provider.SnapshotHostPool(), h => h.HostId == hostId).Reserved;
+
     [Fact]
     public async Task CreateAsync_marks_failed_host_unhealthy_and_retries_another_host()
     {

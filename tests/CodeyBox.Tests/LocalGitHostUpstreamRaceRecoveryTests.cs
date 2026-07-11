@@ -501,6 +501,95 @@ public sealed class LocalGitHostUpstreamRaceRecoveryTests : IDisposable
     }
 
     [Fact]
+    public async Task ListFilesEndingWithAsync_RecordsCoordinatorGitCommandDurationMetric()
+    {
+        // The streamed ls-tree path launches git directly rather than through
+        // RunGitAsync, so it must record the coordinator git-command metric on
+        // its own — otherwise this host-side git op would be an unmeasured
+        // scaling pinch point (the exact gap the completeness auditor flagged).
+        var measurements = new ConcurrentQueue<(string? Operation, string? Outcome)>();
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "CodeyBox.Coordinator"
+                && instrument.Name == "codeybox.coordinator.git.command.duration_ms")
+            {
+                l.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            string? operation = null;
+            string? outcome = null;
+            for (var i = 0; i < tags.Length; i++)
+            {
+                if (tags[i].Key == "operation")
+                    operation = tags[i].Value?.ToString();
+                if (tags[i].Key == "outcome")
+                    outcome = tags[i].Value?.ToString();
+            }
+            measurements.Enqueue((operation, outcome));
+        });
+        listener.Start();
+        var gitHost = CreateGitHost(processFactory: _ =>
+            new FakeLocalGitProcess(stdout: "src/App.cs\nREADME.md\n", exitCode: 0));
+        var repoId = WorkItemId.New().ToString();
+        Directory.CreateDirectory(gitHost.GetRepoPath(repoId));
+
+        var matches = await gitHost.ListFilesEndingWithAsync(repoId, "main", [".cs"], maxResults: 10);
+
+        Assert.Equal(["src/App.cs"], matches);
+        var observed = SpinWait.SpinUntil(
+            () => measurements.Any(m => m.Operation == "ls-tree" && m.Outcome == "success"),
+            TimeSpan.FromSeconds(2));
+        Assert.True(observed, "Expected ListFilesEndingWithAsync to emit ls-tree git command duration metric.");
+    }
+
+    [Fact]
+    public async Task ListFilesEndingWithAsync_CapExceeded_RecordsOutputLimitOutcome()
+    {
+        // A match-cap breach kills the child and throws; the metric must still
+        // record with the "output_limit" outcome so an operator sees the
+        // ceiling being hit rather than silent degradation.
+        var measurements = new ConcurrentQueue<(string? Operation, string? Outcome)>();
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "CodeyBox.Coordinator"
+                && instrument.Name == "codeybox.coordinator.git.command.duration_ms")
+            {
+                l.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            string? operation = null;
+            string? outcome = null;
+            for (var i = 0; i < tags.Length; i++)
+            {
+                if (tags[i].Key == "operation")
+                    operation = tags[i].Value?.ToString();
+                if (tags[i].Key == "outcome")
+                    outcome = tags[i].Value?.ToString();
+            }
+            measurements.Enqueue((operation, outcome));
+        });
+        listener.Start();
+        var gitHost = CreateGitHost(processFactory: _ =>
+            new FakeLocalGitProcess(stdout: "a.cs\nb.cs\nc.cs\n", exitCode: 0));
+        var repoId = WorkItemId.New().ToString();
+        Directory.CreateDirectory(gitHost.GetRepoPath(repoId));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => gitHost.ListFilesEndingWithAsync(repoId, "main", [".cs"], maxResults: 1));
+
+        var observed = SpinWait.SpinUntil(
+            () => measurements.Any(m => m.Operation == "ls-tree" && m.Outcome == "output_limit"),
+            TimeSpan.FromSeconds(2));
+        Assert.True(observed, "Expected ListFilesEndingWithAsync cap breach to emit output_limit outcome.");
+    }
+
+    [Fact]
     public async Task ListFilesEndingWithAsync_TextFileBusyProcessStartAfterRetryCap_DisposesAndPropagates()
     {
         var starts = 0;

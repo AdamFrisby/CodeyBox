@@ -942,6 +942,17 @@ public sealed class LocalGitHost : IGitHost
         SanitizeBareRepositoryConfig(path);
         SanitizeAlternates(path);
 
+        // Streamed ls-tree launches git directly rather than through
+        // RunGitAsync, so it must record the coordinator git-command metric
+        // itself — otherwise this host-side git path would be an unmeasured
+        // scaling pinch point. Duration is captured from process start; the
+        // cap-exceeded throws below map to the "output_limit" outcome, matching
+        // RunGitAsync's convention.
+        var sw = Stopwatch.StartNew();
+        var metricOutcome = "error";
+        try
+        {
+
         var psi = new ProcessStartInfo
         {
             FileName = _opts.GitExecutable,
@@ -1050,26 +1061,43 @@ public sealed class LocalGitHost : IGitHost
 
         if (stderrLimitExceeded)
         {
+            metricOutcome = "output_limit";
             throw new InvalidOperationException(
                 $"git ls-tree '{treeish}' stderr exceeded LocalGitHostOptions.GitCommandMaxOutputBytes={_opts.GitCommandMaxOutputBytes.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
         }
 
         if (scannedCapExceeded)
         {
+            metricOutcome = "output_limit";
             throw new InvalidOperationException(
                 $"git ls-tree '{treeish}' scanned more than {_opts.ListFilesEndingScannedPathCeiling} paths without filling the match cap (tree too large to inspect safely)");
         }
 
         if (capExceeded)
         {
+            metricOutcome = "output_limit";
             throw new InvalidOperationException(
                 $"git ls-tree '{treeish}' produced more than {maxResults} matching paths (output cap exceeded)");
         }
 
         if (p.ExitCode != 0)
+        {
+            metricOutcome = "exit_nonzero";
             throw new InvalidOperationException($"git ls-tree '{treeish}' failed: {stderr}");
+        }
 
+        metricOutcome = "success";
         return results;
+        }
+        catch (OperationCanceledException)
+        {
+            metricOutcome = "canceled";
+            throw;
+        }
+        finally
+        {
+            RecordGitCommandDuration("ls-tree", sw, metricOutcome);
+        }
     }
 
     private static bool EndsWithAnySuffix(string path, IReadOnlyList<string> suffixes)
@@ -1572,10 +1600,7 @@ public sealed class LocalGitHost : IGitHost
     private readonly record struct GitOutputReadResult(string Text, bool LimitExceeded);
 
     private static void RecordGitCommandDuration(string operation, Stopwatch sw, string outcome) =>
-        CodeyBoxMeters.CoordinatorGitCommandDuration.Record(
-            sw.ElapsedMilliseconds,
-            new KeyValuePair<string, object?>("operation", operation),
-            new KeyValuePair<string, object?>("outcome", outcome));
+        CoordinatorGitMetrics.Record(operation, sw, outcome);
 
     private static string ResolveGitOperation(IReadOnlyList<string> args)
     {
