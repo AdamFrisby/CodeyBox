@@ -6687,12 +6687,30 @@ while True:
         sb.AppendLine();
         sb.AppendLine(") &");
         sb.AppendLine("codeybox_detached_pid=$!");
-        sb.AppendLine("codeybox_marker_deadline=$(($(codeybox_now_seconds) + codeybox_marker_wait_seconds))");
+        // Deadline structure: launch_deadline is a real-clock backstop for the
+        // case where the child never publishes its pgid file (e.g. the launcher
+        // exits early). Once the child_pgid_file appears (or launch_deadline
+        // elapses), marker_deadline arms on the virtual clock so tests can
+        // advance it deterministically. launch_deadline stays on $SECONDS
+        // because virtual time is pinned at 0 on success paths — a virtualised
+        // launch_deadline would never fire, leaving the "child never wrote its
+        // pgid" fallback branch untestable.
+        sb.AppendLine("codeybox_launch_deadline=$((SECONDS + codeybox_marker_wait_seconds))");
+        sb.AppendLine("codeybox_marker_deadline=");
         sb.AppendLine("while ! codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; do");
         sb.AppendLine("    if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
         sb.AppendLine("        break");
         sb.AppendLine("    fi");
-        sb.AppendLine("    if [ \"$(codeybox_now_seconds)\" -ge \"$codeybox_marker_deadline\" ]; then");
+        sb.AppendLine("    if codeybox_report_child_status_if_present; then");
+        sb.AppendLine("        :");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    if [ -z \"$codeybox_marker_deadline\" ] && [ -s \"$codeybox_child_pgid_file\" ]; then");
+        sb.AppendLine("        codeybox_marker_deadline=$(($(codeybox_now_seconds) + codeybox_marker_wait_seconds))");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    if [ -z \"$codeybox_marker_deadline\" ] && [ \"$SECONDS\" -ge \"$codeybox_launch_deadline\" ]; then");
+        sb.AppendLine("        codeybox_marker_deadline=$(codeybox_now_seconds)");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    if [ -n \"$codeybox_marker_deadline\" ] && [ \"$(codeybox_now_seconds)\" -ge \"$codeybox_marker_deadline\" ]; then");
         sb.AppendLine("        if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
         sb.AppendLine("            break");
         sb.AppendLine("        fi");
@@ -6743,7 +6761,7 @@ while True:
         sb.AppendLine("        if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
         sb.AppendLine("            break");
         sb.AppendLine("        fi");
-        sb.AppendLine("        if [ ! -s \"$codeybox_child_pgid_file\" ] && [ \"$(codeybox_now_seconds)\" -lt \"$codeybox_marker_deadline\" ]; then");
+        sb.AppendLine("        if [ ! -s \"$codeybox_child_pgid_file\" ] && [ \"$SECONDS\" -lt \"$codeybox_launch_deadline\" ]; then");
         sb.AppendLine("            sleep 0.1");
         sb.AppendLine("            continue");
         sb.AppendLine("        fi");
@@ -7356,17 +7374,18 @@ while True:
 
         try
         {
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            cts.CancelAfter(ResolveResourceMetricsCaptureTimeout(_opts));
+            var timeout = ResolveResourceMetricsCaptureTimeout(_opts);
+            using var captureCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            captureCts.CancelAfter(timeout);
 
             await using var captureScope = await TimingScope.BeginAsync(
                 _timings, _timingItemId, _timingPhase, "vm.resource_capture", log: _log);
-            var metrics = await CaptureResourceMetricsAsync(cts.Token).ConfigureAwait(false);
+            var metrics = await CaptureResourceMetricsAsync(captureCts.Token).ConfigureAwait(false);
             if (metrics is null)
                 return null;
 
             _resourceMetrics = metrics;
-            await TryPersistResourceMetricsAsync(metrics, cts.Token).ConfigureAwait(false);
+            await TryPersistResourceMetricsAsync(metrics, timeout, ct).ConfigureAwait(false);
             RecordResourceMetricInstruments(metrics);
             return metrics;
         }
@@ -7490,11 +7509,13 @@ while True:
         return HasRequiredResourceMetrics(metrics) ? metrics : null;
     }
 
-    private async Task TryPersistResourceMetricsAsync(SandboxResourceMetrics metrics, CancellationToken ct)
+    private async Task TryPersistResourceMetricsAsync(SandboxResourceMetrics metrics, TimeSpan timeout, CancellationToken ct)
     {
         try
         {
-            await PersistResourceMetricsAsync(metrics, ct).WaitAsync(ct).ConfigureAwait(false);
+            using var persistCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            persistCts.CancelAfter(timeout);
+            await PersistResourceMetricsAsync(metrics, persistCts.Token).WaitAsync(persistCts.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {

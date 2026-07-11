@@ -129,6 +129,36 @@ public sealed class MultipassResourceMetricsTests : IDisposable
     }
 
     [Fact]
+    public async Task DisposeAsync_WhenCaptureUsesMostTimeout_StillPersistsWithFreshBoundedBudget()
+    {
+        using var store = new SqliteSandboxResourceUsageStore(_dbPath);
+        var delayedStore = new DelayedResourceUsageStore(store, TimeSpan.FromMilliseconds(300));
+        var workItemId = WorkItemId.New();
+        var runner = new RecordingMultipassRunner(async (argv, stdin, ct) =>
+        {
+            if (IsMetricsExec(argv))
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(800), ct);
+                return new ProcessRunResult(0, MetricsStdout(), "");
+            }
+
+            return new ProcessRunResult(0, "", "");
+        });
+
+        var sandbox = BuildSandbox(
+            runner,
+            CaptureOptions(timeout: TimeSpan.FromSeconds(1)),
+            workItemId,
+            resourceUsageStore: delayedStore);
+
+        await sandbox.DisposeAsync();
+
+        Assert.NotNull(sandbox.ResourceMetrics);
+        var row = Assert.Single(await store.ListRecentAsync(10));
+        Assert.Equal(workItemId, row.WorkItemId);
+    }
+
+    [Fact]
     public async Task DisposeAsync_CaptureResourceMetricsOff_SkipsInVmExec()
     {
         var execCalls = 0;
@@ -673,5 +703,29 @@ public sealed class MultipassResourceMetricsTests : IDisposable
             DateTimeOffset? sinceUtc = null,
             CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<SandboxResourceUsageRecord>>([]);
+    }
+
+    private sealed class DelayedResourceUsageStore : ISandboxResourceUsageStore
+    {
+        private readonly ISandboxResourceUsageStore _inner;
+        private readonly TimeSpan _recordDelay;
+
+        public DelayedResourceUsageStore(ISandboxResourceUsageStore inner, TimeSpan recordDelay)
+        {
+            _inner = inner;
+            _recordDelay = recordDelay;
+        }
+
+        public async Task RecordAsync(SandboxResourceUsageRecord record, CancellationToken ct = default)
+        {
+            await Task.Delay(_recordDelay, ct);
+            await _inner.RecordAsync(record, ct);
+        }
+
+        public Task<IReadOnlyList<SandboxResourceUsageRecord>> ListRecentAsync(
+            int limit,
+            DateTimeOffset? sinceUtc = null,
+            CancellationToken ct = default) =>
+            _inner.ListRecentAsync(limit, sinceUtc, ct);
     }
 }

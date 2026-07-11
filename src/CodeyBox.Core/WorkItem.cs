@@ -111,6 +111,12 @@ public sealed record WorkItem
     public string? FailureKind { get; init; }
 
     /// <summary>
+    /// Scope of an <c>auth_required</c> terminal failure. Null for non-auth
+    /// failures and legacy rows written before the structured scope existed.
+    /// </summary>
+    public WorkItemAuthFailureScope? AuthFailureScope { get; init; }
+
+    /// <summary>
     /// When the quota window that caused a "quota" failure is expected to
     /// reset. Prefer parsed agent-output reset hints; quota failures may also
     /// use probe-derived reset times or the orchestrator's default pause.
@@ -672,7 +678,8 @@ public sealed record WorkItem
         WorkItemCancellationReason? cancellationReason = null,
         string? failureKind = null,
         DateTimeOffset? quotaResetAt = null,
-        string? cancellationSource = null)
+        string? cancellationSource = null,
+        WorkItemAuthFailureScope? authFailureScope = null)
     {
         var preserveQueuedPickup =
             state == WorkItemState.Queued
@@ -683,6 +690,11 @@ public sealed record WorkItem
         var nextFailureKind = IsFailureKindCarryingState(state)
             ? (failureKind ?? FailureKind)
             : null;
+        var nextAuthFailureScope =
+            state == WorkItemState.Failed
+            && string.Equals(nextFailureKind, WorkItemFailureKinds.AuthRequired, StringComparison.OrdinalIgnoreCase)
+                ? (authFailureScope ?? AuthFailureScope)
+                : null;
         var carriesQuotaRetry = IsQuotaShapedState(state);
         var carriesTransientRetry =
             state == WorkItemState.WaitingForTransientRetry
@@ -703,6 +715,7 @@ public sealed record WorkItem
             // NextQuotaRetryAt so the retry scheduler can re-arm timers
             // across host restarts.
             FailureKind = nextFailureKind,
+            AuthFailureScope = nextAuthFailureScope,
             QuotaResetAt = carriesQuotaRetry ? (quotaResetAt ?? QuotaResetAt) : null,
             NextQuotaRetryAt = carriesQuotaRetry ? NextQuotaRetryAt : null,
             QuotaRetryFrom = carriesQuotaRetry ? QuotaRetryFrom : null,
@@ -739,6 +752,7 @@ public sealed record WorkItem
 
     private static bool IsFailureKindCarryingState(WorkItemState state) =>
         state is WorkItemState.Failed
+            or WorkItemState.MergeConflictResolutionFailed
             or WorkItemState.WaitingForQuotaReset
             or WorkItemState.WaitingForTransientRetry;
 

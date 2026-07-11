@@ -126,6 +126,41 @@ public sealed class CodeyBoxOptionsValidatorTests
     }
 
     [Fact]
+    public void Validate_AutoRequeueOnAgentRestore_DefaultsEnabled()
+    {
+        var options = ValidCodeyBoxOptions();
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(options.AutoRequeueOnAgentRestore.Enabled);
+        Assert.False(result.Failed, result.FailureMessage);
+    }
+
+    [Theory]
+    [InlineData("lookback", "CodeyBox:AutoRequeueOnAgentRestore:LookbackGrace")]
+    [InlineData("post-margin", "CodeyBox:AutoRequeueOnAgentRestore:PostRestoreMargin")]
+    public void Validate_RejectsInvalidAutoRequeueOnAgentRestoreOptions(
+        string scenario,
+        string expectedFailure)
+    {
+        var options = ValidCodeyBoxOptions();
+        switch (scenario)
+        {
+            case "lookback":
+                options.AutoRequeueOnAgentRestore.LookbackGrace = "not-a-timespan";
+                break;
+            case "post-margin":
+                options.AutoRequeueOnAgentRestore.PostRestoreMargin = "-00:00:01";
+                break;
+        }
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(expectedFailure, result.FailureMessage);
+    }
+
+    [Fact]
     public void ValidateAndPrepare_CreatesConsoleLogDirectoryWhenEnabled()
     {
         var root = Directory.CreateTempSubdirectory("codeybox-console-log-prepare-").FullName;

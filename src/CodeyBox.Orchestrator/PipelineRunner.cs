@@ -1950,14 +1950,31 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 detection.ResetAt);
         }
 
+        await ThrowIfAuthRequiredOutputAsync(
+            item,
+            project,
+            runner.Kind,
+            "planning",
+            result,
+            requireStdoutOnlyCorroboration: true,
+            ct);
+        var classification = _authFailureClassifier.ClassifyFailure(runner, result);
+        await ThrowIfAuthErrorAgentFailureAsync(
+            item,
+            project,
+            runner,
+            result,
+            "planning",
+            classification,
+            ct);
         ThrowIfTransientAgentFailure(runner, result, "planning");
-        var detail = string.Join("\n",
-            new[]
-            {
-                $"Planning agent {runner.Kind} reported failure: {RedactAndTruncateAgentDetail(result.Summary)}",
-                !string.IsNullOrEmpty(result.Stderr) ? $"stderr:\n{RedactAndTruncateAgentDetail(result.Stderr)}" : null,
-                !string.IsNullOrEmpty(result.Stdout) ? $"stdout:\n{RedactAndTruncateAgentDetail(result.Stdout)}" : null,
-            }.Where(s => s is not null));
+        ThrowIfInfrastructureAgentFailure(
+            runner,
+            result,
+            "planning",
+            $"Planning agent {runner.Kind} reported failure",
+            classification);
+        var detail = BuildAgentFailureDetail($"Planning agent {runner.Kind} reported failure", result);
         throw new InvalidOperationException(detail);
     }
 
@@ -2208,7 +2225,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 }, CancellationToken.None);
                 await TransitionFailed(item,
                     $"credential smoke test failed: {smokeResult.FailureReason}",
-                    CancellationToken.None, project, failureKind: "infrastructure");
+                    CancellationToken.None, project, failureKind: WorkItemFailureKinds.AgentUnavailable, agent: agentKind);
                 return;
             }
 
@@ -2282,7 +2299,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 }, CancellationToken.None);
                 await TransitionFailed(item,
                     $"in-VM smoke gate: {reason}",
-                    CancellationToken.None, project, failureKind: "infrastructure");
+                    CancellationToken.None, project, failureKind: WorkItemFailureKinds.AgentUnavailable, agent: agentKind);
                 return;
             }
         }
@@ -2831,7 +2848,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         countAttempt: !conflictReworkAttemptAlreadyReserved);
                     if (!reworkOutcome.Success)
                     {
-                        throw new MergeConflictResolutionFailedException(reworkOutcome.ParkReason!, firstFailure);
+                        throw new MergeConflictResolutionFailedException(
+                            reworkOutcome.ParkReason!,
+                            firstFailure,
+                            failureKind: reworkOutcome.FailureKind,
+                            agent: reworkOutcome.Agent);
                     }
 
                     // Refresh the local snapshot so subsequent UpdateAsync
@@ -2898,7 +2919,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 throw;
             }
 
-            await HandleOperatorCancelAsync(item, project);
+            await HandleOperatorCancelAsync(item, project, pex.Phase);
             throw;
         }
         catch (PhaseCancellationException pex) when (CancellationSources.IsPhaseTimeout(pex.Source))
@@ -2990,8 +3011,19 @@ public sealed partial class PipelineRunner : IPipelineRunner
         {
             _log.LogWarning("Work item {Id} merge conflict resolution failed: {Error}", item.Id, ex.Message);
             var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
-            var failed = current.With(WorkItemState.MergeConflictResolutionFailed, ex.Message);
+            var attributed = ex.Agent is { } failedAgent
+                ? current with
+                {
+                    Agent = failedAgent,
+                    AgentInstanceId = current.Agent == failedAgent ? current.AgentInstanceId : null,
+                }
+                : current;
+            var failed = attributed.With(
+                WorkItemState.MergeConflictResolutionFailed,
+                ex.Message,
+                failureKind: ex.FailureKind);
             await _store.UpdateAsync(failed, CancellationToken.None);
+            await RecordMergeConflictFailureAttributionAsync(failed, ex);
             var mergeFailedRevision = await BuildTerminalRevisionAsync(failed, CancellationToken.None);
             await _webhooks.PublishAsync(new WebhookEvent
             {
@@ -3020,18 +3052,45 @@ public sealed partial class PipelineRunner : IPipelineRunner
             _log.LogWarning(
                 "Work item {Id} failed because agent {Agent} requires re-authentication in phase {Phase}: {Reason}",
                 item.Id, ex.Agent.Value, ex.Phase, ex.Message);
-            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: WorkItemFailureKinds.AuthRequired);
+            await TransitionFailed(
+                item,
+                ex.Message,
+                CancellationToken.None,
+                project,
+                failureKind: WorkItemFailureKinds.AuthRequired,
+                agent: ex.Agent,
+                authFailureScope: ex.Scope);
+        }
+        catch (AgentInfrastructureFailureException ex)
+        {
+            _log.LogWarning(
+                "Work item {Id} failed because agent {Agent} hit infrastructure failure in phase {Phase}: {Reason}",
+                item.Id, ex.Agent.Value, ex.Phase, ex.Message);
+            await TransitionFailed(
+                item,
+                ex.Message,
+                CancellationToken.None,
+                project,
+                failureKind: WorkItemFailureKinds.Infrastructure,
+                agent: ex.Agent);
         }
         catch (AgentUnavailableException ex)
         {
-            // Distinct from MergeConflictResolutionFailed: the resolver never
-            // ran because no candidate passed the pre-dispatch resolver gates
-            // (for example quota/budget exhaustion or missing routing support).
-            // Failure is structured so operators can grep
-            // failureKind=agent_unavailable and fix the routing, quota, or
-            // credential gap rather than chasing a phantom merge bug.
+            // Pre-dispatch availability/routing failed before an agent reasoning
+            // loop could start. Structure the failure so operators can distinguish
+            // a concrete unavailable runner from aggregate routing/capacity misses.
             _log.LogWarning("Work item {Id} agent unavailable: {Error}", item.Id, ex.Message);
-            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "agent_unavailable");
+            var failureKind = ex.Agent is null
+                ? WorkItemFailureKinds.AgentRoutingUnavailable
+                : WorkItemFailureKinds.AgentUnavailable;
+            await TransitionFailed(
+                item,
+                ex.Message,
+                CancellationToken.None,
+                project,
+                failureKind: failureKind,
+                agent: ex.Agent,
+                clearAgent: ex.Agent is null);
         }
         catch (AgentStuckException stuckEx)
         {
@@ -3134,7 +3193,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 // call sites; previously this branch published side effects
                 // unconditionally on the stdout-only path, defeating the
                 // corroboration safety net for resumable runners.
-                await HandleAuthRequiredDetectionAsync(
+                var authHandling = await HandleAuthRequiredDetectionAsync(
                     item,
                     project,
                     exhaustedRunner.Kind,
@@ -3149,10 +3208,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     item.Id, exhaustedRunner.Kind.Value, ex.Message);
                 await TransitionFailed(
                     item,
-                    _authRequiredHandler.BuildReason("session-resume", authDetection.Classification, authDetection.IsStdoutOnly),
+                    authHandling.Reason
+                        ?? _authRequiredHandler.BuildReason("session-resume", authDetection.Classification, authDetection.IsStdoutOnly),
                     CancellationToken.None,
                     project,
-                    failureKind: WorkItemFailureKinds.AuthRequired);
+                    failureKind: WorkItemFailureKinds.AuthRequired,
+                    agent: exhaustedRunner.Kind,
+                    authFailureScope: authHandling.Scope);
                 return;
             }
 
@@ -4009,6 +4071,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             resolveResult.FailureRunner,
                             resolveResult.FailureClassificationResult,
                             "rebase");
+                        var classification = _authFailureClassifier.ClassifyFailure(
+                            resolveResult.FailureRunner,
+                            resolveResult.FailureClassificationResult);
+                        if (classification.Kind == AgentFailureKind.Infrastructure)
+                        {
+                            throw new MergeConflictResolutionFailedException(
+                                $"pickup-time rebase resolver failed for work branch '{workBranch}'; work branch left at original tip {oldTip}: {resolveResult.Summary}",
+                                failureKind: WorkItemFailureKinds.Infrastructure,
+                                agent: resolveResult.FailureRunner.Kind,
+                                phase: "rebase-resolver");
+                        }
                     }
                     throw new MergeConflictResolutionFailedException(
                         $"pickup-time rebase resolver failed for work branch '{workBranch}'; work branch left at original tip {oldTip}: {resolveResult.Summary}");
@@ -4047,6 +4120,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     or AgentUnavailableException
                     or AgentPausedException
                     or AgentAuthRequiredException
+                    or AgentInfrastructureFailureException
                     or AgentClassExhaustedException
                     or TerminalTransientNetworkError)
                     throw;
@@ -5003,9 +5077,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
             await TryRecordCostAsync(agentResult.Stdout, agentResult.Stderr,
                 runner.Kind, item.AgentInstanceId, item.Id, agentPhase, iteration, agentStartedAt, agentEndedAt, observedModelId);
             agentSw.Stop();
+            AgentFailureClassification? availabilityFailureClassification = null;
             if (_availability is { } regOnFinish)
             {
-                await RecordAvailabilityOutcomeAsync(
+                availabilityFailureClassification = await RecordAvailabilityOutcomeAsync(
                     regOnFinish,
                     runner,
                     agentResult,
@@ -5054,6 +5129,15 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     requireStdoutOnlyCorroboration: true,
                     ct: ct);
 
+                await ThrowIfAuthErrorAgentFailureAsync(
+                    item,
+                    project,
+                    runner,
+                    agentResult,
+                    agentPhase,
+                    availabilityFailureClassification,
+                    ct);
+
                 // Per-provider detector (registered as IQuotaFailureClassifier) inspects
                 // stderr/stdout and structured stream events. Per-CLI classification +
                 // reset-window parsing now live in the per-provider library.
@@ -5081,6 +5165,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 }
 
                 ThrowIfTransientAgentFailure(runner, agentResult, agentPhase);
+                ThrowIfInfrastructureAgentFailure(
+                    runner,
+                    agentResult,
+                    agentPhase,
+                    $"Agent {runner.Kind} reported failure",
+                    availabilityFailureClassification);
 
                 await _quotaClassifier.RecordIfQuotaFailureAsync(
                     _quotaFailures,
@@ -5097,12 +5187,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 // Redact and truncate agent-controlled output before it reaches
                 // LastError, audit persistence, webhooks, or API responses via the
                 // exception message chain.
-                var detail = string.Join("\n",
-                    new[] {
-                        $"Agent {runner.Kind} reported failure: {RedactAndTruncateAgentDetail(agentResult.Summary)}",
-                        !string.IsNullOrEmpty(agentResult.Stderr) ? $"stderr:\n{RedactAndTruncateAgentDetail(agentResult.Stderr)}" : null,
-                        !string.IsNullOrEmpty(agentResult.Stdout) ? $"stdout:\n{RedactAndTruncateAgentDetail(agentResult.Stdout)}" : null,
-                    }.Where(s => s is not null));
+                var detail = BuildAgentFailureDetail($"Agent {runner.Kind} reported failure", agentResult);
                 throw new InvalidOperationException(detail);
             }
 
@@ -5959,7 +6044,27 @@ public sealed partial class PipelineRunner : IPipelineRunner
             _log.LogWarning(
                 "Work item {Id} check-and-act failed because agent {Agent} requires re-authentication in phase {Phase}: {Reason}",
                 item.Id, authEx.Agent.Value, authEx.Phase, authEx.Message);
-            await TransitionFailed(item, authEx.Message, CancellationToken.None, project, failureKind: WorkItemFailureKinds.AuthRequired);
+            await TransitionFailed(
+                item,
+                authEx.Message,
+                CancellationToken.None,
+                project,
+                failureKind: WorkItemFailureKinds.AuthRequired,
+                agent: authEx.Agent,
+                authFailureScope: authEx.Scope);
+        }
+        catch (AgentInfrastructureFailureException infraEx)
+        {
+            _log.LogWarning(
+                "Work item {Id} check-and-act failed because agent {Agent} hit infrastructure failure in phase {Phase}: {Reason}",
+                item.Id, infraEx.Agent.Value, infraEx.Phase, infraEx.Message);
+            await TransitionFailed(
+                item,
+                infraEx.Message,
+                CancellationToken.None,
+                project,
+                failureKind: WorkItemFailureKinds.Infrastructure,
+                agent: infraEx.Agent);
         }
         catch (Exception ex)
         {
@@ -6172,7 +6277,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             $"in-VM smoke gate: {reason}",
             CancellationToken.None,
             project,
-            failureKind: "infrastructure");
+            failureKind: WorkItemFailureKinds.AgentUnavailable,
+            agent: agentKind);
         return false;
     }
 
@@ -6285,60 +6391,89 @@ public sealed partial class PipelineRunner : IPipelineRunner
             SandboxConventions.WorkDir,
             source: "check-and-act",
             ct);
-        var startedAt = DateTimeOffset.UtcNow;
-        var result = supervision is null
-            ? await agentRunner.RunAsync(
-                sandbox, SandboxConventions.WorkDir, prompt, credential,
-                item.ModelId, item.ReasoningMode, ct,
-                stdoutChunkCallback: chunkCallback,
-                captureStructuredStream: false)
-            : await AgentSupervisionTurnRunner.RunAutonomousAndQueuedInjectionsAsync(
-                agentRunner,
-                sandbox,
-                SandboxConventions.WorkDir,
-                prompt,
-                credential,
-                item.ModelId,
-                item.ReasoningMode,
-                supervision,
-                chunkCallback,
-                captureStructuredStream: false,
-                promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
-                    item.Id, agentRunner.Kind, AgentPromptPhase.CheckAndAct,
-                    1, project, sandbox, raw, pct),
-                ct);
-        var endedAt = DateTimeOffset.UtcNow;
-
-        var aggregatedStdout = aggregator.ToString();
-        if (!string.IsNullOrEmpty(result.Stdout) && !aggregatedStdout.EndsWith(result.Stdout, StringComparison.Ordinal))
+        var involvementId = await RecordInvolvementStartAsync(
+            item.Id,
+            agentRunner.Kind,
+            item.AgentInstanceId,
+            item.ModelId,
+            "check",
+            iteration: null);
+        try
         {
-            aggregator.Append(result.Stdout);
-            aggregatedStdout = aggregator.ToString();
+            var startedAt = DateTimeOffset.UtcNow;
+            var result = supervision is null
+                ? await agentRunner.RunAsync(
+                    sandbox, SandboxConventions.WorkDir, prompt, credential,
+                    item.ModelId, item.ReasoningMode, ct,
+                    stdoutChunkCallback: chunkCallback,
+                    captureStructuredStream: false)
+                : await AgentSupervisionTurnRunner.RunAutonomousAndQueuedInjectionsAsync(
+                    agentRunner,
+                    sandbox,
+                    SandboxConventions.WorkDir,
+                    prompt,
+                    credential,
+                    item.ModelId,
+                    item.ReasoningMode,
+                    supervision,
+                    chunkCallback,
+                    captureStructuredStream: false,
+                    promptPreprocessor: (raw, pct) => ProcessAgentPromptAsync(
+                        item.Id, agentRunner.Kind, AgentPromptPhase.CheckAndAct,
+                        1, project, sandbox, raw, pct),
+                    ct);
+            var endedAt = DateTimeOffset.UtcNow;
+
+            var aggregatedStdout = aggregator.ToString();
+            if (!string.IsNullOrEmpty(result.Stdout) && !aggregatedStdout.EndsWith(result.Stdout, StringComparison.Ordinal))
+            {
+                aggregator.Append(result.Stdout);
+                aggregatedStdout = aggregator.ToString();
+            }
+
+            await TryRecordCostAsync(aggregatedStdout, result.Stderr,
+                agentRunner.Kind, item.AgentInstanceId, item.Id, "check", iteration: null,
+                startedAt, endedAt, ResolveObservedModelId(agentRunner, item.ModelId));
+
+            // Check-and-act stdout is parsed model output. Detect auth evidence so
+            // the item fails as infrastructure instead of verdict-parse noise, but
+            // force an in-VM corroboration attempt before publishing the fleet-wide
+            // auth bench reason. A missing/inconclusive probe must not suppress the
+            // fail-fast auth exclusion because smoke can be disabled during the exact
+            // outage this detector is meant to catch.
+            await ThrowIfAuthRequiredOutputAsync(
+                item, project, agentRunner.Kind, "check", aggregatedStdout, result.Stderr,
+                requireStdoutOnlyCorroboration: true,
+                ct: ct);
+
+            if (!result.Success)
+            {
+                await ThrowIfAuthErrorAgentFailureAsync(
+                    item,
+                    project,
+                    agentRunner,
+                    result,
+                    "check",
+                    classification: null,
+                    ct);
+                ThrowIfTransientAgentFailure(agentRunner, result, "check");
+                ThrowIfInfrastructureAgentFailure(
+                    agentRunner,
+                    result,
+                    "check",
+                    $"Check-and-act agent {agentRunner.Kind} reported failure");
+                var detail = BuildAgentFailureDetail("check-and-act agent failed", result);
+                throw new InvalidOperationException(detail);
+            }
+
+            await FinalizeInvolvementAsync(involvementId, AgentInvolvementOutcomes.Success);
+            return aggregatedStdout;
         }
-
-        await TryRecordCostAsync(aggregatedStdout, result.Stderr,
-            agentRunner.Kind, item.AgentInstanceId, item.Id, "check", iteration: null,
-            startedAt, endedAt, ResolveObservedModelId(agentRunner, item.ModelId));
-
-        // Check-and-act stdout is parsed model output. Detect auth evidence so
-        // the item fails as infrastructure instead of verdict-parse noise, but
-        // force an in-VM corroboration attempt before publishing the fleet-wide
-        // auth bench reason. A missing/inconclusive probe must not suppress the
-        // fail-fast auth exclusion because smoke can be disabled during the exact
-        // outage this detector is meant to catch.
-        await ThrowIfAuthRequiredOutputAsync(
-            item, project, agentRunner.Kind, "check", aggregatedStdout, result.Stderr,
-            requireStdoutOnlyCorroboration: true,
-            ct: ct);
-
-        if (!result.Success)
+        catch (Exception ex)
         {
-            ThrowIfTransientAgentFailure(agentRunner, result, "check");
-            var stderrTail = string.IsNullOrEmpty(result.Stderr) ? "" : $" — stderr: {result.Stderr}";
-            throw new InvalidOperationException($"check-and-act agent failed: {result.Summary}{stderrTail}");
+            await FinalizeInvolvementAsync(involvementId, OutcomeForFailure(ex));
+            throw;
         }
-
-        return aggregatedStdout;
     }
 
     private void ThrowIfTransientAgentFailure(
@@ -6348,6 +6483,53 @@ public sealed partial class PipelineRunner : IPipelineRunner
     {
         if (TryBuildTransientAgentFailure(runner, result, phase, "during") is { } transient)
             throw transient;
+    }
+
+    private void ThrowIfInfrastructureAgentFailure(
+        IAgentRunner runner,
+        AgentResult result,
+        string phase,
+        string messagePrefix,
+        AgentFailureClassification? classification = null)
+    {
+        var resolved = classification ?? _authFailureClassifier.ClassifyFailure(runner, result);
+        if (resolved.Kind != AgentFailureKind.Infrastructure)
+            return;
+
+        var detail = BuildAgentFailureDetail(messagePrefix, result);
+        throw new AgentInfrastructureFailureException(runner.Kind, phase, detail);
+    }
+
+    private async Task ThrowIfAuthErrorAgentFailureAsync(
+        WorkItem item,
+        Project project,
+        IAgentRunner runner,
+        AgentResult result,
+        string phase,
+        AgentFailureClassification? classification,
+        CancellationToken ct)
+    {
+        var resolved = classification ?? _authFailureClassifier.ClassifyFailure(runner, result);
+        if (resolved.Kind != AgentFailureKind.AuthError)
+            return;
+
+        await ThrowAuthErrorAgentFailureAsync(item, project, runner.Kind, phase, resolved, ct);
+    }
+
+    private async Task ThrowAuthErrorAgentFailureAsync(
+        WorkItem item,
+        Project project,
+        AgentKind agent,
+        string phase,
+        AgentFailureClassification classification,
+        CancellationToken ct)
+    {
+        var reason = _authRequiredHandler.BuildReason(
+            phase,
+            classification,
+            stdoutOnlyEvidence: false);
+        await _authRequiredHandler.PublishSideEffectsAsync(agent, reason, item, project, ct: ct);
+        throw new AgentAuthRequiredException(agent, phase, reason, WorkItemAuthFailureScope.Fleet);
     }
 
     private void ThrowIfTransientAgentFailure(
@@ -6386,6 +6568,15 @@ public sealed partial class PipelineRunner : IPipelineRunner
             classification,
             $"Agent {runner.Kind} reported transient transport failure {failureContext}{phaseSuffix}: {summary} ({reason})");
     }
+
+    private static string BuildAgentFailureDetail(string firstLine, AgentResult result) =>
+        string.Join("\n",
+            new[]
+            {
+                $"{firstLine}: {RedactAndTruncateAgentDetail(result.Summary)}",
+                !string.IsNullOrEmpty(result.Stderr) ? $"stderr:\n{RedactAndTruncateAgentDetail(result.Stderr)}" : null,
+                !string.IsNullOrEmpty(result.Stdout) ? $"stdout:\n{RedactAndTruncateAgentDetail(result.Stdout)}" : null,
+            }.Where(s => s is not null));
 
     /// <summary>
     /// Builds and persists the on-yes follow-up Normal work item triggered by
@@ -6833,8 +7024,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (!result.Success)
         {
             ThrowIfTransientAgentFailure(agentRunner, result, "post-act-recheck");
-            var stderrTail = string.IsNullOrEmpty(result.Stderr) ? "" : $" — stderr: {result.Stderr}";
-            throw new InvalidOperationException($"post-act re-check agent failed: {result.Summary}{stderrTail}");
+            var detail = BuildAgentFailureDetail("post-act re-check agent failed", result);
+            throw new InvalidOperationException(detail);
         }
 
         return aggregatedStdout;
@@ -7052,7 +7243,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         return RawOutputRedactor.TruncateToBytes(RawOutputRedactor.Redact(s), MaxOutputBytes);
     }
 
-    private async Task RecordAvailabilityOutcomeAsync(
+    private async Task<AgentFailureClassification?> RecordAvailabilityOutcomeAsync(
         IAgentAvailabilityRegistry registry,
         IAgentRunner runner,
         AgentResult result,
@@ -7068,7 +7259,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             var classification = _authFailureClassifier.ClassifyFailure(runner, classificationResult ?? result);
             if (classification.Kind is AgentFailureKind.Infrastructure
                 or AgentFailureKind.TransientNetwork
-                or AgentFailureKind.AuthRequired)
+                or AgentFailureKind.AuthRequired
+                or AgentFailureKind.AuthError)
             {
                 if (classification.Kind == AgentFailureKind.Infrastructure)
                 {
@@ -7089,7 +7281,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     phase,
                     result.Summary,
                     classification.Reason);
-                return;
+                return classification;
             }
         }
 
@@ -7118,6 +7310,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 },
             }, CancellationToken.None);
         }
+        return null;
     }
 
     /// <summary>
@@ -7196,7 +7389,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (detection is null || detection.Classification.Kind != AgentFailureKind.AuthRequired)
             return false;
 
-        return await HandleAuthRequiredDetectionAsync(
+        var handling = await HandleAuthRequiredDetectionAsync(
             item,
             project,
             agent,
@@ -7206,9 +7399,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
             stdoutOnlyEvidence: detection.IsStdoutOnly,
             requireStdoutOnlyCorroboration: requireStdoutOnlyCorroboration,
             ct: ct);
+        return handling.Matched;
     }
 
-    private async Task<bool> HandleAuthRequiredDetectionAsync(
+    private async Task<AuthRequiredHandlingResult> HandleAuthRequiredDetectionAsync(
         WorkItem? item,
         Project project,
         AgentKind agent,
@@ -7221,7 +7415,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         CancellationToken ct = default)
     {
         if (classification.Kind != AgentFailureKind.AuthRequired)
-            return false;
+            return AuthRequiredHandlingResult.NotMatched;
 
         var publishSideEffects = true;
         string? authCorroborationNote = null;
@@ -7249,14 +7443,25 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
 
         var reason = _authRequiredHandler.BuildReason(phase, classification, stdoutOnlyEvidence, authCorroborationNote);
+        var scope = publishSideEffects
+            ? WorkItemAuthFailureScope.Fleet
+            : WorkItemAuthFailureScope.Item;
 
         if (publishSideEffects)
             await _authRequiredHandler.PublishSideEffectsAsync(agent, reason, item, project, ct: ct);
 
         if (throwOnMatch)
-            throw new AgentAuthRequiredException(agent, phase, reason);
+            throw new AgentAuthRequiredException(agent, phase, reason, scope);
 
-        return true;
+        return new AuthRequiredHandlingResult(true, reason, scope);
+    }
+
+    private readonly record struct AuthRequiredHandlingResult(
+        bool Matched,
+        string? Reason,
+        WorkItemAuthFailureScope? Scope)
+    {
+        public static AuthRequiredHandlingResult NotMatched { get; } = new(false, null, null);
     }
 
     private async Task ThrowIfNoDiffReworkQuotaFailureAsync(
@@ -7748,7 +7953,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         AgentAuthRequiredException? firstThrow = null;
         foreach (var failure in authFailures)
         {
-            await HandleAuthRequiredDetectionAsync(
+            var handling = await HandleAuthRequiredDetectionAsync(
                 item,
                 project,
                 failure.Runner.Kind,
@@ -7768,7 +7973,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     phase,
                     failure.Classification,
                     failure.StdoutOnlyEvidence);
-                firstThrow = new AgentAuthRequiredException(failure.Runner.Kind, phase, reason);
+                firstThrow = new AgentAuthRequiredException(
+                    failure.Runner.Kind,
+                    phase,
+                    handling.Reason ?? reason,
+                    handling.Scope ?? WorkItemAuthFailureScope.Fleet);
             }
         }
 
@@ -8610,7 +8819,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         var completed = rows.Any(row =>
             string.Equals(row.Phase, "rework", StringComparison.Ordinal)
             && row.Iteration == reworkIterationNumber
-            && string.Equals(row.Outcome, "success", StringComparison.Ordinal)
+            && string.Equals(row.Outcome, AgentInvolvementOutcomes.Success, StringComparison.Ordinal)
             && row.EndedAt is not null);
         if (!completed)
         {
@@ -11402,6 +11611,15 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 ct: ct);
         }
 
+        if (IsLlmAgentExecutionFailure(run.Result))
+        {
+            var classification = _authFailureClassifier.ClassifyFailure(
+                run.Runner,
+                ToAgentResultForAuditFailureClassification(run.Result));
+            if (classification.Kind == AgentFailureKind.AuthError)
+                await ThrowAuthErrorAgentFailureAsync(item, project, run.Runner.Kind, phase, classification, ct);
+        }
+
         // LLM audit-agent execution failures report CLI diagnostics through
         // AgentStdout/AgentStderr, not source-code review prose. Accept guarded
         // stdout login fragments here so auth wins over a companion quota
@@ -12925,8 +13143,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             try
             {
                 var result = await invoker(runner, trialItem, attemptCt);
-                await FinalizeInvolvementAsync(involvementId, "success");
-                outcome = "success";
+                await FinalizeInvolvementAsync(involvementId, AgentInvolvementOutcomes.Success);
+                outcome = AgentInvolvementOutcomes.Success;
                 return result;
             }
             catch (OperationCanceledException oce) when (
@@ -12934,7 +13152,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 && phaseCancellation is not null
                 && oce is not PhaseCancellationException)
             {
-                await FinalizeInvolvementAsync(involvementId, "failure:timeout");
+                await FinalizeInvolvementAsync(involvementId, AgentInvolvementOutcomes.FailureTimeout);
                 outcome = "canceled";
                 if (phaseCancellation.Token.IsCancellationRequested
                     || phaseCancellation.Source is not null)
@@ -12957,24 +13175,24 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 if (await TryConvertResumeExhaustionToAuthRequiredAsync(runner, trialItem, ex, attemptCt)
                     .ConfigureAwait(false) is { } authEx)
                 {
-                    await FinalizeInvolvementAsync(involvementId, "failure:auth");
+                    await FinalizeInvolvementAsync(involvementId, AgentInvolvementOutcomes.FailureAuth);
                     throw authEx;
                 }
 
                 if (await TryConvertResumeExhaustionToQuotaAsync(runner, trialItem, ex, attemptCt)
                     .ConfigureAwait(false) is { } quotaEx)
                 {
-                    await FinalizeInvolvementAsync(involvementId, "failure:quota");
+                    await FinalizeInvolvementAsync(involvementId, AgentInvolvementOutcomes.FailureQuota);
                     throw quotaEx;
                 }
 
                 if (TryConvertResumeExhaustionToTransient(runner, ex) is { } transientEx)
                 {
-                    await FinalizeInvolvementAsync(involvementId, "failure:transient");
+                    await FinalizeInvolvementAsync(involvementId, AgentInvolvementOutcomes.FailureTransient);
                     throw transientEx;
                 }
 
-                await FinalizeInvolvementAsync(involvementId, "failure:agent");
+                await FinalizeInvolvementAsync(involvementId, AgentInvolvementOutcomes.FailureAgent);
                 throw;
             }
             catch (Exception ex)
@@ -13003,28 +13221,52 @@ public sealed partial class PipelineRunner : IPipelineRunner
         {
             var last = resumeEx.LastResult;
             var detection = _authFailureClassifier.DetectDetailed(runner.Kind, last.Stderr, last.Stdout);
-            if (detection is not { Classification.Kind: AgentFailureKind.AuthRequired })
+            if (detection is { Classification.Kind: AgentFailureKind.AuthRequired })
+            {
+                // Route stdout-only evidence through the shared corroboration
+                // policy so a model-controlled stdout match cannot globally bench
+                // the agent without the forced in-VM probe confirming the prompt.
+                // The exception we return still fails the work item terminally —
+                // that's the deterministic per-item handling — but the global
+                // bench side effect only fires when corroborated.
+                var handling = await HandleAuthRequiredDetectionAsync(
+                    trialItem,
+                    project,
+                    runner.Kind,
+                    phase,
+                    detection.Classification,
+                    throwOnMatch: false,
+                    stdoutOnlyEvidence: detection.IsStdoutOnly,
+                    requireStdoutOnlyCorroboration: true,
+                    ct: token).ConfigureAwait(false);
+
+                var reason = _authRequiredHandler.BuildReason(phase, detection.Classification, detection.IsStdoutOnly);
+                return new AgentAuthRequiredException(
+                    runner.Kind,
+                    phase,
+                    handling.Reason ?? reason,
+                    handling.Scope ?? WorkItemAuthFailureScope.Fleet);
+            }
+
+            var classification = _authFailureClassifier.ClassifyFailure(runner, last);
+            if (classification.Kind != AgentFailureKind.AuthError)
                 return null;
 
-            // Route stdout-only evidence through the shared corroboration
-            // policy so a model-controlled stdout match cannot globally bench
-            // the agent without the forced in-VM probe confirming the prompt.
-            // The exception we return still fails the work item terminally —
-            // that's the deterministic per-item handling — but the global
-            // bench side effect only fires when corroborated.
-            await HandleAuthRequiredDetectionAsync(
+            var authErrorReason = _authRequiredHandler.BuildReason(
+                phase,
+                classification,
+                stdoutOnlyEvidence: false);
+            await _authRequiredHandler.PublishSideEffectsAsync(
+                runner.Kind,
+                authErrorReason,
                 trialItem,
                 project,
+                ct: token).ConfigureAwait(false);
+            return new AgentAuthRequiredException(
                 runner.Kind,
                 phase,
-                detection.Classification,
-                throwOnMatch: false,
-                stdoutOnlyEvidence: detection.IsStdoutOnly,
-                requireStdoutOnlyCorroboration: true,
-                ct: token).ConfigureAwait(false);
-
-            var reason = _authRequiredHandler.BuildReason(phase, detection.Classification, detection.IsStdoutOnly);
-            return new AgentAuthRequiredException(runner.Kind, phase, reason);
+                authErrorReason,
+                WorkItemAuthFailureScope.Fleet);
         }
 
         async Task<TerminalQuotaError?> TryConvertResumeExhaustionToQuotaAsync(
@@ -13128,7 +13370,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 var reason = smokeAvailability.Reason ?? "unavailable";
                 throw new AgentUnavailableException(
                     $"agent '{initialRunner.Kind.Value}' rejected by in-VM smoke gate in phase '{phase}': {reason}",
-                    $"{initialRunner.Kind.Value}: smoke gate: {reason}");
+                    $"{initialRunner.Kind.Value}: smoke gate: {reason}",
+                    initialRunner.Kind);
             }
 
             try
@@ -13346,7 +13589,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 if (smokeRejected)
                     throw new AgentUnavailableException(
                         $"all eligible member(s) of class '{classId}' were rejected by the in-VM smoke gate in phase '{phase}'; last rejection: {safeReason}",
-                        safeReason);
+                        safeReason,
+                        currentMember.Agent);
 
                 if (pausedRejected && sawQuotaBlockedCandidate)
                 {
@@ -13528,7 +13772,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     quotaResetAt: null,
                     terminalException: new AgentUnavailableException(
                         $"agent '{currentRunner.Kind.Value}' rejected by in-VM smoke gate in phase '{phase}': {safeReason}",
-                        safeReason),
+                        safeReason,
+                        currentRunner.Kind),
                     smokeRejected: true);
                 continue;
             }
@@ -13616,16 +13861,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private string AuditorRunOutcome(IAgentRunner runner, AuditResult result)
     {
         if (_quotaClassifier.Detect(runner.Kind, result.AgentStderr, result.AgentStdout) is not null)
-            return "failure:quota";
+            return AgentInvolvementOutcomes.FailureQuota;
 
         var classification = _authFailureClassifier.ClassifyFailure(runner, ToAgentResultForAuditFailureClassification(result));
         if (classification.Kind == AgentFailureKind.QuotaExhausted)
-            return "failure:quota";
+            return AgentInvolvementOutcomes.FailureQuota;
         if (classification.Kind == AgentFailureKind.TransientNetwork)
-            return "failure:transient";
+            return AgentInvolvementOutcomes.FailureTransient;
+        if (classification.Kind == AgentFailureKind.AuthError)
+            return AgentInvolvementOutcomes.FailureAuth;
         if (IsLlmAgentExecutionFailure(result))
-            return "failure:agent";
-        return "success";
+            return AgentInvolvementOutcomes.FailureAgent;
+        return AgentInvolvementOutcomes.Success;
     }
 
     private static AgentResult ToAgentResultForAuditFailureClassification(AuditResult result) =>
@@ -14048,9 +14295,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 chosenMergeRunner.Kind == item.Agent ? item.AgentInstanceId : null,
                 item.Id, "merge", null, mergeStartedAt, mergeEndedAt, observedModelId);
             mergeSw.Stop();
+            AgentFailureClassification? mergeAvailabilityFailureClassification = null;
             if (_availability is { } regOnMergeFinish)
             {
-                await RecordAvailabilityOutcomeAsync(
+                mergeAvailabilityFailureClassification = await RecordAvailabilityOutcomeAsync(
                     regOnMergeFinish,
                     chosenMergeRunner,
                     agentResult,
@@ -14078,9 +14326,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 ct: ct);
             if (!agentResult.Success)
             {
+                var classificationResult = agentResultForAvailabilityClassification ?? agentResult;
+                await ThrowIfAuthErrorAgentFailureAsync(
+                    item,
+                    project,
+                    chosenMergeRunner,
+                    classificationResult,
+                    "merge",
+                    mergeAvailabilityFailureClassification,
+                    ct);
                 _quotaAuditEmitter.EmitAdvisoryAuditEvents(
                     chosenMergeRunner.Kind, agentResult.Stderr, agentResult.Stdout, "merge", sandbox.Id);
-                var classificationResult = agentResultForAvailabilityClassification ?? agentResult;
                 var detection = _quotaClassifier.Detect(
                     chosenMergeRunner.Kind,
                     classificationResult.Stderr,
@@ -14102,6 +14358,22 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 }
 
                 ThrowIfTransientAgentFailure(chosenMergeRunner, classificationResult, "merge");
+                var mergeFailureClassification = mergeAvailabilityFailureClassification
+                    ?? _authFailureClassifier.ClassifyFailure(chosenMergeRunner, classificationResult);
+                if (mergeFailureClassification.Kind == AgentFailureKind.Infrastructure && hostMerge.HasConflicts)
+                {
+                    throw new MergeConflictResolutionFailedException(
+                        $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}",
+                        failureKind: WorkItemFailureKinds.Infrastructure,
+                        agent: chosenMergeRunner.Kind,
+                        phase: "merge");
+                }
+                ThrowIfInfrastructureAgentFailure(
+                    chosenMergeRunner,
+                    classificationResult,
+                    "merge",
+                    $"Merge agent {chosenMergeRunner.Kind} reported failure",
+                    mergeFailureClassification);
 
                 await _quotaClassifier.RecordIfQuotaFailureAsync(
                     _quotaFailures,
@@ -14118,12 +14390,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 if (hostMerge.HasConflicts)
                     throw new MergeConflictResolutionFailedException(
                         $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}");
-                var detail = string.Join("\n",
-                    new[] {
-                        $"Merge agent {chosenMergeRunner.Kind} reported failure: {RedactAndTruncateAgentDetail(agentResult.Summary)}",
-                        !string.IsNullOrEmpty(agentResult.Stderr) ? $"stderr:\n{RedactAndTruncateAgentDetail(agentResult.Stderr)}" : null,
-                        !string.IsNullOrEmpty(agentResult.Stdout) ? $"stdout:\n{RedactAndTruncateAgentDetail(agentResult.Stdout)}" : null,
-                    }.Where(s => s is not null));
+                var detail = BuildAgentFailureDetail($"Merge agent {chosenMergeRunner.Kind} reported failure", agentResult);
                 throw new InvalidOperationException(detail);
             }
 
@@ -14584,7 +14851,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 sandbox,
                 ct);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException and not AgentAuthRequiredException)
+        catch (Exception ex) when (ex is not OperationCanceledException
+            and not AgentAuthRequiredException
+            and not AgentInfrastructureFailureException)
         {
             _log.LogWarning(ex, "Advisory merge security review failed for work item {WorkItemId}", workItemId);
             return;
@@ -15089,7 +15358,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     && ex is not TerminalTransientNetworkError
                     && ex is not SandboxProvisioningDeferredException
                     && ex is not AgentPausedException
-                    && ex is not AgentAuthRequiredException)
+                    && ex is not AgentAuthRequiredException
+                    && ex is not AgentInfrastructureFailureException)
                 {
                     if (TryGetUpstreamReconcileConflict(ex, out var conflict))
                     {
@@ -15401,7 +15671,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
     /// message the outer catch will record on
     /// <see cref="WorkItemState.MergeConflictResolutionFailed"/>.
     /// </summary>
-    private readonly record struct ConflictReworkResult(bool Success, string? ParkReason);
+    private readonly record struct ConflictReworkResult(
+        bool Success,
+        string? ParkReason,
+        string? FailureKind = null,
+        AgentKind? Agent = null);
 
     /// <summary>
     /// Runs the focused conflict-rework iteration: re-engages the original
@@ -15474,8 +15748,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 item = bumped ?? item;
             }
 
-            return new ConflictReworkResult(false,
-                $"in-VM smoke gate: {smokeAvailability.Reason ?? "unavailable"}");
+            return new ConflictReworkResult(
+                false,
+                $"in-VM smoke gate: {smokeAvailability.Reason ?? "unavailable"}",
+                FailureKind: WorkItemFailureKinds.AgentUnavailable,
+                Agent: runner.Kind);
         }
 
         if (countAttempt)
@@ -15560,7 +15837,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         catch (Exception ex) when (ex is not OperationCanceledException
             && ex is not SandboxProvisioningDeferredException
             && ex is not AgentPausedException
-            && ex is not AgentAuthRequiredException)
+            && ex is not AgentAuthRequiredException
+            && ex is not AgentInfrastructureFailureException)
         {
             _log.LogWarning(ex,
                 "Conflict rework agent invocation failed for work item {Id}: {Message}",
@@ -15594,7 +15872,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 success: false, newTip: outcome.NewTip, filesChanged: outcome.FilesChanged,
                 insertions: outcome.Insertions, deletions: outcome.Deletions,
                 semanticIncompatible: null, parkReason: parkMsg);
-            return new ConflictReworkResult(false, parkMsg);
+            return new ConflictReworkResult(
+                false,
+                parkMsg,
+                FailureKind: outcome.FailureKind,
+                Agent: outcome.Agent);
         }
 
         // Anti-abandonment guard: the file-set the work agent touched
@@ -15686,7 +15968,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string? SemanticIncompatibleReason,
         IReadOnlyList<string>? FilesChanged,
         int? Insertions,
-        int? Deletions);
+        int? Deletions,
+        string? FailureKind = null,
+        AgentKind? Agent = null);
 
     /// <summary>
     /// Drives the agent through a single conflict-rework iteration inside an
@@ -15872,7 +16156,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
             catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)
             {
-                await FinalizeInvolvementAsync(conflictInvolvementId, "failure:cancelled");
+                await FinalizeInvolvementAsync(conflictInvolvementId, AgentInvolvementOutcomes.FailureCancelled);
                 throw phase.Wrap(oce);
             }
             catch (AgentSessionResumeExhaustedException ex)
@@ -15884,7 +16168,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     ex.LastResult.Stdout);
                 if (authDetection is { Classification.Kind: AgentFailureKind.AuthRequired })
                 {
-                    await FinalizeInvolvementAsync(conflictInvolvementId, "failure:agent");
+                    await FinalizeInvolvementAsync(conflictInvolvementId, AgentInvolvementOutcomes.FailureAuth);
                     // Match the work-phase session-resume catch (see RunWorkAgentAsync):
                     // a single model-controlled stdout match must not globally bench
                     // the agent without forced in-VM probe corroboration.
@@ -15900,12 +16184,40 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         ct: ct);
                 }
 
+                if (classification.Kind == AgentFailureKind.AuthError)
+                {
+                    await FinalizeInvolvementAsync(conflictInvolvementId, AgentInvolvementOutcomes.FailureAuth);
+                    await ThrowAuthErrorAgentFailureAsync(
+                        item,
+                        project,
+                        runner.Kind,
+                        ConflictReworkPhaseKey,
+                        classification,
+                        ct);
+                }
+
                 await FinalizeInvolvementAsync(
                     conflictInvolvementId,
-                    classification.Kind == AgentFailureKind.TransientNetwork
-                        ? "failure:transient"
-                        : "failure:agent");
+                    classification.Kind switch
+                    {
+                        AgentFailureKind.TransientNetwork => AgentInvolvementOutcomes.FailureTransient,
+                        AgentFailureKind.Infrastructure => AgentInvolvementOutcomes.FailureInfrastructure,
+                        _ => AgentInvolvementOutcomes.FailureAgent,
+                    });
                 ThrowIfTransientAgentFailure(runner, ex, ConflictReworkPhaseKey);
+                if (classification.Kind == AgentFailureKind.Infrastructure)
+                {
+                    return new ConflictReworkAgentOutcome(
+                        AgentSucceeded: false,
+                        NewTip: null,
+                        FailureReason: BuildAgentFailureDetail(
+                            $"Conflict-rework agent {runner.Kind} reported infrastructure failure after exhausting session resume",
+                            ex.LastResult),
+                        SemanticIncompatibleReason: null,
+                        FilesChanged: null, Insertions: null, Deletions: null,
+                        FailureKind: WorkItemFailureKinds.Infrastructure,
+                        Agent: runner.Kind);
+                }
                 throw;
             }
             catch (Exception ex)
@@ -15933,18 +16245,25 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
             var combined = (agentResult.Stdout ?? string.Empty) + "\n" + (agentResult.Stderr ?? string.Empty);
             var semanticIncompatible = ExtractSemanticIncompatibleReason(combined);
+            var agentFailureClassification = !agentResult.Success
+                ? _authFailureClassifier.ClassifyFailure(runner, agentResult)
+                : null;
             // A semantic-incompatible declaration is the disposition the pipeline
             // acts on (it parks the item with that reason) even though the agent
             // legitimately exits non-zero to signal it — so it must be checked
             // before the generic !Success → failure:agent fallback, otherwise the
             // involvement outcome would mislabel it as a plain agent failure.
-            var transientFailure = !agentResult.Success
-                && _authFailureClassifier.ClassifyFailure(runner, agentResult).Kind == AgentFailureKind.TransientNetwork;
-            await FinalizeInvolvementAsync(conflictInvolvementId,
-                semanticIncompatible is not null ? "failure:semantic-incompatible"
-                : transientFailure ? "failure:transient"
-                : !agentResult.Success ? "failure:agent"
-                : "success");
+            var conflictInvolvementOutcome = semanticIncompatible is not null
+                ? AgentInvolvementOutcomes.FailureSemanticIncompatible
+                : agentFailureClassification?.Kind switch
+                {
+                    AgentFailureKind.AuthRequired or AgentFailureKind.AuthError => AgentInvolvementOutcomes.FailureAuth,
+                    AgentFailureKind.TransientNetwork => AgentInvolvementOutcomes.FailureTransient,
+                    AgentFailureKind.Infrastructure => AgentInvolvementOutcomes.FailureInfrastructure,
+                    null => AgentInvolvementOutcomes.Success,
+                    _ => AgentInvolvementOutcomes.FailureAgent,
+                };
+            await FinalizeInvolvementAsync(conflictInvolvementId, conflictInvolvementOutcome);
             // An exit-0 conflict-rework run that printed a login prompt would
             // otherwise fall through to the rebase/status handling below and be
             // recorded as an ordinary dirty/conflict rework failure, leaving
@@ -15972,7 +16291,31 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
             if (!agentResult.Success)
             {
+                var classification = agentFailureClassification
+                    ?? _authFailureClassifier.ClassifyFailure(runner, agentResult);
+                await ThrowIfAuthErrorAgentFailureAsync(
+                    item,
+                    project,
+                    runner,
+                    agentResult,
+                    ConflictReworkPhaseKey,
+                    classification,
+                    ct);
                 ThrowIfTransientAgentFailure(runner, agentResult, ConflictReworkPhaseKey);
+                if (classification.Kind == AgentFailureKind.Infrastructure)
+                {
+                    return new ConflictReworkAgentOutcome(
+                        AgentSucceeded: false,
+                        NewTip: null,
+                        FailureReason: BuildAgentFailureDetail(
+                            $"Conflict-rework agent {runner.Kind} reported infrastructure failure",
+                            agentResult),
+                        SemanticIncompatibleReason: null,
+                        FilesChanged: null, Insertions: null, Deletions: null,
+                        FailureKind: WorkItemFailureKinds.Infrastructure,
+                        Agent: runner.Kind);
+                }
+
                 return new ConflictReworkAgentOutcome(
                     AgentSucceeded: false,
                     NewTip: null,
@@ -17027,6 +17370,38 @@ Original merge-phase failure (JSON string, for context only):
     internal async Task<TerminalRevisionAttribution?> BuildTerminalRevisionAsync(WorkItem item, CancellationToken ct)
         => await _terminalRevisionBuilder.BuildTerminalRevisionAsync(item, ct);
 
+    private async Task RecordMergeConflictFailureAttributionAsync(
+        WorkItem failed,
+        MergeConflictResolutionFailedException ex)
+    {
+        if (ex.Agent is not { } agent || !WorkItemFailureKinds.IsInfraShaped(ex.FailureKind))
+            return;
+
+        var phase = string.IsNullOrWhiteSpace(ex.Phase)
+            ? "merge_conflict_resolution"
+            : ex.Phase;
+        var agentInstanceId = failed.Agent == agent ? failed.AgentInstanceId : null;
+        var modelId = failed.Agent == agent ? failed.ModelId : null;
+        var involvementId = await RecordInvolvementStartAsync(
+            failed.Id,
+            agent,
+            agentInstanceId,
+            modelId,
+            phase,
+            iteration: null);
+        await FinalizeInvolvementAsync(
+            involvementId,
+            MergeConflictFailureInvolvementOutcome(ex.FailureKind));
+    }
+
+    private static string MergeConflictFailureInvolvementOutcome(string? failureKind)
+    {
+        if (string.Equals(failureKind, WorkItemFailureKinds.AuthRequired, StringComparison.OrdinalIgnoreCase))
+            return AgentInvolvementOutcomes.FailureAuth;
+
+        return AgentInvolvementOutcomes.FailureInfrastructure;
+    }
+
     /// <summary>
     /// Best-effort cost summary lookup for webhook usage blocks. Returns null
     /// when the cost store is absent, no rows exist for the work item, or the
@@ -17044,7 +17419,17 @@ Original merge-phase failure (JSON string, for context only):
         }
     }
 
-    private async Task TransitionFailed(WorkItem item, string error, CancellationToken ct, Project? project = null, string? failureKind = null, DateTimeOffset? quotaResetAt = null, string? cancellationSource = null)
+    private async Task TransitionFailed(
+        WorkItem item,
+        string error,
+        CancellationToken ct,
+        Project? project = null,
+        string? failureKind = null,
+        DateTimeOffset? quotaResetAt = null,
+        string? cancellationSource = null,
+        AgentKind? agent = null,
+        WorkItemAuthFailureScope? authFailureScope = null,
+        bool clearAgent = false)
     {
         if (string.Equals(failureKind, "transient", StringComparison.OrdinalIgnoreCase))
         {
@@ -17073,6 +17458,9 @@ Original merge-phase failure (JSON string, for context only):
                 new WorkItemTerminalFailureTransitionCommand
                 {
                     FailureKind = failureKind,
+                    AuthFailureScope = authFailureScope,
+                    Agent = agent,
+                    ClearAgent = clearAgent,
                     QuotaResetAt = effectiveQuotaResetAt,
                     CancellationSource = cancellationSource,
                 },
@@ -17097,13 +17485,22 @@ Original merge-phase failure (JSON string, for context only):
     /// catch route through identical state-write logic. Idempotent — if the
     /// item is already in a terminal-ish state, the cancel is skipped.
     /// </summary>
-    private async Task HandleOperatorCancelAsync(WorkItem item, Project? project)
+    private async Task HandleOperatorCancelAsync(WorkItem item, Project? project, string? phase = null)
     {
         var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
         if (current.State is WorkItemState.Done or WorkItemState.Failed
             or WorkItemState.MergeConflictResolutionFailed
             or WorkItemState.AbandonedAfterRecoveryAttempts)
             return;
+        if (IsRecoveredResumeStateForCancelledPhase(current, phase))
+        {
+            _log.LogInformation(
+                "Work item {Id} already advanced to recovery resume state {State} for cancelled phase '{Phase}'; skipping operator-cancel write",
+                item.Id,
+                current.State,
+                phase);
+            return;
+        }
 
         var cancelled = current.With(WorkItemState.Cancelled, "cancelled via API",
             WorkItemCancellationReason.OperatorRequested,
@@ -17133,6 +17530,15 @@ Original merge-phase failure (JSON string, for context only):
 
     private bool IsRecoveryCancellation(WorkItemId itemId) =>
         _cancellations?.GetRequestKind(itemId) == CancellationRequestKind.Recovery;
+
+    private static bool IsRecoveredResumeStateForCancelledPhase(WorkItem current, string? phase)
+    {
+        if (string.IsNullOrWhiteSpace(phase))
+            return false;
+
+        var resumeState = DurableResumeStateForInterruptedPhase(phase);
+        return resumeState is not null && current.State == resumeState.Value;
+    }
 
     /// <summary>
     /// Handles a <see cref="PhaseCancellationException"/> whose source could
@@ -17226,7 +17632,14 @@ Original merge-phase failure (JSON string, for context only):
     /// — driving the full pipeline through each phase to exercise this switch
     /// would dwarf the table it verifies.
     /// </summary>
-    internal static WorkItemState ResumeStateForTransientRetry(WorkItem current, string phase) => phase switch
+    internal static WorkItemState ResumeStateForTransientRetry(WorkItem current, string phase)
+    {
+        _ = current;
+        // Unknown phase name: re-queue from the start — safer than guessing.
+        return DurableResumeStateForInterruptedPhase(phase) ?? WorkItemState.Queued;
+    }
+
+    private static WorkItemState? DurableResumeStateForInterruptedPhase(string phase) => phase switch
     {
         // Work / rework-resume / rework / audit all left the agent commits on
         // the work branch (or about to); resume at the matching phase entry.
@@ -17238,8 +17651,7 @@ Original merge-phase failure (JSON string, for context only):
         "audit" => WorkItemState.WorkComplete,
         "merge" => WorkItemState.AuditPassed,
         "upstream" => WorkItemState.Merged,
-        // Unknown phase name: re-queue from the start — safer than guessing.
-        _ => WorkItemState.Queued,
+        _ => null,
     };
 
     private async Task<DateTimeOffset> ResolveQuotaResetAtForFailedTransitionAsync(
@@ -17344,7 +17756,7 @@ Original merge-phase failure (JSON string, for context only):
             _log.LogInformation(
                 "Work item {Id} has an active operator cancellation; applying cancellation instead of scheduling transient retry",
                 item.Id);
-            await HandleOperatorCancelAsync(item, project);
+            await HandleOperatorCancelAsync(item, project, phase);
             return;
         }
 
@@ -17365,7 +17777,7 @@ Original merge-phase failure (JSON string, for context only):
                 _log.LogInformation(
                     "Work item {Id} has an active operator cancellation; applying cancellation instead of scheduling transient retry",
                     item.Id);
-                await HandleOperatorCancelAsync(current, project);
+                await HandleOperatorCancelAsync(current, project, phase);
                 return;
             }
 

@@ -13,6 +13,8 @@ namespace CodeyBox.Tests;
 [Collection("Background service timing")]
 public sealed class SqliteWriteGateConcurrencyTests : IDisposable
 {
+    private static readonly TimeSpan PostReleaseCompletionTimeout = TimeSpan.FromSeconds(60);
+
     private readonly string _dbPath =
         Path.Combine(Path.GetTempPath(), $"codeybox-write-gate-{Guid.NewGuid():N}.db");
 
@@ -294,12 +296,12 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
         var streamSummaryTask = streamSummaries.UpsertAsync(streamRow);
         var reconcileTask = costs.ReconcileFromAgentStreamSummaryAsync(streamRow);
         var allWrites = postTasks
-            .Select(t => (Task)t)
-            .Concat(heartbeatTasks)
-            .Concat(timingTasks)
-            .Append(pruneTask)
-            .Append(streamSummaryTask)
-            .Append(reconcileTask)
+            .Select((task, i) => new NamedWriteTask($"post-{i}", task))
+            .Concat(heartbeatTasks.Select((task, i) => new NamedWriteTask($"heartbeat-{i}", task)))
+            .Concat(timingTasks.Select((task, i) => new NamedWriteTask($"timing-{i}", task)))
+            .Append(new NamedWriteTask("usage-prune", pruneTask))
+            .Append(new NamedWriteTask("stream-summary-upsert", streamSummaryTask))
+            .Append(new NamedWriteTask("cost-reconcile", reconcileTask))
             .ToArray();
 
         try
@@ -309,8 +311,8 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
             await Task.Delay(100);
             Assert.All(
                 allWrites,
-                t => Assert.False(t.IsCompleted, "Writers should queue behind the shared write gate while maintenance owns it."));
-            Assert.DoesNotContain(allWrites, t => t.IsFaulted);
+                t => Assert.False(t.Task.IsCompleted, "Writers should queue behind the shared write gate while maintenance owns it."));
+            Assert.DoesNotContain(allWrites, t => t.Task.IsFaulted);
 
             await maintenance.ReleaseSqliteWriteLockAsync();
             await AssertUngatedWriterCanWriteWhileGateHeldAsync(_dbPath);
@@ -318,7 +320,7 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
             Assert.All(
                 allWrites,
                 t => Assert.False(
-                    t.IsCompleted,
+                    t.Task.IsCompleted,
                     "A writer completed after the raw SQLite lock was released while the shared write gate was still held, which indicates it bypassed the gate."));
         }
         finally
@@ -326,9 +328,10 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
             await maintenance.DisposeAsync();
         }
 
-        var responses = await Task.WhenAll(postTasks).WaitAsync(TimeSpan.FromSeconds(15));
-        await Task.WhenAll(heartbeatTasks.Concat(timingTasks).Append(streamSummaryTask).Append(reconcileTask)).WaitAsync(TimeSpan.FromSeconds(15));
-        var pruned = await pruneTask.WaitAsync(TimeSpan.FromSeconds(15));
+        await WaitForReleasedWritersAsync(allWrites);
+
+        var responses = await Task.WhenAll(postTasks);
+        var pruned = await pruneTask;
 
         try
         {
@@ -439,6 +442,26 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
             gate.Release();
         }
     }
+
+    private static async Task WaitForReleasedWritersAsync(
+        IReadOnlyCollection<NamedWriteTask> writes)
+    {
+        try
+        {
+            await Task.WhenAll(writes.Select(w => w.Task)).WaitAsync(PostReleaseCompletionTimeout);
+        }
+        catch (TimeoutException ex)
+        {
+            var statuses = string.Join(
+                ", ",
+                writes.Select(w => $"{w.Name}:{w.Task.Status}"));
+            throw new TimeoutException(
+                $"Writers did not complete within {PostReleaseCompletionTimeout}. Statuses: {statuses}",
+                ex);
+        }
+    }
+
+    private readonly record struct NamedWriteTask(string Name, Task Task);
 
     private static async Task AssertUngatedWriterBlockedBySqliteLockAsync(string dbPath)
     {

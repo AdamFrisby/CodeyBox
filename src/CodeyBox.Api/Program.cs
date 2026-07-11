@@ -1988,6 +1988,8 @@ builder.Services.AddSingleton<IAgentAuthAvailabilityRegistry>(sp =>
     sp.GetRequiredService<AgentAvailabilityRegistry>());
 builder.Services.AddSingleton<IAgentAuthRequiredAvailabilityReader>(sp =>
     sp.GetRequiredService<AgentAvailabilityRegistry>());
+builder.Services.AddSingleton<IAgentRestorePublisher>(sp =>
+    sp.GetRequiredService<AgentAvailabilityRegistry>());
 builder.Services.AddSingleton<IAgentDispatchAvailability>(sp => new AgentDispatchAvailability(
     sp.GetService<IAgentEffectiveAvailabilityReader>(),
     sp.GetService<IInVmSmokeGate>(),
@@ -2040,7 +2042,8 @@ builder.Services.AddSingleton<IInVmSmokeCache>(sp =>
 // re-verified. The admin endpoint depends on this one contract.
 builder.Services.AddSingleton<IAgentAvailabilityReset>(sp => new AgentAvailabilityReset(
     sp.GetRequiredService<ISmokeAvailabilityRegistry>(),
-    sp.GetRequiredService<IInVmSmokeCache>()));
+    sp.GetRequiredService<IInVmSmokeCache>(),
+    sp.GetRequiredService<IAgentRestorePublisher>()));
 builder.Services.AddSingleton<InVmSmokeProber>(sp => new InVmSmokeProber(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IBaselineImageResolver>(),
@@ -3039,6 +3042,34 @@ builder.Services.AddSingleton<AgentPauseRetryScheduler>(sp => new AgentPauseRetr
     sp.GetRequiredService<IAgentPauseSignal>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentPauseRetryScheduler>());
 
+// IAgentRestoreSignal is implemented by the same AgentAvailabilityRegistry
+// singleton — exposed here as the narrow port so the restore-retry scheduler
+// can subscribe without depending on the concrete registry type.
+builder.Services.AddSingleton<IAgentRestoreSignal>(sp =>
+    sp.GetRequiredService<AgentAvailabilityRegistry>());
+builder.Services.AddSingleton<AgentRestoreRetryScheduler>(sp => new AgentRestoreRetryScheduler(
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<WorkItemRetrier>(),
+    () =>
+    {
+        var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.AutoRequeueOnAgentRestore;
+        return OrchestratorOptionsFactory.BuildAgentRestoreRetryOptions(
+            live.Enabled,
+            live.LookbackGrace,
+            live.PostRestoreMargin,
+            live.InvolvementTerminalLookback,
+            live.InvolvementTerminalClockSkew,
+            live.MaxCandidatesPerSweep,
+            live.EventQueueCapacity);
+    },
+    sp.GetRequiredService<ILogger<AgentRestoreRetryScheduler>>(),
+    sp.GetRequiredService<IAgentRestoreSignal>(),
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetService<IAgentInvolvementStore>(),
+    sp.GetService<TimeProvider>()));
+builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentRestoreRetryScheduler>());
+
 // --- Failure-class recovery -------------------------------------------------
 // Pure deterministic classifier in front of the hosted recovery service.
 // Operators wire alternate classifiers (e.g. LLM-precision layer) by replacing
@@ -3854,8 +3885,20 @@ app.MapPost("/admin/agent/{name}/smoke", async (
     });
 });
 
-app.MapPost("/admin/agent/{name}/reset", (string name, IAgentAvailabilityRegistry registry, IAgentRegistry agents, IAgentAvailabilityReset reset) =>
+app.MapPost("/admin/agent/{name}/reset", (
+    string name,
+    HttpContext httpContext,
+    ApiKeyState apiKeyState,
+    IAgentAvailabilityRegistry registry,
+    IAgentRegistry agents,
+    IAgentAvailabilityReset reset) =>
 {
+    if (!ApiKeyAuth.IsAuthorized(httpContext, apiKeyState))
+    {
+        httpContext.Response.Headers["WWW-Authenticate"] = "Bearer";
+        return Results.Text("unauthorized", statusCode: StatusCodes.Status401Unauthorized);
+    }
+
     // Mirror /smoke: normalise to lowercase so case-mismatched names match the
     // canonical kinds returned by IAgentRegistry.Available.
     var kind = new AgentKind(name.ToLowerInvariant());
@@ -4639,6 +4682,14 @@ namespace CodeyBox.Api
         /// </summary>
         public TerminalFailureRecoveryConfig TerminalFailureRecovery { get; set; } = new();
 
+        /// <summary>
+        /// Auto-requeue policy for infra-failed work items on agent recovery —
+        /// see <see cref="AutoRequeueOnAgentRestoreConfig"/>. Enabled by
+        /// default so restored agents automatically drain outage-window
+        /// infra-failed victims through normal routing.
+        /// </summary>
+        public AutoRequeueOnAgentRestoreConfig AutoRequeueOnAgentRestore { get; set; } = new();
+
         /// <summary>OpenTelemetry export configuration. See docs/observability.md.</summary>
         public OtelOptions Otel { get; set; } = new();
 
@@ -4956,6 +5007,62 @@ namespace CodeyBox.Api
         public string MaxBackoff { get; set; } = "00:30:00";
         public double JitterFraction { get; set; } = 0.2;
         public int MaxAutoRetriesPerWorkItem { get; set; } = 3;
+    }
+
+    /// <summary>
+    /// Bound from <c>CodeyBox:AutoRequeueOnAgentRestore</c>. Hot-reloadable
+    /// except <see cref="EventQueueCapacity"/>, which sizes the scheduler
+    /// channel at startup. See
+    /// <see cref="CodeyBox.Orchestrator.AgentRestoreRetryScheduler"/> for
+    /// runtime semantics.
+    /// </summary>
+    public sealed class AutoRequeueOnAgentRestoreConfig
+    {
+        /// <summary>
+        /// Master switch for restore-driven infra-failure sweeps. Default
+        /// <c>true</c>; set false only when an operator wants to perform these
+        /// recovery sweeps manually.
+        /// </summary>
+        public bool Enabled { get; set; } = true;
+
+        /// <summary>
+        /// Non-negative <see cref="TimeSpan"/> string subtracted from the
+        /// restore event's outage start when selecting failed candidates.
+        /// </summary>
+        public string LookbackGrace { get; set; } = AgentRestoreRetryOptions.DefaultLookbackGraceConfigValue;
+
+        /// <summary>
+        /// Non-negative <see cref="TimeSpan"/> string added after the restore
+        /// timestamp to absorb ordering races between terminal writes and the
+        /// restore signal.
+        /// </summary>
+        public string PostRestoreMargin { get; set; } = AgentRestoreRetryOptions.DefaultPostRestoreMarginConfigValue;
+
+        /// <summary>
+        /// Non-negative <see cref="TimeSpan"/> string used to match a failed
+        /// agent-involvement row to a nearby terminal work-item write.
+        /// </summary>
+        public string InvolvementTerminalLookback { get; set; } = AgentRestoreRetryOptions.DefaultInvolvementTerminalLookbackConfigValue;
+
+        /// <summary>
+        /// Non-negative <see cref="TimeSpan"/> string allowing failed involvement
+        /// rows to land slightly after the terminal work-item update they
+        /// explain.
+        /// </summary>
+        public string InvolvementTerminalClockSkew { get; set; } = AgentRestoreRetryOptions.DefaultInvolvementTerminalClockSkewConfigValue;
+
+        /// <summary>
+        /// Positive cap applied inside the work-item store before buffering
+        /// restore-sweep candidates. Default 500.
+        /// </summary>
+        public int MaxCandidatesPerSweep { get; set; } = AgentRestoreRetryOptions.DefaultMaxCandidatesPerSweep;
+
+        /// <summary>
+        /// Positive bounded-channel capacity for pending restore notifications.
+        /// Startup-only; restart the API to apply changes. Default 128.
+        /// </summary>
+        public int EventQueueCapacity { get; set; } = AgentRestoreRetryOptions.DefaultEventQueueCapacity;
+
     }
 
     /// <summary>

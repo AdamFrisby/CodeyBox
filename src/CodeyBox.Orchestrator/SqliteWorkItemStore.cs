@@ -50,6 +50,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             lockHeld = true;
             _conn.Open();
             RegisterQuotaRetryPhaseFunctions(_conn);
+            RegisterAgentInvolvementFailureFunction(_conn);
+            RegisterRestoreRetryEligibilityFunction(_conn);
 
             // WAL mode allows concurrent readers; SqliteDatabaseWriteGate serializes writers in-process.
             // busy_timeout is per-connection and gives external lock holders a retry window.
@@ -84,6 +86,22 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 CREATE INDEX IF NOT EXISTS idx_work_items_project ON work_items(project_id);
                 """;
             cmd.ExecuteNonQuery();
+
+            using (var restoreClaimCmd = _conn.CreateCommand())
+            {
+                restoreClaimCmd.CommandText = """
+                    CREATE TABLE IF NOT EXISTS agent_restore_retry_claims (
+                        work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                        restored_agent TEXT NOT NULL,
+                        outage_started_at TEXT NOT NULL,
+                        restored_at TEXT NOT NULL,
+                        claimed_at TEXT NOT NULL,
+                        PRIMARY KEY (work_item_id, restored_agent, outage_started_at)
+                    );
+                    """;
+                restoreClaimCmd.ExecuteNonQuery();
+            }
+            ReconcileAgentRestoreRetryClaimsKey();
 
             // Additive migration: add depends_on_json column if it doesn't exist yet.
             // Existing rows get the default '[]' so behaviour is unchanged.
@@ -172,6 +190,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
 
             // Additive migration: capture failure details for auto-retry logic.
             RunMigration("ALTER TABLE work_items ADD COLUMN failure_kind TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN auth_failure_scope TEXT;");
+            RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_restore_retry_candidates ON work_items(state, failure_kind, updated_at, created_at);");
             RunMigration("ALTER TABLE work_items ADD COLUMN quota_reset_at TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN next_quota_retry_at TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN quota_retry_attempts INTEGER NOT NULL DEFAULT 0;");
@@ -423,6 +443,44 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             isDeterministic: true);
     }
 
+    private static void RegisterAgentInvolvementFailureFunction(SqliteConnection conn)
+    {
+        conn.CreateFunction<string?, int>(
+            "codeybox_agent_involvement_is_failure",
+            static outcome => AgentInvolvementOutcomes.IsFailure(outcome) ? 1 : 0,
+            isDeterministic: true);
+    }
+
+    private void ReconcileAgentRestoreRetryClaimsKey()
+    {
+        using var tx = _conn.BeginTransaction();
+        using (var dedupe = _conn.CreateCommand())
+        {
+            dedupe.Transaction = tx;
+            dedupe.CommandText = """
+                DELETE FROM agent_restore_retry_claims
+                WHERE rowid NOT IN (
+                    SELECT MIN(rowid)
+                    FROM agent_restore_retry_claims
+                    GROUP BY work_item_id, restored_agent, outage_started_at
+                );
+                """;
+            dedupe.ExecuteNonQuery();
+        }
+
+        using (var unique = _conn.CreateCommand())
+        {
+            unique.Transaction = tx;
+            unique.CommandText = """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_restore_retry_claims_key
+                ON agent_restore_retry_claims(work_item_id, restored_agent, outage_started_at);
+                """;
+            unique.ExecuteNonQuery();
+        }
+
+        tx.Commit();
+    }
+
     private void RunMigration(string sql)
     {
         try
@@ -437,6 +495,69 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             // Column already exists from a previous startup — nothing to do.
         }
     }
+
+    private bool TableExists(string tableName)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = $table_name
+            LIMIT 1;
+            """;
+        cmd.Parameters.AddWithValue("$table_name", tableName);
+        return cmd.ExecuteScalar() is not null;
+    }
+
+    private static void RegisterRestoreRetryEligibilityFunction(SqliteConnection conn)
+    {
+        conn.CreateFunction<long, string?, string?, string?, string, string?, int>(
+            "codeybox_restore_retry_is_eligible",
+            static (stateValue, failureKind, authScopeValue, itemAgentValue, restoredAgentValue, latestFailedAgentValue) =>
+                IsRestoreRetryEligibleForSqlite(
+                    stateValue,
+                    failureKind,
+                    authScopeValue,
+                    itemAgentValue,
+                    restoredAgentValue,
+                    latestFailedAgentValue),
+            isDeterministic: true);
+    }
+
+    private static int IsRestoreRetryEligibleForSqlite(
+        long stateValue,
+        string? failureKind,
+        string? authScopeValue,
+        string? itemAgentValue,
+        string restoredAgentValue,
+        string? latestFailedAgentValue)
+    {
+        if (stateValue < int.MinValue || stateValue > int.MaxValue)
+            return 0;
+
+        var authScope = TryParseAuthFailureScope(authScopeValue);
+        var itemAgent = string.IsNullOrEmpty(itemAgentValue)
+            ? (AgentKind?)null
+            : new AgentKind(itemAgentValue);
+        var latestFailedAgent = string.IsNullOrEmpty(latestFailedAgentValue)
+            ? (AgentKind?)null
+            : new AgentKind(latestFailedAgentValue);
+
+        return AgentRestoreRetryCandidatePolicy.IsEligible(
+            (WorkItemState)stateValue,
+            failureKind,
+            authScope,
+            itemAgent,
+            new AgentKind(restoredAgentValue),
+            latestFailedAgent)
+            ? 1
+            : 0;
+    }
+
+    private static WorkItemAuthFailureScope? TryParseAuthFailureScope(string? value) =>
+        Enum.TryParse<WorkItemAuthFailureScope>(value, ignoreCase: true, out var scope)
+            ? scope
+            : null;
 
     private void ReconcileDuplicateOriginCheckFollowupsBeforeUniqueIndex()
     {
@@ -486,7 +607,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         local_squash_sha, merged_pr_number, merged_pr_url,
                         min_model_score, cancellation_reason, recovery_attempts, recovery_attempt_source_state, release_id, preempted_at, preempt_checkpoint,
                         suspended_vm_name, suspended_at, agent_log_path,
-                        failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from,
+                        failure_kind, auth_failure_scope, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from,
                         quota_retry_phase,
                         next_transient_retry_at, transient_retry_attempts, transient_retry_first_failed_at, transient_retry_from,
                         agent_pause_target, agent_pause_retry_from, auditor_profile, priority,
@@ -503,7 +624,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         $local_squash_sha, $merged_pr_number, $merged_pr_url,
                         $min_model_score, $cancellation_reason, $recovery_attempts, $recovery_attempt_source_state, $release_id, $preempted_at, $preempt_checkpoint,
                         $suspended_vm_name, $suspended_at, $agent_log_path,
-                        $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from,
+                        $failure_kind, $auth_failure_scope, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from,
                         $quota_retry_phase,
                         $next_transient_retry_at, $transient_retry_attempts, $transient_retry_first_failed_at, $transient_retry_from,
                         $agent_pause_target, $agent_pause_retry_from, $auditor_profile, $priority,
@@ -638,6 +759,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     suspended_at = $suspended_at,
                     agent_log_path = $agent_log_path,
                     failure_kind = $failure_kind,
+                    auth_failure_scope = $auth_failure_scope,
                     quota_reset_at = $quota_reset_at,
                     next_quota_retry_at = $next_quota_retry_at,
                     quota_retry_attempts = $quota_retry_attempts,
@@ -723,6 +845,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     suspended_at = $suspended_at,
                     agent_log_path = $agent_log_path,
                     failure_kind = $failure_kind,
+                    auth_failure_scope = $auth_failure_scope,
                     quota_reset_at = $quota_reset_at,
                     next_quota_retry_at = $next_quota_retry_at,
                     quota_retry_attempts = $quota_retry_attempts,
@@ -809,6 +932,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     suspended_at = $suspended_at,
                     agent_log_path = $agent_log_path,
                     failure_kind = $failure_kind,
+                    auth_failure_scope = $auth_failure_scope,
                     quota_reset_at = $quota_reset_at,
                     next_quota_retry_at = $next_quota_retry_at,
                     quota_retry_attempts = $quota_retry_attempts,
@@ -1375,6 +1499,393 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
 
+    public async IAsyncEnumerable<WorkItem> ListRestoreRetryCandidatesAsync(
+        AgentKind restoredAgent,
+        DateTimeOffset windowStart,
+        DateTimeOffset windowEnd,
+        TimeSpan involvementTerminalLookback,
+        TimeSpan involvementTerminalClockSkew,
+        int limit,
+        DateTimeOffset? afterUpdatedAt = null,
+        WorkItemId? afterId = null,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        if (limit <= 0)
+            yield break;
+
+        var rows = new List<WorkItem>(Math.Min(limit, 256));
+        IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using (var cmd = _conn.CreateCommand())
+            {
+                var involvementTableExists = TableExists("agent_involvement");
+                cmd.CommandText = involvementTableExists
+                    ? """
+                        WITH terminal_items AS (
+                            SELECT *
+                            FROM work_items
+                            WHERE state IN ($failed, $merge_conflict_failed)
+                              AND updated_at >= $window_start
+                              AND updated_at <= $window_end
+                              AND (
+                                  $after_updated_at IS NULL
+                                  OR updated_at > $after_updated_at
+                                  OR (updated_at = $after_updated_at AND id > $after_id)
+                              )
+                        ),
+                        ranked_failed_involvement AS (
+                            SELECT
+                                ai.work_item_id,
+                                ai.agent_kind,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY ai.work_item_id
+                                    ORDER BY COALESCE(ai.ended_at, ai.started_at) DESC, ai.started_at DESC, ai.id DESC
+                                ) AS rank
+                            FROM agent_involvement ai
+                            JOIN terminal_items wi ON wi.id = ai.work_item_id
+                            WHERE codeybox_agent_involvement_is_failure(ai.outcome) = 1
+                              AND julianday(COALESCE(ai.ended_at, ai.started_at)) >= julianday(wi.updated_at) - $terminal_lookback_days
+                              AND julianday(COALESCE(ai.ended_at, ai.started_at)) <= julianday(wi.updated_at) + $terminal_clock_skew_days
+                        ),
+                        latest_failed_involvement AS (
+                            SELECT work_item_id, agent_kind
+                            FROM ranked_failed_involvement
+                            WHERE rank = 1
+                        )
+                        SELECT terminal_items.*
+                        FROM terminal_items
+                        LEFT JOIN latest_failed_involvement lfi ON lfi.work_item_id = terminal_items.id
+                        WHERE codeybox_restore_retry_is_eligible(
+                            terminal_items.state,
+                            terminal_items.failure_kind,
+                            terminal_items.auth_failure_scope,
+                            terminal_items.agent,
+                            $restored_agent,
+                            lfi.agent_kind
+                        ) = 1
+                        ORDER BY terminal_items.updated_at ASC, terminal_items.id ASC
+                        LIMIT $limit;
+                        """
+                    : """
+                        SELECT *
+                        FROM work_items
+                        WHERE state IN ($failed, $merge_conflict_failed)
+                          AND updated_at >= $window_start
+                          AND updated_at <= $window_end
+                          AND (
+                              $after_updated_at IS NULL
+                              OR updated_at > $after_updated_at
+                              OR (updated_at = $after_updated_at AND id > $after_id)
+                          )
+                          AND codeybox_restore_retry_is_eligible(
+                              state,
+                              failure_kind,
+                              auth_failure_scope,
+                              agent,
+                              $restored_agent,
+                              NULL
+                          ) = 1
+                        ORDER BY updated_at ASC, id ASC
+                        LIMIT $limit;
+                        """;
+                cmd.Parameters.AddWithValue("$failed", (int)WorkItemState.Failed);
+                cmd.Parameters.AddWithValue("$merge_conflict_failed", (int)WorkItemState.MergeConflictResolutionFailed);
+                cmd.Parameters.AddWithValue("$window_start", windowStart.ToString("O"));
+                cmd.Parameters.AddWithValue("$window_end", windowEnd.ToString("O"));
+                cmd.Parameters.AddWithValue("$restored_agent", restoredAgent.Value);
+                cmd.Parameters.AddWithValue("$limit", limit);
+                cmd.Parameters.AddWithValue("$after_updated_at", (object?)afterUpdatedAt?.ToString("O") ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$after_id", (object?)afterId?.ToString() ?? DBNull.Value);
+                if (involvementTableExists)
+                {
+                    cmd.Parameters.AddWithValue("$terminal_lookback_days", involvementTerminalLookback.TotalDays);
+                    cmd.Parameters.AddWithValue("$terminal_clock_skew_days", involvementTerminalClockSkew.TotalDays);
+                }
+                using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+                while (await reader.ReadAsync(ct).ConfigureAwait(false))
+                    rows.Add(Read(reader));
+            }
+            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+
+        foreach (var item in rows)
+            yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
+    }
+
+    public async Task<bool> TryClaimAgentRestoreRetryAsync(
+        WorkItemId id,
+        AgentKind restoredAgent,
+        DateTimeOffset outageStartedAt,
+        DateTimeOffset restoredAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT OR IGNORE INTO agent_restore_retry_claims (
+                    work_item_id,
+                    restored_agent,
+                    outage_started_at,
+                    restored_at,
+                    claimed_at
+                )
+                VALUES (
+                    $work_item_id,
+                    $restored_agent,
+                    $outage_started_at,
+                    $restored_at,
+                    $claimed_at
+                );
+                """;
+            cmd.Parameters.AddWithValue("$work_item_id", id.ToString());
+            cmd.Parameters.AddWithValue("$restored_agent", restoredAgent.Value);
+            cmd.Parameters.AddWithValue("$outage_started_at", outageStartedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$restored_at", restoredAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$claimed_at", DateTimeOffset.UtcNow.ToString("O"));
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) > 0;
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("TryClaimAgentRestoreRetryAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<bool> TryUpdateIfStateAndUpdatedAtWithAgentRestoreRetryClaimAsync(
+        WorkItem item,
+        WorkItemState onlyIfState,
+        DateTimeOffset onlyIfUpdatedAt,
+        AgentKind restoredAgent,
+        DateTimeOffset outageStartedAt,
+        DateTimeOffset restoredAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var tx = _conn.BeginTransaction();
+            using (var stale = _conn.CreateCommand())
+            {
+                stale.Transaction = tx;
+                stale.CommandText = """
+                    DELETE FROM agent_restore_retry_claims
+                    WHERE work_item_id = $work_item_id
+                      AND restored_agent = $restored_agent
+                      AND outage_started_at = $outage_started_at
+                      AND EXISTS (
+                          SELECT 1
+                          FROM work_items
+                          WHERE id = $work_item_id
+                            AND state IN ($failed, $merge_conflict_failed)
+                            AND julianday(updated_at) < julianday(agent_restore_retry_claims.claimed_at)
+                      );
+                    """;
+                stale.Parameters.AddWithValue("$work_item_id", item.Id.ToString());
+                stale.Parameters.AddWithValue("$restored_agent", restoredAgent.Value);
+                stale.Parameters.AddWithValue("$outage_started_at", outageStartedAt.ToString("O"));
+                stale.Parameters.AddWithValue("$failed", (int)WorkItemState.Failed);
+                stale.Parameters.AddWithValue("$merge_conflict_failed", (int)WorkItemState.MergeConflictResolutionFailed);
+                await stale.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+
+            using (var claim = _conn.CreateCommand())
+            {
+                claim.Transaction = tx;
+                claim.CommandText = """
+                    INSERT OR IGNORE INTO agent_restore_retry_claims (
+                        work_item_id,
+                        restored_agent,
+                        outage_started_at,
+                        restored_at,
+                        claimed_at
+                    )
+                    VALUES (
+                        $work_item_id,
+                        $restored_agent,
+                        $outage_started_at,
+                        $restored_at,
+                        $claimed_at
+                    );
+                    """;
+                claim.Parameters.AddWithValue("$work_item_id", item.Id.ToString());
+                claim.Parameters.AddWithValue("$restored_agent", restoredAgent.Value);
+                claim.Parameters.AddWithValue("$outage_started_at", outageStartedAt.ToString("O"));
+                claim.Parameters.AddWithValue("$restored_at", restoredAt.ToString("O"));
+                claim.Parameters.AddWithValue("$claimed_at", DateTimeOffset.UtcNow.ToString("O"));
+                if (await claim.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 0)
+                {
+                    tx.Rollback();
+                    return false;
+                }
+            }
+
+            using (var update = _conn.CreateCommand())
+            {
+                update.Transaction = tx;
+                // Same full-row field set as UpdateAsync / TryUpdateIfStateAsync,
+                // guarded by the exact snapshot stamp the recovery path inspected.
+                update.CommandText = """
+                    UPDATE work_items SET
+                        project_id = $project_id, title = $title,
+                        base_branch = $base, work_branch = $work, agent = $agent,
+                        agent_instance_id = $agent_instance_id,
+                        work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
+                        state = $state, updated_at = $ua, last_error = $err,
+                        upstream_push_attempts = $att, depends_on_json = $deps,
+                        agent_class_id = $class_id, queue_position = $qpos,
+                        stuck_retries = $sretries, started_at = $started_at,
+                        replay_of_work_item_id = $replay_of, merge_sha = $merge_sha,
+                        local_squash_sha = $local_squash_sha,
+                        merged_pr_number = $merged_pr_number,
+                        merged_pr_url = $merged_pr_url,
+                        min_model_score = $min_model_score,
+                        cancellation_reason = $cancellation_reason,
+                        recovery_attempts = $recovery_attempts,
+                        recovery_attempt_source_state = $recovery_attempt_source_state,
+                        release_id = $release_id,
+                        preempted_at = $preempted_at,
+                        preempt_checkpoint = $preempt_checkpoint,
+                        suspended_vm_name = $suspended_vm_name,
+                        suspended_at = $suspended_at,
+                        agent_log_path = $agent_log_path,
+                        failure_kind = $failure_kind,
+                        auth_failure_scope = $auth_failure_scope,
+                        quota_reset_at = $quota_reset_at,
+                        next_quota_retry_at = $next_quota_retry_at,
+                        quota_retry_attempts = $quota_retry_attempts,
+                        quota_retry_from = $quota_retry_from,
+                        quota_retry_phase = $quota_retry_phase,
+                        next_transient_retry_at = $next_transient_retry_at,
+                        transient_retry_attempts = $transient_retry_attempts,
+                        transient_retry_first_failed_at = $transient_retry_first_failed_at,
+                        transient_retry_from = $transient_retry_from,
+                        agent_pause_target = $agent_pause_target,
+                        agent_pause_retry_from = $agent_pause_retry_from,
+                        auditor_profile = $auditor_profile,
+                        cancellation_source = $cancellation_source,
+                        transient_cancel_retries = $transient_cancel_retries,
+                        conflict_rework_attempts = $conflict_rework_attempts,
+                        baseline_image_ref = $baseline_image_ref,
+                        required_capabilities_json = $required_capabilities,
+                        job_type = $job_type,
+                        check_spec_json = $check_spec,
+                        agent_control_json = $agent_control,
+                        check_verdict_json = $check_verdict,
+                        origin_check_work_item_id = $origin_check,
+                        re_check_verdicts_json = $re_check_verdicts,
+                        template_name = $template_name,
+                        template_entry_index = $template_entry_index,
+                        preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup,
+                        terminal_retry_attempts = $terminal_retry_attempts,
+                        next_terminal_retry_at = $next_terminal_retry_at,
+                        plan_artifact = CASE WHEN prompt_revision = $prompt_revision THEN $plan_artifact ELSE plan_artifact END,
+                        plan_generated_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_generated_at ELSE plan_generated_at END,
+                        plan_reviewed_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_reviewed_at ELSE plan_reviewed_at END,
+                        plan_review_summary = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_summary ELSE plan_review_summary END
+                    WHERE id = $id AND state = $only_if_state AND updated_at = $only_if_updated_at;
+                    """;
+                Bind(update, item);
+                update.Parameters.AddWithValue("$only_if_state", (int)onlyIfState);
+                update.Parameters.AddWithValue("$only_if_updated_at", onlyIfUpdatedAt.ToString("O"));
+                if (await update.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 0)
+                {
+                    tx.Rollback();
+                    return false;
+                }
+            }
+
+            tx.Commit();
+            return true;
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("TryUpdateIfStateAndUpdatedAtWithAgentRestoreRetryClaimAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task ReleaseAgentRestoreRetryClaimAsync(
+        WorkItemId id,
+        AgentKind restoredAgent,
+        DateTimeOffset outageStartedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                DELETE FROM agent_restore_retry_claims
+                WHERE work_item_id = $work_item_id
+                  AND restored_agent = $restored_agent
+                  AND outage_started_at = $outage_started_at;
+                """;
+            cmd.Parameters.AddWithValue("$work_item_id", id.ToString());
+            cmd.Parameters.AddWithValue("$restored_agent", restoredAgent.Value);
+            cmd.Parameters.AddWithValue("$outage_started_at", outageStartedAt.ToString("O"));
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("ReleaseAgentRestoreRetryClaimAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<bool> HasAgentRestoreRetryClaimAsync(
+        WorkItemId id,
+        AgentKind restoredAgent,
+        DateTimeOffset outageStartedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT 1
+                FROM agent_restore_retry_claims c
+                JOIN work_items wi ON wi.id = c.work_item_id
+                WHERE c.work_item_id = $work_item_id
+                  AND c.restored_agent = $restored_agent
+                  AND c.outage_started_at = $outage_started_at
+                  AND (
+                      wi.state NOT IN ($failed, $merge_conflict_failed)
+                      OR julianday(wi.updated_at) >= julianday(c.claimed_at)
+                  )
+                LIMIT 1;
+                """;
+            cmd.Parameters.AddWithValue("$work_item_id", id.ToString());
+            cmd.Parameters.AddWithValue("$restored_agent", restoredAgent.Value);
+            cmd.Parameters.AddWithValue("$outage_started_at", outageStartedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$failed", (int)WorkItemState.Failed);
+            cmd.Parameters.AddWithValue("$merge_conflict_failed", (int)WorkItemState.MergeConflictResolutionFailed);
+            return await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false) is not null;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default)
     {
         await _writeLock.WaitAsync(ct);
@@ -1472,33 +1983,31 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         await _writeLock.WaitAsync(ct);
         try
         {
-            var skipFilter = string.Empty;
-            if (skipIds.Count > 0)
-            {
-                await PopulateDispatchSkipTableAsync(skipIds, ct);
-                skipFilter = DispatchSkipFilterSql;
-            }
+            await PopulateDispatchSkipTableAsync(skipIds, ct);
 
             using (var cmd = _conn.CreateCommand())
             {
-                // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- interpolation is limited to enum integer constants and an exact internal skip-filter constant; all runtime values are parameters
-                cmd.CommandText = $"""
+                cmd.CommandText = """
                     SELECT * FROM (
                         SELECT wi.*, wi.state AS dispatch_ordering_state, 0 AS dispatch_source_order
                         FROM work_items wi
                         WHERE wi.state NOT IN (
-                            {(int)WorkItemState.Done},
-                            {(int)WorkItemState.Failed},
-                            {(int)WorkItemState.Cancelled},
-                            {(int)WorkItemState.AuditFailed},
-                            {(int)WorkItemState.MergeConflictResolutionFailed},
-                            {(int)WorkItemState.AbandonedAfterRecoveryAttempts},
-                            {(int)WorkItemState.NeedsOperatorInput},
-                            {(int)WorkItemState.WaitingForQuotaReset},
-                            {(int)WorkItemState.WaitingForAgentResume},
-                            {(int)WorkItemState.WaitingForTransientRetry}
+                            $state_done,
+                            $state_failed,
+                            $state_cancelled,
+                            $state_audit_failed,
+                            $state_merge_conflict_resolution_failed,
+                            $state_abandoned_after_recovery_attempts,
+                            $state_needs_operator_input,
+                            $state_waiting_for_quota_reset,
+                            $state_waiting_for_agent_resume,
+                            $state_waiting_for_transient_retry
                         )
-                        {skipFilter}
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM temp.codeybox_dispatch_skip_ids skipped
+                            WHERE skipped.id = wi.id
+                        )
 
                         UNION ALL
 
@@ -1510,21 +2019,25 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                             ) AS dispatch_ordering_state,
                             1 AS dispatch_source_order
                         FROM work_items wi
-                        WHERE wi.state = {(int)WorkItemState.WaitingForQuotaReset}
+                        WHERE wi.state = $state_waiting_for_quota_reset
                           AND (
                               $include_future_quota_retries = 1
                               OR wi.next_quota_retry_at IS NULL
                               OR julianday(wi.next_quota_retry_at) <= julianday($now)
                           )
-                        {skipFilter}
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM temp.codeybox_dispatch_skip_ids skipped
+                              WHERE skipped.id = wi.id
+                          )
                     )
                     ORDER BY
                         CASE
                             WHEN dispatch_ordering_state IN (
-                                {(int)WorkItemState.AuditPassed},
-                                {(int)WorkItemState.Merging},
-                                {(int)WorkItemState.Merged},
-                                {(int)WorkItemState.UpstreamPushing}
+                                $state_audit_passed,
+                                $state_merging,
+                                $state_merged,
+                                $state_upstream_pushing
                             ) THEN 0
                             ELSE 1
                         END ASC,
@@ -1533,6 +2046,20 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         dispatch_source_order ASC
                     LIMIT $limit;
                     """;
+                cmd.Parameters.AddWithValue("$state_done", (int)WorkItemState.Done);
+                cmd.Parameters.AddWithValue("$state_failed", (int)WorkItemState.Failed);
+                cmd.Parameters.AddWithValue("$state_cancelled", (int)WorkItemState.Cancelled);
+                cmd.Parameters.AddWithValue("$state_audit_failed", (int)WorkItemState.AuditFailed);
+                cmd.Parameters.AddWithValue("$state_merge_conflict_resolution_failed", (int)WorkItemState.MergeConflictResolutionFailed);
+                cmd.Parameters.AddWithValue("$state_abandoned_after_recovery_attempts", (int)WorkItemState.AbandonedAfterRecoveryAttempts);
+                cmd.Parameters.AddWithValue("$state_needs_operator_input", (int)WorkItemState.NeedsOperatorInput);
+                cmd.Parameters.AddWithValue("$state_waiting_for_quota_reset", (int)WorkItemState.WaitingForQuotaReset);
+                cmd.Parameters.AddWithValue("$state_waiting_for_agent_resume", (int)WorkItemState.WaitingForAgentResume);
+                cmd.Parameters.AddWithValue("$state_waiting_for_transient_retry", (int)WorkItemState.WaitingForTransientRetry);
+                cmd.Parameters.AddWithValue("$state_audit_passed", (int)WorkItemState.AuditPassed);
+                cmd.Parameters.AddWithValue("$state_merging", (int)WorkItemState.Merging);
+                cmd.Parameters.AddWithValue("$state_merged", (int)WorkItemState.Merged);
+                cmd.Parameters.AddWithValue("$state_upstream_pushing", (int)WorkItemState.UpstreamPushing);
                 cmd.Parameters.AddWithValue("$now", now.ToString("O"));
                 cmd.Parameters.AddWithValue(
                     "$include_future_quota_retries",
@@ -1552,9 +2079,6 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
-
-    private const string DispatchSkipFilterSql =
-        "AND NOT EXISTS (SELECT 1 FROM temp.codeybox_dispatch_skip_ids skipped WHERE skipped.id = wi.id)";
 
     private async Task PopulateDispatchSkipTableAsync(
         IReadOnlySet<WorkItemId> skipIds,
@@ -2578,6 +3102,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$suspended_at", (object?)item.SuspendedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$agent_log_path", (object?)item.AgentLogPath ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$failure_kind", (object?)item.FailureKind ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$auth_failure_scope",
+            item.AuthFailureScope.HasValue ? (object)item.AuthFailureScope.Value.ToString() : DBNull.Value);
         cmd.Parameters.AddWithValue("$quota_reset_at", (object?)item.QuotaResetAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$next_quota_retry_at", (object?)item.NextQuotaRetryAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$quota_retry_attempts", item.QuotaRetryAttempts);
@@ -2704,6 +3230,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         SuspendedAt = ReadNullableDateTimeOffset(r, "suspended_at"),
         AgentLogPath = ReadNullableString(r, "agent_log_path"),
         FailureKind = r.IsDBNull(r.GetOrdinal("failure_kind")) ? null : r.GetString(r.GetOrdinal("failure_kind")),
+        AuthFailureScope = ReadNullableAuthFailureScope(r, "auth_failure_scope"),
         QuotaResetAt = ReadNullableDateTimeOffset(r, "quota_reset_at"),
         NextQuotaRetryAt = ReadNullableDateTimeOffset(r, "next_quota_retry_at"),
         QuotaRetryAttempts = ReadInt32OrDefault(r, "quota_retry_attempts", defaultValue: 0),
@@ -2861,6 +3388,20 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     {
         var raw = ReadNullableString(r, column);
         return string.IsNullOrWhiteSpace(raw) ? null : new AgentKind(raw);
+    }
+
+    private static WorkItemAuthFailureScope? ReadNullableAuthFailureScope(SqliteDataReader r, string column)
+    {
+        var raw = ReadNullableString(r, column);
+        if (string.IsNullOrWhiteSpace(raw))
+            return null;
+        if (Enum.TryParse<WorkItemAuthFailureScope>(raw, ignoreCase: true, out var value))
+            return value;
+
+        var idOrd = r.GetOrdinal("id");
+        var id = r.IsDBNull(idOrd) ? "(unknown)" : r.GetString(idOrd);
+        throw new InvalidDataException(
+            $"work item {id}: auth_failure_scope value '{raw}' is not a known WorkItemAuthFailureScope; refusing to read the row as legacy null.");
     }
 
     private static WorkItemState? ReadNullableWorkItemState(SqliteDataReader r, string column)

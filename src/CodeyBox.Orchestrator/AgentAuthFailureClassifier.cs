@@ -132,14 +132,17 @@ public sealed class AgentAuthRequiredException : Exception
 {
     public AgentKind Agent { get; }
     public string Phase { get; }
+    public WorkItemAuthFailureScope Scope { get; }
 
     public AgentAuthRequiredException(
         AgentKind agent,
         string phase,
-        string message)
+        string message,
+        WorkItemAuthFailureScope scope = WorkItemAuthFailureScope.Fleet)
         : base(message)
     {
         Agent = agent;
         Phase = phase;
+        Scope = scope;
     }
 }

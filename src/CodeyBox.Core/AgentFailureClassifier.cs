@@ -327,7 +327,7 @@ public static class AgentFailureClassifier
         }
 
         var stderrAuthError = ContainsAuthErrorPattern(stderr);
-        if (stderrAuthError || ContainsAny(stdout, AuthPatterns))
+        if (stderrAuthError)
             return new AgentFailureClassification(AgentFailureKind.AuthError, Reason: "auth pattern matched");
 
         // The transient list is intentionally conservative; apply it to the
@@ -433,14 +433,12 @@ public static class AgentFailureClassifier
     {
         if (IsExit127(summary)
             && (ContainsAny(stderr, BinaryNotFoundPatterns)
-                || ContainsAny(stdout, BinaryNotFoundPatterns)
                 || string.IsNullOrWhiteSpace(stderr) && string.IsNullOrWhiteSpace(stdout)))
         {
             return true;
         }
 
-        return IsSandboxWrapperBinaryLaunchFailure(stderr)
-            || IsSandboxWrapperBinaryLaunchFailure(stdout);
+        return IsSandboxWrapperBinaryLaunchFailure(stderr);
     }
 
     private static bool IsMaterialisationFailure(string? summary) =>
