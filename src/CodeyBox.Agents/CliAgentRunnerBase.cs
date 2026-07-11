@@ -961,7 +961,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         return int.TryParse(tail, out var code) ? code : -1;
     }
 
-    private AgentResult? RejectUnsupportedFileBackedCredentials(ISandbox sandbox, AgentCredential? credential)
+    protected AgentResult? RejectUnsupportedFileBackedCredentials(ISandbox sandbox, AgentCredential? credential)
     {
         // In production the sandbox is wrapped by admission-control / reusable decorators that cannot
         // conditionally re-implement the IRejectsFileBackedAgentCredentials marker, so probe the whole
@@ -990,6 +990,10 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 
         return null;
     }
+
+    protected bool SandboxRejectsFileBackedCredentials(ISandbox sandbox) =>
+        FileBackedCredentialEnvironmentVariables.Count > 0
+        && ResolveFileBackedCredentialPolicy(sandbox) is not null;
 
     private static IRejectsFileBackedAgentCredentials? ResolveFileBackedCredentialPolicy(ISandbox sandbox)
     {

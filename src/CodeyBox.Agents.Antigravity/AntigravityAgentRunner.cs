@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.Json;
 using System.Threading;
 using CodeyBox.Agents;
 using CodeyBox.Core;
@@ -39,10 +40,27 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
     /// </summary>
     private const int MaxLogTailBytes = 256 * 1024;
 
+    private const string StructuredStreamOutputFormatFlag = "--output-format";
+    private const string StructuredStreamOutputFormatValue = "stream-json";
+    private const int StructuredStreamProbeJsonMaxDepth = 64;
+    private const int StructuredStreamVersionMaxChars = 256;
+    private const int StructuredStreamBinaryMaxChars = 256;
+    private const int StructuredStreamSupportCacheMaxEntries = 64;
+    private const long MinStructuredStreamProbeTimeoutSeconds = 1;
+    private const long MaxStructuredStreamProbeTimeoutSeconds = 60;
+
+    internal const string StructuredStreamProbePrompt =
+        "Reply with exactly CODEYBOX_STRUCTURED_STREAM_PROBE. Do not inspect or modify files.";
+    internal const int StructuredStreamProbeMaxStdoutBytes = 64 * 1024;
+    internal const int StructuredStreamProbeMaxStderrBytes = 16 * 1024;
+
     // Threads the per-invocation agy log path into BuildAgyInvocation (whose
     // signature is fixed by the base class) without a new IAgentRunner
     // parameter. Set for the duration of a single run and cleared in finally.
     private readonly AsyncLocal<string?> _currentLogPath = new();
+    private readonly object _structuredStreamSupportCacheLock = new();
+    private readonly Dictionary<string, bool> _structuredStreamSupportByVersion = new(StringComparer.Ordinal);
+    private readonly Queue<string> _structuredStreamSupportCacheOrder = new();
 
     public override AgentKind Kind => AgentKind.Antigravity;
 
@@ -67,30 +85,83 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
     public TimeSpan PrintTimeout { get; init; } = TimeSpan.FromMinutes(20);
 
     /// <summary>
-    /// Probes <c>agy --help</c> for structured-stream support. The agy CLI is
-    /// shape-compatible with Claude Code (see <see cref="AntigravityCostExtractor"/>'s
-    /// comment about the terminal <c>type:result</c> NDJSON envelope), so when
-    /// the help text advertises <c>--output-format</c> with <c>stream-json</c>,
-    /// the runner asks for it on the next dispatch. If the flag is absent
-    /// (older agy build, or a release that pivots to a different schema), the
-    /// orchestrator falls back to plaintext capture via the runner's normal
-    /// stdout/stderr stream — captured all the same by AgentStreamStore — and
-    /// <see cref="AntigravityStreamParser"/> defers to the plaintext-fallback
-    /// summary path.
+    /// Verifies structured-stream support with a real one-shot print-mode
+    /// invocation. Some agy builds can mention <c>--output-format stream-json</c>
+    /// in help text without accepting the flag in <c>--print</c>; only a
+    /// successful NDJSON probe enables structured capture. Ambiguous failures
+    /// fall back to plaintext capture. This method executes agy in the supplied
+    /// sandbox and may materialise Antigravity CLI auth/session state before the
+    /// probe; callers must not treat it as a side-effect-free query.
     /// </summary>
     public async Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default)
     {
-        var help = await sandbox.ExecAsync(new SandboxExec
+        try
         {
-            Argv = [Binary, "--help"],
-        }, ct).ConfigureAwait(false);
+            if (SandboxRejectsFileBackedCredentials(sandbox))
+                return false;
 
-        if (!help.Success)
+            var version = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = [Binary, "--version"],
+                MaxStdoutBytes = StructuredStreamProbeMaxStdoutBytes,
+                MaxStderrBytes = StructuredStreamProbeMaxStderrBytes,
+            }, ct).ConfigureAwait(false);
+
+            if (!ProbeExecSucceeded(version))
+                return false;
+
+            if (!TryBuildStructuredStreamCacheKey(Binary, CombinedOutput(version), out var cacheKey))
+                return false;
+
+            if (TryGetCachedStructuredStreamSupport(cacheKey, out var cached))
+                return cached;
+
+            var help = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = [Binary, "--help"],
+                MaxStdoutBytes = StructuredStreamProbeMaxStdoutBytes,
+                MaxStderrBytes = StructuredStreamProbeMaxStderrBytes,
+            }, ct).ConfigureAwait(false);
+
+            if (!ProbeExecSucceeded(help))
+            {
+                CacheStructuredStreamSupport(cacheKey, supported: false);
+                return false;
+            }
+
+            var helpOutput = CombinedOutput(help);
+            if (!helpOutput.Contains(StructuredStreamOutputFormatFlag, StringComparison.Ordinal)
+                || !helpOutput.Contains(StructuredStreamOutputFormatValue, StringComparison.Ordinal))
+            {
+                CacheStructuredStreamSupport(cacheKey, supported: false);
+                return false;
+            }
+
+            if (!await TryMaterialiseAuthForProbeAsync(sandbox, ct).ConfigureAwait(false))
+                return false;
+
+            var probe = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = BuildStructuredStreamProbeArgv(),
+                WorkingDirectory = "/tmp",
+                Stdin = StructuredStreamProbePrompt,
+                MaxStdoutBytes = StructuredStreamProbeMaxStdoutBytes,
+                MaxStderrBytes = StructuredStreamProbeMaxStderrBytes,
+            }, ct).ConfigureAwait(false);
+
+            var supported = ProbeExecSucceeded(probe) && IsStructuredNdjson(probe.Stdout);
+            CacheStructuredStreamSupport(cacheKey, supported);
+            return supported;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            AuditLog.AgentStructuredStreamProbeFailed(Kind, ex.GetType().Name, ex.Message);
             return false;
-
-        var output = string.Concat(help.Stdout, "\n", help.Stderr);
-        return output.Contains("--output-format", StringComparison.Ordinal)
-            && output.Contains("stream-json", StringComparison.Ordinal);
+        }
     }
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories =>
@@ -105,7 +176,7 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
 
     protected override string PreemptProcessPattern => Binary;
 
-    public override Task<AgentResult> RunAsync(
+    public override async Task<AgentResult> RunAsync(
         ISandbox sandbox,
         string workingDirectory,
         string prompt,
@@ -115,12 +186,37 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         CancellationToken ct = default,
         Action<string>? stdoutChunkCallback = null,
         bool captureStructuredStream = false)
-        => RunWithLogCaptureAsync(
+    {
+        if (RejectUnsupportedFileBackedCredentials(sandbox, credential) is { } unsupported)
+            return unsupported;
+
+        var structuredStreamSupported = !captureStructuredStream
+            || await SupportsStructuredStreamAsync(sandbox, ct).ConfigureAwait(false);
+        var effectiveCaptureStructuredStream = captureStructuredStream && structuredStreamSupported;
+
+        var result = await RunWithLogCaptureAsync(
             sandbox,
-            captureStructuredStream,
+            effectiveCaptureStructuredStream,
             stdoutChunkCallback,
             ct,
-            () => base.RunAsync(sandbox, workingDirectory, prompt, credential, modelId, reasoningMode, ct, stdoutChunkCallback, captureStructuredStream));
+            () => base.RunAsync(
+                sandbox,
+                workingDirectory,
+                prompt,
+                credential,
+                modelId,
+                reasoningMode,
+                ct,
+                stdoutChunkCallback,
+                effectiveCaptureStructuredStream)).ConfigureAwait(false);
+
+        if (!captureStructuredStream || structuredStreamSupported)
+            return result;
+
+        var warning = $"Warning: Antigravity CLI at '{Binary}' could not verify {StructuredStreamOutputFormatFlag} {StructuredStreamOutputFormatValue} support in --print mode; structured stream capture was disabled.";
+        var stderr = string.IsNullOrEmpty(result.Stderr) ? warning : $"{warning}\n{result.Stderr}";
+        return result with { Stderr = stderr };
+    }
 
     public override Task<AgentResult> RunResumedAsync(
         ISandbox sandbox,
@@ -448,7 +544,7 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         // agy --print --dangerously-skip-permissions [...]: one-shot prompt
         // that auto-approves tool calls. The sandbox boundary is the real
         // permission boundary — same shape we use for Claude.
-        var argv = new List<string> { Binary, "--print", "--dangerously-skip-permissions" };
+        var argv = BuildAgyPrintModePrefix();
 
         if (_currentLogPath.Value is { } logPath)
         {
@@ -483,17 +579,14 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
             argv.Add(modelId);
         }
 
-        // captureStructuredStream is set by PipelineRunner when
-        // CanCaptureStructuredStreamAsync returned true — i.e.
-        // SupportsStructuredStreamAsync confirmed `agy --help` advertises
-        // the flag. Pass it through so the captured stream file is NDJSON
-        // (AntigravityCostExtractor / AntigravityStreamParser then extract
-        // the structured token usage). When false, agy emits its human-
-        // readable footer and the plaintext-fallback summariser takes over.
+        // captureStructuredStream is set only after SupportsStructuredStreamAsync
+        // has verified that print-mode accepts this flag and emits parseable
+        // NDJSON. When false, agy emits its human-readable footer and the
+        // plaintext-fallback summariser takes over.
         if (captureStructuredStream)
         {
-            argv.Add("--output-format");
-            argv.Add("stream-json");
+            argv.Add(StructuredStreamOutputFormatFlag);
+            argv.Add(StructuredStreamOutputFormatValue);
         }
 
         // Reasoning level is encoded in the model id for Antigravity (each
@@ -507,6 +600,148 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         // prompts that include many audit findings can exceed that and surface
         // as exit 126 from the sandbox wrapper's exec. Mirrors GeminiAgentRunner.
         return new AgentInvocation(argv, Stdin: prompt);
+    }
+
+    private IReadOnlyList<string> BuildStructuredStreamProbeArgv()
+    {
+        var argv = BuildAgyPrintModePrefix();
+        if (PrintTimeout > TimeSpan.Zero)
+        {
+            var probeTimeoutSeconds = Math.Clamp(
+                (long)PrintTimeout.TotalSeconds,
+                MinStructuredStreamProbeTimeoutSeconds,
+                MaxStructuredStreamProbeTimeoutSeconds);
+            argv.Add("--print-timeout");
+            argv.Add($"{probeTimeoutSeconds}s");
+        }
+
+        argv.Add(StructuredStreamOutputFormatFlag);
+        argv.Add(StructuredStreamOutputFormatValue);
+        return argv;
+    }
+
+    private List<string> BuildAgyPrintModePrefix() =>
+        [Binary, "--print", "--dangerously-skip-permissions"];
+
+    private async Task<bool> TryMaterialiseAuthForProbeAsync(ISandbox sandbox, CancellationToken ct)
+    {
+        var write = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["bash", "-c", AuthMaterialisationScript],
+            MaxStdoutBytes = StructuredStreamProbeMaxStdoutBytes,
+            MaxStderrBytes = StructuredStreamProbeMaxStderrBytes,
+        }, ct).ConfigureAwait(false);
+        return ProbeExecSucceeded(write);
+    }
+
+    private const string AuthMaterialisationScript =
+        "set -eu\n" +
+        "umask 077\n" +
+        "mkdir -p \"$HOME/.gemini/antigravity-cli\"\n" +
+        "if [ -n \"${CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON:-}\" ]; then\n" +
+        "  printf '%s' \"$CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON\" > \"$HOME/.gemini/antigravity-cli/antigravity-oauth-token\"\n" +
+        "  chmod 600 \"$HOME/.gemini/antigravity-cli/antigravity-oauth-token\"\n" +
+        "fi\n";
+
+    private static string CombinedOutput(SandboxExecResult result) =>
+        string.Concat(result.Stdout, "\n", result.Stderr);
+
+    private static bool IsStructuredNdjson(string stdout)
+    {
+        var sawStructuredEvent = false;
+        using var reader = new StringReader(stdout);
+        string? line;
+        while ((line = reader.ReadLine()) is not null)
+        {
+            if (string.IsNullOrWhiteSpace(line))
+                continue;
+
+            try
+            {
+                using var document = JsonDocument.Parse(
+                    line,
+                    new JsonDocumentOptions { MaxDepth = StructuredStreamProbeJsonMaxDepth });
+                var root = document.RootElement;
+                if (root.ValueKind != JsonValueKind.Object)
+                    return false;
+
+                sawStructuredEvent |= AntigravityStreamParser.IsStructuredStreamJsonEvent(root);
+            }
+            catch (JsonException)
+            {
+                return false;
+            }
+        }
+
+        return sawStructuredEvent;
+    }
+
+    private static bool ProbeExecSucceeded(SandboxExecResult result) =>
+        result.Success;
+
+    private static bool TryBuildStructuredStreamCacheKey(
+        string binary,
+        string versionOutput,
+        out string cacheKey)
+    {
+        cacheKey = string.Empty;
+        var normalizedBinary = NormalizeCacheComponent(binary, StructuredStreamBinaryMaxChars);
+        var normalizedVersion = NormalizeVersionOutput(versionOutput);
+        if (normalizedBinary is null || normalizedVersion is null)
+            return false;
+
+        cacheKey = $"{normalizedBinary}\n{normalizedVersion}";
+        return true;
+    }
+
+    private static string? NormalizeVersionOutput(string versionOutput)
+    {
+        var parts = versionOutput.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        return NormalizeCacheComponent(string.Join(' ', parts), StructuredStreamVersionMaxChars);
+    }
+
+    private static string? NormalizeCacheComponent(string value, int maxChars)
+    {
+        var trimmed = value.Trim();
+        if (trimmed.Length == 0 || trimmed.Length > maxChars)
+            return null;
+
+        return trimmed;
+    }
+
+    private bool TryGetCachedStructuredStreamSupport(string cacheKey, out bool supported)
+    {
+        lock (_structuredStreamSupportCacheLock)
+        {
+            return _structuredStreamSupportByVersion.TryGetValue(cacheKey, out supported);
+        }
+    }
+
+    private void CacheStructuredStreamSupport(string cacheKey, bool supported)
+    {
+        lock (_structuredStreamSupportCacheLock)
+        {
+            if (_structuredStreamSupportByVersion.ContainsKey(cacheKey))
+            {
+                _structuredStreamSupportByVersion[cacheKey] = supported;
+                return;
+            }
+
+            while (_structuredStreamSupportByVersion.Count >= StructuredStreamSupportCacheMaxEntries
+                && _structuredStreamSupportCacheOrder.TryDequeue(out var oldestKey))
+            {
+                _structuredStreamSupportByVersion.Remove(oldestKey);
+            }
+
+            if (_structuredStreamSupportByVersion.Count >= StructuredStreamSupportCacheMaxEntries)
+            {
+                _structuredStreamSupportByVersion.Clear();
+                _structuredStreamSupportCacheOrder.Clear();
+            }
+
+            _structuredStreamSupportByVersion.Add(cacheKey, supported);
+            _structuredStreamSupportCacheOrder.Enqueue(cacheKey);
+        }
     }
 
     internal const string ConversationCheckpointPrefix = "agy-conversation:";

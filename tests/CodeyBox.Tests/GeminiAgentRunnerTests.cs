@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http;
 using System.Text.Json;
+using CodeyBox.Agents.Antigravity;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -782,8 +783,9 @@ public sealed class GeminiAgentRunnerTests
 }
 
 /// <summary>
-/// Fake sandbox that records the most recent <see cref="SandboxExec"/> it
-/// received and returns configurable exit code, stdout, and stderr.
+/// Fake sandbox that records every <see cref="SandboxExec"/>, exposes the most
+/// recent one, and can return canned version/help/structured-probe responses
+/// before falling back to configurable exit code, stdout, stderr, and chunks.
 /// </summary>
 internal sealed class CapturingSandbox : ISandbox
 {
@@ -808,12 +810,51 @@ internal sealed class CapturingSandbox : ISandbox
     /// stream detection). When null, falls back to the regular stdout/stderr.
     /// </summary>
     public string? HelpOutput { get; init; }
+    public string? VersionOutput { get; init; }
+    public string? StructuredProbeOutput { get; init; }
+    public string? StructuredProbeStderr { get; init; }
+    public int StructuredProbeExitCode { get; init; }
+    public bool VersionStdoutLimitExceeded { get; init; }
+    public bool VersionStderrLimitExceeded { get; init; }
+    public bool HelpStdoutLimitExceeded { get; init; }
+    public bool HelpStderrLimitExceeded { get; init; }
+    public bool StructuredProbeStdoutLimitExceeded { get; init; }
+    public bool StructuredProbeStderrLimitExceeded { get; init; }
+    public List<SandboxExec> Execs { get; } = [];
 
     public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
+        Execs.Add(exec);
         CapturedExec = exec;
+        if (VersionOutput is not null && exec.Argv.Contains("--version"))
+        {
+            return Task.FromResult(new SandboxExecResult(
+                0,
+                VersionOutput,
+                string.Empty,
+                VersionStdoutLimitExceeded,
+                VersionStderrLimitExceeded));
+        }
         if (HelpOutput is not null && exec.Argv.Contains("--help"))
-            return Task.FromResult(new SandboxExecResult(0, HelpOutput, string.Empty));
+        {
+            return Task.FromResult(new SandboxExecResult(
+                0,
+                HelpOutput,
+                string.Empty,
+                HelpStdoutLimitExceeded,
+                HelpStderrLimitExceeded));
+        }
+        if (StructuredProbeOutput is not null
+            && exec.Argv.Contains("--output-format")
+            && string.Equals(exec.Stdin, AntigravityAgentRunner.StructuredStreamProbePrompt, StringComparison.Ordinal))
+        {
+            return Task.FromResult(new SandboxExecResult(
+                StructuredProbeExitCode,
+                StructuredProbeOutput,
+                StructuredProbeStderr ?? string.Empty,
+                StructuredProbeStdoutLimitExceeded,
+                StructuredProbeStderrLimitExceeded));
+        }
         if (_stdoutChunk is not null)
             exec.StdoutChunkCallback?.Invoke(_stdoutChunk);
         return Task.FromResult(new SandboxExecResult(_exitCode, _stdout, _stderr));
