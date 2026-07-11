@@ -22,4 +22,6 @@ public sealed record ComputerUseModelTurnContext
     public required int TurnIndex { get; init; }
     public byte[]? ScreenshotPng { get; init; }
     public IReadOnlyList<ComputerUseRequest> PriorActions { get; init; } = [];
+    public int MaxResponseBytes { get; init; } = BoundedHttpBodyReader.DefaultMaxBodyBytes;
+    public int MaxToolUses { get; init; } = 16;
 }

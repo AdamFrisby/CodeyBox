@@ -20,6 +20,10 @@ public sealed record RecordingComputerUseBridgeOptions
     /// for the web pilot; CLI/API recorders should override.
     /// </summary>
     public string Modality { get; init; } = "web-graphical";
+
+    public int MaxTraceEntries { get; init; } = 256;
+
+    public int MaxTraceBytes { get; init; } = 32 * 1024 * 1024;
 }
 
 /// <summary>
@@ -60,6 +64,7 @@ public sealed class RecordingComputerUseBridge : IComputerUseExplorationTarget
     private SessionTrace _trace;
     private TraceTargetDescriptor? _lastTargetDescriptor;
     private int _sequence;
+    private long _traceBytesUsed;
 
     public RecordingComputerUseBridge(
         ComputerUseBridge inner,
@@ -119,6 +124,36 @@ public sealed class RecordingComputerUseBridge : IComputerUseExplorationTarget
         {
             _trace = _trace with { EndedAt = _timeProvider.GetUtcNow() };
         }
+    }
+
+    private void EnsureTraceCapacity(TraceEntry entry)
+    {
+        if (_entries.Count >= _options.MaxTraceEntries)
+        {
+            throw new InvalidOperationException(
+                $"Authoring trace entry cap of {_options.MaxTraceEntries} was exceeded.");
+        }
+
+        var projected = _traceBytesUsed + EstimateTraceEntryBytes(entry);
+        if (projected > _options.MaxTraceBytes)
+        {
+            throw new InvalidOperationException(
+                $"Authoring trace byte cap of {_options.MaxTraceBytes} was exceeded.");
+        }
+    }
+
+    private static long EstimateTraceEntryBytes(TraceEntry entry)
+    {
+        long bytes = 256;
+        if (entry.Action.TargetDescriptor.AccessibilitySnapshotJson is { } preJson)
+            bytes += System.Text.Encoding.UTF8.GetByteCount(preJson);
+        if (entry.Observation.AccessibilitySnapshotJson is { } postJson)
+            bytes += System.Text.Encoding.UTF8.GetByteCount(postJson);
+        if (entry.Observation.ScreenshotPng is { } screenshot)
+            bytes += screenshot.LongLength;
+        if (entry.Action.TargetDescriptor.Visual?.Region is { } region)
+            bytes += region.Width * region.Height * 4L;
+        return bytes;
     }
 
     /// <summary>
@@ -218,7 +253,9 @@ public sealed class RecordingComputerUseBridge : IComputerUseExplorationTarget
 
         lock (_entries)
         {
+            EnsureTraceCapacity(entry);
             _entries.Add(entry);
+            _traceBytesUsed += EstimateTraceEntryBytes(entry);
         }
 
         return result;

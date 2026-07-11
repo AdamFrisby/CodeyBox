@@ -581,18 +581,18 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
         var allowed = CurrentAllowedOrigins();
         var fillSecrets = _options?.CurrentValue.FillSecrets
             ?? new Dictionary<string, string>(StringComparer.Ordinal);
+        var resolvedSteps = E2eReplaySensitiveValueRedaction.ResolveStepSecrets(artifact.Steps, fillSecrets);
         return new ReplayDriverInput(
             artifact.Name,
             artifact.Readiness,
-            artifact.Steps,
+            resolvedSteps,
             artifact.Assertions,
             allowed
                 .Where(static origin => Uri.TryCreate(origin, UriKind.Absolute, out _))
                 .Select(static origin => E2eReplayOriginPolicy.NormalizeOrigin(new Uri(origin)))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray(),
-            egressPolicy.HostResolverRules,
-            fillSecrets);
+            egressPolicy.HostResolverRules);
     }
 
     private static string NormalizeHost(string host)
@@ -690,8 +690,7 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
         [property: JsonPropertyName("steps")] IReadOnlyList<E2eReplayStep> Steps,
         [property: JsonPropertyName("assertions")] IReadOnlyList<E2eReplayAssertion> Assertions,
         [property: JsonPropertyName("__codeyboxAllowedOrigins")] IReadOnlyList<string> AllowedOrigins,
-        [property: JsonPropertyName("__codeyboxHostResolverRules")] IReadOnlyList<ReplayHostResolverRule> HostResolverRules,
-        [property: JsonPropertyName("__codeyboxFillSecrets")] IReadOnlyDictionary<string, string> FillSecrets);
+        [property: JsonPropertyName("__codeyboxHostResolverRules")] IReadOnlyList<ReplayHostResolverRule> HostResolverRules);
 
     private sealed record ReplayEgressPolicy(
         IReadOnlyList<ReplayAllowedEndpoint> Endpoints,
@@ -759,14 +758,6 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
         function buildAllowedOriginSet(artifact) {
           const origins = Array.isArray(artifact.__codeyboxAllowedOrigins) ? artifact.__codeyboxAllowedOrigins : [];
           return new Set(origins.map(normalizeOrigin));
-        }
-
-        function resolveFillValue(value, artifact) {
-          const raw = String(value || '');
-          const secrets = artifact.__codeyboxFillSecrets;
-          if (!secrets || typeof secrets !== 'object') return raw;
-          if (Object.prototype.hasOwnProperty.call(secrets, raw)) return String(secrets[raw]);
-          return raw;
         }
 
         function ensureAllowedUrl(raw, allowedOrigins, label) {
@@ -838,7 +829,7 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
           }
           else if (action === 'click') await page.locator(step.selector).click();
           else if (action === 'doubleclick') await page.locator(step.selector).dblclick();
-          else if (action === 'fill') await page.locator(step.selector).fill(resolveFillValue(step.value, artifact) || '');
+          else if (action === 'fill') await page.locator(step.selector).fill(step.value || '');
           else if (action === 'press') await page.locator(step.selector).press(step.value || '');
           else if (action === 'select') await page.locator(step.selector).selectOption(step.value || '');
           else if (action === 'check') await page.locator(step.selector).check();

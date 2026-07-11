@@ -12,6 +12,8 @@ public sealed record CheapModelCuaAuthorOptions
 {
     /// <summary>Default Haiku-class model used for computer-use authoring.</summary>
     public string ModelId { get; init; } = "claude-haiku-4-5-20251001";
+
+    public ComputerUseAuthoringLimits AuthoringLimits { get; init; } = new();
 }
 
 /// <summary>
@@ -53,6 +55,7 @@ public sealed class CheapModelCuaAuthor
 
         explorer ??= CreateDefaultExplorer();
         var recorder = CreateRecorder(session, plan);
+        ComputerUseAuthoringActionPolicy.EnsurePlanAllowed(plan, _options.AuthoringLimits);
         await explorer.ExploreAsync(session.Sandbox, recorder, plan, ct).ConfigureAwait(false);
         recorder.EndTrace();
 
@@ -73,10 +76,16 @@ public sealed class CheapModelCuaAuthor
 
     private RecordingComputerUseBridge CreateRecorder(AppUnderTestSession session, E2eExplorationPlan plan)
     {
+        var limits = _options.AuthoringLimits;
         var recorder = new RecordingComputerUseBridge(
             session.ComputerUse,
             _timeProvider,
-            new RecordingComputerUseBridgeOptions { Modality = plan.Modality });
+            new RecordingComputerUseBridgeOptions
+            {
+                Modality = plan.Modality,
+                MaxTraceEntries = limits.MaxTraceEntries,
+                MaxTraceBytes = limits.MaxTraceBytes,
+            });
 
         recorder.SetMetadata(
             targetName: plan.TargetName,
@@ -90,7 +99,10 @@ public sealed class CheapModelCuaAuthor
         if (_defaultModelClient is null)
             throw new InvalidOperationException("No IE2eCuaExplorer was supplied and no default IComputerUseModelClient is configured.");
 
-        return new AnthropicCheapModelCuaExplorer(_defaultModelClient, _options.ModelId);
+        return new AnthropicCheapModelCuaExplorer(
+            _defaultModelClient,
+            _options.ModelId,
+            _options.AuthoringLimits);
     }
 }
 

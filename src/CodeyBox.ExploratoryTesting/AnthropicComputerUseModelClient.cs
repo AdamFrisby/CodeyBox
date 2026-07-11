@@ -87,20 +87,39 @@ public sealed class AnthropicComputerUseModelClient : IComputerUseModelClient
         request.Headers.Add("anthropic-version", AnthropicVersion);
         request.Headers.Add("anthropic-beta", ComputerUseBeta);
 
-        using var response = await _httpClient.SendAsync(request, ct).ConfigureAwait(false);
-        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode)
+        var maxBodyBytes = context.MaxResponseBytes;
+        if (maxBodyBytes is < 1 or > BoundedHttpBodyReader.MaximumBodyBytes)
+            throw new ArgumentOutOfRangeException(nameof(context), "MaxResponseBytes is out of range.");
+
+        var (statusCode, body, bodyTooLarge) = await BoundedHttpBodyReader.SendAsync(
+            _httpClient,
+            request,
+            maxBodyBytes,
+            ct).ConfigureAwait(false);
+
+        if (bodyTooLarge)
         {
-            var tail = body.Length <= 240 ? body : body[^240..];
             throw new InvalidOperationException(
-                $"Anthropic computer-use call failed ({(int)response.StatusCode}): {tail}");
+                $"Anthropic computer-use response exceeded the {maxBodyBytes}-byte cap.");
         }
 
-        return ParseToolUses(body);
+        if ((int)statusCode is < 200 or > 299)
+        {
+            var tail = body is null or { Length: 0 }
+                ? string.Empty
+                : body.Length <= 240 ? body : body[^240..];
+            throw new InvalidOperationException(
+                $"Anthropic computer-use call failed ({(int)statusCode}): {tail}");
+        }
+
+        return ParseToolUses(body ?? string.Empty, context.MaxToolUses);
     }
 
-    internal static IReadOnlyList<ComputerUseRequest> ParseToolUses(string responseJson)
+    internal static IReadOnlyList<ComputerUseRequest> ParseToolUses(string responseJson, int maxToolUses = 16)
     {
+        if (maxToolUses <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxToolUses));
+
         using var doc = JsonDocument.Parse(responseJson);
         var actions = new List<ComputerUseRequest>();
         if (!doc.RootElement.TryGetProperty("content", out var content) || content.ValueKind != JsonValueKind.Array)
@@ -108,6 +127,12 @@ public sealed class AnthropicComputerUseModelClient : IComputerUseModelClient
 
         foreach (var block in content.EnumerateArray())
         {
+            if (actions.Count >= maxToolUses)
+            {
+                throw new InvalidOperationException(
+                    $"Anthropic computer-use response contained more than {maxToolUses} tool_use blocks.");
+            }
+
             if (!block.TryGetProperty("type", out var type) || type.GetString() != "tool_use")
                 continue;
             if (!block.TryGetProperty("input", out var input) || input.ValueKind != JsonValueKind.Object)

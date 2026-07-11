@@ -11,17 +11,17 @@ public sealed class AnthropicCheapModelCuaExplorer : IE2eCuaExplorer
 {
     private readonly IComputerUseModelClient _modelClient;
     private readonly string _modelId;
-    private readonly int _maxTurns;
+    private readonly ComputerUseAuthoringLimits _limits;
 
     public AnthropicCheapModelCuaExplorer(
         IComputerUseModelClient modelClient,
         string modelId,
-        int maxTurns = 32)
+        ComputerUseAuthoringLimits? limits = null)
     {
         _modelClient = modelClient ?? throw new ArgumentNullException(nameof(modelClient));
         CheapModelAllowlist.EnsureCheap(modelId);
         _modelId = modelId;
-        _maxTurns = maxTurns;
+        _limits = limits ?? new ComputerUseAuthoringLimits();
     }
 
     public async Task ExploreAsync(
@@ -34,8 +34,12 @@ public sealed class AnthropicCheapModelCuaExplorer : IE2eCuaExplorer
         ArgumentNullException.ThrowIfNull(target);
         ArgumentNullException.ThrowIfNull(plan);
 
+        ComputerUseAuthoringActionPolicy.EnsurePlanAllowed(plan, _limits);
+
         var priorActions = new List<ComputerUseRequest>();
-        for (var turn = 0; turn < _maxTurns; turn++)
+        var totalExecutedActions = 0;
+
+        for (var turn = 0; turn < _limits.MaxTurns; turn++)
         {
             ct.ThrowIfCancellationRequested();
             var screenshot = await target.ExecuteAsync(
@@ -51,11 +55,19 @@ public sealed class AnthropicCheapModelCuaExplorer : IE2eCuaExplorer
                     TurnIndex = turn,
                     ScreenshotPng = screenshot.ScreenshotPng,
                     PriorActions = priorActions,
+                    MaxResponseBytes = _limits.MaxModelResponseBytes,
+                    MaxToolUses = _limits.MaxActionsPerTurn,
                 },
                 ct).ConfigureAwait(false);
 
             if (actions.Count == 0)
                 break;
+
+            if (actions.Count > _limits.MaxActionsPerTurn)
+            {
+                throw new InvalidOperationException(
+                    $"Model returned {actions.Count} actions; the per-turn cap is {_limits.MaxActionsPerTurn}.");
+            }
 
             foreach (var action in actions)
             {
@@ -63,8 +75,16 @@ public sealed class AnthropicCheapModelCuaExplorer : IE2eCuaExplorer
                 if (string.Equals(action.Action, "screenshot", StringComparison.OrdinalIgnoreCase))
                     continue;
 
+                if (totalExecutedActions >= _limits.MaxTotalActions)
+                {
+                    throw new InvalidOperationException(
+                        $"Authoring action cap of {_limits.MaxTotalActions} total actions was exceeded.");
+                }
+
+                ComputerUseAuthoringActionPolicy.EnsureActionAllowed(action, _limits);
                 await target.ExecuteAsync(sandbox, action, ct).ConfigureAwait(false);
                 priorActions.Add(action);
+                totalExecutedActions++;
             }
         }
     }

@@ -441,4 +441,73 @@ public sealed class E2eReplayArtifactEmitterTests
             ],
         };
     }
+
+    [Fact]
+    public void ResolveStepSecrets_resolves_press_and_fill_placeholders()
+    {
+        var steps = new List<E2eReplayStep>
+        {
+            new() { Action = "fill", Selector = "#password", Value = E2eReplaySensitiveValueRedaction.PasswordPlaceholder },
+            new() { Action = "press", Selector = "#password", Value = E2eReplaySensitiveValueRedaction.PasswordPlaceholder },
+            new() { Action = "click", Selector = "#login-btn" },
+        };
+        var secrets = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            [E2eReplaySensitiveValueRedaction.PasswordPlaceholder] = "secret",
+        };
+
+        var resolved = E2eReplaySensitiveValueRedaction.ResolveStepSecrets(steps, secrets);
+
+        Assert.Equal("secret", resolved[0].Value);
+        Assert.Equal("secret", resolved[1].Value);
+        Assert.Equal("#login-btn", resolved[2].Selector);
+    }
+
+    [Fact]
+    public void ResolveStepSecrets_keeps_placeholder_when_secret_is_empty()
+    {
+        var steps = new List<E2eReplayStep>
+        {
+            new() { Action = "press", Selector = "#password", Value = E2eReplaySensitiveValueRedaction.PasswordPlaceholder },
+        };
+        var secrets = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            [E2eReplaySensitiveValueRedaction.PasswordPlaceholder] = string.Empty,
+        };
+
+        var resolved = E2eReplaySensitiveValueRedaction.ResolveStepSecrets(steps, secrets);
+
+        Assert.Equal(E2eReplaySensitiveValueRedaction.PasswordPlaceholder, Assert.Single(resolved).Value);
+    }
+
+    [Fact]
+    public void ComputerUseAuthoringActionPolicy_rejects_disallowed_actions_and_keys()
+    {
+        var limits = new ComputerUseAuthoringLimits();
+
+        Assert.Throws<InvalidOperationException>(() =>
+            ComputerUseAuthoringActionPolicy.EnsureActionAllowed(
+                new ComputerUseRequest { Action = "scroll", ScrollX = 1 },
+                limits));
+
+        Assert.Throws<InvalidOperationException>(() =>
+            ComputerUseAuthoringActionPolicy.EnsureActionAllowed(
+                new ComputerUseRequest { Action = "key", Key = "Control+Alt+t" },
+                limits));
+    }
+
+    [Fact]
+    public void AnthropicComputerUseModelClient_ParseToolUses_enforces_tool_use_cap()
+    {
+        const string response = """
+            {
+              "content": [
+                { "type": "tool_use", "input": { "action": "screenshot" } },
+                { "type": "tool_use", "input": { "action": "screenshot" } }
+              ]
+            }
+            """;
+
+        Assert.Throws<InvalidOperationException>(() => AnthropicComputerUseModelClient.ParseToolUses(response, maxToolUses: 1));
+    }
 }
