@@ -36,15 +36,19 @@ public sealed class GraphicalSmokeWiringTests
         // always-on prompt-revision trailer, build-script, and mutation-rigor
         // auditors are appended after preset auditors (all auto-included when
         // registered), then the config-enabled-by-default plan-adherence
-        // reviewer is appended last (it self-limits to planned items at run
-        // time). With no language/auditType presets this project ends up with
-        // all five registered always-on auditors composed.
-        Assert.Equal(5, composed.Count);
+        // reviewer and the plan-audit chain (TEST 01) auditors are appended last.
+        // With no language/auditType presets this project ends up with all six
+        // registered always-on auditors composed. (The plan-audit auditor is
+        // Plan-target only, so ComposeForTarget(Code) filters it out; the
+        // untargeted Compose here returns the full registered set.)
+        Assert.Equal(6, composed.Count);
         Assert.IsType<GraphicalSmokeAuditor>(composed[0]);
         Assert.IsType<PromptRevisionTrailerAuditor>(composed[1]);
         Assert.IsType<BuildScriptAuditor>(composed[2]);
         Assert.Equal("tests:mutation-rigor", composed[3].Name);
         Assert.Equal("plan:adherence", composed[4].Name);
+        Assert.Equal(
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test01AuditorName, composed[5].Name);
     }
 
     [Fact]
@@ -67,11 +71,13 @@ public sealed class GraphicalSmokeWiringTests
 
         var composed = composer.Compose(project, new ScriptedAgent([]));
 
-        Assert.Equal(4, composed.Count);
+        Assert.Equal(5, composed.Count);
         Assert.IsType<PromptRevisionTrailerAuditor>(composed[0]);
         Assert.IsType<BuildScriptAuditor>(composed[1]);
         Assert.Equal("tests:mutation-rigor", composed[2].Name);
         Assert.Equal("plan:adherence", composed[3].Name);
+        Assert.Equal(
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test01AuditorName, composed[4].Name);
         Assert.Contains(composed, a => a.Name == BuildScriptAuditor.AuditorName);
         Assert.DoesNotContain(composed, a => a.Name == "gui:smoke");
     }

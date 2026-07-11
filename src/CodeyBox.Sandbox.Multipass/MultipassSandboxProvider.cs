@@ -6695,7 +6695,23 @@ while True:
         // because virtual time is pinned at 0 on success paths — a virtualised
         // launch_deadline would never fire, leaving the "child never wrote its
         // pgid" fallback branch untestable.
+        //
+        // marker_baseline is the virtual instant sampled ONCE here, before the
+        // detached child can publish its pgid file, so the marker deadline is
+        // baseline+wait rather than (now-at-arming)+wait. Sampling at arming
+        // time raced a test that advances the virtual clock the moment it sees
+        // the child's readiness file: if the advance landed before the arming
+        // read, the deadline armed to (advanced_now)+wait and never fired,
+        // hanging the launcher until the watchdog. Anchoring to a pre-child
+        // baseline makes the armed deadline independent of when the supervisor
+        // happens to read the clock. In production (no virtual file) the sample
+        // is $SECONDS, so the marker deadline still lands wait seconds after
+        // launch.
         sb.AppendLine("codeybox_launch_deadline=$((SECONDS + codeybox_marker_wait_seconds))");
+        sb.AppendLine("codeybox_marker_baseline=$(codeybox_now_seconds)");
+        sb.AppendLine("case \"$codeybox_marker_baseline\" in");
+        sb.AppendLine("    ''|*[!0-9]*) codeybox_marker_baseline=0 ;;");
+        sb.AppendLine("esac");
         sb.AppendLine("codeybox_marker_deadline=");
         sb.AppendLine("while ! codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; do");
         sb.AppendLine("    if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
@@ -6705,7 +6721,7 @@ while True:
         sb.AppendLine("        :");
         sb.AppendLine("    fi");
         sb.AppendLine("    if [ -z \"$codeybox_marker_deadline\" ] && [ -s \"$codeybox_child_pgid_file\" ]; then");
-        sb.AppendLine("        codeybox_marker_deadline=$(($(codeybox_now_seconds) + codeybox_marker_wait_seconds))");
+        sb.AppendLine("        codeybox_marker_deadline=$((codeybox_marker_baseline + codeybox_marker_wait_seconds))");
         sb.AppendLine("    fi");
         sb.AppendLine("    if [ -z \"$codeybox_marker_deadline\" ] && [ \"$SECONDS\" -ge \"$codeybox_launch_deadline\" ]; then");
         sb.AppendLine("        codeybox_marker_deadline=$(codeybox_now_seconds)");

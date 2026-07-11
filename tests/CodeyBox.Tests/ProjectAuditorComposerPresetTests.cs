@@ -115,6 +115,49 @@ public sealed class ProjectAuditorComposerPresetTests
     }
 
     [Fact]
+    public void ComposeForTarget_AutoIncludesRegisteredPlanAuditChainOnPlanOnly_ToggledByExclusion()
+    {
+        var planAuditor = new CodeyBox.Audit.Llm.PlanAudit.PlanAuditChainAuditor(
+            new CodeyBox.Audit.Llm.PlanAudit.PlanAuditChainAuditorOptions
+            {
+                Test = CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test01,
+                Agent = new CapturingAgent(),
+            });
+        var composer = new ProjectAuditorComposer(
+            new PresetCatalog(),
+            [planAuditor],
+            NullLogger<ProjectAuditorComposer>.Instance);
+        Project Project(params string[] excluded) => new()
+        {
+            Id = new ProjectId("alpha"),
+            DisplayName = "Alpha",
+            RepositoryUrl = "https://example.com/repo.git",
+            Audit = new ProjectAudit
+            {
+                AuditTypes = ["architecture"],
+                ExcludedAuditors = excluded,
+            },
+        };
+
+        var planTargets = composer.ComposeForTarget(Project(), new CapturingAgent(), AuditTarget.Plan)
+            .Select(a => a.Name).ToArray();
+        var codeTargets = composer.ComposeForTarget(Project(), new CapturingAgent(), AuditTarget.Code)
+            .Select(a => a.Name).ToArray();
+
+        // Auto-included on the plan target for every plan-enabled project...
+        Assert.Contains(CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test01AuditorName, planTargets);
+        // ...but never on the code target (it is Plan-only).
+        Assert.DoesNotContain(CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test01AuditorName, codeTargets);
+
+        // Per-project relevance is the toggle: listing its name removes it.
+        var toggledOff = composer.ComposeForTarget(
+                Project(CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test01AuditorName),
+                new CapturingAgent(), AuditTarget.Plan)
+            .Select(a => a.Name).ToArray();
+        Assert.DoesNotContain(CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test01AuditorName, toggledOff);
+    }
+
+    [Fact]
     public void ComposeForTarget_PlanIncludesBuiltInArchitectureCompletenessAndQuality()
     {
         var composer = new ProjectAuditorComposer(new PresetCatalog());
