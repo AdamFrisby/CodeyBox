@@ -8112,7 +8112,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     ModelId: item.ModelId, ReasoningMode: item.ReasoningMode,
                     PromptRevisionAtDispatch: revisionForCtx,
                     BuildScriptRequired: project.Audit.BuildScriptRequired,
-                    ProjectId: project.Id.Value);
+                    ProjectId: project.Id.Value,
+                    Target: AuditTarget.Code,
+                    // Carry the approved plan into the code audit so the
+                    // plan-adherence reviewer can compare the diff against it.
+                    // Null for unplanned items, which the reviewer treats as
+                    // "no plan to check" and passes as a no-op.
+                    PlanArtifact: item.PlanArtifact);
                 var preCollectedFindings = new List<AuditFinding>();
                 var preCompletedAuditors = new List<string>();
                 var prePassedBuildTestGateEvidence = BuildTestGateEvidence.None;
@@ -8216,7 +8222,19 @@ public sealed partial class PipelineRunner : IPipelineRunner
             if (activeAuditAgentKind is not null)
                 AuditLog.CrossReviewActive(runner.Kind, activeAuditAgentKind.Value);
 
-            var blocking = findings.Where(f => f.Severity >= project.Audit.FailingSeverity).ToList();
+            // Rebalance the code audit for PLANNED items: findings from the
+            // configured approach reviewer(s) are demoted to advisory so a planned
+            // item's rework does not re-litigate an approach the plan stage already
+            // reviewed. Objective gates keep full blocking authority; unplanned
+            // items are unaffected. See PlannedItemAuditRebalance.
+            var pipelineTuning = _pipelineTuning.Current;
+            var itemWasPlanned = HasReviewedPlanArtifact(item);
+            var blocking = PlannedItemAuditRebalance.SelectBlocking(
+                findings,
+                project.Audit.FailingSeverity,
+                itemWasPlanned,
+                pipelineTuning.PlannedItemAuditRebalanceEnabled,
+                pipelineTuning.PlannedItemAdvisoryAuditors).ToList();
             if (incompleteVerdict && findings.Count == 0)
             {
                 var incompleteList = incompleteAuditors.Count == 0
@@ -8316,6 +8334,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 "self_review_checklist", selfReviewChecklistEnabled ? "on" : "off");
             var iterationTag = new KeyValuePair<string, object?>(
                 "iteration", iteration.ToString());
+            // Cohort tag for planned-vs-unplanned measurement. Every AuditIterations
+            // emission carries it so dashboards can compare code-stage iteration
+            // count across the two cohorts.
+            var plannedTag = new KeyValuePair<string, object?>(
+                "planned", itemWasPlanned ? "on" : "off");
 
             if (blocking.Count == 0)
             {
@@ -8325,14 +8348,21 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 CodeyBoxMeters.AuditIterations.Add(1,
                     new KeyValuePair<string, object?>("outcome", "passed"),
                     selfReviewTag,
-                    iterationTag);
+                    iterationTag,
+                    plannedTag);
                 EmitSessionAuditOutcomeMetrics(iteration, "passed");
                 if (iteration == 1)
+                {
+                    EmitFirstAuditOutcomeMetric("passed", plannedTag);
                     EmitSessionFirstAuditOutcomeMetric("passed");
+                }
                 return false;
             }
             if (iteration == 1)
+            {
+                EmitFirstAuditOutcomeMetric("failed", plannedTag);
                 EmitSessionFirstAuditOutcomeMetric("failed");
+            }
 
             _log.LogInformation("Audit iteration {Iter} of {Max} found {Count} blocking findings for {Id}",
                 iteration, maxIterations, blocking.Count, item.Id);
@@ -8344,7 +8374,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     CodeyBoxMeters.AuditIterations.Add(1,
                         new KeyValuePair<string, object?>("outcome", "needs_operator_input"),
                         selfReviewTag,
-                        iterationTag);
+                        iterationTag,
+                        plannedTag);
                     EmitSessionAuditOutcomeMetrics(iteration, "needs_operator_input");
                     await ParkAuditMaxIterationsForOperatorAsync(item, project, auditHistory, ct);
                     return true;
@@ -8353,7 +8384,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 CodeyBoxMeters.AuditIterations.Add(1,
                     new KeyValuePair<string, object?>("outcome", "failed"),
                     selfReviewTag,
-                    iterationTag);
+                    iterationTag,
+                    plannedTag);
                 EmitSessionAuditOutcomeMetrics(iteration, "failed");
                 AuditLog.AuditFailed(iteration, blocking.Count);
                 var summary = string.Join("; ", blocking
@@ -8366,7 +8398,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             CodeyBoxMeters.AuditIterations.Add(1,
                 new KeyValuePair<string, object?>("outcome", "reworking"),
                 selfReviewTag,
-                iterationTag);
+                iterationTag,
+                plannedTag);
             // Close the audit phase scope before the incremental rebase and
             // rework begins; neither should contribute to audit duration.
             auditPhaseScope.Dispose();
@@ -8423,6 +8456,27 @@ public sealed partial class PipelineRunner : IPipelineRunner
     }
 
     /// <summary>
+    /// Emits the always-on first-audit-outcome counter tagged with the planned
+    /// cohort. Called once per work item (only at iteration == 1) so dashboards
+    /// can chart first-audit pass-rate for PLANNED vs UNPLANNED items — the
+    /// measurement proving whether planning improves the first-pass rate.
+    /// Observability must never break a pipeline step, so any failure is silent.
+    /// </summary>
+    private static void EmitFirstAuditOutcomeMetric(string outcome, KeyValuePair<string, object?> plannedTag)
+    {
+        try
+        {
+            CodeyBoxMeters.FirstAuditOutcome.Add(1,
+                new KeyValuePair<string, object?>("outcome", outcome),
+                plannedTag);
+        }
+        catch
+        {
+            // Observability must never break a pipeline step.
+        }
+    }
+
+    /// <summary>
     /// Emits the session-mode first-audit-outcome counter with the
     /// <c>self_review</c> tag. Called once per session item (only at
     /// iteration == 1) so dashboards can chart first-audit pass-rate WITH vs
@@ -8464,13 +8518,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (HasAuditConvergenceProgress(auditHistory))
         {
             CodeyBoxMeters.AuditIterations.Add(1,
-                new KeyValuePair<string, object?>("outcome", "needs_operator_input"));
+                new KeyValuePair<string, object?>("outcome", "needs_operator_input"),
+                new KeyValuePair<string, object?>("planned", HasReviewedPlanArtifact(item) ? "on" : "off"));
             await ParkAuditMaxIterationsForOperatorAsync(item, project, auditHistory, ct);
             return true;
         }
 
         var last = auditHistory[^1];
-        CodeyBoxMeters.AuditIterations.Add(1, new KeyValuePair<string, object?>("outcome", "failed"));
+        CodeyBoxMeters.AuditIterations.Add(1,
+            new KeyValuePair<string, object?>("outcome", "failed"),
+            new KeyValuePair<string, object?>("planned", HasReviewedPlanArtifact(item) ? "on" : "off"));
         var blockingFindings = BlockingProgressFindingsForSummary(last);
         AuditLog.AuditFailed(last.Iteration, blockingFindings.Count);
         var summary = string.Join("; ", blockingFindings

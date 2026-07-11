@@ -200,9 +200,58 @@ public sealed class PipelineTuningOptions
     /// </summary>
     public bool SelfReviewChecklistEnabled { get; set; }
 
+    /// <summary>
+    /// The plan-stage "approach" reviewer whose CODE-audit findings are demoted
+    /// to advisory for planned items by default. This is the architecture LLM
+    /// reviewer (audit-type <c>architecture</c>, name <c>architecture:llm-review</c>),
+    /// which already ran at the plan-review stage for planned items — re-blocking
+    /// on it during code rework is the "re-litigating the approach" the planning
+    /// loop is meant to avoid. Operators override the full set via
+    /// <see cref="PlannedItemAdvisoryAuditors"/>.
+    /// </summary>
+    public const string DefaultPlannedItemAdvisoryAuditor = "architecture:llm-review";
+
+    /// <summary>
+    /// Whether the code audit is rebalanced toward objective checks for PLANNED
+    /// items: blocking findings from the <see cref="PlannedItemAdvisoryAuditors"/>
+    /// are demoted to advisory (recorded, not merge-blocking) so a planned item's
+    /// code rework does not re-litigate an approach the plan stage already
+    /// reviewed. Objective gates (build, tests, security, cheating, completeness,
+    /// plan-adherence) always keep full blocking authority. No effect on
+    /// unplanned items. Default true. Hot-reloaded with the rest of
+    /// <c>PipelineTuning</c>.
+    /// </summary>
+    public bool PlannedItemAuditRebalanceEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Auditor names whose code-audit findings are demoted from blocking to
+    /// advisory for planned items when
+    /// <see cref="PlannedItemAuditRebalanceEnabled"/> is true. Matched
+    /// case-insensitively against <see cref="Core.AuditFinding.AuditorName"/>.
+    /// Defaults to the single plan-stage approach reviewer
+    /// (<see cref="DefaultPlannedItemAdvisoryAuditor"/>). Never list objective
+    /// gates here (build/test gates, security, cheating, completeness,
+    /// plan-adherence): demoting those would let a planned item merge past a
+    /// real defect. An empty list disables demotion without disabling the flag.
+    /// </summary>
+    public IList<string> PlannedItemAdvisoryAuditors { get; set; } =
+        new List<string> { DefaultPlannedItemAdvisoryAuditor };
+
     public void Validate()
     {
         _ = PlanReviewIterationLimit.Create(MaxPlanReviewIterations);
+        if (PlannedItemAdvisoryAuditors is null)
+        {
+            throw new ArgumentNullException(
+                nameof(PlannedItemAdvisoryAuditors),
+                "PlannedItemAdvisoryAuditors must not be null (use an empty list to disable demotion).");
+        }
+        if (PlannedItemAdvisoryAuditors.Any(string.IsNullOrWhiteSpace))
+        {
+            throw new ArgumentException(
+                "PlannedItemAdvisoryAuditors entries must be non-empty auditor names.",
+                nameof(PlannedItemAdvisoryAuditors));
+        }
         if (!double.IsFinite(PlanTaskBindingCoverageRatio)
             || PlanTaskBindingCoverageRatio <= 0.0
             || PlanTaskBindingCoverageRatio > 1.0)
