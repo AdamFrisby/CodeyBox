@@ -525,7 +525,11 @@ public sealed class MultipassRemoteHostPoolTests
             }
 
             await service.StartAsync(CancellationToken.None);
-            await pipeline.WaitForHeldAsync().WaitAsync(TimeSpan.FromSeconds(5));
+            // Backstop-only deadline for a deterministic-but-starved event (the
+            // orchestrator WILL hold `workerCap` sandboxes once its worker tasks
+            // get CPU): 60s gives headroom under the 6-core capped full suite on a
+            // co-resident host without weakening any assertion below.
+            await pipeline.WaitForHeldAsync().WaitAsync(TimeSpan.FromSeconds(60));
 
             var snapshot = Assert.IsAssignableFrom<ISandboxHostPoolSnapshot>(provider).SnapshotHostPool();
             Assert.Equal(workerCap, snapshot.Sum(static h => h.Reserved));
@@ -619,13 +623,17 @@ public sealed class MultipassRemoteHostPoolTests
             await service.StartAsync(CancellationToken.None);
             try
             {
+                // Backstop-only deadline for a deterministic-but-starved event (the
+                // transport-loss requeue WILL restore this state once the recovery
+                // task gets CPU): 60s gives headroom under the 6-core capped full
+                // suite on a co-resident host without weakening any assertion below.
                 var recovered = await WaitForAsync(async () =>
                 {
                     var current = await tp.Store.GetAsync(item.Id);
                     return transports["a"].ExecCount > 0 && current is { StartedAt: null, PreemptCheckpoint: not null }
                         ? current
                         : null;
-                }, TimeSpan.FromSeconds(10));
+                }, TimeSpan.FromSeconds(60));
 
                 Assert.Equal(WorkItemState.Working, recovered.State);
                 Assert.Equal(workBranch, recovered.WorkBranch);

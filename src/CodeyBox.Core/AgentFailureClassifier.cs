@@ -198,6 +198,10 @@ public static class AgentFailureClassifier
         "timeout waiting for child process to exit",
         "Connection timed out",
         "i/o timeout",
+        "agent output HTTP ingest unavailable before launch",
+        "agent output transport produced nothing",
+        "detached run reported no exit",
+        "without authenticated exit completion",
     };
 
     private static string[] _transientNetworkPatterns = DefaultTransientNetworkPatterns.ToArray();
