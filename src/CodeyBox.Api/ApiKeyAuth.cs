@@ -90,7 +90,7 @@ internal static class ApiKeyAuth
                 }
             }
 
-            if (!TryExtractBearer(ctx, out var presented) || !ConstantTimeEquals(presented, state.Token!))
+            if (!IsAuthorized(ctx, state))
             {
                 ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
                 ctx.Response.Headers["WWW-Authenticate"] = "Bearer";
@@ -100,6 +100,15 @@ internal static class ApiKeyAuth
 
             await next();
         });
+    }
+
+    public static bool IsAuthorized(HttpContext ctx, ApiKeyState state)
+    {
+        ArgumentNullException.ThrowIfNull(ctx);
+        ArgumentNullException.ThrowIfNull(state);
+
+        return state.Disabled
+            || (TryExtractBearer(ctx, out var presented) && ConstantTimeEquals(presented, state.Token!));
     }
 
     private static bool TryExtractBearer(HttpContext ctx, out string token)

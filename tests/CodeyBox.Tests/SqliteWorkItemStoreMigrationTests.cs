@@ -137,6 +137,33 @@ public sealed class SqliteWorkItemStoreMigrationTests : IDisposable
     }
 
     [Fact]
+    public async Task AuthFailureScope_RoundTripsThroughWorkItemStore()
+    {
+        using var store = new SqliteWorkItemStore(_dbPath);
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("proj"),
+            Title = "auth",
+            Prompt = "p",
+        };
+        await store.CreateAsync(item);
+
+        var failed = item.With(
+            WorkItemState.Failed,
+            "auth required",
+            failureKind: WorkItemFailureKinds.AuthRequired,
+            authFailureScope: WorkItemAuthFailureScope.Fleet);
+        await store.UpdateAsync(failed);
+
+        var read = await store.GetAsync(item.Id);
+
+        Assert.NotNull(read);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, read!.FailureKind);
+        Assert.Equal(WorkItemAuthFailureScope.Fleet, read.AuthFailureScope);
+    }
+
+    [Fact]
     public async Task Backfill_SkipsItemsWithNullExternalIdColumn()
     {
         // Items that never had a legacy external_id must NOT produce a side-table row.

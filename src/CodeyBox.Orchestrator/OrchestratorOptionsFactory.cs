@@ -162,6 +162,69 @@ public static class OrchestratorOptionsFactory
         };
     }
 
+    public static AgentRestoreRetryOptions BuildAgentRestoreRetryOptions(
+        bool enabled,
+        string lookbackGrace,
+        string postRestoreMargin,
+        string? involvementTerminalLookback = null,
+        string? involvementTerminalClockSkew = null,
+        int maxCandidatesPerSweep = AgentRestoreRetryOptions.DefaultMaxCandidatesPerSweep,
+        int eventQueueCapacity = AgentRestoreRetryOptions.DefaultEventQueueCapacity)
+    {
+        if (!enabled)
+            return new AgentRestoreRetryOptions { Enabled = false };
+
+        var lookback = ParseNonNegativeTimeSpan(
+            "CodeyBox:AutoRequeueOnAgentRestore:LookbackGrace",
+            lookbackGrace,
+            AgentRestoreRetryOptions.DefaultLookbackGraceConfigValue);
+        var margin = ParseNonNegativeTimeSpan(
+            "CodeyBox:AutoRequeueOnAgentRestore:PostRestoreMargin",
+            postRestoreMargin,
+            AgentRestoreRetryOptions.DefaultPostRestoreMarginConfigValue);
+        var terminalLookback = ParseNonNegativeTimeSpan(
+            "CodeyBox:AutoRequeueOnAgentRestore:InvolvementTerminalLookback",
+            involvementTerminalLookback ?? AgentRestoreRetryOptions.DefaultInvolvementTerminalLookbackConfigValue,
+            AgentRestoreRetryOptions.DefaultInvolvementTerminalLookbackConfigValue);
+        var terminalClockSkew = ParseNonNegativeTimeSpan(
+            "CodeyBox:AutoRequeueOnAgentRestore:InvolvementTerminalClockSkew",
+            involvementTerminalClockSkew ?? AgentRestoreRetryOptions.DefaultInvolvementTerminalClockSkewConfigValue,
+            AgentRestoreRetryOptions.DefaultInvolvementTerminalClockSkewConfigValue);
+
+        if (maxCandidatesPerSweep <= 0)
+            throw new InvalidOperationException(
+                "CodeyBox:AutoRequeueOnAgentRestore:MaxCandidatesPerSweep must be positive");
+
+        if (eventQueueCapacity <= 0)
+            throw new InvalidOperationException(
+                "CodeyBox:AutoRequeueOnAgentRestore:EventQueueCapacity must be positive");
+
+        return new AgentRestoreRetryOptions
+        {
+            Enabled = true,
+            LookbackGrace = lookback,
+            PostRestoreMargin = margin,
+            InvolvementTerminalLookback = terminalLookback,
+            InvolvementTerminalClockSkew = terminalClockSkew,
+            MaxCandidatesPerSweep = maxCandidatesPerSweep,
+            EventQueueCapacity = eventQueueCapacity,
+        };
+    }
+
+    private static TimeSpan ParseNonNegativeTimeSpan(
+        string configPath,
+        string? rawValue,
+        string exampleValue)
+    {
+        if (!TimeSpan.TryParse(rawValue, System.Globalization.CultureInfo.InvariantCulture, out TimeSpan value))
+            throw new InvalidOperationException(
+                $"{configPath} must be a valid TimeSpan (e.g. '{exampleValue}')");
+        if (value < TimeSpan.Zero)
+            throw new InvalidOperationException(
+                $"{configPath} must be non-negative");
+        return value;
+    }
+
     public static AutoRetryOnQuotaFailureOptions BuildAutoRetryOptions(
         bool enabled,
         string periodicCheckInterval,

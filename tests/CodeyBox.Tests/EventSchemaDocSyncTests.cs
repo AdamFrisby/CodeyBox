@@ -111,8 +111,10 @@ public sealed class EventSchemaDocSyncTests
                 !kv.Key.StartsWith("worker_pool.", StringComparison.Ordinal) &&
                 kv.Key is not "agent.paused"
                     and not "agent.resumed"
+                    and not "agent.restore_requeue_swept"
                     and not "work_item.waiting_for_agent_resume"
                     and not "work_item.waiting_for_transient_retry"
+                    and not "work_item.agent_restore_requeued"
                     and not "work_item.planning"
                     and not "work_item.plan_review"
                     and not "work_item.plan_approved"),
@@ -123,6 +125,8 @@ public sealed class EventSchemaDocSyncTests
         Assert.Equal("1.3", schema.EventTypes["agent.resumed"].IntroducedIn);
         Assert.Equal("1.3", schema.EventTypes["work_item.waiting_for_agent_resume"].IntroducedIn);
         Assert.Equal("1.4", schema.EventTypes["work_item.waiting_for_transient_retry"].IntroducedIn);
+        Assert.Equal("1.5", schema.EventTypes["agent.restore_requeue_swept"].IntroducedIn);
+        Assert.Equal("1.5", schema.EventTypes["work_item.agent_restore_requeued"].IntroducedIn);
         Assert.Equal("1.5", schema.EventTypes["work_item.planning"].IntroducedIn);
         Assert.Equal("1.5", schema.EventTypes["work_item.plan_review"].IntroducedIn);
         Assert.Equal("1.5", schema.EventTypes["work_item.plan_approved"].IntroducedIn);

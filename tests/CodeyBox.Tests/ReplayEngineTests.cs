@@ -5,6 +5,7 @@ using CodeyBox.Sandbox.Graphical;
 using System.Buffers.Binary;
 using System.IO.Compression;
 using System.Text;
+using ControllableTimeProvider = Microsoft.Extensions.Time.Testing.FakeTimeProvider;
 
 namespace CodeyBox.Tests;
 
@@ -363,7 +364,8 @@ public sealed class ReplayEngineTests
             ? Task.FromResult(frames.Dequeue())
             : Task.FromResult<byte[]>(new byte[] { 9, 9 });
 
-        var wait = new ScreenshotStabilityWait();
+        var clock = new ControllableTimeProvider(FrozenNow);
+        var wait = new ScreenshotStabilityWait(clock);
         var options = new ReplayOptions
         {
             VisualWaitPollInterval = TimeSpan.FromMilliseconds(1),
@@ -371,7 +373,16 @@ public sealed class ReplayEngineTests
             StableFrameCount = 2,
         };
 
-        var settled = await wait.WaitAsync(sandbox, predicate: null, options, CancellationToken.None);
+        var task = wait.WaitAsync(sandbox, predicate: null, options, CancellationToken.None);
+        var maxPollsThroughTimeout = (int)(options.VisualWaitTimeout.Ticks / options.VisualWaitPollInterval.Ticks) + 2;
+        for (var i = 0; i < maxPollsThroughTimeout && !task.IsCompleted; i++)
+        {
+            clock.Advance(options.VisualWaitPollInterval);
+            await Task.Yield();
+        }
+        if (!task.IsCompleted)
+            Assert.Fail("visual wait did not complete after advancing the injected clock through its timeout");
+        var settled = await task;
 
         Assert.NotNull(settled);
         Assert.Equal(new byte[] { 9, 9 }, settled);

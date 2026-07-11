@@ -242,6 +242,60 @@ public sealed class RecoveryCancellationPipelineTests : IDisposable
     }
 
     [Fact]
+    public async Task OperatorCancel_RowRecoveredBeforeCancelHandlerRead_DoesNotOverwrite_NoCancelWebhook()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var registry = new CancellationRegistry(CancellationToken.None);
+        var webhooks = new RecordingWebhookDispatcher();
+        var raceFactory = (SqliteWorkItemStore inner) => new RaceAdvancingStore(inner);
+
+        using var harness = BuildPipeline(
+            seed,
+            new BlockingAgentRunner(),
+            registry,
+            webhooks,
+            storeDecorator: raceFactory);
+
+        var raceStore = (RaceAdvancingStore)harness.PipelineStore;
+
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+
+        using var registration = registry.Register(item.Id);
+        using var hostShutdownCts = new CancellationTokenSource();
+
+        var pipelineTask = Task.Run(() =>
+            harness.Pipeline.RunAsync(item, registration.Token, hostShutdownCts.Token));
+
+        await WaitForStateAsync(harness.Store, item.Id, WorkItemState.Working, TimeSpan.FromSeconds(30));
+
+        raceStore.ArmRace();
+        var staleSnapshot = await raceStore.GetAsync(item.Id);
+        Assert.NotNull(staleSnapshot);
+        Assert.Equal(WorkItemState.Working, staleSnapshot!.State);
+        Assert.True(raceStore.RaceInjected,
+            "Race was not injected — the test did not exercise the recovered-before-handler branch.");
+
+        var recoveredBeforeCancel = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(recoveredBeforeCancel);
+        Assert.Equal(WorkItemState.Queued, recoveredBeforeCancel!.State);
+
+        Assert.True(registry.Cancel(item.Id));
+        Assert.Equal(CancellationRequestKind.Operator, registry.GetRequestKind(item.Id));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pipelineTask);
+
+        var final = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Queued, final!.State);
+        Assert.Null(final.CancellationReason);
+        Assert.Null(final.CancellationSource);
+
+        Assert.DoesNotContain(webhooks.Events, e =>
+            string.Equals(e.Event, "work_item.cancelled", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task OperatorCancel_RacingTransientAgentFailure_CancelsInsteadOfParkingTransientRetry()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

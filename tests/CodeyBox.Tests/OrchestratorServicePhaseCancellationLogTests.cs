@@ -13,6 +13,11 @@ namespace CodeyBox.Tests;
 /// a typo in the template, swallowing the wrong exception type, or omitting
 /// the phase/source placeholders would silently regress the operator dashboard
 /// contract advertised in docs/audit-logging.md and docs/work-items.md.
+///
+/// <para>Pinned to the "Background service timing" collection because both
+/// tests wait up to 15s for the OrchestratorService worker loop to pick the
+/// item up — suite-level threadpool contention from parallel fixtures pushed
+/// pickup past the 10s pipeline-started wait / 15s log-observed wait.</para>
 /// </summary>
 // Serialised with other BackgroundService timing-sensitive tests: the host-shutdown
 // case waits up to 10s for the pipeline's Started TCS to signal, which can miss

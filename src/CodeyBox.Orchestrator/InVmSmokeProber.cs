@@ -621,6 +621,13 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
             // evidence the CLI launches and may lift the fast-fail circuit breaker.
             transition = _availability.MarkSmokeResult(
                 probe.Kind, result, SmokeExclusionSource.InVmSmoke, clearsFastFail: true);
+            if (result.Ok)
+            {
+                var authTransition = _availability.MarkSmokeResult(
+                    probe.Kind, result, SmokeExclusionSource.AuthRequired, clearsFastFail: false);
+                if (!transition.PreviouslyExcluded || transition.NowExcluded)
+                    transition = authTransition;
+            }
         }
         await EmitTransitionEventsAsync(probe.Kind, result, transition);
         return result;

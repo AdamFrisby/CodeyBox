@@ -13,6 +13,12 @@ namespace CodeyBox.Tests;
 /// (<c>SweepIntervalSeconds &lt;= 0</c>) path, the repeating interval loop
 /// (<c>SweepIntervalSeconds &gt; 0</c>), and that a sweep fault is swallowed
 /// instead of escaping <c>ExecuteAsync</c>.
+///
+/// <para>Pinned to the "Background service timing" collection because
+/// <c>StartupSweep_*</c> waits on the <c>ExecuteTask</c> of a
+/// <see cref="BackgroundService"/> with a 15s budget — suite-level threadpool
+/// contention from parallel fixtures was tripping <c>AwaitExecute</c>'s
+/// <c>Assert.Same(done, winner)</c>.</para>
 /// </summary>
 // Serialised with other BackgroundService timing-sensitive tests: AwaitExecute
 // races ExecuteTask against a 15s Task.Delay; parallel CPU contention from other

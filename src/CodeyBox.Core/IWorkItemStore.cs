@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+
 namespace CodeyBox.Core;
 
 /// <summary>
@@ -299,6 +301,89 @@ public interface IWorkItemStore
             "This work item store must implement bounded WaitingForQuotaReset priority queries before quota recovery sweeps can run.");
 
     /// <summary>
+    /// Returns at most <paramref name="limit"/> terminal rows eligible for the
+    /// agent-restore retry sweep. Implementations must push the state, outage
+    /// window, <see cref="AgentRestoreRetryCandidatePolicy"/>, latest failed
+    /// involvement attribution, ordering, and limit into the backing store so a
+    /// restore event cannot buffer all historical failures, consume the sweep
+    /// cap with unrelated agents' failures, or reject infrastructure failures
+    /// before the scheduler can apply the same involvement-aware policy.
+    /// </summary>
+    IAsyncEnumerable<WorkItem> ListRestoreRetryCandidatesAsync(
+        AgentKind restoredAgent,
+        DateTimeOffset windowStart,
+        DateTimeOffset windowEnd,
+        TimeSpan involvementTerminalLookback,
+        TimeSpan involvementTerminalClockSkew,
+        int limit,
+        DateTimeOffset? afterUpdatedAt = null,
+        WorkItemId? afterId = null,
+        CancellationToken ct = default)
+        => throw new NotSupportedException(
+            "This work item store must implement involvement-aware agent-restore retry candidate listing.");
+
+    /// <summary>
+    /// Returns true when an agent-restore retry was already claimed for the
+    /// same work item, restored agent, and outage start. Used before retrying so
+    /// duplicate restore events do not repeat work already handled for this
+    /// outage window.
+    /// </summary>
+    Task<bool> HasAgentRestoreRetryClaimAsync(
+        WorkItemId id,
+        AgentKind restoredAgent,
+        DateTimeOffset outageStartedAt,
+        CancellationToken ct = default)
+        => throw new NotSupportedException(
+            "This work item store does not implement agent-restore retry claim lookup.");
+
+    /// <summary>
+    /// Claims a work item for a single agent-restore sweep key before the retry
+    /// mutation is attempted. Persistent stores should make this atomic and
+    /// return false when another duplicate restore event already claimed the
+    /// same item/window.
+    /// </summary>
+    Task<bool> TryClaimAgentRestoreRetryAsync(
+        WorkItemId id,
+        AgentKind restoredAgent,
+        DateTimeOffset outageStartedAt,
+        DateTimeOffset restoredAt,
+        CancellationToken ct = default)
+        => throw new NotSupportedException(
+            "This work item store does not implement agent-restore retry claims.");
+
+    /// <summary>
+    /// Atomically claims an agent-restore retry key and applies the guarded
+    /// retry update. Stores used by the restore-retry scheduler must override
+    /// this operation and commit the claim and state transition together so a
+    /// process crash cannot leave a terminal item permanently skipped by an
+    /// idempotency row that never requeued it.
+    /// </summary>
+    Task<bool> TryUpdateIfStateAndUpdatedAtWithAgentRestoreRetryClaimAsync(
+        WorkItem item,
+        WorkItemState onlyIfState,
+        DateTimeOffset onlyIfUpdatedAt,
+        AgentKind restoredAgent,
+        DateTimeOffset outageStartedAt,
+        DateTimeOffset restoredAt,
+        CancellationToken ct = default)
+        => throw new NotSupportedException(
+            "This work item store does not implement atomic agent-restore retry claim updates.");
+
+    /// <summary>
+    /// Releases a previously created agent-restore retry claim when the retry
+    /// mutation or queue kick failed, so a later sweep for the same restore
+    /// window can try again. Must match the same idempotency key as
+    /// <see cref="TryClaimAgentRestoreRetryAsync"/>.
+    /// </summary>
+    Task ReleaseAgentRestoreRetryClaimAsync(
+        WorkItemId id,
+        AgentKind restoredAgent,
+        DateTimeOffset outageStartedAt,
+        CancellationToken ct = default)
+        => throw new NotSupportedException(
+            "This work item store does not implement agent-restore retry claim release.");
+
+    /// <summary>
     /// Returns the number of work items currently persisted in
     /// <paramref name="state"/> without loading the rows.
     /// </summary>
@@ -346,7 +431,7 @@ public interface IWorkItemStore
         DateTimeOffset now,
         int limit,
         QuotaRetryDispatchEligibility quotaRetryEligibility = QuotaRetryDispatchEligibility.DueOnly,
-        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<(WorkItem Item, WorkItemState OrderingState, int Sequence)>();
         var sequence = 0;

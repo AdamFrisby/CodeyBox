@@ -53,7 +53,8 @@ public enum TransitionClassification
 /// When <see cref="Classification"/> is <see cref="TransitionClassification.InfraFailure"/>,
 /// a short kind label (<c>quota</c>, <c>timeout</c>, <c>agent</c>,
 /// <c>auditor_failed</c>, <c>infrastructure</c>, <c>build</c>, <c>configuration</c>,
-/// <c>agent_unavailable</c>, <c>merge_conflict_resolution_failed</c>) used in
+/// <c>agent_unavailable</c>, <c>agent_routing_unavailable</c>,
+/// <c>merge_conflict_resolution_failed</c>) used in
 /// the breakdown's <c>infraByKind</c> tally. Null for Legitimate / Skipped.
 /// </param>
 /// <param name="OccurredAt">

@@ -18,6 +18,7 @@ public sealed class DefaultTerminalFailureClassifierTests
     [Theory]
     [InlineData("infrastructure", TerminalFailureClass.Transient)]
     [InlineData("agent_unavailable", TerminalFailureClass.Transient)]
+    [InlineData("agent_routing_unavailable", TerminalFailureClass.Transient)]
     public void Infra_shaped_failures_are_Transient(string kind, TerminalFailureClass expected)
     {
         var item = BuildItem(state: WorkItemState.Failed, kind);
@@ -100,7 +101,7 @@ public sealed class DefaultTerminalFailureClassifierTests
     {
         foreach (var kind in new[]
         {
-            "quota", "infrastructure", "agent_unavailable", "timeout",
+            "quota", "infrastructure", "agent_unavailable", "agent_routing_unavailable", "timeout",
             "build", "agent", "configuration", "cancelled", WorkItemFailureKinds.AuthRequired, "other", null,
         })
         {

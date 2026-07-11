@@ -141,6 +141,8 @@ public sealed class PickupSmokeTests : IDisposable
 
         var final = await r.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AgentUnavailable, final.FailureKind);
+        Assert.Equal(AgentKind.Claude, final.Agent);
     }
 
     [Fact]
