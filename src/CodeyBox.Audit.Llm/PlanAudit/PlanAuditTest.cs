@@ -64,6 +64,9 @@ public static class PlanAuditTests
     /// <summary>Stable name of the TEST 02 auditor (referenced by DI + composition).</summary>
     public const string Test02AuditorName = "plan:goal-scope-acceptance";
 
+    /// <summary>Stable name of the TEST 03 auditor (referenced by DI + composition).</summary>
+    public const string Test03AuditorName = "plan:architecture-boundary";
+
     /// <summary>
     /// TEST 01 — PLAN INTEGRITY AND EVIDENCE CLASSIFICATION. Determines whether
     /// the plan is grounded in the actual system rather than hallucinated
@@ -181,10 +184,83 @@ public static class PlanAuditTests
     };
 
     /// <summary>
+    /// TEST 03 — ARCHITECTURAL BOUNDARY, MODULARITY, AND COUPLING. Determines
+    /// whether the plan places the change inside the correct architectural
+    /// boundary with minimal coupling and appropriate abstraction — the right
+    /// module/layer owns the new behavior, domain logic stays out of
+    /// UI/transport/persistence/glue, and any new interface, adapter, service, or
+    /// abstraction is justified by concrete volatility, testability, security, a
+    /// second implementation, or a clearly-owned boundary rather than vague future
+    /// extensibility or architecture-by-fashion.
+    /// </summary>
+    public static PlanAuditTest Test03 { get; } = new()
+    {
+        Id = "03",
+        AuditorName = Test03AuditorName,
+        Title = "ARCHITECTURAL BOUNDARY, MODULARITY, AND COUPLING",
+        Objective =
+            "Determine whether the plan places the change inside the correct architectural boundary " +
+            "with minimal coupling and appropriate abstraction.",
+        ReviewGuidance = """
+            - Which module / layer / service / component owns the new behavior, and is that owner named?
+            - Does the plan preserve the existing architecture and its idioms (layer direction,
+              dependency rules, established patterns) rather than cutting against them?
+            - Does domain / business logic stay out of UI, transport, persistence, and glue code?
+            - Does the change minimize the number of boundaries it crosses?
+            - Does it avoid leaking vendor / database / transport / framework / UI details into layers
+              that should not know about them?
+            - Are any new interfaces or adapters justified (a real seam), and are they narrow and stable?
+            - Is every new abstraction justified by CONCRETE volatility, testability, security,
+              a clearly-owned boundary, or multiple implementations — not vague future extensibility?
+            - Does it avoid architecture-by-fashion — unnecessary microservices, event buses, plugin
+              systems, CQRS, queues, Redis, or generic factories introduced without a concrete need?
+            - If it proposes a distributed / multi-process architecture, does it explain data ownership,
+              consistency, deployment, and operational impact?
+            """,
+        PassCriteria =
+            "The plan identifies the correct owner boundary for the new behavior; changes are localized " +
+            "and cohesive within that boundary; new interfaces/adapters are stable, narrow, and " +
+            "purposeful; and every new abstraction is concretely justified.",
+        FailCriteria =
+            "The plan spreads business logic across layers; couples broadly to a third-party or " +
+            "implementation detail; justifies abstractions only by vague future extensibility; or adds " +
+            "a new service / package / module without lifecycle, ownership, scaling, security, or " +
+            "coupling justification.",
+        AutomaticBlocker = """
+            Treat as an automatic BLOCKER when the plan:
+            - corrupts a core architectural boundary (e.g. inverts the layer direction, introduces a
+              dependency cycle, or makes an inner/platform-neutral layer depend on an outer/vendor one); or
+            - places authoritative business rules only in UI, client, or request-edge code; or
+            - proposes a distributed / multi-process architecture without explaining data ownership,
+              consistency, deployment, and operational impact.
+            """,
+        RequiredFixes = """
+            - Name the affected boundary and the module / layer that owns the new behavior.
+            - Move authoritative business rules to the layer that owns them, out of UI/transport/glue.
+            - Add or narrow the interfaces / adapters needed to keep the boundary clean and decoupled.
+            - Remove speculative abstractions that lack a concrete second consumer or volatility driver.
+            - Separate any preparatory refactoring from the behavior change into a distinct step.
+            """,
+        Criteria =
+        [
+            "boundary-ownership",          // a specific module/layer/service owns the new behavior
+            "architecture-preservation",   // preserves existing layer direction, dependency rules, idioms
+            "domain-logic-placement",      // business logic stays out of UI/transport/persistence/glue
+            "boundary-crossings",          // minimizes the boundaries the change crosses
+            "no-detail-leakage",           // no vendor/db/transport/framework/UI leak into unrelated layers
+            "interface-justification",     // new interfaces/adapters are real, narrow, stable seams
+            "abstraction-justification",   // abstractions justified by concrete volatility/testability/etc.
+            "no-architecture-by-fashion",  // no unjustified microservice/event-bus/plugin/CQRS/queue/Redis/factory
+            "distributed-architecture",    // distributed arch explains ownership/consistency/deploy/ops
+            "refactor-separation",         // preparatory refactoring is separated from behavior change
+        ],
+    };
+
+    /// <summary>
     /// Every built-in plan-audit chain test, in chain order. The DI registration
     /// and <c>ProjectAuditorComposer</c> auto-inclusion both iterate this list,
     /// so adding a chain test here wires it everywhere without touching either
     /// call site (one source of truth for the chain membership).
     /// </summary>
-    public static IReadOnlyList<PlanAuditTest> All { get; } = [Test01, Test02];
+    public static IReadOnlyList<PlanAuditTest> All { get; } = [Test01, Test02, Test03];
 }
