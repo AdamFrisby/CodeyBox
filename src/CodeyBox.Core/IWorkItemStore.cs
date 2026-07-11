@@ -618,9 +618,13 @@ public interface IWorkItemStore
         int limit,
         CancellationToken ct = default)
     {
-        var result = new List<BaselinePinnedWorkItem>();
         if (limit <= 0)
-            return result;
+            return Array.Empty<BaselinePinnedWorkItem>();
+        // ListAsync yields newest-first, so collect every match then sort by
+        // created_at ASC, id ASC before truncating — this makes the default honor
+        // the documented stable, resumable ordering (and match the SQL override),
+        // rather than dropping the OLDEST items on truncation.
+        var matches = new List<(DateTimeOffset CreatedAt, BaselinePinnedWorkItem Item)>();
         await foreach (var item in ListAsync(ct).ConfigureAwait(false))
         {
             if (item.BaselineImageRef is not { Length: > 0 } pin)
@@ -631,11 +635,14 @@ public interface IWorkItemStore
                 continue;
             if (baselineImageRef is { } oldRef && !string.Equals(pin, oldRef, StringComparison.Ordinal))
                 continue;
-            result.Add(new BaselinePinnedWorkItem(item.Id, item.ProjectId, item.State, pin));
-            if (result.Count >= limit)
-                break;
+            matches.Add((item.CreatedAt, new BaselinePinnedWorkItem(item.Id, item.ProjectId, item.State, pin)));
         }
-        return result;
+        return matches
+            .OrderBy(static m => m.CreatedAt)
+            .ThenBy(static m => m.Item.Id.ToString(), StringComparer.Ordinal)
+            .Take(limit)
+            .Select(static m => m.Item)
+            .ToList();
     }
 
     /// <summary>

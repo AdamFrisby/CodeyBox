@@ -166,12 +166,41 @@ public sealed class BaselineMigrationServiceTests : IDisposable
         Assert.False(third.Truncated);
     }
 
+    [Fact]
+    public async Task ResolverThrows_ClearsPinsToNoRecomputeTarget_WithoutAborting()
+    {
+        // A resolver that fails (e.g. transient config error) must not abort the
+        // migration: matching stale pins still clear, treated as "no current
+        // baseline", so they migrate to a null recompute target — exactly what a
+        // failing pickup resolve would produce.
+        _resolver.ThrowOnResolve = true;
+        var item = Sample("cb-baseline-old");
+        await _store.CreateAsync(item);
+
+        var result = await _service.MigrateAsync(default);
+
+        Assert.Equal(1, result.MigratedCount);
+        Assert.Null((await _store.GetAsync(item.Id))!.BaselineImageRef);
+        var target = Assert.Single(result.RecomputeTargets);
+        Assert.Null(target.BaselineImageRef);
+        Assert.Equal(1, target.Count);
+    }
+
     private sealed class FakeBaselineResolver : IBaselineImageResolver
     {
         /// <summary>The ref the live config currently resolves to.</summary>
         public string? Current { get; set; }
 
-        public string? ResolveBaselineRef(string? profileName, SandboxProfileFlavor flavor) => Current;
+        /// <summary>When true, <see cref="ResolveBaselineRef"/> throws to exercise
+        /// the service's resolver-failure fallback.</summary>
+        public bool ThrowOnResolve { get; set; }
+
+        public string? ResolveBaselineRef(string? profileName, SandboxProfileFlavor flavor)
+        {
+            if (ThrowOnResolve)
+                throw new InvalidOperationException("resolver unavailable");
+            return Current;
+        }
 
         public Task<IReadOnlyList<BaselineImageInfo>> ListBaselineImagesAsync(CancellationToken ct) =>
             Task.FromResult<IReadOnlyList<BaselineImageInfo>>([]);
