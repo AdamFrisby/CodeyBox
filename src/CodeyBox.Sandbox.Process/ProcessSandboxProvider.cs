@@ -190,6 +190,7 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox, IPreserveOnDisposeSa
         foreach (var (k, v) in _spec.Environment) psi.EnvironmentVariables[k] = TranslateEnvironmentValue(k, v);
         if (exec.ExtraEnvironment is not null)
             foreach (var (k, v) in exec.ExtraEnvironment) psi.EnvironmentVariables[k] = TranslateEnvironmentValue(k, v);
+        exec.ApplyEnvironmentRemovals(name => psi.EnvironmentVariables.Remove(name));
 
         using var proc = new System.Diagnostics.Process { StartInfo = psi };
         var stdout = new StringBuilder();

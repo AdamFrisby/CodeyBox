@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Sandbox.Incus;
 using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Api;
@@ -22,11 +23,47 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
     {
         var failures = new List<string>();
 
+        var selectedProvider = NormalizeSandboxProviderId(options.SandboxProvider, failures);
+        var retainedProviders = ValidateRetainedSandboxProviderInventory(options, failures);
+        if (string.Equals(selectedProvider, SandboxProviderKinds.Incus, StringComparison.OrdinalIgnoreCase)
+            || retainedProviders.Contains(SandboxProviderKinds.Incus))
+        {
+            // Retained providers are activated for lifecycle inventory even
+            // when they are not selected for new work.
+            try
+            {
+                failures.AddRange(
+                    IncusSandboxOptions.Validate(IncusSandboxConfigMapper.Build(options))
+                        .Select(static error => $"CodeyBox:Incus:{error}"));
+            }
+            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException
+                or NotSupportedException or PathTooLongException)
+            {
+                failures.Add($"CodeyBox:Incus:{ex.Message}");
+            }
+        }
+
         if (double.IsNaN(options.PhaseAbsoluteTimeoutMultiplier)
             || double.IsInfinity(options.PhaseAbsoluteTimeoutMultiplier)
             || options.PhaseAbsoluteTimeoutMultiplier < 1.0)
         {
             failures.Add("CodeyBox:PhaseAbsoluteTimeoutMultiplier must be finite and >= 1");
+        }
+
+        if (options.DeepAuditFailurePersistence is null)
+        {
+            failures.Add("CodeyBox:DeepAuditFailurePersistence must not be null");
+        }
+        else
+        {
+            try
+            {
+                options.DeepAuditFailurePersistence.Validate();
+            }
+            catch (InvalidOperationException ex)
+            {
+                failures.Add(ex.Message);
+            }
         }
 
         if (options.MaxTemplateChecks is < 1 or > CodeyBoxOptions.MaximumMaxTemplateChecks)
@@ -305,7 +342,7 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             }
         }
 
-        ValidateMultipassRemote(options, failures);
+        ValidateMultipassRemote(options, selectedProvider, failures);
 
         failures.AddRange(AuditLogStartup.Validate(options.AuditLog));
 
@@ -313,6 +350,70 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             ? ValidateOptionsResult.Success
             : ValidateOptionsResult.Fail(failures);
     }
+
+    private static string NormalizeSandboxProviderId(
+        string? configuredProviderId,
+        ICollection<string> failures)
+    {
+        try
+        {
+            return ReloadableSandboxProvider.NormalizeConfiguredProviderId(configuredProviderId);
+        }
+        catch (InvalidOperationException ex)
+        {
+            failures.Add($"CodeyBox:SandboxProvider is invalid: {ex.Message}");
+            return string.Empty;
+        }
+    }
+
+    private static HashSet<string> ValidateRetainedSandboxProviderInventory(
+        CodeyBoxOptions options,
+        ICollection<string> failures)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var retained = options.SandboxProviderCutover?.RetainedInventoryProviders;
+        if (retained is null)
+        {
+            failures.Add("CodeyBox:SandboxProviderCutover:RetainedInventoryProviders must not be null");
+            return seen;
+        }
+
+        var index = 0;
+        foreach (var configuredProviderId in retained)
+        {
+            if (index == SandboxProviderCutoverConfig.MaximumRetainedInventoryProviders)
+            {
+                failures.Add(
+                    $"CodeyBox:SandboxProviderCutover:RetainedInventoryProviders must contain at most {SandboxProviderCutoverConfig.MaximumRetainedInventoryProviders} entries");
+                return seen;
+            }
+
+            string providerId;
+            try
+            {
+                providerId = ReloadableSandboxProvider.NormalizeConfiguredProviderId(configuredProviderId);
+            }
+            catch (InvalidOperationException)
+            {
+                providerId = string.Empty;
+            }
+            if (!SandboxProviderKinds.SupportsHotReload(providerId))
+            {
+                failures.Add(
+                    $"CodeyBox:SandboxProviderCutover:RetainedInventoryProviders:{index} must name a registered hot-reload provider");
+                index++;
+                continue;
+            }
+            if (!seen.Add(providerId))
+            {
+                failures.Add(
+                    $"CodeyBox:SandboxProviderCutover:RetainedInventoryProviders:{index} duplicates an earlier provider ID");
+            }
+            index++;
+        }
+        return seen;
+    }
+
 
     private static IReadOnlyList<E2eMultipassRemoteHostConfig> GetE2eRemoteHostConfigs(CodeyBoxOptions options)
     {
@@ -323,12 +424,15 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             : [options.E2eMultipassRemoteSandbox];
     }
 
-    private static void ValidateMultipassRemote(CodeyBoxOptions options, List<string> failures)
+    private static void ValidateMultipassRemote(
+        CodeyBoxOptions options,
+        string selectedProvider,
+        List<string> failures)
     {
         var providerIsRemote = string.Equals(
-            options.SandboxProvider?.Trim(),
+            selectedProvider,
             "multipass-remote",
-            StringComparison.OrdinalIgnoreCase);
+            StringComparison.Ordinal);
         var cfg = options.MultipassRemoteSandbox;
         if (cfg is null)
         {

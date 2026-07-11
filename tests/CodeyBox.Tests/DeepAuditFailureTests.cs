@@ -1,6 +1,7 @@
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Webhooks;
+using ControllableTimeProvider = Microsoft.Extensions.Time.Testing.FakeTimeProvider;
 
 namespace CodeyBox.Tests;
 
@@ -159,6 +160,63 @@ public sealed class DeepAuditFailureTests : IDisposable
             wi.Title.Contains("remediation", StringComparison.OrdinalIgnoreCase));
     }
 
+    [Fact]
+    public async Task UnexpectedDeepAuditFailure_FirstTerminalTransitionWriteFails_RetriesToDurableFailedState()
+    {
+        var retryDelay = TimeSpan.FromSeconds(30);
+        var timeProvider = new ControllableTimeProvider();
+        var releaseStore = new FailFirstTerminalTransitionReleaseStore(_releaseStore);
+        var projects = new InMemoryProjectRepository(
+            ReleaseTestHelper.EnabledProjectWithDeepAuditors(AuditorName, maxIterations: 1));
+        var service = ReleaseTestHelper.BuildService(
+            releaseStore,
+            _workItemStore,
+            projects,
+            _webhooks,
+            deepAuditors: [new ScriptedDeepAuditor(AuditorName)],
+            sandboxes: new ThrowingCreateSandboxProvider(),
+            gitHost: new DeepAuditTestGitHost(),
+            deepAuditFailurePersistenceOptions: () => new DeepAuditFailurePersistenceOptions
+            {
+                MaxAttempts = 2,
+                RetryDelay = retryDelay,
+            },
+            timeProvider: timeProvider);
+
+        var release = ReleaseTestHelper.SeedRelease(ReleaseState.Closed, branchName: "release/v1.0");
+        await releaseStore.CreateAsync(release);
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = release.ProjectId,
+            Title = "seed item",
+            Prompt = "do work",
+            Agent = AgentKind.Claude,
+            ReleaseId = release.Id,
+        };
+        await _workItemStore.CreateAsync(item);
+        await _workItemStore.UpdateAsync(item.With(WorkItemState.Done));
+
+        await service.OnWorkItemTerminalAsync(release.Id, default);
+        await releaseStore.FirstTerminalTransitionFailure.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Release? persisted = null;
+        for (var iteration = 0; iteration < 100; iteration++)
+        {
+            timeProvider.Advance(retryDelay);
+            persisted = await _releaseStore.GetAsync(release.Id);
+            if (persisted?.State == ReleaseState.Failed)
+                break;
+            await Task.Yield();
+        }
+
+        Assert.Equal(ReleaseState.Failed, persisted?.State);
+        Assert.Equal(2, releaseStore.TerminalTransitionAttempts);
+        Assert.Equal(
+            "deep audit phase failed due to an internal credential or sandbox error",
+            persisted?.FailedReason);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private async Task<(ReleaseService svc, Release rel, WorkItem item)> SetupAsync(
@@ -207,5 +265,89 @@ public sealed class DeepAuditFailureTests : IDisposable
         }
         var final = await _releaseStore.GetAsync(id);
         return final?.State ?? ReleaseState.Open;
+    }
+
+    private sealed class ThrowingCreateSandboxProvider : ISandboxProvider
+    {
+        public string Name => "throwing-create";
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+            => throw new InvalidOperationException("simulated sandbox creation failure");
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    private sealed class FailFirstTerminalTransitionReleaseStore : IReleaseStore
+    {
+        private readonly IReleaseStore _inner;
+        private readonly TaskCompletionSource _firstTerminalTransitionFailure = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _terminalTransitionAttempts;
+
+        public FailFirstTerminalTransitionReleaseStore(IReleaseStore inner) => _inner = inner;
+
+        public int TerminalTransitionAttempts => Volatile.Read(ref _terminalTransitionAttempts);
+        public Task FirstTerminalTransitionFailure => _firstTerminalTransitionFailure.Task;
+
+        public Task CreateAsync(Release release, CancellationToken ct = default)
+            => _inner.CreateAsync(release, ct);
+
+        public Task UpdateAsync(Release release, CancellationToken ct = default)
+            => _inner.UpdateAsync(release, ct);
+
+        public Task<Release?> GetAsync(ReleaseId id, CancellationToken ct = default)
+            => _inner.GetAsync(id, ct);
+
+        public Task<Release?> GetByNameAsync(
+            ProjectId projectId,
+            string name,
+            CancellationToken ct = default)
+            => _inner.GetByNameAsync(projectId, name, ct);
+
+        public Task<IReadOnlyList<Release>> ListAsync(
+            ProjectId? projectId = null,
+            ReleaseState? state = null,
+            int? limit = null,
+            int? offset = null,
+            CancellationToken ct = default)
+            => _inner.ListAsync(projectId, state, limit, offset, ct);
+
+        public Task<bool> TrySetBranchAsync(
+            ReleaseId id,
+            string branchName,
+            string baseCommitSha,
+            CancellationToken ct = default)
+            => _inner.TrySetBranchAsync(id, branchName, baseCommitSha, ct);
+
+        public Task<bool> TryTransitionStateAsync(
+            Release release,
+            ReleaseState expectedCurrentState,
+            CancellationToken ct = default)
+        {
+            if (expectedCurrentState == ReleaseState.InReview && release.State == ReleaseState.Failed)
+            {
+                var attempt = Interlocked.Increment(ref _terminalTransitionAttempts);
+                if (attempt == 1)
+                {
+                    _firstTerminalTransitionFailure.TrySetResult();
+                    throw new IOException("simulated transient terminal transition write failure");
+                }
+            }
+
+            return _inner.TryTransitionStateAsync(release, expectedCurrentState, ct);
+        }
+
+        public Task SaveAuditIterationAsync(
+            ReleaseAuditIteration iteration,
+            CancellationToken ct = default)
+            => _inner.SaveAuditIterationAsync(iteration, ct);
+
+        public Task<IReadOnlyList<ReleaseAuditIteration>> ListAuditIterationsAsync(
+            ReleaseId releaseId,
+            CancellationToken ct = default)
+            => _inner.ListAuditIterationsAsync(releaseId, ct);
     }
 }

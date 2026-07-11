@@ -191,7 +191,10 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         }
     }
 
-    public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+    public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+        await ListManagedInventoryAsync(ct).ConfigureAwait(false);
+
+    public async Task<ManagedSandboxInventory> ListManagedInventoryAsync(CancellationToken ct)
     {
         var managed = await _inner.ListManagedInventoryAsync(ct).ConfigureAwait(false);
         var managedIds = managed.Select(SandboxAdmissionIdentity.FromManaged).ToArray();
@@ -212,6 +215,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
 
     public async Task DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
     {
+        ArgumentNullException.ThrowIfNull(sandbox);
         await _inner.DisposeLeakedAsync(sandbox, ct).ConfigureAwait(false);
         var identity = SandboxAdmissionIdentity.FromManaged(sandbox);
         _preservedLiveSandboxes.TryRemove(identity, out _);
@@ -228,21 +232,39 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     public IReadOnlyList<SandboxHostPoolEntry> SnapshotHostPool() =>
         _hostPoolSnapshot?.SnapshotHostPool() ?? [];
 
-    public async Task ResumeSandboxAsync(string name, CancellationToken ct)
+    public Task ResumeSandboxAsync(string name, CancellationToken ct) =>
+        ResumeSandboxCoreAsync(
+            SandboxAdmissionIdentity.FromName(name),
+            provider => provider.ResumeSandboxAsync(name, ct),
+            ct);
+
+    public Task ResumeSandboxAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
     {
+        ArgumentNullException.ThrowIfNull(sandbox);
+        return ResumeSandboxCoreAsync(
+            SandboxAdmissionIdentity.FromManaged(sandbox),
+            provider => provider.ResumeSandboxAsync(sandbox, ct),
+            ct);
+    }
+
+    private async Task ResumeSandboxCoreAsync(
+        SandboxAdmissionIdentity identity,
+        Func<ISuspendingSandboxProvider, Task> resume,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(identity.Name);
         var suspendingProvider = _suspendingProvider
             ?? throw new NotSupportedException("The wrapped sandbox provider does not support suspend/resume.");
         var resumeAdmissions = _resumeAdmissions
             ?? throw new NotSupportedException("The wrapped sandbox provider does not track resume admission.");
 
-        var identity = SandboxAdmissionIdentity.FromName(name);
         resumeAdmissions.Begin(identity);
         SandboxAdmissionLease? lease = null;
         var retained = false;
         try
         {
             lease = await _gate.AcquireAsync(ct).ConfigureAwait(false);
-            await suspendingProvider.ResumeSandboxAsync(name, ct).ConfigureAwait(false);
+            await resume(suspendingProvider).ConfigureAwait(false);
             if (TryAdoptResumeAdmission(identity, lease))
                 resumeAdmissions.CancelPending(identity);
             else
@@ -311,7 +333,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         var baselineResolver = _baselineResolver
             ?? throw new NotSupportedException("The wrapped sandbox provider does not resolve baseline images.");
         var baselines = await baselineResolver.ListBaselineImagesAsync(ct).ConfigureAwait(false);
-        _disposedBaselineAdmissions.ReleaseMissing(baselines.Select(static info => SandboxAdmissionIdentity.FromName(info.Name)));
+        _disposedBaselineAdmissions.ReleaseMissing(baselines.Select(SandboxAdmissionIdentity.FromBaseline));
         return baselines;
     }
 
@@ -320,7 +342,8 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         var baselineResolver = _baselineResolver
             ?? throw new NotSupportedException("The wrapped sandbox provider does not resolve baseline images.");
         await baselineResolver.DisposeBaselineImageAsync(name, ct).ConfigureAwait(false);
-        _disposedBaselineAdmissions.Release(SandboxAdmissionIdentity.FromName(name));
+        var remaining = await baselineResolver.ListBaselineImagesAsync(ct).ConfigureAwait(false);
+        _disposedBaselineAdmissions.ReleaseMissing(remaining.Select(SandboxAdmissionIdentity.FromBaseline));
     }
 
     public async Task<string?> EnsureBaselineImageAsync(
@@ -419,19 +442,9 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         }
     }
 
-    private static bool ShouldReleaseAdmissionAfterHostLoss(ISandbox sandbox)
-    {
-        var current = sandbox;
-        while (current is ISandboxDecorator decorator)
-        {
-            var inner = decorator.InnerSandbox;
-            if (ReferenceEquals(inner, current))
-                break;
-            current = inner;
-        }
-
-        return current is IReleaseAdmissionOnHostLossSandbox { ReleaseAdmissionAfterHostLoss: true };
-    }
+    private static bool ShouldReleaseAdmissionAfterHostLoss(ISandbox sandbox) =>
+        SandboxCapability.Find<IReleaseAdmissionOnHostLossSandbox>(sandbox) is
+            { ReleaseAdmissionAfterHostLoss: true };
 
     private void OnSandboxPreserved(AdmissionControlledSandbox sandbox)
     {
@@ -508,23 +521,54 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     private static bool IsRetainedBaselineProvisioning(SandboxProvisioningDeferredException ex) =>
         ex.Operation.StartsWith("baseline-", StringComparison.Ordinal);
 
-    private readonly record struct SandboxAdmissionIdentity(string Name, string? HostId)
+    private readonly record struct SandboxAdmissionIdentity(
+        string Name,
+        string? LifecycleProviderId,
+        string? HostId)
     {
         public static SandboxAdmissionIdentity FromName(string name) =>
-            new(name, HostId: null);
+            new(name, LifecycleProviderId: null, HostId: null);
+
+        public static SandboxAdmissionIdentity FromBaseline(BaselineImageInfo info) =>
+            new(
+                info.Name,
+                NormalizeLifecycleProviderId(info.LifecycleProviderId),
+                HostId: null);
 
         public static SandboxAdmissionIdentity FromManaged(ManagedSandboxInfo info) =>
-            new(info.Name, NormalizeHostId(info.HostId));
+            new(
+                info.Name,
+                NormalizeLifecycleProviderId(info.LifecycleProviderId),
+                NormalizeHostId(info.HostId));
 
         public static SandboxAdmissionIdentity FromException(SandboxProvisioningDeferredException ex) =>
-            new(ex.RetainedSandboxName!, NormalizeHostId(ex.RetainedSandboxHostId));
+            new(
+                ex.RetainedSandboxName!,
+                NormalizeLifecycleProviderId(ex.RetainedSandboxLifecycleProviderId),
+                NormalizeHostId(ex.RetainedSandboxHostId));
 
         public static SandboxAdmissionIdentity FromSandbox(ISandbox sandbox)
         {
+            var lifecycleProviderId = SandboxCapability.Find<IProviderOwnedSandbox>(sandbox)?.ProviderId;
             var hostId = sandbox is IHostQualifiedSandbox hostQualified
                 ? hostQualified.HostId
                 : null;
-            return new SandboxAdmissionIdentity(sandbox.Id, NormalizeHostId(hostId));
+            return new SandboxAdmissionIdentity(
+                sandbox.Id,
+                NormalizeLifecycleProviderId(lifecycleProviderId),
+                NormalizeHostId(hostId));
+        }
+
+        private static string? NormalizeLifecycleProviderId(string? lifecycleProviderId)
+        {
+            if (lifecycleProviderId is null)
+                return null;
+            if (string.IsNullOrWhiteSpace(lifecycleProviderId))
+            {
+                throw new InvalidOperationException(
+                    "A sandbox lifecycle provider identifier cannot be empty or whitespace.");
+            }
+            return lifecycleProviderId;
         }
 
         private static string? NormalizeHostId(string? hostId) =>

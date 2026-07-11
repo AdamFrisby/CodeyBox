@@ -9,21 +9,20 @@ namespace CodeyBox.Core;
 /// </summary>
 public interface IManagedSandboxLifecycle
 {
-    /// <summary>Stable identifier for diagnostics ("process", "bubblewrap", "multipass").</summary>
+    /// <summary>Stable provider identifier used for diagnostics and lifecycle scoping.</summary>
     string Name { get; }
 
     /// <summary>
-    /// Returns all sandboxes on the host that belong to this provider
-    /// (i.e. match the <c>codeybox-*</c> naming prefix). Used by the
+    /// Returns all sandboxes on the host that this provider verifies as owned,
+    /// using its configured namespace and/or durable ownership metadata. Used by the
     /// <see cref="CodeyBox.Orchestrator.SandboxLeakReaper"/> to detect
     /// sandboxes that outlived their work item.
     ///
     /// <para>Implementations that have no persistent sandbox lifecycle
     /// (bubblewrap, process) return an empty list.</para>
     ///
-    /// <para>Implementations that shell out to an external tool (multipass)
-    /// cache results for a short TTL to avoid hammering the daemon on
-    /// repeated API calls.</para>
+    /// <para>Implementations may cache inventory briefly when repeated reads
+    /// would otherwise overload an external lifecycle service.</para>
     /// </summary>
     Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct);
 
@@ -57,17 +56,28 @@ public interface IManagedSandboxLifecycle
     /// provider metadata to route disposal back to the lifecycle that reported
     /// the sandbox; multi-host providers use executor metadata to target the
     /// owning host instead of rediscovering by name across a host pool.
+    /// The default implementation delegates only unscoped snapshots; providers
+    /// that understand either scope dimension must override this overload.
     /// </summary>
-    Task DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct) =>
-        DisposeLeakedAsync(sandbox.Name, ct);
+    Task DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(sandbox);
+        if (sandbox.LifecycleProviderId is not null || sandbox.HostId is not null)
+        {
+            throw new NotSupportedException(
+                "This sandbox lifecycle cannot interpret a provider- or host-scoped disposal snapshot.");
+        }
+        return DisposeLeakedAsync(sandbox.Name, ct);
+    }
 }
 
 /// <summary>
 /// Builds and starts isolated execution sandboxes. Implementations include a
 /// plain-process dev runner (UNSAFE; for local testing only), bubblewrap
-/// (namespace isolation, shared kernel), and Multipass (KVM-backed VMs with
-/// a separate guest kernel — recommended for production). The orchestrator
-/// picks one provider per deployment.
+/// (namespace isolation, shared kernel), and VM-backed implementations with a
+/// separate guest kernel. The orchestrator selects one provider for new work;
+/// a composition layer may change that choice without rerouting existing
+/// sandbox handles.
 /// </summary>
 public interface ISandboxProvider : IManagedSandboxLifecycle
 {
@@ -95,14 +105,13 @@ public interface ISandboxProvider : IManagedSandboxLifecycle
 
 /// <summary>
 /// Optional <see cref="ISandboxProvider"/> capability that reports whether the
-/// provider captures per-VM resource metrics at teardown (the multipass
-/// <c>CaptureResourceMetrics</c> toggle). When true, each work-item timing
-/// phase must be kept on its own VM so a persisted per-phase resource record is
+/// provider captures per-VM resource metrics at teardown. When true, each
+/// work-item timing phase must be kept on its own VM so a persisted per-phase resource record is
 /// attributable to a single phase; when false (the default), a warm reusable VM
 /// is shared across phases as before, incurring no extra teardown/rebuild churn.
-/// <c>WorkSandboxContext</c> queries this so the phase-keyed VM isolation only
-/// fires when the capture feature is enabled. Providers that never capture
-/// metrics simply do not implement this interface.
+/// Live-handle reuse reads <see cref="IResourceMetricsCapturingSandbox"/> so a
+/// provider hot reload cannot change the policy of an existing VM. Providers
+/// that never capture metrics simply do not implement this interface.
 /// </summary>
 public interface IResourceMetricsCapturingProvider
 {
@@ -114,8 +123,19 @@ public interface IResourceMetricsCapturingProvider
 }
 
 /// <summary>
+/// Optional live-sandbox capability exposing the immutable resource-metrics
+/// capture policy attached to that concrete handle. Reuse decisions must read
+/// this snapshot instead of a hot-reloadable provider selection that may now
+/// describe a different backend or a later options version.
+/// </summary>
+public interface IResourceMetricsCapturingSandbox : ISandbox
+{
+    bool CapturesResourceMetrics { get; }
+}
+
+/// <summary>
 /// Snapshot of a sandbox that exists on the host, returned by
-/// <see cref="ISandboxProvider.ListAllManagedAsync"/>.
+/// <see cref="IManagedSandboxLifecycle.ListAllManagedAsync"/>.
 /// </summary>
 /// <param name="Name">VM name / namespace ID.</param>
 /// <param name="CreatedAt">Best-effort creation timestamp; null if not derivable.</param>
@@ -371,17 +391,78 @@ public interface IRejectsFileBackedAgentCredentials : ISandbox
 }
 
 /// <summary>
+/// Optional capability exposing the stable provider identifier that owns a
+/// sandbox. Durable session references use this value to route lifecycle
+/// operations back to the provider that created the sandbox, even after the
+/// live provider selector changes.
+/// </summary>
+public interface IProviderOwnedSandbox : ISandbox
+{
+    string ProviderId { get; }
+}
+
+/// <summary>
+/// Optional capability for sandboxes whose private guest root filesystem can
+/// be safely modified by privileged setup commands. Consumers use this for
+/// security tooling that must replace absolute executable paths inside a VM.
+/// Sandboxes that execute against the host root, or whose root may be shared
+/// with the host, must not implement this capability.
+/// </summary>
+public interface IPrivilegedGuestFileHardeningSandbox : ISandbox
+{
+}
+
+/// <summary>
 /// Implemented by sandbox wrappers/decorators (e.g. the admission-control and
 /// reusable-sandbox families) that forward an inner <see cref="ISandbox"/>.
 /// Marker capabilities like <see cref="IRejectsFileBackedAgentCredentials"/>
-/// cannot be conditionally re-implemented by a decorator, so consumers that
-/// probe for a capability must walk <see cref="InnerSandbox"/> to the innermost
-/// sandbox rather than relying on <c>is</c> against the outermost wrapper.
+/// cannot be conditionally re-implemented by a decorator, so consumers use
+/// <see cref="SandboxCapability.Find{T}(ISandbox)"/> rather than relying on
+/// <c>is</c> against the outermost wrapper.
 /// </summary>
 public interface ISandboxDecorator : ISandbox
 {
     /// <summary>The sandbox this decorator wraps.</summary>
     ISandbox InnerSandbox { get; }
+}
+
+/// <summary>
+/// Resolves optional capabilities from a sandbox and any transparent decorator
+/// chain around it. A malformed decorator chain fails closed instead of hiding
+/// a security-relevant capability or recursing forever.
+/// </summary>
+public static class SandboxCapability
+{
+    /// <summary>
+    /// Returns the first <typeparamref name="T"/> exposed by
+    /// <paramref name="sandbox"/> or one of its inner sandboxes. Returns null
+    /// when the well-formed chain does not expose that capability.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// A decorator returns a null inner sandbox or the chain contains a cycle.
+    /// </exception>
+    public static T? Find<T>(ISandbox sandbox)
+        where T : class, ISandbox
+    {
+        ArgumentNullException.ThrowIfNull(sandbox);
+
+        var current = sandbox;
+        var visited = new HashSet<ISandbox>(ReferenceEqualityComparer.Instance);
+        while (visited.Add(current))
+        {
+            if (current is T capability)
+                return capability;
+            if (current is not ISandboxDecorator decorator)
+                return null;
+
+            current = decorator.InnerSandbox
+                ?? throw new InvalidOperationException(
+                    "A sandbox decorator returned a null inner sandbox while resolving a capability.");
+        }
+
+        throw new InvalidOperationException(
+            "A sandbox decorator cycle prevents capability resolution.");
+    }
 }
 
 /// <summary>
@@ -684,6 +765,23 @@ public interface ISuspendingSandboxProvider
     Task ResumeSandboxAsync(string name, CancellationToken ct);
 
     /// <summary>
+    /// Resumes a scoped lifecycle snapshot. Plain providers use the name-only
+    /// implementation only for unscoped snapshots; composites and multi-host
+    /// providers override this overload so opaque provider or host identity can
+    /// select the exact resource without ambiguous ownership rediscovery.
+    /// </summary>
+    Task ResumeSandboxAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(sandbox);
+        if (sandbox.LifecycleProviderId is not null || sandbox.HostId is not null)
+        {
+            throw new NotSupportedException(
+                "This sandbox provider cannot interpret a provider- or host-scoped resume snapshot.");
+        }
+        return ResumeSandboxAsync(sandbox.Name, ct);
+    }
+
+    /// <summary>
     /// R8-core: after <see cref="ResumeSandboxAsync"/> brings the VM back to
     /// Running, the startup resume handler asks the provider to wait for the
     /// in-VM agent process to finish, streaming what's left of
@@ -800,9 +898,11 @@ public interface IBaselineImageResolver
     /// Lists every baseline image currently present on the host that this
     /// provider considers a baseline. Used by the
     /// <see cref="CodeyBox.Orchestrator.BaselineImageReaper"/> to compute the
-    /// orphan set (multipass baselines minus the live-ref set from the work
-    /// store). Returns an empty list when the provider has no baselines or
-    /// cannot enumerate them.
+    /// orphan set (provider baselines minus the live-ref set from the work
+    /// store). An empty list is authoritative evidence that enumeration
+    /// completed and found no baselines. Implementations must throw when the
+    /// inventory cannot be enumerated completely so lifecycle and admission
+    /// callers do not mistake an unknown inventory for proven absence.
     /// </summary>
     Task<IReadOnlyList<BaselineImageInfo>> ListBaselineImagesAsync(CancellationToken ct);
 
@@ -866,7 +966,16 @@ public sealed class NullBaselineImageProvisioner : IBaselineImageProvisioner
 /// <param name="Name">VM / baseline name (e.g. <c>cb-baseline-abc123</c>).</param>
 /// <param name="CreatedAt">Best-effort creation timestamp; null if not derivable.</param>
 /// <param name="DiskBytes">Reported disk usage; null when unavailable.</param>
-public sealed record BaselineImageInfo(string Name, DateTimeOffset? CreatedAt, long? DiskBytes);
+/// <param name="LifecycleProviderId">
+/// Optional opaque identifier for the lifecycle provider that reported this
+/// snapshot. Composite resolvers populate it so same-named baseline resources
+/// remain distinct while admission cleanup is reconciled.
+/// </param>
+public sealed record BaselineImageInfo(
+    string Name,
+    DateTimeOffset? CreatedAt,
+    long? DiskBytes,
+    string? LifecycleProviderId = null);
 
 /// <summary>
 /// Null Object resolver for <see cref="IBaselineImageResolver"/>. Returned by
@@ -1163,11 +1272,58 @@ public sealed record SandboxNetworkPolicy
     public static SandboxNetworkPolicy Denied { get; } = new();
 }
 
+/// <summary>Provider-neutral validation for POSIX environment-variable names.</summary>
+public static class SandboxEnvironmentVariableName
+{
+    /// <summary>Maximum characters accepted in one environment-variable name.</summary>
+    public const int MaximumLength = 128;
+
+    /// <summary>Validates a bounded ASCII POSIX environment-variable identifier.</summary>
+    public static void Validate(string value, string parameterName)
+    {
+        if (value is null || value.Length == 0)
+            throw new ArgumentException("Environment variable name must be non-empty.", parameterName);
+        if (value.Length > MaximumLength)
+            throw new ArgumentException("Environment variable name exceeds the size limit.", parameterName);
+        if (string.IsNullOrWhiteSpace(value))
+            throw new ArgumentException("Environment variable name must be non-empty.", parameterName);
+        if (!IsAsciiLetter(value[0]) && value[0] != '_')
+            throw new ArgumentException("Environment variable name is not a POSIX identifier.", parameterName);
+        for (var index = 1; index < value.Length; index++)
+        {
+            var character = value[index];
+            if (IsAsciiLetter(character) || character is >= '0' and <= '9' || character == '_')
+                continue;
+            throw new ArgumentException("Environment variable name is not a POSIX identifier.", parameterName);
+        }
+    }
+
+    private static bool IsAsciiLetter(char value) =>
+        value is >= 'A' and <= 'Z' or >= 'a' and <= 'z';
+}
+
 public sealed record SandboxExec
 {
+    /// <summary>Maximum distinct environment-variable removals requested by one exec.</summary>
+    public const int MaximumEnvironmentVariablesToUnset = 256;
+
+    private IReadOnlyList<string> _environmentVariablesToUnset = [];
+
     public required IReadOnlyList<string> Argv { get; init; }
     public string? WorkingDirectory { get; init; }
     public IReadOnlyDictionary<string, string>? ExtraEnvironment { get; init; }
+    /// <summary>
+    /// Bounded immutable set of environment variables that must be absent from
+    /// the launched process. Providers apply these removals after merging their
+    /// baseline/spec environment and <see cref="ExtraEnvironment"/>. Removal
+    /// therefore wins deterministically when a name is also present in
+    /// <see cref="ExtraEnvironment"/>.
+    /// </summary>
+    public IReadOnlyList<string> EnvironmentVariablesToUnset
+    {
+        get => _environmentVariablesToUnset;
+        init => _environmentVariablesToUnset = SnapshotEnvironmentVariablesToUnset(value);
+    }
     /// <summary>
     /// Marks <see cref="ExtraEnvironment"/> as secret-bearing. Providers must
     /// deliver it without placing values in host-visible command argv and must
@@ -1190,6 +1346,51 @@ public sealed record SandboxExec
     /// </summary>
     public Action<string>? StdoutChunkCallback { get; init; }
     public Action<string>? StderrChunkCallback { get; init; }
+
+    /// <summary>
+    /// Applies the validated removal request at a provider's final environment
+    /// sink. Call only after every provider/spec/exec environment merge and
+    /// immediately before process launch or guest-environment serialization.
+    /// </summary>
+    public void ApplyEnvironmentRemovals(Action<string> remove)
+    {
+        ArgumentNullException.ThrowIfNull(remove);
+        foreach (var name in _environmentVariablesToUnset)
+            remove(name);
+    }
+
+    private static IReadOnlyList<string> SnapshotEnvironmentVariablesToUnset(
+        IReadOnlyList<string> source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        if (source.Count > MaximumEnvironmentVariablesToUnset)
+        {
+            throw new ArgumentException(
+                $"An exec cannot unset more than {MaximumEnvironmentVariablesToUnset} environment variables.",
+                nameof(EnvironmentVariablesToUnset));
+        }
+
+        var snapshot = new List<string>(source.Count);
+        var distinct = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var name in source)
+        {
+            if (snapshot.Count >= MaximumEnvironmentVariablesToUnset)
+            {
+                throw new ArgumentException(
+                    $"An exec cannot unset more than {MaximumEnvironmentVariablesToUnset} environment variables.",
+                    nameof(EnvironmentVariablesToUnset));
+            }
+            SandboxEnvironmentVariableName.Validate(name, nameof(EnvironmentVariablesToUnset));
+            if (!distinct.Add(name))
+            {
+                throw new ArgumentException(
+                    "Environment variable removal names must be unique.",
+                    nameof(EnvironmentVariablesToUnset));
+            }
+            snapshot.Add(name);
+        }
+        return Array.AsReadOnly(snapshot.ToArray());
+    }
 }
 
 public enum SandboxAgentOutputTransportPreference

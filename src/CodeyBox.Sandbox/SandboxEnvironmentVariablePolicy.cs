@@ -1,3 +1,6 @@
+using System.Collections.ObjectModel;
+using CodeyBox.Core;
+
 namespace CodeyBox.Sandbox;
 
 /// <summary>
@@ -36,6 +39,53 @@ public static class SandboxEnvironmentVariablePolicy
     public static void ValidateForSandboxEnvironment(string name, string parameterName)
     {
         SandboxCredentialFileWriter.ValidateEnvironmentVariableName(name, parameterName);
+    }
+
+    /// <summary>
+    /// Validates a runner-scoped credential environment and returns an immutable
+    /// snapshot containing only variables the runner declares as direct CLI
+    /// inputs. Every credential name must be classified as exactly one of direct
+    /// or file-backed; file-backed payload and destination metadata remain on the
+    /// stdin materialisation path and are never copied into ambient process state.
+    /// </summary>
+    public static IReadOnlyDictionary<string, string> SelectDirectCredentialEnvironment(
+        AgentCredential credential,
+        IAgentRunner runner,
+        string parameterName)
+    {
+        ArgumentNullException.ThrowIfNull(credential);
+        ArgumentNullException.ThrowIfNull(runner);
+        if (credential.Agent != runner.Kind)
+        {
+            throw new ArgumentException(
+                $"Credential belongs to agent '{credential.Agent.Value}', not '{runner.Kind.Value}'.",
+                parameterName);
+        }
+        if (credential.EnvironmentVariables.Count == 0)
+            return new ReadOnlyDictionary<string, string>(new Dictionary<string, string>(StringComparer.Ordinal));
+        if (runner is not IAgentCredentialEnvironmentPolicy policy)
+        {
+            throw new ArgumentException(
+                $"Agent runner '{runner.Kind.Value}' does not declare a credential environment policy.",
+                parameterName);
+        }
+
+        var direct = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var (name, value) in credential.EnvironmentVariables)
+        {
+            ValidateCredentialEnvironmentVariable(name, parameterName);
+            var isDirect = policy.DirectCredentialEnvironmentVariables.Contains(name);
+            var isFileBacked = policy.FileBackedCredentialEnvironmentVariables.Contains(name);
+            if (isDirect == isFileBacked)
+            {
+                throw new ArgumentException(
+                    $"Credential environment variable '{name}' must be classified as exactly one of direct or file-backed by runner '{runner.Kind.Value}'.",
+                    parameterName);
+            }
+            if (isDirect)
+                direct.Add(name, value);
+        }
+        return new ReadOnlyDictionary<string, string>(direct);
     }
 
     /// <summary>

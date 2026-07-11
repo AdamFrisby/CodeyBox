@@ -2559,9 +2559,17 @@ internal sealed partial class PlanningAwareAgent : IAgentRunner, ITextOnlyAgentR
     private static partial Regex MergePromptShape();
 }
 
-internal sealed partial class SandboxOnlyPlanningAgent : IAgentRunner
+internal sealed partial class SandboxOnlyPlanningAgent : IAgentRunner, IAgentCredentialEnvironmentPolicy
 {
     public AgentKind Kind => AgentKind.Claude;
+    public IReadOnlySet<string> DirectCredentialEnvironmentVariables { get; } =
+        new HashSet<string>(StringComparer.Ordinal)
+        {
+            PlanningMarkerCredentialProvider.MarkerKey,
+        };
+    public IReadOnlySet<string> FileBackedCredentialEnvironmentVariables { get; } =
+        new HashSet<string>(StringComparer.Ordinal);
+    public IReadOnlyList<AgentCredentialFileDestination> CredentialFileDestinations { get; } = [];
     public int PlanningCalls { get; private set; }
     public int WorkCalls { get; private set; }
     public bool PlanningReceivedSandbox { get; private set; }
@@ -3078,10 +3086,18 @@ internal sealed class CodeOnlyRecordingAuditor : IAuditor
     }
 }
 
-internal sealed class PlanReviewTextAgent(AgentKind kind, IReadOnlyList<string> outputs) : IAgentRunner, ITextOnlyAgentRunner
+internal sealed class PlanReviewTextAgent(AgentKind kind, IReadOnlyList<string> outputs) :
+    IAgentRunner,
+    ITextOnlyAgentRunner,
+    IAgentCredentialEnvironmentPolicy
 {
     private readonly Queue<string> _outputs = new(outputs);
     public AgentKind Kind { get; } = kind;
+    public IReadOnlySet<string> DirectCredentialEnvironmentVariables { get; } =
+        new HashSet<string>(StringComparer.Ordinal) { "TEST_AGENT_CREDENTIAL" };
+    public IReadOnlySet<string> FileBackedCredentialEnvironmentVariables { get; } =
+        new HashSet<string>(StringComparer.Ordinal);
+    public IReadOnlyList<AgentCredentialFileDestination> CredentialFileDestinations { get; } = [];
     public int TextOnlyCalls { get; private set; }
     public int SandboxRunCalls { get; private set; }
     public bool SupportsSeparateSystemPrompt => true;
@@ -3185,9 +3201,17 @@ internal sealed class PlanReviewTextAgent(AgentKind kind, IReadOnlyList<string> 
     }
 }
 
-internal sealed class SandboxRequiredPlanReviewAgent : IAgentRunner, ITextOnlyAgentRunner
+internal sealed class SandboxRequiredPlanReviewAgent :
+    IAgentRunner,
+    ITextOnlyAgentRunner,
+    IAgentCredentialEnvironmentPolicy
 {
     public AgentKind Kind => AgentKind.Codex;
+    public IReadOnlySet<string> DirectCredentialEnvironmentVariables { get; } =
+        new HashSet<string>(StringComparer.Ordinal) { "TEST_AGENT_CREDENTIAL" };
+    public IReadOnlySet<string> FileBackedCredentialEnvironmentVariables { get; } =
+        new HashSet<string>(StringComparer.Ordinal);
+    public IReadOnlyList<AgentCredentialFileDestination> CredentialFileDestinations { get; } = [];
     public bool TextOnlyRequiresSandbox => true;
     public bool SupportsSeparateSystemPrompt => true;
     public int TextOnlyCalls { get; private set; }

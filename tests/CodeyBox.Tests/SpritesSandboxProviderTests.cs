@@ -113,7 +113,12 @@ public sealed class SpritesSandboxProviderTests
             Argv = ["bash", "-lc", "cat"],
             WorkingDirectory = "/work",
             Stdin = "hello",
-            ExtraEnvironment = new Dictionary<string, string> { ["SECRET"] = "env-value" },
+            ExtraEnvironment = new Dictionary<string, string>
+            {
+                ["BASE"] = "exec-override",
+                ["SECRET"] = "env-value",
+            },
+            EnvironmentVariablesToUnset = ["BASE"],
         });
 
         Assert.Equal(7, result.ExitCode);
@@ -129,6 +134,7 @@ public sealed class SpritesSandboxProviderTests
 
         Assert.Equal("sprite-token", socket.BearerToken);
         AssertWrappedCommand(query, ["bash", "-lc", "cat"], "/work");
+        Assert.Contains("BASE", query["cmd"]);
         // The working directory is established by the in-sandbox bootstrap (mkdir+cd) rather than
         // the documented `dir` query param, so the sprite never chdir's into a not-yet-created
         // directory. dir must be absent from the URL; the workdir travels as a bootstrap argv element.
@@ -137,6 +143,12 @@ public sealed class SpritesSandboxProviderTests
             frame.Length > 1 &&
             frame[0] == 0 &&
             Encoding.UTF8.GetString(frame[1..]).EndsWith("hello", StringComparison.Ordinal));
+        var stdinPayload = string.Concat(
+            socket.SentFrames
+                .Where(static frame => frame.Length > 1 && frame[0] == 0)
+                .Select(static frame => Encoding.UTF8.GetString(frame[1..])));
+        Assert.DoesNotContain("BASE=", stdinPayload, StringComparison.Ordinal);
+        Assert.Contains("SECRET=", stdinPayload, StringComparison.Ordinal);
         Assert.Contains(socket.SentFrames, frame => frame.SequenceEqual(new byte[] { 4 }));
     }
 
@@ -466,6 +478,23 @@ public sealed class SpritesSandboxProviderTests
         Assert.False(result.Success);
         Assert.Contains("file-backed credentials are not supported", result.Summary, StringComparison.Ordinal);
         Assert.Null(socket.ConnectedUri);
+    }
+
+    [Fact]
+    public async Task FileBackedCredentialRunner_DecoratorCycleFailsClosed()
+    {
+        var sandbox = new CyclicSandboxDecorator();
+        var runner = new CodexAgentRunner();
+        var credential = new AgentCredential(
+            AgentKind.Codex,
+            new Dictionary<string, string> { ["CODEX_AUTH_JSON"] = "{}" },
+            new Dictionary<string, string>());
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            runner.RunAsync(sandbox, "/work", "prompt", credential));
+
+        Assert.Contains("cycle", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, sandbox.ExecCalls);
     }
 
     [Fact]
@@ -1336,6 +1365,21 @@ public sealed class SpritesSandboxProviderTests
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
     }
 
+    private sealed class CyclicSandboxDecorator : ISandboxDecorator
+    {
+        public string Id => "cyclic-sandbox";
+        public ISandbox InnerSandbox => this;
+        public int ExecCalls { get; private set; }
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            ExecCalls++;
+            return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
     private sealed class TempDirectory : IDisposable
     {
         public TempDirectory()
@@ -1397,7 +1441,7 @@ public sealed class SpritesSandboxProviderTests
     private static void AssertWrappedCommand(Dictionary<string, List<string>> query, IReadOnlyList<string> expectedOriginalArgv, string expectedWorkingDirectory = "/")
     {
         var cmd = query["cmd"];
-        Assert.True(cmd.Count >= expectedOriginalArgv.Count + 6, $"wrapped command had too few argv entries: {string.Join(" ", cmd)}");
+        Assert.True(cmd.Count >= expectedOriginalArgv.Count + 7, $"wrapped command had too few argv entries: {string.Join(" ", cmd)}");
         Assert.Equal("sh", cmd[0]);
         Assert.Equal("-c", cmd[1]);
         Assert.Contains("exec \"$@\"", cmd[2], StringComparison.Ordinal);
@@ -1407,7 +1451,13 @@ public sealed class SpritesSandboxProviderTests
         Assert.True(int.TryParse(cmd[4], NumberStyles.None, CultureInfo.InvariantCulture, out var envBytes), "env byte count should be numeric");
         Assert.True(envBytes > 0);
         Assert.Equal(expectedWorkingDirectory, cmd[5]);
-        Assert.Equal(expectedOriginalArgv, cmd.Skip(6).ToArray());
+        Assert.True(
+            int.TryParse(cmd[6], NumberStyles.None, CultureInfo.InvariantCulture, out var unsetCount),
+            "unset variable count should be numeric");
+        Assert.InRange(unsetCount, 0, SandboxExec.MaximumEnvironmentVariablesToUnset);
+        var originalArgvStart = 7 + unsetCount;
+        Assert.True(originalArgvStart <= cmd.Count, "unset variable count exceeds wrapped argv");
+        Assert.Equal(expectedOriginalArgv, cmd.Skip(originalArgvStart).ToArray());
     }
 
     private sealed class RecordingHttpHandler : HttpMessageHandler

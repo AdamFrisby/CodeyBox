@@ -10,6 +10,112 @@ namespace CodeyBox.Tests;
 public sealed class CodeyBoxOptionsValidatorTests
 {
     [Theory]
+    [InlineData(0)]
+    [InlineData(DeepAuditFailurePersistenceOptions.MaximumMaxAttempts + 1)]
+    public void Validate_RejectsOutOfRangeDeepAuditFailurePersistenceAttempts(int maxAttempts)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.DeepAuditFailurePersistence.MaxAttempts = maxAttempts;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:DeepAuditFailurePersistence:MaxAttempts", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsOutOfRangeDeepAuditFailurePersistenceRetryDelay()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.DeepAuditFailurePersistence.RetryDelay =
+            DeepAuditFailurePersistenceOptions.MaximumRetryDelay + TimeSpan.FromMilliseconds(1);
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:DeepAuditFailurePersistence:RetryDelay", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_AllowsUniqueRegisteredRetainedSandboxProviders()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.SandboxProviderCutover.RetainedInventoryProviders = ["multipass", "incus"];
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.False(result.Failed, result.FailureMessage);
+    }
+
+    [Theory]
+    [InlineData("process", "must name a registered hot-reload provider")]
+    [InlineData("multipass,multipass", "duplicates an earlier provider ID")]
+    public void Validate_RejectsInvalidRetainedSandboxProviderInventory(
+        string configured,
+        string expectedFailure)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.SandboxProviderCutover.RetainedInventoryProviders = configured.Split(',').ToList();
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(expectedFailure, result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsOversizedRetainedSandboxProviderInventoryAtEnumerationBound()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.SandboxProviderCutover.RetainedInventoryProviders = Enumerable
+            .Repeat("multipass", SandboxProviderCutoverConfig.MaximumRetainedInventoryProviders + 1)
+            .ToList();
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("must contain at most", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsHugeSandboxProviderSelectorBeforeNormalization()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.SandboxProvider = new string(' ', 1_000_000);
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:SandboxProvider is invalid", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsHugeRetainedProviderIdAtBoundedEntryGuard()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.SandboxProviderCutover.RetainedInventoryProviders = [new string(' ', 1_000_000)];
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("RetainedInventoryProviders:0", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_ValidatesRetainedIncusConfigurationWhenMultipassIsSelected()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.SandboxProvider = "multipass";
+        options.SandboxProviderCutover.RetainedInventoryProviders = ["incus"];
+        options.Incus.StoragePoolName = string.Empty;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:Incus:StoragePoolName", result.FailureMessage);
+    }
+
+    [Theory]
     [InlineData("acquisition", "CodeyBox:SqliteWriteGate:AcquisitionTimeout must be positive")]
     [InlineData("acquisition-max", "CodeyBox:SqliteWriteGate:AcquisitionTimeout must be <=")]
     [InlineData("hold", "CodeyBox:SqliteWriteGate:MaxHoldDuration must be positive")]

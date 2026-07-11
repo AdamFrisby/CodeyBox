@@ -49,6 +49,7 @@ namespace CodeyBox.Sandbox.Multipass;
 /// </summary>
 public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IActiveSandboxProgressProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner, IResourceMetricsCapturingProvider
 {
+    public const string ProviderId = "multipass";
     // Options are resolved through a delegate once per public operation so an
     // operator can edit ExtraRuncmd / ExtraCloudInit / NetworkProfiles /
     // UseBaselineImages in appsettings.json and have the change land on the next
@@ -201,7 +202,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         return Path.Combine(Path.GetTempPath(), "codeybox-mp-staging");
     }
 
-    public string Name => "multipass";
+    public string Name => ProviderId;
     // HTTP ingest and detached launch are spec-dependent: the concrete sandbox
     // advertises them only when its network profile resolves to a host bridge.
     public SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.ExecPipe;
@@ -1504,6 +1505,25 @@ git push origin HEAD:{refName}";
         return baselineName;
     }
 
+    public static bool IsOwnedBaselineRef(MultipassSandboxOptions options, string baselineRef)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        if (string.IsNullOrEmpty(baselineRef) || baselineRef.Length > 24)
+            return false;
+
+        var prefix = options.BaselineNamePrefix;
+        if (string.IsNullOrEmpty(prefix) || prefix.Length >= 24 || !IsValidSandboxName(prefix))
+            return false;
+        if (!baselineRef.StartsWith(prefix, StringComparison.Ordinal))
+            return false;
+
+        var expectedLength = Math.Min(prefix.Length + 12, 24);
+        if (baselineRef.Length != expectedLength)
+            return false;
+
+        return baselineRef.AsSpan(prefix.Length).IndexOfAnyExcept("0123456789abcdef") < 0;
+    }
+
     /// <inheritdoc/>
     public async Task<string?> EnsureBaselineImageAsync(
         string profileName,
@@ -1525,19 +1545,32 @@ git push origin HEAD:{refName}";
         var listRun = await RunAsync(opts, [opts.MultipassBinary, "list", "--format=json"], stdin: null, ct: ct);
         if (listRun.ExitCode != 0)
         {
-            _log.LogWarning("multipass list failed (exit {Exit}): {Stderr}", listRun.ExitCode, listRun.Stderr);
-            return [];
+            throw new InvalidOperationException(
+                $"Could not enumerate Multipass baseline images because 'multipass list --format=json' exited with code {listRun.ExitCode}.");
         }
         var results = new List<BaselineImageInfo>();
         try
         {
             using var doc = JsonDocument.Parse(listRun.Stdout);
-            if (!doc.RootElement.TryGetProperty("list", out var list)) return results;
+            if (doc.RootElement.ValueKind != JsonValueKind.Object
+                || !doc.RootElement.TryGetProperty("list", out var list)
+                || list.ValueKind != JsonValueKind.Array)
+            {
+                throw new JsonException(
+                    "Multipass baseline inventory must contain a JSON array property named 'list'.");
+            }
             foreach (var entry in list.EnumerateArray())
             {
-                if (!entry.TryGetProperty("name", out var nameProp)) continue;
+                if (entry.ValueKind != JsonValueKind.Object
+                    || !entry.TryGetProperty("name", out var nameProp)
+                    || nameProp.ValueKind != JsonValueKind.String)
+                {
+                    throw new JsonException(
+                        "Every Multipass inventory entry must contain a string property named 'name'.");
+                }
                 var name = nameProp.GetString();
-                if (string.IsNullOrEmpty(name)) continue;
+                if (string.IsNullOrEmpty(name))
+                    throw new JsonException("Multipass inventory entry names must be non-empty.");
                 if (!name.StartsWith(prefix, StringComparison.Ordinal)) continue;
                 // multipass list doesn't expose created-at in --format=json;
                 // mtime of the disk image is the next-best signal but is provider-
@@ -1548,8 +1581,9 @@ git push origin HEAD:{refName}";
         }
         catch (JsonException ex)
         {
-            _log.LogWarning(ex, "Failed to parse multipass list JSON output");
-            return [];
+            throw new InvalidOperationException(
+                "Could not enumerate Multipass baseline images because 'multipass list --format=json' returned an invalid inventory document.",
+                ex);
         }
         return results;
     }
@@ -5220,7 +5254,7 @@ public sealed record MultipassDiskGuardOptions
     public TimeSpan RecheckIn { get; init; } = TimeSpan.FromMinutes(5);
 }
 
-internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDisposeSandbox, ISuspendableSandbox, IShutdownTeardownSandbox
+internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDisposeSandbox, ISuspendableSandbox, IShutdownTeardownSandbox, IProviderOwnedSandbox, IPrivilegedGuestFileHardeningSandbox, IResourceMetricsCapturingSandbox
 {
     internal const int ArgvBytesWarningThreshold = 64 * 1024;
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
@@ -5372,6 +5406,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     }
 
     public string Id { get; }
+    public string ProviderId => MultipassSandboxProvider.ProviderId;
+    public bool CapturesResourceMetrics => _opts.CaptureResourceMetrics;
 
     internal ActiveSandboxProgress SnapshotActiveProgress(WorkItemId workItemId)
     {
@@ -5424,8 +5460,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         var stdoutChunkCallback = exec.StdoutChunkCallback;
         var stderrChunkCallback = exec.StderrChunkCallback;
         var effectiveEnvironment = BuildEffectiveExecEnvironment(exec);
-        var forceEnvironmentFile = exec.EnvironmentContainsSecrets
-            && effectiveEnvironment is { Count: > 0 };
+        var forceEnvironmentFile = exec.EnvironmentVariablesToUnset.Count > 0
+            || (exec.EnvironmentContainsSecrets && effectiveEnvironment is { Count: > 0 });
         var detachedHttpIngest = false;
         string? detachedExitToken = null;
         string? detachedProcessGroupMarker = null;
@@ -5457,9 +5493,11 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 if (agentOutputIngest is not null)
                 {
                     detachedHttpIngest = ShouldDetachAgentOutputHttpIngest(exec);
-                    effectiveEnvironment = MergeExecEnvironment(
-                        RemoveAgentOutputExitToken(effectiveEnvironment),
-                        agentOutputIngest.BuildEnvironment(includeExitToken: false));
+                    effectiveEnvironment = ApplyEnvironmentRemovals(
+                        exec,
+                        MergeExecEnvironment(
+                            RemoveAgentOutputExitToken(effectiveEnvironment),
+                            agentOutputIngest.BuildEnvironment(includeExitToken: false)));
                     if (detachedHttpIngest)
                     {
                         detachedExitToken = agentOutputIngest.ExitToken;
@@ -5487,11 +5525,14 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
         List<string> wrapped;
         IReadOnlyList<string> argv;
-        if (forceEnvironmentFile && effectiveEnvironment is { Count: > 0 })
+        if (forceEnvironmentFile)
         {
             try
             {
-                var envFile = await TransferExecEnvironmentAsync(effectiveEnvironment, ct);
+                var envFile = await TransferExecEnvironmentAsync(
+                    effectiveEnvironment ?? new Dictionary<string, string>(StringComparer.Ordinal),
+                    exec.EnvironmentVariablesToUnset,
+                    ct);
                 transferredVmPaths.Add(envFile);
                 if (detachedHttpIngest)
                 {
@@ -5513,10 +5554,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                if (exec.EnvironmentContainsSecrets)
+                if (exec.EnvironmentContainsSecrets || exec.EnvironmentVariablesToUnset.Count > 0)
                 {
                     throw new InvalidOperationException(
-                        "Secret sandbox environment delivery failed before process launch.",
+                        "Required sandbox environment delivery failed before process launch.",
                         ex);
                 }
                 if (detachedHttpIngest)
@@ -5568,7 +5609,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
             if (effectiveEnvironment is { Count: > 0 })
             {
-                var envFile = await TransferExecEnvironmentAsync(effectiveEnvironment, ct);
+                var envFile = await TransferExecEnvironmentAsync(
+                    effectiveEnvironment,
+                    exec.EnvironmentVariablesToUnset,
+                    ct);
                 transferredVmPaths.Add(envFile);
                 wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, envFile, stdinFile: null);
                 argv = BuildMultipassExecArgv(wrapped);
@@ -6059,25 +6103,15 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
     private IReadOnlyDictionary<string, string>? BuildEffectiveExecEnvironment(SandboxExec exec)
     {
-        if (_spec.Flavor != SandboxProfileFlavor.Graphical)
-            return exec.ExtraEnvironment;
-
-        if (exec.ExtraEnvironment is null || exec.ExtraEnvironment.Count == 0)
+        Dictionary<string, string>? merged = exec.ExtraEnvironment is { Count: > 0 }
+            ? new Dictionary<string, string>(exec.ExtraEnvironment, StringComparer.Ordinal)
+            : null;
+        if (_spec.Flavor == SandboxProfileFlavor.Graphical)
         {
-            return new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["DISPLAY"] = SandboxConventions.GraphicalDisplay,
-            };
+            merged ??= new Dictionary<string, string>(StringComparer.Ordinal);
+            merged.TryAdd("DISPLAY", SandboxConventions.GraphicalDisplay);
         }
-
-        if (exec.ExtraEnvironment.ContainsKey("DISPLAY"))
-            return exec.ExtraEnvironment;
-
-        var merged = new Dictionary<string, string>(exec.ExtraEnvironment, StringComparer.Ordinal)
-        {
-            ["DISPLAY"] = SandboxConventions.GraphicalDisplay,
-        };
-        return merged;
+        return ApplyEnvironmentRemovals(exec, merged);
     }
 
     private bool ShouldUseAgentOutputHttpIngest(
@@ -6124,6 +6158,17 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         return merged;
     }
 
+    private static IReadOnlyDictionary<string, string>? ApplyEnvironmentRemovals(
+        SandboxExec exec,
+        IReadOnlyDictionary<string, string>? environment)
+    {
+        if (environment is null || exec.EnvironmentVariablesToUnset.Count == 0)
+            return environment;
+        var scrubbed = new Dictionary<string, string>(environment, StringComparer.Ordinal);
+        exec.ApplyEnvironmentRemovals(name => scrubbed.Remove(name));
+        return scrubbed.Count == 0 ? null : scrubbed;
+    }
+
     private static IReadOnlyDictionary<string, string>? RemoveAgentOutputExitToken(
         IReadOnlyDictionary<string, string>? environment)
     {
@@ -6167,7 +6212,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         {
             wrapped.AddRange(["--env-file", extraEnvFile]);
         }
-        else if (effectiveEnvironment is { Count: > 0 })
+        if (extraEnvFile is null && effectiveEnvironment is { Count: > 0 })
         {
             // env(1) takes KEY=VALUE pairs followed by the command. This
             // keeps the common case small and preserves historical ordering.
@@ -6190,14 +6235,25 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         return total;
     }
 
-    private async Task<string> TransferExecEnvironmentAsync(IReadOnlyDictionary<string, string> env, CancellationToken ct)
+    private async Task<string> TransferExecEnvironmentAsync(
+        IReadOnlyDictionary<string, string> env,
+        IReadOnlyList<string> environmentVariablesToUnset,
+        CancellationToken ct)
     {
         var fileName = $"env-{Guid.NewGuid():N}";
         var hostDir = Path.Combine(_sandboxRoot, "exec-env");
         Directory.CreateDirectory(hostDir);
         MultipassSandboxProvider.TryChmod0700(hostDir);
         var hostPath = Path.Combine(hostDir, fileName);
-        await File.WriteAllTextAsync(hostPath, MultipassSandboxProvider.BuildEnvironmentFileContent(env), ct);
+        var content = new StringBuilder(MultipassSandboxProvider.BuildEnvironmentFileContent(env));
+        foreach (var name in environmentVariablesToUnset)
+        {
+            SandboxEnvironmentVariableName.Validate(name, nameof(environmentVariablesToUnset));
+            content.Append("unset -- ")
+                .Append(MultipassSandboxProvider.ShellSingleQuote(name))
+                .Append('\n');
+        }
+        await File.WriteAllTextAsync(hostPath, content.ToString(), ct);
         try
         {
             if (!OperatingSystem.IsWindows())
@@ -7411,7 +7467,7 @@ while True:
 
             _resourceMetrics = metrics;
             await TryPersistResourceMetricsAsync(metrics, timeout, ct).ConfigureAwait(false);
-            RecordResourceMetricInstruments(metrics);
+            SandboxResourceMetricsTelemetry.Record(metrics);
             return metrics;
         }
         catch (OperationCanceledException)
@@ -7579,20 +7635,6 @@ while True:
         }
     }
 
-    private static void RecordResourceMetricInstruments(SandboxResourceMetrics metrics)
-    {
-        var phaseTag = new KeyValuePair<string, object?>("phase", metrics.Phase);
-        var networkTag = new KeyValuePair<string, object?>("network_profile", metrics.NetworkProfile ?? "");
-        if (BytesToMb(metrics.PeakRamBytes) is { } peak)
-            CodeyBoxMeters.SandboxPeakRamMb.Record(peak, phaseTag, networkTag);
-        if (metrics.AvgCpuPercent is { } cpu)
-            CodeyBoxMeters.SandboxAvgCpuPercent.Record(cpu, phaseTag, networkTag);
-        if (BytesToMb(metrics.NetRxBytes) is { } rx)
-            CodeyBoxMeters.SandboxNetRxMb.Record(rx, phaseTag, networkTag);
-        if (BytesToMb(metrics.NetTxBytes) is { } tx)
-            CodeyBoxMeters.SandboxNetTxMb.Record(tx, phaseTag, networkTag);
-    }
-
     private static bool HasRequiredResourceMetrics(SandboxResourceMetrics metrics) =>
         metrics.PeakRamBytes.HasValue
         && metrics.AvgCpuPercent.HasValue
@@ -7620,13 +7662,7 @@ while True:
     {
         if (!values.TryGetValue(key, out var raw) || string.IsNullOrWhiteSpace(raw))
             return null;
-        if (!double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
-            return null;
-        if (double.IsNaN(value) || double.IsInfinity(value) || value < min)
-            return null;
-        if (max.HasValue && value > max.Value)
-            return null;
-        return value;
+        return SandboxResourceMetricValidation.ParseFiniteDouble(raw, min, max);
     }
 
     private static double? BytesToMb(long? bytes) =>

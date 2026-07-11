@@ -188,6 +188,7 @@ internal sealed class BubblewrapSandbox : ISandbox
         foreach (var (k, v) in _spec.Environment) psi.EnvironmentVariables[k] = v;
         if (exec.ExtraEnvironment is not null)
             foreach (var (k, v) in exec.ExtraEnvironment) psi.EnvironmentVariables[k] = v;
+        exec.ApplyEnvironmentRemovals(name => psi.EnvironmentVariables.Remove(name));
 
         var isFirstExec = Interlocked.CompareExchange(ref _firstExecEmitted, 1, 0) == 0;
         TimingScope? firstExecScope = isFirstExec

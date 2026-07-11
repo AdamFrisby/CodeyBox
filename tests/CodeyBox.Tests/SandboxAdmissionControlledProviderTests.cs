@@ -198,6 +198,27 @@ public sealed class SandboxAdmissionControlledProviderTests
     }
 
     [Fact]
+    public async Task ManagedInventory_PreservesInnerCompletenessAndHostCoverage()
+    {
+        var inner = new CountingSandboxProvider
+        {
+            ManagedSandboxes = new ManagedSandboxInventory(
+                [],
+                isComplete: false,
+                inventoriedHostIds: new HashSet<string>(["host-a"], StringComparer.Ordinal)),
+        };
+        var provider = SandboxAdmissionControlledProvider.Wrap(
+            inner,
+            maxConcurrentSandboxes: 1,
+            NullLogger.Instance);
+
+        var inventory = await provider.ListManagedInventoryAsync(CancellationToken.None);
+
+        Assert.False(inventory.IsComplete);
+        Assert.Equal(["host-a"], inventory.InventoriedHostIds);
+    }
+
+    [Fact]
     public async Task CreateFailureWithRetainedBaseline_UsesBaselineInventoryForAdmissionRelease()
     {
         var inner = new CountingSandboxProvider
@@ -324,6 +345,23 @@ public sealed class SandboxAdmissionControlledProviderTests
     }
 
     [Fact]
+    public async Task Dispose_DecoratorCycleFailsClosedWithoutReleasingAdmission()
+    {
+        var provider = SandboxAdmissionControlledProvider.Wrap(
+            new SelfCyclingSandboxProvider(),
+            maxConcurrentSandboxes: 1,
+            NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+        var sandbox = await provider.CreateAsync(Spec());
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await sandbox.DisposeAsync());
+
+        Assert.Contains("cycle", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+    }
+
+    [Fact]
     public async Task ActiveSnapshot_ReturnsAdmissionControlledHandleThatReleasesTokenOnDispose()
     {
         var inner = new CountingSandboxProvider();
@@ -412,6 +450,43 @@ public sealed class SandboxAdmissionControlledProviderTests
         await using var sandbox = await queued.WaitAsync(TestDeadline);
 
         Assert.Equal(1, inner.DisposeBaselineCalls);
+    }
+
+    [Fact]
+    public async Task DisposeBaselineImageAsync_InventoryFailureRetainsEveryUnprovenAdmission()
+    {
+        var inner = new CountingSandboxProvider
+        {
+            FailNextEnsureBaselineRetainedName = "cb-baseline-retained-a",
+        };
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 2, NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<ISandboxAdmissionSnapshot>(provider);
+        var provisioner = Assert.IsAssignableFrom<IBaselineImageProvisioner>(provider);
+        var resolver = Assert.IsAssignableFrom<IBaselineImageResolver>(provider);
+
+        await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() => provisioner.EnsureBaselineImageAsync(
+            "default",
+            SandboxProfileFlavor.Headless,
+            pinnedBaselineRef: null,
+            CancellationToken.None));
+        inner.FailNextEnsureBaselineRetainedName = "cb-baseline-retained-b";
+        await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() => provisioner.EnsureBaselineImageAsync(
+            "default",
+            SandboxProfileFlavor.Headless,
+            pinnedBaselineRef: null,
+            CancellationToken.None));
+        Assert.Equal(2, admission.CurrentAdmittedSandboxes);
+
+        inner.ThrowOnListBaseline = true;
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            resolver.DisposeBaselineImageAsync("cb-baseline-retained-a", CancellationToken.None));
+
+        Assert.Equal(1, inner.DisposeBaselineCalls);
+        Assert.Equal(2, admission.CurrentAdmittedSandboxes);
+
+        inner.ThrowOnListBaseline = false;
+        Assert.Empty(await resolver.ListBaselineImagesAsync(CancellationToken.None));
+        Assert.Equal(0, admission.CurrentAdmittedSandboxes);
     }
 
     [Fact]
@@ -676,7 +751,7 @@ public sealed class SandboxAdmissionControlledProviderTests
         Assert.Equal(1, inner.ReconcileCalls);
         Assert.Equal(1, inner.DiskSampleCalls);
         Assert.Equal(1, inner.ResolveBaselineCalls);
-        Assert.Equal(1, inner.ListBaselineCalls);
+        Assert.Equal(2, inner.ListBaselineCalls);
         Assert.Equal(1, inner.DisposeBaselineCalls);
         Assert.Equal(1, inner.EnsureBaselineCalls);
         Assert.Equal(1, inner.ProgressSnapshotCalls);
@@ -954,7 +1029,7 @@ public sealed class SandboxAdmissionControlledProviderTests
             Assert.Empty(await resolver.ListBaselineImagesAsync(CancellationToken.None));
             await resolver.DisposeBaselineImageAsync("baseline", CancellationToken.None);
             Assert.Equal(1, inner.ResolveBaselineCalls);
-            Assert.Equal(1, inner.ListBaselineCalls);
+            Assert.Equal(2, inner.ListBaselineCalls);
             Assert.Equal(1, inner.DisposeBaselineCalls);
         }
 
@@ -1385,6 +1460,31 @@ public sealed class SandboxAdmissionControlledProviderTests
             Task.CompletedTask;
     }
 
+    private sealed class SelfCyclingSandboxProvider : ISandboxProvider
+    {
+        public string Name => "self-cycling";
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) =>
+            Task.FromResult<ISandbox>(new SelfCyclingOwnedSandbox());
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    private sealed class SelfCyclingOwnedSandbox : ISandboxDecorator, IProviderOwnedSandbox
+    {
+        public string Id => "self-cycling-sandbox";
+        public string ProviderId => "self-cycling";
+        public ISandbox InnerSandbox => this;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
+            Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
     private abstract class CapabilitySandboxBase : ISandbox
     {
         private bool _suspended;
@@ -1608,6 +1708,7 @@ public sealed class SandboxAdmissionControlledProviderTests
         public IReadOnlyList<ActiveSandboxProgress> ActiveProgress { get; set; } = [];
         public bool BlockEnsureBaseline { get; init; }
         public bool ThrowOnEnsureBaseline { get; init; }
+        public bool ThrowOnListBaseline { get; set; }
         public string? FailNextEnsureBaselineRetainedName { get; set; }
         public bool BlockResume { get; init; }
         public TaskCompletionSource ResumeStarted { get; } =
@@ -1693,6 +1794,8 @@ public sealed class SandboxAdmissionControlledProviderTests
         public Task<IReadOnlyList<BaselineImageInfo>> ListBaselineImagesAsync(CancellationToken ct)
         {
             Interlocked.Increment(ref _listBaselineCalls);
+            if (ThrowOnListBaseline)
+                throw new InvalidOperationException("baseline inventory failed");
             return Task.FromResult<IReadOnlyList<BaselineImageInfo>>([]);
         }
 

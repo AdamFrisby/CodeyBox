@@ -1133,11 +1133,12 @@ An empty array means no workers are currently registered. A row with a stale `la
 
 ### `GET /sandboxes/leaked`
 
-Returns the list of `codeybox-*` Multipass VMs that were detected as leaked on
-the most recent reaper sweep (default every 15 minutes) and not yet
-successfully disposed. An empty array means no pending leaked sandboxes remain
-from the last sweep; with `AutoDispose=true`, stale VMs may have been detected
-and already purged.
+Returns the provider-owned persistent sandboxes detected as leaked on the most
+recent reaper sweep (default every 15 minutes) and not yet successfully
+disposed. An empty array means no pending leaked sandboxes remain from the last
+sweep; with `AutoDispose=true`, stale instances may have been detected and
+already purged. `providerId` identifies the lifecycle backend that reported the
+snapshot and disambiguates equal names during a provider cutover.
 
 ```json
 [
@@ -1146,7 +1147,8 @@ and already purged.
     "createdAt": "2026-05-04T02:00:00+00:00",
     "ageMinutes": 127.3,
     "diskMb": null,
-    "reason": "untracked_sandbox_age_threshold_exceeded"
+    "reason": "untracked_sandbox_age_threshold_exceeded",
+    "providerId": "incus"
   }
 ]
 ```
@@ -1170,7 +1172,8 @@ Response: `200 OK`
       "createdAt": "2026-05-04T02:00:00+00:00",
       "ageMinutes": 127.3,
       "diskMb": null,
-      "reason": "untracked_sandbox_age_threshold_exceeded"
+      "reason": "untracked_sandbox_age_threshold_exceeded",
+      "providerId": "incus"
     }
   ]
 }
@@ -1207,12 +1210,14 @@ Response: `200 OK`
 ### `GET /baselines`
 
 Returns the most recent baseline-image-reaper sweep. Each entry is one
-content-hashed Multipass baseline VM (`cb-baseline-*`) on the host, paired
-with the list of work items still pinned to it via
+content-hashed baseline instance reported by the active managed VM
+provider(s), paired with the list of work items still pinned to it via
 `WorkItem.baselineImageRef`. `isLive=true` means at least one non-terminal
 work item references the baseline; `isLive=false` items are orphan candidates
 inside the configured grace window (default 24h) and will be reaped on a
-future sweep if no work item re-pins them.
+future sweep if no work item re-pins them. Baseline names and ownership
+metadata are provider-specific; a Multipass/Incus cutover inventories both
+activated backends and refuses partial results.
 
 Response: `200 OK`
 
@@ -1263,11 +1268,15 @@ Response: `200 OK`
 
 ### `POST /sandboxes/leaked/{name}/dispose`
 
-Operator-triggered dispose of a leaked sandbox by name. The name must start with
-`codeybox-`. Returns `{ "disposed": "<name>" }` on success.
+Operator-triggered dispose of a leaked sandbox from the latest reaper snapshot.
+Returns `{ "disposed": "<name>" }` on success. The owning lifecycle provider
+re-verifies resource ownership before deletion. When two providers report the
+same name, pass the exact `providerId` returned by `GET /sandboxes/leaked` as
+`?providerId=...`; a name-only request is intentionally ambiguous.
 
-* Returns `400` if the name does not start with `codeybox-`.
+* Returns `400` for an invalid `providerId` value.
 * Returns `404` if the sandbox is not present in the latest leaked list (use `GET /sandboxes/leaked` to verify it is detected as a leak before calling).
+* Returns `409` if multiple provider snapshots have that name and no exact `providerId` was supplied.
 * Returns `504` if the dispose times out (5-minute per-sandbox cap).
 * Returns `500` on other errors.
 

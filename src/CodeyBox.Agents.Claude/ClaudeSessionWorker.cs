@@ -405,6 +405,13 @@ public sealed class ClaudeSessionWorker : IScopedSessionAgentRunner, ICredential
         try
         {
             ThrowIfClosed(state);
+            var preemptible = SandboxCapability.Find<IPreemptibleSandbox>(state.Sandbox);
+            if (preemptible is not null
+                && SandboxCapability.Find<ISuspendableSandbox>(state.Sandbox) is null)
+            {
+                throw new NotSupportedException(
+                    "The sandbox does not support stopped-session resume.");
+            }
             try
             {
                 await state.TransportSession.SuspendAsync(ct).ConfigureAwait(false);
@@ -414,7 +421,7 @@ public sealed class ClaudeSessionWorker : IScopedSessionAgentRunner, ICredential
             {
                 // Transport-side suspend failures must not block the VM stop.
             }
-            if (state.Sandbox is IPreemptibleSandbox preemptible)
+            if (preemptible is not null)
                 await preemptible.StopAndPreserveAsync(ct).ConfigureAwait(false);
             state.Suspended = true;
         }
@@ -436,6 +443,12 @@ public sealed class ClaudeSessionWorker : IScopedSessionAgentRunner, ICredential
         try
         {
             ThrowIfClosed(state);
+            if (SandboxCapability.Find<IPreemptibleSandbox>(state.Sandbox) is not null
+                && SandboxCapability.Find<ISuspendableSandbox>(state.Sandbox) is null)
+            {
+                throw new NotSupportedException(
+                    "The sandbox does not support stopped-session resume.");
+            }
 
             if (_sandboxResumeHook is not null)
             {

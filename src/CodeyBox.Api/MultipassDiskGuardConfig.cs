@@ -23,40 +23,15 @@ internal static class MultipassDiskGuardConfig
     /// </summary>
     public static MultipassDiskGuardOptions? Build(CodeyBoxOptions opts, ILogger startupLog)
     {
-        var cfg = opts.DiskGuard;
-        if (cfg is null || !cfg.Enabled) return null;
-        if (cfg.MinFreeBytes <= 0)
-        {
-            startupLog.LogWarning(
-                "CodeyBox:DiskGuard:MinFreeBytes={MinFreeBytes} is non-positive; disabling disk-guard preflight",
-                cfg.MinFreeBytes);
-            return null;
-        }
-
-        TimeSpan recheck = TimeSpan.FromMinutes(5);
-        if (!string.IsNullOrWhiteSpace(cfg.RecheckIn))
-        {
-            if (!TimeSpan.TryParse(cfg.RecheckIn, out recheck) || recheck <= TimeSpan.Zero)
-                throw new InvalidOperationException(
-                    $"CodeyBox:DiskGuard:RecheckIn '{cfg.RecheckIn}' must be a positive TimeSpan (e.g. '00:05:00').");
-        }
-
-        // Auto-include the state-database directory so a write-side ENOSPC is
-        // caught by the preflight before it surfaces as SQLITE_FULL.
-        var extras = new List<string>(cfg.AdditionalPaths);
-        if (!string.IsNullOrWhiteSpace(opts.StateDatabasePath))
-        {
-            var dbDir = Path.GetDirectoryName(opts.StateDatabasePath);
-            if (!string.IsNullOrEmpty(dbDir) && !extras.Contains(dbDir, StringComparer.Ordinal))
-                extras.Add(dbDir);
-        }
+        var resolved = SharedDiskGuardConfig.Resolve(opts, startupLog);
+        if (resolved is null) return null;
 
         return new MultipassDiskGuardOptions
         {
-            MinFreeBytes = cfg.MinFreeBytes,
-            MultipassDataPath = cfg.MultipassDataPath,
-            RecheckIn = recheck,
-            AdditionalPaths = extras,
+            MinFreeBytes = resolved.MinFreeBytes,
+            MultipassDataPath = opts.DiskGuard.MultipassDataPath,
+            RecheckIn = resolved.RecheckIn,
+            AdditionalPaths = resolved.AdditionalPaths,
         };
     }
 }

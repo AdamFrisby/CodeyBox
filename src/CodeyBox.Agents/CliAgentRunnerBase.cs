@@ -180,6 +180,28 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         CancellationToken ct,
         bool preserveExistingCredentialFiles = true)
     {
+        IReadOnlyList<EnvBackedCredentialMaterialization> materializationPlan = [];
+        try
+        {
+            materializationPlan = BuildEnvBackedCredentialMaterializationPlan(credential);
+            SandboxCredentialFileWriter.ValidateMaterializationPlan(
+                credential,
+                materializationPlan
+                    .Select(static entry => new SandboxCredentialFileMaterialization(entry.Target, entry.Contents))
+                    .ToArray());
+        }
+        catch (ArgumentException ex)
+        {
+            var failureDescription = materializationPlan.Count == 1
+                ? materializationPlan[0].File.FailureDescription
+                : "agent credentials";
+            return new AgentResult(
+                Success: false,
+                Summary: $"failed to materialise {failureDescription}: credential materialization plan is invalid",
+                Stdout: null,
+                Stderr: ex.Message);
+        }
+
         var agentPreparation = await PrepareAgentSandboxAsync(
             sandbox, workingDirectory, credential, resume, ct).ConfigureAwait(false);
         if (agentPreparation is not null)
@@ -187,39 +209,33 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 
         return await MaterialiseEnvBackedCredentialFilesAsync(
             sandbox,
-            credential,
+            materializationPlan,
             preserveExistingCredentialFile: preserveExistingCredentialFiles && resume is not null,
             ct).ConfigureAwait(false);
     }
 
     private async Task<AgentResult?> MaterialiseEnvBackedCredentialFilesAsync(
         ISandbox sandbox,
-        AgentCredential? credential,
+        IReadOnlyList<EnvBackedCredentialMaterialization> materializationPlan,
         bool preserveExistingCredentialFile,
         CancellationToken ct)
     {
-        if (EnvBackedCredentialFiles.Count == 0)
+        if (materializationPlan.Count == 0)
             return null;
 
         var overwritePolicy = preserveExistingCredentialFile
             ? SandboxCredentialOverwritePolicy.PreserveNonEmpty
             : SandboxCredentialOverwritePolicy.Overwrite;
 
-        foreach (var file in EnvBackedCredentialFiles)
+        foreach (var materialization in materializationPlan)
         {
-            ValidateEnvBackedCredentialFile(file);
-
-            if (credential?.EnvironmentVariables.TryGetValue(file.EnvironmentVariable, out var contents) == true
-                && !string.IsNullOrEmpty(contents))
+            if (materialization.Contents is { } contents)
             {
                 try
                 {
                     await SandboxCredentialFileWriter.WriteAsync(
                         sandbox,
-                        new SandboxCredentialFileTarget(
-                            SandboxCredentialFileRoot.Home,
-                            file.HomeRelativePath,
-                            ResolveCredentialDestinationOverride(file, credential.EnvironmentVariables)),
+                        materialization.Target,
                         contents,
                         overwritePolicy,
                         ct).ConfigureAwait(false);
@@ -228,22 +244,22 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 {
                     return new AgentResult(
                         Success: false,
-                        Summary: $"failed to materialise {file.FailureDescription}: exit {ex.ExitCode}",
+                        Summary: $"failed to materialise {materialization.File.FailureDescription}: exit {ex.ExitCode}",
                         Stdout: ex.Stdout,
                         Stderr: ex.Stderr);
                 }
             }
-            else if (credential is null && file.MaterialiseFromSandboxEnvironmentWhenCredentialMissing)
+            else if (materialization.FromSandboxEnvironment)
             {
                 var write = await sandbox.ExecAsync(new SandboxExec
                 {
-                    Argv = ["bash", "-c", BuildEnvBackedCredentialScript(file)],
+                    Argv = ["bash", "-c", BuildEnvBackedCredentialScript(materialization.File)],
                 }, ct).ConfigureAwait(false);
                 if (!write.Success)
                 {
                     return new AgentResult(
                         Success: false,
-                        Summary: $"failed to materialise {file.FailureDescription}: exit {write.ExitCode}",
+                        Summary: $"failed to materialise {materialization.File.FailureDescription}: exit {write.ExitCode}",
                         Stdout: write.Stdout,
                         Stderr: write.Stderr);
                 }
@@ -251,6 +267,50 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         }
 
         return null;
+    }
+
+    private IReadOnlyList<EnvBackedCredentialMaterialization> BuildEnvBackedCredentialMaterializationPlan(
+        AgentCredential? credential)
+    {
+        var result = new List<EnvBackedCredentialMaterialization>();
+        var entriesSeen = 0;
+        foreach (var file in EnvBackedCredentialFiles)
+        {
+            if (++entriesSeen > AgentCredentialMaterializationPolicy.MaximumFiles)
+            {
+                throw new ArgumentException(
+                    $"A runner cannot declare more than {AgentCredentialMaterializationPolicy.MaximumFiles} credential-file destinations.");
+            }
+            ValidateEnvBackedCredentialFile(file);
+            if (credential?.EnvironmentVariables.TryGetValue(file.EnvironmentVariable, out var contents) == true
+                && !string.IsNullOrEmpty(contents))
+            {
+                result.Add(new EnvBackedCredentialMaterialization(
+                    file,
+                    new SandboxCredentialFileTarget(
+                        SandboxCredentialFileRoot.Home,
+                        file.HomeRelativePath,
+                        ResolveCredentialDestinationOverride(file, credential.EnvironmentVariables)),
+                    contents,
+                    FromSandboxEnvironment: false));
+            }
+            else if (credential is null && file.MaterialiseFromSandboxEnvironmentWhenCredentialMissing)
+            {
+                result.Add(new EnvBackedCredentialMaterialization(
+                    file,
+                    new SandboxCredentialFileTarget(
+                        SandboxCredentialFileRoot.Home,
+                        file.HomeRelativePath),
+                    Contents: null,
+                    FromSandboxEnvironment: true));
+            }
+        }
+        if (result.Count(static entry => entry.FromSandboxEnvironment) > 1)
+        {
+            throw new ArgumentException(
+                "A runner can materialise at most one credential file from ambient sandbox environment state.");
+        }
+        return result;
     }
 
     protected static string BuildEnvBackedCredentialScript(EnvBackedCredentialFile file)
@@ -287,6 +347,12 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 
     private static void ValidateEnvironmentVariableName(string value, string fieldName)
         => SandboxCredentialFileWriter.ValidateEnvironmentVariableName(value, fieldName);
+
+    private sealed record EnvBackedCredentialMaterialization(
+        EnvBackedCredentialFile File,
+        SandboxCredentialFileTarget Target,
+        string? Contents,
+        bool FromSandboxEnvironment);
 
     public virtual async Task<AgentResult> RunAsync(
         ISandbox sandbox,
@@ -995,16 +1061,8 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         FileBackedCredentialEnvironmentVariables.Count > 0
         && ResolveFileBackedCredentialPolicy(sandbox) is not null;
 
-    private static IRejectsFileBackedAgentCredentials? ResolveFileBackedCredentialPolicy(ISandbox sandbox)
-    {
-        for (ISandbox? current = sandbox; current is not null; current = (current as ISandboxDecorator)?.InnerSandbox)
-        {
-            if (current is IRejectsFileBackedAgentCredentials policy)
-                return policy;
-        }
-
-        return null;
-    }
+    private static IRejectsFileBackedAgentCredentials? ResolveFileBackedCredentialPolicy(ISandbox sandbox) =>
+        SandboxCapability.Find<IRejectsFileBackedAgentCredentials>(sandbox);
 
     public virtual async Task RequestPreemptAsync(ISandbox sandbox, string workingDirectory, CancellationToken ct = default)
     {

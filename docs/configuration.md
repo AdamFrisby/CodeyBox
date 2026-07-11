@@ -26,6 +26,10 @@ Hot-reloadable today:
 - `Projects[].Audit.PerIterationTimeoutMinutes` — the resolved `Project`
   record is captured once at work-item pickup, so a change mid-iteration
   does not move the goalposts for an item already running.
+- `DeepAuditFailurePersistence.{MaxAttempts,RetryDelay}` — captured as one
+  validated snapshot when an unexpected deep-audit failure must be persisted.
+  A change applies to the next failure reconciliation; an in-progress retry
+  sequence keeps the bounds it started with.
 - `AgentConcurrency` — re-applied via `AgentConfigHotReload`. Reload propagates
   to `OrchestratorService` (dispatch gate) and `PipelineRunner` (rebase-resolver
   cap-aware routing) through a shared snapshot. `MaxConcurrent` values **must
@@ -82,6 +86,19 @@ Hot-reloadable today:
   `MultipassSandbox.VmStartTimeout` / `MultipassSandbox.VmStopTimeout`
   — re-read on every sandbox launch. VMs already running keep the snapshot they
   booted with.
+- `Incus.*` except `ProjectName` and the effective `StagingDirectory`, plus
+  `SandboxNetworkProfiles` — re-read for the next Incus provider operation. A
+  sandbox keeps the immutable option snapshot captured when it was created, so
+  changing the pool, guest identity, limits, or bridge map does not alter that
+  sandbox halfway through its lifecycle.
+- `SandboxProvider` between `multipass` and `incus` — when the process started
+  with either VM provider, creations already in progress continue on the
+  provider they selected and subsequent creation/baseline-provisioning
+  operations route to the newly selected provider. Existing sandbox handles
+  retain their owning provider. This is routing, not failover: a selected
+  provider failure is propagated and is never retried through the other
+  backend. Changes to or from any other provider remain restart-only and are
+  rejected on reload.
 - `SandboxLeak.LeakAgeThreshold` / `PreemptRetention` / `AutoDispose` /
   `MaxConcurrentAutoDispose` — re-read on every reaper sweep. `Enabled` and
   `CheckInterval` are sampled once at startup (PeriodicTimer cadence is fixed).
@@ -104,8 +121,12 @@ Hot-reloadable today:
 
 Not hot-reloadable (rejected by `IValidateOptions<CodeyBoxOptions>` if changed):
 
-- `SandboxProvider` — switching from `multipass` to `bubblewrap` mid-flight
-  would orphan running sandboxes.
+- `SandboxProvider` changes other than the guarded `multipass`↔`incus` switch
+  described above. Other providers are constructed with different startup-only
+  dependencies and therefore require a restart.
+- `Incus.ProjectName` and the effective `Incus.StagingDirectory` — these define
+  lifecycle inventory ownership and the persistent cleanup root. Reloading
+  either could make existing instances or staged files invisible to leak reap.
 - `StateDatabasePath`, `GitRootDirectory`, `AgentStreams.Path` — captured by
   open file/SQLite handles at startup.
 
@@ -158,12 +179,12 @@ startup); we add explicit guards as we tighten the contract.
 | `GitRootDirectory` | string | `/var/lib/codeybox/repos` | Root for bare host git repos. |
 | `StateDatabasePath` | string | `/var/lib/codeybox/state.db` | SQLite database path. |
 | `TemplateDirectory` | string | `templates` | Directory containing task-template JSON files. Relative paths resolve under the API content root. Files are discovered and validated on demand. |
-| `SandboxImageReference` | string | `codeybox/agent:latest` | OCI image reference for agent sandboxes. |
+| `SandboxImageReference` | string | `""` | Optional provider-specific sandbox image override. Empty (or the legacy sentinel `ignored`) uses the selected provider's configured default. For Incus, use a VM image alias/fingerprint; OCI-style references are only meaningful to providers that consume OCI images. |
 | `AgentAllowedHosts` | string[] | `["api.anthropic.com","api.openai.com","api.githubcopilot.com","generativelanguage.googleapis.com"]` | Egress allowlist inside agent sandboxes. Add third-party hosts only for deployments that intentionally route work to agents that require them. |
 | `AuditToolAllowedHosts` | string[] | public package/vulnerability registries | Egress allowlist for network-capable tool auditors such as `deps-cve-scan`; keep this separate from agent API hosts. |
 | `BuildScriptAudit.TimeoutSeconds` | int | `1800` | Hot-reloadable per-run timeout for the credential-free `process:build-script` auditor that executes repo-root `./build.sh`. |
 | `AuthFailurePatterns.<agent>[]` | object[] | `[]` | Extra runtime auth/login-prompt substrings for one agent kind. Each entry is `{ "pattern": "...", "stream": "stderr" }` by default; set `"stream": "stdout"` or `"stderrAndStdout"` only for tightly-formed CLI transcripts because stdout can contain model text. Built-in defaults already cover common OAuth/login prompts. |
-| `SandboxProvider` | string | — | One of `multipass`, `bubblewrap`, `process`. Required in non-Development environments. |
+| `SandboxProvider` | string | — | One of `incus`, `multipass`, `multipass-remote`, `sprites`, `bubblewrap`, or `process`. Required in non-Development environments. Only a process started with `multipass` or `incus` can hot-switch, and only between those two. |
 | `SandboxNetworkProfiles.graphical` | string | `cb-graphical` | Conventional bridge mapping for projects that explicitly select the `graphical` network profile; create it with `scripts/setup-host-networks.sh`. |
 | `MultipassSandbox.CloudInitReadyRetryAttempts` | int | `3` | Number of `cloud-init status --wait` attempts before probing VM readiness when cloud-init returns exit 1. |
 | `MultipassSandbox.VmStartTimeout` | TimeSpan | `00:03:00` | Deadline for the post-launch poll that waits for the VM to reach `Running`. Bump on hosts that observe boot contention under concurrent launches. |
@@ -172,8 +193,120 @@ startup); we add explicit guards as we tighten the contract.
 | `DangerouslyAllowProcessSandbox` | bool | `false` | Allow process sandbox outside Development. Do not use in production. |
 | `UpstreamPushMaxAttempts` | int | `5` | Retry count for upstream push (GitHub PR creation). |
 | `UpstreamPushBackoffSeconds` | int | `15` | Seconds between upstream push retries. |
+| `DeepAuditFailurePersistence.MaxAttempts` | int | `3` | Total attempts to persist an unexpected deep-audit failure, including the initial attempt. Must be between 1 and 10; hot-reloadable for the next reconciliation. |
+| `DeepAuditFailurePersistence.RetryDelay` | TimeSpan | `00:00:00.100` | Delay between terminal-failure persistence attempts. Must be non-negative and no greater than one minute; hot-reloadable for the next reconciliation. |
 | `Shutdown.SandboxTeardownMode` | enum | `Stop` | Graceful-shutdown sandbox teardown mode: `Stop` cleanly stops and preserves the VM without a RAM snapshot; `Suspend` preserves RAM state via `multipass suspend` and is opt-in; `Dispose` purges the VM. |
 | `PhaseAbsoluteTimeoutMultiplier` | number | `3.0` | Multiplier applied to a phase's per-attempt timeout to bound fallback chains. Work/rework attempts each get the full `WorkTimeout`; merge attempts each get the full `MergeTimeout`; the whole fallback chain is capped at this multiplier times that per-attempt timeout. |
+
+---
+
+## `SandboxProviderCutover`
+
+Provider-neutral lifecycle retention for a hot-reload sandbox-provider
+cutover. Providers activated in the current process remain inventoried
+automatically. When a cutover spans a restart, list any previous provider whose
+preserved sandboxes or baselines still need inventory and cleanup:
+
+```json
+"SandboxProviderCutover": {
+  "RetainedInventoryProviders": ["multipass"]
+}
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `RetainedInventoryProviders` | string[] | `[]` | Provider IDs retained for lifecycle and baseline inventory after restart. Values must be unique members of the registered hot-reload provider set; currently `multipass` and `incus`. Remove an ID after that provider's resources are gone. Maximum 8 entries. |
+
+---
+
+## `Incus`
+
+Operational settings for `SandboxProvider=incus`. Except for `ProjectName` and
+the effective `StagingDirectory`, these settings are read for the next provider
+operation. A process that started with `multipass` or `incus` can switch
+between those two providers on hot reload; selecting any other
+provider still requires a restart. Incus consumes the shared
+`SandboxNetworkProfiles` map so both VM providers use the same host-enforced
+bridge policy during cutover. All Incus provisioning and lifecycle settings are
+independent: no `Multipass*` value is inherited.
+
+Durable queued Incus baseline pins remain routable after a
+`BaselineNamePrefix` edit or process restart. Cutover routing recognizes the
+stable Incus baseline shape (`-headless-` or `-gui-` followed by 12 lowercase
+hex characters) without treating that shape as proof of ownership; Incus still
+requires exact instance metadata, profile, flavor, pool, and the `ready`
+snapshot before using a pin.
+
+```json
+"Incus": {
+  "BinaryPath": "incus",
+  "ProjectName": "codeybox",
+  "StoragePoolName": "codeybox-zfs",
+  "DefaultImage": "images:ubuntu/24.04/cloud",
+  "InstanceNamePrefix": "codeybox-",
+  "BaselineNamePrefix": "cb-incus-baseline-",
+  "UseBaselineImages": true
+}
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `BinaryPath` | string | `incus` | Incus 6.3-or-newer CLI executable name or absolute path. The installed release's upstream requirements also apply: the recommended Incus 7.0 LTS requires Linux 6.12 or newer and QEMU 8.2 or newer. Independently, the provider requires Linux 5.6 or newer for restricted-path `openat2` confinement. |
+| `ProjectName` | string | `codeybox` | Restart-only dedicated non-default project containing CodeyBox-owned instances. When absent, the provider creates it with exact ownership/schema markers `user.codeybox.managed=true` and `user.codeybox.project-schema=1`, `features.images=false`, the Incus-required `features.profiles=true`, and all required restrictions. Every VM is nevertheless created with `--no-profiles` and exact topology read-back. It refuses to adopt or mutate an existing project unless both markers and both feature flags match exactly. Disk paths, NIC/snapshot access, and `restricted.virtual-machines.lowlevel=block` are applied atomically and verified before VM creation; per-instance validation separately rejects nesting. |
+| `StoragePoolName` | string | `codeybox-zfs` | Existing ZFS or Btrfs pool used for VM roots and COW clones. CodeyBox never creates or reformats it; ZFS is strongly recommended for VM workloads. |
+| `DefaultImage` | string | `images:ubuntu/24.04/cloud` | VM image used when a sandbox specification has no explicit image. |
+| `InstanceNamePrefix` | string | `codeybox-` | Prefix identifying provider-owned ordinary VM instances. |
+| `BaselineNamePrefix` | string | `cb-incus-baseline-` | Prefix for content-addressed baked baseline instances. |
+| `UseBaselineImages` | bool | `true` | Lazily bake baselines and create sandboxes with COW `incus copy` clones. Set false to use the full-launch path. |
+| `ExtraRuncmd` | string[] | `[]` | Incus-specific first-boot/baseline provisioning commands. At most 256 commands are accepted; each command is limited to 64 KiB of UTF-8 and the aggregate to 1 MiB. Multipass provisioning settings are never inherited. |
+| `ExtraCloudInit` | string or null | null | Incus-specific additional top-level cloud-init YAML sent through `user.user-data`. Multipass cloud-init settings are never inherited. Do not put secrets here. |
+| `StagingDirectory` | string or null | `<StateDatabasePath directory>/incus-staging` | Restart-only persistent absolute host directory for isolation snapshots and mount staging. Its canonical, non-symlink parent must already exist; normally leave the root absent so CodeyBox creates it with mode `0700` and its ownership marker. An existing root is accepted only when owned by the service UID/GID with exact mode `0700` and an exact provider-owned `.codeybox-incus-staging-v1` marker (mode `0600`). Set an explicit path to place staging on a separate filesystem. The filesystem root, commas, and control characters are rejected because this path is included in the project's restricted disk-path list. |
+| `AllowedHostMountRoots` | string[] | `[]` plus managed Git roots | Up to 64 additional canonical host-directory roots that may be attached directly through virtiofs. `GitRootDirectory` and the effective shared upstream mirror directory (when enabled) are included automatically, for at most 66 effective roots. The exact canonical roots plus staging form the dedicated project's nonempty `restricted.devices.disk.paths` value; filesystem root, commas, controls, and paths outside the bounded list are rejected. Mounts outside these roots fail closed; add only narrowly scoped trusted directories. |
+| `GuestUserId` | uint | `1000` | Non-root guest user ID used for untrusted sandbox commands. Incus VM virtiofs does not shift IDs; when any host-backed mount is present, this must exactly match the CodeyBox process's effective host UID. |
+| `GuestGroupId` | uint | `1000` | Non-root guest group ID used for untrusted sandbox commands. When any host-backed mount is present, this must exactly match the CodeyBox process's effective host GID. |
+| `GuestHome` | string | `/home/ubuntu` | Normalized absolute home directory for the configured guest identity. |
+| `OperationTimeout` | TimeSpan | `00:02:00` | General deadline for one Incus CLI lifecycle operation. |
+| `ExecTimeout` | TimeSpan | `06:00:00` | Provider-side upper bound for one guest command. A sandbox wall-clock limit or caller cancellation can end it sooner. |
+| `ImageProvisioningTimeout` | TimeSpan | `00:30:00` | Deadline for a cold image download/import and VM-root initialization. This is deliberately longer than the general operation timeout. |
+| `VmStartTimeout` | TimeSpan | `00:05:00` | Deadline for VM boot and guest-agent readiness. |
+| `VmStopTimeout` | TimeSpan | `00:02:00` | Deadline for graceful VM stop. |
+| `CloudInitTimeout` | TimeSpan | `00:05:00` | Deadline for cloud-init completion. |
+| `MountReadyTimeout` | TimeSpan | `00:05:00` | Deadline for a configured virtiofs mount to become usable in the guest. |
+| `ReadinessPollInterval` | TimeSpan | `00:00:01` | Delay between bounded readiness probes. |
+| `CliProcessCleanupTimeout` | TimeSpan | `00:00:05` | Independent deadline for terminating an Incus CLI process tree and draining its redirected streams after cancellation or failure; valid through 5 minutes. Read live for each CLI invocation. |
+| `CliProcessGroupExitPollInterval` | TimeSpan | `00:00:00.010` | Delay between Linux process-group absence probes during Incus CLI cleanup; must be positive, at most 1 second, and no greater than `CliProcessCleanupTimeout`. Read live for each CLI invocation. |
+| `ExecPidPollAttempts` | int | `5` | Attempts to obtain an active guest exec process-group ID before forced cleanup; valid range 1–100 and read live. |
+| `ExecControlFileCleanupAttempts` | int | `3` | Attempts to delete and verify absence of each transient guest exec control file; valid range 1–100 and read live. |
+| `ExecCompletionProbeAttempts` | int | `3` | Attempts to read and validate a guest exec completion sentinel; valid range 1–100 and read live. |
+| `MaxConcurrentOperations` | int | `2` | Concurrent heavy Incus lifecycle/device operations; valid range 1–64. |
+| `MaxCliStdoutBytes` | int | `4194304` | Maximum retained stdout from one Incus CLI invocation. |
+| `MaxCliStderrBytes` | int | `4194304` | Maximum retained stderr from one Incus CLI invocation. |
+| `CaptureResourceMetrics` | bool | `false` | Capture best-effort guest resource metrics before teardown. |
+| `ResourceMetricsCaptureTimeout` | TimeSpan | `00:00:05` | Deadline for the best-effort metrics read during teardown. |
+| `ResourceMetricsSampleInterval` | TimeSpan | `00:00:10` | Interval used by the guest peak-memory sampler. |
+| `BaselineCpus` | int | `6` | Default vCPU allocation for baked baselines. |
+| `BaselineMemoryBytes` | long | `17179869184` | Default baseline memory allocation (16 GiB). |
+| `BaselineDiskBytes` | long | `8589934592` | Default baseline root disk size (8 GiB logical allocation, matching the default sandbox limit). |
+| `MaxSnapshotBytes` | long | `17179869184` | Maximum aggregate bytes copied into private staging across all `SnapshotForIsolation` and individual-file mounts in one sandbox. |
+| `MaxSnapshotEntries` | int | `100000` | Maximum aggregate number of files, directories, and links copied into private staging for one sandbox. |
+| `MaxReadinessProbeEntries` | int | `4096` | Maximum direct-mount entries inspected while selecting a bounded host/guest identity probe file. |
+| `MaxTmpfsDeviceBytes` | long | `17179869184` | Maximum logical size of one guest tmpfs mount (16 GiB). |
+| `MaxAggregateTmpfsBytes` | long | `34359738368` | Maximum aggregate logical size of all guest tmpfs mounts in one sandbox (32 GiB). |
+
+See [Sandbox providers](sandbox-providers.md#incus--cow-vms-with-virtiofs) for
+Incus installation, project, ZFS/Btrfs pool, and security prerequisites. Incus
+also derives its pool and host-volume preflight from the shared
+`CodeyBox:DiskGuard:Enabled`, `MinFreeBytes`, `RecheckIn`, and `AdditionalPaths`
+settings. The effective Incus staging path is added automatically.
+`CodeyBox:DiskGuard:MultipassDataPath` remains Multipass-only and is never read
+by Incus.
+
+| Shared disk-guard key | Default | Incus behavior |
+|-----------------------|---------|----------------|
+| `CodeyBox:DiskGuard:Enabled` | `true` | Enables/disables both the Incus pool-space probe and host-path probes. |
+| `CodeyBox:DiskGuard:MinFreeBytes` | `10737418240` | Defers sandbox creation when the pool or any monitored host filesystem has less than 10 GiB free. |
+| `CodeyBox:DiskGuard:RecheckIn` | `00:05:00` | Delay reported for deferred work. |
+| `CodeyBox:DiskGuard:AdditionalPaths` | `[]` | Up to 64 extra host paths to probe; the state-database directory and effective Incus staging directory are included automatically, for at most 66 effective Incus host paths. |
 
 ---
 

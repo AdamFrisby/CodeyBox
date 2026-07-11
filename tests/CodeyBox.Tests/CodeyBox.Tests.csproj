@@ -77,6 +77,7 @@
     <ProjectReference Include="..\..\src\CodeyBox.Audit.Llm\CodeyBox.Audit.Llm.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Bubblewrap\CodeyBox.Sandbox.Bubblewrap.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Graphical\CodeyBox.Sandbox.Graphical.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Incus\CodeyBox.Sandbox.Incus.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Multipass\CodeyBox.Sandbox.Multipass.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.MultipassRemote\CodeyBox.Sandbox.MultipassRemote.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Sprites\CodeyBox.Sandbox.Sprites.csproj" />

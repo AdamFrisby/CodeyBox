@@ -569,7 +569,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
                 project,
                 new SandboxTarget(sandboxTarget.NetworkProfile, sandboxTarget.Flavor),
-                item.BaselineImageRef));
+                item.BaselineImageRef),
+            credentialRunner: runner);
 
         var sandbox = await _sandboxes.CreateAsync(spec, ct).ConfigureAwait(false);
         try
@@ -1782,7 +1783,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
                     project,
                     new SandboxTarget(sandboxTarget.NetworkProfile, sandboxTarget.Flavor),
-                    item.BaselineImageRef));
+                    item.BaselineImageRef),
+                credentialRunner: runner);
 
             sandbox = await _sandboxes.CreateAsync(spec, ct);
 
@@ -3581,17 +3583,20 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
             var access = _gitHost.GetSandboxAccess(repoId);
             // Pre-resolve the exact resolver candidate set before sandbox
-            // creation. Candidate environment credentials are scoped to this
-            // resolver sandbox at creation time; they are not copied into
-            // per-exec environment. Non-secret credential adjunct mounts must
-            // also be present at creation time, so the typed plan below unions
-            // only compatible mounts and requests an ephemeral credential tmpfs
-            // whenever the resolver has a credential scope.
+            // creation. Candidate environment credentials must not enter the
+            // shared sandbox environment: the conflict resolver scopes only the
+            // current candidate's direct variables to that candidate's execs,
+            // while file-backed values are materialised through stdin. Non-secret
+            // credential adjunct mounts must still be present at creation time,
+            // so the typed plan below unions only compatible mounts and requests
+            // an ephemeral credential tmpfs whenever the resolver has a
+            // credential scope.
             //
             // Candidate/routing or mount-plan failures are captured and raised
             // only if a conflict actually needs the resolver. A clean rebase
-            // therefore needs no credentials at all and does not retry or
-            // expose the work runner when it is not a viable candidate.
+            // never materialises candidate secrets and ignores pre-resolution
+            // failures, though a successful plan can still attach validated
+            // non-secret adjunct mounts and the credential tmpfs.
             //
             // Network profile prefers the agent profile (Work) so AllowedHosts
             // includes the agent's API endpoints. We fall back through the
@@ -3599,12 +3604,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // unconfigured.
             var (precomputedCandidates, precomputedCandidateFailure) =
                 await TryBuildPickupRebaseResolverCandidatesAsync(item, project, runner, ct);
-            var credentialPlan = PickupRebaseCredentialPlan.Empty;
+            var credentialPlan = ResolverCredentialPlan.Empty;
             if (precomputedCandidates is not null)
             {
                 try
                 {
-                    credentialPlan = BuildPickupRebaseCredentialPlan(precomputedCandidates, access);
+                    credentialPlan = BuildResolverCredentialPlan(precomputedCandidates, access);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
@@ -3622,7 +3627,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 hostNetworkProfile: rebaseProfile,
                 timingWorkItemId: item.Id,
                 timingPhase: timingPhase,
-                extraEnvironment: credentialPlan.Environment,
                 additionalCredentialMounts: credentialPlan.Mounts,
                 includeCredentialsTmpfs: credentialPlan.RequiresCredentialsTmpfs,
                 agentCredentialScope: true,
@@ -4001,21 +4005,19 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
     }
 
-    private sealed record PickupRebaseCredentialPlan(
+    private sealed record ResolverCredentialPlan(
         IReadOnlyList<SandboxMount> Mounts,
-        IReadOnlyDictionary<string, string> Environment,
         bool RequiresCredentialsTmpfs)
     {
-        public static PickupRebaseCredentialPlan Empty { get; } =
-            new([], new Dictionary<string, string>(StringComparer.Ordinal), false);
+        public static ResolverCredentialPlan Empty { get; } =
+            new([], false);
     }
 
-    private static PickupRebaseCredentialPlan BuildPickupRebaseCredentialPlan(
+    private static ResolverCredentialPlan BuildResolverCredentialPlan(
         AgenticConflictCandidatesResult candidates,
         SandboxRepositoryAccess repositoryAccess)
     {
         var mountsByDestination = new Dictionary<string, SandboxMount>(StringComparer.Ordinal);
-        var environment = new Dictionary<string, string>(StringComparer.Ordinal);
         var reservedDestinations = repositoryAccess.Mounts
             .Select(static mount => mount.SandboxPath)
             .Append(SandboxConventions.WorkDir)
@@ -4032,27 +4034,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     candidate.Runner.Kind,
                     $"credential belongs to agent '{credential.Agent.Value}'");
             }
-            ValidateResolverCandidateCredentialEnvironment(candidate);
+            _ = SandboxEnvironmentVariablePolicy.SelectDirectCredentialEnvironment(
+                credential,
+                candidate.Runner,
+                nameof(credential.EnvironmentVariables));
 
             requiresCredentialsTmpfs = true;
-            foreach (var (name, value) in credential.EnvironmentVariables)
-            {
-                SandboxEnvironmentVariablePolicy.ValidateCredentialEnvironmentVariable(
-                    name,
-                    nameof(credential.EnvironmentVariables));
-                if (value.Contains('\0'))
-                    throw new ArgumentException("Resolver candidate credential environment contains a NUL byte.");
-                if (value.Length > SandboxConventions.CredentialsTmpfsBytes)
-                    throw new ArgumentException("Resolver candidate credential environment exceeds the size limit.");
-                if (environment.TryGetValue(name, out var existing)
-                    && !string.Equals(existing, value, StringComparison.Ordinal))
-                {
-                    throw new InvalidOperationException(
-                        "Resolver candidate credentials declare conflicting values for the same sandbox environment variable.");
-                }
-                environment[name] = value;
-            }
-
             foreach (var mount in credential.Mounts)
             {
                 if (!mount.SandboxPath.StartsWith("/", StringComparison.Ordinal)
@@ -4080,33 +4067,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
         }
 
-        return new PickupRebaseCredentialPlan(
+        return new ResolverCredentialPlan(
             mountsByDestination.Values.ToArray(),
-            environment,
             requiresCredentialsTmpfs);
-    }
-
-    private static void ValidateResolverCandidateCredentialEnvironment(
-        AgenticConflictResolverCandidate candidate)
-    {
-        if (candidate.Credential?.EnvironmentVariables is not { Count: > 0 } env)
-            return;
-        if (candidate.Runner is not IAgentCredentialEnvironmentPolicy policy)
-        {
-            throw new InvalidOperationException(
-                $"Resolver candidate '{candidate.Runner.Kind.Value}' has environment credentials but does not declare a credential environment policy.");
-        }
-
-        foreach (var name in env.Keys)
-        {
-            if (policy.DirectCredentialEnvironmentVariables.Contains(name)
-                || policy.FileBackedCredentialEnvironmentVariables.Contains(name))
-            {
-                continue;
-            }
-            throw new InvalidOperationException(
-                $"Resolver candidate '{candidate.Runner.Kind.Value}' credential environment variable '{name}' is not supported by the runner.");
-        }
     }
 
     private async Task<PickupRebaseResolutionResult> RebaseCheckedOutBranchWithScopeFenceAsync(
@@ -4791,7 +4754,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
                 project,
                 new SandboxTarget(networkProfile, sandboxFlavor),
-                item.BaselineImageRef));
+                item.BaselineImageRef),
+            credentialRunner: runner);
 
         // Session-mode (Claude resumable worker) reuses ONE sandbox across the
         // work phase + every rework iteration: the VM is stopped during each
@@ -6516,7 +6480,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
                 project,
                 new SandboxTarget(project.NetworkProfiles.Work, SandboxProfileFlavor.Headless),
-                item.BaselineImageRef));
+                item.BaselineImageRef),
+            credentialRunner: agentRunner);
 
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
         if (credential is not null && credential.Files.Count > 0)
@@ -7105,7 +7070,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
                 project,
                 new SandboxTarget(project.NetworkProfiles.Work, SandboxProfileFlavor.Headless),
-                item.BaselineImageRef));
+                item.BaselineImageRef),
+            credentialRunner: agentRunner);
 
         await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
         if (credential is not null && credential.Files.Count > 0)
@@ -10412,7 +10378,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 var built = BuildSandboxSpec(repositoryAccess, includeAgentCredential: credential, allowAgentNetwork: needsNetwork,
                     hostNetworkProfile: sandboxTarget.NetworkProfile, timingWorkItemId: ctx.WorkItemId, timingPhase: "audit",
                     flavor: sandboxTarget.Flavor,
-                    baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef));
+                    baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef),
+                    credentialRunner: credential is null ? null : groupRunner);
                 return built with
                 {
                     Mounts = [.. built.Mounts, new SandboxMount { SandboxPath = "/audit", Tmpfs = true, SizeBytes = 1024 * 1024 }],
@@ -10611,7 +10578,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 var sem = new SemaphoreSlim(maxPar, maxPar);
                 var disposeSemaphoreOnExit = true;
 
-                (SandboxSpec Spec, AuditReviewDotnetShim DotnetShim) BuildLlmSandboxSpec(AgentCredential? candidateCredential)
+                (SandboxSpec Spec, AuditReviewDotnetShim DotnetShim) BuildLlmSandboxSpec(
+                    AgentCredential? candidateCredential,
+                    IAgentRunner candidateRunner)
                 {
                     var candidateSpec = BuildSandboxSpec(access,
                         includeAgentCredential: candidateCredential,
@@ -10620,8 +10589,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         timingWorkItemId: ctx.WorkItemId,
                         timingPhase: "audit",
                         flavor: sandboxTarget.Flavor,
-                        baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef));
-                    var dotnetShim = AuditReviewDotnetShim.From(_pipelineTuning.Current, _sandboxes.Name);
+                        baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef),
+                        credentialRunner: candidateCredential is null ? null : candidateRunner);
+                    var dotnetShim = AuditReviewDotnetShim.From(_pipelineTuning.Current);
                     var specWithAuditMount = candidateSpec with
                     {
                         Mounts =
@@ -10642,7 +10612,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     var candidateCredential = needsCreds
                         ? await ResolveAgentCredentialAsync(candidateRunner.Kind, project, trialItem, attemptCt)
                         : null;
-                    var (candidateSpec, dotnetShim) = BuildLlmSandboxSpec(candidateCredential);
+                    var (candidateSpec, dotnetShim) = BuildLlmSandboxSpec(candidateCredential, candidateRunner);
                     await using var sandbox = await CreateAuditSandboxWithIdleTimeoutAsync(
                         candidateSpec,
                         pair.Auditor.Name,
@@ -14218,7 +14188,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
         CancellationToken ct,
         CancellationToken hostShutdownToken)
     {
-        var credential = await ResolveAgentCredentialAsync(runner.Kind, project, item, ct);
         var preMergeSha = await _gitHost.ResolveCommitAsync(repoId, baseBranch, ct);
         var workTipSha = await _gitHost.ResolveCommitAsync(repoId, workBranch, ct);
         var hostMerge = await _gitHost.ComputeMergeTreeAsync(repoId, preMergeSha, workTipSha, ct);
@@ -14279,12 +14248,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
             return (cleanMergeSha, null);
         }
 
-        // Conflict path only. The agentic resolver runs the agent CLI inside
-        // the merge sandbox and needs both auth and egress, so always bake
-        // creds + open network for the merge sandbox (the pre-#168 conditional
-        // that nulled the credential when hostMerge.HasConflicts was wrong: it
-        // assumed the conflict path resolved text-only from the host).
-        var mergeCredential = credential;
+        // Conflict path only. Pre-resolve the exact candidate set before the
+        // shared merge sandbox is created. The sandbox receives the union of
+        // validated, non-secret candidate mounts plus an ephemeral credential
+        // tmpfs, but no candidate's direct environment or credential files.
+        // AgenticConflictResolver scopes those secrets to the current candidate
+        // immediately before it runs and clears them before trying another.
         var isolatedMergeRepoPath = hostMerge.HasConflicts
             ? await CreateIsolatedMergeRepositoryAsync(repoId, item.Id, ct)
             : null;
@@ -14293,8 +14262,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
             var access = isolatedMergeRepoPath is null
                 ? _gitHost.GetSandboxAccess(repoId)
                 : _gitHost.GetIsolatedRepoSandboxAccess(isolatedMergeRepoPath);
-            var spec = BuildSandboxSpec(access, includeAgentCredential: mergeCredential, allowAgentNetwork: true,
+            var candidateResult = await BuildAgenticConflictCandidatesAsync(
+                item,
+                project,
+                runner,
+                ct,
+                AgenticConflictResolverOperation.Merge);
+            var credentialPlan = BuildResolverCredentialPlan(candidateResult, access);
+            var spec = BuildSandboxSpec(access, includeAgentCredential: null, allowAgentNetwork: true,
                 hostNetworkProfile: networkProfile, timingWorkItemId: item.Id, timingPhase: "merge",
+                additionalCredentialMounts: credentialPlan.Mounts,
+                includeCredentialsTmpfs: credentialPlan.RequiresCredentialsTmpfs,
+                agentCredentialScope: true,
                 baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(
                     project,
                     new SandboxTarget(networkProfile, SandboxProfileFlavor.Headless),
@@ -14305,9 +14284,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 : await CreateMergeSandboxWithStagingRestoreAsync(spec, repoId, isolatedMergeRepoPath, ct);
             mergeSandboxStartSw.Stop();
             CodeyBoxMeters.SandboxLifecycle.Record(mergeSandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
-
-            if (mergeCredential is not null && mergeCredential.Files.Count > 0)
-                await MaterialiseCredentialFilesAsync(sandbox, mergeCredential, ct);
 
             var mergeCloneScope = await TimingScope.BeginAsync(
                 _timings, item.Id, "merge", "git.clone_into_sandbox",
@@ -14360,7 +14336,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             // commit's trailer attribute the work to the agent that actually did
             // it. Mirrors the pickup-rebase pattern where chosenResolver swaps in.
             var chosenMergeRunner = runner;
-            var chosenMergeCredential = credential;
+            AgentCredential? chosenMergeCredential = null;
             if (hostMerge.HasConflicts)
             {
                 var mergeExecScope = await TimingScope.BeginAsync(
@@ -14376,8 +14352,6 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 await using (mergeExecScope)
                 {
                     AuditLog.AgentStarted(runner.Kind, sandbox.Id, "merge");
-                    var candidateResult = await BuildAgenticConflictCandidatesAsync(
-                        item, project, runner, ct, AgenticConflictResolverOperation.Merge);
                     var candidates = WrapPromptPreprocessedCandidates(
                         candidateResult.Candidates,
                         item.Id,
@@ -16173,7 +16147,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             var spec = BuildSandboxSpec(access, includeAgentCredential: credential, allowAgentNetwork: true,
                 hostNetworkProfile: conflictReworkTarget.NetworkProfile,
                 timingWorkItemId: item.Id, timingPhase: ConflictReworkPhaseKey,
-                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, conflictReworkTarget, item.BaselineImageRef));
+                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, conflictReworkTarget, item.BaselineImageRef),
+                credentialRunner: runner);
 
             await using var sandbox = await CreateMergeSandboxWithStagingRestoreAsync(spec, repoId, isolatedRepoPath, ct);
             if (credential is not null && credential.Files.Count > 0)
@@ -16850,7 +16825,8 @@ Original merge-phase failure (JSON string, for context only):
         string? baselineImageRef = null,
         IReadOnlyList<SandboxMount>? additionalCredentialMounts = null,
         bool includeCredentialsTmpfs = false,
-        bool agentCredentialScope = false)
+        bool agentCredentialScope = false,
+        IAgentRunner? credentialRunner = null)
     {
         var mounts = new List<SandboxMount>(access.Mounts)
         {
@@ -16860,13 +16836,23 @@ Original merge-phase failure (JSON string, for context only):
         var env = new Dictionary<string, string>();
         if (includeAgentCredential is not null)
         {
+            if (credentialRunner is null)
+            {
+                throw new ArgumentException(
+                    "A credential runner is required when a sandbox includes an agent credential.",
+                    nameof(credentialRunner));
+            }
             mounts.Add(new SandboxMount
             {
                 SandboxPath = SandboxConventions.CredentialsDir,
                 Tmpfs = true,
                 SizeBytes = SandboxConventions.CredentialsTmpfsBytes,
             });
-            foreach (var (k, v) in includeAgentCredential.EnvironmentVariables)
+            var directEnvironment = SandboxEnvironmentVariablePolicy.SelectDirectCredentialEnvironment(
+                includeAgentCredential,
+                credentialRunner,
+                nameof(includeAgentCredential.EnvironmentVariables));
+            foreach (var (k, v) in directEnvironment)
                 env[k] = v;
             foreach (var m in includeAgentCredential.Mounts)
                 mounts.Add(m);
@@ -16938,6 +16924,7 @@ Original merge-phase failure (JSON string, for context only):
 
     private static async Task MaterialiseCredentialFilesAsync(ISandbox sandbox, AgentCredential credential, CancellationToken ct)
     {
+        SandboxCredentialFileWriter.ValidateMaterializationPlan(credential, []);
         foreach (var (relativePath, contents) in credential.Files)
         {
             var safePath = SanitiseCredentialFileName(relativePath);
@@ -18084,7 +18071,7 @@ Original merge-phase failure (JSON string, for context only):
                 ToAgent: null,
                 ToModel: null,
                 Reason: error),
-            }, ct);
+        }, ct);
     }
 
     private async Task RecordDirectQuotaParkAsync(

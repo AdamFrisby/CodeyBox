@@ -537,6 +537,8 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
             "CURSOR_API_KEY",
             "GH_TOKEN",
             "CODEYBOX_TEST_MARKER",
+            "TEST_TOKEN",
+            "WORK_TOKEN",
         };
     public IReadOnlySet<string> FileBackedCredentialEnvironmentVariables { get; } =
         new HashSet<string>(StringComparer.Ordinal)

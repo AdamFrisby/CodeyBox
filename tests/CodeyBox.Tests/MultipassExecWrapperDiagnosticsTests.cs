@@ -185,6 +185,47 @@ public sealed class MultipassExecWrapperDiagnosticsTests
     }
 
     [Fact]
+    public async Task ExecWrapper_UnsetEnvironmentRunsAfterInheritedAndExecEnvironmentMerges()
+    {
+        if (OperatingSystem.IsWindows()) return;
+
+        var workDir = Path.Combine(Path.GetTempPath(), $"codeybox-wrap-work-{Guid.NewGuid():N}");
+        var wrapperPath = await CreateExecutableWrapperAsync();
+        var envPath = Path.Combine(Path.GetTempPath(), $"codeybox-env-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(workDir);
+        await File.WriteAllTextAsync(
+            envPath,
+            MultipassSandboxProvider.BuildEnvironmentFileContent(
+                new Dictionary<string, string> { ["REMOVE_ME"] = "exec-value" })
+            + "unset -- 'REMOVE_ME'\n");
+
+        try
+        {
+            var (exit, stdout, stderr) = await RunProcessAsync(
+                "/bin/bash",
+                [
+                    wrapperPath,
+                    workDir,
+                    "--env-file", envPath,
+                    "sh", "-c", "if [ \"${REMOVE_ME+x}\" = x ]; then printf present; else printf absent; fi",
+                ],
+                new Dictionary<string, string?> { ["REMOVE_ME"] = "spec-value" });
+
+            Assert.Equal(0, exit);
+            Assert.Equal("", stderr);
+            Assert.Equal("absent", stdout);
+            Assert.False(File.Exists(envPath));
+        }
+        finally
+        {
+            File.Delete(wrapperPath);
+            if (File.Exists(envPath))
+                File.Delete(envPath);
+            Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task ExecWrapper_StdinFileFeedsChildCommandStdin()
     {
         if (OperatingSystem.IsWindows()) return;

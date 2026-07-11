@@ -314,6 +314,64 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task ResolveAsync_MaterialisationRollbackFailurePoisonsSandboxBeforeFallbackRuns()
+    {
+        var sandbox = new ConflictSandbox { FailCredentialCleanupWrites = true };
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+        var first = new FakeAgentResolverRunner(_ =>
+            new AgentResult(false, "must not run", null, null))
+        { Kind = new AgentKind("first-file-agent") };
+        var fallback = new FakeAgentResolverRunner(sb =>
+        {
+            sb.WriteFile("src/a.txt", "m + w\n");
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "must not run", null, null);
+        })
+        { Kind = new AgentKind("fallback-agent") };
+        var credential = new AgentCredential(
+            first.Kind,
+            new Dictionary<string, string>(),
+            new Dictionary<string, string> { ["agent/auth.json"] = "residual-secret" });
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions
+            {
+                MaxIterations = 2,
+                MaxAttemptsPerAgent = 1,
+            }),
+            credentialFileMaterialiser: async (candidateSandbox, candidateCredential, ct) =>
+            {
+                var file = Assert.Single(candidateCredential.Files);
+                await SandboxCredentialFileWriter.WriteAsync(
+                    candidateSandbox,
+                    new SandboxCredentialFileTarget(
+                        SandboxCredentialFileRoot.CredentialsDirectory,
+                        file.Key),
+                    file.Value,
+                    SandboxCredentialOverwritePolicy.Overwrite,
+                    ct);
+                throw new InvalidOperationException("second credential write failed");
+            });
+
+        var error = await Assert.ThrowsAsync<AgentCredentialSandboxPoisonedException>(() =>
+            resolver.ResolveAsync(
+                sandbox,
+                "/work",
+                WorkItemId.New(),
+                new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+                [
+                    new AgenticConflictResolverCandidate(first, credential),
+                    new AgenticConflictResolverCandidate(fallback, Credential: null),
+                ],
+                CancellationToken.None));
+
+        Assert.Equal(first.Kind, error.Candidate);
+        Assert.Equal(0, first.InvocationCount);
+        Assert.Equal(0, fallback.InvocationCount);
+        Assert.True(sandbox.TryGetCredentialFile("agent/auth.json", out var residual));
+        Assert.Equal("residual-secret", residual);
+    }
+
+    [Fact]
     public async Task ResolveAsync_ClearsPreviousCandidateCredentialFilesBeforeNextCandidate()
     {
         var sandbox = new ConflictSandbox();
@@ -1584,6 +1642,7 @@ public sealed class AgenticConflictResolverTests
         public int GrepCallCount { get; private set; }
         public int LsFilesCallCount { get; private set; }
         public int KillActiveExecsCallCount { get; private set; }
+        public bool FailCredentialCleanupWrites { get; init; }
 
         public void AddConflictedFile(string relativePath, string content)
         {
@@ -1647,6 +1706,8 @@ public sealed class AgenticConflictResolverTests
                 var relativePath = argv[5];
                 if (root != SandboxConventions.CredentialsDir)
                     return Task.FromResult(new SandboxExecResult(2, "", "unexpected credential root"));
+                if (string.IsNullOrEmpty(exec.Stdin) && FailCredentialCleanupWrites)
+                    return Task.FromResult(new SandboxExecResult(5, "", "credential cleanup rejected"));
                 if (string.IsNullOrEmpty(exec.Stdin))
                     _credentialFiles.Remove(relativePath);
                 else

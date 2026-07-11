@@ -6,20 +6,19 @@ using System.Collections.Concurrent;
 namespace CodeyBox.Orchestrator;
 
 /// <summary>
-/// Periodic background sweep that detects — and optionally disposes — Multipass
-/// VMs (or other managed sandboxes) that outlived their work item. These "leaked"
-/// sandboxes accumulate when the orchestrator crashes mid-disposal, slowly eating
-/// disk and memory on the host.
+/// Periodic background sweep that detects — and optionally disposes — persistent
+/// managed sandboxes that outlived their work item. These "leaked" sandboxes
+/// accumulate when the orchestrator crashes mid-disposal, slowly consuming
+/// provider disk and memory.
 ///
-/// <para><b>What counts as a leak:</b> a sandbox whose name starts with
-/// <c>codeybox-*</c>, that is not in the current process's in-memory active set
-/// (meaning the current orchestrator did not create it, or the creating instance
-/// crashed before calling DisposeAsync, or normal phase disposal failed and
-/// released active ownership), and whose creation timestamp is either older than
-/// <see cref="SandboxLeakOptions.LeakAgeThreshold"/> or missing because staging
-/// metadata was deleted. The age threshold guards against mistaking a sandbox
-/// that is mid-way through work-phase clone — typically less than 30 minutes —
-/// for a genuine leak.</para>
+/// <para><b>What counts as a leak:</b> a provider-owned sandbox reported by the
+/// managed lifecycle inventory, that is not in the current process's active
+/// ownership snapshot (meaning the creating process crashed, or normal phase
+/// disposal failed and released ownership), and whose creation timestamp is
+/// either older than <see cref="SandboxLeakOptions.LeakAgeThreshold"/> or missing.
+/// Each provider enforces its own ownership metadata and configurable namespace;
+/// the age threshold guards against mistaking an in-progress provision for a
+/// genuine leak.</para>
 ///
 /// <para><b>Auto-dispose:</b> on by default. Operators can set
 /// <see cref="SandboxLeakOptions.AutoDispose"/> to false for detection-only
@@ -40,11 +39,11 @@ public sealed class SandboxLeakReaper : BackgroundService
     private readonly Func<DateTimeOffset> _clock;
     private readonly LeakDetectionSink? _leakSink;
 
-    // First time THIS reaper observed each VM in a suspend-lifecycle state with no
+    // First time THIS reaper observed each sandbox in a suspend-lifecycle state with no
     // live mapping. The suspend-orphan grace is measured from this timestamp, NOT
     // from CreatedAt: a long-running in-flight VM has an old CreatedAt, so a
     // CreatedAt-based age gate would purge it on the first sweep after it enters
-    // Suspending — mid-snapshot, while multipassd may still be writing the RAM
+    // Suspending — mid-snapshot, while the provider may still be writing the RAM
     // image. Pruned each sweep to the set of identities still observed as orphans,
     // so it does not grow without bound. ConcurrentDictionary because the
     // operator-dispose endpoint and the sweep can touch reaper state from
@@ -104,7 +103,7 @@ public sealed class SandboxLeakReaper : BackgroundService
     /// <summary>
     /// Removes a single entry from the latest leak list. Called by the operator-dispose
     /// endpoint immediately after a successful disposal so that a second POST call for
-    /// the same name returns 404 rather than attempting a redundant multipass delete.
+    /// the same snapshot returns 404 rather than attempting a redundant provider delete.
     /// </summary>
     public void RemoveFromLatestLeaks(string name, string? hostId = null)
     {
@@ -129,7 +128,7 @@ public sealed class SandboxLeakReaper : BackgroundService
         }
 
         // Guard against misconfigured intervals that would cause ArgumentOutOfRangeException
-        // (TimeSpan.Zero) or a tight multipass-hammering loop (very small values).
+        // (TimeSpan.Zero) or a tight provider-hammering loop (very small values).
         var interval = _opts.CheckInterval < TimeSpan.FromMinutes(1)
             ? TimeSpan.FromMinutes(1)
             : _opts.CheckInterval;
@@ -168,7 +167,7 @@ public sealed class SandboxLeakReaper : BackgroundService
 
             // R8-core: any VM named in a work item's SuspendedVmName is being
             // held across an orchestrator restart and MUST NOT be reaped — the
-            // startup resume handler will multipass-start it back to Running
+            // startup resume handler will start it through its owning lifecycle provider
             // (or clear the bookkeeping if the resume fails). Built fresh per
             // sweep so a resume that completes between sweeps takes effect on
             // the next pass without an explicit invalidation hook.
@@ -207,8 +206,8 @@ public sealed class SandboxLeakReaper : BackgroundService
                 {
                     // Dedicated suspend grace, NOT the CreatedAt-based age gate. A
                     // VM that just entered Suspending may still be writing its RAM
-                    // image to disk — multipass routinely takes many minutes for a
-                    // loaded VM. Measure the grace from when this reaper FIRST saw
+                    // image to disk — providers may take many minutes for a loaded
+                    // VM. Measure the grace from when this reaper FIRST saw
                     // the VM in a suspend state (a long-running VM's old CreatedAt
                     // would otherwise clear LeakAgeThreshold immediately and we'd
                     // purge mid-snapshot). Only once the grace elapses with still no
@@ -477,12 +476,12 @@ public sealed class SandboxLeakOptions
     public TimeSpan PreemptRetention { get; set; } = TimeSpan.FromHours(24);
 
     /// <summary>
-    /// Dedicated grace before a suspend-lifecycle VM (multipass
-    /// <c>Suspending</c>/<c>Suspended</c>) with no live <c>SuspendedVmName</c>
+    /// Dedicated grace before a suspend-lifecycle VM (as abstracted by
+    /// <see cref="ManagedSandboxInfo.IsSuspendLifecycleOrFrozen"/>) with no live <c>SuspendedVmName</c>
     /// mapping is treated as a leak and purged. Measured from when the reaper first
     /// observes the VM in a suspend state — NOT from the VM's creation time — so a
     /// long-running in-flight VM that has just begun freezing is not purged while
-    /// multipassd may still be writing its RAM image. Sized to the worst-case
+    /// its provider may still be writing the RAM image. Sized to the worst-case
     /// RAM-snapshot budget for the default VM profile so a slow snapshot completes
     /// (or the orchestrator restarts and reclaims the mapping) before the reaper
     /// acts. Default ~30 minutes (<see cref="SuspendTimeoutPolicy.For(long?, System.TimeSpan?, System.TimeSpan?)"/>
@@ -502,15 +501,14 @@ public sealed class SandboxLeakOptions
 
     /// <summary>
     /// Maximum number of leaked sandboxes to dispose concurrently in one sweep.
-    /// Default 4 to limit pressure on multipassd during restart cleanup.
+    /// Default 4 to limit pressure on lifecycle backends during restart cleanup.
     /// <para><b>Hot-reloadable:</b> read on each sweep.</para>
     /// </summary>
     public int MaxConcurrentAutoDispose { get; set; } = 4;
 
     /// <summary>
-    /// Per-sandbox timeout for a single <c>multipass delete --purge</c> call.
-    /// Default 5 minutes — matches the worst-case latency observed when
-    /// multipassd is under load. Raising this allows slow purges to complete
+    /// Per-sandbox timeout for one managed-provider disposal operation.
+    /// Default 5 minutes. Raising this allows a slow backend purge to complete
     /// instead of being abandoned mid-operation.
     /// <para><b>Hot-reloadable:</b> read from the Func accessor on each sweep.</para>
     /// </summary>

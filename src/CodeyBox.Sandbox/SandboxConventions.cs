@@ -18,7 +18,7 @@ public static class SandboxConventions
     public const string CredentialsDir = "/run/codeybox/creds";
 
     /// <summary>Default tmpfs size for credentials.</summary>
-    public const long CredentialsTmpfsBytes = 4L * 1024 * 1024;
+    public const long CredentialsTmpfsBytes = AgentCredentialMaterializationPolicy.MaterializationBudgetBytes;
 
     /// <summary>
     /// R8-core: directory inside the sandbox where the exec wrapper writes the

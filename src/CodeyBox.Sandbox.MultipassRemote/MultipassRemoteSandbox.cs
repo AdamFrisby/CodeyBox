@@ -25,7 +25,11 @@ namespace CodeyBox.Sandbox.MultipassRemote;
 /// snapshot is correctly typed and a future suspend implementation slots in
 /// without changing the provider surface.</para>
 /// </summary>
-internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQualifiedSandbox, IReleaseAdmissionOnHostLossSandbox
+internal sealed class MultipassRemoteSandbox :
+    IShutdownTeardownSandbox,
+    IPrivilegedGuestFileHardeningSandbox,
+    IHostQualifiedSandbox,
+    IReleaseAdmissionOnHostLossSandbox
 {
     private readonly SandboxSpec _spec;
     private readonly IReadOnlyList<StagedBindMount> _stagedMounts;
@@ -100,12 +104,16 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
 
         var opts = _opts;
         var workdir = exec.WorkingDirectory ?? _spec.WorkingDirectory ?? SandboxConventions.WorkDir;
+        var effectiveEnvironment = exec.ExtraEnvironment is { Count: > 0 }
+            ? new Dictionary<string, string>(exec.ExtraEnvironment, StringComparer.Ordinal)
+            : new Dictionary<string, string>(StringComparer.Ordinal);
+        exec.ApplyEnvironmentRemovals(name => effectiveEnvironment.Remove(name));
 
         IReadOnlyList<string> remoteArgv;
         string? transportStdin;
-        if (exec.EnvironmentContainsSecrets && exec.ExtraEnvironment is { Count: > 0 } secretEnvironment)
+        if (exec.EnvironmentContainsSecrets && effectiveEnvironment.Count > 0)
         {
-            var environmentFile = SandboxEnvironmentVariablePolicy.BuildShellEnvironmentFileContent(secretEnvironment);
+            var environmentFile = SandboxEnvironmentVariablePolicy.BuildShellEnvironmentFileContent(effectiveEnvironment);
             var commandStdin = exec.Stdin ?? string.Empty;
             remoteArgv =
             [
@@ -120,6 +128,8 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
                 Encoding.UTF8.GetByteCount(environmentFile).ToString(System.Globalization.CultureInfo.InvariantCulture),
                 Encoding.UTF8.GetByteCount(commandStdin).ToString(System.Globalization.CultureInfo.InvariantCulture),
                 workdir,
+                exec.EnvironmentVariablesToUnset.Count.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                .. exec.EnvironmentVariablesToUnset,
                 .. exec.Argv,
             ];
             transportStdin = environmentFile + commandStdin;
@@ -133,9 +143,12 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
             var inVmScript = new StringBuilder();
             inVmScript.Append("cd ").Append(QuoteShellWord(workdir)).Append(" && ");
 
-            if (exec.ExtraEnvironment is not null && exec.ExtraEnvironment.Count > 0)
+            foreach (var name in exec.EnvironmentVariablesToUnset)
+                inVmScript.Append("unset -- ").Append(QuoteShellWord(name)).Append(" && ");
+
+            if (effectiveEnvironment.Count > 0)
             {
-                foreach (var (k, v) in exec.ExtraEnvironment)
+                foreach (var (k, v) in effectiveEnvironment)
                 {
                     ValidateEnvKey(k);
                     inVmScript.Append(k).Append('=').Append(QuoteShellWord(v)).Append(' ');
@@ -267,10 +280,16 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
         dd if=/dev/stdin of="$codeybox_env_file" bs=1 count="$1" status=none
         dd if=/dev/stdin of="$codeybox_stdin_file" bs=1 count="$2" status=none
         codeybox_workdir=$3
-        shift 3
+        codeybox_unset_count=$4
+        shift 4
         set -a
         . "$codeybox_env_file"
         set +a
+        while [ "$codeybox_unset_count" -gt 0 ]; do
+            unset -- "$1"
+            shift
+            codeybox_unset_count=$((codeybox_unset_count - 1))
+        done
         cd "$codeybox_workdir"
         "$@" < "$codeybox_stdin_file"
         """;

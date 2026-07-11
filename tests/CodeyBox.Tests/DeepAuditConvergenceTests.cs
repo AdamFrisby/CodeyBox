@@ -268,8 +268,23 @@ public sealed class DeepAuditConvergenceTests : IDisposable
             },
             credentials: new ConstantCredentialProvider(new AgentCredential(
                 AgentKind.Claude,
-                new Dictionary<string, string> { ["TEST_TOKEN"] = "secret" },
-                new Dictionary<string, string>())));
+                new Dictionary<string, string>
+                {
+                    ["ANTHROPIC_API_KEY"] = "direct-secret",
+                    ["CODEYBOX_CURSOR_AUTH_JSON"] = "file-backed-secret",
+                },
+                new Dictionary<string, string>())
+            {
+                Mounts =
+                [
+                    new SandboxMount
+                    {
+                        HostPath = Path.Combine(Path.GetTempPath(), "codeybox-release-credential-adjunct"),
+                        SandboxPath = "/opt/codeybox/release-credential-adjunct",
+                        ReadOnly = true,
+                    },
+                ],
+            }));
 
         var rel = ReleaseTestHelper.SeedRelease(ReleaseState.Closed, branchName: "release/v1.0");
         await _releaseStore.CreateAsync(rel);
@@ -287,7 +302,36 @@ public sealed class DeepAuditConvergenceTests : IDisposable
         Assert.Equal("audit-agent-profile", spec.Network.ProfileName);
         Assert.Contains("api.anthropic.com", spec.Network.AllowedHosts);
         Assert.DoesNotContain("registry.npmjs.org", spec.Network.AllowedHosts);
-        Assert.Equal("secret", spec.Environment["TEST_TOKEN"]);
+        Assert.Equal("direct-secret", spec.Environment["ANTHROPIC_API_KEY"]);
+        Assert.DoesNotContain("CODEYBOX_CURSOR_AUTH_JSON", spec.Environment.Keys);
+        Assert.Contains(spec.Mounts, mount =>
+            mount.HostPath == Path.Combine(Path.GetTempPath(), "codeybox-release-credential-adjunct")
+            && mount.SandboxPath == "/opt/codeybox/release-credential-adjunct"
+            && mount.ReadOnly);
+    }
+
+    [Fact]
+    public async Task DeepAuditCredentialedSandbox_RejectsCredentialForDifferentAgentBeforeCreate()
+    {
+        var (state, sandboxes) = await RunCredentialValidationScenarioAsync(new AgentCredential(
+            AgentKind.Codex,
+            new Dictionary<string, string>(),
+            new Dictionary<string, string>()));
+
+        Assert.Equal(ReleaseState.Failed, state);
+        Assert.Empty(sandboxes.Specs);
+    }
+
+    [Fact]
+    public async Task DeepAuditCredentialedSandbox_RejectsReservedEnvironmentBeforeCreate()
+    {
+        var (state, sandboxes) = await RunCredentialValidationScenarioAsync(new AgentCredential(
+            AgentKind.Claude,
+            new Dictionary<string, string> { ["BASH_ENV"] = "/tmp/untrusted-startup" },
+            new Dictionary<string, string>()));
+
+        Assert.Equal(ReleaseState.Failed, state);
+        Assert.Empty(sandboxes.Specs);
     }
 
     [Fact]
@@ -583,6 +627,41 @@ public sealed class DeepAuditConvergenceTests : IDisposable
         await _workItemStore.UpdateAsync(item.With(WorkItemState.Done));
 
         return (svc, rel, item);
+    }
+
+    private async Task<(ReleaseState State, CapturingSandboxProvider Sandboxes)>
+        RunCredentialValidationScenarioAsync(AgentCredential credential)
+    {
+        var auditor = new ScriptedDeepAuditor(
+            AuditorName,
+            AuditCapabilities.AgentCredentials,
+            new AuditResult(true, []));
+        var projects = new InMemoryProjectRepository(
+            ReleaseTestHelper.EnabledProjectWithDeepAuditors(AuditorName, maxIterations: 1));
+        var sandboxes = new CapturingSandboxProvider();
+        var service = ReleaseTestHelper.BuildService(
+            _releaseStore,
+            _workItemStore,
+            projects,
+            _webhooks,
+            deepAuditors: [auditor],
+            taskQueue: new AutoCompleteTaskQueue(_workItemStore),
+            sandboxes: sandboxes,
+            gitHost: new DeepAuditTestGitHost(),
+            agents: new AgentRegistry([new ScriptedAgent([MergeStrategy.RealMerge])]),
+            credentials: new ConstantCredentialProvider(credential));
+        var release = ReleaseTestHelper.SeedRelease(ReleaseState.Closed, branchName: "release/v1.0");
+        await _releaseStore.CreateAsync(release);
+        var item = MakeWorkItem(release.Id, WorkItemState.Done);
+        await _workItemStore.CreateAsync(item);
+        await _workItemStore.UpdateAsync(item.With(WorkItemState.Done));
+
+        await service.OnWorkItemTerminalAsync(release.Id, default);
+        var state = await PollUntilAsync(
+            release.Id,
+            candidate => candidate is ReleaseState.Released or ReleaseState.Failed,
+            timeoutSeconds: 5);
+        return (state, sandboxes);
     }
 
     private async Task<ReleaseState> PollUntilAsync(

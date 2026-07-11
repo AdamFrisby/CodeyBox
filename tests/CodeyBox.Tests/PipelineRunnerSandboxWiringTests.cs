@@ -10,11 +10,10 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// Pins the wiring fix that broke the in-VM agentic conflict resolver. The
-/// pickup-rebase sandbox must have agent network and credential tmpfs scope.
-/// Candidate credential payloads are materialised immediately before that
-/// candidate runs instead of being installed in the shared sandbox environment.
-/// The agent-merge sandbox still
-/// carries the chosen agent credential at creation time.
+/// pickup-rebase and merge-conflict sandboxes must have agent network and
+/// credential tmpfs scope. Candidate credential payloads are materialised
+/// immediately before that candidate runs instead of being installed in the
+/// shared sandbox environment.
 ///
 /// The new resolver-side integration tests in
 /// <c>AgenticConflictResolverIntegrationTests</c> assert the resolver's own
@@ -34,6 +33,8 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     private const string MarkerHost = "agent.example.invalid";
     private const string CursorAuthEnvKey = "CODEYBOX_CURSOR_AUTH_JSON";
     private const string CursorAuthJson = """{"token":"cursor-fallback-token"}""";
+    private const string CursorApiKeyEnvKey = "CURSOR_API_KEY";
+    private const string CursorApiKeyValue = "cursor-candidate-api-key";
     private const string CodexApiKeyEnvKey = "OPENAI_API_KEY";
     private const string CodexApiKeyValue = "codex-candidate-api-key";
     private const string ClaudeApiKeyEnvKey = "ANTHROPIC_API_KEY";
@@ -99,7 +100,87 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
 
         var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
         AssertCredentialTmpfsAndOpenNetwork(pickupSpec, "pickup-rebase");
-        Assert.Equal(MarkerEnvValue, pickupSpec.Environment[MarkerEnvKey]);
+        Assert.DoesNotContain(MarkerEnvKey, pickupSpec.Environment.Keys);
+    }
+
+    [Fact]
+    public async Task PipelineSandbox_RejectsReservedCredentialEnvironmentBeforeAnyCreate()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var recorder = new RecordingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        using var pipeline = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            credentials: new ConstantCredentialProvider(new AgentCredential(
+                AgentKind.Claude,
+                new Dictionary<string, string> { ["BASH_ENV"] = "/tmp/untrusted-startup" },
+                new Dictionary<string, string>())),
+            sandboxProvider: recorder);
+        pipeline.Agent.WorkPlan.Enqueue(new FileWrite("must-not-run.txt", "unsafe\n"));
+        var item = NewItem("feature/reserved-credential-environment");
+        await pipeline.Store.CreateAsync(item);
+
+        await pipeline.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await pipeline.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.NotEqual(WorkItemState.Done, final.State);
+        Assert.Contains("reserved", final.LastError ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(recorder.Specs);
+    }
+
+    [Fact]
+    public async Task PipelineSandbox_ExposesOnlyRunnerDeclaredDirectCredentialEnvironment()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var recorder = new RecordingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        using var pipeline = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            credentials: new ConstantCredentialProvider(new AgentCredential(
+                AgentKind.Claude,
+                new Dictionary<string, string>
+                {
+                    ["ANTHROPIC_API_KEY"] = "direct-secret",
+                    [CursorAuthEnvKey] = CursorAuthJson,
+                },
+                new Dictionary<string, string>())),
+            sandboxProvider: recorder);
+        pipeline.Agent.WorkPlan.Enqueue(new FileWrite("credential-scope.txt", "safe\n"));
+        var item = NewItem("feature/scoped-credential-environment");
+        await pipeline.Store.CreateAsync(item);
+
+        await pipeline.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await pipeline.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final.State);
+        Assert.NotEmpty(recorder.Specs);
+        Assert.Contains(recorder.Specs, spec =>
+            spec.Environment.TryGetValue("ANTHROPIC_API_KEY", out var value)
+            && value == "direct-secret");
+        Assert.All(recorder.Specs, spec =>
+            Assert.DoesNotContain(CursorAuthEnvKey, spec.Environment.Keys));
+    }
+
+    [Fact]
+    public void CredentialEnvironmentSelection_RejectsNamesWithoutExactRunnerClassification()
+    {
+        var runner = new ScriptedAgent([MergeStrategy.RealMerge]);
+        var credential = new AgentCredential(
+            runner.Kind,
+            new Dictionary<string, string> { ["UNCLASSIFIED_CREDENTIAL"] = "secret" },
+            new Dictionary<string, string>());
+
+        var error = Assert.Throws<ArgumentException>(() =>
+            SandboxEnvironmentVariablePolicy.SelectDirectCredentialEnvironment(
+                credential,
+                runner,
+                nameof(credential.EnvironmentVariables)));
+
+        Assert.Contains("exactly one of direct or file-backed", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -165,7 +246,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task PickupRebaseResolver_CreationEnvironmentIncludesOnlyCandidateCredentials()
+    public async Task PickupRebaseResolver_CreationEnvironmentExcludesAllCandidateCredentials()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var recorder = new RecordingSandboxProvider(
@@ -195,8 +276,8 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         Assert.DoesNotContain(AgentKind.Opencode, credentials.RequestedAgents);
 
         var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
-        Assert.Equal(CodexApiKeyValue, pickupSpec.Environment[CodexApiKeyEnvKey]);
-        Assert.Equal(CursorAuthJson, pickupSpec.Environment[CursorAuthEnvKey]);
+        Assert.DoesNotContain(CodexApiKeyEnvKey, pickupSpec.Environment.Keys);
+        Assert.DoesNotContain(CursorAuthEnvKey, pickupSpec.Environment.Keys);
         Assert.False(pickupSpec.Environment.ContainsKey(NonCandidateEnvKey),
             "non-candidate opencode credential must not enter the resolver sandbox");
         Assert.Equal(
@@ -315,11 +396,11 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
 
         Assert.Equal(WorkItemState.Done, run.Final.State);
         var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
-        Assert.Equal(ClaudeApiKeyValue, pickupSpec.Environment[ClaudeApiKeyEnvKey]);
+        Assert.DoesNotContain(ClaudeApiKeyEnvKey, pickupSpec.Environment.Keys);
     }
 
     [Fact]
-    public async Task PickupRebaseResolver_ApiKeyOnlyCandidate_ReceivesSandboxEnvironment()
+    public async Task PickupRebaseResolver_ApiKeyOnlyCandidate_ReceivesScopedExecEnvironment()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var primary = new DirectEnvironmentAssertingResolverAgent();
@@ -341,6 +422,40 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
                 run.BarePath,
                 run.WorkBranch,
                 "direct-credential-observed.txt")).TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
+    public async Task PickupRebaseResolver_EachFallbackCandidateReceivesOnlyItsOwnDirectEnvironment()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var primary = new CandidateEnvironmentIsolationResolverAgent(
+            AgentKind.Codex,
+            resolveConflict: false);
+        var fallback = new CandidateEnvironmentIsolationResolverAgent(
+            AgentKind.Cursor,
+            resolveConflict: true);
+        var classRouter = BuildResolverClassRouter(primary, fallback);
+        var project = NewResolverProject(seed, AgentKind.Codex);
+        var recorder = new RecordingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+
+        var run = await RunPickupRebaseConflictAsync(
+            seed,
+            project,
+            new TwoCandidateDirectCredentialProvider(),
+            primary,
+            [fallback],
+            classRouter,
+            recorder);
+
+        Assert.True(
+            run.Final.State == WorkItemState.Done,
+            run.Final.LastError ?? $"unexpected state: {run.Final.State}");
+        Assert.Equal($"{CodexApiKeyValue}||", primary.ObservedEnvironment);
+        Assert.Equal($"{CursorApiKeyValue}||", fallback.ObservedEnvironment);
+        var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
+        Assert.DoesNotContain(CodexApiKeyEnvKey, pickupSpec.Environment.Keys);
+        Assert.DoesNotContain(CursorApiKeyEnvKey, pickupSpec.Environment.Keys);
     }
 
     [Fact]
@@ -405,50 +520,67 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task AgentMergeSandbox_IsCreatedWithAgentCredentialAndOpenNetwork()
+    public async Task AgentMergeResolver_AuditCandidateCannotReadOmittedWorkRunnerCredential()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var recorder = new RecordingSandboxProvider(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
-
+        var primary = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+        var auditCandidate = new MergeCandidateCredentialIsolationResolverAgent();
         var pipelineOptions = new PipelineOptions
         {
             SandboxImageReference = "ignored",
             AgentAllowedHosts = [MarkerHost],
         };
+        var project = NewResolverProject(seed, AgentKind.Codex, defaultAgentClass: null) with
+        {
+            Audit = new ProjectAudit
+            {
+                MaxIterations = 1,
+                AuditTypes = ["scripted"],
+                AuditAgent = AgentKind.Cursor,
+            },
+        };
 
-        // A clean (non-conflicting) merge is now completed entirely host-side
-        // with no sandbox, so it builds no merge spec to inspect. The merge
-        // sandbox is created ONLY on the agentic conflict-resolver path; induce
-        // a real conflict (work writes README, the auditor advances main's
-        // README during audit) so RunAgentMergePhaseAsync reaches
-        // BuildSandboxSpec(... timingPhase: "merge" ...) — the call site whose
-        // credential + open-network wiring this test pins.
+        // The configured audit agent is the sole merge-resolver candidate, so
+        // the work runner is omitted from the candidate set. Before candidate
+        // scoping was applied at sandbox creation, the primary Codex environment
+        // and file credential were still installed in this shared sandbox and
+        // remained readable by the first Cursor candidate.
         var auditor = new MainAdvancingAuditor(_workspace, "README.md", "main\n");
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
             auditors: [auditor],
             pipelineOptions: pipelineOptions,
-            credentials: new MarkerCredentialProvider(),
-            sandboxProvider: recorder);
+            credentials: new MergeCandidateIsolationCredentialProvider(),
+            sandboxProvider: recorder,
+            projectRepository: new InMemoryProjectRepository(project),
+            agentOverride: primary,
+            extraAgentRunners: [auditCandidate]);
         auditor.GitRoot = tp.GitRoot;
 
-        tp.Agent.WorkPlan.Enqueue(new FileWrite("README.md", "work\n"));
-        tp.Agent.ConflictResolutionPlan.Enqueue(_ => new Dictionary<string, string>(StringComparer.Ordinal)
+        primary.WorkPlan.Enqueue(new FileWrite("README.md", "work\n"));
+        var item = NewItem("feature/merge-wiring") with
         {
-            ["README.md"] = "main\nwork\n",
-        });
-        var item = NewItem("feature/merge-wiring");
+            Agent = AgentKind.Codex,
+            AgentClassId = null,
+        };
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.NotNull(final);
+        Assert.True(
+            final.State == WorkItemState.Done,
+            final.LastError ?? $"unexpected state: {final.State}");
 
-        // RunAgentMergePhaseAsync builds the merge sandbox with timingPhase = "merge".
         var mergeSpec = Assert.Single(recorder.SpecsForPhase("merge"));
-        AssertCredentialAndOpenNetwork(mergeSpec, "agent-merge");
+        AssertCredentialTmpfsAndOpenNetwork(mergeSpec, "agent-merge");
+        Assert.DoesNotContain(CodexApiKeyEnvKey, mergeSpec.Environment.Keys);
+        Assert.DoesNotContain(CursorApiKeyEnvKey, mergeSpec.Environment.Keys);
+        Assert.Equal($"{CursorApiKeyValue}||absent", auditCandidate.ObservedCredentialScope);
+        Assert.Empty(primary.AgenticConflictInvocations);
     }
 
     [Fact]
@@ -504,6 +636,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
                 null,
                 false,
                 false,
+                tp.Agent,
             ]));
 
         Assert.Contains(MarkerHost, spec.Network.AllowedHosts);
@@ -736,54 +869,84 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         });
     }
 
-    // The sandbox-side env var that AuditReviewDotnetShim.Apply injects to arm
-    // the absolute-path hardening script. It is the ONLY defense on the
-    // production (multipass) provider against an auditor bypassing the PATH
-    // shim via an absolute dotnet path (e.g. /usr/bin/dotnet test). The branch
-    // that sets it is environment-independent, so it is unit-tested directly
-    // here rather than only through the ProcessSandboxProvider integration path
-    // (where hardening is always off) — a typo'd provider name or a dropped env
-    // var would otherwise silently disable hardening in production with no
-    // failing test.
-    private const string HardenAbsoluteEnvKey = "CODEYBOX_AUDIT_DOTNET_SHIM_HARDEN_ABSOLUTE";
+    private const string HardenAbsoluteEnvKey =
+        AuditReviewDotnetShim.PrivilegedHardeningEnvironmentVariable;
 
-    [Theory]
-    [InlineData("multipass")]
-    [InlineData("multipass-remote")]
-    public void AuditDotnetShim_ArmsAbsolutePathHardening_OnMultipassProviders(string providerName)
+    [Fact]
+    public void AuditDotnetShim_Apply_DoesNotInferPrivilegedHardeningFromProviderNames()
     {
-        var shim = AuditReviewDotnetShim.From(new PipelineTuningOptions(), providerName);
-        var applied = shim.Apply(BaseAuditSpec());
-
-        Assert.True(
-            applied.Environment.TryGetValue(HardenAbsoluteEnvKey, out var value),
-            $"provider '{providerName}' must arm absolute-path hardening — it is the only bypass defense on that provider");
-        Assert.Equal("1", value);
-        AssertShimApplied(applied);
-    }
-
-    [Theory]
-    [InlineData("process")]
-    [InlineData("bubblewrap")]
-    [InlineData("multipass-local")] // near-miss: must NOT match the multipass prefix
-    [InlineData("Multipass")]       // case mismatch: comparison is Ordinal, not IgnoreCase
-    public void AuditDotnetShim_DoesNotArmAbsolutePathHardening_OnOtherProviders(string providerName)
-    {
-        var shim = AuditReviewDotnetShim.From(new PipelineTuningOptions(), providerName);
+        var shim = AuditReviewDotnetShim.From(new PipelineTuningOptions());
         var applied = shim.Apply(BaseAuditSpec());
 
         Assert.DoesNotContain(HardenAbsoluteEnvKey, applied.Environment.Keys);
-        // The PATH shim + tmpfs mount still apply on every provider — only the
-        // privileged absolute-path hardening is multipass-scoped.
         AssertShimApplied(applied);
     }
 
     [Fact]
-    public void AuditDotnetShim_Disabled_AppliesNothing_EvenOnMultipass()
+    public async Task AuditDotnetShim_Install_ArmsPrivilegedHardeningThroughDecorator()
+    {
+        var inner = new PrivilegedHardeningRecordingSandbox();
+        var sandbox = new TestSandboxDecorator(inner);
+        var shim = AuditReviewDotnetShim.From(new PipelineTuningOptions());
+
+        await shim.InstallAsync(sandbox, CancellationToken.None);
+
+        var hardeningExec = Assert.Single(
+            inner.Execs,
+            exec => exec.ExtraEnvironment?.ContainsKey(HardenAbsoluteEnvKey) == true);
+        var hardeningEnvironment = Assert.IsAssignableFrom<IReadOnlyDictionary<string, string>>(
+            hardeningExec.ExtraEnvironment);
+        Assert.Equal("1", hardeningEnvironment[HardenAbsoluteEnvKey]);
+        Assert.Equal(["sh", "-s", "--", "/usr/bin/dotnet"], hardeningExec.Argv);
+    }
+
+    [Fact]
+    public async Task AuditDotnetShim_Install_DoesNotRunPrivilegedHardeningWithoutCapability()
+    {
+        var sandbox = new RecordingExecSandbox();
+        var shim = AuditReviewDotnetShim.From(new PipelineTuningOptions());
+
+        await shim.InstallAsync(sandbox, CancellationToken.None);
+
+        Assert.DoesNotContain(sandbox.Execs, exec =>
+            exec.ExtraEnvironment?.ContainsKey(HardenAbsoluteEnvKey) == true);
+        Assert.DoesNotContain(sandbox.Execs, exec => exec.Argv.SequenceEqual(["sh", "-s", "--", "/usr/bin/dotnet"]));
+    }
+
+    [Fact]
+    public void VmSandboxHandles_ExposePrivilegedGuestFileHardeningCapabilityOnlyWhenSupported()
+    {
+        Assert.All(
+            new[]
+            {
+                typeof(CodeyBox.Sandbox.Multipass.MultipassSandbox),
+                typeof(CodeyBox.Sandbox.MultipassRemote.MultipassRemoteSandbox),
+            },
+            sandboxType => Assert.True(
+                typeof(IPrivilegedGuestFileHardeningSandbox).IsAssignableFrom(sandboxType),
+                $"{sandboxType.FullName} must declare privileged guest-file hardening support"));
+        Assert.False(
+            typeof(IPrivilegedGuestFileHardeningSandbox)
+                .IsAssignableFrom(typeof(CodeyBox.Sandbox.Incus.IncusSandbox)),
+            "Incus guest commands run as a no-new-privileges non-root identity and cannot harden absolute guest paths");
+    }
+
+    [Fact]
+    public void SandboxCapability_DecoratorCycleFailsClosed()
+    {
+        var sandbox = new CyclicSandboxDecorator();
+
+        var error = Assert.Throws<InvalidOperationException>(() =>
+            SandboxCapability.Find<IPrivilegedGuestFileHardeningSandbox>(sandbox));
+
+        Assert.Contains("cycle", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void AuditDotnetShim_Disabled_AppliesNothing()
     {
         var shim = AuditReviewDotnetShim.From(
-            new PipelineTuningOptions { BlockRedundantDotnetBuildTestInAuditSandbox = false },
-            "multipass");
+            new PipelineTuningOptions { BlockRedundantDotnetBuildTestInAuditSandbox = false });
         var spec = BaseAuditSpec();
         var applied = shim.Apply(spec);
 
@@ -793,14 +956,10 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     }
 
     // Behavioral coverage for AuditReviewDotnetShim.PrivilegedHardeningScript —
-    // the ONLY defense on the production (multipass) provider against an auditor
-    // bypassing the PATH shim by invoking dotnet via an absolute path (e.g.
-    // /usr/bin/dotnet test). Every other AuditDotnetShim test exercises the PATH
-    // shim only; the ~60-line privileged hardening body never runs there because
-    // CODEYBOX_AUDIT_DOTNET_SHIM_HARDEN_ABSOLUTE is only armed on multipass and
-    // the ProcessSandboxProvider integration path always leaves it off. This
-    // drives the REAL hardening + shim scripts against a throwaway fixture tree
-    // so the load-bearing actions run without root or the /codeybox/bin mount:
+    // the absolute-path bypass defense used by isolated guest-root sandboxes.
+    // The ProcessSandboxProvider integration path intentionally does not expose
+    // that capability, so this drives the real hardening + shim scripts against
+    // a throwaway fixture tree without requiring root or the /codeybox/bin mount:
     // the arm-env gate, moving the real dotnet aside to <target>.codeybox-real,
     // dropping the shim over the target, the {Directory}/* skip guard, and the
     // shim's ${0}.codeybox-real passthrough for absolute invocations.
@@ -811,9 +970,9 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
             return; // POSIX shell + unix file modes; the audit sandboxes are Linux.
 
         var fixture = Directory.CreateTempSubdirectory("codeybox-harden-").FullName;
+        var shimDir = Path.Combine(fixture, "codeybox", "bin");
         try
         {
-            var shimDir = Path.Combine(fixture, "codeybox", "bin");
             Directory.CreateDirectory(shimDir);
             var shimPath = Path.Combine(shimDir, "dotnet");
             await File.WriteAllTextAsync(shimPath, AuditReviewDotnetShim.ShimScript);
@@ -844,7 +1003,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
             MakeExecutable(target);
 
             var script = AuditReviewDotnetShim.BuildPrivilegedHardeningScript(
-                shimPath, shimDir, shimDirSibling);
+                shimPath, shimDir, [shimDirSibling]);
 
             // Gate: without the arming env var the script is a no-op.
             var noop = await RunHostShimScriptAsync(script, shimDir, target, arm: false);
@@ -875,22 +1034,181 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(fixture, recursive: true); } catch { }
+            RestoreFixtureDirectoryForCleanup(shimDir);
+            Directory.Delete(fixture, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task PrivilegedHardeningScript_RestoresOriginalAndFailsWhenReplacementWriteFails()
+    {
+        if (OperatingSystem.IsWindows())
+            return; // POSIX shell, ulimit, and unix file modes; the VM sandboxes are Linux.
+
+        var fixture = Directory.CreateTempSubdirectory("codeybox-harden-fail-").FullName;
+        var shimDir = Path.Combine(fixture, "codeybox", "bin");
+        try
+        {
+            Directory.CreateDirectory(shimDir);
+            var shimPath = Path.Combine(shimDir, "dotnet");
+            await File.WriteAllTextAsync(shimPath, AuditReviewDotnetShim.ShimScript);
+            MakeExecutable(shimPath);
+            var fakeSudo = Path.Combine(shimDir, "sudo");
+            await File.WriteAllTextAsync(fakeSudo, "#!/bin/sh\nexit 1\n");
+            MakeExecutable(fakeSudo);
+
+            var realDir = Path.Combine(fixture, "opt", "dotnet");
+            Directory.CreateDirectory(realDir);
+            var target = Path.Combine(realDir, "dotnet");
+            const string realBody = "#!/bin/sh\necho original\n";
+            await File.WriteAllTextAsync(target, realBody);
+            MakeExecutable(target);
+
+            var script = AuditReviewDotnetShim.BuildPrivilegedHardeningScript(
+                shimPath,
+                shimDir,
+                absoluteCandidates: []);
+            var failed = await RunHostShimScriptAsync(
+                script,
+                shimDir,
+                target,
+                arm: true,
+                prohibitFileWrites: true);
+
+            Assert.NotEqual(0, failed.code);
+            Assert.Contains("the original was restored", failed.stderr, StringComparison.Ordinal);
+            Assert.Equal(realBody, await File.ReadAllTextAsync(target));
+            Assert.False(File.Exists(target + ".codeybox-real"));
+            var restored = await RunHostBinaryAsync(target, []);
+            Assert.Equal(0, restored.code);
+            Assert.Contains("original", restored.stdout, StringComparison.Ordinal);
+        }
+        finally
+        {
+            RestoreFixtureDirectoryForCleanup(shimDir);
+            Directory.Delete(fixture, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task PrivilegedHardeningScript_QuotesHostileAbsolutePathsAsSingleTargets()
+    {
+        if (OperatingSystem.IsWindows())
+            return; // POSIX shell and unix file modes; the VM sandboxes are Linux.
+
+        var fixture = Directory.CreateTempSubdirectory("codeybox-harden-quote-").FullName;
+        var shimDir = Path.Combine(fixture, "shim ' $(printf injected); dir");
+        try
+        {
+            Directory.CreateDirectory(shimDir);
+            var shimPath = Path.Combine(shimDir, "dot net");
+            await File.WriteAllTextAsync(shimPath, AuditReviewDotnetShim.ShimScript);
+            MakeExecutable(shimPath);
+            var fakeSudo = Path.Combine(shimDir, "sudo");
+            await File.WriteAllTextAsync(fakeSudo, "#!/bin/sh\nexit 1\n");
+            MakeExecutable(fakeSudo);
+
+            var realDir = Path.Combine(fixture, "target ' $(printf escaped); dir");
+            Directory.CreateDirectory(realDir);
+            var target = Path.Combine(realDir, "dynamic dot net");
+            var staticTarget = Path.Combine(realDir, "static ' $(printf safe); dot net");
+            const string realBody = "#!/bin/sh\necho quoted-original\n";
+            await File.WriteAllTextAsync(target, realBody);
+            MakeExecutable(target);
+            await File.WriteAllTextAsync(staticTarget, realBody);
+            MakeExecutable(staticTarget);
+
+            var script = AuditReviewDotnetShim.BuildPrivilegedHardeningScript(
+                shimPath,
+                shimDir,
+                [staticTarget]);
+            var result = await RunHostShimScriptAsync(script, shimDir, target, arm: true);
+
+            Assert.Equal(0, result.code);
+            Assert.Equal(AuditReviewDotnetShim.ShimScript, await File.ReadAllTextAsync(target));
+            Assert.Equal(realBody, await File.ReadAllTextAsync(target + ".codeybox-real"));
+            Assert.Equal(AuditReviewDotnetShim.ShimScript, await File.ReadAllTextAsync(staticTarget));
+            Assert.Equal(realBody, await File.ReadAllTextAsync(staticTarget + ".codeybox-real"));
+        }
+        finally
+        {
+            RestoreFixtureDirectoryForCleanup(shimDir);
+            Directory.Delete(fixture, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task PrivilegedHardeningScript_PassthroughFollowsMovedSymlinkToCanonicalRealSibling()
+    {
+        if (OperatingSystem.IsWindows())
+            return; // POSIX shell, symlinks, and unix file modes; the VM sandboxes are Linux.
+
+        var fixture = Directory.CreateTempSubdirectory("codeybox-harden-link-").FullName;
+        var shimDir = Path.Combine(fixture, "codeybox", "bin");
+        try
+        {
+            Directory.CreateDirectory(shimDir);
+            var shimPath = Path.Combine(shimDir, "dotnet");
+            await File.WriteAllTextAsync(shimPath, AuditReviewDotnetShim.ShimScript);
+            MakeExecutable(shimPath);
+            var fakeSudo = Path.Combine(shimDir, "sudo");
+            await File.WriteAllTextAsync(fakeSudo, "#!/bin/sh\nexit 1\n");
+            MakeExecutable(fakeSudo);
+
+            var canonicalDir = Path.Combine(fixture, "share", "dotnet");
+            var entryDir = Path.Combine(fixture, "usr", "bin");
+            Directory.CreateDirectory(canonicalDir);
+            Directory.CreateDirectory(entryDir);
+            var canonicalTarget = Path.Combine(canonicalDir, "dotnet");
+            const string realBody = "#!/bin/sh\necho \"canonical real $*\"\n";
+            await File.WriteAllTextAsync(canonicalTarget, realBody);
+            MakeExecutable(canonicalTarget);
+            var symlinkEntry = Path.Combine(entryDir, "dotnet");
+            File.CreateSymbolicLink(symlinkEntry, canonicalTarget);
+
+            var script = AuditReviewDotnetShim.BuildPrivilegedHardeningScript(
+                shimPath,
+                shimDir,
+                [canonicalTarget]);
+            var hardened = await RunHostShimScriptAsync(script, shimDir, symlinkEntry, arm: true);
+
+            Assert.Equal(0, hardened.code);
+            var info = await RunHostBinaryAsync(symlinkEntry, ["--info"]);
+            Assert.Equal(0, info.code);
+            Assert.Contains("canonical real --info", info.stdout, StringComparison.Ordinal);
+            var build = await RunHostBinaryAsync(symlinkEntry, ["build"]);
+            Assert.Equal(0, build.code);
+            Assert.Contains(AuditDotnetShimNotice, build.stdout, StringComparison.Ordinal);
+        }
+        finally
+        {
+            RestoreFixtureDirectoryForCleanup(shimDir);
+            Directory.Delete(fixture, recursive: true);
         }
     }
 
     private static Task<(int code, string stdout, string stderr)> RunHostShimScriptAsync(
-        string script, string shimDir, string target, bool arm)
+        string script,
+        string shimDir,
+        string target,
+        bool arm,
+        bool prohibitFileWrites = false)
     {
-        // shimDir leads PATH so the script's `command -v dotnet` resolves to the
-        // fixture shim (and is skipped) rather than any real host dotnet.
+        // shimDir leads PATH so the fixture's deliberately failing sudo wins
+        // over any passwordless host sudo and keeps the test unprivileged.
         var env = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["PATH"] = shimDir + ":/usr/bin:/bin",
             // Empty (not absent) so an inherited value can never arm the gate.
             ["CODEYBOX_AUDIT_DOTNET_SHIM_HARDEN_ABSOLUTE"] = arm ? "1" : "",
         };
-        return RunHostProcessAsync("/bin/sh", ["-s", "--", target], script, env);
+        return prohibitFileWrites
+            ? RunHostProcessAsync(
+                "/bin/sh",
+                ["-c", "ulimit -f 0; exec /bin/sh -s -- \"$1\"", "sh", target],
+                script,
+                env)
+            : RunHostProcessAsync("/bin/sh", ["-s", "--", target], script, env);
     }
 
     private static Task<(int code, string stdout, string stderr)> RunHostBinaryAsync(
@@ -906,6 +1224,16 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
             UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
             | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
             | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+    }
+
+    private static void RestoreFixtureDirectoryForCleanup(string path)
+    {
+        if (!OperatingSystem.IsWindows() && Directory.Exists(path))
+        {
+            File.SetUnixFileMode(
+                path,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
     }
 
     private static async Task<(int code, string stdout, string stderr)> RunHostProcessAsync(
@@ -953,18 +1281,53 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         Assert.Contains(applied.Mounts, m => m.Tmpfs && m.SandboxPath == AuditDotnetShimDir);
     }
 
-    private static void AssertCredentialAndOpenNetwork(SandboxSpec spec, string phaseName)
+    private class RecordingExecSandbox : ISandbox
     {
-        Assert.True(spec.Environment.TryGetValue(MarkerEnvKey, out var marker),
-            $"{phaseName} sandbox was created without the chosen runner's credential env vars — credential argument was nulled or the credential's env was not propagated");
-        Assert.Equal(MarkerEnvValue, marker);
-        Assert.Contains(MarkerHost, spec.Network.AllowedHosts);
-        // When allowAgentNetwork is false, BuildSandboxSpec sets AllowedHosts
-        // to an empty array regardless of credential. A non-empty AllowedHosts
-        // that includes the marker host pins both "allowAgentNetwork: true"
-        // AND "credential != null" — those are the two switches the resolver
-        // sandbox setup defect (#168 follow-up) flipped to the wrong values.
-        Assert.NotEmpty(spec.Network.AllowedHosts);
+        private readonly List<SandboxExec> _execs = [];
+
+        public string Id => "recording-exec";
+
+        public IReadOnlyList<SandboxExec> Execs => _execs;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            _execs.Add(exec);
+            var stdout = exec.Argv.SequenceEqual(["sh", "-c", "command -v dotnet 2>/dev/null || true"])
+                ? "/usr/bin/dotnet\n"
+                : string.Empty;
+            return Task.FromResult(new SandboxExecResult(0, stdout, string.Empty));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class PrivilegedHardeningRecordingSandbox :
+        RecordingExecSandbox,
+        IPrivilegedGuestFileHardeningSandbox
+    {
+    }
+
+    private sealed class TestSandboxDecorator(ISandbox inner) : ISandboxDecorator
+    {
+        public ISandbox InnerSandbox { get; } = inner;
+        public string Id => InnerSandbox.Id;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
+            InnerSandbox.ExecAsync(exec, ct);
+
+        public ValueTask DisposeAsync() => InnerSandbox.DisposeAsync();
+    }
+
+    private sealed class CyclicSandboxDecorator : ISandboxDecorator
+    {
+        public ISandbox InnerSandbox => this;
+        public string Id => "cyclic-decorator";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
+            Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private static void AssertCredentialTmpfsAndOpenNetwork(SandboxSpec spec, string phaseName)
@@ -1330,6 +1693,49 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         }
     }
 
+    private sealed class TwoCandidateDirectCredentialProvider : ICredentialProvider
+    {
+        public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+        {
+            AgentCredential? credential = agent switch
+            {
+                var kind when kind == AgentKind.Codex => new AgentCredential(
+                    AgentKind.Codex,
+                    new Dictionary<string, string> { [CodexApiKeyEnvKey] = CodexApiKeyValue },
+                    new Dictionary<string, string>()),
+                var kind when kind == AgentKind.Cursor => new AgentCredential(
+                    AgentKind.Cursor,
+                    new Dictionary<string, string> { [CursorApiKeyEnvKey] = CursorApiKeyValue },
+                    new Dictionary<string, string>()),
+                _ => null,
+            };
+            return Task.FromResult(credential);
+        }
+    }
+
+    private sealed class MergeCandidateIsolationCredentialProvider : ICredentialProvider
+    {
+        public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+        {
+            AgentCredential? credential = agent switch
+            {
+                var kind when kind == AgentKind.Codex => new AgentCredential(
+                    AgentKind.Codex,
+                    new Dictionary<string, string> { [CodexApiKeyEnvKey] = CodexApiKeyValue },
+                    new Dictionary<string, string>
+                    {
+                        ["codex/auth.json"] = ResolverCredentialProvider.CodexCredentialJson,
+                    }),
+                var kind when kind == AgentKind.Cursor => new AgentCredential(
+                    AgentKind.Cursor,
+                    new Dictionary<string, string> { [CursorApiKeyEnvKey] = CursorApiKeyValue },
+                    new Dictionary<string, string>()),
+                _ => null,
+            };
+            return Task.FromResult(credential);
+        }
+    }
+
     private sealed class CursorPreResolutionFailureCredentialProvider : ICredentialProvider
     {
         private readonly ResolverCredentialProvider _inner = new();
@@ -1547,9 +1953,6 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
             bool captureStructuredStream = false)
         {
             var observationPath = $"{workingDirectory}/direct-credential-observed.txt";
-            var directEnvironment = credential?.EnvironmentVariables
-                .Where(pair => DirectCredentialEnvironmentVariables.Contains(pair.Key))
-                .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
             var observe = await sandbox.ExecAsync(new SandboxExec
             {
                 Argv =
@@ -1560,8 +1963,6 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
                     "sh",
                     observationPath,
                 ],
-                ExtraEnvironment = directEnvironment,
-                EnvironmentContainsSecrets = directEnvironment is { Count: > 0 },
             }, ct);
             if (!observe.Success)
                 return new AgentResult(false, "direct credential missing", observe.Stdout, observe.Stderr);
@@ -1584,6 +1985,158 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         }
     }
 
+    private sealed class CandidateEnvironmentIsolationResolverAgent(
+        AgentKind kind,
+        bool resolveConflict) : IAgentRunner, IAgentCredentialEnvironmentPolicy
+    {
+        private readonly string _ownEnvironmentName = kind == AgentKind.Codex
+            ? CodexApiKeyEnvKey
+            : CursorApiKeyEnvKey;
+
+        public AgentKind Kind => kind;
+        public string? ObservedEnvironment { get; private set; }
+        public IReadOnlySet<string> DirectCredentialEnvironmentVariables { get; } =
+            new HashSet<string>(StringComparer.Ordinal)
+            {
+                kind == AgentKind.Codex
+                    ? CodexApiKeyEnvKey
+                    : CursorApiKeyEnvKey,
+            };
+        public IReadOnlySet<string> FileBackedCredentialEnvironmentVariables { get; } =
+            new HashSet<string>(StringComparer.Ordinal);
+        public IReadOnlyList<AgentCredentialFileDestination> CredentialFileDestinations => [];
+
+        public async Task<AgentResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            Action<string>? stdoutChunkCallback = null,
+            bool captureStructuredStream = false)
+        {
+            _ = prompt;
+            _ = credential;
+            _ = modelId;
+            _ = reasoningMode;
+            _ = stdoutChunkCallback;
+            _ = captureStructuredStream;
+
+            var observeScript = kind == AgentKind.Codex
+                ? "printf '%s|%s|%s' \"${OPENAI_API_KEY-}\" \"${CURSOR_API_KEY-}\" \"${CURSOR_API_KEY+x}\""
+                : "printf '%s|%s|%s' \"${CURSOR_API_KEY-}\" \"${OPENAI_API_KEY-}\" \"${OPENAI_API_KEY+x}\"";
+            var observe = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", observeScript],
+            }, ct);
+            if (!observe.Success)
+                return new AgentResult(false, "failed to inspect candidate credential scope", observe.Stdout, observe.Stderr);
+            ObservedEnvironment = observe.Stdout.TrimEnd('\r', '\n');
+
+            var expectedOwnValue = kind == AgentKind.Codex
+                ? CodexApiKeyValue
+                : CursorApiKeyValue;
+            if (!string.Equals(ObservedEnvironment, $"{expectedOwnValue}||", StringComparison.Ordinal))
+            {
+                return new AgentResult(
+                    false,
+                    $"candidate environment isolation failed for {_ownEnvironmentName}: observed '{ObservedEnvironment}'",
+                    observe.Stdout,
+                    observe.Stderr);
+            }
+            if (!resolveConflict)
+                return new AgentResult(false, "primary candidate deliberately declined", null, "ordinary resolver failure");
+
+            var write = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/README.md"],
+                Stdin = "main branch change\nwork branch change\n",
+            }, ct);
+            if (!write.Success)
+                return new AgentResult(false, "failed to resolve README", write.Stdout, write.Stderr);
+            var add = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", workingDirectory, "add", "--", "README.md"],
+            }, ct);
+            return add.Success
+                ? new AgentResult(true, "fallback resolved with isolated credential", null, null)
+                : new AgentResult(false, "failed to stage isolated resolution", add.Stdout, add.Stderr);
+        }
+    }
+
+    private sealed class MergeCandidateCredentialIsolationResolverAgent
+        : IAgentRunner, IAgentCredentialEnvironmentPolicy
+    {
+        public AgentKind Kind => AgentKind.Cursor;
+        public string? ObservedCredentialScope { get; private set; }
+        public IReadOnlySet<string> DirectCredentialEnvironmentVariables { get; } =
+            new HashSet<string>(StringComparer.Ordinal) { CursorApiKeyEnvKey };
+        public IReadOnlySet<string> FileBackedCredentialEnvironmentVariables { get; } =
+            new HashSet<string>(StringComparer.Ordinal);
+        public IReadOnlyList<AgentCredentialFileDestination> CredentialFileDestinations => [];
+
+        public async Task<AgentResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            Action<string>? stdoutChunkCallback = null,
+            bool captureStructuredStream = false)
+        {
+            _ = prompt;
+            _ = credential;
+            _ = modelId;
+            _ = reasoningMode;
+            _ = stdoutChunkCallback;
+            _ = captureStructuredStream;
+
+            var observe = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "sh",
+                    "-c",
+                    "if [ -e \"$1\" ]; then file=present; else file=absent; fi; printf '%s|%s|%s' \"${CURSOR_API_KEY-}\" \"${OPENAI_API_KEY+x}\" \"$file\"",
+                    "sh",
+                    $"{SandboxConventions.CredentialsDir}/codex/auth.json",
+                ],
+            }, ct);
+            if (!observe.Success)
+                return new AgentResult(false, "failed to inspect merge candidate credential scope", observe.Stdout, observe.Stderr);
+
+            ObservedCredentialScope = observe.Stdout.TrimEnd('\r', '\n');
+            if (!string.Equals(ObservedCredentialScope, $"{CursorApiKeyValue}||absent", StringComparison.Ordinal))
+            {
+                return new AgentResult(
+                    false,
+                    $"merge candidate credential isolation failed: observed '{ObservedCredentialScope}'",
+                    observe.Stdout,
+                    observe.Stderr);
+            }
+
+            var write = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/README.md"],
+                Stdin = "main\nwork\n",
+            }, ct);
+            if (!write.Success)
+                return new AgentResult(false, "failed to resolve README", write.Stdout, write.Stderr);
+
+            var add = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", workingDirectory, "add", "--", "README.md"],
+            }, ct);
+            return add.Success
+                ? new AgentResult(true, "audit candidate resolved with isolated credential", null, null)
+                : new AgentResult(false, "failed to stage isolated resolution", add.Stdout, add.Stderr);
+        }
+    }
+
     /// <summary>
     /// Captures every <see cref="SandboxSpec"/> the orchestrator passes to
     /// <see cref="ISandboxProvider.CreateAsync"/>, partitioned by
@@ -1598,6 +2151,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         public RecordingSandboxProvider(ISandboxProvider inner) => _inner = inner;
 
         public string Name => _inner.Name;
+        public IReadOnlyList<SandboxSpec> Specs => _specs;
 
         public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
         {

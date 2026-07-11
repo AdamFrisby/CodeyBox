@@ -60,7 +60,9 @@ internal static class ReleaseTestHelper
         PipelineOptions? pipelineOptions = null,
         ICredentialProvider? credentials = null,
         IAgentAuthFailureClassifier? authFailureClassifier = null,
-        IAgentAuthAvailabilityRegistry? authAvailability = null)
+        IAgentAuthAvailabilityRegistry? authAvailability = null,
+        Func<DeepAuditFailurePersistenceOptions>? deepAuditFailurePersistenceOptions = null,
+        TimeProvider? timeProvider = null)
     {
         var resolvedAuthAvailability = authAvailability
             ?? new AgentAvailabilityRegistry(
@@ -88,7 +90,9 @@ internal static class ReleaseTestHelper
             () => TimeSpan.FromMinutes(30),
             agentStreams,
             authFailureClassifier: authFailureClassifier,
-            authAvailability: resolvedAuthAvailability);
+            authAvailability: resolvedAuthAvailability,
+            deepAuditFailurePersistenceOptions: deepAuditFailurePersistenceOptions,
+            timeProvider: timeProvider);
     }
 
     public static Release SeedRelease(
