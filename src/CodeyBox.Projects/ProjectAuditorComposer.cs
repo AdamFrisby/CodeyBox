@@ -2,6 +2,7 @@ using System.Reflection;
 using System.Text.RegularExpressions;
 using CodeyBox.Audit;
 using CodeyBox.Audit.Llm;
+using CodeyBox.Audit.Llm.PlanAudit;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
@@ -196,6 +197,17 @@ public sealed class ProjectAuditorComposer
             && !auditors.Any(a => a.Name.Equals(planAdherence.Name, StringComparison.OrdinalIgnoreCase)))
         {
             auditors.Add(new PlanAdherenceAuditor(ctx.Agent, planAdherence));
+        }
+
+        // Always include the plan-audit chain's TEST 01 grounding gate when it
+        // has been registered. It is plan-target only (filtered out of the code
+        // phase by ComposeForTarget) and applies to any project's plan; a
+        // project that does not want it lists its name under ExcludedAuditors.
+        if (_registeredAuditorsByName.ContainsKey(PlanAuditTests.Test01AuditorName)
+            && !auditors.Any(a => a.Name.Equals(
+                PlanAuditTests.Test01AuditorName, StringComparison.OrdinalIgnoreCase)))
+        {
+            IncludeRegisteredAuditor(PlanAuditTests.Test01AuditorName, auditors, prepend: false);
         }
 
         if (project.Audit.ExcludedAuditors.Count > 0)
