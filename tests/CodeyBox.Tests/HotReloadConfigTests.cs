@@ -140,10 +140,21 @@ public sealed class HotReloadConfigTests
             await fixture.Store.CreateAsync(item);
 
             var runTask = fixture.Pipeline.RunAsync(item, CancellationToken.None);
-            // Generous headroom: under parallel audit-suite load the worker loop
-            // can be starved long enough that BeforeWorkAsync is not reached
-            // inside a short window even though the pipeline is healthy.
-            await workStarted.Task.WaitAsync(TimeSpan.FromMinutes(2));
+            // Generous timeout: under parallel audit-suite/CI load the worker
+            // loop can be starved, and reaching the work phase requires creating
+            // the sandbox and cloning the seed repo — either of which can take
+            // well over the nominal time even when the pipeline is healthy. If
+            // RunAsync instead faults during setup, workStarted never completes
+            // — observe runTask so the real exception surfaces immediately
+            // rather than being masked as a wait timeout.
+            var reachedWork = await Task.WhenAny(
+                workStarted.Task,
+                runTask).WaitAsync(TimeSpan.FromMinutes(2));
+            if (reachedWork == runTask)
+            {
+                // Completed before work was released: propagate its fault/result.
+                await runTask;
+            }
             var working = await fixture.Store.GetAsync(item.Id);
             Assert.Equal(WorkItemState.Working, working!.State);
 
