@@ -2158,19 +2158,23 @@ builder.Services.AddSingleton<IAuditor>(sp => new BuildScriptAuditor(
     () => sp.GetRequiredService<IOptionsMonitor<BuildScriptAuditorOptions>>().CurrentValue));
 builder.Services.AddSingleton<IAuditor, PromptRevisionTrailerAuditor>();
 
-// Plan-audit chain — TEST 01 (plan integrity & evidence classification). A
-// plan-stage IAuditor (Targets = plan only) that grounds the PLAN against the
-// supplied context before implementation. Auto-included for every plan-enabled
-// project by ProjectAuditorComposer and toggled off per project via
-// ExcludedAuditors. The pipeline supplies the resolved review runner per
-// invocation via AuditContext.AuditRunner; the baked-in Claude runner is only a
-// host-side text-only fallback so the auditor is constructible without an
-// override.
-builder.Services.AddSingleton<IAuditor>(sp => new PlanAuditChainAuditor(new PlanAuditChainAuditorOptions
+// Plan-audit chain — one plan-stage IAuditor per chain test (Targets = plan
+// only) that reviews the PLAN against the supplied context before
+// implementation. Each is auto-included for every plan-enabled project by
+// ProjectAuditorComposer and toggled off per project via ExcludedAuditors. The
+// pipeline supplies the resolved review runner per invocation via
+// AuditContext.AuditRunner; the baked-in Claude runner is only a host-side
+// text-only fallback so the auditor is constructible without an override.
+// PlanAuditTests.All is the single source of truth for chain membership.
+foreach (var planAuditTest in PlanAuditTests.All)
 {
-    Test = PlanAuditTests.Test01,
-    Agent = sp.GetServices<IAgentRunner>().OfType<ClaudeAgentRunner>().First(),
-}));
+    var test = planAuditTest; // capture per-iteration for the resolver closure
+    builder.Services.AddSingleton<IAuditor>(sp => new PlanAuditChainAuditor(new PlanAuditChainAuditorOptions
+    {
+        Test = test,
+        Agent = sp.GetServices<IAgentRunner>().OfType<ClaudeAgentRunner>().First(),
+    }));
+}
 builder.Services.AddSingleton<IMechanicalFixer, DotnetFormatMechanicalFixer>();
 builder.Services.AddSingleton<IMechanicalFixerRegistry, MechanicalFixerRegistry>();
 builder.Services.AddSingleton<IMechanicalFixerInputProvider, DotnetFormatMechanicalFixerInputProvider>();

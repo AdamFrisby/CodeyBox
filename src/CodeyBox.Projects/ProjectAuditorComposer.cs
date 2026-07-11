@@ -199,15 +199,20 @@ public sealed class ProjectAuditorComposer
             auditors.Add(new PlanAdherenceAuditor(ctx.Agent, planAdherence));
         }
 
-        // Always include the plan-audit chain's TEST 01 grounding gate when it
-        // has been registered. It is plan-target only (filtered out of the code
-        // phase by ComposeForTarget) and applies to any project's plan; a
-        // project that does not want it lists its name under ExcludedAuditors.
-        if (_registeredAuditorsByName.ContainsKey(PlanAuditTests.Test01AuditorName)
-            && !auditors.Any(a => a.Name.Equals(
-                PlanAuditTests.Test01AuditorName, StringComparison.OrdinalIgnoreCase)))
+        // Always include every registered plan-audit chain gate. Each is
+        // plan-target only (filtered out of the code phase by ComposeForTarget)
+        // and applies to any project's plan; a project that does not want a
+        // specific one lists its name under ExcludedAuditors. Iterating
+        // PlanAuditTests.All (chain order) keeps this loop the one place the
+        // chain is composed, so a new test needs no edit here.
+        foreach (var planAuditTest in PlanAuditTests.All)
         {
-            IncludeRegisteredAuditor(PlanAuditTests.Test01AuditorName, auditors, prepend: false);
+            var name = planAuditTest.AuditorName;
+            if (_registeredAuditorsByName.ContainsKey(name)
+                && !auditors.Any(a => a.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+            {
+                IncludeRegisteredAuditor(name, auditors, prepend: false);
+            }
         }
 
         if (project.Audit.ExcludedAuditors.Count > 0)
