@@ -120,7 +120,8 @@ Outbound HTTP calls (GitHub API, agent quota probes, webhooks) automatically rec
 | `codeybox.agent.fallbacks` | `{fallback}` | `from_agent`, `to_agent` (`(none)` on class exhaustion), `kind` (`quota` \| `auth` \| `timeout` \| `resume_exhausted`), `phase` | One per agent fallback / class-exhaustion event. |
 | `codeybox.agent.tokens` | `{token}` | `agent.kind`, `model`, `token_type` (`input` \| `cached_input` \| `output`) | Tokens consumed, summed as cost rows are recorded. |
 | `codeybox.agent.cost_usd` | `USD` | `agent.kind`, `model` | Estimated agent cost, summed as cost rows are recorded (aligned with the per-work-item cost rows — no double counting). |
-| `codeybox.audit.iterations` | `{iteration}` | `outcome` (`passed` \| `reworking` \| `failed`) | Incremented once per completed audit iteration. |
+| `codeybox.audit.iterations` | `{iteration}` | `outcome` (`passed` \| `reworking` \| `failed` \| `needs_operator_input`), `iteration`, `self_review_checklist` (`on` \| `off`), `planned` (`on` \| `off`) | Incremented once per completed code-audit iteration. The `planned` tag slices code-stage iteration count for planned vs unplanned items. |
+| `codeybox.audit.first_audit.outcome` | `{audit}` | `outcome` (`passed` \| `failed`), `planned` (`on` \| `off`) | One per work item at its first code-audit iteration. Slices first-audit pass-rate by the planned cohort (proves whether planning reduces cycles). |
 | `codeybox.audit.rework_empty.events` | `{event}` | `outcome` (`detected` \| `escalation_succeeded` \| `parked` \| `failed`) | Empty audit-rework handling sub-events. |
 | `codeybox.webhook.deliveries` | `{delivery}` | `endpoint`, `event`, `outcome` (`delivered` \| `failed`) | One per terminal webhook delivery outcome. |
 

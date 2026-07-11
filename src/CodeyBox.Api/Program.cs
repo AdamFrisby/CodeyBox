@@ -2173,6 +2173,20 @@ builder.Services.AddSingleton<IAuditor>(sp =>
         ratchet);
 });
 
+// Plan-adherence reviewer (closes the planning loop on the implementation side).
+// Hot-reloadable via CodeyBox:PlanAdherence and enabled by default; the auditor
+// self-limits to PLANNED items at run time (no plan artifact -> no-op), so
+// unplanned items are unaffected. The accessor mirrors the Func<TestRunOptions>
+// pattern so the ProjectAuditorComposer observes the same live IOptionsMonitor
+// snapshot and composes the reviewer with the resolving project's agent.
+builder.Services.Configure<PlanAdherenceAuditorOptions>(
+    builder.Configuration.GetSection("CodeyBox:PlanAdherence"));
+builder.Services.AddSingleton<Func<PlanAdherenceAuditorOptions>>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<PlanAdherenceAuditorOptions>>();
+    return () => monitor.CurrentValue;
+});
+
 builder.Services.AddSingleton<ProjectAuditorComposer>();
 builder.Services.AddSingleton<ProjectMechanicalFixerComposer>();
 

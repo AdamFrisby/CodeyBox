@@ -28,6 +28,7 @@ public sealed class ProjectAuditorComposer
     private readonly IPresetCatalog _catalog;
     private readonly PresetCatalogOptions _catalogOptions;
     private readonly Func<TestRunOptions>? _testRunOptions;
+    private readonly Func<PlanAdherenceAuditorOptions>? _planAdherenceOptions;
     private readonly IReadOnlyDictionary<string, IAuditor> _registeredAuditorsByName;
     private readonly IReadOnlyDictionary<string, IAuditor> _pluginAuditors;
     private readonly ILogger<ProjectAuditorComposer> _logger;
@@ -46,16 +47,26 @@ public sealed class ProjectAuditorComposer
     /// back to <see cref="TestRunOptions.Default"/>. Null keeps the default
     /// (byte-identical) behaviour used by tests.
     /// </param>
+    /// <param name="planAdherenceOptions">
+    /// Live accessor for hot-reloadable <see cref="PlanAdherenceAuditorOptions"/>.
+    /// When non-null and <see cref="PlanAdherenceAuditorOptions.Enabled"/> is
+    /// true, a code-target <see cref="PlanAdherenceAuditor"/> is composed into
+    /// every project's audit panel (it self-limits to planned items at run
+    /// time). Null (the default used by tests) keeps the reviewer out of the
+    /// panel entirely — the feature is off unless the host wires the accessor.
+    /// </param>
     public ProjectAuditorComposer(
         IPresetCatalog catalog,
         IEnumerable<IAuditor> registeredAuditors,
         ILogger<ProjectAuditorComposer> logger,
         PresetCatalogOptions? catalogOptions = null,
-        Func<TestRunOptions>? testRunOptions = null)
+        Func<TestRunOptions>? testRunOptions = null,
+        Func<PlanAdherenceAuditorOptions>? planAdherenceOptions = null)
     {
         _catalog = catalog;
         _catalogOptions = catalogOptions?.Clone() ?? new PresetCatalogOptions();
         _testRunOptions = testRunOptions;
+        _planAdherenceOptions = planAdherenceOptions;
         _logger = logger;
 
         var byName = new Dictionary<string, IAuditor>(StringComparer.OrdinalIgnoreCase);
@@ -173,6 +184,18 @@ public sealed class ProjectAuditorComposer
                 "tests:mutation-rigor", StringComparison.OrdinalIgnoreCase)))
         {
             IncludeRegisteredAuditor("tests:mutation-rigor", auditors, prepend: false);
+        }
+
+        // Plan-adherence reviewer: a code-target LLM auditor that checks the diff
+        // against the approved plan. Config-gated by CodeyBox:PlanAdherence and
+        // composed with the resolving project's agent (like the preset LLM
+        // auditors) so it can cross-review. It self-limits to planned items at run
+        // time — for an unplanned item there is no plan artifact and it no-ops.
+        // Operators drop it on a specific project via ExcludedAuditors by name.
+        if (_planAdherenceOptions?.Invoke() is { Enabled: true } planAdherence
+            && !auditors.Any(a => a.Name.Equals(planAdherence.Name, StringComparison.OrdinalIgnoreCase)))
+        {
+            auditors.Add(new PlanAdherenceAuditor(ctx.Agent, planAdherence));
         }
 
         if (project.Audit.ExcludedAuditors.Count > 0)

@@ -215,6 +215,29 @@ is included in the subsequent implementation prompt. Planning uses the work
 agent and work sandbox/network profile, but its sandbox is discarded: file edits,
 commits, and pushes from the planning turn are not imported.
 
+The planning loop is closed on the implementation side (all config-gated,
+hot-reloadable):
+
+- **`CodeyBox:PlanAdherence:Enabled`** (default `true`) — composes the code-target
+  `plan:adherence` reviewer into every project's audit panel. It compares the diff
+  to the approved plan and blocks only on *unjustified* deviations from the agreed
+  approach; justified adaptations are expected and never block. It self-limits to
+  planned items (an unplanned item has no plan artifact and it no-ops), so
+  unplanned items are unaffected. Remove it on a specific project by adding
+  `plan:adherence` to that project's `ExcludedAuditors`. `CodeyBox:PlanAdherence`
+  also exposes `Name` and `ReviewFocus` overrides.
+- **`CodeyBox:PipelineTuning:PlannedItemAuditRebalanceEnabled`** (default `true`)
+  and **`PlannedItemAdvisoryAuditors`** (default `["architecture:llm-review"]`) —
+  for planned items only, demote blocking findings from the listed approach
+  reviewer(s) to advisory (recorded, not merge-blocking) so a planned item's code
+  rework does not re-litigate an approach the plan stage already reviewed.
+  Objective gates (build, tests, security, cheating, completeness, plan-adherence)
+  always keep full blocking authority — never list them here. An empty list
+  disables demotion without disabling the flag.
+
+The effect is measured by the `planned` tag (`on`/`off`) on the
+`codeybox.audit.iterations` and `codeybox.audit.first_audit.outcome` metrics.
+
 ## Storage shape
 
 - **WorkItem**: `IReadOnlyDictionary<string, string> Knobs` (case-insensitive
