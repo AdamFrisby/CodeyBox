@@ -40,3 +40,6 @@ rubric-annotations/
 
 # Repo-local NuGet package cache (see NuGet.Config globalPackagesFolder).
 .nuget/
+
+# Repo-local dotnet CLI home (DOTNET_CLI_HOME for sandboxed builds).
+.dotnet-cli-home/

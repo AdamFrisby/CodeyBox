@@ -31,7 +31,10 @@
          evaluation independent of the build account's home directory.
          Sandboxed agents often have a root-owned ~/.nuget parent that blocks
          creating the user-level NuGet config directory; RestoreConfigFile
-         limits config discovery to this file only. -->
+         limits config discovery to this file only. Callers must also set
+         DOTNET_CLI_HOME to a writable repo-local path (see
+         DotnetCliHomeConventions / build.sh) because the SDK still probes the
+         user config directory before RestoreConfigFile applies. -->
     <RestoreConfigFile>$(MSBuildThisFileDirectory)nuget.config</RestoreConfigFile>
     <!-- The initial target may redirect DOTNET_CLI_HOME solely for NuGet's
          user-config/proxy cache. Keep packages in the caller's original
