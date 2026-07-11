@@ -8,6 +8,7 @@ namespace CodeyBox.Tests;
 /// Verifies that a paused IQueueController prevents new work-item pickup
 /// while leaving in-flight items unaffected.
 /// </summary>
+[Collection("Background service timing")]
 public sealed class PausePickupTests : IDisposable
 {
     private static readonly TimeSpan FullSuiteSchedulingTimeout = TimeSpan.FromSeconds(30);

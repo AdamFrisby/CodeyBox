@@ -60,6 +60,11 @@ Hot-reloadable today:
   constructors at startup.
 - `DeadWorker.MaxRecoveryAttempts` and `DeadWorker.DeadWorkerThreshold` —
   re-read on every reaper sweep.
+- `SqliteWriteGate.{AcquisitionTimeout,MaxHoldDuration,MaxQueuedWaiters,MaxConcurrentReadConnections}`
+  — sampled on each subsequent SQLite gate/read-slot acquisition. Edits do not
+  alter a holder already inside the gate. Values have defensive upper bounds:
+  acquisition timeout <= 30 seconds, hold diagnostic threshold <= 5 minutes,
+  queued waiters <= 4096, and concurrent read connections <= 128.
 - `WorkerProgressWatchdog.ProgressTimeout`,
   `WorkerProgressWatchdog.AutoRecover`,
   `WorkerProgressWatchdog.MaxRecoveryAttempts`,

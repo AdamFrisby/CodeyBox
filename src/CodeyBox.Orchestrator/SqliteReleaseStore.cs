@@ -17,13 +17,15 @@ public sealed class SqliteReleaseStore : IReleaseStore, IDisposable
     private readonly SqliteDatabaseWriteGate _writeLock;
     private int _disposed;
 
-    public SqliteReleaseStore(string path)
+    public SqliteReleaseStore(
+        string path,
+        SqliteDatabaseWriteGateFactory? writeGateFactory = null)
     {
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock = SqliteDatabaseWriteGateFactory.Resolve(writeGateFactory).ForPath(path);
         _writeLock.Wait();
         try
         {

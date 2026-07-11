@@ -25,7 +25,8 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
     public SqliteAgentPauseController(
         string dbPath,
         ILogger<SqliteAgentPauseController> log,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        SqliteDatabaseWriteGateFactory? writeGateFactory = null)
     {
         _log = log;
         _time = timeProvider ?? TimeProvider.System;
@@ -34,7 +35,7 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={dbPath}");
-        _lock = SqliteDatabaseWriteGate.ForPath(dbPath);
+        _lock = SqliteDatabaseWriteGateFactory.Resolve(writeGateFactory).ForPath(dbPath);
         _lock.Wait();
         try
         {
@@ -194,6 +195,7 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
     {
         var now = _time.GetUtcNow();
         var expired = new List<AgentPauseState>();
+        var startedPaused = new List<AgentPauseState>();
 
         using (var cmd = _conn.CreateCommand())
         {
@@ -213,7 +215,7 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
                 }
 
                 _states[PauseKey(state.Agent, state.AgentInstanceId)] = state;
-                AuditLog.AgentStartedWhilePaused(state.Agent, state.PausedReason);
+                startedPaused.Add(state);
             }
         }
 
@@ -223,8 +225,12 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
                 .ConfigureAwait(false)
                 .GetAwaiter()
                 .GetResult();
-            AuditLog.AgentPauseExpired(state.Agent, state.PausedReason);
         }
+
+        foreach (var state in startedPaused)
+            AuditLog.AgentStartedWhilePaused(state.Agent, state.PausedReason);
+        foreach (var state in expired)
+            AuditLog.AgentPauseExpired(state.Agent, state.PausedReason);
     }
 
     private async Task PruneIfExpiredAsync(string key, CancellationToken ct)
@@ -235,6 +241,7 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
 
     private async Task ResumeExpiredAsync(string key, AgentPauseState observed, CancellationToken ct)
     {
+        AgentPauseState? expired = null;
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
@@ -245,13 +252,15 @@ public sealed class SqliteAgentPauseController : IAgentPauseController, IAgentPa
 
             _states.TryRemove(key, out _);
             await PersistRunningAsync(key, current.Agent, _time.GetUtcNow(), ct).ConfigureAwait(false);
-            AuditLog.AgentPauseExpired(current.Agent, current.PausedReason);
+            expired = current;
         }
         finally
         {
             _lock.Release();
         }
 
+        if (expired is not null)
+            AuditLog.AgentPauseExpired(expired.Agent, expired.PausedReason);
         NotifyPauseChanged();
     }
 

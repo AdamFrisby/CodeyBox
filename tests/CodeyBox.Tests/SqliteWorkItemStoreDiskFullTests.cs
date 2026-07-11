@@ -64,7 +64,7 @@ public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
         var ex = await Assert.ThrowsAsync<WorkItemStoreDiskFullException>(() => store.CreateAsync(item));
         Assert.Equal("CreateAsync", ex.Operation);
         Assert.IsType<SqliteException>(ex.InnerException);
-        AssertAuditEmitted("CreateAsync");
+        await AssertAuditEmittedAsync("CreateAsync");
     }
 
     [Fact]
@@ -94,7 +94,7 @@ public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
         var ex = await Assert.ThrowsAsync<WorkItemStoreDiskFullException>(() => store.UpdateAsync(bigError));
         Assert.Equal("UpdateAsync", ex.Operation);
         Assert.IsType<SqliteException>(ex.InnerException);
-        AssertAuditEmitted("UpdateAsync");
+        await AssertAuditEmittedAsync("UpdateAsync");
     }
 
     /// <summary>
@@ -132,7 +132,7 @@ public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
             () => store.TryUpdateIfStateAsync(bigError, item.State));
         Assert.Equal("TryUpdateIfStateAsync", ex.Operation);
         Assert.IsType<SqliteException>(ex.InnerException);
-        AssertAuditEmitted("TryUpdateIfStateAsync");
+        await AssertAuditEmittedAsync("TryUpdateIfStateAsync");
     }
 
     [Fact]
@@ -167,7 +167,7 @@ public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
                 item.UpdatedAt));
         Assert.Equal("TryReplaceKnobsIfStateAndUpdatedAtAsync", ex.Operation);
         Assert.IsType<SqliteException>(ex.InnerException);
-        AssertAuditEmitted("TryReplaceKnobsIfStateAndUpdatedAtAsync");
+        await AssertAuditEmittedAsync("TryReplaceKnobsIfStateAndUpdatedAtAsync");
     }
 
     [Fact]
@@ -204,15 +204,22 @@ public sealed class SqliteWorkItemStoreDiskFullTests : IDisposable
                 item.UpdatedAt));
         Assert.Equal("TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync", ex.Operation);
         Assert.IsType<SqliteException>(ex.InnerException);
-        AssertAuditEmitted("TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync");
+        await AssertAuditEmittedAsync("TryUpdateQueuedFieldsAndKnobsIfStateAndUpdatedAtAsync");
     }
 
-    private void AssertAuditEmitted(string expectedOperation)
+    private async Task AssertAuditEmittedAsync(string expectedOperation)
     {
-        var evt = _sink.Events.FirstOrDefault(e =>
-            e.Properties.TryGetValue("EventName", out var name)
-            && name is ScalarValue sv
-            && (string?)sv.Value == "store.disk_full");
+        LogEvent? evt = null;
+        var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(2);
+        while (evt is null && DateTimeOffset.UtcNow < deadline)
+        {
+            evt = _sink.Events.FirstOrDefault(e =>
+                e.Properties.TryGetValue("EventName", out var name)
+                && name is ScalarValue sv
+                && (string?)sv.Value == "store.disk_full");
+            if (evt is null)
+                await Task.Delay(TimeSpan.FromMilliseconds(10));
+        }
 
         Assert.NotNull(evt);
         Assert.Equal(LogEventLevel.Fatal, evt!.Level);

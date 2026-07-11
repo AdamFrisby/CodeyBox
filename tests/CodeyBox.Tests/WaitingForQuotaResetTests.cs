@@ -15,6 +15,7 @@ namespace CodeyBox.Tests;
 /// flipping a literal) would cause a parked item to be re-dispatched and
 /// immediately re-fail with the same quota error.
 /// </summary>
+[Collection("Background service timing")]
 public sealed class WaitingForQuotaResetTests : IDisposable
 {
     private readonly string _workspace;

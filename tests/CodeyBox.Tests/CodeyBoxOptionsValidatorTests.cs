@@ -10,6 +10,56 @@ namespace CodeyBox.Tests;
 public sealed class CodeyBoxOptionsValidatorTests
 {
     [Theory]
+    [InlineData("acquisition", "CodeyBox:SqliteWriteGate:AcquisitionTimeout must be positive")]
+    [InlineData("acquisition-max", "CodeyBox:SqliteWriteGate:AcquisitionTimeout must be <=")]
+    [InlineData("hold", "CodeyBox:SqliteWriteGate:MaxHoldDuration must be positive")]
+    [InlineData("hold-max", "CodeyBox:SqliteWriteGate:MaxHoldDuration must be <=")]
+    [InlineData("waiters", "CodeyBox:SqliteWriteGate:MaxQueuedWaiters must be positive")]
+    [InlineData("waiters-max", "CodeyBox:SqliteWriteGate:MaxQueuedWaiters must be <=")]
+    [InlineData("reads", "CodeyBox:SqliteWriteGate:MaxConcurrentReadConnections must be positive")]
+    [InlineData("reads-max", "CodeyBox:SqliteWriteGate:MaxConcurrentReadConnections must be <=")]
+    public void Validate_RejectsInvalidSqliteWriteGateOptions(
+        string scenario,
+        string expectedFailure)
+    {
+        var options = ValidCodeyBoxOptions();
+        switch (scenario)
+        {
+            case "acquisition":
+                options.SqliteWriteGate.AcquisitionTimeout = TimeSpan.Zero;
+                break;
+            case "acquisition-max":
+                options.SqliteWriteGate.AcquisitionTimeout = SqliteWriteGateOptions.MaximumAcquisitionTimeout.Add(TimeSpan.FromMilliseconds(1));
+                break;
+            case "hold":
+                options.SqliteWriteGate.MaxHoldDuration = TimeSpan.Zero;
+                break;
+            case "hold-max":
+                options.SqliteWriteGate.MaxHoldDuration = SqliteWriteGateOptions.MaximumAllowedHoldDuration.Add(TimeSpan.FromMilliseconds(1));
+                break;
+            case "waiters":
+                options.SqliteWriteGate.MaxQueuedWaiters = 0;
+                break;
+            case "waiters-max":
+                options.SqliteWriteGate.MaxQueuedWaiters = SqliteWriteGateOptions.MaximumQueuedWaiters + 1;
+                break;
+            case "reads":
+                options.SqliteWriteGate.MaxConcurrentReadConnections = 0;
+                break;
+            case "reads-max":
+                options.SqliteWriteGate.MaxConcurrentReadConnections = SqliteWriteGateOptions.MaximumConcurrentReadConnections + 1;
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null);
+        }
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(expectedFailure, result.FailureMessage);
+    }
+
+    [Theory]
     [InlineData("retention", "CodeyBox:AuditLog:RetainedDays must be >= 1")]
     [InlineData("path", "CodeyBox:AuditLog:Path must be non-empty")]
     [InlineData("audit-path", "CodeyBox:AuditLog:AuditPath must be non-empty")]

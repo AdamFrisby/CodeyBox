@@ -41,6 +41,22 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
                 $"CodeyBox:MaxBulkItems must be between 1 and {CodeyBoxOptions.MaximumMaxBulkItems}");
         }
 
+        if (options.SqliteWriteGate is null)
+        {
+            failures.Add("CodeyBox:SqliteWriteGate must not be null");
+        }
+        else
+        {
+            try
+            {
+                options.SqliteWriteGate.Validate();
+            }
+            catch (InvalidOperationException ex)
+            {
+                failures.Add(ex.Message);
+            }
+        }
+
         var e2e = options.E2eExecution;
         if (e2e is not null)
         {

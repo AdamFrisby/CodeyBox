@@ -14,6 +14,8 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
 {
     private const int SqliteBusy = 5;
     private const int SqliteLocked = 6;
+    private const int HeartbeatMaxAttempts = 5;
+    private static readonly TimeSpan HeartbeatInitialRetryDelay = TimeSpan.FromMilliseconds(50);
 
     private readonly SqliteConnection _conn;
     private readonly SqliteDatabaseWriteGate _writeLock;
@@ -24,7 +26,8 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
     public SqliteWorkerRegistry(
         string path,
         ILogger<SqliteWorkerRegistry>? logger = null,
-        int busyTimeoutMilliseconds = 30000)
+        int busyTimeoutMilliseconds = 30000,
+        SqliteDatabaseWriteGateFactory? writeGateFactory = null)
     {
         _logger = logger;
         _commandTimeoutSeconds = Math.Max(1, (int)Math.Ceiling(Math.Max(1, busyTimeoutMilliseconds) / 1000.0));
@@ -32,7 +35,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock = SqliteDatabaseWriteGateFactory.Resolve(writeGateFactory).ForPath(path);
         var initialized = false;
         _writeLock.Wait();
         try
@@ -104,31 +107,48 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
     /// </remarks>
     public async Task HeartbeatAsync(string workerId, string? currentWorkItemId, CancellationToken ct = default)
     {
-        try
+        for (var attempt = 1; ; attempt++)
         {
-            await _writeLock.WaitAsync(ct);
             try
             {
-                using var cmd = _conn.CreateCommand();
-                cmd.CommandTimeout = _commandTimeoutSeconds;
-                cmd.CommandText = """
-                    UPDATE worker_registry
-                    SET last_heartbeat_at = $hb, current_work_item_id = $item
-                    WHERE worker_id = $id;
-                    """;
-                cmd.Parameters.AddWithValue("$hb", DateTimeOffset.UtcNow.ToString("O"));
-                cmd.Parameters.AddWithValue("$item", (object?)currentWorkItemId ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("$id", workerId);
-                await cmd.ExecuteNonQueryAsync(ct);
+                await _writeLock.WaitAsync(ct);
+                try
+                {
+                    using var cmd = _conn.CreateCommand();
+                    cmd.CommandTimeout = _commandTimeoutSeconds;
+                    cmd.CommandText = """
+                        UPDATE worker_registry
+                        SET last_heartbeat_at = $hb, current_work_item_id = $item
+                        WHERE worker_id = $id;
+                        """;
+                    cmd.Parameters.AddWithValue("$hb", DateTimeOffset.UtcNow.ToString("O"));
+                    cmd.Parameters.AddWithValue("$item", (object?)currentWorkItemId ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("$id", workerId);
+                    await cmd.ExecuteNonQueryAsync(ct);
+                    return;
+                }
+                finally
+                {
+                    _writeLock.Release();
+                }
             }
-            finally
+            catch (Exception ex) when (IsTransientHeartbeatStorageFailure(ex) && attempt < HeartbeatMaxAttempts)
             {
-                _writeLock.Release();
+                var delay = TimeSpan.FromMilliseconds(HeartbeatInitialRetryDelay.TotalMilliseconds * (1 << (attempt - 1)));
+                _logger?.LogWarning(ex, "Heartbeat failed for worker {WorkerId}; retrying attempt {Attempt}/{MaxAttempts}", workerId, attempt + 1, HeartbeatMaxAttempts);
+                await Task.Delay(delay, ct);
             }
-        }
-        catch (Exception ex) when (IsTransientHeartbeatStorageFailure(ex))
-        {
-            _logger?.LogWarning(ex, "Heartbeat failed for worker {WorkerId}; will retry on next interval", workerId);
+            catch (Exception ex) when (IsTransientHeartbeatStorageFailure(ex))
+            {
+                // Fail-soft: transient writer contention is expected under load.
+                // The heartbeat is a best-effort, idempotent liveness signal; the
+                // caller re-issues it on the next interval, and the dead-worker
+                // threshold provides the safety net. Swallowing here (after
+                // bounded, backed-off retries) avoids surfacing routine SQLITE_BUSY
+                // as a hard failure. Non-transient storage errors still propagate.
+                _logger?.LogWarning(ex, "Heartbeat failed for worker {WorkerId} after {Attempts} attempts; will retry on next interval", workerId, attempt);
+                return;
+            }
         }
     }
 
@@ -291,5 +311,6 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
     };
 
     private static bool IsTransientHeartbeatStorageFailure(Exception ex) =>
-        ex is SqliteException { SqliteErrorCode: SqliteBusy or SqliteLocked };
+        ex is SqliteWriteGateAcquisitionTimeoutException
+        || ex is SqliteException { SqliteErrorCode: SqliteBusy or SqliteLocked };
 }

@@ -22,7 +22,10 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
     private readonly SqliteCommand _insertCmd;
     private readonly AgentCostCalculator? _costCalculator;
 
-    public SqliteWorkItemCostStore(string path, AgentCostCalculator? costCalculator = null)
+    public SqliteWorkItemCostStore(
+        string path,
+        AgentCostCalculator? costCalculator = null,
+        SqliteDatabaseWriteGateFactory? writeGateFactory = null)
     {
         _costCalculator = costCalculator;
         _path = path;
@@ -30,7 +33,7 @@ public sealed class SqliteWorkItemCostStore : IWorkItemCostStore, IRecentCostsBy
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock = SqliteDatabaseWriteGateFactory.Resolve(writeGateFactory).ForPath(path);
         _writeLock.Wait();
         try
         {

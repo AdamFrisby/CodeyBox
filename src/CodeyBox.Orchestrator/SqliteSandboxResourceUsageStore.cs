@@ -13,13 +13,15 @@ public sealed class SqliteSandboxResourceUsageStore : ISandboxResourceUsageStore
     private readonly SqliteDatabaseWriteGate _writeLock;
     private readonly SqliteCommand _insertCmd;
 
-    public SqliteSandboxResourceUsageStore(string path)
+    public SqliteSandboxResourceUsageStore(
+        string path,
+        SqliteDatabaseWriteGateFactory? writeGateFactory = null)
     {
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock = SqliteDatabaseWriteGateFactory.Resolve(writeGateFactory).ForPath(path);
         _writeLock.Wait();
         try
         {
