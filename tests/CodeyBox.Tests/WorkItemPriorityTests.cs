@@ -228,7 +228,7 @@ public sealed class WorkItemPriorityTests : IDisposable
     public async Task Dispatch_BumpedPriority_JumpsAheadOnNextPickup()
     {
         // Construct a scenario where FIFO order would be A, B, C; we bump C's
-        // priority while A is in-flight so that the next pickup must be C — not
+        // priority after A is reserved so that the next pickup must be C — not
         // B — to prove priority overrides creation order on a mid-queue bump.
         var t0 = DateTimeOffset.UtcNow;
         var a = MakeItem(priority: 0, createdAt: t0);
@@ -239,13 +239,37 @@ public sealed class WorkItemPriorityTests : IDisposable
         await _store.CreateAsync(b);
         await _store.CreateAsync(c);
 
-        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var entered = new TaskCompletionSource<WorkItemId>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = new GatedPipelineRunner(_store, release.Task, entered);
-
         var queue = new InMemoryTaskQueue();
         var registry = new CancellationRegistry(CancellationToken.None);
-        var opts = new OrchestratorOptions { MaxConcurrentWorkers = 1 };
+        var pipeline = new OrderedPipelineRunner(_store);
+        var bumped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var opts = new OrchestratorOptions
+        {
+            MaxConcurrentWorkers = 1,
+            OnWorkerReservedForTest = async id =>
+            {
+                if (id != a.Id)
+                    return;
+
+                try
+                {
+                    var current = await _store.GetAsync(c.Id);
+                    if (current is null)
+                        throw new InvalidOperationException("Expected C to exist before priority bump.");
+
+                    var bump = await _store.UpdatePriorityAsync(current.Id, 500, DateTimeOffset.UtcNow);
+                    if (bump.Outcome != PriorityUpdateOutcome.Updated)
+                        throw new InvalidOperationException($"Expected C priority bump to update, got {bump.Outcome}.");
+
+                    await queue.EnqueueAsync(c.Id); // kick
+                    bumped.TrySetResult();
+                }
+                catch (Exception ex)
+                {
+                    bumped.TrySetException(ex);
+                }
+            },
+        };
         var svc = new OrchestratorService(queue, _store, pipeline, registry, opts,
             NullLogger<OrchestratorService>.Instance);
 
@@ -255,33 +279,13 @@ public sealed class WorkItemPriorityTests : IDisposable
 
         await svc.StartAsync(CancellationToken.None);
 
-        // Wait for the first worker to enter the pipeline.
-        var firstIn = await entered.Task.WaitAsync(TimeSpan.FromSeconds(30));
-        Assert.Equal(a.Id, firstIn);
-
-        // Bump C's priority while A is held in the pipeline. The dispatcher's
-        // next pickup must see the new value and pick C over B (FIFO older).
-        var current = await _store.GetAsync(c.Id);
-        Assert.NotNull(current);
-        var bump = await _store.UpdatePriorityAsync(current!.Id, 500, DateTimeOffset.UtcNow);
-        Assert.Equal(PriorityUpdateOutcome.Updated, bump.Outcome);
-        await queue.EnqueueAsync(c.Id); // kick
-
-        // Let A finish. The next pickup should be C, not B.
-        pipeline.ResetEntered();
-        release.SetResult();
-
-        var secondIn = await pipeline.NextEnteredAsync(TimeSpan.FromSeconds(30));
-        Assert.Equal(c.Id, secondIn);
-
-        // Let remaining items finish.
-        pipeline.ReleaseAll();
-
         var allDone = await WaitForAllDoneAsync(new[] { a.Id, b.Id, c.Id },
             TimeSpan.FromSeconds(30));
         await svc.StopAsync(CancellationToken.None);
 
         Assert.True(allDone);
+        await bumped.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.Equal(new[] { a.Id, c.Id, b.Id }, pipeline.Order);
     }
 
     [Fact]
@@ -441,61 +445,6 @@ internal sealed class OrderedPipelineRunner : IPipelineRunner
     public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
     {
         _order.Enqueue(item.Id);
-        await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
-    }
-}
-
-/// <summary>
-/// Pipeline that blocks each item on a shared TaskCompletionSource so tests can
-/// observe pickup order one item at a time. <see cref="ResetEntered"/> rearms
-/// the "next-entered" probe.
-/// </summary>
-internal sealed class GatedPipelineRunner : IPipelineRunner
-{
-    private readonly IWorkItemStore _store;
-    private Task _release;
-    private TaskCompletionSource<WorkItemId> _entered;
-    private readonly object _lock = new();
-
-    public GatedPipelineRunner(IWorkItemStore store, Task release, TaskCompletionSource<WorkItemId> entered)
-    {
-        _store = store;
-        _release = release;
-        _entered = entered;
-    }
-
-    public void ResetEntered()
-    {
-        lock (_lock)
-        {
-            _entered = new TaskCompletionSource<WorkItemId>(TaskCreationOptions.RunContinuationsAsynchronously);
-            _release = Task.CompletedTask;
-        }
-    }
-
-    public Task<WorkItemId> NextEnteredAsync(TimeSpan timeout)
-    {
-        TaskCompletionSource<WorkItemId> tcs;
-        lock (_lock) { tcs = _entered; }
-        return tcs.Task.WaitAsync(timeout);
-    }
-
-    public void ReleaseAll()
-    {
-        lock (_lock) { _release = Task.CompletedTask; }
-    }
-
-    public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
-    {
-        TaskCompletionSource<WorkItemId> enteredSnapshot;
-        Task releaseSnapshot;
-        lock (_lock)
-        {
-            enteredSnapshot = _entered;
-            releaseSnapshot = _release;
-        }
-        enteredSnapshot.TrySetResult(item.Id);
-        await releaseSnapshot.WaitAsync(ct);
         await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
     }
 }

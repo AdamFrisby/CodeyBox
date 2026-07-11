@@ -636,17 +636,13 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     {
         if (OperatingSystem.IsWindows()) return;
         var runner = new DefaultProcessRunner();
-        // The sh busy-loop competes for CPU with the .NET reader. On a fast
-        // host the kill fires in milliseconds, but in a CPU-constrained
-        // sandbox (e.g. an audit Multipass VM) the reader can be starved
-        // long enough for a 5s cap to fire WaitForExitAsync via OCE before
-        // the reader observes the limit. The ct here is only a backstop
-        // against hangs — it must NOT be tight enough to race the actual
-        // limit-detection path.
+        // Emit a finite oversized burst, then wait. This exercises the
+        // output-limit kill path without a CPU-bound producer starving the
+        // async reader under loaded audit VMs.
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
 
         var result = await runner.RunAsync(
-            ["sh", "-c", "while :; do printf 1234567890; done"],
+            ["sh", "-c", "printf '%2048s' ''; sleep 60"],
             stdin: null,
             ct: timeout.Token,
             maxStdoutBytes: 1024,
@@ -1543,7 +1539,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 listenerAccepted.TrySetResult();
                 await releaseListener.Task.WaitAsync(acceptCts.Token);
             }
-            catch (OperationCanceledException)
+            catch (Exception ex) when (acceptCts.IsCancellationRequested
+                && ex is OperationCanceledException or ObjectDisposedException or SocketException)
             {
             }
             catch (ObjectDisposedException) when (acceptCts.IsCancellationRequested)
@@ -1918,7 +1915,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             [launchScript],
             environmentOverrides: FakeSudoPathEnvironment());
 
-        Assert.Equal(88, exit);
+        Assert.True(
+            exit == 88,
+            $"Expected launch-lock-timeout exit 88, got {exit}. stdout: {stdout}; stderr: {stderr}");
         Assert.Equal("", stdout);
         Assert.Contains("codeybox-detached: timed out waiting for launch lock", stderr, StringComparison.Ordinal);
         Assert.False(File.Exists(processGroupMarker));
@@ -2315,6 +2314,18 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             $$"""
             #!/bin/sh
             {{MultipassSandboxProvider.ShellSingleQuote(realSetsid)}} "$@" &
+            child=$!
+            i=0
+            while [ "$i" -lt 200 ]; do
+                if [ -f {{MultipassSandboxProvider.ShellSingleQuote(sudoProcessGroupFile)}} ]; then
+                    exit 88
+                fi
+                if ! kill -0 "$child" 2>/dev/null; then
+                    exit 88
+                fi
+                i=$((i + 1))
+                sleep 0.05
+            done
             exit 88
             """);
         File.SetUnixFileMode(fakeSetsid, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
@@ -2334,7 +2345,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             virtualTime.AdvanceTo(5);
             var (exit, stdout, stderr) = await launchTask;
 
-            Assert.Equal(88, exit);
+            Assert.True(
+                exit == 88,
+                $"Expected marker-timeout exit 88, got {exit}. stdout: {stdout}; stderr: {stderr}");
             Assert.Equal("", stdout);
             Assert.Contains("codeybox-detached: timed out waiting for process group marker", stderr, StringComparison.Ordinal);
             Assert.False(File.Exists(processGroupMarker));
@@ -2427,7 +2440,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             virtualTime.AdvanceTo(5);
             var (exit, stdout, stderr) = await launchTask;
 
-            Assert.Equal(88, exit);
+            Assert.True(
+                exit == 88,
+                $"Expected marker-timeout exit 88, got {exit}. stdout: {stdout}; stderr: {stderr}");
             Assert.Equal("", stdout);
             Assert.Contains("codeybox-detached: timed out waiting for process group marker", stderr, StringComparison.Ordinal);
             Assert.False(File.Exists(processGroupMarker));
@@ -3804,12 +3819,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     {
         if (OperatingSystem.IsWindows()) return;
         var runner = new DefaultProcessRunner();
-        // See sibling stdout test for the rationale: the cap is a hang
-        // backstop, not a tight bound on limit-detection latency.
+        // See sibling stdout test for the rationale: the cap is only a hang
+        // backstop for the deterministic oversized-write scenario.
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
 
         var result = await runner.RunAsync(
-            ["sh", "-c", "while :; do printf 1234567890 >&2; done"],
+            ["sh", "-c", "printf '%2048s' '' >&2; sleep 60"],
             stdin: null,
             ct: timeout.Token,
             maxStdoutBytes: 1024,

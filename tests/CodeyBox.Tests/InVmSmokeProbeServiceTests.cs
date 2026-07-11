@@ -4,6 +4,7 @@ using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
 using CodeyBox.Webhooks;
 using Microsoft.Extensions.Logging.Abstractions;
+using ControllableTimeProvider = Microsoft.Extensions.Time.Testing.FakeTimeProvider;
 
 namespace CodeyBox.Tests;
 
@@ -20,16 +21,26 @@ namespace CodeyBox.Tests;
 /// contention from parallel fixtures was tripping <c>AwaitExecute</c>'s
 /// <c>Assert.Same(done, winner)</c>.</para>
 /// </summary>
-// Serialised with other BackgroundService timing-sensitive tests: AwaitExecute
-// races ExecuteTask against a 15s Task.Delay; parallel CPU contention from other
-// suites can starve the BackgroundService loop past that deadline.
+// Serialised with other BackgroundService timing-sensitive tests because the
+// periodic cases exercise short BackgroundService delay/cancellation loops.
 [Collection("Background service timing")]
-public sealed class InVmSmokeProbeServiceTests
+public sealed class InVmSmokeProbeServiceTests : IDisposable
 {
+    private static readonly TimeSpan TestHangGuard = TimeSpan.FromMinutes(1);
+    private const int PeriodicSweepIntervalSeconds = 120;
+
     private static readonly AgentCredential CursorCred = new(
         AgentKind.Cursor,
         new Dictionary<string, string> { ["CODEYBOX_CURSOR_AUTH_JSON"] = "{\"token\":\"t\"}" },
         new Dictionary<string, string>());
+
+    private readonly CancellationTokenSource _testHangGuard = new(TestHangGuard);
+
+    public void Dispose()
+    {
+        _testHangGuard.Cancel();
+        _testHangGuard.Dispose();
+    }
 
     private static InVmSmokeProber BuildProber(
         ScriptedSandboxProvider provider,
@@ -53,21 +64,27 @@ public sealed class InVmSmokeProbeServiceTests
     private static AgentAvailabilityRegistry NewRegistry() =>
         new(new AvailabilityOptions(), TimeProvider.System, NullLogger<AgentAvailabilityRegistry>.Instance);
 
-    private static InVmSmokeProbeService BuildService(InVmSmokeProber prober, int sweepIntervalSeconds = 0) =>
+    private static InVmSmokeProbeService BuildService(
+        InVmSmokeProber prober,
+        int sweepIntervalSeconds = 0,
+        TimeProvider? timeProvider = null) =>
         new(prober,
             new InVmSmokeOptions { Enabled = true, ImageReference = "img", NetworkProfile = "work-profile", SweepIntervalSeconds = sweepIntervalSeconds },
-            NullLogger<InVmSmokeProbeService>.Instance);
+            NullLogger<InVmSmokeProbeService>.Instance,
+            timeProvider: timeProvider);
 
-    private static async Task AwaitExecute(InVmSmokeProbeService service)
+    private async Task AwaitExecute(InVmSmokeProbeService service)
     {
         var done = service.ExecuteTask ?? Task.CompletedTask;
-        // 45 s ceiling (not 15 s): the single sweep completes in milliseconds on a
-        // healthy box, but under parallel audit-suite load the sweep's scripted
-        // sandbox exec can be starved of a thread-pool thread past 15 s. Task.WhenAny
-        // returns the instant the sweep finishes, so this only widens headroom.
-        var winner = await Task.WhenAny(done, Task.Delay(TimeSpan.FromSeconds(45)));
-        Assert.Same(done, winner); // single-sweep ExecuteAsync must complete promptly
-        await done; // surface any exception that escaped (there must be none)
+        try
+        {
+            await done.WaitAsync(_testHangGuard.Token); // surface any exception that escaped (there must be none)
+        }
+        catch (OperationCanceledException) when (_testHangGuard.IsCancellationRequested)
+        {
+            throw new Xunit.Sdk.XunitException(
+                "InVmSmokeProbeService.ExecuteTask did not complete before the test hang guard fired.");
+        }
     }
 
     [Fact]
@@ -129,37 +146,60 @@ public sealed class InVmSmokeProbeServiceTests
     {
         // SweepIntervalSeconds > 0 takes the while-loop path: a startup sweep
         // plus at least one interval-driven re-invocation of SafeSweepAsync. The
-        // one-shot tests above never exercise the Task.Delay loop, so a
-        // regression that dropped the re-sweep (or the delay wiring) would slip
-        // past them. A counting gate proves ProbeAllAsync fires more than once.
+        // one-shot tests above never exercise the Task.Delay loop, so this test
+        // observes the fake-time timer before advancing it.
         var gate = new CountingGate();
+        var time = new DelayTrackingTimeProvider();
         var service = new InVmSmokeProbeService(
             gate,
-            new InVmSmokeOptions { Enabled = true, ImageReference = "img", NetworkProfile = "work-profile", SweepIntervalSeconds = 1 },
-            NullLogger<InVmSmokeProbeService>.Instance);
+            new InVmSmokeOptions { Enabled = true, ImageReference = "img", NetworkProfile = "work-profile", SweepIntervalSeconds = PeriodicSweepIntervalSeconds },
+            NullLogger<InVmSmokeProbeService>.Instance,
+            timeProvider: time);
 
         await service.StartAsync(CancellationToken.None);
-        var reachedTwo = await gate.WaitForAtLeastAsync(2, TimeSpan.FromSeconds(5));
-        await service.StopAsync(CancellationToken.None);
+        try
+        {
+            var startupCount = await gate.WaitForAtLeastAsync(1, _testHangGuard.Token);
+            Assert.True(startupCount >= 1, $"Expected at least one startup sweep, observed {startupCount}.");
+            await time.WaitForTimerCountAsync(1, _testHangGuard.Token);
+            Assert.Equal(1, gate.SweepCount);
 
-        Assert.True(reachedTwo, $"expected the interval loop to sweep >=2 times, saw {gate.SweepCount}");
+            time.Advance(TimeSpan.FromSeconds(PeriodicSweepIntervalSeconds));
+            var intervalCount = await gate.WaitForAtLeastAsync(2, _testHangGuard.Token);
+            Assert.True(intervalCount >= 2, $"Expected at least two sweeps after advancing fake time, observed {intervalCount}.");
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
     }
 
     [Fact]
     public async Task PeriodicSweep_StaysAlive_WhenGateStartsDisabledAndLaterEnables()
     {
         var gate = new CountingGate { Enabled = false };
+        var time = new DelayTrackingTimeProvider();
         var service = new InVmSmokeProbeService(
             gate,
-            new InVmSmokeOptions { Enabled = true, ImageReference = "img", NetworkProfile = "work-profile", SweepIntervalSeconds = 1 },
-            NullLogger<InVmSmokeProbeService>.Instance);
+            new InVmSmokeOptions { Enabled = true, ImageReference = "img", NetworkProfile = "work-profile", SweepIntervalSeconds = PeriodicSweepIntervalSeconds },
+            NullLogger<InVmSmokeProbeService>.Instance,
+            timeProvider: time);
 
         await service.StartAsync(CancellationToken.None);
-        gate.Enabled = true;
-        var reachedOne = await gate.WaitForAtLeastAsync(1, TimeSpan.FromSeconds(5));
-        await service.StopAsync(CancellationToken.None);
+        try
+        {
+            await time.WaitForTimerCountAsync(1, _testHangGuard.Token);
+            Assert.Equal(0, gate.SweepCount);
 
-        Assert.True(reachedOne, "expected the periodic service to observe the live gate after it was re-enabled");
+            gate.Enabled = true;
+            time.Advance(TimeSpan.FromSeconds(PeriodicSweepIntervalSeconds));
+            var enabledCount = await gate.WaitForAtLeastAsync(1, _testHangGuard.Token);
+            Assert.True(enabledCount >= 1, $"Expected the re-enabled periodic gate to sweep, observed {enabledCount}.");
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
     }
 
     [Fact]
@@ -286,11 +326,11 @@ public sealed class InVmSmokeProbeServiceTests
     private sealed class CountingGate : IInVmSmokeGate
     {
         private readonly object _sync = new();
-        private readonly TaskCompletionSource _reached = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly List<Waiter> _waiters = [];
+        private volatile bool _enabled = true;
         private int _count;
-        private int _target = int.MaxValue;
 
-        public bool Enabled { get; set; } = true;
+        public bool Enabled { get => _enabled; set => _enabled = value; }
         public int SweepCount { get { lock (_sync) return _count; } }
         public List<InVmSmokeSandboxTarget> Targets { get; } = [];
 
@@ -299,7 +339,13 @@ public sealed class InVmSmokeProbeServiceTests
             lock (_sync)
             {
                 _count++;
-                if (_count >= _target) _reached.TrySetResult();
+                for (var i = _waiters.Count - 1; i >= 0; i--)
+                {
+                    var waiter = _waiters[i];
+                    if (_count < waiter.Target) continue;
+                    _waiters.RemoveAt(i);
+                    waiter.Tcs.TrySetResult(_count);
+                }
             }
             return Task.CompletedTask;
         }
@@ -319,15 +365,100 @@ public sealed class InVmSmokeProbeServiceTests
         public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct)
             => Task.FromResult<AgentAvailability?>(new AgentAvailability(true, null, null));
 
-        public async Task<bool> WaitForAtLeastAsync(int target, TimeSpan timeout)
+        public async Task<int> WaitForAtLeastAsync(int target, CancellationToken ct)
         {
+            Waiter waiter;
             lock (_sync)
             {
-                _target = target;
-                if (_count >= target) return true;
+                if (_count >= target) return _count;
+                waiter = new Waiter(target);
+                _waiters.Add(waiter);
             }
-            var winner = await Task.WhenAny(_reached.Task, Task.Delay(timeout));
-            return winner == _reached.Task;
+            try
+            {
+                return await waiter.Tcs.Task.WaitAsync(ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                lock (_sync) _waiters.Remove(waiter);
+                throw new Xunit.Sdk.XunitException(
+                    $"Timed out waiting for at least {target} in-VM smoke sweeps; observed {SweepCount}.");
+            }
+        }
+
+        private sealed class Waiter
+        {
+            public Waiter(int target) => Target = target;
+
+            public int Target { get; }
+            public TaskCompletionSource<int> Tcs { get; } =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+    }
+
+    private sealed class DelayTrackingTimeProvider : TimeProvider
+    {
+        private readonly object _sync = new();
+        private readonly ControllableTimeProvider _inner = new();
+        private readonly List<Waiter> _waiters = [];
+        private int _timerCount;
+
+        public override TimeZoneInfo LocalTimeZone => _inner.LocalTimeZone;
+        public override long TimestampFrequency => _inner.TimestampFrequency;
+
+        public override DateTimeOffset GetUtcNow() => _inner.GetUtcNow();
+
+        public override long GetTimestamp() => _inner.GetTimestamp();
+
+        public void Advance(TimeSpan delta) => _inner.Advance(delta);
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            var timer = _inner.CreateTimer(callback, state, dueTime, period);
+            lock (_sync)
+            {
+                _timerCount++;
+                for (var i = _waiters.Count - 1; i >= 0; i--)
+                {
+                    var waiter = _waiters[i];
+                    if (_timerCount < waiter.Target) continue;
+                    _waiters.RemoveAt(i);
+                    waiter.Tcs.TrySetResult(_timerCount);
+                }
+            }
+
+            return timer;
+        }
+
+        public async Task<int> WaitForTimerCountAsync(int target, CancellationToken ct)
+        {
+            Waiter waiter;
+            lock (_sync)
+            {
+                if (_timerCount >= target) return _timerCount;
+                waiter = new Waiter(target);
+                _waiters.Add(waiter);
+            }
+
+            try
+            {
+                return await waiter.Tcs.Task.WaitAsync(ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                lock (_sync) _waiters.Remove(waiter);
+                throw new Xunit.Sdk.XunitException(
+                    $"Timed out waiting for at least {target} fake-time timers; observed {_timerCount}.");
+            }
+        }
+
+        private sealed class Waiter
+        {
+            public Waiter(int target) => Target = target;
+
+            public int Target { get; }
+            public TaskCompletionSource<int> Tcs { get; } =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
         }
     }
 
