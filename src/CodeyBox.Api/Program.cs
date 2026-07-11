@@ -3400,6 +3400,15 @@ builder.Services.AddSingleton<WorkItemRetrier>(sp => new WorkItemRetrier(
     sp.GetService<IWorkItemQuestionStore>(),
     sp.GetRequiredService<IAuditProgressStore>()));
 
+// Shared stale-base remediation router used by both the pipeline's
+// upstream-push path and the out-of-band StalePullRequestSweeper. Reads the
+// same hot-reloadable StalePullRequestSweep options so the enable flag and
+// attempt cap have a single source of truth.
+builder.Services.AddSingleton<StaleBaseConflictReworkRouter>(sp => new StaleBaseConflictReworkRouter(
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<WorkItemRetrier>(),
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.StalePullRequestSweep,
+    sp.GetRequiredService<ILogger<StaleBaseConflictReworkRouter>>()));
 builder.Services.AddOptions<CheckAndActCompletionOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox:CheckAndActCompletion"));
 builder.Services.AddOptions<CompletionClientOptions>()
@@ -3508,7 +3517,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     mergeScopeResolver: sp.GetRequiredService<IMergeScopeResolver>(),
     quotaAvailabilityPublisher: sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>(),
     e2eReplayGate: sp.GetService<WorkItemE2eReplayGate>(),
-    jobTrackExporter: sp.GetService<IJobTrackTestCaseExporter>()));
+    jobTrackExporter: sp.GetService<IJobTrackTestCaseExporter>(),
+    staleBaseReworkRouter: sp.GetRequiredService<StaleBaseConflictReworkRouter>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -4068,7 +4078,10 @@ builder.Services.AddHostedService(sp =>
         sp.GetRequiredService<IUpstreamRemoteFactory>(),
         sp.GetRequiredService<IWebhookDispatcher>(),
         () => monitor.CurrentValue.StalePullRequestSweep,
-        sp.GetRequiredService<ILogger<StalePullRequestSweeper>>());
+        sp.GetRequiredService<ILogger<StalePullRequestSweeper>>(),
+        time: null,
+        store: sp.GetRequiredService<IWorkItemStore>(),
+        reworkRouter: sp.GetRequiredService<StaleBaseConflictReworkRouter>());
 });
 
 // --- Plugin foundation -------------------------------------------------------

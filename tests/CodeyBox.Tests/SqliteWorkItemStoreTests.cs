@@ -91,6 +91,33 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task GetByMergedPrNumber_ReturnsMatchingItemScopedToProject()
+    {
+        var projectA = new ProjectId("project-a");
+        var projectB = new ProjectId("project-b");
+        var itemA = Sample() with { ProjectId = projectA, MergedPrNumber = 77 };
+        // Same PR number in a different project must NOT be returned for project-a.
+        var itemB = Sample() with { ProjectId = projectB, MergedPrNumber = 77 };
+        // An item with no recorded PR must be excluded by the partial index/filter.
+        var itemNoPr = Sample() with { ProjectId = projectA, MergedPrNumber = null };
+        await _store.CreateAsync(itemA);
+        await _store.CreateAsync(itemB);
+        await _store.CreateAsync(itemNoPr);
+
+        var found = await _store.GetByMergedPrNumberAsync(projectA, 77);
+        Assert.NotNull(found);
+        Assert.Equal(itemA.Id, found!.Id);
+        Assert.Equal(projectA, found.ProjectId);
+
+        // Cross-project isolation: project-b's item is the only match there.
+        var foundB = await _store.GetByMergedPrNumberAsync(projectB, 77);
+        Assert.Equal(itemB.Id, foundB!.Id);
+
+        // No match → null (not an exception, not a wrong-project leak).
+        Assert.Null(await _store.GetByMergedPrNumberAsync(projectA, 999));
+    }
+
+    [Fact]
     public async Task UpdateAsync_PersistsTransitions()
     {
         var item = Sample();

@@ -901,7 +901,13 @@ terminal failure event in the same way as for the iteration/audit phases.
 
 Fired by the `StalePullRequestSweeper` background service when a
 CodeyBox-authored PR is observed in the forge's "dirty" (conflicting)
-state. **De-duplication**: the same `(projectId, prNumber, headSha)`
+state. **Remediation**: this event is always the detection signal; when
+`CodeyBox:StalePullRequestSweep:RouteToConflictRework` is enabled the sweeper
+also routes the owning work item into the conflict-rework state machine (rebase
+onto the refreshed base + agentic resolution + re-merge/re-push), bounded by
+`MaxReworkAttempts` — parking at `MergeConflictResolutionFailed` on cap
+exhaustion. With the flag off (the default) the sweeper is notify-only.
+**De-duplication**: the same `(projectId, prNumber, headSha)`
 tuple fires the event at most once per orchestrator process. A new push to
 the PR head (changing `headSha`) produces a fresh event if the PR remains
 stale; that is the intended signal that the operator's most recent rebase

@@ -9,10 +9,13 @@ namespace CodeyBox.Orchestrator;
 /// when a CodeyBox-authored pull request's base branch has moved and produced
 /// a merge conflict the auto-merger can no longer resolve.
 ///
-/// <para>Operators (or a downstream tracker watching the event bus) react by
-/// rebasing the PR manually, closing it as superseded, or re-running the work
-/// item. The orchestrator itself takes no destructive action — see the bug
-/// spec's option (c).</para>
+/// <para>This event is always emitted as the detection signal. When
+/// <see cref="StalePullRequestSweeperOptions.RouteToConflictRework"/> is
+/// disabled (the default) that is the only reaction — operators (or a
+/// downstream tracker) rebase the PR manually, close it as superseded, or
+/// re-run the work item. When routing is enabled the sweeper additionally
+/// drives the owning work item into the conflict-rework state machine (bounded
+/// by <see cref="StalePullRequestSweeperOptions.MaxReworkAttempts"/>).</para>
 /// </summary>
 public sealed record StalePullRequestDetails
 {
@@ -37,6 +40,17 @@ public sealed record StalePullRequestDetails
 /// sweeper emits an <c>upstream.pr_stale_base</c> webhook event and an audit
 /// log entry so operators see the orphan within minutes rather than days.
 ///
+/// <para><b>Remediation:</b> when
+/// <see cref="StalePullRequestSweeperOptions.RouteToConflictRework"/> is enabled
+/// and the remediation collaborators are wired, the sweeper goes beyond
+/// notifying: it looks up the owning work item and routes it into the existing
+/// conflict-rework state machine (rebase onto the refreshed canonical base +
+/// agentic conflict resolution + re-merge/re-push) via
+/// <see cref="StaleBaseConflictReworkRouter"/>. On exhausting the configured
+/// attempt cap the item is parked at
+/// <see cref="WorkItemState.MergeConflictResolutionFailed"/>. When the flag is
+/// off (the default) the sweeper stays notify-only.</para>
+///
 /// <para><b>Identity / idempotency:</b> a stale PR is identified by the
 /// tuple <c>(projectId, prNumber, headSha)</c>. Repeated observations of the
 /// same identity do not re-fire the event. If the operator pushes a new
@@ -57,6 +71,14 @@ public sealed class StalePullRequestSweeper : BackgroundService
     private readonly ILogger<StalePullRequestSweeper> _log;
     private readonly TimeProvider _time;
 
+    // Optional remediation collaborators. When both are wired AND the
+    // RouteToConflictRework option is on, a detected stale-base conflict drives
+    // the owning work item into the conflict-rework state machine instead of
+    // only firing the notify signal. Null (or option off) preserves the
+    // historical notify-only behaviour.
+    private readonly IWorkItemStore? _store;
+    private readonly StaleBaseConflictReworkRouter? _reworkRouter;
+
     // Stale-PR identity → first-detection timestamp. Used both to dedupe the
     // event firing (repeated ticks against the same identity stay quiet) and
     // to recover the original detection timestamp when the resolved-event
@@ -75,8 +97,10 @@ public sealed class StalePullRequestSweeper : BackgroundService
         IWebhookDispatcher webhooks,
         StalePullRequestSweeperOptions opts,
         ILogger<StalePullRequestSweeper> log,
-        TimeProvider? time = null)
-        : this(projects, upstreamFactory, webhooks, () => opts, log, time) { }
+        TimeProvider? time = null,
+        IWorkItemStore? store = null,
+        StaleBaseConflictReworkRouter? reworkRouter = null)
+        : this(projects, upstreamFactory, webhooks, () => opts, log, time, store, reworkRouter) { }
 
     public StalePullRequestSweeper(
         IProjectRepository projects,
@@ -84,7 +108,9 @@ public sealed class StalePullRequestSweeper : BackgroundService
         IWebhookDispatcher webhooks,
         Func<StalePullRequestSweeperOptions> optsAccessor,
         ILogger<StalePullRequestSweeper> log,
-        TimeProvider? time = null)
+        TimeProvider? time = null,
+        IWorkItemStore? store = null,
+        StaleBaseConflictReworkRouter? reworkRouter = null)
     {
         _projects = projects;
         _upstreamFactory = upstreamFactory;
@@ -92,6 +118,8 @@ public sealed class StalePullRequestSweeper : BackgroundService
         _optsAccessor = optsAccessor;
         _log = log;
         _time = time ?? TimeProvider.System;
+        _store = store;
+        _reworkRouter = reworkRouter;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -248,8 +276,159 @@ public sealed class StalePullRequestSweeper : BackgroundService
                     "StalePullRequestSweeper: webhook publish failed for PR #{Number} in project {ProjectId}",
                     pr.Number, project.Id.Value);
             }
+
+            // Beyond notify-only: drive the owning work item into the existing
+            // conflict-rework state machine (gated by RouteToConflictRework).
+            await TryRouteToReworkAsync(project, pr, ct);
         }
     }
+
+    /// <summary>
+    /// Looks up the work item that opened <paramref name="pr"/> and, when the
+    /// feature is enabled, routes it into conflict-rework (or parks it at the
+    /// existing terminal on cap exhaustion). A no-op when the remediation
+    /// collaborators are not wired or the feature is off — the notify signal
+    /// already fired above, so the sweeper stays notify-only in that case.
+    /// </summary>
+    private async Task TryRouteToReworkAsync(Project project, UpstreamPullRequest pr, CancellationToken ct)
+    {
+        if (_store is null || _reworkRouter is null || !_reworkRouter.Enabled)
+            return;
+
+        WorkItem? item;
+        try
+        {
+            item = await _store.GetByMergedPrNumberAsync(project.Id, pr.Number, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex,
+                "StalePullRequestSweeper: could not resolve work item for PR #{Number} in project {ProjectId}",
+                pr.Number, project.Id.Value);
+            return;
+        }
+
+        if (item is null)
+        {
+            _log.LogDebug(
+                "StalePullRequestSweeper: no work item recorded for PR #{Number} in project {ProjectId}; nothing to route",
+                pr.Number, project.Id.Value);
+            return;
+        }
+
+        // Only remediate items that have finished work/audit and reached (or
+        // parked past) the push. Re-dispatching an item another worker is
+        // actively running would corrupt its in-flight pipeline.
+        if (!IsEligibleForStaleBaseRework(item.State))
+        {
+            _log.LogDebug(
+                "StalePullRequestSweeper: work item {Id} for PR #{Number} is in state {State}; not eligible for stale-base rework",
+                item.Id, pr.Number, item.State);
+            return;
+        }
+
+        StaleBaseReworkOutcome outcome;
+        try
+        {
+            outcome = await _reworkRouter.TryRouteAsync(item, "stale-pr-sweep", ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex,
+                "StalePullRequestSweeper: routing work item {Id} for PR #{Number} into conflict-rework failed",
+                item.Id, pr.Number);
+            return;
+        }
+
+        switch (outcome)
+        {
+            case StaleBaseReworkOutcome.Routed:
+                _log.LogInformation(
+                    "StalePullRequestSweeper: routed work item {Id} into conflict-rework for stale PR #{Number}",
+                    item.Id, pr.Number);
+                break;
+            case StaleBaseReworkOutcome.CapExhausted:
+                await ParkAtMergeConflictFailedAsync(project, item, pr, ct);
+                break;
+            case StaleBaseReworkOutcome.NotEnabled:
+            default:
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Parks a work item that has exhausted its stale-base rework budget at the
+    /// existing terminal <see cref="WorkItemState.MergeConflictResolutionFailed"/>.
+    /// Uses a conditional (compare-and-set) update so a concurrent transition
+    /// (e.g. the item being re-dispatched by another surface) is not clobbered.
+    /// </summary>
+    private async Task ParkAtMergeConflictFailedAsync(
+        Project project, WorkItem item, UpstreamPullRequest pr, CancellationToken ct)
+    {
+        if (_store is null)
+            return;
+
+        if (item.State == WorkItemState.MergeConflictResolutionFailed)
+            return; // already parked; nothing to do
+
+        var reason =
+            $"stale-base PR #{pr.Number} exhausted the conflict-rework attempt cap " +
+            $"({item.ConflictReworkAttempts}); manual resolution required";
+        var parked = item.With(WorkItemState.MergeConflictResolutionFailed, reason);
+
+        bool updated;
+        try
+        {
+            updated = await _store.TryUpdateIfStateAsync(parked, item.State, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex,
+                "StalePullRequestSweeper: parking work item {Id} at MergeConflictResolutionFailed failed",
+                item.Id);
+            return;
+        }
+
+        if (!updated)
+        {
+            _log.LogDebug(
+                "StalePullRequestSweeper: work item {Id} changed state before cap-exhaustion park; skipping",
+                item.Id);
+            return;
+        }
+
+        try
+        {
+            await _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "work_item.merge_conflict_resolution_failed",
+                WorkItem = parked,
+                Project = project,
+            }, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex,
+                "StalePullRequestSweeper: cap-exhaustion webhook publish failed for work item {Id}",
+                item.Id);
+        }
+
+        _log.LogInformation(
+            "StalePullRequestSweeper: parked work item {Id} at MergeConflictResolutionFailed after exhausting stale-base rework attempts for PR #{Number}",
+            item.Id, pr.Number);
+    }
+
+    /// <summary>
+    /// A work item may be routed into stale-base rework only from a settled
+    /// post-push state. In-flight states (work/audit/merge/push in progress)
+    /// are excluded so the sweeper never re-dispatches an item another worker
+    /// owns.
+    /// </summary>
+    private static bool IsEligibleForStaleBaseRework(WorkItemState state) =>
+        state is WorkItemState.Done
+            or WorkItemState.Merged
+            or WorkItemState.MergeConflictResolutionFailed
+            or WorkItemState.Failed;
 
     /// <summary>
     /// Identity tuple for dedup: project, PR number, and the head sha at the
