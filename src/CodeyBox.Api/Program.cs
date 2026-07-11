@@ -983,10 +983,19 @@ builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 builder.Services.AddOptions<AgentPromptPreprocessingOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox:PromptPreprocessing"));
 builder.Services.AddSingleton<IAgentPromptPreprocessor, ProjectRulesPromptPreprocessor>();
-// Attachment support is API/storage-only in this foundation task. The
-// reserved preprocessor remains no-op until a future in-VM delivery task
-// defines a safe, non-prompt-injection delivery contract.
-builder.Services.AddSingleton<IAgentPromptPreprocessor, AttachmentManifestPromptPreprocessor>();
+// Attachment delivery: for the configured delivery phases (default work /
+// rework / audit) the preprocessor stages a work item's attachment blobs into
+// the sandbox and injects an ATTACHMENTS manifest so the agent knows they exist
+// and where to read them. The source maps stored metadata to collision-free
+// in-VM paths; the blob store supplies the host-side bytes. Both are optional so
+// the preprocessor stays a no-op when attachments are not wired.
+builder.Services.AddSingleton<IWorkItemAttachmentSource, StoreWorkItemAttachmentSource>();
+builder.Services.AddSingleton<IAgentPromptPreprocessor>(sp =>
+    new AttachmentManifestPromptPreprocessor(
+        sp.GetRequiredService<ILogger<AttachmentManifestPromptPreprocessor>>(),
+        sp.GetService<IWorkItemAttachmentSource>(),
+        sp.GetService<IWorkItemAttachmentBlobStore>(),
+        () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Attachments));
 // Cross-agent handoff brief injection: fires only when the involvement store
 // shows a prior phase ran under a different AgentKind. Gated end-to-end by
 // CodeyBox:PipelineTuning:EnableHandoffSeeding (default off) — the builder

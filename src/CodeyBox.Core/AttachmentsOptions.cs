@@ -71,6 +71,25 @@ public sealed class AttachmentsOptions
     public int MaxMultipartErrorMessageChars { get; set; } = 240;
 
     /// <summary>
+    /// When true, a work item's attachments are staged into its sandbox VM and
+    /// announced to the agent (via the attachment manifest injected into the
+    /// prompt) for the phases listed in <see cref="DeliverToPhases"/>. When
+    /// false, attachments stay host-only (upload/download API) and no bytes are
+    /// staged into any sandbox — behaviour identical to the storage-only
+    /// foundation. Default true.
+    /// </summary>
+    public bool DeliverToSandbox { get; set; } = true;
+
+    /// <summary>
+    /// Agent prompt phases whose invocations stage attachments into the sandbox
+    /// and inject the attachment manifest. Compared case-insensitively against
+    /// the phase value (<c>work</c>, <c>rework</c>, <c>audit</c>, …). A phase
+    /// not listed behaves as if the item had no attachments (nothing staged,
+    /// no manifest). Default: work, rework, audit.
+    /// </summary>
+    public IReadOnlyList<string> DeliverToPhases { get; set; } = ["work", "rework", "audit"];
+
+    /// <summary>
     /// TTL for attachments on non-terminal work items whose owning item has
     /// not been updated recently. Terminal work items are eligible on the
     /// next cleanup sweep regardless of this value. Default 7 days.
@@ -113,6 +132,8 @@ public sealed class AttachmentsOptions
             throw new InvalidOperationException("CodeyBox:Attachments:MultipartHeadersLengthLimitBytes must be positive");
         if (MaxMultipartErrorMessageChars <= 0)
             throw new InvalidOperationException("CodeyBox:Attachments:MaxMultipartErrorMessageChars must be positive");
+        if (DeliverToPhases is null)
+            throw new InvalidOperationException("CodeyBox:Attachments:DeliverToPhases must not be null");
         if (TerminalCleanupTtl < TimeSpan.Zero)
             throw new InvalidOperationException("CodeyBox:Attachments:TerminalCleanupTtl must be non-negative");
         if (CleanupSweepInterval < TimeSpan.Zero)

@@ -4,20 +4,21 @@ namespace CodeyBox.Orchestrator;
 
 /// <summary>
 /// Adapts <see cref="IWorkItemAttachmentStore"/> to
-/// <see cref="IWorkItemAttachmentSource"/> for the future in-VM attachment
-/// delivery task.
+/// <see cref="IWorkItemAttachmentSource"/>: maps stored metadata rows to
+/// in-VM delivery records, assigning each a collision-free delivery filename
+/// under <see cref="SandboxStagingDirectory"/>.
 /// </summary>
 /// <remarks>
-/// The current attachment foundation does not wire this adapter into the
-/// production agent prompt path. It only centralizes planned delivery names so
-/// a future staging service can share the same duplicate-name policy.
+/// This is the single source of truth for the duplicate-name policy so the
+/// staged on-disk name, the manifest's bold filename, and the manifest's path
+/// can never disagree.
 /// </remarks>
 public sealed class StoreWorkItemAttachmentSource : IWorkItemAttachmentSource
 {
     /// <summary>
-    /// Per-item staging directory inside the sandbox. The eventual delivery
-    /// step (out of scope here) writes blobs under this path keyed by the safe
-    /// delivery filename.
+    /// Per-item staging directory inside the sandbox. The
+    /// <c>AttachmentManifestPromptPreprocessor</c> writes each blob under this
+    /// path keyed by the safe delivery filename before announcing it to the agent.
     /// </summary>
     public const string SandboxStagingDirectory = "/work/.codeybox/attachments";
 
@@ -54,7 +55,9 @@ public sealed class StoreWorkItemAttachmentSource : IWorkItemAttachmentSource
                 InVmPath: $"{SandboxStagingDirectory}/{deliveryName}",
                 FileName: fileName,
                 ContentType: row.ContentType,
-                Caption: row.Caption));
+                Caption: row.Caption,
+                SizeBytes: row.SizeBytes,
+                Sha256: row.Sha256));
         }
         return result;
     }
