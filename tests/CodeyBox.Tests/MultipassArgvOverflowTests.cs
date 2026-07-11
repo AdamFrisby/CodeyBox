@@ -49,6 +49,37 @@ public sealed class MultipassArgvOverflowTests : IDisposable
     }
 
     [Fact]
+    public async Task ExecAsync_SecretEnvironment_TransfersFileAndNeverUsesHostArgv()
+    {
+        const string secret = "candidate-account-secret";
+        var runner = new RecordingProcessRunner();
+        var sandbox = NewSandbox(runner);
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["printenv", "OPENAI_API_KEY"],
+            ExtraEnvironment = new Dictionary<string, string>
+            {
+                ["OPENAI_API_KEY"] = secret,
+            },
+            EnvironmentContainsSecrets = true,
+        });
+
+        Assert.True(result.Success);
+        Assert.DoesNotContain(
+            runner.Calls.SelectMany(static call => call.Argv),
+            argument => argument.Contains(secret, StringComparison.Ordinal));
+        var finalExec = runner.Calls.Single(call =>
+            call.Argv is ["multipass", "exec", "codeybox-test", "--", "/usr/local/bin/codeybox-exec", ..]);
+        Assert.Contains("--env-file", finalExec.Argv);
+        var transfer = Assert.Single(
+            runner.Transfers,
+            item => item.Destination.Contains(".codeybox-exec-env/", StringComparison.Ordinal));
+        Assert.Contains(secret, transfer.Content, StringComparison.Ordinal);
+        Assert.False(File.Exists(transfer.Source));
+    }
+
+    [Fact]
     public async Task ExecAsync_LargeExtraEnvironment_TransfersEnvFileAndKeepsExecutedArgvSmall()
     {
         var runner = new RecordingProcessRunner();

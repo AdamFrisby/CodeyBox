@@ -1,5 +1,7 @@
+using CodeyBox.Agents.Cursor;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Projects;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -7,13 +9,12 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Pins the wiring fix that broke the in-VM agentic conflict resolver: the
-/// pickup-rebase sandbox AND the agent-merge sandbox MUST be created with a
-/// non-null agent credential and <c>allowAgentNetwork: true</c>. Without these,
-/// the agent CLI invoked in-sandbox by
-/// <see cref="AgenticConflictResolver"/> starves for both auth and egress —
-/// the exact "agent exited 1 in the resolver sandbox" failure that
-/// MergeConflictResolutionFailed items hit after PR #168.
+/// Pins the wiring fix that broke the in-VM agentic conflict resolver. The
+/// pickup-rebase sandbox must have agent network and credential tmpfs scope.
+/// Candidate credential payloads are materialised immediately before that
+/// candidate runs instead of being installed in the shared sandbox environment.
+/// The agent-merge sandbox still
+/// carries the chosen agent credential at creation time.
 ///
 /// The new resolver-side integration tests in
 /// <c>AgenticConflictResolverIntegrationTests</c> assert the resolver's own
@@ -31,6 +32,14 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     private const string MarkerEnvKey = "CODEYBOX_TEST_MARKER";
     private const string MarkerEnvValue = "marker-credential-present";
     private const string MarkerHost = "agent.example.invalid";
+    private const string CursorAuthEnvKey = "CODEYBOX_CURSOR_AUTH_JSON";
+    private const string CursorAuthJson = """{"token":"cursor-fallback-token"}""";
+    private const string CodexApiKeyEnvKey = "OPENAI_API_KEY";
+    private const string CodexApiKeyValue = "codex-candidate-api-key";
+    private const string ClaudeApiKeyEnvKey = "ANTHROPIC_API_KEY";
+    private const string ClaudeApiKeyValue = "claude-primary-api-key";
+    private const string NonCandidateEnvKey = "CODEYBOX_NON_CANDIDATE_SECRET";
+    private const string NonCandidateEnvValue = "must-not-enter-resolver-sandbox";
     private const string AuditDotnetShimDir = AuditReviewDotnetShim.Directory;
     private const string AuditDotnetShimNotice = AuditReviewDotnetShim.Notice;
 
@@ -43,16 +52,15 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task PickupRebaseSandbox_IsCreatedWithAgentCredentialAndOpenNetwork()
+    public async Task PickupRebaseSandbox_IsCreatedWithAgentNetworkAndCredentialTmpfsWithoutCandidateEnv()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var recorder = new RecordingSandboxProvider(
             new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
 
         // PipelineOptions's AgentAllowedHosts must be non-empty so we can tell
-        // "credential != null, allowAgentNetwork: true" apart from a
-        // "credential null, network disabled" regression — BuildSandboxSpec
-        // picks AgentAllowedHosts only when both conditions hold.
+        // the resolver sandbox's agent-network scope apart from the audit-tool
+        // network fallback.
         var pipelineOptions = new PipelineOptions
         {
             SandboxImageReference = "ignored",
@@ -90,7 +98,310 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
-        AssertCredentialAndOpenNetwork(pickupSpec, "pickup-rebase");
+        AssertCredentialTmpfsAndOpenNetwork(pickupSpec, "pickup-rebase");
+        Assert.Equal(MarkerEnvValue, pickupSpec.Environment[MarkerEnvKey]);
+    }
+
+    [Fact]
+    public async Task PickupRebaseResolver_CodexPrimaryCursorFallback_MaterialisesCursorCredential()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var primary = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+        primary.AgenticConflictResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "codex resolver failed before editing",
+            Stdout: null,
+            Stderr: "ordinary resolver failure"));
+        var cursor = new CursorAgentRunner { Binary = await InstallFakeCursorAgentAsync("cursor-fallback") };
+        var classRouter = BuildResolverClassRouter(primary, cursor);
+        var project = NewResolverProject(seed, AgentKind.Codex);
+
+        var run = await RunPickupRebaseConflictAsync(
+            seed,
+            project,
+            new ResolverCredentialProvider(),
+            primary,
+            [cursor],
+            classRouter);
+
+        Assert.Equal(WorkItemState.Done, run.Final.State);
+        Assert.DoesNotContain("Authentication required", run.Final.LastError ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        Assert.Single(primary.AgenticConflictInvocations);
+        Assert.Equal(
+            CursorAuthJson,
+            (await ReadBareBranchFileAsync(run.BarePath, run.WorkBranch, "cursor-auth-observed.json")).TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
+    public async Task PickupRebaseResolver_MaterialisesCandidateCredentialMounts()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var mountSource = Directory.CreateDirectory(Path.Combine(_workspace, "resolver-adjunct"));
+        await File.WriteAllTextAsync(Path.Combine(mountSource.FullName, "marker.txt"), "mount-marker");
+        var recorder = new RecordingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        var primary = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+        primary.AgenticConflictResults.Enqueue(new AgentResult(
+            false, "codex resolver failed before editing", null, "ordinary resolver failure"));
+        var cursor = new CursorAgentRunner { Binary = await InstallFakeCursorAgentAsync("cursor-mount-fallback") };
+        var classRouter = BuildResolverClassRouter(primary, cursor);
+        var project = NewResolverProject(seed, AgentKind.Codex);
+
+        var run = await RunPickupRebaseConflictAsync(
+            seed,
+            project,
+            new MountedResolverCredentialProvider(mountSource.FullName),
+            primary,
+            [cursor],
+            classRouter,
+            sandboxProvider: recorder);
+
+        Assert.Equal(WorkItemState.Done, run.Final.State);
+        var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
+        Assert.Contains(pickupSpec.Mounts, mount =>
+            mount.SandboxPath == "/opt/codeybox/resolver-adjunct"
+            && mount.HostPath == mountSource.FullName
+            && mount.ReadOnly);
+    }
+
+    [Fact]
+    public async Task PickupRebaseResolver_CreationEnvironmentIncludesOnlyCandidateCredentials()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var recorder = new RecordingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        var primary = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+        primary.AgenticConflictResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "codex resolver failed before editing",
+            Stdout: null,
+            Stderr: "ordinary resolver failure"));
+        var cursor = new CursorAgentRunner { Binary = await InstallFakeCursorAgentAsync("cursor-isolation") };
+        var registeredNonCandidate = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Opencode };
+        var classRouter = BuildResolverClassRouter(primary, cursor);
+        var credentials = new TrackingResolverCredentialProvider();
+        var project = NewResolverProject(seed, AgentKind.Codex);
+
+        var run = await RunPickupRebaseConflictAsync(
+            seed,
+            project,
+            credentials,
+            primary,
+            [cursor, registeredNonCandidate],
+            classRouter,
+            sandboxProvider: recorder);
+
+        Assert.Equal(WorkItemState.Done, run.Final.State);
+        Assert.DoesNotContain(AgentKind.Opencode, credentials.RequestedAgents);
+
+        var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
+        Assert.Equal(CodexApiKeyValue, pickupSpec.Environment[CodexApiKeyEnvKey]);
+        Assert.Equal(CursorAuthJson, pickupSpec.Environment[CursorAuthEnvKey]);
+        Assert.False(pickupSpec.Environment.ContainsKey(NonCandidateEnvKey),
+            "non-candidate opencode credential must not enter the resolver sandbox");
+        Assert.Equal(
+            CursorAuthJson,
+            (await ReadBareBranchFileAsync(run.BarePath, run.WorkBranch, "cursor-auth-observed.json")).TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
+    public async Task PickupRebaseResolver_CursorPrimary_MaterialisesCursorCredential()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var cursor = new CursorAgentRunner { Binary = await InstallFakeCursorAgentAsync("cursor-primary") };
+        var project = NewResolverProject(seed, AgentKind.Cursor, defaultAgentClass: null);
+
+        var run = await RunPickupRebaseConflictAsync(
+            seed,
+            project,
+            new ResolverCredentialProvider(),
+            cursor,
+            []);
+
+        Assert.Equal(WorkItemState.Done, run.Final.State);
+        Assert.DoesNotContain("Authentication required", run.Final.LastError ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(
+            CursorAuthJson,
+            (await ReadBareBranchFileAsync(run.BarePath, run.WorkBranch, "cursor-auth-observed.json")).TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
+    public async Task PickupRebaseResolver_CodexPrimaryClaudeFileFallback_MaterialisesFallbackFileCredential()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var primary = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+        primary.AgenticConflictResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "codex resolver failed before editing",
+            Stdout: null,
+            Stderr: "ordinary resolver failure"));
+        var fallback = new FileCredentialAssertingResolverAgent();
+        var classRouter = BuildResolverClassRouter(primary, fallback);
+        var project = NewResolverProject(seed, AgentKind.Codex);
+
+        var run = await RunPickupRebaseConflictAsync(
+            seed,
+            project,
+            new ResolverCredentialProvider(),
+            primary,
+            [fallback],
+            classRouter);
+
+        Assert.Equal(WorkItemState.Done, run.Final.State);
+        Assert.Single(primary.AgenticConflictInvocations);
+        Assert.Equal(
+            ResolverCredentialProvider.ClaudeCredentialJson,
+            (await ReadBareBranchFileAsync(run.BarePath, run.WorkBranch, "file-credential-observed.json")).TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
+    public async Task PickupRebaseResolver_ClaudePrimaryCodexFileFallback_MaterialisesCodexFallbackFileCredential()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var primary = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Claude };
+        primary.AgenticConflictResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "claude resolver failed before editing",
+            Stdout: null,
+            Stderr: "ordinary resolver failure"));
+        var fallback = new FileCredentialAssertingResolverAgent(
+            AgentKind.Codex,
+            "codex/auth.json",
+            "codex-file-credential-observed.json");
+        var classRouter = BuildResolverClassRouter(primary, fallback);
+        var project = NewResolverProject(seed, AgentKind.Claude);
+
+        var run = await RunPickupRebaseConflictAsync(
+            seed,
+            project,
+            new ResolverCredentialProvider(),
+            primary,
+            [fallback],
+            classRouter);
+
+        Assert.Equal(WorkItemState.Done, run.Final.State);
+        Assert.Single(primary.AgenticConflictInvocations);
+        Assert.Equal(
+            ResolverCredentialProvider.CodexCredentialJson,
+            (await ReadBareBranchFileAsync(run.BarePath, run.WorkBranch, "codex-file-credential-observed.json")).TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
+    public async Task PickupRebaseResolver_CleanRebase_DoesNotExposeCandidateEnvironment()
+    {
+        // Candidate credentials are resolved before sandbox creation to plan
+        // mounts/tmpfs, but env values stay out of the shared sandbox
+        // environment. A clean rebase therefore carries no candidate secret.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var recorder = new RecordingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        var primary = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Claude };
+        var credentials = new ApiKeyOnlyPrimaryCredentialProvider(
+            AgentKind.Claude, ClaudeApiKeyEnvKey, ClaudeApiKeyValue);
+        var project = NewResolverProject(seed, AgentKind.Claude, defaultAgentClass: null);
+
+        var run = await RunPickupRebaseAsync(
+            seed,
+            project,
+            credentials,
+            primary,
+            [],
+            classRouter: null,
+            sandboxProvider: recorder,
+            workPath: "work-only.txt",
+            workContents: "work branch change\n",
+            mainPath: "main-only.txt",
+            mainContents: "main branch change\n");
+
+        Assert.Equal(WorkItemState.Done, run.Final.State);
+        var pickupSpec = Assert.Single(recorder.SpecsForPhase("pickup"));
+        Assert.Equal(ClaudeApiKeyValue, pickupSpec.Environment[ClaudeApiKeyEnvKey]);
+    }
+
+    [Fact]
+    public async Task PickupRebaseResolver_ApiKeyOnlyCandidate_ReceivesSandboxEnvironment()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var primary = new DirectEnvironmentAssertingResolverAgent();
+        var credentials = new ApiKeyOnlyPrimaryCredentialProvider(
+            AgentKind.Codex, CodexApiKeyEnvKey, CodexApiKeyValue);
+        var project = NewResolverProject(seed, AgentKind.Codex, defaultAgentClass: null);
+
+        var run = await RunPickupRebaseConflictAsync(
+            seed,
+            project,
+            credentials,
+            primary,
+            []);
+
+        Assert.Equal(WorkItemState.Done, run.Final.State);
+        Assert.Equal(
+            CodexApiKeyValue,
+            (await ReadBareBranchFileAsync(
+                run.BarePath,
+                run.WorkBranch,
+                "direct-credential-observed.txt")).TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
+    public async Task PickupRebaseResolver_PreResolutionFailure_DoesNotFailCleanRebase()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var primary = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+        var fallback = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Cursor };
+        var credentials = new CursorPreResolutionFailureCredentialProvider();
+        var classRouter = BuildResolverClassRouter(primary, fallback);
+        var project = NewResolverProject(seed, AgentKind.Codex);
+
+        var run = await RunPickupRebaseAsync(
+            seed,
+            project,
+            credentials,
+            primary,
+            [fallback],
+            classRouter,
+            workPath: "work-only.txt",
+            workContents: "work branch change\n",
+            mainPath: "main-only.txt",
+            mainContents: "main branch change\n");
+
+        Assert.Equal(WorkItemState.Done, run.Final.State);
+        Assert.True(credentials.CursorRequests > 0);
+        Assert.Empty(primary.AgenticConflictInvocations);
+        Assert.Empty(fallback.AgenticConflictInvocations);
+        Assert.Equal(
+            "work branch change",
+            (await ReadBareBranchFileAsync(run.BarePath, run.WorkBranch, "work-only.txt")).TrimEnd('\r', '\n'));
+        Assert.Equal(
+            "main branch change",
+            (await ReadBareBranchFileAsync(run.BarePath, run.WorkBranch, "main-only.txt")).TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
+    public async Task PickupRebaseResolver_PreResolutionFailureOnConflict_AbortsWithoutMovingWorkBranch()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var primary = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Codex };
+        var fallback = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Cursor };
+        var credentials = new CursorPreResolutionFailureCredentialProvider();
+        var classRouter = BuildResolverClassRouter(primary, fallback);
+        var project = NewResolverProject(seed, AgentKind.Codex);
+
+        var run = await RunPickupRebaseConflictAsync(
+            seed,
+            project,
+            credentials,
+            primary,
+            [fallback],
+            classRouter);
+
+        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, run.Final.State);
+        Assert.Contains("cursor credential pre-resolution failed", run.Final.LastError, StringComparison.Ordinal);
+        Assert.Empty(primary.AgenticConflictInvocations);
+        Assert.Empty(fallback.AgenticConflictInvocations);
+        Assert.Equal(
+            "work branch change",
+            (await ReadBareBranchFileAsync(run.BarePath, run.WorkBranch, "README.md")).TrimEnd('\r', '\n'));
     }
 
     [Fact]
@@ -190,6 +501,9 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
                 SandboxProfileFlavor.Headless,
                 null,
                 null,
+                null,
+                false,
+                false,
             ]));
 
         Assert.Contains(MarkerHost, spec.Network.AllowedHosts);
@@ -714,7 +1028,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     private static void AssertCredentialAndOpenNetwork(SandboxSpec spec, string phaseName)
     {
         Assert.True(spec.Environment.TryGetValue(MarkerEnvKey, out var marker),
-            $"{phaseName} sandbox was created without baked credential env vars — credential argument was nulled or the credential's env was not propagated");
+            $"{phaseName} sandbox was created without the chosen runner's credential env vars — credential argument was nulled or the credential's env was not propagated");
         Assert.Equal(MarkerEnvValue, marker);
         Assert.Contains(MarkerHost, spec.Network.AllowedHosts);
         // When allowAgentNetwork is false, BuildSandboxSpec sets AllowedHosts
@@ -723,6 +1037,139 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         // AND "credential != null" — those are the two switches the resolver
         // sandbox setup defect (#168 follow-up) flipped to the wrong values.
         Assert.NotEmpty(spec.Network.AllowedHosts);
+    }
+
+    private static void AssertCredentialTmpfsAndOpenNetwork(SandboxSpec spec, string phaseName)
+    {
+        Assert.Contains(
+            spec.Mounts,
+            mount => mount.Tmpfs
+                && string.Equals(mount.SandboxPath, SandboxConventions.CredentialsDir, StringComparison.Ordinal));
+        Assert.Contains(MarkerHost, spec.Network.AllowedHosts);
+        Assert.True(spec.Network.AllowedHosts.Count > 0, $"{phaseName} sandbox was created without agent network hosts");
+    }
+
+    private static Project NewResolverProject(
+        string seed,
+        AgentKind defaultAgent,
+        string? defaultAgentClass = "frontier")
+        => new()
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test Project",
+            RepositoryUrl = seed,
+            DefaultBaseBranch = "main",
+            DefaultAgent = defaultAgent,
+            DefaultAgentClass = defaultAgentClass,
+            Audit = new ProjectAudit { MaxIterations = 1, AuditTypes = [] },
+        };
+
+    private Task<PickupRebaseRunResult> RunPickupRebaseConflictAsync(
+        string seed,
+        Project project,
+        ICredentialProvider credentials,
+        IAgentRunner primaryRunner,
+        IReadOnlyList<IAgentRunner> extraAgentRunners,
+        AgentClassRouter? classRouter = null,
+        ISandboxProvider? sandboxProvider = null,
+        PipelineOptions? pipelineOptions = null)
+        => RunPickupRebaseAsync(
+            seed,
+            project,
+            credentials,
+            primaryRunner,
+            extraAgentRunners,
+            classRouter,
+            sandboxProvider,
+            pipelineOptions,
+            workPath: "README.md",
+            workContents: "work branch change\n",
+            mainPath: "README.md",
+            mainContents: "main branch change\n");
+
+    private async Task<PickupRebaseRunResult> RunPickupRebaseAsync(
+        string seed,
+        Project project,
+        ICredentialProvider credentials,
+        IAgentRunner primaryRunner,
+        IReadOnlyList<IAgentRunner> extraAgentRunners,
+        AgentClassRouter? classRouter = null,
+        ISandboxProvider? sandboxProvider = null,
+        PipelineOptions? pipelineOptions = null,
+        string workPath = "README.md",
+        string workContents = "work branch change\n",
+        string mainPath = "README.md",
+        string mainContents = "main branch change\n")
+    {
+        var agentOverride = primaryRunner as ScriptedAgent;
+        var additionalRunners = extraAgentRunners.ToList();
+        if (agentOverride is null && !additionalRunners.Any(runner => ReferenceEquals(runner, primaryRunner)))
+            additionalRunners.Insert(0, primaryRunner);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            projectRepository: new InMemoryProjectRepository(project),
+            classRouter: classRouter,
+            credentials: credentials,
+            agentOverride: agentOverride,
+            extraAgentRunners: additionalRunners,
+            sandboxProvider: sandboxProvider,
+            pipelineOptions: pipelineOptions ?? new PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                AgentAllowedHosts = [],
+            });
+
+        var itemId = WorkItemId.New();
+        var item = NewItem($"codeybox/{itemId.ToString()[..8]}") with
+        {
+            Id = itemId,
+            Agent = project.DefaultAgent,
+            AgentClassId = project.DefaultAgentClass,
+            State = WorkItemState.WorkComplete,
+        };
+        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed);
+        var barePath = tp.GitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(
+            barePath,
+            item.WorkBranch!,
+            workPath,
+            workContents,
+            "work branch changes");
+        await CommitToSeedAsync(seed, mainPath, mainContents, "main branch changes");
+
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        return new PickupRebaseRunResult(final!, barePath, item.WorkBranch!);
+    }
+
+    private sealed record PickupRebaseRunResult(WorkItem Final, string BarePath, string WorkBranch);
+
+    private static AgentClassRouter BuildResolverClassRouter(params IAgentRunner[] runners)
+    {
+        var agentClass = new AgentClass
+        {
+            Id = "frontier",
+            DisplayName = "Frontier",
+            Members = runners
+                .Select((runner, index) => new AgentMembership
+                {
+                    Agent = runner.Kind,
+                    Billing = AgentBilling.Subscription,
+                    QualityScore = 100 - index,
+                })
+                .ToList(),
+        };
+
+        return new AgentClassRouter(
+            [agentClass],
+            probes: [],
+            new QuotaRouterOptions { MinQuotaPct = 10.0 },
+            NullLogger<AgentClassRouter>.Instance);
     }
 
     private static async Task InstallFakeDotnetAsync(ISandbox sandbox, string fakeBin, CancellationToken ct)
@@ -804,6 +1251,51 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         await TestSupport.RunGit(clone, "push", "origin", $"{branch}:{branch}");
     }
 
+    private async Task CommitToSeedAsync(string repoPath, string path, string content, string message)
+    {
+        await TestSupport.RunGit(repoPath, "config", "user.email", "t@l");
+        await TestSupport.RunGit(repoPath, "config", "user.name", "T");
+        await File.WriteAllTextAsync(Path.Combine(repoPath, path), content);
+        await TestSupport.RunGit(repoPath, "add", path);
+        await TestSupport.RunGit(repoPath, "commit", "-m", message);
+    }
+
+    private static async Task<string> ReadBareBranchFileAsync(string barePath, string branch, string path)
+    {
+        var (_, stdout, _) = await TestSupport.RunGit(barePath, "show", $"{branch}:{path}");
+        return stdout;
+    }
+
+    private async Task<string> InstallFakeCursorAgentAsync(string name)
+    {
+        var dir = Path.Combine(_workspace, "fake-cursor-" + name + "-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, "agent");
+        const string script = """
+            #!/bin/sh
+            set -eu
+            auth="$HOME/.config/cursor/auth.json"
+            if [ ! -s "$auth" ]; then
+              printf '%s\n' 'Authentication required. Please run '"'"'agent login'"'"' first, or set CURSOR_API_KEY' >&2
+              exit 1
+            fi
+            cat "$auth" > cursor-auth-observed.json
+            cat >/dev/null
+            printf '%s\n%s\n' 'main branch change' 'work branch change' > README.md
+            git add -- README.md cursor-auth-observed.json
+            """;
+        await File.WriteAllTextAsync(path, script);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                path,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+                UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+        }
+        return path;
+    }
+
     private static WorkItem NewItem(string workBranch) => new()
     {
         Id = WorkItemId.New(),
@@ -860,9 +1352,10 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     }
 
     /// <summary>
-    /// Returns a credential with a single marker env var so the recorded
-    /// <see cref="SandboxSpec.Environment"/> can tell credential-was-passed
-    /// apart from credential-was-nulled at the call site.
+    /// Returns a credential with a single marker env var. Merge/audit call-site
+    /// tests assert the marker is present when a chosen agent credential is in
+    /// scope; pickup-rebase asserts candidate credentials are pre-resolved
+    /// without being exposed through the shared resolver sandbox environment.
     /// </summary>
     private sealed class MarkerCredentialProvider : ICredentialProvider
     {
@@ -871,6 +1364,296 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
                 agent,
                 EnvironmentVariables: new Dictionary<string, string> { [MarkerEnvKey] = MarkerEnvValue },
                 Files: new Dictionary<string, string>()));
+    }
+
+    private sealed class ResolverCredentialProvider : ICredentialProvider
+    {
+        public const string ClaudeCredentialJson = """{"claudeAiOauth":{"accessToken":"claude-token"}}""";
+        public const string CodexCredentialJson = """{"tokens":{"access_token":"codex-token"}}""";
+
+        public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+        {
+            AgentCredential? credential = agent switch
+            {
+                var kind when kind == AgentKind.Codex => new AgentCredential(
+                    AgentKind.Codex,
+                    EnvironmentVariables: new Dictionary<string, string>
+                    {
+                        [CodexApiKeyEnvKey] = CodexApiKeyValue,
+                    },
+                    Files: new Dictionary<string, string>
+                    {
+                        ["codex/auth.json"] = CodexCredentialJson,
+                    }),
+                var kind when kind == AgentKind.Cursor => new AgentCredential(
+                    AgentKind.Cursor,
+                    EnvironmentVariables: new Dictionary<string, string> { [CursorAuthEnvKey] = CursorAuthJson },
+                    Files: new Dictionary<string, string>()),
+                var kind when kind == AgentKind.Claude => new AgentCredential(
+                    AgentKind.Claude,
+                    EnvironmentVariables: new Dictionary<string, string>(),
+                    Files: new Dictionary<string, string>
+                    {
+                        ["claude/credentials.json"] = ClaudeCredentialJson,
+                    }),
+                _ => null,
+            };
+            return Task.FromResult(credential);
+        }
+    }
+
+    private sealed class CursorPreResolutionFailureCredentialProvider : ICredentialProvider
+    {
+        private readonly ResolverCredentialProvider _inner = new();
+
+        public int CursorRequests { get; private set; }
+
+        public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+        {
+            if (agent == AgentKind.Cursor)
+            {
+                CursorRequests++;
+                throw new InvalidOperationException("cursor credential pre-resolution failed");
+            }
+
+            return _inner.GetAsync(agent, ct);
+        }
+    }
+
+    private sealed class MountedResolverCredentialProvider(string hostPath) : ICredentialProvider
+    {
+        private readonly ResolverCredentialProvider _inner = new();
+
+        public async Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+        {
+            var credential = await _inner.GetAsync(agent, ct);
+            return agent == AgentKind.Codex && credential is not null
+                ? credential with
+                {
+                    Mounts =
+                    [
+                        new SandboxMount
+                        {
+                            SandboxPath = "/opt/codeybox/resolver-adjunct",
+                            HostPath = hostPath,
+                            ReadOnly = true,
+                            SnapshotForIsolation = true,
+                        },
+                    ],
+                }
+                : credential;
+        }
+    }
+
+    /// <summary>
+    /// Returns an env-var-only API-key credential (Files empty) for one agent
+    /// kind and null for all others. This mirrors the ANTHROPIC_API_KEY /
+    /// OPENAI_API_KEY / GEMINI_API_KEY shape a real credential provider yields
+    /// when the operator configured a plain API key rather than a subscription
+    /// auth file.
+    /// </summary>
+    private sealed class ApiKeyOnlyPrimaryCredentialProvider : ICredentialProvider
+    {
+        private readonly AgentKind _target;
+        private readonly string _apiKeyEnvVar;
+        private readonly string _apiKeyValue;
+
+        public ApiKeyOnlyPrimaryCredentialProvider(AgentKind target, string apiKeyEnvVar, string apiKeyValue)
+        {
+            _target = target;
+            _apiKeyEnvVar = apiKeyEnvVar;
+            _apiKeyValue = apiKeyValue;
+        }
+
+        public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+        {
+            if (agent != _target)
+                return Task.FromResult<AgentCredential?>(null);
+            return Task.FromResult<AgentCredential?>(new AgentCredential(
+                agent,
+                EnvironmentVariables: new Dictionary<string, string> { [_apiKeyEnvVar] = _apiKeyValue },
+                Files: new Dictionary<string, string>()));
+        }
+    }
+
+    private sealed class TrackingResolverCredentialProvider : ICredentialProvider
+    {
+        private readonly ResolverCredentialProvider _inner = new();
+        private readonly List<AgentKind> _requestedAgents = new();
+
+        public IReadOnlyList<AgentKind> RequestedAgents
+        {
+            get
+            {
+                lock (_requestedAgents)
+                    return _requestedAgents.ToList();
+            }
+        }
+
+        public async Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+        {
+            lock (_requestedAgents)
+                _requestedAgents.Add(agent);
+
+            if (agent == AgentKind.Opencode)
+            {
+                return new AgentCredential(
+                    AgentKind.Opencode,
+                    EnvironmentVariables: new Dictionary<string, string>
+                    {
+                        [NonCandidateEnvKey] = NonCandidateEnvValue,
+                    },
+                    Files: new Dictionary<string, string>
+                    {
+                        ["opencode/auth.json"] = """{"token":"opencode-non-candidate"}""",
+                    });
+            }
+
+            return await _inner.GetAsync(agent, ct);
+        }
+    }
+
+    private sealed class FileCredentialAssertingResolverAgent : IAgentRunner, IAgentCredentialEnvironmentPolicy
+    {
+        private readonly AgentKind _kind;
+        private readonly string _credentialPath;
+        private readonly string _observationPath;
+
+        public FileCredentialAssertingResolverAgent()
+            : this(AgentKind.Claude, "claude/credentials.json", "file-credential-observed.json")
+        {
+        }
+
+        public FileCredentialAssertingResolverAgent(
+            AgentKind kind,
+            string credentialPath,
+            string observationPath)
+        {
+            _kind = kind;
+            _credentialPath = credentialPath;
+            _observationPath = observationPath;
+        }
+
+        public AgentKind Kind => _kind;
+        public IReadOnlySet<string> DirectCredentialEnvironmentVariables =>
+            _kind == AgentKind.Codex
+                ? new HashSet<string>(StringComparer.Ordinal) { CodexApiKeyEnvKey }
+                : new HashSet<string>(StringComparer.Ordinal);
+        public IReadOnlySet<string> FileBackedCredentialEnvironmentVariables { get; } =
+            new HashSet<string>(StringComparer.Ordinal);
+        public IReadOnlyList<AgentCredentialFileDestination> CredentialFileDestinations => [];
+
+        public async Task<AgentResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            Action<string>? stdoutChunkCallback = null,
+            bool captureStructuredStream = false)
+        {
+            _ = modelId;
+            _ = reasoningMode;
+            _ = stdoutChunkCallback;
+            _ = captureStructuredStream;
+
+            if (!prompt.StartsWith("# Conflict-resolution mode (in-sandbox agentic resolver)", StringComparison.Ordinal))
+                return new AgentResult(false, "unsupported prompt", null, "unsupported prompt");
+
+            var readCredential = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["cat", $"{SandboxConventions.CredentialsDir}/{_credentialPath}"],
+            }, ct);
+            if (!readCredential.Success)
+                return new AgentResult(false, $"missing {_kind.Value} credential file", readCredential.Stdout, readCredential.Stderr);
+
+            if (!prompt.Contains("\"README.md\"", StringComparison.Ordinal))
+                return new AgentResult(false, "resolver prompt did not list README.md", null, null);
+
+            var writeCredentialObservation = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/{_observationPath}"],
+                Stdin = readCredential.Stdout,
+            }, ct);
+            if (!writeCredentialObservation.Success)
+                return new AgentResult(false, "failed to write credential observation", writeCredentialObservation.Stdout, writeCredentialObservation.Stderr);
+
+            var write = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/README.md"],
+                Stdin = "main branch change\nwork branch change\n",
+            }, ct);
+            if (!write.Success)
+                return new AgentResult(false, "failed to write README.md", write.Stdout, write.Stderr);
+
+            var add = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", workingDirectory, "add", "--", "README.md", _observationPath],
+            }, ct);
+            return add.Success
+                ? new AgentResult(true, $"{_kind.Value} resolved", null, null)
+                : new AgentResult(false, "failed to stage README.md", add.Stdout, add.Stderr);
+        }
+    }
+
+    private sealed class DirectEnvironmentAssertingResolverAgent : IAgentRunner, IAgentCredentialEnvironmentPolicy
+    {
+        public AgentKind Kind => AgentKind.Codex;
+        public IReadOnlySet<string> DirectCredentialEnvironmentVariables { get; } =
+            new HashSet<string>(StringComparer.Ordinal) { CodexApiKeyEnvKey };
+        public IReadOnlySet<string> FileBackedCredentialEnvironmentVariables { get; } =
+            new HashSet<string>(StringComparer.Ordinal);
+        public IReadOnlyList<AgentCredentialFileDestination> CredentialFileDestinations => [];
+
+        public async Task<AgentResult> RunAsync(
+            ISandbox sandbox,
+            string workingDirectory,
+            string prompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            Action<string>? stdoutChunkCallback = null,
+            bool captureStructuredStream = false)
+        {
+            var observationPath = $"{workingDirectory}/direct-credential-observed.txt";
+            var directEnvironment = credential?.EnvironmentVariables
+                .Where(pair => DirectCredentialEnvironmentVariables.Contains(pair.Key))
+                .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
+            var observe = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "sh",
+                    "-c",
+                    "test -n \"$OPENAI_API_KEY\" && printf %s \"$OPENAI_API_KEY\" > \"$1\"",
+                    "sh",
+                    observationPath,
+                ],
+                ExtraEnvironment = directEnvironment,
+                EnvironmentContainsSecrets = directEnvironment is { Count: > 0 },
+            }, ct);
+            if (!observe.Success)
+                return new AgentResult(false, "direct credential missing", observe.Stdout, observe.Stderr);
+
+            var write = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/README.md"],
+                Stdin = "main branch change\nwork branch change\n",
+            }, ct);
+            if (!write.Success)
+                return new AgentResult(false, "failed to resolve README", write.Stdout, write.Stderr);
+
+            var add = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", workingDirectory, "add", "--", "README.md", "direct-credential-observed.txt"],
+            }, ct);
+            return add.Success
+                ? new AgentResult(true, "resolved with direct credential", null, null)
+                : new AgentResult(false, "failed to stage direct credential observation", add.Stdout, add.Stderr);
+        }
     }
 
     /// <summary>

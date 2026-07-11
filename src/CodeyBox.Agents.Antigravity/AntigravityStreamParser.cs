@@ -39,6 +39,9 @@ public sealed class AntigravityStreamParser : FlexibleAgentStreamParser
         || string.Equals(sniffed.Value, AgentKind.Claude.Value, StringComparison.OrdinalIgnoreCase)
         || string.Equals(sniffed.Value, AgentKind.Gemini.Value, StringComparison.OrdinalIgnoreCase);
 
+    internal static bool IsStructuredStreamJsonEvent(JsonElement root) =>
+        IsClaudeStreamJsonEvent(root) || IsGeminiPayload(root);
+
     protected override ParsedEvent ParseEvent(JsonElement root)
     {
         var type = FirstString(root, "type", "event", "name") ?? "unknown";
@@ -105,6 +108,17 @@ public sealed class AntigravityStreamParser : FlexibleAgentStreamParser
             OutputTokens = output ?? parsed.OutputTokens,
             CachedInputTokens = cached ?? parsed.CachedInputTokens,
         };
+    }
+
+    private static bool IsClaudeStreamJsonEvent(JsonElement root)
+    {
+        if (root.ValueKind != JsonValueKind.Object) return false;
+        if (!root.TryGetProperty("type", out var typeProp)
+            || typeProp.ValueKind != JsonValueKind.String)
+            return false;
+
+        var type = typeProp.GetString();
+        return type is "assistant" or "user" or "result" or "tool_use" or "tool_result";
     }
 
     private static bool IsGeminiPayload(JsonElement root) =>

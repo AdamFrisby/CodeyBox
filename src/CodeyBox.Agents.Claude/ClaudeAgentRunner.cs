@@ -28,6 +28,10 @@ namespace CodeyBox.Agents.Claude;
 public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, ICliSessionResumableAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner, IPlanArtifactExtractor
 {
     private static readonly HttpClient SharedTextOnlyHttp = new();
+    private static readonly EnvBackedCredentialFile OAuthCredentialFile = new(
+        "CODEYBOX_CLAUDE_OAUTH_JSON",
+        ".claude/.credentials.json",
+        "claude auth");
 
     internal const string MessagesEndpoint = "https://api.anthropic.com/v1/messages";
     // /v1/models endpoint and anthropic-version pin live in ClaudeModelListProbe;
@@ -131,37 +135,22 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".claude/projects", ".claude/todos"];
 
-    protected override IReadOnlyList<string> FileBackedCredentialEnvironmentVariables => ["CODEYBOX_CLAUDE_OAUTH_JSON"];
+    protected override IReadOnlyList<EnvBackedCredentialFile> EnvBackedCredentialFiles => [OAuthCredentialFile];
+
+    protected override IReadOnlyList<string> DirectCredentialEnvironmentVariables =>
+        ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"];
 
     protected override string PreemptProcessPattern => Binary;
 
     /// <summary>
-    /// Materialises the host's <c>~/.claude/.credentials.json</c> inside the
-    /// sandbox if the env-var bundle is present (set by
-    /// <c>ClaudeOAuthFileCredentialProvider</c>). The bundle is sanitised — it
-    /// carries the access_token (plus the expires_at hint when available) but
-    /// <em>omits</em> the refresh_token, so the in-VM <c>claude</c> CLI cannot
-    /// initiate its own refresh. This is deliberate: Anthropic's refresh tokens
-    /// are single-use, and the host CLI is the sole party allowed to refresh
-    /// (see <c>ClaudeOAuthFileCredentialProvider</c>'s class summary for the
-    /// race rationale). An in-VM iteration that outlives the access_token's
-    /// expiry surfaces as a 401, which is treated as transient/auth (not a
-    /// quota event) and audit-logged via
-    /// <c>AuditLog.ClaudeUnauthorizedObserved</c>; the next iteration picks up
-    /// the host's currently-fresh token. The legacy
-    /// <c>CLAUDE_CODE_OAUTH_TOKEN</c> env var remains the primary auth path;
-    /// this hook is purely additive.
-    ///
-    /// <para>
     /// When a <paramref name="resume"/> context is supplied (preempt-recovery
     /// path), this method also sanitises the restored session JSONL transcripts
     /// under <c>~/.claude/projects/**/*.jsonl</c> so a replayed conversation
     /// cannot 400 with "thinking blocks cannot be modified"
     /// (anthropics/claude-code #63335). Gated by
     /// <see cref="ClaudeThinkingBlockSanitizerConfig.Enabled"/>.
-    /// </para>
     /// </summary>
-    protected override async Task<AgentResult?> PrepareSandboxAsync(
+    protected override async Task<AgentResult?> PrepareAgentSandboxAsync(
         ISandbox sandbox,
         string workingDirectory,
         AgentCredential? credential,
@@ -182,36 +171,6 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             }
         }
 
-        // Skip the bash hook entirely when no OAuth bundle is present (e.g.
-        // ANTHROPIC_API_KEY flows); the CLI uses whichever env-var auth path
-        // the credential pipeline plugged in.
-        if (credential is null
-            || !credential.EnvironmentVariables.ContainsKey("CODEYBOX_CLAUDE_OAUTH_JSON"))
-            return null;
-
-        // umask 077 ensures the new file is 0600; the explicit chmod is belt-
-        // and-braces in case the sandbox image overrides umask elsewhere.
-        var script =
-            "set -eu\n" +
-            "umask 077\n" +
-            "mkdir -p \"$HOME/.claude\"\n" +
-            "if [ -n \"${CODEYBOX_CLAUDE_OAUTH_JSON:-}\" ]; then\n" +
-            "  printf '%s' \"$CODEYBOX_CLAUDE_OAUTH_JSON\" > \"$HOME/.claude/.credentials.json\"\n" +
-            "  chmod 600 \"$HOME/.claude/.credentials.json\"\n" +
-            "fi\n";
-        var write = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["bash", "-c", script],
-            ExtraEnvironment = credential.EnvironmentVariables,
-        }, ct).ConfigureAwait(false);
-        if (!write.Success)
-        {
-            return new AgentResult(
-                Success: false,
-                Summary: $"failed to materialise claude auth: exit {write.ExitCode}",
-                Stdout: write.Stdout,
-                Stderr: write.Stderr);
-        }
         return null;
     }
 
@@ -539,19 +498,20 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         var fakeResume = cliResumeSessionId is null
             ? null
             : new AgentResumeContext(CheckpointRef: $"claude-session:{cliResumeSessionId}");
-        var preparation = await PrepareSandboxAsync(sandbox, workingDirectory, credential, fakeResume, ct)
+        var preparation = await PrepareSandboxForRunAsync(
+                sandbox,
+                workingDirectory,
+                credential,
+                fakeResume,
+                ct,
+                preserveExistingCredentialFiles: false)
             .ConfigureAwait(false);
         if (preparation is not null)
             return preparation;
 
         var invocation = BuildClaudeSessionInvocation(
             prompt, modelId, reasoningMode, cliResumeSessionId, captureStructuredStream);
-        invocation = invocation with
-        {
-            ExtraEnvironment = MergeCredentialEnvironment(invocation.ExtraEnvironment, credential),
-        };
-
-        var result = await ExecOnceAsync(sandbox, workingDirectory, invocation, stdoutChunkCallback, ct)
+        var result = await ExecOnceAsync(sandbox, workingDirectory, invocation, credential, stdoutChunkCallback, ct)
             .ConfigureAwait(false);
 
         if (!result.Success
@@ -562,7 +522,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
                 .ConfigureAwait(false);
             if (sanitized is null)
             {
-                result = await ExecOnceAsync(sandbox, workingDirectory, invocation, stdoutChunkCallback, ct)
+                result = await ExecOnceAsync(sandbox, workingDirectory, invocation, credential, stdoutChunkCallback, ct)
                     .ConfigureAwait(false);
             }
             else
@@ -582,6 +542,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         ISandbox sandbox,
         string workingDirectory,
         AgentInvocation invocation,
+        AgentCredential? credential,
         Action<string>? stdoutChunkCallback,
         CancellationToken ct)
     {
@@ -589,7 +550,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         {
             Argv = invocation.Argv,
             WorkingDirectory = workingDirectory,
-            ExtraEnvironment = invocation.ExtraEnvironment,
+            ExtraEnvironment = BuildExecEnvironment(invocation.ExtraEnvironment),
             Stdin = invocation.Stdin,
             StdoutChunkCallback = stdoutChunkCallback,
             AgentOutputTransport = SelectBatchAgentOutputTransport(sandbox),

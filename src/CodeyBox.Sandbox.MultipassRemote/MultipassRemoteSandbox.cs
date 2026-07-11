@@ -105,28 +105,61 @@ internal sealed class MultipassRemoteSandbox :
         var opts = _opts;
         var workdir = exec.WorkingDirectory ?? _spec.WorkingDirectory ?? SandboxConventions.WorkDir;
 
-        // Build the in-VM command: `cd <wd> && <argv...>` so subsequent execs
-        // honour the requested working directory without depending on a
-        // multipass --working-directory flag (versions differ).
-        var quotedArgv = QuoteArgvForShell(exec.Argv);
-        var inVmScript = new StringBuilder();
-        inVmScript.Append("cd ").Append(QuoteShellWord(workdir)).Append(" && ");
-
-        if (exec.ExtraEnvironment is not null && exec.ExtraEnvironment.Count > 0)
+        IReadOnlyList<string> remoteArgv;
+        string? transportStdin;
+        if (exec.EnvironmentContainsSecrets && exec.ExtraEnvironment is { Count: > 0 } secretEnvironment)
         {
-            foreach (var (k, v) in exec.ExtraEnvironment)
-            {
-                ValidateEnvKey(k);
-                inVmScript.Append(k).Append('=').Append(QuoteShellWord(v)).Append(' ');
-            }
+            var environmentFile = SandboxEnvironmentVariablePolicy.BuildShellEnvironmentFileContent(secretEnvironment);
+            var commandStdin = exec.Stdin ?? string.Empty;
+            remoteArgv =
+            [
+                opts.RemoteMultipassPath,
+                "exec",
+                Id,
+                "--",
+                "bash",
+                "-c",
+                SecretEnvironmentBootstrapScript,
+                "codeybox-secret-environment",
+                Encoding.UTF8.GetByteCount(environmentFile).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                Encoding.UTF8.GetByteCount(commandStdin).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                workdir,
+                .. exec.Argv,
+            ];
+            transportStdin = environmentFile + commandStdin;
         }
-        inVmScript.Append(quotedArgv);
-
-        // multipass exec <vm> -- bash -lc 'cd ... && ...'
-        var remoteArgv = new List<string>(8)
+        else
         {
-            opts.RemoteMultipassPath, "exec", Id, "--", "bash", "-lc", inVmScript.ToString(),
-        };
+            // Build the in-VM command: `cd <wd> && <argv...>` so subsequent execs
+            // honour the requested working directory without depending on a
+            // multipass --working-directory flag (versions differ).
+            var quotedArgv = QuoteArgvForShell(exec.Argv);
+            var inVmScript = new StringBuilder();
+            inVmScript.Append("cd ").Append(QuoteShellWord(workdir)).Append(" && ");
+
+            if (exec.ExtraEnvironment is not null && exec.ExtraEnvironment.Count > 0)
+            {
+                foreach (var (k, v) in exec.ExtraEnvironment)
+                {
+                    ValidateEnvKey(k);
+                    inVmScript.Append(k).Append('=').Append(QuoteShellWord(v)).Append(' ');
+                }
+            }
+            inVmScript.Append(quotedArgv);
+
+            // multipass exec <vm> -- bash -lc 'cd ... && ...'
+            remoteArgv =
+            [
+                opts.RemoteMultipassPath,
+                "exec",
+                Id,
+                "--",
+                "bash",
+                "-lc",
+                inVmScript.ToString(),
+            ];
+            transportStdin = exec.Stdin;
+        }
 
         // Chunk callbacks are pure live-update side channels; the transport's
         // ProcessRunResult.Stdout / Stderr remain authoritative for the final
@@ -177,7 +210,7 @@ internal sealed class MultipassRemoteSandbox :
             {
                 var run = await _transport.RunAsync(
                     remoteArgv,
-                    stdin: exec.Stdin,
+                    stdin: transportStdin,
                     linkedCts.Token,
                     stdoutChunkCallback: OnStdout,
                     stderrChunkCallback: OnStderr,
@@ -228,18 +261,76 @@ internal sealed class MultipassRemoteSandbox :
         }
     }
 
+    private const string SecretEnvironmentBootstrapScript =
+        """
+        set -eu
+        umask 077
+        codeybox_env_file=$(mktemp)
+        codeybox_stdin_file=$(mktemp)
+        trap 'rm -f "$codeybox_env_file" "$codeybox_stdin_file"' EXIT
+        dd if=/dev/stdin of="$codeybox_env_file" bs=1 count="$1" status=none
+        dd if=/dev/stdin of="$codeybox_stdin_file" bs=1 count="$2" status=none
+        codeybox_workdir=$3
+        shift 3
+        set -a
+        . "$codeybox_env_file"
+        set +a
+        cd "$codeybox_workdir"
+        "$@" < "$codeybox_stdin_file"
+        """;
+
     public async Task KillActiveExecsAsync(CancellationToken ct = default)
     {
-        // Best-effort: cancel every in-flight exec's linked token. The
-        // OpenSSH child observing cancellation will tear down the SSH
-        // session, which kills the remote command.
+        // Best-effort: cancel every in-flight exec's linked token. The SSH
+        // child observing cancellation tears down the current remote command.
         foreach (var (cts, _) in _activeExecCts)
         {
             try { cts.Cancel(); } catch { }
         }
-        _ = ct;
-        await Task.CompletedTask.ConfigureAwait(false);
+
+        var opts = _opts;
+        var kill = await _runRemoteMaybeGated(
+            [
+                opts.RemoteMultipassPath,
+                "exec",
+                Id,
+                "--",
+                "bash",
+                "-lc",
+                KillSameUserProcessesScript,
+            ],
+            ct).ConfigureAwait(false);
+        if (kill.ExitCode != 0)
+        {
+            _log.LogWarning(
+                "Best-effort process cleanup for remote multipass sandbox {Name} returned exit {ExitCode}: {Stderr}",
+                Id,
+                kill.ExitCode,
+                kill.Stderr);
+        }
     }
+
+    private const string KillSameUserProcessesScript =
+        """
+        set -eu
+        self=$$
+        parent=$PPID
+        uid=$(id -u)
+        list_pids() {
+          ps -eo pid=,ppid=,uid= |
+            awk -v uid="$uid" -v self="$self" -v parent="$parent" \
+              '$3 == uid && $1 != self && $1 != parent { print $1 }'
+        }
+        pids=$(list_pids || true)
+        if [ -n "$pids" ]; then
+          kill -TERM $pids 2>/dev/null || true
+          sleep 1
+          pids=$(list_pids || true)
+          if [ -n "$pids" ]; then
+            kill -KILL $pids 2>/dev/null || true
+          fi
+        fi
+        """;
 
     public bool IsOwnedByShutdownHandler { get; private set; }
     public void MarkOwnedByShutdownHandler() => IsOwnedByShutdownHandler = true;

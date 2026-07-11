@@ -17,6 +17,8 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase
 
     public string Binary { get; init; } = DefaultBinary;
 
+    protected override IReadOnlyList<string> DirectCredentialEnvironmentVariables => ["GH_TOKEN", "GITHUB_TOKEN"];
+
     protected override AgentInvocation BuildInvocation(
         string prompt,
         AgentCredential? credential,

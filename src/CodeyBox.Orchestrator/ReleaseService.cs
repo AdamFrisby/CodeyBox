@@ -575,10 +575,26 @@ public sealed class ReleaseService
             var sandboxTarget = SandboxTargetResolver.ResolveAudit(
                 needsCreds ? project.NetworkProfiles.AuditAgent : project.NetworkProfiles.AuditTool,
                 group.Key);
+            var mounts = new List<SandboxMount>(access.Mounts)
+            {
+                new() { SandboxPath = SandboxConventions.WorkDir, Tmpfs = true },
+            };
+            if (credential is not null)
+            {
+                if (credential.Files.Count > 0)
+                {
+                    mounts.Add(new SandboxMount
+                    {
+                        SandboxPath = SandboxConventions.CredentialsDir,
+                        Tmpfs = true,
+                        SizeBytes = SandboxConventions.CredentialsTmpfsBytes,
+                    });
+                }
+            }
             var spec = new SandboxSpec
             {
                 ImageReference = _pipelineOpts.SandboxImageReference,
-                Mounts = [.. access.Mounts, new SandboxMount { SandboxPath = "/work", Tmpfs = true }],
+                Mounts = mounts,
                 Environment = env,
                 Network = new SandboxNetworkPolicy
                 {
@@ -1066,24 +1082,15 @@ public sealed class ReleaseService
 
     private static async Task MaterialiseCredentialFilesAsync(ISandbox sandbox, AgentCredential credential, CancellationToken ct)
     {
-        await sandbox.ExecAsync(new SandboxExec { Argv = ["mkdir", "-p", SandboxConventions.CredentialsDir] }, ct);
         foreach (var (relativePath, contents) in credential.Files)
         {
             var safePath = relativePath.Replace('\\', '/').TrimStart('/');
-            if (safePath.Contains("..", StringComparison.Ordinal))
-                throw new ArgumentException($"Credential file path must not contain '..': {relativePath}");
-            if (safePath.Length == 0)
-                throw new ArgumentException($"Credential file name resolves empty: {relativePath}");
-            var fullPath = $"{SandboxConventions.CredentialsDir}/{safePath}";
-            var dir = fullPath[..fullPath.LastIndexOf('/')];
-            await sandbox.ExecAsync(new SandboxExec { Argv = ["mkdir", "-p", dir] }, ct);
-            var write = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["sh", "-c", "umask 077 && cat > \"$0\"", fullPath],
-                Stdin = contents,
-            }, ct);
-            if (!write.Success)
-                throw new InvalidOperationException($"Failed to write credential file {safePath}: {write.Stderr}");
+            await SandboxCredentialFileWriter.WriteAsync(
+                sandbox,
+                new SandboxCredentialFileTarget(SandboxCredentialFileRoot.CredentialsDirectory, safePath),
+                contents,
+                SandboxCredentialOverwritePolicy.Overwrite,
+                ct).ConfigureAwait(false);
         }
     }
 }

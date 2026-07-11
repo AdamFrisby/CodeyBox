@@ -6,7 +6,7 @@ namespace CodeyBox.Orchestrator;
 /// <summary>
 /// Reads the Gemini CLI's OAuth credentials and settings from the host
 /// (default <c>~/.gemini/</c>) and surfaces them as environment variables that
-/// <see cref="CodeyBox.Agents.Gemini.GeminiAgentRunner.PrepareSandboxAsync"/>
+/// the Gemini runner's shared credential-preparation lifecycle
 /// materialises into <c>~/.gemini/</c> inside the sandbox. Backed by shared
 /// <see cref="CredentialFileSource"/> instances so the host's file-watcher
 /// picks up out-of-band token rotations (operator running <c>gemini</c> on

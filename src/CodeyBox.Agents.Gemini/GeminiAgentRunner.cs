@@ -16,6 +16,14 @@ namespace CodeyBox.Agents.Gemini;
 public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, ITextOnlyAgentRunner
 {
     private static readonly HttpClient SharedTextOnlyHttp = new();
+    private static readonly EnvBackedCredentialFile OAuthCredentialFile = new(
+        CodeyBox.Core.GeminiConstants.OAuthCredsEnvVar,
+        ".gemini/oauth_creds.json",
+        "gemini auth");
+    private static readonly EnvBackedCredentialFile SettingsCredentialFile = new(
+        CodeyBox.Core.GeminiConstants.SettingsEnvVar,
+        ".gemini/settings.json",
+        "gemini settings");
     private const string DefaultTextOnlyModel = "gemini-2.5-pro";
     private const int TextOnlyMaxOutputTokens = 8192;
 
@@ -64,56 +72,12 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".gemini/tmp", ".gemini/history"];
 
-    protected override IReadOnlyList<string> FileBackedCredentialEnvironmentVariables =>
-        [CodeyBox.Core.GeminiConstants.OAuthCredsEnvVar, "CODEYBOX_GEMINI_SETTINGS_JSON"];
+    protected override IReadOnlyList<EnvBackedCredentialFile> EnvBackedCredentialFiles =>
+        [OAuthCredentialFile, SettingsCredentialFile];
+
+    protected override IReadOnlyList<string> DirectCredentialEnvironmentVariables => ["GEMINI_API_KEY"];
 
     protected override string PreemptProcessPattern => Binary;
-
-    /// <summary>
-    /// Materialises the Gemini OAuth credentials and settings file into
-    /// <c>~/.gemini/</c> inside the sandbox if the env-var bundle is present
-    /// (set by <c>GeminiOAuthFileCredentialProvider</c>). The Gemini CLI
-    /// hard-reads these paths and offers no env-var alternative for OAuth, so
-    /// we shuttle them in via env vars and write them at sandbox-prepare time.
-    /// </summary>
-    protected override async Task<AgentResult?> PrepareSandboxAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        AgentCredential? credential,
-        AgentResumeContext? resume,
-        CancellationToken ct = default)
-    {
-        // Skip the bash hook entirely when no OAuth bundle is present (e.g.
-        // operators using GEMINI_API_KEY); the CLI will fall back to whichever
-        // env-var auth path the credential pipeline plugged in.
-        if (credential is null
-            || !credential.EnvironmentVariables.ContainsKey(CodeyBox.Core.GeminiConstants.OAuthCredsEnvVar))
-            return null;
-
-        var script =
-            "set -eu\n" +
-            "mkdir -p \"$HOME/.gemini\"\n" +
-            "umask 077\n" +
-            "if [ -n \"${CODEYBOX_GEMINI_OAUTH_CREDS_JSON:-}\" ]; then\n" +
-            "  printf '%s' \"$CODEYBOX_GEMINI_OAUTH_CREDS_JSON\" > \"$HOME/.gemini/oauth_creds.json\"\n" +
-            "fi\n" +
-            "if [ -n \"${CODEYBOX_GEMINI_SETTINGS_JSON:-}\" ]; then\n" +
-            "  printf '%s' \"$CODEYBOX_GEMINI_SETTINGS_JSON\" > \"$HOME/.gemini/settings.json\"\n" +
-            "fi\n";
-        var write = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["bash", "-c", script],
-        }, ct);
-        if (!write.Success)
-        {
-            return new AgentResult(
-                Success: false,
-                Summary: $"failed to materialise gemini auth: exit {write.ExitCode}",
-                Stdout: write.Stdout,
-                Stderr: write.Stderr);
-        }
-        return null;
-    }
 
     public async Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default)
     {

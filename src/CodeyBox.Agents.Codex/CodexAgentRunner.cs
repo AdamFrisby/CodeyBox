@@ -20,6 +20,11 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
 {
     private static readonly AsyncLocal<string?> CurrentStructuredStreamFlag = new();
     private static readonly HttpClient SharedTextOnlyHttp = new();
+    private static readonly EnvBackedCredentialFile AuthCredentialFile = new(
+        "CODEX_AUTH_JSON",
+        ".codex/auth.json",
+        "codex auth",
+        MaterialiseFromSandboxEnvironmentWhenCredentialMissing: true);
 
     private readonly AgentDefaultsSnapshot? _defaults;
     private readonly AgentNetworkToleranceSnapshot? _networkTolerance;
@@ -75,7 +80,9 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".codex/sessions", ".codex/history.jsonl"];
 
-    protected override IReadOnlyList<string> FileBackedCredentialEnvironmentVariables => ["CODEX_AUTH_JSON"];
+    protected override IReadOnlyList<EnvBackedCredentialFile> EnvBackedCredentialFiles => [AuthCredentialFile];
+
+    protected override IReadOnlyList<string> DirectCredentialEnvironmentVariables => ["OPENAI_API_KEY"];
 
     protected override string PreemptProcessPattern => Binary;
 
@@ -87,48 +94,6 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
 
     public async Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default) =>
         await DetectStructuredStreamFlagAsync(sandbox, ct).ConfigureAwait(false) is not null;
-
-    /// <summary>
-    /// ChatGPT-subscription auth: ensure <c>~/.codex/auth.json</c> is present
-    /// inside the sandbox. The codex CLI reads ONLY that file path; there's no
-    /// env-var equivalent.
-    ///
-    /// The runner preserves any non-empty auth file already present in the
-    /// sandbox, then falls back to writing a private snapshot from
-    /// <c>CODEX_AUTH_JSON</c>. Credential providers intentionally do not
-    /// bind-mount the host <c>~/.codex</c> directory into untrusted agent
-    /// sandboxes.
-    ///
-    /// We always read from the in-sandbox env var (rather than the credential
-    /// parameter) because LlmReviewAuditor and similar call-sites pass
-    /// credential=null on the assumption that env-var auth is sufficient —
-    /// true for Claude (env-var-based), false for Codex (file-based). If the
-    /// env var is absent and no file is present, this is a no-op and codex
-    /// falls back to OPENAI_API_KEY (api-key mode).
-    /// </summary>
-    protected override async Task<AgentResult?> PrepareSandboxAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        AgentCredential? credential,
-        AgentResumeContext? resume,
-        CancellationToken ct = default)
-    {
-        // If sandbox setup or restored home state already supplied auth.json,
-        // leave it alone; otherwise materialise the private snapshot.
-        var write = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["bash", "-c", "set -eu; if [ -s \"$HOME/.codex/auth.json\" ]; then exit 0; fi; if [ -n \"${CODEX_AUTH_JSON:-}\" ]; then mkdir -p \"$HOME/.codex\"; umask 077; printf '%s' \"$CODEX_AUTH_JSON\" > \"$HOME/.codex/auth.json\"; fi"],
-        }, ct);
-        if (!write.Success)
-        {
-            return new AgentResult(
-                Success: false,
-                Summary: $"failed to materialise codex auth: exit {write.ExitCode}",
-                Stdout: write.Stdout,
-                Stderr: write.Stderr);
-        }
-        return null;
-    }
 
     public override async Task<AgentResult> RunAsync(
         ISandbox sandbox,

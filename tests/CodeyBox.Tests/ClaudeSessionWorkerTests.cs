@@ -288,8 +288,12 @@ public sealed class ClaudeSessionWorkerTests
         await worker.RefreshSessionCredentialAsync(handle, refreshed);
         await worker.SendTurnAsync(handle, "second");
 
-        Assert.Equal("old-token", sandbox.AllAgentExecs[0].ExtraEnvironment!["ANTHROPIC_API_KEY"]);
-        Assert.Equal("new-token", sandbox.AllAgentExecs[1].ExtraEnvironment!["ANTHROPIC_API_KEY"]);
+        var materialisedCredentials = sandbox.AllExecs
+            .Where(exec => string.Equals(exec.Stdin, "old-token", StringComparison.Ordinal)
+                || string.Equals(exec.Stdin, "new-token", StringComparison.Ordinal))
+            .Select(exec => exec.Stdin!)
+            .ToArray();
+        Assert.Equal(["old-token", "new-token"], materialisedCredentials);
     }
 
     // ── Sanitiser & 400 thinking-block recovery ───────────────────────────────
@@ -597,7 +601,7 @@ public sealed class ClaudeSessionWorkerTests
             AgentKind.Claude,
             new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["ANTHROPIC_API_KEY"] = token,
+                ["CODEYBOX_CLAUDE_OAUTH_JSON"] = token,
             },
             new Dictionary<string, string>(StringComparer.Ordinal));
 

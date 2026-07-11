@@ -156,6 +156,27 @@ public sealed class ProcessSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task ExecAsync_StdinBrokenPipe_ReturnsProcessExitResult()
+    {
+        const int stdinBytes = 1024 * 1024;
+        var provider = new ProcessSandboxProvider(new RecordingLogger<ProcessSandboxProvider>());
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            WorkingDirectory = "/work",
+        });
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "printf immediate-failure >&2; exit 23"],
+            Stdin = new string('x', stdinBytes),
+        });
+
+        Assert.Equal(23, result.ExitCode);
+        Assert.Equal("immediate-failure", result.Stderr.TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
     public async Task ExecAsync_MaxStdoutBytes_KillsProcessAndFlagsTruncation()
     {
         var provider = new ProcessSandboxProvider(new RecordingLogger<ProcessSandboxProvider>());

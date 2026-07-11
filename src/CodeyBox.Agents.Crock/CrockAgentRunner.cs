@@ -41,7 +41,7 @@ namespace CodeyBox.Agents.Crock;
 ///     ephemeral tunnel — and authorising the callback path without
 ///     widening the sandbox's network policy beyond what its
 ///     internet-only profile already allows — is the harder half of the
-///     follow-up. <see cref="PrepareSandboxAsync"/> here only materialises
+///     follow-up. The shared preparation lifecycle here only materialises
 ///     the credential file; the tunnel side is intentionally NOT wired.
 ///   </item>
 ///   <item>
@@ -57,6 +57,11 @@ namespace CodeyBox.Agents.Crock;
 /// </summary>
 public sealed class CrockAgentRunner : CliAgentRunnerBase
 {
+    private static readonly EnvBackedCredentialFile ConfigCredentialFile = new(
+        ConfigEnvVar,
+        ".crockcode/config.json",
+        "crock config");
+
     /// <summary>Default crock CLI binary name inside the sandbox.</summary>
     public const string DefaultBinary = "crock";
 
@@ -81,29 +86,18 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
         "crock: credentials are invalid (CROCK_CONFIG_JSON not set)";
 
     /// <summary>
-    /// Bash that materialises crock's <c>~/.crockcode/config.json</c> from
-    /// <see cref="ConfigEnvVar"/>. Mirrors the umask-077 / chmod-600 pattern
-    /// used by <see cref="OpencodeAgentRunner"/> and the Codex runner so the
-    /// credential never sits at world-readable modes inside the VM. Exposed
-    /// as a constant so an in-VM smoke probe can run it verbatim and stay in
-    /// lock-step with the runner. The bash literal references the env-var
-    /// name via the interpolation site below; a rename of
-    /// <see cref="ConfigEnvVar"/> updates both at once.
+    /// Bash/Python 3 materialiser for crock's <c>~/.crockcode/config.json</c> from
+    /// <see cref="ConfigEnvVar"/> using the shared env-backed credential-file
+    /// writer. Exposed so an in-VM smoke probe can run the env-reading
+    /// smoke/create-time path against the same destination the runner uses
+    /// when it materialises the credential bundle via stdin before dispatch.
     /// </summary>
-    public static readonly string ConfigMaterialiseScript =
-        "set -eu\n" +
-        "dest=\"$HOME/.crockcode/config.json\"\n" +
-        "umask 077\n" +
-        "mkdir -p \"$(dirname \"$dest\")\"\n" +
-        $"if [ -n \"${{{ConfigEnvVar}:-}}\" ]; then\n" +
-        $"  printf '%s' \"${ConfigEnvVar}\" > \"$dest\"\n" +
-        "  chmod 600 \"$dest\"\n" +
-        "fi\n";
+    public static readonly string ConfigMaterialiseScript = BuildEnvBackedCredentialScript(ConfigCredentialFile);
 
     /// <summary>Path to the crock binary inside the sandbox.</summary>
     public string Binary { get; init; } = DefaultBinary;
 
-    protected override IReadOnlyList<string> FileBackedCredentialEnvironmentVariables => [ConfigEnvVar];
+    protected override IReadOnlyList<EnvBackedCredentialFile> EnvBackedCredentialFiles => [ConfigCredentialFile];
 
     /// <summary>
     /// Initial delay before the first <c>crock status</c> poll, and the floor
@@ -157,7 +151,7 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
     /// than letting the CLI crash on its own missing-config error — keeps the
     /// failure shape consistent with the other subscription runners.
     /// </summary>
-    protected override async Task<AgentResult?> PrepareSandboxAsync(
+    protected override Task<AgentResult?> PrepareAgentSandboxAsync(
         ISandbox sandbox,
         string workingDirectory,
         AgentCredential? credential,
@@ -168,26 +162,14 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
             || !credential.EnvironmentVariables.TryGetValue(ConfigEnvVar, out var json)
             || string.IsNullOrWhiteSpace(json))
         {
-            return new AgentResult(
+            return Task.FromResult<AgentResult?>(new AgentResult(
                 Success: false,
                 Summary: MissingCredentialMarker,
                 Stdout: null,
-                Stderr: MissingCredentialMarker);
+                Stderr: MissingCredentialMarker));
         }
 
-        var write = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["bash", "-c", ConfigMaterialiseScript],
-        }, ct);
-        if (!write.Success)
-        {
-            return new AgentResult(
-                Success: false,
-                Summary: $"failed to materialise crock config: exit {write.ExitCode}",
-                Stdout: write.Stdout,
-                Stderr: write.Stderr);
-        }
-        return null;
+        return Task.FromResult<AgentResult?>(null);
     }
 
     /// <summary>
@@ -274,7 +256,7 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
         Action<string>? stdoutChunkCallback = null,
         bool captureStructuredStream = false)
     {
-        var preparation = await PrepareSandboxAsync(sandbox, workingDirectory, credential, resume: null, ct);
+        var preparation = await PrepareSandboxForRunAsync(sandbox, workingDirectory, credential, resume: null, ct);
         if (preparation is not null)
             return preparation;
 

@@ -8,9 +8,11 @@ namespace CodeyBox.Agents;
 /// <summary>
 /// Shared scaffolding for agent runners that drive a one-shot CLI binary
 /// inside the sandbox. Subclasses describe how to invoke their CLI; this base
-/// handles credential staging and result wrapping uniformly.
+/// handles credential staging and result wrapping uniformly. Subclasses that
+/// override <see cref="RunAsync"/> or <see cref="RunResumedAsync"/> must call
+/// <see cref="PrepareSandboxForRunAsync"/> before invoking their CLI.
 /// </summary>
-public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAgentRunner
+public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAgentRunner, IAgentCredentialEnvironmentPolicy
 {
     private const string AgentRunIdEnvironmentVariable = "CODEYBOX_AGENT_RUN_ID";
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> ActiveAgentRunIds = new();
@@ -69,12 +71,57 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     protected virtual IReadOnlyList<string> ScratchpadHomeDirectories => [];
 
     /// <summary>
-    /// Credential environment variables that this runner materialises as files
-    /// inside the sandbox before invoking the CLI. Sandboxes that reject
-    /// file-backed credentials use this list to fail before secrets are written
-    /// to persistent storage.
+    /// A credential payload carried in <see cref="AgentCredential.EnvironmentVariables"/>
+    /// that must be materialised to a regular file under <c>$HOME</c> before
+    /// invoking the CLI.
     /// </summary>
-    protected virtual IReadOnlyList<string> FileBackedCredentialEnvironmentVariables => [];
+    protected sealed record EnvBackedCredentialFile(
+        string EnvironmentVariable,
+        string HomeRelativePath,
+        string FailureDescription,
+        string? DestinationEnvironmentVariable = null,
+        bool MaterialiseFromSandboxEnvironmentWhenCredentialMissing = false);
+
+    /// <summary>
+    /// Env-var-backed credential files this runner writes before executing the
+    /// agent CLI. The shared writer requires Python 3 in the sandbox image.
+    /// Values supplied by a concrete <see cref="AgentCredential"/> are passed
+    /// via stdin, not per-exec environment, so fallback candidates can
+    /// authenticate without exposing file payloads to argv or the CLI process.
+    /// </summary>
+    protected virtual IReadOnlyList<EnvBackedCredentialFile> EnvBackedCredentialFiles => [];
+
+    /// <summary>
+    /// Credential environment variables the CLI reads directly from its
+    /// sandbox environment. The shared exec path deliberately does not copy
+    /// these values into per-exec environment.
+    /// </summary>
+    protected virtual IReadOnlyList<string> DirectCredentialEnvironmentVariables => [];
+
+    /// <summary>
+    /// Credential payload and destination-metadata variables consumed by the
+    /// staging lifecycle rather than exposed to the agent CLI process.
+    /// </summary>
+    protected virtual IReadOnlyList<string> FileBackedCredentialEnvironmentVariables =>
+        EnvBackedCredentialFiles
+            .SelectMany(static file => file.DestinationEnvironmentVariable is null
+                ? [file.EnvironmentVariable]
+                : new[] { file.EnvironmentVariable, file.DestinationEnvironmentVariable })
+            .ToArray();
+
+    IReadOnlySet<string> IAgentCredentialEnvironmentPolicy.DirectCredentialEnvironmentVariables =>
+        DirectCredentialEnvironmentVariables.ToHashSet(StringComparer.Ordinal);
+
+    IReadOnlySet<string> IAgentCredentialEnvironmentPolicy.FileBackedCredentialEnvironmentVariables =>
+        FileBackedCredentialEnvironmentVariables.ToHashSet(StringComparer.Ordinal);
+
+    IReadOnlyList<AgentCredentialFileDestination> IAgentCredentialEnvironmentPolicy.CredentialFileDestinations =>
+        EnvBackedCredentialFiles
+            .Select(static file => new AgentCredentialFileDestination(
+                file.EnvironmentVariable,
+                file.HomeRelativePath,
+                file.DestinationEnvironmentVariable))
+            .ToArray();
 
     /// <summary>
     /// Pattern used to ask the running CLI to stop before scratchpad capture.
@@ -111,17 +158,135 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             $"{Kind} declares CLI session resume but does not implement {nameof(BuildSessionResumeInvocation)}.");
 
     /// <summary>
-    /// Gives subclasses a chance to materialise non-argv CLI prerequisites
-    /// immediately before invoking the binary. Returning a result short-circuits
-    /// the run with that failure.
+    /// Gives subclasses a chance to prepare agent-specific, non-credential
+    /// prerequisites immediately before credential staging and CLI invocation.
+    /// Returning a result short-circuits the run with that failure. Overrides
+    /// of the public run methods must still call <see cref="PrepareSandboxForRunAsync"/>
+    /// so credential staging and resume preservation semantics remain intact.
     /// </summary>
-    protected virtual Task<AgentResult?> PrepareSandboxAsync(
+    protected virtual Task<AgentResult?> PrepareAgentSandboxAsync(
         ISandbox sandbox,
         string workingDirectory,
         AgentCredential? credential,
         AgentResumeContext? resume,
         CancellationToken ct)
         => Task.FromResult<AgentResult?>(null);
+
+    protected async Task<AgentResult?> PrepareSandboxForRunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AgentCredential? credential,
+        AgentResumeContext? resume,
+        CancellationToken ct,
+        bool preserveExistingCredentialFiles = true)
+    {
+        var agentPreparation = await PrepareAgentSandboxAsync(
+            sandbox, workingDirectory, credential, resume, ct).ConfigureAwait(false);
+        if (agentPreparation is not null)
+            return agentPreparation;
+
+        return await MaterialiseEnvBackedCredentialFilesAsync(
+            sandbox,
+            credential,
+            preserveExistingCredentialFile: preserveExistingCredentialFiles && resume is not null,
+            ct).ConfigureAwait(false);
+    }
+
+    private async Task<AgentResult?> MaterialiseEnvBackedCredentialFilesAsync(
+        ISandbox sandbox,
+        AgentCredential? credential,
+        bool preserveExistingCredentialFile,
+        CancellationToken ct)
+    {
+        if (EnvBackedCredentialFiles.Count == 0)
+            return null;
+
+        var overwritePolicy = preserveExistingCredentialFile
+            ? SandboxCredentialOverwritePolicy.PreserveNonEmpty
+            : SandboxCredentialOverwritePolicy.Overwrite;
+
+        foreach (var file in EnvBackedCredentialFiles)
+        {
+            ValidateEnvBackedCredentialFile(file);
+
+            if (credential?.EnvironmentVariables.TryGetValue(file.EnvironmentVariable, out var contents) == true
+                && !string.IsNullOrEmpty(contents))
+            {
+                try
+                {
+                    await SandboxCredentialFileWriter.WriteAsync(
+                        sandbox,
+                        new SandboxCredentialFileTarget(
+                            SandboxCredentialFileRoot.Home,
+                            file.HomeRelativePath,
+                            ResolveCredentialDestinationOverride(file, credential.EnvironmentVariables)),
+                        contents,
+                        overwritePolicy,
+                        ct).ConfigureAwait(false);
+                }
+                catch (SandboxCredentialFileWriteException ex)
+                {
+                    return new AgentResult(
+                        Success: false,
+                        Summary: $"failed to materialise {file.FailureDescription}: exit {ex.ExitCode}",
+                        Stdout: ex.Stdout,
+                        Stderr: ex.Stderr);
+                }
+            }
+            else if (credential is null && file.MaterialiseFromSandboxEnvironmentWhenCredentialMissing)
+            {
+                var write = await sandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["bash", "-c", BuildEnvBackedCredentialScript(file)],
+                }, ct).ConfigureAwait(false);
+                if (!write.Success)
+                {
+                    return new AgentResult(
+                        Success: false,
+                        Summary: $"failed to materialise {file.FailureDescription}: exit {write.ExitCode}",
+                        Stdout: write.Stdout,
+                        Stderr: write.Stderr);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    protected static string BuildEnvBackedCredentialScript(EnvBackedCredentialFile file)
+    {
+        ValidateEnvBackedCredentialFile(file);
+        return SandboxCredentialFileWriter.BuildEnvironmentMaterialisationScript(
+            file.EnvironmentVariable,
+            file.HomeRelativePath,
+            file.DestinationEnvironmentVariable,
+            SandboxCredentialOverwritePolicy.PreserveNonEmpty);
+    }
+
+    private static string ResolveCredentialDestinationOverride(
+        EnvBackedCredentialFile file,
+        IReadOnlyDictionary<string, string> environment)
+    {
+        if (file.DestinationEnvironmentVariable is null)
+            return string.Empty;
+
+        return environment.TryGetValue(file.DestinationEnvironmentVariable, out var destination)
+            ? destination
+            : string.Empty;
+    }
+
+    private static void ValidateEnvBackedCredentialFile(EnvBackedCredentialFile file)
+    {
+        ValidateEnvironmentVariableName(file.EnvironmentVariable, nameof(file.EnvironmentVariable));
+        if (file.DestinationEnvironmentVariable is not null)
+            ValidateEnvironmentVariableName(file.DestinationEnvironmentVariable, nameof(file.DestinationEnvironmentVariable));
+        SandboxCredentialFileWriter.ValidateRelativePath(file.HomeRelativePath, nameof(file.HomeRelativePath));
+        if (string.IsNullOrWhiteSpace(file.FailureDescription))
+            throw new ArgumentException("Credential file failure description must be non-empty.", nameof(file));
+    }
+
+    private static void ValidateEnvironmentVariableName(string value, string fieldName)
+        => SandboxCredentialFileWriter.ValidateEnvironmentVariableName(value, fieldName);
 
     public virtual async Task<AgentResult> RunAsync(
         ISandbox sandbox,
@@ -134,13 +299,13 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         Action<string>? stdoutChunkCallback = null,
         bool captureStructuredStream = false)
     {
-        // The credential env is set on the container at boot via SandboxSpec.Environment
-        // so secrets don't land on per-exec argv. We deliberately do NOT merge
-        // credential.EnvironmentVariables into the per-exec ExtraEnvironment.
+        // File-backed credential payloads are materialised below via stdin.
+        // Direct CLI env credentials are provisioned with the sandbox, not
+        // copied into per-exec environment.
         if (RejectUnsupportedFileBackedCredentials(sandbox, credential) is { } unsupported)
             return unsupported;
 
-        var preparation = await PrepareSandboxAsync(sandbox, workingDirectory, credential, resume: null, ct);
+        var preparation = await PrepareSandboxForRunAsync(sandbox, workingDirectory, credential, resume: null, ct);
         if (preparation is not null)
             return preparation;
 
@@ -149,6 +314,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             sandbox,
             workingDirectory,
             invocation,
+            credential,
             stdoutChunkCallback,
             captureStructuredStream,
             ct,
@@ -202,7 +368,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 
         await RestoreScratchpadAsync(sandbox, workingDirectory, resume, ct);
 
-        var preparation = await PrepareSandboxAsync(sandbox, workingDirectory, credential, resume, ct);
+        var preparation = await PrepareSandboxForRunAsync(sandbox, workingDirectory, credential, resume, ct);
         if (preparation is not null)
             return preparation;
 
@@ -217,6 +383,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             sandbox,
             workingDirectory,
             invocation,
+            credential,
             stdoutChunkCallback,
             captureStructuredStream,
             ct,
@@ -232,6 +399,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         ISandbox sandbox,
         string workingDirectory,
         AgentInvocation invocation,
+        AgentCredential? credential,
         Action<string>? stdoutChunkCallback,
         bool captureStructuredStream,
         CancellationToken ct,
@@ -251,6 +419,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 sandbox,
                 workingDirectory,
                 current,
+                sessionResumeContext?.Credential ?? credential,
                 stdoutChunkCallback,
                 captureStructuredStream,
                 ct);
@@ -504,6 +673,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         ISandbox sandbox,
         string workingDirectory,
         AgentInvocation invocation,
+        AgentCredential? credential,
         Action<string>? stdoutChunkCallback,
         bool captureStructuredStream,
         CancellationToken ct)
@@ -540,7 +710,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         {
             Argv = invocation.Argv,
             WorkingDirectory = workingDirectory,
-            ExtraEnvironment = WithAgentRunId(invocation.ExtraEnvironment, runId),
+            ExtraEnvironment = BuildExecEnvironment(invocation.ExtraEnvironment, runId),
             Stdin = invocation.Stdin,
             StdoutChunkCallback = stdoutChunkCallback,
             StderrChunkCallback = stderrChunkCallback,
@@ -710,7 +880,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             && !string.IsNullOrWhiteSpace(json))
             return null;
 
-        // Bundle present but auth JSON absent — PrepareSandboxAsync no-ops; image auth may suffice.
+        // Bundle present but auth JSON absent — credential staging no-ops; image auth may suffice.
         return null;
     }
 
@@ -728,21 +898,6 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             null));
     }
 
-    protected static IReadOnlyDictionary<string, string>? MergeCredentialEnvironment(
-        IReadOnlyDictionary<string, string>? baseEnvironment,
-        AgentCredential? credential)
-    {
-        if (credential?.EnvironmentVariables is not { Count: > 0 } env)
-            return baseEnvironment;
-
-        var merged = baseEnvironment is null
-            ? new Dictionary<string, string>(StringComparer.Ordinal)
-            : new Dictionary<string, string>(baseEnvironment, StringComparer.Ordinal);
-        foreach (var (key, value) in env)
-            merged[key] = value;
-        return merged;
-    }
-
     protected async Task<TextOnlyAgentResult> ExecuteTextOnlyInSandboxAsync(
         ISandbox sandbox,
         string workingDirectory,
@@ -755,7 +910,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         if (RejectUnsupportedFileBackedCredentials(sandbox, credential) is { } unsupported)
             return new TextOnlyAgentResult(false, unsupported.Summary, unsupported.Stdout, unsupported.Stderr);
 
-        var preparation = await PrepareSandboxAsync(sandbox, workingDirectory, credential, resume: null, ct);
+        var preparation = await PrepareSandboxForRunAsync(sandbox, workingDirectory, credential, resume: null, ct);
         if (preparation is not null)
             return new TextOnlyAgentResult(false, preparation.Summary, preparation.Stdout, preparation.Stderr);
 
@@ -806,7 +961,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         return int.TryParse(tail, out var code) ? code : -1;
     }
 
-    private AgentResult? RejectUnsupportedFileBackedCredentials(ISandbox sandbox, AgentCredential? credential)
+    protected AgentResult? RejectUnsupportedFileBackedCredentials(ISandbox sandbox, AgentCredential? credential)
     {
         // In production the sandbox is wrapped by admission-control / reusable decorators that cannot
         // conditionally re-implement the IRejectsFileBackedAgentCredentials marker, so probe the whole
@@ -835,6 +990,10 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
 
         return null;
     }
+
+    protected bool SandboxRejectsFileBackedCredentials(ISandbox sandbox) =>
+        FileBackedCredentialEnvironmentVariables.Count > 0
+        && ResolveFileBackedCredentialPolicy(sandbox) is not null;
 
     private static IRejectsFileBackedAgentCredentials? ResolveFileBackedCredentialPolicy(ISandbox sandbox)
     {
@@ -1318,14 +1477,16 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     private string AgentRunKey(ISandbox sandbox, string workingDirectory) =>
         $"{Kind.Value}\n{sandbox.Id}\n{workingDirectory}";
 
-    private static IReadOnlyDictionary<string, string> WithAgentRunId(
+    protected IReadOnlyDictionary<string, string>? BuildExecEnvironment(
         IReadOnlyDictionary<string, string>? environment,
-        string runId)
+        string? runId = null)
     {
         var merged = environment is null
             ? new Dictionary<string, string>(StringComparer.Ordinal)
             : new Dictionary<string, string>(environment, StringComparer.Ordinal);
-        merged[AgentRunIdEnvironmentVariable] = runId;
+
+        if (runId is not null)
+            merged[AgentRunIdEnvironmentVariable] = runId;
         // R8-core: the orchestrator-controlled invocation context optionally
         // requests tee'd capture of the agent CLI's stdout/stderr into an in-VM
         // log file. The codeybox-exec wrapper honours this env var; without it
@@ -1334,7 +1495,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         var logPath = AgentInvocationLogContext.CurrentLogPath;
         if (!string.IsNullOrEmpty(logPath))
             merged[SandboxConventions.AgentLogFileEnv] = logPath;
-        return merged;
+        return merged.Count == 0 ? null : merged;
     }
 
     private static void RemoveActiveAgentRunId(string runKey, string runId)

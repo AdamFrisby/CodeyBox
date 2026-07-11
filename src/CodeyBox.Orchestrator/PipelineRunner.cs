@@ -3580,41 +3580,55 @@ public sealed partial class PipelineRunner : IPipelineRunner
             lockEntered = true;
 
             var access = _gitHost.GetSandboxAccess(repoId);
-            // Pre-resolve the primary runner's credential and bake it into the
-            // sandbox. The vast majority of pickup-rebases are conflict-free
-            // and will not invoke the agent CLI at all, so these creds sit
-            // unused — but when a conflict triggers AgenticConflictResolver,
-            // the agent runs in THIS sandbox via IAgentRunner.RunAsync, and
-            // env-based credentials are baked at sandbox-create time only
-            // (CliAgentRunnerBase.RunAsync documents this; file-based creds
-            // are materialised post-create). Building the sandbox with no
-            // credential + no network — the pre-#168 shape, when conflict
-            // resolution ran from the host via text-only HTTP — leaves the
-            // in-VM CLI starving for both auth and egress and was the cause
-            // of every "agent exited 1" we saw on MergeConflictResolutionFailed
-            // items after PR #168.
+            // Pre-resolve the exact resolver candidate set before sandbox
+            // creation. Candidate environment credentials are scoped to this
+            // resolver sandbox at creation time; they are not copied into
+            // per-exec environment. Non-secret credential adjunct mounts must
+            // also be present at creation time, so the typed plan below unions
+            // only compatible mounts and requests an ephemeral credential tmpfs
+            // whenever the resolver has a credential scope.
+            //
+            // Candidate/routing or mount-plan failures are captured and raised
+            // only if a conflict actually needs the resolver. A clean rebase
+            // therefore needs no credentials at all and does not retry or
+            // expose the work runner when it is not a viable candidate.
             //
             // Network profile prefers the agent profile (Work) so AllowedHosts
             // includes the agent's API endpoints. We fall back through the
             // audit profiles for the baseline-clone fast path when Work is
             // unconfigured.
-            var credential = await ResolveAgentCredentialAsync(runner.Kind, project, item, ct);
+            var (precomputedCandidates, precomputedCandidateFailure) =
+                await TryBuildPickupRebaseResolverCandidatesAsync(item, project, runner, ct);
+            var credentialPlan = PickupRebaseCredentialPlan.Empty;
+            if (precomputedCandidates is not null)
+            {
+                try
+                {
+                    credentialPlan = BuildPickupRebaseCredentialPlan(precomputedCandidates, access);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    precomputedCandidateFailure ??= ExceptionDispatchInfo.Capture(ex);
+                }
+            }
             var rebaseProfile = project.NetworkProfiles.Work
                 ?? project.NetworkProfiles.AuditAgent
                 ?? project.NetworkProfiles.AuditTool;
             var rebaseTarget = new SandboxTarget(rebaseProfile, SandboxProfileFlavor.Headless);
             var spec = BuildSandboxSpec(
                 access,
-                includeAgentCredential: credential,
+                includeAgentCredential: null,
                 allowAgentNetwork: true,
                 hostNetworkProfile: rebaseProfile,
                 timingWorkItemId: item.Id,
                 timingPhase: timingPhase,
+                extraEnvironment: credentialPlan.Environment,
+                additionalCredentialMounts: credentialPlan.Mounts,
+                includeCredentialsTmpfs: credentialPlan.RequiresCredentialsTmpfs,
+                agentCredentialScope: true,
                 baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, rebaseTarget, baselineImageRef));
 
             await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
-            if (credential is not null && credential.Files.Count > 0)
-                await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
             await using (var cloneScope = await TimingScope.BeginAsync(
                 _timings, item.Id, timingPhase, "git.clone_into_sandbox",
                 activitySource: CodeyBoxActivities.Sandbox, log: _log))
@@ -3667,6 +3681,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     oldTip,
                     rebaseMergeScope,
                     project,
+                    precomputedCandidates,
+                    precomputedCandidateFailure,
                     ct);
                 rebaseConflictFiles = rebaseResult.ConflictFiles;
                 rebaseReviewRunner = rebaseResult.ChosenResolver;
@@ -3961,6 +3977,138 @@ public sealed partial class PipelineRunner : IPipelineRunner
         IAgentRunner? ChosenResolver,
         AgentCredential? ChosenCredential);
 
+    private async Task<(AgenticConflictCandidatesResult? Candidates, ExceptionDispatchInfo? Failure)>
+        TryBuildPickupRebaseResolverCandidatesAsync(
+            WorkItem item,
+            Project project,
+            IAgentRunner runner,
+            CancellationToken ct)
+    {
+        try
+        {
+            return (await BuildAgenticConflictCandidatesAsync(item, project, runner, ct), null);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex,
+                "Pickup-time rebase resolver candidate pre-resolution failed for work item {WorkItemId}; deferring failure unless the rebase conflicts",
+                item.Id);
+            return (null, ExceptionDispatchInfo.Capture(ex));
+        }
+    }
+
+    private sealed record PickupRebaseCredentialPlan(
+        IReadOnlyList<SandboxMount> Mounts,
+        IReadOnlyDictionary<string, string> Environment,
+        bool RequiresCredentialsTmpfs)
+    {
+        public static PickupRebaseCredentialPlan Empty { get; } =
+            new([], new Dictionary<string, string>(StringComparer.Ordinal), false);
+    }
+
+    private static PickupRebaseCredentialPlan BuildPickupRebaseCredentialPlan(
+        AgenticConflictCandidatesResult candidates,
+        SandboxRepositoryAccess repositoryAccess)
+    {
+        var mountsByDestination = new Dictionary<string, SandboxMount>(StringComparer.Ordinal);
+        var environment = new Dictionary<string, string>(StringComparer.Ordinal);
+        var reservedDestinations = repositoryAccess.Mounts
+            .Select(static mount => mount.SandboxPath)
+            .Append(SandboxConventions.WorkDir)
+            .Append(SandboxConventions.CredentialsDir)
+            .ToHashSet(StringComparer.Ordinal);
+        var requiresCredentialsTmpfs = false;
+        foreach (var candidate in candidates.Candidates)
+        {
+            if (candidate.Credential is not { } credential)
+                continue;
+            if (credential.Agent != candidate.Runner.Kind)
+            {
+                throw new AgentCredentialScopeException(
+                    candidate.Runner.Kind,
+                    $"credential belongs to agent '{credential.Agent.Value}'");
+            }
+            ValidateResolverCandidateCredentialEnvironment(candidate);
+
+            requiresCredentialsTmpfs = true;
+            foreach (var (name, value) in credential.EnvironmentVariables)
+            {
+                SandboxEnvironmentVariablePolicy.ValidateCredentialEnvironmentVariable(
+                    name,
+                    nameof(credential.EnvironmentVariables));
+                if (value.Contains('\0'))
+                    throw new ArgumentException("Resolver candidate credential environment contains a NUL byte.");
+                if (value.Length > SandboxConventions.CredentialsTmpfsBytes)
+                    throw new ArgumentException("Resolver candidate credential environment exceeds the size limit.");
+                if (environment.TryGetValue(name, out var existing)
+                    && !string.Equals(existing, value, StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        "Resolver candidate credentials declare conflicting values for the same sandbox environment variable.");
+                }
+                environment[name] = value;
+            }
+
+            foreach (var mount in credential.Mounts)
+            {
+                if (!mount.SandboxPath.StartsWith("/", StringComparison.Ordinal)
+                    || mount.SandboxPath.Split('/', StringSplitOptions.RemoveEmptyEntries)
+                        .Any(static segment => segment is "." or ".."))
+                {
+                    throw new ArgumentException(
+                        "Resolver candidate credential mount path must be an absolute canonical sandbox path.");
+                }
+                if (reservedDestinations.Contains(mount.SandboxPath))
+                {
+                    throw new InvalidOperationException(
+                        "Resolver candidate credential mount conflicts with a reserved sandbox path.");
+                }
+                if (mountsByDestination.TryGetValue(mount.SandboxPath, out var existing))
+                {
+                    if (existing != mount)
+                    {
+                        throw new InvalidOperationException(
+                            "Resolver candidate credential mounts conflict at the same sandbox path.");
+                    }
+                    continue;
+                }
+                mountsByDestination.Add(mount.SandboxPath, mount);
+            }
+        }
+
+        return new PickupRebaseCredentialPlan(
+            mountsByDestination.Values.ToArray(),
+            environment,
+            requiresCredentialsTmpfs);
+    }
+
+    private static void ValidateResolverCandidateCredentialEnvironment(
+        AgenticConflictResolverCandidate candidate)
+    {
+        if (candidate.Credential?.EnvironmentVariables is not { Count: > 0 } env)
+            return;
+        if (candidate.Runner is not IAgentCredentialEnvironmentPolicy policy)
+        {
+            throw new InvalidOperationException(
+                $"Resolver candidate '{candidate.Runner.Kind.Value}' has environment credentials but does not declare a credential environment policy.");
+        }
+
+        foreach (var name in env.Keys)
+        {
+            if (policy.DirectCredentialEnvironmentVariables.Contains(name)
+                || policy.FileBackedCredentialEnvironmentVariables.Contains(name))
+            {
+                continue;
+            }
+            throw new InvalidOperationException(
+                $"Resolver candidate '{candidate.Runner.Kind.Value}' credential environment variable '{name}' is not supported by the runner.");
+        }
+    }
+
     private async Task<PickupRebaseResolutionResult> RebaseCheckedOutBranchWithScopeFenceAsync(
         WorkItem item,
         IAgentRunner runner,
@@ -3972,6 +4120,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string oldTip,
         MergeScopeHint mergeScope,
         Project project,
+        AgenticConflictCandidatesResult? precomputedCandidateResult,
+        ExceptionDispatchInfo? precomputedCandidateFailure,
         CancellationToken ct)
     {
         var conflictFiles = new SortedSet<string>(StringComparer.Ordinal);
@@ -3979,12 +4129,14 @@ public sealed partial class PipelineRunner : IPipelineRunner
         var selectedResolverLogged = false;
         IAgentRunner? chosenResolver = null;
         AgentCredential? chosenCredential = null;
-        // Candidate list is built lazily on first conflict so a clean rebase
-        // (no conflicts) never has to resolve credentials for fallback agents.
-        // The same list is reused for every conflict iteration within this
-        // rebase.
+        // The candidate list is pre-resolved before sandbox creation so routing,
+        // quota, and credential-provider failures are captured while the known
+        // candidate set is still available. The wrapped list is still built
+        // lazily on first conflict so clean rebases avoid prompt-preprocessor
+        // work and any pre-resolution failure is ignored unless a resolver is
+        // actually needed.
         IReadOnlyList<AgenticConflictResolverCandidate>? candidates = null;
-        AgenticConflictCandidatesResult? candidateResult = null;
+        AgenticConflictCandidatesResult? candidateResult = precomputedCandidateResult;
 
         var rebase = await sandbox.ExecAsync(new SandboxExec
         {
@@ -4005,7 +4157,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             {
                 if (candidates is null)
                 {
-                    candidateResult = await BuildAgenticConflictCandidatesAsync(item, project, runner, ct);
+                    precomputedCandidateFailure?.Throw();
+                    candidateResult ??= await BuildAgenticConflictCandidatesAsync(item, project, runner, ct);
                     candidates = WrapPromptPreprocessedCandidates(
                         candidateResult.Candidates,
                         item.Id,
@@ -16694,7 +16847,10 @@ Original merge-phase failure (JSON string, for context only):
         string? timingPhase = null,
         SandboxProfileFlavor flavor = SandboxProfileFlavor.Headless,
         IReadOnlyDictionary<string, string>? extraEnvironment = null,
-        string? baselineImageRef = null)
+        string? baselineImageRef = null,
+        IReadOnlyList<SandboxMount>? additionalCredentialMounts = null,
+        bool includeCredentialsTmpfs = false,
+        bool agentCredentialScope = false)
     {
         var mounts = new List<SandboxMount>(access.Mounts)
         {
@@ -16715,6 +16871,30 @@ Original merge-phase failure (JSON string, for context only):
             foreach (var m in includeAgentCredential.Mounts)
                 mounts.Add(m);
         }
+        else if (includeCredentialsTmpfs)
+        {
+            mounts.Add(new SandboxMount
+            {
+                SandboxPath = SandboxConventions.CredentialsDir,
+                Tmpfs = true,
+                SizeBytes = SandboxConventions.CredentialsTmpfsBytes,
+            });
+        }
+        if (additionalCredentialMounts is not null)
+            mounts.AddRange(additionalCredentialMounts);
+        var distinctMounts = new List<SandboxMount>(mounts.Count);
+        var mountsByDestination = new Dictionary<string, SandboxMount>(StringComparer.Ordinal);
+        foreach (var mount in mounts)
+        {
+            if (mountsByDestination.TryGetValue(mount.SandboxPath, out var existing))
+            {
+                if (existing != mount)
+                    throw new InvalidOperationException($"Sandbox mounts conflict at destination '{mount.SandboxPath}'.");
+                continue;
+            }
+            mountsByDestination.Add(mount.SandboxPath, mount);
+            distinctMounts.Add(mount);
+        }
         if (extraEnvironment is not null)
         {
             // Extra env overrides credential env on key collision so the
@@ -16724,7 +16904,7 @@ Original merge-phase failure (JSON string, for context only):
                 env[k] = v;
         }
         var allowedHosts = allowAgentNetwork
-            ? includeAgentCredential is null
+            ? includeAgentCredential is null && !agentCredentialScope
                 ? _opts.AuditToolAllowedHosts
                 : _opts.AgentAllowedHosts
             : Array.Empty<string>();
@@ -16745,7 +16925,7 @@ Original merge-phase failure (JSON string, for context only):
         return SandboxConventions.WithTimingEnvironment(new SandboxSpec
         {
             ImageReference = _opts.SandboxImageReference,
-            Mounts = mounts,
+            Mounts = distinctMounts,
             Environment = env,
             Network = net,
             Flavor = flavor,
@@ -16758,20 +16938,15 @@ Original merge-phase failure (JSON string, for context only):
 
     private static async Task MaterialiseCredentialFilesAsync(ISandbox sandbox, AgentCredential credential, CancellationToken ct)
     {
-        await RunWithCancellation(sandbox, ct, "mkdir", "-p", SandboxConventions.CredentialsDir);
         foreach (var (relativePath, contents) in credential.Files)
         {
             var safePath = SanitiseCredentialFileName(relativePath);
-            var fullPath = $"{SandboxConventions.CredentialsDir}/{safePath}";
-            var dir = fullPath[..fullPath.LastIndexOf('/')];
-            await RunWithCancellation(sandbox, ct, "mkdir", "-p", dir);
-            var write = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["sh", "-c", "umask 077 && cat > \"$0\"", fullPath],
-                Stdin = contents,
-            }, ct);
-            if (!write.Success)
-                throw new InvalidOperationException($"Failed to write credential file {safePath}: {write.Stderr}");
+            await SandboxCredentialFileWriter.WriteAsync(
+                sandbox,
+                new SandboxCredentialFileTarget(SandboxCredentialFileRoot.CredentialsDirectory, safePath),
+                contents,
+                SandboxCredentialOverwritePolicy.Overwrite,
+                ct).ConfigureAwait(false);
         }
     }
 
@@ -16944,12 +17119,8 @@ Original merge-phase failure (JSON string, for context only):
 
     private static string SanitiseCredentialFileName(string path)
     {
-        if (string.IsNullOrEmpty(path)) throw new ArgumentException("Empty credential file name");
-        var trimmed = path.Replace('\\', '/').TrimStart('/');
-        if (trimmed.Contains("..", StringComparison.Ordinal))
-            throw new ArgumentException($"Credential file path must not contain '..': {path}");
-        if (trimmed.Length == 0) throw new ArgumentException("Credential file name resolves empty");
-        return trimmed;
+        SandboxCredentialFileWriter.ValidateRelativePath(path, nameof(path));
+        return path;
     }
 
     // ── Stuck-probe integration ──────────────────────────────────────────────
