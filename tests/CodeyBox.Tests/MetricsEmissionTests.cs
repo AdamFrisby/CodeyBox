@@ -221,7 +221,23 @@ public sealed class MetricsEmissionTests
         using (var gate1 = SqliteDatabaseWriteGate.ForPath(path))
         using (var gate2 = SqliteDatabaseWriteGate.ForPath(path))
         {
-            gate1.Wait();
+            // Hold gate1 on its own flow: acquiring it here would activate the
+            // gate's AsyncLocal ownership scope in the test's execution context,
+            // which Task.Run would then capture into the waiter and (correctly)
+            // trip the re-entry guard. Independent writers each acquire from their
+            // own flow, so the holder and waiter must live on separate tasks.
+            var holderAcquired = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseHolder = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var holder = Task.Run(async () =>
+            {
+                await gate1.WaitAsync();
+                holderAcquired.SetResult();
+                await releaseHolder.Task;
+                gate1.Release();
+            });
+
+            await holderAcquired.Task;
+
             var waiter = Task.Run(async () =>
             {
                 await gate2.WaitAsync();
@@ -229,8 +245,8 @@ public sealed class MetricsEmissionTests
             });
 
             await Task.Delay(25);
-            gate1.Release();
-            await waiter;
+            releaseHolder.SetResult();
+            await Task.WhenAll(holder, waiter);
 
             AssertEventuallyContains(measurements, measurement =>
                 measurement.TagValue == "acquired");
@@ -249,10 +265,26 @@ public sealed class MetricsEmissionTests
         using (var gate1 = SqliteDatabaseWriteGate.ForPath(path))
         using (var gate2 = SqliteDatabaseWriteGate.ForPath(path))
         {
-            // Saturate the single-writer gate so the second waiter blocks.
-            gate1.Wait();
+            // Saturate the single-writer gate on an independent flow so the waiter
+            // neither inherits the holder's ownership scope (which would trip the
+            // re-entry guard) nor shares its execution context.
+            var holderAcquired = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseHolder = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var holder = Task.Run(async () =>
+            {
+                await gate1.WaitAsync();
+                holderAcquired.SetResult();
+                await releaseHolder.Task;
+                gate1.Release();
+            });
+
+            await holderAcquired.Task;
+
             using var cts = new CancellationTokenSource();
-            var waiter = Task.Run(() => gate2.WaitAsync(cts.Token));
+            // Await the acquisition inside the task so the waiter genuinely parks
+            // on the semaphore; WaitAsync only returns the awaitable, so failing to
+            // await it would complete the task before the gate is ever acquired.
+            var waiter = Task.Run(async () => await gate2.WaitAsync(cts.Token));
 
             // The waiter is parked on the semaphore; cancel it while saturated.
             await Task.Delay(25);
@@ -266,7 +298,8 @@ public sealed class MetricsEmissionTests
             AssertEventuallyContains(measurements, measurement =>
                 measurement.TagValue == "canceled");
 
-            gate1.Release();
+            releaseHolder.SetResult();
+            await holder;
         }
     }
 
