@@ -45,6 +45,35 @@ public interface IAgentRunner
 }
 
 /// <summary>
+/// Declares the exact credential environment names a runner supports. Direct
+/// variables are read by the CLI from the sandbox's provisioned environment;
+/// file-backed variables are payload or destination metadata consumed by the
+/// runner's stdin-based credential staging and must not be exposed through
+/// per-exec process environment.
+/// </summary>
+public interface IAgentCredentialEnvironmentPolicy
+{
+    IReadOnlySet<string> DirectCredentialEnvironmentVariables { get; }
+    IReadOnlySet<string> FileBackedCredentialEnvironmentVariables { get; }
+    IReadOnlyList<AgentCredentialFileDestination> CredentialFileDestinations { get; }
+}
+
+/// <summary>
+/// Runner-declared HOME credential destination for a payload carried in an
+/// environment variable. <paramref name="HomeRelativePath"/> must be a
+/// non-empty path relative to HOME with no traversal segments. When
+/// <paramref name="DestinationEnvironmentVariable"/> is present, its value may
+/// override the destination with an absolute path, relative path, <c>~/...</c>,
+/// or <c>$HOME/...</c>; materialisation must normalize and reject overrides
+/// that escape HOME. Existing non-empty files are preserved only when the
+/// caller explicitly selects preserve-nonempty staging.
+/// </summary>
+public sealed record AgentCredentialFileDestination(
+    string PayloadEnvironmentVariable,
+    string HomeRelativePath,
+    string? DestinationEnvironmentVariable = null);
+
+/// <summary>
 /// Optional runner capability for CLIs that can emit structured stdout
 /// streams suitable for persistent capture.
 /// </summary>

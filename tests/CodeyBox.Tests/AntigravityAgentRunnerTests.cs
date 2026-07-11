@@ -131,7 +131,7 @@ public sealed class AntigravityAgentRunnerTests
     public async Task RunAsync_WithOAuthCredsBundle_WritesCredentialsFileToSandbox()
     {
         // PrepareSandboxAsync must materialise the agy token bundle into
-        // ~/.gemini/antigravity-cli/antigravity-oauth-token (chmod 600) — agy's
+        // ~/.gemini/antigravity-cli/antigravity-oauth-token (mode 0600) — agy's
         // fileTokenStorage path when no system keyring is present (every headless
         // sandbox). The bundle is shipped verbatim by upstream credential
         // providers (refresh_token retained so the in-VM agy can self-refresh —
@@ -156,9 +156,10 @@ public sealed class AntigravityAgentRunnerTests
         Assert.Equal("bash", prep.Argv[0]);
         Assert.Equal("-c", prep.Argv[1]);
         var script = prep.Argv[2];
-        Assert.Contains("$HOME/.gemini/antigravity-cli/antigravity-oauth-token", script);
-        Assert.Contains(AntigravityConstants.OAuthCredsEnvVar, script);
-        Assert.Contains("chmod 600", script);
+        Assert.Equal(".gemini/antigravity-cli/antigravity-oauth-token", prep.Argv[5]);
+        Assert.Equal(credential.EnvironmentVariables[AntigravityConstants.OAuthCredsEnvVar], prep.Stdin);
+        Assert.DoesNotContain(AntigravityConstants.OAuthCredsEnvVar, script);
+        Assert.Contains("0o600", script);
         // Second exec is the agy CLI invocation, not the prep hook.
         Assert.Equal("agy", prepAndAgyExecs[1].Argv[0]);
     }

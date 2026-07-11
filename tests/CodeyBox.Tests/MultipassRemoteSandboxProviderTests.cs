@@ -206,6 +206,84 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
+    public async Task ExecAsync_secret_environment_uses_stdin_bootstrap_not_remote_argv()
+    {
+        const string secret = "remote-candidate-secret";
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            return ProcessRunOk();
+        };
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+        var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            WorkingDirectory = "/work",
+        });
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["agent", "--print"],
+            Stdin = "user prompt",
+            ExtraEnvironment = new Dictionary<string, string>
+            {
+                ["OPENAI_API_KEY"] = secret,
+            },
+            EnvironmentContainsSecrets = true,
+        });
+
+        Assert.True(result.Success);
+        Assert.DoesNotContain(
+            transport.RecordedCalls.SelectMany(static call => call.Argv),
+            argument => argument.Contains(secret, StringComparison.Ordinal));
+        var exec = Assert.Single(transport.RecordedCalls, call =>
+            call.Argv.Count > 1
+            && call.Argv[0] == opts.RemoteMultipassPath
+            && call.Argv[1] == "exec");
+        Assert.Equal("OPENAI_API_KEY='remote-candidate-secret'\nuser prompt", exec.Stdin);
+        Assert.Contains(exec.Argv, argument =>
+            argument.Contains("dd if=/dev/stdin", StringComparison.Ordinal));
+        await sandbox.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task KillActiveExecsAsync_RunsInVmProcessCleanup()
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+        var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            WorkingDirectory = "/work",
+        });
+
+        await sandbox.KillActiveExecsAsync();
+
+        Assert.Contains(transport.RecordedCalls, call =>
+            call.Argv.Count >= 7
+            && call.Argv[0] == opts.RemoteMultipassPath
+            && call.Argv[1] == "exec"
+            && call.Argv[2] == sandbox.Id
+            && call.Argv.Contains("bash")
+            && call.Argv.Any(argument => argument.Contains("kill -TERM", StringComparison.Ordinal)));
+        await sandbox.DisposeAsync();
+    }
+
+
+    [Fact]
     public async Task ExecAsync_surfaces_nonzero_remote_exit_code_as_result_not_exception()
     {
         var opts = DefaultOptions();

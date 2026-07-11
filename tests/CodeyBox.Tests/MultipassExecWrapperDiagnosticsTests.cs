@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Multipass;
 
 namespace CodeyBox.Tests;
@@ -31,6 +32,26 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         var env = new Dictionary<string, string> { ["B\0AD"] = "value" };
         Assert.Throws<ArgumentException>(
             () => MultipassSandboxProvider.BuildEnvironmentFileContent(env));
+    }
+
+    [Theory]
+    [InlineData("1INVALID")]
+    [InlineData("X; touch /work/pwn #")]
+    public void BuildEnvironmentFileContent_RejectsInvalidKey(string key)
+    {
+        var env = new Dictionary<string, string> { [key] = "value" };
+        Assert.Throws<ArgumentException>(
+            () => MultipassSandboxProvider.BuildEnvironmentFileContent(env));
+    }
+
+    [Theory]
+    [InlineData("HOME")]
+    [InlineData("PATH")]
+    [InlineData("LD_PRELOAD")]
+    public void CredentialEnvironmentPolicy_RejectsReservedKey(string key)
+    {
+        Assert.Throws<ArgumentException>(
+            () => SandboxEnvironmentVariablePolicy.ValidateCredentialEnvironmentVariable(key, nameof(key)));
     }
 
     [Theory]

@@ -41,9 +41,10 @@ public sealed class ConcreteAgentRunnerUatTests
 
         Assert.True(result.Success);
         Assert.Equal(["claude", "--help"], sandbox.Execs[0].Argv);
-        Assert.Contains("$HOME/.claude/.credentials.json", sandbox.Execs[1].Argv[2]);
-        Assert.Contains(ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar, sandbox.Execs[1].Argv[2]);
-        Assert.Contains("chmod 600", sandbox.Execs[1].Argv[2]);
+        Assert.Equal(".claude/.credentials.json", sandbox.Execs[1].Argv[5]);
+        Assert.Equal(credential.EnvironmentVariables[ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar], sandbox.Execs[1].Stdin);
+        Assert.DoesNotContain(ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar, sandbox.Execs[1].Argv[2]);
+        Assert.Contains("0o600", sandbox.Execs[1].Argv[2]);
 
         var argv = sandbox.Execs[2].Argv.ToList();
         Assert.Equal("claude", argv[0]);
@@ -76,7 +77,7 @@ public sealed class ConcreteAgentRunnerUatTests
         Assert.True(result.Success);
         Assert.Equal(["codex", "exec", "--help"], sandbox.Execs[0].Argv);
         Assert.Contains("CODEX_AUTH_JSON", sandbox.Execs[1].Argv[2]);
-        Assert.Contains("$HOME/.codex/auth.json", sandbox.Execs[1].Argv[2]);
+        Assert.Contains(".codex/auth.json", sandbox.Execs[1].Argv[2]);
 
         var argv = sandbox.Execs[2].Argv.ToList();
         Assert.Equal(["codex", "exec"], argv[..2]);
@@ -114,10 +115,12 @@ public sealed class ConcreteAgentRunnerUatTests
 
         Assert.True(result.Success);
         Assert.Equal(["gemini", "--help"], sandbox.Execs[0].Argv);
-        Assert.Contains("$HOME/.gemini/oauth_creds.json", sandbox.Execs[1].Argv[2]);
-        Assert.Contains("$HOME/.gemini/settings.json", sandbox.Execs[1].Argv[2]);
+        Assert.Equal(".gemini/oauth_creds.json", sandbox.Execs[1].Argv[5]);
+        Assert.Equal(credential.EnvironmentVariables[GeminiOAuthFileCredentialProvider.OAuthCredsEnvVar], sandbox.Execs[1].Stdin);
+        Assert.Equal(".gemini/settings.json", sandbox.Execs[2].Argv[5]);
+        Assert.Equal(credential.EnvironmentVariables[GeminiOAuthFileCredentialProvider.SettingsEnvVar], sandbox.Execs[2].Stdin);
 
-        var argv = sandbox.Execs[2].Argv.ToList();
+        var argv = sandbox.Execs[3].Argv.ToList();
         Assert.Equal("gemini", argv[0]);
         Assert.Contains("--yolo", argv);
         Assert.Contains("--skip-trust", argv);
@@ -128,7 +131,7 @@ public sealed class ConcreteAgentRunnerUatTests
         // Linux's 128 KiB per-argv MAX_ARG_STRLEN ceiling.
         Assert.DoesNotContain("-p", argv);
         Assert.DoesNotContain("build", argv);
-        Assert.Equal("build", sandbox.Execs[2].Stdin);
+        Assert.Equal("build", sandbox.Execs[3].Stdin);
         Assert.DoesNotContain("--thinking", argv);
         Assert.DoesNotContain("--reasoning", argv);
         Assert.DoesNotContain("--effort", argv);

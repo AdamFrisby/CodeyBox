@@ -1168,6 +1168,12 @@ public sealed record SandboxExec
     public required IReadOnlyList<string> Argv { get; init; }
     public string? WorkingDirectory { get; init; }
     public IReadOnlyDictionary<string, string>? ExtraEnvironment { get; init; }
+    /// <summary>
+    /// Marks <see cref="ExtraEnvironment"/> as secret-bearing. Providers must
+    /// deliver it without placing values in host-visible command argv and must
+    /// not fall back to an inline transport if secure delivery fails.
+    /// </summary>
+    public bool EnvironmentContainsSecrets { get; init; }
     public string? Stdin { get; init; }
     public int? MaxStdoutBytes { get; init; }
     public int? MaxStderrBytes { get; init; }

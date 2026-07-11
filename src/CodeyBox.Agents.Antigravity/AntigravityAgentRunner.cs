@@ -23,6 +23,11 @@ namespace CodeyBox.Agents.Antigravity;
 /// </summary>
 public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner
 {
+    private static readonly EnvBackedCredentialFile OAuthCredentialFile = new(
+        AntigravityConstants.OAuthCredsEnvVar,
+        ".gemini/antigravity-cli/antigravity-oauth-token",
+        "antigravity auth");
+
     /// <summary>
     /// Upper bound on how many bytes of agy's glog we read back for capture
     /// (256 KiB). agy's glog is cumulative and can grow large on a long tool-heavy
@@ -95,53 +100,10 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         // up via --conversation <id>.
         [".gemini/antigravity-cli/conversations", ".gemini/antigravity-cli/brain"];
 
-    protected override IReadOnlyList<string> FileBackedCredentialEnvironmentVariables =>
-        [AntigravityConstants.OAuthCredsEnvVar];
+    protected override IReadOnlyList<EnvBackedCredentialFile> EnvBackedCredentialFiles =>
+        [OAuthCredentialFile];
 
     protected override string PreemptProcessPattern => Binary;
-
-    /// <summary>
-    /// Materialises the Antigravity OAuth token bundle into the sandbox at
-    /// <c>~/.gemini/antigravity-cli/antigravity-oauth-token</c> — the path agy's
-    /// <c>fileTokenStorage</c> reads when no system keyring is present (every
-    /// headless sandbox). The bundle is written verbatim: it carries the
-    /// refresh_token so the in-VM agy can refresh the short-lived access_token
-    /// itself (it has no other refresh path). When no bundle is present, the
-    /// runner falls back to whatever auth path the credential pipeline plugged in.
-    /// </summary>
-    protected override async Task<AgentResult?> PrepareSandboxAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        AgentCredential? credential,
-        AgentResumeContext? resume,
-        CancellationToken ct = default)
-    {
-        if (credential is null
-            || !credential.EnvironmentVariables.ContainsKey(AntigravityConstants.OAuthCredsEnvVar))
-            return null;
-
-        var script =
-            "set -eu\n" +
-            "umask 077\n" +
-            "mkdir -p \"$HOME/.gemini/antigravity-cli\"\n" +
-            "if [ -n \"${CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON:-}\" ]; then\n" +
-            "  printf '%s' \"$CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON\" > \"$HOME/.gemini/antigravity-cli/antigravity-oauth-token\"\n" +
-            "  chmod 600 \"$HOME/.gemini/antigravity-cli/antigravity-oauth-token\"\n" +
-            "fi\n";
-        var write = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["bash", "-c", script],
-        }, ct).ConfigureAwait(false);
-        if (!write.Success)
-        {
-            return new AgentResult(
-                Success: false,
-                Summary: $"failed to materialise antigravity auth: exit {write.ExitCode}",
-                Stdout: write.Stdout,
-                Stderr: write.Stderr);
-        }
-        return null;
-    }
 
     public override Task<AgentResult> RunAsync(
         ISandbox sandbox,
@@ -233,7 +195,7 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
     /// <summary>
     /// agy's <c>--log-file</c> open fails if the parent directory is missing.
     /// The exec wrapper only creates the log dir when <c>CODEYBOX_AGENT_LOG_FILE</c>
-    /// is set, and <see cref="PrepareSandboxAsync"/> only creates
+    /// is set, and the shared credential preparation step only creates
     /// <c>~/.gemini/…</c> on the OAuth-creds branch — so create the directory
     /// unconditionally here, before agy runs, independent of the credential path.
     /// </summary>

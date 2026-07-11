@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net.Sockets;
 using System.Text;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -245,8 +246,15 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox, IPreserveOnDisposeSa
             }
             if (exec.Stdin is not null)
             {
-                await proc.StandardInput.WriteAsync(exec.Stdin);
-                proc.StandardInput.Close();
+                try
+                {
+                    await WriteStandardInputAsync(proc, exec.Stdin, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    KillProcessTree(proc);
+                    throw;
+                }
             }
 
             try
@@ -277,6 +285,47 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox, IPreserveOnDisposeSa
         {
             UnregisterProcess(proc);
         }
+    }
+
+    private static async Task WriteStandardInputAsync(
+        System.Diagnostics.Process process,
+        string stdin,
+        CancellationToken ct)
+    {
+        var shouldClose = true;
+        try
+        {
+            await process.StandardInput.WriteAsync(stdin.AsMemory(), ct).ConfigureAwait(false);
+        }
+        catch (IOException ex) when (IsBrokenPipe(ex))
+        {
+            // The child closed stdin early; keep waiting so callers receive its exit code and stderr.
+            shouldClose = false;
+        }
+
+        if (!shouldClose)
+            return;
+
+        try
+        {
+            process.StandardInput.Close();
+        }
+        catch (IOException ex) when (IsBrokenPipe(ex))
+        {
+            // Close may flush buffered data after the child has already exited.
+        }
+    }
+
+    private static bool IsBrokenPipe(IOException ex)
+    {
+        const int hResultBrokenPipe = unchecked((int)0x8007006D);
+        const int hResultNoData = unchecked((int)0x800700E8);
+        const int nativeBrokenPipe = 32;
+
+        return ex.HResult is hResultBrokenPipe or hResultNoData
+            || ex.InnerException is SocketException socket
+            && (socket.NativeErrorCode == nativeBrokenPipe
+                || socket.SocketErrorCode is SocketError.Shutdown or SocketError.ConnectionReset);
     }
 
     private void RegisterProcess(System.Diagnostics.Process process)

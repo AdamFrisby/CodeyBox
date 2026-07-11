@@ -3325,23 +3325,7 @@ test "$work" = present && test "$exec_wrapper" = present
     }
 
     internal static string BuildEnvironmentFileContent(IReadOnlyDictionary<string, string> env)
-    {
-        var sb = new StringBuilder();
-        foreach (var (k, v) in env)
-        {
-            if (k.Contains('=') || k.Contains('\n') || k.Contains('\0'))
-                throw new ArgumentException($"Invalid env key: {k}");
-            // /bin/sh dot-source has undefined behaviour on NUL bytes —
-            // some implementations truncate the file at the NUL, others
-            // fail with "syntax error". Either way the wrapper would
-            // exit 126 with no useful diagnostic, so reject up front.
-            if (v.Contains('\0'))
-                throw new ArgumentException($"Env value for '{k}' contains NUL byte");
-            sb.Append(k).Append('=').Append(ShellSingleQuote(v)).Append('\n');
-        }
-
-        return sb.ToString();
-    }
+        => SandboxEnvironmentVariablePolicy.BuildShellEnvironmentFileContent(env);
 
     internal static string ShellSingleQuote(string value) =>
         "'" + value.Replace("'", "'\"'\"'", StringComparison.Ordinal) + "'";
@@ -5439,13 +5423,14 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         MultipassAgentOutputHttpIngestSession? agentOutputIngest = null;
         var stdoutChunkCallback = exec.StdoutChunkCallback;
         var stderrChunkCallback = exec.StderrChunkCallback;
-        var forceEnvironmentFile = false;
+        var effectiveEnvironment = BuildEffectiveExecEnvironment(exec);
+        var forceEnvironmentFile = exec.EnvironmentContainsSecrets
+            && effectiveEnvironment is { Count: > 0 };
         var detachedHttpIngest = false;
         string? detachedExitToken = null;
         string? detachedProcessGroupMarker = null;
         string? detachedStdinFile = null;
         string? multipassStdin = exec.Stdin;
-        var effectiveEnvironment = BuildEffectiveExecEnvironment(exec);
         var pipeEnvironment = effectiveEnvironment;
         var prefersDetachedHttpIngest = ShouldDetachAgentOutputHttpIngest(exec)
             && maxStdoutBytes is null
@@ -5528,6 +5513,12 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
+                if (exec.EnvironmentContainsSecrets)
+                {
+                    throw new InvalidOperationException(
+                        "Secret sandbox environment delivery failed before process launch.",
+                        ex);
+                }
                 if (detachedHttpIngest)
                 {
                     _log.LogWarning(ex,
@@ -6207,15 +6198,32 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         MultipassSandboxProvider.TryChmod0700(hostDir);
         var hostPath = Path.Combine(hostDir, fileName);
         await File.WriteAllTextAsync(hostPath, MultipassSandboxProvider.BuildEnvironmentFileContent(env), ct);
-        if (!OperatingSystem.IsWindows())
-            File.SetUnixFileMode(hostPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        try
+        {
+            if (!OperatingSystem.IsWindows())
+                File.SetUnixFileMode(hostPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
 
-        const string vmDir = "/home/ubuntu/.codeybox-exec-env";
-        await RunVmCommandAsync(["mkdir", "-p", vmDir], ct);
-        await TransferFileToVmAsync(hostPath, $".codeybox-exec-env/{fileName}", "multipass transfer exec env file", ct);
-        var vmPath = $"{vmDir}/{fileName}";
-        await RunVmCommandAsync(["chmod", "0600", vmPath], ct);
-        return vmPath;
+            const string vmDir = "/home/ubuntu/.codeybox-exec-env";
+            await RunVmCommandAsync(["mkdir", "-p", vmDir], ct);
+            await TransferFileToVmAsync(hostPath, $".codeybox-exec-env/{fileName}", "multipass transfer exec env file", ct);
+            var vmPath = $"{vmDir}/{fileName}";
+            await RunVmCommandAsync(["chmod", "0600", vmPath], ct);
+            return vmPath;
+        }
+        finally
+        {
+            try
+            {
+                File.Delete(hostPath);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                _log.LogWarning(
+                    ex,
+                    "Failed to delete host-side sandbox exec environment file {FileName} from protected sandbox directory",
+                    fileName);
+            }
+        }
     }
 
     private async Task<string> TransferExecScriptAsync(IReadOnlyList<string> wrapped, CancellationToken ct)
