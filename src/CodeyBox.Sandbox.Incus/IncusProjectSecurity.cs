@@ -25,7 +25,6 @@ internal static class IncusProjectSecurity
     internal const string RestrictedSnapshotsKey = "restricted.snapshots";
     internal const string RestrictedVmLowLevelKey = "restricted.virtual-machines.lowlevel";
 
-    private const int MaximumRoots = 65;
     private const int MaximumEncodedRootsBytes = 256 * 1024;
 
     internal static IReadOnlyList<string> ResolveRequiredRoots(
@@ -78,7 +77,8 @@ internal static class IncusProjectSecurity
                 4096,
                 nameof(roots),
                 "Incus restricted-project disk root");
-            if (normalized.Count > MaximumRoots || encodedBytes > MaximumEncodedRootsBytes)
+            if (normalized.Count > IncusSandboxOptions.MaximumRestrictedProjectRoots
+                || encodedBytes > MaximumEncodedRootsBytes)
             {
                 throw new InvalidOperationException(
                     "Incus restricted-project disk roots exceed their configured count or aggregate size bound.");

@@ -26,10 +26,12 @@ credentials at once without collision.
 
 ## Sandbox install commands
 
-Each agent CLI must be present in the sandbox baseline image, or dispatch fails
-with exit 127 (`<binary>: No such file or directory`). The orchestrator does
-**not** install agent binaries — that is operator-owned config under
-`CodeyBox:MultipassExtraRuncmd` (see [`baseline-bake-examples.md`](baseline-bake-examples.md)).
+Each agent CLI must be present in the sandbox VM before dispatch; otherwise
+dispatch fails with exit 127 (`<binary>: No such file or directory`). This
+applies to both baked baselines and full-launch provisioning. The orchestrator
+does **not** install agent binaries — that is operator-owned config under
+`CodeyBox:MultipassExtraRuncmd` or `CodeyBox:Incus:ExtraRuncmd` (see
+[`baseline-bake-examples.md`](baseline-bake-examples.md)).
 Adding an `AgentKind` to an agent class without also adding its install line is
 the most common cause of fresh-class dispatch failures.
 
@@ -41,12 +43,13 @@ the most common cause of fresh-class dispatch failures.
 | `gemini`  | `npm install -g @google/gemini-cli` | `ReasoningMode` is **not** wired into argv — Gemini's reasoning level is encoded in `ModelId` (pick a `gemini-3-*-preview` model for HIGH). See [Gemini quirks](#google-gemini-cli-googlegemini-cli). |
 | `cursor`  | `curl -fsSL https://cursor.com/install \| bash` | Installs as `agent` (not `cursor-agent`). See [Cursor quirks](#cursor-cli-agent). |
 | `opencode` | *not yet integrated in this repo — no `IAgentRunner` for opencode has shipped.* Operators tracking the integration can pre-stage with `curl -fsSL https://opencode.ai/install \| bash`, but the orchestrator will not route work to it until a runner is registered. | Listed for doc parity with the install-checklist; **does not** imply opencode is dispatchable today. |
-| `antigravity` | *operator-supplied — stage the `agy` binary on the host and ship it into the baseline via `CodeyBox:MultipassExecutableProvisions`* (see [Antigravity quirks](#google-antigravity-cli-agy)). The previously documented `curl -fsSL https://antigravity.google/cli/install.sh \| bash` URL no longer serves a shell script (returns HTML as of 2026-06-17); piping HTML into `bash` fails silently if the runcmd ends with `\|\| true`. | Installs the proprietary `agy` CLI on the non-login sandbox PATH. Multi-model gateway — each gateway model id is a separate quota bucket. Configure each accepted model as its own `AgentClass` member; the router gates per-model via the existing `(AgentKind, ModelId)` exhaustion key. |
+| `antigravity` | *operator-supplied — stage the `agy` binary on the host and ship it via `CodeyBox:MultipassExecutableProvisions` or `CodeyBox:Incus:ExecutableProvisions`, matching the selected provider* (see [Antigravity quirks](#google-antigravity-cli-agy)). The previously documented `curl -fsSL https://antigravity.google/cli/install.sh \| bash` URL no longer serves a shell script (returns HTML as of 2026-06-17); piping HTML into `bash` fails silently if the runcmd ends with `\|\| true`. | Installs the proprietary `agy` CLI on the non-login sandbox PATH. Multi-model gateway — each gateway model id is a separate quota bucket. Configure each accepted model as its own `AgentClass` member; the router gates per-model via the existing `(AgentKind, ModelId)` exhaustion key. |
 
 Verify each command against its upstream install docs at the time of baking —
-versions and install URLs change. After updating
-`CodeyBox:MultipassExtraRuncmd`, delete any cached `cb-baseline-*` images to
-force a fresh bake on the next sandbox launch.
+versions and install URLs change. Multipass and Incus keep independent bake
+inputs and baseline identities; changing a selected provider's explicit
+provisioning config changes its baseline hash and triggers the corresponding
+new bake.
 
 ## Adding a new agent
 
@@ -71,15 +74,15 @@ force a fresh bake on the next sandbox launch.
    new AgentCredentialMapping(new AgentKind("aider"), "CODEYBOX_AIDER_KEY", "OPENAI_API_KEY"),
    ```
 
-5. **Install the binary in the sandbox baseline image.** This is **not
+5. **Install the binary during sandbox VM provisioning.** This is **not
    optional** — without it, every dispatch to the new agent fails with
    exit 127 (`<binary>: No such file or directory`). The orchestrator does
    not auto-install; the install line lives in operator config under
-   `CodeyBox:MultipassExtraRuncmd` (see
-   [`baseline-bake-examples.md`](baseline-bake-examples.md)). After
-   editing operator config, delete the cached baseline image so the next
-   sandbox launch re-bakes with the new tool. Pin by digest where the
-   upstream supports it.
+   `CodeyBox:MultipassExtraRuncmd` or `CodeyBox:Incus:ExtraRuncmd` (see
+   [`baseline-bake-examples.md`](baseline-bake-examples.md)). The providers
+   keep independent content-addressed baseline identities, and Incus also
+   applies its explicit inputs on the full-launch path. Pin by digest where
+   the upstream supports it.
 
 6. **Document the install command** in the "Sandbox install commands"
    table above and add a "Per-agent quirks" subsection covering the
@@ -453,7 +456,8 @@ CodeyBox derives the provider id from the effective model id and falls back to
 ### Opencode CLI (`sst/opencode`)
 
 **Install in the sandbox image** — add the install line to
-`CodeyBox:MultipassExtraRuncmd`. opencode publishes both an `npm`
+`CodeyBox:MultipassExtraRuncmd` or `CodeyBox:Incus:ExtraRuncmd`, matching the
+selected provider. opencode publishes both an `npm`
 distribution and a `curl | bash` installer:
 
 ```sh
@@ -530,8 +534,8 @@ a warning.
 npm install -g @google/gemini-cli
 ```
 Node.js is already on the baseline image (installed for the Claude CLI), so
-adding the Gemini CLI costs only one extra `npm install -g` line in
-`MultipassExtraRuncmd`.
+adding the Gemini CLI costs only one extra `npm install -g` line in the
+selected provider's `ExtraRuncmd` configuration.
 
 **Credential:** set `CODEYBOX_GEMINI_API_KEY` on the orchestrator host to your
 [Google AI Studio API key](https://aistudio.google.com/app/apikey) (format
@@ -645,12 +649,13 @@ when re-auth is required.
 **Binary name:** the Cursor CLI installs as `agent` (NOT `cursor-agent`).
 
 **Install in the sandbox image:** follow Cursor's official install
-instructions for your distro. For example, on the Ubuntu baseline used by
-the multipass provider:
+instructions for your distro. For example, on the Ubuntu VM image used by
+the VM providers:
 ```sh
 curl -fsSL https://cursor.com/install | bash
 ```
-Add the install command to `CodeyBox:MultipassExtraRuncmd`. The binary must
+Add the install command to `CodeyBox:MultipassExtraRuncmd` or
+`CodeyBox:Incus:ExtraRuncmd`, matching the selected provider. The binary must
 end up on `$PATH` as `agent`.
 
 **Subscription auth setup:**
@@ -727,8 +732,9 @@ Google AI subscription quota. The runner is registered as **light-duty
 overflow**, not a workhorse: AI Pro caps requests on a weekly window with
 up to a 7-day lockout on cap breach, so over-use is especially expensive.
 
-**Binary name:** `agy`. **Provision via `MultipassExecutableProvisions`, not
-`MultipassExtraRuncmd`.** The previously documented installer at
+**Binary name:** `agy`. **Provision through the selected provider's explicit
+executable list — `CodeyBox:MultipassExecutableProvisions` or
+`CodeyBox:Incus:ExecutableProvisions` — not an `ExtraRuncmd` installer.** The previously documented installer at
 `https://antigravity.google/cli/install.sh` no longer serves a shell script —
 as of 2026-06-17 it returns the Antigravity landing page (HTTP 200,
 `Content-Type: text/html`). Piping HTML into `bash` exits 2; with a trailing
@@ -755,17 +761,35 @@ the baseline at bake time:
 }
 ```
 
-The provisioner `multipass transfer`s the host file into the VM, then runs
-`install -m 0755 -o root -g root` so the executable bit and ownership are
-set deterministically (neither `File.Copy` on the host staging side nor
-`multipass transfer` documents preservation of the executable bit). The
-`/usr/local/bin/agy` symlink puts `agy` on the non-login sandbox PATH that
-`multipass exec` uses. The baseline bake verifies `agy --version` for
+For Incus, the same vetted host binary is configured explicitly under the
+Incus provider instead; there is no fallback from the Multipass list:
+
+```jsonc
+// settings.json
+{
+  "CodeyBox": {
+    "Incus": {
+      "ExecutableProvisions": [
+        {
+          "HostSourcePath": "/home/<operator>/.codeybox/agy-seed/agy",
+          "VmDestPath": "/home/ubuntu/.local/bin/agy",
+          "VmSymlinks": ["/usr/local/bin/agy"],
+          "Label": "antigravity"
+        }
+      ]
+    }
+  }
+}
+```
+
+The selected provider copies the host file into the VM and installs it with
+mode 0755 and deterministic root ownership. The `/usr/local/bin/agy` symlink
+puts `agy` on the non-login sandbox PATH. Baseline provisioning verifies `agy --version` for
 configured Antigravity members before the image is marked ready to clone,
 so a missing/broken host binary fails the bake loudly instead of surfacing
 as dispatch exit 127. Hot-reloadable via the existing `IOptionsMonitor`
-plumbing; changing the host path or symlinks invalidates the cached
-`cb-baseline-*` images via the baseline hash.
+plumbing; changing the host path or symlinks invalidates that provider's
+content-addressed baseline via its hash.
 
 **Non-interactive invocation:** `agy --print --dangerously-skip-permissions
 --model <gateway-model-id>` with the prompt on stdin (the sandbox is the

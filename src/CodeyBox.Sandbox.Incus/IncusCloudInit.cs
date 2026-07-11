@@ -9,8 +9,11 @@ internal static class IncusCloudInit
     internal const string RuntimeDirectory = "/run/codeybox";
     internal const string ControlDirectory = "/run/codeybox-control";
     internal const string PeakRamPath = "/run/codeybox-peak-ram-bytes";
+    internal const string PeakRamSamplerPath = "/usr/local/sbin/codeybox-peak-ram-sampler";
+    internal const string PeakRamServicePath = "/etc/systemd/system/codeybox-peak-ram-sampler.service";
+    internal const string NonLoginPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-    internal const string ExecWrapper = """
+    internal const string ExecWrapper = $$"""
         #!/bin/bash
         set -uo pipefail
         if [ "$#" -lt 8 ]; then
@@ -34,7 +37,7 @@ internal static class IncusCloudInit
         fi
         environment=(
           "HOME=$guest_home"
-          "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          "PATH={{NonLoginPath}}"
           "LANG=C.UTF-8"
         )
         while IFS= read -r -d '' entry; do
@@ -103,12 +106,12 @@ internal static class IncusCloudInit
         result.Append("    content: ").AppendLine(wrapperBase64);
         if (options.CaptureResourceMetrics)
         {
-            result.AppendLine("  - path: /usr/local/sbin/codeybox-peak-ram-sampler");
+            result.Append("  - path: ").AppendLine(PeakRamSamplerPath);
             result.AppendLine("    owner: root:root");
             result.AppendLine("    permissions: '0755'");
             result.AppendLine("    encoding: b64");
             result.Append("    content: ").AppendLine(samplerBase64);
-            result.AppendLine("  - path: /etc/systemd/system/codeybox-peak-ram-sampler.service");
+            result.Append("  - path: ").AppendLine(PeakRamServicePath);
             result.AppendLine("    owner: root:root");
             result.AppendLine("    permissions: '0644'");
             result.AppendLine("    encoding: b64");
@@ -221,6 +224,23 @@ internal static class IncusCloudInit
         }
         if (!sawTopLevelMapping)
             throw new InvalidOperationException("ExtraCloudInit must contain at least one top-level mapping key.");
+    }
+
+    internal static bool OverlapsProviderOwnedPath(string path)
+    {
+        string[] protectedPaths =
+        [
+            RuntimeDirectory,
+            ControlDirectory,
+            ExecWrapperPath,
+            PeakRamPath,
+            PeakRamSamplerPath,
+            PeakRamServicePath,
+        ];
+        return protectedPaths.Any(protectedPath =>
+            string.Equals(path, protectedPath, StringComparison.Ordinal)
+            || path.StartsWith(protectedPath + "/", StringComparison.Ordinal)
+            || protectedPath.StartsWith(path + "/", StringComparison.Ordinal));
     }
 
     private static int FindUnquotedColon(string value)

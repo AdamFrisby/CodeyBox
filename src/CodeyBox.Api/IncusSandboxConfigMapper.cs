@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Incus;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -15,9 +16,15 @@ internal static class IncusSandboxConfigMapper
     private const int MaximumHostPathCharacters = 4096;
 
     public static IncusSandboxOptions Build(CodeyBoxOptions options) =>
-        Build(options, NullLogger.Instance);
+        Build(options, NullLogger.Instance, verificationCommands: null);
 
-    public static IncusSandboxOptions Build(CodeyBoxOptions options, ILogger log)
+    public static IncusSandboxOptions Build(CodeyBoxOptions options, ILogger log) =>
+        Build(options, log, verificationCommands: null);
+
+    internal static IncusSandboxOptions Build(
+        CodeyBoxOptions options,
+        ILogger log,
+        IEnumerable<BaselineVerificationCommand>? verificationCommands)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(log);
@@ -39,6 +46,9 @@ internal static class IncusSandboxConfigMapper
             // Provider provisioning is independent: an empty Incus value
             // intentionally remains empty during a side-by-side cutover.
             ExtraRuncmd = SnapshotExtraRuncmd(incus.ExtraRuncmd),
+            PackageCacheSeeds = SnapshotPackageCacheSeeds(incus.PackageCacheSeeds),
+            ExecutableProvisions = SnapshotExecutableProvisions(incus.ExecutableProvisions),
+            BaselineVerificationCommands = SnapshotBaselineVerificationCommands(verificationCommands),
             ExtraCloudInit = incus.ExtraCloudInit,
             StagingDirectory = stagingDirectory,
             GuestUserId = incus.GuestUserId,
@@ -74,6 +84,11 @@ internal static class IncusSandboxConfigMapper
             BaselineCpus = incus.BaselineCpus,
             BaselineMemoryBytes = incus.BaselineMemoryBytes,
             BaselineDiskBytes = incus.BaselineDiskBytes,
+            MaxExecutableProvisionBytes = incus.MaxExecutableProvisionBytes,
+            MaxAggregateExecutableProvisionBytes = incus.MaxAggregateExecutableProvisionBytes,
+            MaxPackageCacheSeedBytes = incus.MaxPackageCacheSeedBytes,
+            MaxAggregatePackageCacheSeedBytes = incus.MaxAggregatePackageCacheSeedBytes,
+            MaxPackageCacheSeedEntries = incus.MaxPackageCacheSeedEntries,
             MaxSnapshotBytes = incus.MaxSnapshotBytes,
             MaxSnapshotEntries = incus.MaxSnapshotEntries,
             MaxReadinessProbeEntries = incus.MaxReadinessProbeEntries,
@@ -146,6 +161,88 @@ internal static class IncusSandboxConfigMapper
         return copy.Count == 0
             ? Array.Empty<string>()
             : Array.AsReadOnly(copy.ToArray());
+    }
+
+    internal static IReadOnlyList<BaselinePackageCacheSeed> SnapshotPackageCacheSeeds(
+        IEnumerable<PackageCacheSeedConfig>? seeds) =>
+        BaselineProvisioningConfigSnapshot.SnapshotPackageCacheSeeds(
+            seeds,
+            "CodeyBox:Incus:PackageCacheSeeds");
+
+    internal static IReadOnlyList<BaselineExecutableProvision> SnapshotExecutableProvisions(
+        IEnumerable<ExecutableProvisionConfig>? provisions) =>
+        BaselineProvisioningConfigSnapshot.SnapshotExecutableProvisions(
+            provisions,
+            "CodeyBox:Incus:ExecutableProvisions");
+
+    internal static IReadOnlyList<BaselineVerificationCommand> SnapshotBaselineVerificationCommands(
+        IEnumerable<BaselineVerificationCommand>? commands)
+    {
+        if (commands is null)
+            return [];
+
+        var copy = new List<BaselineVerificationCommand>(
+            Math.Min(IncusSandboxOptions.MaximumBaselineVerificationCommands, 16));
+        long aggregateBytes = 0;
+        foreach (var command in commands)
+        {
+            if (copy.Count >= IncusSandboxOptions.MaximumBaselineVerificationCommands)
+            {
+                throw new InvalidOperationException(
+                    $"Incus baseline verification cannot contain more than {IncusSandboxOptions.MaximumBaselineVerificationCommands} commands.");
+            }
+            if (command is null)
+                throw new InvalidOperationException("Incus baseline verification cannot contain null commands.");
+
+            AddVerificationText(command.Label, "Incus baseline verification label");
+            if (command.FailureHint is not null)
+                AddVerificationText(command.FailureHint, "Incus baseline verification failure hint");
+
+            var argv = new List<string>(Math.Min(IncusSandboxOptions.MaximumVerificationArgv, 8));
+            var sourceArgv = command.Argv
+                ?? throw new InvalidOperationException("Incus baseline verification argv cannot be null.");
+            foreach (var argument in sourceArgv)
+            {
+                if (argv.Count >= IncusSandboxOptions.MaximumVerificationArgv)
+                {
+                    throw new InvalidOperationException(
+                        $"Incus baseline verification argv cannot contain more than {IncusSandboxOptions.MaximumVerificationArgv} arguments.");
+                }
+                AddVerificationText(argument, "Incus baseline verification argument");
+                argv.Add(argument);
+            }
+            copy.Add(new BaselineVerificationCommand(
+                command.Label,
+                Array.AsReadOnly(argv.ToArray()),
+                command.FailureHint));
+        }
+        return Array.AsReadOnly(copy.ToArray());
+
+        void AddVerificationText(string value, string fieldName)
+        {
+            var bytes = GetProvisioningTextByteCount(value, fieldName);
+            if (bytes > IncusSandboxOptions.MaximumAggregateVerificationTextUtf8Bytes - aggregateBytes)
+            {
+                throw new InvalidOperationException(
+                    $"Incus baseline verification text exceeds {IncusSandboxOptions.MaximumAggregateVerificationTextUtf8Bytes} UTF-8 bytes in aggregate.");
+            }
+            aggregateBytes += bytes;
+        }
+    }
+
+    private static int GetProvisioningTextByteCount(string? value, string fieldName)
+    {
+        ConfigurationInputBounds.EnsureCharacterBound(
+            value,
+            IncusSandboxOptions.MaximumProvisioningTextUtf8Bytes,
+            fieldName);
+        var bytes = System.Text.Encoding.UTF8.GetByteCount(value!);
+        if (bytes > IncusSandboxOptions.MaximumProvisioningTextUtf8Bytes)
+        {
+            throw new InvalidOperationException(
+                $"{fieldName} exceeds {IncusSandboxOptions.MaximumProvisioningTextUtf8Bytes} UTF-8 bytes.");
+        }
+        return bytes;
     }
 
     private static IReadOnlyList<string> SnapshotAllowedHostMountRoots(CodeyBoxOptions options)

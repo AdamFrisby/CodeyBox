@@ -7,6 +7,8 @@ namespace CodeyBox.Sandbox.Incus;
 internal static partial class IncusSafeFile
 {
     private const int OpenReadOnly = 0;
+    private const int OpenReadWrite = 2;
+    private const int OpenCreate = 0x40;
     private const int OpenNonBlock = 0x800;
     private const int OpenDirectory = 0x10000;
     private const int OpenNoFollow = 0x20000;
@@ -20,6 +22,9 @@ internal static partial class IncusSafeFile
     private const ushort RegularFileType = 0x8000;
     private const ushort SymbolicLinkFileType = 0xA000;
     private const int AlreadyExists = 17;
+    private const int WouldBlock = 11;
+    private const int LockExclusive = 2;
+    private const int LockNonBlocking = 4;
 
     internal static bool TryCreateDirectoryExclusive(string path)
     {
@@ -55,6 +60,60 @@ internal static partial class IncusSafeFile
             handle.Dispose();
             throw;
         }
+    }
+
+    internal static FileStream OpenOrCreatePrivateLeaseNoFollow(string path)
+    {
+        if (!OperatingSystem.IsLinux())
+            throw new PlatformNotSupportedException("The Incus provider requires Linux lease-file semantics.");
+        const uint ownerReadWriteMode = 0x180; // 0600
+        var descriptor = OpenWithMode(
+            path,
+            OpenReadWrite | OpenCreate | OpenNoFollow | OpenCloseOnExec,
+            ownerReadWriteMode);
+        if (descriptor < 0)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            throw new IOException("Unable to open the private Incus provisioning lease without following links.", new Win32Exception(error));
+        }
+        SafeFileHandle? handle = new((nint)descriptor, ownsHandle: true);
+        try
+        {
+            var status = ReadStatus(handle, RegularFileType, "private Incus provisioning lease");
+            var identity = IncusHostIdentity.GetEffectiveIdentity();
+            if (status.UserId != identity.UserId || status.GroupId != identity.GroupId)
+            {
+                throw new InvalidOperationException(
+                    "Refusing an Incus provisioning lease owned by another host identity.");
+            }
+            if (SetFileMode(descriptor, ownerReadWriteMode) != 0)
+            {
+                var error = Marshal.GetLastPInvokeError();
+                throw new IOException("Unable to set the private Incus provisioning lease mode.", new Win32Exception(error));
+            }
+            var result = new FileStream(handle, FileAccess.ReadWrite, bufferSize: 1, isAsync: false);
+            handle = null;
+            return result;
+        }
+        finally
+        {
+            handle?.Dispose();
+        }
+    }
+
+    internal static bool TryAcquireExclusiveLease(FileStream lease)
+    {
+        ArgumentNullException.ThrowIfNull(lease);
+        if (AcquireFileLock(
+                lease.SafeFileHandle.DangerousGetHandle().ToInt32(),
+                LockExclusive | LockNonBlocking) == 0)
+        {
+            return true;
+        }
+        var error = Marshal.GetLastPInvokeError();
+        if (error == WouldBlock)
+            return false;
+        throw new IOException("Unable to acquire the private Incus provisioning lease.", new Win32Exception(error));
     }
 
     /// <summary>
@@ -298,6 +357,9 @@ internal static partial class IncusSafeFile
     [LibraryImport("libc", EntryPoint = "open", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
     private static partial int Open(string path, int flags);
 
+    [LibraryImport("libc", EntryPoint = "open", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
+    private static partial int OpenWithMode(string path, int flags, uint mode);
+
     [LibraryImport("libc", EntryPoint = "openat", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
     private static partial int OpenAt(int directoryDescriptor, string path, int flags);
 
@@ -311,6 +373,12 @@ internal static partial class IncusSafeFile
 
     [LibraryImport("libc", EntryPoint = "mkdir", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
     private static partial int CreateDirectory(string path, uint mode);
+
+    [LibraryImport("libc", EntryPoint = "fchmod", SetLastError = true)]
+    private static partial int SetFileMode(int descriptor, uint mode);
+
+    [LibraryImport("libc", EntryPoint = "flock", SetLastError = true)]
+    private static partial int AcquireFileLock(int descriptor, int operation);
 
     [StructLayout(LayoutKind.Explicit, Size = 256)]
     private struct StatxBuffer

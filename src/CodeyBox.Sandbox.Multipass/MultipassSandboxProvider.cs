@@ -1460,7 +1460,7 @@ git push origin HEAD:{refName}";
         return Convert.ToHexString(hash.AsSpan(0, 6)).ToLowerInvariant();
     }
 
-    private static string RenderExecutableProvisionForHash(ExecutableProvisionOptions exe)
+    private static string RenderExecutableProvisionForHash(BaselineExecutableProvision exe)
     {
         var hostPath = ResolvePath(exe.HostSourcePath);
         return string.Join("\u001f", new[]
@@ -1485,7 +1485,7 @@ git push origin HEAD:{refName}";
         return "sha256:" + Convert.ToHexString(sha.ComputeHash(stream)).ToLowerInvariant();
     }
 
-    private static string RenderBaselineVerificationCommandForHash(MultipassBaselineVerificationCommand cmd) =>
+    private static string RenderBaselineVerificationCommandForHash(BaselineVerificationCommand cmd) =>
         string.Join("\u001f", new[]
         {
             cmd.Label,
@@ -4884,19 +4884,6 @@ internal static class MultipassRetry
     }
 }
 
-/// <summary>
-/// A provider-neutral baseline-bake validation command: a one-shot in-VM command the
-/// provider runs against a freshly-baked baseline before it is stopped and reused as a
-/// clone source. <see cref="Label"/> is a human-readable identifier used only in log lines
-/// and error messages; the provider does not interpret it. Mapping from agent (or any
-/// other producer) to validation command lives in the composition layer — this record
-/// keeps the sandbox infrastructure layer free of agent-catalog semantics.
-/// </summary>
-public sealed record MultipassBaselineVerificationCommand(
-    string Label,
-    IReadOnlyList<string> Argv,
-    string? FailureHint = null);
-
 public sealed record MultipassSandboxOptions
 {
     public const int DefaultCloudInitReadyRetryAttempts = 3;
@@ -4936,9 +4923,9 @@ public sealed record MultipassSandboxOptions
     /// derives this list from configured AgentClass members so enabling a CLI-backed
     /// agent fails the bake immediately if its binary is missing from PATH. The
     /// sandbox layer itself only executes the commands and surfaces failures by
-    /// <see cref="MultipassBaselineVerificationCommand.Label"/>.
+    /// <see cref="BaselineVerificationCommand.Label"/>.
     /// </summary>
-    public IReadOnlyList<MultipassBaselineVerificationCommand> BaselineVerificationCommands { get; init; } = [];
+    public IReadOnlyList<BaselineVerificationCommand> BaselineVerificationCommands { get; init; } = [];
 
     /// <summary>
     /// Extra cloud-init YAML appended after the orchestrator's own
@@ -5142,7 +5129,7 @@ public sealed record MultipassSandboxOptions
     /// <summary>
     /// Configurable list of package cache seeds to copy from the host to the baseline VM at bake time.
     /// </summary>
-    public IReadOnlyList<PackageCacheSeedOptions> PackageCacheSeeds { get; init; } = [];
+    public IReadOnlyList<BaselinePackageCacheSeed> PackageCacheSeeds { get; init; } = [];
 
     /// <summary>
     /// Host-staged executable binaries to ship into the baseline VM at bake time.
@@ -5156,57 +5143,7 @@ public sealed record MultipassSandboxOptions
     /// to fail loudly if the file is missing rather than silently proceed.
     /// </para>
     /// </summary>
-    public IReadOnlyList<ExecutableProvisionOptions> ExecutableProvisions { get; init; } = [];
-}
-
-/// <summary>
-/// Configuration for a package cache seed to be copied into the baseline VM.
-/// </summary>
-public sealed record PackageCacheSeedOptions
-{
-    public string HostSourcePath { get; init; } = string.Empty;
-    public string VmDestPath { get; init; } = string.Empty;
-    public double? MaxSizeMB { get; init; }
-}
-
-/// <summary>
-/// Configuration for a host-staged executable binary that the baseline bake
-/// must ship into the VM at a known absolute path with mode 0755.
-/// <para>
-/// Provisioning uses <c>multipass transfer</c> for the bytes followed by an
-/// in-VM <c>install -m 0755 -o root -g root</c>, so the executable bit and
-/// file ownership are set deterministically — neither <c>File.Copy</c> on the
-/// host staging side nor <c>multipass transfer</c> documents preservation of
-/// the executable bit, and depending on it has produced silent breakage.
-/// </para>
-/// </summary>
-public sealed record ExecutableProvisionOptions
-{
-    /// <summary>Host path to the executable file. Tilde-expansion is honoured.</summary>
-    public string HostSourcePath { get; init; } = string.Empty;
-
-    /// <summary>
-    /// Absolute VM path where the executable must land (e.g.
-    /// <c>/home/ubuntu/.local/bin/agy</c>). The parent directory is created if it
-    /// does not already exist; parents below <c>/home/ubuntu</c> are kept owned by
-    /// the unprivileged <c>ubuntu</c> user even though the executable file itself
-    /// is root-owned.
-    /// </summary>
-    public string VmDestPath { get; init; } = string.Empty;
-
-    /// <summary>
-    /// Optional absolute VM paths at which to create symlinks pointing to
-    /// <see cref="VmDestPath"/>. Use to put a binary installed under the
-    /// non-login user's home onto a system PATH (e.g.
-    /// <c>/usr/local/bin/agy</c>).
-    /// </summary>
-    public IReadOnlyList<string> VmSymlinks { get; init; } = [];
-
-    /// <summary>
-    /// Diagnostic label used in log lines and bake-failure messages. Defaults to
-    /// the destination filename when unset.
-    /// </summary>
-    public string? Label { get; init; }
+    public IReadOnlyList<BaselineExecutableProvision> ExecutableProvisions { get; init; } = [];
 }
 
 /// <summary>

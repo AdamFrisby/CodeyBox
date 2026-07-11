@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.HostProcess;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Incus;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -45,12 +46,15 @@ public sealed class IncusIntegrationTests
         var emptyReadOnlySource = Path.Combine(workspace, "readonly-empty");
         var isolatedSource = Path.Combine(workspace, "isolated");
         var singleFileSource = Path.Combine(workspace, "single-file.txt");
+        var executableSource = Path.Combine(workspace, "codeybox-provisioned-tool");
+        var cacheSeedSource = Path.Combine(workspace, "package-cache-seed");
         var staging = Path.Combine(workspace, "staging");
         var baselineMarkerPath = $"/var/lib/codeybox-incus-test/bake-{token}";
         Directory.CreateDirectory(writableSource);
         Directory.CreateDirectory(readOnlySource);
         Directory.CreateDirectory(emptyReadOnlySource);
         Directory.CreateDirectory(isolatedSource);
+        Directory.CreateDirectory(cacheSeedSource);
         if (OperatingSystem.IsLinux())
         {
             File.SetUnixFileMode(
@@ -69,6 +73,12 @@ public sealed class IncusIntegrationTests
             Path.Combine(isolatedSource, "snapshot.txt"),
             "before-snapshot\n");
         await File.WriteAllTextAsync(singleFileSource, "single-file\n");
+        await File.WriteAllTextAsync(
+            executableSource,
+            "#!/bin/sh\nif [ \"${1:-}\" = \"--version\" ]; then printf 'codeybox-provisioned-tool 1.0\\n'; else printf 'provisioned-exec-ok\\n'; fi\n");
+        await File.WriteAllTextAsync(
+            Path.Combine(cacheSeedSource, "seed.txt"),
+            "package-cache-seed-ok\n");
         var hostIdentity = IncusHostIdentity.GetEffectiveIdentity();
 
         var options = new IncusSandboxOptions
@@ -91,6 +101,32 @@ public sealed class IncusIntegrationTests
             [
                 $"install -d -m 0755 /var/lib/codeybox-incus-test && " +
                 $"printf '{token}\\n' >> {baselineMarkerPath} && chmod 0644 {baselineMarkerPath}",
+            ],
+            ExecutableProvisions =
+            [
+                new BaselineExecutableProvision
+                {
+                    HostSourcePath = executableSource,
+                    VmDestPath = "/home/ubuntu/.local/bin/codeybox-provisioned-tool",
+                    VmSymlinks = ["/usr/local/bin/codeybox-provisioned-tool"],
+                    Label = "integration executable",
+                },
+            ],
+            BaselineVerificationCommands =
+            [
+                new BaselineVerificationCommand(
+                    "integration executable",
+                    ["codeybox-provisioned-tool", "--version"],
+                    "the host-staged integration executable must be runnable on the sandbox PATH"),
+            ],
+            PackageCacheSeeds =
+            [
+                new BaselinePackageCacheSeed
+                {
+                    HostSourcePath = cacheSeedSource,
+                    VmDestPath = "/home/ubuntu/.nuget/packages/codeybox-integration",
+                    MaxSizeMB = 1,
+                },
             ],
             StagingDirectory = staging,
             OperationTimeout = TimeSpan.FromMinutes(5),
@@ -122,9 +158,11 @@ public sealed class IncusIntegrationTests
             var bakedBaseline = await provisioner.EnsureBaselineImageAsync(
                 profile,
                 SandboxProfileFlavor.Headless,
-                baseline,
-                CancellationToken.None);
+                pinnedBaselineRef: null,
+                CancellationToken.None)
+                ?? throw new InvalidOperationException("The Incus integration baseline bake returned null.");
             Assert.Equal(baseline, bakedBaseline);
+            baseline = bakedBaseline;
 
             var copy = await RunCheckedAsync(
                 [
@@ -218,6 +256,56 @@ public sealed class IncusIntegrationTests
             });
             Assert.True(exec.Success, exec.Stderr);
             Assert.Equal("incus-exec-ok\n", exec.Stdout);
+
+            var provisionedExecutable = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["codeybox-provisioned-tool"],
+            });
+            Assert.True(provisionedExecutable.Success, provisionedExecutable.Stderr);
+            Assert.Equal("provisioned-exec-ok\n", provisionedExecutable.Stdout);
+
+            var provisionedExecutableMetadata = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "stat", "-Lc", "%u:%g:%a",
+                    "/home/ubuntu/.local/bin/codeybox-provisioned-tool",
+                ],
+            });
+            Assert.True(provisionedExecutableMetadata.Success, provisionedExecutableMetadata.Stderr);
+            Assert.Equal("0:0:755", provisionedExecutableMetadata.Stdout.Trim());
+
+            var provisioningParentsWritable = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "sh", "-c",
+                    "set -eu; printf sibling > /home/ubuntu/.local/bin/codeybox-write-probe; " +
+                    "mkdir -p /home/ubuntu/.nuget/packages/codeybox-write-probe; " +
+                    "rm -rf /home/ubuntu/.local/bin/codeybox-write-probe /home/ubuntu/.nuget/packages/codeybox-write-probe",
+                ],
+            });
+            Assert.True(provisioningParentsWritable.Success, provisioningParentsWritable.Stderr);
+
+            var provisionedCache = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["cat", "/home/ubuntu/.nuget/packages/codeybox-integration/seed.txt"],
+            });
+            Assert.True(provisionedCache.Success, provisionedCache.Stderr);
+            Assert.Equal("package-cache-seed-ok\n", provisionedCache.Stdout);
+
+            var provisionedCacheWritable = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "sh", "-c",
+                    "printf 'package-cache-updated\\n' > " +
+                    "/home/ubuntu/.nuget/packages/codeybox-integration/seed.txt && " +
+                    "cat /home/ubuntu/.nuget/packages/codeybox-integration/seed.txt",
+                ],
+            });
+            Assert.True(provisionedCacheWritable.Success, provisionedCacheWritable.Stderr);
+            Assert.Equal("package-cache-updated\n", provisionedCacheWritable.Stdout);
 
             var secret = $"incus-secret-{token}";
             var secretEnvironment = await sandbox.ExecAsync(new SandboxExec
