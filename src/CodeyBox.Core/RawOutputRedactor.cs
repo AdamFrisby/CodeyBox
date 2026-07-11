@@ -4,7 +4,8 @@ namespace CodeyBox.Core;
 
 /// <summary>
 /// Applies the same secret-value patterns as <see cref="SensitiveDataRedactionEnricher"/>
-/// to arbitrary strings. Used to scrub auditor raw output before persisting it.
+/// to arbitrary strings and removes terminal control characters before persistence.
+/// Used to scrub auditor raw output before persisting it.
 /// Reuses <see cref="SensitiveDataRedactionEnricher.SecretValuePatternSource"/> so
 /// the auditor path and SignalR/log paths stay in lockstep on what counts as a secret.
 /// </summary>
@@ -15,11 +16,44 @@ public static class RawOutputRedactor
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     /// <summary>
-    /// Replaces any detected secret token in <paramref name="text"/> with <c>***</c>.
-    /// Returns the original string unchanged when no secrets are found.
+    /// Replaces any detected secret token in <paramref name="text"/> with <c>***</c>
+    /// and strips unsafe control characters. Newlines and tabs are retained so
+    /// multi-line diagnostics remain readable.
     /// </summary>
     public static string Redact(string text) =>
-        SensitiveDataRedactionEnricher.RedactJsonSensitiveProperties(SecretPattern.Replace(text, "***"));
+        StripUnsafeControlCharacters(
+            SensitiveDataRedactionEnricher.RedactJsonSensitiveProperties(
+                SecretPattern.Replace(text, "***")));
+
+    private static string StripUnsafeControlCharacters(string text)
+    {
+        if (!ContainsUnsafeControlCharacter(text))
+            return text;
+
+        var buffer = new char[text.Length];
+        var written = 0;
+        foreach (var ch in text)
+        {
+            if (IsRetainedCharacter(ch))
+                buffer[written++] = ch;
+        }
+
+        return new string(buffer, 0, written);
+    }
+
+    private static bool IsRetainedCharacter(char ch) =>
+        !char.IsControl(ch) || ch is '\n' or '\t';
+
+    private static bool ContainsUnsafeControlCharacter(string text)
+    {
+        foreach (var ch in text)
+        {
+            if (!IsRetainedCharacter(ch))
+                return true;
+        }
+
+        return false;
+    }
 
     /// <summary>
     /// Truncates <paramref name="text"/> to at most <paramref name="maxBytes"/> UTF-8 bytes,

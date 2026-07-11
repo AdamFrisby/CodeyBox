@@ -186,6 +186,10 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
             credential,
             "OPENCODE_AUTH_JSON");
 
+    // The opencode CLI runs inside the work-item sandbox; a host-side text-only
+    // call with no sandbox returns failure (see RunTextOnlyAsync below).
+    public bool TextOnlyRequiresSandbox => true;
+
     public Task<TextOnlyAgentResult> RunTextOnlyAsync(
         string prompt,
         AgentCredential? credential,

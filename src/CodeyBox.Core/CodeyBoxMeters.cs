@@ -19,9 +19,34 @@ public static class CodeyBoxMeters
     public static readonly Counter<long> PipelineTransitions =
         PipelineMeter.CreateCounter<long>("codeybox.work_item.transitions");
 
-    /// <summary>Incremented once per audit iteration. Tag: <c>outcome</c> (passed | reworking | failed).</summary>
+    /// <summary>
+    /// Incremented once per code-audit iteration. Tags: <c>outcome</c>
+    /// (passed | reworking | failed | needs_operator_input), <c>iteration</c>,
+    /// <c>self_review_checklist</c> (on | off), and <c>planned</c> (on | off).
+    /// The <c>planned</c> tag lets dashboards compare code-stage audit-iteration
+    /// count for PLANNED vs UNPLANNED items — the measurement that proves whether
+    /// planning net-reduces code cycles.
+    /// </summary>
     public static readonly Counter<long> AuditIterations =
         AuditMeter.CreateCounter<long>("codeybox.audit.iterations");
+
+    /// <summary>
+    /// One increment per work item at its FIRST code-audit iteration. Tags:
+    /// <c>outcome</c> (passed | failed) and <c>planned</c> (on | off). Unlike
+    /// <see cref="SessionFirstAuditOutcome"/> (session-mode only), this is emitted
+    /// for every work item, so first-audit pass-rate can be sliced by the planned
+    /// cohort to measure whether planning improves the first-pass rate.
+    /// </summary>
+    public static readonly Counter<long> FirstAuditOutcome =
+        AuditMeter.CreateCounter<long>("codeybox.audit.first_audit.outcome", unit: "{audit}");
+
+    /// <summary>
+    /// Incremented for empty-rework handling sub-events. Tag:
+    /// <c>outcome</c> (<c>detected</c> | <c>escalation_succeeded</c> |
+    /// <c>parked</c> | <c>failed</c>).
+    /// </summary>
+    public static readonly Counter<long> ReworkEmptyEvents =
+        AuditMeter.CreateCounter<long>("codeybox.audit.rework_empty.events", unit: "{event}");
 
     /// <summary>
     /// One increment per pre-emptive self-review turn outcome on a session-
@@ -105,7 +130,8 @@ public static class CodeyBoxMeters
     /// One increment per agent fallback event (the routed member was swapped for
     /// another, or the class was fully exhausted). Tags: <c>from_agent</c>,
     /// <c>to_agent</c> (<c>(none)</c> when the class exhausted), <c>kind</c>
-    /// (<c>quota</c> | <c>timeout</c>), <c>phase</c>.
+    /// (<c>quota</c> | <c>auth</c> | <c>timeout</c> |
+    /// <c>resume_exhausted</c>), <c>phase</c>.
     /// </summary>
     public static readonly Counter<long> AgentFallbacks =
         PipelineMeter.CreateCounter<long>("codeybox.agent.fallbacks", unit: "{fallback}");

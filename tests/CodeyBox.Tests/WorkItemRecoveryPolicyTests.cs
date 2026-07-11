@@ -478,6 +478,7 @@ public sealed class WorkItemRecoveryPolicyTests
             PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
             PlanReviewedAt = from == WorkItemState.PlanApproved ? DateTimeOffset.UtcNow.AddMinutes(-1) : null,
             PlanReviewSummary = from == WorkItemState.PlanApproved ? "approved" : null,
+            PlanReviewAttempts = 2,
             LastError = "deferred",
             FailureKind = "infrastructure",
         };
@@ -494,6 +495,7 @@ public sealed class WorkItemRecoveryPolicyTests
             Assert.Null(recovered.PlanGeneratedAt);
             Assert.Null(recovered.PlanReviewedAt);
             Assert.Null(recovered.PlanReviewSummary);
+            Assert.Equal(0, recovered.PlanReviewAttempts);
         }
         else
         {
@@ -501,6 +503,7 @@ public sealed class WorkItemRecoveryPolicyTests
             Assert.Equal(item.PlanGeneratedAt, recovered.PlanGeneratedAt);
             Assert.Equal(item.PlanReviewedAt, recovered.PlanReviewedAt);
             Assert.Equal(item.PlanReviewSummary, recovered.PlanReviewSummary);
+            Assert.Equal(item.PlanReviewAttempts, recovered.PlanReviewAttempts);
         }
         Assert.Null(recovered.LastError);
         Assert.Null(recovered.FailureKind);

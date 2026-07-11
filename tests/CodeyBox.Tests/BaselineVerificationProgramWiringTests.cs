@@ -205,9 +205,9 @@ public sealed class BaselineVerificationProgramWiringTests
         var visited = new HashSet<object>();
         while (current is not MultipassSandboxProvider && visited.Add(current))
         {
-            if (current is HotSwappableSandboxProvider cutover)
+            if (current is ReloadableSandboxProvider reloadable)
             {
-                current = cutover.MultipassProvider;
+                current = reloadable.GetProvider(SandboxProviderKinds.Multipass);
                 continue;
             }
             var innerField = FindInnerField(current.GetType());

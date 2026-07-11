@@ -73,7 +73,7 @@ public sealed class AuditReportsEndpointUatTests : IDisposable
             auditorName: "security:gitleaks",
             rawOutput: "scan completed\n"));
 
-        var response = await _client.GetAsync($"/workitems/{item.Id}/audit-reports/1/security%3Agitleaks/raw");
+        var response = await _client.GetAsync($"/workitems/{item.Id}/audit-reports/code/1/security%3Agitleaks/raw");
         response.EnsureSuccessStatusCode();
 
         Assert.Contains("text/plain", response.Content.Headers.ContentType?.MediaType);

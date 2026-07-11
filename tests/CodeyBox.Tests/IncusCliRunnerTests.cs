@@ -30,6 +30,49 @@ public sealed class IncusCliRunnerTests
     }
 
     [Fact]
+    public async Task RunCheckedAsync_SuppliesConfiguredOutputBoundsToProcessBoundary()
+    {
+        var process = new CapturingProcessRunner();
+        var options = Options with
+        {
+            MaxCliStdoutBytes = 12_345,
+            MaxCliStderrBytes = 6_789,
+        };
+        var runner = new IncusCliRunner(process);
+
+        await runner.RunCheckedAsync(
+            "probe",
+            options,
+            ["incus", "version"],
+            stdin: null,
+            timeout: null,
+            CancellationToken.None);
+
+        Assert.Equal(options.MaxCliStdoutBytes, process.MaxStdoutBytes);
+        Assert.Equal(options.MaxCliStderrBytes, process.MaxStderrBytes);
+        Assert.True(process.KillOnOutputLimit);
+    }
+
+    [Theory]
+    [InlineData(null, 1024)]
+    [InlineData(1024, null)]
+    public async Task IncusProcessBoundary_RejectsMissingOutputBound(
+        int? maxStdoutBytes,
+        int? maxStderrBytes)
+    {
+        var runner = new IncusCliProcessRunner();
+
+        var exception = await Assert.ThrowsAsync<ArgumentException>(() => runner.RunAsync(
+            ["/bin/true"],
+            stdin: null,
+            CancellationToken.None,
+            maxStdoutBytes: maxStdoutBytes,
+            maxStderrBytes: maxStderrBytes));
+
+        Assert.Contains("requires explicit stdout and stderr limits", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task RunCheckedAsync_MapsNonZeroExitToContextualBoundedError()
     {
         var longError = "daemon failed\r\n" + new string('x', 5000);
@@ -145,6 +188,25 @@ public sealed class IncusCliRunnerTests
         Assert.Equal("Incus version probe could not be executed.", exception.Message);
     }
 
+    [Fact]
+    public async Task RunAllowFailureAsync_PreservesUnexpectedRunnerFailureAsCause()
+    {
+        var cause = new IOException("process table unavailable");
+        var runner = new IncusCliRunner(new StubProcessRunner((_, _, _) =>
+            Task.FromException<ProcessRunResult>(cause)));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            runner.RunAllowFailureAsync(
+                Options,
+                ["incus", "list"],
+                stdin: null,
+                timeout: null,
+                CancellationToken.None));
+
+        Assert.Same(cause, exception.InnerException);
+        Assert.Equal("Incus CLI operation could not be executed.", exception.Message);
+    }
+
     private sealed class StubProcessRunner(
         Func<IReadOnlyList<string>, string?, CancellationToken, Task<ProcessRunResult>> handler)
         : IProcessRunner
@@ -160,5 +222,29 @@ public sealed class IncusCliRunnerTests
             IReadOnlyDictionary<string, string>? environment = null,
             bool killOnOutputLimit = true)
             => handler(argv, stdin, ct);
+    }
+
+    private sealed class CapturingProcessRunner : IProcessRunner
+    {
+        internal int? MaxStdoutBytes { get; private set; }
+        internal int? MaxStderrBytes { get; private set; }
+        internal bool KillOnOutputLimit { get; private set; }
+
+        public Task<ProcessRunResult> RunAsync(
+            IReadOnlyList<string> argv,
+            string? stdin,
+            CancellationToken ct,
+            Action<string>? stdoutChunkCallback = null,
+            Action<string>? stderrChunkCallback = null,
+            int? maxStdoutBytes = null,
+            int? maxStderrBytes = null,
+            IReadOnlyDictionary<string, string>? environment = null,
+            bool killOnOutputLimit = true)
+        {
+            MaxStdoutBytes = maxStdoutBytes;
+            MaxStderrBytes = maxStderrBytes;
+            KillOnOutputLimit = killOnOutputLimit;
+            return Task.FromResult(new ProcessRunResult(0, string.Empty, string.Empty));
+        }
     }
 }

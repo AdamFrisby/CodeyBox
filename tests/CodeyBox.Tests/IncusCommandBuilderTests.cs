@@ -145,6 +145,12 @@ public sealed class IncusCommandBuilderTests
             "images:ubuntu/24.04/cloud",
             "codeybox-test",
             new SandboxResourceLimits { CpuCount = 0 }));
+
+        Assert.Throws<ArgumentException>(() => IncusCommandBuilder.BuildInit(
+            Options,
+            new string('i', 4097),
+            "codeybox-test",
+            SandboxResourceLimits.Default));
     }
 
     [Theory]
@@ -269,18 +275,17 @@ public sealed class IncusCommandBuilderTests
                 ["internet-only"] = "cb-net",
             },
         };
-        var provider = new IncusSandboxProvider(
-            options,
-            NullLogger<IncusSandboxProvider>.Instance);
         var derived = IncusBaselineNaming.DeriveBaselineName(
             options,
             "internet-only",
             SandboxProfileFlavor.Headless);
 
-        Assert.True(provider.OwnsBaselineRef(derived));
-        Assert.False(provider.OwnsBaselineRef(derived[..^1] + "g"));
-        Assert.False(provider.OwnsBaselineRef("foreign-" + derived));
-        Assert.False(provider.OwnsBaselineRef(derived + "0"));
+        Assert.True(IncusSandboxProvider.IsOwnedBaselineRef(options, derived));
+        Assert.False(IncusSandboxProvider.IsOwnedBaselineRef(options, derived[..^1] + "g"));
+        Assert.False(IncusSandboxProvider.IsOwnedBaselineRef(options, "foreign-" + derived));
+        Assert.False(IncusSandboxProvider.IsOwnedBaselineRef(options, derived + "0"));
+        Assert.False(IncusSandboxProvider.IsOwnedBaselineRef("unsafe/path", derived));
+        Assert.False(IncusSandboxProvider.IsOwnedBaselineRef("cb-bake-", derived));
     }
 
     [Theory]

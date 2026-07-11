@@ -1,11 +1,36 @@
 using System.Globalization;
 using System.Text;
 using CodeyBox.HostProcess;
+using CodeyBox.Sandbox.Incus;
 
 namespace CodeyBox.Tests;
 
 public sealed class DefaultProcessRunnerCancellationTests
 {
+    [Fact]
+    public async Task DefaultRunner_DoesNotCreateNewLinuxSession()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+        var runner = new DefaultProcessRunner();
+
+        var result = await runner.RunAsync(
+            [
+                "/bin/sh", "-c",
+                "printf '%s\\n' \"$$\"; read -r pid comm state ppid pgrp sid rest < \"/proc/$$/stat\"; printf '%s\\n' \"$sid\"",
+            ],
+            stdin: null,
+            CancellationToken.None);
+
+        Assert.Equal(0, result.ExitCode);
+        var identifiers = result.Stdout
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(value => int.Parse(value, NumberStyles.None, CultureInfo.InvariantCulture))
+            .ToArray();
+        Assert.Equal(2, identifiers.Length);
+        Assert.NotEqual(identifiers[0], identifiers[1]);
+    }
+
     [Fact]
     public async Task CancellationWhileChildDoesNotReadLargeStdin_KillsRootAndDescendantPromptly()
     {
@@ -13,7 +38,7 @@ public sealed class DefaultProcessRunnerCancellationTests
             return;
         var transcript = new PidTranscript();
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        var runner = new DefaultProcessRunner();
+        var runner = NewIsolatedRunner();
         var run = runner.RunAsync(
             [
                 "/bin/sh", "-c",
@@ -40,7 +65,7 @@ public sealed class DefaultProcessRunnerCancellationTests
         if (!OperatingSystem.IsLinux())
             return;
         var transcript = new PidTranscript();
-        var runner = new DefaultProcessRunner();
+        var runner = new IncusCliProcessRunner();
         var run = runner.RunAsync(
             [
                 "/bin/sh", "-c",
@@ -65,7 +90,7 @@ public sealed class DefaultProcessRunnerCancellationTests
         if (!OperatingSystem.IsLinux())
             return;
         var transcript = new PidTranscript();
-        var runner = new DefaultProcessRunner();
+        var runner = NewIsolatedRunner();
         var result = await runner.RunAsync(
             [
                 "/bin/sh", "-c",
@@ -89,7 +114,7 @@ public sealed class DefaultProcessRunnerCancellationTests
             return;
         var transcript = new PidTranscript();
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        var runner = new DefaultProcessRunner();
+        var runner = NewIsolatedRunner();
         var run = runner.RunAsync(
             [
                 "/bin/sh", "-c",
@@ -109,28 +134,29 @@ public sealed class DefaultProcessRunnerCancellationTests
     }
 
     [Fact]
-    public async Task MissingExplicitOutputLimit_UsesFiniteDefaultAndKillsWriter()
+    public async Task MissingExplicitOutputLimit_PreservesUnboundedSharedRunnerBehavior()
     {
         if (!OperatingSystem.IsLinux())
             return;
-        const int expectedDefaultLimit = 16 * 1024 * 1024;
-        var transcript = new PidTranscript();
+        const int outputBytes = (16 * 1024 * 1024) + 1;
         var runner = new DefaultProcessRunner();
 
         var result = await runner.RunAsync(
             [
                 "/bin/sh", "-c",
-                "sh -c 'printf \"child=%s\\n\" $$ >&2; while :; do printf 0123456789; done' & exit 0",
+                $"yes x | head -c {outputBytes.ToString(CultureInfo.InvariantCulture)}",
             ],
             stdin: null,
-            CancellationToken.None,
-            stderrChunkCallback: transcript.Append).WaitAsync(TimeSpan.FromSeconds(10));
-        var descendantPid = await transcript.ChildPid.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
 
-        Assert.True(result.StdoutLimitExceeded);
-        Assert.Equal(expectedDefaultLimit, Encoding.UTF8.GetByteCount(result.Stdout));
-        await AssertProcessesGoneAsync(descendantPid);
+        Assert.Equal(0, result.ExitCode);
+        Assert.False(result.StdoutLimitExceeded);
+        Assert.False(result.StderrLimitExceeded);
+        Assert.Equal(outputBytes, Encoding.UTF8.GetByteCount(result.Stdout));
     }
+
+    private static DefaultProcessRunner NewIsolatedRunner() => new(
+        new DefaultProcessRunnerOptions { IsolateLinuxProcessGroup = true });
 
     private static async Task AssertProcessesGoneAsync(params int[] processIds)
     {

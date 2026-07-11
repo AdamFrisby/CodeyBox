@@ -3,6 +3,7 @@ using CodeyBox.Git;
 using CodeyBox.Orchestrator;
 using CodeyBox.Orchestrator.Knobs;
 using CodeyBox.Webhooks;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
@@ -339,15 +340,19 @@ public sealed class CheckAndActPipelineTests : IDisposable
         // RunCheckAndActAgentAsync throws InvalidOperationException when the
         // scripted agent returns Success=false; the outer catch in
         // RunCheckAndActAsync must convert that into TransitionFailed with
-        // failureKind="other" and the agent stderr surfaced in LastError —
-        // without persisting a verdict and without enqueuing the on-yes
-        // follow-up. The scripted agent has CheckPlan empty here so its
-        // HandleCheckAsync returns AgentResult(false, ...).
+        // failureKind="other" and the scrubbed agent diagnostics surfaced in
+        // LastError without persisting a verdict and without enqueuing the
+        // on-yes follow-up.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var tp = TestSupport.BuildPipeline(_workspace, seed);
 
-        // CheckPlan intentionally empty — scripted agent returns Success=false.
-        Assert.Empty(tp.Agent.CheckPlan);
+        var secret = "sk-ant-api03-AABBCCDDEEFFGGHHIIJJKKLLMMNNOOPPQQRRSSTT-0123456";
+        var escape = (char)0x1B;
+        tp.Agent.CheckResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: $"agent leaked summary {secret}",
+            Stdout: $"stdout leaked {secret}",
+            Stderr: $"stderr leaked {escape}[31m{secret}{escape}[0m"));
 
         var check = new WorkItem
         {
@@ -376,12 +381,76 @@ public sealed class CheckAndActPipelineTests : IDisposable
         // "check-and-act agent failed" — pin that so a regression that
         // swallows the agent's failure summary or stderr is caught.
         Assert.Contains("check-and-act agent failed", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("stderr:", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("stdout:", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("***", final.LastError, StringComparison.Ordinal);
+        Assert.DoesNotContain(secret, final.LastError, StringComparison.Ordinal);
+        Assert.DoesNotContain(escape.ToString(), final.LastError, StringComparison.Ordinal);
         Assert.Null(final.Verdict);
 
         // No follow-up was enqueued.
         var allItems = new List<WorkItem>();
         await foreach (var it in tp.Store.ListAsync()) allItems.Add(it);
         Assert.DoesNotContain(allItems, i => i.OriginCheckWorkItemId == check.Id);
+    }
+
+    [Fact]
+    public async Task InfrastructureFailureDuringCheck_TransitionsCheckToFailed_WithInfraMetadata()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var stateDbPath = Path.Combine(_workspace, $"check-infra-{Guid.NewGuid():N}.db");
+        using var involvement = new SqliteAgentInvolvementStore(stateDbPath);
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            stateDbPathOverride: stateDbPath,
+            involvement: involvement);
+
+        tp.Agent.CheckResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 127",
+            Stdout: null,
+            Stderr: "env: 'claude': No such file or directory"));
+
+        var check = NewCheckItem("codeybox/checkact-infra-check");
+        await tp.Store.CreateAsync(check);
+
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(check.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, final.FailureKind);
+        Assert.Equal(AgentKind.Claude, final.Agent);
+        Assert.Contains("Check-and-act agent claude reported failure", final.LastError);
+        Assert.Contains("agent exited 127", final.LastError);
+
+        var involvementRows = await involvement.ListByWorkItemAsync(check.Id);
+        var failedInvolvement = Assert.Single(involvementRows);
+        Assert.Equal(AgentKind.Claude, failedInvolvement.AgentKind);
+        Assert.Equal(AgentInvolvementOutcomes.FailureInfrastructure, failedInvolvement.Outcome);
+
+        var restoreQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(
+            tp.Store,
+            restoreQueue,
+            tp.GitHost,
+            NullLogger<WorkItemRetrier>.Instance);
+        var scheduler = new AgentRestoreRetryScheduler(
+            tp.Store,
+            retrier,
+            () => new AgentRestoreRetryOptions(),
+            NullLogger<AgentRestoreRetryScheduler>.Instance,
+            involvement: involvement);
+
+        var summary = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(
+                AgentKind.Claude,
+                final.UpdatedAt.AddMinutes(-1),
+                final.UpdatedAt.AddMinutes(1)));
+
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(WorkItemState.Queued, (await tp.Store.GetAsync(check.Id))!.State);
+        Assert.Equal(1, restoreQueue.Count);
     }
 
     [Fact]
@@ -457,11 +526,33 @@ public sealed class CheckAndActPipelineTests : IDisposable
         var final = await tp.Store.GetAsync(check.Id);
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Equal(WorkItemAuthFailureScope.Item, final.AuthFailureScope);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("check", final.LastError);
         Assert.Contains("item-level failure only, no fleet-wide bench", final.LastError);
         Assert.True(registry.GetAvailability(AgentKind.Claude).Available);
         Assert.DoesNotContain(webhooks.Events, e => e.Event == "agent.smoke_failed");
+
+        var restoreQueue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(
+            tp.Store,
+            restoreQueue,
+            tp.GitHost,
+            NullLogger<WorkItemRetrier>.Instance);
+        var scheduler = new AgentRestoreRetryScheduler(
+            tp.Store,
+            retrier,
+            () => new AgentRestoreRetryOptions(),
+            NullLogger<AgentRestoreRetryScheduler>.Instance);
+        var summary = await scheduler.SweepForTestAsync(
+            new AgentRestoredEvent(
+                AgentKind.Claude,
+                final.UpdatedAt.AddMinutes(-1),
+                final.UpdatedAt.AddMinutes(1)));
+
+        Assert.Equal(0, summary.Requeued);
+        Assert.Equal(WorkItemState.Failed, (await tp.Store.GetAsync(check.Id))!.State);
+        Assert.Equal(0, restoreQueue.Count);
     }
 
     [Fact]
@@ -732,6 +823,51 @@ public sealed class CheckAndActPipelineTests : IDisposable
         Assert.False(final.Verdict!.Answer);
         Assert.Single(completion.Requests);
         Assert.Single(tp.Agent.CheckInvocations);
+        Assert.Single(gate.Targets);
+    }
+
+    [Fact]
+    public async Task CompletionFallback_InVmGateFailure_FailsWithAgentUnavailableMetadata()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var gate = new RejectingInVmSmokeGate("agent binary not runnable");
+        var completion = new ScriptedCompletionRunner();
+        completion.Results.Enqueue(null);
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            inVmSmokeGate: gate,
+            checkCompletionRunner: completion);
+
+        var check = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "Completion fallback unavailable",
+            Prompt = "evaluate",
+            BaseBranch = "main",
+            WorkBranch = "codeybox/checkact-completion-unavailable",
+            PushUpstream = false,
+            JobType = JobType.CheckAndAct,
+            Check = new CheckAndActSpec
+            {
+                Mode = CheckAndActModes.Completion,
+                Question = "Is remediation required?",
+                ActionableAnswer = true,
+                OnYes = new OnYesActionSpec { Title = "Fix", Prompt = "go" },
+            },
+        };
+        await tp.Store.CreateAsync(check);
+
+        await tp.Pipeline.RunAsync(check, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(check.Id);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("in-VM smoke gate", final.LastError);
+        Assert.Equal(WorkItemFailureKinds.AgentUnavailable, final.FailureKind);
+        Assert.Equal(AgentKind.Claude, final.Agent);
+        Assert.Single(completion.Requests);
+        Assert.Empty(tp.Agent.CheckInvocations);
         Assert.Single(gate.Targets);
     }
 
@@ -1743,6 +1879,29 @@ public sealed class CheckAndActPipelineTests : IDisposable
 
         public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct) =>
             Task.FromResult<AgentAvailability?>(new AgentAvailability(true, null, null));
+    }
+
+    private sealed class RejectingInVmSmokeGate(string reason) : IInVmSmokeGate
+    {
+        public bool Enabled => true;
+        public List<InVmSmokeSandboxTarget> Targets { get; } = [];
+
+        public Task<AgentAvailability> EnsureAvailableAsync(
+            AgentKind kind,
+            InVmSmokeSandboxTarget target,
+            CancellationToken ct)
+        {
+            _ = kind;
+            _ = ct;
+            Targets.Add(target);
+            return Task.FromResult(new AgentAvailability(false, reason, null));
+        }
+
+        public Task ProbeAllAsync(CancellationToken ct) => Task.CompletedTask;
+        public Task ProbeAllAsync(InVmSmokeSandboxTarget target, CancellationToken ct) => Task.CompletedTask;
+
+        public Task<AgentAvailability?> ForceProbeAsync(AgentKind kind, CancellationToken ct) =>
+            Task.FromResult<AgentAvailability?>(new AgentAvailability(false, reason, null));
     }
 
     private sealed class TogglePauseInVmSmokeGate : IInVmSmokeGate

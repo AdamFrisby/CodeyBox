@@ -200,8 +200,10 @@ storage-create command.
       "InstanceNamePrefix": "codeybox-",
       "BaselineNamePrefix": "cb-incus-baseline-",
       "UseBaselineImages": true,
-      "IncludeMultipassCutoverInventory": false,
       "ExtraRuncmd": []
+    },
+    "SandboxProviderCutover": {
+      "RetainedInventoryProviders": []
     },
     "SandboxNetworkProfiles": {
       "isolated": "cb-iso",
@@ -224,10 +226,11 @@ provider still requires a restart. See
 
 If a cutover spans a process restart and preserved/leaked Multipass resources
 still exist after Incus becomes the startup selection, set
-`Incus:IncludeMultipassCutoverInventory=true` until those resources are gone.
-Leave it false on an Incus-only host; dormant Multipass is then neither invoked
-nor required. Once both providers have been activated, inventory fails closed
-rather than reporting a partial list if either backend becomes unavailable.
+`SandboxProviderCutover:RetainedInventoryProviders=["multipass"]` until those
+resources are gone. Leave the list empty on an Incus-only host; dormant
+Multipass is then neither invoked nor required. Once both providers have been
+activated, inventory fails closed rather than reporting a partial list if
+either backend becomes unavailable.
 
 The default baseline root is 8 GiB, matching CodeyBox's default sandbox disk
 limit. Keeping the baseline at the smallest supported root matters because a

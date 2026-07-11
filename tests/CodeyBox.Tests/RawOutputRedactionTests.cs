@@ -143,6 +143,23 @@ public sealed class RawOutputRedactionTests
     }
 
     [Fact]
+    public void Redact_StripsUnsafeControlCharacters_ButKeepsReadableWhitespace()
+    {
+        var escape = (char)0x1B;
+        var bell = (char)0x07;
+        var input = $"before{escape}[31mred{bell}\r\n\tmiddle";
+
+        var result = RawOutputRedactor.Redact(input);
+
+        Assert.DoesNotContain(escape.ToString(), result, StringComparison.Ordinal);
+        Assert.DoesNotContain(bell.ToString(), result, StringComparison.Ordinal);
+        Assert.DoesNotContain("\r", result, StringComparison.Ordinal);
+        Assert.Contains("\n", result, StringComparison.Ordinal);
+        Assert.Contains("\t", result, StringComparison.Ordinal);
+        Assert.Equal("before[31mred\n\tmiddle", result);
+    }
+
+    [Fact]
     public void Redact_EmptyString_ReturnsEmpty()
     {
         Assert.Equal("", RawOutputRedactor.Redact(""));

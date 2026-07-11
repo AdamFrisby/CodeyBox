@@ -70,6 +70,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             // target to consume the slot).
             var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
             Assert.Equal(WorkItemState.Failed, final!.State);
+            Assert.Equal(WorkItemFailureKinds.Infrastructure, final.FailureKind);
+            Assert.Equal(AgentKind.Codex, final.Agent);
         }
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
@@ -420,17 +422,12 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task SuccessfulNoDiffRun_WithCapturedStdoutAuthPrompt_NoInVmGate_FailsItemWithoutFleetBench()
+    public async Task InitialNoDiffRun_WithCapturedStdoutAuthPrompt_FailsAuthRequiredWithoutFleetBench()
     {
-        // With no in-VM smoke gate wired the corroboration check returns
-        // Unavailable. The fleet-wide "operator action required" bench is an
-        // irreversible action, so it fails CLOSED: Unavailable does NOT
-        // corroborate, so only the item fails (AuthRequired) and the resolver
-        // reroutes to another class member — the agent is NOT globally benched
-        // on model-controllable stdout that could never be corroborated (in-VM
-        // smoke is disabled by the #187 stopgap). Only POSITIVELY corroborated
-        // stdout-only evidence (or a stderr-detected auth failure) benches the
-        // fleet; see PipelineRunner.TryCorroborateStdoutOnlyAuthRequiredAsync.
+        // Empty initial work stays terminal rather than entering rework
+        // fallback. Auth-looking stdout can still classify the item failure as
+        // AuthRequired, but without in-VM corroboration it must not publish a
+        // fleet-wide auth bench.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var fix = BuildPipeline(seed);
         var transcript = await File.ReadAllTextAsync(
@@ -448,12 +445,13 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
         Assert.Contains("item-level failure only, no fleet-wide bench", final.LastError);
-        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.DoesNotContain("Agent produced no changes to commit", final.LastError);
 
-        // Not benched: in-VM smoke could not corroborate, so the fleet-wide
-        // bench does not fire and the agent stays available for other items.
+        // Not benched: stdout auth evidence was not corroborated, so the agent
+        // stays available for other items.
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
         Assert.True(availability.Available, availability.Reason);
         Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
@@ -551,15 +549,38 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     }
 
     [Fact]
-    public async Task AuthLoginPrompt_SurvivesSmokeDisabled_GateBenchesAgentForNextItem()
+    public async Task FailedWorkRun_WithPure401AuthError_RequeuesAfterAgentRestore()
     {
-        // Master smoke switch OFF. The non-smoke exclusion source
-        // (SmokeExclusionSource.AuthRequired) MUST still hold the agent
-        // benched — if the auth source were tracked as InVmSmoke/HostSmoke,
-        // AgentDispatchAvailability.GetAvailabilityWithoutSmokeGateExclusions
-        // would silently ignore it and route the next item to the same
-        // unauthenticated CLI. Pin the regression so a future refactor that
-        // re-classifies AuthRequired as a smoke source fails this test.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 1",
+            Stdout: null,
+            Stderr: "API Error: 401 Unauthorized"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Equal(WorkItemAuthFailureScope.Fleet, final.AuthFailureScope);
+
+        var restored = fix.Registry.Reset(AgentKind.Codex);
+        Assert.NotNull(restored);
+
+        await AssertRestoreSweepRequeuesAsync(fix, item.Id, restored!);
+    }
+
+    [Fact]
+    public async Task AuthLoginPrompt_SurvivesSmokeDisabled_DoesNotBenchAgentForNextItem()
+    {
+        // Master smoke switch OFF. Captured agent stderr is not trusted enough
+        // to publish a fleet-wide auth bench without in-VM corroboration, so the
+        // item fails terminally but the next dispatch remains eligible.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false });
         using var fix = BuildPipeline(seed, smokeOptions: smokeOptions);
@@ -576,17 +597,22 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         await fix.Store.CreateAsync(item);
         await fix.Pipeline.RunAsync(item, CancellationToken.None);
 
-        // Even with smoke disabled the dispatch-availability view must
-        // report the agent as unavailable.
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Contains("item-level failure only, no fleet-wide bench", final.LastError);
+
+        // With smoke disabled there is no authoritative corroboration, so the
+        // dispatch-availability view must not bench the agent.
         var dispatch = new AgentDispatchAvailability(fix.Registry, inVmSmokeGate: null, smokeOptions: smokeOptions);
         var verdict = dispatch.GetAvailability(AgentKind.Codex);
         Assert.NotNull(verdict);
-        Assert.False(verdict!.Available);
-        Assert.Contains("auth required from agent output", verdict.Reason);
+        Assert.True(verdict!.Available, verdict.Reason);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
     }
 
     [Fact]
-    public async Task AuthLoginPrompt_PublishesAlertEvenWhenAgentAlreadyExcludedByOtherSource()
+    public async Task AuthLoginPrompt_WithoutCorroboration_DoesNotPublishAlertWhenAgentAlreadyExcludedByOtherSource()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var smokeOptions = new SmokeOptionsSnapshot(new SmokeOptions { Enabled = false });
@@ -608,16 +634,12 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         await fix.Store.CreateAsync(item);
         await fix.Pipeline.RunAsync(item, CancellationToken.None);
 
-        var failed = Assert.Single(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
-        var details = Assert.IsType<AgentSmokeFailedDetails>(failed.Details);
-        Assert.Equal("codex", details.AgentKind);
-        Assert.Equal(SmokeFailureCategory.Persistent, details.Category);
-        Assert.Contains("auth required from agent output", details.Reason);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
         Assert.False(availability.Available);
         Assert.Contains("host probe already failed", availability.Reason);
-        Assert.Contains("auth required from agent output", availability.Reason);
+        Assert.DoesNotContain("auth required from agent output", availability.Reason);
     }
 
     [Fact]
@@ -862,7 +884,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("stdout corroborated by forced in-VM smoke probe", final.LastError);
+        Assert.Contains("auth evidence corroborated by forced in-VM smoke probe", final.LastError);
         Assert.Equal(1, gate.ForceProbeCalls);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
@@ -907,7 +929,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
-        Assert.Contains("stdout accepted for item failure only", final.LastError);
+        Assert.Contains("auth evidence accepted for item failure only", final.LastError);
         Assert.Equal(1, gate.ForceProbeCalls);
 
         var availability = fix.Registry.GetAvailability(AgentKind.Codex);
@@ -1075,7 +1097,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("stdout corroborated by forced in-VM smoke probe", final.LastError);
+        Assert.Contains("auth evidence corroborated by forced in-VM smoke probe", final.LastError);
         Assert.Equal(1, gate.ForceProbeCalls);
         Assert.Single(gate.ForceProbeTargets);
 
@@ -1148,7 +1170,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("stdout accepted for item failure only", final.LastError);
+        Assert.Contains("auth evidence accepted for item failure only", final.LastError);
         Assert.Contains("forced in-VM smoke probe did not corroborate auth", final.LastError);
         Assert.Equal(1, gate.ForceProbeCalls);
         Assert.Single(gate.ForceProbeTargets);
@@ -1183,7 +1205,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
         Assert.Contains("auth required from agent output", final.LastError);
-        Assert.Contains("stdout accepted for item failure only", final.LastError);
+        Assert.Contains("auth evidence accepted for item failure only", final.LastError);
         Assert.Contains("forced in-VM smoke probe did not corroborate auth", final.LastError);
         Assert.Equal(1, gate.ForceProbeCalls);
         Assert.Single(gate.ForceProbeTargets);
@@ -1192,6 +1214,42 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.True(availability.Available, availability.Reason);
 
         Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "agent.smoke_failed");
+    }
+
+    [Fact]
+    public async Task InfrastructureWorkFailure_WithPipelineInvolvement_RequeuesAfterAgentRestore()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-1);
+        fix.Codex.ScriptedFailures.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "agent exited 127",
+            Stdout: null,
+            Stderr: "env: 'codex': No such file or directory"));
+
+        var item = NewItem(AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, final.FailureKind);
+        Assert.Equal(AgentKind.Codex, final.Agent);
+
+        var involvementRows = await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.Contains(
+            involvementRows,
+            row => row.AgentKind == AgentKind.Codex
+                && row.Phase == "work"
+                && row.Outcome == AgentInvolvementOutcomes.FailureInfrastructure
+                && row.EndedAt is not null);
+
+        await AssertRestoreSweepRequeuesAsync(
+            fix,
+            item.Id,
+            new AgentRestoredEvent(AgentKind.Codex, outageStart, DateTimeOffset.UtcNow));
     }
 
     [Fact]
@@ -1326,6 +1384,22 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, final.FailureKind);
+        Assert.Equal(AgentKind.Codex, final.Agent);
+
+        var involvementRows = await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.Contains(
+            involvementRows,
+            row => row.AgentKind == AgentKind.Codex
+                && row.Phase == "merge"
+                && row.Outcome == AgentInvolvementOutcomes.FailureInfrastructure
+                && row.EndedAt is not null);
+
+        await AssertRestoreSweepRequeuesAsync(
+            fix,
+            item.Id,
+            new AgentRestoredEvent(AgentKind.Codex, DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow));
+
         Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
 
         // An infra failure must not touch the breaker. Because work is skipped
@@ -1384,8 +1458,24 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
         var final = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, final.FailureKind);
+        Assert.Equal(AgentKind.Claude, final.Agent);
         Assert.Single(codex.AgenticConflictInvocations);
         Assert.Single(claude.AgenticConflictInvocations);
+
+        var involvementRows = await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.Contains(
+            involvementRows,
+            row => row.AgentKind == AgentKind.Claude
+                && row.Phase == "rebase-resolver"
+                && row.Outcome == AgentInvolvementOutcomes.FailureInfrastructure
+                && row.EndedAt is not null);
+
+        await AssertRestoreSweepRequeuesAsync(
+            fix.Store,
+            fix.Involvement,
+            item.Id,
+            new AgentRestoredEvent(AgentKind.Claude, DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow));
 
         Assert.True(fix.Registry.GetAvailability(AgentKind.Codex).Available);
         Assert.True(fix.Registry.GetAvailability(AgentKind.Claude).Available);
@@ -1491,6 +1581,8 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Contains("in-VM smoke gate", final.LastError);
         Assert.Contains("agent binary not runnable", final.LastError);
+        Assert.Equal(WorkItemFailureKinds.AgentUnavailable, final.FailureKind);
+        Assert.Equal(AgentKind.Cursor, final.Agent);
         Assert.Equal(0, cursorAgent.CallCount);
 
         // The prober benched cursor on the exit-127 version step.
@@ -1647,6 +1739,46 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
 
     // ── Harness ──────────────────────────────────────────────────────────────
 
+    private static async Task AssertRestoreSweepRequeuesAsync(
+        TestFixture fix,
+        WorkItemId itemId,
+        AgentRestoredEvent restored)
+        => await AssertRestoreSweepRequeuesAsync(fix.Store, fix.Involvement, itemId, restored);
+
+    private static async Task AssertRestoreSweepRequeuesAsync(
+        SqliteWorkItemStore store,
+        SqliteAgentInvolvementStore involvement,
+        WorkItemId itemId,
+        AgentRestoredEvent restored)
+    {
+        var queue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(
+            store,
+            queue,
+            new NullGitHost(),
+            NullLogger<WorkItemRetrier>.Instance);
+        var options = new AgentRestoreRetryOptions
+        {
+            Enabled = true,
+            LookbackGrace = TimeSpan.FromMinutes(30),
+            PostRestoreMargin = TimeSpan.FromMinutes(5),
+            MaxCandidatesPerSweep = 10,
+        };
+        var scheduler = new AgentRestoreRetryScheduler(
+            store,
+            retrier,
+            () => options,
+            NullLogger<AgentRestoreRetryScheduler>.Instance,
+            involvement: involvement);
+
+        var summary = await scheduler.SweepForTestAsync(restored);
+
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(0, summary.Skipped);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(itemId, CancellationToken.None))!.State);
+        Assert.Equal(itemId, await queue.DequeueAsync(CancellationToken.None));
+    }
+
     private TestFixture BuildPipeline(
         string seedRepoUrl,
         int maxConsecutiveFastFails = 3,
@@ -1658,6 +1790,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
 
         var store = new SqliteWorkItemStore(stateDb);
+        var involvement = new SqliteAgentInvolvementStore(stateDb);
         var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
         var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var prs = new InMemoryPullRequestService();
@@ -1725,9 +1858,10 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             dispatchAvailability: new AgentDispatchAvailability(availability, inVmSmokeGate, smokeOptions),
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions,
-            inVmSmokeGate: inVmSmokeGate);
+            inVmSmokeGate: inVmSmokeGate,
+            involvement: involvement);
 
-        return new TestFixture(pipeline, store, codex, webhooks, availability, gitHost);
+        return new TestFixture(pipeline, store, involvement, codex, webhooks, availability, gitHost);
     }
 
     private ConflictMergeFixture BuildConflictMergePipeline(
@@ -1739,6 +1873,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
 
         var store = new SqliteWorkItemStore(stateDb);
+        var involvement = new SqliteAgentInvolvementStore(stateDb);
         var gitHost = new LocalGitHost(new LocalGitHostOptions { RootDirectory = gitRoot }, NullLogger<LocalGitHost>.Instance);
         var sandboxes = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var prs = new InMemoryPullRequestService();
@@ -1804,9 +1939,10 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
             authAvailability: availability,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,
-            terminalRevisionBuilder: terminalTransitions);
+            terminalRevisionBuilder: terminalTransitions,
+            involvement: involvement);
 
-        return new ConflictMergeFixture(pipeline, store, gitHost, webhooks, availability);
+        return new ConflictMergeFixture(pipeline, store, involvement, gitHost, webhooks, availability);
     }
 
     private sealed class RejectingInVmSmokeGate : IInVmSmokeGate
@@ -2073,6 +2209,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     {
         public PipelineRunner Pipeline { get; }
         public SqliteWorkItemStore Store { get; }
+        public SqliteAgentInvolvementStore Involvement { get; }
         public ScriptableAgent Codex { get; }
         public CapturingWebhookDispatcher Webhooks { get; }
         public AgentAvailabilityRegistry Registry { get; }
@@ -2081,6 +2218,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         public TestFixture(
             PipelineRunner pipeline,
             SqliteWorkItemStore store,
+            SqliteAgentInvolvementStore involvement,
             ScriptableAgent codex,
             CapturingWebhookDispatcher webhooks,
             AgentAvailabilityRegistry registry,
@@ -2088,22 +2226,32 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         {
             Pipeline = pipeline;
             Store = store;
+            Involvement = involvement;
             Codex = codex;
             Webhooks = webhooks;
             Registry = registry;
             GitHost = gitHost;
         }
 
-        public void Dispose() => Store.Dispose();
+        public void Dispose()
+        {
+            Involvement.Dispose();
+            Store.Dispose();
+        }
     }
 
     private sealed record ConflictMergeFixture(
         PipelineRunner Pipeline,
         SqliteWorkItemStore Store,
+        SqliteAgentInvolvementStore Involvement,
         LocalGitHost GitHost,
         CapturingWebhookDispatcher Webhooks,
         AgentAvailabilityRegistry Registry) : IDisposable
     {
-        public void Dispose() => Store.Dispose();
+        public void Dispose()
+        {
+            Involvement.Dispose();
+            Store.Dispose();
+        }
     }
 }

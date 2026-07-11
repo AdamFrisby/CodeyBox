@@ -466,6 +466,14 @@ public sealed record ProjectAudit
     public IReadOnlyDictionary<string, ProjectAuditTypeOverride> AuditTypeOverrides { get; init; }
         = new Dictionary<string, ProjectAuditTypeOverride>(StringComparer.OrdinalIgnoreCase);
     public string? LlmPromptFrameTemplate { get; init; }
+
+    /// <summary>
+    /// Optional trusted frame for text-only Plan review. Supported placeholders
+    /// are <c>workingDirectory</c>, <c>reviewFocus</c>, <c>baseBranch</c>,
+    /// <c>workBranch</c>, <c>originalPrompt</c>, <c>planArtifact</c>, and
+    /// <c>resultFile</c>. Null uses the built-in frame.
+    /// </summary>
+    public string? LlmPlanPromptFrameTemplate { get; init; }
     public IReadOnlyList<CustomAuditorDescriptor> Custom { get; init; } = [];
     public IReadOnlyList<string> ExcludedAuditors { get; init; } = [];
     /// <summary>
@@ -553,6 +561,20 @@ public sealed record ProjectAuditTypeOverride
 {
     public string? DisplayName { get; init; }
     public string? ReviewFocus { get; init; }
+
+    /// <summary>
+    /// Plan-specific LLM review focus. Null falls back to
+    /// <see cref="ReviewFocus"/> (or the preset's code focus when composing an
+    /// additive override).
+    /// </summary>
+    public string? PlanReviewFocus { get; init; }
+
+    /// <summary>
+    /// Open-set target values such as <c>plan</c> and <c>code</c>. Empty leaves
+    /// the underlying preset target declaration unchanged; a replacement with
+    /// no inherited declaration defaults to Code.
+    /// </summary>
+    public IReadOnlyList<string> Targets { get; init; } = [];
     public bool Replace { get; init; }
     public IReadOnlyList<ProjectConfiguredAuditor> Auditors { get; init; } = [];
     public IReadOnlyList<DiffPatternDescriptor> Patterns { get; init; } = [];
@@ -585,6 +607,14 @@ public sealed record CustomAuditorDescriptor
     public IReadOnlyList<string> Argv { get; init; } = [];
     public string? ReviewFocus { get; init; }
     public IReadOnlyList<DiffPatternDescriptor> Patterns { get; init; } = [];
+
+    /// <summary>
+    /// Open-set review targets. Empty means Code-only for shell, diff-pattern,
+    /// and LLM descriptors. For plugins, empty applies no descriptor-level
+    /// narrowing and preserves the plugin auditor's own targets; a non-empty
+    /// list is intersected with that declaration.
+    /// </summary>
+    public IReadOnlyList<string> Targets { get; init; } = [];
     public string? Role { get; init; }
     public string? GateEvidence { get; init; }
 }

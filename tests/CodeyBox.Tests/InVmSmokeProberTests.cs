@@ -179,6 +179,37 @@ public sealed class InVmSmokeProberTests
     }
 
     [Fact]
+    public async Task PassingProbeAfterAuthRequiredClearsAuthSourceAndEmitsRestore()
+    {
+        var transcript = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "Fixtures", "Auth", "agy-login-prompt.redacted.txt"));
+        var authBroken = true;
+        var provider = new FakeSandboxProvider(exec =>
+            IsAgent(exec, "status") && authBroken
+                ? new SandboxExecResult(0, transcript, "")
+                : new SandboxExecResult(0, "ok", ""));
+        var registry = NewRegistry();
+        AgentRestoredEvent? restored = null;
+        registry.AgentRestored += evt => restored = evt;
+        var prober = Build(provider, registry, NewCache(), new FakeBaselineResolver("base-A"),
+            authAvailability: registry);
+
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        Assert.True(registry.GetAuthRequiredAvailability(AgentKind.Cursor).AuthRequired);
+        Assert.False(registry.GetAvailability(AgentKind.Cursor).Available);
+
+        authBroken = false;
+        await prober.ProbeAllAsync(CancellationToken.None);
+
+        Assert.False(registry.GetAuthRequiredAvailability(AgentKind.Cursor).AuthRequired);
+        Assert.True(registry.GetAvailability(AgentKind.Cursor).Available);
+        Assert.NotNull(restored);
+        Assert.Equal(AgentKind.Cursor, restored!.Agent);
+        Assert.NotNull(restored.OutageStartedAt);
+    }
+
+    [Fact]
     public async Task StatusExitZeroWithAuthPrompt_RoutedViaAuthRegistry_StaysGatedEvenWhenSmokeDisabled()
     {
         // Pair the auth-registry route with a smoke-disabled dispatch read.

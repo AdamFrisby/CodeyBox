@@ -9,7 +9,7 @@ namespace CodeyBox.Core;
 /// </summary>
 public interface IManagedSandboxLifecycle
 {
-    /// <summary>Stable identifier for diagnostics (for example, "process", "multipass", or "incus").</summary>
+    /// <summary>Stable provider identifier used for diagnostics and lifecycle scoping.</summary>
     string Name { get; }
 
     /// <summary>
@@ -21,10 +21,8 @@ public interface IManagedSandboxLifecycle
     /// <para>Implementations that have no persistent sandbox lifecycle
     /// (bubblewrap, process) return an empty list.</para>
     ///
-    /// <para>Implementations that shell out to an external tool (for example,
-    /// Multipass or Incus)
-    /// cache results for a short TTL to avoid hammering the daemon on
-    /// repeated API calls.</para>
+    /// <para>Implementations may cache inventory briefly when repeated reads
+    /// would otherwise overload an external lifecycle service.</para>
     /// </summary>
     Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct);
 
@@ -53,10 +51,10 @@ public interface IManagedSandboxLifecycle
 /// <summary>
 /// Builds and starts isolated execution sandboxes. Implementations include a
 /// plain-process dev runner (UNSAFE; for local testing only), bubblewrap
-/// (namespace isolation, shared kernel), Multipass, and Incus (KVM-backed VMs
-/// with separate guest kernels). The orchestrator selects one provider for new
-/// work; the guarded Multipass/Incus cutover selector can change that choice
-/// without rerouting existing sandbox handles.
+/// (namespace isolation, shared kernel), and VM-backed implementations with a
+/// separate guest kernel. The orchestrator selects one provider for new work;
+/// a composition layer may change that choice without rerouting existing
+/// sandbox handles.
 /// </summary>
 public interface ISandboxProvider : IManagedSandboxLifecycle
 {
@@ -85,13 +83,12 @@ public interface ISandboxProvider : IManagedSandboxLifecycle
 /// <summary>
 /// Optional <see cref="ISandboxProvider"/> capability that reports whether the
 /// provider captures per-VM resource metrics at teardown. When true, each
-/// work-item timing
-/// phase must be kept on its own VM so a persisted per-phase resource record is
+/// work-item timing phase must be kept on its own VM so a persisted per-phase resource record is
 /// attributable to a single phase; when false (the default), a warm reusable VM
 /// is shared across phases as before, incurring no extra teardown/rebuild churn.
-/// <c>WorkSandboxContext</c> queries this so the phase-keyed VM isolation only
-/// fires when the capture feature is enabled. Providers that never capture
-/// metrics simply do not implement this interface.
+/// Live-handle reuse reads <see cref="IResourceMetricsCapturingSandbox"/> so a
+/// provider hot reload cannot change the policy of an existing VM. Providers
+/// that never capture metrics simply do not implement this interface.
 /// </summary>
 public interface IResourceMetricsCapturingProvider
 {
@@ -99,6 +96,17 @@ public interface IResourceMetricsCapturingProvider
     /// True when the provider captures per-VM resource usage at teardown. Read
     /// live so a hot-reload of the capture toggle is observed on the next call.
     /// </summary>
+    bool CapturesResourceMetrics { get; }
+}
+
+/// <summary>
+/// Optional live-sandbox capability exposing the immutable resource-metrics
+/// capture policy attached to that concrete handle. Reuse decisions must read
+/// this snapshot instead of a hot-reloadable provider selection that may now
+/// describe a different backend or a later options version.
+/// </summary>
+public interface IResourceMetricsCapturingSandbox : ISandbox
+{
     bool CapturesResourceMetrics { get; }
 }
 
@@ -302,17 +310,67 @@ public interface IProviderOwnedSandbox : ISandbox
 }
 
 /// <summary>
+/// Optional capability for sandboxes whose private guest root filesystem can
+/// be safely modified by privileged setup commands. Consumers use this for
+/// security tooling that must replace absolute executable paths inside a VM.
+/// Sandboxes that execute against the host root, or whose root may be shared
+/// with the host, must not implement this capability.
+/// </summary>
+public interface IPrivilegedGuestFileHardeningSandbox : ISandbox
+{
+}
+
+/// <summary>
 /// Implemented by sandbox wrappers/decorators (e.g. the admission-control and
 /// reusable-sandbox families) that forward an inner <see cref="ISandbox"/>.
 /// Marker capabilities like <see cref="IRejectsFileBackedAgentCredentials"/>
-/// cannot be conditionally re-implemented by a decorator, so consumers that
-/// probe for a capability must walk <see cref="InnerSandbox"/> to the innermost
-/// sandbox rather than relying on <c>is</c> against the outermost wrapper.
+/// cannot be conditionally re-implemented by a decorator, so consumers use
+/// <see cref="SandboxCapability.Find{T}(ISandbox)"/> rather than relying on
+/// <c>is</c> against the outermost wrapper.
 /// </summary>
 public interface ISandboxDecorator : ISandbox
 {
     /// <summary>The sandbox this decorator wraps.</summary>
     ISandbox InnerSandbox { get; }
+}
+
+/// <summary>
+/// Resolves optional capabilities from a sandbox and any transparent decorator
+/// chain around it. A malformed decorator chain fails closed instead of hiding
+/// a security-relevant capability or recursing forever.
+/// </summary>
+public static class SandboxCapability
+{
+    /// <summary>
+    /// Returns the first <typeparamref name="T"/> exposed by
+    /// <paramref name="sandbox"/> or one of its inner sandboxes. Returns null
+    /// when the well-formed chain does not expose that capability.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// A decorator returns a null inner sandbox or the chain contains a cycle.
+    /// </exception>
+    public static T? Find<T>(ISandbox sandbox)
+        where T : class, ISandbox
+    {
+        ArgumentNullException.ThrowIfNull(sandbox);
+
+        var current = sandbox;
+        var visited = new HashSet<ISandbox>(ReferenceEqualityComparer.Instance);
+        while (visited.Add(current))
+        {
+            if (current is T capability)
+                return capability;
+            if (current is not ISandboxDecorator decorator)
+                return null;
+
+            current = decorator.InnerSandbox
+                ?? throw new InvalidOperationException(
+                    "A sandbox decorator returned a null inner sandbox while resolving a capability.");
+        }
+
+        throw new InvalidOperationException(
+            "A sandbox decorator cycle prevents capability resolution.");
+    }
 }
 
 /// <summary>
@@ -593,6 +651,23 @@ public interface ISuspendingSandboxProvider
     Task ResumeSandboxAsync(string name, CancellationToken ct);
 
     /// <summary>
+    /// Resumes a provider-scoped lifecycle snapshot. Plain providers use the
+    /// name-only implementation; composites override this overload so an
+    /// opaque <see cref="ManagedSandboxInfo.LifecycleProviderId"/> can select
+    /// the exact reporting provider without rediscovering ambiguous ownership.
+    /// </summary>
+    Task ResumeSandboxAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(sandbox);
+        if (sandbox.LifecycleProviderId is not null)
+        {
+            throw new NotSupportedException(
+                "This sandbox provider cannot interpret a provider-scoped resume snapshot.");
+        }
+        return ResumeSandboxAsync(sandbox.Name, ct);
+    }
+
+    /// <summary>
     /// R8-core: after <see cref="ResumeSandboxAsync"/> brings the VM back to
     /// Running, the startup resume handler asks the provider to wait for the
     /// in-VM agent process to finish, streaming what's left of
@@ -721,24 +796,6 @@ public interface IBaselineImageResolver
     /// on failure; callers wrap in try/catch.
     /// </summary>
     Task DisposeBaselineImageAsync(string name, CancellationToken ct);
-}
-
-/// <summary>
-/// Optional companion to <see cref="IBaselineImageResolver"/> that identifies
-/// refs in a provider's own validated baseline-name namespace without touching
-/// the host. Cutover routers use this to distinguish a ref created by the other
-/// backend from an arbitrary or malformed stale ref; ownership of an actual
-/// host instance is still re-verified by the provider at every destructive
-/// sink.
-/// </summary>
-public interface IBaselineRefNamespace
-{
-    /// <summary>
-    /// Returns true only when <paramref name="baselineRef"/> has the exact
-    /// bounded shape produced under this provider's live baseline prefix.
-    /// This is namespace classification, not proof that the instance exists.
-    /// </summary>
-    bool OwnsBaselineRef(string baselineRef);
 }
 
 /// <summary>

@@ -21,14 +21,16 @@ public sealed class SqliteTimingStore : ITimingStore, IDisposable
     private readonly SqliteCommand _insertCmd;
     private readonly SqliteCommand _updateCmd;
 
-    public SqliteTimingStore(string path)
+    public SqliteTimingStore(
+        string path,
+        SqliteDatabaseWriteGateFactory? writeGateFactory = null)
     {
         _path = path;
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock = SqliteDatabaseWriteGateFactory.Resolve(writeGateFactory).ForPath(path);
         _writeLock.Wait();
         try
         {

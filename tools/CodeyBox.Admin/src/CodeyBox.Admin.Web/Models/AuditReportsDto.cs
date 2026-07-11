@@ -12,6 +12,7 @@ public sealed class AuditReportsDto
 
 public sealed class AuditReportIterationDto
 {
+    public string Target { get; set; } = "code";
     public int Iteration { get; set; }
     public int BlockingCount { get; set; }
     public int NonBlockingCount { get; set; }

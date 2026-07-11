@@ -2,6 +2,7 @@ using System.Reflection;
 using System.Text.RegularExpressions;
 using CodeyBox.Audit;
 using CodeyBox.Audit.Llm;
+using CodeyBox.Audit.Llm.PlanAudit;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
@@ -28,6 +29,7 @@ public sealed class ProjectAuditorComposer
     private readonly IPresetCatalog _catalog;
     private readonly PresetCatalogOptions _catalogOptions;
     private readonly Func<TestRunOptions>? _testRunOptions;
+    private readonly Func<PlanAdherenceAuditorOptions>? _planAdherenceOptions;
     private readonly IReadOnlyDictionary<string, IAuditor> _registeredAuditorsByName;
     private readonly IReadOnlyDictionary<string, IAuditor> _pluginAuditors;
     private readonly ILogger<ProjectAuditorComposer> _logger;
@@ -46,16 +48,26 @@ public sealed class ProjectAuditorComposer
     /// back to <see cref="TestRunOptions.Default"/>. Null keeps the default
     /// (byte-identical) behaviour used by tests.
     /// </param>
+    /// <param name="planAdherenceOptions">
+    /// Live accessor for hot-reloadable <see cref="PlanAdherenceAuditorOptions"/>.
+    /// When non-null and <see cref="PlanAdherenceAuditorOptions.Enabled"/> is
+    /// true, a code-target <see cref="PlanAdherenceAuditor"/> is composed into
+    /// every project's audit panel (it self-limits to planned items at run
+    /// time). Null (the default used by tests) keeps the reviewer out of the
+    /// panel entirely — the feature is off unless the host wires the accessor.
+    /// </param>
     public ProjectAuditorComposer(
         IPresetCatalog catalog,
         IEnumerable<IAuditor> registeredAuditors,
         ILogger<ProjectAuditorComposer> logger,
         PresetCatalogOptions? catalogOptions = null,
-        Func<TestRunOptions>? testRunOptions = null)
+        Func<TestRunOptions>? testRunOptions = null,
+        Func<PlanAdherenceAuditorOptions>? planAdherenceOptions = null)
     {
         _catalog = catalog;
         _catalogOptions = catalogOptions?.Clone() ?? new PresetCatalogOptions();
         _testRunOptions = testRunOptions;
+        _planAdherenceOptions = planAdherenceOptions;
         _logger = logger;
 
         var byName = new Dictionary<string, IAuditor>(StringComparer.OrdinalIgnoreCase);
@@ -77,10 +89,35 @@ public sealed class ProjectAuditorComposer
     public ProjectAuditorComposer(IPresetCatalog catalog)
         : this(catalog, [], NullLogger<ProjectAuditorComposer>.Instance) { }
 
+    /// <summary>
+    /// Composes the project's effective auditor list filtered to a single
+    /// review <paramref name="target"/>. The plan-review phase passes
+    /// <see cref="AuditTarget.Plan"/> and the code-audit phase passes
+    /// <see cref="AuditTarget.Code"/>; both draw from the same registry,
+    /// preset selection, and config-driven active set (ExcludedAuditors etc.).
+    /// Only auditors whose <see cref="IAuditor.Targets"/> contains the target
+    /// survive — there is no bespoke per-phase wiring.
+    /// </summary>
+    public IReadOnlyList<IAuditor> ComposeForTarget(
+        Project project,
+        IAgentRunner agentForLlmAuditors,
+        AuditTarget target,
+        string? profile = null)
+        => Compose(project, agentForLlmAuditors, profile, target)
+            .Where(a => a.Targets.Contains(target))
+            .ToList();
+
     public IReadOnlyList<IAuditor> Compose(
         Project project,
         IAgentRunner agentForLlmAuditors,
         string? profile = null)
+        => Compose(project, agentForLlmAuditors, profile, target: null);
+
+    private IReadOnlyList<IAuditor> Compose(
+        Project project,
+        IAgentRunner agentForLlmAuditors,
+        string? profile,
+        AuditTarget? target)
     {
         var audit = project.Audit.ResolveProfile(profile);
         project = project with { Audit = audit };
@@ -99,11 +136,14 @@ public sealed class ProjectAuditorComposer
         {
             if (custom.Kind.Equals("plugin", StringComparison.OrdinalIgnoreCase))
             {
-                IncludePluginAuditor(custom, auditors);
+                IncludePluginAuditor(custom, auditors, target);
             }
             else
             {
-                auditors.Add(MaterialiseCustom(custom, ctx, catalog.LlmPromptFrameTemplate));
+                var descriptorTargets = ParseCustomAuditorTargets(custom);
+                if (target is not null && !descriptorTargets.Contains(target.Value))
+                    continue;
+                auditors.Add(MaterialiseCustom(custom, ctx, catalog.LlmPromptFrameTemplate, catalog.LlmPlanPromptFrameTemplate));
             }
         }
 
@@ -145,6 +185,34 @@ public sealed class ProjectAuditorComposer
                 "tests:mutation-rigor", StringComparison.OrdinalIgnoreCase)))
         {
             IncludeRegisteredAuditor("tests:mutation-rigor", auditors, prepend: false);
+        }
+
+        // Plan-adherence reviewer: a code-target LLM auditor that checks the diff
+        // against the approved plan. Config-gated by CodeyBox:PlanAdherence and
+        // composed with the resolving project's agent (like the preset LLM
+        // auditors) so it can cross-review. It self-limits to planned items at run
+        // time — for an unplanned item there is no plan artifact and it no-ops.
+        // Operators drop it on a specific project via ExcludedAuditors by name.
+        if (_planAdherenceOptions?.Invoke() is { Enabled: true } planAdherence
+            && !auditors.Any(a => a.Name.Equals(planAdherence.Name, StringComparison.OrdinalIgnoreCase)))
+        {
+            auditors.Add(new PlanAdherenceAuditor(ctx.Agent, planAdherence));
+        }
+
+        // Always include every registered plan-audit chain gate. Each is
+        // plan-target only (filtered out of the code phase by ComposeForTarget)
+        // and applies to any project's plan; a project that does not want a
+        // specific one lists its name under ExcludedAuditors. Iterating
+        // PlanAuditTests.All (chain order) keeps this loop the one place the
+        // chain is composed, so a new test needs no edit here.
+        foreach (var planAuditTest in PlanAuditTests.All)
+        {
+            var name = planAuditTest.AuditorName;
+            if (_registeredAuditorsByName.ContainsKey(name)
+                && !auditors.Any(a => a.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+            {
+                IncludeRegisteredAuditor(name, auditors, prepend: false);
+            }
         }
 
         if (project.Audit.ExcludedAuditors.Count > 0)
@@ -196,7 +264,8 @@ public sealed class ProjectAuditorComposer
     private static bool HasProjectPresetOverrides(Project project)
         => project.Audit.LanguageOverrides.Count > 0 ||
            project.Audit.AuditTypeOverrides.Count > 0 ||
-           project.Audit.LlmPromptFrameTemplate is not null;
+           project.Audit.LlmPromptFrameTemplate is not null ||
+           project.Audit.LlmPlanPromptFrameTemplate is not null;
 
     private static void ValidateSelectedPresets(Project project, IPresetCatalog catalog)
     {
@@ -205,7 +274,7 @@ public sealed class ProjectAuditorComposer
         PresetCatalogSelectionValidator.ValidateAuditTypeIds(owner, project.Audit.AuditTypes, catalog.KnownAuditTypes);
     }
 
-    private void IncludePluginAuditor(CustomAuditorDescriptor descriptor, List<IAuditor> auditors)
+    private void IncludePluginAuditor(CustomAuditorDescriptor descriptor, List<IAuditor> auditors, AuditTarget? target)
     {
         if (HasCustomGateMetadata(descriptor))
             throw new InvalidOperationException(
@@ -226,6 +295,12 @@ public sealed class ProjectAuditorComposer
             return;
         }
 
+        if (target is not null && TryParseCustomAuditorTargetNarrowing(descriptor, out var narrowedTargets)
+            && !narrowedTargets.Contains(target.Value))
+        {
+            return;
+        }
+
         auditors.Add(auditor);
     }
 
@@ -235,7 +310,11 @@ public sealed class ProjectAuditorComposer
     ///   "diff-pattern" — DiffPatternAuditor with the given Patterns
     ///   "llm"          — LlmReviewAuditor with the given ReviewFocus
     /// </summary>
-    private static IAuditor MaterialiseCustom(CustomAuditorDescriptor c, PresetContext ctx, string frameTemplate)
+    private static IAuditor MaterialiseCustom(
+        CustomAuditorDescriptor c,
+        PresetContext ctx,
+        string frameTemplate,
+        string planFrameTemplate)
     {
         if (string.IsNullOrWhiteSpace(c.Name))
             throw new InvalidOperationException($"Custom auditor of kind '{c.Kind}' requires a non-empty Name");
@@ -246,6 +325,7 @@ public sealed class ProjectAuditorComposer
 
         var role = ParseCustomAuditorRole(c);
         var gateEvidence = ParseCustomGateEvidence(c, role);
+        var targets = ParseCustomAuditorTargets(c);
 
         return c.Kind.ToLowerInvariant() switch
         {
@@ -253,6 +333,7 @@ public sealed class ProjectAuditorComposer
             {
                 Name = c.Name,
                 Argv = c.Argv.Count > 0 ? c.Argv : throw new InvalidOperationException($"shell auditor '{c.Name}' needs Argv"),
+                Targets = targets,
                 Role = role,
                 BuildTestGateEvidence = gateEvidence,
             }),
@@ -265,6 +346,7 @@ public sealed class ProjectAuditorComposer
                     Description = p.Description,
                     Severity = AuditSeverityParser.Parse(p.Severity),
                 }).ToList(),
+                Targets = targets,
             }),
             "llm" => new LlmReviewAuditor(new LlmReviewAuditorOptions
             {
@@ -272,9 +354,40 @@ public sealed class ProjectAuditorComposer
                 Agent = ctx.Agent,
                 ReviewFocus = c.ReviewFocus ?? throw new InvalidOperationException($"llm auditor '{c.Name}' needs ReviewFocus"),
                 FrameTemplate = frameTemplate,
+                PlanFrameTemplate = planFrameTemplate,
+                Targets = targets,
             }),
             _ => throw new InvalidOperationException($"Unknown custom auditor kind '{c.Kind}' for '{c.Name}' (expected: shell | diff-pattern | llm)"),
         };
+    }
+
+    private static IReadOnlySet<AuditTarget> ParseCustomAuditorTargets(CustomAuditorDescriptor descriptor)
+    {
+        try
+        {
+            // Single source of truth for empty-means-CodeOnly plus the
+            // string-to-target canonicalisation shared with preset loading.
+            return AuditTargets.ParseOrCodeOnly(descriptor.Targets);
+        }
+        catch (ArgumentException ex)
+        {
+            throw new InvalidOperationException(
+                $"Custom auditor '{descriptor.Name}' has an invalid target value: {ex.Message}", ex);
+        }
+    }
+
+    private static bool TryParseCustomAuditorTargetNarrowing(
+        CustomAuditorDescriptor descriptor,
+        out IReadOnlySet<AuditTarget> targets)
+    {
+        if (descriptor.Targets.Count == 0)
+        {
+            targets = AuditTargets.CodeOnly;
+            return false;
+        }
+
+        targets = ParseCustomAuditorTargets(descriptor);
+        return true;
     }
 
     private static bool HasCustomGateMetadata(CustomAuditorDescriptor descriptor)

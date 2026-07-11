@@ -94,6 +94,7 @@ public static class AgentFailureClassifier
         "401 Unauthorized",
         "API Error: 401",
         "403 Forbidden",
+        "API Error: 403",
         "invalid_api_key",
         "authentication failed",
         "credentials are invalid",
@@ -326,7 +327,7 @@ public static class AgentFailureClassifier
         }
 
         var stderrAuthError = ContainsAuthErrorPattern(stderr);
-        if (stderrAuthError || ContainsAny(stdout, AuthPatterns))
+        if (stderrAuthError)
             return new AgentFailureClassification(AgentFailureKind.AuthError, Reason: "auth pattern matched");
 
         // The transient list is intentionally conservative; apply it to the
@@ -364,6 +365,7 @@ public static class AgentFailureClassifier
         var matchedDefaultStdout = matchedTrustedStdoutTranscript
             || ContainsShortAuthRequiredStdout(stdout);
         var matchedStdoutFragment = ContainsAuthRequiredFragmentInStdout(stdout);
+        var matchedConfiguredStderr = false;
         var matchedConfiguredStdout = false;
 
         foreach (var pattern in AdditionalAuthPatternsFor(kind, additionalPatternsByAgent))
@@ -375,6 +377,7 @@ public static class AgentFailureClassifier
                 && !string.IsNullOrEmpty(stderr)
                 && stderr.Contains(pattern.Pattern, StringComparison.OrdinalIgnoreCase))
             {
+                matchedConfiguredStderr = true;
                 matchedStderr = true;
             }
 
@@ -405,7 +408,10 @@ public static class AgentFailureClassifier
             matchedStdout,
             matchedTrustedStdoutTranscript,
             matchedConfiguredStdout,
-            matchedDefaultStdout);
+            matchedDefaultStdout)
+        {
+            MatchedConfiguredStderrPattern = matchedConfiguredStderr,
+        };
     }
 
     private static IEnumerable<AuthFailurePattern> AdditionalAuthPatternsFor(
@@ -427,14 +433,12 @@ public static class AgentFailureClassifier
     {
         if (IsExit127(summary)
             && (ContainsAny(stderr, BinaryNotFoundPatterns)
-                || ContainsAny(stdout, BinaryNotFoundPatterns)
                 || string.IsNullOrWhiteSpace(stderr) && string.IsNullOrWhiteSpace(stdout)))
         {
             return true;
         }
 
-        return IsSandboxWrapperBinaryLaunchFailure(stderr)
-            || IsSandboxWrapperBinaryLaunchFailure(stdout);
+        return IsSandboxWrapperBinaryLaunchFailure(stderr);
     }
 
     private static bool IsMaterialisationFailure(string? summary) =>

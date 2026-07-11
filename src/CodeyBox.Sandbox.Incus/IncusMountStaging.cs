@@ -48,6 +48,7 @@ internal sealed record IncusOwnedStagingTree(string Name, DateTimeOffset Created
 
 internal static class IncusMountStaging
 {
+    internal const int MaximumMounts = 256;
     private const string OwnershipMarkerName = ".codeybox-incus-owner";
     private const string StagingRootMarkerName = ".codeybox-incus-staging-v1";
     private const string StagingRootMarkerPayload = "codeybox-incus-staging-v1\n";
@@ -223,8 +224,8 @@ internal static class IncusMountStaging
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(mounts);
-        if (mounts.Count > 256)
-            throw new InvalidOperationException("An Incus sandbox cannot have more than 256 mounts.");
+        if (mounts.Count > MaximumMounts)
+            throw new InvalidOperationException($"An Incus sandbox cannot have more than {MaximumMounts} mounts.");
         var prepared = new List<IncusPreparedMount>();
         var links = new List<IncusGuestLink>();
         var fileGroups = new Dictionary<string, List<(SandboxMount Mount, string Source)>>(StringComparer.Ordinal);
@@ -241,6 +242,8 @@ internal static class IncusMountStaging
             {
                 ct.ThrowIfCancellationRequested();
                 var mount = mounts[index];
+                if (mount is null)
+                    throw new InvalidOperationException("Incus sandbox mounts cannot contain null entries.");
                 IncusInputValidation.ValidateAbsoluteGuestPath(mount.SandboxPath, nameof(mounts));
                 if (mount.SnapshotForIsolation && !mount.ReadOnly)
                     throw new InvalidOperationException("SnapshotForIsolation requires a read-only sandbox mount.");

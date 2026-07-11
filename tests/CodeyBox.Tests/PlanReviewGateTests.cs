@@ -1,9 +1,8 @@
 using CodeyBox.Core;
-using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Tests;
 
-public sealed class PlanReviewGateTests
+public sealed class PlanArtifactDocumentTests
 {
     [Theory]
     [InlineData(
@@ -51,20 +50,18 @@ public sealed class PlanReviewGateTests
         {"approach":"do it","files":"","testStrategy":["run tests"],"risks":["none"],"satisfiesTask":"does the task"}
         """,
         "missing required string-array field 'files'")]
-    public async Task AlwaysPassReview_RejectsIncompleteOrWronglyTypedPlan(
+    public void ParseCanonical_RejectsIncompleteOrWronglyTypedPlan(
         string artifact,
         string expectedMessage)
     {
-        var gate = new AlwaysPassPlanReviewGate();
-
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await gate.ReviewAsync(SampleRequest(artifact)));
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            PlanArtifactDocument.ParseCanonical(artifact));
 
         Assert.Contains(expectedMessage, ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task AlwaysPassReview_RedactsSecretsBeforeCanonicalPersistenceAndGuidance()
+    public void NormalizeRaw_RedactsSecretsBeforeCanonicalPersistenceAndGuidance()
     {
         var raw = """
             ```json
@@ -79,11 +76,9 @@ public sealed class PlanReviewGateTests
             """;
 
         var normalized = PlanArtifactDocument.NormalizeRaw(raw, maxChars: 20_000);
-        var gate = new AlwaysPassPlanReviewGate();
-        var decision = await gate.ReviewAsync(SampleRequest(normalized));
+        _ = PlanArtifactDocument.ParseCanonical(normalized);
         var guidance = PlanArtifactDocument.ToImplementationGuidance(normalized);
 
-        Assert.True(decision.Approved);
         Assert.DoesNotContain("ghp_XYZ", normalized, StringComparison.Ordinal);
         Assert.DoesNotContain("sk-ant-api03", normalized, StringComparison.Ordinal);
         Assert.Contains("***", normalized, StringComparison.Ordinal);
@@ -209,15 +204,4 @@ public sealed class PlanReviewGateTests
             $"Expected non-object root rejection, but got: {ex.Message}");
     }
 
-    private static PlanReviewRequest SampleRequest(string artifact) => new(
-        WorkItemId.New(),
-        new ProjectId("test-project"),
-        "plan review",
-        "do work",
-        PromptRevision: 1,
-        artifact,
-        AgentKind.Claude,
-        AgentInstanceId: null,
-        ModelId: null,
-        ReasoningMode: null);
 }

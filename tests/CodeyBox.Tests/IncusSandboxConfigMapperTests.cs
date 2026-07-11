@@ -1,4 +1,5 @@
 using CodeyBox.Api;
+using CodeyBox.Sandbox.Incus;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
@@ -61,6 +62,24 @@ public sealed class IncusSandboxConfigMapperTests
             mapped.AllowedHostMountRoots);
         Assert.Contains(Path.TrimEndingDirectorySeparator(Path.GetFullPath(explicitRoot)), mapped.AllowedHostMountRoots);
         Assert.DoesNotContain("/changed", mapped.AllowedHostMountRoots);
+    }
+
+    [Fact]
+    public void Build_RejectsOversizedCollectionsBeforeCopyingThem()
+    {
+        var excessiveProfiles = Enumerable
+            .Range(0, IncusSandboxOptions.MaximumNetworkProfiles + 1)
+            .ToDictionary(index => $"profile-{index}", _ => "cb-net", StringComparer.Ordinal);
+        var options = CreateOptions();
+        options.SandboxNetworkProfiles = excessiveProfiles;
+
+        Assert.Throws<InvalidOperationException>(() => IncusSandboxConfigMapper.Build(options));
+
+        options.SandboxNetworkProfiles = new Dictionary<string, string>();
+        options.Incus.ExtraRuncmd = Enumerable
+            .Repeat("true", IncusSandboxOptions.MaximumExtraRuncmdCount + 1)
+            .ToList();
+        Assert.Throws<InvalidOperationException>(() => IncusSandboxConfigMapper.Build(options));
     }
 
     [Fact]
@@ -135,12 +154,13 @@ public sealed class IncusSandboxConfigMapperTests
 
         var mapped = IncusSandboxConfigMapper.Build(options, NullLogger.Instance);
 
-        Assert.NotNull(mapped.DiskGuard);
-        Assert.Equal(42L * 1024 * 1024, mapped.DiskGuard!.MinFreeBytes);
-        Assert.Equal(TimeSpan.FromMinutes(3), mapped.DiskGuard.RecheckIn);
+        var diskGuard = mapped.DiskGuard
+            ?? throw new InvalidOperationException("The mapped Incus disk guard is unexpectedly disabled.");
+        Assert.Equal(42L * 1024 * 1024, diskGuard.MinFreeBytes);
+        Assert.Equal(TimeSpan.FromMinutes(3), diskGuard.RecheckIn);
         Assert.Equal(
             ["/srv/codeybox", "/srv/extra", "/srv/codeybox/incus-staging"],
-            mapped.DiskGuard.HostPaths);
+            diskGuard.HostPaths);
     }
 
     [Fact]

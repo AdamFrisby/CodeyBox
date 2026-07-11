@@ -31,6 +31,7 @@ public sealed class PresetCatalog : IPresetCatalog
     {
         var snapshot = new PresetConfigLoader().Load(options);
         LlmPromptFrameTemplate = snapshot.LlmPromptFrame;
+        LlmPlanPromptFrameTemplate = snapshot.LlmPlanPromptFrame;
         _auditTypeDefinitions = snapshot.AuditTypes;
 
         foreach (var (name, definition) in snapshot.Languages)
@@ -39,7 +40,7 @@ public sealed class PresetCatalog : IPresetCatalog
             RegisterLanguage(name, _ => PresetConfigLoader.MaterialiseLanguage(captured, testRunOptions));
         }
 
-        AuditTypePresets.Register(this, snapshot.AuditTypes, snapshot.LlmPromptFrame);
+        AuditTypePresets.Register(this, snapshot.AuditTypes, snapshot.LlmPromptFrame, snapshot.LlmPlanPromptFrame);
     }
 
     public IReadOnlyList<IAuditor> ResolveLanguage(string name, PresetContext ctx)
@@ -51,6 +52,7 @@ public sealed class PresetCatalog : IPresetCatalog
     public IReadOnlyList<string> KnownLanguages => [.. _languages.Keys];
     public IReadOnlyList<string> KnownAuditTypes => [.. _auditTypes.Keys];
     public string LlmPromptFrameTemplate { get; }
+    public string LlmPlanPromptFrameTemplate { get; }
 
     public string GetAuditTypeReviewFocus(string id)
         => _auditTypeDefinitions.TryGetValue(id, out var definition) ? definition.ReviewFocus : string.Empty;

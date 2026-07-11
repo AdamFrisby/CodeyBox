@@ -272,6 +272,14 @@ public sealed class CursorAgentRunnerTests
     }
 
     [Fact]
+    public void TextOnlyRequiresSandbox_IsTrue()
+    {
+        ITextOnlyAgentRunner runner = new CursorAgentRunner();
+
+        Assert.True(runner.TextOnlyRequiresSandbox);
+    }
+
+    [Fact]
     public async Task RunTextOnlyInSandboxAsync_InvokesAgentPrintWithModelAndStdin()
     {
         const string prompt = "resolve this conflict";

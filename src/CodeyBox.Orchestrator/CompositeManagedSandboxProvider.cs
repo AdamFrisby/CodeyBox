@@ -52,8 +52,8 @@ public sealed class CompositeManagedSandboxProvider : IManagedSandboxLifecycle
                 foreach (var info in listed)
                 {
                     // A lifecycle can itself be a composite (the production
-                    // admission wrapper around the Multipass/Incus cutover
-                    // router is one). Preserve that inner route in the opaque
+                    // admission wrapper around a reloadable provider router is
+                    // one). Preserve that inner route in the opaque
                     // provider ID instead of flattening both backends to the
                     // same outer provider.
                     var scopedProviderId = info.LifecycleProviderId is null

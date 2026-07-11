@@ -96,6 +96,7 @@ subscribe to.
 | `agent.fallback` | 1.0 | Agent class router fell back to an alternate agent. |
 | `agent.paused` | 1.3 | Operator paused new dispatch to one agent kind or pooled instance route. |
 | `agent.resumed` | 1.3 | Operator resumed dispatch to one agent kind or pooled instance route. |
+| `agent.restore_requeue_swept` | 1.5 | Agent restore triggered the infra-failure retry sweep; details include restored agent, outage window, requeued count, and skipped count. |
 | `sandbox.leak_detected` | 1.0 | Leaked `codeybox-*` sandbox detected by reaper. |
 | `sandbox.leak_disposed` | 1.0 | Reaper successfully disposed a leaked sandbox. |
 | `sandbox.leak_dispose_failed` | 1.0 | Reaper failed to dispose a leaked sandbox. |
@@ -128,7 +129,8 @@ subscribe to.
 | `work_item.waiting_for_agent_resume` | 1.3 | Work item parked because its only eligible agent is paused. |
 | `work_item.waiting_for_transient_retry` | 1.4 | Work item parked until the transient transport/network retry backoff expires. |
 | `work_item.agent_stuck` | 1.0 | Stuck-agent probe killed a hung agent. |
-| `work_item.auto_retry` | 1.0 | Quota auto-retry re-queued a failed item. |
+| `work_item.auto_retry` | 1.0 | Quota/transient auto-retry re-queued a failed item. |
+| `work_item.agent_restore_requeued` | 1.5 | Agent-restore infra sweep re-queued a failed item. |
 | `work_item.recovered` | 1.0 | Dead-worker reaper recovered an item with a state-changing transition. |
 | `work_item.suggestion` | 1.0 | Agent emitted a suggestion entry. |
 | `work_item.question_asked` | 1.0 | Agent parked an item waiting for an answer. |

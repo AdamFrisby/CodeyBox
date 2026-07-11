@@ -321,29 +321,32 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
             now);
 
         using var gate = _store.AcquireConnectionGateForTesting();
+        var independentGet = await RunWithoutHeldGateContext(() => _store.GetAsync(queued.Id))
+            .WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(queued.Id, independentGet!.Id);
+        await RunWithoutHeldGateContext(() => DrainAsync(_store.ListAsync())).WaitAsync(TimeSpan.FromSeconds(5));
+        await RunWithoutHeldGateContext(() => DrainAsync(_store.ListByStateAsync(WorkItemState.Working))).WaitAsync(TimeSpan.FromSeconds(5));
+        await RunWithoutHeldGateContext(() => DrainAsync(_store.ListSuspendedAsync())).WaitAsync(TimeSpan.FromSeconds(5));
+        await RunWithoutHeldGateContext(() => DrainAsync(_store.ListByReplaySourceAsync(source.Id))).WaitAsync(TimeSpan.FromSeconds(5));
+        await RunWithoutHeldGateContext(() => DrainAsync(_store.ListByReleaseAsync(releaseId))).WaitAsync(TimeSpan.FromSeconds(5));
+
         var reads = new Dictionary<string, Task>(StringComparer.Ordinal)
         {
-            ["GetAsync"] = _store.GetAsync(queued.Id),
-            ["ListAsync"] = DrainAsync(_store.ListAsync()),
-            ["ListByStateAsync"] = DrainAsync(_store.ListByStateAsync(WorkItemState.Working)),
-            ["CountByStateAsync"] = _store.CountByStateAsync(WorkItemState.Queued),
-            ["ListDispatchEligibleByPriorityAsync"] = DrainAsync(
-                _store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId>())),
-            ["CountStartedInWindowAsync"] = _store.CountStartedInWindowAsync(working.ProjectId, now.AddHours(-1)),
-            ["CountInFlightAsync"] = _store.CountInFlightAsync(working.ProjectId),
-            ["CountInFlightSplitByRefactorAsync"] = _store.CountInFlightSplitByRefactorAsync(working.ProjectId),
-            ["GetByExternalIdAsync"] = _store.GetByExternalIdAsync(working.ProjectId, "EXT-123"),
-            ["GetByNamespacedExternalIdAsync"] = _store.GetByNamespacedExternalIdAsync(working.ProjectId, "jobtrack", "EXT-123"),
-            ["GetFleetStateCountsAsync"] = _store.GetFleetStateCountsAsync(),
-            ["GetFleetRecentOutcomesAsync"] = _store.GetFleetRecentOutcomesAsync(),
-            ["GetFleetPauseStatesAsync"] = _store.GetFleetPauseStatesAsync(),
-            ["ListSuspendedAsync"] = DrainAsync(_store.ListSuspendedAsync()),
-            ["GetActiveBaselineImageRefsAsync"] = _store.GetActiveBaselineImageRefsAsync(),
-            ["ListWorkItemsForBaselineAsync"] = _store.ListWorkItemsForBaselineAsync("cb-baseline-gated-read"),
-            ["ListByReplaySourceAsync"] = DrainAsync(_store.ListByReplaySourceAsync(source.Id)),
-            ["ListByReleaseAsync"] = DrainAsync(_store.ListByReleaseAsync(releaseId)),
-            ["GetIterationsAsync"] = _store.GetIterationsAsync(working.Id),
-            ["GetAuditProgressAsync"] = _store.GetAuditProgressAsync(working.Id, attemptStartedAt),
+            ["CountByStateAsync"] = RunWithoutHeldGateContext(() => _store.CountByStateAsync(WorkItemState.Queued)),
+            ["ListDispatchEligibleByPriorityAsync"] = RunWithoutHeldGateContext(() => DrainAsync(
+                _store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId>()))),
+            ["CountStartedInWindowAsync"] = RunWithoutHeldGateContext(() => _store.CountStartedInWindowAsync(working.ProjectId, now.AddHours(-1))),
+            ["CountInFlightAsync"] = RunWithoutHeldGateContext(() => _store.CountInFlightAsync(working.ProjectId)),
+            ["CountInFlightSplitByRefactorAsync"] = RunWithoutHeldGateContext(() => _store.CountInFlightSplitByRefactorAsync(working.ProjectId)),
+            ["GetByExternalIdAsync"] = RunWithoutHeldGateContext(() => _store.GetByExternalIdAsync(working.ProjectId, "EXT-123")),
+            ["GetByNamespacedExternalIdAsync"] = RunWithoutHeldGateContext(() => _store.GetByNamespacedExternalIdAsync(working.ProjectId, "jobtrack", "EXT-123")),
+            ["GetFleetStateCountsAsync"] = RunWithoutHeldGateContext(() => _store.GetFleetStateCountsAsync()),
+            ["GetFleetRecentOutcomesAsync"] = RunWithoutHeldGateContext(() => _store.GetFleetRecentOutcomesAsync()),
+            ["GetFleetPauseStatesAsync"] = RunWithoutHeldGateContext(() => _store.GetFleetPauseStatesAsync()),
+            ["GetActiveBaselineImageRefsAsync"] = RunWithoutHeldGateContext(() => _store.GetActiveBaselineImageRefsAsync()),
+            ["ListWorkItemsForBaselineAsync"] = RunWithoutHeldGateContext(() => _store.ListWorkItemsForBaselineAsync("cb-baseline-gated-read")),
+            ["GetIterationsAsync"] = RunWithoutHeldGateContext(() => _store.GetIterationsAsync(working.Id)),
+            ["GetAuditProgressAsync"] = RunWithoutHeldGateContext(() => _store.GetAuditProgressAsync(working.Id, attemptStartedAt)),
         };
 
         await Task.Delay(100);
@@ -1031,6 +1034,7 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
             PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-2),
             PlanReviewedAt = approvedAt,
             PlanReviewSummary = "approved",
+            PlanReviewAttempts = 2,
         };
         await _store.CreateAsync(item);
         var stalePickupSnapshot = await _store.GetAsync(item.Id);
@@ -1057,6 +1061,7 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         Assert.Null(read.PlanGeneratedAt);
         Assert.Null(read.PlanReviewedAt);
         Assert.Null(read.PlanReviewSummary);
+        Assert.Equal(0, read.PlanReviewAttempts);
         Assert.Equal("abc123", read.LocalSquashSha);
     }
 
@@ -1089,5 +1094,17 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         await foreach (var _ in items)
         {
         }
+    }
+
+    private static Task RunWithoutHeldGateContext(Func<Task> action)
+    {
+        using (ExecutionContext.SuppressFlow())
+            return Task.Run(action);
+    }
+
+    private static Task<T> RunWithoutHeldGateContext<T>(Func<Task<T>> action)
+    {
+        using (ExecutionContext.SuppressFlow())
+            return Task.Run(action);
     }
 }

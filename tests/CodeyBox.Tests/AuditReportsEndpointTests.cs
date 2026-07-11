@@ -16,7 +16,7 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// HTTP-level tests for GET /workitems/{id}/audit-reports and
-/// GET /workitems/{id}/audit-reports/{iteration}/{auditor}/raw.
+/// GET /workitems/{id}/audit-reports/{target}/{iteration}/{auditor}/raw.
 /// </summary>
 [Collection("GlobalSerilog")]
 public sealed class AuditReportsEndpointTests : IDisposable
@@ -43,6 +43,7 @@ public sealed class AuditReportsEndpointTests : IDisposable
 
     private static AuditReport MakeReport(
         string workItemId, int iteration = 1,
+        AuditTarget? target = null,
         string auditorName = "Lint",
         string auditorKind = "diff-pattern",
         string? rawOutput = null,
@@ -51,6 +52,7 @@ public sealed class AuditReportsEndpointTests : IDisposable
             Id = Guid.NewGuid().ToString(),
             WorkItemId = workItemId,
             Iteration = iteration,
+            Target = target ?? AuditTarget.Code,
             AuditorName = auditorName,
             AuditorKind = auditorKind,
             WorstSeverity = findings?.Count > 0 ? "Error" : "none",
@@ -106,6 +108,7 @@ public sealed class AuditReportsEndpointTests : IDisposable
 
         var iter = iterations[0];
         Assert.Equal(1, iter.GetProperty("iteration").GetInt32());
+        Assert.Equal("code", iter.GetProperty("target").GetString());
         var auditors = iter.GetProperty("auditors");
         Assert.Equal(1, auditors.GetArrayLength());
         Assert.Equal("Lint", auditors[0].GetProperty("name").GetString());
@@ -127,6 +130,26 @@ public sealed class AuditReportsEndpointTests : IDisposable
         Assert.Equal(1, iterations.GetArrayLength());
         var auditors = iterations[0].GetProperty("auditors");
         Assert.Equal(2, auditors.GetArrayLength());
+    }
+
+    [Fact]
+    public async Task GetAuditReports_SeparatesPlanAndCodeIterations()
+    {
+        var id = WorkItemId.New();
+        await _factory.WorkItemStore.CreateAsync(MakeItem(id));
+        await _factory.AuditReportStore.CreateAsync(MakeReport(
+            id.ToString(), target: AuditTarget.Code, auditorName: "architecture:llm-review"));
+        await _factory.AuditReportStore.CreateAsync(MakeReport(
+            id.ToString(), target: AuditTarget.Plan, auditorName: "architecture:llm-review"));
+
+        var response = await _client.GetAsync($"/workitems/{id}/audit-reports");
+        var document = await response.Content.ReadFromJsonAsync<JsonElement>();
+        var iterations = document.GetProperty("iterations");
+
+        Assert.Equal(2, iterations.GetArrayLength());
+        Assert.Equal(["code", "plan"], iterations.EnumerateArray()
+            .Select(element => element.GetProperty("target").GetString() ?? string.Empty)
+            .ToArray());
     }
 
     [Fact]
@@ -207,12 +230,29 @@ public sealed class AuditReportsEndpointTests : IDisposable
         await _factory.AuditReportStore.CreateAsync(
             MakeReport(id.ToString(), auditorName: "Lint", rawOutput: "line 1\nline 2\n"));
 
-        var resp = await _client.GetAsync($"/workitems/{id}/audit-reports/1/Lint/raw");
+        var resp = await _client.GetAsync($"/workitems/{id}/audit-reports/code/1/Lint/raw");
         resp.EnsureSuccessStatusCode();
 
         Assert.Contains("text/plain", resp.Content.Headers.ContentType?.MediaType);
         var body = await resp.Content.ReadAsStringAsync();
         Assert.Equal("line 1\nline 2\n", body);
+    }
+
+    [Fact]
+    public async Task GetRawOutput_SelectsRequestedTargetWhenKeysCollide()
+    {
+        var id = WorkItemId.New();
+        await _factory.WorkItemStore.CreateAsync(MakeItem(id));
+        await _factory.AuditReportStore.CreateAsync(MakeReport(
+            id.ToString(), target: AuditTarget.Code, auditorName: "architecture", rawOutput: "code"));
+        await _factory.AuditReportStore.CreateAsync(MakeReport(
+            id.ToString(), target: AuditTarget.Plan, auditorName: "architecture", rawOutput: "plan"));
+
+        var response = await _client.GetAsync(
+            $"/workitems/{id}/audit-reports/plan/1/architecture/raw");
+
+        response.EnsureSuccessStatusCode();
+        Assert.Equal("plan", await response.Content.ReadAsStringAsync());
     }
 
     [Fact]
@@ -223,14 +263,14 @@ public sealed class AuditReportsEndpointTests : IDisposable
         await _factory.AuditReportStore.CreateAsync(
             MakeReport(id.ToString(), auditorName: "Lint", rawOutput: null));
 
-        var resp = await _client.GetAsync($"/workitems/{id}/audit-reports/1/Lint/raw");
+        var resp = await _client.GetAsync($"/workitems/{id}/audit-reports/code/1/Lint/raw");
         Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
     }
 
     [Fact]
     public async Task GetRawOutput_NotFound_WhenWorkItemDoesNotExist()
     {
-        var resp = await _client.GetAsync("/workitems/aabbccdd-0000-0000-0000-000000000099/audit-reports/1/Lint/raw");
+        var resp = await _client.GetAsync("/workitems/aabbccdd-0000-0000-0000-000000000099/audit-reports/code/1/Lint/raw");
         Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
     }
 

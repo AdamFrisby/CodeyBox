@@ -10,6 +10,22 @@ public sealed class IncusSandboxOptionsTests
         Assert.Empty(IncusSandboxOptions.Validate(new IncusSandboxOptions()));
     }
 
+    [Theory]
+    [InlineData("cb-bake-")]
+    [InlineData("cb-")]
+    [InlineData("cb-bake-candidate-")]
+    public void Validate_RejectsBaselinePrefixesThatOverlapBakeCandidateNamespace(string prefix)
+    {
+        var errors = IncusSandboxOptions.Validate(new IncusSandboxOptions
+        {
+            BaselineNamePrefix = prefix,
+        });
+
+        Assert.Contains(
+            errors,
+            error => error.StartsWith("BaselineNamePrefix must not overlap", StringComparison.Ordinal));
+    }
+
     [Fact]
     public void Validate_RejectsUnsafeNamesPathsAndLimits()
     {
@@ -87,6 +103,17 @@ public sealed class IncusSandboxOptionsTests
         });
 
         Assert.Contains(errors, error => error.StartsWith("ExtraCloudInit is invalid:", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Validate_RejectsOversizedCloudInitBeforeStructuralParsing()
+    {
+        var errors = IncusSandboxOptions.Validate(new IncusSandboxOptions
+        {
+            ExtraCloudInit = new string('x', IncusSandboxOptions.MaximumExtraCloudInitUtf8Bytes + 1),
+        });
+
+        Assert.Equal(["ExtraCloudInit exceeds 1 MiB."], errors);
     }
 
     [Fact]

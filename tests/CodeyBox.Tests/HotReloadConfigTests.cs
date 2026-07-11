@@ -257,6 +257,27 @@ public sealed class HotReloadConfigTests
     }
 
     [Fact]
+    public void MultipassStartup_IgnoresInvalidDormantIncusOperationalConfig()
+    {
+        var options = new CodeyBoxOptions
+        {
+            SandboxProvider = "multipass",
+            Incus = new IncusSandboxConfig
+            {
+                BaselineNamePrefix = "unsafe/path",
+                StagingDirectory = "\0invalid-staging-path",
+            },
+        };
+
+        var operational = new CodeyBoxOptionsValidator().Validate(name: null, options);
+        var immutable = new ImmutableCodeyBoxOptionsValidator(options)
+            .Validate(name: null, options);
+
+        Assert.True(operational.Succeeded);
+        Assert.True(immutable.Succeeded);
+    }
+
+    [Fact]
     public void ImmutableCodeyBoxOptionsValidator_RejectsGitRootDirectoryChange()
     {
         var startup = new CodeyBoxOptions { GitRootDirectory = "/var/lib/codeybox/repos" };

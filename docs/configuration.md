@@ -60,6 +60,11 @@ Hot-reloadable today:
   constructors at startup.
 - `DeadWorker.MaxRecoveryAttempts` and `DeadWorker.DeadWorkerThreshold` —
   re-read on every reaper sweep.
+- `SqliteWriteGate.{AcquisitionTimeout,MaxHoldDuration,MaxQueuedWaiters,MaxConcurrentReadConnections}`
+  — sampled on each subsequent SQLite gate/read-slot acquisition. Edits do not
+  alter a holder already inside the gate. Values have defensive upper bounds:
+  acquisition timeout <= 30 seconds, hold diagnostic threshold <= 5 minutes,
+  queued waiters <= 4096, and concurrent read connections <= 128.
 - `WorkerProgressWatchdog.ProgressTimeout`,
   `WorkerProgressWatchdog.AutoRecover`,
   `WorkerProgressWatchdog.MaxRecoveryAttempts`,
@@ -189,6 +194,25 @@ startup); we add explicit guards as we tighten the contract.
 
 ---
 
+## `SandboxProviderCutover`
+
+Provider-neutral lifecycle retention for a hot-reload sandbox-provider
+cutover. Providers activated in the current process remain inventoried
+automatically. When a cutover spans a restart, list any previous provider whose
+preserved sandboxes or baselines still need inventory and cleanup:
+
+```json
+"SandboxProviderCutover": {
+  "RetainedInventoryProviders": ["multipass"]
+}
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `RetainedInventoryProviders` | string[] | `[]` | Provider IDs retained for lifecycle and baseline inventory after restart. Values must be unique members of the registered hot-reload provider set; currently `multipass` and `incus`. Remove an ID after that provider's resources are gone. Maximum 8 entries. |
+
+---
+
 ## `Incus`
 
 Operational settings for `SandboxProvider=incus`. Except for `ProjectName` and
@@ -221,7 +245,6 @@ independent: no `Multipass*` value is inherited.
 | `InstanceNamePrefix` | string | `codeybox-` | Prefix identifying provider-owned ordinary VM instances. |
 | `BaselineNamePrefix` | string | `cb-incus-baseline-` | Prefix for content-addressed baked baseline instances. |
 | `UseBaselineImages` | bool | `true` | Lazily bake baselines and create sandboxes with COW `incus copy` clones. Set false to use the full-launch path. |
-| `IncludeMultipassCutoverInventory` | bool | `false` | Inventory/reap Multipass resources when a restarted process begins with Incus selected. Enable only during a cross-restart cutover; false keeps an Incus-only host independent of the Multipass CLI. Once Multipass is activated during a process lifetime, both inventories remain fail-closed and complete. |
 | `ExtraRuncmd` | string[] | `[]` | Incus-specific first-boot/baseline provisioning commands. Multipass provisioning settings are never inherited. |
 | `ExtraCloudInit` | string or null | null | Incus-specific additional top-level cloud-init YAML sent through `user.user-data`. Multipass cloud-init settings are never inherited. Do not put secrets here. |
 | `StagingDirectory` | string or null | `<StateDatabasePath directory>/incus-staging` | Restart-only persistent absolute host directory for isolation snapshots and mount staging. Its canonical, non-symlink parent must already exist; normally leave the root absent so CodeyBox creates it with mode `0700` and its ownership marker. An existing root is accepted only when owned by the service UID/GID with exact mode `0700` and an exact provider-owned `.codeybox-incus-staging-v1` marker (mode `0600`). Set an explicit path to place staging on a separate filesystem. The filesystem root, commas, and control characters are rejected because this path is included in the project's restricted disk-path list. |
@@ -305,6 +328,7 @@ Hot-reloadable retry and recovery bounds used by pipeline execution.
 "PipelineTuning": {
   "AgentSuspendMaxRetries": 1,
   "AgentSessionResumeMaxAttempts": 2,
+  "EmptyReworkEscalationRetries": 1,
   "BlockRedundantDotnetBuildTestInAuditSandbox": true
 }
 ```
@@ -313,6 +337,7 @@ Hot-reloadable retry and recovery bounds used by pipeline execution.
 |-----|---------|-------------|
 | `AgentSuspendMaxRetries` | `1` | Legacy same-command retry count for unknown failures with suspend-related exit codes. Classified transient-network failures use the durable scheduler instead. |
 | `AgentSessionResumeMaxAttempts` | `2` | CLI-native same-session resume attempts after a transient non-zero agent crash with a captured session id and a live sandbox including `/repo`. Set to `0` to disable session resume. |
+| `EmptyReworkEscalationRetries` | `1` | Extra rework dispatches after a genuine no-diff audit rework when audit history shows convergence. Set to `0` to park immediately for operator review. |
 | `BlockRedundantDotnetBuildTestInAuditSandbox` | `true` | Prepends an audit-sandbox-only `dotnet` shim that immediately succeeds `dotnet build` and `dotnet test` with a notice because the deterministic build/test gate already ran. Other `dotnet` subcommands pass through unchanged; work, merge, and conflict-resolution sandboxes are unaffected. |
 | `CSharpTestPassAuditorIdleTimeout` | unset | Test-runner-specific idle guard for the `csharp:test-pass` (dotnet test) auditor, applied in place of `AuditorIdleTimeout`. Sourced through `DotnetTestAuditor` (an `ITestRunnerAuditor`). Unset means the generic `AuditorIdleTimeout` applies. |
 | `CSharpTestPassBlameHangTimeout` | unset | Per-test hang-dump timeout injected into the `csharp:test-pass` command as `--blame-hang --blame-hang-timeout`. Unset omits blame-hang, keeping the command byte-identical to the legacy path. |
@@ -799,9 +824,57 @@ Rolling file log configuration.
 
 ---
 
+## `Attachments`
+
+Work-item attachment storage and lifecycle configuration. These values are
+hot-reloadable; uploads, blob-root resolution, and cleanup sweeps read the
+current `CodeyBox:Attachments` options at use time.
+
+```json
+"Attachments": {
+  "RootDirectory": "~/.codeybox/attachments",
+  "MaxFileSizeBytes": 104857600,
+  "MaxAttachmentsPerWorkItem": 32,
+  "MaxTotalBytesPerWorkItem": 536870912,
+  "MaxCaptionChars": 2000,
+  "MaxFileNameChars": 255,
+  "MaxContentTypeChars": 255,
+  "MultipartHeadersCountLimit": 256,
+  "MultipartHeadersLengthLimitBytes": 8192,
+  "MaxMultipartErrorMessageChars": 240,
+  "DeliverToSandbox": true,
+  "DeliverToPhases": [ "work", "rework", "audit" ],
+  "TerminalCleanupTtl": "7.00:00:00",
+  "CleanupSweepInterval": "01:00:00",
+  "OrphanSweepInterval": "06:00:00",
+  "OrphanGracePeriod": "00:10:00"
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `RootDirectory` | `~/.codeybox/attachments` | Host content-addressed blob root. |
+| `MaxFileSizeBytes` | `104857600` | Per-file streaming cap (100 MiB). |
+| `MaxAttachmentsPerWorkItem` | `32` | Max attachments per work item. |
+| `MaxTotalBytesPerWorkItem` | `536870912` | Max total attachment bytes per work item (512 MiB). |
+| `MaxCaptionChars` | `2000` | Max UTF-16 code units for one caption field. |
+| `MaxFileNameChars` | `255` | Max UTF-16 code units for a sanitized display filename. |
+| `MaxContentTypeChars` | `255` | Max characters for a stored multipart file `Content-Type`. |
+| `MultipartHeadersCountLimit` | `256` | Max headers per multipart section. |
+| `MultipartHeadersLengthLimitBytes` | `8192` | Max aggregate header bytes per multipart section. |
+| `MaxMultipartErrorMessageChars` | `240` | Max parser-error text included in 400 responses. |
+| `DeliverToSandbox` | `true` | When true, a work item's attachments are staged into its sandbox VM and announced to the agent (via the injected `## Attachments` manifest) for the phases in `DeliverToPhases`. When false, attachments stay host-only (upload/download API) and nothing is staged into any sandbox. |
+| `DeliverToPhases` | `["work","rework","audit"]` | Agent prompt phases whose invocations stage attachments and inject the manifest. Compared case-insensitively; a phase not listed behaves as if the item had no attachments. |
+| `TerminalCleanupTtl` | `7.00:00:00` | TTL cutoff for non-terminal stale attachment cleanup. Terminal work items are cleaned on the next sweep. |
+| `CleanupSweepInterval` | `01:00:00` | Period between terminal/TTL cleanup sweeps. |
+| `OrphanSweepInterval` | `06:00:00` | Period between orphan-blob sweeps. |
+| `OrphanGracePeriod` | `00:10:00` | Grace window before unreferenced blobs/temp files are removed. |
+
+---
+
 ## `PromptPreprocessing`
 
-Agent prompt preprocessing configuration. CodeyBox ships three built-in
+Agent prompt preprocessing configuration. CodeyBox ships built-in
 preprocessors that run in order before every agent invocation:
 
 1. **`ProjectRulesPromptPreprocessor`** — prepends the project rules file
@@ -809,12 +882,15 @@ preprocessors that run in order before every agent invocation:
    path for house rules across Codex, Claude, Cursor, opencode, and any
    future runner; root-level agent file discovery is a compatibility aid,
    not the enforcement mechanism.
-2. **`AttachmentManifestPromptPreprocessor`** — injects an `## Attachments`
-   manifest listing every blob the attachments foundation has staged into
-   the sandbox for the work item (in-VM path, filename, MIME type, caption).
-   No-op until `IWorkItemAttachmentSource` is wired and the work item carries
-   attachments. The preprocessor never reads files — blob staging is the
-   foundation's responsibility.
+2. **`AttachmentManifestPromptPreprocessor`** — for the delivery phases
+   configured in `Attachments:DeliverToPhases` (default work / rework / audit),
+   stages a work item's attachment blobs into the sandbox (under
+   `/work/.codeybox/attachments`, added to `.git/info/exclude` so a stray
+   `git add -A` can never commit them) and prepends an `## Attachments` manifest
+   listing each staged file's in-VM path, filename, content-type, size, and
+   caption. Filenames and captions are fenced as an untrusted-data section. A
+   no-op when `Attachments:DeliverToSandbox` is false, the phase is not a
+   delivery phase, or the item has no attachments.
 3. **`CrossAgentHandoffPromptPreprocessor`** — injects a `## Cross-agent
    handoff` brief whenever the current invocation runs under a different
    `AgentKind` than the most recent agent-involvement entry (the orchestrator

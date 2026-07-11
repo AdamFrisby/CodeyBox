@@ -34,10 +34,9 @@ internal static class IncusSandboxConfigMapper
             UseBaselineImages = incus.UseBaselineImages,
             NetworkProfiles = SnapshotNetworkProfiles(options.SandboxNetworkProfiles),
             AllowedHostMountRoots = SnapshotAllowedHostMountRoots(options),
-            // Incus is a complete alternative provider. Never inherit
-            // Multipass provisioning: an empty Incus value intentionally
-            // remains empty during side-by-side cutover.
-            ExtraRuncmd = Array.AsReadOnly((incus.ExtraRuncmd ?? []).ToArray()),
+            // Provider provisioning is independent: an empty Incus value
+            // intentionally remains empty during a side-by-side cutover.
+            ExtraRuncmd = SnapshotExtraRuncmd(incus.ExtraRuncmd),
             ExtraCloudInit = incus.ExtraCloudInit,
             StagingDirectory = stagingDirectory,
             GuestUserId = incus.GuestUserId,
@@ -80,16 +79,59 @@ internal static class IncusSandboxConfigMapper
         IReadOnlyDictionary<string, string>? profiles)
     {
         var copy = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        if (profiles is not null)
+        if (profiles is null)
+            return new ReadOnlyDictionary<string, string>(copy);
+        if (profiles.Count > IncusSandboxOptions.MaximumNetworkProfiles)
         {
-            foreach (var (profile, bridge) in profiles)
-                copy.Add(profile, bridge);
+            throw new InvalidOperationException(
+                $"SandboxNetworkProfiles cannot contain more than {IncusSandboxOptions.MaximumNetworkProfiles} entries for Incus.");
+        }
+
+        long bytes = 0;
+        foreach (var (profile, bridge) in profiles)
+        {
+            if (profile is null || bridge is null)
+                throw new InvalidOperationException("SandboxNetworkProfiles cannot contain null keys or values.");
+            var entryBytes = (long)System.Text.Encoding.UTF8.GetByteCount(profile)
+                + System.Text.Encoding.UTF8.GetByteCount(bridge);
+            if (entryBytes > IncusSandboxOptions.MaximumNetworkProfileUtf8Bytes - bytes)
+                throw new InvalidOperationException("SandboxNetworkProfiles exceeds 64 KiB in aggregate for Incus.");
+            bytes += entryBytes;
+            copy.Add(profile, bridge);
         }
         return new ReadOnlyDictionary<string, string>(copy);
     }
 
+    private static IReadOnlyList<string> SnapshotExtraRuncmd(IReadOnlyList<string>? commands)
+    {
+        if (commands is null || commands.Count == 0)
+            return Array.Empty<string>();
+        if (commands.Count > IncusSandboxOptions.MaximumExtraRuncmdCount)
+        {
+            throw new InvalidOperationException(
+                $"Incus:ExtraRuncmd cannot contain more than {IncusSandboxOptions.MaximumExtraRuncmdCount} commands.");
+        }
+
+        var copy = new string[commands.Count];
+        long bytes = 0;
+        for (var index = 0; index < commands.Count; index++)
+        {
+            var command = commands[index]
+                ?? throw new InvalidOperationException("Incus:ExtraRuncmd cannot contain null commands.");
+            var commandBytes = System.Text.Encoding.UTF8.GetByteCount(command);
+            if (commandBytes > IncusSandboxOptions.MaximumExtraRuncmdUtf8Bytes - bytes)
+                throw new InvalidOperationException("Incus:ExtraRuncmd exceeds 1 MiB in aggregate.");
+            bytes += commandBytes;
+            copy[index] = command;
+        }
+        return Array.AsReadOnly(copy);
+    }
+
     private static IReadOnlyList<string> SnapshotAllowedHostMountRoots(CodeyBoxOptions options)
     {
+        var configuredRoots = options.Incus?.AllowedHostMountRoots ?? [];
+        if (configuredRoots.Count > 64)
+            throw new InvalidOperationException("Incus:AllowedHostMountRoots cannot contain more than 64 entries.");
         var roots = new List<string>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
 
@@ -103,7 +145,7 @@ internal static class IncusSandboxConfigMapper
                 ? mirror
                 : Path.Combine(options.GitRootDirectory, mirror));
         }
-        foreach (var root in options.Incus?.AllowedHostMountRoots ?? [])
+        foreach (var root in configuredRoots)
             Add(root);
 
         return Array.AsReadOnly(roots.ToArray());

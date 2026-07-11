@@ -155,6 +155,8 @@ public sealed class SandboxLeakDetectionTests
         Assert.Equal(2, providerIds.Length);
         Assert.All(providerIds, providerId => Assert.False(string.IsNullOrWhiteSpace(providerId)));
         Assert.Equal(2, providerIds.Distinct(StringComparer.Ordinal).Count());
+        var firstProviderId = Assert.IsType<string>(providerIds[0]);
+        var secondProviderId = Assert.IsType<string>(providerIds[1]);
 
         var ambiguousDispose = await client.PostAsync(
             "/sandboxes/leaked/codeybox-duplicate/dispose",
@@ -162,10 +164,10 @@ public sealed class SandboxLeakDetectionTests
         Assert.Equal(HttpStatusCode.Conflict, ambiguousDispose.StatusCode);
 
         var firstDispose = await client.PostAsync(
-            $"/sandboxes/leaked/codeybox-duplicate/dispose?providerId={Uri.EscapeDataString(providerIds[0]!)}",
+            $"/sandboxes/leaked/codeybox-duplicate/dispose?providerId={Uri.EscapeDataString(firstProviderId)}",
             content: null);
         var secondDispose = await client.PostAsync(
-            $"/sandboxes/leaked/codeybox-duplicate/dispose?providerId={Uri.EscapeDataString(providerIds[1]!)}",
+            $"/sandboxes/leaked/codeybox-duplicate/dispose?providerId={Uri.EscapeDataString(secondProviderId)}",
             content: null);
         var thirdDispose = await client.PostAsync(
             "/sandboxes/leaked/codeybox-duplicate/dispose",

@@ -119,7 +119,6 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
 
         try
         {
-            await _queue.EnqueueAsync(item.Id);
             await orchestrator.StartAsync(CancellationToken.None);
             await blocking.Started.Task.WaitAsync(DispatchWaitTimeout);
 
@@ -189,7 +188,6 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
 
         try
         {
-            await _queue.EnqueueAsync(active.Id);
             await orchestrator.StartAsync(CancellationToken.None);
             await blocking.Started.Task.WaitAsync(DispatchWaitTimeout);
 
@@ -259,7 +257,6 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
 
         try
         {
-            await _queue.EnqueueAsync(refactor.Id);
             await orchestrator.StartAsync(CancellationToken.None);
             await blocking.Started.Task.WaitAsync(DispatchWaitTimeout);
 
@@ -327,7 +324,6 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
 
         try
         {
-            await _queue.EnqueueAsync(activeRefactor.Id);
             await orchestrator.StartAsync(CancellationToken.None);
             await blocking.Started.Task.WaitAsync(DispatchWaitTimeout);
 
@@ -403,7 +399,6 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
 
         try
         {
-            await _queue.EnqueueAsync(refactor.Id);
             await orchestrator.StartAsync(CancellationToken.None);
             await projectRepo.Entered.Task.WaitAsync(DispatchWaitTimeout);
 
@@ -497,7 +492,6 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
 
         try
         {
-            await _queue.EnqueueAsync(firstRefactor.Id);
             await orchestrator.StartAsync(CancellationToken.None);
             await projectRepo.Entered.Task.WaitAsync(DispatchWaitTimeout);
 

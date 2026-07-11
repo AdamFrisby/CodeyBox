@@ -25,6 +25,7 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
     private static AuditReport Make(
         string workItemId = "wi-001",
         int iteration = 1,
+        AuditTarget? target = null,
         string auditorName = "Lint",
         string auditorKind = "diff-pattern",
         string? rawOutput = null,
@@ -33,6 +34,7 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
             Id = Guid.NewGuid().ToString(),
             WorkItemId = workItemId,
             Iteration = iteration,
+            Target = target ?? AuditTarget.Code,
             AuditorName = auditorName,
             AuditorKind = auditorKind,
             WorstSeverity = findings?.Count > 0 ? findings[0].Severity : "none",
@@ -78,6 +80,7 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
         Assert.Equal(report.Id, got.Id);
         Assert.Equal("wi-roundtrip", got.WorkItemId);
         Assert.Equal(3, got.Iteration);
+        Assert.Equal(AuditTarget.Code, got.Target);
         Assert.Equal("LlmReview", got.AuditorName);
         Assert.Equal("llm", got.AuditorKind);
         Assert.Equal("Error", got.WorstSeverity);
@@ -136,7 +139,7 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
         var report = Make("wi-null-raw");
         await CreateAsync(report);
 
-        var raw = await _store.GetRawOutputAsync("wi-null-raw", 1, "Lint");
+        var raw = await _store.GetRawOutputAsync("wi-null-raw", AuditTarget.Code, 1, "Lint");
 
         Assert.Null(raw);
     }
@@ -147,15 +150,103 @@ public sealed class SqliteAuditReportStoreTests : IDisposable
         var report = Make("wi-raw", rawOutput: "stdout goes here");
         await CreateAsync(report);
 
-        var raw = await _store.GetRawOutputAsync("wi-raw", 1, "Lint");
+        var raw = await _store.GetRawOutputAsync("wi-raw", AuditTarget.Code, 1, "Lint");
 
         Assert.Equal("stdout goes here", raw);
     }
 
     [Fact]
+    public async Task GetRawOutput_DistinguishesTargetForSameIterationAndAuditor()
+    {
+        const string WorkItemId = "wi-targeted-raw";
+        await CreateAsync(Make(
+            WorkItemId,
+            target: AuditTarget.Code,
+            auditorName: "architecture:llm-review",
+            rawOutput: "code output"));
+        await _store.CreateAsync(Make(
+            WorkItemId,
+            target: AuditTarget.Plan,
+            auditorName: "architecture:llm-review",
+            rawOutput: "plan output"));
+
+        var code = await _store.GetRawOutputAsync(
+            WorkItemId, AuditTarget.Code, 1, "architecture:llm-review");
+        var plan = await _store.GetRawOutputAsync(
+            WorkItemId, AuditTarget.Plan, 1, "architecture:llm-review");
+        var planReports = await _store.GetByWorkItemAsync(WorkItemId, AuditTarget.Plan);
+
+        Assert.Equal("code output", code);
+        Assert.Equal("plan output", plan);
+        Assert.Equal(AuditTarget.Plan, Assert.Single(planReports).Target);
+    }
+
+    [Fact]
+    public async Task Constructor_MigratesLegacyRowsToCodeTarget()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"codeybox-audit-legacy-{Guid.NewGuid():N}.db");
+        var workItemId = new WorkItemId(Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"));
+        try
+        {
+            using (var workItems = new SqliteWorkItemStore(path))
+            {
+                await workItems.CreateAsync(new WorkItem
+                {
+                    Id = workItemId,
+                    ProjectId = new ProjectId("test-project"),
+                    Title = "legacy",
+                    Prompt = "legacy",
+                });
+            }
+
+            await using (var connection = new SqliteConnection($"Data Source={path}"))
+            {
+                await connection.OpenAsync();
+                await using var command = connection.CreateCommand();
+                command.CommandText = """
+                    CREATE TABLE audit_reports (
+                        id TEXT PRIMARY KEY,
+                        work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                        iteration INTEGER NOT NULL,
+                        auditor_name TEXT NOT NULL,
+                        auditor_kind TEXT NOT NULL,
+                        worst_severity TEXT NOT NULL,
+                        started_at TEXT NOT NULL,
+                        ended_at TEXT NOT NULL,
+                        duration_ms INTEGER NOT NULL,
+                        findings_json TEXT NOT NULL,
+                        raw_output TEXT
+                    );
+                    INSERT INTO audit_reports
+                        (id, work_item_id, iteration, auditor_name, auditor_kind,
+                         worst_severity, started_at, ended_at, duration_ms, findings_json, raw_output)
+                    VALUES
+                        ('legacy-report', $workItemId, 1,
+                         'legacy-auditor', 'tool', 'none', $now, $now, 1, '[]', 'legacy output');
+                    """;
+                command.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
+                command.Parameters.AddWithValue("$workItemId", workItemId.ToString());
+                await command.ExecuteNonQueryAsync();
+            }
+
+            using var migrated = new SqliteAuditReportStore(path);
+            var report = Assert.Single(await migrated.GetByWorkItemAsync(workItemId.ToString()));
+            Assert.Equal(AuditTarget.Code, report.Target);
+            Assert.Equal("legacy output", await migrated.GetRawOutputAsync(
+                report.WorkItemId, AuditTarget.Code, 1, "legacy-auditor"));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+            try { File.Delete(path + "-wal"); } catch { }
+            try { File.Delete(path + "-shm"); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task GetRawOutput_ReturnsNull_WhenNotFound()
     {
-        var raw = await _store.GetRawOutputAsync("wi-missing", 99, "NoSuchAuditor");
+        var raw = await _store.GetRawOutputAsync("wi-missing", AuditTarget.Code, 99, "NoSuchAuditor");
         Assert.Null(raw);
     }
 

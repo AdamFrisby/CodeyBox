@@ -15,13 +15,15 @@ public sealed class SqliteSuggestionStore : ISuggestionStore, IDisposable
     private readonly SqliteConnection _conn;
     private readonly SqliteDatabaseWriteGate _writeLock;
 
-    public SqliteSuggestionStore(string path)
+    public SqliteSuggestionStore(
+        string path,
+        SqliteDatabaseWriteGateFactory? writeGateFactory = null)
     {
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
+        _writeLock = SqliteDatabaseWriteGateFactory.Resolve(writeGateFactory).ForPath(path);
         _writeLock.Wait();
         try
         {

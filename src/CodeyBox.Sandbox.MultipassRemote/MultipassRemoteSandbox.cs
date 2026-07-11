@@ -20,7 +20,9 @@ namespace CodeyBox.Sandbox.MultipassRemote;
 /// so the active-sandbox snapshot is correctly typed and a future suspend
 /// implementation slots in without changing the provider surface.</para>
 /// </summary>
-internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox
+internal sealed class MultipassRemoteSandbox :
+    IShutdownTeardownSandbox,
+    IPrivilegedGuestFileHardeningSandbox
 {
     private readonly SandboxSpec _spec;
     private readonly IReadOnlyList<StagedBindMount> _stagedMounts;

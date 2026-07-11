@@ -16,13 +16,15 @@ internal sealed class AuditReviewDotnetShim
         "build and tests already executed by the deterministic gate before this review; skipped to avoid slow redundant re-runs";
 
     private const long TmpfsBytes = 64 * 1024;
+    internal const string PrivilegedHardeningEnvironmentVariable =
+        "CODEYBOX_AUDIT_DOTNET_SHIM_HARDEN_ABSOLUTE";
     private const string DefaultSandboxPath =
         "/codeybox/bin:/home/ubuntu/.local/bin:/home/ubuntu/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin";
 
-    // The absolute locations the multipass baseline may install the real dotnet
-    // at. The hardening script moves any of these aside and drops the shim in
-    // their place so an auditor invoking dotnet via an absolute path (rather
-    // than resolving it through PATH) is still intercepted.
+    // Absolute locations a VM baseline may use for the real dotnet executable.
+    // The hardening script moves any of these aside and drops the shim in their
+    // place so an auditor invoking dotnet via an absolute path (rather than
+    // resolving it through PATH) is still intercepted.
     private const string DefaultAbsoluteDotnetCandidates =
         "/usr/bin/dotnet /usr/local/bin/dotnet /snap/bin/dotnet /usr/share/dotnet/dotnet";
 
@@ -70,7 +72,7 @@ internal sealed class AuditReviewDotnetShim
         string shimPath, string shimDirectory, string absoluteCandidates) => $$"""
         shim={{shimPath}}
 
-        case "${CODEYBOX_AUDIT_DOTNET_SHIM_HARDEN_ABSOLUTE:-}" in
+        case "${{{PrivilegedHardeningEnvironmentVariable}}:-}" in
             1|true|TRUE|yes|YES) ;;
             *) exit 0 ;;
         esac
@@ -133,24 +135,15 @@ internal sealed class AuditReviewDotnetShim
         done
         """;
 
-    private AuditReviewDotnetShim(bool enabled, bool hardenAbsolutePaths)
+    private AuditReviewDotnetShim(bool enabled)
     {
         Enabled = enabled;
-        HardenAbsolutePaths = hardenAbsolutePaths;
     }
 
     public bool Enabled { get; }
-    private bool HardenAbsolutePaths { get; }
 
-    public static AuditReviewDotnetShim From(PipelineTuningOptions tuning, string sandboxProviderName)
-    {
-        var hardenAbsolutePaths = string.Equals(sandboxProviderName, "multipass", StringComparison.Ordinal)
-                                  || string.Equals(sandboxProviderName, "multipass-remote", StringComparison.Ordinal)
-                                  || string.Equals(sandboxProviderName, "incus", StringComparison.Ordinal);
-        return new AuditReviewDotnetShim(
-            tuning.BlockRedundantDotnetBuildTestInAuditSandbox,
-            hardenAbsolutePaths);
-    }
+    public static AuditReviewDotnetShim From(PipelineTuningOptions tuning) =>
+        new(tuning.BlockRedundantDotnetBuildTestInAuditSandbox);
 
     public SandboxSpec Apply(SandboxSpec spec)
     {
@@ -162,8 +155,6 @@ internal sealed class AuditReviewDotnetShim
             ? PrependShimDirectory(existingPath)
             : DefaultSandboxPath;
         environment["PATH"] = path;
-        if (HardenAbsolutePaths)
-            environment["CODEYBOX_AUDIT_DOTNET_SHIM_HARDEN_ABSOLUTE"] = "1";
 
         var mounts = spec.Mounts.Any(m => string.Equals(m.SandboxPath.TrimEnd('/'), Directory, StringComparison.Ordinal))
             ? spec.Mounts
@@ -190,7 +181,11 @@ internal sealed class AuditReviewDotnetShim
         if (!Enabled)
             return;
 
-        var resolvedDotnetPath = await TryResolveDotnetPathAsync(sandbox, ct).ConfigureAwait(false);
+        var supportsPrivilegedHardening =
+            SandboxCapability.Find<IPrivilegedGuestFileHardeningSandbox>(sandbox) is not null;
+        var resolvedDotnetPath = supportsPrivilegedHardening
+            ? await TryResolveDotnetPathAsync(sandbox, ct).ConfigureAwait(false)
+            : null;
 
         await RunOrThrowAsync(sandbox, ct, "mkdir", "-p", Directory).ConfigureAwait(false);
         var write = await sandbox.ExecAsync(new SandboxExec
@@ -204,9 +199,16 @@ internal sealed class AuditReviewDotnetShim
                 $"Failed to install audit dotnet shim at {Path}: {write.Stderr}{write.Stdout}");
         }
 
+        if (!supportsPrivilegedHardening)
+            return;
+
         var harden = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = ["sh", "-s", "--", resolvedDotnetPath ?? ""],
+            ExtraEnvironment = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [PrivilegedHardeningEnvironmentVariable] = "1",
+            },
             Stdin = PrivilegedHardeningScript,
         }, ct).ConfigureAwait(false);
         if (!harden.Success)

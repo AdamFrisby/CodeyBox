@@ -1,23 +1,35 @@
-using System.Text;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Text;
 using DiagProcess = System.Diagnostics.Process;
 
 namespace CodeyBox.HostProcess;
 
 /// <summary>
-/// Default <see cref="IProcessRunner"/> using a host OS process. On Linux,
-/// <c>setsid</c> from util-linux is required so cancellation owns and verifies
-/// teardown of the complete process group, including an orphaned descendant.
+/// Default <see cref="IProcessRunner"/> using a host OS process. Commands run
+/// directly and captured output is unbounded unless the caller supplies limits;
+/// Linux process-group isolation is an explicit construction-time option.
 /// </summary>
 public sealed class DefaultProcessRunner : IProcessRunner
 {
-    internal const int DefaultMaxOutputBytes = 16 * 1024 * 1024;
     private const int ReadBufferChars = 4096;
     private const int SignalKill = 9;
     private const int SignalProbe = 0;
     private const int NoSuchProcess = 3;
     private static readonly TimeSpan CleanupTimeout = TimeSpan.FromSeconds(5);
+    private readonly DefaultProcessRunnerOptions _options;
+
+    /// <summary>Creates a direct, unbounded-by-default host process runner.</summary>
+    public DefaultProcessRunner()
+        : this(new DefaultProcessRunnerOptions())
+    {
+    }
+
+    /// <summary>Creates a host process runner with the supplied isolation policy.</summary>
+    public DefaultProcessRunner(DefaultProcessRunnerOptions options)
+    {
+        _options = options ?? throw new ArgumentNullException(nameof(options));
+    }
 
     public async Task<ProcessRunResult> RunAsync(
         IReadOnlyList<string> argv,
@@ -37,10 +49,7 @@ public sealed class DefaultProcessRunner : IProcessRunner
         if (maxStderrBytes is < 0)
             throw new ArgumentOutOfRangeException(nameof(maxStderrBytes));
 
-        var effectiveMaxStdoutBytes = maxStdoutBytes ?? DefaultMaxOutputBytes;
-        var effectiveMaxStderrBytes = maxStderrBytes ?? DefaultMaxOutputBytes;
-
-        var isolatedLinuxProcessGroup = OperatingSystem.IsLinux();
+        var isolatedLinuxProcessGroup = _options.IsolateLinuxProcessGroup && OperatingSystem.IsLinux();
         var psi = new System.Diagnostics.ProcessStartInfo
         {
             FileName = isolatedLinuxProcessGroup ? ResolveSetsidPath() : argv[0],
@@ -77,8 +86,32 @@ public sealed class DefaultProcessRunner : IProcessRunner
         if (!p.Start())
             return new ProcessRunResult(1, "", "", StartFailed: true);
 
-        Task<LimitedReadResult>? limitedStdoutTask;
-        Task<LimitedReadResult>? limitedStderrTask;
+        var stdout = new StringBuilder();
+        var stderr = new StringBuilder();
+        var limitOutput = maxStdoutBytes.HasValue || maxStderrBytes.HasValue;
+        var streamChunks = stdoutChunkCallback is not null || stderrChunkCallback is not null;
+        if (streamChunks && !limitOutput)
+        {
+            p.OutputDataReceived += (_, e) =>
+            {
+                if (e.Data is null) return;
+                var line = e.Data + "\n";
+                stdout.Append(line);
+                stdoutChunkCallback?.Invoke(line);
+            };
+            p.ErrorDataReceived += (_, e) =>
+            {
+                if (e.Data is null) return;
+                var line = e.Data + "\n";
+                stderr.Append(line);
+                stderrChunkCallback?.Invoke(line);
+            };
+        }
+
+        Task<string>? stdoutTask = null;
+        Task<string>? stderrTask = null;
+        Task<LimitedReadResult>? limitedStdoutTask = null;
+        Task<LimitedReadResult>? limitedStderrTask = null;
         Exception? outputLimitTerminationFailure = null;
         var outputLimitTerminationRequested = 0;
         void KillForLimit()
@@ -108,18 +141,31 @@ public sealed class DefaultProcessRunner : IProcessRunner
             }
         }
 
-        limitedStdoutTask = ReadLimitedAsync(
-            p.StandardOutput,
-            effectiveMaxStdoutBytes,
-            stdoutChunkCallback,
-            killOnOutputLimit ? KillForLimit : null,
-            ct);
-        limitedStderrTask = ReadLimitedAsync(
-            p.StandardError,
-            effectiveMaxStderrBytes,
-            stderrChunkCallback,
-            killOnOutputLimit ? KillForLimit : null,
-            ct);
+        if (streamChunks && !limitOutput)
+        {
+            p.BeginOutputReadLine();
+            p.BeginErrorReadLine();
+        }
+        else if (limitOutput)
+        {
+            limitedStdoutTask = ReadLimitedAsync(
+                p.StandardOutput,
+                maxStdoutBytes,
+                stdoutChunkCallback,
+                killOnOutputLimit ? KillForLimit : null,
+                ct);
+            limitedStderrTask = ReadLimitedAsync(
+                p.StandardError,
+                maxStderrBytes,
+                stderrChunkCallback,
+                killOnOutputLimit ? KillForLimit : null,
+                ct);
+        }
+        else
+        {
+            stdoutTask = p.StandardOutput.ReadToEndAsync(ct);
+            stderrTask = p.StandardError.ReadToEndAsync(ct);
+        }
 
         try
         {
@@ -134,41 +180,53 @@ public sealed class DefaultProcessRunner : IProcessRunner
 
             if (Volatile.Read(ref outputLimitTerminationRequested) != 0)
             {
+                var stdoutReader = limitedStdoutTask
+                    ?? throw new InvalidOperationException("Output-limit termination has no stdout reader.");
+                var stderrReader = limitedStderrTask
+                    ?? throw new InvalidOperationException("Output-limit termination has no stderr reader.");
                 var cleanupErrors = await VerifyOutputLimitTerminationAsync(
                     p,
                     isolatedLinuxProcessGroup,
                     outputLimitTerminationFailure,
-                    limitedStdoutTask,
-                    limitedStderrTask).ConfigureAwait(false);
+                    stdoutReader,
+                    stderrReader).ConfigureAwait(false);
                 if (cleanupErrors.Count != 0)
                 {
                     throw new AggregateException(
-                        "Host process exceeded an output limit and its process-group teardown could not be fully verified.",
+                        "Host process exceeded an output limit and its teardown could not be fully verified.",
                         cleanupErrors);
                 }
             }
-            var stdoutResult = await limitedStdoutTask.ConfigureAwait(false);
-            var stderrResult = await limitedStderrTask.ConfigureAwait(false);
-            return new ProcessRunResult(
-                p.ExitCode,
-                stdoutResult.Text,
-                stderrResult.Text,
-                stdoutResult.LimitExceeded,
-                stderrResult.LimitExceeded);
+
+            if (stdoutTask is not null && stderrTask is not null)
+                return new ProcessRunResult(p.ExitCode, await stdoutTask, await stderrTask);
+            if (limitedStdoutTask is not null && limitedStderrTask is not null)
+            {
+                var stdoutResult = await limitedStdoutTask.ConfigureAwait(false);
+                var stderrResult = await limitedStderrTask.ConfigureAwait(false);
+                return new ProcessRunResult(
+                    p.ExitCode,
+                    stdoutResult.Text,
+                    stderrResult.Text,
+                    stdoutResult.LimitExceeded,
+                    stderrResult.LimitExceeded);
+            }
+
+            return new ProcessRunResult(p.ExitCode, stdout.ToString(), stderr.ToString());
         }
         catch (Exception initiatingError)
         {
             var cleanupErrors = await TerminateAndDrainAsync(
                 p,
                 isolatedLinuxProcessGroup,
-                stdoutTask: null,
-                stderrTask: null,
+                stdoutTask,
+                stderrTask,
                 limitedStdoutTask,
                 limitedStderrTask).ConfigureAwait(false);
             if (cleanupErrors.Count == 0)
                 throw;
             throw new AggregateException(
-                "Host process failed and its process-group teardown could not be fully verified.",
+                "Host process failed and its teardown could not be fully verified.",
                 [initiatingError, .. cleanupErrors]);
         }
     }
@@ -364,7 +422,7 @@ public sealed class DefaultProcessRunner : IProcessRunner
 
     private static async Task<LimitedReadResult> ReadLimitedAsync(
         StreamReader reader,
-        int maxBytes,
+        int? maxBytes,
         Action<string>? chunkCallback,
         Action? onLimitExceeded,
         CancellationToken ct)
@@ -381,12 +439,15 @@ public sealed class DefaultProcessRunner : IProcessRunner
                 return new LimitedReadResult(output.ToString(), limitExceeded);
 
             var chunk = new string(buffer, 0, read);
-            if (!limitExceeded)
+            if (maxBytes is { } limit)
             {
+                if (limitExceeded)
+                    continue;
+
                 var chunkBytes = Encoding.UTF8.GetByteCount(chunk);
-                if (chunkBytes > maxBytes - totalBytes)
+                if (chunkBytes > limit - totalBytes)
                 {
-                    var remaining = Math.Max(0, maxBytes - totalBytes);
+                    var remaining = Math.Max(0, limit - totalBytes);
                     if (remaining > 0)
                     {
                         var truncated = TakeUtf8Prefix(chunk, remaining);
@@ -394,7 +455,7 @@ public sealed class DefaultProcessRunner : IProcessRunner
                         chunkCallback?.Invoke(truncated);
                     }
 
-                    totalBytes = maxBytes;
+                    totalBytes = limit;
                     limitExceeded = true;
                     onLimitExceeded?.Invoke();
                     if (onLimitExceeded is not null)
@@ -403,10 +464,6 @@ public sealed class DefaultProcessRunner : IProcessRunner
                 }
 
                 totalBytes += chunkBytes;
-            }
-            else
-            {
-                continue;
             }
 
             output.Append(chunk);

@@ -16,6 +16,8 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
     private readonly SqliteConnection _conn;
     private readonly SqliteDatabaseWriteGate _lock;
     private readonly ILogger<SqliteQueueController> _log;
+    private readonly object _auditSync = new();
+    private Task _auditTail = Task.CompletedTask;
 
     // volatile so reads outside the lock see writes made inside the lock on ARM64.
     private volatile QueueState _state;
@@ -35,7 +37,10 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
     }
     public string? PausedReason => _pausedReason;
 
-    public SqliteQueueController(string dbPath, ILogger<SqliteQueueController> log)
+    public SqliteQueueController(
+        string dbPath,
+        ILogger<SqliteQueueController> log,
+        SqliteDatabaseWriteGateFactory? writeGateFactory = null)
     {
         _dbPath = dbPath;
         _log = log;
@@ -43,10 +48,13 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={dbPath}");
-        _lock = SqliteDatabaseWriteGate.ForPath(dbPath);
-        _lock.Wait();
+        _lock = SqliteDatabaseWriteGateFactory.Resolve(writeGateFactory).ForPath(dbPath);
+        var lockHeld = false;
+        var initialized = false;
         try
         {
+            _lock.Wait();
+            lockHeld = true;
             _conn.Open();
 
             // WAL mode allows concurrent readers; SqliteDatabaseWriteGate serializes
@@ -79,10 +87,17 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
             cmd.ExecuteNonQuery();
 
             LoadState();
+            initialized = true;
         }
         finally
         {
-            _lock.Release();
+            if (lockHeld)
+                _lock.Release();
+            if (!initialized)
+            {
+                _conn.Dispose();
+                _lock.Dispose();
+            }
         }
 
         if (_state == QueueState.Paused)
@@ -91,6 +106,7 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
 
     public async Task PauseAsync(string reason, CancellationToken ct = default)
     {
+        Action auditEvent;
         await _lock.WaitAsync(ct);
         try
         {
@@ -109,16 +125,19 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
             _state = QueueState.Paused;
             Interlocked.Exchange(ref _pausedAtUtcTicks, now.UtcTicks);
             _pausedReason = reason;
-            AuditLog.QueuePaused(reason);
+            auditEvent = () => AuditLog.QueuePaused(reason);
         }
         finally
         {
             _lock.Release();
         }
+
+        await EnqueueAudit(auditEvent).ConfigureAwait(false);
     }
 
     public async Task ResumeAsync(CancellationToken ct = default)
     {
+        Action? auditEvent = null;
         await _lock.WaitAsync(ct);
         try
         {
@@ -138,16 +157,20 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
             _state = QueueState.Running;
             Interlocked.Exchange(ref _pausedAtUtcTicks, 0);
             _pausedReason = null;
-            AuditLog.QueueResumed();
+            auditEvent = AuditLog.QueueResumed;
         }
         finally
         {
             _lock.Release();
         }
+
+        if (auditEvent is not null)
+            await EnqueueAudit(auditEvent).ConfigureAwait(false);
     }
 
     public async Task PauseProjectAsync(ProjectId projectId, string reason, CancellationToken ct = default)
     {
+        Action auditEvent;
         await _lock.WaitAsync(ct);
         try
         {
@@ -168,16 +191,19 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
             cmd.Parameters.AddWithValue("$reason", reason);
             cmd.Parameters.AddWithValue("$ua", now.ToString("O"));
             await cmd.ExecuteNonQueryAsync(ct);
-            AuditLog.ProjectQueuePaused(projectId, reason);
+            auditEvent = () => AuditLog.ProjectQueuePaused(projectId, reason);
         }
         finally
         {
             _lock.Release();
         }
+
+        await EnqueueAudit(auditEvent).ConfigureAwait(false);
     }
 
     public async Task ResumeProjectAsync(ProjectId projectId, CancellationToken ct = default)
     {
+        Action auditEvent;
         await _lock.WaitAsync(ct);
         try
         {
@@ -195,12 +221,14 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
             cmd.Parameters.AddWithValue("$pid", projectId.Value);
             cmd.Parameters.AddWithValue("$ua", now.ToString("O"));
             await cmd.ExecuteNonQueryAsync(ct);
-            AuditLog.ProjectQueueResumed(projectId);
+            auditEvent = () => AuditLog.ProjectQueueResumed(projectId);
         }
         finally
         {
             _lock.Release();
         }
+
+        await EnqueueAudit(auditEvent).ConfigureAwait(false);
     }
 
     public async Task<ProjectQueueState?> GetProjectStateAsync(ProjectId projectId, CancellationToken ct = default)
@@ -258,5 +286,28 @@ public sealed class SqliteQueueController : IQueueController, IDisposable
             : DateTimeOffset.Parse(reader.GetString(pausedAtOrd), System.Globalization.CultureInfo.InvariantCulture).UtcTicks;
         var reasonOrd = reader.GetOrdinal("paused_reason");
         _pausedReason = reader.IsDBNull(reasonOrd) ? null : reader.GetString(reasonOrd);
+    }
+
+    private Task EnqueueAudit(Action emit)
+    {
+        lock (_auditSync)
+        {
+            var next = RunAuditAfterAsync(_auditTail, emit);
+            _auditTail = next;
+            return next;
+        }
+    }
+
+    private static async Task RunAuditAfterAsync(Task prior, Action emit)
+    {
+        try
+        {
+            await prior.ConfigureAwait(false);
+        }
+        catch
+        {
+        }
+
+        emit();
     }
 }

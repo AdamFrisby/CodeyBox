@@ -71,6 +71,7 @@ public sealed class AgentFailureClassifierTests
 
     [Theory]
     [InlineData("API Error: 401 Unauthorized")]
+    [InlineData("API Error: 403")]
     [InlineData("invalid_api_key supplied")]
     [InlineData("OAuth token expired; please reauthenticate")]
     public void AuthPatterns_Classified_AsAuthError(string snippet)
@@ -78,6 +79,15 @@ public sealed class AgentFailureClassifierTests
         var c = AgentFailureClassifier.Classify(stderr: snippet);
         Assert.Equal(AgentFailureKind.AuthError, c.Kind);
         Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
+    }
+
+    [Theory]
+    [InlineData("The API can return 401 Unauthorized when a token expires.")]
+    [InlineData("Handle API Error: 401 by refreshing credentials in the sample client.")]
+    public void AuthPatterns_InStdoutOnlyTaskOutput_AreNotAuthError(string snippet)
+    {
+        var c = AgentFailureClassifier.Classify(stderr: null, stdout: snippet);
+        Assert.NotEqual(AgentFailureKind.AuthError, c.Kind);
     }
 
     [Theory]
@@ -213,7 +223,9 @@ public sealed class AgentFailureClassifierTests
                 ["custom"] = [new AuthFailurePattern("custom auth ceremony required")],
             });
 
-        Assert.NotNull(classifier.Detect(new AgentKind("custom"), "custom auth ceremony required", null));
+        var hit = classifier.DetectDetailed(new AgentKind("custom"), "custom auth ceremony required", null);
+        Assert.NotNull(hit);
+        Assert.True(hit.MatchedConfiguredStderrPattern);
         Assert.Null(classifier.Detect(AgentKind.Codex, "custom auth ceremony required", null));
     }
 
@@ -408,14 +420,14 @@ public sealed class AgentFailureClassifierTests
     }
 
     [Fact]
-    public void Exit127BinaryLaunchFailure_InStdout_Classified_AsInfrastructure()
+    public void Exit127BinaryLaunchFailure_InStdoutOnly_IsNotInfrastructure()
     {
         var c = AgentFailureClassifier.Classify(
             stderr: null,
             stdout: "bash: codex: command not found",
             summary: "agent exited 127");
 
-        Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
+        Assert.NotEqual(AgentFailureKind.Infrastructure, c.Kind);
     }
 
     // Realistic non-binary filesystem ENOENT shapes that the broad

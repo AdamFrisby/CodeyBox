@@ -9,6 +9,24 @@ namespace CodeyBox.Orchestrator;
 public sealed class PipelineTuningOptions
 {
     /// <summary>
+    /// Maximum PLAN-review attempts for one planning lifecycle. The pipeline
+    /// snapshots this hot-reloadable value when a review lifecycle starts, so
+    /// an in-flight loop has a stable cap while the next lifecycle observes a
+    /// configuration edit.
+    /// </summary>
+    public int MaxPlanReviewIterations { get; set; } = PlanReviewIterationLimit.DefaultValue;
+
+    /// <summary>
+    /// Fraction (0, 1] of the operator task's distinctive terms the canonical
+    /// PLAN must reproduce for the deterministic <see cref="PlanApprovalPolicy"/>
+    /// task-binding gate to approve it. Higher values demand the plan cover more
+    /// of the task before the pipeline persists <c>PlanApproved</c>, tightening
+    /// the independent (non-LLM) check against a forged reviewer pass. Default
+    /// <see cref="PlanApprovalPolicy.DefaultTaskBindingCoverage"/>.
+    /// </summary>
+    public double PlanTaskBindingCoverageRatio { get; set; } = PlanApprovalPolicy.DefaultTaskBindingCoverage;
+
+    /// <summary>
     /// Last-resort pause applied when a quota-shaped terminal failure occurs and
     /// neither the agent output nor quota probes expose a reset window.
     /// Default 5 minutes.
@@ -106,6 +124,19 @@ public sealed class PipelineTuningOptions
     public bool AuditShortCircuitEnabled { get; set; } = true;
 
     /// <summary>
+    /// Maximum re-dispatch attempts the audit/rework loop performs when a rework
+    /// agent returns with no committed changes AND the audit history shows
+    /// convergence progress AND no infra (auth / quota) signature explains the
+    /// empty result. Each escalation re-runs the rework with an explicit
+    /// instruction telling the agent its previous pass committed nothing and it
+    /// MUST either modify files or justify each finding as already satisfied /
+    /// invalid. Default <c>1</c>. Set to <c>0</c> to disable escalation entirely
+    /// (an empty non-infra rework parks straight away). Hot-reloaded with the
+    /// rest of <c>PipelineTuning</c>.
+    /// </summary>
+    public int EmptyReworkEscalationRetries { get; set; } = 1;
+
+    /// <summary>
     /// Maximum time a single auditor may run without completing or emitting
     /// an LLM stdout chunk. A value of zero disables the per-auditor idle
     /// guard. Default 5 minutes.
@@ -169,8 +200,67 @@ public sealed class PipelineTuningOptions
     /// </summary>
     public bool SelfReviewChecklistEnabled { get; set; }
 
+    /// <summary>
+    /// The plan-stage "approach" reviewer whose CODE-audit findings are demoted
+    /// to advisory for planned items by default. This is the architecture LLM
+    /// reviewer (audit-type <c>architecture</c>, name <c>architecture:llm-review</c>),
+    /// which already ran at the plan-review stage for planned items — re-blocking
+    /// on it during code rework is the "re-litigating the approach" the planning
+    /// loop is meant to avoid. Operators override the full set via
+    /// <see cref="PlannedItemAdvisoryAuditors"/>.
+    /// </summary>
+    public const string DefaultPlannedItemAdvisoryAuditor = "architecture:llm-review";
+
+    /// <summary>
+    /// Whether the code audit is rebalanced toward objective checks for PLANNED
+    /// items: blocking findings from the <see cref="PlannedItemAdvisoryAuditors"/>
+    /// are demoted to advisory (recorded, not merge-blocking) so a planned item's
+    /// code rework does not re-litigate an approach the plan stage already
+    /// reviewed. Objective gates (build, tests, security, cheating, completeness,
+    /// plan-adherence) always keep full blocking authority. No effect on
+    /// unplanned items. Default true. Hot-reloaded with the rest of
+    /// <c>PipelineTuning</c>.
+    /// </summary>
+    public bool PlannedItemAuditRebalanceEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Auditor names whose code-audit findings are demoted from blocking to
+    /// advisory for planned items when
+    /// <see cref="PlannedItemAuditRebalanceEnabled"/> is true. Matched
+    /// case-insensitively against <see cref="Core.AuditFinding.AuditorName"/>.
+    /// Defaults to the single plan-stage approach reviewer
+    /// (<see cref="DefaultPlannedItemAdvisoryAuditor"/>). Never list objective
+    /// gates here (build/test gates, security, cheating, completeness,
+    /// plan-adherence): demoting those would let a planned item merge past a
+    /// real defect. An empty list disables demotion without disabling the flag.
+    /// </summary>
+    public IList<string> PlannedItemAdvisoryAuditors { get; set; } =
+        new List<string> { DefaultPlannedItemAdvisoryAuditor };
+
     public void Validate()
     {
+        _ = PlanReviewIterationLimit.Create(MaxPlanReviewIterations);
+        if (PlannedItemAdvisoryAuditors is null)
+        {
+            throw new ArgumentNullException(
+                nameof(PlannedItemAdvisoryAuditors),
+                "PlannedItemAdvisoryAuditors must not be null (use an empty list to disable demotion).");
+        }
+        if (PlannedItemAdvisoryAuditors.Any(string.IsNullOrWhiteSpace))
+        {
+            throw new ArgumentException(
+                "PlannedItemAdvisoryAuditors entries must be non-empty auditor names.",
+                nameof(PlannedItemAdvisoryAuditors));
+        }
+        if (!double.IsFinite(PlanTaskBindingCoverageRatio)
+            || PlanTaskBindingCoverageRatio <= 0.0
+            || PlanTaskBindingCoverageRatio > 1.0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(PlanTaskBindingCoverageRatio),
+                PlanTaskBindingCoverageRatio,
+                "PlanTaskBindingCoverageRatio must be in the interval (0, 1].");
+        }
         if (MaxSandboxReuses < 1)
         {
             throw new ArgumentOutOfRangeException(nameof(MaxSandboxReuses), "MaxSandboxReuses must be >= 1");
@@ -198,6 +288,52 @@ public sealed class PipelineTuningOptions
         {
             throw new ArgumentOutOfRangeException(nameof(CSharpTestPassBlameHangTimeout), "CSharpTestPassBlameHangTimeout must be positive when set");
         }
+        if (EmptyReworkEscalationRetries < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(EmptyReworkEscalationRetries),
+                "EmptyReworkEscalationRetries must be non-negative");
+        }
+    }
+}
+
+/// <summary>
+/// Validated PLAN-review iteration cap. Configuration validation and the
+/// orchestration loop share this value object so zero cannot acquire a second,
+/// silently-clamped meaning inside the loop.
+/// </summary>
+public readonly record struct PlanReviewIterationLimit
+{
+    public const int MinimumValue = 1;
+    public const int DefaultValue = 3;
+
+    private PlanReviewIterationLimit(int value) => Value = value;
+
+    public int Value { get; }
+
+    public static bool TryCreate(int value, out PlanReviewIterationLimit limit)
+    {
+        if (value < MinimumValue)
+        {
+            limit = default;
+            return false;
+        }
+
+        limit = new PlanReviewIterationLimit(value);
+        return true;
+    }
+
+    public static PlanReviewIterationLimit Create(int value)
+    {
+        if (!TryCreate(value, out var limit))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(value),
+                value,
+                $"MaxPlanReviewIterations must be >= {MinimumValue}");
+        }
+
+        return limit;
     }
 }
 

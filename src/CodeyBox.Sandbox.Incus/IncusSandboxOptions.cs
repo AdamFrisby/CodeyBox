@@ -12,6 +12,11 @@ public sealed record IncusSandboxOptions
     public static readonly TimeSpan DefaultVmStopTimeout = TimeSpan.FromMinutes(2);
     public static readonly TimeSpan DefaultReadinessPollInterval = TimeSpan.FromSeconds(1);
     public const int DefaultMaxCliOutputBytes = 4 * 1024 * 1024;
+    public const int MaximumNetworkProfiles = 128;
+    public const int MaximumNetworkProfileUtf8Bytes = 64 * 1024;
+    public const int MaximumExtraRuncmdCount = 256;
+    public const int MaximumExtraRuncmdUtf8Bytes = 1024 * 1024;
+    public const int MaximumExtraCloudInitUtf8Bytes = 1024 * 1024;
 
     /// <summary>Path to an Incus 6.3-or-newer CLI. Incus 7.0 LTS is recommended.</summary>
     public string BinaryPath { get; init; } = "incus";
@@ -124,6 +129,16 @@ public sealed record IncusSandboxOptions
         RequireText(options.DefaultImage, nameof(DefaultImage), 4096, errors);
         RequirePrefix(options.InstanceNamePrefix, nameof(InstanceNamePrefix), errors);
         RequirePrefix(options.BaselineNamePrefix, nameof(BaselineNamePrefix), errors);
+        if (IsValidPrefix(options.BaselineNamePrefix))
+        {
+            var baselinePrefix = IncusBaselineNaming.NormalizeEffectivePrefix(options);
+            if (IncusBaselineNaming.OverlapsBakeCandidateNamespace(baselinePrefix))
+            {
+                errors.Add(
+                    $"{nameof(BaselineNamePrefix)} must not overlap the reserved " +
+                    $"'{IncusBaselineNaming.BakeCandidatePrefix}' bake-candidate namespace.");
+            }
+        }
         RequirePositiveDuration(options.OperationTimeout, nameof(OperationTimeout), errors);
         RequirePositiveDuration(options.ExecTimeout, nameof(ExecTimeout), errors);
         RequirePositiveDuration(options.ImageProvisioningTimeout, nameof(ImageProvisioningTimeout), errors);
@@ -168,70 +183,127 @@ public sealed record IncusSandboxOptions
                 $"{nameof(DiskGuard)}.{nameof(IncusDiskGuardOptions.RecheckIn)}",
                 errors);
             if (diskGuard.HostPaths.Count > 64)
-                errors.Add($"{nameof(DiskGuard)}.{nameof(IncusDiskGuardOptions.HostPaths)} cannot contain more than 64 paths.");
-            var hostPathBytes = 0L;
-            foreach (var path in diskGuard.HostPaths)
             {
-                hostPathBytes += System.Text.Encoding.UTF8.GetByteCount(path);
-                if (string.IsNullOrWhiteSpace(path)
-                    || path.Length > 4096
-                    || path.Any(char.IsControl)
-                    || !Path.IsPathFullyQualified(path))
-                    errors.Add($"Every {nameof(DiskGuard)}.{nameof(IncusDiskGuardOptions.HostPaths)} entry must be an absolute bounded host path.");
+                errors.Add($"{nameof(DiskGuard)}.{nameof(IncusDiskGuardOptions.HostPaths)} cannot contain more than 64 paths.");
             }
-            if (hostPathBytes > 256 * 1024)
-                errors.Add($"{nameof(DiskGuard)}.{nameof(IncusDiskGuardOptions.HostPaths)} exceeds 256 KiB in aggregate.");
+            else
+            {
+                var hostPathBytes = 0L;
+                foreach (var path in diskGuard.HostPaths)
+                {
+                    if (path is null)
+                    {
+                        errors.Add($"{nameof(DiskGuard)}.{nameof(IncusDiskGuardOptions.HostPaths)} cannot contain null paths.");
+                        continue;
+                    }
+                    hostPathBytes += System.Text.Encoding.UTF8.GetByteCount(path);
+                    if (string.IsNullOrWhiteSpace(path)
+                        || path.Length > 4096
+                        || path.Any(char.IsControl)
+                        || !Path.IsPathFullyQualified(path))
+                        errors.Add($"Every {nameof(DiskGuard)}.{nameof(IncusDiskGuardOptions.HostPaths)} entry must be an absolute bounded host path.");
+                }
+                if (hostPathBytes > 256 * 1024)
+                    errors.Add($"{nameof(DiskGuard)}.{nameof(IncusDiskGuardOptions.HostPaths)} exceeds 256 KiB in aggregate.");
+            }
         }
         if (options.GuestUserId is 0 or uint.MaxValue || options.GuestGroupId is 0 or uint.MaxValue)
             errors.Add("GuestUserId and GuestGroupId must be neither root (0) nor the reserved uint.MaxValue identity.");
         if (!IsAbsoluteGuestPath(options.GuestHome))
             errors.Add($"{nameof(GuestHome)} must be a normalized absolute Unix path.");
-        if (options.ExtraRuncmd.Count > 256)
-            errors.Add($"{nameof(ExtraRuncmd)} cannot contain more than 256 commands.");
-        var commandBytes = 0L;
-        foreach (var command in options.ExtraRuncmd)
+        if (options.ExtraRuncmd.Count > MaximumExtraRuncmdCount)
         {
-            commandBytes += System.Text.Encoding.UTF8.GetByteCount(command);
-            if (command.Contains('\0'))
-                errors.Add($"An {nameof(ExtraRuncmd)} command contains NUL.");
-            if (System.Text.Encoding.UTF8.GetByteCount(command) > 64 * 1024)
-                errors.Add($"An {nameof(ExtraRuncmd)} command exceeds 65536 UTF-8 bytes.");
+            errors.Add(
+                $"{nameof(ExtraRuncmd)} cannot contain more than {MaximumExtraRuncmdCount} commands.");
         }
-        if (commandBytes > 1024 * 1024)
-            errors.Add($"{nameof(ExtraRuncmd)} exceeds 1 MiB in aggregate.");
-        if (options.ExtraCloudInit is { } cloudInit
-            && System.Text.Encoding.UTF8.GetByteCount(cloudInit) > 1024 * 1024)
-            errors.Add($"{nameof(ExtraCloudInit)} exceeds 1 MiB.");
-        foreach (var (profile, bridge) in options.NetworkProfiles)
+        else
         {
-            RequireName(profile, $"NetworkProfiles key '{profile}'", 63, errors);
-            if (string.IsNullOrWhiteSpace(bridge)
-                || bridge.Length > 15
-                || bridge.Any(c => !(char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.')))
-                errors.Add($"NetworkProfiles['{profile}'] must be a valid Linux interface name of at most 15 characters.");
+            var commandBytes = 0L;
+            foreach (var command in options.ExtraRuncmd)
+            {
+                if (command is null)
+                {
+                    errors.Add($"{nameof(ExtraRuncmd)} cannot contain null commands.");
+                    continue;
+                }
+                var bytes = System.Text.Encoding.UTF8.GetByteCount(command);
+                commandBytes += bytes;
+                if (command.Contains('\0'))
+                    errors.Add($"An {nameof(ExtraRuncmd)} command contains NUL.");
+                if (bytes > 64 * 1024)
+                    errors.Add($"An {nameof(ExtraRuncmd)} command exceeds 65536 UTF-8 bytes.");
+            }
+            if (commandBytes > MaximumExtraRuncmdUtf8Bytes)
+                errors.Add($"{nameof(ExtraRuncmd)} exceeds 1 MiB in aggregate.");
+        }
+        var validateExtraCloudInit = true;
+        if (options.ExtraCloudInit is { } cloudInit
+            && System.Text.Encoding.UTF8.GetByteCount(cloudInit) > MaximumExtraCloudInitUtf8Bytes)
+        {
+            errors.Add($"{nameof(ExtraCloudInit)} exceeds 1 MiB.");
+            validateExtraCloudInit = false;
+        }
+        if (options.NetworkProfiles.Count > MaximumNetworkProfiles)
+        {
+            errors.Add(
+                $"{nameof(NetworkProfiles)} cannot contain more than {MaximumNetworkProfiles} entries.");
+        }
+        else
+        {
+            var networkProfileBytes = 0L;
+            foreach (var (profile, bridge) in options.NetworkProfiles)
+            {
+                if (profile is null || bridge is null)
+                {
+                    errors.Add($"{nameof(NetworkProfiles)} cannot contain null keys or values.");
+                    continue;
+                }
+                networkProfileBytes += System.Text.Encoding.UTF8.GetByteCount(profile);
+                networkProfileBytes += System.Text.Encoding.UTF8.GetByteCount(bridge);
+                RequireName(profile, "NetworkProfiles key", 63, errors);
+                if (string.IsNullOrWhiteSpace(bridge)
+                    || bridge.Length > 15
+                    || bridge.Any(c => !(char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.')))
+                {
+                    errors.Add(
+                        "NetworkProfiles values must be valid Linux interface names of at most 15 characters.");
+                }
+            }
+            if (networkProfileBytes > MaximumNetworkProfileUtf8Bytes)
+                errors.Add($"{nameof(NetworkProfiles)} exceeds 64 KiB in aggregate.");
         }
         if (options.AllowedHostMountRoots.Count > 64)
-            errors.Add($"{nameof(AllowedHostMountRoots)} cannot contain more than 64 entries.");
-        var allowedRootBytes = 0L;
-        foreach (var root in options.AllowedHostMountRoots)
         {
-            allowedRootBytes += System.Text.Encoding.UTF8.GetByteCount(root);
-            if (string.IsNullOrWhiteSpace(root)
-                || root.Length > 4096
-                || root.Contains(',')
-                || root.Any(char.IsControl)
-                || !Path.IsPathFullyQualified(root))
-            {
-                errors.Add(
-                    $"Each {nameof(AllowedHostMountRoots)} entry must be a bounded absolute path without commas or control characters.");
-            }
-            else if (IsHostFilesystemRoot(root))
-            {
-                errors.Add($"{nameof(AllowedHostMountRoots)} cannot include the host filesystem root.");
-            }
+            errors.Add($"{nameof(AllowedHostMountRoots)} cannot contain more than 64 entries.");
         }
-        if (allowedRootBytes > 256 * 1024)
-            errors.Add($"{nameof(AllowedHostMountRoots)} exceeds 256 KiB in aggregate.");
+        else
+        {
+            var allowedRootBytes = 0L;
+            foreach (var root in options.AllowedHostMountRoots)
+            {
+                if (root is null)
+                {
+                    errors.Add($"{nameof(AllowedHostMountRoots)} cannot contain null roots.");
+                    continue;
+                }
+                allowedRootBytes += System.Text.Encoding.UTF8.GetByteCount(root);
+                if (string.IsNullOrWhiteSpace(root)
+                    || root.Length > 4096
+                    || root.Contains(',')
+                    || root.Any(char.IsControl)
+                    || !Path.IsPathFullyQualified(root))
+                {
+                    errors.Add(
+                        $"Each {nameof(AllowedHostMountRoots)} entry must be a bounded absolute path without commas or control characters.");
+                }
+                else if (IsHostFilesystemRoot(root))
+                {
+                    errors.Add($"{nameof(AllowedHostMountRoots)} cannot include the host filesystem root.");
+                }
+            }
+            if (allowedRootBytes > 256 * 1024)
+                errors.Add($"{nameof(AllowedHostMountRoots)} exceeds 256 KiB in aggregate.");
+        }
         if (!string.IsNullOrWhiteSpace(options.StagingDirectory)
             && (options.StagingDirectory.Length > 4096
                 || options.StagingDirectory.Contains(',')
@@ -244,7 +316,8 @@ public sealed record IncusSandboxOptions
         }
         try
         {
-            IncusCloudInit.ValidateExtraFragment(options.ExtraCloudInit);
+            if (validateExtraCloudInit)
+                IncusCloudInit.ValidateExtraFragment(options.ExtraCloudInit);
         }
         catch (InvalidOperationException ex)
         {
@@ -300,10 +373,17 @@ public sealed record IncusSandboxOptions
     private static void RequirePrefix(string value, string name, ICollection<string> errors)
     {
         RequireText(value, name, 32, errors);
-        if (string.IsNullOrWhiteSpace(value)
-            || !char.IsAsciiLetterOrDigit(value[0])
-            || value.Any(c => !(char.IsAsciiLetterOrDigit(c) || c == '-')))
+        if (!IsValidPrefix(value))
             errors.Add($"{name} may contain only ASCII letters, digits, and hyphens, and must start alphanumeric.");
+    }
+
+    private static bool IsValidPrefix(string value)
+    {
+        return !string.IsNullOrWhiteSpace(value)
+            && value.Length <= 32
+            && !value.Any(char.IsControl)
+            && char.IsAsciiLetterOrDigit(value[0])
+            && value.All(c => char.IsAsciiLetterOrDigit(c) || c == '-');
     }
 
     private static void RequireName(string value, string name, int maxLength, ICollection<string> errors)

@@ -47,6 +47,7 @@ internal static class IncusCloudInit
         cd -- "$working_directory" || exit 72
         umask 077
         setsid -- setpriv \
+          --no-new-privs \
           --reuid="$guest_uid" \
           --regid="$guest_gid" \
           --clear-groups \
@@ -160,6 +161,8 @@ internal static class IncusCloudInit
     {
         if (string.IsNullOrWhiteSpace(fragment))
             return;
+        if (Encoding.UTF8.GetByteCount(fragment) > IncusSandboxOptions.MaximumExtraCloudInitUtf8Bytes)
+            throw new InvalidOperationException("ExtraCloudInit exceeds 1 MiB.");
         var normalized = fragment.Replace("\r\n", "\n", StringComparison.Ordinal);
         if (normalized.Any(c => (char.IsControl(c) && c != '\n')
             || c is '\u0085' or '\u2028' or '\u2029'))

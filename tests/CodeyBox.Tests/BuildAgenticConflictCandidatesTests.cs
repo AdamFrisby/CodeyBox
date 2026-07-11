@@ -146,7 +146,7 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
         // Throw type pinned: AgentUnavailableException (NOT
         // MergeConflictResolutionFailedException — the catch in
         // RebaseCheckedOutBranchWithScopeFenceAsync re-raises this type
-        // specifically so the work item parks as failureKind=agent_unavailable
+        // specifically so the work item parks as a routing-unavailable failure
         // instead of merge-conflict-resolution-failed).
         Assert.Contains("no agent has viable credentials", ex.Message, StringComparison.Ordinal);
         // Per-candidate skip reasons must be threaded through the throw.
@@ -283,7 +283,7 @@ public sealed class BuildAgenticConflictCandidatesTests : IDisposable
     {
         // When EVERYTHING is at cap the primary still leads — the cap-bucket
         // sort preserves index order within each bucket. Confirms the
-        // permissive escape hatch: rather than parking with agent_unavailable,
+        // permissive escape hatch: rather than parking with routing-unavailable,
         // the resolver proceeds and accepts a possible 429.
         var primary = new FakeAgentRunner(AgentKind.Claude);
         var codex = new FakeAgentRunner(AgentKind.Codex);

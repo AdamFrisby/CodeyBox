@@ -3,12 +3,14 @@ using System.Collections;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using System.Text;
 using CodeyBox.Audit.Llm;
 using CodeyBox.Audit.Presets.Presets;
 using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
 using Json.Schema;
 using YamlDotNet.Core;
+using YamlDotNet.Core.Events;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
@@ -18,6 +20,22 @@ internal sealed class PresetConfigLoader
 {
     private const string ResourcePrefix = "CodeyBox.Audit.Presets.Defaults.";
     private const string UnrunnableTestsRule = "Tests which cannot be run in this environment are not part of the scoring or auditing criteria.";
+    // Aggregate (across all project roots) and per-directory hard cap on
+    // repository preset YAML files, applied identically to the languages and
+    // audit-types directories. The per-directory cap is enforced during
+    // enumeration, before any sort/accumulation, so an attacker-controlled repo
+    // cannot exhaust host memory/CPU by dropping a huge number of YAML files.
+    private const int MaxRepositoryPresetFiles = 64;
+    private const int MaxRepositoryPresetBytes = 256 * 1024;
+    private const int MaxRepositoryAuditorsPerFile = 16;
+    private const int MaxRepositoryPatternsPerFile = 64;
+    private const int MaxRepositoryAuditEntries = 128;
+    // Maximum YAML mapping/sequence nesting accepted from any preset document.
+    // A small deeply-nested document could otherwise overflow the process stack
+    // in the normalizer/serializer before schema validation runs.
+    private const int MaxYamlDepth = 64;
+    private const int StreamReadBufferBytes = 4096;
+    private static readonly byte[] Utf8ByteOrderMark = [0xEF, 0xBB, 0xBF];
     private static readonly IReadOnlySet<string> AuditTypesWithUnrunnableTestsRule =
         new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -55,18 +73,27 @@ internal sealed class PresetConfigLoader
         var languages = LoadEmbeddedLanguages(assembly);
         var auditTypes = LoadEmbeddedAuditTypes(assembly);
         var frame = LoadEmbeddedFrame(assembly);
+        var planFrame = LoadEmbeddedPlanFrame(assembly);
 
+        var repositoryLanguageFiles = 0;
+        var repositoryAuditTypeFiles = 0;
+        var repositoryAuditEntries = 0;
         foreach (var projectRoot in ProjectRoots(options))
         {
-            LoadUserLanguageFiles(projectRoot, languages);
-            LoadUserAuditTypeFiles(projectRoot, auditTypes);
+            LoadUserLanguageFiles(projectRoot, languages, ref repositoryLanguageFiles);
+            LoadUserAuditTypeFiles(
+                projectRoot,
+                auditTypes,
+                ref repositoryAuditTypeFiles,
+                ref repositoryAuditEntries);
         }
 
-        ApplyProjectConfigOverrides(options, languages, auditTypes, ref frame);
+        ApplyProjectConfigOverrides(options, languages, auditTypes, ref frame, ref planFrame);
         ApplyMandatoryReviewFocusRules(auditTypes);
         ValidateFrame("llm-prompt-frame.yaml", frame.Frame);
+        ValidateFrame("llm-plan-prompt-frame.yaml", planFrame.Frame);
 
-        return new PresetConfigSnapshot(languages, auditTypes, frame.Frame);
+        return new PresetConfigSnapshot(languages, auditTypes, frame.Frame, planFrame.Frame);
     }
 
     private static Dictionary<string, LanguagePresetDefinition> LoadEmbeddedLanguages(Assembly assembly)
@@ -100,11 +127,28 @@ internal sealed class PresetConfigLoader
         return frame;
     }
 
-    private static void LoadUserLanguageFiles(string? projectRoot, Dictionary<string, LanguagePresetDefinition> languages)
+    private static FramePresetDefinition LoadEmbeddedPlanFrame(Assembly assembly)
+    {
+        var frame = ReadYamlResource<FramePresetDefinition>(assembly, ResourcePrefix + "llm-plan-prompt-frame.yaml", "frame");
+        ValidateFrame("Defaults/llm-plan-prompt-frame.yaml", frame.Frame);
+        return frame;
+    }
+
+    private static void LoadUserLanguageFiles(
+        string? projectRoot,
+        Dictionary<string, LanguagePresetDefinition> languages,
+        ref int repositoryFileCount)
     {
         foreach (var file in PresetFiles(projectRoot, "languages"))
         {
-            var definition = ReadYamlFile<LanguagePresetDefinition>(file, "language");
+            repositoryFileCount++;
+            if (repositoryFileCount > MaxRepositoryPresetFiles)
+            {
+                throw new PresetConfigurationException(
+                    $"Repository language configuration exceeds the {MaxRepositoryPresetFiles}-file limit.");
+            }
+
+            var definition = ReadYamlFile<LanguagePresetDefinition>(file, "language", MaxRepositoryPresetBytes);
             if (definition.Marker?.Script != null)
                 throw new PresetConfigurationException($"{file}: /marker/script is not allowed in repository-provided configuration for security reasons. Use /marker/globs instead.");
 
@@ -113,15 +157,47 @@ internal sealed class PresetConfigLoader
         }
     }
 
-    private static void LoadUserAuditTypeFiles(string? projectRoot, Dictionary<string, AuditTypePresetDefinition> auditTypes)
+    private static void LoadUserAuditTypeFiles(
+        string? projectRoot,
+        Dictionary<string, AuditTypePresetDefinition> auditTypes,
+        ref int repositoryFileCount,
+        ref int repositoryEntryCount)
     {
         foreach (var file in PresetFiles(projectRoot, "audit-types"))
         {
-            var definition = ReadYamlFile<AuditTypePresetDefinition>(file, "audit-type");
+            repositoryFileCount++;
+            if (repositoryFileCount > MaxRepositoryPresetFiles)
+            {
+                throw new PresetConfigurationException(
+                    $"Repository audit-type configuration exceeds the {MaxRepositoryPresetFiles}-file limit.");
+            }
+
+            var definition = ReadYamlFile<AuditTypePresetDefinition>(file, "audit-type", MaxRepositoryPresetBytes);
             if (!string.IsNullOrWhiteSpace(definition.LlmAuditorName))
                 throw new PresetConfigurationException($"{file}: /llmAuditorName is not allowed in repository-provided configuration for security reasons.");
             if (!string.IsNullOrWhiteSpace(definition.ReviewFocus))
                 throw new PresetConfigurationException($"{file}: /reviewFocus is not allowed in repository-provided configuration for security reasons.");
+            if (!string.IsNullOrWhiteSpace(definition.PlanReviewFocus))
+                throw new PresetConfigurationException($"{file}: /planReviewFocus is not allowed in repository-provided configuration for security reasons.");
+            if (definition.Targets.Count > 0)
+                throw new PresetConfigurationException($"{file}: /targets is not allowed in repository-provided configuration for security reasons.");
+            if (definition.Auditors.Count > MaxRepositoryAuditorsPerFile)
+            {
+                throw new PresetConfigurationException(
+                    $"{file}: /auditors exceeds the repository limit of {MaxRepositoryAuditorsPerFile}.");
+            }
+            if (definition.Patterns.Count > MaxRepositoryPatternsPerFile)
+            {
+                throw new PresetConfigurationException(
+                    $"{file}: /patterns exceeds the repository limit of {MaxRepositoryPatternsPerFile}.");
+            }
+
+            repositoryEntryCount = checked(repositoryEntryCount + definition.Auditors.Count + definition.Patterns.Count);
+            if (repositoryEntryCount > MaxRepositoryAuditEntries)
+            {
+                throw new PresetConfigurationException(
+                    $"Repository audit-type configuration exceeds the total {MaxRepositoryAuditEntries}-entry work limit.");
+            }
 
             ValidateAuditType(file, definition, isTrusted: false);
             ComposeAuditType(auditTypes, definition, isTrusted: false);
@@ -132,7 +208,8 @@ internal sealed class PresetConfigLoader
         PresetCatalogOptions options,
         Dictionary<string, LanguagePresetDefinition> languages,
         Dictionary<string, AuditTypePresetDefinition> auditTypes,
-        ref FramePresetDefinition frame)
+        ref FramePresetDefinition frame,
+        ref FramePresetDefinition planFrame)
     {
         foreach (var (id, ov) in options.LanguageOverrides)
         {
@@ -165,7 +242,9 @@ internal sealed class PresetConfigLoader
                 Id = id,
                 DisplayName = ov.DisplayName,
                 ReviewFocus = ov.ReviewFocus ?? string.Empty,
+                PlanReviewFocus = ov.PlanReviewFocus,
                 Replace = ov.Replace,
+                Targets = [.. ov.Targets],
                 Auditors = ov.Auditors.Select(a => new AuditorDefinition
                 {
                     Name = a.Name,
@@ -195,6 +274,11 @@ internal sealed class PresetConfigLoader
             frame = new FramePresetDefinition { Frame = options.LlmPromptFrameTemplate };
             ValidateFrame("Audit.LlmPromptFrame", frame.Frame);
         }
+        if (options.LlmPlanPromptFrameTemplate is not null)
+        {
+            planFrame = new FramePresetDefinition { Frame = options.LlmPlanPromptFrameTemplate };
+            ValidateFrame("Audit.LlmPlanPromptFrame", planFrame.Frame);
+        }
     }
 
     private static void ComposeAuditType(
@@ -202,6 +286,14 @@ internal sealed class PresetConfigLoader
         AuditTypePresetDefinition incoming,
         bool isTrusted)
     {
+        if (!isTrusted)
+        {
+            incoming.CodeOnlyAuditors.AddRange(incoming.Auditors);
+            incoming.CodeOnlyPatterns.AddRange(incoming.Patterns);
+            incoming.Auditors = [];
+            incoming.Patterns = [];
+        }
+
         var shouldReplace = incoming.Replace && isTrusted;
         if (!auditTypes.TryGetValue(incoming.Id, out var existing) || shouldReplace)
         {
@@ -213,11 +305,17 @@ internal sealed class PresetConfigLoader
             existing.DisplayName = incoming.DisplayName;
         if (!string.IsNullOrWhiteSpace(incoming.ReviewFocus))
             existing.ReviewFocus = incoming.ReviewFocus;
+        if (!string.IsNullOrWhiteSpace(incoming.PlanReviewFocus))
+            existing.PlanReviewFocus = incoming.PlanReviewFocus;
         if (!string.IsNullOrWhiteSpace(incoming.LlmAuditorName))
             existing.LlmAuditorName = incoming.LlmAuditorName;
+        if (incoming.Targets.Count > 0)
+            existing.Targets = [.. incoming.Targets];
 
         existing.Auditors.AddRange(incoming.Auditors);
         existing.Patterns.AddRange(incoming.Patterns);
+        existing.CodeOnlyAuditors.AddRange(incoming.CodeOnlyAuditors);
+        existing.CodeOnlyPatterns.AddRange(incoming.CodeOnlyPatterns);
     }
 
     private static void ApplyMandatoryReviewFocusRules(Dictionary<string, AuditTypePresetDefinition> auditTypes)
@@ -277,15 +375,86 @@ internal sealed class PresetConfigLoader
             !string.IsNullOrWhiteSpace(a.Role) ||
             !string.IsNullOrWhiteSpace(a.GateEvidence));
 
-    private static IEnumerable<string> PresetFiles(string? projectRoot, string childDirectory)
+    private static IReadOnlyList<string> PresetFiles(string? projectRoot, string childDirectory)
     {
         if (string.IsNullOrWhiteSpace(projectRoot))
             return [];
 
         var directory = Path.Combine(projectRoot, "codeybox", childDirectory);
-        return Directory.Exists(directory)
-            ? Directory.EnumerateFiles(directory, "*.yaml").Order(StringComparer.Ordinal)
-            : [];
+        if (!Directory.Exists(directory))
+            return [];
+
+        var canonicalDirectory = Path.GetFullPath(directory);
+        EnsurePresetDirectoryChainNotLinked(projectRoot, canonicalDirectory);
+
+        // Bound enumeration BEFORE sorting/accumulating so an attacker-controlled
+        // repository with an arbitrarily large number of YAML files cannot exhaust
+        // host memory/CPU via Order() before the advertised file cap runs.
+        var files = new List<string>();
+        foreach (var file in Directory.EnumerateFiles(directory, "*.yaml"))
+        {
+            if (files.Count >= MaxRepositoryPresetFiles)
+            {
+                throw new PresetConfigurationException(
+                    $"Repository preset directory '{directory}' exceeds the {MaxRepositoryPresetFiles}-file limit.");
+            }
+
+            EnsurePresetFileContained(file, canonicalDirectory);
+            files.Add(file);
+        }
+
+        files.Sort(StringComparer.Ordinal);
+        return files;
+    }
+
+    // Reject a symlinked preset-directory chain (codeybox/<child>): a linked
+    // component would relocate the whole enumeration outside the project root and
+    // let a malicious repository point preset loading at arbitrary host paths.
+    // projectRoot itself is orchestrator-supplied and treated as the trusted base.
+    private static void EnsurePresetDirectoryChainNotLinked(string projectRoot, string canonicalDirectory)
+    {
+        var root = Path.GetFullPath(projectRoot);
+        var current = canonicalDirectory;
+        while (!string.Equals(current, root, StringComparison.Ordinal))
+        {
+            var info = new DirectoryInfo(current);
+            if (info.LinkTarget is not null)
+            {
+                throw new PresetConfigurationException(
+                    $"{canonicalDirectory}: repository preset path component '{info.Name}' must not be a symbolic link.");
+            }
+
+            var parent = info.Parent?.FullName;
+            if (parent is null || string.Equals(parent, current, StringComparison.Ordinal))
+                break;
+            current = parent;
+        }
+    }
+
+    private static void EnsurePresetFileContained(string path, string canonicalDirectory)
+    {
+        // No-follow intent: a symbolic-link / reparse-point file is rejected before
+        // it is ever opened, so following it can never read an arbitrary host file
+        // or special device accessible to the service account. The byte cap does
+        // not establish path containment; this does.
+        var info = new FileInfo(path);
+        if (info.LinkTarget is not null)
+        {
+            throw new PresetConfigurationException(
+                $"{path}: repository preset files must be regular files, not symbolic links.");
+        }
+
+        // Canonicalise-then-contain (defence in depth against '..' components):
+        // the resolved file path must remain beneath the canonical preset directory.
+        var fullPath = Path.GetFullPath(path);
+        var containedPrefix = canonicalDirectory.EndsWith(Path.DirectorySeparatorChar)
+            ? canonicalDirectory
+            : canonicalDirectory + Path.DirectorySeparatorChar;
+        if (!fullPath.StartsWith(containedPrefix, StringComparison.Ordinal))
+        {
+            throw new PresetConfigurationException(
+                $"{path}: repository preset files must reside within '{canonicalDirectory}'.");
+        }
     }
 
     private static IEnumerable<string> ProjectRoots(PresetCatalogOptions options)
@@ -314,14 +483,84 @@ internal sealed class PresetConfigLoader
         return ReadYamlText<T>(reader.ReadToEnd(), resourceName, schemaName);
     }
 
-    private static T ReadYamlFile<T>(string path, string schemaName)
-        => ReadYamlText<T>(File.ReadAllText(path), path, schemaName);
+    private static T ReadYamlFile<T>(string path, string schemaName, int maxBytes)
+    {
+        using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            StreamReadBufferBytes,
+            FileOptions.SequentialScan);
+        if (stream.Length > maxBytes)
+            throw new PresetConfigurationException($"{path}: preset exceeds the {maxBytes}-byte limit.");
+
+        var bytes = new byte[maxBytes + 1];
+        var totalRead = 0;
+        while (totalRead < bytes.Length)
+        {
+            var read = stream.Read(bytes, totalRead, bytes.Length - totalRead);
+            if (read == 0)
+                break;
+            totalRead += read;
+        }
+        if (totalRead > maxBytes)
+            throw new PresetConfigurationException($"{path}: preset exceeds the {maxBytes}-byte limit.");
+
+        var content = bytes.AsSpan(0, totalRead);
+        if (content.Length >= Utf8ByteOrderMark.Length
+            && content[..Utf8ByteOrderMark.Length].SequenceEqual(Utf8ByteOrderMark))
+            content = content[Utf8ByteOrderMark.Length..];
+        try
+        {
+            return ReadYamlText<T>(new UTF8Encoding(false, true).GetString(content), path, schemaName);
+        }
+        catch (DecoderFallbackException ex)
+        {
+            throw new PresetConfigurationException($"{path}: preset is not valid UTF-8.", ex);
+        }
+    }
 
     private static T ReadYamlText<T>(string yaml, string source, string schemaName)
     {
+        // Enforce a conservative nesting bound while streaming parser events (no
+        // object graph is built), so a deeply nested document is rejected before
+        // the recursive normalizer/serializer can consume the process stack.
+        EnsureYamlDepthWithinLimit(yaml);
         var json = ReadYamlJson(yaml, source);
         ValidateJsonSchema(typeof(PresetConfigLoader).Assembly, schemaName, source, json);
         return ReadYaml<T>(yaml, source);
+    }
+
+    private static void EnsureYamlDepthWithinLimit(string yaml)
+    {
+        try
+        {
+            var parser = new Parser(new StringReader(yaml));
+            var depth = 0;
+            while (parser.MoveNext())
+            {
+                switch (parser.Current)
+                {
+                    case MappingStart:
+                    case SequenceStart:
+                        depth++;
+                        if (depth > MaxYamlDepth)
+                            throw new PresetConfigurationException(
+                                $"YAML nesting exceeds the maximum depth of {MaxYamlDepth}.");
+                        break;
+                    case MappingEnd:
+                    case SequenceEnd:
+                        depth--;
+                        break;
+                }
+            }
+        }
+        catch (YamlException)
+        {
+            // Malformed YAML surfaces a consistent, located error from the
+            // downstream document parser; the depth pre-scan only guards nesting.
+        }
     }
 
     private static T ReadYaml<T>(string yaml, string source)
@@ -404,8 +643,16 @@ internal sealed class PresetConfigLoader
         }
     }
 
-    private static object? NormalizeYamlValue(object? value)
+    private static object? NormalizeYamlValue(object? value) => NormalizeYamlValue(value, depth: 0);
+
+    private static object? NormalizeYamlValue(object? value, int depth)
     {
+        // Belt-and-suspenders alongside the parser-event pre-scan: bound recursion
+        // here too so a deeply nested value can never overflow the process stack.
+        if (depth > MaxYamlDepth)
+            throw new PresetConfigurationException(
+                $"YAML nesting exceeds the maximum depth of {MaxYamlDepth}.");
+
         if (value is IDictionary dictionary)
         {
             var normalized = new Dictionary<string, object?>(StringComparer.Ordinal);
@@ -414,7 +661,7 @@ internal sealed class PresetConfigLoader
                 var key = entry.Key?.ToString();
                 if (string.IsNullOrWhiteSpace(key))
                     continue;
-                normalized[key] = NormalizeYamlValue(entry.Value);
+                normalized[key] = NormalizeYamlValue(entry.Value, depth + 1);
             }
             return normalized;
         }
@@ -423,7 +670,7 @@ internal sealed class PresetConfigLoader
         {
             var normalized = new List<object?>();
             foreach (var item in enumerable)
-                normalized.Add(NormalizeYamlValue(item));
+                normalized.Add(NormalizeYamlValue(item, depth + 1));
             return normalized;
         }
 
@@ -620,6 +867,13 @@ internal sealed class PresetConfigLoader
                 throw new PresetConfigurationException($"{source}: {pointer}/regex '{pattern.Regex}' is not a valid regex: {ex.Message}", ex);
             }
         }
+
+        for (var i = 0; i < definition.Targets.Count; i++)
+        {
+            if (string.IsNullOrWhiteSpace(definition.Targets[i]))
+                throw new PresetConfigurationException($"{source}: /targets/{i} must be non-empty.");
+            _ = new AuditTarget(definition.Targets[i]);
+        }
     }
 
     private static void ValidateFrame(string source, string? frame)
@@ -756,7 +1010,8 @@ internal sealed class PresetConfigLoader
 internal sealed record PresetConfigSnapshot(
     IReadOnlyDictionary<string, LanguagePresetDefinition> Languages,
     IReadOnlyDictionary<string, AuditTypePresetDefinition> AuditTypes,
-    string LlmPromptFrame);
+    string LlmPromptFrame,
+    string LlmPlanPromptFrame);
 
 internal sealed class LanguagePresetDefinition
 {
@@ -803,10 +1058,18 @@ internal sealed class AuditTypePresetDefinition
     public string Id { get; set; } = string.Empty;
     public string? DisplayName { get; set; }
     public string ReviewFocus { get; set; } = string.Empty;
+    public string? PlanReviewFocus { get; set; }
     public string? LlmAuditorName { get; set; }
+    public List<string> Targets { get; set; } = [];
     public bool Replace { get; set; }
     public List<AuditorDefinition> Auditors { get; set; } = [];
     public List<DiffPatternDefinition> Patterns { get; set; } = [];
+
+    // Repository-provided additions retain their untrusted origin here so a
+    // trusted built-in or operator override cannot make them inherit Plan.
+    // They are always materialised with AuditTargets.CodeOnly.
+    public List<AuditorDefinition> CodeOnlyAuditors { get; } = [];
+    public List<DiffPatternDefinition> CodeOnlyPatterns { get; } = [];
 }
 
 internal sealed class DiffPatternDefinition

@@ -10,7 +10,10 @@ public static class SandboxResourceMetricsTelemetry
         var networkTag = new KeyValuePair<string, object?>("network_profile", metrics.NetworkProfile ?? string.Empty);
         if (ToMegabytes(metrics.PeakRamBytes) is { } peak)
             CodeyBoxMeters.SandboxPeakRamMb.Record(peak, phaseTag, networkTag);
-        if (metrics.AvgCpuPercent is { } cpu)
+        if (SandboxResourceMetricValidation.NormalizeFiniteDouble(
+                metrics.AvgCpuPercent,
+                minimumInclusive: 0,
+                maximumInclusive: 100) is { } cpu)
             CodeyBoxMeters.SandboxAvgCpuPercent.Record(cpu, phaseTag, networkTag);
         if (ToMegabytes(metrics.NetRxBytes) is { } rx)
             CodeyBoxMeters.SandboxNetRxMb.Record(rx, phaseTag, networkTag);
@@ -19,5 +22,5 @@ public static class SandboxResourceMetricsTelemetry
     }
 
     private static double? ToMegabytes(long? bytes) =>
-        bytes.HasValue ? bytes.Value / (1024d * 1024d) : null;
+        bytes is >= 0 ? bytes.Value / (1024d * 1024d) : null;
 }

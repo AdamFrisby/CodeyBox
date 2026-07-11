@@ -160,6 +160,7 @@ internal static class PipelineLifecycleUatHelpers
         public IReadOnlyList<string> KnownLanguages => [];
         public IReadOnlyList<string> KnownAuditTypes => _auditors.Count == 0 ? [] : ["uat-scripted"];
         public string LlmPromptFrameTemplate => "{{reviewFocus}}\n{{originalPrompt}}\n{{resultFile}}";
+        public string LlmPlanPromptFrameTemplate => CodeyBox.Audit.Llm.LlmPromptFrameTemplate.DefaultPlanFrameTemplate;
     }
 }
 

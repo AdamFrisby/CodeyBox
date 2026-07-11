@@ -35,6 +35,7 @@ internal static class IncusProvisioningDecision
 
 internal static class IncusBaselineNaming
 {
+    internal const string BakeCandidatePrefix = "cb-bake-";
     private const int MaxInstanceNameLength = 63;
 
     internal static string DeriveBaselineName(
@@ -58,12 +59,38 @@ internal static class IncusBaselineNaming
 
     internal static string NormalizeEffectivePrefix(IncusSandboxOptions options)
     {
-        var prefix = NormalizePrefix(options.BaselineNamePrefix);
+        ArgumentNullException.ThrowIfNull(options);
+        return NormalizeEffectivePrefix(options.BaselineNamePrefix);
+    }
+
+    internal static bool TryNormalizeEffectivePrefix(string? configuredPrefix, out string prefix)
+    {
+        prefix = string.Empty;
+        if (string.IsNullOrWhiteSpace(configuredPrefix)
+            || configuredPrefix.Length > 32
+            || configuredPrefix.Any(char.IsControl)
+            || !char.IsAsciiLetterOrDigit(configuredPrefix[0])
+            || configuredPrefix.Any(c => !(char.IsAsciiLetterOrDigit(c) || c == '-')))
+        {
+            return false;
+        }
+
+        prefix = NormalizeEffectivePrefix(configuredPrefix);
+        return true;
+    }
+
+    private static string NormalizeEffectivePrefix(string configuredPrefix)
+    {
+        var prefix = NormalizePrefix(configuredPrefix);
         const int maximumPrefixLength = 20;
         return prefix.Length > maximumPrefixLength
             ? prefix[..maximumPrefixLength].TrimEnd('-') + "-"
             : prefix;
     }
+
+    internal static bool OverlapsBakeCandidateNamespace(string effectivePrefix) =>
+        effectivePrefix.StartsWith(BakeCandidatePrefix, StringComparison.Ordinal)
+        || BakeCandidatePrefix.StartsWith(effectivePrefix, StringComparison.Ordinal);
 
     internal static string ComputeConfigHash(
         IncusSandboxOptions options,
@@ -128,7 +155,7 @@ internal static class IncusCommandBuilder
         SandboxResourceLimits limits)
     {
         IncusInputValidation.ValidateOptionsIdentity(options);
-        IncusInputValidation.ValidateOpaqueArgument(image, nameof(image));
+        IncusInputValidation.ValidateOpaqueArgument(image, nameof(image), maximumLength: 4096);
         IncusInputValidation.ValidateInstanceName(name, nameof(name));
         if (limits.CpuCount is <= 0)
             throw new ArgumentOutOfRangeException(nameof(limits), "CPU count must be positive.");
@@ -312,13 +339,21 @@ internal static class IncusInputValidation
             throw new ArgumentException("The guest path must be a normalized absolute Unix path.", parameterName);
     }
 
-    internal static void ValidateOpaqueArgument(string value, string parameterName)
+    internal static void ValidateOpaqueArgument(
+        string value,
+        string parameterName,
+        int maximumLength = 4096)
     {
         if (string.IsNullOrWhiteSpace(value)
+            || value.Length > maximumLength
             || value.StartsWith("-", StringComparison.Ordinal)
             || value.Contains('\0')
             || value.Any(c => char.IsControl(c)))
-            throw new ArgumentException("The argument must be non-empty, must not start with '-', and must contain no control characters.", parameterName);
+        {
+            throw new ArgumentException(
+                $"The argument must be non-empty, at most {maximumLength} characters, must not start with '-', and must contain no control characters.",
+                parameterName);
+        }
     }
 
     private static void ValidateIdentifier(

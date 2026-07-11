@@ -11,7 +11,13 @@ namespace CodeyBox.Tests;
 /// not respond within <see cref="PrDescriptionOptions.Timeout"/>, the call is
 /// cancelled and <see cref="GitHubUpstreamRemote.CompleteAsync"/> falls back
 /// to the static template without blocking PR creation.
+///
+/// <para>Pinned to the "Background service timing" collection because the test
+/// asserts on a 50 ms generator timeout and guards the whole call with a 30s
+/// <see cref="TestHangGuard"/>; suite-level threadpool contention from
+/// parallel fixtures was tripping the hang guard.</para>
 /// </summary>
+[Xunit.Collection("Background service timing")]
 public sealed class PullRequestDescriptionTimeoutTests
 {
     // Backstop against a genuine hang only — CompleteAsync returns in well under a

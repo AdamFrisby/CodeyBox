@@ -182,8 +182,27 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
     public IReadOnlyList<ActiveSandboxProgress> SnapshotActiveSandboxProgress() =>
         _progressProvider?.SnapshotActiveSandboxProgress() ?? [];
 
-    public async Task ResumeSandboxAsync(string name, CancellationToken ct)
+    public Task ResumeSandboxAsync(string name, CancellationToken ct) =>
+        ResumeSandboxCoreAsync(
+            name,
+            provider => provider.ResumeSandboxAsync(name, ct),
+            ct);
+
+    public Task ResumeSandboxAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
     {
+        ArgumentNullException.ThrowIfNull(sandbox);
+        return ResumeSandboxCoreAsync(
+            sandbox.Name,
+            provider => provider.ResumeSandboxAsync(sandbox, ct),
+            ct);
+    }
+
+    private async Task ResumeSandboxCoreAsync(
+        string name,
+        Func<ISuspendingSandboxProvider, Task> resume,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
         var suspendingProvider = _suspendingProvider
             ?? throw new NotSupportedException("The wrapped sandbox provider does not support suspend/resume.");
         var resumeAdmissions = _resumeAdmissions
@@ -195,7 +214,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         try
         {
             lease = await _gate.AcquireAsync(ct).ConfigureAwait(false);
-            await suspendingProvider.ResumeSandboxAsync(name, ct).ConfigureAwait(false);
+            await resume(suspendingProvider).ConfigureAwait(false);
             if (TryAdoptResumeAdmission(name, lease))
                 resumeAdmissions.CancelPending(name);
             else

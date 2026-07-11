@@ -96,6 +96,11 @@ internal sealed class IncusCliRunner
         Action<string>? stderrChunkCallback = null,
         bool killOnOutputLimit = true)
     {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(argv);
+        if (argv.Count == 0)
+            throw new ArgumentException("CLI argv must not be empty.", nameof(argv));
+
         IDisposable? gateLease = null;
         if (heavyOperation)
             gateLease = await _operationGate.EnterAsync(options.MaxConcurrentOperations, ct).ConfigureAwait(false);
@@ -125,12 +130,9 @@ internal sealed class IncusCliRunner
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                _ = ex;
-                return new ProcessRunResult(
-                    1,
-                    string.Empty,
-                    "Incus CLI execution was unavailable.",
-                    ExecutionUnavailable: true);
+                throw new InvalidOperationException(
+                    "Incus CLI operation could not be executed.",
+                    ex);
             }
         }
         finally
@@ -177,9 +179,8 @@ internal sealed class IncusCliRunner
                 waiter.Node = _waiters.AddLast(waiter);
                 GrantWaitersLocked();
             }
-            using var registration = ct.Register(
-                static state => ((CancelState)state!).Gate.Cancel((CancelState)state),
-                new CancelState(this, waiter, ct));
+            var cancelState = new CancelState(this, waiter, ct);
+            using var registration = ct.Register(() => cancelState.Gate.Cancel(cancelState));
             return await waiter.Completion.Task.ConfigureAwait(false);
         }
 

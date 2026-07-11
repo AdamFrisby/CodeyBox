@@ -104,6 +104,7 @@ public sealed class IncusMountAndCloudInitTests
         Assert.Contains("setsid -- setpriv", IncusCloudInit.ExecWrapper, StringComparison.Ordinal);
         Assert.Contains("-- env -i --", IncusCloudInit.ExecWrapper, StringComparison.Ordinal);
         Assert.Contains("--clear-groups", IncusCloudInit.ExecWrapper, StringComparison.Ordinal);
+        Assert.Contains("--no-new-privs", IncusCloudInit.ExecWrapper, StringComparison.Ordinal);
         var cleanup = IncusCloudInit.ExecWrapper.IndexOf("rm -f -- \"$env_file\"", StringComparison.Ordinal);
         var launch = IncusCloudInit.ExecWrapper.IndexOf("setsid -- setpriv", StringComparison.Ordinal);
         Assert.True(cleanup >= 0 && cleanup < launch, "secret environment file must be removed before the agent starts");
@@ -125,9 +126,9 @@ public sealed class IncusMountAndCloudInitTests
 
         Assert.Single(plan.Mounts);
         Assert.NotNull(plan.Mounts[0].PinnedHostDirectory);
-        var probe = plan.Mounts[0].ReadinessProbe!;
+        var probe = Assert.IsType<IncusMountReadinessProbe>(plan.Mounts[0].ReadinessProbe);
         Assert.Equal("seed.txt", probe.RelativeFilePath);
-        Assert.Equal(64, plan.Mounts[0].ReadinessProbe!.ExpectedSha256.Length);
+        Assert.Equal(64, probe.ExpectedSha256.Length);
         Assert.Equal(before, Directory.GetFileSystemEntries(source).Select(Path.GetFileName).ToArray());
     }
 
@@ -154,10 +155,10 @@ public sealed class IncusMountAndCloudInitTests
                 8L * 1024 * 1024 * 1024);
 
             var mount = Assert.Single(plan.Mounts);
-            Assert.NotNull(mount.PinnedHostDirectory);
+            var pinnedDirectory = Assert.IsType<IncusPinnedDirectory>(mount.PinnedHostDirectory);
             Assert.Null(mount.ReadinessProbe);
             Assert.Empty(Directory.GetFileSystemEntries(source));
-            IncusMountStaging.EnsurePinnedHostSourceMatches(source, mount.PinnedHostDirectory!);
+            IncusMountStaging.EnsurePinnedHostSourceMatches(source, pinnedDirectory);
         }
         finally
         {
@@ -180,13 +181,14 @@ public sealed class IncusMountAndCloudInitTests
             [new SandboxMount { HostPath = source, SandboxPath = "/repo", ReadOnly = false }],
             8L * 1024 * 1024 * 1024);
         var mount = Assert.Single(plan.Mounts);
-        IncusMountStaging.EnsurePinnedHostSourceMatches(source, mount.PinnedHostDirectory!);
+        var pinnedDirectory = Assert.IsType<IncusPinnedDirectory>(mount.PinnedHostDirectory);
+        IncusMountStaging.EnsurePinnedHostSourceMatches(source, pinnedDirectory);
 
         Directory.Move(source, displaced);
         Directory.CreateDirectory(source);
 
         Assert.Throws<IOException>(() =>
-            IncusMountStaging.EnsurePinnedHostSourceMatches(source, mount.PinnedHostDirectory!));
+            IncusMountStaging.EnsurePinnedHostSourceMatches(source, pinnedDirectory));
     }
 
     [Fact]
@@ -337,7 +339,9 @@ public sealed class IncusMountAndCloudInitTests
         File.WriteAllText(Path.Combine(source, "target.txt"), "snapshot content");
         const string relativeTarget = "target.txt";
         var absoluteTarget = fixture.Path("outside/host-only.txt");
-        Directory.CreateDirectory(Path.GetDirectoryName(absoluteTarget)!);
+        var absoluteTargetDirectory = Path.GetDirectoryName(absoluteTarget)
+            ?? throw new InvalidOperationException("The absolute fixture path has no parent directory.");
+        Directory.CreateDirectory(absoluteTargetDirectory);
         File.WriteAllText(absoluteTarget, "must not be copied through the link");
         File.CreateSymbolicLink(Path.Combine(source, "relative-link.txt"), relativeTarget);
         File.CreateSymbolicLink(Path.Combine(source, "absolute-link.txt"), absoluteTarget);
@@ -349,7 +353,7 @@ public sealed class IncusMountAndCloudInitTests
             [new SandboxMount { HostPath = source, SandboxPath = "/repo", SnapshotForIsolation = true }],
             8L * 1024 * 1024 * 1024);
 
-        var staged = Assert.Single(plan.Mounts).HostSource!;
+        var staged = Assert.IsType<string>(Assert.Single(plan.Mounts).HostSource);
         Assert.Equal("snapshot content", File.ReadAllText(Path.Combine(staged, "target.txt")));
         Assert.Equal(relativeTarget, new FileInfo(Path.Combine(staged, "relative-link.txt")).LinkTarget);
         Assert.Equal(absoluteTarget, new FileInfo(Path.Combine(staged, "absolute-link.txt")).LinkTarget);
@@ -444,7 +448,8 @@ public sealed class IncusMountAndCloudInitTests
                 }],
                 1024 * 1024);
 
-            stagedNested = Path.Combine(Assert.Single(plan.Mounts).HostSource!, "nested");
+            var stagedRoot = Assert.IsType<string>(Assert.Single(plan.Mounts).HostSource);
+            stagedNested = Path.Combine(stagedRoot, "nested");
             Assert.Equal("child", File.ReadAllText(Path.Combine(stagedNested, "child.txt")));
             Assert.Equal(
                 UnixFileMode.UserRead | UnixFileMode.UserExecute,
@@ -662,13 +667,12 @@ public sealed class IncusMountAndCloudInitTests
         {
             NetworkProfiles = new Dictionary<string, string> { ["internet"] = "cb-net" },
         };
-        var provider = new IncusSandboxProvider(options, NullLogger<IncusSandboxProvider>.Instance);
         var derived = IncusBaselineNaming.DeriveBaselineName(options, "internet", SandboxProfileFlavor.Headless);
 
-        Assert.True(provider.OwnsBaselineRef(derived));
-        Assert.False(provider.OwnsBaselineRef(derived + "0"));
-        Assert.False(provider.OwnsBaselineRef("x" + derived));
-        Assert.False(provider.OwnsBaselineRef(derived[..^1] + "g"));
+        Assert.True(IncusSandboxProvider.IsOwnedBaselineRef(options, derived));
+        Assert.False(IncusSandboxProvider.IsOwnedBaselineRef(options, derived + "0"));
+        Assert.False(IncusSandboxProvider.IsOwnedBaselineRef(options, "x" + derived));
+        Assert.False(IncusSandboxProvider.IsOwnedBaselineRef(options, derived[..^1] + "g"));
     }
 
     [Fact]

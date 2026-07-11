@@ -4,29 +4,36 @@ using System.Text.Json.Serialization;
 
 namespace CodeyBox.Core;
 
-public interface IPlanReviewGate
-{
-    ValueTask<PlanReviewDecision> ReviewAsync(
-        PlanReviewRequest request,
-        CancellationToken ct = default);
-}
-
-public sealed record PlanReviewRequest(
-    WorkItemId WorkItemId,
-    ProjectId ProjectId,
-    string Title,
-    string Prompt,
-    int PromptRevision,
-    string PlanArtifact,
-    AgentKind? Agent,
-    string? AgentInstanceId,
-    string? ModelId,
-    string? ReasoningMode);
-
 public sealed record PlanReviewDecision(
     bool Approved,
     string Summary,
-    string? RejectionReason = null);
+    PlanReviewFeedback? ReworkFeedback = null);
+
+/// <summary>
+/// Structured, bounded feedback shown to a later planning-agent turn. That
+/// turn drives a tool-bearing, credentialed agent, so the payload carries only
+/// orchestrator-authored enumerated metadata — never model-authored reviewer
+/// prose (title/description/location), which could smuggle instructions into
+/// the planning prompt. <see cref="BlockingIssueCount"/> is the total blocker
+/// count; <see cref="Issues"/> is a bounded sample identifying each blocker by
+/// its trusted category, severity, and stable finding id so the agent can
+/// locate the full finding out-of-band without the prose crossing the prompt
+/// boundary.
+/// </summary>
+public sealed record PlanReviewFeedback(
+    int BlockingIssueCount,
+    IReadOnlyList<PlanReviewFeedbackIssue> Issues);
+
+/// <summary>
+/// A single blocking plan-review issue reduced to trusted, enumerated metadata.
+/// <see cref="Category"/> is derived from the auditor name by the orchestrator,
+/// <see cref="Severity"/> is an enum, and <see cref="FindingId"/> is a stable
+/// opaque digest — none of which carries free-form reviewer text.
+/// </summary>
+public sealed record PlanReviewFeedbackIssue(
+    AuditSeverity Severity,
+    string Category,
+    string FindingId);
 
 public sealed record PlanArtifactDocument(
     string Approach,

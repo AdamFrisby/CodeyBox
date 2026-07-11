@@ -422,55 +422,81 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         });
     }
 
-    // The sandbox-side env var that AuditReviewDotnetShim.Apply injects to arm
-    // the absolute-path hardening script. It is the ONLY defense on the
-    // production VM providers against an auditor bypassing the PATH
-    // shim via an absolute dotnet path (e.g. /usr/bin/dotnet test). The branch
-    // that sets it is environment-independent, so it is unit-tested directly
-    // here rather than only through the ProcessSandboxProvider integration path
-    // (where hardening is always off) — a typo'd provider name or a dropped env
-    // var would otherwise silently disable hardening in production with no
-    // failing test.
-    private const string HardenAbsoluteEnvKey = "CODEYBOX_AUDIT_DOTNET_SHIM_HARDEN_ABSOLUTE";
+    private const string HardenAbsoluteEnvKey =
+        AuditReviewDotnetShim.PrivilegedHardeningEnvironmentVariable;
 
-    [Theory]
-    [InlineData("multipass")]
-    [InlineData("multipass-remote")]
-    [InlineData("incus")]
-    public void AuditDotnetShim_ArmsAbsolutePathHardening_OnVmProviders(string providerName)
+    [Fact]
+    public void AuditDotnetShim_Apply_DoesNotInferPrivilegedHardeningFromProviderNames()
     {
-        var shim = AuditReviewDotnetShim.From(new PipelineTuningOptions(), providerName);
-        var applied = shim.Apply(BaseAuditSpec());
-
-        Assert.True(
-            applied.Environment.TryGetValue(HardenAbsoluteEnvKey, out var value),
-            $"provider '{providerName}' must arm absolute-path hardening — it is the only bypass defense on that provider");
-        Assert.Equal("1", value);
-        AssertShimApplied(applied);
-    }
-
-    [Theory]
-    [InlineData("process")]
-    [InlineData("bubblewrap")]
-    [InlineData("multipass-local")] // near-miss: must NOT match the multipass prefix
-    [InlineData("Multipass")]       // case mismatch: comparison is Ordinal, not IgnoreCase
-    public void AuditDotnetShim_DoesNotArmAbsolutePathHardening_OnOtherProviders(string providerName)
-    {
-        var shim = AuditReviewDotnetShim.From(new PipelineTuningOptions(), providerName);
+        var shim = AuditReviewDotnetShim.From(new PipelineTuningOptions());
         var applied = shim.Apply(BaseAuditSpec());
 
         Assert.DoesNotContain(HardenAbsoluteEnvKey, applied.Environment.Keys);
-        // The PATH shim + tmpfs mount still apply on every provider — only the
-        // privileged absolute-path hardening is multipass-scoped.
         AssertShimApplied(applied);
     }
 
     [Fact]
-    public void AuditDotnetShim_Disabled_AppliesNothing_EvenOnMultipass()
+    public async Task AuditDotnetShim_Install_ArmsPrivilegedHardeningThroughDecorator()
+    {
+        var inner = new PrivilegedHardeningRecordingSandbox();
+        var sandbox = new TestSandboxDecorator(inner);
+        var shim = AuditReviewDotnetShim.From(new PipelineTuningOptions());
+
+        await shim.InstallAsync(sandbox, CancellationToken.None);
+
+        var hardeningExec = Assert.Single(
+            inner.Execs,
+            exec => exec.ExtraEnvironment?.ContainsKey(HardenAbsoluteEnvKey) == true);
+        var hardeningEnvironment = Assert.IsAssignableFrom<IReadOnlyDictionary<string, string>>(
+            hardeningExec.ExtraEnvironment);
+        Assert.Equal("1", hardeningEnvironment[HardenAbsoluteEnvKey]);
+        Assert.Equal(["sh", "-s", "--", "/usr/bin/dotnet"], hardeningExec.Argv);
+    }
+
+    [Fact]
+    public async Task AuditDotnetShim_Install_DoesNotRunPrivilegedHardeningWithoutCapability()
+    {
+        var sandbox = new RecordingExecSandbox();
+        var shim = AuditReviewDotnetShim.From(new PipelineTuningOptions());
+
+        await shim.InstallAsync(sandbox, CancellationToken.None);
+
+        Assert.DoesNotContain(sandbox.Execs, exec =>
+            exec.ExtraEnvironment?.ContainsKey(HardenAbsoluteEnvKey) == true);
+        Assert.DoesNotContain(sandbox.Execs, exec => exec.Argv.SequenceEqual(["sh", "-s", "--", "/usr/bin/dotnet"]));
+    }
+
+    [Fact]
+    public void VmSandboxHandles_ExposePrivilegedGuestFileHardeningCapability()
+    {
+        Assert.All(
+            new[]
+            {
+                typeof(CodeyBox.Sandbox.Incus.IncusSandbox),
+                typeof(CodeyBox.Sandbox.Multipass.MultipassSandbox),
+                typeof(CodeyBox.Sandbox.MultipassRemote.MultipassRemoteSandbox),
+            },
+            sandboxType => Assert.True(
+                typeof(IPrivilegedGuestFileHardeningSandbox).IsAssignableFrom(sandboxType),
+                $"{sandboxType.FullName} must declare privileged guest-file hardening support"));
+    }
+
+    [Fact]
+    public void SandboxCapability_DecoratorCycleFailsClosed()
+    {
+        var sandbox = new CyclicSandboxDecorator();
+
+        var error = Assert.Throws<InvalidOperationException>(() =>
+            SandboxCapability.Find<IPrivilegedGuestFileHardeningSandbox>(sandbox));
+
+        Assert.Contains("cycle", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void AuditDotnetShim_Disabled_AppliesNothing()
     {
         var shim = AuditReviewDotnetShim.From(
-            new PipelineTuningOptions { BlockRedundantDotnetBuildTestInAuditSandbox = false },
-            "multipass");
+            new PipelineTuningOptions { BlockRedundantDotnetBuildTestInAuditSandbox = false });
         var spec = BaseAuditSpec();
         var applied = shim.Apply(spec);
 
@@ -480,14 +506,10 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
     }
 
     // Behavioral coverage for AuditReviewDotnetShim.PrivilegedHardeningScript —
-    // the ONLY defense on the production (multipass) provider against an auditor
-    // bypassing the PATH shim by invoking dotnet via an absolute path (e.g.
-    // /usr/bin/dotnet test). Every other AuditDotnetShim test exercises the PATH
-    // shim only; the ~60-line privileged hardening body never runs there because
-    // CODEYBOX_AUDIT_DOTNET_SHIM_HARDEN_ABSOLUTE is only armed on multipass and
-    // the ProcessSandboxProvider integration path always leaves it off. This
-    // drives the REAL hardening + shim scripts against a throwaway fixture tree
-    // so the load-bearing actions run without root or the /codeybox/bin mount:
+    // the absolute-path bypass defense used by isolated guest-root sandboxes.
+    // The ProcessSandboxProvider integration path intentionally does not expose
+    // that capability, so this drives the real hardening + shim scripts against
+    // a throwaway fixture tree without requiring root or the /codeybox/bin mount:
     // the arm-env gate, moving the real dotnet aside to <target>.codeybox-real,
     // dropping the shim over the target, the {Directory}/* skip guard, and the
     // shim's ${0}.codeybox-real passthrough for absolute invocations.
@@ -638,6 +660,55 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         Assert.True(applied.Environment.TryGetValue("PATH", out var path));
         Assert.StartsWith(AuditDotnetShimDir + ":", path);
         Assert.Contains(applied.Mounts, m => m.Tmpfs && m.SandboxPath == AuditDotnetShimDir);
+    }
+
+    private class RecordingExecSandbox : ISandbox
+    {
+        private readonly List<SandboxExec> _execs = [];
+
+        public string Id => "recording-exec";
+
+        public IReadOnlyList<SandboxExec> Execs => _execs;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            _execs.Add(exec);
+            var stdout = exec.Argv.SequenceEqual(["sh", "-c", "command -v dotnet 2>/dev/null || true"])
+                ? "/usr/bin/dotnet\n"
+                : string.Empty;
+            return Task.FromResult(new SandboxExecResult(0, stdout, string.Empty));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class PrivilegedHardeningRecordingSandbox :
+        RecordingExecSandbox,
+        IPrivilegedGuestFileHardeningSandbox
+    {
+    }
+
+    private sealed class TestSandboxDecorator(ISandbox inner) : ISandboxDecorator
+    {
+        public ISandbox InnerSandbox { get; } = inner;
+        public string Id => InnerSandbox.Id;
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
+            InnerSandbox.ExecAsync(exec, ct);
+
+        public ValueTask DisposeAsync() => InnerSandbox.DisposeAsync();
+    }
+
+    private sealed class CyclicSandboxDecorator : ISandboxDecorator
+    {
+        public ISandbox InnerSandbox => this;
+        public string Id => "cyclic-decorator";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
+            Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private static void AssertCredentialAndOpenNetwork(SandboxSpec spec, string phaseName)

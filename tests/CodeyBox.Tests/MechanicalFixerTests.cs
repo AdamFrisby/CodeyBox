@@ -9,6 +9,7 @@ using CodeyBox.Audit.Presets;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Process;
 using CodeyBox.Core;
+using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
 
 namespace CodeyBox.Tests;
@@ -1855,8 +1856,17 @@ public sealed class MechanicalFixerTests : IDisposable
     }
 
     [Fact]
-    public async Task Pipeline_NoChangeReworkFailsBeforeMechanicalFixerCanMaskIt()
+    public async Task Pipeline_NoChangeReworkParksForOperatorBeforeMechanicalFixerCanMaskIt()
     {
+        // Updated behavior: a single empty rework no longer terminal-fails the
+        // work item — instead it parks for operator review (or, when audit
+        // history shows convergence, escalates with one re-dispatched rework
+        // first). Either way the mechanical fixer must NOT mask the empty
+        // result by running and creating a normalisation commit; that
+        // invariant is the point of this regression. We disable escalation
+        // here (PipelineTuning.EmptyReworkEscalationRetries=0) so the test
+        // exercises the pure park path deterministically without depending on
+        // convergence detection / agent re-dispatch.
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         await AddTrackedFileAsync(seed, "normalizer.txt", "");
         var fixer = new SecondIterationMechanicalFixer();
@@ -1867,12 +1877,17 @@ public sealed class MechanicalFixerTests : IDisposable
             AuditTypes = ["scripted"],
             MechanicalFixers = [SecondIterationMechanicalFixer.FixerName],
         };
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            EmptyReworkEscalationRetries = 0,
+        });
         using var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
             auditors: [auditor],
             projectAudit: audit,
-            mechanicalFixers: [fixer]);
+            mechanicalFixers: [fixer],
+            pipelineTuning: tuning);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "same-content\n"));
         tp.Agent.WorkPlan.Enqueue(new FileWrite("work.txt", "same-content\n"));
 
@@ -1881,8 +1896,9 @@ public sealed class MechanicalFixerTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Contains("Rework agent produced no changes", final.LastError, StringComparison.Ordinal);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, final!.State);
+        Assert.Contains("produced no changes", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Audit reached max iteration budget", final.LastError, StringComparison.Ordinal);
         Assert.Equal(1, auditor.Calls);
         Assert.Equal([1], fixer.SeenIterations);
 

@@ -272,13 +272,16 @@ public sealed class CrossAgentHandoffPromptPreprocessorTests
     }
 
     [Fact]
-    public async Task PreprocessorFiresThroughChain_OrderRespectedAfterProjectRulesAndAttachments()
+    public async Task PreprocessorsFireThroughChain_AttachmentsAndHandoffBothInjectedInOrder()
     {
         var workItemId = WorkItemId.New();
+        var sha = new string('a', 64);
         var attachments = new StubAttachmentSourceForChain(
         [
-            new WorkItemAttachment("/work/.codeybox/attachments/spec.md", "spec.md", "text/markdown", "spec"),
+            new WorkItemAttachment("/work/.codeybox/attachments/spec.md", "spec.md", "text/markdown", "the design spec", 5, sha),
         ]);
+        var blobs = new StubBlobStoreForChain();
+        blobs.Add(sha, System.Text.Encoding.UTF8.GetBytes("hello"));
         var history = new StubFallbackHistoryStore(
         [
             FallbackRecord(workItemId, AgentKind.Claude, AgentKind.Codex, "rework", 2)
@@ -287,7 +290,9 @@ public sealed class CrossAgentHandoffPromptPreprocessorTests
 
         var attachmentPreprocessor = new AttachmentManifestPromptPreprocessor(
             NullLogger<AttachmentManifestPromptPreprocessor>.Instance,
-            attachments);
+            attachments,
+            blobs,
+            () => new AttachmentsOptions());
         var handoffPreprocessor = new CrossAgentHandoffPromptPreprocessor(
             NullLogger<CrossAgentHandoffPromptPreprocessor>.Instance,
             history,
@@ -298,12 +303,15 @@ public sealed class CrossAgentHandoffPromptPreprocessorTests
         var ctx = NewContext(workItemId, AgentKind.Codex);
         var result = await chain.ProcessAsync(ctx, "next prompt");
 
+        // Both built-ins fire; the trailing task prompt stays last.
         var handoffIdx = result.IndexOf("## Cross-agent handoff", StringComparison.Ordinal);
-        var attachmentIdx = result.IndexOf("## Attachments", StringComparison.Ordinal);
+        var attachmentsIdx = result.IndexOf("## Attachments", StringComparison.Ordinal);
         var promptIdx = result.IndexOf("next prompt", StringComparison.Ordinal);
         Assert.True(handoffIdx >= 0);
-        Assert.True(attachmentIdx > handoffIdx);
-        Assert.True(promptIdx > attachmentIdx);
+        Assert.True(attachmentsIdx >= 0);
+        Assert.Contains("spec.md", result);
+        Assert.True(promptIdx > handoffIdx);
+        Assert.True(promptIdx > attachmentsIdx);
     }
 
     [Fact]
@@ -439,6 +447,17 @@ public sealed class CrossAgentHandoffPromptPreprocessorTests
             _ = ct;
             return Task.FromResult(attachments);
         }
+    }
+
+    private sealed class StubBlobStoreForChain : IWorkItemAttachmentBlobStore
+    {
+        private readonly Dictionary<string, byte[]> _blobs = new(StringComparer.Ordinal);
+        public void Add(string sha256, byte[] bytes) => _blobs[sha256] = bytes;
+        public Stream? OpenRead(string sha256) =>
+            _blobs.TryGetValue(sha256, out var bytes) ? new MemoryStream(bytes, writable: false) : null;
+        public bool Exists(string sha256) => _blobs.ContainsKey(sha256);
+        public Task<AttachmentBlobStageResult> StageAsync(Stream source, long maxBytes, CancellationToken ct = default) =>
+            throw new NotSupportedException();
     }
 
     private sealed class NoopSandbox : ISandbox

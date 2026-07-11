@@ -179,7 +179,9 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
             ? "OPENAI_API_KEY is required for text-only calls"
             : null;
 
-    public async Task<TextOnlyAgentResult> RunTextOnlyAsync(
+    public bool SupportsSeparateSystemPrompt => true;
+
+    public Task<TextOnlyAgentResult> RunTextOnlyAsync(
         string prompt,
         AgentCredential? credential,
         string? modelId = null,
@@ -187,6 +189,28 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         CancellationToken ct = default,
         ISandbox? sandbox = null,
         string? workingDirectory = null)
+        => RunTextOnlyCoreAsync(null, prompt, credential, modelId, reasoningMode, ct, sandbox, workingDirectory);
+
+    public Task<TextOnlyAgentResult> RunTextOnlyWithSystemPromptAsync(
+        string systemPrompt,
+        string userPrompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
+        => RunTextOnlyCoreAsync(systemPrompt, userPrompt, credential, modelId, reasoningMode, ct, sandbox, workingDirectory);
+
+    private async Task<TextOnlyAgentResult> RunTextOnlyCoreAsync(
+        string? systemPrompt,
+        string userPrompt,
+        AgentCredential? credential,
+        string? modelId,
+        string? reasoningMode,
+        CancellationToken ct,
+        ISandbox? sandbox,
+        string? workingDirectory)
     {
         _ = sandbox;
         _ = workingDirectory;
@@ -203,9 +227,11 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
             var body = new Dictionary<string, object?>
             {
                 ["model"] = effectiveModel,
-                ["input"] = prompt,
+                ["input"] = userPrompt,
                 ["max_output_tokens"] = 8192,
             };
+            if (systemPrompt is not null)
+                body["instructions"] = systemPrompt;
             if (!string.IsNullOrWhiteSpace(reasoningMode))
                 body["reasoning"] = new Dictionary<string, string> { ["effort"] = reasoningMode };
 
@@ -213,8 +239,10 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
             request.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
 
-            using var response = await _textOnlyHttp.SendAsync(request, ct).ConfigureAwait(false);
-            var responseText = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            var response = await BoundedHttpResponseReader.SendAsync(_textOnlyHttp, request, ct: ct).ConfigureAwait(false);
+            if (response.BodyTooLarge)
+                return new TextOnlyAgentResult(false, "Codex text-only call failed: response too large", null, "Response size exceeded 256 KiB limit.");
+            var responseText = response.Body ?? string.Empty;
             if (!response.IsSuccessStatusCode)
                 return new TextOnlyAgentResult(false, $"Codex text-only call failed: HTTP {(int)response.StatusCode}", null, responseText);
 

@@ -68,15 +68,8 @@ internal sealed class InvolvementTracker
     /// Maps an attempt-terminating exception to a compact involvement outcome
     /// label ("failure:&lt;reason&gt;") for operator-facing attribution.
     /// </summary>
-    public static string OutcomeForFailure(Exception ex) => ex switch
-    {
-        TerminalQuotaError => "failure:quota",
-        AuditorIdleTimeoutException => "failure:timeout",
-        TerminalTransientNetworkError => "failure:transient",
-        PipelineRunner.AgentAttemptTimeoutException => "failure:timeout",
-        OperationCanceledException => "failure:cancelled",
-        _ => "failure:agent",
-    };
+    public static string OutcomeForFailure(Exception ex) =>
+        AgentInvolvementOutcomes.ForFailure(ex);
 
     /// <summary>
     /// Persists one involvement mutation (start insert or finalize update) with a

@@ -18,6 +18,7 @@ using CodeyBox.Api;
 using CodeyBox.Api.Hubs;
 using CodeyBox.Audit;
 using CodeyBox.Audit.Llm;
+using CodeyBox.Audit.Llm.PlanAudit;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
@@ -270,6 +271,10 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
 builder.Services.AddOptions<CodeyBoxOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox"))
     .PostConfigure(opts => AgentClassesOverrideResolver.ApplyTo(opts, builder.Configuration));
+builder.Services.AddSingleton(sp => new SqliteDatabaseWriteGateFactory(
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SqliteWriteGate,
+    sp.GetRequiredService<ILoggerFactory>(),
+    TimeProvider.System));
 builder.Services.Configure<BuildScriptAuditorOptions>(builder.Configuration.GetSection("CodeyBox:BuildScriptAudit"));
 builder.Services.Configure<NotificationsOptions>(builder.Configuration.GetSection("CodeyBox:Notifications"));
 // E2eExecutionOptions binds as a standalone section so the pool / dispatcher can
@@ -375,12 +380,10 @@ ApiKeyAuth.Configure(builder);
 //                 SPRITES_TOKEN (or configured token env var).
 builder.Services.AddSingleton<ISandboxProvider>(SelectSandboxProvider);
 
-// B1: register the baseline-image resolver capability as a derived view of
-// the registered sandbox provider. The factory returns null when the
-// provider does not implement IBaselineImageResolver (process / bubblewrap);
-// consumers must use GetService (not GetRequiredService) and handle null.
-// The factory is gated on the resolved provider — non-multipass setups get a
-// null factory hit, which the consumer treats as "no baseline pinning".
+// B1: register baseline-image capabilities as derived views of the selected
+// provider. Providers without baseline support (process / bubblewrap) receive
+// null-object implementations, so consumers can depend on the capability
+// without knowing which concrete provider is active.
 builder.Services.AddSingleton(sp =>
     sp.GetRequiredService<ISandboxProvider>() as IBaselineImageResolver
         ?? NullBaselineImageResolver.Instance);
@@ -442,9 +445,8 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         }
     }
 
-    var inner = kind is HotSwappableSandboxProvider.MultipassProviderId
-        or HotSwappableSandboxProvider.IncusProviderId
-        ? BuildMultipassIncusCutoverProvider(sp, opts, loggerFactory, startupLog)
+    var inner = SandboxProviderKinds.SupportsHotReload(kind)
+        ? BuildReloadableSandboxProvider(sp, opts, loggerFactory, startupLog)
         : BuildSandboxProviderInner(sp, opts, environment, startupLog, loggerFactory, kind);
     var orchestratorOptions = sp.GetRequiredService<OrchestratorOptions>();
     startupLog.LogInformation(
@@ -457,33 +459,43 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         loggerFactory.CreateLogger<SandboxAdmissionControlledProvider>());
 }
 
-static HotSwappableSandboxProvider BuildMultipassIncusCutoverProvider(
+static ReloadableSandboxProvider BuildReloadableSandboxProvider(
     IServiceProvider sp,
     CodeyBoxOptions startupOptions,
     ILoggerFactory loggerFactory,
     ILogger startupLog)
 {
-    // Each independent provider is constructed lazily on first activation.
-    // The routing wrapper reads IOptionsMonitor for every new operation, so a
-    // live selector change affects only future work; handles and lifecycle
-    // state created before the cutover stay owned by their original backend.
-    // It deliberately never retries a selected-provider failure through the
-    // other provider.
-    return new HotSwappableSandboxProvider(
-        sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>(),
-        () => BuildMultipass(
-            startupOptions,
-            sp,
-            loggerFactory,
-            startupLog,
-            sp.GetService<ITimingStore>(),
-            sp.GetService<ISandboxResourceUsageStore>()),
-        () => BuildIncus(
-            sp,
-            loggerFactory,
-            sp.GetService<ITimingStore>(),
-            sp.GetService<ISandboxResourceUsageStore>()),
-        loggerFactory.CreateLogger<HotSwappableSandboxProvider>());
+    var options = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    var multipassBaselineNamespace = new MultipassSandboxOptions();
+    var incusBaselineNamePrefix = new IncusSandboxOptions().BaselineNamePrefix;
+    return new ReloadableSandboxProvider(
+        () => options.CurrentValue.SandboxProvider ?? string.Empty,
+        () => options.CurrentValue.SandboxProviderCutover?.RetainedInventoryProviders?.ToArray() ?? [],
+        [
+            new ReloadableSandboxProvider.ProviderRegistration(
+                SandboxProviderKinds.Multipass,
+                () => BuildMultipass(
+                    startupOptions,
+                    sp,
+                    loggerFactory,
+                    startupLog,
+                    sp.GetService<ITimingStore>(),
+                    sp.GetService<ISandboxResourceUsageStore>()),
+                baselineRef => MultipassSandboxProvider.IsOwnedBaselineRef(
+                    multipassBaselineNamespace,
+                    baselineRef)),
+            new ReloadableSandboxProvider.ProviderRegistration(
+                SandboxProviderKinds.Incus,
+                () => BuildIncus(
+                    sp,
+                    loggerFactory,
+                    sp.GetService<ITimingStore>(),
+                    sp.GetService<ISandboxResourceUsageStore>()),
+                baselineRef => IncusSandboxProvider.IsOwnedBaselineRef(
+                    options.CurrentValue.Incus?.BaselineNamePrefix ?? incusBaselineNamePrefix,
+                    baselineRef)),
+        ],
+        loggerFactory.CreateLogger<ReloadableSandboxProvider>());
 }
 
 static ISandboxProvider BuildSandboxProviderInner(
@@ -501,14 +513,14 @@ static ISandboxProvider BuildSandboxProviderInner(
             new BubblewrapSandboxOptions(),
             loggerFactory.CreateLogger<BubblewrapSandboxProvider>(),
             sp.GetService<ITimingStore>()),
-        "multipass" => BuildMultipass(
+        SandboxProviderKinds.Multipass => BuildMultipass(
             opts,
             sp,
             loggerFactory,
             startupLog,
             sp.GetService<ITimingStore>(),
             sp.GetService<ISandboxResourceUsageStore>()),
-        "incus" => BuildIncus(
+        SandboxProviderKinds.Incus => BuildIncus(
             sp,
             loggerFactory,
             sp.GetService<ITimingStore>(),
@@ -709,7 +721,7 @@ static ISandboxProvider BuildProcess(CodeyBoxOptions opts, IHostEnvironment env,
         throw new InvalidOperationException(
             "CodeyBox:SandboxProvider=process is UNSAFE outside Development. " +
             "Set CodeyBox:DangerouslyAllowProcessSandbox=true to override (NOT recommended), " +
-            "or pick multipass | bubblewrap.");
+            "or pick incus | multipass | bubblewrap.");
     }
     startupLog.LogWarning("Using Process sandbox provider — NO ISOLATION. Dev only.");
     return new ProcessSandboxProvider(loggerFactory.CreateLogger<ProcessSandboxProvider>());
@@ -723,8 +735,8 @@ static IncusSandboxProvider BuildIncus(
 {
     var configLog = loggerFactory.CreateLogger("CodeyBox.Incus.Config");
     var provider = new IncusSandboxProvider(
-        // The cutover wrapper may route future work between Multipass and
-        // Incus, while each Incus operation resolves the latest allowed
+        // The reloadable selector may route future work to another registered
+        // provider, while each Incus operation resolves the latest allowed
         // settings. A live sandbox keeps the immutable IncusSandboxOptions
         // snapshot captured when it was created, so a reload cannot change its
         // project, pool, or device map halfway through teardown.
@@ -1046,10 +1058,19 @@ builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 builder.Services.AddOptions<AgentPromptPreprocessingOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox:PromptPreprocessing"));
 builder.Services.AddSingleton<IAgentPromptPreprocessor, ProjectRulesPromptPreprocessor>();
-// Attachment-manifest injection: routed through the preprocessor chain so the
-// pipeline never grew a bespoke "inject ATTACHMENTS section" branch. No-op
-// until IWorkItemAttachmentSource is wired by the attachments foundation.
-builder.Services.AddSingleton<IAgentPromptPreprocessor, AttachmentManifestPromptPreprocessor>();
+// Attachment delivery: for the configured delivery phases (default work /
+// rework / audit) the preprocessor stages a work item's attachment blobs into
+// the sandbox and injects an ATTACHMENTS manifest so the agent knows they exist
+// and where to read them. The source maps stored metadata to collision-free
+// in-VM paths; the blob store supplies the host-side bytes. Both are optional so
+// the preprocessor stays a no-op when attachments are not wired.
+builder.Services.AddSingleton<IWorkItemAttachmentSource, StoreWorkItemAttachmentSource>();
+builder.Services.AddSingleton<IAgentPromptPreprocessor>(sp =>
+    new AttachmentManifestPromptPreprocessor(
+        sp.GetRequiredService<ILogger<AttachmentManifestPromptPreprocessor>>(),
+        sp.GetService<IWorkItemAttachmentSource>(),
+        sp.GetService<IWorkItemAttachmentBlobStore>(),
+        () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Attachments));
 // Cross-agent handoff brief injection: fires only when the involvement store
 // shows a prior phase ran under a different AgentKind. Gated end-to-end by
 // CodeyBox:PipelineTuning:EnableHandoffSeeding (default off) — the builder
@@ -1114,26 +1135,26 @@ builder.Services.AddSingleton<CodeyBox.Agents.Claude.ClaudeSessionWorker>(sp =>
         .OfType<ClaudeAgentRunner>()
         .First();
 
-    // Resume hook: provider identity is persisted with the sandbox reference so
-    // the live Multipass/Incus selector cannot redirect an existing session.
-    // Legacy references with no provider predate Incus and remain Multipass-
-    // resumable. Incus does not yet support stopped-session resume, so the
-    // worker receives a fail-before-stop guard as well as a guarded resume sink.
+    // Provider identity is persisted with the sandbox reference so a live
+    // selector change cannot redirect an existing session to another backend.
     var provider = sp.GetService<ISandboxProvider>();
     Func<AgentSessionSandboxRef, CancellationToken, Task>? resumeHook = null;
-    Func<AgentSessionSandboxRef, string?>? resumeUnsupportedReason = null;
     if (provider is ISuspendingSandboxProvider suspending)
     {
-        resumeHook = (sandboxRef, ct) =>
-            AgentSessionSandboxRouting.ResumeWithMultipassAsync(suspending, sandboxRef, ct);
-        resumeUnsupportedReason = AgentSessionSandboxRouting.GetMultipassResumeUnsupportedReason;
+        resumeHook = (sandboxRef, ct) => AgentSessionSandboxRouting.ResumeAsync(
+            suspending,
+            // Provider-less durable references predate the Incus provider and
+            // were written when Multipass was the only resumable backend.
+            AgentSessionSandboxRouting.AddProviderScopeIfMissing(
+                sandboxRef,
+                SandboxProviderKinds.Multipass),
+            ct);
     }
 
     return new CodeyBox.Agents.Claude.ClaudeSessionWorker(
         runner,
         sandboxReattacher: null,
         sandboxResumeHook: resumeHook,
-        sandboxResumeUnsupportedReason: resumeUnsupportedReason,
         credentialProvider: sp.GetService<ICredentialProvider>(),
         sandboxRefFactory: AgentSessionSandboxRouting.CreateReference,
         metricsSink: sp.GetRequiredService<CodeyBox.Agents.Claude.IClaudeSessionMetricsSink>(),
@@ -1488,7 +1509,9 @@ builder.Services.AddSingleton<IAgentQuotaGate>(sp => new QuotaGateAvailability(
 builder.Services.AddSingleton<IQuotaFailureStore>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteQuotaFailureStore(cbOpts.StateDatabasePath);
+    return new SqliteQuotaFailureStore(
+        cbOpts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<AgentQuotaAvailabilityBroadcaster>();
 builder.Services.AddSingleton<IAgentQuotaAvailabilityPublisher>(sp =>
@@ -1498,12 +1521,16 @@ builder.Services.AddSingleton<IAgentQuotaAvailabilityObservationSource>(sp =>
 builder.Services.AddSingleton<IAgentFallbackHistoryStore>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteAgentFallbackHistoryStore(cbOpts.StateDatabasePath);
+    return new SqliteAgentFallbackHistoryStore(
+        cbOpts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<IAgentInvolvementStore>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteAgentInvolvementStore(cbOpts.StateDatabasePath);
+    return new SqliteAgentInvolvementStore(
+        cbOpts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 // OAuth-refreshing quota-token sources. These wrap the raw credential file
 // sources with provider-specific refresh logic so an expired access_token is
@@ -2049,6 +2076,8 @@ builder.Services.AddSingleton<IAgentAuthAvailabilityRegistry>(sp =>
     sp.GetRequiredService<AgentAvailabilityRegistry>());
 builder.Services.AddSingleton<IAgentAuthRequiredAvailabilityReader>(sp =>
     sp.GetRequiredService<AgentAvailabilityRegistry>());
+builder.Services.AddSingleton<IAgentRestorePublisher>(sp =>
+    sp.GetRequiredService<AgentAvailabilityRegistry>());
 builder.Services.AddSingleton<IAgentDispatchAvailability>(sp => new AgentDispatchAvailability(
     sp.GetService<IAgentEffectiveAvailabilityReader>(),
     sp.GetService<IInVmSmokeGate>(),
@@ -2101,7 +2130,8 @@ builder.Services.AddSingleton<IInVmSmokeCache>(sp =>
 // re-verified. The admin endpoint depends on this one contract.
 builder.Services.AddSingleton<IAgentAvailabilityReset>(sp => new AgentAvailabilityReset(
     sp.GetRequiredService<ISmokeAvailabilityRegistry>(),
-    sp.GetRequiredService<IInVmSmokeCache>()));
+    sp.GetRequiredService<IInVmSmokeCache>(),
+    sp.GetRequiredService<IAgentRestorePublisher>()));
 builder.Services.AddSingleton<InVmSmokeProber>(sp => new InVmSmokeProber(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IBaselineImageResolver>(),
@@ -2205,6 +2235,24 @@ builder.Services.AddSingleton<IAuditor, GraphicalSmokeAuditor>();
 builder.Services.AddSingleton<IAuditor>(sp => new BuildScriptAuditor(
     () => sp.GetRequiredService<IOptionsMonitor<BuildScriptAuditorOptions>>().CurrentValue));
 builder.Services.AddSingleton<IAuditor, PromptRevisionTrailerAuditor>();
+
+// Plan-audit chain — one plan-stage IAuditor per chain test (Targets = plan
+// only) that reviews the PLAN against the supplied context before
+// implementation. Each is auto-included for every plan-enabled project by
+// ProjectAuditorComposer and toggled off per project via ExcludedAuditors. The
+// pipeline supplies the resolved review runner per invocation via
+// AuditContext.AuditRunner; the baked-in Claude runner is only a host-side
+// text-only fallback so the auditor is constructible without an override.
+// PlanAuditTests.All is the single source of truth for chain membership.
+foreach (var planAuditTest in PlanAuditTests.All)
+{
+    var test = planAuditTest; // capture per-iteration for the resolver closure
+    builder.Services.AddSingleton<IAuditor>(sp => new PlanAuditChainAuditor(new PlanAuditChainAuditorOptions
+    {
+        Test = test,
+        Agent = sp.GetServices<IAgentRunner>().OfType<ClaudeAgentRunner>().First(),
+    }));
+}
 builder.Services.AddSingleton<IMechanicalFixer, DotnetFormatMechanicalFixer>();
 builder.Services.AddSingleton<IMechanicalFixerRegistry, MechanicalFixerRegistry>();
 builder.Services.AddSingleton<IMechanicalFixerInputProvider, DotnetFormatMechanicalFixerInputProvider>();
@@ -2242,6 +2290,20 @@ builder.Services.AddSingleton<IAuditor>(sp =>
         () => monitor.CurrentValue,
         sp.GetRequiredService<IMutationRunner>(),
         ratchet);
+});
+
+// Plan-adherence reviewer (closes the planning loop on the implementation side).
+// Hot-reloadable via CodeyBox:PlanAdherence and enabled by default; the auditor
+// self-limits to PLANNED items at run time (no plan artifact -> no-op), so
+// unplanned items are unaffected. The accessor mirrors the Func<TestRunOptions>
+// pattern so the ProjectAuditorComposer observes the same live IOptionsMonitor
+// snapshot and composes the reviewer with the resolving project's agent.
+builder.Services.Configure<PlanAdherenceAuditorOptions>(
+    builder.Configuration.GetSection("CodeyBox:PlanAdherence"));
+builder.Services.AddSingleton<Func<PlanAdherenceAuditorOptions>>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<PlanAdherenceAuditorOptions>>();
+    return () => monitor.CurrentValue;
 });
 
 builder.Services.AddSingleton<ProjectAuditorComposer>();
@@ -2460,40 +2522,80 @@ builder.Services.AddSingleton(sp =>
 builder.Services.AddSingleton<IReleaseStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteReleaseStore(opts.StateDatabasePath);
+    return new SqliteReleaseStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<Func<IReleaseStore?>>(sp => () => sp.GetService<IReleaseStore>());
 builder.Services.AddSingleton<SqliteWorkItemStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteWorkItemStore(opts.StateDatabasePath);
+    return new SqliteWorkItemStore(
+        opts.StateDatabasePath,
+        writeGateFactory: sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<IWorkItemStore>(sp => sp.GetRequiredService<SqliteWorkItemStore>());
 builder.Services.AddSingleton<IAuditProgressStore>(sp => sp.GetRequiredService<SqliteWorkItemStore>());
 builder.Services.AddSingleton<IIdempotencyStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteIdempotencyStore(opts.StateDatabasePath);
+    return new SqliteIdempotencyStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<ISuggestionStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteSuggestionStore(opts.StateDatabasePath);
+    return new SqliteSuggestionStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
+// --- Work-item attachments ---------------------------------------------------
+// Metadata index lives next to the work-item rows in state.db; blobs live on
+// disk under a content-addressed root (default ~/.codeybox/attachments).
+builder.Services.AddSingleton<SqliteWorkItemAttachmentStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteWorkItemAttachmentStore(opts.StateDatabasePath);
+});
+builder.Services.AddSingleton<IWorkItemAttachmentStore>(sp =>
+    sp.GetRequiredService<SqliteWorkItemAttachmentStore>());
+builder.Services.AddSingleton<HostWorkItemAttachmentBlobStore>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    return new HostWorkItemAttachmentBlobStore(
+        () => AttachmentsOptions.ResolveRoot(monitor.CurrentValue.Attachments.RootDirectory),
+        sp.GetService<ILogger<HostWorkItemAttachmentBlobStore>>());
+});
+builder.Services.AddSingleton<IWorkItemAttachmentBlobStore>(sp =>
+    sp.GetRequiredService<HostWorkItemAttachmentBlobStore>());
+builder.Services.AddSingleton<IWorkItemAttachmentBlobStoreAdmin>(sp =>
+    sp.GetRequiredService<HostWorkItemAttachmentBlobStore>());
+builder.Services.AddHostedService(sp => new AttachmentCleanupService(
+    sp.GetRequiredService<IWorkItemAttachmentStore>(),
+    sp.GetRequiredService<IWorkItemAttachmentBlobStoreAdmin>(),
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Attachments,
+    sp.GetRequiredService<ILogger<AttachmentCleanupService>>()));
 builder.Services.AddSingleton<IWorkItemQuestionStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteWorkItemQuestionStore(opts.StateDatabasePath);
+    return new SqliteWorkItemQuestionStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<ITestCaseStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteTestCaseStore(opts.StateDatabasePath);
+    return new SqliteTestCaseStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<IE2eRunStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteE2eRunStore(opts.StateDatabasePath);
+    return new SqliteE2eRunStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<IE2eReplayRuntime, E2eReplayRuntime>();
 builder.Services.AddSingleton<E2eReplayArtifactAdmissionValidator>();
@@ -2507,37 +2609,53 @@ builder.Services.AddHostedService<E2eRunDispatcher>();
 builder.Services.AddSingleton<IAuditReportStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteAuditReportStore(opts.StateDatabasePath);
+    return new SqliteAuditReportStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<ITimingStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteTimingStore(opts.StateDatabasePath);
+    return new SqliteTimingStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<ISandboxResourceUsageStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteSandboxResourceUsageStore(opts.StateDatabasePath);
+    return new SqliteSandboxResourceUsageStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<IWorkItemCostStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteWorkItemCostStore(opts.StateDatabasePath, sp.GetRequiredService<AgentCostCalculator>());
+    return new SqliteWorkItemCostStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<AgentCostCalculator>(),
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<IAgentUsageStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteAgentUsageStore(opts.StateDatabasePath);
+    return new SqliteAgentUsageStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<IAgentStreamSummaryStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteAgentStreamSummaryStore(opts.StateDatabasePath);
+    return new SqliteAgentStreamSummaryStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<IQueueController>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteQueueController(opts.StateDatabasePath, sp.GetRequiredService<ILogger<SqliteQueueController>>());
+    return new SqliteQueueController(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<ILogger<SqliteQueueController>>(),
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<SqliteAgentPauseController>(sp =>
 {
@@ -2545,7 +2663,8 @@ builder.Services.AddSingleton<SqliteAgentPauseController>(sp =>
     return new SqliteAgentPauseController(
         opts.StateDatabasePath,
         sp.GetRequiredService<ILogger<SqliteAgentPauseController>>(),
-        TimeProvider.System);
+        TimeProvider.System,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<IAgentPauseController>(sp =>
     sp.GetRequiredService<SqliteAgentPauseController>());
@@ -2560,7 +2679,10 @@ builder.Services.AddSingleton<ITaskTemplateRegistry, FileTaskTemplateRegistry>()
 builder.Services.AddSingleton<IWorkerRegistry>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
-    return new SqliteWorkerRegistry(opts.StateDatabasePath, sp.GetRequiredService<ILogger<SqliteWorkerRegistry>>());
+    return new SqliteWorkerRegistry(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<ILogger<SqliteWorkerRegistry>>(),
+        writeGateFactory: sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
 builder.Services.AddSingleton<DeadWorkerOptions>(sp =>
 {
@@ -2873,8 +2995,6 @@ builder.Services.AddSingleton<IWorkItemTerminalTransition>(sp =>
     sp.GetRequiredService<WorkItemTerminalTransition>());
 builder.Services.AddSingleton<IWorkItemTerminalRevisionBuilder>(sp =>
     sp.GetRequiredService<WorkItemTerminalTransition>());
-builder.Services.AddSingleton<IPlanReviewGate, AlwaysPassPlanReviewGate>();
-
 builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IGitHost>(),
@@ -2952,7 +3072,6 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     inVmSmokeGate: sp.GetService<IInVmSmokeGate>(),
     authRequiredHandler: sp.GetRequiredService<IAgentAuthRequiredHandler>(),
     authRequiredReader: sp.GetRequiredService<IAgentAuthRequiredAvailabilityReader>(),
-    planReviewGate: sp.GetRequiredService<IPlanReviewGate>(),
     testCaseStore: sp.GetService<ITestCaseStore>(),
     mergeScopeResolver: sp.GetRequiredService<IMergeScopeResolver>(),
     quotaAvailabilityPublisher: sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>()));
@@ -3028,6 +3147,34 @@ builder.Services.AddSingleton<AgentPauseRetryScheduler>(sp => new AgentPauseRetr
     sp.GetRequiredService<ILogger<AgentPauseRetryScheduler>>(),
     sp.GetRequiredService<IAgentPauseSignal>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentPauseRetryScheduler>());
+
+// IAgentRestoreSignal is implemented by the same AgentAvailabilityRegistry
+// singleton — exposed here as the narrow port so the restore-retry scheduler
+// can subscribe without depending on the concrete registry type.
+builder.Services.AddSingleton<IAgentRestoreSignal>(sp =>
+    sp.GetRequiredService<AgentAvailabilityRegistry>());
+builder.Services.AddSingleton<AgentRestoreRetryScheduler>(sp => new AgentRestoreRetryScheduler(
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<WorkItemRetrier>(),
+    () =>
+    {
+        var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.AutoRequeueOnAgentRestore;
+        return OrchestratorOptionsFactory.BuildAgentRestoreRetryOptions(
+            live.Enabled,
+            live.LookbackGrace,
+            live.PostRestoreMargin,
+            live.InvolvementTerminalLookback,
+            live.InvolvementTerminalClockSkew,
+            live.MaxCandidatesPerSweep,
+            live.EventQueueCapacity);
+    },
+    sp.GetRequiredService<ILogger<AgentRestoreRetryScheduler>>(),
+    sp.GetRequiredService<IAgentRestoreSignal>(),
+    sp.GetRequiredService<IWebhookDispatcher>(),
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetService<IAgentInvolvementStore>(),
+    sp.GetService<TimeProvider>()));
+builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentRestoreRetryScheduler>());
 
 // --- Failure-class recovery -------------------------------------------------
 // Pure deterministic classifier in front of the hosted recovery service.
@@ -3468,6 +3615,7 @@ IdempotencyMiddleware.Use(app);
 WorkItemEndpoints.Map(app);
 TestCaseEndpoints.Map(app);
 E2eRunEndpoints.Map(app);
+WorkItemAttachmentEndpoints.Map(app);
 TaskTemplateEndpoints.Map(app);
 WorkItemTimingsEndpoints.Map(app);
 WorkItemCostsEndpoints.Map(app);
@@ -3843,8 +3991,20 @@ app.MapPost("/admin/agent/{name}/smoke", async (
     });
 });
 
-app.MapPost("/admin/agent/{name}/reset", (string name, IAgentAvailabilityRegistry registry, IAgentRegistry agents, IAgentAvailabilityReset reset) =>
+app.MapPost("/admin/agent/{name}/reset", (
+    string name,
+    HttpContext httpContext,
+    ApiKeyState apiKeyState,
+    IAgentAvailabilityRegistry registry,
+    IAgentRegistry agents,
+    IAgentAvailabilityReset reset) =>
 {
+    if (!ApiKeyAuth.IsAuthorized(httpContext, apiKeyState))
+    {
+        httpContext.Response.Headers["WWW-Authenticate"] = "Bearer";
+        return Results.Text("unauthorized", statusCode: StatusCodes.Status401Unauthorized);
+    }
+
     // Mirror /smoke: normalise to lowercase so case-mismatched names match the
     // canonical kinds returned by IAgentRegistry.Available.
     var kind = new AgentKind(name.ToLowerInvariant());
@@ -3927,10 +4087,26 @@ finally
 namespace CodeyBox.Api
 {
     /// <summary>
+    /// Provider-neutral lifecycle inventory retained across a process restart
+    /// during a hot-reload provider cutover. IDs must name providers registered
+    /// in the API's reloadable provider set.
+    /// </summary>
+    public sealed class SandboxProviderCutoverConfig
+    {
+        public const int MaximumRetainedInventoryProviders =
+            ReloadableSandboxProvider.MaximumRetainedInventoryProviders;
+
+        /// <summary>
+        /// Provider IDs whose managed sandboxes and baselines must continue to
+        /// be inventoried and reaped even when another provider is selected.
+        /// </summary>
+        public List<string> RetainedInventoryProviders { get; set; } = [];
+    }
+
+    /// <summary>
     /// Hot-reloadable settings for
-    /// <c>CodeyBox:SandboxProvider=incus</c>. A process started with Incus or
-    /// Multipass may switch between those providers on hot reload; changes
-    /// under <c>CodeyBox:Incus</c> (except the restart-only project and staging
+    /// <c>CodeyBox:SandboxProvider=incus</c>. Changes under
+    /// <c>CodeyBox:Incus</c> (except the restart-only project and staging
     /// identities) are captured by the next provider operation and do not
     /// mutate already-created sandboxes.
     ///
@@ -3963,13 +4139,6 @@ namespace CodeyBox.Api
 
         /// <summary>Use lazily baked baselines and COW <c>incus copy</c> clones for sandbox creation.</summary>
         public bool UseBaselineImages { get; set; } = Defaults.UseBaselineImages;
-
-        /// <summary>
-        /// Also inventory Multipass resources after a restart that begins on
-        /// Incus. Enable during a cross-restart cutover; leave false on an
-        /// Incus-only host so no Multipass CLI is required.
-        /// </summary>
-        public bool IncludeMultipassCutoverInventory { get; set; }
 
         /// <summary>
         /// Shell commands run once while baking a baseline or during a full
@@ -4339,7 +4508,8 @@ namespace CodeyBox.Api
     ///   <see cref="IOptionsMonitor{T}"/> on each consumer access (or
     ///   re-applied via the <c>AgentConfigHotReload</c> bridge). Today:
     ///   <c>TemplateDirectory</c>, <c>MaxTemplateChecks</c>, <c>AgentConcurrency</c>, <c>AgentClasses</c>, <c>AgentScoreModifiers</c>,
-    ///   <c>AgentBurnEstimator</c>, <c>AgentPauses</c>, <c>AgentPricing</c>, <c>Smoke.Enabled</c>, <c>DeadWorker</c>
+    ///   <c>AgentBurnEstimator</c>, <c>AgentPauses</c>, <c>AgentPricing</c>, <c>SqliteWriteGate</c>,
+    ///   <c>Smoke.Enabled</c>, <c>DeadWorker</c>
     ///   (per-sweep), <c>Shutdown.SandboxResumeMode</c>,
     ///   <c>Shutdown.SandboxResumeTimeout</c>,
     ///   <c>Shutdown.SandboxAdoptionDeadlineSeconds</c>, <c>SandboxLeak</c>
@@ -4378,6 +4548,7 @@ namespace CodeyBox.Api
         public bool EnableSharedUpstreamMirror { get; set; } = false;
         public string SharedUpstreamMirrorDirectory { get; set; } = "_upstream-mirror";
         public string StateDatabasePath { get; set; } = "/var/lib/codeybox/state.db";
+        public SqliteWriteGateOptions SqliteWriteGate { get; set; } = new();
         public string TemplateDirectory { get; set; } = "templates";
         public const int DefaultMaxTemplateChecks = 256;
         public const int MaximumMaxTemplateChecks = 1000;
@@ -4459,6 +4630,14 @@ namespace CodeyBox.Api
 
         /// <summary>Graceful shutdown drain and preemption timing.</summary>
         public ShutdownOptions Shutdown { get; set; } = new();
+
+        /// <summary>
+        /// Deprecated compatibility section for older configs that set
+        /// <c>CodeyBox:PlanReview:UseAuditors</c>. Auditor-backed plan review
+        /// is always enabled by the pipeline; this option is accepted only so
+        /// strict unbound-key validation does not reject existing deployments.
+        /// </summary>
+        public PlanReviewOptions PlanReview { get; set; } = new();
 
         /// <summary>Heartbeat and dead-worker reaper configuration.</summary>
         public DeadWorkerOptions DeadWorker { get; set; } = new();
@@ -4543,16 +4722,24 @@ namespace CodeyBox.Api
         public string? SandboxProvider { get; set; }
 
         /// <summary>
+        /// Provider-neutral lifecycle inventory retained during a hot-reload
+        /// sandbox-provider cutover.
+        /// </summary>
+        public SandboxProviderCutoverConfig SandboxProviderCutover { get; set; } = new();
+
+        /// <summary>
         /// Override that lets <c>process</c> sandbox load outside Development.
         /// Don't.
         /// </summary>
         public bool DangerouslyAllowProcessSandbox { get; set; }
 
         /// <summary>
-        /// Incus VM, baseline, storage, and CLI settings. Consumed only when
-        /// <c>SandboxProvider=incus</c>; fields other than
-        /// <c>ProjectName</c> and the effective <c>StagingDirectory</c> are
-        /// hot-reloaded for the next provider operation.
+        /// Incus VM, baseline, storage, and CLI settings. Full settings are
+        /// consumed when Incus is selected or retained for cutover inventory;
+        /// dormant-provider routing reads only the baseline namespace. Fields
+        /// other than <c>ProjectName</c> and the effective
+        /// <c>StagingDirectory</c> are hot-reloaded for the next Incus
+        /// operation.
         /// </summary>
         public IncusSandboxConfig Incus { get; set; } = new();
 
@@ -4617,10 +4804,12 @@ namespace CodeyBox.Api
         ///   "graphical": "cb-graphical"
         /// }
         /// </code>
-        /// Bridge names are limited to 15 characters by Linux IFNAMSIZ.
-        /// Profile names (the keys) have no such limit. Multipass attaches
-        /// the selected bridge as a second NIC; Incus uses it as the VM's
-        /// only NIC and does not inherit an Incus NAT profile.
+        /// Bridge names are limited to 15 characters by Linux IFNAMSIZ. Incus
+        /// additionally requires profile names to be valid identifiers of at
+        /// most 63 ASCII letters, digits, hyphens, underscores, or dots;
+        /// Multipass does not impose that profile-name limit. Multipass
+        /// attaches the selected bridge as a second NIC; Incus uses it as the
+        /// VM's only NIC and does not inherit an Incus NAT profile.
         /// </summary>
         public Dictionary<string, string> SandboxNetworkProfiles { get; set; } = new(StringComparer.OrdinalIgnoreCase)
         {
@@ -4782,6 +4971,14 @@ namespace CodeyBox.Api
         /// </summary>
         public TerminalFailureRecoveryConfig TerminalFailureRecovery { get; set; } = new();
 
+        /// <summary>
+        /// Auto-requeue policy for infra-failed work items on agent recovery —
+        /// see <see cref="AutoRequeueOnAgentRestoreConfig"/>. Enabled by
+        /// default so restored agents automatically drain outage-window
+        /// infra-failed victims through normal routing.
+        /// </summary>
+        public AutoRequeueOnAgentRestoreConfig AutoRequeueOnAgentRestore { get; set; } = new();
+
         /// <summary>OpenTelemetry export configuration. See docs/observability.md.</summary>
         public OtelOptions Otel { get; set; } = new();
 
@@ -4863,6 +5060,22 @@ namespace CodeyBox.Api
         /// deployment.
         /// </summary>
         public E2eExecutionOptions E2eExecution { get; set; } = new();
+
+        /// <summary>
+        /// Work-item attachments storage configuration. Hot-reloadable: the
+        /// root directory, limits, and TTL are read on every upload, sweep,
+        /// and orphan scan.
+        /// </summary>
+        public AttachmentsOptions Attachments { get; set; } = new();
+    }
+
+    /// <summary>
+    /// Deprecated compatibility plan-review options. The review loop is always
+    /// auditor-backed; <see cref="UseAuditors"/> is ignored.
+    /// </summary>
+    public sealed class PlanReviewOptions
+    {
+        public bool UseAuditors { get; set; } = true;
     }
 
     /// <summary>
@@ -5083,6 +5296,62 @@ namespace CodeyBox.Api
         public string MaxBackoff { get; set; } = "00:30:00";
         public double JitterFraction { get; set; } = 0.2;
         public int MaxAutoRetriesPerWorkItem { get; set; } = 3;
+    }
+
+    /// <summary>
+    /// Bound from <c>CodeyBox:AutoRequeueOnAgentRestore</c>. Hot-reloadable
+    /// except <see cref="EventQueueCapacity"/>, which sizes the scheduler
+    /// channel at startup. See
+    /// <see cref="CodeyBox.Orchestrator.AgentRestoreRetryScheduler"/> for
+    /// runtime semantics.
+    /// </summary>
+    public sealed class AutoRequeueOnAgentRestoreConfig
+    {
+        /// <summary>
+        /// Master switch for restore-driven infra-failure sweeps. Default
+        /// <c>true</c>; set false only when an operator wants to perform these
+        /// recovery sweeps manually.
+        /// </summary>
+        public bool Enabled { get; set; } = true;
+
+        /// <summary>
+        /// Non-negative <see cref="TimeSpan"/> string subtracted from the
+        /// restore event's outage start when selecting failed candidates.
+        /// </summary>
+        public string LookbackGrace { get; set; } = AgentRestoreRetryOptions.DefaultLookbackGraceConfigValue;
+
+        /// <summary>
+        /// Non-negative <see cref="TimeSpan"/> string added after the restore
+        /// timestamp to absorb ordering races between terminal writes and the
+        /// restore signal.
+        /// </summary>
+        public string PostRestoreMargin { get; set; } = AgentRestoreRetryOptions.DefaultPostRestoreMarginConfigValue;
+
+        /// <summary>
+        /// Non-negative <see cref="TimeSpan"/> string used to match a failed
+        /// agent-involvement row to a nearby terminal work-item write.
+        /// </summary>
+        public string InvolvementTerminalLookback { get; set; } = AgentRestoreRetryOptions.DefaultInvolvementTerminalLookbackConfigValue;
+
+        /// <summary>
+        /// Non-negative <see cref="TimeSpan"/> string allowing failed involvement
+        /// rows to land slightly after the terminal work-item update they
+        /// explain.
+        /// </summary>
+        public string InvolvementTerminalClockSkew { get; set; } = AgentRestoreRetryOptions.DefaultInvolvementTerminalClockSkewConfigValue;
+
+        /// <summary>
+        /// Positive cap applied inside the work-item store before buffering
+        /// restore-sweep candidates. Default 500.
+        /// </summary>
+        public int MaxCandidatesPerSweep { get; set; } = AgentRestoreRetryOptions.DefaultMaxCandidatesPerSweep;
+
+        /// <summary>
+        /// Positive bounded-channel capacity for pending restore notifications.
+        /// Startup-only; restart the API to apply changes. Default 128.
+        /// </summary>
+        public int EventQueueCapacity { get; set; } = AgentRestoreRetryOptions.DefaultEventQueueCapacity;
+
     }
 
     /// <summary>

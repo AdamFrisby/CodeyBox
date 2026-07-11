@@ -148,6 +148,8 @@ internal static class TestSupport
         CancellationRegistry? cancellationRegistry = null,
         AgentAvailabilityRegistry? availabilityRegistry = null,
         ScriptedAgent? agentOverride = null,
+        IQuotaFailureStore? quotaFailures = null,
+        IEnumerable<IAgentQuotaProbe>? auditQuotaProbes = null,
         IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? toolCallCounters = null,
         IMergeScopeResolver? mergeScopeResolver = null,
         IReadOnlyDictionary<string, string>? projectKnobs = null)
@@ -268,9 +270,11 @@ internal static class TestSupport
             resolvedOptions,
             NullLogger<PipelineRunner>.Instance,
             timingStore: timingStore,
+            auditQuotaProbes: auditQuotaProbes,
             auditReports: auditReportStore,
             agentStreams: agentStreams,
             auditQuotaOptions: auditQuotaOptions,
+            quotaFailures: quotaFailures,
             classRouter: classRouter,
             costStore: costStore,
             costExtractors: costExtractors,
@@ -457,6 +461,7 @@ internal sealed class ScriptedAuditorCatalog : IPresetCatalog
     public IReadOnlyList<string> KnownLanguages => [];
     public IReadOnlyList<string> KnownAuditTypes => _auditors.Count == 0 ? [] : ["scripted"];
     public string LlmPromptFrameTemplate => "{{reviewFocus}}\n{{originalPrompt}}\n{{resultFile}}";
+    public string LlmPlanPromptFrameTemplate => CodeyBox.Audit.Llm.LlmPromptFrameTemplate.DefaultPlanFrameTemplate;
 }
 
 internal enum MergeStrategy

@@ -29,7 +29,8 @@ public sealed class IncusIntegrationTests
     {
         var settings = IncusIntegrationSettings.FromEnvironment();
         var skipReason = await GetSkipReasonAsync(settings);
-        Skip.If(skipReason is not null, skipReason!);
+        if (skipReason is not null)
+            Skip.If(condition: true, skipReason);
 
         var runId = Guid.NewGuid().ToString("N");
         var token = runId[..10];
@@ -110,7 +111,8 @@ public sealed class IncusIntegrationTests
             recordingRunner);
         var resolver = Assert.IsAssignableFrom<IBaselineImageResolver>(provider);
         var provisioner = Assert.IsAssignableFrom<IBaselineImageProvisioner>(provider);
-        var baseline = resolver.ResolveBaselineRef(profile, SandboxProfileFlavor.Headless);
+        var baseline = resolver.ResolveBaselineRef(profile, SandboxProfileFlavor.Headless)
+            ?? throw new InvalidOperationException("The Incus integration baseline resolver returned null.");
         Assert.False(string.IsNullOrWhiteSpace(baseline));
 
         ISandbox? sandbox = null;
@@ -127,7 +129,7 @@ public sealed class IncusIntegrationTests
             var copy = await RunCheckedAsync(
                 [
                     settings.IncusBinary, "--project", settings.Project,
-                    "copy", baseline! + "/ready", copyProbe,
+                    "copy", baseline + "/ready", copyProbe,
                     "--storage", settings.Pool,
                     "--no-profiles",
                 ],
@@ -136,7 +138,7 @@ public sealed class IncusIntegrationTests
                 copy.Elapsed <= settings.MaximumCloneDuration,
                 $"COW copy took {copy.Elapsed.TotalSeconds:F3}s; expected at most " +
                 $"{settings.MaximumCloneDuration.TotalSeconds:F3}s. stdout={copy.Result.Stdout} stderr={copy.Result.Stderr}");
-            await AssertZfsCowCloneAsync(settings, baseline!, copyProbe);
+            await AssertZfsCowCloneAsync(settings, baseline, copyProbe);
 
             sandbox = await provider.CreateAsync(new SandboxSpec
             {
@@ -196,7 +198,7 @@ public sealed class IncusIntegrationTests
                 providerCopy <= settings.MaximumCloneDuration,
                 $"Provider incus copy took {providerCopy.TotalSeconds:F3}s; expected at most " +
                 $"{settings.MaximumCloneDuration.TotalSeconds:F3}s.");
-            await AssertZfsCowCloneAsync(settings, baseline!, sandbox.Id);
+            await AssertZfsCowCloneAsync(settings, baseline, sandbox.Id);
             Assert.Empty(Directory.GetFileSystemEntries(emptyReadOnlySource));
 
             await File.WriteAllTextAsync(
@@ -236,6 +238,17 @@ public sealed class IncusIntegrationTests
             Assert.Equal(
                 "guest-to-host\n",
                 await File.ReadAllTextAsync(Path.Combine(writableSource, "from-guest.txt")));
+
+            var privilegedMountWrite = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "sudo", "-n", "sh", "-c",
+                    "install -m 4755 /bin/true /integration-rw/root-setuid",
+                ],
+            });
+            Assert.False(privilegedMountWrite.Success);
+            Assert.False(File.Exists(Path.Combine(writableSource, "root-setuid")));
 
             var readOnlyWrite = await sandbox.ExecAsync(new SandboxExec
             {
@@ -327,7 +340,7 @@ public sealed class IncusIntegrationTests
             () => DeleteInstancesWithPrefixAsync(settings, instancePrefix),
             cleanupFailures);
         await CaptureCleanupFailureAsync(
-            () => DisposeBaselineIfPresentAsync(resolver, baseline!),
+            () => DisposeBaselineIfPresentAsync(resolver, baseline),
             cleanupFailures);
         await CaptureCleanupFailureAsync(
             () => DeleteProjectIfPresentAsync(settings),

@@ -161,8 +161,47 @@ Cancelled (via DELETE /workitems/{id}) is reachable from any non-terminal state.
 
 `Planning` is optional and gated by the `plan` knob, which defaults to `off`.
 The planning turn runs in a discardable sandbox and persists only the PLAN
-artifact on the work item; the placeholder `PlanReview` approves it and
-`PlanApproved` flows into normal implementation.
+artifact on the work item.
+
+`PlanReview` is a review loop analogous to the audit loop. Auditors declare a
+multi-valued `IAuditor.Targets` set (default `{ Code }`); the composer selects
+`{ Plan }`-target reviewers for this phase (respecting the same
+config-driven active set as code audit) and evaluates the PLAN artifact.
+Blocking findings send the plan back for a plan-rework turn (the planning agent
+receives only bounded categories, severities, counts, and stable finding IDs,
+never model-authored reviewer prose) and re-review, up to
+the hot-reloadable `CodeyBox:PipelineTuning:MaxPlanReviewIterations`; the plan must pass before
+`PlanApproved` flows into implementation. `CodeyBox:PlanReview:UseAuditors`
+is compatibility-only and ignored; Plan-target auditors are always composed by
+the pipeline, and canonical PLAN parsing occurs at the artifact boundary before
+the selected auditor panel is authoritative. Plan-target reviewers run through
+the shared auditor credential, quota, persistence, and post-processing path,
+with `AuditContext.Target == Plan` and the PLAN artifact carried on the context.
+LLM plan reviewers additionally require a host-side text-only provider call
+that places trusted review instructions in the system channel and the untrusted
+task/PLAN data in a separate user channel. Moving subjective / architectural review to the cheap PLAN
+artifact lets the code-stage audit stay objective and low-cycle.
+
+The planning loop is closed on the implementation side by three cooperating
+pieces. First, `PlanApproved` feeds the reviewed plan into the work-phase prompt,
+so the agent implements against it. Second, a code-target **`plan:adherence`**
+reviewer (config-gated by `CodeyBox:PlanAdherence`, enabled by default) compares
+the diff to the approved plan and blocks only on *unjustified* deviations from
+the agreed approach; it self-limits to planned items (no plan artifact → no-op),
+so unplanned items are unaffected. Third, the code audit is **rebalanced** for
+planned items: because the subjective/architectural judgement already happened at
+the plan stage, blocking findings from the configured approach reviewer(s)
+(default `architecture:llm-review`, via
+`CodeyBox:PipelineTuning:PlannedItemAdvisoryAuditors`) are demoted to advisory —
+still recorded, no longer forcing a rework cycle — while the objective gates
+(build, tests, security, cheating, completeness, plan-adherence) keep full
+blocking authority. No auditor is removed; only which findings block is
+reweighted, and only for planned items. The thesis — subjective review on a small
+plan plus objective + adherence review on the code — is measured by the
+`planned` tag on the `codeybox.audit.iterations` and
+`codeybox.audit.first_audit.outcome` instruments, which lets dashboards compare
+code-stage iteration count and first-audit pass-rate for planned vs unplanned
+items and prove (or disprove) that planning net-reduces cycles.
 
 `*` Before each `Auditing` run, configured mechanical fixers may run in a
 credential-free sandbox and commit deterministic normalizations. This is a

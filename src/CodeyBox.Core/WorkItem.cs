@@ -111,6 +111,12 @@ public sealed record WorkItem
     public string? FailureKind { get; init; }
 
     /// <summary>
+    /// Scope of an <c>auth_required</c> terminal failure. Null for non-auth
+    /// failures and legacy rows written before the structured scope existed.
+    /// </summary>
+    public WorkItemAuthFailureScope? AuthFailureScope { get; init; }
+
+    /// <summary>
     /// When the quota window that caused a "quota" failure is expected to
     /// reset. Prefer parsed agent-output reset hints; quota failures may also
     /// use probe-derived reset times or the orchestrator's default pause.
@@ -262,6 +268,14 @@ public sealed record WorkItem
     /// <see cref="WorkItemState.MergeConflictResolutionFailed"/>.
     /// </summary>
     public int ConflictReworkAttempts { get; init; }
+
+    /// <summary>
+    /// Number of plan-review passes attempted for the current planning
+    /// lifecycle. Kept across plan-rework artifacts and reset only when the
+    /// plan fields are cleared. Persisted so the max-plan-review-iterations
+    /// cap survives orchestrator restarts.
+    /// </summary>
+    public int PlanReviewAttempts { get; init; }
 
     /// <summary>
     /// Number of times the failure-class recovery service has auto-retried
@@ -629,13 +643,19 @@ public sealed record WorkItem
     public DateTimeOffset? PlanGeneratedAt { get; init; }
 
     /// <summary>
-    /// UTC timestamp when the plan-review gate approved the current
-    /// <see cref="PlanArtifact"/>. The initial scaffold uses an always-pass
-    /// placeholder reviewer.
+    /// UTC timestamp when the configured Plan-target auditor panel and the
+    /// deterministic task-binding policy approved the current
+    /// <see cref="PlanArtifact"/>. Rows approved by older placeholder flows are
+    /// reopened for current review before implementation.
     /// </summary>
     public DateTimeOffset? PlanReviewedAt { get; init; }
 
-    /// <summary>Short operator-facing summary of the plan-review decision.</summary>
+    /// <summary>
+    /// Short operator-facing summary of the plan-review decision. Current
+    /// approvals carry an <c>auditor-loop/v1:</c> provenance prefix so durable
+    /// placeholder approvals from older deployments can be distinguished and
+    /// reopened safely.
+    /// </summary>
     public string? PlanReviewSummary { get; init; }
 
     /// <summary>
@@ -658,7 +678,8 @@ public sealed record WorkItem
         WorkItemCancellationReason? cancellationReason = null,
         string? failureKind = null,
         DateTimeOffset? quotaResetAt = null,
-        string? cancellationSource = null)
+        string? cancellationSource = null,
+        WorkItemAuthFailureScope? authFailureScope = null)
     {
         var preserveQueuedPickup =
             state == WorkItemState.Queued
@@ -669,6 +690,11 @@ public sealed record WorkItem
         var nextFailureKind = IsFailureKindCarryingState(state)
             ? (failureKind ?? FailureKind)
             : null;
+        var nextAuthFailureScope =
+            state == WorkItemState.Failed
+            && string.Equals(nextFailureKind, WorkItemFailureKinds.AuthRequired, StringComparison.OrdinalIgnoreCase)
+                ? (authFailureScope ?? AuthFailureScope)
+                : null;
         var carriesQuotaRetry = IsQuotaShapedState(state);
         var carriesTransientRetry =
             state == WorkItemState.WaitingForTransientRetry
@@ -689,6 +715,7 @@ public sealed record WorkItem
             // NextQuotaRetryAt so the retry scheduler can re-arm timers
             // across host restarts.
             FailureKind = nextFailureKind,
+            AuthFailureScope = nextAuthFailureScope,
             QuotaResetAt = carriesQuotaRetry ? (quotaResetAt ?? QuotaResetAt) : null,
             NextQuotaRetryAt = carriesQuotaRetry ? NextQuotaRetryAt : null,
             QuotaRetryFrom = carriesQuotaRetry ? QuotaRetryFrom : null,
@@ -725,6 +752,7 @@ public sealed record WorkItem
 
     private static bool IsFailureKindCarryingState(WorkItemState state) =>
         state is WorkItemState.Failed
+            or WorkItemState.MergeConflictResolutionFailed
             or WorkItemState.WaitingForQuotaReset
             or WorkItemState.WaitingForTransientRetry;
 

@@ -29,8 +29,8 @@ public sealed class CodeyBoxOptionsStartupSnapshot
 /// elsewhere in the service graph — re-binding them mid-flight would either
 /// leak the prior resource or quietly continue using the stale value, which is
 /// worse than rejecting the change outright. The one provider-selector
-/// exception is a process that starts with Multipass or Incus: it can lazily
-/// activate both providers and may switch only between those two at runtime.
+/// exception is a process that starts with a provider in the registered
+/// hot-reload set: it may switch only within that set at runtime.
 ///
 /// Production passes an eager startup snapshot into the constructor after all
 /// layered configuration sources are registered. The parameterless constructor
@@ -78,7 +78,8 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
             Check("CodeyBox:WorkerPool:MaxConcurrentSandboxes", _snapshot.MaxConcurrentSandboxes, options.WorkerPool.MaxConcurrentSandboxes, failures);
             Check("CodeyBox:EnableSharedUpstreamMirror", _snapshot.EnableSharedUpstreamMirror, options.EnableSharedUpstreamMirror, failures);
             Check("CodeyBox:SharedUpstreamMirrorDirectory", _snapshot.SharedUpstreamMirrorDirectory, NormalizePath(options.SharedUpstreamMirrorDirectory), failures);
-            if (IsMultipassIncus(_snapshot.SandboxProvider) || IsMultipassIncus(candidateSandboxProvider))
+            if (IsReloadableSandboxProvider(_snapshot.SandboxProvider)
+                || IsReloadableSandboxProvider(candidateSandboxProvider))
             {
                 Check(
                     "CodeyBox:Incus:ProjectName",
@@ -88,9 +89,7 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
                 Check(
                     "CodeyBox:Incus:StagingDirectory",
                     _snapshot.IncusStagingDirectory,
-                    NormalizePath(IncusSandboxConfigMapper.ResolveStagingDirectory(
-                        options,
-                        options.Incus?.StagingDirectory)),
+                    NormalizeConfiguredPath(options.Incus?.StagingDirectory),
                     failures);
             }
 
@@ -103,7 +102,7 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
     private static Snapshot Capture(CodeyBoxOptions options)
     {
         var sandboxProvider = NormalizeSandboxProvider(options.SandboxProvider);
-        var captureIncusIdentity = IsMultipassIncus(sandboxProvider);
+        var captureIncusIdentity = IsReloadableSandboxProvider(sandboxProvider);
         return new Snapshot(
             sandboxProvider,
             NormalizePath(options.StateDatabasePath),
@@ -116,9 +115,7 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
                 ? NormalizeString((options.Incus ?? new IncusSandboxConfig()).ProjectName)
                 : string.Empty,
             captureIncusIdentity
-                ? NormalizePath(IncusSandboxConfigMapper.ResolveStagingDirectory(
-                    options,
-                    options.Incus?.StagingDirectory))
+                ? NormalizeConfiguredPath(options.Incus?.StagingDirectory)
                 : string.Empty);
     }
 
@@ -130,17 +127,16 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
         if (string.Equals(startup, candidate, StringComparison.Ordinal))
             return;
 
-        if (IsMultipassIncus(startup) && IsMultipassIncus(candidate))
+        if (IsReloadableSandboxProvider(startup) && IsReloadableSandboxProvider(candidate))
             return;
 
         failures.Add(
-            "CodeyBox:SandboxProvider only supports a hot multipass <-> incus cutover when the process " +
-            "started with one of those providers; restart CodeyBox for every other provider change.");
+            "CodeyBox:SandboxProvider can change at runtime only within the registered hot-reload provider set; " +
+            "restart CodeyBox for every other provider change.");
     }
 
-    private static bool IsMultipassIncus(string value) =>
-        value is HotSwappableSandboxProvider.MultipassProviderId
-            or HotSwappableSandboxProvider.IncusProviderId;
+    private static bool IsReloadableSandboxProvider(string value) =>
+        SandboxProviderKinds.SupportsHotReload(value);
 
     private static void Check(string field, string startup, string candidate, List<string> failures)
     {
@@ -178,6 +174,9 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
         try { return Path.GetFullPath(value); }
         catch { return value.Trim(); }
     }
+
+    private static string NormalizeConfiguredPath(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? string.Empty : NormalizePath(value);
 
     private sealed record Snapshot(
         string SandboxProvider,

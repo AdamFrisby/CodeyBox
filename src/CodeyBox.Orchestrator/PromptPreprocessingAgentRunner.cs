@@ -5,11 +5,24 @@ namespace CodeyBox.Orchestrator;
 
 /// <summary>
 /// Wraps an inner <see cref="IAgentRunner"/> so the
-/// <see cref="AgentPromptPreprocessorChain"/> runs against every prompt
-/// immediately before the agent is invoked. Use <see cref="Wrap"/> to
-/// construct one — the factory returns subclasses that mirror optional
-/// runner capabilities, so <c>is</c> checks on the returned instance reflect
-/// the inner runner's true capability instead of the wrapper's claim.
+/// <see cref="AgentPromptPreprocessorChain"/> runs immediately before the agent
+/// is invoked. Use <see cref="Wrap"/> to construct one — the factory returns
+/// subclasses that mirror optional runner capabilities, so <c>is</c> checks on
+/// the returned instance reflect the inner runner's true capability instead of
+/// the wrapper's claim.
+///
+/// <para><b>Exception — separated-channel plan review.</b> The chain runs
+/// against every prompt EXCEPT the separated system/user plan-review path
+/// (<see cref="RunTextOnlyWithSystemPromptInnerAsync"/> when
+/// <see cref="AgentPromptPhase.PlanReview"/> is active). That path deliberately
+/// keeps its user message as the exact bounded JSON envelope the trusted system
+/// prompt promises ("exactly two string fields"); running arbitrary
+/// preprocessors would let them inject text into the untrusted-data user
+/// channel and break the system/user separation the plan reviewer relies on.
+/// The one built-in preprocessor that would otherwise apply
+/// (<see cref="ProjectRulesPromptPreprocessor"/>) already no-ops for this phase.
+/// Every other invocation path — including the planning/plan-rework agent turn,
+/// which goes through <see cref="RunAsync"/> — is preprocessed normally.</para>
 /// </summary>
 internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModelProvider
 {
@@ -19,6 +32,7 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
     protected readonly AgentPromptPhase Phase;
     protected readonly int Iteration;
     protected readonly Project Project;
+    protected readonly AuditTarget? AuditTarget;
 
     protected PromptPreprocessingAgentRunner(
         IAgentRunner inner,
@@ -26,7 +40,8 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
         WorkItemId itemId,
         AgentPromptPhase phase,
         int iteration,
-        Project project)
+        Project project,
+        AuditTarget? auditTarget = null)
     {
         Inner = inner;
         Chain = chain;
@@ -34,6 +49,7 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
         Phase = phase;
         Iteration = iteration;
         Project = project;
+        AuditTarget = auditTarget;
     }
 
     public static PromptPreprocessingAgentRunner Wrap(
@@ -42,19 +58,20 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
         WorkItemId itemId,
         AgentPromptPhase phase,
         int iteration,
-        Project project)
+        Project project,
+        AuditTarget? auditTarget = null)
     {
         var textOnly = inner is ITextOnlyAgentRunner;
         var cliSessionResumable = inner is ICliSessionResumableAgentRunner;
 
         if (textOnly && cliSessionResumable)
-            return new TextOnlyCliSessionResumablePromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project);
+            return new TextOnlyCliSessionResumablePromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project, auditTarget);
         if (textOnly)
-            return new TextOnlyPromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project);
+            return new TextOnlyPromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project, auditTarget);
         if (cliSessionResumable)
-            return new CliSessionResumablePromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project);
+            return new CliSessionResumablePromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project, auditTarget);
 
-        return new PromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project);
+        return new PromptPreprocessingAgentRunner(inner, chain, itemId, phase, iteration, project, auditTarget);
     }
 
     public AgentKind Kind => Inner.Kind;
@@ -77,7 +94,7 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
         bool captureStructuredStream = false)
     {
         var processed = await Chain.ProcessAsync(
-            new PromptContext(ItemId, Inner.Kind, Phase, Iteration, Project, sandbox, workingDirectory),
+            new PromptContext(ItemId, Inner.Kind, Phase, Iteration, Project, sandbox, workingDirectory, AuditTarget),
             prompt,
             ct).ConfigureAwait(false);
 
@@ -116,13 +133,48 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
                 ? SandboxConventions.WorkDir
                 : workingDirectory;
             prompt = await Chain.ProcessAsync(
-                new PromptContext(ItemId, Inner.Kind, Phase, Iteration, Project, sandbox, resolvedWorkingDirectory),
+                new PromptContext(ItemId, Inner.Kind, Phase, Iteration, Project, sandbox, resolvedWorkingDirectory, AuditTarget),
                 prompt,
                 ct).ConfigureAwait(false);
         }
 
         return await ((ITextOnlyAgentRunner)Inner).RunTextOnlyAsync(
             prompt,
+            credential,
+            modelId,
+            reasoningMode,
+            ct,
+            sandbox,
+            workingDirectory).ConfigureAwait(false);
+    }
+
+    protected async Task<TextOnlyAgentResult> RunTextOnlyWithSystemPromptInnerAsync(
+        string systemPrompt,
+        string userPrompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
+    {
+        // Plan review is the documented exception (see class summary): its user
+        // channel must stay the exact bounded JSON envelope, so the preprocessor
+        // chain is intentionally NOT run for this separated-prompt path.
+        if (sandbox is not null && Phase != AgentPromptPhase.PlanReview)
+        {
+            var resolvedWorkingDirectory = string.IsNullOrWhiteSpace(workingDirectory)
+                ? SandboxConventions.WorkDir
+                : workingDirectory;
+            userPrompt = await Chain.ProcessAsync(
+                new PromptContext(ItemId, Inner.Kind, Phase, Iteration, Project, sandbox, resolvedWorkingDirectory, AuditTarget),
+                userPrompt,
+                ct).ConfigureAwait(false);
+        }
+
+        return await ((ITextOnlyAgentRunner)Inner).RunTextOnlyWithSystemPromptAsync(
+            systemPrompt,
+            userPrompt,
             credential,
             modelId,
             reasoningMode,
@@ -140,8 +192,9 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
             WorkItemId itemId,
             AgentPromptPhase phase,
             int iteration,
-            Project project)
-            : base(inner, chain, itemId, phase, iteration, project)
+            Project project,
+            AuditTarget? auditTarget = null)
+            : base(inner, chain, itemId, phase, iteration, project, auditTarget)
         {
         }
 
@@ -167,13 +220,20 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
             WorkItemId itemId,
             AgentPromptPhase phase,
             int iteration,
-            Project project)
-            : base(inner, chain, itemId, phase, iteration, project)
+            Project project,
+            AuditTarget? auditTarget = null)
+            : base(inner, chain, itemId, phase, iteration, project, auditTarget)
         {
         }
 
         public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential) =>
             GetInnerTextOnlyUnavailabilityReason(credential);
+
+        public bool TextOnlyRequiresSandbox =>
+            ((ITextOnlyAgentRunner)Inner).TextOnlyRequiresSandbox;
+
+        public bool SupportsSeparateSystemPrompt =>
+            ((ITextOnlyAgentRunner)Inner).SupportsSeparateSystemPrompt;
 
         public Task<TextOnlyAgentResult> RunTextOnlyAsync(
             string prompt,
@@ -184,6 +244,25 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
             ISandbox? sandbox = null,
             string? workingDirectory = null)
             => RunTextOnlyInnerAsync(prompt, credential, modelId, reasoningMode, ct, sandbox, workingDirectory);
+
+        public Task<TextOnlyAgentResult> RunTextOnlyWithSystemPromptAsync(
+            string systemPrompt,
+            string userPrompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            ISandbox? sandbox = null,
+            string? workingDirectory = null)
+            => RunTextOnlyWithSystemPromptInnerAsync(
+                systemPrompt,
+                userPrompt,
+                credential,
+                modelId,
+                reasoningMode,
+                ct,
+                sandbox,
+                workingDirectory);
     }
 
     private sealed class TextOnlyCliSessionResumablePromptPreprocessingAgentRunner
@@ -195,13 +274,20 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
             WorkItemId itemId,
             AgentPromptPhase phase,
             int iteration,
-            Project project)
-            : base(inner, chain, itemId, phase, iteration, project)
+            Project project,
+            AuditTarget? auditTarget = null)
+            : base(inner, chain, itemId, phase, iteration, project, auditTarget)
         {
         }
 
         public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential) =>
             GetInnerTextOnlyUnavailabilityReason(credential);
+
+        public bool TextOnlyRequiresSandbox =>
+            ((ITextOnlyAgentRunner)Inner).TextOnlyRequiresSandbox;
+
+        public bool SupportsSeparateSystemPrompt =>
+            ((ITextOnlyAgentRunner)Inner).SupportsSeparateSystemPrompt;
 
         public Task<TextOnlyAgentResult> RunTextOnlyAsync(
             string prompt,
@@ -212,5 +298,24 @@ internal class PromptPreprocessingAgentRunner : IAgentRunner, IAgentDefaultModel
             ISandbox? sandbox = null,
             string? workingDirectory = null)
             => RunTextOnlyInnerAsync(prompt, credential, modelId, reasoningMode, ct, sandbox, workingDirectory);
+
+        public Task<TextOnlyAgentResult> RunTextOnlyWithSystemPromptAsync(
+            string systemPrompt,
+            string userPrompt,
+            AgentCredential? credential,
+            string? modelId = null,
+            string? reasoningMode = null,
+            CancellationToken ct = default,
+            ISandbox? sandbox = null,
+            string? workingDirectory = null)
+            => RunTextOnlyWithSystemPromptInnerAsync(
+                systemPrompt,
+                userPrompt,
+                credential,
+                modelId,
+                reasoningMode,
+                ct,
+                sandbox,
+                workingDirectory);
     }
 }

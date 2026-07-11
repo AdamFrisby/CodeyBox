@@ -20,6 +20,21 @@ public interface IWorkItemTerminalRevisionBuilder
 public sealed record WorkItemTerminalFailureTransitionCommand
 {
     public string? FailureKind { get; init; }
+    public WorkItemAuthFailureScope? AuthFailureScope { get; init; }
+
+    /// <summary>
+    /// Failed agent attribution. When set, the transition rewrites
+    /// <see cref="WorkItem.Agent"/> to this value and clears
+    /// <see cref="WorkItem.AgentInstanceId"/> if the prior instance belonged to
+    /// a different agent.
+    /// </summary>
+    public AgentKind? Agent { get; init; }
+
+    /// <summary>
+    /// Clears <see cref="WorkItem.Agent"/> and <see cref="WorkItem.AgentInstanceId"/>.
+    /// Takes precedence over <see cref="Agent"/> when both are set.
+    /// </summary>
+    public bool ClearAgent { get; init; }
     public DateTimeOffset? QuotaResetAt { get; init; }
     public string? CancellationSource { get; init; }
     public IReadOnlyCollection<WorkItemState>? ExpectedStates { get; init; }
@@ -111,12 +126,27 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
                 CurrentWorkItem: current);
         }
 
-        var failed = current.With(
+        var attributed = command.ClearAgent
+            ? current with
+            {
+                Agent = null,
+                AgentInstanceId = null,
+            }
+            : command.Agent is { } agent
+            ? current with
+            {
+                Agent = agent,
+                AgentInstanceId = current.Agent == agent ? current.AgentInstanceId : null,
+            }
+            : current;
+
+        var failed = attributed.With(
             WorkItemState.Failed,
             error,
             failureKind: command.FailureKind,
             quotaResetAt: command.QuotaResetAt,
-            cancellationSource: command.CancellationSource);
+            cancellationSource: command.CancellationSource,
+            authFailureScope: command.AuthFailureScope);
 
         if (string.Equals(command.FailureKind, "quota", StringComparison.OrdinalIgnoreCase))
         {

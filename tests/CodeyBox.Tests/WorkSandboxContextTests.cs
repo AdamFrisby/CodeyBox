@@ -58,6 +58,8 @@ public sealed class WorkSandboxContextTests
         {
         }
 
+        provider.CapturesResourceMetrics = false;
+
         await using (await context.GetOrCreateSandboxAsync(new SandboxSpec
         {
             ImageReference = "ignored",
@@ -92,6 +94,9 @@ public sealed class WorkSandboxContextTests
         {
         }
 
+
+        provider.CapturesResourceMetrics = true;
+
         await using (await context.GetOrCreateSandboxAsync(new SandboxSpec
         {
             ImageReference = "ignored",
@@ -103,6 +108,40 @@ public sealed class WorkSandboxContextTests
 
         Assert.Single(provider.Created);
         Assert.False(provider.Created[0].Disposed);
+    }
+
+    [Fact]
+    public async Task GetOrCreateSandboxAsync_DoesNotReuseAcrossProviderSelectionChange()
+    {
+        var provider = new RecordingSandboxProvider { Name = "alpha" };
+        await using var context = new WorkSandboxContext(
+            provider,
+            new PipelineTuningSnapshot(new PipelineTuningOptions
+            {
+                EnableSandboxReuse = true,
+                MaxSandboxReuses = 10,
+            }),
+            NullLogger.Instance);
+        var spec = new SandboxSpec
+        {
+            ImageReference = "ignored",
+            WorkingDirectory = "/work",
+            TimingPhase = "work",
+        };
+
+        await using (await context.GetOrCreateSandboxAsync(spec, CancellationToken.None))
+        {
+        }
+
+        provider.Name = "beta";
+        await using (await context.GetOrCreateSandboxAsync(spec, CancellationToken.None))
+        {
+        }
+
+        Assert.Equal(2, provider.Created.Count);
+        Assert.True(provider.Created[0].Disposed);
+        Assert.Equal("alpha", provider.Created[0].ProviderId);
+        Assert.Equal("beta", provider.Created[1].ProviderId);
     }
 
     [Fact]
@@ -151,7 +190,7 @@ public sealed class WorkSandboxContextTests
 
     private sealed class RecordingSandboxProvider : ISandboxProvider, IResourceMetricsCapturingProvider
     {
-        public string Name => "recording";
+        public string Name { get; set; } = "recording";
         public List<RecordingSandbox> Created { get; } = [];
         public bool CapturesResourceMetrics { get; set; }
 
@@ -160,7 +199,9 @@ public sealed class WorkSandboxContextTests
             var sandbox = new RecordingSandbox(
                 SandboxAgentOutputTransportKind.ExecPipe,
                 SandboxBatchLaunchMode.Attached,
-                $"recording-{Created.Count + 1}");
+                $"recording-{Created.Count + 1}",
+                Name,
+                CapturesResourceMetrics);
             Created.Add(sandbox);
             return Task.FromResult<ISandbox>(sandbox);
         }
@@ -174,9 +215,16 @@ public sealed class WorkSandboxContextTests
     private sealed class RecordingSandbox(
         SandboxAgentOutputTransportKind transportKind,
         SandboxBatchLaunchMode batchLaunchMode,
-        string? id = null) : ISandbox
+        string? id = null,
+        string providerId = "recording",
+        bool capturesResourceMetrics = false) :
+        ISandbox,
+        IProviderOwnedSandbox,
+        IResourceMetricsCapturingSandbox
     {
         public string Id { get; } = id ?? "recording-work-context";
+        public string ProviderId { get; } = providerId;
+        public bool CapturesResourceMetrics { get; } = capturesResourceMetrics;
         public SandboxAgentOutputTransportKind AgentOutputTransportKind { get; } = transportKind;
         public SandboxBatchLaunchMode BatchLaunchMode { get; } = batchLaunchMode;
         public List<SandboxExec> Execs { get; } = [];

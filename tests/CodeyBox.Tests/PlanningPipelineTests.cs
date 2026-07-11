@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
 using CodeyBox.Agents.Claude;
+using CodeyBox.Audit.Llm;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Core;
 using CodeyBox.Git;
@@ -53,7 +54,7 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Contains("\"approach\"", final.PlanArtifact, StringComparison.Ordinal);
         Assert.NotNull(final.PlanGeneratedAt);
         Assert.NotNull(final.PlanReviewedAt);
-        Assert.Equal("Placeholder plan review approved.", final.PlanReviewSummary);
+        Assert.StartsWith("auditor-loop/v1: Plan approved by the deterministic task-binding policy", final.PlanReviewSummary, StringComparison.Ordinal);
         Assert.Equal(1, agent.PlanningCalls);
         Assert.Equal(1, agent.WorkCalls);
         Assert.Contains("## Reviewed planning metadata", agent.LastWorkPrompt, StringComparison.Ordinal);
@@ -77,6 +78,30 @@ public sealed class PlanningPipelineTests : IDisposable
         var (_, mainTreeOutput, _) = await TestSupport.RunGit(
             barePath, "ls-tree", "-r", "main", "--name-only");
         Assert.DoesNotContain("planning-pushed.txt", mainTreeOutput);
+    }
+
+    [Fact]
+    public async Task PlanOn_NoActivePlanAuditors_FailsClosedBeforeImplementation()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        using var setup = BuildPipeline(agent, _workspace, seed, auditors: []);
+        var item = NewItem("feature/no-plan-auditors") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(0, agent.WorkCalls);
+        Assert.Contains("no active Plan-target auditors", final.LastError, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -699,18 +724,19 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal(0, agent.PlanningCalls);
         Assert.Equal(1, agent.WorkCalls);
         Assert.NotNull(final.PlanReviewedAt);
-        Assert.Equal("Placeholder plan review approved.", final.PlanReviewSummary);
+        Assert.StartsWith("auditor-loop/v1: Plan approved by the deterministic task-binding policy", final.PlanReviewSummary, StringComparison.Ordinal);
         Assert.Contains("## Reviewed planning metadata", agent.LastWorkPrompt, StringComparison.Ordinal);
         Assert.Contains("output.txt", agent.LastWorkPrompt, StringComparison.Ordinal);
         Assert.Contains("resume from review", agent.LastWorkPrompt, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task ResumeFromPlanApproved_DoesNotRerunPlanningAndInjectsApprovedPlan()
+    public async Task ResumeFromLegacyPlanApproved_ReopensReviewBeforeImplementation()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var agent = new PlanningAwareAgent();
-        using var setup = BuildPipeline(agent, _workspace, seed);
+        var auditor = new ScriptedPlanTextAuditor([new AuditResult(true, [])]);
+        using var setup = BuildPipeline(agent, _workspace, seed, auditors: [auditor]);
         var item = NewItem("feature/resume-plan-approved") with
         {
             State = WorkItemState.PlanApproved,
@@ -735,8 +761,10 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.Done, final!.State);
         Assert.Equal(0, agent.PlanningCalls);
+        Assert.Equal(1, auditor.Calls);
         Assert.Equal(1, agent.WorkCalls);
-        Assert.Equal("approved earlier", final.PlanReviewSummary);
+        Assert.NotEqual("approved earlier", final.PlanReviewSummary);
+        Assert.StartsWith("auditor-loop/v1:", final.PlanReviewSummary, StringComparison.Ordinal);
         Assert.Contains("## Reviewed planning metadata", agent.LastWorkPrompt, StringComparison.Ordinal);
         Assert.Contains("already approved", agent.LastWorkPrompt, StringComparison.Ordinal);
     }
@@ -862,16 +890,532 @@ public sealed class PlanningPipelineTests : IDisposable
     }
 
     [Fact]
-    public async Task PlanOn_PlanReviewRejection_FailsBeforeImplementation()
+    public async Task PlanOn_PlanningInfrastructureFailure_FailsWithInfraMetadata()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent
+        {
+            PlanningResult = new AgentResult(
+                Success: false,
+                Summary: "agent exited 127",
+                Stdout: null,
+                Stderr: "env: 'claude': No such file or directory"),
+        };
+        using var setup = BuildPipeline(agent, _workspace, seed);
+        var item = NewItem("feature/planning-infra") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, final.FailureKind);
+        Assert.Equal(AgentKind.Claude, final.Agent);
+        Assert.Equal(1, agent.PlanningCalls);
+        Assert.Equal(0, agent.WorkCalls);
+        Assert.Contains("Planning agent claude reported failure", final.LastError, StringComparison.Ordinal);
+        Assert.Contains("agent exited 127", final.LastError, StringComparison.Ordinal);
+
+        var involvement = await setup.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.Contains(
+            involvement,
+            row => row.AgentKind == AgentKind.Claude
+                && row.Phase == "planning"
+                && row.Outcome == AgentInvolvementOutcomes.FailureInfrastructure
+                && row.EndedAt is not null);
+
+        var queue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(
+            setup.Store,
+            queue,
+            new NullGitHost(),
+            NullLogger<WorkItemRetrier>.Instance);
+        var scheduler = new AgentRestoreRetryScheduler(
+            setup.Store,
+            retrier,
+            () => new AgentRestoreRetryOptions
+            {
+                Enabled = true,
+                LookbackGrace = TimeSpan.FromMinutes(30),
+                PostRestoreMargin = TimeSpan.FromMinutes(5),
+                MaxCandidatesPerSweep = 10,
+            },
+            NullLogger<AgentRestoreRetryScheduler>.Instance,
+            involvement: setup.Involvement);
+
+        var summary = await scheduler.SweepForTestAsync(new AgentRestoredEvent(
+            AgentKind.Claude,
+            DateTimeOffset.UtcNow.AddMinutes(-5),
+            DateTimeOffset.UtcNow));
+
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(0, summary.Skipped);
+        Assert.Equal(WorkItemState.Queued, (await setup.Store.GetAsync(item.Id))!.State);
+        Assert.Equal(item.Id, await queue.DequeueAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task PlanOn_PlanningAuthFailure_FailsWithAuthMetadataAndRestoresFromAgent()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var registry = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(),
+            TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        var agent = new PlanningAwareAgent
+        {
+            PlanningResult = new AgentResult(
+                Success: false,
+                Summary: "agent exited 1",
+                Stdout: null,
+                Stderr: "API Error: 401 Unauthorized"),
+        };
+        using var setup = BuildPipeline(agent, _workspace, seed, authAvailability: registry);
+        var item = NewItem("feature/planning-auth") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Equal(WorkItemAuthFailureScope.Fleet, final.AuthFailureScope);
+        Assert.Equal(AgentKind.Claude, final.Agent);
+        Assert.Equal(1, agent.PlanningCalls);
+        Assert.Equal(0, agent.WorkCalls);
+        Assert.Contains("auth required from agent output during planning", final.LastError, StringComparison.Ordinal);
+
+        var involvement = await setup.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None);
+        Assert.Contains(
+            involvement,
+            row => row.AgentKind == AgentKind.Claude
+                && row.Phase == "planning"
+                && row.Outcome == AgentInvolvementOutcomes.FailureAuth
+                && row.EndedAt is not null);
+
+        var queue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(
+            setup.Store,
+            queue,
+            new NullGitHost(),
+            NullLogger<WorkItemRetrier>.Instance);
+        var scheduler = new AgentRestoreRetryScheduler(
+            setup.Store,
+            retrier,
+            () => new AgentRestoreRetryOptions
+            {
+                Enabled = true,
+                LookbackGrace = TimeSpan.FromMinutes(30),
+                PostRestoreMargin = TimeSpan.FromMinutes(5),
+                MaxCandidatesPerSweep = 10,
+            },
+            NullLogger<AgentRestoreRetryScheduler>.Instance,
+            involvement: setup.Involvement);
+
+        var restored = registry.Reset(AgentKind.Claude);
+        Assert.NotNull(restored);
+        var summary = await scheduler.SweepForTestAsync(restored!);
+
+        Assert.Equal(1, summary.Requeued);
+        Assert.Equal(0, summary.Skipped);
+        Assert.Equal(WorkItemState.Queued, (await setup.Store.GetAsync(item.Id))!.State);
+        Assert.Equal(item.Id, await queue.DequeueAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task PlanOn_PlanReviewAlwaysRejects_FailsAfterMaxPlanIterations()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var agent = new PlanningAwareAgent();
+        var auditor = new ScriptedPlanTextAuditor([
+            new AuditResult(false, [new AuditFinding(
+                "architecture:llm-review",
+                AuditSeverity.Error,
+                "test review rejection",
+                "rejected by the test reviewer")]),
+        ]);
         using var setup = BuildPipeline(
             agent,
             _workspace,
             seed,
-            planReviewGate: new RejectingPlanReviewGate());
+            auditors: [auditor],
+            maxPlanReviewIterations: 2);
         var item = NewItem("feature/rejected-plan") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        // Initial plan + one rework turn = 2 planning calls (== max iterations),
+        // then the still-blocked plan fails before any implementation.
+        Assert.Equal(2, agent.PlanningCalls);
+        Assert.Equal(2, final.PlanReviewAttempts);
+        Assert.Equal(0, agent.WorkCalls);
+        Assert.Contains("did not approve the planning artifact after 2 plan-review iteration", final.LastError, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PlanReviewIterationCap_UsesHotReloadedSnapshotAtLifecycleStart()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        var auditor = new ScriptedPlanTextAuditor([
+            new AuditResult(false, [new AuditFinding(
+                "architecture:llm-review",
+                AuditSeverity.Error,
+                "revise once",
+                "The first plan needs one revision.")]),
+            new AuditResult(true, []),
+        ]);
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            MaxPlanReviewIterations = 1,
+        });
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            auditors: [auditor],
+            pipelineTuning: tuning);
+        tuning.Replace(new PipelineTuningOptions { MaxPlanReviewIterations = 2 });
+        var item = NewItem("feature/hot-reloaded-plan-cap") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(2, final.PlanReviewAttempts);
+        Assert.Equal(2, auditor.Calls);
+    }
+
+    [Fact]
+    public async Task PlanOn_PlanReviewRejectsThenApproves_ReworksPlanThenImplements()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        var auditor = new ScriptedPlanTextAuditor([
+            new AuditResult(false, [new AuditFinding(
+                "architecture:llm-review",
+                AuditSeverity.Error,
+                "needs a different approach",
+                "The data flow is backward.")]),
+            new AuditResult(true, []),
+        ]);
+        using var setup = BuildPipeline(agent, _workspace, seed, auditors: [auditor]);
+        var item = NewItem("feature/reworked-plan") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // First review rejected → one plan-rework turn → second review approved.
+        Assert.Equal(2, agent.PlanningCalls);
+        Assert.Equal(2, auditor.Calls);
+        Assert.Equal(1, agent.WorkCalls);
+        Assert.NotNull(final.PlanReviewedAt);
+        // The rework turn carries only trusted, enumerated metadata (category,
+        // severity, stable finding id) — never the model-authored reviewer prose,
+        // which must not cross into the tool-bearing planning prompt.
+        Assert.Contains("was REJECTED by plan review", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("PLAN_REVIEW_REWORK_FEEDBACK_JSON", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("\"Category\":\"architecture\"", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("\"FindingId\":\"f-", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("different approach", agent.LastPlanningPrompt, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("data flow is backward", agent.LastPlanningPrompt, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task PlanReworkFeedback_DoesNotForwardReviewerProseToToolBearingPrompt()
+    {
+        const string TruncatedTail = "REVIEWER_TAIL_MUST_NOT_CROSS_BOUNDARY";
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        var auditor = new ScriptedPlanTextAuditor([
+            new AuditResult(false, [new AuditFinding(
+                "architecture:llm-review",
+                AuditSeverity.Error,
+                new string('t', 500) + TruncatedTail,
+                new string('d', 5000) + TruncatedTail,
+                "PLAN:" + new string('l', 500) + TruncatedTail)]),
+            new AuditResult(true, []),
+        ]);
+        using var setup = BuildPipeline(agent, _workspace, seed, auditors: [auditor]);
+        var item = NewItem("feature/bounded-plan-feedback") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        // No reviewer prose — title, description, or location text — reaches the
+        // planning prompt; only enumerated metadata (category + finding id) does.
+        Assert.DoesNotContain(TruncatedTail, agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('d', 30), agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('t', 30), agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('l', 30), agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("PLAN_REVIEW_REWORK_FEEDBACK_JSON", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("\"FindingId\":\"f-", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.True(agent.LastPlanningPrompt.Length < 10_000, $"bounded prompt length was {agent.LastPlanningPrompt.Length}");
+    }
+
+    [Fact]
+    public async Task PlanOn_PlanTargetAuditor_ReworksThenApproves()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        var auditor = new ScriptedPlanTextAuditor([
+            new AuditResult(false, [new AuditFinding(
+                "plan:approach",
+                AuditSeverity.Error,
+                "needs a different approach",
+                "The data flow is backward.")]),
+            new AuditResult(true, []),
+        ]);
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            auditors: [auditor]);
+        var item = NewItem("feature/plan-target-auditor") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(2, auditor.Calls);
+        Assert.Equal(AuditTarget.Plan, auditor.LastContext?.EffectiveTarget);
+        Assert.Contains("\"approach\"", auditor.LastContext?.PlanArtifact, StringComparison.Ordinal);
+        Assert.Equal(2, agent.PlanningCalls);
+        Assert.Equal(1, agent.WorkCalls);
+        Assert.Contains("PLAN_REVIEW_REWORK_FEEDBACK_JSON", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("\"Category\":\"review\"", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("\"FindingId\":\"f-", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("needs a different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("The data flow is backward", agent.LastPlanningPrompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PlanOn_ReworkedPlanArtifactIsReviewedAndPersisted()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        const string RevisedMarker = "revised-marker";
+        var initialPlan = """
+            {
+              "approach": "initial approach without the required marker.",
+              "files": ["output.txt"],
+              "testStrategy": ["pipeline integration verifies final branch."],
+              "risks": ["none for this fixture."],
+              "satisfiesTask": "creates output.txt."
+            }
+            """;
+        var revisedPlan = $$"""
+            {
+              "approach": "updated approach with {{RevisedMarker}}.",
+              "files": ["output.txt"],
+              "testStrategy": ["pipeline integration verifies final branch."],
+              "risks": ["none for this fixture."],
+              "satisfiesTask": "creates output.txt with the revised plan."
+            }
+            """;
+        var agent = new PlanningAwareAgent { PlanOutputs = [initialPlan, revisedPlan] };
+        var auditor = new ArtifactMarkerPlanAuditor(RevisedMarker);
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            auditors: [auditor]);
+        var item = NewItem("feature/reworked-plan-artifact") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(2, agent.PlanningCalls);
+        Assert.Equal(2, auditor.SeenArtifacts.Count);
+        Assert.DoesNotContain(RevisedMarker, auditor.SeenArtifacts[0], StringComparison.Ordinal);
+        Assert.Contains(RevisedMarker, auditor.SeenArtifacts[1], StringComparison.Ordinal);
+        Assert.NotNull(final.PlanArtifact);
+        Assert.Contains(RevisedMarker, final.PlanArtifact!, StringComparison.Ordinal);
+        Assert.Equal(1, agent.WorkCalls);
+    }
+
+    [Fact]
+    public async Task PlanReview_ExcludesCodeOnlyAuditorsDuringPlanReview()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        var planAuditor = new ScriptedPlanTextAuditor([
+            new AuditResult(true, []),
+        ]);
+        var codeAuditor = new CodeOnlyRecordingAuditor();
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            auditors: [planAuditor, codeAuditor]);
+        var item = NewItem("feature/plan-excludes-code-only") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(1, planAuditor.Calls);
+        Assert.Equal(1, codeAuditor.Calls);
+        Assert.All(codeAuditor.TargetsSeen, target => Assert.Equal(AuditTarget.Code, target));
+    }
+
+    [Fact]
+    public async Task PlanReview_LlmReviewAuditorUsesSharedAuditPathAndBlocksBeforeImplementation()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        var reviewAgent = new PlanReviewTextAgent(AgentKind.Codex, [
+            """
+            {"passed":false,"findings":[{"severity":"error","title":"needs a different approach","description":"The data flow is backward."}]}
+            """,
+            """
+            {"passed":true,"findings":[]}
+            """,
+        ]);
+        var auditor = new LlmReviewAuditor(new LlmReviewAuditorOptions
+        {
+            Name = "architecture:llm-review",
+            Agent = reviewAgent,
+            ReviewFocus = "- Architectural fit before implementation.",
+            FrameTemplate = "{{reviewFocus}}\n{{originalPrompt}}\n{{resultFile}}",
+            Targets = AuditTargets.PlanOnly,
+        });
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectAudit: new ProjectAudit
+            {
+                AuditTypes = ["scripted"],
+                AuditAgent = AgentKind.Codex,
+            },
+            extraAgentRunners: [reviewAgent],
+            credentials: new SingleAgentCredentialProvider(AgentKind.Codex));
+        var item = NewItem("feature/llm-plan-review-text-only") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(2, reviewAgent.TextOnlyCalls);
+        Assert.Equal(0, reviewAgent.SandboxRunCalls);
+        Assert.Equal(2, agent.PlanningCalls);
+        Assert.Equal(1, agent.WorkCalls);
+        Assert.Contains("PLAN_REVIEW_REWORK_FEEDBACK_JSON", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.Contains("\"Category\":\"architecture\"", agent.LastPlanningPrompt, StringComparison.Ordinal);
+        Assert.DoesNotContain("needs a different approach", agent.LastPlanningPrompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PlanReview_UnrunnableLlmReviewerFailsAsInfrastructureWithoutPlanRework()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        var reviewAgent = new SandboxRequiredPlanReviewAgent();
+        var auditor = new LlmReviewAuditor(new LlmReviewAuditorOptions
+        {
+            Name = "architecture:llm-review",
+            Agent = reviewAgent,
+            ReviewFocus = "Review architecture.",
+            FrameTemplate = "{{reviewFocus}} {{resultFile}}",
+            Targets = AuditTargets.PlanOnly,
+        });
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectAudit: new ProjectAudit
+            {
+                AuditTypes = ["scripted"],
+                AuditAgent = AgentKind.Codex,
+            },
+            extraAgentRunners: [reviewAgent],
+            credentials: new SingleAgentCredentialProvider(AgentKind.Codex));
+        var item = NewItem("feature/unrunnable-plan-review") with
         {
             Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
             {
@@ -887,7 +1431,269 @@ public sealed class PlanningPipelineTests : IDisposable
         Assert.Equal(WorkItemState.Failed, final!.State);
         Assert.Equal(1, agent.PlanningCalls);
         Assert.Equal(0, agent.WorkCalls);
-        Assert.Contains("Plan review rejected the planning artifact", final.LastError, StringComparison.Ordinal);
+        Assert.Equal(1, final.PlanReviewAttempts);
+        Assert.Contains("could not run", final.LastError, StringComparison.Ordinal);
+        Assert.Equal(0, reviewAgent.TextOnlyCalls);
+    }
+
+    [Fact]
+    public async Task PlanReview_PersistsPlanAndCodeReportsUnderDistinctTargets()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        var auditor = new BothTargetPassingAuditor();
+        var reports = new PlanningCapturingAuditReportStore();
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            auditors: [auditor],
+            auditReportStore: reports);
+        var item = NewItem("feature/targeted-audit-reports") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var matching = reports.Reports
+            .Where(report => report.AuditorName == auditor.Name && report.Iteration == 1)
+            .ToList();
+        Assert.Equal(2, matching.Count);
+        Assert.Contains(matching, report => report.Target == AuditTarget.Plan);
+        Assert.Contains(matching, report => report.Target == AuditTarget.Code);
+    }
+
+    [Fact]
+    public async Task PlanReview_RejectVerdictWithoutErrorFinding_IsNormalizedToBlocking()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        var auditor = new ScriptedPlanTextAuditor([
+            new AuditResult(false, [new AuditFinding(
+                "plan:approach",
+                AuditSeverity.Warning,
+                "reviewer rejected without error",
+                "The reviewer rejected the plan but only emitted advisory severity.")]),
+        ]);
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxPlanReviewIterations: 1);
+        var item = NewItem("feature/plan-reject-normalized") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(1, auditor.Calls);
+        Assert.Equal(0, agent.WorkCalls);
+        Assert.Contains("finding IDs: f-", final.LastError, StringComparison.Ordinal);
+        Assert.DoesNotContain("reviewer rejected without error", final.LastError, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PlanReview_IterationCapError_ExcludesReviewerProseAndControlCharacters()
+    {
+        const string SecretEcho = "REVIEWER_ECHOED_SECRET_123";
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        var auditor = new ScriptedPlanTextAuditor([
+            new AuditResult(false, [new AuditFinding(
+                "architecture:llm-review",
+                AuditSeverity.Error,
+                "\u001b[31m" + SecretEcho,
+                "inject a log line\n" + SecretEcho,
+                "PLAN:approach\n" + SecretEcho)]),
+        ]);
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxPlanReviewIterations: 1);
+        var item = NewItem("feature/plan-review-log-safety") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("finding IDs: f-", final.LastError, StringComparison.Ordinal);
+        Assert.DoesNotContain(SecretEcho, final.LastError, StringComparison.Ordinal);
+        Assert.DoesNotContain('\u001b', final.LastError ?? string.Empty);
+    }
+
+    [Fact]
+    public async Task PlanOff_CodeAuditExcludesPlanOnlyAuditor()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        var planOnly = new ThrowingPlanOnlyAuditor();
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            auditors: [planOnly]);
+        var item = NewItem("feature/code-excludes-plan-only");
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.False(planOnly.Called);
+    }
+
+    [Fact]
+    public async Task PlanReview_UsesWorkItemSelectedAuditProfile()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        var auditor = new ScriptedPlanTextAuditor([
+            new AuditResult(false, [new AuditFinding(
+                "plan:strict",
+                AuditSeverity.Error,
+                "strict profile blocked plan",
+                "The selected profile must run before implementation.")]),
+        ])
+        {
+            NameOverride = "plan:strict",
+        };
+        var audit = new ProjectAudit
+        {
+            AuditTypes = [],
+            Profiles = new Dictionary<string, ProjectAudit>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["strict"] = new() { AuditTypes = ["scripted"] },
+            },
+        };
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectAudit: audit,
+            maxPlanReviewIterations: 1);
+        var item = NewItem("feature/profiled-plan-review") with
+        {
+            State = WorkItemState.PlanReview,
+            PlanArtifact = PlanningAwareAgentJson.DefaultPlan,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+            AuditorProfile = "strict",
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(1, auditor.Calls);
+        Assert.Contains("finding IDs: f-", final.LastError, StringComparison.Ordinal);
+        Assert.DoesNotContain("strict profile blocked plan", final.LastError, StringComparison.Ordinal);
+        Assert.Equal(0, agent.WorkCalls);
+    }
+
+    [Fact]
+    public async Task PlanReview_RoutesCredentialedAuditorThroughPerAuditorAgent()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        var auditAgent = new PlanReviewTextAgent(AgentKind.Codex, []);
+        var auditor = new RoutedPlanAuditor();
+        var audit = new ProjectAudit
+        {
+            AuditTypes = ["scripted"],
+            PerAuditorAgent = new Dictionary<string, AgentKind>(StringComparer.OrdinalIgnoreCase)
+            {
+                [auditor.Name] = AgentKind.Codex,
+            },
+        };
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            auditors: [auditor],
+            projectAudit: audit,
+            extraAgentRunners: [auditAgent],
+            credentials: new SingleAgentCredentialProvider(AgentKind.Codex));
+        var item = NewItem("feature/plan-review-routing") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.True(final!.State == WorkItemState.Done, final.LastError);
+        Assert.Equal(AgentKind.Codex, auditor.ObservedRunnerKind);
+        Assert.Equal(AgentKind.Codex, auditor.ObservedCredentialKind);
+    }
+
+    [Fact]
+    public async Task ResumeFromPlanReview_EnforcesPersistedPlanReviewAttempts()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new PlanningAwareAgent();
+        var auditor = new ScriptedPlanTextAuditor([
+            new AuditResult(false, [new AuditFinding(
+                "architecture:llm-review",
+                AuditSeverity.Error,
+                "still blocked",
+                "still blocked")]),
+        ]);
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            auditors: [auditor],
+            maxPlanReviewIterations: 2);
+        var item = NewItem("feature/resumed-cap") with
+        {
+            State = WorkItemState.PlanReview,
+            PlanArtifact = PlanningAwareAgentJson.DefaultPlan,
+            PlanGeneratedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+            PlanReviewAttempts = 1,
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(2, final.PlanReviewAttempts);
+        Assert.Equal(0, agent.PlanningCalls);
+        Assert.Equal(0, agent.WorkCalls);
+        Assert.Contains("after 2 plan-review iteration", final.LastError, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1109,8 +1915,8 @@ public sealed class PlanningPipelineTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var agent = new PlanningAwareAgent();
-        var gate = new MutatingPlanReviewGate();
-        using var setup = BuildPipeline(agent, _workspace, seed, planReviewGate: gate);
+        var auditor = new ScriptedPlanTextAuditor([new AuditResult(true, [])]);
+        using var setup = BuildPipeline(agent, _workspace, seed, auditors: [auditor]);
         var item = NewItem("feature/stale-during-review") with
         {
             Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -1118,7 +1924,7 @@ public sealed class PlanningPipelineTests : IDisposable
                 [PlanKnob.KeyName] = PlanKnob.ValueOn,
             },
         };
-        gate.OnReviewAsync = async ct =>
+        auditor.OnReviewAsync = async ct =>
         {
             await setup.Store.TryReplacePromptAsync(item.Id, "edited during review", DateTimeOffset.UtcNow, ct);
         };
@@ -1142,8 +1948,8 @@ public sealed class PlanningPipelineTests : IDisposable
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var agent = new PlanningAwareAgent();
-        var gate = new MutatingPlanReviewGate();
-        using var setup = BuildPipeline(agent, _workspace, seed, planReviewGate: gate);
+        var auditor = new ScriptedPlanTextAuditor([new AuditResult(true, [])]);
+        using var setup = BuildPipeline(agent, _workspace, seed, auditors: [auditor]);
         var item = NewItem("feature/state-race-during-review") with
         {
             Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -1151,7 +1957,7 @@ public sealed class PlanningPipelineTests : IDisposable
                 [PlanKnob.KeyName] = PlanKnob.ValueOn,
             },
         };
-        gate.OnReviewAsync = async ct =>
+        auditor.OnReviewAsync = async ct =>
         {
             var current = await setup.Store.GetAsync(item.Id, ct)
                 ?? throw new InvalidOperationException("test item disappeared");
@@ -1401,7 +2207,6 @@ public sealed class PlanningPipelineTests : IDisposable
         IReadOnlyDictionary<string, string>? projectKnobs = null,
         ISessionAgentRunner? sessionRunner = null,
         bool enableClaudeSession = false,
-        IPlanReviewGate? planReviewGate = null,
         IQuotaFailureClassifier? quotaClassifier = null,
         IWorkItemAutoRetryScheduler? retryScheduler = null,
         IAgentPauseController? agentPauseController = null,
@@ -1410,15 +2215,23 @@ public sealed class PlanningPipelineTests : IDisposable
         ISandboxProvider? sandboxProvider = null,
         PipelineOptions? pipelineOptions = null,
         Func<SqliteWorkItemStore, IWorkItemStore>? workItemStoreDecorator = null,
+        IReadOnlyList<IAuditor>? auditors = null,
+        ProjectAudit? projectAudit = null,
+        IReadOnlyList<IAgentRunner>? extraAgentRunners = null,
         bool omitKnobRegistry = false,
         bool wireTestCaseStore = false,
-        ILogger<PipelineRunner>? pipelineLogger = null)
+        ILogger<PipelineRunner>? pipelineLogger = null,
+        IAuditReportStore? auditReportStore = null,
+        PipelineTuningSnapshot? pipelineTuning = null,
+        int maxPlanReviewIterations = 3,
+        IAgentAuthAvailabilityRegistry? authAvailability = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
 
         var store = new SqliteWorkItemStore(stateDb);
         var pipelineStore = workItemStoreDecorator?.Invoke(store) ?? store;
+        var involvement = new SqliteAgentInvolvementStore(stateDb);
         // Share the same DB file so the test_cases FK to work_items resolves.
         var testCaseStore = wireTestCaseStore ? new SqliteTestCaseStore(stateDb) : null;
         var gitHost = new LocalGitHost(
@@ -1427,8 +2240,13 @@ public sealed class PlanningPipelineTests : IDisposable
         var sandboxes = sandboxProvider
             ?? new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
         var prs = new InMemoryPullRequestService();
-        var registry = new AgentRegistry([agent]);
+        var runners = new List<IAgentRunner> { agent };
+        if (extraAgentRunners is not null)
+            runners.AddRange(extraAgentRunners);
+        var registry = new AgentRegistry(runners);
         var webhooks = new CapturingWebhookDispatcher();
+        var auditorList = (auditors ?? [new PassingPlanAuditor()]).ToList();
+        var auditTypes = auditorList.Count > 0 ? new[] { "scripted" } : Array.Empty<string>();
         var projects = new InMemoryProjectRepository(new Project
         {
             Id = new ProjectId("test-project"),
@@ -1438,15 +2256,20 @@ public sealed class PlanningPipelineTests : IDisposable
             DefaultAgent = AgentKind.Claude,
             Knobs = projectKnobs ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
             ClaudeSession = new ProjectClaudeSessionConfig { Enabled = enableClaudeSession },
+            Audit = projectAudit ?? new ProjectAudit { AuditTypes = auditTypes },
         });
-        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog([]));
+        var composer = new ProjectAuditorComposer(new ScriptedAuditorCatalog(auditorList));
         var terminalTransitions = TestSupport.CreateTerminalTransition(pipelineStore, webhooks, projects);
 
         var pipeline = new PipelineRunner(
             sandboxes, gitHost, registry, credentials ?? new StaticCredentialProvider(), prs,
             projects, new TestUpstreamFactory(), composer,
             pipelineStore, webhooks,
-            pipelineOptions ?? new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
+            pipelineOptions ?? new PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                AgentAllowedHosts = [],
+            },
             pipelineLogger ?? NullLogger<PipelineRunner>.Instance,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,
@@ -1457,11 +2280,17 @@ public sealed class PlanningPipelineTests : IDisposable
             agentPauseController: agentPauseController,
             sessionAgentRunner: sessionRunner,
             sessionDispatchOptions: new AgentSessionDispatchOptions { Enabled = enableClaudeSession },
-            planReviewGate: planReviewGate,
             promptPreprocessors: promptPreprocessors,
-            testCaseStore: testCaseStore);
+            testCaseStore: testCaseStore,
+            auditReports: auditReportStore,
+            pipelineTuning: pipelineTuning ?? new PipelineTuningSnapshot(new PipelineTuningOptions
+            {
+                MaxPlanReviewIterations = maxPlanReviewIterations,
+            }),
+            involvement: involvement,
+            authAvailability: authAvailability);
 
-        return new PlanningPipelineSetup(pipeline, store, webhooks, gitRoot, testCaseStore);
+        return new PlanningPipelineSetup(pipeline, store, involvement, webhooks, gitRoot, testCaseStore);
     }
 
     private static WorkItem NewItem(string branch) => new()
@@ -1477,12 +2306,14 @@ public sealed class PlanningPipelineTests : IDisposable
 internal sealed class PlanningPipelineSetup(
     PipelineRunner Pipeline,
     SqliteWorkItemStore Store,
+    SqliteAgentInvolvementStore Involvement,
     CapturingWebhookDispatcher Webhooks,
     string GitRoot,
     SqliteTestCaseStore? TestCaseStore = null) : IDisposable
 {
     public PipelineRunner Pipeline { get; } = Pipeline;
     public SqliteWorkItemStore Store { get; } = Store;
+    public SqliteAgentInvolvementStore Involvement { get; } = Involvement;
     public CapturingWebhookDispatcher Webhooks { get; } = Webhooks;
     public string GitRoot { get; } = GitRoot;
     public SqliteTestCaseStore? TestCaseStore { get; } = TestCaseStore;
@@ -1490,6 +2321,7 @@ internal sealed class PlanningPipelineSetup(
     public void Dispose()
     {
         TestCaseStore?.Dispose();
+        Involvement.Dispose();
         Store.Dispose();
     }
 }
@@ -1541,6 +2373,7 @@ internal sealed partial class PlanningAwareAgent : IAgentRunner, ITextOnlyAgentR
     public bool ClassifyPlanningFailureAsTransient { get; init; }
     public bool StreamPlanningOutput { get; init; } = true;
     public string PlanOutput { get; init; } = DefaultPlan;
+    public IReadOnlyList<string>? PlanOutputs { get; init; }
     public AgentResult? PlanningResult { get; init; }
     public Func<CancellationToken, Task>? OnPlanningBeforeReturnAsync { get; set; }
     public string LastPlanningPrompt { get; private set; } = string.Empty;
@@ -1615,9 +2448,10 @@ internal sealed partial class PlanningAwareAgent : IAgentRunner, ITextOnlyAgentR
             if (PlanningResult is not null)
                 return PlanningResult;
 
+            var planOutput = CurrentPlanOutput();
             if (StreamPlanningOutput)
-                stdoutChunkCallback?.Invoke(PlanOutput);
-            return new AgentResult(true, "planned", PlanOutput, null);
+                stdoutChunkCallback?.Invoke(planOutput);
+            return new AgentResult(true, "planned", planOutput, null);
         }
 
         WorkCalls++;
@@ -1684,7 +2518,16 @@ internal sealed partial class PlanningAwareAgent : IAgentRunner, ITextOnlyAgentR
                 PlanningResult.Stderr);
         }
 
-        return new TextOnlyAgentResult(true, "planned", PlanOutput, null);
+        return new TextOnlyAgentResult(true, "planned", CurrentPlanOutput(), null);
+    }
+
+    private string CurrentPlanOutput()
+    {
+        if (PlanOutputs is not { Count: > 0 })
+            return PlanOutput;
+
+        var index = Math.Clamp(PlanningCalls - 1, 0, PlanOutputs.Count - 1);
+        return PlanOutputs[index];
     }
 
     private static async Task<AgentResult> HandleMergeAsync(
@@ -2032,33 +2875,399 @@ internal sealed class PlanningRecordingSandboxProvider(ISandboxProvider inner) :
         => inner.DisposeLeakedAsync(name, ct);
 }
 
-internal sealed class RejectingPlanReviewGate : IPlanReviewGate
+internal sealed class ScriptedPlanTextAuditor(IReadOnlyList<AuditResult> results) : IAuditor
 {
-    public ValueTask<PlanReviewDecision> ReviewAsync(
-        PlanReviewRequest request,
+    public string? NameOverride { get; init; }
+    public string Name => NameOverride ?? "plan:approach";
+    public string Kind => "llm";
+    public AuditCapabilities Required => AuditCapabilities.None;
+    public IReadOnlySet<AuditTarget> Targets => AuditTargets.PlanOnly;
+    public int Calls { get; private set; }
+    public AuditContext? LastContext { get; private set; }
+    public Func<CancellationToken, Task>? OnReviewAsync { get; set; }
+
+    public async Task<AuditResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
         CancellationToken ct = default)
     {
-        _ = request;
+        _ = sandbox;
+        _ = workingDirectory;
         ct.ThrowIfCancellationRequested();
-        return ValueTask.FromResult(new PlanReviewDecision(
-            Approved: false,
-            Summary: "Rejected by test gate.",
-            RejectionReason: "test review rejection"));
+        Calls++;
+        LastContext = context;
+        if (OnReviewAsync is not null)
+            await OnReviewAsync(ct);
+        var idx = Math.Min(Calls - 1, results.Count - 1);
+        return results[idx];
     }
 }
 
-internal sealed class MutatingPlanReviewGate : IPlanReviewGate
+internal sealed class PassingPlanAuditor : IAuditor
 {
-    public Func<CancellationToken, Task>? OnReviewAsync { get; set; }
+    public string Name => "plan:contract-pass";
+    public string Kind => "tool";
+    public AuditCapabilities Required => AuditCapabilities.None;
+    public IReadOnlySet<AuditTarget> Targets => AuditTargets.PlanOnly;
 
-    public async ValueTask<PlanReviewDecision> ReviewAsync(
-        PlanReviewRequest request,
+    public Task<AuditResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
         CancellationToken ct = default)
     {
-        _ = PlanArtifactDocument.ParseCanonical(request.PlanArtifact);
-        if (OnReviewAsync is not null)
-            await OnReviewAsync(ct);
-        return new PlanReviewDecision(true, "mutating test review approved");
+        _ = sandbox;
+        _ = workingDirectory;
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult(new AuditResult(
+            context.EffectiveTarget == AuditTarget.Plan && !string.IsNullOrWhiteSpace(context.PlanArtifact),
+            []));
+    }
+}
+
+internal sealed class BothTargetPassingAuditor : IAuditor
+{
+    public string Name => "shared:both-targets";
+    public string Kind => "tool";
+    public AuditCapabilities Required => AuditCapabilities.None;
+    public IReadOnlySet<AuditTarget> Targets => AuditTargets.PlanAndCode;
+
+    public Task<AuditResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        CancellationToken ct = default)
+    {
+        _ = sandbox;
+        _ = workingDirectory;
+        _ = context;
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult(new AuditResult(true, [], RawOutput: "passed"));
+    }
+}
+
+internal sealed class PlanningCapturingAuditReportStore : IAuditReportStore
+{
+    public List<AuditReport> Reports { get; } = [];
+
+    public Task CreateAsync(AuditReport report, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        Reports.Add(report);
+        return Task.CompletedTask;
+    }
+
+    public Task<IReadOnlyList<AuditReport>> GetByWorkItemAsync(
+        string workItemId,
+        CancellationToken ct = default)
+        => Task.FromResult<IReadOnlyList<AuditReport>>(
+            Reports.Where(report => report.WorkItemId == workItemId).ToList());
+
+    public Task<string?> GetRawOutputAsync(
+        string workItemId,
+        AuditTarget target,
+        int iteration,
+        string auditorName,
+        CancellationToken ct = default)
+        => Task.FromResult<string?>(null);
+
+    public Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)
+        => Task.FromResult(0);
+}
+
+internal sealed class ArtifactMarkerPlanAuditor(string requiredMarker) : IAuditor
+{
+    public string Name => "plan:artifact-marker";
+    public string Kind => "tool";
+    public AuditCapabilities Required => AuditCapabilities.None;
+    public IReadOnlySet<AuditTarget> Targets => AuditTargets.PlanOnly;
+    public List<string> SeenArtifacts { get; } = [];
+
+    public Task<AuditResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        CancellationToken ct = default)
+    {
+        _ = sandbox;
+        _ = workingDirectory;
+        ct.ThrowIfCancellationRequested();
+        var artifact = context.PlanArtifact ?? string.Empty;
+        SeenArtifacts.Add(artifact);
+        if (artifact.Contains(requiredMarker, StringComparison.Ordinal))
+            return Task.FromResult(new AuditResult(true, []));
+
+        return Task.FromResult(new AuditResult(false, [new AuditFinding(
+            Name,
+            AuditSeverity.Error,
+            "revised plan marker missing",
+            $"The plan must include {requiredMarker} before implementation.")]));
+    }
+}
+
+internal sealed class ThrowingPlanOnlyAuditor : IAuditor
+{
+    public string Name => "plan:must-not-run-during-code-audit";
+    public string Kind => "tool";
+    public AuditCapabilities Required => AuditCapabilities.None;
+    public IReadOnlySet<AuditTarget> Targets => AuditTargets.PlanOnly;
+    public bool Called { get; private set; }
+
+    public Task<AuditResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        CancellationToken ct = default)
+    {
+        _ = sandbox;
+        _ = workingDirectory;
+        _ = context;
+        _ = ct;
+        Called = true;
+        throw new InvalidOperationException("plan-only auditor must not run during code audit");
+    }
+}
+
+internal sealed class RoutedPlanAuditor : IAuditor
+{
+    public string Name => "plan:routed";
+    public string Kind => "llm";
+    public AuditCapabilities Required => AuditCapabilities.AgentCredentials;
+    public IReadOnlySet<AuditTarget> Targets => AuditTargets.PlanOnly;
+    public AgentKind? ObservedRunnerKind { get; private set; }
+    public AgentKind? ObservedCredentialKind { get; private set; }
+
+    public Task<AuditResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        CancellationToken ct = default)
+    {
+        _ = sandbox;
+        _ = workingDirectory;
+        ct.ThrowIfCancellationRequested();
+        ObservedRunnerKind = context.AuditRunner?.Kind;
+        ObservedCredentialKind = context.AuditCredential?.Agent;
+        return Task.FromResult(new AuditResult(true, []));
+    }
+}
+
+internal sealed class CodeOnlyRecordingAuditor : IAuditor
+{
+    public string Name => "code:recording";
+    public string Kind => "tool";
+    public AuditCapabilities Required => AuditCapabilities.None;
+    public int Calls { get; private set; }
+    public List<AuditTarget> TargetsSeen { get; } = [];
+
+    public Task<AuditResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        AuditContext context,
+        CancellationToken ct = default)
+    {
+        _ = sandbox;
+        _ = workingDirectory;
+        ct.ThrowIfCancellationRequested();
+        Calls++;
+        TargetsSeen.Add(context.EffectiveTarget);
+        if (context.EffectiveTarget == AuditTarget.Plan)
+            throw new InvalidOperationException("code-only auditor ran during plan review");
+        return Task.FromResult(new AuditResult(true, []));
+    }
+}
+
+internal sealed class PlanReviewTextAgent(AgentKind kind, IReadOnlyList<string> outputs) : IAgentRunner, ITextOnlyAgentRunner
+{
+    private readonly Queue<string> _outputs = new(outputs);
+    public AgentKind Kind { get; } = kind;
+    public int TextOnlyCalls { get; private set; }
+    public int SandboxRunCalls { get; private set; }
+    public bool SupportsSeparateSystemPrompt => true;
+
+    public Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
+    {
+        _ = credential;
+        _ = modelId;
+        _ = reasoningMode;
+        _ = stdoutChunkCallback;
+        _ = captureStructuredStream;
+        ct.ThrowIfCancellationRequested();
+        SandboxRunCalls++;
+        if (!prompt.Contains("reviewing a proposed implementation PLAN", StringComparison.Ordinal) ||
+            !prompt.Contains("audit/result.json", StringComparison.Ordinal))
+        {
+            return Task.FromResult(new AgentResult(false, "unexpected prompt", null, prompt));
+        }
+
+        var output = _outputs.Count > 0 ? _outputs.Dequeue() : """{"passed":true,"findings":[]}""";
+        return WriteResultAsync(sandbox, workingDirectory, output, ct);
+    }
+
+    public Task<TextOnlyAgentResult> RunTextOnlyAsync(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
+    {
+        _ = credential;
+        _ = modelId;
+        _ = reasoningMode;
+        _ = sandbox;
+        _ = workingDirectory;
+        ct.ThrowIfCancellationRequested();
+        TextOnlyCalls++;
+        if (!prompt.Contains("reviewing a proposed implementation PLAN", StringComparison.Ordinal))
+            return Task.FromResult(new TextOnlyAgentResult(false, "unexpected prompt", null, prompt));
+        var output = _outputs.Count > 0 ? _outputs.Dequeue() : """{"passed":true,"findings":[]}""";
+        return Task.FromResult(new TextOnlyAgentResult(true, "reviewed", output, null));
+    }
+
+    public Task<TextOnlyAgentResult> RunTextOnlyWithSystemPromptAsync(
+        string systemPrompt,
+        string userPrompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
+    {
+        _ = credential;
+        _ = modelId;
+        _ = reasoningMode;
+        _ = sandbox;
+        _ = workingDirectory;
+        ct.ThrowIfCancellationRequested();
+        TextOnlyCalls++;
+        if (!systemPrompt.Contains("reviewing a proposed implementation PLAN", StringComparison.Ordinal)
+            || !userPrompt.Contains("planArtifact", StringComparison.Ordinal))
+        {
+            return Task.FromResult(new TextOnlyAgentResult(
+                false,
+                "unexpected separated prompts",
+                null,
+                systemPrompt));
+        }
+        var output = _outputs.Count > 0 ? _outputs.Dequeue() : """{"passed":true,"findings":[]}""";
+        return Task.FromResult(new TextOnlyAgentResult(true, "reviewed", output, null));
+    }
+
+    private static async Task<AgentResult> WriteResultAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string output,
+        CancellationToken ct)
+    {
+        var write = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat > audit/result.json"],
+            WorkingDirectory = workingDirectory,
+            Stdin = output,
+        }, ct);
+
+        return write.Success
+            ? new AgentResult(true, "reviewed", "reviewed", null)
+            : new AgentResult(false, "write failed", write.Stdout, write.Stderr);
+    }
+}
+
+internal sealed class SandboxRequiredPlanReviewAgent : IAgentRunner, ITextOnlyAgentRunner
+{
+    public AgentKind Kind => AgentKind.Codex;
+    public bool TextOnlyRequiresSandbox => true;
+    public bool SupportsSeparateSystemPrompt => true;
+    public int TextOnlyCalls { get; private set; }
+
+    public Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
+        => throw new InvalidOperationException("The unrunnable Plan reviewer must fail capability validation before invocation.");
+
+    public Task<TextOnlyAgentResult> RunTextOnlyAsync(
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
+    {
+        TextOnlyCalls++;
+        throw new InvalidOperationException("The unrunnable Plan reviewer must fail capability validation before invocation.");
+    }
+
+    public Task<TextOnlyAgentResult> RunTextOnlyWithSystemPromptAsync(
+        string systemPrompt,
+        string userPrompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        ISandbox? sandbox = null,
+        string? workingDirectory = null)
+    {
+        TextOnlyCalls++;
+        throw new InvalidOperationException("The unrunnable Plan reviewer must fail capability validation before invocation.");
+    }
+}
+
+internal sealed class NoopKindAgent(AgentKind kind) : IAgentRunner
+{
+    public AgentKind Kind { get; } = kind;
+
+    public Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
+    {
+        _ = sandbox;
+        _ = workingDirectory;
+        _ = prompt;
+        _ = credential;
+        _ = modelId;
+        _ = reasoningMode;
+        _ = stdoutChunkCallback;
+        _ = captureStructuredStream;
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult(new AgentResult(true, "ok", null, null));
+    }
+}
+
+internal sealed class SingleAgentCredentialProvider(AgentKind credentialKind) : ICredentialProvider
+{
+    public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult<AgentCredential?>(agent == credentialKind
+            ? new AgentCredential(agent, new Dictionary<string, string> { ["TEST_AGENT_CREDENTIAL"] = "1" }, new Dictionary<string, string>())
+            : null);
     }
 }
 

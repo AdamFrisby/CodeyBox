@@ -84,4 +84,60 @@ public sealed class PipelineTuningOptionsValidationTests
         Assert.Null(opts.CSharpTestPassAuditorIdleTimeout);
         Assert.Null(opts.CSharpTestPassBlameHangTimeout);
     }
+
+    [Fact]
+    public void Validate_ZeroMaxPlanReviewIterations_ThrowsSharedLimitError()
+    {
+        var opts = new PipelineTuningOptions { MaxPlanReviewIterations = 0 };
+
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(opts.Validate);
+
+        Assert.Equal("value", ex.ParamName);
+        Assert.Contains("MaxPlanReviewIterations must be >= 1", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Defaults_RebalanceEnabled_WithArchitectureAdvisory()
+    {
+        var opts = new PipelineTuningOptions();
+        opts.Validate();
+
+        Assert.True(opts.PlannedItemAuditRebalanceEnabled);
+        Assert.Equal(
+            [PipelineTuningOptions.DefaultPlannedItemAdvisoryAuditor],
+            opts.PlannedItemAdvisoryAuditors);
+    }
+
+    [Fact]
+    public void Validate_NullAdvisoryList_Throws()
+    {
+        var opts = new PipelineTuningOptions { PlannedItemAdvisoryAuditors = null! };
+
+        var ex = Assert.Throws<ArgumentNullException>(opts.Validate);
+        Assert.Equal(nameof(PipelineTuningOptions.PlannedItemAdvisoryAuditors), ex.ParamName);
+    }
+
+    [Fact]
+    public void Validate_BlankAdvisoryEntry_Throws()
+    {
+        var opts = new PipelineTuningOptions
+        {
+            PlannedItemAdvisoryAuditors = new List<string> { "architecture:llm-review", "  " },
+        };
+
+        var ex = Assert.Throws<ArgumentException>(opts.Validate);
+        Assert.Equal(nameof(PipelineTuningOptions.PlannedItemAdvisoryAuditors), ex.ParamName);
+    }
+
+    [Fact]
+    public void Validate_EmptyAdvisoryList_Allowed()
+    {
+        // An empty list disables demotion without disabling the flag.
+        var opts = new PipelineTuningOptions
+        {
+            PlannedItemAdvisoryAuditors = new List<string>(),
+        };
+
+        opts.Validate();
+    }
 }

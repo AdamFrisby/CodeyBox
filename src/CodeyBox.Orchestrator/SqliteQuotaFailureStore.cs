@@ -11,13 +11,15 @@ public sealed class SqliteQuotaFailureStore : IQuotaFailureStore, IDisposable
     private readonly SemaphoreSlim _connectionLock = new(1, 1);
     private readonly SqliteDatabaseWriteGate _lock;
 
-    public SqliteQuotaFailureStore(string path)
+    public SqliteQuotaFailureStore(
+        string path,
+        SqliteDatabaseWriteGateFactory? writeGateFactory = null)
     {
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
         _conn = new SqliteConnection($"Data Source={path}");
-        _lock = SqliteDatabaseWriteGate.ForPath(path);
+        _lock = SqliteDatabaseWriteGateFactory.Resolve(writeGateFactory).ForPath(path);
         _lock.Wait();
         try
         {

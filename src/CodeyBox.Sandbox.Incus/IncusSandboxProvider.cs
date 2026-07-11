@@ -21,9 +21,11 @@ namespace CodeyBox.Sandbox.Incus;
 /// <c>incus-admin</c>, a dedicated non-default Incus project, and a
 /// pre-created ZFS or Btrfs pool. A missing project is created with exact
 /// CodeyBox ownership/schema markers and restrictions; an existing project is
-/// mutated only when those markers and its disabled image/profile features
-/// already match exactly. Low-level VM configuration and VM nesting are
-/// blocked, and empty restricted disk paths are never accepted. The staging
+/// mutated only when those markers, the shared default-project image catalog,
+/// and required
+/// project-owned profile feature already match exactly. Low-level VM
+/// configuration and VM nesting are blocked, and empty restricted disk paths
+/// are never accepted. The staging
 /// directory's canonical non-symlink parent must exist; an existing staging
 /// root additionally requires the provider ownership marker and exact service
 /// ownership/mode. ZFS is strongly recommended for VMs. For the intended I/O
@@ -49,11 +51,10 @@ public sealed class IncusSandboxProvider :
     IActiveSandboxProgressProvider,
     IDiskGuardedSandboxProvider,
     IBaselineImageResolver,
-    IBaselineRefNamespace,
     IBaselineImageProvisioner,
     IResourceMetricsCapturingProvider
 {
-    internal const string ProviderId = "incus";
+    public const string ProviderId = "incus";
     internal const string ManagedKey = "user.codeybox.managed";
     internal const string KindKey = "user.codeybox.kind";
     internal const string CreatedAtKey = "user.codeybox.created_at";
@@ -68,7 +69,6 @@ public sealed class IncusSandboxProvider :
     internal const string SandboxKind = "sandbox";
     internal const string BaselineKind = "baseline";
     internal const string ReadySnapshot = "ready";
-    internal const string BakeCandidatePrefix = "cb-bake-";
 
     private readonly Func<IncusSandboxOptions> _optionsAccessor;
     private readonly ILogger<IncusSandboxProvider> _log;
@@ -91,7 +91,7 @@ public sealed class IncusSandboxProvider :
         ILogger<IncusSandboxProvider> log,
         ITimingStore? timings = null,
         ISandboxResourceUsageStore? resourceUsageStore = null)
-        : this(() => options, log, timings, new DefaultProcessRunner(), resourceUsageStore)
+        : this(() => options, log, timings, new IncusCliProcessRunner(), resourceUsageStore)
     {
     }
 
@@ -100,7 +100,7 @@ public sealed class IncusSandboxProvider :
         ILogger<IncusSandboxProvider> log,
         ITimingStore? timings = null,
         ISandboxResourceUsageStore? resourceUsageStore = null)
-        : this(optionsAccessor, log, timings, new DefaultProcessRunner(), resourceUsageStore)
+        : this(optionsAccessor, log, timings, new IncusCliProcessRunner(), resourceUsageStore)
     {
     }
 
@@ -147,7 +147,9 @@ public sealed class IncusSandboxProvider :
             throw new NotSupportedException("The Incus provider currently supports headless work/audit/merge sandboxes only.");
         ValidateResourceLimits(spec.Limits);
         IncusInputValidation.ValidateAbsoluteGuestPath(spec.WorkingDirectory, nameof(spec.WorkingDirectory));
+        IncusSandbox.ValidateEnvironment(spec.Environment, nameof(spec));
         spec = SandboxConventions.WithTimingEnvironment(spec);
+        IncusSandbox.ValidateEnvironment(spec.Environment, nameof(spec));
         var options = ReadOptions();
         IncusHostIdentity.ValidateHostMountIdentity(options, spec.Mounts);
         await EnsureHostPreflightAsync(options, ct).ConfigureAwait(false);
@@ -316,13 +318,32 @@ public sealed class IncusSandboxProvider :
         return IncusBaselineNaming.DeriveBaselineName(options, profileName, flavor);
     }
 
-    public bool OwnsBaselineRef(string baselineRef)
+    public static bool IsOwnedBaselineRef(
+        IncusSandboxOptions options,
+        string baselineRef)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return IsOwnedBaselineRef(options.BaselineNamePrefix, baselineRef);
+    }
+
+    /// <summary>
+    /// Classifies a baseline reference from namespace configuration alone.
+    /// Invalid or reserved-overlapping dormant-provider configuration is not
+    /// considered an owned namespace and never materializes provider state.
+    /// </summary>
+    public static bool IsOwnedBaselineRef(
+        string? baselineNamePrefix,
+        string baselineRef)
     {
         if (string.IsNullOrWhiteSpace(baselineRef) || baselineRef.Length > 63)
             return false;
         try { IncusInputValidation.ValidateInstanceName(baselineRef, nameof(baselineRef)); }
         catch (ArgumentException) { return false; }
-        var prefix = IncusBaselineNaming.NormalizeEffectivePrefix(ReadOptions());
+        if (!IncusBaselineNaming.TryNormalizeEffectivePrefix(baselineNamePrefix, out var prefix)
+            || IncusBaselineNaming.OverlapsBakeCandidateNamespace(prefix))
+        {
+            return false;
+        }
         if (!baselineRef.StartsWith(prefix, StringComparison.Ordinal))
             return false;
         var tail = baselineRef[prefix.Length..];
@@ -365,7 +386,7 @@ public sealed class IncusSandboxProvider :
     public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
     {
         var options = ReadOptions();
-        var instances = await ProjectExistsAsync(options, ct).ConfigureAwait(false)
+        var instances = await RequireManagedProjectIfPresentAsync(options, ct).ConfigureAwait(false)
             ? await ListInstancesAsync(options, ct).ConfigureAwait(false)
             : [];
         var listed = instances
@@ -401,7 +422,7 @@ public sealed class IncusSandboxProvider :
             throw new InvalidOperationException("Refusing to dispose an Incus sandbox tracked as active.");
         var stagingRoot = ResolveStagingRoot(options);
         var sandboxRoot = Path.Combine(stagingRoot, name);
-        var instance = await ProjectExistsAsync(options, ct).ConfigureAwait(false)
+        var instance = await RequireManagedProjectIfPresentAsync(options, ct).ConfigureAwait(false)
             ? await FindInstanceAsync(options, name, ct).ConfigureAwait(false)
             : null;
         var ownsStaging = IncusMountStaging.EnumerateOwnedTrees(stagingRoot)
@@ -429,7 +450,7 @@ public sealed class IncusSandboxProvider :
     public async Task<IReadOnlyList<BaselineImageInfo>> ListBaselineImagesAsync(CancellationToken ct)
     {
         var options = ReadOptions();
-        if (!await ProjectExistsAsync(options, ct).ConfigureAwait(false))
+        if (!await RequireManagedProjectIfPresentAsync(options, ct).ConfigureAwait(false))
             return [];
         var instances = await ListInstancesAsync(options, ct).ConfigureAwait(false);
         var listed = instances
@@ -449,19 +470,21 @@ public sealed class IncusSandboxProvider :
     {
         var options = ReadOptions();
         IncusInputValidation.ValidateInstanceName(name, nameof(name));
-        var baseline = await FindInstanceAsync(options, name, ct).ConfigureAwait(false);
+        var baseline = await RequireManagedProjectIfPresentAsync(options, ct).ConfigureAwait(false)
+            ? await FindInstanceAsync(options, name, ct).ConfigureAwait(false)
+            : null;
         if (baseline is null && _uncertainBaselines.TryRemove(name, out _))
             return;
         if (baseline is null || !IsOwned(baseline, BaselineKind))
             throw new InvalidOperationException("Refusing to delete a baseline not owned by this Incus provider.");
-        if (name.StartsWith(BakeCandidatePrefix, StringComparison.Ordinal)
+        if (name.StartsWith(IncusBaselineNaming.BakeCandidatePrefix, StringComparison.Ordinal)
             && string.IsNullOrWhiteSpace(GetConfig(baseline.Config, BakeTokenKey)))
             throw new InvalidOperationException("Refusing to delete a bake candidate without its ownership token.");
         await DeleteVerifiedOwnedInstanceAsync(
             options,
             name,
             BaselineKind,
-            name.StartsWith(BakeCandidatePrefix, StringComparison.Ordinal)
+            name.StartsWith(IncusBaselineNaming.BakeCandidatePrefix, StringComparison.Ordinal)
                 ? GetConfig(baseline.Config, BakeTokenKey)
                 : null,
             ct).ConfigureAwait(false);
@@ -717,7 +740,7 @@ public sealed class IncusSandboxProvider :
         var space = document.RootElement.GetProperty("space");
         var total = space.GetProperty("total").GetInt64();
         var used = space.GetProperty("used").GetInt64();
-        var free = Math.Max(0, total - used);
+        var free = CalculateStorageFreeBytes(total, used);
         Interlocked.Exchange(ref _lastPoolFreeBytes, free);
         Volatile.Write(ref _lastPoolName, options.StoragePoolName);
         if (free < guard.MinFreeBytes)
@@ -732,6 +755,16 @@ public sealed class IncusSandboxProvider :
             if (hostFree is { } available && available < guard.MinFreeBytes)
                 throw new SandboxDiskDeferredException(path, available, guard.MinFreeBytes, guard.RecheckIn);
         }
+    }
+
+    internal static long CalculateStorageFreeBytes(long total, long used)
+    {
+        if (total < 0 || used < 0 || used > total)
+        {
+            throw new InvalidOperationException(
+                "Incus storage resource data reported an invalid total/used byte relationship.");
+        }
+        return total - used;
     }
 
     private async Task VerifyBaselinePoolAsync(
@@ -822,6 +855,25 @@ public sealed class IncusSandboxProvider :
             maxStdoutBytes: 64 * 1024,
             maxStderrBytes: 4096).ConfigureAwait(false);
         return IncusProjectSecurity.ParseProjectQuery(result.Stdout, options.ProjectName);
+    }
+
+    private async Task<bool> RequireManagedProjectIfPresentAsync(
+        IncusSandboxOptions options,
+        CancellationToken ct)
+    {
+        if (!await ProjectExistsAsync(options, ct).ConfigureAwait(false))
+            return false;
+
+        // Cold-start inventory and reaping can run before CreateAsync performs
+        // host preflight. Prove the project is the exact dedicated project this
+        // provider would create before any instance-owned metadata is trusted.
+        var project = await ReadProjectSecurityAsync(options, ct).ConfigureAwait(false);
+        IncusProjectSecurity.EnsureDedicatedShape(project);
+        var requiredRoots = IncusProjectSecurity.ResolveRequiredRoots(
+            options,
+            ResolveStagingRootPath(options));
+        IncusProjectSecurity.EnsureCompliant(project, requiredRoots);
+        return true;
     }
 
     private async Task<bool> ProjectExistsAsync(IncusSandboxOptions options, CancellationToken ct)
@@ -1766,7 +1818,7 @@ public sealed class IncusSandboxProvider :
     {
         var baselineHash = Convert.ToHexStringLower(
             System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(baselineName)))[..10];
-        return $"{BakeCandidatePrefix}{baselineHash}-{bakeToken[..20]}";
+        return $"{IncusBaselineNaming.BakeCandidatePrefix}{baselineHash}-{bakeToken[..20]}";
     }
 
     private static string NormalizedPrefix(string prefix) => prefix.ToLowerInvariant();

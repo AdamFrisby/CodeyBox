@@ -12,10 +12,12 @@ internal sealed class IncusSandbox :
     IPreemptibleSandbox,
     IPreserveOnDisposeSandbox,
     IShutdownTeardownSandbox,
-    IProviderOwnedSandbox
+    IProviderOwnedSandbox,
+    IPrivilegedGuestFileHardeningSandbox,
+    IResourceMetricsCapturingSandbox
 {
     private const int MaxExecArguments = 4096;
-    private const int MaxExecEnvironmentEntries = 512;
+    internal const int MaxExecEnvironmentEntries = 512;
     private const int MaxExecArgvUtf8Bytes = 1024 * 1024;
     private const int MaxExecInputUtf8Bytes = 16 * 1024 * 1024;
     private const string ResourceMetricsScript = """
@@ -94,6 +96,7 @@ internal sealed class IncusSandbox :
 
     public string Id { get; }
     public string ProviderId => IncusSandboxProvider.ProviderId;
+    public bool CapturesResourceMetrics => _options.CaptureResourceMetrics;
     public SandboxResourceMetrics? ResourceMetrics { get; private set; }
     public bool IsOwnedByShutdownHandler => Volatile.Read(ref _ownedByShutdownHandler) != 0;
 
@@ -929,14 +932,18 @@ internal sealed class IncusSandbox :
                 maxStdoutBytes: 4096,
                 maxStderrBytes: 4096).ConfigureAwait(false);
             var values = ParseMetrics(result.Stdout);
-            var uptimeSeconds = ParseDouble(values, "uptime");
-            var avgCpuPercent = ParseDouble(values, "cpu");
+            var uptimeSeconds = ParseMetricDouble(values, "uptime", minimumInclusive: 0);
+            var avgCpuPercent = ParseMetricDouble(
+                values,
+                "cpu",
+                minimumInclusive: 0,
+                maximumInclusive: 100);
             var peakRamBytes = ParseLong(values, "peak");
             var rxBytes = ParseLong(values, "rx");
             var txBytes = ParseLong(values, "tx");
-            var load1 = ParseDouble(values, "load1");
-            var load5 = ParseDouble(values, "load5");
-            var load15 = ParseDouble(values, "load15");
+            var load1 = ParseMetricDouble(values, "load1", minimumInclusive: 0);
+            var load5 = ParseMetricDouble(values, "load5", minimumInclusive: 0);
+            var load15 = ParseMetricDouble(values, "load15", minimumInclusive: 0);
             ResourceMetrics = new SandboxResourceMetrics(
                 peakRamBytes,
                 avgCpuPercent,
@@ -993,10 +1000,16 @@ internal sealed class IncusSandbox :
         return result;
     }
 
-    private static double? ParseDouble(IReadOnlyDictionary<string, string> values, string key) =>
+    internal static double? ParseMetricDouble(
+        IReadOnlyDictionary<string, string> values,
+        string key,
+        double minimumInclusive,
+        double? maximumInclusive = null) =>
         values.TryGetValue(key, out var value)
-        && double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)
-            ? parsed
+            ? SandboxResourceMetricValidation.ParseFiniteDouble(
+                value,
+                minimumInclusive,
+                maximumInclusive)
             : null;
 
     private static long? ParseLong(IReadOnlyDictionary<string, string> values, string key) =>
@@ -1009,33 +1022,79 @@ internal sealed class IncusSandbox :
         IReadOnlyDictionary<string, string> baseline,
         IReadOnlyDictionary<string, string>? extra)
     {
-        var result = new Dictionary<string, string>(baseline, StringComparer.Ordinal);
+        ValidateEnvironment(baseline, nameof(baseline));
         if (extra is not null)
-        {
-            foreach (var (key, value) in extra)
-                result[key] = value;
-        }
-        if (result.Count > MaxExecEnvironmentEntries)
-            throw new ArgumentException($"Exec environment exceeds {MaxExecEnvironmentEntries} entries.", nameof(extra));
-        foreach (var (key, value) in result)
-        {
-            if (!IsEnvironmentKey(key) || value.Contains('\0'))
-                throw new ArgumentException($"Exec environment contains an invalid key or NUL value for '{key}'.", nameof(extra));
-        }
+            ValidateEnvironment(extra, nameof(extra));
+
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        AddEntries(baseline);
+        if (extra is not null)
+            AddEntries(extra);
         return result;
+
+        void AddEntries(IReadOnlyDictionary<string, string> source)
+        {
+            foreach (var (key, value) in source)
+            {
+                if (!result.ContainsKey(key) && result.Count >= MaxExecEnvironmentEntries)
+                {
+                    throw new ArgumentException(
+                        $"Exec environment exceeds {MaxExecEnvironmentEntries} unique entries.",
+                        nameof(extra));
+                }
+                result[key] = value;
+            }
+        }
     }
 
-    private static string SerializeEnvironment(IReadOnlyDictionary<string, string> environment)
+    internal static void ValidateEnvironment(
+        IReadOnlyDictionary<string, string> environment,
+        string parameterName)
     {
+        ArgumentNullException.ThrowIfNull(environment);
+        if (environment.Count > MaxExecEnvironmentEntries)
+        {
+            throw new ArgumentException(
+                $"Exec environment exceeds {MaxExecEnvironmentEntries} entries.",
+                parameterName);
+        }
+
+        long bytes = 0;
+        foreach (var (key, value) in environment)
+        {
+            if (key is null || value is null || !IsEnvironmentKey(key) || value.Contains('\0'))
+            {
+                throw new ArgumentException(
+                    "Exec environment contains an invalid key, null entry, or NUL value.",
+                    parameterName);
+            }
+            var entryBytes = (long)Encoding.UTF8.GetByteCount(key)
+                + Encoding.UTF8.GetByteCount(value)
+                + 2;
+            if (entryBytes > MaxExecInputUtf8Bytes - bytes)
+            {
+                throw new ArgumentException(
+                    "Exec environment exceeds the 16 MiB safety bound.",
+                    parameterName);
+            }
+            bytes += entryBytes;
+        }
+    }
+
+    internal static string SerializeEnvironment(IReadOnlyDictionary<string, string> environment)
+    {
+        ValidateEnvironment(environment, nameof(environment));
         var result = new StringBuilder();
-        var bytes = 0;
+        long bytes = 0;
         foreach (var (key, value) in environment.OrderBy(pair => pair.Key, StringComparer.Ordinal))
         {
-            var entry = $"{key}={value}\0";
-            bytes += Encoding.UTF8.GetByteCount(entry);
-            if (bytes > MaxExecInputUtf8Bytes)
+            var entryBytes = (long)Encoding.UTF8.GetByteCount(key)
+                + Encoding.UTF8.GetByteCount(value)
+                + 2;
+            if (entryBytes > MaxExecInputUtf8Bytes - bytes)
                 throw new ArgumentException("Exec environment exceeds the 16 MiB safety bound.", nameof(environment));
-            result.Append(entry);
+            bytes += entryBytes;
+            result.Append(key).Append('=').Append(value).Append('\0');
         }
         return result.ToString();
     }
@@ -1051,20 +1110,23 @@ internal sealed class IncusSandbox :
     {
         if (exec.Argv.Count is < 1 or > MaxExecArguments)
             throw new ArgumentException($"Exec argv must contain between 1 and {MaxExecArguments} arguments.", nameof(exec));
-        var bytes = 0;
+        long bytes = 0;
         for (var index = 0; index < exec.Argv.Count; index++)
         {
             var argument = exec.Argv[index];
-            if (argument.Contains('\0'))
-                throw new ArgumentException($"Exec argv argument {index} contains NUL.", nameof(exec));
-            bytes += Encoding.UTF8.GetByteCount(argument);
-            if (bytes > MaxExecArgvUtf8Bytes)
+            if (argument is null || argument.Contains('\0'))
+                throw new ArgumentException($"Exec argv argument {index} is null or contains NUL.", nameof(exec));
+            var argumentBytes = Encoding.UTF8.GetByteCount(argument);
+            if (argumentBytes > MaxExecArgvUtf8Bytes - bytes)
                 throw new ArgumentException("Exec argv exceeds the 1 MiB safety bound.", nameof(exec));
+            bytes += argumentBytes;
         }
         if (string.IsNullOrEmpty(exec.Argv[0]))
             throw new ArgumentException("Exec executable must not be empty.", nameof(exec));
         if (exec.Stdin is { } stdin && Encoding.UTF8.GetByteCount(stdin) > MaxExecInputUtf8Bytes)
             throw new ArgumentException("Exec stdin exceeds the 16 MiB safety bound.", nameof(exec));
+        if (exec.ExtraEnvironment is not null)
+            ValidateEnvironment(exec.ExtraEnvironment, nameof(exec));
         if (exec.MaxStdoutBytes is <= 0 || exec.MaxStderrBytes is <= 0)
             throw new ArgumentOutOfRangeException(nameof(exec), "Exec output limits must be positive when supplied.");
         if (exec.MaxStdoutBytes > _options.MaxCliStdoutBytes

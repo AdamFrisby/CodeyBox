@@ -671,8 +671,8 @@ public static class AuditLog
     /// Emitted when every candidate (configured primary + class chain) failed
     /// the resolver's pre-dispatch gates, so the pickup-time rebase resolver
     /// could not run at all. The work item is failed with
-    /// <c>failureKind=agent_unavailable</c>; distinct from resolver failures
-    /// where an agent ran but produced an unmergeable answer.
+    /// <c>failureKind=agent_routing_unavailable</c>; distinct from resolver
+    /// failures where an agent ran but produced an unmergeable answer.
     /// <paramref name="candidateReasons"/> carries the per-agent gate reasons
     /// so operators can tell a credential gap from a quota steer.
     /// </summary>
@@ -929,6 +929,48 @@ public static class AuditLog
             .Information(
                 "Work item {WorkItemId} re-enqueued after agent pause change: source={Source} from={RetryFrom}",
                 id.ToString(), source, retryFrom);
+
+    /// <summary>
+    /// Emitted once per agent-restore sweep: the agent's availability
+    /// transitioned from excluded to routable and the sweep evaluated
+    /// candidate infra-failed work items. <paramref name="requeued"/> counts
+    /// items the sweep actually transitioned back to Queued.
+    /// <paramref name="skipped"/> counts evaluated candidate rows that were not
+    /// requeued: final attribution rejects, duplicate idempotency claims,
+    /// retrier guard rejects (for example concurrent state change or an open
+    /// operator question), and retrier exceptions caught so the sweep can keep
+    /// going. Candidates outside the configured store-level cap or never
+    /// returned by the store candidate query are NOT counted. Also emitted
+    /// (with zeros) when
+    /// the sweep is skipped because <c>outageStartedAt</c> is null, so
+    /// operators can tell "feature disabled" (no event) from "no window
+    /// known" (event with outageStartedAt=(unknown)) from "no candidates
+    /// matched" (event with zeros and a real outage start).
+    /// </summary>
+    public static void AgentRestoreRequeueSwept(
+        AgentKind agent,
+        DateTimeOffset? outageStartedAt,
+        DateTimeOffset restoredAt,
+        int requeued,
+        int skipped) =>
+        Audit("agent.restore_requeue_swept")
+            .Information(
+                "Agent {Agent} restored at {RestoredAt}; infra-failure sweep requeued {Requeued} item(s), skipped {Skipped} (outageStartedAt={OutageStartedAt})",
+                agent.Value, restoredAt, requeued, skipped, outageStartedAt?.ToString("O") ?? "(unknown)");
+
+    /// <summary>
+    /// Emitted per work item the agent-restore sweep auto-requeues. Pairs
+    /// with <see cref="AgentRestoreRequeueSwept"/> for per-item traceability.
+    /// </summary>
+    public static void AgentRestoreRequeueItem(
+        WorkItemId id,
+        AgentKind restoredAgent,
+        string? failureKind,
+        string actualFrom) =>
+        Audit("agent.restore_requeue_item")
+            .Information(
+                "Work item {WorkItemId} re-enqueued after {Agent} restore: failureKind={FailureKind} from={From}",
+                id.ToString(), restoredAgent.Value, failureKind ?? "(null)", actualFrom);
 
     // ── Suggestions ─────────────────────────────────────────────────────────
 

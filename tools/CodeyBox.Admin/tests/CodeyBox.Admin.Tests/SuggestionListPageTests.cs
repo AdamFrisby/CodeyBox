@@ -270,7 +270,7 @@ internal sealed class SuggestionCapturingClient : ICodeyBoxApiClient
         => Task.FromResult<WorkItemTimelineDto?>(null);
     public Task<AuditReportsDto?> GetAuditReportsAsync(string workItemId, CancellationToken ct = default)
         => Task.FromResult<AuditReportsDto?>(null);
-    public Task<string?> GetAuditReportRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default)
+    public Task<string?> GetAuditReportRawOutputAsync(string workItemId, string target, int iteration, string auditorName, CancellationToken ct = default)
         => Task.FromResult<string?>(null);
     public Task<WorkItemTimingsDto?> GetWorkItemTimingsAsync(string id, CancellationToken ct = default)
         => Task.FromResult<WorkItemTimingsDto?>(null);
@@ -388,7 +388,7 @@ internal sealed class SuggestionFakeClient : ICodeyBoxApiClient
         => Task.FromResult<WorkItemTimelineDto?>(null);
     public Task<AuditReportsDto?> GetAuditReportsAsync(string workItemId, CancellationToken ct = default)
         => Task.FromResult<AuditReportsDto?>(null);
-    public Task<string?> GetAuditReportRawOutputAsync(string workItemId, int iteration, string auditorName, CancellationToken ct = default)
+    public Task<string?> GetAuditReportRawOutputAsync(string workItemId, string target, int iteration, string auditorName, CancellationToken ct = default)
         => Task.FromResult<string?>(null);
     public Task<WorkItemTimingsDto?> GetWorkItemTimingsAsync(string id, CancellationToken ct = default)
         => Task.FromResult<WorkItemTimingsDto?>(null);

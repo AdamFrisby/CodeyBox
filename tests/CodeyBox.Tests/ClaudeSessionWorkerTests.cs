@@ -119,7 +119,7 @@ public sealed class ClaudeSessionWorkerTests
     [Fact]
     public async Task SuspendThenResume_StopsAndResumesVmBetweenTurns()
     {
-        var sandbox = new PreemptibleScriptedSandbox(
+        var sandbox = new SuspendablePreemptibleScriptedSandbox(
             StreamJsonFirstTurn("cli-sess-stop"),
             StreamJsonSecondTurn("cli-sess-stop"));
         var resumeHookCalled = 0;
@@ -129,11 +129,7 @@ public sealed class ClaudeSessionWorkerTests
             {
                 Interlocked.Increment(ref resumeHookCalled);
                 return Task.CompletedTask;
-            },
-            sandboxRefFactory: static sandbox => new AgentSessionSandboxRef(
-                sandbox.Id,
-                HotSwappableSandboxProvider.MultipassProviderId),
-            sandboxResumeUnsupportedReason: AgentSessionSandboxRouting.GetMultipassResumeUnsupportedReason);
+            });
 
         var handle = await worker.OpenSessionAsync(sandbox, "/work", credential: null);
         await worker.SendTurnAsync(handle, "first");
@@ -153,35 +149,31 @@ public sealed class ClaudeSessionWorkerTests
     }
 
     [Fact]
-    public async Task IncusSession_ResumeUnsupported_FailsBeforeStopOrMultipassHook()
+    public async Task NonSuspendableSandbox_ResumeUnsupported_FailsBeforeStopOrResumeHook()
     {
         var sandbox = new PreemptibleScriptedSandbox(
             StreamJsonFirstTurn("cli-incus-running"),
             StreamJsonSecondTurn("cli-incus-running"));
-        var multipassResumeCalls = 0;
+        var resumeCalls = 0;
         var worker = new ClaudeSessionWorker(
             BuildRunner(),
             sandboxResumeHook: (_, _) =>
             {
-                Interlocked.Increment(ref multipassResumeCalls);
+                Interlocked.Increment(ref resumeCalls);
                 return Task.CompletedTask;
-            },
-            sandboxRefFactory: static current => new AgentSessionSandboxRef(
-                current.Id,
-                HotSwappableSandboxProvider.IncusProviderId),
-            sandboxResumeUnsupportedReason: AgentSessionSandboxRouting.GetMultipassResumeUnsupportedReason);
+            });
 
         var handle = await worker.OpenSessionAsync(sandbox, "/work", credential: null);
         await worker.SendTurnAsync(handle, "first");
 
         var suspendFailure = await Assert.ThrowsAsync<NotSupportedException>(
             () => worker.SuspendSessionAsync(handle));
-        Assert.Contains("Incus", suspendFailure.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("stopped-session resume", suspendFailure.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(0, sandbox.StopCallCount);
 
         await Assert.ThrowsAsync<NotSupportedException>(
             () => worker.ResumeSessionAsync(handle));
-        Assert.Equal(0, multipassResumeCalls);
+        Assert.Equal(0, resumeCalls);
 
         // The failed suspension made no transport or sandbox state transition;
         // the still-running session remains usable until the caller chooses a
@@ -195,7 +187,7 @@ public sealed class ClaudeSessionWorkerTests
     [Fact]
     public async Task TurnWhileSuspended_ThrowsClearError()
     {
-        var sandbox = new PreemptibleScriptedSandbox(StreamJsonFirstTurn("cli-sess-blocked"));
+        var sandbox = new SuspendablePreemptibleScriptedSandbox(StreamJsonFirstTurn("cli-sess-blocked"));
         var worker = new ClaudeSessionWorker(BuildRunner());
 
         var handle = await worker.OpenSessionAsync(sandbox, "/work", credential: null);
@@ -657,7 +649,7 @@ public sealed class ClaudeSessionWorkerTests
         }
     }
 
-    private sealed class PreemptibleScriptedSandbox : ScriptedSandbox, IPreemptibleSandbox
+    private class PreemptibleScriptedSandbox : ScriptedSandbox, IPreemptibleSandbox
     {
         public int StopCallCount { get; private set; }
         public PreemptibleScriptedSandbox(params string[] agentStdouts) : base(agentStdouts) { }
@@ -668,10 +660,23 @@ public sealed class ClaudeSessionWorkerTests
         }
     }
 
+    private sealed class SuspendablePreemptibleScriptedSandbox :
+        PreemptibleScriptedSandbox,
+        ISuspendableSandbox
+    {
+        public SuspendablePreemptibleScriptedSandbox(params string[] agentStdouts)
+            : base(agentStdouts)
+        {
+        }
+
+        public Task SuspendAsync(CancellationToken ct = default) => Task.CompletedTask;
+    }
+
     private sealed class PreserveOnDisposeScriptedSandbox :
         ScriptedSandbox,
         IPreemptibleSandbox,
-        IPreserveOnDisposeSandbox
+        IPreserveOnDisposeSandbox,
+        ISuspendableSandbox
     {
         private bool _preserveOnDispose;
         public int StopCallCount { get; private set; }
@@ -686,6 +691,8 @@ public sealed class ClaudeSessionWorkerTests
             _preserveOnDispose = true;
             return Task.CompletedTask;
         }
+
+        public Task SuspendAsync(CancellationToken ct = default) => Task.CompletedTask;
 
         public void DisablePreserveOnDispose()
         {

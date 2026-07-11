@@ -183,7 +183,8 @@ public sealed record AuditCompletedDetails
 
 /// <summary>
 /// Details payload for <c>work_item.needs_operator_input</c> when the audit
-/// loop reaches its iteration ceiling while still showing progress.
+/// loop parks with audit history that an operator should inspect, including
+/// iteration-ceiling-with-progress and genuine empty-rework parks.
 /// </summary>
 public sealed record AuditMaxIterationsEscalationDetails
 {

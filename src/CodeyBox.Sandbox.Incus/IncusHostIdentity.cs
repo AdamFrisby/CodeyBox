@@ -13,7 +13,19 @@ internal static partial class IncusHostIdentity
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(mounts);
-        if (!mounts.Any(static mount => mount.HostPath is not null))
+        if (mounts.Count > IncusMountStaging.MaximumMounts)
+        {
+            throw new InvalidOperationException(
+                $"An Incus sandbox cannot have more than {IncusMountStaging.MaximumMounts} mounts.");
+        }
+        var hasHostMount = false;
+        foreach (var mount in mounts)
+        {
+            if (mount is null)
+                throw new InvalidOperationException("Incus sandbox mounts cannot contain null entries.");
+            hasHostMount |= mount.HostPath is not null;
+        }
+        if (!hasHostMount)
             return;
         if (options.GuestUserId != effectiveUserId || options.GuestGroupId != effectiveGroupId)
         {

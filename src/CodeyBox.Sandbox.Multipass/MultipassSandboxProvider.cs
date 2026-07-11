@@ -47,9 +47,9 @@ namespace CodeyBox.Sandbox.Multipass;
 /// on first boot, OR build a Multipass image with agents pre-installed
 /// and reference it via <see cref="SandboxSpec.ImageReference"/>.</para>
 /// </summary>
-public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IActiveSandboxProgressProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineRefNamespace, IBaselineImageProvisioner, IResourceMetricsCapturingProvider
+public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IActiveSandboxProgressProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner, IResourceMetricsCapturingProvider
 {
-    internal const string ProviderId = "multipass";
+    public const string ProviderId = "multipass";
     // Options are resolved through a delegate once per public operation so an
     // operator can edit ExtraRuncmd / ExtraCloudInit / NetworkProfiles /
     // UseBaselineImages in appsettings.json and have the change land on the next
@@ -1505,11 +1505,7 @@ git push origin HEAD:{refName}";
         return baselineName;
     }
 
-    /// <inheritdoc/>
-    public bool OwnsBaselineRef(string baselineRef) =>
-        IsOwnedBaselineRef(ReadOptions(), baselineRef);
-
-    internal static bool IsOwnedBaselineRef(MultipassSandboxOptions options, string baselineRef)
+    public static bool IsOwnedBaselineRef(MultipassSandboxOptions options, string baselineRef)
     {
         ArgumentNullException.ThrowIfNull(options);
         if (string.IsNullOrEmpty(baselineRef) || baselineRef.Length > 24)
@@ -5260,7 +5256,7 @@ public sealed record MultipassDiskGuardOptions
     public TimeSpan RecheckIn { get; init; } = TimeSpan.FromMinutes(5);
 }
 
-internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDisposeSandbox, ISuspendableSandbox, IShutdownTeardownSandbox, IProviderOwnedSandbox
+internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDisposeSandbox, ISuspendableSandbox, IShutdownTeardownSandbox, IProviderOwnedSandbox, IPrivilegedGuestFileHardeningSandbox, IResourceMetricsCapturingSandbox
 {
     internal const int ArgvBytesWarningThreshold = 64 * 1024;
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
@@ -5413,6 +5409,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
     public string Id { get; }
     public string ProviderId => MultipassSandboxProvider.ProviderId;
+    public bool CapturesResourceMetrics => _opts.CaptureResourceMetrics;
 
     internal ActiveSandboxProgress SnapshotActiveProgress(WorkItemId workItemId)
     {
@@ -6322,6 +6319,16 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         return sb.ToString();
     }
 
+    // The optional elapsed-time file is a cross-process clock seam that drives
+    // ONLY the process-group marker deadline (codeybox_now_seconds). Tests
+    // atomically rename it to advance virtual time after observing a child
+    // signal, so the timeout branch fires deterministically instead of racing a
+    // real wall-clock deadline under parallel load. Production omits it and
+    // retains Bash's monotonic SECONDS clock. It is deliberately the single
+    // reader of this file — the HTTP-readiness probe keeps its own real timeout
+    // so no second component reimplements clock parsing. Poll/grace delays stay
+    // real `sleep`s regardless of mode: they are short, bounded latency, not
+    // deadlines, so they never flake and keep the SIGTERM→SIGKILL grace genuine.
     internal static string BuildDetachedLaunchScript(
         string envFile,
         string processGroupMarker,
@@ -6329,7 +6336,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         IReadOnlyList<string> command,
         int launchLockAttempts = 300,
         string? exitTokenFile = null,
-        int markerWaitSeconds = 30)
+        int markerWaitSeconds = 30,
+        string? virtualElapsedSecondsFile = null)
     {
         if (launchLockAttempts < 0)
             throw new ArgumentOutOfRangeException(nameof(launchLockAttempts), "Launch lock attempts must be non-negative.");
@@ -6381,8 +6389,28 @@ while True:
         sb.Append("codeybox_exit_token_file=").Append(MultipassSandboxProvider.ShellSingleQuote(exitTokenFile ?? "")).Append('\n');
         sb.Append("codeybox_lock_max=").Append(launchLockAttempts.ToString(CultureInfo.InvariantCulture)).Append('\n');
         sb.Append("codeybox_marker_wait_seconds=").Append(markerWaitSeconds.ToString(CultureInfo.InvariantCulture)).Append('\n');
+        sb.Append("codeybox_virtual_elapsed_seconds_file=")
+            .Append(MultipassSandboxProvider.ShellSingleQuote(virtualElapsedSecondsFile ?? ""))
+            .Append('\n');
         sb.AppendLine("codeybox_supervisor_dir=$(dirname \"$codeybox_pgid_marker\")");
         sb.AppendLine("codeybox_lock_dir=\"$codeybox_pgid_marker.lock\"");
+        // Elapsed-seconds clock for the marker deadline. Reads $SECONDS in
+        // production; in test/virtual mode reads the atomically-renamed clock
+        // file. The value is capped at 10 digits so the later $((...)) deadline
+        // arithmetic can never overflow bash's signed 64-bit integer range.
+        sb.AppendLine("codeybox_now_seconds() {");
+        sb.AppendLine("    if [ -z \"$codeybox_virtual_elapsed_seconds_file\" ]; then");
+        sb.AppendLine("        printf '%s\\n' \"$SECONDS\"");
+        sb.AppendLine("        return 0");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    local codeybox_virtual_now");
+        sb.AppendLine("    IFS= read -r -n 11 codeybox_virtual_now < \"$codeybox_virtual_elapsed_seconds_file\" || return 1");
+        sb.AppendLine("    case \"$codeybox_virtual_now\" in");
+        sb.AppendLine("        ''|*[!0-9]*) return 1 ;;");
+        sb.AppendLine("    esac");
+        sb.AppendLine("    if [ \"${#codeybox_virtual_now}\" -gt 10 ]; then return 1; fi");
+        sb.AppendLine("    printf '%s\\n' \"$codeybox_virtual_now\"");
+        sb.AppendLine("}");
         sb.AppendLine("codeybox_root_sh() {");
         sb.AppendLine("    local codeybox_script=\"$1\"");
         sb.AppendLine("    shift");
@@ -6459,6 +6487,13 @@ while True:
         // environment, is a separate work-item preemption hint and is left
         // untouched by this output-transport scrub.
         sb.AppendLine("unset CODEYBOX_AGENT_OUTPUT_URL CODEYBOX_AGENT_OUTPUT_TOKEN CODEYBOX_AGENT_OUTPUT_EXIT_TOKEN CODEYBOX_AGENT_OUTPUT_RUN_ID");
+        // HTTP-readiness preflight. This owns its OWN real timeout (socket
+        // timeout + SIGALRM backstop) and never reads the virtual clock, so the
+        // marker-deadline clock has a single reader. Its outcome is already
+        // deterministic under test: a listener that accepts but never sends a
+        // ready response makes opener.open time out at exactly `timeout=1.0`
+        // regardless of host load, so tests assert exit 86 off that internal
+        // deadline, not a host-scheduling race.
         sb.AppendLine("codeybox_http_ready() {");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_URL=\"$codeybox_output_url\" \\");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_TOKEN=\"$codeybox_output_token\" \\");
@@ -6481,7 +6516,6 @@ while True:
         sb.AppendLine("    data=b'',");
         sb.AppendLine("    method='POST',");
         sb.AppendLine("    headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/octet-stream'})");
-        sb.AppendLine("opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))");
         sb.AppendLine("try:");
         sb.AppendLine("    with opener.open(req, timeout=1.0) as resp:");
         sb.AppendLine("        code = resp.getcode()");
@@ -6675,12 +6709,46 @@ while True:
         sb.AppendLine();
         sb.AppendLine(") &");
         sb.AppendLine("codeybox_detached_pid=$!");
-        sb.AppendLine("codeybox_marker_deadline=$((SECONDS + codeybox_marker_wait_seconds))");
+        // Deadline structure: launch_deadline is a real-clock backstop for the
+        // case where the child never publishes its pgid file (e.g. the launcher
+        // exits early). Once the child_pgid_file appears (or launch_deadline
+        // elapses), marker_deadline arms on the virtual clock so tests can
+        // advance it deterministically. launch_deadline stays on $SECONDS
+        // because virtual time is pinned at 0 on success paths — a virtualised
+        // launch_deadline would never fire, leaving the "child never wrote its
+        // pgid" fallback branch untestable.
+        //
+        // marker_baseline is the virtual instant sampled ONCE here, before the
+        // detached child can publish its pgid file, so the marker deadline is
+        // baseline+wait rather than (now-at-arming)+wait. Sampling at arming
+        // time raced a test that advances the virtual clock the moment it sees
+        // the child's readiness file: if the advance landed before the arming
+        // read, the deadline armed to (advanced_now)+wait and never fired,
+        // hanging the launcher until the watchdog. Anchoring to a pre-child
+        // baseline makes the armed deadline independent of when the supervisor
+        // happens to read the clock. In production (no virtual file) the sample
+        // is $SECONDS, so the marker deadline still lands wait seconds after
+        // launch.
+        sb.AppendLine("codeybox_launch_deadline=$((SECONDS + codeybox_marker_wait_seconds))");
+        sb.AppendLine("codeybox_marker_baseline=$(codeybox_now_seconds)");
+        sb.AppendLine("case \"$codeybox_marker_baseline\" in");
+        sb.AppendLine("    ''|*[!0-9]*) codeybox_marker_baseline=0 ;;");
+        sb.AppendLine("esac");
+        sb.AppendLine("codeybox_marker_deadline=");
         sb.AppendLine("while ! codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; do");
         sb.AppendLine("    if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
         sb.AppendLine("        break");
         sb.AppendLine("    fi");
-        sb.AppendLine("    if [ \"$SECONDS\" -ge \"$codeybox_marker_deadline\" ]; then");
+        sb.AppendLine("    if codeybox_report_child_status_if_present; then");
+        sb.AppendLine("        :");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    if [ -z \"$codeybox_marker_deadline\" ] && [ -s \"$codeybox_child_pgid_file\" ]; then");
+        sb.AppendLine("        codeybox_marker_deadline=$((codeybox_marker_baseline + codeybox_marker_wait_seconds))");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    if [ -z \"$codeybox_marker_deadline\" ] && [ \"$SECONDS\" -ge \"$codeybox_launch_deadline\" ]; then");
+        sb.AppendLine("        codeybox_marker_deadline=$(codeybox_now_seconds)");
+        sb.AppendLine("    fi");
+        sb.AppendLine("    if [ -n \"$codeybox_marker_deadline\" ] && [ \"$(codeybox_now_seconds)\" -ge \"$codeybox_marker_deadline\" ]; then");
         sb.AppendLine("        if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
         sb.AppendLine("            break");
         sb.AppendLine("        fi");
@@ -6695,12 +6763,29 @@ while True:
         sb.AppendLine("        if kill -0 \"-$codeybox_detached_pgid\" 2>/dev/null; then");
         sb.AppendLine("            kill -KILL \"-$codeybox_detached_pgid\" 2>/dev/null || true");
         sb.AppendLine("        fi");
-        sb.AppendLine("        kill -KILL \"$codeybox_detached_pid\" 2>/dev/null || true");
-        sb.AppendLine("        if ! kill -0 \"$codeybox_detached_pid\" 2>/dev/null; then");
-        sb.AppendLine("            set +e");
-        sb.AppendLine("            wait \"$codeybox_detached_pid\" 2>/dev/null");
-        sb.AppendLine("            set -e");
+        sb.AppendLine("        codeybox_kill_i=0");
+        sb.AppendLine("        while kill -0 \"-$codeybox_detached_pgid\" 2>/dev/null && [ \"$codeybox_kill_i\" -lt 20 ]; do");
+        sb.AppendLine("            sleep 0.05");
+        sb.AppendLine("            codeybox_kill_i=$((codeybox_kill_i + 1))");
+        sb.AppendLine("        done");
+        sb.AppendLine("        if kill -0 \"$codeybox_detached_pid\" 2>/dev/null; then");
+        sb.AppendLine("            kill -TERM \"$codeybox_detached_pid\" 2>/dev/null || true");
+        sb.AppendLine("            codeybox_launcher_term_i=0");
+        sb.AppendLine("            while kill -0 \"$codeybox_detached_pid\" 2>/dev/null && [ \"$codeybox_launcher_term_i\" -lt 20 ]; do");
+        sb.AppendLine("                sleep 0.05");
+        sb.AppendLine("                codeybox_launcher_term_i=$((codeybox_launcher_term_i + 1))");
+        sb.AppendLine("            done");
+        sb.AppendLine("            if kill -0 \"$codeybox_detached_pid\" 2>/dev/null; then");
+        sb.AppendLine("                kill -KILL \"$codeybox_detached_pid\" 2>/dev/null || true");
+        sb.AppendLine("            fi");
         sb.AppendLine("        fi");
+        sb.AppendLine("        set +e");
+        sb.AppendLine("        if ! kill -0 \"$codeybox_detached_pid\" 2>/dev/null; then");
+        sb.AppendLine("            wait \"$codeybox_detached_pid\" 2>/dev/null");
+        sb.AppendLine("        else");
+        sb.AppendLine("            disown \"$codeybox_detached_pid\" 2>/dev/null || true");
+        sb.AppendLine("        fi");
+        sb.AppendLine("        set -e");
         sb.AppendLine("        echo \"codeybox-detached: timed out waiting for process group marker\" >&2");
         sb.AppendLine($"        exit {DetachedSupervisorSetupFailedExitCode}");
         sb.AppendLine("    fi");
@@ -6714,7 +6799,7 @@ while True:
         sb.AppendLine("        if codeybox_root_sh 'test -f \"$1\"' \"$codeybox_pgid_marker\"; then");
         sb.AppendLine("            break");
         sb.AppendLine("        fi");
-        sb.AppendLine("        if [ ! -s \"$codeybox_child_pgid_file\" ] && [ \"$SECONDS\" -lt \"$codeybox_marker_deadline\" ]; then");
+        sb.AppendLine("        if [ ! -s \"$codeybox_child_pgid_file\" ] && [ \"$SECONDS\" -lt \"$codeybox_launch_deadline\" ]; then");
         sb.AppendLine("            sleep 0.1");
         sb.AppendLine("            continue");
         sb.AppendLine("        fi");
@@ -7327,17 +7412,18 @@ while True:
 
         try
         {
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            cts.CancelAfter(ResolveResourceMetricsCaptureTimeout(_opts));
+            var timeout = ResolveResourceMetricsCaptureTimeout(_opts);
+            using var captureCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            captureCts.CancelAfter(timeout);
 
             await using var captureScope = await TimingScope.BeginAsync(
                 _timings, _timingItemId, _timingPhase, "vm.resource_capture", log: _log);
-            var metrics = await CaptureResourceMetricsAsync(cts.Token).ConfigureAwait(false);
+            var metrics = await CaptureResourceMetricsAsync(captureCts.Token).ConfigureAwait(false);
             if (metrics is null)
                 return null;
 
             _resourceMetrics = metrics;
-            await TryPersistResourceMetricsAsync(metrics, cts.Token).ConfigureAwait(false);
+            await TryPersistResourceMetricsAsync(metrics, timeout, ct).ConfigureAwait(false);
             SandboxResourceMetricsTelemetry.Record(metrics);
             return metrics;
         }
@@ -7461,11 +7547,13 @@ while True:
         return HasRequiredResourceMetrics(metrics) ? metrics : null;
     }
 
-    private async Task TryPersistResourceMetricsAsync(SandboxResourceMetrics metrics, CancellationToken ct)
+    private async Task TryPersistResourceMetricsAsync(SandboxResourceMetrics metrics, TimeSpan timeout, CancellationToken ct)
     {
         try
         {
-            await PersistResourceMetricsAsync(metrics, ct).WaitAsync(ct).ConfigureAwait(false);
+            using var persistCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            persistCts.CancelAfter(timeout);
+            await PersistResourceMetricsAsync(metrics, persistCts.Token).WaitAsync(persistCts.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -7531,13 +7619,7 @@ while True:
     {
         if (!values.TryGetValue(key, out var raw) || string.IsNullOrWhiteSpace(raw))
             return null;
-        if (!double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
-            return null;
-        if (double.IsNaN(value) || double.IsInfinity(value) || value < min)
-            return null;
-        if (max.HasValue && value > max.Value)
-            return null;
-        return value;
+        return SandboxResourceMetricValidation.ParseFiniteDouble(raw, min, max);
     }
 
     private static double? BytesToMb(long? bytes) =>

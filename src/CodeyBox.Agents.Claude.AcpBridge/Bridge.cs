@@ -19,6 +19,16 @@ namespace CodeyBox.Agents.Claude.AcpBridge;
 /// </summary>
 internal sealed class Bridge : IAsyncDisposable
 {
+    private const int SignalHangup = 1;
+    private const int SignalInterrupt = 2;
+    private const int SignalKill = 9;
+    private const int SignalTerm = 15;
+    private const int ClaudeSigtermGraceMilliseconds = 1500;
+    private const int ClaudeSigkillWaitMilliseconds = 500;
+    // Starts after Shutdown has already run; this is only the final grace for
+    // a signal-interrupted stdin read to unwind cooperatively.
+    private const int SignalForceExitGraceMilliseconds = 2500;
+
     private readonly CancellationTokenSource _cts = new();
     private readonly Func<TcpListener> _listenerFactory;
     private readonly Func<TcpClient, Process?, bool> _peerAuthorizer;
@@ -689,12 +699,10 @@ internal sealed class Bridge : IAsyncDisposable
 
     /// <summary>
     /// Single-fire claude_exit emission. The monitor task calls this when the
-    /// claude process exits naturally; Shutdown can also call it directly when
-    /// it terminates the process so the envelope lands before background tasks
-    /// have a chance to be cancelled (and so a fast-exiting stub can never
-    /// drop the envelope because the monitor task hadn't yet started parking
-    /// on WaitForExitAsync). The Interlocked guard makes the second caller a
-    /// no-op so duplicates can't be emitted.
+    /// claude process exits naturally; Shutdown can also call it directly after
+    /// it terminates and waits for the process so the envelope lands before
+    /// background tasks are cancelled. The Interlocked guard makes the second
+    /// caller a no-op so duplicates can't be emitted.
     /// </summary>
     private void EmitClaudeExitOnce(Process proc)
     {
@@ -717,10 +725,10 @@ internal sealed class Bridge : IAsyncDisposable
         if (OperatingSystem.IsWindows()) return null;
         return (exitCode - 128) switch
         {
-            1 => "SIGHUP",
-            2 => "SIGINT",
-            9 => "SIGKILL",
-            15 => "SIGTERM",
+            SignalHangup => "SIGHUP",
+            SignalInterrupt => "SIGINT",
+            SignalKill => "SIGKILL",
+            SignalTerm => "SIGTERM",
             _ => null,
         };
     }
@@ -754,31 +762,47 @@ internal sealed class Bridge : IAsyncDisposable
         if (Interlocked.Exchange(ref _shutdownState, 1) != 0) return;
         _exitCode = code;
         try { _turnDeadline?.Dispose(); } catch { }
+
+        // CRITICAL: Delete the lockfile first to prevent any leak if we get terminated early.
+        if (_lockPath is not null)
+        {
+            try
+            {
+                File.Delete(_lockPath);
+            }
+            catch (Exception ex)
+            {
+                Emitter.Emit("lockfile_delete_failed", w =>
+                {
+                    w.WriteString("path", _lockPath);
+                    w.WriteString("exception", ex.GetType().FullName);
+                    w.WriteString("message", ex.Message);
+                });
+            }
+        }
+
+        // Clean up connections and streams to immediately unblock the main thread's stdin read
+        WebSocketConnection? peerToClose;
+        lock (_pendingLock) peerToClose = _peer;
+        try { peerToClose?.Close(); } catch { }
+        try { _listener?.Stop(); } catch { }
+        try { _stdinStream?.Dispose(); } catch { }
+
+        // Terminate the Claude child, then emit claude_exit only after a real
+        // process exit code is available. Emitting before the wait turns a live
+        // child into code -1 and blocks the later true status via the
+        // single-fire guard.
         try
         {
             if (_claudeProcess is { } p)
             {
                 if (!HasProcessExited(p)) TerminateClaudeProcess(p);
-                // Emit claude_exit BEFORE cancelling _cts. The monitor task
-                // also calls this on its WaitForExitAsync completion, but
-                // emitting it here while we're still on the cleanup path
-                // means a host-side observer sees claude_exit before
-                // peer_closed / process teardown, and it lands deterministic-
-                // ally before the test's emitter scope can be disposed (the
-                // monitor task may not have a chance to wake up before the
-                // CTS cancel propagates). EmitClaudeExitOnce is single-fire,
-                // so the monitor task's later call is a no-op.
-                EmitClaudeExitOnce(p);
+                if (HasProcessExited(p)) EmitClaudeExitOnce(p);
             }
         }
         catch { }
-        WebSocketConnection? peerToClose;
-        lock (_pendingLock) peerToClose = _peer;
-        try { peerToClose?.Close(); } catch { }
-        try { _listener?.Stop(); } catch { }
-        try { if (_lockPath is not null) File.Delete(_lockPath); } catch { }
+
         try { _cts.Cancel(); } catch { }
-        try { _stdinStream?.Dispose(); } catch { }
     }
 
     private static bool HasProcessExited(Process proc)
@@ -825,8 +849,7 @@ internal sealed class Bridge : IAsyncDisposable
         {
             try
             {
-                // SIGTERM = 15 on Linux.
-                politeSent = NativeMethods.Kill(pid, 15) == 0;
+                politeSent = NativeMethods.Kill(pid, SignalTerm) == 0;
             }
             catch { politeSent = false; }
         }
@@ -837,7 +860,7 @@ internal sealed class Bridge : IAsyncDisposable
             // before exiting. 1.5s is well under any operator-visible
             // teardown latency while comfortably covering the JSONL flush
             // path; if claude is wedged we still SIGKILL below.
-            try { p.WaitForExit(milliseconds: 1500); }
+            try { p.WaitForExit(milliseconds: ClaudeSigtermGraceMilliseconds); }
             catch { /* WaitForExit can throw if the handle is racing dispose */ }
         }
 
@@ -851,7 +874,7 @@ internal sealed class Bridge : IAsyncDisposable
             // wedged. Fall back to the original SIGKILL behaviour so a
             // hung child can never pin shutdown.
             try { p.Kill(entireProcessTree: true); } catch { }
-            try { p.WaitForExit(milliseconds: 500); } catch { }
+            try { p.WaitForExit(milliseconds: ClaudeSigkillWaitMilliseconds); } catch { }
         }
     }
 
@@ -870,7 +893,7 @@ internal sealed class Bridge : IAsyncDisposable
     {
         _ = Task.Run(async () =>
         {
-            try { await Task.Delay(1500).ConfigureAwait(false); }
+            try { await Task.Delay(SignalForceExitGraceMilliseconds).ConfigureAwait(false); }
             catch { }
             try { _forceExit(_exitCode); }
             catch { }

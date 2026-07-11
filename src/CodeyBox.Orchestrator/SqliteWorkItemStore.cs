@@ -19,27 +19,39 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     };
     private readonly SqliteConnection _conn;
     private readonly string _connectionString;
+    private readonly string _dbPath;
     private readonly Serilog.ILogger _auditLogger;
+    private readonly SqliteDatabaseWriteGateFactory _writeGateFactory;
     // Also guards buffered reads on this store instance: Microsoft.Data.Sqlite
     // connections are not safe for overlapping commands from dispatcher and
     // worker tasks, even when WAL permits file-level read/write concurrency.
     private readonly SqliteDatabaseWriteGate _writeLock;
     private int _disposed;
 
-    public SqliteWorkItemStore(string path, Serilog.ILogger? auditLogger = null)
+    public SqliteWorkItemStore(
+        string path,
+        Serilog.ILogger? auditLogger = null,
+        SqliteDatabaseWriteGateFactory? writeGateFactory = null)
     {
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
+        _dbPath = path;
         _connectionString = $"Data Source={path}";
         _conn = new SqliteConnection(_connectionString);
         _auditLogger = auditLogger ?? Serilog.Log.Logger;
-        _writeLock = SqliteDatabaseWriteGate.ForPath(path);
-        _writeLock.Wait();
+        _writeGateFactory = SqliteDatabaseWriteGateFactory.Resolve(writeGateFactory);
+        _writeLock = _writeGateFactory.ForPath(path);
+        var lockHeld = false;
+        var initialized = false;
         try
         {
+            _writeLock.Wait();
+            lockHeld = true;
             _conn.Open();
             RegisterQuotaRetryPhaseFunctions(_conn);
+            RegisterAgentInvolvementFailureFunction(_conn);
+            RegisterRestoreRetryEligibilityFunction(_conn);
 
             // WAL mode allows concurrent readers; SqliteDatabaseWriteGate serializes writers in-process.
             // busy_timeout is per-connection and gives external lock holders a retry window.
@@ -74,6 +86,22 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 CREATE INDEX IF NOT EXISTS idx_work_items_project ON work_items(project_id);
                 """;
             cmd.ExecuteNonQuery();
+
+            using (var restoreClaimCmd = _conn.CreateCommand())
+            {
+                restoreClaimCmd.CommandText = """
+                    CREATE TABLE IF NOT EXISTS agent_restore_retry_claims (
+                        work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                        restored_agent TEXT NOT NULL,
+                        outage_started_at TEXT NOT NULL,
+                        restored_at TEXT NOT NULL,
+                        claimed_at TEXT NOT NULL,
+                        PRIMARY KEY (work_item_id, restored_agent, outage_started_at)
+                    );
+                    """;
+                restoreClaimCmd.ExecuteNonQuery();
+            }
+            ReconcileAgentRestoreRetryClaimsKey();
 
             // Additive migration: add depends_on_json column if it doesn't exist yet.
             // Existing rows get the default '[]' so behaviour is unchanged.
@@ -162,6 +190,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
 
             // Additive migration: capture failure details for auto-retry logic.
             RunMigration("ALTER TABLE work_items ADD COLUMN failure_kind TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN auth_failure_scope TEXT;");
+            RunMigration("CREATE INDEX IF NOT EXISTS idx_work_items_restore_retry_candidates ON work_items(state, failure_kind, updated_at, created_at);");
             RunMigration("ALTER TABLE work_items ADD COLUMN quota_reset_at TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN next_quota_retry_at TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN quota_retry_attempts INTEGER NOT NULL DEFAULT 0;");
@@ -330,6 +360,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             RunMigration("ALTER TABLE work_items ADD COLUMN plan_generated_at TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN plan_reviewed_at TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN plan_review_summary TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN plan_review_attempts INTEGER NOT NULL DEFAULT 0;");
 
             // Per-iteration dispatch record. One row per (work_item_id, iteration);
             // most-recent-dispatch-wins — a re-dispatch (e.g. orchestrator
@@ -387,13 +418,20 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     SELECT id, project_id, 'legacy', external_id
                     FROM work_items
                     WHERE external_id IS NOT NULL;
-                    """;
+                """;
                 backfill.ExecuteNonQuery();
             }
+            initialized = true;
         }
         finally
         {
-            _writeLock.Release();
+            if (lockHeld)
+                _writeLock.Release();
+            if (!initialized)
+            {
+                _conn.Dispose();
+                _writeLock.Dispose();
+            }
         }
     }
 
@@ -403,6 +441,44 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             "codeybox_quota_retry_dispatch_ordering_state",
             QuotaRetryPhasePolicy.OrderingStateForQuotaRetryCandidate,
             isDeterministic: true);
+    }
+
+    private static void RegisterAgentInvolvementFailureFunction(SqliteConnection conn)
+    {
+        conn.CreateFunction<string?, int>(
+            "codeybox_agent_involvement_is_failure",
+            static outcome => AgentInvolvementOutcomes.IsFailure(outcome) ? 1 : 0,
+            isDeterministic: true);
+    }
+
+    private void ReconcileAgentRestoreRetryClaimsKey()
+    {
+        using var tx = _conn.BeginTransaction();
+        using (var dedupe = _conn.CreateCommand())
+        {
+            dedupe.Transaction = tx;
+            dedupe.CommandText = """
+                DELETE FROM agent_restore_retry_claims
+                WHERE rowid NOT IN (
+                    SELECT MIN(rowid)
+                    FROM agent_restore_retry_claims
+                    GROUP BY work_item_id, restored_agent, outage_started_at
+                );
+                """;
+            dedupe.ExecuteNonQuery();
+        }
+
+        using (var unique = _conn.CreateCommand())
+        {
+            unique.Transaction = tx;
+            unique.CommandText = """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_restore_retry_claims_key
+                ON agent_restore_retry_claims(work_item_id, restored_agent, outage_started_at);
+                """;
+            unique.ExecuteNonQuery();
+        }
+
+        tx.Commit();
     }
 
     private void RunMigration(string sql)
@@ -419,6 +495,69 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             // Column already exists from a previous startup — nothing to do.
         }
     }
+
+    private bool TableExists(string tableName)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = $table_name
+            LIMIT 1;
+            """;
+        cmd.Parameters.AddWithValue("$table_name", tableName);
+        return cmd.ExecuteScalar() is not null;
+    }
+
+    private static void RegisterRestoreRetryEligibilityFunction(SqliteConnection conn)
+    {
+        conn.CreateFunction<long, string?, string?, string?, string, string?, int>(
+            "codeybox_restore_retry_is_eligible",
+            static (stateValue, failureKind, authScopeValue, itemAgentValue, restoredAgentValue, latestFailedAgentValue) =>
+                IsRestoreRetryEligibleForSqlite(
+                    stateValue,
+                    failureKind,
+                    authScopeValue,
+                    itemAgentValue,
+                    restoredAgentValue,
+                    latestFailedAgentValue),
+            isDeterministic: true);
+    }
+
+    private static int IsRestoreRetryEligibleForSqlite(
+        long stateValue,
+        string? failureKind,
+        string? authScopeValue,
+        string? itemAgentValue,
+        string restoredAgentValue,
+        string? latestFailedAgentValue)
+    {
+        if (stateValue < int.MinValue || stateValue > int.MaxValue)
+            return 0;
+
+        var authScope = TryParseAuthFailureScope(authScopeValue);
+        var itemAgent = string.IsNullOrEmpty(itemAgentValue)
+            ? (AgentKind?)null
+            : new AgentKind(itemAgentValue);
+        var latestFailedAgent = string.IsNullOrEmpty(latestFailedAgentValue)
+            ? (AgentKind?)null
+            : new AgentKind(latestFailedAgentValue);
+
+        return AgentRestoreRetryCandidatePolicy.IsEligible(
+            (WorkItemState)stateValue,
+            failureKind,
+            authScope,
+            itemAgent,
+            new AgentKind(restoredAgentValue),
+            latestFailedAgent)
+            ? 1
+            : 0;
+    }
+
+    private static WorkItemAuthFailureScope? TryParseAuthFailureScope(string? value) =>
+        Enum.TryParse<WorkItemAuthFailureScope>(value, ignoreCase: true, out var scope)
+            ? scope
+            : null;
 
     private void ReconcileDuplicateOriginCheckFollowupsBeforeUniqueIndex()
     {
@@ -468,7 +607,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         local_squash_sha, merged_pr_number, merged_pr_url,
                         min_model_score, cancellation_reason, recovery_attempts, recovery_attempt_source_state, release_id, preempted_at, preempt_checkpoint,
                         suspended_vm_name, suspended_at, agent_log_path,
-                        failure_kind, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from,
+                        failure_kind, auth_failure_scope, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from,
                         quota_retry_phase,
                         next_transient_retry_at, transient_retry_attempts, transient_retry_first_failed_at, transient_retry_from,
                         agent_pause_target, agent_pause_retry_from, auditor_profile, priority,
@@ -479,13 +618,13 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         re_check_verdicts_json, template_name, template_entry_index,
                         preserve_work_branch_on_queued_pickup,
                         terminal_retry_attempts, next_terminal_retry_at,
-                        knobs_json, plan_artifact, plan_generated_at, plan_reviewed_at, plan_review_summary)
+                        knobs_json, plan_artifact, plan_generated_at, plan_reviewed_at, plan_review_summary, plan_review_attempts)
                     VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $agent_instance_id, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                         $local_squash_sha, $merged_pr_number, $merged_pr_url,
                         $min_model_score, $cancellation_reason, $recovery_attempts, $recovery_attempt_source_state, $release_id, $preempted_at, $preempt_checkpoint,
                         $suspended_vm_name, $suspended_at, $agent_log_path,
-                        $failure_kind, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from,
+                        $failure_kind, $auth_failure_scope, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from,
                         $quota_retry_phase,
                         $next_transient_retry_at, $transient_retry_attempts, $transient_retry_first_failed_at, $transient_retry_from,
                         $agent_pause_target, $agent_pause_retry_from, $auditor_profile, $priority,
@@ -496,7 +635,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         $re_check_verdicts, $template_name, $template_entry_index,
                         $preserve_work_branch_on_queued_pickup,
                         $terminal_retry_attempts, $next_terminal_retry_at,
-                        $knobs, $plan_artifact, $plan_generated_at, $plan_reviewed_at, $plan_review_summary);
+                        $knobs, $plan_artifact, $plan_generated_at, $plan_reviewed_at, $plan_review_summary, $plan_review_attempts);
                     """;
                 Bind(cmd, item);
                 await cmd.ExecuteNonQueryAsync(ct);
@@ -620,6 +759,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     suspended_at = $suspended_at,
                     agent_log_path = $agent_log_path,
                     failure_kind = $failure_kind,
+                    auth_failure_scope = $auth_failure_scope,
                     quota_reset_at = $quota_reset_at,
                     next_quota_retry_at = $next_quota_retry_at,
                     quota_retry_attempts = $quota_retry_attempts,
@@ -651,7 +791,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     plan_artifact = CASE WHEN prompt_revision = $prompt_revision THEN $plan_artifact ELSE plan_artifact END,
                     plan_generated_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_generated_at ELSE plan_generated_at END,
                     plan_reviewed_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_reviewed_at ELSE plan_reviewed_at END,
-                    plan_review_summary = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_summary ELSE plan_review_summary END
+                    plan_review_summary = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_summary ELSE plan_review_summary END,
+                    plan_review_attempts = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_attempts ELSE plan_review_attempts END
                 WHERE id = $id;
                 """;
             Bind(cmd, item);
@@ -704,6 +845,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     suspended_at = $suspended_at,
                     agent_log_path = $agent_log_path,
                     failure_kind = $failure_kind,
+                    auth_failure_scope = $auth_failure_scope,
                     quota_reset_at = $quota_reset_at,
                     next_quota_retry_at = $next_quota_retry_at,
                     quota_retry_attempts = $quota_retry_attempts,
@@ -735,7 +877,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     plan_artifact = CASE WHEN prompt_revision = $prompt_revision THEN $plan_artifact ELSE plan_artifact END,
                     plan_generated_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_generated_at ELSE plan_generated_at END,
                     plan_reviewed_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_reviewed_at ELSE plan_reviewed_at END,
-                    plan_review_summary = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_summary ELSE plan_review_summary END
+                    plan_review_summary = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_summary ELSE plan_review_summary END,
+                    plan_review_attempts = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_attempts ELSE plan_review_attempts END
                 WHERE id = $id AND state = $only_if_state;
                 """;
             Bind(cmd, item);
@@ -789,6 +932,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     suspended_at = $suspended_at,
                     agent_log_path = $agent_log_path,
                     failure_kind = $failure_kind,
+                    auth_failure_scope = $auth_failure_scope,
                     quota_reset_at = $quota_reset_at,
                     next_quota_retry_at = $next_quota_retry_at,
                     quota_retry_attempts = $quota_retry_attempts,
@@ -820,7 +964,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     plan_artifact = CASE WHEN prompt_revision = $prompt_revision THEN $plan_artifact ELSE plan_artifact END,
                     plan_generated_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_generated_at ELSE plan_generated_at END,
                     plan_reviewed_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_reviewed_at ELSE plan_reviewed_at END,
-                    plan_review_summary = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_summary ELSE plan_review_summary END
+                    plan_review_summary = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_summary ELSE plan_review_summary END,
+                    plan_review_attempts = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_attempts ELSE plan_review_attempts END
                 WHERE id = $id AND state = $only_if_state AND updated_at = $only_if_updated_at;
                 """;
             Bind(cmd, item);
@@ -897,23 +1042,25 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
 
     public async Task<WorkItem?> GetAsync(WorkItemId id, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
-        try
+        WorkItem? row;
+        using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
+        using var readConn = await OpenReadConnectionAsync(ct);
+        using var tx = readConn.BeginTransaction();
+        using (var cmd = readConn.CreateCommand())
         {
-            WorkItem? row;
-            using (var cmd = _conn.CreateCommand())
-            {
-                cmd.CommandText = "SELECT * FROM work_items WHERE id = $id;";
-                cmd.Parameters.AddWithValue("$id", id.ToString());
-                using var reader = await cmd.ExecuteReaderAsync(ct);
-                row = await reader.ReadAsync(ct) ? Read(reader) : null;
-            }
-            return await EnrichOneAsync(row, ct);
+            cmd.Transaction = tx;
+            cmd.CommandText = "SELECT * FROM work_items WHERE id = $id;";
+            cmd.Parameters.AddWithValue("$id", id.ToString());
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            row = await reader.ReadAsync(ct) ? Read(reader) : null;
         }
-        finally
-        {
-            _writeLock.Release();
-        }
+
+        if (row is null)
+            return null;
+
+        var externalIds = await LoadExternalIdsForAsync(row.Id, readConn, ct, tx);
+        tx.Commit();
+        return row with { ExternalIds = externalIds };
     }
 
     public async Task<PriorityUpdateResult> UpdatePriorityAsync(
@@ -955,7 +1102,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             if (current is null)
                 return new PriorityUpdateResult(PriorityUpdateOutcome.NotFound, null, null);
 
-            current = current with { ExternalIds = await LoadExternalIdsForAsync(current.Id, tx: null, ct) };
+            current = current with { ExternalIds = await LoadExternalIdsForAsync(current.Id, _conn, ct) };
 
             if (WorkItemDependencies.TerminalStates.Contains(current.State))
                 return new PriorityUpdateResult(PriorityUpdateOutcome.TerminalState, current, current.Priority);
@@ -1022,7 +1169,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             if (current is null)
                 return new DependsOnUpdateResult(DependsOnUpdateOutcome.NotFound, null, null);
 
-            current = current with { ExternalIds = await LoadExternalIdsForAsync(current.Id, tx: null, ct) };
+            current = current with { ExternalIds = await LoadExternalIdsForAsync(current.Id, _conn, ct) };
 
             if (WorkItemDependencies.TerminalStates.Contains(current.State))
                 return new DependsOnUpdateResult(DependsOnUpdateOutcome.TerminalState, current, current.DependsOn);
@@ -1076,7 +1223,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             if (current is null)
                 return new AuditBudgetUpdateResult(AuditBudgetUpdateOutcome.NotFound, null);
 
-            current = current with { ExternalIds = await LoadExternalIdsForAsync(current.Id, tx: null, ct) };
+            current = current with { ExternalIds = await LoadExternalIdsForAsync(current.Id, _conn, ct) };
 
             if (WorkItemDependencies.TerminalStates.Contains(current.State))
                 return new AuditBudgetUpdateResult(AuditBudgetUpdateOutcome.TerminalState, current);
@@ -1224,7 +1371,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     plan_artifact = $plan_artifact,
                     plan_generated_at = $plan_generated_at,
                     plan_reviewed_at = $plan_reviewed_at,
-                    plan_review_summary = $plan_review_summary
+                    plan_review_summary = $plan_review_summary,
+                    plan_review_attempts = $plan_review_attempts
                 WHERE id = $id
                   AND state = $only_if_state
                   AND updated_at = $only_if_updated_at;
@@ -1247,22 +1395,18 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     public async IAsyncEnumerable<WorkItem> ListAsync([EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<WorkItem>();
-        IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
-        await _writeLock.WaitAsync(ct);
-        try
+        using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
+        using var readConn = await OpenReadConnectionAsync(ct);
+        using var tx = readConn.BeginTransaction();
+        using (var cmd = readConn.CreateCommand())
         {
-            using (var cmd = _conn.CreateCommand())
-            {
-                cmd.CommandText = "SELECT * FROM work_items ORDER BY created_at DESC;";
-                using var reader = await cmd.ExecuteReaderAsync(ct);
-                while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
-            }
-            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+            cmd.Transaction = tx;
+            cmd.CommandText = "SELECT * FROM work_items ORDER BY created_at DESC;";
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
         }
-        finally
-        {
-            _writeLock.Release();
-        }
+        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), readConn, ct, tx);
+        tx.Commit();
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
@@ -1270,39 +1414,35 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     public async IAsyncEnumerable<WorkItem> ListByStateAsync(WorkItemState state, [EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<WorkItem>();
-        IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
-        await _writeLock.WaitAsync(ct);
-        try
+        using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
+        using var readConn = await OpenReadConnectionAsync(ct);
+        using var tx = readConn.BeginTransaction();
+        using (var cmd = readConn.CreateCommand())
         {
-            using (var cmd = _conn.CreateCommand())
+            cmd.Transaction = tx;
+            // Queued items: honour explicit queue_position (1, 2, 3 …) first; items with
+            // queue_position = 0 (pre-migration or newly created without explicit pos) sort
+            // last via the CASE sentinel, then by creation time for stable tie-breaking.
+            // Other states: simple creation-time ordering.
+            if (state == WorkItemState.Queued)
             {
-                // Queued items: honour explicit queue_position (1, 2, 3 …) first; items with
-                // queue_position = 0 (pre-migration or newly created without explicit pos) sort
-                // last via the CASE sentinel, then by creation time for stable tie-breaking.
-                // Other states: simple creation-time ordering.
-                if (state == WorkItemState.Queued)
-                {
-                    cmd.CommandText = """
-                        SELECT * FROM work_items WHERE state = $state
-                        ORDER BY
-                            CASE WHEN queue_position > 0 THEN queue_position ELSE 9223372036854775807 END ASC,
-                            created_at ASC;
-                        """;
-                }
-                else
-                {
-                    cmd.CommandText = "SELECT * FROM work_items WHERE state = $state ORDER BY created_at;";
-                }
-                cmd.Parameters.AddWithValue("$state", (int)state);
-                using var reader = await cmd.ExecuteReaderAsync(ct);
-                while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
+                cmd.CommandText = """
+                    SELECT * FROM work_items WHERE state = $state
+                    ORDER BY
+                        CASE WHEN queue_position > 0 THEN queue_position ELSE 9223372036854775807 END ASC,
+                        created_at ASC;
+                    """;
             }
-            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+            else
+            {
+                cmd.CommandText = "SELECT * FROM work_items WHERE state = $state ORDER BY created_at;";
+            }
+            cmd.Parameters.AddWithValue("$state", (int)state);
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
         }
-        finally
-        {
-            _writeLock.Release();
-        }
+        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), readConn, ct, tx);
+        tx.Commit();
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
@@ -1316,43 +1456,159 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             yield break;
 
         var rows = new List<WorkItem>();
+        using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
+        using var readConn = await OpenReadConnectionAsync(ct);
+        using var tx = readConn.BeginTransaction();
+        using (var cmd = readConn.CreateCommand())
+        {
+            cmd.Transaction = tx;
+            cmd.CommandText = $"""
+                SELECT * FROM work_items
+                WHERE state = {(int)WorkItemState.WaitingForQuotaReset}
+                  AND (
+                      $after_priority IS NULL
+                      OR priority < $after_priority
+                      OR (priority = $after_priority AND created_at > $after_created_at)
+                      OR (priority = $after_priority AND created_at = $after_created_at AND id > $after_id)
+                  )
+                ORDER BY priority DESC, created_at ASC, id ASC
+                LIMIT $limit;
+                """;
+            cmd.Parameters.AddWithValue("$limit", limit);
+            if (after is { } cursor)
+            {
+                cmd.Parameters.AddWithValue("$after_priority", cursor.Priority);
+                cmd.Parameters.AddWithValue("$after_created_at", cursor.CreatedAt.ToString("O"));
+                cmd.Parameters.AddWithValue("$after_id", cursor.Id.ToString());
+            }
+            else
+            {
+                cmd.Parameters.AddWithValue("$after_priority", DBNull.Value);
+                cmd.Parameters.AddWithValue("$after_created_at", DBNull.Value);
+                cmd.Parameters.AddWithValue("$after_id", DBNull.Value);
+            }
+
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+                rows.Add(Read(reader));
+        }
+        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), readConn, ct, tx);
+        tx.Commit();
+
+        foreach (var item in rows)
+            yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
+    }
+
+    public async IAsyncEnumerable<WorkItem> ListRestoreRetryCandidatesAsync(
+        AgentKind restoredAgent,
+        DateTimeOffset windowStart,
+        DateTimeOffset windowEnd,
+        TimeSpan involvementTerminalLookback,
+        TimeSpan involvementTerminalClockSkew,
+        int limit,
+        DateTimeOffset? afterUpdatedAt = null,
+        WorkItemId? afterId = null,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        if (limit <= 0)
+            yield break;
+
+        var rows = new List<WorkItem>(Math.Min(limit, 256));
         IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
         await _writeLock.WaitAsync(ct);
         try
         {
             using (var cmd = _conn.CreateCommand())
             {
-                cmd.CommandText = $"""
-                    SELECT * FROM work_items
-                    WHERE state = {(int)WorkItemState.WaitingForQuotaReset}
-                      AND (
-                          $after_priority IS NULL
-                          OR priority < $after_priority
-                          OR (priority = $after_priority AND created_at > $after_created_at)
-                          OR (priority = $after_priority AND created_at = $after_created_at AND id > $after_id)
-                      )
-                    ORDER BY priority DESC, created_at ASC, id ASC
-                    LIMIT $limit;
-                    """;
+                var involvementTableExists = TableExists("agent_involvement");
+                cmd.CommandText = involvementTableExists
+                    ? """
+                        WITH terminal_items AS (
+                            SELECT *
+                            FROM work_items
+                            WHERE state IN ($failed, $merge_conflict_failed)
+                              AND updated_at >= $window_start
+                              AND updated_at <= $window_end
+                              AND (
+                                  $after_updated_at IS NULL
+                                  OR updated_at > $after_updated_at
+                                  OR (updated_at = $after_updated_at AND id > $after_id)
+                              )
+                        ),
+                        ranked_failed_involvement AS (
+                            SELECT
+                                ai.work_item_id,
+                                ai.agent_kind,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY ai.work_item_id
+                                    ORDER BY COALESCE(ai.ended_at, ai.started_at) DESC, ai.started_at DESC, ai.id DESC
+                                ) AS rank
+                            FROM agent_involvement ai
+                            JOIN terminal_items wi ON wi.id = ai.work_item_id
+                            WHERE codeybox_agent_involvement_is_failure(ai.outcome) = 1
+                              AND julianday(COALESCE(ai.ended_at, ai.started_at)) >= julianday(wi.updated_at) - $terminal_lookback_days
+                              AND julianday(COALESCE(ai.ended_at, ai.started_at)) <= julianday(wi.updated_at) + $terminal_clock_skew_days
+                        ),
+                        latest_failed_involvement AS (
+                            SELECT work_item_id, agent_kind
+                            FROM ranked_failed_involvement
+                            WHERE rank = 1
+                        )
+                        SELECT terminal_items.*
+                        FROM terminal_items
+                        LEFT JOIN latest_failed_involvement lfi ON lfi.work_item_id = terminal_items.id
+                        WHERE codeybox_restore_retry_is_eligible(
+                            terminal_items.state,
+                            terminal_items.failure_kind,
+                            terminal_items.auth_failure_scope,
+                            terminal_items.agent,
+                            $restored_agent,
+                            lfi.agent_kind
+                        ) = 1
+                        ORDER BY terminal_items.updated_at ASC, terminal_items.id ASC
+                        LIMIT $limit;
+                        """
+                    : """
+                        SELECT *
+                        FROM work_items
+                        WHERE state IN ($failed, $merge_conflict_failed)
+                          AND updated_at >= $window_start
+                          AND updated_at <= $window_end
+                          AND (
+                              $after_updated_at IS NULL
+                              OR updated_at > $after_updated_at
+                              OR (updated_at = $after_updated_at AND id > $after_id)
+                          )
+                          AND codeybox_restore_retry_is_eligible(
+                              state,
+                              failure_kind,
+                              auth_failure_scope,
+                              agent,
+                              $restored_agent,
+                              NULL
+                          ) = 1
+                        ORDER BY updated_at ASC, id ASC
+                        LIMIT $limit;
+                        """;
+                cmd.Parameters.AddWithValue("$failed", (int)WorkItemState.Failed);
+                cmd.Parameters.AddWithValue("$merge_conflict_failed", (int)WorkItemState.MergeConflictResolutionFailed);
+                cmd.Parameters.AddWithValue("$window_start", windowStart.ToString("O"));
+                cmd.Parameters.AddWithValue("$window_end", windowEnd.ToString("O"));
+                cmd.Parameters.AddWithValue("$restored_agent", restoredAgent.Value);
                 cmd.Parameters.AddWithValue("$limit", limit);
-                if (after is { } cursor)
+                cmd.Parameters.AddWithValue("$after_updated_at", (object?)afterUpdatedAt?.ToString("O") ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$after_id", (object?)afterId?.ToString() ?? DBNull.Value);
+                if (involvementTableExists)
                 {
-                    cmd.Parameters.AddWithValue("$after_priority", cursor.Priority);
-                    cmd.Parameters.AddWithValue("$after_created_at", cursor.CreatedAt.ToString("O"));
-                    cmd.Parameters.AddWithValue("$after_id", cursor.Id.ToString());
+                    cmd.Parameters.AddWithValue("$terminal_lookback_days", involvementTerminalLookback.TotalDays);
+                    cmd.Parameters.AddWithValue("$terminal_clock_skew_days", involvementTerminalClockSkew.TotalDays);
                 }
-                else
-                {
-                    cmd.Parameters.AddWithValue("$after_priority", DBNull.Value);
-                    cmd.Parameters.AddWithValue("$after_created_at", DBNull.Value);
-                    cmd.Parameters.AddWithValue("$after_id", DBNull.Value);
-                }
-
-                using var reader = await cmd.ExecuteReaderAsync(ct);
-                while (await reader.ReadAsync(ct))
+                using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+                while (await reader.ReadAsync(ct).ConfigureAwait(false))
                     rows.Add(Read(reader));
             }
-            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct)
+                .ConfigureAwait(false);
         }
         finally
         {
@@ -1361,6 +1617,273 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
 
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
+    }
+
+    public async Task<bool> TryClaimAgentRestoreRetryAsync(
+        WorkItemId id,
+        AgentKind restoredAgent,
+        DateTimeOffset outageStartedAt,
+        DateTimeOffset restoredAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT OR IGNORE INTO agent_restore_retry_claims (
+                    work_item_id,
+                    restored_agent,
+                    outage_started_at,
+                    restored_at,
+                    claimed_at
+                )
+                VALUES (
+                    $work_item_id,
+                    $restored_agent,
+                    $outage_started_at,
+                    $restored_at,
+                    $claimed_at
+                );
+                """;
+            cmd.Parameters.AddWithValue("$work_item_id", id.ToString());
+            cmd.Parameters.AddWithValue("$restored_agent", restoredAgent.Value);
+            cmd.Parameters.AddWithValue("$outage_started_at", outageStartedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$restored_at", restoredAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$claimed_at", DateTimeOffset.UtcNow.ToString("O"));
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) > 0;
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("TryClaimAgentRestoreRetryAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<bool> TryUpdateIfStateAndUpdatedAtWithAgentRestoreRetryClaimAsync(
+        WorkItem item,
+        WorkItemState onlyIfState,
+        DateTimeOffset onlyIfUpdatedAt,
+        AgentKind restoredAgent,
+        DateTimeOffset outageStartedAt,
+        DateTimeOffset restoredAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var tx = _conn.BeginTransaction();
+            using (var stale = _conn.CreateCommand())
+            {
+                stale.Transaction = tx;
+                stale.CommandText = """
+                    DELETE FROM agent_restore_retry_claims
+                    WHERE work_item_id = $work_item_id
+                      AND restored_agent = $restored_agent
+                      AND outage_started_at = $outage_started_at
+                      AND EXISTS (
+                          SELECT 1
+                          FROM work_items
+                          WHERE id = $work_item_id
+                            AND state IN ($failed, $merge_conflict_failed)
+                            AND julianday(updated_at) < julianday(agent_restore_retry_claims.claimed_at)
+                      );
+                    """;
+                stale.Parameters.AddWithValue("$work_item_id", item.Id.ToString());
+                stale.Parameters.AddWithValue("$restored_agent", restoredAgent.Value);
+                stale.Parameters.AddWithValue("$outage_started_at", outageStartedAt.ToString("O"));
+                stale.Parameters.AddWithValue("$failed", (int)WorkItemState.Failed);
+                stale.Parameters.AddWithValue("$merge_conflict_failed", (int)WorkItemState.MergeConflictResolutionFailed);
+                await stale.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+
+            using (var claim = _conn.CreateCommand())
+            {
+                claim.Transaction = tx;
+                claim.CommandText = """
+                    INSERT OR IGNORE INTO agent_restore_retry_claims (
+                        work_item_id,
+                        restored_agent,
+                        outage_started_at,
+                        restored_at,
+                        claimed_at
+                    )
+                    VALUES (
+                        $work_item_id,
+                        $restored_agent,
+                        $outage_started_at,
+                        $restored_at,
+                        $claimed_at
+                    );
+                    """;
+                claim.Parameters.AddWithValue("$work_item_id", item.Id.ToString());
+                claim.Parameters.AddWithValue("$restored_agent", restoredAgent.Value);
+                claim.Parameters.AddWithValue("$outage_started_at", outageStartedAt.ToString("O"));
+                claim.Parameters.AddWithValue("$restored_at", restoredAt.ToString("O"));
+                claim.Parameters.AddWithValue("$claimed_at", DateTimeOffset.UtcNow.ToString("O"));
+                if (await claim.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 0)
+                {
+                    tx.Rollback();
+                    return false;
+                }
+            }
+
+            using (var update = _conn.CreateCommand())
+            {
+                update.Transaction = tx;
+                // Same full-row field set as UpdateAsync / TryUpdateIfStateAsync,
+                // guarded by the exact snapshot stamp the recovery path inspected.
+                update.CommandText = """
+                    UPDATE work_items SET
+                        project_id = $project_id, title = $title,
+                        base_branch = $base, work_branch = $work, agent = $agent,
+                        agent_instance_id = $agent_instance_id,
+                        work_timeout_ticks = $wt, merge_timeout_ticks = $mt, push_upstream = $pu,
+                        state = $state, updated_at = $ua, last_error = $err,
+                        upstream_push_attempts = $att, depends_on_json = $deps,
+                        agent_class_id = $class_id, queue_position = $qpos,
+                        stuck_retries = $sretries, started_at = $started_at,
+                        replay_of_work_item_id = $replay_of, merge_sha = $merge_sha,
+                        local_squash_sha = $local_squash_sha,
+                        merged_pr_number = $merged_pr_number,
+                        merged_pr_url = $merged_pr_url,
+                        min_model_score = $min_model_score,
+                        cancellation_reason = $cancellation_reason,
+                        recovery_attempts = $recovery_attempts,
+                        recovery_attempt_source_state = $recovery_attempt_source_state,
+                        release_id = $release_id,
+                        preempted_at = $preempted_at,
+                        preempt_checkpoint = $preempt_checkpoint,
+                        suspended_vm_name = $suspended_vm_name,
+                        suspended_at = $suspended_at,
+                        agent_log_path = $agent_log_path,
+                        failure_kind = $failure_kind,
+                        auth_failure_scope = $auth_failure_scope,
+                        quota_reset_at = $quota_reset_at,
+                        next_quota_retry_at = $next_quota_retry_at,
+                        quota_retry_attempts = $quota_retry_attempts,
+                        quota_retry_from = $quota_retry_from,
+                        quota_retry_phase = $quota_retry_phase,
+                        next_transient_retry_at = $next_transient_retry_at,
+                        transient_retry_attempts = $transient_retry_attempts,
+                        transient_retry_first_failed_at = $transient_retry_first_failed_at,
+                        transient_retry_from = $transient_retry_from,
+                        agent_pause_target = $agent_pause_target,
+                        agent_pause_retry_from = $agent_pause_retry_from,
+                        auditor_profile = $auditor_profile,
+                        cancellation_source = $cancellation_source,
+                        transient_cancel_retries = $transient_cancel_retries,
+                        conflict_rework_attempts = $conflict_rework_attempts,
+                        baseline_image_ref = $baseline_image_ref,
+                        required_capabilities_json = $required_capabilities,
+                        job_type = $job_type,
+                        check_spec_json = $check_spec,
+                        agent_control_json = $agent_control,
+                        check_verdict_json = $check_verdict,
+                        origin_check_work_item_id = $origin_check,
+                        re_check_verdicts_json = $re_check_verdicts,
+                        template_name = $template_name,
+                        template_entry_index = $template_entry_index,
+                        preserve_work_branch_on_queued_pickup = $preserve_work_branch_on_queued_pickup,
+                        terminal_retry_attempts = $terminal_retry_attempts,
+                        next_terminal_retry_at = $next_terminal_retry_at,
+                        plan_artifact = CASE WHEN prompt_revision = $prompt_revision THEN $plan_artifact ELSE plan_artifact END,
+                        plan_generated_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_generated_at ELSE plan_generated_at END,
+                        plan_reviewed_at = CASE WHEN prompt_revision = $prompt_revision THEN $plan_reviewed_at ELSE plan_reviewed_at END,
+                        plan_review_summary = CASE WHEN prompt_revision = $prompt_revision THEN $plan_review_summary ELSE plan_review_summary END
+                    WHERE id = $id AND state = $only_if_state AND updated_at = $only_if_updated_at;
+                    """;
+                Bind(update, item);
+                update.Parameters.AddWithValue("$only_if_state", (int)onlyIfState);
+                update.Parameters.AddWithValue("$only_if_updated_at", onlyIfUpdatedAt.ToString("O"));
+                if (await update.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 0)
+                {
+                    tx.Rollback();
+                    return false;
+                }
+            }
+
+            tx.Commit();
+            return true;
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("TryUpdateIfStateAndUpdatedAtWithAgentRestoreRetryClaimAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task ReleaseAgentRestoreRetryClaimAsync(
+        WorkItemId id,
+        AgentKind restoredAgent,
+        DateTimeOffset outageStartedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                DELETE FROM agent_restore_retry_claims
+                WHERE work_item_id = $work_item_id
+                  AND restored_agent = $restored_agent
+                  AND outage_started_at = $outage_started_at;
+                """;
+            cmd.Parameters.AddWithValue("$work_item_id", id.ToString());
+            cmd.Parameters.AddWithValue("$restored_agent", restoredAgent.Value);
+            cmd.Parameters.AddWithValue("$outage_started_at", outageStartedAt.ToString("O"));
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull("ReleaseAgentRestoreRetryClaimAsync", sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<bool> HasAgentRestoreRetryClaimAsync(
+        WorkItemId id,
+        AgentKind restoredAgent,
+        DateTimeOffset outageStartedAt,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT 1
+                FROM agent_restore_retry_claims c
+                JOIN work_items wi ON wi.id = c.work_item_id
+                WHERE c.work_item_id = $work_item_id
+                  AND c.restored_agent = $restored_agent
+                  AND c.outage_started_at = $outage_started_at
+                  AND (
+                      wi.state NOT IN ($failed, $merge_conflict_failed)
+                      OR julianday(wi.updated_at) >= julianday(c.claimed_at)
+                  )
+                LIMIT 1;
+                """;
+            cmd.Parameters.AddWithValue("$work_item_id", id.ToString());
+            cmd.Parameters.AddWithValue("$restored_agent", restoredAgent.Value);
+            cmd.Parameters.AddWithValue("$outage_started_at", outageStartedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$failed", (int)WorkItemState.Failed);
+            cmd.Parameters.AddWithValue("$merge_conflict_failed", (int)WorkItemState.MergeConflictResolutionFailed);
+            return await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false) is not null;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task<int> CountByStateAsync(WorkItemState state, CancellationToken ct = default)
@@ -1435,12 +1958,12 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     rows.Add(item);
                 }
             }
-            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         }
         finally
         {
             _writeLock.Release();
         }
+        extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
@@ -1460,32 +1983,31 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         await _writeLock.WaitAsync(ct);
         try
         {
-            var skipFilter = string.Empty;
-            if (skipIds.Count > 0)
-            {
-                await PopulateDispatchSkipTableAsync(skipIds, ct);
-                skipFilter = DispatchSkipFilterSql;
-            }
+            await PopulateDispatchSkipTableAsync(skipIds, ct);
 
             using (var cmd = _conn.CreateCommand())
             {
-                cmd.CommandText = $"""
+                cmd.CommandText = """
                     SELECT * FROM (
                         SELECT wi.*, wi.state AS dispatch_ordering_state, 0 AS dispatch_source_order
                         FROM work_items wi
                         WHERE wi.state NOT IN (
-                            {(int)WorkItemState.Done},
-                            {(int)WorkItemState.Failed},
-                            {(int)WorkItemState.Cancelled},
-                            {(int)WorkItemState.AuditFailed},
-                            {(int)WorkItemState.MergeConflictResolutionFailed},
-                            {(int)WorkItemState.AbandonedAfterRecoveryAttempts},
-                            {(int)WorkItemState.NeedsOperatorInput},
-                            {(int)WorkItemState.WaitingForQuotaReset},
-                            {(int)WorkItemState.WaitingForAgentResume},
-                            {(int)WorkItemState.WaitingForTransientRetry}
+                            $state_done,
+                            $state_failed,
+                            $state_cancelled,
+                            $state_audit_failed,
+                            $state_merge_conflict_resolution_failed,
+                            $state_abandoned_after_recovery_attempts,
+                            $state_needs_operator_input,
+                            $state_waiting_for_quota_reset,
+                            $state_waiting_for_agent_resume,
+                            $state_waiting_for_transient_retry
                         )
-                        {skipFilter}
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM temp.codeybox_dispatch_skip_ids skipped
+                            WHERE skipped.id = wi.id
+                        )
 
                         UNION ALL
 
@@ -1497,21 +2019,25 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                             ) AS dispatch_ordering_state,
                             1 AS dispatch_source_order
                         FROM work_items wi
-                        WHERE wi.state = {(int)WorkItemState.WaitingForQuotaReset}
+                        WHERE wi.state = $state_waiting_for_quota_reset
                           AND (
                               $include_future_quota_retries = 1
                               OR wi.next_quota_retry_at IS NULL
                               OR julianday(wi.next_quota_retry_at) <= julianday($now)
                           )
-                        {skipFilter}
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM temp.codeybox_dispatch_skip_ids skipped
+                              WHERE skipped.id = wi.id
+                          )
                     )
                     ORDER BY
                         CASE
                             WHEN dispatch_ordering_state IN (
-                                {(int)WorkItemState.AuditPassed},
-                                {(int)WorkItemState.Merging},
-                                {(int)WorkItemState.Merged},
-                                {(int)WorkItemState.UpstreamPushing}
+                                $state_audit_passed,
+                                $state_merging,
+                                $state_merged,
+                                $state_upstream_pushing
                             ) THEN 0
                             ELSE 1
                         END ASC,
@@ -1520,6 +2046,20 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         dispatch_source_order ASC
                     LIMIT $limit;
                     """;
+                cmd.Parameters.AddWithValue("$state_done", (int)WorkItemState.Done);
+                cmd.Parameters.AddWithValue("$state_failed", (int)WorkItemState.Failed);
+                cmd.Parameters.AddWithValue("$state_cancelled", (int)WorkItemState.Cancelled);
+                cmd.Parameters.AddWithValue("$state_audit_failed", (int)WorkItemState.AuditFailed);
+                cmd.Parameters.AddWithValue("$state_merge_conflict_resolution_failed", (int)WorkItemState.MergeConflictResolutionFailed);
+                cmd.Parameters.AddWithValue("$state_abandoned_after_recovery_attempts", (int)WorkItemState.AbandonedAfterRecoveryAttempts);
+                cmd.Parameters.AddWithValue("$state_needs_operator_input", (int)WorkItemState.NeedsOperatorInput);
+                cmd.Parameters.AddWithValue("$state_waiting_for_quota_reset", (int)WorkItemState.WaitingForQuotaReset);
+                cmd.Parameters.AddWithValue("$state_waiting_for_agent_resume", (int)WorkItemState.WaitingForAgentResume);
+                cmd.Parameters.AddWithValue("$state_waiting_for_transient_retry", (int)WorkItemState.WaitingForTransientRetry);
+                cmd.Parameters.AddWithValue("$state_audit_passed", (int)WorkItemState.AuditPassed);
+                cmd.Parameters.AddWithValue("$state_merging", (int)WorkItemState.Merging);
+                cmd.Parameters.AddWithValue("$state_merged", (int)WorkItemState.Merged);
+                cmd.Parameters.AddWithValue("$state_upstream_pushing", (int)WorkItemState.UpstreamPushing);
                 cmd.Parameters.AddWithValue("$now", now.ToString("O"));
                 cmd.Parameters.AddWithValue(
                     "$include_future_quota_retries",
@@ -1529,19 +2069,16 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                 while (await reader.ReadAsync(ct))
                     rows.Add(Read(reader));
             }
-            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
         }
         finally
         {
             _writeLock.Release();
         }
+        extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
 
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
-
-    private const string DispatchSkipFilterSql =
-        "AND NOT EXISTS (SELECT 1 FROM temp.codeybox_dispatch_skip_ids skipped WHERE skipped.id = wi.id)";
 
     private async Task PopulateDispatchSkipTableAsync(
         IReadOnlySet<WorkItemId> skipIds,
@@ -1977,26 +2514,22 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         // suspended_vm_name WHERE suspended_vm_name IS NOT NULL) so the query
         // scales with the in-flight suspend count, not the full table.
         var rows = new List<WorkItem>();
-        IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
-        await _writeLock.WaitAsync(ct);
-        try
+        using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
+        using var readConn = await OpenReadConnectionAsync(ct);
+        using var tx = readConn.BeginTransaction();
+        using (var cmd = readConn.CreateCommand())
         {
-            using (var cmd = _conn.CreateCommand())
-            {
-                cmd.CommandText = """
-                    SELECT * FROM work_items
-                    WHERE suspended_vm_name IS NOT NULL
-                    ORDER BY suspended_at IS NULL, suspended_at ASC, created_at ASC, rowid ASC;
-                    """;
-                using var reader = await cmd.ExecuteReaderAsync(ct);
-                while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
-            }
-            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+            cmd.Transaction = tx;
+            cmd.CommandText = """
+                SELECT * FROM work_items
+                WHERE suspended_vm_name IS NOT NULL
+                ORDER BY suspended_at IS NULL, suspended_at ASC, created_at ASC, rowid ASC;
+                """;
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
         }
-        finally
-        {
-            _writeLock.Release();
-        }
+        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), readConn, ct, tx);
+        tx.Commit();
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
@@ -2073,27 +2606,23 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         WorkItemId sourceId, [EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<WorkItem>();
-        IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
-        await _writeLock.WaitAsync(ct);
-        try
+        using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
+        using var readConn = await OpenReadConnectionAsync(ct);
+        using var tx = readConn.BeginTransaction();
+        using (var cmd = readConn.CreateCommand())
         {
-            using (var cmd = _conn.CreateCommand())
-            {
-                cmd.CommandText = """
-                    SELECT * FROM work_items
-                    WHERE replay_of_work_item_id = $source_id
-                    ORDER BY created_at ASC;
-                    """;
-                cmd.Parameters.AddWithValue("$source_id", sourceId.ToString());
-                using var reader = await cmd.ExecuteReaderAsync(ct);
-                while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
-            }
-            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+            cmd.Transaction = tx;
+            cmd.CommandText = """
+                SELECT * FROM work_items
+                WHERE replay_of_work_item_id = $source_id
+                ORDER BY created_at ASC;
+                """;
+            cmd.Parameters.AddWithValue("$source_id", sourceId.ToString());
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
         }
-        finally
-        {
-            _writeLock.Release();
-        }
+        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), readConn, ct, tx);
+        tx.Commit();
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
@@ -2125,23 +2654,19 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         var rows = new List<WorkItem>();
-        IReadOnlyDictionary<WorkItemId, IReadOnlyDictionary<string, string>> extByItem;
-        await _writeLock.WaitAsync(ct);
-        try
+        using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
+        using var readConn = await OpenReadConnectionAsync(ct);
+        using var tx = readConn.BeginTransaction();
+        using (var cmd = readConn.CreateCommand())
         {
-            using (var cmd = _conn.CreateCommand())
-            {
-                cmd.CommandText = "SELECT * FROM work_items WHERE release_id = $rid ORDER BY created_at;";
-                cmd.Parameters.AddWithValue("$rid", releaseId.ToString());
-                using var reader = await cmd.ExecuteReaderAsync(ct);
-                while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
-            }
-            extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), ct);
+            cmd.Transaction = tx;
+            cmd.CommandText = "SELECT * FROM work_items WHERE release_id = $rid ORDER BY created_at;";
+            cmd.Parameters.AddWithValue("$rid", releaseId.ToString());
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct)) rows.Add(Read(reader));
         }
-        finally
-        {
-            _writeLock.Release();
-        }
+        var extByItem = await LoadExternalIdsBatchAsync(rows.Select(r => r.Id).ToList(), readConn, ct, tx);
+        tx.Commit();
         foreach (var item in rows)
             yield return item with { ExternalIds = extByItem.GetValueOrDefault(item.Id, EmptyExternalIds) };
     }
@@ -2188,7 +2713,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     plan_artifact = NULL,
                     plan_generated_at = NULL,
                     plan_reviewed_at = NULL,
-                    plan_review_summary = NULL
+                    plan_review_summary = NULL,
+                    plan_review_attempts = 0
                 WHERE id = $id;
                 """;
             cmd.Parameters.AddWithValue("$prompt", newPrompt);
@@ -2576,6 +3102,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$suspended_at", (object?)item.SuspendedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$agent_log_path", (object?)item.AgentLogPath ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$failure_kind", (object?)item.FailureKind ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$auth_failure_scope",
+            item.AuthFailureScope.HasValue ? (object)item.AuthFailureScope.Value.ToString() : DBNull.Value);
         cmd.Parameters.AddWithValue("$quota_reset_at", (object?)item.QuotaResetAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$next_quota_retry_at", (object?)item.NextQuotaRetryAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$quota_retry_attempts", item.QuotaRetryAttempts);
@@ -2619,6 +3147,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$plan_generated_at", (object?)item.PlanGeneratedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$plan_reviewed_at", (object?)item.PlanReviewedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$plan_review_summary", (object?)item.PlanReviewSummary ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$plan_review_attempts", item.PlanReviewAttempts);
     }
 
     private static string SerialiseKnobs(IReadOnlyDictionary<string, string>? knobs)
@@ -2701,6 +3230,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         SuspendedAt = ReadNullableDateTimeOffset(r, "suspended_at"),
         AgentLogPath = ReadNullableString(r, "agent_log_path"),
         FailureKind = r.IsDBNull(r.GetOrdinal("failure_kind")) ? null : r.GetString(r.GetOrdinal("failure_kind")),
+        AuthFailureScope = ReadNullableAuthFailureScope(r, "auth_failure_scope"),
         QuotaResetAt = ReadNullableDateTimeOffset(r, "quota_reset_at"),
         NextQuotaRetryAt = ReadNullableDateTimeOffset(r, "next_quota_retry_at"),
         QuotaRetryAttempts = ReadInt32OrDefault(r, "quota_retry_attempts", defaultValue: 0),
@@ -2738,6 +3268,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         PlanGeneratedAt = ReadNullableDateTimeOffset(r, "plan_generated_at"),
         PlanReviewedAt = ReadNullableDateTimeOffset(r, "plan_reviewed_at"),
         PlanReviewSummary = ReadNullableString(r, "plan_review_summary"),
+        PlanReviewAttempts = ReadInt32OrDefault(r, "plan_review_attempts", defaultValue: 0),
     };
 
     private static IReadOnlyList<CheckVerdict> ReadReCheckVerdicts(SqliteDataReader r)
@@ -2859,6 +3390,20 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         return string.IsNullOrWhiteSpace(raw) ? null : new AgentKind(raw);
     }
 
+    private static WorkItemAuthFailureScope? ReadNullableAuthFailureScope(SqliteDataReader r, string column)
+    {
+        var raw = ReadNullableString(r, column);
+        if (string.IsNullOrWhiteSpace(raw))
+            return null;
+        if (Enum.TryParse<WorkItemAuthFailureScope>(raw, ignoreCase: true, out var value))
+            return value;
+
+        var idOrd = r.GetOrdinal("id");
+        var id = r.IsDBNull(idOrd) ? "(unknown)" : r.GetString(idOrd);
+        throw new InvalidDataException(
+            $"work item {id}: auth_failure_scope value '{raw}' is not a known WorkItemAuthFailureScope; refusing to read the row as legacy null.");
+    }
+
     private static WorkItemState? ReadNullableWorkItemState(SqliteDataReader r, string column)
     {
         var ord = r.GetOrdinal(column);
@@ -2913,23 +3458,17 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
 
     /// <summary>
     /// Loads the namespaced external IDs for a single work item. Returns an
-    /// empty dictionary when the item has none. Caller-supplied
-    /// <paramref name="tx"/> is reused so reads see writes from the same
-    /// transaction; pass null for a no-transaction read.
+    /// empty dictionary when the item has none, using the caller-supplied
+    /// connection.
     /// </summary>
     private async Task<IReadOnlyDictionary<string, string>> LoadExternalIdsForAsync(
         WorkItemId id,
-        SqliteTransaction? tx,
-        CancellationToken ct)
+        SqliteConnection connection,
+        CancellationToken ct,
+        SqliteTransaction? tx = null)
     {
-        // The store has one long-lived connection for writes and legacy reads.
-        // External-id enrichment happens after those readers are disposed and
-        // can be triggered concurrently by polling/dispatch paths, so use a
-        // short-lived read connection unless the caller needs same-transaction
-        // visibility.
-        using var readConn = tx is null ? await OpenReadConnectionAsync(ct) : null;
-        using var cmd = tx is null ? readConn!.CreateCommand() : _conn.CreateCommand();
-        if (tx is not null) cmd.Transaction = tx;
+        using var cmd = connection.CreateCommand();
+        cmd.Transaction = tx;
         cmd.CommandText = "SELECT namespace, external_id FROM work_item_external_ids WHERE work_item_id = $id;";
         cmd.Parameters.AddWithValue("$id", id.ToString());
         using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -2948,12 +3487,23 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         IReadOnlyCollection<WorkItemId> ids,
         CancellationToken ct)
     {
+        using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
+        using var readConn = await OpenReadConnectionAsync(ct);
+        return await LoadExternalIdsBatchAsync(ids, readConn, ct);
+    }
+
+    private static async Task<Dictionary<WorkItemId, IReadOnlyDictionary<string, string>>> LoadExternalIdsBatchAsync(
+        IReadOnlyCollection<WorkItemId> ids,
+        SqliteConnection connection,
+        CancellationToken ct,
+        SqliteTransaction? tx = null)
+    {
         var result = new Dictionary<WorkItemId, IReadOnlyDictionary<string, string>>();
         if (ids.Count == 0) return result;
 
         var idSet = ids as HashSet<WorkItemId> ?? new HashSet<WorkItemId>(ids);
-        using var readConn = await OpenReadConnectionAsync(ct);
-        using var cmd = readConn.CreateCommand();
+        using var cmd = connection.CreateCommand();
+        cmd.Transaction = tx;
         if (ids.Count > 256)
         {
             cmd.CommandText = "SELECT work_item_id, namespace, external_id FROM work_item_external_ids;";
@@ -2990,6 +3540,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
 
     private async Task<SqliteConnection> OpenReadConnectionAsync(CancellationToken ct)
     {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         var conn = new SqliteConnection(_connectionString);
         await conn.OpenAsync(ct);
 
@@ -2997,17 +3548,6 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         pragma.CommandText = "PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON;";
         await pragma.ExecuteNonQueryAsync(ct);
         return conn;
-    }
-
-    /// <summary>
-    /// Enriches a single in-memory item with its external IDs loaded from the
-    /// side table. No-op when the item is null.
-    /// </summary>
-    private async Task<WorkItem?> EnrichOneAsync(WorkItem? item, CancellationToken ct)
-    {
-        if (item is null) return null;
-        var extIds = await LoadExternalIdsForAsync(item.Id, tx: null, ct);
-        return item with { ExternalIds = extIds };
     }
 
     private sealed class ConnectionGateLease(SqliteDatabaseWriteGate gate) : IDisposable

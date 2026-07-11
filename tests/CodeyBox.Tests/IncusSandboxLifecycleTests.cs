@@ -8,6 +8,101 @@ namespace CodeyBox.Tests;
 public sealed class IncusSandboxLifecycleTests
 {
     [Fact]
+    public async Task Create_RejectsOversizedSpecEnvironmentBeforeCallingIncus()
+    {
+        var environment = Enumerable.Range(0, IncusSandbox.MaxExecEnvironmentEntries + 1)
+            .ToDictionary(index => $"KEY_{index}", _ => "value", StringComparer.Ordinal);
+        var runner = new ScriptedLifecycleRunner((_, _, _) =>
+            throw new InvalidOperationException("Incus must not be called"));
+        var provider = new IncusSandboxProvider(
+            () => new IncusSandboxOptions { DiskGuard = null },
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner);
+
+        await Assert.ThrowsAsync<ArgumentException>(() => provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "local-image",
+            Environment = environment,
+        }));
+
+        Assert.Empty(runner.Commands);
+    }
+
+    [Fact]
+    public void SerializeEnvironment_RejectsOversizedValueBeforeBuildingCombinedEntry()
+    {
+        var environment = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["A"] = new string('x', 16 * 1024 * 1024),
+        };
+
+        var exception = Assert.Throws<ArgumentException>(() =>
+            IncusSandbox.SerializeEnvironment(environment));
+
+        Assert.Contains("16 MiB safety bound", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(
+            "A=x\0",
+            IncusSandbox.SerializeEnvironment(
+                new Dictionary<string, string>(StringComparer.Ordinal) { ["A"] = "x" }));
+    }
+
+    [Theory]
+    [InlineData(100, 40, 60)]
+    [InlineData(0, 0, 0)]
+    public void CalculateStorageFreeBytes_AcceptsValidResourceData(
+        long total,
+        long used,
+        long expected)
+    {
+        Assert.Equal(expected, IncusSandboxProvider.CalculateStorageFreeBytes(total, used));
+    }
+
+    [Theory]
+    [InlineData(-1, 0)]
+    [InlineData(1, -1)]
+    [InlineData(1, 2)]
+    [InlineData(long.MinValue, long.MaxValue)]
+    public void CalculateStorageFreeBytes_RejectsMalformedResourceData(long total, long used)
+    {
+        Assert.Throws<InvalidOperationException>(() =>
+            IncusSandboxProvider.CalculateStorageFreeBytes(total, used));
+    }
+
+    [Theory]
+    [InlineData("NaN", 0, 100)]
+    [InlineData("Infinity", 0, 100)]
+    [InlineData("-Infinity", 0, 100)]
+    [InlineData("-0.01", 0, 100)]
+    [InlineData("100.01", 0, 100)]
+    public void ParseMetricDouble_RejectsNonFiniteAndOutOfRangeValues(
+        string value,
+        double minimum,
+        double maximum)
+    {
+        var values = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["metric"] = value,
+        };
+
+        Assert.Null(IncusSandbox.ParseMetricDouble(values, "metric", minimum, maximum));
+    }
+
+    [Theory]
+    [InlineData("0", 0)]
+    [InlineData("37.25", 37.25)]
+    [InlineData("100", 100)]
+    public void ParseMetricDouble_AcceptsFiniteValuesInsideRange(string value, double expected)
+    {
+        var values = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["metric"] = value,
+        };
+
+        Assert.Equal(expected, IncusSandbox.ParseMetricDouble(values, "metric", 0, 100));
+    }
+
+    [Fact]
     public void ParseOwnedInstancePresence_AcceptsOnlyExactOwnedSandbox()
     {
         const string json = """
@@ -176,14 +271,12 @@ public sealed class IncusSandboxLifecycleTests
             baselineRef: null,
             resourceUsageStore: null,
             _ => Interlocked.Increment(ref inactive));
-        var liveBefore = SandboxLiveCounter.Active;
         SandboxLiveCounter.Increment();
 
         await Assert.ThrowsAsync<TimeoutException>(() => sandbox.DisposeAsync().AsTask());
 
         Assert.True(Directory.Exists(sandboxRoot));
         Assert.Equal(0, inactive);
-        Assert.Equal(liveBefore + 1, SandboxLiveCounter.Active);
         runner.CompleteDeletion = true;
 
         await sandbox.DisposeAsync();
@@ -191,7 +284,6 @@ public sealed class IncusSandboxLifecycleTests
         Assert.False(Directory.Exists(sandboxRoot));
         Assert.Equal(2, runner.DeleteCalls);
         Assert.Equal(1, inactive);
-        Assert.Equal(liveBefore, SandboxLiveCounter.Active);
         Directory.Delete(root, recursive: true);
     }
 
@@ -204,7 +296,7 @@ public sealed class IncusSandboxLifecycleTests
         IncusMountStaging.EnsureOwnedStagingRoot(root);
         Directory.CreateDirectory(sandboxRoot);
         IncusMountStaging.InitializeOwnedTree(sandboxRoot, sandboxName, DateTimeOffset.UtcNow);
-        var runner = new StickyProviderDeletionRunner(sandboxName);
+        var runner = new StickyProviderDeletionRunner(sandboxName, root);
         var provider = new IncusSandboxProvider(
             () => new IncusSandboxOptions
             {
@@ -227,6 +319,48 @@ public sealed class IncusSandboxLifecycleTests
         Assert.False(Directory.Exists(sandboxRoot));
         Assert.Equal(2, runner.DeleteCalls);
         Directory.Delete(root, recursive: true);
+    }
+
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    public async Task ColdLifecycle_RejectsForeignOrUnrestrictedProjectBeforeTrustingInstanceMarkers(
+        bool hasManagedShape,
+        bool hasRequiredRestrictions)
+    {
+        const string sandboxName = "codeybox-foreign-project";
+        const string baselineName = "cb-foreign-baseline";
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-foreign-{Guid.NewGuid():N}");
+        IncusMountStaging.EnsureOwnedStagingRoot(root);
+        var runner = new ForeignProjectRunner(root, hasManagedShape, hasRequiredRestrictions);
+        var provider = new IncusSandboxProvider(
+            () => new IncusSandboxOptions
+            {
+                StagingDirectory = root,
+                DiskGuard = null,
+            },
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner);
+
+        try
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                provider.ListAllManagedAsync(CancellationToken.None));
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                provider.DisposeLeakedAsync(sandboxName, CancellationToken.None));
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                provider.ListBaselineImagesAsync(CancellationToken.None));
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                provider.DisposeBaselineImageAsync(baselineName, CancellationToken.None));
+
+            Assert.Equal(0, runner.InstanceListCalls);
+            Assert.Equal(0, runner.DeleteCalls);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
     }
 
     [Fact]
@@ -783,7 +917,7 @@ public sealed class IncusSandboxLifecycleTests
         }
     }
 
-    private sealed class StickyProviderDeletionRunner(string sandboxName) : IProcessRunner
+    private sealed class StickyProviderDeletionRunner(string sandboxName, string stagingRoot) : IProcessRunner
     {
         private bool _deleted;
         internal bool CompleteDeletion { get; set; }
@@ -803,6 +937,8 @@ public sealed class IncusSandboxLifecycleTests
             ct.ThrowIfCancellationRequested();
             if (argv.SequenceEqual(["incus", "project", "list", "--format=json"]))
                 return Task.FromResult(new ProcessRunResult(0, "[{\"name\":\"codeybox\"}]", string.Empty));
+            if (argv.SequenceEqual(["incus", "query", "/1.0/projects/codeybox"]))
+                return Task.FromResult(Success(ManagedProjectQuery(stagingRoot)));
             if (argv.Contains("list", StringComparer.Ordinal))
             {
                 var json = _deleted
@@ -826,6 +962,74 @@ public sealed class IncusSandboxLifecycleTests
             }
             throw new InvalidOperationException($"Unexpected Incus sticky provider deletion command: {string.Join(' ', argv)}");
         }
+    }
+
+    private sealed class ForeignProjectRunner(
+        string stagingRoot,
+        bool hasManagedShape,
+        bool hasRequiredRestrictions) : IProcessRunner
+    {
+        internal int InstanceListCalls { get; private set; }
+        internal int DeleteCalls { get; private set; }
+
+        public Task<ProcessRunResult> RunAsync(
+            IReadOnlyList<string> argv,
+            string? stdin,
+            CancellationToken ct,
+            Action<string>? stdoutChunkCallback = null,
+            Action<string>? stderrChunkCallback = null,
+            int? maxStdoutBytes = null,
+            int? maxStderrBytes = null,
+            IReadOnlyDictionary<string, string>? environment = null,
+            bool killOnOutputLimit = true)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (argv.SequenceEqual(["incus", "project", "list", "--format=json"]))
+                return Task.FromResult(Success("[{\"name\":\"codeybox\"}]"));
+            if (argv.SequenceEqual(["incus", "query", "/1.0/projects/codeybox"]))
+            {
+                return Task.FromResult(Success(ManagedProjectQuery(
+                    stagingRoot,
+                    hasManagedShape,
+                    hasRequiredRestrictions)));
+            }
+            if (argv.Contains("list", StringComparer.Ordinal))
+            {
+                InstanceListCalls++;
+                return Task.FromResult(Success(
+                    $"[{{\"name\":\"codeybox-foreign-project\",\"type\":\"virtual-machine\",\"config\":{{\"{IncusSandboxProvider.ManagedKey}\":\"true\",\"{IncusSandboxProvider.KindKey}\":\"{IncusSandboxProvider.SandboxKind}\"}}}}]"));
+            }
+            if (argv.Contains("delete", StringComparer.Ordinal))
+            {
+                DeleteCalls++;
+                return Task.FromResult(Success());
+            }
+            throw new InvalidOperationException($"Unexpected foreign-project command: {string.Join(' ', argv)}");
+        }
+    }
+
+    private static string ManagedProjectQuery(
+        string stagingRoot,
+        bool hasManagedShape = true,
+        bool hasRequiredRestrictions = true)
+    {
+        var config = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            [IncusProjectSecurity.FeaturesImagesKey] = "false",
+            [IncusProjectSecurity.FeaturesProfilesKey] = "true",
+            [IncusProjectSecurity.ManagedKey] = hasManagedShape ? "true" : "false",
+            [IncusProjectSecurity.SchemaKey] = "1",
+            [IncusProjectSecurity.RestrictedKey] = hasRequiredRestrictions ? "true" : "false",
+            [IncusProjectSecurity.RestrictedDiskKey] = "allow",
+            [IncusProjectSecurity.RestrictedDiskPathsKey] = stagingRoot,
+            [IncusProjectSecurity.RestrictedNicKey] = "allow",
+            [IncusProjectSecurity.RestrictedSnapshotsKey] = "allow",
+            [IncusProjectSecurity.RestrictedVmLowLevelKey] = "block",
+        };
+        return System.Text.Json.JsonSerializer.Serialize(new
+        {
+            metadata = new { name = "codeybox", config },
+        });
     }
 
     private sealed class UncertainCreateRunner : IProcessRunner

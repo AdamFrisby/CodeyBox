@@ -24,14 +24,23 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         var failures = new List<string>();
 
         var selectedProvider = options.SandboxProvider?.Trim();
-        if (string.Equals(selectedProvider, HotSwappableSandboxProvider.IncusProviderId, StringComparison.OrdinalIgnoreCase))
+        ValidateRetainedSandboxProviderInventory(options, failures);
+        if (string.Equals(selectedProvider, SandboxProviderKinds.Incus, StringComparison.OrdinalIgnoreCase)
+            || RetainsSandboxProvider(options, SandboxProviderKinds.Incus))
         {
-            // Dormant cutover providers are constructed lazily. Validate Incus
-            // only when it is selected; a later selector switch validates the
-            // candidate before the options monitor publishes it.
-            failures.AddRange(
-                IncusSandboxOptions.Validate(IncusSandboxConfigMapper.Build(options))
-                    .Select(static error => $"CodeyBox:Incus:{error}"));
+            // Retained providers are activated for lifecycle inventory even
+            // when they are not selected for new work.
+            try
+            {
+                failures.AddRange(
+                    IncusSandboxOptions.Validate(IncusSandboxConfigMapper.Build(options))
+                        .Select(static error => $"CodeyBox:Incus:{error}"));
+            }
+            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException
+                or NotSupportedException or PathTooLongException)
+            {
+                failures.Add($"CodeyBox:Incus:{ex.Message}");
+            }
         }
 
         if (double.IsNaN(options.PhaseAbsoluteTimeoutMultiplier)
@@ -51,6 +60,22 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         {
             failures.Add(
                 $"CodeyBox:MaxBulkItems must be between 1 and {CodeyBoxOptions.MaximumMaxBulkItems}");
+        }
+
+        if (options.SqliteWriteGate is null)
+        {
+            failures.Add("CodeyBox:SqliteWriteGate must not be null");
+        }
+        else
+        {
+            try
+            {
+                options.SqliteWriteGate.Validate();
+            }
+            catch (InvalidOperationException ex)
+            {
+                failures.Add(ex.Message);
+            }
         }
 
         var e2e = options.E2eExecution;
@@ -220,6 +245,11 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         {
             failures.Add("CodeyBox:PipelineTuning:MaxSandboxReuses must be >= 1");
         }
+        if (!PlanReviewIterationLimit.TryCreate(options.PipelineTuning.MaxPlanReviewIterations, out _))
+        {
+            failures.Add(
+                $"CodeyBox:PipelineTuning:MaxPlanReviewIterations must be >= {PlanReviewIterationLimit.MinimumValue}");
+        }
         if (options.PipelineTuning.MaxSandboxLifetime <= TimeSpan.Zero)
         {
             failures.Add("CodeyBox:PipelineTuning:MaxSandboxLifetime must be a positive TimeSpan");
@@ -234,6 +264,10 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         if (options.PipelineTuning.AuditorIdleTimeout < TimeSpan.Zero)
         {
             failures.Add("CodeyBox:PipelineTuning:AuditorIdleTimeout must be non-negative");
+        }
+        if (options.PipelineTuning.EmptyReworkEscalationRetries < 0)
+        {
+            failures.Add("CodeyBox:PipelineTuning:EmptyReworkEscalationRetries must be non-negative");
         }
 
         if (options.PipelineTuning.CSharpTestPassAuditorIdleTimeout is { } cSharpTestIdle && cSharpTestIdle < TimeSpan.Zero)
@@ -255,9 +289,37 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             failures.Add(ex.Message);
         }
 
+        try
+        {
+            options.Attachments.Validate();
+        }
+        catch (InvalidOperationException ex)
+        {
+            failures.Add(ex.Message);
+        }
+
         if (options.EnableSharedUpstreamMirror && string.IsNullOrWhiteSpace(options.SharedUpstreamMirrorDirectory))
         {
             failures.Add("CodeyBox:SharedUpstreamMirrorDirectory must not be empty if EnableSharedUpstreamMirror is true");
+        }
+
+        if (options.AutoRequeueOnAgentRestore.Enabled)
+        {
+            try
+            {
+                _ = OrchestratorOptionsFactory.BuildAgentRestoreRetryOptions(
+                    options.AutoRequeueOnAgentRestore.Enabled,
+                    options.AutoRequeueOnAgentRestore.LookbackGrace,
+                    options.AutoRequeueOnAgentRestore.PostRestoreMargin,
+                    options.AutoRequeueOnAgentRestore.InvolvementTerminalLookback,
+                    options.AutoRequeueOnAgentRestore.InvolvementTerminalClockSkew,
+                    options.AutoRequeueOnAgentRestore.MaxCandidatesPerSweep,
+                    options.AutoRequeueOnAgentRestore.EventQueueCapacity);
+            }
+            catch (InvalidOperationException ex)
+            {
+                failures.Add(ex.Message);
+            }
         }
 
         failures.AddRange(AuditLogStartup.Validate(options.AuditLog));
@@ -265,6 +327,67 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         return failures.Count == 0
             ? ValidateOptionsResult.Success
             : ValidateOptionsResult.Fail(failures);
+    }
+
+    private static void ValidateRetainedSandboxProviderInventory(
+        CodeyBoxOptions options,
+        ICollection<string> failures)
+    {
+        var retained = options.SandboxProviderCutover?.RetainedInventoryProviders;
+        if (retained is null)
+        {
+            failures.Add("CodeyBox:SandboxProviderCutover:RetainedInventoryProviders must not be null");
+            return;
+        }
+        if (retained.Count > SandboxProviderCutoverConfig.MaximumRetainedInventoryProviders)
+        {
+            failures.Add(
+                $"CodeyBox:SandboxProviderCutover:RetainedInventoryProviders must contain at most {SandboxProviderCutoverConfig.MaximumRetainedInventoryProviders} entries");
+            return;
+        }
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        for (var index = 0; index < retained.Count; index++)
+        {
+            var configuredProviderId = retained[index];
+            if (string.IsNullOrWhiteSpace(configuredProviderId)
+                || configuredProviderId.Length > ReloadableSandboxProvider.MaximumProviderIdLength)
+            {
+                failures.Add(
+                    $"CodeyBox:SandboxProviderCutover:RetainedInventoryProviders:{index} must name a registered hot-reload provider");
+                continue;
+            }
+            var providerId = configuredProviderId.Trim().ToLowerInvariant();
+            if (!SandboxProviderKinds.SupportsHotReload(providerId))
+            {
+                failures.Add(
+                    $"CodeyBox:SandboxProviderCutover:RetainedInventoryProviders:{index} must name a registered hot-reload provider");
+                continue;
+            }
+            if (!seen.Add(providerId))
+            {
+                failures.Add(
+                    $"CodeyBox:SandboxProviderCutover:RetainedInventoryProviders:{index} duplicates an earlier provider ID");
+            }
+        }
+    }
+
+    private static bool RetainsSandboxProvider(CodeyBoxOptions options, string expectedProviderId)
+    {
+        var retained = options.SandboxProviderCutover?.RetainedInventoryProviders;
+        if (retained is null
+            || retained.Count > SandboxProviderCutoverConfig.MaximumRetainedInventoryProviders)
+        {
+            return false;
+        }
+
+        return retained.Any(configuredProviderId =>
+            !string.IsNullOrWhiteSpace(configuredProviderId)
+            && configuredProviderId.Length <= ReloadableSandboxProvider.MaximumProviderIdLength
+            && string.Equals(
+                configuredProviderId.Trim(),
+                expectedProviderId,
+                StringComparison.OrdinalIgnoreCase));
     }
 
     private static IReadOnlyList<E2eMultipassRemoteHostConfig> GetE2eRemoteHostConfigs(CodeyBoxOptions options)

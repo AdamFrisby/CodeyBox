@@ -9,6 +9,111 @@ namespace CodeyBox.Tests;
 
 public sealed class CodeyBoxOptionsValidatorTests
 {
+    [Fact]
+    public void Validate_AllowsUniqueRegisteredRetainedSandboxProviders()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.SandboxProviderCutover.RetainedInventoryProviders = ["multipass", "incus"];
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.False(result.Failed, result.FailureMessage);
+    }
+
+    [Theory]
+    [InlineData("process", "must name a registered hot-reload provider")]
+    [InlineData("multipass,multipass", "duplicates an earlier provider ID")]
+    public void Validate_RejectsInvalidRetainedSandboxProviderInventory(
+        string configured,
+        string expectedFailure)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.SandboxProviderCutover.RetainedInventoryProviders = configured.Split(',').ToList();
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(expectedFailure, result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsOversizedRetainedSandboxProviderInventoryBeforeIteration()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.SandboxProviderCutover.RetainedInventoryProviders = Enumerable
+            .Repeat("multipass", SandboxProviderCutoverConfig.MaximumRetainedInventoryProviders + 1)
+            .ToList();
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("must contain at most", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_ValidatesRetainedIncusConfigurationWhenMultipassIsSelected()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.SandboxProvider = "multipass";
+        options.SandboxProviderCutover.RetainedInventoryProviders = ["incus"];
+        options.Incus.StoragePoolName = string.Empty;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:Incus:StoragePoolName", result.FailureMessage);
+    }
+
+    [Theory]
+    [InlineData("acquisition", "CodeyBox:SqliteWriteGate:AcquisitionTimeout must be positive")]
+    [InlineData("acquisition-max", "CodeyBox:SqliteWriteGate:AcquisitionTimeout must be <=")]
+    [InlineData("hold", "CodeyBox:SqliteWriteGate:MaxHoldDuration must be positive")]
+    [InlineData("hold-max", "CodeyBox:SqliteWriteGate:MaxHoldDuration must be <=")]
+    [InlineData("waiters", "CodeyBox:SqliteWriteGate:MaxQueuedWaiters must be positive")]
+    [InlineData("waiters-max", "CodeyBox:SqliteWriteGate:MaxQueuedWaiters must be <=")]
+    [InlineData("reads", "CodeyBox:SqliteWriteGate:MaxConcurrentReadConnections must be positive")]
+    [InlineData("reads-max", "CodeyBox:SqliteWriteGate:MaxConcurrentReadConnections must be <=")]
+    public void Validate_RejectsInvalidSqliteWriteGateOptions(
+        string scenario,
+        string expectedFailure)
+    {
+        var options = ValidCodeyBoxOptions();
+        switch (scenario)
+        {
+            case "acquisition":
+                options.SqliteWriteGate.AcquisitionTimeout = TimeSpan.Zero;
+                break;
+            case "acquisition-max":
+                options.SqliteWriteGate.AcquisitionTimeout = SqliteWriteGateOptions.MaximumAcquisitionTimeout.Add(TimeSpan.FromMilliseconds(1));
+                break;
+            case "hold":
+                options.SqliteWriteGate.MaxHoldDuration = TimeSpan.Zero;
+                break;
+            case "hold-max":
+                options.SqliteWriteGate.MaxHoldDuration = SqliteWriteGateOptions.MaximumAllowedHoldDuration.Add(TimeSpan.FromMilliseconds(1));
+                break;
+            case "waiters":
+                options.SqliteWriteGate.MaxQueuedWaiters = 0;
+                break;
+            case "waiters-max":
+                options.SqliteWriteGate.MaxQueuedWaiters = SqliteWriteGateOptions.MaximumQueuedWaiters + 1;
+                break;
+            case "reads":
+                options.SqliteWriteGate.MaxConcurrentReadConnections = 0;
+                break;
+            case "reads-max":
+                options.SqliteWriteGate.MaxConcurrentReadConnections = SqliteWriteGateOptions.MaximumConcurrentReadConnections + 1;
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null);
+        }
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(expectedFailure, result.FailureMessage);
+    }
+
     [Theory]
     [InlineData("retention", "CodeyBox:AuditLog:RetainedDays must be >= 1")]
     [InlineData("path", "CodeyBox:AuditLog:Path must be non-empty")]
@@ -73,6 +178,41 @@ public sealed class CodeyBoxOptionsValidatorTests
         var result = new CodeyBoxOptionsValidator().Validate(null, options);
 
         Assert.False(result.Failed, result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_AutoRequeueOnAgentRestore_DefaultsEnabled()
+    {
+        var options = ValidCodeyBoxOptions();
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(options.AutoRequeueOnAgentRestore.Enabled);
+        Assert.False(result.Failed, result.FailureMessage);
+    }
+
+    [Theory]
+    [InlineData("lookback", "CodeyBox:AutoRequeueOnAgentRestore:LookbackGrace")]
+    [InlineData("post-margin", "CodeyBox:AutoRequeueOnAgentRestore:PostRestoreMargin")]
+    public void Validate_RejectsInvalidAutoRequeueOnAgentRestoreOptions(
+        string scenario,
+        string expectedFailure)
+    {
+        var options = ValidCodeyBoxOptions();
+        switch (scenario)
+        {
+            case "lookback":
+                options.AutoRequeueOnAgentRestore.LookbackGrace = "not-a-timespan";
+                break;
+            case "post-margin":
+                options.AutoRequeueOnAgentRestore.PostRestoreMargin = "-00:00:01";
+                break;
+        }
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(expectedFailure, result.FailureMessage);
     }
 
     [Fact]
@@ -998,6 +1138,18 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.Contains(
             "CodeyBox:PipelineTuning:CSharpTestPassBlameHangTimeout must be positive when set",
             result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_RejectsNegativeEmptyReworkEscalationRetries()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.PipelineTuning.EmptyReworkEscalationRetries = -1;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:PipelineTuning:EmptyReworkEscalationRetries must be non-negative", result.FailureMessage);
     }
 
     [Theory]
