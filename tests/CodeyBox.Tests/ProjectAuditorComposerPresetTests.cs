@@ -117,15 +117,19 @@ public sealed class ProjectAuditorComposerPresetTests
     [Fact]
     public void ComposeForTarget_AutoIncludesRegisteredPlanAuditChainOnPlanOnly_ToggledByExclusion()
     {
-        var planAuditor = new CodeyBox.Audit.Llm.PlanAudit.PlanAuditChainAuditor(
-            new CodeyBox.Audit.Llm.PlanAudit.PlanAuditChainAuditorOptions
-            {
-                Test = CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test01,
-                Agent = new CapturingAgent(),
-            });
+        // Register the whole chain from the single source of truth so a new test
+        // is covered here automatically.
+        var chain = CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.All
+            .Select(t => (IAuditor)new CodeyBox.Audit.Llm.PlanAudit.PlanAuditChainAuditor(
+                new CodeyBox.Audit.Llm.PlanAudit.PlanAuditChainAuditorOptions
+                {
+                    Test = t,
+                    Agent = new CapturingAgent(),
+                }))
+            .ToArray();
         var composer = new ProjectAuditorComposer(
             new PresetCatalog(),
-            [planAuditor],
+            chain,
             NullLogger<ProjectAuditorComposer>.Instance);
         Project Project(params string[] excluded) => new()
         {
@@ -144,17 +148,22 @@ public sealed class ProjectAuditorComposerPresetTests
         var codeTargets = composer.ComposeForTarget(Project(), new CapturingAgent(), AuditTarget.Code)
             .Select(a => a.Name).ToArray();
 
-        // Auto-included on the plan target for every plan-enabled project...
-        Assert.Contains(CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test01AuditorName, planTargets);
-        // ...but never on the code target (it is Plan-only).
-        Assert.DoesNotContain(CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test01AuditorName, codeTargets);
+        foreach (var test in CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.All)
+        {
+            // Auto-included on the plan target for every plan-enabled project...
+            Assert.Contains(test.AuditorName, planTargets);
+            // ...but never on the code target (each is Plan-only).
+            Assert.DoesNotContain(test.AuditorName, codeTargets);
+        }
 
-        // Per-project relevance is the toggle: listing its name removes it.
+        // Per-project relevance is the toggle, and it is independent per test:
+        // excluding TEST 02 removes only it and leaves TEST 01 in place.
         var toggledOff = composer.ComposeForTarget(
-                Project(CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test01AuditorName),
+                Project(CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test02AuditorName),
                 new CapturingAgent(), AuditTarget.Plan)
             .Select(a => a.Name).ToArray();
-        Assert.DoesNotContain(CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test01AuditorName, toggledOff);
+        Assert.DoesNotContain(CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test02AuditorName, toggledOff);
+        Assert.Contains(CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test01AuditorName, toggledOff);
     }
 
     [Fact]

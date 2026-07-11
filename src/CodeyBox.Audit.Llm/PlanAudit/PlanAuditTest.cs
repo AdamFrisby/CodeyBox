@@ -52,11 +52,17 @@ public sealed record PlanAuditTest
 /// The built-in plan-audit chain tests. TEST 01 is the foundation
 /// grounding / anti-hallucination gate; later tests in the chain assume a
 /// grounded plan and are added as additional <see cref="PlanAuditTest"/> values.
+/// <see cref="All"/> is the single ordered source of truth the wiring
+/// (DI registration + <c>ProjectAuditorComposer</c> auto-inclusion) iterates,
+/// so a new chain test is wired everywhere by adding it here alone.
 /// </summary>
 public static class PlanAuditTests
 {
     /// <summary>Stable name of the TEST 01 auditor (referenced by DI + composition).</summary>
     public const string Test01AuditorName = "plan:integrity-evidence";
+
+    /// <summary>Stable name of the TEST 02 auditor (referenced by DI + composition).</summary>
+    public const string Test02AuditorName = "plan:goal-scope-acceptance";
 
     /// <summary>
     /// TEST 01 — PLAN INTEGRITY AND EVIDENCE CLASSIFICATION. Determines whether
@@ -111,4 +117,74 @@ public static class PlanAuditTests
             "justified-precision",       // no unjustified line/file-level precision
         ],
     };
+
+    /// <summary>
+    /// TEST 02 — GOAL, SCOPE, NON-GOALS, AND ACCEPTANCE CRITERIA. Verifies the
+    /// plan defines the problem, the intended behavior change, its scope
+    /// boundaries, and measurable, objectively-verifiable completion criteria —
+    /// and that it is the smallest useful change, not an opportunistic bundle of
+    /// unrelated cleanup, broad refactoring, or speculative enhancements.
+    /// </summary>
+    public static PlanAuditTest Test02 { get; } = new()
+    {
+        Id = "02",
+        AuditorName = Test02AuditorName,
+        Title = "GOAL, SCOPE, NON-GOALS, AND ACCEPTANCE CRITERIA",
+        Objective =
+            "Verify the plan defines the problem, the intended behavior change, its scope " +
+            "boundaries, and measurable completion criteria.",
+        ReviewGuidance = """
+            - What user- or system-visible behavior is changing, and is that change stated plainly?
+            - What is explicitly out of scope (non-goals)?
+            - What must NOT regress — what existing behavior, contract, or invariant must remain
+              unchanged / backward-compatible?
+            - What assumptions about the requirements does the plan make, and are they stated?
+            - Are the success / acceptance criteria objectively verifiable (tied to specific
+              behavior, tests, metrics, or compatibility) rather than vague or subjective?
+            - Does the plan define the smallest useful change that satisfies the task?
+            - Does it avoid mixing unrelated cleanup, broad refactoring, or speculative
+              enhancements into the feature?
+            """,
+        PassCriteria =
+            "Goal, non-goals, requirement assumptions, and acceptance criteria are explicit; the " +
+            "success criteria are objectively verifiable (behavior/tests/metrics/compatibility); " +
+            "the plan states what must remain unchanged; and it avoids opportunistic scope expansion.",
+        FailCriteria =
+            "The plan jumps straight to file edits without defining the problem; acceptance criteria " +
+            "are vague, subjective, or absent; or it combines unrelated changes without justification.",
+        AutomaticBlocker = """
+            Treat as an automatic BLOCKER when the plan:
+            - changes user- or system-visible behavior without saying what the behavior should
+              become; or
+            - cannot state what must remain backward-compatible or unchanged (the not-regress set).
+            """,
+        RequiredFixes = """
+            - Add a concise goal statement naming the problem and the intended behavior change.
+            - Add explicit non-goals (what this change deliberately does not do).
+            - Add acceptance criteria tied to concrete behavior, tests, metrics, or compatibility —
+              each objectively verifiable, not subjective.
+            - Name what must remain unchanged / not regress.
+            - Remove or defer unrelated refactors and speculative enhancements to a separate task.
+            """,
+        Criteria =
+        [
+            "goal-statement",           // concise problem statement is present
+            "behavior-change",          // the intended user/system-visible behavior change is stated
+            "scope-boundaries",         // what is in scope is bounded
+            "non-goals",                // explicit out-of-scope / non-goals
+            "requirement-assumptions",  // assumptions about the requirements are explicit
+            "acceptance-criteria",      // objectively-verifiable completion criteria
+            "must-not-regress",         // states what must remain unchanged / backward-compatible
+            "smallest-useful-change",   // defines the smallest useful change
+            "no-scope-creep",           // no unrelated cleanup / refactor / speculative extras
+        ],
+    };
+
+    /// <summary>
+    /// Every built-in plan-audit chain test, in chain order. The DI registration
+    /// and <c>ProjectAuditorComposer</c> auto-inclusion both iterate this list,
+    /// so adding a chain test here wires it everywhere without touching either
+    /// call site (one source of truth for the chain membership).
+    /// </summary>
+    public static IReadOnlyList<PlanAuditTest> All { get; } = [Test01, Test02];
 }
