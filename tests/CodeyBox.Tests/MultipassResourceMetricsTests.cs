@@ -484,7 +484,7 @@ public sealed class MultipassResourceMetricsTests : IDisposable
         var admissionControlled = new AdmissionControlledSandbox(
             mockSandbox,
             lease,
-            (_, _, _, _) => ValueTask.CompletedTask,
+            (_, _, _, _, _) => ValueTask.CompletedTask,
             _ => { },
             NullLogger.Instance);
 

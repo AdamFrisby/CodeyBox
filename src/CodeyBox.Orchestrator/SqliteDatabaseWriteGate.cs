@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using CodeyBox.Core;
 using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Orchestrator;
@@ -59,23 +61,42 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
         ThrowIfReentrant(entry, holderIdentity);
 
         var settings = _factory.GetSettings();
-        var acquired = entry.Semaphore.Wait(0, ct);
-        if (!acquired)
+        var sw = Stopwatch.StartNew();
+        bool acquired;
+        try
         {
-            EnterWaitQueue(entry, settings.MaxQueuedWaiters, holderIdentity);
-            try
+            acquired = entry.Semaphore.Wait(0, ct);
+            if (!acquired)
             {
-                acquired = entry.Semaphore.Wait(settings.AcquisitionTimeout, ct);
+                EnterWaitQueue(entry, settings.MaxQueuedWaiters, holderIdentity);
+                try
+                {
+                    acquired = entry.Semaphore.Wait(settings.AcquisitionTimeout, ct);
+                }
+                finally
+                {
+                    LeaveWaitQueue(entry);
+                }
             }
-            finally
-            {
-                LeaveWaitQueue(entry);
-            }
+        }
+        catch (OperationCanceledException)
+        {
+            RecordWait(sw, "canceled");
+            throw;
+        }
+        catch (SqliteWriteGateWaitQueueFullException)
+        {
+            RecordWait(sw, "queue_full");
+            throw;
         }
 
         if (!acquired)
+        {
+            RecordWait(sw, "timed_out");
             throw CreateAcquisitionTimeout(entry, holderIdentity, settings.AcquisitionTimeout);
+        }
 
+        RecordWait(sw, "acquired");
         CreateLeaseFailureAtomic(entry, holderIdentity, settings).Activate();
     }
 
@@ -126,32 +147,49 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
         CancellationToken ct)
     {
         var settings = _factory.GetSettings();
-        ct.ThrowIfCancellationRequested();
-        var acquired = entry.Semaphore.Wait(0, ct);
-        if (!acquired)
+        var sw = Stopwatch.StartNew();
+        try
         {
-            EnterWaitQueue(entry, settings.MaxQueuedWaiters, holderIdentity);
-            try
+            ct.ThrowIfCancellationRequested();
+            var acquired = entry.Semaphore.Wait(0, ct);
+            if (!acquired)
             {
-                using var timeout = new CancellationTokenSource(settings.AcquisitionTimeout, _factory.TimeProvider);
-                using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
+                EnterWaitQueue(entry, settings.MaxQueuedWaiters, holderIdentity);
                 try
                 {
-                    await entry.Semaphore.WaitAsync(linked.Token).ConfigureAwait(false);
-                    return CreateLeaseFailureAtomic(entry, holderIdentity, settings);
+                    using var timeout = new CancellationTokenSource(settings.AcquisitionTimeout, _factory.TimeProvider);
+                    using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
+                    try
+                    {
+                        await entry.Semaphore.WaitAsync(linked.Token).ConfigureAwait(false);
+                        RecordWait(sw, "acquired");
+                        return CreateLeaseFailureAtomic(entry, holderIdentity, settings);
+                    }
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested && timeout.IsCancellationRequested)
+                    {
+                        RecordWait(sw, "timed_out");
+                        throw CreateAcquisitionTimeout(entry, holderIdentity, settings.AcquisitionTimeout);
+                    }
                 }
-                catch (OperationCanceledException) when (!ct.IsCancellationRequested && timeout.IsCancellationRequested)
+                finally
                 {
-                    throw CreateAcquisitionTimeout(entry, holderIdentity, settings.AcquisitionTimeout);
+                    LeaveWaitQueue(entry);
                 }
             }
-            finally
-            {
-                LeaveWaitQueue(entry);
-            }
-        }
 
-        return CreateLeaseFailureAtomic(entry, holderIdentity, settings);
+            RecordWait(sw, "acquired");
+            return CreateLeaseFailureAtomic(entry, holderIdentity, settings);
+        }
+        catch (OperationCanceledException)
+        {
+            RecordWait(sw, "canceled");
+            throw;
+        }
+        catch (SqliteWriteGateWaitQueueFullException)
+        {
+            RecordWait(sw, "queue_full");
+            throw;
+        }
     }
 
     private HolderLease CreateLeaseFailureAtomic(
@@ -268,6 +306,11 @@ internal sealed class SqliteDatabaseWriteGate : IDisposable
     }
 
     private Entry Current => _entry ?? throw new ObjectDisposedException(nameof(SqliteDatabaseWriteGate));
+
+    private static void RecordWait(Stopwatch sw, string outcome) =>
+        CodeyBoxMeters.CoordinatorSqliteWriteGateWait.Record(
+            sw.ElapsedMilliseconds,
+            new KeyValuePair<string, object?>("outcome", outcome));
 
     /// <summary>
     /// Activates AsyncLocal ownership in GetResult so the caller's continuation,

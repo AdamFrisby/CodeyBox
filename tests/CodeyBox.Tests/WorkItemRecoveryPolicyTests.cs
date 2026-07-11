@@ -510,6 +510,38 @@ public sealed class WorkItemRecoveryPolicyTests
     }
 
     [Fact]
+    public void InfrastructureDeferral_WorkingWithWorkBranch_PreservesQueuedPickupBranch()
+    {
+        var item = MakeItem(WorkItemState.Working) with
+        {
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            WorkBranch = "codeybox/work/recoverable",
+            LastError = "prior error",
+            FailureKind = "infrastructure",
+            NextTransientRetryAt = DateTimeOffset.UtcNow.AddMinutes(5),
+            TransientRetryAttempts = 2,
+            TransientRetryFirstFailedAt = DateTimeOffset.UtcNow.AddMinutes(-3),
+            TransientRetryFrom = "work",
+        };
+
+        var recovered = WorkItemRecoveryPolicy.BuildInfrastructureDeferredResumeState(
+            item,
+            DateTimeOffset.UtcNow);
+
+        Assert.NotNull(recovered);
+        Assert.Equal(WorkItemState.Queued, recovered!.State);
+        Assert.Equal(item.WorkBranch, recovered.WorkBranch);
+        Assert.True(recovered.PreserveWorkBranchOnQueuedPickup);
+        Assert.Null(recovered.StartedAt);
+        Assert.Null(recovered.LastError);
+        Assert.Null(recovered.FailureKind);
+        Assert.Null(recovered.NextTransientRetryAt);
+        Assert.Equal(0, recovered.TransientRetryAttempts);
+        Assert.Null(recovered.TransientRetryFirstFailedAt);
+        Assert.Null(recovered.TransientRetryFrom);
+    }
+
+    [Fact]
     public void GracefulShutdownRecovery_SuspendedItem_IsLeftAlone()
     {
         var item = MakeItem(WorkItemState.Working) with { SuspendedVmName = "vm-1" };

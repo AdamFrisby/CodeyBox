@@ -2120,6 +2120,57 @@ public sealed class AgentConfigHotReloadTests
         Assert.DoesNotContain(capturingLog.Entries, e => e.Level >= LogLevel.Warning);
     }
 
+    [Fact]
+    public async Task Coordinator_OnChange_RemoteHostCapacityLogsFanoutCapWhenPoolGrows()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            WorkerPool = new WorkerPoolOptions
+            {
+                MaxConcurrentWorkers = 4,
+                MaxConcurrentSandboxes = 4,
+            },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var hostPool = new MutableHostPool([HostPoolRow("a", 2)]);
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(initial.AgentConcurrency);
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), initial.AgentBurnEstimator,
+            NullLogger<AgentBurnEstimator>.Instance);
+        var log = new CapturingLogger<AgentConfigHotReload>();
+        var coordinator = new AgentConfigHotReload(
+            monitor,
+            orchFixture.Orchestrator,
+            router,
+            burnEstimator,
+            log,
+            hostPoolSnapshot: hostPool);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        hostPool.Rows = [HostPoolRow("a", 3), HostPoolRow("b", 3)];
+        monitor.Fire(new CodeyBoxOptions
+        {
+            WorkerPool = new WorkerPoolOptions
+            {
+                MaxConcurrentWorkers = 4,
+                MaxConcurrentSandboxes = 4,
+            },
+        });
+
+        await coordinator.StopAsync(CancellationToken.None);
+
+        var warning = Assert.Single(log.Entries, e =>
+            e.Level == LogLevel.Warning
+            && e.Properties.TryGetValue("HostCapacity", out var capacity)
+            && Equals(capacity, "6"));
+        Assert.Equal(4, warning.Properties["GlobalCap"]);
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────────
 
     private static AgentClass MakeClass(string id, AgentKind agent) => new()
@@ -2140,6 +2191,25 @@ public sealed class AgentConfigHotReloadTests
         },
         TimeSpan.Zero,
         TimeSpan.FromHours(24));
+
+    private static SandboxHostPoolEntry HostPoolRow(string id, int capacity) =>
+        new(
+            HostId: id,
+            Capacity: capacity,
+            Reserved: 0,
+            Cordoned: false,
+            ConfiguredHealthy: true,
+            RuntimeHealthy: true,
+            RuntimeUnhealthyReason: null,
+            RuntimeUnhealthyUntil: null,
+            AllowedNetworkProfiles: []);
+
+    private sealed class MutableHostPool(IReadOnlyList<SandboxHostPoolEntry> rows) : ISandboxHostPoolSnapshot
+    {
+        public IReadOnlyList<SandboxHostPoolEntry> Rows { get; set; } = rows;
+
+        public IReadOnlyList<SandboxHostPoolEntry> SnapshotHostPool() => Rows;
+    }
 
     private sealed class OrchestratorFixture : IDisposable
     {

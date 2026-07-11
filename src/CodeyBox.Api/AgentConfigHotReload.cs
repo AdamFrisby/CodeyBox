@@ -81,6 +81,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly TransitionHealthOptionsSnapshot? _transitionHealth;
     private readonly IAgentPauseController? _pauses;
     private readonly IAgentRegistry? _agents;
+    private readonly ISandboxHostPoolSnapshot? _hostPoolSnapshot;
     private readonly ILogger<AgentConfigHotReload> _log;
     private readonly Lock _gate = new();
     private IDisposable? _subscription;
@@ -103,6 +104,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private string _lastTransitionHealth = "";
     private string _lastAgentPauses = "";
     private string _lastNetworkTolerance = "";
+    private string _lastHostPoolCapacity = "";
 
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
 
@@ -126,7 +128,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         SmokeOptionsSnapshot? smokeOptions = null,
         IAgentPauseController? pauses = null,
         IAgentRegistry? agents = null,
-        TransitionHealthOptionsSnapshot? transitionHealth = null)
+        TransitionHealthOptionsSnapshot? transitionHealth = null,
+        ISandboxHostPoolSnapshot? hostPoolSnapshot = null)
     {
         if (costCalculator is not null && pricingState is null)
         {
@@ -154,6 +157,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _transitionHealth = transitionHealth;
         _pauses = pauses;
         _agents = agents;
+        _hostPoolSnapshot = hostPoolSnapshot;
         _log = log;
     }
 
@@ -179,6 +183,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _lastSmoke = SerializeSmoke(initial.Smoke);
         _lastTransitionHealth = SerializeTransitionHealth(initial.TransitionHealth);
         _lastAgentPauses = SerializeAgentPauses(initial.AgentPauses);
+        _lastHostPoolCapacity = SerializeHostPoolCapacity(initial);
 
         AgentSuspendResilience.SetMaxRetries(initial.PipelineTuning.AgentSuspendMaxRetries);
         SessionResumeOptions.SetMaxResumeAttempts(initial.PipelineTuning.AgentSessionResumeMaxAttempts);
@@ -207,6 +212,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         lock (_gate)
         {
             ApplyWorkerPoolIfChanged(opts);
+            LogRemoteHostCapacityIfChanged(opts);
             ApplyConcurrencyIfChanged(opts);
             ApplySmokeIfChanged(opts);
             ApplyTransitionHealthIfChanged(opts);
@@ -521,6 +527,54 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         return 1;
     }
 
+    private static int ResolveEffectiveMaxConcurrentSandboxes(WorkerPoolOptions workerPool, int maxConcurrentWorkers) =>
+        workerPool.MaxConcurrentSandboxes
+        ?? OrchestratorOptionsFactory.DeriveDefaultMaxConcurrentSandboxes(maxConcurrentWorkers);
+
+    private void LogRemoteHostCapacityIfChanged(CodeyBoxOptions opts)
+    {
+        if (_hostPoolSnapshot is null) return;
+
+        string next;
+        try
+        {
+            next = SerializeHostPoolCapacity(opts);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "Hot-reload remote host capacity check failed before logging fan-out cap state. " +
+                "Fix the configuration error and re-save to retry.");
+            return;
+        }
+
+        if (string.Equals(_lastHostPoolCapacity, next, StringComparison.Ordinal))
+            return;
+
+        var prev = _lastHostPoolCapacity;
+        try
+        {
+            var maxWorkers = ResolveEffectiveMaxConcurrentWorkers(opts.WorkerPool, opts.Concurrency);
+            var maxSandboxes = ResolveEffectiveMaxConcurrentSandboxes(opts.WorkerPool, maxWorkers);
+            RemoteHostPoolCapacityLogger.Log(
+                _hostPoolSnapshot,
+                new OrchestratorOptions
+                {
+                    MaxConcurrentWorkers = maxWorkers,
+                    MaxConcurrentSandboxes = maxSandboxes,
+                },
+                _log);
+            _lastHostPoolCapacity = next;
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "Hot-reload remote host capacity check rejected; keeping prior fan-out capacity snapshot ({Prev}). " +
+                "Fix the configuration error and re-save to retry.",
+                prev);
+        }
+    }
+
     private void ApplyConcurrencyIfChanged(CodeyBoxOptions opts)
     {
         var next = SerializeConcurrency(opts.AgentConcurrency);
@@ -735,6 +789,37 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 LegacyConcurrency = legacyConcurrency,
             },
             JsonOpts);
+
+    private string SerializeHostPoolCapacity(CodeyBoxOptions opts)
+    {
+        if (_hostPoolSnapshot is null)
+            return "";
+
+        var maxWorkers = ResolveEffectiveMaxConcurrentWorkers(opts.WorkerPool, opts.Concurrency);
+        var maxSandboxes = ResolveEffectiveMaxConcurrentSandboxes(opts.WorkerPool, maxWorkers);
+        var rows = _hostPoolSnapshot.SnapshotHostPool()
+            .OrderBy(static row => row.HostId, StringComparer.Ordinal)
+            .Select(static row => new
+            {
+                row.HostId,
+                row.Capacity,
+                row.Cordoned,
+                row.ConfiguredHealthy,
+                AllowedNetworkProfiles = row.AllowedNetworkProfiles
+                    .OrderBy(static profile => profile, StringComparer.OrdinalIgnoreCase)
+                    .ToArray(),
+            })
+            .ToArray();
+
+        return JsonSerializer.Serialize(
+            new
+            {
+                MaxConcurrentWorkers = maxWorkers,
+                MaxConcurrentSandboxes = maxSandboxes,
+                Hosts = rows,
+            },
+            JsonOpts);
+    }
 
     private static string SerializeConcurrency(AgentConcurrencyOptions opts) =>
         JsonSerializer.Serialize(

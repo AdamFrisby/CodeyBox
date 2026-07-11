@@ -1268,6 +1268,22 @@ public sealed class E2eExecutionTests : IDisposable
     }
 
     [Fact]
+    public async Task CompositeLifecycleProvider_reports_partial_inventory_when_one_provider_fails()
+    {
+        var local = new ManagedProviderDouble(
+            "local",
+            [new ManagedSandboxInfo("local-vm", DateTimeOffset.UtcNow, null, IsTrackedActive: false)]);
+        var remote = new ManagedProviderDouble("remote", []) { ThrowOnList = true };
+        var composite = new CompositeManagedSandboxProvider([local, remote]);
+
+        var inventory = await composite.ListManagedInventoryAsync(CancellationToken.None);
+
+        var info = Assert.Single(inventory);
+        Assert.Equal("local-vm", info.Name);
+        Assert.False(inventory.IsComplete);
+    }
+
+    [Fact]
     public async Task CompositeLifecycleProvider_throws_when_unscoped_dispose_cannot_be_routed()
     {
         var local = new ManagedProviderDouble(

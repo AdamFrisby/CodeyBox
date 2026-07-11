@@ -2755,6 +2755,11 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             }
         }
 
+        // The item itself has either progressed or been deferred. Release the
+        // global worker slot before follow-up fan-out so unrelated queued work
+        // is not left waiting behind dependency scans or release callbacks.
+        await ReleaseCompletedWorkerSlotLeaseAsync(slotLease, ct);
+
         // After the pipeline finishes (any outcome), check whether any
         // Queued items were waiting on this item and are now unblocked.
         await EnqueueSatisfiedDependentsAsync(id, ct);

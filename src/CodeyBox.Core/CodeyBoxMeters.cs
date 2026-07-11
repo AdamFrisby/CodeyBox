@@ -14,6 +14,7 @@ public static class CodeyBoxMeters
     private static readonly Meter SandboxMeter = new("CodeyBox.Sandbox");
     private static readonly Meter AuditMeter = new("CodeyBox.Audit");
     private static readonly Meter UpstreamMeter = new("CodeyBox.Upstream");
+    private static readonly Meter CoordinatorMeter = new("CodeyBox.Coordinator");
 
     /// <summary>Incremented on every work-item state transition. Tag: <c>to_state</c>.</summary>
     public static readonly Counter<long> PipelineTransitions =
@@ -110,9 +111,41 @@ public static class CodeyBoxMeters
     public static readonly Histogram<double> SandboxNetTxMb =
         SandboxMeter.CreateHistogram<double>("codeybox.sandbox.resource.net_tx_mb", unit: "MB");
 
+    /// <summary>Remote sandbox placement attempts. Tags: <c>host_id</c>, <c>outcome</c>.</summary>
+    public static readonly Counter<long> SandboxRemotePlacements =
+        SandboxMeter.CreateCounter<long>("codeybox.sandbox.remote_placement.count", unit: "{placement}");
+
+    /// <summary>Remote sandbox placement deferrals. Tags: <c>reason</c>, <c>network_profile</c>.</summary>
+    public static readonly Counter<long> SandboxRemotePlacementDeferrals =
+        SandboxMeter.CreateCounter<long>("codeybox.sandbox.remote_placement.deferrals", unit: "{deferral}");
+
+    /// <summary>Runtime remote-host health transitions. Tags: <c>host_id</c>, <c>state</c>.</summary>
+    public static readonly Counter<long> SandboxRemoteHostHealthTransitions =
+        SandboxMeter.CreateCounter<long>("codeybox.sandbox.remote_host.health_transitions", unit: "{transition}");
+
     /// <summary>Upstream API call duration. Tags: <c>endpoint</c>, <c>status_code</c>.</summary>
     public static readonly Histogram<long> UpstreamApiCallDuration =
         UpstreamMeter.CreateHistogram<long>("codeybox.upstream.api_call.duration_ms");
+
+    /// <summary>SQLite single-writer gate wait time.</summary>
+    public static readonly Histogram<long> CoordinatorSqliteWriteGateWait =
+        CoordinatorMeter.CreateHistogram<long>("codeybox.coordinator.sqlite.write_gate.wait_ms", unit: "ms");
+
+    /// <summary>Host-side git command duration. Tags: <c>operation</c>, <c>outcome</c>.</summary>
+    public static readonly Histogram<long> CoordinatorGitCommandDuration =
+        CoordinatorMeter.CreateHistogram<long>("codeybox.coordinator.git.command.duration_ms", unit: "ms");
+
+    /// <summary>Agent stream capture writer I/O duration. Tags: <c>phase</c>, <c>outcome</c>.</summary>
+    public static readonly Histogram<long> CoordinatorAgentStreamCaptureDuration =
+        CoordinatorMeter.CreateHistogram<long>("codeybox.coordinator.agent_stream.capture.duration_ms", unit: "ms");
+
+    /// <summary>Agent stream enqueue backpressure wait. Tags: <c>phase</c>, <c>outcome</c>.</summary>
+    public static readonly Histogram<long> CoordinatorAgentStreamBackpressureWait =
+        CoordinatorMeter.CreateHistogram<long>("codeybox.coordinator.agent_stream.backpressure.wait_ms", unit: "ms");
+
+    /// <summary>Agent stream bytes dropped by stream-size caps. Tags: <c>phase</c>, <c>reason</c>.</summary>
+    public static readonly Counter<long> CoordinatorAgentStreamDroppedBytes =
+        CoordinatorMeter.CreateCounter<long>("codeybox.coordinator.agent_stream.dropped_bytes", unit: "By");
 
     /// <summary>Incremented once each time a work item is dispatched to a worker.</summary>
     public static readonly Counter<long> Dispatches =

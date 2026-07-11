@@ -41,17 +41,37 @@ public interface IRemoteHostTransport
     /// implementations MUST NOT buffer to EOF, since agent runners rely on the
     /// live stream for AgentStreamCapture.</para>
     ///
+    /// <para>When <paramref name="maxStdoutBytes"/> or
+    /// <paramref name="maxStderrBytes"/> is non-null, the value is the maximum
+    /// UTF-8 byte count retained and forwarded for that stream. Implementations
+    /// set the matching limit-exceeded flag on <see cref="ProcessRunResult"/>
+    /// when the cap is crossed; <paramref name="killOnOutputLimit"/> controls
+    /// whether the remote command is terminated at that point or the excess
+    /// bytes are drained and discarded. A null stream limit means the caller has
+    /// not requested a cap for that stream.</para>
+    ///
     /// <para>Connection / auth failures throw
     /// <see cref="RemoteSshTransportException"/>. A successfully-executed
     /// remote command that exits non-zero returns a <see cref="ProcessRunResult"/>
     /// with <c>ExitCode != 0</c> — that is NOT a transport failure.</para>
     /// </summary>
+    /// <param name="argv">Remote program and arguments before transport quoting.</param>
+    /// <param name="stdin">Optional text stdin to send to the remote command.</param>
+    /// <param name="ct">Cancellation token for the local transport operation.</param>
+    /// <param name="stdoutChunkCallback">Optional live stdout callback receiving retained chunks.</param>
+    /// <param name="stderrChunkCallback">Optional live stderr callback receiving retained chunks.</param>
+    /// <param name="maxStdoutBytes">Optional retained stdout limit in UTF-8 bytes; null means no caller cap.</param>
+    /// <param name="maxStderrBytes">Optional retained stderr limit in UTF-8 bytes; null means no caller cap.</param>
+    /// <param name="killOnOutputLimit">True to terminate the remote command when a stream cap is exceeded; false to keep draining while discarding excess bytes.</param>
     Task<ProcessRunResult> RunAsync(
         IReadOnlyList<string> argv,
         string? stdin,
         CancellationToken ct,
         Action<string>? stdoutChunkCallback = null,
-        Action<string>? stderrChunkCallback = null);
+        Action<string>? stderrChunkCallback = null,
+        int? maxStdoutBytes = null,
+        int? maxStderrBytes = null,
+        bool killOnOutputLimit = true);
 
     /// <summary>
     /// Stage a host-local source path into the remote host at

@@ -229,6 +229,7 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
              .AddMeter("CodeyBox.Sandbox")
              .AddMeter("CodeyBox.Audit")
              .AddMeter("CodeyBox.Upstream")
+             .AddMeter("CodeyBox.Coordinator")
              .AddRuntimeInstrumentation();
             if (otelOpts.Enabled)
                 m.AddOtlpExporter(o => ConfigureOtlp(o, otelOpts));
@@ -449,6 +450,8 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         "Sandbox admission control: provider={Provider}, MaxConcurrentSandboxes={MaxConcurrentSandboxes}",
         inner.Name,
         orchestratorOptions.MaxConcurrentSandboxes);
+    if (inner is ISandboxHostPoolSnapshot hostPool)
+        RemoteHostPoolCapacityLogger.Log(hostPool, orchestratorOptions, startupLog);
     return SandboxAdmissionControlledProvider.Wrap(
         inner,
         orchestratorOptions.MaxConcurrentSandboxes,
@@ -793,18 +796,16 @@ static MultipassRemoteSandboxProvider BuildMultipassRemoteFromConfig(
     Func<CodeyBoxOptions, MultipassRemoteSandboxConfig?> configSelector)
 {
     // All options resolved through IOptionsMonitor so SSH endpoint, key path,
-    // staging dir, and timeouts hot-reload on the next CreateAsync without an
-    // orchestrator restart. The OpenSSH-CLI transport is constructed once and
-    // re-reads options the same way for every call.
+    // staging dir, host-pool membership, and timeouts hot-reload on the next
+    // CreateAsync without an orchestrator restart.
     var transportLogger = loggerFactory.CreateLogger<OpenSshCliTransport>();
     var runner = sp.GetService<IProcessRunner>() ?? new DefaultProcessRunner();
-    var transport = new OpenSshCliTransport(
-        () => ReadRemoteOpts(sp, configSelector),
-        runner,
-        transportLogger);
     return new MultipassRemoteSandboxProvider(
         () => ReadRemoteOpts(sp, configSelector),
-        transport,
+        hostOptions => new OpenSshCliTransport(
+            () => hostOptions,
+            runner,
+            transportLogger),
         loggerFactory.CreateLogger<MultipassRemoteSandboxProvider>());
 
     static MultipassRemoteSandboxOptions ReadRemoteOpts(
@@ -812,28 +813,7 @@ static MultipassRemoteSandboxProvider BuildMultipassRemoteFromConfig(
         Func<CodeyBoxOptions, MultipassRemoteSandboxConfig?> configSelector)
     {
         var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
-        var cfg = configSelector(live) ?? new MultipassRemoteSandboxConfig();
-        var fromDefaults = new MultipassRemoteSandboxOptions();
-        return new MultipassRemoteSandboxOptions
-        {
-            SshBinary = !string.IsNullOrWhiteSpace(cfg.SshBinary) ? cfg.SshBinary! : fromDefaults.SshBinary,
-            SshTarget = cfg.SshTarget ?? "",
-            SshPort = cfg.SshPort,
-            SshKeyPath = cfg.SshKeyPath,
-            ExtraSshOptions = cfg.ExtraSshOptions?.ToArray() ?? [],
-            AcceptUnknownHostKeys = cfg.AcceptUnknownHostKeys,
-            ServerAliveIntervalSeconds = cfg.ServerAliveIntervalSeconds ?? fromDefaults.ServerAliveIntervalSeconds,
-            ServerAliveCountMax = cfg.ServerAliveCountMax ?? fromDefaults.ServerAliveCountMax,
-            ConnectTimeoutSeconds = cfg.ConnectTimeoutSeconds ?? fromDefaults.ConnectTimeoutSeconds,
-            LocalTarBinary = !string.IsNullOrWhiteSpace(cfg.LocalTarBinary) ? cfg.LocalTarBinary! : fromDefaults.LocalTarBinary,
-            RemoteMultipassPath = !string.IsNullOrWhiteSpace(cfg.RemoteMultipassPath) ? cfg.RemoteMultipassPath! : fromDefaults.RemoteMultipassPath,
-            RemoteStagingRoot = !string.IsNullOrWhiteSpace(cfg.RemoteStagingRoot) ? cfg.RemoteStagingRoot! : fromDefaults.RemoteStagingRoot,
-            DefaultImage = cfg.DefaultImage,
-            VmStartTimeout = cfg.VmStartTimeout ?? fromDefaults.VmStartTimeout,
-            VmStopTimeout = cfg.VmStopTimeout ?? fromDefaults.VmStopTimeout,
-            VmStateCheckInterval = cfg.VmStateCheckInterval ?? fromDefaults.VmStateCheckInterval,
-            VmNamePrefix = !string.IsNullOrWhiteSpace(cfg.VmNamePrefix) ? cfg.VmNamePrefix! : fromDefaults.VmNamePrefix,
-        };
+        return MultipassRemoteOptionsMapper.Map(configSelector(live), live.SandboxNetworkProfiles);
     }
 }
 
@@ -926,6 +906,7 @@ builder.Services.AddSingleton<LocalGitHost>(sp =>
         new LocalGitHostOptions
         {
             RootDirectory = opts.GitRootDirectory,
+            GitCommandMaxOutputBytes = opts.GitCommandMaxOutputBytes,
             EnableSharedUpstreamMirror = opts.EnableSharedUpstreamMirror,
             SharedUpstreamMirrorDirectory = opts.SharedUpstreamMirrorDirectory
         },
@@ -3352,7 +3333,8 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         smokeOptions: sp.GetRequiredService<SmokeOptionsSnapshot>(),
         pauses: sp.GetRequiredService<IAgentPauseController>(),
         agents: sp.GetRequiredService<IAgentRegistry>(),
-        transitionHealth: sp.GetRequiredService<TransitionHealthOptionsSnapshot>());
+        transitionHealth: sp.GetRequiredService<TransitionHealthOptionsSnapshot>(),
+        hostPoolSnapshot: sp.GetService<ISandboxProvider>() as ISandboxHostPoolSnapshot);
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AgentConfigHotReload>());
 builder.Services.AddHostedService(sp => new StartupSmokeProbeService(
@@ -4076,7 +4058,11 @@ namespace CodeyBox.Api
     /// </summary>
     public sealed class MultipassRemoteSandboxConfig
     {
-        /// <summary>SSH destination passed verbatim to <c>ssh &lt;target&gt;</c>. Required.</summary>
+        /// <summary>
+        /// Default SSH destination passed verbatim to <c>ssh &lt;target&gt;</c>.
+        /// Required for single-host mode; optional when every executor host
+        /// under <see cref="ExecutorHosts"/> supplies its own target.
+        /// </summary>
         public string? SshTarget { get; set; }
 
         /// <summary>OpenSSH binary. Default <c>ssh</c> (resolved via $PATH).</summary>
@@ -4109,6 +4095,18 @@ namespace CodeyBox.Api
         /// <summary>Local tar binary used by the staging pipeline. Default <c>tar</c>.</summary>
         public string? LocalTarBinary { get; set; }
 
+        /// <summary>Maximum tar bytes accepted from a remote writable mount during sync-back. Null = provider default.</summary>
+        public long? StageOutMaxArchiveBytes { get; set; }
+
+        /// <summary>Maximum non-metadata tar entries accepted during remote sync-back validation. Null = provider default.</summary>
+        public int? StageOutMaxEntries { get; set; }
+
+        /// <summary>Maximum declared-payload/archive-byte ratio accepted during remote sync-back validation. Null = provider default.</summary>
+        public double? StageOutMaxExpansionRatio { get; set; }
+
+        /// <summary>Maximum stdout/stderr bytes accepted from remote inventory commands. Null = provider default.</summary>
+        public int? RemoteInventoryMaxOutputBytes { get; set; }
+
         /// <summary>Absolute path to <c>multipass</c> on the remote host.</summary>
         public string? RemoteMultipassPath { get; set; }
 
@@ -4133,6 +4131,67 @@ namespace CodeyBox.Api
         /// leak-dispose safety check that refuses to delete arbitrary VMs.
         /// </summary>
         public string? VmNamePrefix { get; set; }
+
+        /// <summary>
+        /// Optional host-local cap for the legacy single-host shape. Null means
+        /// uncapped here; global WorkerPool sandbox/worker gates still apply.
+        /// </summary>
+        public int? MaxConcurrentSandboxes { get; set; }
+
+        /// <summary>No new VMs are placed on this host while true; existing VMs drain.</summary>
+        public bool Cordoned { get; set; }
+
+        /// <summary>Operator health gate. False routes new VMs away from this host.</summary>
+        public bool Healthy { get; set; } = true;
+
+        /// <summary>
+        /// Logical network profiles this host accepts. Empty or "*" means all;
+        /// "(default)" matches sandboxes with no explicit network profile.
+        /// </summary>
+        public IList<string>? AllowedNetworkProfiles { get; set; }
+
+        /// <summary>Retry delay when no executor host currently has eligible capacity.</summary>
+        public TimeSpan? PlacementRecheckIn { get; set; }
+
+        /// <summary>Runtime unhealthy backoff after an SSH transport drop.</summary>
+        public TimeSpan? RuntimeUnhealthyBackoff { get; set; }
+
+        /// <summary>
+        /// Multi-host executor pool. Host entries inherit unset SSH/staging
+        /// fields from this top-level block. When empty, the top-level block is
+        /// treated as one legacy host named "default".
+        /// </summary>
+        public IList<MultipassRemoteExecutorHostConfig>? ExecutorHosts { get; set; }
+    }
+
+    public sealed class MultipassRemoteExecutorHostConfig
+    {
+        public string? Id { get; set; }
+        public string? SshTarget { get; set; }
+        public string? SshBinary { get; set; }
+        public int? SshPort { get; set; }
+        public string? SshKeyPath { get; set; }
+        public IList<string>? ExtraSshOptions { get; set; }
+        public bool? AcceptUnknownHostKeys { get; set; }
+        public int? ServerAliveIntervalSeconds { get; set; }
+        public int? ServerAliveCountMax { get; set; }
+        public int? ConnectTimeoutSeconds { get; set; }
+        public string? LocalTarBinary { get; set; }
+        public long? StageOutMaxArchiveBytes { get; set; }
+        public int? StageOutMaxEntries { get; set; }
+        public double? StageOutMaxExpansionRatio { get; set; }
+        public int? RemoteInventoryMaxOutputBytes { get; set; }
+        public string? RemoteMultipassPath { get; set; }
+        public string? RemoteStagingRoot { get; set; }
+        public string? DefaultImage { get; set; }
+        public TimeSpan? VmStartTimeout { get; set; }
+        public TimeSpan? VmStopTimeout { get; set; }
+        public TimeSpan? VmStateCheckInterval { get; set; }
+        public string? VmNamePrefix { get; set; }
+        public int? MaxConcurrentSandboxes { get; set; }
+        public bool? Cordoned { get; set; }
+        public bool? Healthy { get; set; }
+        public IList<string>? AllowedNetworkProfiles { get; set; }
     }
 
     /// <summary>
@@ -4290,7 +4349,8 @@ namespace CodeyBox.Api
     /// <item><b>Startup-only and rejected</b> on reload by
     ///   <see cref="ImmutableCodeyBoxOptionsValidator"/>:
     ///   <c>SandboxProvider</c>, <c>StateDatabasePath</c>,
-    ///   <c>GitRootDirectory</c>, <c>AgentStreams.Path</c>,
+    ///   <c>GitRootDirectory</c>, <c>GitCommandMaxOutputBytes</c>,
+    ///   <c>AgentStreams.Path</c>,
     ///   <c>WorkerPool.MaxConcurrentSandboxes</c>,
     ///   <c>EnableSharedUpstreamMirror</c>, and
     ///   <c>SharedUpstreamMirrorDirectory</c>. The retaining
@@ -4309,6 +4369,7 @@ namespace CodeyBox.Api
     public sealed class CodeyBoxOptions
     {
         public string GitRootDirectory { get; set; } = "/var/lib/codeybox/repos";
+        public int GitCommandMaxOutputBytes { get; set; } = LocalGitHostOptions.DefaultGitCommandMaxOutputBytes;
         public bool EnableSharedUpstreamMirror { get; set; } = false;
         public string SharedUpstreamMirrorDirectory { get; set; } = "_upstream-mirror";
         public string StateDatabasePath { get; set; } = "/var/lib/codeybox/state.db";

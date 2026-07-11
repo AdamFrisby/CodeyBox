@@ -34,6 +34,8 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
     private readonly ObservableGauge<long> _workersMax;
     private readonly ObservableGauge<long> _sandboxActive;
     private readonly ObservableGauge<long> _sandboxMax;
+    private readonly ObservableGauge<long>? _remoteHostReserved;
+    private readonly ObservableGauge<long>? _remoteHostCapacity;
     private readonly ObservableGauge<double>? _quotaAvailable;
 
     // Refreshed off-thread; read by the work-item gauge callback.
@@ -88,6 +90,21 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
             ObserveSandboxMax,
             unit: "{sandbox}",
             description: "Configured MaxConcurrentSandboxes admission ceiling.");
+
+        if (_sandboxes is ISandboxHostPoolSnapshot)
+        {
+            _remoteHostReserved = CodeyBoxMeters.CreateSandboxObservableGauge<long>(
+                "codeybox.sandbox.remote_host.reserved",
+                ObserveRemoteHostReserved,
+                unit: "{sandbox}",
+                description: "Per-remote-host reserved sandbox slots, including provisioning and active VMs.");
+
+            _remoteHostCapacity = CodeyBoxMeters.CreateSandboxObservableGauge<long>(
+                "codeybox.sandbox.remote_host.capacity",
+                ObserveRemoteHostCapacity,
+                unit: "{sandbox}",
+                description: "Per-remote-host placement capacity after hot-reloaded host-pool configuration.");
+        }
 
         if (_quotaSnapshot is not null)
         {
@@ -159,6 +176,50 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
         {
             return [];
         }
+    }
+
+    private IEnumerable<Measurement<long>> ObserveRemoteHostReserved()
+    {
+        if (_disposed || _sandboxes is not ISandboxHostPoolSnapshot pool) return [];
+
+        try
+        {
+            return pool.SnapshotHostPool()
+                .Select(row => new Measurement<long>(
+                    row.Reserved,
+                    RemoteHostTags(row).ToArray()))
+                .ToArray();
+        }
+        catch (ObjectDisposedException)
+        {
+            return [];
+        }
+    }
+
+    private IEnumerable<Measurement<long>> ObserveRemoteHostCapacity()
+    {
+        if (_disposed || _sandboxes is not ISandboxHostPoolSnapshot pool) return [];
+
+        try
+        {
+            return pool.SnapshotHostPool()
+                .Select(row => new Measurement<long>(
+                    row.Capacity,
+                    RemoteHostTags(row).ToArray()))
+                .ToArray();
+        }
+        catch (ObjectDisposedException)
+        {
+            return [];
+        }
+    }
+
+    private static IEnumerable<KeyValuePair<string, object?>> RemoteHostTags(SandboxHostPoolEntry row)
+    {
+        yield return new("host_id", row.HostId);
+        yield return new("cordoned", row.Cordoned);
+        yield return new("configured_healthy", row.ConfiguredHealthy);
+        yield return new("runtime_healthy", row.RuntimeHealthy);
     }
 
     private IEnumerable<Measurement<double>> ObserveQuotaAvailability()
@@ -240,6 +301,8 @@ public sealed class CodeyBoxObservableMetrics : IHostedService, IDisposable
         GC.KeepAlive(_workersMax);
         GC.KeepAlive(_sandboxActive);
         GC.KeepAlive(_sandboxMax);
+        GC.KeepAlive(_remoteHostReserved);
+        GC.KeepAlive(_remoteHostCapacity);
         GC.KeepAlive(_quotaAvailable);
     }
 }

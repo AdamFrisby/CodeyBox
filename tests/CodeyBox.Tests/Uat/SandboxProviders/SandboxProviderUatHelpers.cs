@@ -208,6 +208,7 @@ internal sealed class UatSandboxProvider : ISandboxProvider
     private readonly object _gate = new();
     private readonly List<ManagedSandboxInfo> _managed = [];
     private readonly List<string> _disposedNames = [];
+    private readonly List<(string Name, string? HostId)> _disposedManaged = [];
     private readonly HashSet<string> _throwOnDispose = new(StringComparer.Ordinal);
     private bool _throwOnList;
 
@@ -218,6 +219,15 @@ internal sealed class UatSandboxProvider : ISandboxProvider
         {
             lock (_gate)
                 return _disposedNames.ToList();
+        }
+    }
+
+    public IReadOnlyList<(string Name, string? HostId)> DisposedManaged
+    {
+        get
+        {
+            lock (_gate)
+                return _disposedManaged.ToList();
         }
     }
 
@@ -246,6 +256,18 @@ internal sealed class UatSandboxProvider : ISandboxProvider
             throw new InvalidOperationException("dispose failed");
         lock (_gate)
             _disposedNames.Add(name);
+        return Task.CompletedTask;
+    }
+
+    public Task DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
+    {
+        if (_throwOnDispose.Contains(sandbox.Name))
+            throw new InvalidOperationException("dispose failed");
+        lock (_gate)
+        {
+            _disposedNames.Add(sandbox.Name);
+            _disposedManaged.Add((sandbox.Name, sandbox.HostId));
+        }
         return Task.CompletedTask;
     }
 }

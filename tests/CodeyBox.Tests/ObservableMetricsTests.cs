@@ -191,6 +191,46 @@ public sealed class ObservableMetricsTests : IDisposable
     }
 
     [Fact]
+    public async Task RemoteHostPoolGauges_ReportWrappedProviderSnapshot()
+    {
+        var store = new SqliteWorkItemStore(_dbPath);
+        var provider = SandboxAdmissionControlledProvider.Wrap(
+            new FakeHostPoolProvider(
+            [
+                new SandboxHostPoolEntry(
+                    HostId: "host-a",
+                    Capacity: 3,
+                    Reserved: 2,
+                    Cordoned: false,
+                    ConfiguredHealthy: true,
+                    RuntimeHealthy: true,
+                    RuntimeUnhealthyReason: null,
+                    RuntimeUnhealthyUntil: null,
+                    AllowedNetworkProfiles: ["work"]),
+            ]),
+            maxConcurrentSandboxes: 4,
+            NullLogger.Instance);
+        using var svc = new CodeyBoxObservableMetrics(
+            store,
+            provider,
+            new OrchestratorOptions { MaxConcurrentWorkers = 4, MaxConcurrentSandboxes = 4 },
+            NullLogger<CodeyBoxObservableMetrics>.Instance,
+            workerPool: new FakeWorkerPool(0),
+            quotaSnapshot: null,
+            refreshInterval: TimeSpan.FromMinutes(10));
+        await svc.StartAsync(CancellationToken.None);
+
+        var observed = CollectLong(svc, "host_id",
+            "codeybox.sandbox.remote_host.reserved",
+            "codeybox.sandbox.remote_host.capacity");
+
+        Assert.Contains(observed, m => m.Instrument == "codeybox.sandbox.remote_host.reserved" && m.Tag == "host-a" && m.Value == 2);
+        Assert.Contains(observed, m => m.Instrument == "codeybox.sandbox.remote_host.capacity" && m.Tag == "host-a" && m.Value == 3);
+
+        await svc.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task QuotaAvailableGauge_RegisteredWhenSnapshotPresent_ReportsPerAgentPct()
     {
         var store = new SqliteWorkItemStore(_dbPath);
@@ -481,6 +521,18 @@ public sealed class ObservableMetricsTests : IDisposable
         public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
             Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
         public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    private sealed class FakeHostPoolProvider(IReadOnlyList<SandboxHostPoolEntry> rows)
+        : ISandboxProvider, ISandboxHostPoolSnapshot
+    {
+        public string Name => "host-pool";
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
+        public IReadOnlyList<SandboxHostPoolEntry> SnapshotHostPool() => rows;
     }
 
     /// <summary>

@@ -210,6 +210,7 @@ public sealed class ReleaseService
             throw new InvalidOperationException(
                 $"command failed: git push {branchName}\n{pushResult.Stderr}");
         }
+        await sandbox.SyncStateToHostAsync(ct);
 
         // Now atomically record in DB. The winner proceeds; the loser reads the winner's value.
         var won = await _releases.TrySetBranchAsync(release.Id, branchName, baseCommitSha, ct);

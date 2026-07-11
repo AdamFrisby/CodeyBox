@@ -1,17 +1,19 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
+using CodeyBox.HostProcess;
 using CodeyBox.Sandbox;
 
 namespace CodeyBox.Sandbox.MultipassRemote;
 
 /// <summary>
 /// Sandbox provider that drives <c>multipass</c> on a REMOTE host over SSH.
-/// CHEAP-PATH distributed VMs, step 1 of 2: a single orchestrator brain
-/// keeping all state in its local SQLite, with VM execution offloaded to
-/// another machine.
+/// CHEAP-PATH distributed VMs: a single orchestrator brain keeping all state
+/// in its local SQLite, with VM execution placed across one or more remote
+/// executor machines.
 ///
 /// <para><b>Architecture.</b> The orchestrator runs locally; the multipass
 /// daemon and every per-work-item VM live on the remote host. Every
@@ -57,6 +59,11 @@ namespace CodeyBox.Sandbox.MultipassRemote;
 /// <see cref="SandboxExecResult"/> with that exit code, exactly like local
 /// multipass.</para>
 ///
+/// <para><b>Host pool.</b> Placement is capacity-aware across configured
+/// executor hosts. It respects per-host caps, cordon/drain, configured
+/// health, runtime SSH health backoff, network-profile allowlists, and the
+/// orchestrator's global worker/sandbox admission gates.</para>
+///
 /// <para><b>Scope.</b> This provider supports cloning from an operator-baked
 /// remote Multipass baseline when <see cref="SandboxSpec.BaselineImageRef"/>
 /// is set. It intentionally does NOT implement: baseline image bake,
@@ -64,24 +71,29 @@ namespace CodeyBox.Sandbox.MultipassRemote;
 /// seeding. Those host-side concerns
 /// either don't translate cleanly to a remote host without further design
 /// (suspend/resume needs network-stable VM identity across orchestrator
-/// restarts; baselines need a per-remote-host cache) or are operator-tuning
-/// concerns we want to defer until the basic distributed-VM path is
-/// working end-to-end. The provider implements the <see cref="ISandboxProvider"/>
-/// + <see cref="ISandbox"/> contract with the lifecycle (create / exec /
-/// stop / dispose / list / leak-dispose) that the orchestrator needs.
+/// restarts; baselines need a per-remote-host cache) or remain
+/// operator-tuning concerns. The provider implements the
+/// <see cref="ISandboxProvider"/> + <see cref="ISandbox"/> contract with
+/// the lifecycle (create / exec / stop / dispose / list / leak-dispose)
+/// that the orchestrator needs.
 /// </para>
 /// </summary>
-public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IActiveSandboxProgressProvider
+public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IActiveSandboxProgressProvider, ISandboxHostPoolSnapshot
 {
     private readonly Func<MultipassRemoteSandboxOptions> _optsAccessor;
-    private readonly IRemoteHostTransport _transport;
+    private readonly Func<MultipassRemoteSandboxOptions, IRemoteHostTransport> _transportFactory;
     private readonly ILogger<MultipassRemoteSandboxProvider> _log;
-    private readonly SemaphoreSlim _heavyMultipassGate = new(1, 1);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _heavyMultipassGates =
+        new(StringComparer.Ordinal);
+    private readonly object _placementLock = new();
+    private readonly Dictionary<string, int> _hostReservations = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<RemoteSandboxIdentity, HostReservation> _retainedReservations = new();
+    private readonly ConcurrentDictionary<string, RemoteHostUnhealthyState> _runtimeUnhealthy =
+        new(StringComparer.Ordinal);
 
     // Tracks sandboxes still owned by a currently-running phase in this process.
     // Used by ListAllManagedAsync to compute ManagedSandboxInfo.IsTrackedActive.
-    private readonly ConcurrentDictionary<string, MultipassRemoteSandbox> _active =
-        new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<RemoteSandboxIdentity, MultipassRemoteSandbox> _active = new();
 
     public MultipassRemoteSandboxProvider(
         MultipassRemoteSandboxOptions opts,
@@ -94,9 +106,16 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         Func<MultipassRemoteSandboxOptions> optsAccessor,
         IRemoteHostTransport transport,
         ILogger<MultipassRemoteSandboxProvider> log)
+        : this(optsAccessor, _ => transport, log)
+    { }
+
+    public MultipassRemoteSandboxProvider(
+        Func<MultipassRemoteSandboxOptions> optsAccessor,
+        Func<MultipassRemoteSandboxOptions, IRemoteHostTransport> transportFactory,
+        ILogger<MultipassRemoteSandboxProvider> log)
     {
         _optsAccessor = optsAccessor;
-        _transport = transport;
+        _transportFactory = transportFactory;
         _log = log;
     }
 
@@ -105,14 +124,179 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {
         spec = SandboxConventions.WithTimingEnvironment(spec);
-        var opts = _optsAccessor();
+        var skippedHosts = new HashSet<string>(StringComparer.Ordinal);
+        Exception? lastHostFailure = null;
 
-        var vmName = NewVmName(opts);
-        var remoteSandboxRoot = JoinRemote(opts.RemoteStagingRoot, vmName);
-        var remoteFsRoot = JoinRemote(remoteSandboxRoot, "fs");
+        while (true)
+        {
+            HostReservation reservation;
+            try
+            {
+                reservation = await ReserveHostAsync(spec, skippedHosts, ct).ConfigureAwait(false);
+            }
+            catch (SandboxProvisioningDeferredException ex) when (lastHostFailure is not null)
+            {
+                throw new SandboxProvisioningDeferredException(
+                    ex.Provider,
+                    ex.Operation,
+                    "all-hosts-unavailable",
+                    $"{ex.Detail}; last host failure: {lastHostFailure.Message}",
+                    ex.RecheckIn,
+                    innerException: lastHostFailure);
+            }
 
+            var opts = reservation.HostOptions;
+            IRemoteHostTransport? transport = null;
+            string? vmName = null;
+            string? remoteSandboxRoot = null;
+            try
+            {
+                transport = _transportFactory(opts);
+                vmName = RemoteMultipassVmNames.NewVmName(opts);
+                remoteSandboxRoot = RemoteMultipassVmNames.BuildRemoteSandboxRoot(opts.RemoteStagingRoot, vmName);
+                var remoteFsRoot = JoinRemote(remoteSandboxRoot, "fs");
+                var sandbox = await CreateOnReservedHostAsync(
+                    spec,
+                    opts,
+                    transport,
+                    vmName,
+                    remoteSandboxRoot,
+                    remoteFsRoot,
+                    reservation,
+                    ct).ConfigureAwait(false);
+
+                MarkRuntimeHealthy(opts.HostId);
+                return sandbox;
+            }
+            catch (RemoteSshTransportException ex) when (ex.IsHostTransportFailure)
+            {
+                lastHostFailure = ex;
+                skippedHosts.Add(opts.HostId);
+                MarkRuntimeUnhealthy(opts, ex);
+                await RollBackCreateFailureAsync(
+                    opts,
+                    reservation,
+                    transport,
+                    vmName,
+                    remoteSandboxRoot,
+                    ex,
+                    ct,
+                    throwOnCleanupFailure: true).ConfigureAwait(false);
+
+                _log.LogWarning(
+                    ex,
+                    "Remote multipass host {HostId} transport failed during CreateAsync; retrying placement on another eligible host",
+                    opts.HostId);
+            }
+            catch (RemoteSshTransportException ex)
+            {
+                await RollBackCreateFailureAsync(opts, reservation, transport, vmName, remoteSandboxRoot, ex, ct).ConfigureAwait(false);
+                _log.LogWarning(
+                    ex,
+                    "Remote multipass host {HostId} failed request-specific staging during CreateAsync; failing the sandbox request",
+                    opts.HostId);
+                throw;
+            }
+            catch (RemoteHostProvisioningException ex) when (ex.IsHostRuntimeFailure)
+            {
+                lastHostFailure = ex;
+                skippedHosts.Add(opts.HostId);
+                MarkRuntimeUnhealthy(opts, ex);
+                await RollBackCreateFailureAsync(
+                    opts,
+                    reservation,
+                    transport,
+                    vmName,
+                    remoteSandboxRoot,
+                    ex,
+                    ct,
+                    throwOnCleanupFailure: true).ConfigureAwait(false);
+
+                _log.LogWarning(
+                    ex,
+                    "Remote multipass host {HostId} failed host-level provisioning during CreateAsync; retrying placement on another eligible host",
+                    opts.HostId);
+            }
+            catch (RemoteHostProvisioningException ex)
+            {
+                await RollBackCreateFailureAsync(opts, reservation, transport, vmName, remoteSandboxRoot, ex, ct).ConfigureAwait(false);
+                _log.LogWarning(
+                    ex,
+                    "Remote multipass host {HostId} failed request-specific provisioning during CreateAsync; failing the sandbox request",
+                    opts.HostId);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                await RollBackCreateFailureAsync(opts, reservation, transport, vmName, remoteSandboxRoot, ex, ct).ConfigureAwait(false);
+                throw;
+            }
+        }
+    }
+
+    private async Task RollBackCreateFailureAsync(
+        MultipassRemoteSandboxOptions opts,
+        HostReservation reservation,
+        IRemoteHostTransport? transport,
+        string? vmName,
+        string? remoteSandboxRoot,
+        Exception? cause,
+        CancellationToken ct,
+        bool throwOnCleanupFailure = true)
+    {
+        if (transport is null || string.IsNullOrWhiteSpace(vmName) || string.IsNullOrWhiteSpace(remoteSandboxRoot))
+        {
+            reservation.Dispose();
+            return;
+        }
+
+        try
+        {
+            await DeleteRemoteStateOrThrowAsync(
+                opts,
+                transport,
+                vmName,
+                remoteSandboxRoot,
+                CancellationToken.None).ConfigureAwait(false);
+            reservation.Dispose();
+        }
+        catch (Exception cleanupEx) when (cleanupEx is not OperationCanceledException || !ct.IsCancellationRequested)
+        {
+            RetainReservation(vmName, reservation);
+            _log.LogWarning(
+                cleanupEx,
+                "Retaining remote host reservation for {Vm} on host {HostId} because create rollback cleanup could not confirm deletion",
+                vmName,
+                opts.HostId);
+            if (!throwOnCleanupFailure)
+                return;
+
+            var causeDetail = cause is null ? "" : $"create failure: {cause.Message}; ";
+            throw new SandboxProvisioningDeferredException(
+                provider: Name,
+                operation: "create-rollback-cleanup",
+                errorClass: "remote-cleanup-unconfirmed",
+                detail: $"host={opts.HostId}; vm={vmName}; {causeDetail}{cleanupEx.Message}",
+                recheckIn: opts.PlacementRecheckIn,
+                retainedSandboxName: vmName,
+                retainedSandboxHostId: opts.HostId,
+                innerException: cleanupEx);
+        }
+    }
+
+    private async Task<ISandbox> CreateOnReservedHostAsync(
+        SandboxSpec spec,
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        string vmName,
+        string remoteSandboxRoot,
+        string remoteFsRoot,
+        HostReservation reservation,
+        CancellationToken ct)
+    {
         // 1) Prepare the per-sandbox staging directory on the remote host.
-        await EnsureRemoteStagingDirAsync(remoteSandboxRoot, ct).ConfigureAwait(false);
+        await EnsureRemoteStagingDirAsync(opts, transport, remoteSandboxRoot, ct).ConfigureAwait(false);
+        await WriteRemoteCreatedAtAsync(opts, transport, remoteSandboxRoot, DateTimeOffset.UtcNow, ct).ConfigureAwait(false);
 
         // 2) Stage each bind-mount source. Writable mounts get tracked so we
         //    can sync them back at dispose; tmpfs mounts get an empty remote
@@ -124,7 +308,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             var remoteStaged = JoinRemote(remoteFsRoot, safeSegment);
             if (mount.Tmpfs)
             {
-                await RunRemoteOrThrowAsync(["mkdir", "-p", remoteStaged], ct).ConfigureAwait(false);
+                await RunRemoteOrThrowAsync(transport, ["mkdir", "-p", remoteStaged], ct).ConfigureAwait(false);
                 stagedMounts.Add(new StagedBindMount(
                     SandboxPath: mount.SandboxPath,
                     RemoteStagedPath: remoteStaged,
@@ -140,8 +324,8 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                         hostPath,
                         $"Host bind-mount source missing for remote staging: {hostPath}");
 
-                await RunRemoteOrThrowAsync(["mkdir", "-p", ParentOf(remoteStaged)], ct).ConfigureAwait(false);
-                await _transport.StageInAsync(hostPath, remoteStaged, ct).ConfigureAwait(false);
+                await RunRemoteOrThrowAsync(transport, ["mkdir", "-p", ParentOf(remoteStaged)], ct).ConfigureAwait(false);
+                await transport.StageInAsync(hostPath, remoteStaged, ct).ConfigureAwait(false);
                 stagedMounts.Add(new StagedBindMount(
                     SandboxPath: mount.SandboxPath,
                     RemoteStagedPath: remoteStaged,
@@ -153,14 +337,20 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
 
         var sandbox = new MultipassRemoteSandbox(
             vmName,
+            opts.HostId,
             spec,
             stagedMounts,
             remoteSandboxRoot,
-            _transport,
-            RunRemoteMaybeGatedAsync,
-            _optsAccessor,
+            transport,
+            (argv, token) => RunRemoteMaybeGatedAsync(opts, transport, argv, token),
+            opts,
             _log,
-            onDispose: name => _active.TryRemove(name, out _));
+            onTransportFailure: ex => MarkRuntimeUnhealthy(opts, ex),
+            onDispose: (hostId, name) =>
+            {
+                _active.TryRemove(new RemoteSandboxIdentity(hostId, name), out _);
+                reservation.Dispose();
+            });
 
         // 3) Create the VM on the remote host. E2E replays pass
         //    BaselineImageRef and take the clone path so expensive setup is
@@ -170,6 +360,15 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         if (spec.Limits.CpuCount is { } cpu) { launchArgv.Add("--cpus"); launchArgv.Add(cpu.ToString(CultureInfo.InvariantCulture)); }
         if (spec.Limits.MemoryBytes is { } mem) { launchArgv.Add("--memory"); launchArgv.Add(((mem + (1L << 30) - 1) >> 30).ToString(CultureInfo.InvariantCulture) + "G"); }
         if (spec.Limits.DiskBytes is { } disk) { launchArgv.Add("--disk"); launchArgv.Add(((disk + (1L << 30) - 1) >> 30).ToString(CultureInfo.InvariantCulture) + "G"); }
+        if (!string.IsNullOrWhiteSpace(spec.Network.ProfileName))
+        {
+            if (!opts.NetworkProfiles.TryGetValue(spec.Network.ProfileName, out var bridge))
+                throw new InvalidOperationException(
+                    $"Network profile '{spec.Network.ProfileName}' is not configured in MultipassRemoteSandboxOptions.NetworkProfiles. " +
+                    $"Configured profiles: [{string.Join(", ", opts.NetworkProfiles.Keys)}]. " +
+                    "Either add the profile to CodeyBox:SandboxNetworkProfiles or configure matching bridges on the remote executor hosts.");
+            launchArgv.AddRange(["--network", $"name={bridge},mode=auto"]);
+        }
         if (!string.IsNullOrWhiteSpace(spec.ImageReference) && !string.Equals(spec.ImageReference, "ignored", StringComparison.Ordinal))
             launchArgv.Add(spec.ImageReference);
         else if (!string.IsNullOrWhiteSpace(opts.DefaultImage))
@@ -177,28 +376,28 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
 
         try
         {
-            // Track before clone/launch makes the VM visible to multipass list.
-            // Otherwise a concurrent leak sweep can mistake an in-progress remote
-            // clone with no CreatedAt metadata for an old orphan and purge it.
-            _active[vmName] = sandbox;
+            // Track before clone/launch so an in-progress VM that appears in
+            // multipass list is treated as active by leak sweeps.
+            var activeKey = new RemoteSandboxIdentity(opts.HostId, vmName);
+            _active[activeKey] = sandbox;
 
             if (!string.IsNullOrWhiteSpace(spec.BaselineImageRef))
             {
-                await CloneRemoteBaselineAsync(opts, spec.BaselineImageRef!, vmName, ct).ConfigureAwait(false);
-                await RunRemoteOrThrowAsync([opts.RemoteMultipassPath, "start", vmName], ct).ConfigureAwait(false);
+                await CloneRemoteBaselineAsync(opts, transport, spec.BaselineImageRef!, vmName, ct).ConfigureAwait(false);
+                await RunRemoteOrThrowAsync(opts, transport, [opts.RemoteMultipassPath, "start", vmName], ct).ConfigureAwait(false);
             }
             else
             {
-                await RunRemoteOrThrowAsync(launchArgv, ct).ConfigureAwait(false);
+                await RunRemoteOrThrowAsync(opts, transport, launchArgv, ct).ConfigureAwait(false);
             }
 
-            await WaitForVmStateAsync(vmName, "Running", opts.VmStartTimeout, ct).ConfigureAwait(false);
+            await WaitForVmStateAsync(opts, transport, vmName, "Running", opts.VmStartTimeout, ct).ConfigureAwait(false);
 
-            // 4) Apply environment via a stamped /etc/environment.d fragment.
+            // 4) Apply environment via a stamped /etc/environment fragment.
             //    multipass exec is per-call by default; environment from the
             //    spec needs to be visible to subsequent ExecAsync calls.
             if (spec.Environment.Count > 0)
-                await ApplyVmEnvironmentAsync(vmName, spec.Environment, ct).ConfigureAwait(false);
+                await ApplyVmEnvironmentAsync(opts, transport, vmName, spec.Environment, ct).ConfigureAwait(false);
 
             // 5) Apply mounts.
             foreach (var staged in stagedMounts)
@@ -209,106 +408,230 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                     staged.RemoteStagedPath,
                     $"{vmName}:{staged.SandboxPath}",
                 };
-                await RunRemoteOrThrowAsync(mountArgv, ct).ConfigureAwait(false);
+                await RunRemoteOrThrowAsync(opts, transport, mountArgv, ct).ConfigureAwait(false);
             }
-
-            SandboxLiveCounter.Increment();
-            _log.LogInformation("Remote multipass sandbox {Vm} created on {Target} via {Transport}",
-                vmName, opts.SshTarget, _transport.DiagnosticId);
-            return sandbox;
         }
         catch
         {
-            // Best-effort cleanup of any partial remote state. We DO NOT log
-            // here at error level — the original exception is the real story
-            // and is about to be rethrown by the caller's try.
-            _active.TryRemove(vmName, out _);
-            await BestEffortRemoteDeleteAsync(vmName, remoteSandboxRoot).ConfigureAwait(false);
+            _active.TryRemove(new RemoteSandboxIdentity(opts.HostId, vmName), out _);
             throw;
         }
+
+        SandboxLiveCounter.Increment();
+        CodeyBoxMeters.SandboxRemotePlacements.Add(
+            1,
+            new KeyValuePair<string, object?>("host_id", opts.HostId),
+            new KeyValuePair<string, object?>("outcome", "created"));
+        _log.LogInformation(
+            "Remote multipass sandbox {Vm} created on host {HostId} ({Target}) via {Transport}; reservation {Reserved}/{Capacity}",
+            vmName,
+            opts.HostId,
+            opts.SshTarget,
+            transport.DiagnosticId,
+            ReservedForHost(opts.HostId),
+            FormatCapacity(MultipassRemoteSandboxOptions.EffectiveCapacity(opts)));
+        return sandbox;
     }
 
-    public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+    public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+        await ListManagedInventoryAsync(ct).ConfigureAwait(false);
+
+    public async Task<ManagedSandboxInventory> ListManagedInventoryAsync(CancellationToken ct)
     {
-        var opts = _optsAccessor();
-        if (string.IsNullOrWhiteSpace(opts.SshTarget))
-            return [];
-
-        // multipass list --format json is the documented machine-readable
-        // shape. We parse only the fields we need.
-        var argv = new[] { opts.RemoteMultipassPath, "list", "--format", "json" };
-        ProcessRunResultLike result;
-        try
-        {
-            result = await RunRemoteAsync(argv, ct).ConfigureAwait(false);
-        }
-        catch (RemoteSshTransportException ex)
-        {
-            // List is called by the leak reaper; a transport drop must not
-            // crash that loop. We log and return an empty list — the next
-            // tick re-tries.
-            _log.LogWarning(ex, "ListAllManagedAsync: SSH transport failure; returning empty list");
-            return [];
-        }
-
-        if (result.ExitCode != 0)
-        {
-            _log.LogWarning("multipass list (remote) exited {Exit}: {Stderr}",
-                result.ExitCode, result.Stderr);
-            return [];
-        }
-
         var infos = new List<ManagedSandboxInfo>();
-        try
+        var hosts = ResolveHosts();
+        var expectedHostIds = hosts
+            .Select(static host => host.HostId)
+            .ToHashSet(StringComparer.Ordinal);
+        var inventoriedHostIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var opts in hosts)
         {
-            using var doc = JsonDocument.Parse(result.Stdout);
-            if (!doc.RootElement.TryGetProperty("list", out var list) || list.ValueKind != JsonValueKind.Array)
-                return infos;
+            if (string.IsNullOrWhiteSpace(opts.SshTarget))
+                continue;
 
-            foreach (var entry in list.EnumerateArray())
+            var transport = _transportFactory(opts);
+            // multipass list --format json is the documented machine-readable
+            // shape. We parse only the fields we need.
+            var argv = new[] { opts.RemoteMultipassPath, "list", "--format", "json" };
+            ProcessRunResultLike result;
+            try
             {
-                if (!entry.TryGetProperty("name", out var nameEl) || nameEl.ValueKind != JsonValueKind.String)
-                    continue;
-                var name = nameEl.GetString();
-                if (string.IsNullOrEmpty(name)) continue;
-                if (!name.StartsWith(opts.VmNamePrefix, StringComparison.Ordinal)) continue;
+                result = await RunRemoteInventoryAsync(opts, transport, argv, ct).ConfigureAwait(false);
+                MarkRuntimeHealthy(opts.HostId);
+            }
+            catch (RemoteSshTransportException ex)
+            {
+                // List is called by the leak reaper; a transport drop on one
+                // host must not crash the sweep or hide other healthy hosts.
+                MarkRuntimeUnhealthy(opts, ex);
+                _log.LogWarning(ex,
+                    "ListAllManagedAsync: SSH transport failure on remote host {HostId}; continuing with other hosts",
+                    opts.HostId);
+                continue;
+            }
+            catch (RemoteHostProvisioningException ex) when (ex.IsHostRuntimeFailure)
+            {
+                MarkRuntimeUnhealthy(opts, ex);
+                _log.LogWarning(ex,
+                    "ListAllManagedAsync: inventory command failed on remote host {HostId}; continuing with other hosts",
+                    opts.HostId);
+                continue;
+            }
 
-                var isTrackedActive = _active.ContainsKey(name);
-                var state = entry.TryGetProperty("state", out var st) && st.ValueKind == JsonValueKind.String ? st.GetString() : null;
-                var isSuspendOrFreezing = state is "Suspended" or "Suspending" or "Freezing";
+            if (result.ExitCode != 0)
+            {
+                MarkRuntimeUnhealthy(
+                    opts,
+                    $"multipass list exited {result.ExitCode}: {TruncateForLog(result.Stderr)}");
+                _log.LogWarning("multipass list (remote host {HostId}) exited {Exit}: {Stderr}",
+                    opts.HostId, result.ExitCode, TruncateForLog(result.Stderr));
+                continue;
+            }
 
-                infos.Add(new ManagedSandboxInfo(
-                    Name: name,
-                    CreatedAt: null,
-                    DiskBytes: null,
-                    IsTrackedActive: isTrackedActive,
-                    HasPreemptMarker: false,
-                    IsSuspendLifecycleOrFrozen: isSuspendOrFreezing));
+            try
+            {
+                var createdAtByName = await ReadRemoteCreatedAtMetadataAsync(opts, transport, ct).ConfigureAwait(false);
+                AddManagedFromListJson(infos, opts, result.Stdout, createdAtByName);
+                inventoriedHostIds.Add(opts.HostId);
+            }
+            catch (RemoteSshTransportException ex)
+            {
+                // A host can drop between the primary inventory call and the
+                // staging metadata scan. Keep the sweep partial instead of
+                // aborting healthy hosts later in the pool.
+                MarkRuntimeUnhealthy(opts, ex);
+                _log.LogWarning(ex,
+                    "ListAllManagedAsync: metadata scan transport failure on remote host {HostId}; continuing with other hosts",
+                    opts.HostId);
+            }
+            catch (RemoteHostProvisioningException ex) when (ex.IsHostRuntimeFailure)
+            {
+                MarkRuntimeUnhealthy(opts, ex);
+                _log.LogWarning(ex,
+                    "ListAllManagedAsync: metadata scan failed on remote host {HostId}; continuing with other hosts",
+                    opts.HostId);
+            }
+            catch (JsonException ex)
+            {
+                MarkRuntimeUnhealthy(opts, $"failed to parse multipass list JSON: {ex.Message}");
+                _log.LogWarning(ex,
+                    "Failed to parse remote multipass list JSON from host {HostId}; skipping host",
+                    opts.HostId);
             }
         }
-        catch (JsonException ex)
-        {
-            _log.LogWarning(ex, "Failed to parse remote multipass list JSON; returning empty list");
-        }
-        return infos;
+
+        ReleaseMissingRetainedReservations(inventoriedHostIds, infos);
+        return new ManagedSandboxInventory(
+            infos,
+            isComplete: inventoriedHostIds.SetEquals(expectedHostIds),
+            inventoriedHostIds: inventoriedHostIds);
     }
 
     public async Task DisposeLeakedAsync(string name, CancellationToken ct)
     {
-        var opts = _optsAccessor();
         if (string.IsNullOrWhiteSpace(name)) return;
-        if (!name.StartsWith(opts.VmNamePrefix, StringComparison.Ordinal))
+
+        var activeMatches = _active
+            .Where(kv => string.Equals(kv.Key.Name, name, StringComparison.Ordinal))
+            .Select(kv => kv.Value)
+            .ToArray();
+        if (activeMatches.Length == 1)
         {
-            _log.LogWarning(
-                "Refusing to dispose VM '{Name}' — does not match expected prefix '{Prefix}'",
-                name, opts.VmNamePrefix);
+            await activeMatches[0].ForceDisposeLeakedAsync(ct).ConfigureAwait(false);
             return;
         }
+        if (activeMatches.Length > 1)
+            throw new InvalidOperationException(
+                $"Refusing to dispose remote VM '{name}' by bare name because it is active on multiple executor hosts.");
+
+        var retainedMatches = _retainedReservations
+            .Where(kv => string.Equals(kv.Key.Name, name, StringComparison.Ordinal))
+            .ToArray();
+        if (retainedMatches.Length == 1)
+        {
+            await DisposeLeakedOnHostAsync(retainedMatches[0].Value.HostOptions, name, ct).ConfigureAwait(false);
+            return;
+        }
+        if (retainedMatches.Length > 1)
+            throw new InvalidOperationException(
+                $"Refusing to dispose remote VM '{name}' by bare name because retained reservations exist on multiple executor hosts.");
+
+        var discovered = (await ListAllManagedAsync(ct).ConfigureAwait(false))
+            .Where(info => string.Equals(info.Name, name, StringComparison.Ordinal))
+            .ToArray();
+        if (discovered.Length == 1 && !string.IsNullOrWhiteSpace(discovered[0].HostId))
+        {
+            await DisposeLeakedAsync(discovered[0], ct).ConfigureAwait(false);
+            return;
+        }
+        if (discovered.Length > 1)
+        {
+            throw new InvalidOperationException(
+                $"Refusing to dispose remote VM '{name}' by bare name because it exists on multiple executor hosts.");
+        }
+
+        var hosts = ResolveHosts();
+        var matchingHosts = hosts
+            .Where(h => RemoteMultipassVmNames.IsManagedVmNameForPrefix(name, h.VmNamePrefix))
+            .ToArray();
+        if (matchingHosts.Length == 0)
+        {
+            _log.LogWarning(
+                "Refusing to dispose VM '{Name}' — does not match any configured remote VM prefix ({Prefixes})",
+                name,
+                string.Join(", ", hosts.Select(h => h.VmNamePrefix).Distinct(StringComparer.Ordinal)));
+            return;
+        }
+        if (matchingHosts.Length > 1)
+        {
+            throw new InvalidOperationException(
+                $"Refusing to dispose remote VM '{name}' by bare name because {matchingHosts.Length} executor hosts share a matching prefix; use a managed sandbox record with HostId.");
+        }
+
         // Honor the reaper's cancellation token: if the orchestrator is
         // shutting down, abandon this sweep — the leak isn't going anywhere
         // and the next sweep will retry. The CreateAsync rollback path uses a
         // different overload pinned to CancellationToken.None.
-        await BestEffortRemoteDeleteAsync(name, JoinRemote(opts.RemoteStagingRoot, name), ct).ConfigureAwait(false);
+        await DisposeLeakedOnHostAsync(matchingHosts[0], name, ct).ConfigureAwait(false);
+    }
+
+    public async Task DisposeLeakedAsync(ManagedSandboxInfo sandbox, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(sandbox.Name)) return;
+        if (!string.IsNullOrWhiteSpace(sandbox.HostId)
+            && _active.TryGetValue(new RemoteSandboxIdentity(sandbox.HostId!, sandbox.Name), out var active))
+        {
+            await active.ForceDisposeLeakedAsync(ct).ConfigureAwait(false);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(sandbox.HostId))
+        {
+            await DisposeLeakedAsync(sandbox.Name, ct).ConfigureAwait(false);
+            return;
+        }
+
+        var host = ResolveHosts().FirstOrDefault(h => string.Equals(h.HostId, sandbox.HostId, StringComparison.Ordinal));
+        if (host is null)
+            throw new InvalidOperationException(
+                $"Refusing to dispose remote VM '{sandbox.Name}' because executor host '{sandbox.HostId}' is not configured.");
+        if (!RemoteMultipassVmNames.IsManagedVmNameForPrefix(sandbox.Name, host.VmNamePrefix))
+            throw new InvalidOperationException(
+                $"Refusing to dispose remote VM '{sandbox.Name}' on host '{host.HostId}' because it does not match the safe managed VM name grammar or that host's prefix '{host.VmNamePrefix}'.");
+
+        await DisposeLeakedOnHostAsync(host, sandbox.Name, ct).ConfigureAwait(false);
+    }
+
+    private async Task DisposeLeakedOnHostAsync(MultipassRemoteSandboxOptions opts, string name, CancellationToken ct)
+    {
+        var transport = _transportFactory(opts);
+        await DeleteRemoteStateOrThrowAsync(
+            opts,
+            transport,
+            name,
+            JoinRemote(opts.RemoteStagingRoot, name),
+            ct).ConfigureAwait(false);
+        ReleaseRetainedReservation(opts.HostId, name);
     }
 
     public IReadOnlyList<(WorkItemId WorkItemId, IShutdownTeardownSandbox Sandbox)> SnapshotActiveSandboxes()
@@ -325,81 +648,293 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
     public IReadOnlyList<ActiveSandboxProgress> SnapshotActiveSandboxProgress()
     {
         var snap = new List<ActiveSandboxProgress>(_active.Count);
-        foreach (var (name, sb) in _active)
+        foreach (var (_, sb) in _active)
         {
             if (sb.OwningWorkItemId is { } id)
-                snap.Add(new ActiveSandboxProgress(id, name, Status: "running"));
+                snap.Add(new ActiveSandboxProgress(id, sb.Id, Status: $"running host={sb.HostId}"));
         }
         return snap;
     }
 
+    public IReadOnlyList<SandboxHostPoolEntry> SnapshotHostPool()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var rows = new List<SandboxHostPoolEntry>();
+        foreach (var host in ResolveHosts())
+        {
+            var runtimeHealthy = IsRuntimeHealthy(host.HostId, now, out var unhealthy, removeExpired: false);
+            rows.Add(new SandboxHostPoolEntry(
+                HostId: host.HostId,
+                Capacity: MultipassRemoteSandboxOptions.EffectiveCapacity(host),
+                Reserved: ReservedForHost(host.HostId),
+                Cordoned: host.Cordoned,
+                ConfiguredHealthy: host.Healthy,
+                RuntimeHealthy: runtimeHealthy,
+                RuntimeUnhealthyReason: unhealthy?.Reason,
+                RuntimeUnhealthyUntil: unhealthy?.Until,
+                AllowedNetworkProfiles: host.AllowedNetworkProfiles));
+        }
+        return rows;
+    }
+
     internal async Task RunRemoteOrThrowAsync(IReadOnlyList<string> argv, CancellationToken ct)
     {
-        var r = await RunRemoteMaybeGatedAsync(argv, ct).ConfigureAwait(false);
+        var host = ResolveHosts()[0];
+        await RunRemoteOrThrowAsync(host, _transportFactory(host), argv, ct).ConfigureAwait(false);
+    }
+
+    internal async Task RunRemoteOrThrowAsync(IRemoteHostTransport transport, IReadOnlyList<string> argv, CancellationToken ct)
+    {
+        var host = ResolveHosts()[0];
+        await RunRemoteOrThrowAsync(host, transport, argv, ct).ConfigureAwait(false);
+    }
+
+    internal async Task RunRemoteOrThrowAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        IReadOnlyList<string> argv,
+        CancellationToken ct)
+    {
+        var r = await RunRemoteMaybeGatedAsync(opts, transport, argv, ct).ConfigureAwait(false);
         if (r.ExitCode != 0)
-            throw new InvalidOperationException(
-                $"Remote multipass command failed (exit {r.ExitCode}): " +
-                $"argv=[{string.Join(' ', argv)}] stderr={TruncateForLog(r.Stderr)}");
+            throw new RemoteHostProvisioningException(
+                opts.HostId,
+                CommandName(argv),
+                $"Remote command failed (exit {r.ExitCode}): argv=[{string.Join(' ', argv)}] stderr={TruncateForLog(r.Stderr)}",
+                isHostRuntimeFailure: IsHostRuntimeCommand(argv));
     }
 
     internal Task<ProcessRunResultLike> RunRemoteAsync(IReadOnlyList<string> argv, CancellationToken ct) =>
-        RunRemoteAsync(argv, stdin: null, stdoutChunkCallback: null, stderrChunkCallback: null, ct);
+        RunRemoteAsync(_transportFactory(ResolveHosts()[0]), argv, stdin: null, stdoutChunkCallback: null, stderrChunkCallback: null, ct);
+
+    internal Task<ProcessRunResultLike> RunRemoteAsync(IRemoteHostTransport transport, IReadOnlyList<string> argv, CancellationToken ct) =>
+        RunRemoteAsync(transport, argv, stdin: null, stdoutChunkCallback: null, stderrChunkCallback: null, ct);
 
     private async Task<ProcessRunResultLike> RunRemoteMaybeGatedAsync(IReadOnlyList<string> argv, CancellationToken ct)
     {
-        if (!IsHeavyRemoteMultipassOperation(argv))
-            return await RunRemoteAsync(argv, ct).ConfigureAwait(false);
+        var host = ResolveHosts()[0];
+        return await RunRemoteMaybeGatedAsync(host, _transportFactory(host), argv, ct).ConfigureAwait(false);
+    }
 
-        await _heavyMultipassGate.WaitAsync(ct).ConfigureAwait(false);
+    private async Task<ProcessRunResultLike> RunRemoteMaybeGatedAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        IReadOnlyList<string> argv,
+        CancellationToken ct)
+    {
+        if (!IsHeavyRemoteMultipassOperation(opts, argv))
+            return await RunRemoteControlAsync(opts, transport, argv, ct).ConfigureAwait(false);
+
+        var gate = _heavyMultipassGates.GetOrAdd(opts.HostId, static _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            return await RunRemoteAsync(argv, ct).ConfigureAwait(false);
+            return await RunRemoteControlAsync(opts, transport, argv, ct).ConfigureAwait(false);
         }
         finally
         {
-            _heavyMultipassGate.Release();
+            gate.Release();
         }
     }
 
     internal async Task<ProcessRunResultLike> RunRemoteAsync(
+        IRemoteHostTransport transport,
         IReadOnlyList<string> argv,
         string? stdin,
         Action<string>? stdoutChunkCallback,
         Action<string>? stderrChunkCallback,
-        CancellationToken ct)
+        CancellationToken ct,
+        int? maxStdoutBytes = null,
+        int? maxStderrBytes = null,
+        bool killOnOutputLimit = true)
     {
-        var native = await _transport.RunAsync(
+        var native = await transport.RunAsync(
             argv,
             stdin,
             ct,
             stdoutChunkCallback: stdoutChunkCallback,
-            stderrChunkCallback: stderrChunkCallback).ConfigureAwait(false);
+            stderrChunkCallback: stderrChunkCallback,
+            maxStdoutBytes: maxStdoutBytes,
+            maxStderrBytes: maxStderrBytes,
+            killOnOutputLimit: killOnOutputLimit).ConfigureAwait(false);
         return new ProcessRunResultLike(native.ExitCode, native.Stdout, native.Stderr, native.StdoutLimitExceeded, native.StderrLimitExceeded);
     }
 
-    private async Task EnsureRemoteStagingDirAsync(string remoteSandboxRoot, CancellationToken ct)
+    private async Task<ProcessRunResultLike> RunRemoteControlAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        IReadOnlyList<string> argv,
+        CancellationToken ct,
+        string? stdin = null)
+    {
+        var maxOutputBytes = opts.RemoteInventoryMaxOutputBytes;
+        var result = await RunRemoteAsync(
+            transport,
+            argv,
+            stdin,
+            stdoutChunkCallback: null,
+            stderrChunkCallback: null,
+            ct,
+            maxStdoutBytes: maxOutputBytes,
+            maxStderrBytes: maxOutputBytes,
+            killOnOutputLimit: true).ConfigureAwait(false);
+
+        if (!result.StdoutLimitExceeded && !result.StderrLimitExceeded)
+            return result;
+
+        var streams = result.StdoutLimitExceeded && result.StderrLimitExceeded
+            ? "stdout/stderr"
+            : result.StdoutLimitExceeded
+                ? "stdout"
+                : "stderr";
+        throw new RemoteHostProvisioningException(
+            opts.HostId,
+            CommandName(argv),
+            $"Remote control command exceeded {maxOutputBytes.ToString(CultureInfo.InvariantCulture)} byte {streams} cap: argv=[{string.Join(' ', argv)}]",
+            isHostRuntimeFailure: IsHostRuntimeCommand(argv));
+    }
+
+    private async Task<ProcessRunResultLike> RunRemoteInventoryAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        IReadOnlyList<string> argv,
+        CancellationToken ct)
+    {
+        var maxOutputBytes = opts.RemoteInventoryMaxOutputBytes;
+        var result = await RunRemoteAsync(
+            transport,
+            argv,
+            stdin: null,
+            stdoutChunkCallback: null,
+            stderrChunkCallback: null,
+            ct,
+            maxStdoutBytes: maxOutputBytes,
+            maxStderrBytes: maxOutputBytes,
+            killOnOutputLimit: true).ConfigureAwait(false);
+
+        if (!result.StdoutLimitExceeded && !result.StderrLimitExceeded)
+            return result;
+
+        var streams = result.StdoutLimitExceeded && result.StderrLimitExceeded
+            ? "stdout/stderr"
+            : result.StdoutLimitExceeded
+                ? "stdout"
+                : "stderr";
+        throw new RemoteHostProvisioningException(
+            opts.HostId,
+            CommandName(argv),
+            $"Remote inventory command exceeded {maxOutputBytes.ToString(CultureInfo.InvariantCulture)} byte {streams} cap: argv=[{string.Join(' ', argv)}]",
+            isHostRuntimeFailure: true);
+    }
+
+    private async Task<IReadOnlyDictionary<string, DateTimeOffset>> ReadRemoteCreatedAtMetadataAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        CancellationToken ct)
+    {
+        var root = OpenSshCliTransport.QuoteShellWord(opts.RemoteStagingRoot);
+        var script =
+            $"find {root} -mindepth 2 -maxdepth 2 -name .codeybox-created-at -type f -print 2>/dev/null " +
+            "| while IFS= read -r f; do d=${f%/.codeybox-created-at}; n=${d##*/}; printf '%s\\t' \"$n\"; head -n 1 \"$f\"; done || true";
+        ProcessRunResultLike result;
+        try
+        {
+            result = await RunRemoteInventoryAsync(opts, transport, ["sh", "-c", script], ct).ConfigureAwait(false);
+        }
+        catch (RemoteSshTransportException ex)
+        {
+            MarkRuntimeUnhealthy(opts, ex);
+            throw;
+        }
+
+        if (result.ExitCode != 0)
+        {
+            _log.LogWarning(
+                "Remote sandbox metadata scan on host {HostId} exited {ExitCode}: {Stderr}",
+                opts.HostId,
+                result.ExitCode,
+                TruncateForLog(result.Stderr));
+            return new Dictionary<string, DateTimeOffset>(StringComparer.Ordinal);
+        }
+
+        var created = new Dictionary<string, DateTimeOffset>(StringComparer.Ordinal);
+        using var reader = new StringReader(result.Stdout);
+        while (reader.ReadLine() is { } line)
+        {
+            var tab = line.IndexOf('\t');
+            if (tab <= 0 || tab == line.Length - 1)
+                continue;
+            var name = line[..tab];
+            var raw = line[(tab + 1)..].Trim();
+            if (DateTimeOffset.TryParse(
+                    raw,
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.RoundtripKind,
+                    out var createdAt))
+            {
+                created[name] = createdAt;
+            }
+        }
+
+        return created;
+    }
+
+    private async Task EnsureRemoteStagingDirAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        string remoteSandboxRoot,
+        CancellationToken ct)
     {
         // 0700 on the per-sandbox dir: only the SSH user can list its
         // contents. Per-staged-source subdirs sit under here.
         var mkdirCmd = $"mkdir -p {OpenSshCliTransport.QuoteShellWord(remoteSandboxRoot)} && chmod 0700 {OpenSshCliTransport.QuoteShellWord(remoteSandboxRoot)}";
-        var r = await _transport.RunAsync(["sh", "-c", mkdirCmd], stdin: null, ct).ConfigureAwait(false);
+        var r = await RunRemoteControlAsync(opts, transport, ["sh", "-c", mkdirCmd], ct).ConfigureAwait(false);
         if (r.ExitCode != 0)
-            throw new InvalidOperationException(
-                $"Failed to create remote sandbox staging dir '{remoteSandboxRoot}' (exit {r.ExitCode}): {TruncateForLog(r.Stderr)}");
+            throw new RemoteHostProvisioningException(
+                opts.HostId,
+                "staging-dir",
+                $"Failed to create remote sandbox staging dir '{remoteSandboxRoot}' (exit {r.ExitCode}): {TruncateForLog(r.Stderr)}",
+                isHostRuntimeFailure: true);
     }
 
     private async Task CloneRemoteBaselineAsync(
         MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
         string baselineName,
         string vmName,
         CancellationToken ct)
     {
-        await RunRemoteOrThrowAsync([opts.RemoteMultipassPath, "stop", baselineName], ct).ConfigureAwait(false);
-        await WaitForVmStateAsync(baselineName, "Stopped", opts.VmStopTimeout, ct).ConfigureAwait(false);
-        await RunRemoteOrThrowAsync([opts.RemoteMultipassPath, "clone", baselineName, "--name", vmName], ct).ConfigureAwait(false);
+        await RunRemoteOrThrowAsync(opts, transport, [opts.RemoteMultipassPath, "stop", baselineName], ct).ConfigureAwait(false);
+        await WaitForVmStateAsync(opts, transport, baselineName, "Stopped", opts.VmStopTimeout, ct).ConfigureAwait(false);
+        await RunRemoteOrThrowAsync(opts, transport, [opts.RemoteMultipassPath, "clone", baselineName, "--name", vmName], ct).ConfigureAwait(false);
     }
 
-    private async Task ApplyVmEnvironmentAsync(string vmName, IReadOnlyDictionary<string, string> env, CancellationToken ct)
+    private async Task WriteRemoteCreatedAtAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        string remoteSandboxRoot,
+        DateTimeOffset createdAt,
+        CancellationToken ct)
+    {
+        var metadataPath = JoinRemote(remoteSandboxRoot, ".codeybox-created-at");
+        var timestamp = createdAt.ToString("O", CultureInfo.InvariantCulture);
+        var script =
+            $"printf '%s\\n' {OpenSshCliTransport.QuoteShellWord(timestamp)} > {OpenSshCliTransport.QuoteShellWord(metadataPath)}";
+        var r = await RunRemoteControlAsync(opts, transport, ["sh", "-c", script], ct).ConfigureAwait(false);
+        if (r.ExitCode != 0)
+            throw new RemoteHostProvisioningException(
+                opts.HostId,
+                "staging-metadata",
+                $"Failed to write remote sandbox metadata '{metadataPath}' (exit {r.ExitCode}): {TruncateForLog(r.Stderr)}",
+                isHostRuntimeFailure: true);
+    }
+
+    private async Task ApplyVmEnvironmentAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        string vmName,
+        IReadOnlyDictionary<string, string> env,
+        CancellationToken ct)
     {
         // /etc/environment is the per-VM persistent env file Multipass /
         // systemd both honour for subsequent exec'd shells. We append (don't
@@ -411,30 +946,48 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             lines.Append(k).Append("=\"").Append(EscapeForDoubleQuotes(v)).Append("\"\n");
         }
         var script = "cat >> /etc/environment";
-        var opts = _optsAccessor();
         var argv = new[] { opts.RemoteMultipassPath, "exec", vmName, "--", "sudo", "sh", "-c", script };
-        var r = await _transport.RunAsync(argv, stdin: lines.ToString(), ct).ConfigureAwait(false);
+        var r = await RunRemoteControlAsync(opts, transport, argv, ct, stdin: lines.ToString()).ConfigureAwait(false);
         if (r.ExitCode != 0)
-            throw new InvalidOperationException(
-                $"Failed to apply env to remote VM '{vmName}' (exit {r.ExitCode}): {TruncateForLog(r.Stderr)}");
+            throw new RemoteHostProvisioningException(
+                opts.HostId,
+                "env",
+                $"Failed to apply env to remote VM '{vmName}' (exit {r.ExitCode}): {TruncateForLog(r.Stderr)}",
+                isHostRuntimeFailure: true);
     }
 
     internal async Task WaitForVmStateAsync(string vmName, string targetState, TimeSpan timeout, CancellationToken ct)
     {
-        var opts = _optsAccessor();
+        var opts = ResolveHosts()[0];
+        await WaitForVmStateAsync(opts, _transportFactory(opts), vmName, targetState, timeout, ct).ConfigureAwait(false);
+    }
+
+    internal async Task WaitForVmStateAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        string vmName,
+        string targetState,
+        TimeSpan timeout,
+        CancellationToken ct)
+    {
         var deadline = DateTime.UtcNow + timeout;
         while (true)
         {
             ct.ThrowIfCancellationRequested();
-            var r = await RunRemoteAsync(
+            var r = await RunRemoteInventoryAsync(
+                opts,
+                transport,
                 [opts.RemoteMultipassPath, "info", vmName, "--format", "json"],
                 ct).ConfigureAwait(false);
             if (r.ExitCode == 0 && TryParseVmState(r.Stdout, vmName, out var state) && string.Equals(state, targetState, StringComparison.Ordinal))
                 return;
 
             if (DateTime.UtcNow >= deadline)
-                throw new TimeoutException(
-                    $"Remote VM '{vmName}' did not reach state '{targetState}' within {timeout}.");
+                throw new RemoteHostProvisioningException(
+                    opts.HostId,
+                    "wait-state",
+                    $"Remote VM '{vmName}' did not reach state '{targetState}' within {timeout}.",
+                    isHostRuntimeFailure: true);
 
             try { await Task.Delay(opts.VmStateCheckInterval, ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { throw; }
@@ -463,42 +1016,519 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
     }
 
     internal Task BestEffortRemoteDeleteAsync(string vmName, string remoteSandboxRoot)
-        => BestEffortRemoteDeleteAsync(vmName, remoteSandboxRoot, CancellationToken.None);
+    {
+        var opts = ResolveHosts()[0];
+        return BestEffortRemoteDeleteAsync(opts, _transportFactory(opts), vmName, remoteSandboxRoot, CancellationToken.None);
+    }
 
     internal async Task BestEffortRemoteDeleteAsync(string vmName, string remoteSandboxRoot, CancellationToken ct)
     {
-        // Callers pass CancellationToken.None when the cleanup MUST run
-        // regardless of outer cancellation (e.g. CreateAsync rollback after a
-        // partial launch); the leak reaper passes its own token so it can
-        // abandon mid-sweep on orchestrator shutdown.
+        var opts = ResolveHosts()[0];
+        await BestEffortRemoteDeleteAsync(opts, _transportFactory(opts), vmName, remoteSandboxRoot, ct).ConfigureAwait(false);
+    }
+
+    internal Task BestEffortRemoteDeleteAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        string vmName,
+        string remoteSandboxRoot)
+        => BestEffortRemoteDeleteAsync(opts, transport, vmName, remoteSandboxRoot, CancellationToken.None);
+
+    internal async Task BestEffortRemoteDeleteAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        string vmName,
+        string remoteSandboxRoot,
+        CancellationToken ct)
+    {
+        await BuildCleanup(opts, transport)
+            .TryDeleteVmAndStagingAsync(vmName, remoteSandboxRoot, ct)
+            .ConfigureAwait(false);
+    }
+
+    internal async Task DeleteRemoteStateOrThrowAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        string vmName,
+        string remoteSandboxRoot,
+        CancellationToken ct)
+    {
+        await BuildCleanup(opts, transport)
+            .DeleteVmAndStagingOrThrowAsync(vmName, remoteSandboxRoot, ct)
+            .ConfigureAwait(false);
+    }
+
+    private RemoteMultipassCleanup BuildCleanup(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport) =>
+        new(
+            opts,
+            transport,
+            (argv, token) => RunRemoteMaybeGatedAsync(opts, transport, argv, token),
+            ex => MarkRuntimeUnhealthy(opts, ex),
+            _log);
+
+    private IReadOnlyList<MultipassRemoteSandboxOptions> ResolveHosts()
+    {
+        var hosts = MultipassRemoteSandboxOptions.ResolveExecutorHosts(_optsAccessor());
+        if (hosts.Count == 0)
+            throw new InvalidOperationException("MultipassRemoteSandboxOptions must resolve at least one executor host.");
+
+        foreach (var host in hosts)
+        {
+            if (string.IsNullOrWhiteSpace(host.HostId))
+                throw new InvalidOperationException("Resolved remote executor host id must not be empty.");
+            if (MultipassRemoteSandboxOptions.EffectiveCapacity(host) <= 0)
+                throw new InvalidOperationException(
+                    $"MultipassRemoteSandbox executor host '{host.HostId}' MaxConcurrentSandboxes must be > 0 when set.");
+            if (host.PlacementRecheckIn <= TimeSpan.Zero)
+                throw new InvalidOperationException("MultipassRemoteSandboxOptions.PlacementRecheckIn must be positive.");
+            if (host.RuntimeUnhealthyBackoff <= TimeSpan.Zero)
+                throw new InvalidOperationException("MultipassRemoteSandboxOptions.RuntimeUnhealthyBackoff must be positive.");
+            if (host.RemoteInventoryMaxOutputBytes <= 0)
+                throw new InvalidOperationException("MultipassRemoteSandboxOptions.RemoteInventoryMaxOutputBytes must be positive.");
+            RemoteMultipassVmNames.ValidateVmNamePrefix(host.VmNamePrefix);
+            RemoteMultipassVmNames.ValidateRemoteStagingRoot(host.RemoteStagingRoot);
+        }
+
+        return hosts;
+    }
+
+    private async Task<HostReservation> ReserveHostAsync(SandboxSpec spec, ISet<string> skippedHosts, CancellationToken ct)
+    {
+        var hosts = ResolveHosts();
+        var inventoryCandidates = GetPlacementInventoryCandidates(spec, skippedHosts, hosts);
+        if (inventoryCandidates.Count == 0)
+            return ReserveHost(spec, skippedHosts, hosts, new Dictionary<string, int>(StringComparer.Ordinal));
+
+        var inventory = await CountManagedByHostForPlacementAsync(inventoryCandidates, ct).ConfigureAwait(false);
         try
         {
-            var opts = _optsAccessor();
-            await RunRemoteMaybeGatedAsync(
-                [opts.RemoteMultipassPath, "delete", "--purge", vmName],
-                ct).ConfigureAwait(false);
-            await _transport.RunAsync(
-                ["rm", "-rf", remoteSandboxRoot],
-                stdin: null,
-                ct: ct).ConfigureAwait(false);
+            return ReserveHost(spec, skippedHosts, hosts, inventory.ManagedCounts);
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        catch (SandboxProvisioningDeferredException ex) when (inventory.LastFailure is not null)
         {
-            // Honored cancellation — not a failure. Let it propagate so the
-            // caller (reaper) can finish its shutdown promptly.
-            throw;
+            throw new SandboxProvisioningDeferredException(
+                ex.Provider,
+                ex.Operation,
+                "all-hosts-unavailable",
+                $"{ex.Detail}; last host failure: {inventory.LastFailure.Message}",
+                ex.RecheckIn,
+                innerException: inventory.LastFailure);
         }
-        catch (RemoteSshTransportException ex)
+    }
+
+    private IReadOnlyList<MultipassRemoteSandboxOptions> GetPlacementInventoryCandidates(
+        SandboxSpec spec,
+        ISet<string> skippedHosts,
+        IReadOnlyList<MultipassRemoteSandboxOptions> hosts)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var candidates = new List<MultipassRemoteSandboxOptions>(hosts.Count);
+        foreach (var host in hosts)
         {
-            // We can't reach the remote host to clean up. Surface as a leak
-            // — the next start-up sweep / reaper will retry.
-            _log.LogWarning(ex,
-                "Best-effort remote cleanup of {Vm} failed; leaving for future leak reaper sweep",
-                vmName);
+            if (skippedHosts.Contains(host.HostId))
+                continue;
+            if (!host.Healthy || host.Cordoned)
+                continue;
+            if (!HostAllowsNetworkProfile(host, spec.Network.ProfileName))
+                continue;
+            if (!IsRuntimeHealthy(host.HostId, now, out _, removeExpired: true))
+                continue;
+            candidates.Add(host);
         }
-        catch (Exception ex)
+
+        return candidates;
+    }
+
+    private async Task<PlacementInventory> CountManagedByHostForPlacementAsync(
+        IReadOnlyList<MultipassRemoteSandboxOptions> hosts,
+        CancellationToken ct)
+    {
+        var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+        Exception? lastFailure = null;
+        foreach (var opts in hosts)
         {
-            _log.LogWarning(ex, "Best-effort remote cleanup of {Vm} failed", vmName);
+            var transport = _transportFactory(opts);
+            try
+            {
+                var result = await RunRemoteInventoryAsync(
+                    opts,
+                    transport,
+                    [opts.RemoteMultipassPath, "list", "--format", "json"],
+                    ct).ConfigureAwait(false);
+                if (result.ExitCode != 0)
+                {
+                    lastFailure = new RemoteHostProvisioningException(
+                        opts.HostId,
+                        "list",
+                        $"multipass list exited {result.ExitCode}: {TruncateForLog(result.Stderr)}");
+                    MarkRuntimeUnhealthy(opts, lastFailure);
+                    continue;
+                }
+
+                counts[opts.HostId] = CountManagedFromListJson(opts, result.Stdout);
+                MarkRuntimeHealthy(opts.HostId);
+            }
+            catch (RemoteSshTransportException ex)
+            {
+                lastFailure = ex;
+                MarkRuntimeUnhealthy(opts, ex);
+            }
+            catch (RemoteHostProvisioningException ex) when (ex.IsHostRuntimeFailure)
+            {
+                lastFailure = ex;
+                MarkRuntimeUnhealthy(opts, ex);
+            }
+            catch (JsonException ex)
+            {
+                lastFailure = ex;
+                MarkRuntimeUnhealthy(opts, $"failed to parse multipass list JSON: {ex.Message}");
+            }
+        }
+
+        return new PlacementInventory(counts, lastFailure);
+    }
+
+    private HostReservation ReserveHost(
+        SandboxSpec spec,
+        ISet<string> skippedHosts,
+        IReadOnlyList<MultipassRemoteSandboxOptions> hosts,
+        IReadOnlyDictionary<string, int> managedCounts)
+    {
+        var profile = NormalizeNetworkProfile(spec.Network.ProfileName);
+        var now = DateTimeOffset.UtcNow;
+        var blocked = new List<string>(hosts.Count);
+
+        lock (_placementLock)
+        {
+            MultipassRemoteSandboxOptions? selected = null;
+            int selectedReserved = 0;
+            double selectedLoad = double.MaxValue;
+
+            foreach (var host in hosts)
+            {
+                var reserved = _hostReservations.TryGetValue(host.HostId, out var count) ? count : 0;
+                var activeForHost = _active.Values.Count(sb => string.Equals(sb.HostId, host.HostId, StringComparison.Ordinal));
+                var retainedForHost = _retainedReservations.Values.Count(r => string.Equals(r.HostOptions.HostId, host.HostId, StringComparison.Ordinal));
+                var managedCount = managedCounts.TryGetValue(host.HostId, out var managed) ? managed : 0;
+                var untrackedManaged = Math.Max(0, managedCount - activeForHost - retainedForHost);
+                var used = reserved + untrackedManaged;
+                var capacity = MultipassRemoteSandboxOptions.EffectiveCapacity(host);
+
+                if (skippedHosts.Contains(host.HostId))
+                {
+                    blocked.Add($"{host.HostId}=tried");
+                    continue;
+                }
+                if (!host.Healthy)
+                {
+                    blocked.Add($"{host.HostId}=configured-unhealthy");
+                    continue;
+                }
+                if (host.Cordoned)
+                {
+                    blocked.Add($"{host.HostId}=cordoned");
+                    continue;
+                }
+                if (!HostAllowsNetworkProfile(host, spec.Network.ProfileName))
+                {
+                    blocked.Add($"{host.HostId}=profile");
+                    continue;
+                }
+                if (!IsRuntimeHealthy(host.HostId, now, out var unhealthy, removeExpired: true))
+                {
+                    blocked.Add($"{host.HostId}=runtime-unhealthy-until-{unhealthy!.Until:O}");
+                    continue;
+                }
+                if (used >= capacity)
+                {
+                    blocked.Add($"{host.HostId}=full({used}/{FormatCapacity(capacity)})");
+                    continue;
+                }
+
+                var load = capacity == int.MaxValue ? 0.0d : (double)used / capacity;
+                if (selected is null
+                    || load < selectedLoad
+                    || (Math.Abs(load - selectedLoad) < double.Epsilon
+                        && used < selectedReserved)
+                    || (Math.Abs(load - selectedLoad) < double.Epsilon
+                        && used == selectedReserved
+                        && string.CompareOrdinal(host.HostId, selected.HostId) < 0))
+                {
+                    selected = host;
+                    selectedReserved = used;
+                    selectedLoad = load;
+                }
+            }
+
+            if (selected is null)
+            {
+                var reason = blocked.Count == 0 ? "no-hosts" : string.Join(", ", blocked);
+                CodeyBoxMeters.SandboxRemotePlacementDeferrals.Add(
+                    1,
+                    new KeyValuePair<string, object?>("reason", "no-eligible-host"),
+                    new KeyValuePair<string, object?>("network_profile", profile));
+                _log.LogWarning(
+                    "Remote sandbox placement deferred: no eligible executor host for network profile {NetworkProfile}. Host states: {HostStates}",
+                    profile,
+                    reason);
+                throw new SandboxProvisioningDeferredException(
+                    provider: Name,
+                    operation: "placement",
+                    errorClass: "no-eligible-host",
+                    detail: $"networkProfile={profile}; hosts={reason}",
+                    recheckIn: hosts[0].PlacementRecheckIn);
+            }
+
+            var currentReserved = _hostReservations.TryGetValue(selected.HostId, out var current) ? current : 0;
+            _hostReservations[selected.HostId] = currentReserved + 1;
+            CodeyBoxMeters.SandboxRemotePlacements.Add(
+                1,
+                new KeyValuePair<string, object?>("host_id", selected.HostId),
+                new KeyValuePair<string, object?>("outcome", "reserved"));
+            _log.LogDebug(
+                "Remote sandbox placement reserved host {HostId}: {Reserved}/{Capacity} for network profile {NetworkProfile}",
+                selected.HostId,
+                currentReserved + 1,
+                FormatCapacity(MultipassRemoteSandboxOptions.EffectiveCapacity(selected)),
+                profile);
+            return new HostReservation(this, selected);
+        }
+    }
+
+    private void ReleaseHostReservation(string hostId)
+    {
+        lock (_placementLock)
+        {
+            if (!_hostReservations.TryGetValue(hostId, out var current))
+                return;
+            if (current <= 1)
+                _hostReservations.Remove(hostId);
+            else
+                _hostReservations[hostId] = current - 1;
+        }
+    }
+
+    private void RetainReservation(string vmName, HostReservation reservation)
+    {
+        var key = new RemoteSandboxIdentity(reservation.HostOptions.HostId, vmName);
+        if (!_retainedReservations.TryAdd(key, reservation))
+        {
+            reservation.Dispose();
+            return;
+        }
+    }
+
+    private void ReleaseRetainedReservation(string hostId, string vmName)
+    {
+        if (_retainedReservations.TryRemove(new RemoteSandboxIdentity(hostId, vmName), out var reservation))
+            reservation.Dispose();
+    }
+
+    private void ReleaseMissingRetainedReservations(
+        IReadOnlyCollection<string> inventoriedHostIds,
+        IReadOnlyCollection<ManagedSandboxInfo> managed)
+    {
+        if (_retainedReservations.IsEmpty || inventoriedHostIds.Count == 0)
+            return;
+
+        var present = managed
+            .Where(static info => !string.IsNullOrWhiteSpace(info.HostId))
+            .Select(static info => (info.HostId!, info.Name))
+            .ToHashSet();
+
+        foreach (var (key, reservation) in _retainedReservations)
+        {
+            if (!inventoriedHostIds.Contains(reservation.HostOptions.HostId))
+                continue;
+            if (present.Contains((key.HostId, key.Name)))
+                continue;
+            ReleaseRetainedReservation(key.HostId, key.Name);
+        }
+    }
+
+    private int ReservedForHost(string hostId)
+    {
+        lock (_placementLock)
+            return _hostReservations.TryGetValue(hostId, out var current) ? current : 0;
+    }
+
+    private void MarkRuntimeUnhealthy(MultipassRemoteSandboxOptions host, RemoteSshTransportException ex)
+        => MarkRuntimeUnhealthy(host, ex.Message);
+
+    private void MarkRuntimeUnhealthy(MultipassRemoteSandboxOptions host, Exception ex)
+        => MarkRuntimeUnhealthy(host, ex.Message);
+
+    private void MarkRuntimeUnhealthy(MultipassRemoteSandboxOptions host, string reason)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var until = now + host.RuntimeUnhealthyBackoff;
+        var wasHealthy = !_runtimeUnhealthy.TryGetValue(host.HostId, out var previous)
+            || previous.Until <= now;
+        _runtimeUnhealthy[host.HostId] = new RemoteHostUnhealthyState(until, reason);
+        if (wasHealthy)
+        {
+            CodeyBoxMeters.SandboxRemoteHostHealthTransitions.Add(
+                1,
+                new KeyValuePair<string, object?>("host_id", host.HostId),
+                new KeyValuePair<string, object?>("state", "unhealthy"));
+        }
+        _log.LogWarning(
+            "Remote executor host {HostId} marked runtime-unhealthy until {Until:O}: {Reason}",
+            host.HostId,
+            until,
+            reason);
+    }
+
+    private void MarkRuntimeHealthy(string hostId)
+    {
+        if (!_runtimeUnhealthy.TryRemove(hostId, out _))
+            return;
+
+        CodeyBoxMeters.SandboxRemoteHostHealthTransitions.Add(
+            1,
+            new KeyValuePair<string, object?>("host_id", hostId),
+            new KeyValuePair<string, object?>("state", "healthy"));
+        _log.LogInformation("Remote executor host {HostId} runtime health restored", hostId);
+    }
+
+    private bool IsRuntimeHealthy(
+        string hostId,
+        DateTimeOffset now,
+        out RemoteHostUnhealthyState? unhealthy,
+        bool removeExpired)
+    {
+        unhealthy = null;
+        if (!_runtimeUnhealthy.TryGetValue(hostId, out var state))
+            return true;
+
+        if (state.Until <= now)
+        {
+            if (removeExpired)
+                MarkRuntimeHealthy(hostId);
+            return true;
+        }
+
+        unhealthy = state;
+        return false;
+    }
+
+    private static bool HostAllowsNetworkProfile(MultipassRemoteSandboxOptions host, string? profileName)
+    {
+        if (host.AllowedNetworkProfiles.Count == 0)
+            return true;
+
+        var profile = NormalizeNetworkProfile(profileName);
+        foreach (var configured in host.AllowedNetworkProfiles)
+        {
+            if (string.IsNullOrWhiteSpace(configured))
+                continue;
+            var value = configured.Trim();
+            if (value == "*")
+                return true;
+            if (string.Equals(value, profile, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    private static string NormalizeNetworkProfile(string? profileName) =>
+        string.IsNullOrWhiteSpace(profileName) ? "(default)" : profileName.Trim();
+
+    private static string CommandName(IReadOnlyList<string> argv)
+    {
+        if (argv.Count == 0)
+            return "(none)";
+        if (argv.Count > 1 && argv[0].Contains("multipass", StringComparison.OrdinalIgnoreCase))
+            return argv[1];
+        return argv[0];
+    }
+
+    private static bool IsHostRuntimeCommand(IReadOnlyList<string> argv)
+    {
+        if (argv.Count == 0)
+            return false;
+        if (argv[0].Contains("multipass", StringComparison.OrdinalIgnoreCase))
+            return true;
+        return argv[0] is "mkdir" or "rm";
+    }
+
+    private void AddManagedFromListJson(
+        List<ManagedSandboxInfo> infos,
+        MultipassRemoteSandboxOptions opts,
+        string json,
+        IReadOnlyDictionary<string, DateTimeOffset> createdAtByName)
+    {
+        using var doc = JsonDocument.Parse(json);
+        if (!doc.RootElement.TryGetProperty("list", out var list) || list.ValueKind != JsonValueKind.Array)
+            return;
+
+        foreach (var entry in list.EnumerateArray())
+        {
+            if (!entry.TryGetProperty("name", out var nameEl) || nameEl.ValueKind != JsonValueKind.String)
+                continue;
+            var name = nameEl.GetString();
+            if (string.IsNullOrEmpty(name)) continue;
+            if (!RemoteMultipassVmNames.IsManagedVmNameForPrefix(name, opts.VmNamePrefix)) continue;
+
+            var isTrackedActive = _active.TryGetValue(new RemoteSandboxIdentity(opts.HostId, name), out var active) && active.IsTrackedActive;
+            var state = entry.TryGetProperty("state", out var st) && st.ValueKind == JsonValueKind.String ? st.GetString() : null;
+            var isSuspendOrFreezing = state is "Suspended" or "Suspending" or "Freezing";
+            createdAtByName.TryGetValue(name, out var createdAt);
+
+            infos.Add(new ManagedSandboxInfo(
+                Name: name,
+                CreatedAt: createdAt == default ? null : createdAt,
+                DiskBytes: null,
+                IsTrackedActive: isTrackedActive,
+                HasPreemptMarker: false,
+                IsSuspendLifecycleOrFrozen: isSuspendOrFreezing,
+                HostId: opts.HostId));
+        }
+    }
+
+    private static int CountManagedFromListJson(MultipassRemoteSandboxOptions opts, string json)
+    {
+        using var doc = JsonDocument.Parse(json);
+        if (!doc.RootElement.TryGetProperty("list", out var list) || list.ValueKind != JsonValueKind.Array)
+            return 0;
+
+        var count = 0;
+        foreach (var entry in list.EnumerateArray())
+        {
+            if (!entry.TryGetProperty("name", out var nameEl) || nameEl.ValueKind != JsonValueKind.String)
+                continue;
+            var name = nameEl.GetString();
+            if (string.IsNullOrEmpty(name)) continue;
+            if (RemoteMultipassVmNames.IsManagedVmNameForPrefix(name, opts.VmNamePrefix))
+                count++;
+        }
+
+        return count;
+    }
+
+    private static string FormatCapacity(int capacity) =>
+        capacity == int.MaxValue ? "unbounded" : capacity.ToString(CultureInfo.InvariantCulture);
+
+    private sealed class HostReservation : IDisposable
+    {
+        private readonly MultipassRemoteSandboxProvider _owner;
+        private int _disposed;
+
+        public HostReservation(MultipassRemoteSandboxProvider owner, MultipassRemoteSandboxOptions hostOptions)
+        {
+            _owner = owner;
+            HostOptions = hostOptions;
+        }
+
+        public MultipassRemoteSandboxOptions HostOptions { get; }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+            _owner.ReleaseHostReservation(HostOptions.HostId);
         }
     }
 
@@ -521,27 +1551,15 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         return string.IsNullOrEmpty(seg) ? "root" : seg;
     }
 
-    private static string NewVmName(MultipassRemoteSandboxOptions opts)
-    {
-        // multipass instance name limit is 24 chars. Prefix + 22-char hex
-        // gives 24 when prefix is "codeybox-r-" (11 chars) + ~13 hex chars,
-        // so we trim accordingly.
-        var prefix = opts.VmNamePrefix;
-        var hex = Guid.NewGuid().ToString("N");
-        var budget = 24 - prefix.Length;
-        if (budget <= 0)
-            throw new InvalidOperationException($"VmNamePrefix '{prefix}' leaves no budget for a 24-char VM name.");
-        return prefix + hex[..Math.Min(budget, hex.Length)];
-    }
-
     private static string JoinRemote(string a, string b) =>
         a.TrimEnd('/') + "/" + b.TrimStart('/');
 
-    private bool IsHeavyRemoteMultipassOperation(IReadOnlyList<string> argv)
+    private static bool IsHeavyRemoteMultipassOperation(
+        MultipassRemoteSandboxOptions opts,
+        IReadOnlyList<string> argv)
     {
         if (argv.Count < 2)
             return false;
-        var opts = _optsAccessor();
         if (!string.Equals(argv[0], opts.RemoteMultipassPath, StringComparison.Ordinal))
             return false;
 
@@ -573,12 +1591,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
     }
 
     private static string TruncateForLog(string s, int max = 200)
-    {
-        if (string.IsNullOrEmpty(s)) return "";
-        var trimmed = s.Trim();
-        if (trimmed.Length <= max) return trimmed;
-        return trimmed[..max] + "…";
-    }
+        => RemoteMultipassText.TruncateForLog(s, max);
 }
 
 /// <summary>
@@ -592,6 +1605,33 @@ internal readonly record struct ProcessRunResultLike(
     string Stderr,
     bool StdoutLimitExceeded = false,
     bool StderrLimitExceeded = false);
+
+internal sealed record RemoteHostUnhealthyState(DateTimeOffset Until, string Reason);
+
+internal sealed record PlacementInventory(
+    IReadOnlyDictionary<string, int> ManagedCounts,
+    Exception? LastFailure);
+
+internal readonly record struct RemoteSandboxIdentity(string HostId, string Name);
+
+internal sealed class RemoteHostProvisioningException : Exception
+{
+    public RemoteHostProvisioningException(
+        string hostId,
+        string operation,
+        string message,
+        bool isHostRuntimeFailure = false)
+        : base(message)
+    {
+        HostId = hostId;
+        Operation = operation;
+        IsHostRuntimeFailure = isHostRuntimeFailure;
+    }
+
+    public string HostId { get; }
+    public string Operation { get; }
+    public bool IsHostRuntimeFailure { get; }
+}
 
 /// <summary>
 /// One bind-mount that has been staged to the remote host's filesystem so

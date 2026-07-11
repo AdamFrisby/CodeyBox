@@ -1,3 +1,5 @@
+using System.Formats.Tar;
+using System.Globalization;
 using System.Text;
 using CodeyBox.HostProcess;
 using Microsoft.Extensions.Logging;
@@ -27,6 +29,8 @@ namespace CodeyBox.Sandbox.MultipassRemote;
 /// </summary>
 public sealed class OpenSshCliTransport : IRemoteHostTransport
 {
+    private const int ReadBufferChars = 4096;
+
     /// <summary>
     /// OpenSSH's reserved exit code for "the ssh client itself failed before
     /// the remote command even ran." Used to distinguish a transport drop
@@ -55,7 +59,10 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         string? stdin,
         CancellationToken ct,
         Action<string>? stdoutChunkCallback = null,
-        Action<string>? stderrChunkCallback = null)
+        Action<string>? stderrChunkCallback = null,
+        int? maxStdoutBytes = null,
+        int? maxStderrBytes = null,
+        bool killOnOutputLimit = true)
     {
         ArgumentNullException.ThrowIfNull(argv);
         if (argv.Count == 0) throw new ArgumentException("argv must be non-empty.", nameof(argv));
@@ -74,7 +81,10 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
             stdin,
             ct,
             stdoutChunkCallback: stdoutChunkCallback,
-            stderrChunkCallback: stderrChunkCallback).ConfigureAwait(false);
+            stderrChunkCallback: stderrChunkCallback,
+            maxStdoutBytes: maxStdoutBytes,
+            maxStderrBytes: maxStderrBytes,
+            killOnOutputLimit: killOnOutputLimit).ConfigureAwait(false);
 
         if (result.StartFailed)
             throw new RemoteSshTransportException(
@@ -138,21 +148,31 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         // we keep using IProcessRunner (which already streams stderr) for
         // each leg.
         using var tarProc = StartLocalTar(opts, hostParent, basename);
+        var tarStderrTask = tarProc.StandardError.ReadToEndAsync(ct);
         try
         {
             // IProcessRunner doesn't accept a binary stdin stream — tar
             // produces opaque bytes — so the staging path runs the OpenSSH
             // child directly and copies tar.stdout → ssh.stdin.
-            var sshResult = await RunSshWithBinaryStdinAsync(opts, sshArgv, tarProc.StandardOutput.BaseStream, ct).ConfigureAwait(false);
+            var sshResult = await RunSshWithBinaryStdinAsync(
+                opts,
+                sshArgv,
+                tarProc.StandardOutput.BaseStream,
+                opts.RemoteInventoryMaxOutputBytes,
+                ct).ConfigureAwait(false);
 
             await tarProc.WaitForExitAsync(ct).ConfigureAwait(false);
+            var tarStderr = await tarStderrTask.ConfigureAwait(false);
             if (tarProc.ExitCode != 0)
                 throw new RemoteSshTransportException(
-                    $"Local tar failed (exit {tarProc.ExitCode}) staging '{hostPath}' into '{remotePath}'.");
+                    $"Local tar failed (exit {tarProc.ExitCode}) staging '{hostPath}' into '{remotePath}': {TailFor(tarStderr)}",
+                    RemoteSshTransportFailureKind.RemoteCommand);
 
             if (sshResult.StartFailed)
                 throw new RemoteSshTransportException(
                     $"OpenSSH client failed to start during StageInAsync at '{opts.SshBinary}'.");
+
+            ThrowIfStagingOutputLimitExceeded("StageInAsync", opts, sshResult);
 
             if (sshResult.ExitCode == SshTransportFailureExitCode)
                 throw new RemoteSshTransportException(
@@ -160,11 +180,13 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
 
             if (sshResult.ExitCode != 0)
                 throw new RemoteSshTransportException(
-                    $"Remote tar-extract failed (exit {sshResult.ExitCode}) for '{remotePath}': {TailFor(sshResult.Stderr)}");
+                    $"Remote tar-extract failed (exit {sshResult.ExitCode}) for '{remotePath}': {TailFor(sshResult.Stderr)}",
+                    RemoteSshTransportFailureKind.RemoteCommand);
         }
         finally
         {
             try { if (!tarProc.HasExited) tarProc.Kill(entireProcessTree: true); } catch { }
+            try { await tarStderrTask.ConfigureAwait(false); } catch { }
         }
     }
 
@@ -186,9 +208,10 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         var remoteParent = RemoteParent(remotePath);
         var remoteBasename = RemoteBasename(remotePath);
 
-        // Remote tars the source dir to stdout; local tar reads from stdin
-        // into the host parent directory. If the basenames differ we rename
-        // on the host side after extraction.
+        // Remote tars the source dir to stdout; the host writes that stream to
+        // a private temp archive, validates metadata, extracts into a private
+        // temp directory, then swaps the validated tree into place. Never
+        // extract sandbox-controlled tar metadata directly over the host repo.
         var remoteCmd =
             $"set -e; cd {QuoteShellWord(remoteParent)}; " +
             $"if [ ! -e {QuoteShellWord(remoteBasename)} ]; then echo 'remote source missing: {EscapeForSingleQuotes(remoteParent + "/" + remoteBasename)}' >&2; exit 2; fi; " +
@@ -197,20 +220,45 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         var sshArgv = BuildSshArgv(opts, remoteCmd);
 
         using var sshProc = StartSshChild(opts, sshArgv);
-        using var tarProc = StartLocalTarExtract(opts, hostParent);
+        var tempRoot = Path.Combine(hostParent, ".codeybox-stageout-" + Guid.NewGuid().ToString("N"));
+        var extractRoot = Path.Combine(tempRoot, "extract");
+        var archivePath = Path.Combine(tempRoot, "archive.tar");
+        Directory.CreateDirectory(extractRoot);
+        var outputLimitKilled = 0;
+        void KillForOutputLimit()
+        {
+            Interlocked.Exchange(ref outputLimitKilled, 1);
+            try { if (!sshProc.HasExited) sshProc.Kill(entireProcessTree: true); } catch { }
+        }
+
         try
         {
-            // Stream ssh stdout -> local tar stdin.
-            var copyTask = sshProc.StandardOutput.BaseStream.CopyToAsync(tarProc.StandardInput.BaseStream, ct);
-            var sshErrTask = sshProc.StandardError.ReadToEndAsync(ct);
-
-            await copyTask.ConfigureAwait(false);
-            tarProc.StandardInput.Close();
+            var sshErrTask = ReadTextToLimitAsync(
+                sshProc.StandardError,
+                opts.RemoteInventoryMaxOutputBytes,
+                KillForOutputLimit,
+                ct);
+            await using (var archive = new FileStream(
+                archivePath,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None,
+                bufferSize: 128 * 1024,
+                useAsync: true))
+            {
+                await CopyToArchiveWithLimitAsync(
+                    sshProc.StandardOutput.BaseStream,
+                    archive,
+                    opts.StageOutMaxArchiveBytes,
+                    remotePath,
+                    ct).ConfigureAwait(false);
+            }
 
             await sshProc.WaitForExitAsync(ct).ConfigureAwait(false);
-            await tarProc.WaitForExitAsync(ct).ConfigureAwait(false);
-
-            var sshErr = await sshErrTask.ConfigureAwait(false);
+            var sshErrResult = await sshErrTask.ConfigureAwait(false);
+            if (sshErrResult.LimitExceeded)
+                throw BuildStagingOutputLimitException("StageOutAsync", opts, "stderr", null);
+            var sshErr = sshErrResult.Text;
 
             if (sshProc.ExitCode == SshTransportFailureExitCode)
                 throw new RemoteSshTransportException(
@@ -218,33 +266,36 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
 
             if (sshProc.ExitCode != 0)
                 throw new RemoteSshTransportException(
-                    $"Remote tar-create failed (exit {sshProc.ExitCode}) for '{remotePath}': {TailFor(sshErr)}");
+                    $"Remote tar-create failed (exit {sshProc.ExitCode}) for '{remotePath}': {TailFor(sshErr)}",
+                    RemoteSshTransportFailureKind.RemoteCommand);
 
-            if (tarProc.ExitCode != 0)
-                throw new RemoteSshTransportException(
-                    $"Local tar-extract failed (exit {tarProc.ExitCode}) for '{hostPath}'.");
+            ValidateTarArchive(
+                archivePath,
+                remoteBasename,
+                opts.StageOutMaxEntries,
+                opts.StageOutMaxExpansionRatio);
+            await ExtractTarArchiveAsync(opts, archivePath, extractRoot, ct).ConfigureAwait(false);
+            ValidateExtractedTree(extractRoot);
 
-            // Rename on the host if the host basename differs from the remote.
-            if (!string.Equals(basename, remoteBasename, StringComparison.Ordinal))
-            {
-                var extracted = Path.Combine(hostParent, remoteBasename);
-                var target = Path.Combine(hostParent, basename);
-                if (Directory.Exists(extracted))
-                {
-                    if (Directory.Exists(target)) Directory.Delete(target, recursive: true);
-                    Directory.Move(extracted, target);
-                }
-                else if (File.Exists(extracted))
-                {
-                    if (File.Exists(target)) File.Delete(target);
-                    File.Move(extracted, target);
-                }
-            }
+            var extracted = Path.Combine(extractRoot, remoteBasename);
+            if (!Directory.Exists(extracted) && !File.Exists(extracted))
+                throw ContentValidationException(
+                    $"Validated tar archive for '{remotePath}' did not contain expected root '{remoteBasename}'.");
+
+            ReplacePath(extracted, Path.Combine(hostParent, basename));
+        }
+        catch (IOException ex) when (Volatile.Read(ref outputLimitKilled) != 0)
+        {
+            throw BuildStagingOutputLimitException("StageOutAsync", opts, "stderr", ex);
         }
         finally
         {
             try { if (!sshProc.HasExited) sshProc.Kill(entireProcessTree: true); } catch { }
-            try { if (!tarProc.HasExited) tarProc.Kill(entireProcessTree: true); } catch { }
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true); }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Failed to remove StageOut temp directory {TempRoot}", tempRoot);
+            }
         }
     }
 
@@ -269,24 +320,268 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         return p;
     }
 
-    private static System.Diagnostics.Process StartLocalTarExtract(MultipassRemoteSandboxOptions opts, string hostParent)
+    private static System.Diagnostics.Process StartLocalTarExtract(MultipassRemoteSandboxOptions opts, string archivePath, string extractRoot)
     {
         var psi = new System.Diagnostics.ProcessStartInfo
         {
             FileName = opts.LocalTarBinary,
-            RedirectStandardInput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
             CreateNoWindow = true,
-            WorkingDirectory = hostParent,
+            WorkingDirectory = extractRoot,
         };
         psi.ArgumentList.Add("-xf");
-        psi.ArgumentList.Add("-");
+        psi.ArgumentList.Add(archivePath);
         var p = new System.Diagnostics.Process { StartInfo = psi };
         if (!p.Start())
             throw new RemoteSshTransportException(
                 $"Failed to start local tar at '{opts.LocalTarBinary}'.");
         return p;
+    }
+
+    private static async Task CopyToArchiveWithLimitAsync(
+        Stream source,
+        Stream destination,
+        long maxBytes,
+        string remotePath,
+        CancellationToken ct)
+    {
+        var buffer = new byte[128 * 1024];
+        long copied = 0;
+        while (true)
+        {
+            var read = await source.ReadAsync(buffer, ct).ConfigureAwait(false);
+            if (read == 0)
+                return;
+
+            copied += read;
+            if (copied > maxBytes)
+            {
+                throw new RemoteSshTransportException(
+                    $"Remote tar archive for '{remotePath}' exceeded configured StageOutMaxArchiveBytes={maxBytes.ToString(CultureInfo.InvariantCulture)}.",
+                    RemoteSshTransportFailureKind.ResourceLimit);
+            }
+
+            await destination.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task ExtractTarArchiveAsync(
+        MultipassRemoteSandboxOptions opts,
+        string archivePath,
+        string extractRoot,
+        CancellationToken ct)
+    {
+        using var tarProc = StartLocalTarExtract(opts, archivePath, extractRoot);
+        try
+        {
+            var stderrTask = tarProc.StandardError.ReadToEndAsync(ct);
+            await tarProc.WaitForExitAsync(ct).ConfigureAwait(false);
+            var stderr = await stderrTask.ConfigureAwait(false);
+            if (tarProc.ExitCode != 0)
+                throw ContentValidationException(
+                    $"Local tar-extract failed (exit {tarProc.ExitCode}) for staged archive '{archivePath}': {TailFor(stderr)}");
+        }
+        finally
+        {
+            try { if (!tarProc.HasExited) tarProc.Kill(entireProcessTree: true); } catch { }
+        }
+    }
+
+    private static void ValidateTarArchive(
+        string archivePath,
+        string expectedRootName,
+        int maxEntries,
+        double maxExpansionRatio)
+    {
+        var archiveBytes = new FileInfo(archivePath).Length;
+        var maxDeclaredBytes = MaxDeclaredPayloadBytes(archiveBytes, maxExpansionRatio);
+        long declaredRegularFileBytes = 0;
+        var entryCount = 0;
+        var sawRootedEntry = false;
+        try
+        {
+            using var archive = File.OpenRead(archivePath);
+            using var reader = new TarReader(archive, leaveOpen: false);
+            TarEntry? entry;
+            while ((entry = reader.GetNextEntry(copyData: false)) is not null)
+            {
+                if (IsTarMetadataEntry(entry.EntryType))
+                    continue;
+
+                entryCount++;
+                if (entryCount > maxEntries)
+                    throw new RemoteSshTransportException(
+                        $"Remote tar archive exceeded configured StageOutMaxEntries={maxEntries.ToString(CultureInfo.InvariantCulture)}.",
+                        RemoteSshTransportFailureKind.ResourceLimit);
+
+                if (!IsSafeTarEntryType(entry.EntryType))
+                    throw ContentValidationException(
+                        $"Unsafe tar entry '{entry.Name}' has unsupported type '{entry.EntryType}'.");
+
+                if (entry.EntryType is TarEntryType.RegularFile or TarEntryType.V7RegularFile)
+                {
+                    if (entry.Length > maxDeclaredBytes - declaredRegularFileBytes)
+                    {
+                        var attemptedDeclaredBytes = declaredRegularFileBytes > long.MaxValue - entry.Length
+                            ? long.MaxValue
+                            : declaredRegularFileBytes + entry.Length;
+                        throw new RemoteSshTransportException(
+                            $"Remote tar archive declared {attemptedDeclaredBytes.ToString(CultureInfo.InvariantCulture)} file bytes, exceeding StageOutMaxExpansionRatio={maxExpansionRatio.ToString(CultureInfo.InvariantCulture)} for archive size {archiveBytes.ToString(CultureInfo.InvariantCulture)}.",
+                            RemoteSshTransportFailureKind.ResourceLimit);
+                    }
+                    declaredRegularFileBytes += entry.Length;
+                }
+
+                var name = NormalizeTarEntryName(entry.Name);
+                EnsureTarEntryUnderExpectedRoot(name, expectedRootName);
+                sawRootedEntry = true;
+            }
+        }
+        catch (RemoteSshTransportException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is InvalidDataException or IOException)
+        {
+            throw new RemoteSshTransportException(
+                $"Remote tar archive failed validation: {ex.Message}",
+                RemoteSshTransportFailureKind.ContentValidation,
+                ex);
+        }
+
+        if (!sawRootedEntry)
+            throw ContentValidationException("Remote tar archive contained no extractable entries.");
+    }
+
+    private static long MaxDeclaredPayloadBytes(long archiveBytes, double maxExpansionRatio)
+    {
+        var capped = archiveBytes * maxExpansionRatio;
+        if (double.IsInfinity(capped) || capped >= long.MaxValue)
+            return long.MaxValue;
+        return Math.Max(archiveBytes, (long)Math.Ceiling(capped));
+    }
+
+    private static bool IsSafeTarEntryType(TarEntryType type) =>
+        type is TarEntryType.Directory
+            or TarEntryType.RegularFile
+            or TarEntryType.V7RegularFile;
+
+    private static bool IsTarMetadataEntry(TarEntryType type) =>
+        type is TarEntryType.ExtendedAttributes
+            or TarEntryType.GlobalExtendedAttributes;
+
+    internal static string NormalizeTarEntryName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            throw ContentValidationException("Tar archive contains an entry with an empty name.");
+        if (name.IndexOf('\0') >= 0)
+            throw ContentValidationException("Tar archive contains an entry with a NUL byte in its name.");
+
+        var normalized = name.Replace('\\', '/');
+        while (normalized.StartsWith("./", StringComparison.Ordinal))
+            normalized = normalized[2..];
+        normalized = normalized.TrimEnd('/');
+        if (normalized.Length == 0 || normalized[0] == '/')
+            throw ContentValidationException($"Unsafe tar entry path '{name}'.");
+
+        var parts = normalized.Split('/');
+        foreach (var part in parts)
+        {
+            if (part.Length == 0 || part == "." || part == "..")
+                throw ContentValidationException($"Unsafe tar entry path '{name}'.");
+        }
+
+        return normalized;
+    }
+
+    private static void EnsureTarEntryUnderExpectedRoot(string entryName, string expectedRootName)
+    {
+        if (string.Equals(entryName, expectedRootName, StringComparison.Ordinal))
+            return;
+        if (entryName.StartsWith(expectedRootName + "/", StringComparison.Ordinal))
+            return;
+        throw ContentValidationException(
+            $"Unsafe tar entry '{entryName}' is outside expected root '{expectedRootName}'.");
+    }
+
+    internal static void ValidateExtractedTree(string extractRoot)
+    {
+        var root = Path.GetFullPath(extractRoot);
+        foreach (var path in Directory.EnumerateFileSystemEntries(root, "*", SearchOption.AllDirectories))
+        {
+            var full = Path.GetFullPath(path);
+            EnsureContainedPath(root, full);
+            var attributes = File.GetAttributes(full);
+            if ((attributes & FileAttributes.ReparsePoint) != 0)
+                throw ContentValidationException(
+                    $"Unsafe extracted filesystem entry '{full}' is a reparse point.");
+        }
+    }
+
+    private static void EnsureContainedPath(string root, string candidate)
+    {
+        var normalizedRoot = root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (!candidate.StartsWith(normalizedRoot, StringComparison.Ordinal))
+            throw ContentValidationException(
+                $"Unsafe extracted filesystem entry '{candidate}' escapes staging root '{root}'.");
+    }
+
+    internal static RemoteSshTransportException ContentValidationException(string message) =>
+        new(message, RemoteSshTransportFailureKind.ContentValidation);
+
+    private static void ReplacePath(string source, string target)
+    {
+        var backup = target + ".codeybox-backup-" + Guid.NewGuid().ToString("N");
+        var hadTarget = PathExists(target);
+        if (hadTarget)
+            MovePath(target, backup);
+
+        try
+        {
+            MovePath(source, target);
+        }
+        catch
+        {
+            if (hadTarget && !PathExists(target) && PathExists(backup))
+                MovePath(backup, target);
+            throw;
+        }
+
+        if (PathExists(backup))
+            DeletePath(backup);
+    }
+
+    private static void MovePath(string source, string target)
+    {
+        if (Directory.Exists(source) && !IsReparsePoint(source))
+        {
+            Directory.Move(source, target);
+            return;
+        }
+
+        File.Move(source, target, overwrite: false);
+    }
+
+    private static void DeletePath(string path)
+    {
+        if (Directory.Exists(path) && !IsReparsePoint(path))
+            Directory.Delete(path, recursive: true);
+        else if (File.Exists(path) || IsReparsePoint(path))
+            File.Delete(path);
+    }
+
+    private static bool PathExists(string path) =>
+        File.Exists(path) || Directory.Exists(path) || IsReparsePoint(path);
+
+    private static bool IsReparsePoint(string path)
+    {
+        try
+        {
+            return (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0;
+        }
+        catch (FileNotFoundException) { return false; }
+        catch (DirectoryNotFoundException) { return false; }
     }
 
     private static System.Diagnostics.Process StartSshChild(MultipassRemoteSandboxOptions opts, IReadOnlyList<string> sshArgv)
@@ -301,16 +596,62 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         };
         for (var i = 1; i < sshArgv.Count; i++) psi.ArgumentList.Add(sshArgv[i]);
         var p = new System.Diagnostics.Process { StartInfo = psi };
-        if (!p.Start())
+        if (!StartWithTextBusyRetry(p))
             throw new RemoteSshTransportException(
                 $"Failed to start OpenSSH client at '{opts.SshBinary}'.");
         return p;
+    }
+
+    // Linux errno for ETXTBSY ("Text file busy"). Process.Start forks and execs;
+    // when the orchestrator spawns many processes concurrently (hundreds of VMs
+    // fanned across hosts), a sibling fork can transiently inherit an open
+    // write fd to the target executable, making exec fail with ETXTBSY even
+    // though the binary is complete. It clears in milliseconds once the writer
+    // closes, so a brief bounded retry is the correct handling rather than
+    // surfacing a spurious start failure.
+    private const int ETXTBSY = 26;
+
+    // Retry budget for the ETXTBSY window. The condition clears within a few
+    // milliseconds of the concurrent writer closing its fd, so the poll is
+    // deliberately tight: up to 20 attempts spaced 10ms apart caps the added
+    // start latency at ~200ms before we stop retrying and surface the failure.
+    // Kept small on purpose — a genuine (non-transient) start failure must not
+    // be masked by a long spin.
+    private const int TextBusyMaxAttempts = 20;
+    private const int TextBusyRetryDelayMs = 10;
+
+    private static bool StartWithTextBusyRetry(System.Diagnostics.Process p)
+        => StartWithTextBusyRetry(
+            p.Start,
+            static _ => System.Threading.Thread.Sleep(TextBusyRetryDelayMs));
+
+    // Test seam: the retry policy is driven through this overload with an
+    // injected start delegate and a no-op / recording sleep so all three
+    // branches (retry-then-succeed, exhaustion after TextBusyMaxAttempts, and
+    // immediate propagation of a non-ETXTBSY Win32Exception) can be exercised
+    // without depending on real fork/exec timing. Production callers use the
+    // Process overload above, which forwards Process.Start here.
+    internal static bool StartWithTextBusyRetry(Func<bool> start, Action<int> onBusyRetry)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return start();
+            }
+            catch (System.ComponentModel.Win32Exception ex)
+                when (ex.NativeErrorCode == ETXTBSY && attempt < TextBusyMaxAttempts)
+            {
+                onBusyRetry(attempt);
+            }
+        }
     }
 
     private static async Task<ProcessRunResult> RunSshWithBinaryStdinAsync(
         MultipassRemoteSandboxOptions opts,
         IReadOnlyList<string> sshArgv,
         Stream binaryStdin,
+        int maxOutputBytes,
         CancellationToken ct)
     {
         var psi = new System.Diagnostics.ProcessStartInfo
@@ -324,15 +665,47 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         };
         for (var i = 1; i < sshArgv.Count; i++) psi.ArgumentList.Add(sshArgv[i]);
         using var p = new System.Diagnostics.Process { StartInfo = psi };
-        if (!p.Start())
+        if (!StartWithTextBusyRetry(p))
             return new ProcessRunResult(1, "", "", StartFailed: true);
 
-        var stderrTask = p.StandardError.ReadToEndAsync(ct);
-        var stdoutTask = p.StandardOutput.ReadToEndAsync(ct);
+        var outputLimitKilled = 0;
+        void KillForOutputLimit()
+        {
+            Interlocked.Exchange(ref outputLimitKilled, 1);
+            try { if (!p.HasExited) p.Kill(entireProcessTree: true); } catch { }
+        }
+
+        var stderrTask = ReadTextToLimitAsync(p.StandardError, maxOutputBytes, KillForOutputLimit, ct);
+        var stdoutTask = ReadTextToLimitAsync(p.StandardOutput, maxOutputBytes, KillForOutputLimit, ct);
 
         try
         {
             await binaryStdin.CopyToAsync(p.StandardInput.BaseStream, ct).ConfigureAwait(false);
+        }
+        catch (IOException ex) when (!ct.IsCancellationRequested)
+        {
+            try { p.StandardInput.Close(); } catch { }
+            try { await p.WaitForExitAsync(ct).ConfigureAwait(false); } catch { }
+            var partialStdout = await ReadCompletedOrEmptyLimitedAsync(stdoutTask).ConfigureAwait(false);
+            var partialStderr = await ReadCompletedOrEmptyLimitedAsync(stderrTask).ConfigureAwait(false);
+            if (Volatile.Read(ref outputLimitKilled) != 0)
+                return new ProcessRunResult(
+                    p.HasExited ? p.ExitCode : 137,
+                    partialStdout.Text,
+                    partialStderr.Text,
+                    partialStdout.LimitExceeded,
+                    partialStderr.LimitExceeded);
+            if (p.HasExited && p.ExitCode != SshTransportFailureExitCode)
+                return new ProcessRunResult(
+                    p.ExitCode,
+                    partialStdout.Text,
+                    partialStderr.Text,
+                    partialStdout.LimitExceeded,
+                    partialStderr.LimitExceeded);
+
+            throw new RemoteSshTransportException(
+                $"SSH transport failure streaming binary stdin to '{opts.SshTarget}': {TailFor(partialStderr.Text)}",
+                ex);
         }
         finally
         {
@@ -343,8 +716,111 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         var stdout = await stdoutTask.ConfigureAwait(false);
         var stderr = await stderrTask.ConfigureAwait(false);
         _ = opts;
-        return new ProcessRunResult(p.ExitCode, stdout, stderr);
+        return new ProcessRunResult(
+            p.ExitCode,
+            stdout.Text,
+            stderr.Text,
+            stdout.LimitExceeded,
+            stderr.LimitExceeded);
     }
+
+    private static async Task<LimitedTextReadResult> ReadCompletedOrEmptyLimitedAsync(Task<LimitedTextReadResult> task)
+    {
+        try
+        {
+            return task.IsCompleted
+                ? await task.ConfigureAwait(false)
+                : new LimitedTextReadResult("", LimitExceeded: false);
+        }
+        catch
+        {
+            return new LimitedTextReadResult("", LimitExceeded: false);
+        }
+    }
+
+    private static async Task<LimitedTextReadResult> ReadTextToLimitAsync(
+        StreamReader reader,
+        int maxBytes,
+        Action? onLimitExceeded,
+        CancellationToken ct)
+    {
+        var output = new StringBuilder();
+        var buffer = new char[ReadBufferChars];
+        var totalBytes = 0;
+
+        while (true)
+        {
+            var read = await reader.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
+            if (read == 0)
+                return new LimitedTextReadResult(output.ToString(), LimitExceeded: false);
+
+            var chunk = new string(buffer, 0, read);
+            var chunkBytes = Encoding.UTF8.GetByteCount(chunk);
+            if (totalBytes + chunkBytes > maxBytes)
+            {
+                var remaining = Math.Max(0, maxBytes - totalBytes);
+                if (remaining > 0)
+                    output.Append(TakeUtf8Prefix(chunk, remaining));
+                onLimitExceeded?.Invoke();
+                return new LimitedTextReadResult(output.ToString(), LimitExceeded: true);
+            }
+
+            output.Append(chunk);
+            totalBytes += chunkBytes;
+        }
+    }
+
+    private static string TakeUtf8Prefix(string value, int maxBytes)
+    {
+        var used = 0;
+        for (var i = 0; i < value.Length;)
+        {
+            var charCount = char.IsHighSurrogate(value[i])
+                && i + 1 < value.Length
+                && char.IsLowSurrogate(value[i + 1])
+                    ? 2
+                    : 1;
+            var charBytes = Encoding.UTF8.GetByteCount(value.AsSpan(i, charCount));
+            if (used + charBytes > maxBytes)
+                return value[..i];
+            used += charBytes;
+            i += charCount;
+        }
+
+        return value;
+    }
+
+    private static void ThrowIfStagingOutputLimitExceeded(
+        string operation,
+        MultipassRemoteSandboxOptions opts,
+        ProcessRunResult result)
+    {
+        if (!result.StdoutLimitExceeded && !result.StderrLimitExceeded)
+            return;
+
+        var stream = result.StdoutLimitExceeded && result.StderrLimitExceeded
+            ? "stdout/stderr"
+            : result.StdoutLimitExceeded
+                ? "stdout"
+                : "stderr";
+        throw BuildStagingOutputLimitException(operation, opts, stream, null);
+    }
+
+    private static RemoteSshTransportException BuildStagingOutputLimitException(
+        string operation,
+        MultipassRemoteSandboxOptions opts,
+        string stream,
+        Exception? inner) =>
+        inner is null
+            ? new RemoteSshTransportException(
+                $"SSH {operation} {stream} exceeded RemoteInventoryMaxOutputBytes ({opts.RemoteInventoryMaxOutputBytes.ToString(CultureInfo.InvariantCulture)} bytes) for '{opts.SshTarget}'.",
+                RemoteSshTransportFailureKind.ResourceLimit)
+            : new RemoteSshTransportException(
+                $"SSH {operation} {stream} exceeded RemoteInventoryMaxOutputBytes ({opts.RemoteInventoryMaxOutputBytes.ToString(CultureInfo.InvariantCulture)} bytes) for '{opts.SshTarget}'.",
+                RemoteSshTransportFailureKind.ResourceLimit,
+                inner);
+
+    private readonly record struct LimitedTextReadResult(string Text, bool LimitExceeded);
 
     private static IReadOnlyList<string> BuildSshArgv(MultipassRemoteSandboxOptions opts, string remoteCommand)
     {
@@ -361,7 +837,7 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
         argv.Add("-o"); argv.Add($"ConnectTimeout={opts.ConnectTimeoutSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
         // Multiplexed control sockets would reduce per-exec connection cost,
         // but they're host-disk artifacts that need cleanup and are tricky
-        // for our test fakes. Skip them for step 1.
+        // for our test fakes. Keep the transport stateless for now.
         argv.Add("-o"); argv.Add("ControlMaster=no");
         argv.Add("-o"); argv.Add("ControlPath=none");
         if (!string.IsNullOrWhiteSpace(opts.SshKeyPath))
@@ -420,6 +896,16 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
             throw new InvalidOperationException("MultipassRemoteSandboxOptions.ServerAliveCountMax must be > 0.");
         if (opts.ConnectTimeoutSeconds <= 0)
             throw new InvalidOperationException("MultipassRemoteSandboxOptions.ConnectTimeoutSeconds must be > 0.");
+        if (opts.StageOutMaxArchiveBytes <= 0)
+            throw new InvalidOperationException("MultipassRemoteSandboxOptions.StageOutMaxArchiveBytes must be > 0.");
+        if (opts.StageOutMaxEntries <= 0)
+            throw new InvalidOperationException("MultipassRemoteSandboxOptions.StageOutMaxEntries must be > 0.");
+        if (double.IsNaN(opts.StageOutMaxExpansionRatio)
+            || double.IsInfinity(opts.StageOutMaxExpansionRatio)
+            || opts.StageOutMaxExpansionRatio < 1.0d)
+        {
+            throw new InvalidOperationException("MultipassRemoteSandboxOptions.StageOutMaxExpansionRatio must be >= 1.");
+        }
     }
 
     private static void ValidateRemotePath(string remotePath)
@@ -449,9 +935,8 @@ public sealed class OpenSshCliTransport : IRemoteHostTransport
     private static string TailFor(string s, int max = 240)
     {
         if (string.IsNullOrEmpty(s)) return "(no stderr)";
-        var trimmed = s.Trim();
-        if (trimmed.Length <= max) return trimmed;
-        return "…" + trimmed[^max..];
+        var sanitized = RemoteMultipassText.TruncateForLog(s, max);
+        return sanitized.Length == 0 ? "(no stderr)" : sanitized;
     }
 
     /// <summary>
