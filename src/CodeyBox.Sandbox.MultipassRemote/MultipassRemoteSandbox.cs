@@ -284,7 +284,7 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
             try { cts.Cancel(); } catch { }
         }
 
-        var opts = _opts();
+        var opts = _opts;
         var kill = await _runRemoteMaybeGated(
             [
                 opts.RemoteMultipassPath,
