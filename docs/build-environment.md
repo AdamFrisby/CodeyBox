@@ -60,3 +60,29 @@ the failure on its own. For raw invocations, either provision a
 build-user-writable `$HOME/.nuget` (e.g. `chown -R "$(id -un)" "$HOME/.nuget"`),
 or invoke with `DOTNET_CLI_HOME=<writable dir> dotnet build ...` (NuGet resolves
 the per-user settings directory relative to it).
+
+### Durable remediation without root: relocate the root-owned `.nuget`
+
+The audit harness invokes `dotnet build ./CodeyBox.slnx` and `dotnet test
+--no-build` **raw**, so neither the gate's nor `build.sh`'s in-script
+`DOTNET_CLI_HOME` redirect applies to it, and — as shown above — no tracked
+config file can intercept NuGet's early read/create of the per-user settings
+directory. The remediation that *does* work for a raw invocation, and needs no
+`root`, exploits directory ownership: even when `$HOME/.nuget` is owned by
+`root`, the build user owns its parent `$HOME`, so it may rename that directory
+entry out of the way and recreate a writable one, preserving the pre-baked
+package cache by symlink:
+
+```sh
+mv "$HOME/.nuget" "$HOME/.nuget.rootbaked"          # allowed: build user owns $HOME
+mkdir -p "$HOME/.nuget"
+ln -s "$HOME/.nuget.rootbaked/packages" "$HOME/.nuget/packages"
+```
+
+After this, a raw `dotnet build ./CodeyBox.slnx` restores and builds the full
+solution warnings-clean, and `dotnet test --no-build` runs, with no environment
+overrides. This repair mutates only `$HOME` (never the source tree), so it
+survives a same-container audit re-run that checks out a new commit under
+`/work` without resetting `$HOME`. It is the operative remediation for the
+recurring `process:required-build` / `csharp:build-WaE` / `csharp:test-pass`
+findings on this image.
