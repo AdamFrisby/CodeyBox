@@ -151,7 +151,7 @@ public sealed class MultipassRemoteProgramWiringTests
 
     private sealed class MultipassRemoteHotReloadFactory(
         MutableOptionsMonitor<CodeyBoxOptions> monitor,
-        IProcessRunner? runner = null) : WebApplicationFactory<Program>
+        IProcessRunner? runner = null) : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly string _dbPath = Path.Combine(
             Path.GetTempPath(),
@@ -163,7 +163,7 @@ public sealed class MultipassRemoteProgramWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -197,15 +197,11 @@ public sealed class MultipassRemoteProgramWiringTests
             });
         }
 
+        // Disposes the host first (closing SQLite connections and checkpointing
+        // the -wal/-shm sidecars away) before deleting the .db, then wipes the
+        // owned temp root holding the git/log/audit/stream directories.
         protected override void Dispose(bool disposing)
-        {
-            // Dispose the host first so its SQLite connections close and the
-            // -wal/-shm sidecars are checkpointed away; deleting the .db while
-            // the host is still writing orphans those sidecars on disk.
-            base.Dispose(disposing);
-            if (disposing)
-                TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
-        }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
     }
 
     private sealed class MutableOptionsMonitor<T>(T initial) : IOptionsMonitor<T>

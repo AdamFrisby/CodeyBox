@@ -366,6 +366,51 @@ public sealed class TestTempArtifactsTests
         Assert.False(Directory.Exists(gitRoot));
     }
 
+    [Fact]
+    public void AttachmentApiFactory_Dispose_RootsGitAndAuditPathsUnderOwnedTempRootAndRemovesThem()
+    {
+        // Regression: AttachmentApiFactory (and the sibling program-wiring
+        // factories) formerly scattered their git/log/audit directories directly
+        // under Path.GetTempPath() with independent GUIDs and only deleted the
+        // .db in Dispose, leaking a git dir + log files per test. Those artifacts
+        // must instead live UNDER the factory's owned temp root so the single
+        // recursive wipe removes them; otherwise a small /tmp fills under the
+        // parallel suite and SQLite can no longer create tables.
+        string tempRoot;
+        string gitRoot;
+        string auditLogPath;
+        string auditPath;
+        var factory = new AttachmentApiFactory();
+        var client = factory.CreateClient();
+        try
+        {
+            tempRoot = factory.TempRoot;
+            var config = factory.Services.GetRequiredService<IConfiguration>();
+            gitRoot = RequiredConfig(config, "CodeyBox:GitRootDirectory");
+            auditLogPath = RequiredConfig(config, "CodeyBox:AuditLog:Path");
+            auditPath = RequiredConfig(config, "CodeyBox:AuditLog:AuditPath");
+
+            AssertPathUnderRoot(tempRoot, gitRoot);
+            AssertPathUnderRoot(tempRoot, auditLogPath);
+            AssertPathUnderRoot(tempRoot, auditPath);
+
+            Directory.CreateDirectory(gitRoot);
+            File.WriteAllText(Path.Combine(gitRoot, "repo.txt"), "repo");
+            File.WriteAllText(auditLogPath, "{}");
+            File.WriteAllText(auditPath, "{}");
+        }
+        finally
+        {
+            client.Dispose();
+            factory.Dispose();
+        }
+
+        Assert.False(Directory.Exists(tempRoot));
+        Assert.False(Directory.Exists(gitRoot));
+        Assert.False(File.Exists(auditLogPath));
+        Assert.False(File.Exists(auditPath));
+    }
+
     private static string RequiredConfig(IConfiguration config, string key)
         => config[key] ?? throw new InvalidOperationException($"Missing test configuration value: {key}");
 

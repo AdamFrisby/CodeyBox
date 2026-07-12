@@ -688,7 +688,7 @@ public sealed class WorkItemAttachmentEndpointsTests : IDisposable
     }
 }
 
-internal sealed class AttachmentApiFactory : WebApplicationFactory<Program>
+internal sealed class AttachmentApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-attachment-api-{Guid.NewGuid():N}.db");
@@ -729,7 +729,7 @@ internal sealed class AttachmentApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             var attachments = _optionsMonitor.CurrentValue.Attachments;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
@@ -797,7 +797,7 @@ internal sealed class AttachmentApiFactory : WebApplicationFactory<Program>
 
     private CodeyBoxOptions BuildCodeyBoxOptions(AttachmentsOptions attachments)
     {
-        var tmp = Path.GetTempPath();
+        var tmp = Temp.Root;
         return new CodeyBoxOptions
         {
             StateDatabasePath = _dbPath,
