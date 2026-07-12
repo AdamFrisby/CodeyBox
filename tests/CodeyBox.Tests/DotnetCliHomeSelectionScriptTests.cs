@@ -29,9 +29,12 @@ public sealed class DotnetCliHomeSelectionScriptTests : IDisposable
     {
         var resolved = RunSelection(presetCliHome: null, workingDirectory: _workspace);
 
-        Assert.Equal(
-            Path.Combine(_workspace, DotnetCliHomeConventions.DirectoryName),
-            resolved);
+        var expected = Path.Combine(_workspace, DotnetCliHomeConventions.DirectoryName);
+        Assert.Equal(expected, resolved.CliHome);
+        // HOME must track the resolved home so NuGet builds that derive the
+        // user-config directory from $HOME (rather than DOTNET_CLI_HOME) also
+        // avoid a root-owned ~/.nuget.
+        Assert.Equal(expected, resolved.Home);
     }
 
     [Fact]
@@ -42,7 +45,8 @@ public sealed class DotnetCliHomeSelectionScriptTests : IDisposable
 
         var resolved = RunSelection(presetCliHome: writable, workingDirectory: _workspace);
 
-        Assert.Equal(writable, resolved);
+        Assert.Equal(writable, resolved.CliHome);
+        Assert.Equal(writable, resolved.Home);
         // The probe both verifies and materialises the user-config directory
         // NuGet will populate, so restore never has to create it later.
         Assert.True(Directory.Exists(Path.Combine(writable, ".nuget", "NuGet")));
@@ -70,9 +74,9 @@ public sealed class DotnetCliHomeSelectionScriptTests : IDisposable
         {
             var resolved = RunSelection(presetCliHome: poisoned, workingDirectory: _workspace);
 
-            Assert.Equal(
-                Path.Combine(_workspace, DotnetCliHomeConventions.DirectoryName),
-                resolved);
+            var expected = Path.Combine(_workspace, DotnetCliHomeConventions.DirectoryName);
+            Assert.Equal(expected, resolved.CliHome);
+            Assert.Equal(expected, resolved.Home);
         }
         finally
         {
@@ -83,12 +87,16 @@ public sealed class DotnetCliHomeSelectionScriptTests : IDisposable
         }
     }
 
-    private static string RunSelection(string? presetCliHome, string workingDirectory)
+    private readonly record struct SelectionResult(string CliHome, string Home);
+
+    private static SelectionResult RunSelection(string? presetCliHome, string workingDirectory)
     {
-        // Run the exact production prologue, then print the value it exported so
-        // the test observes the real selection, not a reimplementation.
+        // Run the exact production prologue, then print the values it exported so
+        // the test observes the real selection, not a reimplementation. The two
+        // exports are newline-separated so both DOTNET_CLI_HOME and HOME are
+        // asserted against the resolved home.
         var script = SandboxRequiredBuildVerifier.DotnetCliHomeSelectionScript
-            + "\nprintf '%s' \"$DOTNET_CLI_HOME\"\n";
+            + "\nprintf '%s\\n%s' \"$DOTNET_CLI_HOME\" \"$HOME\"\n";
         var psi = new ProcessStartInfo("/bin/sh")
         {
             WorkingDirectory = workingDirectory,
@@ -110,6 +118,8 @@ public sealed class DotnetCliHomeSelectionScriptTests : IDisposable
         var stderr = process.StandardError.ReadToEnd();
         Assert.True(process.WaitForExit(30_000), "sh selection prologue did not exit within 30s.");
         Assert.True(process.ExitCode == 0, $"sh exited {process.ExitCode}; stderr: {stderr}");
-        return stdout;
+        var parts = stdout.Split('\n');
+        Assert.Equal(2, parts.Length);
+        return new SelectionResult(parts[0], parts[1]);
     }
 }

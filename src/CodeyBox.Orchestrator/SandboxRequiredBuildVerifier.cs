@@ -38,9 +38,9 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
     // execution exceeding the required-build budget.
     private const int BuildTimeoutExitCode = 124;
 
-    // POSIX-sh prologue that guarantees DOTNET_CLI_HOME points at a directory we
-    // can actually create NuGet's user-config folder under, BEFORE any dotnet
-    // invocation runs. dotnet/NuGet materialise $DOTNET_CLI_HOME/.nuget
+    // POSIX-sh prologue that guarantees the dotnet/NuGet home points at a
+    // directory we can actually create NuGet's user-config folder under, BEFORE
+    // any dotnet invocation runs. dotnet/NuGet materialise $DOTNET_CLI_HOME/.nuget
     // (defaulting to $HOME when DOTNET_CLI_HOME is unset) on first restore. In
     // agent sandboxes that parent is frequently root-owned and unwritable, so
     // restore aborts with "Failed to read NuGet.Config due to unauthorized
@@ -49,8 +49,15 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
     // value) we fall back to a repo-local home anchored to an absolute $(pwd)
     // path (the checked-out work tree) so a nested build step's CWD change
     // cannot relocate it outside the sandbox and let restore probe root-owned
-    // ~/.nuget again. Exposed internally so a deterministic shell test can
-    // exercise the unset / writable / non-writable branches directly.
+    // ~/.nuget again. We export the resolved path as BOTH DOTNET_CLI_HOME and
+    // HOME: different SDK/NuGet builds derive the user-config directory from one
+    // or the other (older/alternate NuGet resolves it from $HOME, ignoring
+    // DOTNET_CLI_HOME), so pinning only DOTNET_CLI_HOME still lets those builds
+    // probe a root-owned ~/.nuget. Overriding HOME is safe here because the
+    // prologue runs immediately before dotnet inside the build step — the git
+    // clone/checkout that need the caller's HOME run as separate execs before it.
+    // Exposed internally so a deterministic shell test can exercise the unset /
+    // writable / non-writable branches directly.
     internal static readonly string DotnetCliHomeSelectionScript = $$"""
         cli_home="${DOTNET_CLI_HOME:-}"
         if [ -n "$cli_home" ] \
@@ -61,6 +68,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
           cli_home="$(pwd)/{{DotnetCliHomeConventions.DirectoryName}}"
         fi
         export DOTNET_CLI_HOME="$cli_home"
+        export HOME="$cli_home"
         """;
 
     // Exposed to tests so the actual gate script — the exact artifact the
