@@ -121,6 +121,15 @@ cd CodeyBox
 dotnet build CodeyBox.slnx
 ```
 
+> The build user's NuGet user-config directory (`$HOME/.nuget/NuGet`) must be
+> writable. NuGet reads it during every restore regardless of any repo-level
+> `nuget.config` or `RestoreConfigFile` override, so if it is missing or owned by
+> another user the restore fails solution-wide with
+> `Failed to read NuGet.Config due to unauthorized access` — a host/container
+> provisioning problem, not a source defect. Ensure `$HOME` is owned by the build
+> user (a container that seeds `.nuget` as root while running the build as an
+> unprivileged user hits this).
+
 **3. Configure a project.** Drop a JSON file somewhere and point
 `CODEYBOX_EXTRA_CONFIG` at it (it hot-reloads on change):
 
