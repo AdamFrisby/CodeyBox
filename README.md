@@ -122,13 +122,23 @@ dotnet build CodeyBox.slnx
 ```
 
 > The build user's NuGet user-config directory (`$HOME/.nuget/NuGet`) must be
-> writable. NuGet reads it during every restore regardless of any repo-level
-> `nuget.config` or `RestoreConfigFile` override, so if it is missing or owned by
-> another user the restore fails solution-wide with
-> `Failed to read NuGet.Config due to unauthorized access` — a host/container
-> provisioning problem, not a source defect. Ensure `$HOME` is owned by the build
-> user (a container that seeds `.nuget` as root while running the build as an
-> unprivileged user hits this).
+> readable and writable by the build user. NuGet stats and reads it during every
+> restore regardless of any repo-level `nuget.config` or `RestoreConfigFile`
+> override (the read happens a phase earlier than the override, at
+> `NuGet.targets(198,5)`), so if the directory is missing or owned by another
+> user the restore fails solution-wide with
+> `Failed to read NuGet.Config due to unauthorized access`, `dotnet build`
+> reports the projects as failed, and a subsequent `dotnet test --no-build`
+> cannot load the (never-built) test assemblies (`The argument … .dll is
+> invalid`). All three are the same host/container provisioning problem, not a
+> source defect. Ensure `$HOME/.nuget` is owned by the build user — a container
+> that seeds `.nuget` as root while running the build as an unprivileged user
+> hits this. Remediate on the host (not from the repo, which cannot chown a home
+> directory) with:
+>
+> ```bash
+> chown -R "$(id -u)":"$(id -g)" "$HOME/.nuget"
+> ```
 
 **3. Configure a project.** Drop a JSON file somewhere and point
 `CODEYBOX_EXTRA_CONFIG` at it (it hot-reloads on change):
