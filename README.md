@@ -133,11 +133,20 @@ dotnet build CodeyBox.slnx
 > invalid`). All three are the same host/container provisioning problem, not a
 > source defect. Ensure `$HOME/.nuget` is owned by the build user — a container
 > that seeds `.nuget` as root while running the build as an unprivileged user
-> hits this. Remediate on the host (not from the repo, which cannot chown a home
-> directory) with:
+> hits this. A privileged host administrator can repair the ownership with:
 >
 > ```bash
-> chown -R "$(id -u)":"$(id -g)" "$HOME/.nuget"
+> sudo chown -R "$(id -u)":"$(id -g)" "$HOME/.nuget"
+> ```
+>
+> In a locked-down container where privilege escalation is unavailable but the
+> build user owns `$HOME`, preserve the populated package cache and replace only
+> its unwritable parent:
+>
+> ```bash
+> mv "$HOME/.nuget" "$HOME/.nuget.preexisting"
+> mkdir -p "$HOME/.nuget/NuGet"
+> ln -s "$HOME/.nuget.preexisting/packages" "$HOME/.nuget/packages"
 > ```
 
 **3. Configure a project.** Drop a JSON file somewhere and point
