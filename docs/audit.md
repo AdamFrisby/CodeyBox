@@ -208,13 +208,23 @@ or reclaim a root-owned `~/.nuget` in place. Removing the stale entry is
 governed by the write bit on `$HOME` itself (the parent), not by the
 root-owned `~/.nuget`'s own permissions, so an unprivileged agent whose home
 directory is writable can move it aside non-destructively and recreate a
-writable one:
+writable one. The reclaim is safe to re-run — each audit iteration starts from
+a freshly re-provisioned (again root-owned) `~/.nuget`, so recovery must be
+idempotent rather than assume a clean slate:
 
 ```sh
-if [ -w "$HOME" ] && [ ! -w "$HOME/.nuget/NuGet" ]; then
-  mv "$HOME/.nuget" "$HOME/.nuget.unwritable.bak" && mkdir -p "$HOME/.nuget/NuGet"
+if [ -w "$HOME" ] && [ -e "$HOME/.nuget" ] && [ ! -w "$HOME/.nuget/NuGet" ]; then
+  # Move aside to a PID-unique name: a prior reclaim may have left a
+  # `.nuget.unwritable.*.bak` that is itself root-owned and thus not removable
+  # by an unprivileged agent, and reusing a fixed backup name would `mv` the
+  # new `.nuget` *inside* that surviving directory instead of beside it.
+  mv "$HOME/.nuget" "$HOME/.nuget.unwritable.$$.bak" && mkdir -p "$HOME/.nuget/NuGet"
 fi
 ```
+
+The `-e "$HOME/.nuget"` guard skips the move when no `~/.nuget` exists at all
+(a writable `$HOME` lets `dotnet` create it unaided); the block only fires for
+the present-but-unwritable case that actually aborts restore.
 
 Prefer exporting `DOTNET_CLI_HOME` where the launcher allows it; the reclaim
 path is the fallback for a bare host-launched `dotnet` that no repo file or
