@@ -77,3 +77,47 @@ Multipass provisioning now also `chown` the `$HOME/.nuget` parent directory
 `mkdir -p` otherwise leave NuGet unable to create its settings directory on
 fresh clones. Prefer baking images this way; the in-repo self-heal remains the
 backstop for already-baked baselines.
+
+## Host-tool / native-runtime prerequisites for the full test suite
+
+A handful of `CodeyBox.Tests` cases depend on host tooling or on a
+correctly-executing self-contained native binary rather than on repository
+source. They **fail identically on `main` (verified against base commit
+`925943c2`, which predates every change on this branch)** when those external
+prerequisites are missing, so they are provisioning gaps, not regressions of any
+source change. They are recorded here so a misprovisioned container is diagnosed
+against this list instead of a work branch's diff.
+
+- **`file(1)` on `PATH`.**
+  `AcpBridgeUnitTests.AcpBridge_PublishScript_RequiresMultipassWhenVmVerificationIsNotSkipped`
+  (and its siblings) build a fake tool directory that hard-requires `file`,
+  `bash`, `mktemp`, `cat`, … on `PATH`. A container without `file` installed
+  throws `Required test tool not found on PATH: file` from `RequireExecutableOnPath`.
+  Fix by installing `file` (e.g. `apt-get install -y file`).
+
+- **A native ACP bridge binary that executes on the host.**
+  `AcpBridgeUnitTests.Bridge_NativeResource_PosixSignalHandlers_*` run the
+  published self-contained bridge (`src/CodeyBox.Agents.Claude/Resources/acp-bridge`).
+  On a host whose CPU/libc the published binary was not built for, it emits its
+  `bridge_started` envelope and then aborts with `SIGFPE` (process exit `136`)
+  before the `ready` envelope, so `WaitForReadyEnvelopeAsync` observes a closed
+  stdout and the `Assert.NotNull(lockPath)` fails. Fix by re-publishing the bridge
+  for the host (`scripts/publish-acp-bridge.sh`) on a matching toolchain.
+
+- **`flock(2)` release-on-close semantics on the staging filesystem.**
+  `IncusBaselineProvisioningTests.ProvisioningWorkspaceRecovery_DeletesOwnedStaleTreeAndRejectsDeceptiveEntries`
+  expects the advisory coordination lease (`IncusSafeFile.TryAcquireExclusiveLease`,
+  `flock LOCK_EX|LOCK_NB`) taken during `IncusProvisioningWorkspace.Create` to be
+  released when that `FileStream` is disposed, so a subsequent `RecoverStaleWorkspaces`
+  can re-acquire it. On a staging filesystem that does not release `flock` promptly
+  on close, the re-acquire returns `EWOULDBLOCK` and the test throws
+  `Another CodeyBox process is creating or recovering an Incus provisioning
+  workspace`. It reproduces deterministically in isolation on such a host; run the
+  suite with the test temp root on a filesystem with standard `flock` semantics.
+
+- **Headroom for timing-sensitive process/lifecycle waits.**
+  `DefaultProcessRunnerCancellationTests.OutputLimitAfterRootExits_KillsOrphanedWriterProcess`
+  and `IncusSandboxLifecycleTests.Dispose_WhenDeleteReportsSuccessButVmPersists_RetainsStagingUntilVerifiedRetry`
+  assert on wall-clock-bounded process teardown / retry counts; they pass in
+  isolation but can flake when the host is saturated under the parallel audit
+  suite. Run the affected classes with spare CPU headroom.
