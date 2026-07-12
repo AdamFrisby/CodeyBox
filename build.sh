@@ -2,15 +2,34 @@
 set -eu
 
 codeybox_script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+cli_home="$codeybox_script_dir/.dotnet-cli-home"
 
 # Route the .NET CLI home to a writable repo-local path so `dotnet` never
 # probes an inherited, potentially root-owned $HOME/.nuget in agent sandboxes.
 # Paired with Directory.Build.props' RestoreConfigFile and the repo-level
 # NuGet.Config, this keeps restore off the user home entirely. See
 # DotnetCliHomeConventions for the same convention applied in-process (shell
-# auditor, required-build verifier, test startup). Respect an explicit override
-# so callers pinning a different home (e.g. CI caches) still win.
-export DOTNET_CLI_HOME="${DOTNET_CLI_HOME:-$codeybox_script_dir/.dotnet-cli-home}"
+# auditor, required-build verifier, test startup).
+#
+# dotnet/NuGet materialise the user-level config under $HOME/.nuget/NuGet (and,
+# for some SDK/NuGet builds, $DOTNET_CLI_HOME/.nuget) on first restore. When the
+# inherited home already has a writable ~/.nuget/NuGet we keep it so the caller's
+# real package cache and credentials are reused (and respect an explicit
+# DOTNET_CLI_HOME override so callers pinning a different home — e.g. CI caches
+# — still win); otherwise (root-owned or unwritable, common in agent sandboxes)
+# we pin both DOTNET_CLI_HOME and HOME to a writable repo-local home so restore
+# never probes a root-owned ~/.nuget. Pinning HOME as well as DOTNET_CLI_HOME
+# mirrors SandboxRequiredBuildVerifier's DotnetCliHomeSelectionScript, whose
+# comment explains why DOTNET_CLI_HOME alone is insufficient for NuGet builds
+# that derive the config dir from HOME.
+if [ -n "${HOME:-}" ] \
+  && mkdir -p "$HOME/.nuget/NuGet" 2>/dev/null \
+  && [ -w "$HOME/.nuget/NuGet" ]; then
+  export DOTNET_CLI_HOME="${DOTNET_CLI_HOME:-$cli_home}"
+else
+  export DOTNET_CLI_HOME="$cli_home"
+  export HOME="$cli_home"
+fi
 
 # Heal an inherited, non-writable per-user NuGet home before dotnet restore so a
 # COW-inherited root-owned $HOME/.nuget cannot abort the build with "Failed to
