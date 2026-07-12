@@ -99,10 +99,18 @@ public sealed class StaleBaseConflictReworkRouter
         new HashSet<WorkItemState> { WorkItemState.UpstreamPushing };
 
     /// <summary>
+    /// Applies the single flooring rule for the configured attempt cap: a value
+    /// below 1 is treated as 1 so the router always permits at least one rework
+    /// attempt. Kept as one method so the rule has a single source of truth
+    /// shared by <see cref="MaxReworkAttempts"/> and <see cref="TryRouteAsync"/>.
+    /// </summary>
+    private static int FloorAttemptCap(int configured) => Math.Max(1, configured);
+
+    /// <summary>
     /// The effective, floored attempt cap. Exposed so callers can decide whether
     /// a park is a cap-exhaustion terminal without duplicating the flooring rule.
     /// </summary>
-    public int MaxReworkAttempts => Math.Max(1, _optionsAccessor().MaxReworkAttempts);
+    public int MaxReworkAttempts => FloorAttemptCap(_optionsAccessor().MaxReworkAttempts);
 
     /// <summary>True when stale-base rework routing is enabled.</summary>
     public bool Enabled => _optionsAccessor().RouteToConflictRework;
@@ -133,7 +141,13 @@ public sealed class StaleBaseConflictReworkRouter
         IReadOnlySet<WorkItemState> eligibleSourceStates,
         CancellationToken ct)
     {
-        if (!_optionsAccessor().RouteToConflictRework)
+        // Snapshot the hot-reloadable options once so the enable-check and the
+        // attempt-cap check below operate on a single, consistent configuration
+        // view. Re-invoking the accessor across the intervening await could tear
+        // a concurrent hot-reload — e.g. routing under a freshly-raised cap while
+        // having gated on the old enable flag.
+        var options = _optionsAccessor();
+        if (!options.RouteToConflictRework)
             return StaleBaseReworkOutcome.NotEnabled;
 
         var current = await _store.GetAsync(item.Id, ct) ?? item;
@@ -155,7 +169,7 @@ public sealed class StaleBaseConflictReworkRouter
             return StaleBaseReworkOutcome.NotEnabled;
         }
 
-        var max = MaxReworkAttempts;
+        var max = FloorAttemptCap(options.MaxReworkAttempts);
         if (current.ConflictReworkAttempts >= max)
         {
             _log.LogInformation(
