@@ -18,7 +18,15 @@ internal static class DemoLoginSandboxExec
         => exec.Argv.Count >= 2 && exec.Argv[0] == "curl"
             && exec.Argv.Any(arg => arg.Contains("/healthz", StringComparison.Ordinal));
 
-    public static async Task<SandboxExecResult> RunShellScriptAsync(string? script, CancellationToken ct)
+    public static Task<SandboxExecResult> RunShellScriptAsync(string? script, CancellationToken ct)
+        => RunShellScriptAsync(script, pathPrefix: null, ct);
+
+    /// <summary>
+    /// Runs a <c>sh -s</c> script through the real shell. <paramref name="pathPrefix"/> is
+    /// prepended to <c>PATH</c> so privileged tools (iptables, sudo, …) resolve to recording
+    /// shims — modeling the replay VM's exec surface deterministically without host root.
+    /// </summary>
+    public static async Task<SandboxExecResult> RunShellScriptAsync(string? script, string? pathPrefix, CancellationToken ct)
     {
         var psi = new ProcessStartInfo("sh", "-s")
         {
@@ -26,6 +34,11 @@ internal static class DemoLoginSandboxExec
             RedirectStandardOutput = true,
             RedirectStandardError = true,
         };
+        if (!string.IsNullOrEmpty(pathPrefix))
+        {
+            var existing = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+            psi.Environment["PATH"] = pathPrefix + Path.PathSeparator + existing;
+        }
 
         using var process = Process.Start(psi) ?? throw new InvalidOperationException("failed to start sh");
         if (!string.IsNullOrEmpty(script))
@@ -154,6 +167,7 @@ public sealed class DemoLoginCuaSandbox : ISandbox
 public sealed class DemoLoginReplaySandbox : ISandbox
 {
     private readonly string _root;
+    private readonly string _shimBin;
     private readonly List<SandboxExec> _firewallExecs = [];
 
     public DemoLoginReplaySandbox()
@@ -162,6 +176,8 @@ public sealed class DemoLoginReplaySandbox : ISandbox
         Directory.CreateDirectory(Path.Combine(_root, "node_modules", "playwright"));
         File.WriteAllText(Path.Combine(_root, "node_modules", "playwright", "index.js"), BuildPlaywrightStub());
         File.WriteAllText(Path.Combine(_root, "dns-hook.js"), DnsHook);
+        _shimBin = Path.Combine(_root, "fw-shim");
+        WriteFirewallShims(_shimBin);
         CopyLinkedomBundle();
     }
 
@@ -176,8 +192,14 @@ public sealed class DemoLoginReplaySandbox : ISandbox
 
         if (DemoLoginSandboxExec.IsShellScript(exec))
         {
+            // The replay runtime installs/removes an egress firewall via `sh -s`. Model the
+            // replay VM by executing that real script with iptables/sudo/id shimmed on PATH,
+            // so its control flow runs to completion deterministically without host root.
             if (exec.Stdin?.Contains("iptables", StringComparison.Ordinal) == true)
+            {
                 _firewallExecs.Add(exec);
+                return await DemoLoginSandboxExec.RunShellScriptAsync(exec.Stdin, _shimBin, ct);
+            }
 
             return await DemoLoginSandboxExec.RunShellScriptAsync(exec.Stdin, ct);
         }
@@ -223,6 +245,55 @@ public sealed class DemoLoginReplaySandbox : ISandbox
 
         return default;
     }
+
+    /// <summary>
+    /// Writes recording shims for the privileged tools the egress-firewall script requires.
+    /// Each shim models the replay VM's tool surface: <c>iptables</c>/<c>ip6tables</c> accept
+    /// rule additions (returning non-zero for <c>-D</c> deletes so cleanup while-loops
+    /// terminate), <c>sudo</c> drops its options and execs the wrapped command, <c>id</c>
+    /// resolves the synthetic run-user to a fixed uid/gid, and the rest are no-ops. The
+    /// script's real branching thus runs to a clean exit without host root or netfilter.
+    /// </summary>
+    private static void WriteFirewallShims(string shimBin)
+    {
+        Directory.CreateDirectory(shimBin);
+        WriteShim(shimBin, "iptables", IptablesShim);
+        WriteShim(shimBin, "ip6tables", IptablesShim);
+        WriteShim(shimBin, "sudo", SudoShim);
+        WriteShim(shimBin, "id", IdShim);
+        WriteShim(shimBin, "chown", NoopShim);
+        WriteShim(shimBin, "useradd", NoopShim);
+        WriteShim(shimBin, "adduser", NoopShim);
+        WriteShim(shimBin, "userdel", NoopShim);
+    }
+
+    private static void WriteShim(string shimBin, string name, string body)
+    {
+        var path = Path.Combine(shimBin, name);
+        File.WriteAllText(path, body);
+        if (!OperatingSystem.IsWindows())
+            File.SetUnixFileMode(
+                path,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
+                | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+    }
+
+    // Non-zero for `-D` (delete) so `while run ... -D ...; do :; done` cleanup loops break;
+    // exit 0 for chain create/append/insert so the install path records rules and succeeds.
+    private const string IptablesShim =
+        "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = \"-D\" ] && exit 1; done\nexit 0\n";
+
+    // Drop sudo's own options (-n, -H, -u user, …) and exec the wrapped command via PATH.
+    private const string SudoShim =
+        "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in -u) shift 2 ;; --) shift; break ;; -*) shift ;; *) break ;; esac; done\nexec \"$@\"\n";
+
+    // `id -u` (current user, one arg) delegates to the real id for the root check; a two-arg
+    // form (`id -u USER` / `id -g USER`) resolves the synthetic run-user to a stable id.
+    private const string IdShim =
+        "#!/bin/sh\nif [ $# -le 1 ]; then exec /usr/bin/id \"$@\"; fi\necho 483\n";
+
+    private const string NoopShim = "#!/bin/sh\nexit 0\n";
 
     private void CopyLinkedomBundle()
     {
