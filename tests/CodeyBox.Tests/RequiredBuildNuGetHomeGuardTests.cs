@@ -64,6 +64,36 @@ public sealed class RequiredBuildNuGetHomeGuardTests : IDisposable
     }
 
     [Fact]
+    public async Task BuildScript_NuGetSettingsDirectoryAbsentUnderUnwritableDotNuget_RelocatesHome()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        // The observed audit-sandbox shape: ~/.nuget exists but is owned by
+        // another uid at mode 755 (traversable, NOT writable) and its NuGet
+        // settings subdirectory has not been created. NuGet must create that
+        // subdirectory on first restore, which fails with "unauthorized access"
+        // -- yet $HOME itself is writable, so a guard that only relocates when
+        // BOTH ~/.nuget and $HOME are unwritable would miss it.
+        var home = Path.Combine(_root, "home-unwritable-dotnuget-" + Guid.NewGuid().ToString("N")[..8]);
+        var dotNuget = Path.Combine(home, ".nuget");
+        Directory.CreateDirectory(dotNuget);
+        // No "NuGet" subdirectory. Make ~/.nuget traversable+readable but not
+        // writable, mirroring a root-owned mode-755 directory.
+        File.SetUnixFileMode(dotNuget,
+            UnixFileMode.UserRead | UnixFileMode.UserExecute |
+            UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+            UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+
+        var (exitCode, invokedHome, buildTargets) = await RunBuildScriptAsync(home);
+
+        Assert.Equal(0, exitCode);
+        Assert.Contains("./repo.slnx", buildTargets);
+        Assert.NotNull(invokedHome);
+        Assert.NotEqual(home, invokedHome);
+    }
+
+    [Fact]
     public async Task BuildScript_HealthyNuGetHome_IsNotRelocated()
     {
         if (OperatingSystem.IsWindows())
@@ -162,20 +192,29 @@ public sealed class RequiredBuildNuGetHomeGuardTests : IDisposable
         {
             foreach (var homeDir in Directory.EnumerateDirectories(_root))
             {
-                var settingsDir = Path.Combine(homeDir, ".nuget", "NuGet");
-                if (!Directory.Exists(settingsDir))
-                    continue;
-                try
+                // Restore write on both ~/.nuget and its NuGet subdirectory:
+                // one test strips write from the parent (settings subdir absent)
+                // and another strips it from the subdir itself.
+                foreach (var dir in new[]
+                         {
+                             Path.Combine(homeDir, ".nuget"),
+                             Path.Combine(homeDir, ".nuget", "NuGet"),
+                         })
                 {
-                    File.SetUnixFileMode(settingsDir,
-                        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-                }
-                catch (IOException)
-                {
-                    // Best-effort restore; the delete below surfaces anything left.
-                }
-                catch (UnauthorizedAccessException)
-                {
+                    if (!Directory.Exists(dir))
+                        continue;
+                    try
+                    {
+                        File.SetUnixFileMode(dir,
+                            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                    }
+                    catch (IOException)
+                    {
+                        // Best-effort restore; the delete below surfaces anything left.
+                    }
+                    catch (UnauthorizedAccessException)
+                    {
+                    }
                 }
             }
         }
