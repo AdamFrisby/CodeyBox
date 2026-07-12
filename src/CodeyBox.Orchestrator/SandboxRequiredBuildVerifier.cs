@@ -38,6 +38,31 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
     // execution exceeding the required-build budget.
     private const int BuildTimeoutExitCode = 124;
 
+    // POSIX-sh prologue that guarantees DOTNET_CLI_HOME points at a directory we
+    // can actually create NuGet's user-config folder under, BEFORE any dotnet
+    // invocation runs. dotnet/NuGet materialise $DOTNET_CLI_HOME/.nuget
+    // (defaulting to $HOME when DOTNET_CLI_HOME is unset) on first restore. In
+    // agent sandboxes that parent is frequently root-owned and unwritable, so
+    // restore aborts with "Failed to read NuGet.Config due to unauthorized
+    // access ... ~/.nuget". We keep an inherited DOTNET_CLI_HOME only when a
+    // write probe succeeds; otherwise (unset, or a non-writable/root-owned
+    // value) we fall back to a repo-local home anchored to an absolute $(pwd)
+    // path (the checked-out work tree) so a nested build step's CWD change
+    // cannot relocate it outside the sandbox and let restore probe root-owned
+    // ~/.nuget again. Exposed internally so a deterministic shell test can
+    // exercise the unset / writable / non-writable branches directly.
+    internal static readonly string DotnetCliHomeSelectionScript = $$"""
+        cli_home="${DOTNET_CLI_HOME:-}"
+        if [ -n "$cli_home" ] \
+          && mkdir -p "$cli_home/.nuget/NuGet" 2>/dev/null \
+          && [ -w "$cli_home/.nuget/NuGet" ]; then
+          :
+        else
+          cli_home="$(pwd)/{{DotnetCliHomeConventions.DirectoryName}}"
+        fi
+        export DOTNET_CLI_HOME="$cli_home"
+        """;
+
     // Exposed to tests so the actual gate script — the exact artifact the
     // sandbox executes via `sh -c` — can be run under a controlled shell.
     internal static readonly string BuildScript = $$"""
