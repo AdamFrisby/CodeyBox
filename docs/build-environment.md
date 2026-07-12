@@ -1,22 +1,24 @@
-# Build environment prerequisites
+# Build & verify-VM environment prerequisites
 
 The solution builds warnings-clean and its test suite passes on any correctly
-provisioned .NET 10 host. This note records one **provisioning** prerequisite
-that is external to the source tree, because it has recurred as a build-gate
-failure when the build container is misconfigured — and the in-repo mitigations
-that make raw `dotnet build` survive that misconfiguration.
+provisioned .NET 10 host. This note records the **provisioning** prerequisites
+that are external to the source tree — because they have recurred as build-gate
+failures when the build / audit ("verify") VM is misconfigured — together with
+the in-repo mitigations that make raw `dotnet build` survive those
+misconfigurations where possible.
 
-## Writable per-user NuGet configuration directory
+## 1. Writable per-user NuGet configuration directory
 
-`dotnet build` / `dotnet restore` unconditionally read — and, when absent,
-**create** — the per-user NuGet settings directory at
+`dotnet build` / `dotnet restore` / `dotnet test` unconditionally read — and,
+when absent, **create** — the per-user NuGet settings directory at
 `$HOME/.nuget/NuGet/` (holding `NuGet.Config`) before any project-, solution-,
 or `RestoreConfigFile`-level configuration is honoured. The build user must be
 able to read and write that directory.
 
-If the container image is baked such that `$HOME/.nuget` (or `$HOME/.nuget/NuGet`)
-is owned by a different user (e.g. `root`) and not writable by the build user,
-every project fails restore with:
+If the container / VM image is baked such that `$HOME/.nuget` (or
+`$HOME/.nuget/NuGet`) is owned by a different user (e.g. `root`, from a
+provisioning step that ran privileged before the unprivileged build user did)
+and not writable by the build user, every project fails restore with:
 
 ```
 error : Failed to read NuGet.Config due to unauthorized access.
@@ -26,6 +28,27 @@ error : Failed to read NuGet.Config due to unauthorized access.
 
 and, because no assemblies are produced, `dotnet test --no-build` then reports
 each test DLL path as an "invalid argument".
+
+A repository `nuget.config`, an MSBuild `RestoreConfigFile`
+(`Directory.Build.props`), and the `NUGET_CONFIG_FILE` environment variable
+were all verified to still fail on their own, because NuGet touches the
+per-user settings directory during settings load, ahead of every override.
+Only a writable NuGet home (or a redirected per-user home, see the gate/
+`build.sh` sections below) fixes it.
+
+### Operator remediation
+
+Run as the account that owns `$HOME`:
+
+```sh
+# Give the build user ownership of its own NuGet home, or remove the
+# root-created directory and let dotnet recreate it writable.
+sudo chown -R "$(id -un):$(id -gn)" "$HOME/.nuget"
+chmod -R u+rwX "$HOME/.nuget"
+```
+
+Prefer provisioning `~/.nuget` owned by the build user (or leaving it absent
+so `dotnet` recreates it) as part of VM baking, not at first build.
 
 ### In-repo self-heal: `Directory.Build.targets`
 
@@ -78,7 +101,22 @@ Multipass provisioning now also `chown` the `$HOME/.nuget` parent directory
 fresh clones. Prefer baking images this way; the in-repo self-heal remains the
 backstop for already-baked baselines.
 
-## Host-tool / native-runtime prerequisites for the full test suite
+## 2. The temp filesystem must have real headroom
+
+The test suite creates a per-test SQLite database (`<guid>.db` plus its `-wal`
+and `-shm` siblings) and git / log / agent-stream working directories under
+`Path.GetTempPath()`. The suite now cleans these up deterministically in
+teardown (see `TestTempArtifacts` / `TestTempDirectory` in
+`tests/CodeyBox.Tests/`), but the parallel `WebApplicationFactory` tests still
+need genuine concurrent free space while running.
+
+On a RAM-backed or undersized `/tmp`, the filesystem can fill mid-run and SQLite
+fails to create tables — surfacing as `no such table: work_items` and
+`test-project cannot be removed` cascades across otherwise-passing tests. Point
+`TMPDIR` at a spacious real disk, or size the verify VM's `/tmp` accordingly,
+before running the full suite.
+
+## 3. Host-tool / native-runtime prerequisites for the full test suite
 
 A handful of `CodeyBox.Tests` cases depend on host tooling or on a
 correctly-executing self-contained native binary rather than on repository

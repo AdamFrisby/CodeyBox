@@ -22,6 +22,8 @@ Start here if you're new:
    and merge phases actually do at the git level.
 10. [`api.md`](api.md) — REST endpoints, configuration, and authentication.
 11. [`operations.md`](operations.md) — running, logs, restarts, failure modes.
+    See also [`build-environment.md`](build-environment.md) — host prerequisites
+    for a clean build / verify VM (NuGet-home ownership, temp-disk headroom).
 12. [`webhooks.md`](webhooks.md) — outbound webhook events, payload shape, HMAC signing, and configuration.
 13. [`audit-logging.md`](audit-logging.md) — structured audit log: location, format, all event names and
     properties. Start here when writing SIEM rules or log-query dashboards.
