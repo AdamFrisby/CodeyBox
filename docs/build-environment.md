@@ -65,6 +65,24 @@ restore reuses it instead of re-downloading, while NuGet can now create its
 `dotnet build ./CodeyBox.slnx` and `dotnet test` succeed on this VM. The
 in-repo self-heal below automates this same rename-aside strategy.
 
+If touching the filesystem is undesirable, the same result is achievable purely
+via the environment: point `DOTNET_CLI_HOME` at a writable directory before the
+build. NuGet derives its user-settings directory from the CLI home, so this
+relocates `NuGet.Config` off the unreadable `~/.nuget/NuGet` without renaming or
+`chown`. Verified to make restore succeed against the root-owned tree:
+
+```sh
+export DOTNET_CLI_HOME="$(mktemp -d)"   # any dir the build user can write
+dotnet build ./CodeyBox.slnx
+```
+
+Note the config-file overrides do **not** help: a repo `nuget.config`, the
+MSBuild `RestoreConfigFile` property, and the `NUGET_CONFIG_FILE`/`--configfile`
+options were all re-verified to still fail, because NuGet ensures its
+user-settings *directory* exists during settings load — before any of those
+overrides apply. Only relocating the home (`DOTNET_CLI_HOME`, the `mv`, or a
+`chown`) works.
+
 Prefer provisioning `~/.nuget` owned by the build user (or leaving it absent
 so `dotnet` recreates it) as part of VM baking, not at first build.
 
