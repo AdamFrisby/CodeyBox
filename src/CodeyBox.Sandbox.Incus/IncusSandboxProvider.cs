@@ -2047,7 +2047,7 @@ public sealed class IncusSandboxProvider :
         }
     }
 
-    private static IReadOnlyList<(string Path, string Name)> SnapshotProvisioningTargets(
+    private static IReadOnlyList<IncusGuestPathAuthorization.ProvisioningTarget> SnapshotProvisioningTargets(
         IncusSandboxOptions options) =>
         IncusGuestPathAuthorization.SnapshotProvisioningTargets(options);
 

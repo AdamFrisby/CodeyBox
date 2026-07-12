@@ -466,6 +466,64 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
     }
 
     [Fact]
+    public async Task ProvisioningValidation_AcceptsBenignAlreadyProvisionedSymlinkAndRejectsHostileAlias()
+    {
+        const string destination = "/home/ubuntu/.local/bin/agy";
+        const string symlink = "/usr/local/bin/agy";
+        var options = BaseOptions() with
+        {
+            ExecutableProvisions =
+            [
+                new BaselineExecutableProvision
+                {
+                    HostSourcePath = "/host/source-not-read-for-validation",
+                    VmDestPath = destination,
+                    VmSymlinks = [symlink],
+                },
+            ],
+        };
+
+        // A COW-inherited baseline (or a re-bake) already has the symlink in place,
+        // so realpath resolves it to the very executable destination we would point
+        // it at. That is benign and must not be rejected as a hostile alias.
+        var benignRunner = new BaselineBakeRunner(
+            Path.Combine(_root, "benign-symlink-staging"),
+            verificationExitCode: 0,
+            canonicalizeGuestPath: path => path == symlink ? destination : path);
+        var benignProvider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            benignRunner,
+            environmentVariableReader: EnvironmentReader(_root));
+        await benignProvider.ValidateCanonicalProvisioningPathsAsync(
+            options,
+            "codeybox-test-instance",
+            mountGuestPaths: [],
+            CancellationToken.None);
+
+        // A symlink resolving anywhere other than its intended destination is a
+        // genuine alias redirect and must still be rejected.
+        var hostileRunner = new BaselineBakeRunner(
+            Path.Combine(_root, "hostile-symlink-staging"),
+            verificationExitCode: 0,
+            canonicalizeGuestPath: path => path == symlink ? "/opt/evil/agy" : path);
+        var hostileProvider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            hostileRunner,
+            environmentVariableReader: EnvironmentReader(_root));
+        var hostile = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            hostileProvider.ValidateCanonicalProvisioningPathsAsync(
+                options,
+                "codeybox-test-instance",
+                mountGuestPaths: [],
+                CancellationToken.None));
+        Assert.Contains("filesystem alias", hostile.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task FullLaunch_RejectsProvisioningMountOverlapBeforeIncusRuns()
     {
         var options = BaseOptions() with
