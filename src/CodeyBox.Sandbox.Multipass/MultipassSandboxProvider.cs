@@ -1172,7 +1172,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
             infos.Add(new ManagedSandboxInfo(
                 name, createdAt, diskBytes > 0 ? diskBytes : null, isActive, hasPreemptMarker,
                 IsSuspendLifecycleState(state),
-                purpose));
+                Purpose: purpose));
         }
         return infos;
     }

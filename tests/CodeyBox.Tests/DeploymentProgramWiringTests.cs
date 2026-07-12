@@ -61,7 +61,8 @@ public sealed class DeploymentProgramWiringTests
             },
         };
 
-        var remote = Program.BuildMultipassRemoteSandboxOptions(options);
+        var remote = MultipassRemoteOptionsMapper.Map(
+            options.MultipassRemoteSandbox, options.SandboxNetworkProfiles);
 
         Assert.Equal("cb-deploy", remote.NetworkProfiles["deploy-isolated"]);
         Assert.Equal("cb-deploy", remote.NetworkProfiles["DEPLOY-ISOLATED"]);
@@ -86,7 +87,8 @@ public sealed class DeploymentProgramWiringTests
             },
         };
 
-        var remote = Program.BuildMultipassRemoteSandboxOptions(options);
+        var remote = MultipassRemoteOptionsMapper.Map(
+            options.MultipassRemoteSandbox, options.SandboxNetworkProfiles);
 
         Assert.Equal("remote-deploy-bridge", remote.NetworkProfiles["deploy-isolated"]);
         Assert.Equal("remote-deploy-bridge", remote.NetworkProfiles["DEPLOY-ISOLATED"]);
