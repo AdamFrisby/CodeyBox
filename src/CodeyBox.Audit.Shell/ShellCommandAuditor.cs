@@ -91,7 +91,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         // rejected in Classify rather than silently run as a code audit.
         return AuditTargetSemantics.Classify(context.EffectiveTarget) == AuditReviewStrategy.PlanReview
             ? await RunPlanTargetAsync(sandbox, workingDirectory, context, environment, toolName, ct)
-            : await ExecAndClassifyAsync(sandbox, workingDirectory, environment, toolName, ct);
+            : await ExecAndClassifyAsync(sandbox, workingDirectory, context, environment, toolName, ct);
     }
 
     private async Task<AuditResult> RunPlanTargetAsync(
@@ -135,7 +135,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
             }
 
             environment["CODEYBOX_PLAN_ARTIFACT_PATH"] = planArtifactPath;
-            var result = await ExecAndClassifyAsync(sandbox, workingDirectory, environment, toolName, ct);
+            var result = await ExecAndClassifyAsync(sandbox, workingDirectory, context, environment, toolName, ct);
 
             // Explicit in-band cleanup so a removal failure on the happy path is
             // surfaced as a blocking finding (the snapshot must not outlive the run).
@@ -170,6 +170,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
     private async Task<AuditResult> ExecAndClassifyAsync(
         ISandbox sandbox,
         string workingDirectory,
+        AuditContext context,
         IReadOnlyDictionary<string, string> environment,
         string toolName,
         CancellationToken ct)
