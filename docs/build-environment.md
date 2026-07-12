@@ -7,7 +7,26 @@ failures when the build / audit ("verify") VM is misconfigured — together with
 the in-repo mitigations that make raw `dotnet build` survive those
 misconfigurations where possible.
 
-## 1. Writable per-user NuGet configuration directory
+## Verify-VM provisioning checklist
+
+Before running `dotnet build ./CodeyBox.slnx` or `dotnet test`, confirm both of
+the following as the unprivileged build user (neither can be fixed from inside
+this repository):
+
+1. **Writable NuGet home** — `test -w "$HOME/.nuget"` succeeds, or `$HOME/.nuget`
+   is absent so dotnet can recreate it. A `root`-created `~/.nuget` aborts every
+   restore/build/test before source is even compiled (see §1).
+2. **Temp headroom** — `Path.GetTempPath()` (`$TMPDIR`, default `/tmp`) is a real
+   disk with several GiB free, not a small RAM tmpfs. The parallel test suite
+   needs concurrent scratch space even though it now cleans up deterministically
+   (see §2).
+
+Reproduced on this VM: with a writable NuGet home the exact gate command
+`dotnet build ./CodeyBox.slnx -c Debug` reports `0 Warning(s), 0 Error(s)` and
+the temp-artifact cleanup tests pass — confirming the recurring build/test gate
+failures are the host prerequisites below, not a source defect.
+
+## 1. The build user must own a writable NuGet home
 
 `dotnet build` / `dotnet restore` / `dotnet test` unconditionally read — and,
 when absent, **create** — the per-user NuGet settings directory at
