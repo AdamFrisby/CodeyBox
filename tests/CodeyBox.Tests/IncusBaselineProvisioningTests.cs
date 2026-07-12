@@ -523,6 +523,60 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         Assert.Contains("filesystem alias", hostile.Message, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData("/usr/local/bin/agy", "/opt/second/agy")]
+    [InlineData("/opt/second/agy", "/usr/local/bin/agy")]
+    public async Task ProvisioningValidation_RejectsHostileSymlinkEvenWhenSiblingIsBenign(
+        string firstSymlink,
+        string secondSymlink)
+    {
+        // Per-symlink evaluation must be independent: a benign already-provisioned
+        // symlink tolerance is granted only for the sibling that resolves to the
+        // destination, and must never let a hostile sibling be skipped. Ordering the
+        // benign link first or last must not change the verdict.
+        const string destination = "/home/ubuntu/.local/bin/agy";
+        const string benignSymlink = "/usr/local/bin/agy";
+        var hostileSymlink = firstSymlink == benignSymlink ? secondSymlink : firstSymlink;
+        var options = BaseOptions() with
+        {
+            ExecutableProvisions =
+            [
+                new BaselineExecutableProvision
+                {
+                    HostSourcePath = "/host/source-not-read-for-validation",
+                    VmDestPath = destination,
+                    VmSymlinks = [firstSymlink, secondSymlink],
+                },
+            ],
+        };
+
+        // The benign symlink resolves to the provisioned destination; the hostile one
+        // resolves into an unrelated location, i.e. an alias redirect.
+        var runner = new BaselineBakeRunner(
+            Path.Combine(_root, "mixed-symlink-staging"),
+            verificationExitCode: 0,
+            canonicalizeGuestPath: path => path switch
+            {
+                _ when path == benignSymlink => destination,
+                _ when path == hostileSymlink => "/opt/evil/agy",
+                _ => path,
+            });
+        var provider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner,
+            environmentVariableReader: EnvironmentReader(_root));
+
+        var rejected = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.ValidateCanonicalProvisioningPathsAsync(
+                options,
+                "codeybox-test-instance",
+                mountGuestPaths: [],
+                CancellationToken.None));
+        Assert.Contains("filesystem alias", rejected.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task FullLaunch_RejectsProvisioningMountOverlapBeforeIncusRuns()
     {
