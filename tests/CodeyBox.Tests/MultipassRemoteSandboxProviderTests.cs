@@ -1124,12 +1124,22 @@ public sealed class MultipassRemoteSandboxProviderTests
                     markerByPath[markerPath] = markerValue;
                     return ProcessRunOk();
                 }
-                if (script.StartsWith("test -f ", StringComparison.Ordinal))
+                if (script.StartsWith("find ", StringComparison.Ordinal))
                 {
-                    var markerPath = ExtractFirstQuotedPath(script);
-                    return markerByPath.TryGetValue(markerPath, out var marker)
-                        ? new ProcessRunResult(0, marker, "")
-                        : new ProcessRunResult(0, "", "");
+                    // Emulate the real `find … | while read` scan in
+                    // ReadRemotePurposeMarkersAsync: for each marker written
+                    // under RemoteStagingRoot/<vm>/.codeybox-purpose it emits a
+                    // tab-separated "<vm>\t<value>" line keyed by the parent dir.
+                    var scan = new StringBuilder();
+                    foreach (var (markerPath, markerValue) in markerByPath)
+                    {
+                        scan.Append(ParentDirectoryName(markerPath))
+                            .Append('\t')
+                            .Append(markerValue)
+                            .Append('\n');
+                    }
+
+                    return new ProcessRunResult(0, scan.ToString(), "");
                 }
             }
             if (Contains(argv, "delete")) return ProcessRunOk();
@@ -1171,18 +1181,26 @@ public sealed class MultipassRemoteSandboxProviderTests
         var provider = new MultipassRemoteSandboxProvider(
             opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
 
-        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        // A per-sandbox staging-marker write failure is classified as a
+        // host-runtime failure (isHostRuntimeFailure: true), identical to the
+        // created-at marker. With the single default host exhausted, placement
+        // surfaces the canonical deferred exception wrapping the host failure.
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
             await provider.CreateAsync(new SandboxSpec
             {
                 ImageReference = "24.04",
                 Purpose = SandboxPurpose.Deployment,
             }));
 
+        var hostFailure = Assert.IsType<RemoteHostProvisioningException>(ex.InnerException);
+        Assert.Equal("staging-purpose", hostFailure.Operation);
+
         Assert.Contains(transport.RecordedCalls, c =>
-            c.Argv.Count >= 3
+            c.Argv.Count >= 4
             && c.Argv[0] == "rm"
             && c.Argv[1] == "-rf"
-            && c.Argv[2].Contains(opts.RemoteStagingRoot, StringComparison.Ordinal));
+            && c.Argv[2] == "--"
+            && c.Argv[3].Contains(opts.RemoteStagingRoot, StringComparison.Ordinal));
         Assert.DoesNotContain(transport.RecordedCalls, c => c.Argv.Contains("launch"));
         Assert.Empty(provider.SnapshotActiveSandboxProgress());
         Assert.Empty(provider.SnapshotActiveSandboxes());
@@ -1711,20 +1729,31 @@ public sealed class MultipassRemoteSandboxProviderTests
     public async Task DisposeLeakedAsync_throws_and_keeps_staging_when_remote_delete_fails()
     {
         var opts = DefaultOptions();
+        var vmName = opts.VmNamePrefix + "abc123";
         var transport = new FakeRemoteHostTransport();
         transport.OnRun = (argv, _) =>
         {
+            // `multipass delete --purge` fails, and the VM is still present on
+            // the subsequent liveness probe — cleanup must NOT be able to prove
+            // the instance is gone, so it must surface the failure rather than
+            // silently reclaim the staging directory.
+            if (Contains(argv, "list"))
+                return new ProcessRunResult(
+                    0, $"{{\"list\":[{{\"name\":\"{vmName}\",\"state\":\"Running\"}}]}}", "");
             if (Contains(argv, "delete")) return new ProcessRunResult(1, "", "still busy");
             return ProcessRunOk();
         };
         var provider = new MultipassRemoteSandboxProvider(
             opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
 
-        var vmName = opts.VmNamePrefix + "abc123";
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        var ex = await Assert.ThrowsAsync<RemoteHostProvisioningException>(async () =>
             await provider.DisposeLeakedAsync(vmName, CancellationToken.None));
 
-        Assert.Contains("delete --purge", ex.Message);
+        Assert.Equal("delete", ex.Operation);
+        Assert.Contains(vmName, ex.Message, StringComparison.Ordinal);
+        Assert.Contains("still busy", ex.Message, StringComparison.Ordinal);
+        // Staging is retained (no rm -rf) so a later reaper sweep can retry once
+        // the VM is truly gone; deleting staging under a live VM would orphan it.
         Assert.DoesNotContain(transport.RecordedCalls, c =>
             c.Argv.Count >= 2 && c.Argv[0] == "rm" && c.Argv[1] == "-rf");
     }
@@ -2479,6 +2508,16 @@ public sealed class MultipassRemoteSandboxProviderTests
         var redirect = script.IndexOf(" > ", StringComparison.Ordinal);
         Assert.True(redirect >= 0, $"expected redirect in script: {script}");
         return ExtractFirstQuotedPath(script[(redirect + 3)..]);
+    }
+
+    // Basename of the directory containing a remote marker file — mirrors the
+    // real scan's `d=${f%/marker}; n=${d##*/}` derivation of the sandbox name.
+    private static string ParentDirectoryName(string markerPath)
+    {
+        var lastSlash = markerPath.LastIndexOf('/');
+        var parent = lastSlash < 0 ? markerPath : markerPath[..lastSlash];
+        var parentSlash = parent.LastIndexOf('/');
+        return parentSlash < 0 ? parent : parent[(parentSlash + 1)..];
     }
 
     private static string ExtractFirstQuotedPath(string script)

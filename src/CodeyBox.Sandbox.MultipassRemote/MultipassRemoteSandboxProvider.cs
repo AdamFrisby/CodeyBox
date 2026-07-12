@@ -379,17 +379,12 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         else if (!string.IsNullOrWhiteSpace(opts.DefaultImage))
             launchArgv.Add(opts.DefaultImage!);
 
-        // Cleanup differentiator: pre-launch failures leave only the staging
-        // directory, so best-effort cleanup can skip the (nonexistent) VM
-        // delete. Post-launch failures may have left a VM behind.
-        var launchAttempted = false;
         try
         {
             // Track before clone/launch so an in-progress VM that appears in
             // multipass list is treated as active by leak sweeps.
             var activeKey = new RemoteSandboxIdentity(opts.HostId, vmName);
             _active[activeKey] = sandbox;
-            launchAttempted = true;
 
             if (!string.IsNullOrWhiteSpace(spec.BaselineImageRef))
             {
@@ -430,14 +425,12 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         }
         catch
         {
+            // Drop the in-progress tracking entry; authoritative remote cleanup
+            // (VM delete + staging removal + reservation handling) is owned by
+            // the placement loop's RollBackCreateFailureAsync, which runs for
+            // every exception path out of this method. Deleting here too would
+            // double-issue `multipass delete`/`rm -rf` on the same target.
             _active.TryRemove(new RemoteSandboxIdentity(opts.HostId, vmName), out _);
-            // Best-effort cleanup of any partial remote state. We DO NOT log
-            // here at error level — the original exception is the real story
-            // and is about to be rethrown by the caller's try.
-            if (launchAttempted)
-                await BestEffortRemoteDeleteAsync(opts, transport, vmName, remoteSandboxRoot, CancellationToken.None).ConfigureAwait(false);
-            else
-                await BestEffortRemoteStagingCleanupAsync(opts, transport, remoteSandboxRoot).ConfigureAwait(false);
             throw;
         }
 
@@ -1267,37 +1260,6 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         }
     }
 
-    internal Task BestEffortRemoteDeleteAsync(string vmName, string remoteSandboxRoot)
-    {
-        var opts = ResolveHosts()[0];
-        return BestEffortRemoteDeleteAsync(opts, _transportFactory(opts), vmName, remoteSandboxRoot, CancellationToken.None);
-    }
-
-    internal async Task BestEffortRemoteDeleteAsync(string vmName, string remoteSandboxRoot, CancellationToken ct)
-    {
-        var opts = ResolveHosts()[0];
-        await BestEffortRemoteDeleteAsync(opts, _transportFactory(opts), vmName, remoteSandboxRoot, ct).ConfigureAwait(false);
-    }
-
-    internal Task BestEffortRemoteDeleteAsync(
-        MultipassRemoteSandboxOptions opts,
-        IRemoteHostTransport transport,
-        string vmName,
-        string remoteSandboxRoot)
-        => BestEffortRemoteDeleteAsync(opts, transport, vmName, remoteSandboxRoot, CancellationToken.None);
-
-    internal async Task BestEffortRemoteDeleteAsync(
-        MultipassRemoteSandboxOptions opts,
-        IRemoteHostTransport transport,
-        string vmName,
-        string remoteSandboxRoot,
-        CancellationToken ct)
-    {
-        await BuildCleanup(opts, transport)
-            .TryDeleteVmAndStagingAsync(vmName, remoteSandboxRoot, ct)
-            .ConfigureAwait(false);
-    }
-
     internal async Task DeleteRemoteStateOrThrowAsync(
         MultipassRemoteSandboxOptions opts,
         IRemoteHostTransport transport,
@@ -1784,33 +1746,6 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
             _owner.ReleaseHostReservation(HostOptions.HostId);
-        }
-    }
-
-    private async Task BestEffortRemoteStagingCleanupAsync(
-        MultipassRemoteSandboxOptions opts,
-        IRemoteHostTransport transport,
-        string remoteSandboxRoot)
-    {
-        try
-        {
-            await RunRemoteControlAsync(
-                opts,
-                transport,
-                ["rm", "-rf", remoteSandboxRoot],
-                CancellationToken.None).ConfigureAwait(false);
-        }
-        catch (RemoteSshTransportException ex)
-        {
-            _log.LogWarning(ex,
-                "Best-effort remote staging cleanup of {Dir} on host {HostId} failed (transport)",
-                remoteSandboxRoot, opts.HostId);
-        }
-        catch (RemoteHostProvisioningException ex)
-        {
-            _log.LogWarning(ex,
-                "Best-effort remote staging cleanup of {Dir} on host {HostId} failed",
-                remoteSandboxRoot, opts.HostId);
         }
     }
 
