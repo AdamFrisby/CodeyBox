@@ -157,6 +157,39 @@ The built-in `process:build-script` auditor runs a repository-owned
 `build.sh` as an ordinary tool audit only; it is not trusted build evidence
 and cannot unlock LLM review.
 
+### .NET build/test gate NuGet-home precondition
+
+The .NET gates (`csharp:build-WaE`, `csharp:test-pass`) and the
+non-skippable `process:required-build` gate invoke `dotnet`, which on the
+first restore materialises a NuGet user-config directory under
+`$DOTNET_CLI_HOME/.nuget/NuGet` — falling back to `$HOME/.nuget/NuGet` when
+`DOTNET_CLI_HOME` is unset. If that parent is present but not writable
+(a root-owned `~/.nuget` is common in agent sandboxes), restore aborts
+before it reads `RestoreConfigFile` with `Failed to read NuGet.Config due
+to unauthorized access ... Access to the path '.../.nuget/NuGet' is
+denied`. `RestoreConfigFile` (pinned in `Directory.Build.props`) selects
+*which* config to read; it does not stop the user-config directory probe,
+so only pointing `DOTNET_CLI_HOME`/`HOME` at a writable location avoids it.
+
+For every dotnet invocation CodeyBox itself launches this is handled
+automatically and needs no operator action: the `SandboxRequiredBuildVerifier`
+`BuildScript` prologue exports both `DOTNET_CLI_HOME` and `HOME` to a
+writable repo-local `.dotnet-cli-home` (writability-probed, so an inherited
+but root-owned value self-heals to the fallback), and
+`DotnetCliHomeConventions` stamps `DOTNET_CLI_HOME` on audit-tool sandboxes
+and on `dotnet` shell-auditor invocations. The repo-root `build.sh` applies
+the same writability-aware selection for the `process:build-script` gate.
+
+**Operator precondition (not a repo defect).** No committed repo file can
+redirect a `dotnet` process that a harness launches *outside* these seams
+(a bare `dotnet build`/`dotnet test` run directly on the host), because the
+NuGet home is chosen from process environment, not repository configuration.
+If such a step fails with the `~/.nuget ... denied` error, the audit host —
+not the branch — must make the NuGet home writable (a non-root-owned
+`~/.nuget`, or a writable `DOTNET_CLI_HOME`/`HOME` exported before the
+command). The solution otherwise builds warnings-clean once the home is
+writable.
+
 ## Built-in auditors
 
 ### `ShellCommandAuditor` (`CodeyBox.Audit.Shell`)
