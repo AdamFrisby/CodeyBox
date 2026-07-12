@@ -1,14 +1,22 @@
 #!/usr/bin/env sh
 set -eu
 
+# Resolve the repo root from this script's location so the build works from any
+# cwd — every gate command below (default and forwarded) uses this to address the
+# solution/scripts, not a relative path that depends on the caller.
+codeybox_script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
 # Heal an inherited, non-writable per-user NuGet home before dotnet restore so a
 # COW-inherited root-owned $HOME/.nuget cannot abort the build with "Failed to
 # read NuGet.Config due to unauthorized access". The recovery is the single
 # source of truth in scripts/nuget-home-heal.sh (shared with the audit
 # build/test gates); source it relative to THIS script so it resolves regardless
 # of the caller's working directory, and only when present so a partial checkout
-# still runs the build.
-codeybox_script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+# still runs the build. This sourced heal is a superset of the subprocess-based
+# scripts/ensure-nuget-writable.sh: both quarantine an unwritable ~/.nuget aside
+# and reuse the preserved package cache, but the sourced heal additionally seeds
+# a readable minimal user config and — when $HOME itself is not writable —
+# exports DOTNET_CLI_HOME to a scratch dir so restore/build still work.
 if [ -f "$codeybox_script_dir/scripts/nuget-home-heal.sh" ]; then
     . "$codeybox_script_dir/scripts/nuget-home-heal.sh"
 fi
@@ -21,9 +29,10 @@ export MSBUILDDISABLENODEREUSE=1
 # `build CodeyBox.slnx`, `build --no-incremental -warnaserror`, `test --no-build`
 # — runs through the NuGet-home heal and hardening exports above, not just the
 # default build. With no arguments, keep the historical behaviour of building
-# the whole solution verbatim (the exports above harden this path too).
+# the whole solution verbatim (the exports above harden this path too), using
+# the script-relative solution path so the build works from any cwd.
 if [ "$#" -gt 0 ]; then
     dotnet "$@"
 else
-    dotnet build CodeyBox.slnx
+    dotnet build "$codeybox_script_dir/CodeyBox.slnx"
 fi

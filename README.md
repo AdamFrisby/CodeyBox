@@ -110,6 +110,22 @@ cd CodeyBox
 dotnet build CodeyBox.slnx
 ```
 
+> **NuGet home must be readable/writable.** `dotnet restore`/`dotnet build`
+> unconditionally read (and, on first run, create) NuGet's user-level config at
+> `$HOME/.nuget/NuGet/NuGet.Config` before any MSBuild target runs; a repo-level
+> `nuget.config`, `--configfile`, or `RestoreConfigFile` does **not** suppress
+> that read. If `~/.nuget` is owned by another user or is otherwise inaccessible,
+> restore fails with `Failed to read NuGet.Config due to unauthorized access`
+> and the build produces no assemblies. Ensure the build user owns `~/.nuget`
+> (or point `NUGET_PACKAGES`/`$HOME` at a writable location) before building.
+>
+> If `~/.nuget` is root-owned and you cannot `chown` it (no `sudo`), run
+> `./build.sh` (or `scripts/ensure-nuget-writable.sh` directly): as long as you
+> own your home directory it relocates the inaccessible tree aside, recreates a
+> user-owned `~/.nuget`, and symlinks the preserved package cache back in so
+> restore reuses it instead of re-downloading. The step is idempotent — a no-op
+> when the NuGet home is already usable.
+
 **3. Configure a project.** Drop a JSON file somewhere and point
 `CODEYBOX_EXTRA_CONFIG` at it (it hot-reloads on change):
 
