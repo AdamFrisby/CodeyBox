@@ -146,6 +146,22 @@ needs.
 * **VM can't reach allowed host.** Check `nft list table inet codeybox`
   for the resolved IPs and re-run `setup-host-networks.sh` if a CDN has
   rotated. See [`host-firewall.md`](host-firewall.md) troubleshooting.
+* **NuGet restore fails with "unauthorized access" before any project
+  builds.** The `.NET` build gates (`process:required-build`,
+  `csharp:build-WaE`, `csharp:test-pass`) all abort with
+  `Failed to read NuGet.Config due to unauthorized access. Path:
+  '<home>/.nuget/NuGet/NuGet.Config' ... Permission denied` when the audit
+  sandbox ships `~/.nuget` owned by another uid (e.g. root-owned mode 755)
+  so the build uid cannot create the `NuGet` settings subdirectory on first
+  restore. NuGet resolves the user-settings path unconditionally, so neither
+  `--configfile` nor a repo-level `nuget.config` avoids it; the only lever is
+  `$HOME`. `build.sh` and the `SandboxRequiredBuildVerifier` build script both
+  detect this and relocate `HOME` to a writable scratch directory (reusing the
+  pre-warmed `~/.nuget/packages` cache), so they build green unaided — but a
+  harness that invokes `dotnet` *directly*, bypassing those entrypoints, does
+  not benefit. When provisioning the sandbox, make `~/.nuget` writable by the
+  build uid (e.g. `chown "$uid" ~/.nuget`, or create it owned by that uid)
+  while keeping the package cache in place.
 
 ## Backups
 
