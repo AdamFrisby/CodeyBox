@@ -190,6 +190,28 @@ not the branch — must make the NuGet home writable (a non-root-owned
 command). The solution otherwise builds warnings-clean once the home is
 writable.
 
+**Recovery.** Either export a writable home before the gate command:
+
+```sh
+export DOTNET_CLI_HOME="$PWD/.dotnet-cli-home" HOME="$PWD/.dotnet-cli-home"
+```
+
+or reclaim a root-owned `~/.nuget` in place. Removing the stale entry is
+governed by the write bit on `$HOME` itself (the parent), not by the
+root-owned `~/.nuget`'s own permissions, so an unprivileged agent whose home
+directory is writable can move it aside non-destructively and recreate a
+writable one:
+
+```sh
+if [ -w "$HOME" ] && [ ! -w "$HOME/.nuget/NuGet" ]; then
+  mv "$HOME/.nuget" "$HOME/.nuget.unwritable.bak" && mkdir -p "$HOME/.nuget/NuGet"
+fi
+```
+
+Prefer exporting `DOTNET_CLI_HOME` where the launcher allows it; the reclaim
+path is the fallback for a bare host-launched `dotnet` that no repo file or
+environment export can reach.
+
 ## Built-in auditors
 
 ### `ShellCommandAuditor` (`CodeyBox.Audit.Shell`)
