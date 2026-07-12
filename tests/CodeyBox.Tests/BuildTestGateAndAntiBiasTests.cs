@@ -1165,7 +1165,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
             seed,
             auditors: TestAuditGates.WithPassedBuildAndTest(gate),
             maxAuditIterations: 1,
-            credentials: AuditCredentials(),
+            credentials: new AgentScopedCredentialProvider(),
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             pipelineTuning: tuning,
             webhookDispatcher: webhooks,
@@ -1234,7 +1234,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
             seed,
             auditors: TestAuditGates.WithPassedBuildAndTest(gate),
             maxAuditIterations: 1,
-            credentials: AuditCredentials(),
+            credentials: new AgentScopedCredentialProvider(),
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             pipelineTuning: tuning,
             webhookDispatcher: webhooks,
@@ -1298,7 +1298,7 @@ public sealed class BuildTestGateOrderingTests : IDisposable
             seed,
             auditors: TestAuditGates.WithPassedBuildAndTest(gate),
             maxAuditIterations: 1,
-            credentials: AuditCredentials(),
+            credentials: new AgentScopedCredentialProvider(),
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             pipelineTuning: tuning,
             webhookDispatcher: webhooks,
@@ -1370,6 +1370,34 @@ public sealed class BuildTestGateOrderingTests : IDisposable
             AgentKind.Claude,
             new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = "test-key" },
             new Dictionary<string, string>()));
+
+    // Credential provider that returns a credential scoped to whichever agent is
+    // requested. Both dangerous sinks that consume a credential —
+    // SandboxEnvironmentVariablePolicy.SelectDirectCredentialEnvironment for the
+    // work sandbox and for the audit sandbox — assert the credential's agent
+    // matches the runner it is loaded into. A test that forces a non-default
+    // audit agent therefore needs the work phase (e.g. claude) AND the audit
+    // phase (e.g. codex) to each receive a matching credential; a single fixed
+    // credential can only satisfy one of the two.
+    private sealed class AgentScopedCredentialProvider : ICredentialProvider
+    {
+        public Task<AgentCredential?> GetAsync(AgentKind agent, CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            return Task.FromResult<AgentCredential?>(new AgentCredential(
+                agent,
+                new Dictionary<string, string> { [CredentialEnvVarFor(agent)] = "test-key" },
+                new Dictionary<string, string>()));
+        }
+    }
+
+    private static string CredentialEnvVarFor(AgentKind agent) => agent.Value switch
+    {
+        "codex" => "OPENAI_API_KEY",
+        "gemini" => "GEMINI_API_KEY",
+        "cursor" => "CURSOR_API_KEY",
+        _ => "ANTHROPIC_API_KEY",
+    };
 
     private static WorkItem NewItem() => new()
     {
@@ -1918,7 +1946,7 @@ file sealed class AuditCredentialLaunchTimeoutSandboxProvider : ISandboxProvider
 
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct)
     {
-        if (spec.TimingPhase == "audit" && spec.Environment.ContainsKey("ANTHROPIC_API_KEY"))
+        if (spec.TimingPhase == "audit" && spec.Environment.ContainsKey("OPENAI_API_KEY"))
             await Task.Delay(TimeSpan.FromSeconds(30), ct);
 
         return await _inner.CreateAsync(spec, ct);
@@ -1949,7 +1977,7 @@ file sealed class TimeoutSandboxProvider : ISandboxProvider
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct)
     {
         var sb = await _inner.CreateAsync(spec, ct);
-        if (spec.TimingPhase == "audit" && spec.Environment.ContainsKey("ANTHROPIC_API_KEY"))
+        if (spec.TimingPhase == "audit" && spec.Environment.ContainsKey("OPENAI_API_KEY"))
         {
             return new TimeoutSandbox(sb, _forceKillTimeout, _forceDisposeTimeout);
         }
