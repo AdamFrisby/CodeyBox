@@ -40,12 +40,23 @@ directory before honouring a repository `nuget.config`,
 `-p:RestoreConfigFile`, or `Directory.Build.props` — each was verified not to
 avoid the failure on its own.)
 
-### Direct `dotnet build` invocations still need a writable home
+### The `build.sh` entry point handles this itself
 
-Outside the gate — a developer or CI running `dotnet build ./CodeyBox.slnx`
-directly — the same prerequisite applies. Either provision a
+`build.sh` — the repository's canonical build entry point — applies the same
+redirect as the gate: it points `DOTNET_CLI_HOME` at a script-owned, writable
+directory (cleaned up on exit) and preserves any pre-baked `$HOME/.nuget/packages`
+cache via `NUGET_PACKAGES` before running `dotnet build CodeyBox.slnx`. Running
+`sh build.sh` therefore succeeds even when the image's `$HOME/.nuget` is owned by
+another user.
+
+### Raw `dotnet` invocations still need a writable home
+
+A developer or tool invoking `dotnet build ./CodeyBox.slnx` **directly** (not via
+`build.sh`) still depends on this prerequisite, because the redirect lives inside
+the script rather than in tracked config files — NuGet touches the per-user
+settings directory before honouring a repository `nuget.config`,
+`-p:RestoreConfigFile`, or `Directory.Build.props`, each verified not to avoid
+the failure on its own. For raw invocations, either provision a
 build-user-writable `$HOME/.nuget` (e.g. `chown -R "$(id -un)" "$HOME/.nuget"`),
 or invoke with `DOTNET_CLI_HOME=<writable dir> dotnet build ...` (NuGet resolves
-the per-user settings directory relative to it). `build.sh` intentionally keeps
-the raw command; use one of the above if the host's `$HOME/.nuget` is not
-writable.
+the per-user settings directory relative to it).
