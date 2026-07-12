@@ -80,8 +80,10 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         export HOME="$cli_home"
         """;
 
-    // Exposed to tests so the actual gate script — the exact artifact the
-    // sandbox executes via `sh -c` — can be run under a controlled shell.
+    // Exposed to tests (internal, not private) so the actual gate script --
+    // the exact artifact the sandbox executes via `sh -c`, including the
+    // NuGet-home relocation guard below -- can be exercised directly by tests
+    // through a real shell rather than only end-to-end through a sandbox.
     internal static readonly string BuildScript = $$"""
         set -eu
         {{NuGetHomeSelfHeal.Preamble}}
@@ -91,6 +93,45 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         if ! command -v dotnet >/dev/null 2>&1; then
           echo "dotnet is not available in the sandbox PATH" >&2
           exit "$dotnet_command_not_found_exit"
+        fi
+
+        # NuGet reads (and, on first restore, creates) the user settings file
+        # $HOME/.nuget/NuGet/NuGet.Config. Audit sandboxes have shipped that
+        # directory owned by another uid or mode 000, which aborts restore with
+        # an "unauthorized access" error before a single project builds --
+        # failing the gate for reasons unrelated to the diff under review.
+        # Detect an unusable settings location and relocate HOME to a writable
+        # scratch directory, preserving a readable+writable package cache so the
+        # restore stays offline where one is available. Checking writability of
+        # the settings directory itself (not just its parent) is required: the
+        # observed failure has a traversable ~/.nuget whose NuGet subdirectory
+        # is inaccessible. On Linux `dotnet` derives NuGet's user-config path
+        # from $HOME (not DOTNET_CLI_HOME), so a $HOME move is the reliable
+        # lever; the DOTNET_CLI_HOME redirect below adds a second layer for
+        # CLI-owned state and package cache location.
+        codeybox_nuget_home="${HOME:-/nonexistent}/.nuget"
+        codeybox_settings_dir="$codeybox_nuget_home/NuGet"
+        codeybox_settings_file="$codeybox_settings_dir/NuGet.Config"
+        codeybox_nuget_usable=1
+        if [ -d "$codeybox_settings_dir" ]; then
+          if [ ! -x "$codeybox_settings_dir" ] || [ ! -w "$codeybox_settings_dir" ]; then
+            codeybox_nuget_usable=0
+          elif [ -e "$codeybox_settings_file" ] && [ ! -r "$codeybox_settings_file" ]; then
+            codeybox_nuget_usable=0
+          fi
+        elif [ ! -w "$codeybox_nuget_home" ] && [ ! -w "${HOME:-/nonexistent}" ]; then
+          codeybox_nuget_usable=0
+        fi
+        if [ "$codeybox_nuget_usable" -eq 0 ]; then
+          echo "CodeyBox required build: $codeybox_settings_dir is unusable for NuGet; relocating HOME to a writable scratch directory." >&2
+          if [ -z "${NUGET_PACKAGES:-}" ] && [ -d "$codeybox_nuget_home/packages" ] \
+             && [ -r "$codeybox_nuget_home/packages" ] && [ -w "$codeybox_nuget_home/packages" ]; then
+            NUGET_PACKAGES="$codeybox_nuget_home/packages"
+            export NUGET_PACKAGES
+          fi
+          HOME="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/codeybox-nuget-home-$$")"
+          export HOME
+          mkdir -p "$HOME"
         fi
 
         tmp_root="${TMPDIR:-/tmp}"
