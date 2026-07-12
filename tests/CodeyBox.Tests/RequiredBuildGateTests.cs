@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using CodeyBox.Audit;
 using CodeyBox.Agents;
 using CodeyBox.Core;
@@ -23,6 +24,160 @@ public sealed class RequiredBuildGateTests : IDisposable
     {
         try { Directory.Delete(_workspace, recursive: true); }
         catch { }
+    }
+
+    [Fact]
+    public async Task BuildScript_RestoresGreen_WhenPerUserNuGetHomeIsNotWritable()
+    {
+        // Regression: sandbox images whose $HOME/.nuget is owned by another
+        // user (e.g. root) made every `dotnet build` fail restore with
+        // "Failed to read NuGet.Config ... Permission denied", producing no
+        // assemblies. The gate script must redirect the CLI/NuGet per-user
+        // home to a writable path so the build no longer depends on a writable
+        // $HOME, while still preserving any pre-baked global-packages cache.
+        if (OperatingSystem.IsWindows())
+            return; // BuildScript is a POSIX sh script executed inside a Linux sandbox.
+
+        var brokenHome = Path.Combine(_workspace, "broken-home-" + Guid.NewGuid().ToString("N")[..8]);
+        // A populated (root-owned in production) global-packages cache the gate must preserve.
+        Directory.CreateDirectory(Path.Combine(brokenHome, ".nuget", "packages", "newtonsoft.json"));
+        // The per-user NuGet settings directory exists but is not writable.
+        var brokenNuGetDir = Path.Combine(brokenHome, ".nuget", "NuGet");
+        Directory.CreateDirectory(brokenNuGetDir);
+        File.SetUnixFileMode(brokenNuGetDir, UnixFileMode.None);
+
+        try
+        {
+            var (exitCode, output) = await RunBuildScriptAsync(brokenHome);
+
+            Assert.Equal(0, exitCode);
+            Assert.Contains("Build succeeded.", output);
+        }
+        finally
+        {
+            // Restore permissions so the workspace can be deleted in Dispose.
+            File.SetUnixFileMode(brokenNuGetDir,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
+    [Fact]
+    public async Task BuildScript_FakeDotnet_IsADiscriminatingDetector()
+    {
+        // Guards the test above from decorativeness: proves the simulated
+        // `dotnet` genuinely fails against a non-writable per-user NuGet home
+        // when the redirect is absent, so BuildScript_RestoresGreen only
+        // passes because the gate script performs the redirect.
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var brokenHome = Path.Combine(_workspace, "broken-home-neg-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(Path.Combine(brokenHome, ".nuget", "packages", "newtonsoft.json"));
+        var brokenNuGetDir = Path.Combine(brokenHome, ".nuget", "NuGet");
+        Directory.CreateDirectory(brokenNuGetDir);
+        File.SetUnixFileMode(brokenNuGetDir, UnixFileMode.None);
+        var fakeDotnet = await WriteNuGetSensitiveFakeDotnetAsync();
+
+        try
+        {
+            // Invoke the fake dotnet directly with no DOTNET_CLI_HOME redirect,
+            // exactly the pre-fix condition, and confirm it reports the failure.
+            var psi = new ProcessStartInfo("/bin/sh")
+            {
+                ArgumentList = { "-c", $"exec '{fakeDotnet}' build ./App.slnx" },
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+            };
+            psi.Environment.Remove("DOTNET_CLI_HOME");
+            psi.Environment.Remove("NUGET_PACKAGES");
+            psi.Environment["HOME"] = brokenHome;
+
+            using var proc = Process.Start(psi)!;
+            var stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+
+            Assert.NotEqual(0, proc.ExitCode);
+            Assert.Contains("Failed to read NuGet.Config", stderr);
+        }
+        finally
+        {
+            File.SetUnixFileMode(brokenNuGetDir,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
+    /// <summary>
+    /// Runs the production <see cref="SandboxRequiredBuildVerifier.BuildScript"/>
+    /// under <c>/bin/sh</c> — the exact way the sandbox executes it — in a fresh
+    /// work directory containing a root solution marker, with a fake
+    /// NuGet-sensitive <c>dotnet</c> on PATH and the given non-writable HOME.
+    /// </summary>
+    private async Task<(int ExitCode, string Output)> RunBuildScriptAsync(string home)
+    {
+        var workDir = Path.Combine(_workspace, "buildscript-wd-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(workDir);
+        await File.WriteAllTextAsync(Path.Combine(workDir, "App.slnx"), "# solution marker\n");
+        var fakeDotnet = await WriteNuGetSensitiveFakeDotnetAsync();
+        var tmpDir = Path.Combine(_workspace, "buildscript-tmp-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tmpDir);
+
+        var psi = new ProcessStartInfo("/bin/sh")
+        {
+            ArgumentList = { "-c", SandboxRequiredBuildVerifier.BuildScript },
+            WorkingDirectory = workDir,
+            RedirectStandardError = true,
+            RedirectStandardOutput = true,
+            UseShellExecute = false,
+        };
+        // Simulate a clean sandbox: no inherited CLI-home / cache redirects.
+        psi.Environment.Remove("DOTNET_CLI_HOME");
+        psi.Environment.Remove("NUGET_PACKAGES");
+        psi.Environment["HOME"] = home;
+        psi.Environment["TMPDIR"] = tmpDir;
+        psi.Environment["PATH"] =
+            Path.GetDirectoryName(fakeDotnet) + Path.PathSeparator + "/usr/bin:/bin";
+
+        using var proc = Process.Start(psi)!;
+        var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+        var stderrTask = proc.StandardError.ReadToEndAsync();
+        await proc.WaitForExitAsync();
+        var output = (await stdoutTask) + (await stderrTask);
+        return (proc.ExitCode, output);
+    }
+
+    /// <summary>
+    /// Writes a fake <c>dotnet</c> that models NuGet restore's real
+    /// precondition: it reads/creates the per-user settings directory under the
+    /// CLI home ($DOTNET_CLI_HOME, else $HOME) and fails if that directory is
+    /// not writable, and it fails if a pre-baked $HOME/.nuget/packages cache
+    /// was not preserved via NUGET_PACKAGES.
+    /// </summary>
+    private async Task<string> WriteNuGetSensitiveFakeDotnetAsync()
+    {
+        var bin = Path.Combine(_workspace, "fake-dotnet-ng-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(bin);
+        var dotnet = Path.Combine(bin, "dotnet");
+        await File.WriteAllTextAsync(dotnet, """
+            #!/bin/sh
+            # Model NuGet's writable per-user settings-directory requirement.
+            cli_home="${DOTNET_CLI_HOME:-$HOME}"
+            ngdir="$cli_home/.nuget/NuGet"
+            mkdir -p "$ngdir" 2>/dev/null || true
+            if ! touch "$ngdir/NuGet.Config" 2>/dev/null; then
+              echo "error : Failed to read NuGet.Config due to unauthorized access. Path: '$ngdir/NuGet.Config'." >&2
+              exit 1
+            fi
+            if [ -n "${HOME:-}" ] && [ -d "$HOME/.nuget/packages" ] \
+               && [ "${NUGET_PACKAGES:-}" != "$HOME/.nuget/packages" ]; then
+              echo "error : pre-baked NuGet package cache not preserved (NUGET_PACKAGES=${NUGET_PACKAGES:-unset})" >&2
+              exit 1
+            fi
+            echo "Build succeeded."
+            exit 0
+            """);
+        MakeExecutable(dotnet);
+        return dotnet;
     }
 
     [Fact]

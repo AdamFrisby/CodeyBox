@@ -26,23 +26,26 @@ error : Failed to read NuGet.Config due to unauthorized access.
 and, because no assemblies are produced, `dotnet test --no-build` then reports
 each test DLL path as an "invalid argument".
 
-### This is not fixable from committed source
+### The required-build gate handles this itself
 
-The following were each verified to **not** avoid the failure, because NuGet
-touches the per-user settings directory before applying them:
+The non-skippable required-build gate (`SandboxRequiredBuildVerifier`) runs its
+`dotnet build` inside a sandbox whose image provisioning it does not control, so
+it **cannot assume** a writable `$HOME`. Its build script therefore redirects
+the CLI/NuGet per-user home to a script-owned, writable directory
+(`DOTNET_CLI_HOME`) before building, and preserves any pre-baked global-packages
+cache (`NUGET_PACKAGES`) so offline images keep restoring. A root-owned
+`$HOME/.nuget` no longer fails the gate. (These are set inside the script rather
+than via tracked config files because NuGet touches the per-user settings
+directory before honouring a repository `nuget.config`,
+`-p:RestoreConfigFile`, or `Directory.Build.props` — each was verified not to
+avoid the failure on its own.)
 
-- a repository-level `nuget.config` (at repo root or alongside the project);
-- `dotnet build -p:RestoreConfigFile=<repo file>`;
-- MSBuild `Directory.Build.props` properties.
+### Direct `dotnet build` invocations still need a writable home
 
-The only mechanisms that avoid it operate on the environment, not on tracked
-files:
-
-- make `$HOME/.nuget` (and its `NuGet` subdirectory) owned by / writable to the
-  build user — e.g. `chown -R "$(id -un)" "$HOME/.nuget"`; or
-- point the CLI at a writable home before invoking the build:
-  `DOTNET_CLI_HOME=<writable dir> dotnet build ...`
-  (NuGet resolves the per-user settings directory relative to it).
-
-Provisioning for build/audit containers must therefore guarantee a
-build-user-writable `$HOME/.nuget`.
+Outside the gate — a developer or CI running `dotnet build ./CodeyBox.slnx`
+directly — the same prerequisite applies. Either provision a
+build-user-writable `$HOME/.nuget` (e.g. `chown -R "$(id -un)" "$HOME/.nuget"`),
+or invoke with `DOTNET_CLI_HOME=<writable dir> dotnet build ...` (NuGet resolves
+the per-user settings directory relative to it). `build.sh` intentionally keeps
+the raw command; use one of the above if the host's `$HOME/.nuget` is not
+writable.
