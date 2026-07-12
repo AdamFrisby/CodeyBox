@@ -102,13 +102,19 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         # failing the gate for reasons unrelated to the diff under review.
         # Detect an unusable settings location and relocate HOME to a writable
         # scratch directory, preserving a readable+writable package cache so the
-        # restore stays offline where one is available. When the settings
-        # directory already exists its own read/traverse/write access is what
-        # matters (not just its parent): the failure has a traversable ~/.nuget
-        # whose NuGet subdirectory is inaccessible. When the settings directory
-        # is ABSENT, NuGet must create it, so the relevant permission is on the
-        # first existing ancestor it has to write into -- a root-owned mode-755
-        # ~/.nuget blocks that creation even though $HOME itself is writable.
+        # restore stays offline where one is available.
+        #
+        # Decide usability by PROBING the actual operation NuGet performs on
+        # first restore -- creating the settings directory and writing a file
+        # inside it -- rather than inferring it from permission bits. Bit
+        # inference (-w/-x tests) can disagree with what the kernel actually
+        # allows: ACLs, read-only bind mounts, overlay filesystems, and a
+        # non-directory occupying the settings path all make the bits read
+        # "writable" while the write is denied. One audit sandbox failed the
+        # gate exactly this way -- the bit check reported ~/.nuget usable, no
+        # relocation happened, and restore then died creating ~/.nuget/NuGet.
+        # A probe that tries mkdir + touch cannot be fooled: if it can create
+        # the directory and a file within it, NuGet can too; if not, relocate.
         # On Linux `dotnet` derives NuGet's user-config path from $HOME (not
         # DOTNET_CLI_HOME), so a $HOME move is the reliable lever; the
         # DOTNET_CLI_HOME redirect below adds a second layer for CLI-owned
@@ -116,23 +122,16 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         codeybox_nuget_home="${HOME:-/nonexistent}/.nuget"
         codeybox_settings_dir="$codeybox_nuget_home/NuGet"
         codeybox_settings_file="$codeybox_settings_dir/NuGet.Config"
+        codeybox_write_probe="$codeybox_settings_dir/.codeybox-write-probe.$$"
         codeybox_nuget_usable=1
-        if [ -d "$codeybox_settings_dir" ]; then
-          if [ ! -x "$codeybox_settings_dir" ] || [ ! -w "$codeybox_settings_dir" ]; then
-            codeybox_nuget_usable=0
-          elif [ -e "$codeybox_settings_file" ] && [ ! -r "$codeybox_settings_file" ]; then
-            codeybox_nuget_usable=0
-          fi
-        elif [ -d "$codeybox_nuget_home" ]; then
-          # ~/.nuget exists but its NuGet settings subdirectory does not; NuGet
-          # must create that subdirectory, which needs write+traverse on
-          # ~/.nuget itself.
-          if [ ! -w "$codeybox_nuget_home" ] || [ ! -x "$codeybox_nuget_home" ]; then
+        if mkdir -p "$codeybox_settings_dir" 2>/dev/null \
+           && touch "$codeybox_write_probe" 2>/dev/null; then
+          rm -f "$codeybox_write_probe" 2>/dev/null || true
+          # The directory is writable; NuGet must also READ an existing config.
+          if [ -e "$codeybox_settings_file" ] && [ ! -r "$codeybox_settings_file" ]; then
             codeybox_nuget_usable=0
           fi
-        elif [ ! -w "${HOME:-/nonexistent}" ]; then
-          # Neither ~/.nuget nor its settings subdirectory exists; NuGet must
-          # create the whole chain under $HOME, which needs $HOME writable.
+        else
           codeybox_nuget_usable=0
         fi
         if [ "$codeybox_nuget_usable" -eq 0 ]; then

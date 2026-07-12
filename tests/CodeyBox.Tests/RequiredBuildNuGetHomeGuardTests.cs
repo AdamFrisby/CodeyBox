@@ -94,6 +94,31 @@ public sealed class RequiredBuildNuGetHomeGuardTests : IDisposable
     }
 
     [Fact]
+    public async Task BuildScript_SettingsPathOccupiedByNonDirectory_RelocatesHome()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        // A false-negative that permission-bit inference misses but the write
+        // probe catches: ~/.nuget is writable, yet its "NuGet" settings path is
+        // occupied by a regular file rather than a directory. A bit check reads
+        // the writable parent and concludes NuGet can proceed; in reality NuGet
+        // cannot create/populate a directory there and restore fails. The probe
+        // (mkdir -p over the file) fails and forces relocation.
+        var home = Path.Combine(_root, "home-settings-is-file-" + Guid.NewGuid().ToString("N")[..8]);
+        var dotNuget = Path.Combine(home, ".nuget");
+        Directory.CreateDirectory(dotNuget);
+        await File.WriteAllTextAsync(Path.Combine(dotNuget, "NuGet"), "not a directory\n");
+
+        var (exitCode, invokedHome, buildTargets) = await RunBuildScriptAsync(home);
+
+        Assert.Equal(0, exitCode);
+        Assert.Contains("./repo.slnx", buildTargets);
+        Assert.NotNull(invokedHome);
+        Assert.NotEqual(home, invokedHome);
+    }
+
+    [Fact]
     public async Task BuildScript_HealthyNuGetHome_IsNotRelocated()
     {
         if (OperatingSystem.IsWindows())
