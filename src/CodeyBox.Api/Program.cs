@@ -4231,6 +4231,13 @@ namespace CodeyBox.Api
         /// <summary>Maximum number of concurrent heavy Incus lifecycle/device operations.</summary>
         public int MaxConcurrentOperations { get; set; } = Defaults.MaxConcurrentOperations;
 
+        /// <summary>Maximum VM boots (incus start + guest-agent readiness) in flight at once — staggers boots so a boot storm does not starve incusd and blow the readiness window. Hot-reloadable.</summary>
+        public int MaxConcurrentBoots { get; set; } = Defaults.MaxConcurrentBoots;
+
+        /// <summary>Inter-boot stagger in milliseconds applied after acquiring a boot slot. Zero disables the delay.</summary>
+        public int BootLaunchDelayMs { get; set; } =
+            (int)Defaults.BootLaunchDelay.TotalMilliseconds;
+
         /// <summary>Maximum stdout bytes retained from one Incus CLI invocation.</summary>
         public int MaxCliStdoutBytes { get; set; } = Defaults.MaxCliStdoutBytes;
 

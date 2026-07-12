@@ -87,6 +87,12 @@ public sealed class IncusSandboxProvider :
     private readonly SemaphoreSlim _hostPreflightLock = new(1, 1);
     private readonly SemaphoreSlim _hostProvisioningInputGate = new(1, 1);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _baselineLocks = new(StringComparer.Ordinal);
+    // Boot gate: staggers concurrent VM boots (incus start + guest-agent wait)
+    // so a boot storm does not starve incusd/host and blow the readiness window.
+    // Hot-reloadable: the semaphore is recreated when MaxConcurrentBoots changes.
+    private readonly object _bootGateGuard = new();
+    private SemaphoreSlim? _bootGate;
+    private int _bootGateCapacity;
     private readonly ConcurrentDictionary<string, bool> _activeNames = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, ActiveOwner> _activeOwners = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, DateTimeOffset> _uncertainBaselines = new(StringComparer.Ordinal);
@@ -1120,12 +1126,61 @@ public sealed class IncusSandboxProvider :
         return ProjectListContains(list.Stdout, options.ProjectName);
     }
 
+    // Acquires a boot slot from the hot-reloadable gate, then applies the
+    // inter-boot stagger. Holding this across `incus start` + guest-agent
+    // readiness bounds how many qemu VMs boot at once. Mirrors the Multipass
+    // boot-gate primitive. Caller MUST dispose to release the slot.
+    internal async Task<IDisposable> AcquireBootSlotAsync(IncusSandboxOptions options, CancellationToken ct)
+    {
+        var desired = options.MaxConcurrentBoots < 1 ? 1 : options.MaxConcurrentBoots;
+        SemaphoreSlim sem;
+        lock (_bootGateGuard)
+        {
+            if (_bootGate is null || _bootGateCapacity != desired)
+            {
+                // Do NOT dispose the old gate: in-flight releasers still hold it
+                // and Release() on dispose; it is GC'd once unreferenced. A
+                // downward resize transiently exceeds the new limit until
+                // in-flight boots on the old semaphore release.
+                _bootGate = new SemaphoreSlim(desired, desired);
+                _bootGateCapacity = desired;
+            }
+            sem = _bootGate;
+        }
+
+        await sem.WaitAsync(ct).ConfigureAwait(false);
+        var delay = options.BootLaunchDelay;
+        if (delay > TimeSpan.Zero)
+        {
+            try
+            {
+                await Task.Delay(delay, _timeProvider, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                sem.Release();
+                throw;
+            }
+        }
+        return new BootGateReleaser(sem);
+    }
+
+    private sealed class BootGateReleaser(SemaphoreSlim sem) : IDisposable
+    {
+        private SemaphoreSlim? _sem = sem;
+        public void Dispose() => Interlocked.Exchange(ref _sem, null)?.Release();
+    }
+
     private async Task StartAndWaitAsync(
         IncusSandboxOptions options,
         string name,
         bool runCloudInit,
         CancellationToken ct)
     {
+        // Stagger concurrent VM boots: hold a boot slot across the start +
+        // guest-agent readiness window (the actual qemu boot), so a boot storm
+        // does not starve incusd/host and push agents past VmStartTimeout.
+        using var bootSlot = await AcquireBootSlotAsync(options, ct).ConfigureAwait(false);
         await _cli.RunCheckedAsync(
             "start VM",
             options,

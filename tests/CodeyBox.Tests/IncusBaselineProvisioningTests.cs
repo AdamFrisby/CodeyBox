@@ -1738,6 +1738,95 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         Assert.Contains(runner.Invocations, invocation => invocation.Argv.Contains("delete", StringComparer.Ordinal));
     }
 
+    [Fact]
+    public async Task BootGate_LimitsConcurrentBoots_ToMaxConcurrentBoots()
+    {
+        var options = BaseOptions() with
+        {
+            MaxConcurrentBoots = 2,
+            BootLaunchDelay = TimeSpan.Zero,
+        };
+        var provider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            new NeverRunner(),
+            environmentVariableReader: EnvironmentReader(_root));
+
+        // Fill both slots.
+        var first = await provider.AcquireBootSlotAsync(options, CancellationToken.None);
+        var second = await provider.AcquireBootSlotAsync(options, CancellationToken.None);
+
+        // The third acquisition must block until a slot is released.
+        var third = provider.AcquireBootSlotAsync(options, CancellationToken.None);
+        Assert.False(third.IsCompleted);
+
+        first.Dispose();
+        var thirdSlot = await third.WaitAsync(TimeSpan.FromSeconds(5));
+
+        thirdSlot.Dispose();
+        second.Dispose();
+    }
+
+    [Fact]
+    public async Task BootGate_AppliesBootLaunchDelay_ViaInjectedClock()
+    {
+        var time = new ControllableTimeProvider(
+            new DateTimeOffset(2026, 7, 12, 0, 0, 0, TimeSpan.Zero));
+        var options = BaseOptions() with
+        {
+            MaxConcurrentBoots = 4,
+            BootLaunchDelay = TimeSpan.FromSeconds(2),
+        };
+        var provider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            new NeverRunner(),
+            timeProvider: time,
+            environmentVariableReader: EnvironmentReader(_root));
+
+        var acquisition = provider.AcquireBootSlotAsync(options, CancellationToken.None);
+
+        // Slot is held pending the stagger delay; the clock has not advanced.
+        Assert.False(acquisition.IsCompleted);
+
+        time.Advance(TimeSpan.FromSeconds(2));
+        var slot = await acquisition.WaitAsync(TimeSpan.FromSeconds(5));
+        slot.Dispose();
+    }
+
+    [Fact]
+    public async Task BootGate_CancellationDuringDelay_ReleasesSlot()
+    {
+        var time = new ControllableTimeProvider(
+            new DateTimeOffset(2026, 7, 12, 0, 0, 0, TimeSpan.Zero));
+        var options = BaseOptions() with
+        {
+            MaxConcurrentBoots = 1,
+            BootLaunchDelay = TimeSpan.FromSeconds(2),
+        };
+        var provider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            new NeverRunner(),
+            timeProvider: time,
+            environmentVariableReader: EnvironmentReader(_root));
+
+        using var cts = new CancellationTokenSource();
+        var cancelled = provider.AcquireBootSlotAsync(options, cts.Token);
+        Assert.False(cancelled.IsCompleted);
+        cts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cancelled);
+
+        // The single slot must have been released back so the next boot can proceed.
+        var next = provider.AcquireBootSlotAsync(options, CancellationToken.None);
+        time.Advance(TimeSpan.FromSeconds(2));
+        var slot = await next.WaitAsync(TimeSpan.FromSeconds(5));
+        slot.Dispose();
+    }
+
     private IncusSandboxOptions BaseOptions() => new()
     {
         ProjectName = "codeybox-tests",
@@ -1745,6 +1834,11 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         DefaultImage = "images:ubuntu/24.04/cloud",
         UseBaselineImages = true,
         DiskGuard = null,
+        // Neutralize the inter-boot stagger for tests: the production default is a
+        // real-time delay, which would otherwise slow every VM-boot test and (under a
+        // non-advancing FakeTimeProvider) hang the provisioning-deadline tests forever.
+        // Tests that exercise the boot gate itself set these explicitly.
+        BootLaunchDelay = TimeSpan.Zero,
         NetworkProfiles = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
             ["internet-only"] = "cb-net",

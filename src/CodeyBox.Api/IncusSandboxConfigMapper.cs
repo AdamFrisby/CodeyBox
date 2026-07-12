@@ -68,6 +68,8 @@ internal static class IncusSandboxConfigMapper
             ExecControlFileCleanupAttempts = incus.ExecControlFileCleanupAttempts,
             ExecCompletionProbeAttempts = incus.ExecCompletionProbeAttempts,
             MaxConcurrentOperations = incus.MaxConcurrentOperations,
+            MaxConcurrentBoots = incus.MaxConcurrentBoots,
+            BootLaunchDelay = TimeSpan.FromMilliseconds(incus.BootLaunchDelayMs),
             MaxCliStdoutBytes = incus.MaxCliStdoutBytes,
             MaxCliStderrBytes = incus.MaxCliStderrBytes,
             CaptureResourceMetrics = incus.CaptureResourceMetrics,

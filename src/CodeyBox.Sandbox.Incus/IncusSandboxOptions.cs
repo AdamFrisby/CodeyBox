@@ -140,6 +140,23 @@ public sealed record IncusSandboxOptions
     /// <summary>Attempts to read and validate a guest exec completion sentinel.</summary>
     public int ExecCompletionProbeAttempts { get; init; } = 3;
     public int MaxConcurrentOperations { get; init; } = 2;
+    /// <summary>
+    /// Maximum VM boots — an <c>incus start</c> plus its guest-agent readiness
+    /// wait (<see cref="VmStartTimeout"/>) — allowed in flight at once. Booting
+    /// many qemu VMs simultaneously starves the incus daemon/host so guest
+    /// agents miss their readiness window and the start fails; staggering boots
+    /// keeps each within its timeout. This is independent of
+    /// <see cref="MaxConcurrentOperations"/>, which bounds individual CLI
+    /// invocations but not the boot-and-readiness window (the boot happens
+    /// inside qemu, after the brief <c>incus start</c> call returns).
+    /// </summary>
+    public int MaxConcurrentBoots { get; init; } = 2;
+    /// <summary>
+    /// Inter-boot stagger applied after a boot slot is acquired, spacing out
+    /// qemu spin-up under the <see cref="MaxConcurrentBoots"/> gate. Zero
+    /// disables the delay.
+    /// </summary>
+    public TimeSpan BootLaunchDelay { get; init; } = TimeSpan.FromSeconds(2);
     public int MaxCliStdoutBytes { get; init; } = DefaultMaxCliOutputBytes;
     public int MaxCliStderrBytes { get; init; } = DefaultMaxCliOutputBytes;
     public bool CaptureResourceMetrics { get; init; }
@@ -244,6 +261,10 @@ public sealed record IncusSandboxOptions
         RequirePositiveDuration(options.ResourceMetricsSampleInterval, nameof(ResourceMetricsSampleInterval), errors);
         if (options.MaxConcurrentOperations is < 1 or > 64)
             errors.Add($"{nameof(MaxConcurrentOperations)} must be between 1 and 64.");
+        if (options.MaxConcurrentBoots is < 1 or > 64)
+            errors.Add($"{nameof(MaxConcurrentBoots)} must be between 1 and 64.");
+        if (options.BootLaunchDelay < TimeSpan.Zero || options.BootLaunchDelay > TimeSpan.FromMinutes(5))
+            errors.Add($"{nameof(BootLaunchDelay)} must be between zero and five minutes.");
         if (options.MaxCliStdoutBytes is < 1024 or > 64 * 1024 * 1024)
             errors.Add($"{nameof(MaxCliStdoutBytes)} must be between 1024 and 67108864.");
         if (options.MaxCliStderrBytes is < 1024 or > 64 * 1024 * 1024)
