@@ -470,6 +470,42 @@ public sealed class DeploymentDriverTests
     }
 
     [Fact]
+    public async Task WebApp_WhitespacePaddedScheme_IsTrimmedForProbeAndEndpoint()
+    {
+        // A scheme with surrounding whitespace validates (ResolveScheme trims),
+        // so the in-substrate readiness probe and the exposed endpoint must use
+        // the same trimmed value — regression for ProbeReadyAsync re-reading the
+        // raw setting and building a malformed " https://..." probe URL.
+        var provider = new FakeDeploymentSandboxProvider();
+        provider.ExecRules.Add(new ExecRule("curl", new SandboxExecResult(0, "", "")));
+
+        var driver = NewWebAppDriver();
+        var recipe = new DeploymentRecipe
+        {
+            Kind = DeploymentKinds.WebApp,
+            ImageReference = "ubuntu-22.04",
+            RunCommand = "./server",
+            Ports = [8443],
+            HealthEndpoint = "/ready",
+            Settings = new Dictionary<string, string>
+            {
+                [WebAppDeploymentDriver.SettingsKeyScheme] = "  https  ",
+            },
+        };
+
+        driver.ValidateRecipe(recipe);
+        await using var handle = await driver.DeployAsync(recipe, Ctx(provider), CancellationToken.None);
+
+        Assert.Equal("https://10.42.0.10:8443", handle.Endpoint.Url);
+        Assert.Contains(
+            provider.ExecLog,
+            c => c.Contains("'https://127.0.0.1:8443/ready'", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            provider.ExecLog,
+            c => c.Contains(" https ://", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void WebApp_InvalidScheme_FailsValidation()
     {
         var driver = NewWebAppDriver();

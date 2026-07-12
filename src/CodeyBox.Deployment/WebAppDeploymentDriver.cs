@@ -78,9 +78,13 @@ public sealed class WebAppDeploymentDriver : SandboxDeploymentDriverBase
         CancellationToken ct)
     {
         var port = recipe.Ports[0];
-        var scheme = recipe.Settings.TryGetValue(SettingsKeyScheme, out var s) && !string.IsNullOrWhiteSpace(s)
-            ? s
-            : "http";
+        // Resolve through the single ResolveScheme source of truth (which trims
+        // and validates) rather than re-reading the raw setting here. A
+        // whitespace-padded scheme like " https " passes ValidateRecipe via
+        // ResolveScheme but, read raw, would build a malformed probe URL
+        // (" https://127.0.0.1...") that curl rejects forever, timing the
+        // deployment out.
+        var scheme = ResolveScheme(recipe);
         var path = NormalizePath(recipe.HealthEndpoint!);
         var probeUrl = $"{scheme}://127.0.0.1:{port}{path}";
 
