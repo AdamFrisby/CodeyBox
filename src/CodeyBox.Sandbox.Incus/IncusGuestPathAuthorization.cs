@@ -57,7 +57,13 @@ internal static class IncusGuestPathAuthorization
                 target.Path,
                 ct).ConfigureAwait(false);
             if (!string.Equals(canonical, target.Path, StringComparison.Ordinal)
-                && !IsBenignProvisionedSymlink(target, canonical))
+                && !await IsBenignProvisionedSymlinkAsync(
+                    cli,
+                    options,
+                    name,
+                    target,
+                    canonical,
+                    ct).ConfigureAwait(false))
             {
                 throw new InvalidOperationException(
                     $"{target.Name} resolves through a guest filesystem alias; " +
@@ -125,10 +131,45 @@ internal static class IncusGuestPathAuthorization
     /// Direct destinations are emitted before their links, so each intended target
     /// is independently required to be canonical.
     /// </summary>
-    private static bool IsBenignProvisionedSymlink(ProvisioningTarget target, string canonical) =>
-        target.Kind == ProvisioningTargetKind.Symlink
-        && target.SymlinkTarget is { } intendedTarget
-        && string.Equals(canonical, intendedTarget, StringComparison.Ordinal);
+    private static async Task<bool> IsBenignProvisionedSymlinkAsync(
+        IncusCliRunner cli,
+        IncusSandboxOptions options,
+        string name,
+        ProvisioningTarget target,
+        string canonical,
+        CancellationToken ct)
+    {
+        if (target.Kind != ProvisioningTargetKind.Symlink
+            || target.SymlinkTarget is not { } intendedTarget
+            || !string.Equals(canonical, intendedTarget, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        // realpath alone cannot prove that the configured path is the exact link
+        // CodeyBox created: a parent-directory alias or a chain of links can resolve
+        // to the same final path. Inspect the link itself and accept only the absolute
+        // target that provisioning passes to ln -sfnT.
+        var result = await cli.RunAllowFailureAsync(
+            options,
+            IncusCommandBuilder.BuildRootExec(
+                options,
+                name,
+                ["/usr/bin/readlink", "--", target.Path]),
+            stdin: null,
+            options.OperationTimeout,
+            ct,
+            heavyOperation: false,
+            maxStdoutBytes: 8192,
+            maxStderrBytes: 4096).ConfigureAwait(false);
+        if (result.ExitCode != 0)
+            return false;
+
+        var linkTarget = result.Stdout.TrimEnd('\r', '\n');
+        return !linkTarget.Contains('\r')
+            && !linkTarget.Contains('\n')
+            && string.Equals(linkTarget, intendedTarget, StringComparison.Ordinal);
+    }
 
     internal static IReadOnlyList<ProvisioningTarget> SnapshotProvisioningTargets(
         IncusSandboxOptions options)

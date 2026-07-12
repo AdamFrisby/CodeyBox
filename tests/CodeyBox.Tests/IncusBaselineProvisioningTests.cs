@@ -489,7 +489,8 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         var benignRunner = new BaselineBakeRunner(
             Path.Combine(_root, "benign-symlink-staging"),
             verificationExitCode: 0,
-            canonicalizeGuestPath: path => path == symlink ? destination : path);
+            canonicalizeGuestPath: path => path == symlink ? destination : path,
+            readSymlinkTarget: path => path == symlink ? destination : null);
         var benignProvider = new IncusSandboxProvider(
             () => options,
             NullLogger<IncusSandboxProvider>.Instance,
@@ -521,6 +522,28 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
                 mountGuestPaths: [],
                 CancellationToken.None));
         Assert.Contains("filesystem alias", hostile.Message, StringComparison.Ordinal);
+
+        // Resolving to the intended destination is insufficient when the literal
+        // link points through an intermediate alias. Provisioning creates a direct,
+        // absolute link, so an inherited chain is not an already-satisfied link.
+        var chainedRunner = new BaselineBakeRunner(
+            Path.Combine(_root, "chained-symlink-staging"),
+            verificationExitCode: 0,
+            canonicalizeGuestPath: path => path == symlink ? destination : path,
+            readSymlinkTarget: path => path == symlink ? "/opt/intermediate/agy" : null);
+        var chainedProvider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            chainedRunner,
+            environmentVariableReader: EnvironmentReader(_root));
+        var chained = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            chainedProvider.ValidateCanonicalProvisioningPathsAsync(
+                options,
+                "codeybox-test-instance",
+                mountGuestPaths: [],
+                CancellationToken.None));
+        Assert.Contains("filesystem alias", chained.Message, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -560,7 +583,8 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
                 _ when path == benignSymlink => destination,
                 _ when path == hostileSymlink => "/opt/evil/agy",
                 _ => path,
-            });
+            },
+            readSymlinkTarget: path => path == benignSymlink ? destination : null);
         var provider = new IncusSandboxProvider(
             () => options,
             NullLogger<IncusSandboxProvider>.Instance,
@@ -2091,6 +2115,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         private readonly Action? _onFilePush;
         private readonly Action? _onStart;
         private readonly Func<string, string> _canonicalizeGuestPath;
+        private readonly Func<string, string?> _readSymlinkTarget;
         private readonly Action? _onCanonicalization;
         private string? _instanceName;
         private string _instanceStatus = "STOPPED";
@@ -2108,7 +2133,8 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
             Action? onFilePush = null,
             Action? onStart = null,
             Func<string, string>? canonicalizeGuestPath = null,
-            Action? onCanonicalization = null)
+            Action? onCanonicalization = null,
+            Func<string, string?>? readSymlinkTarget = null)
         {
             _stagingRoot = stagingRoot;
             _verificationExitCode = verificationExitCode;
@@ -2118,6 +2144,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
             _onStart = onStart;
             _canonicalizeGuestPath = canonicalizeGuestPath ?? (static path => path);
             _onCanonicalization = onCanonicalization;
+            _readSymlinkTarget = readSymlinkTarget ?? (static _ => null);
             if (existingPinnedName is not null)
             {
                 _instanceName = existingPinnedName;
@@ -2215,6 +2242,14 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
                 {
                     _onCanonicalization?.Invoke();
                     return Success(_canonicalizeGuestPath(argv[^1]) + "\n");
+                }
+                var readlinkIndex = IndexOf(argv, "/usr/bin/readlink");
+                if (readlinkIndex >= 0)
+                {
+                    var target = _readSymlinkTarget(argv[^1]);
+                    return target is null
+                        ? Task.FromResult(new ProcessRunResult(1, string.Empty, "not a symbolic link"))
+                        : Success(target + "\n");
                 }
                 if (argv.Contains("setpriv", StringComparer.Ordinal))
                 {
