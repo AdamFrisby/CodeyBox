@@ -31,20 +31,31 @@ set -euo pipefail
 nuget_home="${HOME:?HOME must be set}/.nuget"
 cfg_dir="${nuget_home}/NuGet"
 
-# A directory is usable if we can create and remove a probe file inside it.
-probe_writable() {
+# The NuGet home is usable only if BOTH hold:
+#   1. we can create/remove a probe file in the config directory (so NuGet can
+#      write its user config on first run), and
+#   2. an already-present NuGet.Config is readable (NuGet reads it every restore
+#      — a directory we can write but whose existing config is owned by another
+#      user, e.g. root mode 600, still fails restore with the same error).
+# Checking only (1) would false-positive on that partial case and skip repair.
+probe_usable() {
   local dir="$1"
   [ -d "$dir" ] || return 1
   local probe="${dir}/.codeybox-write-probe.$$"
   if ( : > "$probe" ) 2>/dev/null; then
     rm -f "$probe"
-    return 0
+  else
+    return 1
   fi
-  return 1
+  local cfg="${dir}/NuGet.Config"
+  if [ -e "$cfg" ] && [ ! -r "$cfg" ]; then
+    return 1
+  fi
+  return 0
 }
 
-if probe_writable "$cfg_dir"; then
-  echo "ensure-nuget-writable: ${cfg_dir} is already writable; nothing to do."
+if probe_usable "$cfg_dir"; then
+  echo "ensure-nuget-writable: ${cfg_dir} is already usable; nothing to do."
   exit 0
 fi
 
@@ -69,9 +80,9 @@ if [ -d "${aside}/packages" ] && [ ! -L "${aside}/packages" ]; then
   ln -s "${aside}/packages" "${nuget_home}/packages"
 fi
 
-if ! probe_writable "$cfg_dir"; then
-  echo "ensure-nuget-writable: repair failed — ${cfg_dir} is still not writable." >&2
+if ! probe_usable "$cfg_dir"; then
+  echo "ensure-nuget-writable: repair failed — ${cfg_dir} is still not usable." >&2
   exit 1
 fi
 
-echo "ensure-nuget-writable: ${cfg_dir} is now writable (previous tree preserved at ${aside})."
+echo "ensure-nuget-writable: ${cfg_dir} is now usable (previous tree preserved at ${aside})."
