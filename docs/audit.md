@@ -170,6 +170,14 @@ to unauthorized access ... Access to the path '.../.nuget/NuGet' is
 denied`. `RestoreConfigFile` (pinned in `Directory.Build.props`) selects
 *which* config to read; it does not stop the user-config directory probe,
 so only pointing `DOTNET_CLI_HOME`/`HOME` at a writable location avoids it.
+Verified empirically: with `RestoreConfigFile` pinned and every project
+already restored (`All projects are up-to-date for restore`), a `dotnet
+build` still creates `$HOME/.nuget/NuGet/NuGet.Config` — the user-config
+directory is materialised unconditionally while NuGet loads default
+settings, *before* `RestoreConfigFile` is consulted. There is therefore no
+committed-repo mechanism (NuGet.Config, `Directory.Build.props`, or an
+MSBuild property) that redirects this probe for a `dotnet` the harness
+launches directly; the home is chosen from process environment alone.
 
 For every dotnet invocation CodeyBox itself launches this is handled
 automatically and needs no operator action: the `SandboxRequiredBuildVerifier`
