@@ -2087,6 +2087,27 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                     throw new InvalidOperationException($"Failed to change VM directory ownership: {chownResult.Stderr}");
                 }
 
+                // 5b. When the seed lands under $HOME/.nuget/..., also chown the
+                // .nuget parent. mkdir -p as root leaves that directory
+                // root-owned; NuGet then cannot create $HOME/.nuget/NuGet and
+                // every raw `dotnet build` fails restore. Chown the directory
+                // inode only — packages was already reassigned with -R above.
+                var nugetHome = NuGetPackageCacheGuestPaths.TryGetNuGetHomeDirectory(
+                    vmDestPath,
+                    "/home/ubuntu");
+                if (nugetHome is not null)
+                {
+                    var nugetHomeChown = await RunAsync(
+                        opts,
+                        [opts.MultipassBinary, "exec", baselineName, "--", "sudo", "chown", "ubuntu:ubuntu", nugetHome],
+                        stdin: null, ct: ct, workItemId: workItemId).ConfigureAwait(false);
+                    if (nugetHomeChown.ExitCode != 0)
+                    {
+                        throw new InvalidOperationException(
+                            $"Failed to change VM NuGet home ownership: {nugetHomeChown.Stderr}");
+                    }
+                }
+
                 // 6. Clean up the tarball inside the VM
                 var rmResult = await RunAsync(
                     opts,

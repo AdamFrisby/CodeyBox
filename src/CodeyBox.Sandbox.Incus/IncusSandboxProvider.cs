@@ -1946,6 +1946,31 @@ public sealed class IncusSandboxProvider :
                 ],
                 ct,
                 options.ImageProvisioningTimeout).ConfigureAwait(false);
+
+            // Seed destinations under $HOME/.nuget/... often inherit a
+            // root-owned .nuget parent from ExtraRuncmd `mkdir -p` or from
+            // install -d against a pre-existing root directory. Chown the
+            // packages leaf alone leaves NuGet unable to create
+            // $HOME/.nuget/NuGet. Fix the parent directory inode (not -R —
+            // packages was already reassigned) when the seed lands there.
+            var nugetHome = NuGetPackageCacheGuestPaths.TryGetNuGetHomeDirectory(
+                seed.VmDestPath,
+                options.GuestHome);
+            if (nugetHome is not null)
+            {
+                await RunRootCommandAsync(
+                    options,
+                    name,
+                    "assign NuGet home ownership",
+                    [
+                        "chown",
+                        $"{options.GuestUserId.ToString(CultureInfo.InvariantCulture)}:{options.GuestGroupId.ToString(CultureInfo.InvariantCulture)}",
+                        "--",
+                        nugetHome,
+                    ],
+                    ct,
+                    options.ImageProvisioningTimeout).ConfigureAwait(false);
+            }
         }
     }
 

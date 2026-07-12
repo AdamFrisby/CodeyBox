@@ -3,7 +3,8 @@
 The solution builds warnings-clean and its test suite passes on any correctly
 provisioned .NET 10 host. This note records one **provisioning** prerequisite
 that is external to the source tree, because it has recurred as a build-gate
-failure when the build container is misconfigured.
+failure when the build container is misconfigured — and the in-repo mitigations
+that make raw `dotnet build` survive that misconfiguration.
 
 ## Writable per-user NuGet configuration directory
 
@@ -26,6 +27,23 @@ error : Failed to read NuGet.Config due to unauthorized access.
 and, because no assemblies are produced, `dotnet test --no-build` then reports
 each test DLL path as an "invalid argument".
 
+### In-repo self-heal: `Directory.Build.targets`
+
+`Directory.Build.targets` runs `scripts/ensure-writable-nuget-home.sh` as an
+`InitialTargets` step before any project targets. When `$HOME/.nuget` exists
+but is not writable, the script renames it aside (the build user owns `$HOME`,
+so the rename does not need root), recreates a writable `$HOME/.nuget`, and
+preserves any pre-baked `packages` cache via symlink. Concurrent MSBuild nodes
+share a lock so solution builds do not race.
+
+This is the operative remediation for auditors that invoke `dotnet` **raw**
+(`process:required-build`, `csharp:build-WaE`) against a misprovisioned image:
+those auditors do not go through `build.sh`, and a host orchestrator binary
+that predates the gate's `DOTNET_CLI_HOME` redirect still runs the work
+branch's MSBuild imports. A repository `nuget.config` / `-p:RestoreConfigFile`
+cannot substitute — NuGet touches the per-user settings directory before
+honouring them.
+
 ### The required-build gate handles this itself
 
 The non-skippable required-build gate (`SandboxRequiredBuildVerifier`) runs its
@@ -38,7 +56,9 @@ cache (`NUGET_PACKAGES`) so offline images keep restoring. A root-owned
 than via tracked config files because NuGet touches the per-user settings
 directory before honouring a repository `nuget.config`,
 `-p:RestoreConfigFile`, or `Directory.Build.props` — each was verified not to
-avoid the failure on its own.)
+avoid the failure on its own. The `Directory.Build.targets` InitialTargets
+repair above is the complementary, branch-controlled path that helps when the
+running orchestrator still embeds an older build script.)
 
 ### The `build.sh` entry point handles this itself
 
@@ -49,40 +69,11 @@ cache via `NUGET_PACKAGES` before running `dotnet build CodeyBox.slnx`. Running
 `sh build.sh` therefore succeeds even when the image's `$HOME/.nuget` is owned by
 another user.
 
-### Raw `dotnet` invocations still need a writable home
+### Baseline seeding must guest-own `$HOME/.nuget`
 
-A developer or tool invoking `dotnet build ./CodeyBox.slnx` **directly** (not via
-`build.sh`) still depends on this prerequisite, because the redirect lives inside
-the script rather than in tracked config files — NuGet touches the per-user
-settings directory before honouring a repository `nuget.config`,
-`-p:RestoreConfigFile`, or `Directory.Build.props`, each verified not to avoid
-the failure on its own. For raw invocations, either provision a
-build-user-writable `$HOME/.nuget` (e.g. `chown -R "$(id -un)" "$HOME/.nuget"`),
-or invoke with `DOTNET_CLI_HOME=<writable dir> dotnet build ...` (NuGet resolves
-the per-user settings directory relative to it).
-
-### Durable remediation without root: relocate the root-owned `.nuget`
-
-The audit harness invokes `dotnet build ./CodeyBox.slnx` and `dotnet test
---no-build` **raw**, so neither the gate's nor `build.sh`'s in-script
-`DOTNET_CLI_HOME` redirect applies to it, and — as shown above — no tracked
-config file can intercept NuGet's early read/create of the per-user settings
-directory. The remediation that *does* work for a raw invocation, and needs no
-`root`, exploits directory ownership: even when `$HOME/.nuget` is owned by
-`root`, the build user owns its parent `$HOME`, so it may rename that directory
-entry out of the way and recreate a writable one, preserving the pre-baked
-package cache by symlink:
-
-```sh
-mv "$HOME/.nuget" "$HOME/.nuget.rootbaked"          # allowed: build user owns $HOME
-mkdir -p "$HOME/.nuget"
-ln -s "$HOME/.nuget.rootbaked/packages" "$HOME/.nuget/packages"
-```
-
-After this, a raw `dotnet build ./CodeyBox.slnx` restores and builds the full
-solution warnings-clean, and `dotnet test --no-build` runs, with no environment
-overrides. This repair mutates only `$HOME` (never the source tree), so it
-survives a same-container audit re-run that checks out a new commit under
-`/work` without resetting `$HOME`. It is the operative remediation for the
-recurring `process:required-build` / `csharp:build-WaE` / `csharp:test-pass`
-findings on this image.
+When a package-cache seed lands under `$HOME/.nuget/packages`, Incus and
+Multipass provisioning now also `chown` the `$HOME/.nuget` parent directory
+(not only the `packages` leaf). Root-created parents from ExtraRuncmd
+`mkdir -p` otherwise leave NuGet unable to create its settings directory on
+fresh clones. Prefer baking images this way; the in-repo self-heal remains the
+backstop for already-baked baselines.
