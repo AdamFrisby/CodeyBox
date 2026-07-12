@@ -1,6 +1,6 @@
 {
   "_meta": {
-    "lastUpdated": "2026-05-29",
+    "lastUpdated": "2026-07-12",
     "sources": {
       "opencode": "https://opencode.ai/docs/go",
       "claude": "https://docs.anthropic.com/en/docs/about-claude/pricing",
@@ -14,8 +14,11 @@
       "gemini": "gemini-3-flash-preview is the default AgentClasses model. Pro preview models use short-context rates (<= 200k tokens); long-context tier (>200k) is not represented.",
       "cursor":   "Cursor uses a flat subscription and does not publish per-token rates; intentionally omitted from defaults.",
       "copilot":  "Copilot uses a flat subscription and does not publish per-token rates; intentionally omitted from defaults.",
-      "crock":    "CrockCode is a pay-per-token Anthropic API-key path that rides the Message Batches API (~50% discount applied by Anthropic at billing time). Rates below are the post-batch-discount effective rates (half of the on-demand /v1/messages rate for the same model id) so cost attribution reflects actual spend. Keys mirror the canonical Anthropic model ids."
+      "crock":    "CrockCode is a pay-per-token Anthropic API-key path that rides the Message Batches API (~50% discount applied by Anthropic at billing time). Rates below are the post-batch-discount effective rates (half of the on-demand /v1/messages rate for the same model id). Keys mirror the canonical Anthropic model ids. Cost attribution is an ESTIMATE, not exact spend: like the claude bucket, cache-write (cache_creation) tokens are folded into fresh input at the base rate and Anthropic's 1.25x/2x cache-write premium is not represented. DefaultRates.crock is the Opus-tier upper-bound fallback for any model id not enumerated here."
     }
+  },
+  "DefaultRates": {
+    "crock": { "inputPerMillion": 2.50, "cachedInputPerMillion": 0.25, "outputPerMillion": 12.50 }
   },
   "Rates": {
     "opencode": {

@@ -11,28 +11,35 @@ namespace CodeyBox.Agents.Crock;
 /// provider:
 ///
 /// <list type="number">
-///   <item><description>Adds a bind-mount that exposes the daemon socket's
-///   <em>parent directory</em> inside the sandbox at the parent of
-///   <see cref="CrockSandboxOptions.SandboxDaemonSocketPath"/>. The mount is
-///   <em>not</em> read-only (the in-VM CLI must be able to write to the socket
-///   to send daemon RPCs).</description></item>
+///   <item><description>Adds a <em>read-only</em> bind-mount that exposes the
+///   daemon socket's <em>parent directory</em> inside the sandbox at the parent
+///   of <see cref="CrockSandboxOptions.SandboxDaemonSocketPath"/>. Connecting to
+///   a Unix socket does not require write access to the containing directory, so
+///   the mount is read-only — a less-trusted sandbox process cannot create,
+///   replace, or delete host directory entries (including the socket
+///   itself).</description></item>
 ///   <item><description>Sets the configured
 ///   <see cref="CrockSandboxOptions.DaemonSocketEnvVar"/> env var inside the
 ///   sandbox so the in-VM crock CLI knows where to connect.</description></item>
 /// </list>
 ///
-/// <para><b>Directory mount, not file mount — Multipass compatibility.</b>
+/// <para>The host directory used as the mount source is canonicalised
+/// (<c>Path.GetFullPath</c> collapses <c>..</c> segments; the final directory
+/// symlink is resolved) BEFORE the forbidden-directory gate and BEFORE it is
+/// used as the mount source, so a <c>/dedicated/../etc</c> or symlink shape
+/// cannot slip a shared system root past the gate.</para>
+///
+/// <para><b>Directory mount, not file mount.</b>
 /// The Multipass sandbox provider mounts via
 /// <c>multipass mount --type=native</c>, which only accepts a <em>directory</em>
-/// source (virtiofs / 9p passthrough); pointing it at a Unix socket node would
-/// be rejected by the provider. Binding the socket's parent directory works
-/// uniformly across every shipped sandbox provider — Bubblewrap's <c>--bind</c>
-/// accepts both files and directories so the directory binding is equally
-/// correct there, and the Multipass virtiofs/9p passthrough faithfully
-/// exposes any socket node inside the mounted directory so the in-VM
-/// <c>connect(2)</c> reaches the host daemon. Operators sharing one
-/// directory for multiple sockets get all of them at the cost of one mount;
-/// dedicate the directory to the daemon socket if that surface matters.</para>
+/// source; pointing it at a Unix socket node would be rejected. Binding the
+/// socket's parent directory works on the local Bubblewrap/Multipass providers
+/// whose mounts preserve a live host Unix-domain socket. Providers that stage a
+/// directory <em>copy</em> onto another host (e.g. the remote/sprite providers)
+/// cannot preserve a live local socket; the host-daemon fallback is only
+/// supported on providers that keep a live local bind, and an unsupported
+/// provider will simply fail to connect at run time. Dedicate the directory to
+/// the daemon socket so no co-located host files are exposed.</para>
 ///
 /// <para><b>Why a dedicated provider instead of an
 /// <c>EnvironmentCredentialProvider</c> mapping.</b> The generic provider can
@@ -50,10 +57,12 @@ namespace CodeyBox.Agents.Crock;
 /// limited RPC surface) before honouring any request. See
 /// <see cref="CrockSandboxOptions"/> for the documented expectation.</para>
 ///
-/// <para><b>Never logs.</b> Neither the API key (inside the config JSON) nor
-/// the host daemon socket path is written to any log line — only structured
-/// state ("config present: yes/no", "daemon socket: configured/unset") is
-/// emitted at debug level.</para>
+/// <para><b>Logging.</b> The API key (inside the config JSON) is never written
+/// to any log line — only structured state ("config present: yes/no", "daemon
+/// socket: configured/unset") is emitted at debug level. The canonicalised
+/// parent directory IS handed to the sandbox provider as a mount source, and
+/// some providers log mount sources in diagnostics; that directory path is not
+/// treated as a secret (the key never appears in it).</para>
 /// </summary>
 public sealed class CrockEnvironmentCredentialProvider : ICredentialProvider
 {
@@ -96,72 +105,62 @@ public sealed class CrockEnvironmentCredentialProvider : ICredentialProvider
         var mounts = new List<SandboxMount>();
 
         var opts = _sandboxOptions();
-        if (!string.IsNullOrWhiteSpace(opts.HostDaemonSocketPath))
-        {
-            var sandboxSocketPath = string.IsNullOrWhiteSpace(opts.SandboxDaemonSocketPath)
-                ? "/run/codeybox/crock-daemon.sock"
-                : opts.SandboxDaemonSocketPath;
-
-            // Bind the socket's PARENT DIRECTORY (not the socket file).
-            // multipass mount --type=native only accepts a directory source
-            // (virtiofs / 9p passthrough); pointing it at a Unix socket node is
-            // rejected by the provider. The directory shape is universally
-            // compatible — bubblewrap's --bind also accepts directories — and
-            // the virtiofs/9p passthrough faithfully exposes any socket node
-            // inside the mounted directory so the in-VM connect() reaches the
-            // host daemon.
-            var hostDir = Path.GetDirectoryName(opts.HostDaemonSocketPath);
-            var sandboxDir = Path.GetDirectoryName(sandboxSocketPath);
-            if (string.IsNullOrWhiteSpace(hostDir) || string.IsNullOrWhiteSpace(sandboxDir))
-            {
-                _log?.LogDebug(
-                    "Crock credential: HostDaemonSocketPath has no parent directory; refusing to ship " +
-                    "credential so the runner's pre-flight check fires with the missing-daemon marker");
-                return Task.FromResult<AgentCredential?>(null);
-            }
-
-            if (IsForbiddenParentDirectory(hostDir))
-            {
-                // Catastrophe gate: an operator typo such as
-                // HostDaemonSocketPath="/foo.sock" resolves the parent to "/"
-                // and would bind-mount the entire host filesystem read-write
-                // into the sandbox — defeating sandbox isolation in one
-                // character. The shared-system-root list also blocks /run,
-                // /var/run, /tmp, /var/tmp, /etc, $HOME and the home
-                // directory's parent ("/home") because every one of those
-                // exposes co-located secrets (peer sockets, system D-Bus,
-                // every other tenant's home dir, host shell history, etc.)
-                // to a prompt-injected agent. Operators MUST dedicate a
-                // subdirectory to the daemon socket — see
-                // CrockSandboxOptions docs.
-                _log?.LogWarning(
-                    "Crock credential: refusing to bind-mount catastrophic parent directory (configured " +
-                    "HostDaemonSocketPath resolves to a system root). Operator must dedicate a subdirectory " +
-                    "to the daemon socket. Dispatch will fail at the runner's pre-flight check.");
-                return Task.FromResult<AgentCredential?>(null);
-            }
-
-            mounts.Add(new SandboxMount
-            {
-                SandboxPath = sandboxDir,
-                HostPath = hostDir,
-                ReadOnly = false,
-            });
-
-            var daemonEnvVar = string.IsNullOrWhiteSpace(opts.DaemonSocketEnvVar)
-                ? "CROCK_DAEMON_SOCKET"
-                : opts.DaemonSocketEnvVar;
-            env[daemonEnvVar] = sandboxSocketPath;
-
-            _log?.LogDebug(
-                "Crock credential: config present, host daemon socket configured (env var {EnvVar})",
-                daemonEnvVar);
-        }
-        else
+        if (string.IsNullOrWhiteSpace(opts.HostDaemonSocketPath))
         {
             _log?.LogDebug(
                 "Crock credential: config present, no host daemon socket configured " +
                 "(in-VM tunnels are not supported; dispatch will fail at the runner's pre-flight check)");
+        }
+        else if (TryResolveMountParent(opts.HostDaemonSocketPath, out var hostDir, out var reason))
+        {
+            // Bind the socket's canonical PARENT DIRECTORY (not the socket file)
+            // read-only. multipass mount --type=native only accepts a directory
+            // source; connecting to the socket needs no write access to the
+            // directory. hostDir is already canonicalised + symlink-resolved by
+            // TryResolveMountParent, so it is safe to use as the mount source.
+            var sandboxSocketPath = string.IsNullOrWhiteSpace(opts.SandboxDaemonSocketPath)
+                ? CrockSandboxOptions.DefaultSandboxDaemonSocketPath
+                : opts.SandboxDaemonSocketPath;
+            var sandboxDir = Path.GetDirectoryName(sandboxSocketPath);
+            if (string.IsNullOrWhiteSpace(sandboxDir))
+            {
+                // Config still ships; the runner pre-flight rejects (the daemon
+                // path resolved but the in-sandbox target is malformed).
+                _log?.LogWarning(
+                    "Crock credential: SandboxDaemonSocketPath has no parent directory; shipping config " +
+                    "without a daemon mount so the runner pre-flight rejects with the daemon marker");
+            }
+            else
+            {
+                mounts.Add(new SandboxMount
+                {
+                    SandboxPath = sandboxDir,
+                    HostPath = hostDir,
+                    ReadOnly = true,
+                });
+
+                var daemonEnvVar = string.IsNullOrWhiteSpace(opts.DaemonSocketEnvVar)
+                    ? CrockSandboxOptions.DefaultDaemonSocketEnvVar
+                    : opts.DaemonSocketEnvVar;
+                env[daemonEnvVar] = sandboxSocketPath;
+
+                _log?.LogDebug(
+                    "Crock credential: config present, host daemon socket configured (env var {EnvVar})",
+                    daemonEnvVar);
+            }
+        }
+        else
+        {
+            // The daemon path is SET but not a safe dedicated mount source
+            // (absent parent, non-absolute, or a shared system root after
+            // canonicalisation). Ship the config WITHOUT the mount — never a
+            // catastrophic host bind — and let the runner's pre-flight classify
+            // this as a daemon (Infrastructure) failure rather than a missing
+            // credential (AuthError). The reason is structured, not the path.
+            _log?.LogWarning(
+                "Crock credential: host daemon socket path is not a safe dedicated mount source ({Reason}); " +
+                "shipping config without a daemon mount so the runner pre-flight rejects with the daemon marker",
+                reason);
         }
 
         return Task.FromResult<AgentCredential?>(new AgentCredential(
@@ -174,35 +173,114 @@ public sealed class CrockEnvironmentCredentialProvider : ICredentialProvider
     }
 
     /// <summary>
-    /// Returns true when <paramref name="hostDir"/> is one of the shared
-    /// system directories that a bind-mount would expose huge swathes of
-    /// the host to a prompt-injected sandboxed agent (peer sockets, system
-    /// D-Bus, journald, every other tenant's home directory, etc.). The
-    /// match is canonical-path based; comparisons normalise trailing
-    /// slashes and case (Linux is case-sensitive but the operator may
-    /// have hand-typed mixed casing). HOME and HOME's parent are computed
-    /// at call time so the gate tracks the runtime user, not a baked-in
-    /// constant.
+    /// Resolves the configured host socket path to the canonical, symlink-free
+    /// parent directory that is safe to bind-mount, or returns false with a
+    /// non-sensitive <paramref name="reason"/> when it is unset, non-absolute,
+    /// uncanonicalisable, or (after collapsing <c>..</c> and symlinks) a shared
+    /// system directory. The returned <paramref name="canonicalHostDir"/> is
+    /// what callers MUST mount — validating one path and mounting another would
+    /// reintroduce a TOCTOU/symlink bypass.
+    /// </summary>
+    internal static bool TryResolveMountParent(
+        string? hostSocketPath, out string canonicalHostDir, out string reason)
+    {
+        canonicalHostDir = string.Empty;
+        if (string.IsNullOrWhiteSpace(hostSocketPath))
+        {
+            reason = "host daemon socket path is not configured";
+            return false;
+        }
+
+        var trimmed = hostSocketPath.Trim();
+        if (!Path.IsPathRooted(trimmed))
+        {
+            reason = "host daemon socket path must be absolute";
+            return false;
+        }
+
+        string parent;
+        try
+        {
+            var full = Path.GetFullPath(trimmed);          // collapses ./ and ../
+            var dir = Path.GetDirectoryName(full);
+            if (string.IsNullOrEmpty(dir))
+            {
+                reason = "host daemon socket path has no parent directory";
+                return false;
+            }
+            parent = ResolveDirectorySymlink(dir);
+        }
+        catch (Exception ex) when (ex is ArgumentException or PathTooLongException
+            or IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            reason = "host daemon socket path could not be canonicalised";
+            return false;
+        }
+
+        if (IsForbiddenParentDirectory(parent))
+        {
+            reason = "host daemon socket parent resolves to a shared system directory";
+            return false;
+        }
+
+        canonicalHostDir = parent;
+        reason = string.Empty;
+        return true;
+    }
+
+    /// <summary>
+    /// Resolves <paramref name="dir"/> to its final symlink target when the
+    /// directory itself is a symlink (best-effort — the common
+    /// <c>/dedicated -&gt; /run</c> shape), then re-canonicalises. A path that
+    /// does not exist or is not a link is returned unchanged.
+    /// </summary>
+    private static string ResolveDirectorySymlink(string dir)
+    {
+        try
+        {
+            var target = Directory.ResolveLinkTarget(dir, returnFinalTarget: true);
+            if (target is not null)
+                return Path.GetFullPath(target.FullName);
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+        return dir;
+    }
+
+    /// <summary>
+    /// Returns true when <paramref name="hostDir"/> — after canonicalisation —
+    /// is one of the shared system directories that a bind-mount would expose
+    /// huge swathes of the host to a prompt-injected sandboxed agent (peer
+    /// sockets, system D-Bus, journald, every other tenant's home directory,
+    /// etc.). Callers that pass a raw operator value get canonicalised here too,
+    /// so <c>/run/../etc</c> and a symlinked directory are both caught. HOME and
+    /// HOME's parent are computed at call time so the gate tracks the runtime
+    /// user, not a baked-in constant.
     /// </summary>
     internal static bool IsForbiddenParentDirectory(string hostDir)
     {
         if (string.IsNullOrWhiteSpace(hostDir))
             return true;
 
-        var normalized = NormalizePath(hostDir);
-        if (normalized.Length == 0)
+        string normalized;
+        try
+        {
+            normalized = Path.IsPathRooted(hostDir.Trim())
+                ? ResolveDirectorySymlink(Path.GetFullPath(hostDir.Trim()))
+                : hostDir.Trim();
+        }
+        catch (Exception ex) when (ex is ArgumentException or PathTooLongException
+            or IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            // Uncanonicalisable → fail closed (treat as forbidden).
+            return true;
+        }
+        normalized = TrimTrailingSeparators(normalized);
+        if (normalized.Length == 0 || normalized == "." || normalized == "..")
             return true;
 
-        // Filesystem root (/, C:\, etc.) — Path.GetDirectoryName for
-        // anything at the root returns this. The single most dangerous
-        // shape because it bind-mounts /etc/shadow, /root/.ssh, every
-        // tenant home dir and every host socket into the VM at once.
-        if (normalized == "/" || normalized == "." || normalized == "..")
-            return true;
-
-        // Hard-coded shared system directories. Operator-friendly: the
-        // log line names the gate so an operator can read the failure
-        // and pick a dedicated subdirectory instead.
+        // Shared system directories. Linux is case-sensitive so an ordinal
+        // compare against the canonical path is correct.
         var forbidden = new[]
         {
             "/", "/etc", "/run", "/var", "/var/run", "/tmp", "/var/tmp",
@@ -222,23 +300,21 @@ public sealed class CrockEnvironmentCredentialProvider : ICredentialProvider
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         if (!string.IsNullOrWhiteSpace(home))
         {
-            var normalizedHome = NormalizePath(home);
+            var normalizedHome = TrimTrailingSeparators(home.Trim());
             if (string.Equals(normalized, normalizedHome, StringComparison.Ordinal))
                 return true;
             var homeParent = Path.GetDirectoryName(normalizedHome);
             if (!string.IsNullOrWhiteSpace(homeParent)
-                && string.Equals(normalized, NormalizePath(homeParent!), StringComparison.Ordinal))
+                && string.Equals(normalized, TrimTrailingSeparators(homeParent!), StringComparison.Ordinal))
                 return true;
         }
 
         return false;
     }
 
-    private static string NormalizePath(string path)
+    private static string TrimTrailingSeparators(string path)
     {
         var trimmed = path.Trim();
-        if (trimmed.Length == 0) return trimmed;
-        // Strip trailing slashes except for the bare root.
         while (trimmed.Length > 1
             && (trimmed.EndsWith('/') || trimmed.EndsWith(Path.DirectorySeparatorChar)))
         {

@@ -1,5 +1,8 @@
 using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Http;
 using System.Text.Json;
+using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents.Crock;
 using CodeyBox.Core;
 
@@ -367,7 +370,7 @@ public sealed class CrockAgentRunnerTests
             MaxUnknownStreak = 3,
             SandboxOptions = static () => new CrockSandboxOptions
             {
-                HostDaemonSocketPath = "/tmp/test-crock-daemon.sock",
+                HostDaemonSocketPath = "/tmp/crockd/test-crock-daemon.sock",
             },
         };
         var sandbox = new ScriptedSandbox(
@@ -398,7 +401,7 @@ public sealed class CrockAgentRunnerTests
             MaxUnknownStreak = 3,
             SandboxOptions = static () => new CrockSandboxOptions
             {
-                HostDaemonSocketPath = "/tmp/test-crock-daemon.sock",
+                HostDaemonSocketPath = "/tmp/crockd/test-crock-daemon.sock",
             },
         };
         var sandbox = new ScriptedSandbox(
@@ -596,14 +599,14 @@ public sealed class CrockAgentRunnerTests
     // --- Quota probe contract --------------------------------------------
 
     [Fact]
-    public async Task CrockQuotaProbe_NoArgCtor_ReturnsUnknownForMissingCredential()
+    public async Task CrockQuotaProbe_NoCredential_ReturnsNoCredentialUnknown()
     {
-        // The parameter-less constructor is preserved for the scaffold DI
-        // registration shape, but it has no HTTP client and no API key. It
-        // must still return a structured Unknown snapshot (with NoCredential
-        // when no token is supplied) so the router's QuotaUnknownPolicy gates
-        // dispatch instead of treating the probe as silently OK.
-        var probe = new CrockQuotaProbe();
+        // When the credentials provider yields no API key the probe must return
+        // a structured Unknown/NoCredential snapshot BEFORE touching HTTP, so
+        // the router's QuotaUnknownPolicy gates dispatch instead of treating the
+        // probe as silently OK. The handler throws to prove no request is made.
+        var probe = NewProbe(_ => new AgentQuotaCredentials(null),
+            new ThrowingHandler());
         var member = new AgentMembership
         {
             Agent = AgentKind.Crock,
@@ -614,17 +617,41 @@ public sealed class CrockAgentRunnerTests
         var snapshot = await probe.GetAvailabilityAsync(member, ct: CancellationToken.None);
 
         Assert.False(snapshot.IsKnown);
-        // The default credentials provider for the scaffold path returns
-        // AccessToken=null, so the probe must return NoCredential — not a
-        // generic Permanent — so the last-known-good layer discards any
-        // stale reading (a missing key is not a "transient blip").
+        // A missing key is NoCredential, not a generic Permanent, so the
+        // last-known-good layer discards any stale reading (not a transient blip).
         Assert.Equal(QuotaUnknownReason.NoCredential, snapshot.Unknown);
     }
 
     [Fact]
     public void CrockQuotaProbe_Kind_IsCrock()
     {
-        Assert.Equal(AgentKind.Crock, new CrockQuotaProbe().Kind);
+        Assert.Equal(AgentKind.Crock,
+            NewProbe(_ => new AgentQuotaCredentials(null), new ThrowingHandler()).Kind);
+    }
+
+    [Fact]
+    public void CrockQuotaProbe_RejectsNonPositiveCacheTtl()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new CrockQuotaProbe(
+            new QuotaFakeHttpClientFactory("agent-quota", new ThrowingHandler()),
+            _ => new AgentQuotaCredentials(null),
+            TimeSpan.Zero,
+            NullLogger<CrockQuotaProbe>.Instance));
+    }
+
+    private static CrockQuotaProbe NewProbe(
+        Func<AgentMembership, AgentQuotaCredentials> credentials,
+        HttpMessageHandler handler)
+        => new(
+            new QuotaFakeHttpClientFactory("agent-quota", handler),
+            credentials,
+            TimeSpan.FromMinutes(1),
+            NullLogger<CrockQuotaProbe>.Instance);
+
+    private sealed class ThrowingHandler : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+            => throw new InvalidOperationException("HTTP must not be called on the no-credential path");
     }
 
     // --- API-key extraction from CrockCode config JSON -------------------
@@ -765,7 +792,10 @@ public sealed class CrockAgentRunnerTests
             var mount = Assert.Single(cred.Mounts);
             Assert.Equal("/run/host", mount.HostPath);
             Assert.Equal("/run/vm", mount.SandboxPath);
-            Assert.False(mount.ReadOnly);
+            // Read-only: connecting to a Unix socket needs no write access to
+            // the containing directory, so a less-trusted sandbox process must
+            // not be able to create/replace/delete host directory entries.
+            Assert.True(mount.ReadOnly);
         }
         finally
         {
@@ -821,15 +851,16 @@ public sealed class CrockAgentRunnerTests
     [InlineData("/root/crock-daemon.sock")]   // parent → "/root"
     [InlineData("/proc/crock-daemon.sock")]   // parent → "/proc"
     [InlineData("/dev/crock-daemon.sock")]    // parent → "/dev"
-    public async Task CrockCredentialProvider_ForbiddenParentDirectory_RefusesCredential(string hostSocketPath)
+    [InlineData("/run/codeybox/../../etc/crock.sock")] // dot-segments → "/etc"
+    public async Task CrockCredentialProvider_ForbiddenParentDirectory_ShipsConfigWithoutMount(string hostSocketPath)
     {
         // Hard catastrophe gate: a misconfigured HostDaemonSocketPath whose
-        // parent directory is a system shared root must NOT produce a
-        // credential bundle. Returning null forces the runner's pre-flight
-        // gate to fire the MissingHostDaemonMarker; the alternative would be
-        // bind-mounting / (or /etc, /run, etc.) read-write into the sandbox
-        // and exposing every host secret to a prompt-injected agent on a
-        // single-character operator typo.
+        // parent directory canonicalises to a system shared root must NEVER be
+        // bind-mounted (that would expose every host secret to a prompt-injected
+        // agent). The provider still ships the config env (so the failure is
+        // classified as a daemon/Infrastructure problem, NOT a missing
+        // credential), but with NO mount and NO daemon env var. The runner's
+        // pre-flight then rejects with the daemon marker.
         var previous = Environment.GetEnvironmentVariable(
             CrockEnvironmentCredentialProvider.HostConfigEnvVar);
         try
@@ -841,7 +872,9 @@ public sealed class CrockAgentRunnerTests
 
             var cred = await provider.GetAsync(AgentKind.Crock);
 
-            Assert.Null(cred);
+            Assert.NotNull(cred);
+            Assert.Empty(cred!.Mounts);
+            Assert.False(cred.EnvironmentVariables.ContainsKey("CROCK_DAEMON_SOCKET"));
         }
         finally
         {
@@ -851,12 +884,12 @@ public sealed class CrockAgentRunnerTests
     }
 
     [Fact]
-    public async Task CrockCredentialProvider_RelativeHostSocketPath_RefusesCredential()
+    public async Task CrockCredentialProvider_RelativeHostSocketPath_ShipsConfigWithoutMount()
     {
-        // A bare relative filename (no parent directory) resolves
-        // Path.GetDirectoryName to empty; the provider must refuse rather
-        // than ship a daemon env var pointing at an unmounted location and
-        // letting the in-VM CLI fail late with an opaque connection error.
+        // A bare relative filename is not an absolute dedicated path; the
+        // provider must NOT mount it. Config still ships (so the runner
+        // classifies this as a daemon/Infrastructure failure), but with no
+        // daemon mount or env var.
         var previous = Environment.GetEnvironmentVariable(
             CrockEnvironmentCredentialProvider.HostConfigEnvVar);
         try
@@ -871,7 +904,9 @@ public sealed class CrockAgentRunnerTests
 
             var cred = await provider.GetAsync(AgentKind.Crock);
 
-            Assert.Null(cred);
+            Assert.NotNull(cred);
+            Assert.Empty(cred!.Mounts);
+            Assert.False(cred.EnvironmentVariables.ContainsKey("CROCK_DAEMON_SOCKET"));
         }
         finally
         {
@@ -929,7 +964,7 @@ public sealed class CrockAgentRunnerTests
         // runner without this accessor.
         SandboxOptions = static () => new CrockSandboxOptions
         {
-            HostDaemonSocketPath = "/tmp/test-crock-daemon.sock",
+            HostDaemonSocketPath = "/tmp/crockd/test-crock-daemon.sock",
         },
     };
 

@@ -224,14 +224,13 @@ public sealed class CrockCostExtractorTests
     // ── DefaultPricing surface ──────────────────────────────────────────────
 
     [Fact]
-    public void DefaultPricing_IsPostBatchDiscountOpusUpperBound()
+    public void DefaultPricing_IsNull_RatesLiveInConfigOnly()
     {
-        // The crock extractor's fallback rate must match the documented post-
-        // batch-discount Opus rate ($2.50 / $0.25 / $12.50) so an unknown
-        // model id within CrockCode's curated set never under-bills.
-        Assert.NotNull(Extractor.DefaultPricing);
-        Assert.Equal(2.50, Extractor.DefaultPricing!.InputPerMillion);
-        Assert.Equal(0.25, Extractor.DefaultPricing.CachedInputPerMillion);
-        Assert.Equal(12.50, Extractor.DefaultPricing.OutputPerMillion);
+        // The extractor holds NO compiled fallback rate: all crock rates,
+        // including the unknown-model default, live only in
+        // agent-pricing-defaults.json (the `crock` bucket plus DefaultRates.crock)
+        // so the hot-reloadable pricing config is the single source of truth and
+        // cannot drift from a stale in-source literal.
+        Assert.Null(Extractor.DefaultPricing);
     }
 }

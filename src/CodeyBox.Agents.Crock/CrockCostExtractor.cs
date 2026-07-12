@@ -18,35 +18,30 @@ namespace CodeyBox.Agents.Crock;
 /// summary line — both shapes have been observed in CrockCode preview builds,
 /// so we try the NDJSON path first and fall back to the footer pattern.</para>
 ///
-/// <para><b>Default pricing.</b> The bundled per-model rates in
+/// <para><b>Pricing.</b> The per-model rates in
 /// <c>agent-pricing-defaults.json</c> under the <c>crock</c> bucket are the
 /// post-batch-discount effective rates (half of the on-demand
 /// <c>/v1/messages</c> rate, since Anthropic applies the ~50% batch discount
-/// at billing time). The defaults here mirror those rates so the cost
-/// calculator has a sensible fallback for any model id the pricing file does
-/// not enumerate.</para>
+/// at billing time), and the unknown-model fallback lives in that file's
+/// <c>DefaultRates.crock</c> entry. This extractor holds NO compiled rate — the
+/// pricing config is the single source of truth. Cache-write tokens are folded
+/// into fresh input at the base rate, so the resulting spend is a conservative
+/// estimate, not exact billing (see the <c>crock</c> note in that file).</para>
 /// </summary>
 public sealed class CrockCostExtractor : IAgentCostExtractor
 {
     public AgentKind Kind => AgentKind.Crock;
 
     /// <summary>
-    /// Post-batch-discount fallback for any model id the pricing file does
-    /// not enumerate. Half the Anthropic on-demand <c>/v1/messages</c>
-    /// Opus-tier rate (the conservative top end <em>within CrockCode's
-    /// curated Anthropic-Claude set</em>). Operators pinning an unknown
-    /// model id from a pricier family (e.g. a future frontier model
-    /// released after this list was curated) should configure an explicit
-    /// per-model rate in <c>agent-pricing-defaults.json</c> rather than
-    /// relying on this fallback — the fallback only guarantees the upper
-    /// bound for ids the curated set already covers.
+    /// No compiled pricing fallback. All crock rates — including the
+    /// unknown-model default — live only in <c>agent-pricing-defaults.json</c>
+    /// (the <c>crock</c> per-model bucket plus its <c>DefaultRates.crock</c>
+    /// entry), so the hot-reloadable pricing config is the single source of
+    /// truth and cannot drift from a stale compiled literal. A model with no
+    /// configured rate is declined (priced at zero) rather than charged off an
+    /// in-source constant.
     /// </summary>
-    public ModelRateConfig? DefaultPricing { get; } = new()
-    {
-        InputPerMillion = 2.50,
-        CachedInputPerMillion = 0.25,
-        OutputPerMillion = 12.50,
-    };
+    public ModelRateConfig? DefaultPricing => null;
 
     private static readonly Regex InputPattern = new(
         @"(\d[\d,]*)\s+input\s+tokens?",
@@ -155,12 +150,34 @@ public sealed class CrockCostExtractor : IAgentCostExtractor
     private static void ExtractUsageCounts(
         JsonElement usage, out int inputTokens, out int outputTokens, out int cachedTokens)
     {
-        var freshInput = usage.TryGetProperty("input_tokens", out var it) && it.TryGetInt32(out var itv) ? itv : 0;
-        var cacheCreation = usage.TryGetProperty("cache_creation_input_tokens", out var cct) && cct.TryGetInt32(out var cctv) ? cctv : 0;
-        var cacheRead = usage.TryGetProperty("cache_read_input_tokens", out var crt) && crt.TryGetInt32(out var crtv) ? crtv : 0;
-        inputTokens = freshInput + cacheCreation;
-        outputTokens = usage.TryGetProperty("output_tokens", out var ot) && ot.TryGetInt32(out var otv) ? otv : 0;
+        // Terminal crock stdout is less-trusted agent/dependency output, so
+        // every counter is clamped non-negative and the fresh+cache-creation
+        // sum saturates rather than wrapping — a forged negative or an
+        // Int32-overflowing pair cannot produce a small/negative total that
+        // would false-pass a downstream budget gate.
+        var freshInput = ReadNonNegativeInt(usage, "input_tokens");
+        var cacheCreation = ReadNonNegativeInt(usage, "cache_creation_input_tokens");
+        var cacheRead = ReadNonNegativeInt(usage, "cache_read_input_tokens");
+        var output = ReadNonNegativeInt(usage, "output_tokens");
+
+        // Cache-creation (write) tokens are folded into the fresh-input bucket
+        // and therefore billed at the base input rate. Anthropic charges a
+        // 1.25x-2x premium on cache writes that ModelRateConfig has no bucket
+        // for, so this is a conservative estimate (mirrors ClaudeCostExtractor);
+        // the pricing metadata documents the result as an estimate, not exact
+        // spend.
+        inputTokens = SaturatingAdd(freshInput, cacheCreation);
+        outputTokens = output;
         cachedTokens = cacheRead;
+    }
+
+    private static int ReadNonNegativeInt(JsonElement usage, string propertyName)
+        => usage.TryGetProperty(propertyName, out var el) && el.TryGetInt32(out var v) && v > 0 ? v : 0;
+
+    private static int SaturatingAdd(int a, int b)
+    {
+        var sum = (long)a + b;
+        return sum > int.MaxValue ? int.MaxValue : (int)sum;
     }
 
     private static AgentCostSnapshot? TryParseHumanReadable(string? text)

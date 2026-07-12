@@ -1061,11 +1061,11 @@ builder.Services.AddSingleton<IAgentRunner>(_ => new AntigravityAgentRunner
     PrintTimeout = TimeSpan.FromMinutes(
         builder.Configuration.GetValue<int?>("CodeyBox:Antigravity:PrintTimeoutMinutes") ?? 20),
 });
-// Crock: scaffolded and registered, but DISABLED in shipped agent-class config.
-// Operators opt in by adding `crock` to an AgentClass member list AND setting
+// Crock: registered, but DISABLED in shipped agent-class config. Operators opt
+// in by adding `crock` to an AgentClass member list AND setting
 // CodeyBox:Crock:HostDaemonSocketPath to the on-host `crock daemon` Unix
-// socket. See docs/agents.md and CrockSandboxOptions for the tunnel-model
-// rationale.
+// socket. See the CrockCode section of docs/agents.md and CrockSandboxOptions
+// for the tunnel-model rationale and operator setup.
 builder.Services.AddSingleton<IAgentRunner>(sp => new CrockAgentRunner
 {
     SandboxOptions = () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Crock,

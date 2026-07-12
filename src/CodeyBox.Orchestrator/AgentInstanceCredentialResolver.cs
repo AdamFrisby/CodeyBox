@@ -131,16 +131,30 @@ public static class AgentInstanceCredentialResolver
             return true;
         }
 
-        // Crock: deliberately falls through to the global credential provider
-        // chain (CrockEnvironmentCredentialProvider). The crock runner credential
-        // is a TWO-PIECE bundle — the CROCK_CONFIG_JSON env var AND a bind-mount
-        // exposing the host-side `crock daemon` Unix socket's parent directory —
-        // and only the global provider has access to the sandbox-side
-        // CrockSandboxOptions needed to add that bind-mount. Per-instance
-        // CredentialReference still affects the QUOTA probe (see
-        // TryExtractQuotaCredentials below) so two crock members with distinct
-        // Anthropic keys probe with the correct token; the runner-side env+mount
-        // bundle is a sandbox-global concern.
+        if (agent == AgentKind.Crock)
+        {
+            // Ship the MEMBER'S own CrockCode config (its Anthropic key) as the
+            // sandbox-side CROCK_CONFIG_JSON so EXECUTION bills the SAME key the
+            // quota probe routed on (see TryExtractQuotaCredentials below) —
+            // otherwise a member admitted on key A would submit under the global
+            // key B. The sandbox-global daemon bind-mount is a separate concern
+            // that only the kind-scoped CrockEnvironmentCredentialProvider can
+            // build (it alone sees CrockSandboxOptions); the caller grafts that
+            // provider's mounts onto this env-only bundle. Requires a real key
+            // in the member config, else fall through to the global provider.
+            var key = CredentialFileTokenExtractor.ExtractCrockAnthropicApiKey(raw);
+            if (string.IsNullOrWhiteSpace(key))
+                return false;
+            credential = new AgentCredential(
+                AgentKind.Crock,
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["CROCK_CONFIG_JSON"] = raw,
+                },
+                new Dictionary<string, string>());
+            return true;
+        }
+
         return false;
     }
 

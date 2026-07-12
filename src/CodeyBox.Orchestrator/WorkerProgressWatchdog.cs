@@ -288,11 +288,14 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         {
             var files = await _streams.ListAsync(itemId, limit: AgentStreamStore.MaxListLimit, includeLineCount: false, ct);
             if (files.Count == 0) return null;
-            DateTimeOffset newest = files[0].CapturedAt;
+            // LastActivityAt (last append), not CapturedAt (immutable creation
+            // time), is the liveness signal: a long-batch agent advances it on
+            // every per-poll stream append while the item legitimately waits.
+            DateTimeOffset newest = files[0].LastActivityAt;
             for (var i = 1; i < files.Count; i++)
             {
-                if (files[i].CapturedAt > newest)
-                    newest = files[i].CapturedAt;
+                if (files[i].LastActivityAt > newest)
+                    newest = files[i].LastActivityAt;
             }
             return newest;
         }

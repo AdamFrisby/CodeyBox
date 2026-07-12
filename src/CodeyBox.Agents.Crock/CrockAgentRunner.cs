@@ -76,12 +76,13 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
     public const string DefaultBinary = "crock";
 
     /// <summary>
-    /// Credential env var read by the in-sandbox materialisation script. The
-    /// host-side credential provider is expected to fetch this from
-    /// <c>CODEYBOX_CROCK_CONFIG_JSON</c> (or an equivalent host-namespaced
-    /// source) and ship it inside the credential bundle. The follow-up will
-    /// add an explicit <c>AgentCredentialMapping</c> alongside the
-    /// other agents' mappings in <c>Program.cs</c>.
+    /// Credential env var read by the in-sandbox materialisation script.
+    /// <see cref="CrockEnvironmentCredentialProvider"/> fetches the config JSON
+    /// from <c>CODEYBOX_CROCK_CONFIG_JSON</c> on the host (or the per-instance
+    /// member <c>CredentialReference</c>) and ships it inside the credential
+    /// bundle under this name; the runner materialises it to
+    /// <c>~/.crockcode/config.json</c>. See <c>docs/agents.md</c> (CrockCode
+    /// section) for the operator setup.
     /// </summary>
     public const string ConfigEnvVar = "CROCK_CONFIG_JSON";
 
@@ -190,20 +191,24 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
                 Stderr: MissingCredentialMarker);
         }
 
-        // Hard pre-flight: dispatching crock without a host-side daemon would
-        // leave the Anthropic batch worker with no callback path (the public
-        // tunnel-in-VM shape is incompatible with the sandbox network model;
-        // see CrockSandboxOptions for the full rationale). Fail fast with a
-        // clear marker the operator can read in lastError instead of letting
-        // the batch hang for hours.
+        // Hard pre-flight: dispatching crock without a usable host-side daemon
+        // would leave the Anthropic batch worker with no callback path (the
+        // public tunnel-in-VM shape is incompatible with the sandbox network
+        // model; see CrockSandboxOptions for the full rationale). Validate the
+        // SAME way the credential provider decides whether to mount the socket:
+        // unset OR an unsafe/uncanonicalisable path both fail fast here as a
+        // daemon (Infrastructure) failure — never as a missing credential —
+        // instead of letting the batch hang for hours.
         var opts = SandboxOptions();
-        if (string.IsNullOrWhiteSpace(opts.HostDaemonSocketPath))
+        if (!CrockEnvironmentCredentialProvider.TryResolveMountParent(
+                opts.HostDaemonSocketPath, out _, out var daemonReason))
         {
+            var marker = BuildMissingHostDaemonMarker(daemonReason);
             return new AgentResult(
                 Success: false,
-                Summary: MissingHostDaemonMarker,
+                Summary: marker,
                 Stdout: null,
-                Stderr: MissingHostDaemonMarker);
+                Stderr: marker);
         }
 
         var write = await sandbox.ExecAsync(new SandboxExec
@@ -222,18 +227,19 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
     }
 
     /// <summary>
-    /// Marker the unavailability AgentResult surfaces when the operator has
-    /// not configured a host-side <c>crock daemon</c>. The leading
-    /// <c>"failed to materialise "</c> prefix is load-bearing: it makes
-    /// <see cref="AgentFailureClassifier.IsMaterialisationFailure"/> match,
-    /// which classifies the failure as
-    /// <see cref="AgentFailureKind.Infrastructure"/> — not a transient quota
-    /// wait — so the work item routes to operator triage instead of
-    /// bench-and-retry.
+    /// Builds the unavailability marker surfaced when the host-side
+    /// <c>crock daemon</c> socket is unusable (unset, non-absolute, or resolving
+    /// to a shared system directory). The leading <c>"failed to materialise "</c>
+    /// prefix is load-bearing: it makes
+    /// <see cref="AgentFailureClassifier.IsMaterialisationFailure"/> match, which
+    /// classifies the failure as <see cref="AgentFailureKind.Infrastructure"/> —
+    /// not a transient quota wait or a missing credential — so the work item
+    /// routes to operator triage. The <paramref name="reason"/> is a
+    /// non-sensitive structured phrase (never the raw path).
     /// </summary>
-    private const string MissingHostDaemonMarker =
-        "failed to materialise crock host daemon socket " +
-        "(CodeyBox:Crock:HostDaemonSocketPath unset); " +
+    private static string BuildMissingHostDaemonMarker(string reason) =>
+        "failed to materialise crock host daemon socket mount " +
+        $"(CodeyBox:Crock:HostDaemonSocketPath is unusable: {reason}); " +
         "in-VM public tunnels are not supported by this sandbox model";
 
     /// <summary>

@@ -1,7 +1,7 @@
 using System.Net;
 using System.Net.Http.Headers;
-using System.Text.Json;
 using Microsoft.Extensions.Logging;
+using CodeyBox.Agents;
 using CodeyBox.Core;
 
 namespace CodeyBox.Agents.Crock;
@@ -92,23 +92,20 @@ public sealed class CrockQuotaProbe : IAgentQuotaProbe
     private readonly Dictionary<(string RouteKey, string Token), ExhaustionOverride> _exhausted = new();
     private readonly SemaphoreSlim _lock = new(1, 1);
 
+    /// <summary>
+    /// Upper bound on the probe response body the client will tolerate. The
+    /// probe reads only status + headers, so a well-behaved
+    /// <c>GET /v1/models?limit=1</c> body is a few KiB; this cap is a
+    /// defence-in-depth backstop against a hostile/oversized peer response and
+    /// is enforced together with <see cref="HttpCompletionOption.ResponseHeadersRead"/>
+    /// so the body is never fully buffered.
+    /// </summary>
+    internal const long MaxResponseBytes = 64 * 1024;
+
     public AgentKind Kind => AgentKind.Crock;
 
-    /// <summary>
-    /// Parameter-less constructor preserved for the scaffold's DI registration
-    /// shape (Unknown-only fallback). The router treats this as Unknown /
-    /// Permanent because no credentials and no HTTP client are supplied;
-    /// operators wiring real probing use the full constructor below.
-    /// </summary>
-    public CrockQuotaProbe()
-        : this(httpClientFactory: null!,
-               credentialsProvider: _ => new AgentQuotaCredentials(null),
-               cacheTtl: TimeSpan.FromMinutes(1),
-               log: null!,
-               timeProvider: null)
-    {
-    }
-
+    /// <param name="cacheTtl">Positive cache lifetime; a zero/negative value is
+    /// a composition error and throws rather than silently defaulting.</param>
     public CrockQuotaProbe(
         IHttpClientFactory httpClientFactory,
         Func<AgentMembership, AgentQuotaCredentials> credentialsProvider,
@@ -116,9 +113,14 @@ public sealed class CrockQuotaProbe : IAgentQuotaProbe
         ILogger<CrockQuotaProbe> log,
         TimeProvider? timeProvider = null)
     {
+        ArgumentNullException.ThrowIfNull(httpClientFactory);
+        ArgumentNullException.ThrowIfNull(credentialsProvider);
+        ArgumentNullException.ThrowIfNull(log);
+        if (cacheTtl <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(cacheTtl), cacheTtl, "cache TTL must be positive");
         _httpClientFactory = httpClientFactory;
         _credentialsProvider = credentialsProvider;
-        _cacheTtl = cacheTtl <= TimeSpan.Zero ? TimeSpan.FromMinutes(1) : cacheTtl;
+        _cacheTtl = cacheTtl;
         _log = log;
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
@@ -129,15 +131,6 @@ public sealed class CrockQuotaProbe : IAgentQuotaProbe
         var token = credentials.AccessToken;
         if (string.IsNullOrEmpty(token))
             return AgentQuotaSnapshot.UnknownSnapshot(QuotaUnknownReason.NoCredential, "no crock API key configured");
-
-        if (_httpClientFactory is null || _log is null)
-        {
-            // Scaffold default-constructor path: no HTTP client, no logger.
-            // Still surfaces Unknown/Permanent so the router's unknown policy
-            // gates dispatch — but identifies the configuration gap clearly.
-            return AgentQuotaSnapshot.UnknownSnapshot(QuotaUnknownReason.Permanent,
-                "crock probe not wired (no HTTP client / logger)");
-        }
 
         var routeKey = member.RouteKey;
         var cacheKey = (routeKey, token);
@@ -184,13 +177,18 @@ public sealed class CrockQuotaProbe : IAgentQuotaProbe
         try
         {
             var now = _timeProvider.GetUtcNow();
+            // Normalise a past/current reset hint to null: the IAgentQuotaProbe
+            // contract says such hints are ignored, and a non-future ResetAt
+            // must never be surfaced by GetAvailabilityAsync for an otherwise
+            // active lockout.
+            var futureReset = resetAt is { } candidate && candidate > now ? candidate : (DateTimeOffset?)null;
             // Cap the lockout window at the provider-supplied reset when it
             // is sooner than the TTL — a runtime hint shouldn't push the
             // parking window past the actual reset moment.
             var expiry = now + (ttl > TimeSpan.Zero ? ttl : TimeSpan.FromMinutes(1));
-            if (resetAt is { } r && r > now && r < expiry)
+            if (futureReset is { } r && r < expiry)
                 expiry = r;
-            _exhausted[(member.RouteKey, token)] = new ExhaustionOverride(expiry, resetAt);
+            _exhausted[(member.RouteKey, token)] = new ExhaustionOverride(expiry, futureReset);
         }
         finally
         {
@@ -215,7 +213,22 @@ public sealed class CrockQuotaProbe : IAgentQuotaProbe
             request.Headers.TryAddWithoutValidation("anthropic-version", AnthropicVersion);
             request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
-            using var response = await client.SendAsync(request, ct).ConfigureAwait(false);
+            // ResponseHeadersRead returns as soon as the status line + headers
+            // are in — the probe reads neither, so the body of an oversized or
+            // slow-drip peer response is never buffered into orchestrator
+            // memory. MaxResponseBytes is a belt-and-braces cap in case a
+            // future caller does read the body.
+            using var response = await client
+                .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct)
+                .ConfigureAwait(false);
+            if (response.Content.Headers.ContentLength is { } declared && declared > MaxResponseBytes)
+            {
+                _log.LogDebug(
+                    "Crock quota probe: anthropic /v1/models response Content-Length {Len} exceeds cap {Cap}; treating as transient",
+                    declared, MaxResponseBytes);
+                return AgentQuotaSnapshot.UnknownSnapshot(QuotaUnknownReason.Transient,
+                    "anthropic: probe response too large");
+            }
 
             if (response.StatusCode == HttpStatusCode.TooManyRequests)
             {
@@ -251,8 +264,12 @@ public sealed class CrockQuotaProbe : IAgentQuotaProbe
         {
             throw;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or TimeoutException or IOException)
         {
+            // Only expected transport/timeout faults degrade to Transient.
+            // Programming/configuration faults (disposed factory, invalid URI,
+            // etc.) keep their type and stack instead of masquerading as a
+            // retryable quota blip.
             _log.LogDebug(ex, "Crock quota probe: transient failure calling anthropic /v1/models");
             return AgentQuotaSnapshot.UnknownSnapshot(QuotaUnknownReason.Transient,
                 "anthropic: transient probe error");
@@ -270,38 +287,12 @@ public sealed class CrockQuotaProbe : IAgentQuotaProbe
 
     /// <summary>
     /// Extracts the Anthropic API key from a CrockCode <c>config.json</c>
-    /// payload. CrockCode's config shape is
-    /// <c>{ "anthropic_api_key": "sk-…", "tunnel_provider": "…" }</c>; the key
-    /// extractor is tolerant of leading/trailing whitespace, alternate
-    /// casings (<c>ANTHROPIC_API_KEY</c>), and the camelCase variant
-    /// (<c>anthropicApiKey</c>) that operators sometimes hand-write. Returns
-    /// null on any parse failure — the caller treats null as "no credential".
+    /// payload via the shared <see cref="CrockConfigParser"/> — one parser feeds
+    /// both this probe and the orchestrator's per-instance credential resolver
+    /// so a config-shape change moves both boundaries together.
     /// </summary>
     public static string? TryExtractApiKey(string? configJson)
-    {
-        if (string.IsNullOrWhiteSpace(configJson)) return null;
-        try
-        {
-            using var doc = JsonDocument.Parse(configJson);
-            if (doc.RootElement.ValueKind != JsonValueKind.Object) return null;
-            foreach (var prop in doc.RootElement.EnumerateObject())
-            {
-                if (prop.Value.ValueKind != JsonValueKind.String) continue;
-                if (string.Equals(prop.Name, "anthropic_api_key", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(prop.Name, "anthropicApiKey", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(prop.Name, "ANTHROPIC_API_KEY", StringComparison.Ordinal))
-                {
-                    var raw = prop.Value.GetString();
-                    return string.IsNullOrWhiteSpace(raw) ? null : raw.Trim();
-                }
-            }
-            return null;
-        }
-        catch (JsonException)
-        {
-            return null;
-        }
-    }
+        => CrockConfigParser.TryGetAnthropicApiKey(configJson);
 
     private sealed record CacheEntry(AgentQuotaSnapshot Snapshot, DateTimeOffset ExpiresAt);
     private sealed record ExhaustionOverride(DateTimeOffset ExpiresAt, DateTimeOffset? ResetAt);
