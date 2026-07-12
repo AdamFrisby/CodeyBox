@@ -47,6 +47,24 @@ sudo chown -R "$(id -un):$(id -gn)" "$HOME/.nuget"
 chmod -R u+rwX "$HOME/.nuget"
 ```
 
+If the build user has no `sudo` (so `chown` on a root-owned `~/.nuget` is
+impossible) but *does* own its home directory, the root-owned tree can still be
+moved aside without elevation — renaming an entry needs write permission on the
+**parent** directory, not on the entry itself:
+
+```sh
+# Runs as the unprivileged build user; no sudo required.
+mv "$HOME/.nuget" "$HOME/.nuget.root-owned"          # write on $HOME suffices
+mkdir -p "$HOME/.nuget"                               # fresh, build-user-owned
+ln -s "$HOME/.nuget.root-owned/packages" "$HOME/.nuget/packages"  # reuse cache
+```
+
+The world-traversable `packages/` cache under the old tree stays readable, so
+restore reuses it instead of re-downloading, while NuGet can now create its
+`~/.nuget/NuGet/NuGet.Config` in the writable home. This was verified to make
+`dotnet build ./CodeyBox.slnx` and `dotnet test` succeed on this VM. The
+in-repo self-heal below automates this same rename-aside strategy.
+
 Prefer provisioning `~/.nuget` owned by the build user (or leaving it absent
 so `dotnet` recreates it) as part of VM baking, not at first build.
 
