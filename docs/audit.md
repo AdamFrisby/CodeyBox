@@ -217,6 +217,14 @@ not the branch — must make the NuGet home writable (a non-root-owned
 command). The solution otherwise builds warnings-clean once the home is
 writable.
 
+The recovery must run where the gates execute, which is not necessarily the
+agent's working session: an iteration is provisioned with a fresh, root-owned
+`~/.nuget`, so healing performed only inside a prior agent turn does not carry
+forward once the next iteration re-provisions. Run `reclaim-nuget-home.sh` (or
+export a writable home) on the audit host immediately before the direct
+`dotnet` gate, not merely once during authoring — a healed home read back as a
+no-op is expected, but a re-provisioned host needs the reclaim again.
+
 The recovery is encoded as `scripts/reclaim-nuget-home.sh` so it is
 discoverable and repeatable rather than tribal knowledge (run it on the host
 before the direct `dotnet` step, or once to heal a persistent home). It is
