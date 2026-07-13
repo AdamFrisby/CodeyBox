@@ -198,11 +198,22 @@ the caller's `~/.nuget`.
 redirect a `dotnet` process that a harness launches *outside* these seams (a
 bare `dotnet build`/`dotnet test` run directly on the host), because the NuGet
 home is chosen from process environment, not repository configuration. The
-audit host must make the NuGet home writable before such a step — either a
-non-root-owned `~/.nuget`, or a writable home exported before the command:
+audit host must make the NuGet home writable before such a step — a
+non-root-owned `~/.nuget`, a writable home exported before the command, or an
+unprivileged in-place reclaim of the root-owned home:
 
 ```sh
+# (a) export a writable home for the bare dotnet step
 export DOTNET_CLI_HOME="$PWD/.dotnet-cli-home" HOME="$PWD/.dotnet-cli-home"
+
+# (b) OR reclaim the inherited ~/.nuget without root: renaming/removing a
+#     directory entry needs write on its PARENT, not on the entry, and the
+#     build user owns its own home dir — so this succeeds even when ~/.nuget
+#     itself is root-owned and `sudo chown` is unavailable (the agent sandbox
+#     sets no-new-privileges, which blocks sudo entirely).
+mv ~/.nuget ~/.nuget.provisioned 2>/dev/null || true
+mkdir -p ~/.nuget/NuGet
+ln -sfn ~/.nuget.provisioned/packages ~/.nuget/packages 2>/dev/null || true
 ```
 
 With a writable home the source builds warnings-clean (`dotnet build
@@ -231,13 +242,19 @@ against `/home/ubuntu/.nuget`, whereas this branch's
 `ApplyIfDotnetInvocation` would have exported a repo-local `HOME` before the
 command ran. No commit on the branch under audit changes the already-running
 auditor, so re-running the loop reproduces the identical root-owned `~/.nuget`
-abort every iteration. The deadlock is broken only by an operator step, not by
-more agent reworks: either (a) provision the audit sandbox base image so the
-`ubuntu` user owns a writable `~/.nuget` (a fresh image has none; the
-root-owned one is created by a provisioning step that runs `dotnet`/`nuget` as
-`root`), or (b) export the writable home shown above for the gate step. Once a
-CodeyBox carrying these seams is itself the deployed auditor, the gate
-self-heals for every project with no per-repo action.
+abort every iteration. The deadlock is broken by any of: (a) provision the audit
+sandbox base image so the build user owns a writable `~/.nuget` (a fresh image
+has none; the root-owned one is created by a provisioning step that runs
+`dotnet`/`nuget` as `root`); (b) export the writable home shown above for the
+gate step; or (c) the unprivileged reclaim shown above — because the build user
+owns its home directory, the root-owned `~/.nuget` can be renamed aside and a
+writable one recreated with no `root`/`sudo` (the sandbox's no-new-privileges
+flag makes the previously-attempted `sudo chown` reclaim impossible, which is
+why earlier reclaim attempts never actually ran). Option (c) is the only one an
+unprivileged rework agent can apply itself, and it holds for the grade only when
+the audit reuses the same home the rework wrote to. Once a CodeyBox carrying
+these seams is itself the deployed auditor, the gate self-heals for every
+project with no per-repo action.
 
 
 ## Built-in auditors
