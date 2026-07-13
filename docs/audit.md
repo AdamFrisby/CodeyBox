@@ -175,9 +175,16 @@ already restored (`All projects are up-to-date for restore`), a `dotnet
 build` still creates `$HOME/.nuget/NuGet/NuGet.Config` — the user-config
 directory is materialised unconditionally while NuGet loads default
 settings, *before* `RestoreConfigFile` is consulted. There is therefore no
-committed-repo mechanism (NuGet.Config, `Directory.Build.props`, or an
-MSBuild property) that redirects this probe for a `dotnet` the harness
-launches directly; the home is chosen from process environment alone.
+committed-repo mechanism (NuGet.Config, `Directory.Build.props`, an MSBuild
+property, or a `Directory.Build.rsp` response file that injects default
+restore args) that redirects this probe for a `dotnet` the harness launches
+directly; the home is chosen from process environment alone. Re-verified
+empirically against a root-owned `~/.nuget`: passing `RestoreConfigFile`
+explicitly (`-p:RestoreConfigFile=...`) and injecting the same via a
+`Directory.Build.rsp` both still abort with the identical `.../.nuget/NuGet
+... denied`; only redirecting `DOTNET_CLI_HOME` (or `HOME`) to a writable
+directory lets restore succeed while the root-owned `~/.nuget` stays
+untouched.
 
 For every dotnet invocation CodeyBox itself launches this is handled
 automatically and needs no operator action: the `SandboxRequiredBuildVerifier`
