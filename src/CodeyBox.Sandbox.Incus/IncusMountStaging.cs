@@ -877,8 +877,13 @@ internal static class IncusMountStaging
             throw new InvalidOperationException($"Incus mount path '{path}' overlaps a protected guest system path.");
         var isCredentialPath = path == SandboxConventions.CredentialsDir
             || IncusGuestPaths.IsDescendant(path, SandboxConventions.CredentialsDir);
+        // The agent-turn scratchpad tmpfs (resume/checkpoint capture) is a provider-reserved
+        // /run tree the pipeline itself mounts; it is authorized alongside the credentials tree.
+        var isAgentTurnScratchpadPath = path == SandboxConventions.AgentTurnScratchpadDir
+            || IncusGuestPaths.IsDescendant(path, SandboxConventions.AgentTurnScratchpadDir);
         if ((path == "/run" || IncusGuestPaths.IsDescendant(path, "/run"))
-            && !isCredentialPath)
-            throw new InvalidOperationException("Caller-supplied Incus mounts under /run are reserved except for the credentials tmpfs tree.");
+            && !isCredentialPath
+            && !isAgentTurnScratchpadPath)
+            throw new InvalidOperationException("Caller-supplied Incus mounts under /run are reserved except for the credentials and agent-turn scratchpad tmpfs trees.");
     }
 }

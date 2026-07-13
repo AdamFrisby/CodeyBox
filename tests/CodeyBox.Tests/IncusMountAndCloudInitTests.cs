@@ -251,6 +251,35 @@ public sealed class IncusMountAndCloudInitTests
     }
 
     [Fact]
+    public void RunReservedTree_AuthorizesCredentialsAndAgentTurnScratchpad_RejectsOtherRunMounts()
+    {
+        // Regression: the resume framework mounts a tmpfs at AgentTurnScratchpadDir (under
+        // /run) on every work/rework run. The validator must authorize it alongside the
+        // credentials tree — otherwise every run fails "Caller-supplied Incus mounts under
+        // /run are reserved". Other /run mounts must still be rejected.
+        var credentials = new SandboxMount
+        {
+            SandboxPath = SandboxConventions.CredentialsDir,
+            Tmpfs = true,
+        };
+        var scratchpad = new SandboxMount
+        {
+            SandboxPath = SandboxConventions.AgentTurnScratchpadDir,
+            Tmpfs = true,
+        };
+
+        IncusMountStaging.ValidateAuthorizedMountGuestPath(
+            credentials, authorizedExistingHostSource: null, hostSourceIsDirectory: false);
+        IncusMountStaging.ValidateAuthorizedMountGuestPath(
+            scratchpad, authorizedExistingHostSource: null, hostSourceIsDirectory: false);
+
+        var otherRunMount = new SandboxMount { SandboxPath = "/run/not-reserved", Tmpfs = true };
+        Assert.Throws<InvalidOperationException>(() =>
+            IncusMountStaging.ValidateAuthorizedMountGuestPath(
+                otherRunMount, authorizedExistingHostSource: null, hostSourceIsDirectory: false));
+    }
+
+    [Fact]
     public void Prepare_EnforcesTmpfsBoundsAndProtectsRuntimeControlPaths()
     {
         using var fixture = new MountFixture();
