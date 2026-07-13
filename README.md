@@ -125,11 +125,16 @@ dotnet build CodeyBox.slnx
 > direct project builds and `Directory.Solution.props` for solution builds. Both
 > resolve `NuGet.Config` relative to the repository, so package-source selection is
 > independent of the caller's working directory. NuGet still inspects — and creates,
-> when absent — user-level configuration under `$HOME/.nuget/NuGet/`, so the invoking
-> account needs a **writable** home directory. In locked-down environments where that
-> path is not writable (for example a home baked read-only or owned by another user),
-> point `DOTNET_CLI_HOME` at a writable directory before building; NuGet then keeps its
-> per-user config there instead.
+> when absent — user-level configuration under `$HOME/.nuget/NuGet/`, so it needs a
+> **writable** location for that directory. In locked-down environments where the
+> inherited path is not writable (for example a home baked read-only or owned by
+> another user), NuGet otherwise aborts restore with an unauthorized-access error.
+>
+> `./build.sh` guards against this automatically: it probes the inherited
+> `.nuget/NuGet` directory and, when it is not writable, redirects `DOTNET_CLI_HOME`
+> to a fresh scratch directory for that build. A bare `dotnet build CodeyBox.slnx`
+> (or an IDE build) does not run that probe, so for those either keep the home
+> writable or set `DOTNET_CLI_HOME` to a writable directory yourself.
 
 **3. Configure a project.** Drop a JSON file somewhere and point
 `CODEYBOX_EXTRA_CONFIG` at it (it hot-reloads on change):
