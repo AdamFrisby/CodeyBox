@@ -123,9 +123,10 @@ dotnet build CodeyBox.slnx
 
 > The repository supplies its package sources through `Directory.Build.props`.
 > `Directory.Build.rsp` supplies the same restore property early enough for a
-> solution restore, keeping builds independent of the invoking account's NuGet
-> user configuration. This matters in audit and sandbox environments that can
-> inherit a home directory they cannot traverse.
+> solution restore, so package-source selection does not depend on sources in the
+> invoking account's NuGet configuration. NuGet still requires the account's home
+> directory to be writable because it initializes user-wide settings (including
+> proxy settings); fix ownership of an inherited home directory before building.
 
 **3. Configure a project.** Drop a JSON file somewhere and point
 `CODEYBOX_EXTRA_CONFIG` at it (it hot-reloads on change):

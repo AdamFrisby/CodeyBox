@@ -3,7 +3,8 @@
   <PropertyGroup>
     <!-- Project-level builds use the repository's declared package sources here.
          Directory.Build.rsp supplies the same property early enough for solution
-         restore, before NuGet attempts to discover per-user configuration. -->
+         restore to select those sources. NuGet may still inspect user-wide settings
+         for unrelated features such as proxy configuration. -->
     <RestoreConfigFile>$(MSBuildThisFileDirectory)NuGet.Config</RestoreConfigFile>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
