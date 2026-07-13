@@ -1489,6 +1489,7 @@ public sealed class IncusSandboxProvider :
             options,
             name,
             ct).ConfigureAwait(false);
+        await PrepareDotnetCliHomeAsync(options, name, ct).ConfigureAwait(false);
         if (runCloudInit)
             await WaitForCloudInitAsync(options, name, ct).ConfigureAwait(false);
         await IncusGuestLifecycle.VerifyExecWrapperAsync(
@@ -2083,6 +2084,27 @@ public sealed class IncusSandboxProvider :
             "scrub baseline cloud-init state",
             options,
             BuildRootExec(options, name, ["cloud-init", "clean", "--logs", "--machine-id"]),
+            stdin: null,
+            options.OperationTimeout,
+            ct,
+            heavyOperation: false).ConfigureAwait(false);
+    }
+
+    private async Task PrepareDotnetCliHomeAsync(
+        IncusSandboxOptions options,
+        string name,
+        CancellationToken ct)
+    {
+        await _cli.RunCheckedAsync(
+            "prepare guest dotnet CLI home",
+            options,
+            BuildRootExec(options, name,
+            [
+                "install", "-d", "-m", "0700",
+                "-o", options.GuestUserId.ToString(CultureInfo.InvariantCulture),
+                "-g", options.GuestGroupId.ToString(CultureInfo.InvariantCulture),
+                IncusCloudInit.DotnetCliHome,
+            ]),
             stdin: null,
             options.OperationTimeout,
             ct,

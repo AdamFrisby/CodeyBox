@@ -1318,6 +1318,19 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
             && command.Contains("-d", StringComparer.Ordinal)
             && command.Contains(options.GuestUserId.ToString(), StringComparer.Ordinal)
             && command.Contains("/home/ubuntu/.local/bin", StringComparer.Ordinal));
+        var dotnetCliHomePreparation = Assert.Single(commands, command =>
+            command.Contains("install", StringComparer.Ordinal)
+            && command.Contains(IncusCloudInit.DotnetCliHome, StringComparer.Ordinal));
+        var dotnetCliHomeInstallIndex = IndexOf(dotnetCliHomePreparation, "install");
+        Assert.True(dotnetCliHomeInstallIndex >= 0);
+        Assert.Equal(
+            [
+                "install", "-d", "-m", "0700",
+                "-o", options.GuestUserId.ToString(),
+                "-g", options.GuestGroupId.ToString(),
+                IncusCloudInit.DotnetCliHome,
+            ],
+            dotnetCliHomePreparation.Skip(dotnetCliHomeInstallIndex));
         Assert.DoesNotContain(commands, command =>
             command.Contains("snapshot", StringComparer.Ordinal)
             && command.Contains("create", StringComparer.Ordinal));

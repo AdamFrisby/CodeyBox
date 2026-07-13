@@ -128,6 +128,13 @@ internal static class IncusCloudInit
             .Append("', ")
             .Append(RuntimeDirectory)
             .AppendLine(" ]");
+        result.Append("  - [ install, -d, -m, '0700', -o, '")
+            .Append(options.GuestUserId)
+            .Append("', -g, '")
+            .Append(options.GuestGroupId)
+            .Append("', ")
+            .Append(DotnetCliHome)
+            .AppendLine(" ]");
         result.Append("  - [ install, -d, -m, '0700', -o, '0', -g, '0', ")
             .Append(ControlDirectory)
             .AppendLine(" ]");

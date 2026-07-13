@@ -90,6 +90,19 @@ public sealed class IncusMountAndCloudInitTests
             Directory.Delete(root, recursive: true);
         }
     }
+
+    [Fact]
+    public void CloudInit_CreatesDotnetCliHomeForGuest()
+    {
+        var options = new IncusSandboxOptions();
+        var cloudInit = IncusCloudInit.Build(options, SandboxProfileFlavor.Headless);
+
+        Assert.Contains(
+            $"[ install, -d, -m, '0700', -o, '{options.GuestUserId}', -g, '{options.GuestGroupId}', {IncusCloudInit.DotnetCliHome} ]",
+            cloudInit,
+            StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task ExecWrapper_IsValidBashAndKeepsUtilityOptionBoundaries()
     {
