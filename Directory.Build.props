@@ -1,9 +1,9 @@
 <Project>
 
   <PropertyGroup>
-    <!-- Use the repository's declared package sources after NuGet initializes.
-         NuGet still accesses the invoking account's profile before evaluating this
-         property, so that profile remains a host-level build prerequisite. -->
+    <!-- Project-level builds use the repository's declared package sources here.
+         Directory.Build.rsp supplies the same property early enough for solution
+         restore, before NuGet attempts to discover per-user configuration. -->
     <RestoreConfigFile>$(MSBuildThisFileDirectory)NuGet.Config</RestoreConfigFile>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
