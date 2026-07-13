@@ -7,10 +7,19 @@
        project-level hook in Directory.Build.props. -->
   <Import Project="$(MSBuildThisFileDirectory)Directory.NuGetHomeHeal.targets" />
 
+  <!-- Match Directory.Build.props: redirect DOTNET_CLI_HOME to a repository-local
+       writable path when the caller has not selected one, so NuGet's proxy /
+       user-config initialization cannot fail on an inaccessible user home during
+       the solution-level restore. The imported project's InitialTargets append to
+       ours, so its EnsureRepositoryDotNetCliHome runs alongside CodeyBoxHealNuGetHome. -->
+  <Import Project="$(MSBuildThisFileDirectory)eng/RepositoryBuildEnvironment.props" />
+
   <PropertyGroup>
     <!-- Solution restore evaluates this before dispatching project restores, so
          the repository config is selected even when the solution is built from
-         outside its directory. NuGet can still inspect user-level configuration. -->
+         outside its directory. NuGet can still inspect user-level configuration.
+         Set after the eng import so this explicit repository-root path wins over
+         the equivalent path the import derives relative to itself. -->
     <RestoreConfigFile>$(MSBuildThisFileDirectory)NuGet.Config</RestoreConfigFile>
   </PropertyGroup>
 

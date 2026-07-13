@@ -1,0 +1,36 @@
+<Project InitialTargets="EnsureRepositoryDotNetCliHome">
+
+  <!-- NuGet always probes and may create the user-level config while setting up
+       its HTTP proxy, even when RestoreConfigFile is explicit. Keep that
+       unavoidable state in a writable repository-local home when the caller
+       has not selected a CLI home of its own. -->
+  <PropertyGroup>
+    <RestoreConfigFile>$(MSBuildThisFileDirectory)../NuGet.Config</RestoreConfigFile>
+  </PropertyGroup>
+
+  <UsingTask
+    TaskName="EnsureRepositoryDotNetCliHomeTask"
+    TaskFactory="RoslynCodeTaskFactory"
+    AssemblyFile="$(MSBuildToolsPath)/Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <RepositoryRoot ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System" />
+      <Using Namespace="System.IO" />
+      <Code Type="Fragment" Language="cs">
+        if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("DOTNET_CLI_HOME")))
+        {
+            var repositoryRoot = Path.GetFullPath(RepositoryRoot);
+            var cliHome = Path.Combine(repositoryRoot, ".dotnet-home");
+            Environment.SetEnvironmentVariable("DOTNET_CLI_HOME", cliHome);
+        }
+      </Code>
+    </Task>
+  </UsingTask>
+
+  <Target Name="EnsureRepositoryDotNetCliHome">
+    <EnsureRepositoryDotNetCliHomeTask RepositoryRoot="$(MSBuildThisFileDirectory).." />
+  </Target>
+
+</Project>
