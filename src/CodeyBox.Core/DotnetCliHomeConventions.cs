@@ -35,6 +35,25 @@ public static class DotnetCliHomeConventions
         environment["DOTNET_CLI_HOME"] = ResolvePath(workingDirectory);
     }
 
+    /// <summary>
+    /// Stamps a writable CLI home on the environment of a single
+    /// <c>dotnet</c> invocation. Pins BOTH <c>DOTNET_CLI_HOME</c> and
+    /// <c>HOME</c> to the repo-local home: some NuGet builds derive the
+    /// user-level config directory (<c>~/.nuget/NuGet</c>) from <c>$HOME</c>
+    /// and IGNORE <c>DOTNET_CLI_HOME</c>, so pinning only the latter still lets
+    /// restore probe a root-owned <c>~/.nuget</c> and abort with "Failed to read
+    /// NuGet.Config ... denied" even though <c>DOTNET_CLI_HOME</c> is writable.
+    /// Matching <c>HOME</c> to the same directory lands every NuGet resolution
+    /// strategy on one writable home. This mirrors
+    /// <c>SandboxRequiredBuildVerifier.DotnetCliHomeSelectionScript</c> and
+    /// <c>build.sh</c>, which pin both for the same reason.
+    /// <para>Unlike <see cref="ApplyIfAbsent"/> (used at sandbox creation, where
+    /// overriding <c>HOME</c> would disturb sibling git/tool steps that need the
+    /// caller's home), this is safe to override <c>HOME</c> because callers apply
+    /// it to the per-command environment of the dotnet exec ONLY — see
+    /// <c>ShellCommandAuditor</c>. Existing <c>HOME</c>/<c>DOTNET_CLI_HOME</c>
+    /// values the caller set are respected.</para>
+    /// </summary>
     public static void ApplyIfDotnetInvocation(
         IReadOnlyList<string> argv,
         string workingDirectory,
@@ -46,6 +65,15 @@ public static class DotnetCliHomeConventions
             return;
 
         ApplyIfAbsent(environment, workingDirectory);
+
+        // Point HOME at the same CLI home resolved above so a $HOME-derived
+        // NuGet user-config directory cannot fall back to a root-owned ~/.nuget.
+        if (!environment.ContainsKey("HOME")
+            && environment.TryGetValue("DOTNET_CLI_HOME", out var cliHome)
+            && !string.IsNullOrEmpty(cliHome))
+        {
+            environment["HOME"] = cliHome;
+        }
     }
 
     public static bool IsDotnetInvocation(IReadOnlyList<string> argv)

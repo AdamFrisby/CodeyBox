@@ -191,9 +191,18 @@ automatically and needs no operator action: the `SandboxRequiredBuildVerifier`
 `BuildScript` prologue exports both `DOTNET_CLI_HOME` and `HOME` to a
 writable repo-local `.dotnet-cli-home` (writability-probed, so an inherited
 but root-owned value self-heals to the fallback), and
-`DotnetCliHomeConventions` stamps `DOTNET_CLI_HOME` on audit-tool sandboxes
-and on `dotnet` shell-auditor invocations. The repo-root `build.sh` applies
-the same writability-aware selection for the `process:build-script` gate.
+`DotnetCliHomeConventions.ApplyIfDotnetInvocation` stamps BOTH `DOTNET_CLI_HOME`
+and `HOME` on each `dotnet` shell-auditor invocation (`csharp:build-WaE`,
+`csharp:test-pass`). Pinning `DOTNET_CLI_HOME` alone was insufficient: NuGet
+builds that derive the user-config directory from `$HOME` (ignoring
+`DOTNET_CLI_HOME`) still probed a root-owned `~/.nuget` and aborted those
+gates, so `HOME` must be pinned to the same writable home — matching the
+required-build verifier and `build.sh`. (At sandbox *creation*
+`DotnetCliHomeConventions.ApplyIfAbsent` stamps only `DOTNET_CLI_HOME`, leaving
+`HOME` for sibling git/tool steps that need the caller's home; the per-command
+`ApplyIfDotnetInvocation` overrides `HOME` safely because it scopes to the
+dotnet exec.) The repo-root `build.sh` applies the same writability-aware
+selection for the `process:build-script` gate.
 
 **Operator precondition (not a repo defect).** No committed repo file can
 redirect a `dotnet` process that a harness launches *outside* these seams
