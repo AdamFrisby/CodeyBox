@@ -3134,7 +3134,8 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
     },
     quotaAvailabilitySignal: sp.GetRequiredService<IAgentQuotaAvailabilitySignal>(),
     agentAvailabilityRecoverySignal: sp.GetRequiredService<IAgentAvailabilityRecoverySignal>(),
-    pauseSignal: sp.GetRequiredService<IAgentPauseSignal>()));
+    pauseSignal: sp.GetRequiredService<IAgentPauseSignal>(),
+    auditLogger: Log.Logger));
 builder.Services.AddSingleton<TransientRetryScheduler>(sp => new TransientRetryScheduler(
     sp.GetRequiredService<IWorkItemStore>(),
     sp.GetRequiredService<WorkItemRetrier>(),

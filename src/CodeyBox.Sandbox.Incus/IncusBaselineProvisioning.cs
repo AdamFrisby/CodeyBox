@@ -1,5 +1,6 @@
 using System.Formats.Tar;
 using System.Globalization;
+using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
 using System.Text;
 using CodeyBox.Sandbox;
@@ -183,23 +184,35 @@ internal sealed class IncusProvisioningWorkspace : IDisposable
             var root = _workspaceRoot;
             if (root is null)
                 return;
-            var lease = _lease
-                ?? throw new InvalidOperationException("The Incus provisioning workspace lost its active lease.");
-            if (!TryDeleteVerifiedWorkspace(_stagingRoot, root, lease))
-                throw new IOException("The owned Incus provisioning workspace lease was not active during disposal.");
-            _workspaceRoot = null;
+            var lease = _lease;
             _lease = null;
-            lease.Dispose();
-        }
-    }
-
-    internal void ReleaseLeaseForRecovery()
-    {
-        lock (_disposeGate)
-        {
-            _lease?.Dispose();
-            _lease = null;
-            _workspaceRoot = null;
+            Exception? deletionFailure = null;
+            try
+            {
+                if (!TryDeleteVerifiedWorkspace(_stagingRoot, root, lease))
+                    throw new IOException("The owned Incus provisioning workspace lease was not active during disposal.");
+                _workspaceRoot = null;
+            }
+            catch (Exception ex)
+            {
+                deletionFailure = ex;
+            }
+            try
+            {
+                // A validation or deletion failure intentionally leaves the
+                // workspace for a later verified recovery pass, but it must
+                // never retain the lease that prevents that recovery.
+                lease?.Dispose();
+            }
+            catch (Exception releaseFailure) when (deletionFailure is not null)
+            {
+                throw new AggregateException(
+                    "Incus workspace deletion failed and its recovery lease could not be released.",
+                    deletionFailure,
+                    releaseFailure);
+            }
+            if (deletionFailure is not null)
+                ExceptionDispatchInfo.Capture(deletionFailure).Throw();
         }
     }
 

@@ -101,6 +101,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         _webhooks = webhooks;
         _time = timeProvider ?? TimeProvider.System;
         _baselineResolver = baselineResolver ?? NullBaselineImageResolver.Instance;
+        _auditLogger = auditLogger ?? Serilog.Log.Logger;
         _quotaAvailabilitySignal = quotaAvailabilitySignal;
         if (_quotaAvailabilitySignal is not null)
         {
