@@ -220,6 +220,25 @@ to read NuGet.Config ... denied`, and exporting a writable
 `HOME`/`DOTNET_CLI_HOME` is sufficient to turn all three gates green with no
 source change.
 
+**Why another rework iteration does not clear the gate (deploy-order
+deadlock).** The seams above pin a writable home for every `dotnet` that a
+CodeyBox carrying them launches, but the gate reporting these findings is
+executed by the CodeyBox build **currently deployed as the auditor** — an
+older revision that predates the seams and still launches bare `dotnet` with
+the inherited `HOME`. The evidence is in the gate output itself: it failed
+against `/home/ubuntu/.nuget`, whereas this branch's
+`SandboxRequiredBuildVerifier` prologue and `ShellCommandAuditor`
+`ApplyIfDotnetInvocation` would have exported a repo-local `HOME` before the
+command ran. No commit on the branch under audit changes the already-running
+auditor, so re-running the loop reproduces the identical root-owned `~/.nuget`
+abort every iteration. The deadlock is broken only by an operator step, not by
+more agent reworks: either (a) provision the audit sandbox base image so the
+`ubuntu` user owns a writable `~/.nuget` (a fresh image has none; the
+root-owned one is created by a provisioning step that runs `dotnet`/`nuget` as
+`root`), or (b) export the writable home shown above for the gate step. Once a
+CodeyBox carrying these seams is itself the deployed auditor, the gate
+self-heals for every project with no per-repo action.
+
 
 ## Built-in auditors
 
