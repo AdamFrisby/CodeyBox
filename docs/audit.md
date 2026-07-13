@@ -198,6 +198,16 @@ not the branch — must make the NuGet home writable (a non-root-owned
 command). The solution otherwise builds warnings-clean once the home is
 writable.
 
+The recovery is encoded as `scripts/reclaim-nuget-home.sh` so it is
+discoverable and repeatable rather than tribal knowledge (run it on the host
+before the direct `dotnet` step, or once to heal a persistent home). It is
+safe and idempotent: it acts only when `$HOME/.nuget/NuGet` is not writable,
+leaves a healthy home untouched, and — when it must reclaim — renames the
+unwritable directory aside to a numbered backup (never deleting the possibly
+root-owned contents) before recreating a writable one. Its healthy-no-op,
+create, reclaim, and unset-`HOME` branches are covered by
+`ReclaimNuGetHomeScriptTests`.
+
 **Recovery.** Either export a writable home before the gate command:
 
 ```sh
