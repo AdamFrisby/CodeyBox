@@ -105,6 +105,10 @@ public sealed class IncusMountAndCloudInitTests
         Assert.Contains("-- env -i --", IncusCloudInit.ExecWrapper, StringComparison.Ordinal);
         Assert.Contains("--clear-groups", IncusCloudInit.ExecWrapper, StringComparison.Ordinal);
         Assert.Contains("--no-new-privs", IncusCloudInit.ExecWrapper, StringComparison.Ordinal);
+        Assert.Contains(
+            $"DOTNET_CLI_HOME={IncusCloudInit.DotnetCliHome}",
+            IncusCloudInit.ExecWrapper,
+            StringComparison.Ordinal);
         var cleanup = IncusCloudInit.ExecWrapper.IndexOf("rm -f -- \"$env_file\"", StringComparison.Ordinal);
         var launch = IncusCloudInit.ExecWrapper.IndexOf("setsid -- setpriv", StringComparison.Ordinal);
         Assert.True(cleanup >= 0 && cleanup < launch, "secret environment file must be removed before the agent starts");

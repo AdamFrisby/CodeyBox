@@ -1289,6 +1289,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         Assert.Contains($"--reuid={options.GuestUserId}", verification);
         Assert.Contains($"--regid={options.GuestGroupId}", verification);
         Assert.Contains($"PATH={IncusCloudInit.NonLoginPath}", verification);
+        Assert.Contains($"DOTNET_CLI_HOME={IncusCloudInit.DotnetCliHome}", verification);
         var verificationBoundary = IndexOf(verification, "--");
         Assert.True(verificationBoundary >= 0);
         Assert.Equal(
@@ -1305,6 +1306,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
                 "-i",
                 "--",
                 $"HOME={options.GuestHome}",
+                $"DOTNET_CLI_HOME={IncusCloudInit.DotnetCliHome}",
                 $"PATH={IncusCloudInit.NonLoginPath}",
                 "LANG=C.UTF-8",
                 "probe-tool",

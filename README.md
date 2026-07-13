@@ -123,8 +123,9 @@ dotnet build CodeyBox.slnx
 
 > The repository supplies its package sources through `Directory.Build.props` for
 > direct project builds and `Directory.Solution.props` for solution builds. Both
-> resolve `NuGet.Config` relative to the repository, so restore remains independent
-> of the caller's working directory and inherited user-profile permissions.
+> resolve `NuGet.Config` relative to the repository, so package-source selection is
+> independent of the caller's working directory. NuGet still inspects user-level
+> configuration; the invoking account therefore needs a readable home directory.
 
 **3. Configure a project.** Drop a JSON file somewhere and point
 `CODEYBOX_EXTRA_CONFIG` at it (it hot-reloads on change):

@@ -2,8 +2,8 @@
 
   <PropertyGroup>
     <!-- Solution restore evaluates this before dispatching project restores, so
-         the repository config is selected without consulting an inherited user
-         profile and remains correct when the solution is built from elsewhere. -->
+         the repository config is selected even when the solution is built from
+         outside its directory. NuGet can still inspect user-level configuration. -->
     <RestoreConfigFile>$(MSBuildThisFileDirectory)NuGet.Config</RestoreConfigFile>
   </PropertyGroup>
 

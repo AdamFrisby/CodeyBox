@@ -2010,6 +2010,7 @@ public sealed class IncusSandboxProvider :
             "-i",
             "--",
             $"HOME={options.GuestHome}",
+            $"DOTNET_CLI_HOME={IncusCloudInit.DotnetCliHome}",
             $"PATH={IncusCloudInit.NonLoginPath}",
             "LANG=C.UTF-8",
         };
