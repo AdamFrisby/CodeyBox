@@ -4841,7 +4841,8 @@ internal static class MultipassDaemonRetry
         ILogger log,
         WorkItemId? workItemId,
         CancellationToken ct,
-        MultipassDaemonRetryPolicy? policy = null)
+        MultipassDaemonRetryPolicy? policy = null,
+        Serilog.ILogger? auditLogger = null)
     {
         ArgumentNullException.ThrowIfNull(argv);
         ArgumentNullException.ThrowIfNull(action);
@@ -4849,6 +4850,7 @@ internal static class MultipassDaemonRetry
         ArgumentNullException.ThrowIfNull(log);
 
         policy ??= MultipassDaemonRetryPolicy.Default;
+        auditLogger ??= Serilog.Log.Logger;
         if (policy.MaxAttempts < 1) throw new ArgumentOutOfRangeException(nameof(policy.MaxAttempts));
         if (policy.Backoffs.Count < policy.MaxAttempts - 1)
             throw new ArgumentException("Backoffs must contain one delay per retry.", nameof(policy));
@@ -4872,7 +4874,7 @@ internal static class MultipassDaemonRetry
             var retryOrdinal = attempt;
             var probe = await healthProbe(ct).ConfigureAwait(false);
             var delay = policy.Backoffs[attempt - 1];
-            AuditTransientRetry(workItemId, operation, retryOrdinal, errorClass, policy.AuditLogger);
+            AuditTransientRetry(workItemId, operation, retryOrdinal, errorClass, policy.AuditLogger ?? auditLogger);
 
             if (retryOrdinal == 1)
             {

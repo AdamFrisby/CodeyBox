@@ -2510,7 +2510,8 @@ builder.Services.AddSingleton<IAgentSupervisionNotifier>(sp =>
 builder.Services.AddSingleton<IAgentSupervisionService>(sp => new AgentSupervisionService(
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.AgentSupervision,
     sp.GetRequiredService<IAgentSupervisionNotifier>(),
-    sp.GetRequiredService<ILogger<AgentSupervisionService>>()));
+    sp.GetRequiredService<ILogger<AgentSupervisionService>>(),
+    Log.Logger));
 
 // --- Audit timeline reader ---------------------------------------------------
 builder.Services.AddSingleton(sp =>

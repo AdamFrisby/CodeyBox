@@ -613,7 +613,7 @@ public sealed class IncusSandboxLifecycleTests
         SandboxLiveCounter.Increment();
 
         var firstDispose = sandbox.DisposeAsync().AsTask();
-        await runner.DeleteStarted.WaitAsync(TimeSpan.FromSeconds(5));
+        await runner.AbsenceProbeStarted.WaitAsync(TimeSpan.FromSeconds(5));
         await AdvanceUntilCompletedAsync(time, firstDispose, TimeSpan.FromMilliseconds(10));
         await Assert.ThrowsAsync<TimeoutException>(() => firstDispose);
 
@@ -3591,11 +3591,12 @@ public sealed class IncusSandboxLifecycleTests
         private bool _deleted;
         private string? _recoveryTokenHash;
         private string? _recoveryManifestHash;
-        private readonly TaskCompletionSource _deleteStarted = new(
+        private bool _deleteIssued;
+        private readonly TaskCompletionSource _absenceProbeStarted = new(
             TaskCreationOptions.RunContinuationsAsynchronously);
         internal bool CompleteDeletion { get; set; }
         internal int DeleteCalls { get; private set; }
-        internal Task DeleteStarted => _deleteStarted.Task;
+        internal Task AbsenceProbeStarted => _absenceProbeStarted.Task;
 
         internal void SetRecoveryBinding(string tokenHash, string manifestHash) =>
             (_recoveryTokenHash, _recoveryManifestHash) = (tokenHash, manifestHash);
@@ -3614,6 +3615,8 @@ public sealed class IncusSandboxLifecycleTests
             ct.ThrowIfCancellationRequested();
             if (argv.Contains("list", StringComparer.Ordinal))
             {
+                if (_deleteIssued)
+                    _absenceProbeStarted.TrySetResult();
                 var json = _deleted
                     ? "[]"
                     : OwnedInstanceJson(sandboxName, "RUNNING", _recoveryTokenHash, _recoveryManifestHash);
@@ -3622,7 +3625,7 @@ public sealed class IncusSandboxLifecycleTests
             if (argv.Contains("delete", StringComparer.Ordinal))
             {
                 DeleteCalls++;
-                _deleteStarted.TrySetResult();
+                _deleteIssued = true;
                 _deleted = CompleteDeletion;
                 return Task.FromResult(new ProcessRunResult(0, string.Empty, string.Empty));
             }
