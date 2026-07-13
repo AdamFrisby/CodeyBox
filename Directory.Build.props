@@ -1,6 +1,10 @@
 <Project>
 
   <PropertyGroup>
+    <!-- Keep restore independent of the invoking account's NuGet profile. Audit and
+         sandbox users can inherit a HOME they cannot traverse; an explicit config
+         prevents NuGet from loading that inaccessible per-user configuration. -->
+    <RestoreConfigFile>$(MSBuildThisFileDirectory)NuGet.Config</RestoreConfigFile>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
