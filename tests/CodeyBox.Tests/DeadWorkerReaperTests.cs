@@ -57,18 +57,61 @@ public sealed class DeadWorkerReaperTests : IDisposable
         State = state,
     };
 
-    private async Task PlantDeadWorkerAsync(string workerId, string? workItemId)
+    private async Task PlantDeadWorkerAsync(
+        string workerId,
+        string? workItemId,
+        string hostName = "host",
+        int processId = 1,
+        DateTimeOffset? startedAt = null)
     {
         var reg = new WorkerRegistration
         {
             WorkerId = workerId,
-            HostName = "host",
-            ProcessId = 1,
-            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-10),
+            HostName = hostName,
+            ProcessId = processId,
+            StartedAt = startedAt ?? DateTimeOffset.UtcNow.AddMinutes(-10),
             LastHeartbeatAt = DateTimeOffset.UtcNow.AddMinutes(-10),
             CurrentWorkItemId = workItemId,
         };
         await _registry.RegisterAsync(reg);
+    }
+
+    private async Task<WorkItem> CreateClaimedCheckpointItemAsync()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        var archive = new AgentTurnScratchpadArchive([4, 5, 6]);
+        var checkpointRef = AgentTurnCheckpointRef.Create(
+            item.Id,
+            new string('a', 40),
+            archive);
+        var checkpoint = new AgentTurnResumeCheckpoint(
+                AgentKind.Claude,
+                "claude/default",
+                modelId: null,
+                reasoningMode: null,
+                nativeSessionId: null,
+                WorkItemState.Working,
+                AgentTurnResumePhase.Work,
+                iteration: null,
+                item.PromptRevision,
+                DateTimeOffset.UtcNow.AddMinutes(-10))
+            .ClaimDispatch(Guid.Parse("87d51b7f-65d3-44e7-9a13-70cdd98d4bf9"));
+        var checkpointed = item with
+        {
+            Agent = AgentKind.Claude,
+            AgentInstanceId = "claude/default",
+            WorkBranch = "codeybox/dead-worker-claim",
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            PreemptedAt = DateTimeOffset.UtcNow.AddMinutes(-10),
+            PreemptCheckpoint = checkpointRef.Value,
+            AgentTurnResumeCheckpoint = checkpoint,
+        };
+        await _store.CreateAsync(checkpointed);
+        await ((IAgentTurnScratchpadStore)_store).SaveAsync(
+            checkpointed.Id,
+            checkpointRef,
+            archive);
+        return checkpointed;
     }
 
     private static async Task<SqliteConnection> OpenExternalWriterLockAsync(string dbPath)
@@ -193,6 +236,184 @@ public sealed class DeadWorkerReaperTests : IDisposable
     }
 
     [Fact]
+    public async Task Reaper_ClaimedCheckpoint_RemoteOwnerFailsClosedAndStartupSweepDoesNotBypassFence()
+    {
+        var item = await CreateClaimedCheckpointItemAsync();
+        await PlantDeadWorkerAsync(
+            Guid.NewGuid().ToString(),
+            item.Id.ToString(),
+            hostName: "remote-host",
+            processId: 42);
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+        await _reaper.SweepStrandedItemsAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(item.AgentTurnResumeCheckpoint?.DispatchClaimId,
+            after.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        Assert.Equal(0, after.RecoveryAttempts);
+        Assert.Equal(0, _queue.Count);
+        Assert.Single(await _registry.ListAsync());
+    }
+
+    [Fact]
+    public async Task Reaper_ClaimedCheckpoint_LocalOwnerQuiescesBeforeClaimReleaseAndRequeue()
+    {
+        var item = await CreateClaimedCheckpointItemAsync();
+        await PlantDeadWorkerAsync(
+            Guid.NewGuid().ToString(),
+            item.Id.ToString(),
+            Environment.MachineName,
+            Environment.ProcessId,
+            startedAt: DateTimeOffset.UtcNow);
+        using var cancellations = new CancellationRegistry();
+        using var registration = cancellations.Register(item.Id);
+        var cancellationObserved = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cancellationObservation = registration.Token.Register(
+            () => cancellationObserved.TrySetResult());
+        var reaper = new DeadWorkerReaper(
+            _registry,
+            _store,
+            _queue,
+            _opts,
+            NullLogger<DeadWorkerReaper>.Instance,
+            _webhooks,
+            cancellationRegistry: cancellations);
+
+        var recovery = reaper.RunOnceAsync(CancellationToken.None);
+        await cancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.False(recovery.IsCompleted);
+        var whileOwnerActive = await _store.GetAsync(item.Id);
+        Assert.Equal(item.AgentTurnResumeCheckpoint?.DispatchClaimId,
+            whileOwnerActive?.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        Assert.Equal(0, _queue.Count);
+
+        registration.Dispose();
+        await recovery.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Null(after.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Equal(1, _queue.Count);
+    }
+
+    [Fact]
+    public async Task Reaper_ClaimedCheckpoint_LocalOwnerDoesNotQuiesce_FailsClosedAtBound()
+    {
+        var item = await CreateClaimedCheckpointItemAsync();
+        await PlantDeadWorkerAsync(
+            Guid.NewGuid().ToString(),
+            item.Id.ToString(),
+            Environment.MachineName,
+            Environment.ProcessId,
+            startedAt: DateTimeOffset.UtcNow);
+        using var cancellations = new CancellationRegistry();
+        using var registration = cancellations.Register(item.Id);
+        var boundedOptions = new DeadWorkerOptions
+        {
+            HeartbeatInterval = TimeSpan.FromMilliseconds(5),
+            DeadWorkerThreshold = TimeSpan.FromMilliseconds(25),
+            CheckInterval = TimeSpan.FromMinutes(1),
+            MaxRecoveryAttempts = 2,
+        };
+        var reaper = new DeadWorkerReaper(
+            _registry,
+            _store,
+            _queue,
+            boundedOptions,
+            NullLogger<DeadWorkerReaper>.Instance,
+            _webhooks,
+            cancellationRegistry: cancellations);
+
+        await reaper.RunOnceAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+        await reaper.SweepStrandedItemsAsync(CancellationToken.None);
+
+        Assert.True(registration.Token.IsCancellationRequested);
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(item.AgentTurnResumeCheckpoint?.DispatchClaimId,
+            after.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        Assert.Equal(0, after.RecoveryAttempts);
+        Assert.Equal(0, _queue.Count);
+        Assert.Single(await _registry.ListAsync());
+    }
+
+    [Fact]
+    public async Task Reaper_ClaimedCheckpoint_ExitedSameHostProcessReleasesAndRequeues()
+    {
+        var item = await CreateClaimedCheckpointItemAsync();
+        var priorProcessId = Environment.ProcessId == int.MaxValue
+            ? int.MaxValue - 1
+            : Environment.ProcessId + 1;
+        await PlantDeadWorkerAsync(
+            Guid.NewGuid().ToString(),
+            item.Id.ToString(),
+            Environment.MachineName,
+            priorProcessId);
+        var reaper = new DeadWorkerReaper(
+            _registry,
+            _store,
+            _queue,
+            _opts,
+            NullLogger<DeadWorkerReaper>.Instance,
+            _webhooks,
+            localProcessMayBeRunning: _ => false);
+
+        await reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Null(after.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Equal(1, _queue.Count);
+    }
+
+    [Fact]
+    public async Task Reaper_ClaimedCheckpoint_ReusedPidFromPriorProcessEpochReleasesAndRequeues()
+    {
+        var item = await CreateClaimedCheckpointItemAsync();
+        await PlantDeadWorkerAsync(
+            Guid.NewGuid().ToString(),
+            item.Id.ToString(),
+            Environment.MachineName,
+            Environment.ProcessId,
+            startedAt: DateTimeOffset.UnixEpoch);
+        var reaper = new DeadWorkerReaper(
+            _registry,
+            _store,
+            _queue,
+            _opts,
+            NullLogger<DeadWorkerReaper>.Instance,
+            _webhooks);
+
+        await reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Null(after.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Equal(1, _queue.Count);
+    }
+
+    [Fact]
+    public async Task StartupSweep_ClaimedCheckpointWithoutWorker_ReleasesAndRequeues()
+    {
+        var item = await CreateClaimedCheckpointItemAsync();
+
+        await _reaper.SweepStrandedItemsAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Null(after.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Equal(1, _queue.Count);
+    }
+
+    [Fact]
     public async Task Reaper_WorkingWithPreemptCheckpoint_AtRecoveryCap_Abandons()
     {
         var item = MakeItem(WorkItemState.Working) with
@@ -211,6 +432,49 @@ public sealed class DeadWorkerReaperTests : IDisposable
         Assert.Equal("exceeded MaxRecoveryAttempts", after.LastError);
         Assert.Equal(_opts.MaxRecoveryAttempts + 1, after.RecoveryAttempts);
         Assert.Null(after.PreemptCheckpoint);
+        Assert.Equal(0, _queue.Count);
+    }
+
+    [Fact]
+    public async Task Reaper_WorkingWithRetainedSandbox_AtRecoveryCap_PreservesOperatorRecoveryBoundary()
+    {
+        var item = MakeItem(WorkItemState.Working);
+        var checkpoint = new AgentTurnResumeCheckpoint(
+            AgentKind.Claude,
+            "claude/default",
+            modelId: null,
+            reasoningMode: null,
+            nativeSessionId: null,
+            WorkItemState.Working,
+            AgentTurnResumePhase.Work,
+            iteration: null,
+            item.PromptRevision,
+            DateTimeOffset.UtcNow.AddMinutes(-10));
+        var lease = new SandboxRecoveryLease(
+            "incus",
+            $"retained-{item.Id}",
+            $"token-{item.Id}");
+        item = item with
+        {
+            RecoveryAttempts = _opts.MaxRecoveryAttempts,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            PreemptedAt = DateTimeOffset.UtcNow.AddMinutes(-10),
+            AgentTurnResumeCheckpoint = checkpoint,
+            AgentTurnRecoveryLease = lease,
+        };
+        await _store.CreateAsync(item);
+        await PlantDeadWorkerAsync(Guid.NewGuid().ToString(), item.Id.ToString());
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, after!.State);
+        Assert.Equal("exceeded MaxRecoveryAttempts", after.LastError);
+        Assert.Equal(_opts.MaxRecoveryAttempts + 1, after.RecoveryAttempts);
+        Assert.Equal(checkpoint, after.AgentTurnResumeCheckpoint);
+        Assert.Equal(lease, after.AgentTurnRecoveryLease);
+        Assert.True(after.HasAgentTurnRecoveryBoundary);
         Assert.Equal(0, _queue.Count);
     }
 

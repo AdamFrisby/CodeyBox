@@ -1832,6 +1832,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         private string? _instanceName;
         private string _instanceStatus = "STOPPED";
         private Dictionary<string, string> _instanceConfig = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, string> _guestLinks = new(StringComparer.Ordinal);
         private bool _projectExists;
         private Dictionary<string, string> _projectConfig = new(StringComparer.Ordinal);
 
@@ -1959,6 +1960,20 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
                         "raw-secret-output",
                         "raw-secret-output"));
                 }
+                var linkIndex = IndexOf(argv, "ln");
+                if (linkIndex >= 0
+                    && argv.Contains("-sfnT", StringComparer.Ordinal)
+                    && argv.Count >= 2)
+                {
+                    _guestLinks[argv[^1]] = argv[^2];
+                    return Success();
+                }
+                var readLinkIndex = IndexOf(argv, "readlink");
+                if (readLinkIndex >= 0
+                    && _guestLinks.TryGetValue(argv[^1], out var linkTarget))
+                {
+                    return Success(linkTarget + "\n");
+                }
                 if (_failGuestCleanup
                     && argv.Contains("rm", StringComparer.Ordinal)
                     && argv.Any(argument => argument.Contains("/provision-", StringComparison.Ordinal)))
@@ -2005,6 +2020,17 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
                 && argv.Contains("unset", StringComparer.Ordinal))
             {
                 _instanceConfig.Remove(argv[^1]);
+                return Success();
+            }
+            var configIndex = IndexOf(argv, "config");
+            if (configIndex >= 0
+                && configIndex + 3 < argv.Count
+                && string.Equals(argv[configIndex + 1], "set", StringComparison.Ordinal))
+            {
+                var field = argv[configIndex + 3];
+                var separator = field.IndexOf('=');
+                if (separator > 0)
+                    _instanceConfig[field[..separator]] = field[(separator + 1)..];
                 return Success();
             }
             if (argv.Contains("config", StringComparer.Ordinal))

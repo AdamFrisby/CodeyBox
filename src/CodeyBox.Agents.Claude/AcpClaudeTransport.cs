@@ -262,6 +262,7 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                 exec_result = await _open.Sandbox.ExecAsync(exec, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) { throw; }
+            catch (SandboxExecutionUnavailableException) { throw; }
             catch (Exception ex)
             {
                 throw new AcpTransportUnavailableException(
@@ -273,6 +274,19 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                 : exec_result.Stdout ?? string.Empty;
 
             var observed = ObserveBridgeOutput(combinedStdout);
+
+            if (exec_result.ExecutionUnavailable)
+            {
+                var unavailable = new AgentResult(
+                    Success: false,
+                    Summary: "ACP bridge execution became unavailable",
+                    Stdout: combinedStdout,
+                    Stderr: observed.Stderr ?? exec_result.Stderr)
+                {
+                    ExecutionUnavailable = true,
+                };
+                return new ClaudeTransportTurnResult(unavailable, combinedStdout, observed.SessionId);
+            }
 
             if (observed.Fatal is { } fatal)
             {
@@ -299,8 +313,12 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                 throw new AcpTransportUnavailableException(reason);
             }
 
-            var agentSuccess = observed.TurnError is null && observed.Complete is not null;
-            var summary = agentSuccess
+            var agentSuccess = !exec_result.ExecutionUnavailable
+                && observed.TurnError is null
+                && observed.Complete is not null;
+            var summary = exec_result.ExecutionUnavailable
+                ? "ACP bridge execution became unavailable"
+                : agentSuccess
                 ? "ok"
                 : observed.TurnError is { } te
                     ? $"acp turn error: {te.Message ?? "unknown"}"
@@ -314,7 +332,10 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                 Success: agentSuccess,
                 Summary: summary,
                 Stdout: stdoutForExtractor,
-                Stderr: observed.Stderr ?? exec_result.Stderr);
+                Stderr: observed.Stderr ?? exec_result.Stderr)
+            {
+                ExecutionUnavailable = exec_result.ExecutionUnavailable,
+            };
 
             // Reactive thinking-block 400 recovery — the same safety net the
             // print transport's RunSessionTurnAsync runs. If the turn surfaced
@@ -335,6 +356,7 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                         retryResult = await _open.Sandbox.ExecAsync(exec, ct).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException) { throw; }
+                    catch (SandboxExecutionUnavailableException) { throw; }
                     catch (Exception ex)
                     {
                         throw new AcpTransportUnavailableException(
@@ -342,7 +364,24 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                     }
                     var retryStdout = stdoutBuf.Length > 0 ? stdoutBuf.ToString() : retryResult.Stdout ?? string.Empty;
                     var retryObserved = ObserveBridgeOutput(retryStdout);
-                    var retrySuccess = retryObserved.TurnError is null && retryObserved.Complete is not null;
+                    if (retryResult.ExecutionUnavailable)
+                    {
+                        var unavailable = new AgentResult(
+                            Success: false,
+                            Summary: "ACP bridge execution became unavailable during post-sanitise retry",
+                            Stdout: retryStdout,
+                            Stderr: retryObserved.Stderr ?? retryResult.Stderr)
+                        {
+                            ExecutionUnavailable = true,
+                        };
+                        return new ClaudeTransportTurnResult(
+                            unavailable,
+                            retryStdout,
+                            retryObserved.SessionId ?? observed.SessionId);
+                    }
+                    var retrySuccess = !retryResult.ExecutionUnavailable
+                        && retryObserved.TurnError is null
+                        && retryObserved.Complete is not null;
                     if (retryObserved.TurnError is null && retryObserved.Complete is null)
                     {
                         var reason = retryObserved.TimedOut
@@ -356,9 +395,16 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                         : retryStdout;
                     result = new AgentResult(
                         Success: retrySuccess,
-                        Summary: retrySuccess ? "ok (post-sanitise retry)" : summary,
+                        Summary: retryResult.ExecutionUnavailable
+                            ? "ACP bridge execution became unavailable during post-sanitise retry"
+                            : retrySuccess
+                                ? "ok (post-sanitise retry)"
+                                : summary,
                         Stdout: retryShim,
-                        Stderr: retryObserved.Stderr ?? retryResult.Stderr);
+                        Stderr: retryObserved.Stderr ?? retryResult.Stderr)
+                    {
+                        ExecutionUnavailable = retryResult.ExecutionUnavailable,
+                    };
                     return new ClaudeTransportTurnResult(result, retryShim, retryObserved.SessionId ?? observed.SessionId);
                 }
                 else

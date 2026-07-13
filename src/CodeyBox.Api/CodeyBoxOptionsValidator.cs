@@ -263,6 +263,11 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         {
             failures.Add("CodeyBox:PipelineTuning:MaxSandboxReuses must be >= 1");
         }
+        if (options.PipelineTuning.MaxRetainedAgentTurnSandboxes is < 1 or > 256)
+        {
+            failures.Add(
+                "CodeyBox:PipelineTuning:MaxRetainedAgentTurnSandboxes must be between 1 and 256");
+        }
         if (!PlanReviewIterationLimit.TryCreate(options.PipelineTuning.MaxPlanReviewIterations, out _))
         {
             failures.Add(

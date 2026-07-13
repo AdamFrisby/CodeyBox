@@ -15,6 +15,7 @@ namespace CodeyBox.Agents;
 public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAgentRunner, IAgentCredentialEnvironmentPolicy
 {
     private const string AgentRunIdEnvironmentVariable = "CODEYBOX_AGENT_RUN_ID";
+    private const string NativeSessionRetryCheckpointRef = "codeybox:native-session-retry";
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> ActiveAgentRunIds = new();
 
     public abstract AgentKind Kind { get; }
@@ -148,7 +149,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     /// <see cref="ICliSessionResumableAgentRunner"/> should override this hook.
     /// </summary>
     protected virtual AgentInvocation BuildSessionResumeInvocation(
-        string sessionId,
+        AgentNativeSessionId sessionId,
         string prompt,
         AgentCredential? credential,
         string? modelId = null,
@@ -202,6 +203,35 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 Stderr: ex.Message);
         }
 
+        if (credential is not null)
+        {
+            foreach (var (relativePath, contents) in credential.Files)
+            {
+                try
+                {
+                    await SandboxCredentialFileWriter.WriteAsync(
+                        sandbox,
+                        new SandboxCredentialFileTarget(
+                            SandboxCredentialFileRoot.CredentialsDirectory,
+                            relativePath),
+                        contents,
+                        SandboxCredentialOverwritePolicy.Overwrite,
+                        ct).ConfigureAwait(false);
+                }
+                catch (SandboxCredentialFileWriteException ex)
+                {
+                    return new AgentResult(
+                        Success: false,
+                        Summary: $"failed to re-materialise agent credential bundle: exit {ex.ExitCode}",
+                        Stdout: ex.Stdout,
+                        Stderr: ex.Stderr)
+                    {
+                        ExecutionUnavailable = ex.ExecutionUnavailable,
+                    };
+                }
+            }
+        }
+
         var agentPreparation = await PrepareAgentSandboxAsync(
             sandbox, workingDirectory, credential, resume, ct).ConfigureAwait(false);
         if (agentPreparation is not null)
@@ -246,7 +276,10 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                         Success: false,
                         Summary: $"failed to materialise {materialization.File.FailureDescription}: exit {ex.ExitCode}",
                         Stdout: ex.Stdout,
-                        Stderr: ex.Stderr);
+                        Stderr: ex.Stderr)
+                    {
+                        ExecutionUnavailable = ex.ExecutionUnavailable,
+                    };
                 }
             }
             else if (materialization.FromSandboxEnvironment)
@@ -261,7 +294,10 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                         Success: false,
                         Summary: $"failed to materialise {materialization.File.FailureDescription}: exit {write.ExitCode}",
                         Stdout: write.Stdout,
-                        Stderr: write.Stderr);
+                        Stderr: write.Stderr)
+                    {
+                        ExecutionUnavailable = write.ExecutionUnavailable,
+                    };
                 }
             }
         }
@@ -430,13 +466,34 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         bool captureStructuredStream)
     {
         if (RejectUnsupportedFileBackedCredentials(sandbox, credential) is { } unsupported)
-            return unsupported;
+            return PreserveNativeSessionId(unsupported, resume.NativeSessionId);
 
-        await RestoreScratchpadAsync(sandbox, workingDirectory, resume, ct);
+        try
+        {
+            await RestoreScratchpadAsync(sandbox, workingDirectory, resume, ct);
+        }
+        catch (SandboxExecutionUnavailableException ex)
+        {
+            throw new AgentResumePreparationUnavailableException(ex.ExitCode, ex);
+        }
 
-        var preparation = await PrepareSandboxForRunAsync(sandbox, workingDirectory, credential, resume, ct);
+        AgentResult? preparation;
+        try
+        {
+            preparation = await PrepareSandboxForRunAsync(sandbox, workingDirectory, credential, resume, ct);
+        }
+        catch (SandboxExecutionUnavailableException ex)
+        {
+            throw new AgentResumePreparationUnavailableException(ex.ExitCode, ex);
+        }
+        if (preparation?.ExecutionUnavailable == true)
+        {
+            var preparationExitCode = AgentSuspendResilience.ParseAgentExitCode(preparation.Summary);
+            throw new AgentResumePreparationUnavailableException(
+                preparationExitCode >= 0 ? preparationExitCode : null);
+        }
         if (preparation is not null)
-            return preparation;
+            return PreserveNativeSessionId(preparation, resume.NativeSessionId);
 
         var invocation = BuildResumeInvocation(
             prompt,
@@ -458,8 +515,17 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 credential,
                 modelId,
                 reasoningMode,
-                captureStructuredStream));
+                captureStructuredStream,
+                initialNativeSessionId: resume.NativeSessionId,
+                resumeContext: resume));
     }
+
+    private static AgentResult PreserveNativeSessionId(
+        AgentResult result,
+        AgentNativeSessionId? nativeSessionId) =>
+        nativeSessionId is null || result.Success
+            ? result
+            : result with { NativeSessionId = nativeSessionId };
 
     private async Task<AgentResult> ExecuteWithSuspendResilienceAsync(
         ISandbox sandbox,
@@ -478,7 +544,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         // Tracked across the retry loop so a session id captured on attempt N
         // can drive the rebuild on attempt N+1 even if attempt N+1 itself
         // crashes before re-emitting the init event.
-        string? capturedSessionId = null;
+        var capturedSessionId = sessionResumeContext?.InitialNativeSessionId;
         while (true)
         {
             last = await ExecuteInvocationOnceAsync(
@@ -489,8 +555,6 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 stdoutChunkCallback,
                 captureStructuredStream,
                 ct);
-            if (last.Success)
-                return last;
 
             // Session id extraction requires the CLI's structured (id-bearing)
             // output mode: plain stdout on the model-controlled call paths
@@ -505,13 +569,24 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             if (sessionResumeContext is not null
                 && (!sessionResumeContext.Capability.RequiresStructuredStreamForSessionId
                     || sessionResumeContext.CaptureStructuredStream)
-                && sessionResumeContext.Capability.TryExtractSessionId(last.Stdout) is { Length: > 0 } freshId)
+                && AgentNativeSessionId.TryCreate(
+                    sessionResumeContext.Capability.TryExtractSessionId(last.Stdout)) is { } freshId)
             {
                 capturedSessionId = freshId;
             }
 
+            if (capturedSessionId is not null)
+                last = last with { NativeSessionId = capturedSessionId };
+
+            // A few CLIs report quota/auth termination in structured output
+            // while still exiting zero. Preserve the id before returning so
+            // the pipeline can checkpoint that exact conversation when its
+            // clean-exit/no-diff classifier recognizes the terminal event.
+            if (last.Success)
+                return last;
+
             var classification = ((IAgentRunner)this).ClassifyFailure(last);
-            var exitCode = ParseExitCodeFromSummary(last.Summary);
+            var exitCode = AgentSuspendResilience.ParseAgentExitCode(last.Summary);
 
             // Classify FIRST: a captured session id is not by itself a license
             // to relaunch. Deterministic auth failures and terminal API crashes
@@ -520,7 +595,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             // bounded budget.
             if (sessionResumeContext is not null
                 && capturedSessionId is not null
-                && IsResumeEligibleFailure(classification, exitCode)
+                && IsResumeEligibleFailure(classification, exitCode, last.ExecutionUnavailable)
                 && SessionResumeQuotaGate.AllowsResume(
                     sessionResumeContext.Capability.SessionResumeQuotaClassifier,
                     Kind,
@@ -534,6 +609,26 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                         sandbox, workingDirectory, ct).ConfigureAwait(false);
                     if (!livenessProbe.IsAlive)
                         return WithLivenessProbeNote(last, livenessProbe);
+
+                    var retryResumeContext = sessionResumeContext.ResumeContext is { } existingResume
+                        ? existingResume with { NativeSessionId = capturedSessionId }
+                        : new AgentResumeContext(
+                            CheckpointRef: NativeSessionRetryCheckpointRef,
+                            NativeSessionId: capturedSessionId);
+                    var preparation = await PrepareSandboxForRunAsync(
+                        sandbox,
+                        workingDirectory,
+                        sessionResumeContext.Credential,
+                        retryResumeContext,
+                        ct).ConfigureAwait(false);
+                    if (preparation is not null)
+                    {
+                        return preparation with
+                        {
+                            ExecutionUnavailable = preparation.ExecutionUnavailable || last.ExecutionUnavailable,
+                            NativeSessionId = capturedSessionId,
+                        };
+                    }
 
                     resumeAttempts++;
                     current = BuildSessionResumeInvocation(
@@ -596,17 +691,24 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     /// before the orchestrator fails over.
     /// </para>
     /// </summary>
-    private static bool IsResumeEligibleFailure(AgentFailureClassification classification, int exitCode)
+    private static bool IsResumeEligibleFailure(
+        AgentFailureClassification classification,
+        int exitCode,
+        bool executionUnavailable)
         => classification.Kind switch
         {
             AgentFailureKind.TransientNetwork => true,
-            AgentFailureKind.Unknown => AgentSuspendResilience.IsSuspendRelatedExitCode(exitCode),
+            AgentFailureKind.Unknown => exitCode != 0,
             AgentFailureKind.Normal => exitCode != 0,
             // Soft rate-limit/overload comes through as QuotaExhausted; the
             // session-resume quota gate is the authoritative decision for
             // that shape (it inspects the provider detector). Returning true
             // here defers to that gate.
             AgentFailureKind.QuotaExhausted => true,
+            // Infrastructure-shaped stderr is not sufficient evidence that a
+            // sandbox vanished. Only the provider's typed execution signal may
+            // enter durable/native infrastructure recovery.
+            AgentFailureKind.Infrastructure => executionUnavailable,
             AgentFailureKind.AuthError => false,
             _ => false,
         };
@@ -659,7 +761,11 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             // Sandbox already torn down between the crashed run and the
             // liveness check — VM is gone, resume cannot proceed in this
             // sandbox, and re-drive in a fresh sandbox is the correct path.
-            return new ResumeLivenessProbeResult(IsAlive: false, FailureKind: "sandbox-disposed", FailureDetail: null);
+            return new ResumeLivenessProbeResult(
+                IsAlive: false,
+                FailureKind: "sandbox-disposed",
+                FailureDetail: null,
+                ExecutionUnavailable: true);
         }
         catch (OperationCanceledException)
         {
@@ -676,11 +782,18 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         }
 
         return result.Success
-            ? new ResumeLivenessProbeResult(IsAlive: true, FailureKind: null, FailureDetail: null)
+            ? new ResumeLivenessProbeResult(
+                IsAlive: true,
+                FailureKind: null,
+                FailureDetail: null,
+                ExecutionUnavailable: false)
             : new ResumeLivenessProbeResult(
                 IsAlive: false,
-                FailureKind: "probe-exit-nonzero",
-                FailureDetail: $"exit {result.ExitCode}: {Tail(result.Stderr)}");
+                FailureKind: result.ExecutionUnavailable
+                    ? "sandbox-execution-unavailable"
+                    : "probe-exit-nonzero",
+                FailureDetail: $"exit {result.ExitCode}: {Tail(result.Stderr)}",
+                ExecutionUnavailable: result.ExecutionUnavailable);
     }
 
     private static AgentResult WithLivenessProbeNote(AgentResult original, ResumeLivenessProbeResult probe)
@@ -692,7 +805,11 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             ? $"resume liveness probe rejected ({probe.FailureKind})"
             : $"resume liveness probe rejected ({probe.FailureKind}): {probe.FailureDetail}";
         var stderr = string.IsNullOrEmpty(original.Stderr) ? note : $"{note}\n{original.Stderr}";
-        return original with { Stderr = stderr };
+        return original with
+        {
+            Stderr = stderr,
+            ExecutionUnavailable = original.ExecutionUnavailable || probe.ExecutionUnavailable,
+        };
     }
 
     private static string Tail(string? text)
@@ -702,14 +819,20 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         return text.Length <= max ? text : text[^max..];
     }
 
-    private readonly record struct ResumeLivenessProbeResult(bool IsAlive, string? FailureKind, string? FailureDetail);
+    private readonly record struct ResumeLivenessProbeResult(
+        bool IsAlive,
+        string? FailureKind,
+        string? FailureDetail,
+        bool ExecutionUnavailable);
 
     private SessionResumeRebuildContext? CreateSessionResumeContext(
         string prompt,
         AgentCredential? credential,
         string? modelId,
         string? reasoningMode,
-        bool captureStructuredStream)
+        bool captureStructuredStream,
+        AgentNativeSessionId? initialNativeSessionId = null,
+        AgentResumeContext? resumeContext = null)
         => this is ICliSessionResumableAgentRunner capability
             ? new SessionResumeRebuildContext(
                 prompt,
@@ -717,6 +840,8 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 modelId,
                 reasoningMode,
                 captureStructuredStream,
+                initialNativeSessionId,
+                resumeContext,
                 capability)
             : null;
 
@@ -733,6 +858,8 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         string? ModelId,
         string? ReasoningMode,
         bool CaptureStructuredStream,
+        AgentNativeSessionId? InitialNativeSessionId,
+        AgentResumeContext? ResumeContext,
         ICliSessionResumableAgentRunner Capability);
 
     private async Task<AgentResult> ExecuteInvocationOnceAsync(
@@ -799,7 +926,10 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             Success: result.Success,
             Summary: result.Success ? "ok" : $"agent exited {result.ExitCode}",
             Stdout: result.Stdout,
-            Stderr: result.Stderr);
+            Stderr: result.Stderr)
+        {
+            ExecutionUnavailable = result.ExecutionUnavailable,
+        };
     }
 
     // Centralised batch-runner policy. Transport chooses the output data plane;
@@ -1018,15 +1148,6 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         return new TextOnlyAgentResult(true, "ok", output.Trim(), null);
     }
 
-    private static int ParseExitCodeFromSummary(string summary)
-    {
-        const string prefix = "agent exited ";
-        if (!summary.StartsWith(prefix, StringComparison.Ordinal))
-            return -1;
-        var tail = summary[prefix.Length..];
-        return int.TryParse(tail, out var code) ? code : -1;
-    }
-
     protected AgentResult? RejectUnsupportedFileBackedCredentials(ISandbox sandbox, AgentCredential? credential)
     {
         // In production the sandbox is wrapped by admission-control / reusable decorators that cannot
@@ -1076,8 +1197,12 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 "bash", "-c",
                 $$"""
                 set -euo pipefail
-                mkdir -p .codeybox
                 active_run_id="$2"
+                scratch_root="$3"
+                python3 -c 'import os, stat, sys; fd=os.open(sys.argv[1], os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW); st=os.fstat(fd); stat.S_ISDIR(st.st_mode) or sys.exit(2); os.close(fd)' "$scratch_root"
+                rm -f -- "$scratch_root/scratchpad.tgz"
+                rm -rf -- "$scratch_root"/capture.*
+                rm -f -- "$scratch_root"/scratchpad.tgz.tmp.*
                 pids=""
                 if [ -d /proc ]; then
                   for env_file in /proc/[0-9]*/environ; do
@@ -1113,15 +1238,22 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                   done
                 fi
 
-                scratch_tmp="$(mktemp -d .codeybox/preempt-scratchpad.XXXXXX)"
+                scratch_tmp="$(mktemp -d "$scratch_root/capture.XXXXXX")"
+                cleanup() {
+                  rm -rf -- "$scratch_tmp"
+                  rm -f -- "$scratch_root"/scratchpad.tgz.tmp.*
+                }
+                trap cleanup EXIT
                 manifest="$scratch_tmp/manifest.txt"
                 manifest_tsv="$scratch_tmp/manifest.tsv"
                 printf '%s\n' "Preempt requested at $(date -u +%FT%TZ)." > "$manifest"
                 : > "$manifest_tsv"
-                max_file_bytes=2097152
-                max_total_bytes=26214400
-                max_entries=2000
-                max_depth=16
+                max_file_bytes={{AgentTurnScratchpadArchive.MaximumFileBytes}}
+                max_total_bytes={{AgentTurnScratchpadArchive.MaximumContentBytes}}
+                # Reserve archive entries for '.', the two manifests, and the
+                # home/work scope roots created implicitly by mkdir -p.
+                max_entries={{AgentTurnScratchpadArchive.MaximumEntries - 5}}
+                max_depth={{AgentTurnScratchpadArchive.MaximumPathDepth}}
                 captured=0
                 total_bytes=0
                 entries=0
@@ -1220,7 +1352,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                     fi
                     mkdir -p "$(dirname "$dest")"
                     record_parent_dirs "$scope" "$dest_rel"
-                    cp -p "$path" "$dest"
+                    cp -p --no-dereference -- "$path" "$dest"
                     total_bytes=$((total_bytes + size))
                     record_entry file "$scope" "$dest_rel"
                     captured=1
@@ -1238,18 +1370,101 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 if [ "$captured" -eq 0 ]; then
                   printf '%s\n' "No known CLI scratchpad directory existed at preempt time." >> "$manifest"
                 fi
-                tar -czf .codeybox/preempt-scratchpad.tgz -C "$scratch_tmp" .
-                cp "$manifest" .codeybox/preempt-scratchpad.md
-                rm -rf "$scratch_tmp"
+                python3 - "$scratch_root" "$scratch_tmp" scratchpad.tgz {{AgentTurnScratchpadArchive.MaximumBytes}} {{AgentTurnScratchpadArchive.MaximumExpandedBytes}} {{AgentTurnScratchpadArchive.MaximumEntries}} {{AgentTurnScratchpadArchive.MaximumPathDepth}} {{AgentTurnScratchpadArchive.MaximumFileBytes}} {{AgentTurnScratchpadArchive.MaximumContentBytes}} <<'PY'
+                import os
+                import secrets
+                import stat
+                import sys
+                import tarfile
+
+                root, source, final_name = sys.argv[1:4]
+                maximum_archive_bytes = int(sys.argv[4])
+                maximum_expanded_bytes = int(sys.argv[5])
+                maximum_entries = int(sys.argv[6])
+                maximum_path_depth = int(sys.argv[7])
+                maximum_file_bytes = int(sys.argv[8])
+                maximum_content_bytes = int(sys.argv[9])
+                root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                temporary_name = f"scratchpad.tgz.tmp.{secrets.token_hex(16)}"
+                archive_fd = -1
+                try:
+                    archive_fd = os.open(
+                        temporary_name,
+                        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=root_fd)
+                    member_count = [0]
+                    expanded_bytes = [1024]
+                    content_bytes = [0]
+
+                    def validate_member(info):
+                        member_count[0] += 1
+                        if member_count[0] > maximum_entries:
+                            raise ValueError("scratchpad tar stream exceeds entry limit")
+                        normalized = info.name.removeprefix("./")
+                        if normalized and normalized != ".":
+                            depth = len([part for part in normalized.split("/") if part])
+                            if depth > maximum_path_depth + 1:
+                                raise ValueError("scratchpad tar stream exceeds path-depth limit")
+                        expanded_bytes[0] += 512
+                        if info.isfile():
+                            if info.size > maximum_file_bytes:
+                                raise ValueError("scratchpad staging file exceeds per-file limit")
+                            content_bytes[0] += info.size
+                            if content_bytes[0] > maximum_content_bytes:
+                                raise ValueError("scratchpad staging exceeds cumulative content limit")
+                            expanded_bytes[0] += ((info.size + 511) // 512) * 512
+                        if expanded_bytes[0] > maximum_expanded_bytes:
+                            raise ValueError("scratchpad tar stream exceeds expanded-byte limit")
+                        if not info.isdir() and not info.isfile():
+                            raise ValueError("scratchpad staging contains an unsupported file type")
+                        return info
+
+                    with os.fdopen(os.dup(archive_fd), "wb", closefd=True) as archive_file:
+                        with tarfile.open(
+                            fileobj=archive_file,
+                            mode="w:gz",
+                            dereference=False) as archive:
+                            archive.add(source, arcname=".", recursive=True, filter=validate_member)
+                    os.fsync(archive_fd)
+                    archive_stat = os.fstat(archive_fd)
+                    if not stat.S_ISREG(archive_stat.st_mode):
+                        raise ValueError("scratchpad archive temporary is not a regular file")
+                    if archive_stat.st_size < 1 or archive_stat.st_size > maximum_archive_bytes:
+                        raise ValueError("scratchpad archive exceeds compressed-byte limit")
+                    path_stat = os.stat(temporary_name, dir_fd=root_fd, follow_symlinks=False)
+                    if (path_stat.st_dev, path_stat.st_ino) != (archive_stat.st_dev, archive_stat.st_ino):
+                        raise ValueError("scratchpad archive temporary changed before publication")
+                    os.replace(
+                        temporary_name,
+                        final_name,
+                        src_dir_fd=root_fd,
+                        dst_dir_fd=root_fd)
+                    os.fsync(root_fd)
+                finally:
+                    if archive_fd >= 0:
+                        os.close(archive_fd)
+                    try:
+                        os.unlink(temporary_name, dir_fd=root_fd)
+                    except FileNotFoundError:
+                        pass
+                    os.close(root_fd)
+                PY
                 """,
                 "codeybox-preempt",
                 pattern,
                 activeRunId ?? string.Empty,
+                AgentTurnScratchpadArchive.GuestDirectory,
             ],
             WorkingDirectory = workingDirectory,
         }, ct);
+        if (result.ExecutionUnavailable)
+            throw new SandboxExecutionUnavailableException(result.ExitCode);
         if (!result.Success)
-            throw new InvalidOperationException($"agent preempt signal failed (exit {result.ExitCode}): {result.Stderr}");
+        {
+            throw new InvalidOperationException(
+                $"agent preempt signal failed (exit {result.ExitCode})");
+        }
     }
 
     private async Task RestoreScratchpadAsync(
@@ -1261,82 +1476,171 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         var argv = new List<string>
         {
             "bash", "-c",
-            """
+            $$"""
             set -euo pipefail
             archive="$1"
-            shift
-            [ -f "$archive" ] || exit 0
-            max_archive_bytes=33554432
-            archive_bytes="$(wc -c < "$archive")"
-            [ "$archive_bytes" -le "$max_archive_bytes" ] || {
-              echo "scratchpad archive exceeds restore limit" >&2
-              exit 10
-            }
-
-            scratch_tmp="$(mktemp -d .codeybox/resume-scratchpad.XXXXXX)"
+            scratch_root="$2"
+            shift 2
+            if [ ! -e "$archive" ] && [ ! -L "$archive" ]; then
+              exit 0
+            fi
+            scratch_tmp="$(mktemp -d "$scratch_root/resume.XXXXXX")"
             cleanup() { rm -rf "$scratch_tmp"; }
             trap cleanup EXIT
 
-            manifest="$scratch_tmp/manifest.tsv"
-            max_manifest_bytes=262144
-            max_entries=2000
-            extract_bounded() {
-              local member="$1"
-              local dest="$2"
-              local limit="$3"
-              local tmp="$dest.tmp"
-              rm -f "$tmp"
-              set +e
-              tar -xOzf "$archive" "$member" 2>/dev/null | head -c "$limit" > "$tmp"
-              local tar_status="${PIPESTATUS[0]}"
-              set -e
-              local bytes
-              bytes="$(wc -c < "$tmp")"
-              if [ "$bytes" -ge "$limit" ]; then
-                rm -f "$tmp"
-                return 20
-              fi
-              if [ "$tar_status" -ne 0 ]; then
-                rm -f "$tmp"
-                return 21
-              fi
-              mv "$tmp" "$dest"
-              printf '%s\n' "$bytes"
-              return 0
-            }
+            bounded_tar="$scratch_tmp/archive.tar"
+            python3 - "$scratch_root" "$archive" "$bounded_tar" {{AgentTurnScratchpadArchive.MaximumBytes}} {{AgentTurnScratchpadArchive.MaximumExpandedBytes}} {{AgentTurnScratchpadArchive.MaximumEntries}} {{AgentTurnScratchpadArchive.MaximumPathDepth + 1}} {{AgentTurnScratchpadArchive.MaximumFileBytes}} {{AgentTurnScratchpadArchive.MaximumContentBytes}} {{AgentTurnScratchpadArchive.MaximumManifestBytes}} <<'PY'
+            import gzip
+            import os
+            import stat
+            import sys
+            import tarfile
 
+            root, archive_path, output_path = sys.argv[1:4]
+            maximum_archive_bytes = int(sys.argv[4])
+            maximum_expanded_bytes = int(sys.argv[5])
+            maximum_entries = int(sys.argv[6])
+            maximum_path_depth = int(sys.argv[7])
+            maximum_file_bytes = int(sys.argv[8])
+            maximum_content_bytes = int(sys.argv[9])
+            maximum_manifest_bytes = int(sys.argv[10])
+            if os.path.dirname(os.path.normpath(archive_path)) != os.path.normpath(root):
+                raise ValueError("scratchpad archive is outside the private agent-turn directory")
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            archive_fd = -1
+            output_fd = -1
+            try:
+                archive_fd = os.open(
+                    os.path.basename(archive_path),
+                    os.O_RDONLY | os.O_NOFOLLOW,
+                    dir_fd=root_fd)
+                archive_stat = os.fstat(archive_fd)
+                if not stat.S_ISREG(archive_stat.st_mode):
+                    raise ValueError("scratchpad archive is not a regular file")
+                if archive_stat.st_size < 1 or archive_stat.st_size > maximum_archive_bytes:
+                    raise ValueError("scratchpad archive exceeds compressed-byte limit")
+                output_fd = os.open(
+                    output_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600)
+                expanded_bytes = 0
+                with os.fdopen(os.dup(archive_fd), "rb", closefd=True) as compressed:
+                    with gzip.GzipFile(fileobj=compressed, mode="rb") as uncompressed:
+                        while True:
+                            chunk = uncompressed.read(min(1024 * 1024, maximum_expanded_bytes + 1 - expanded_bytes))
+                            if not chunk:
+                                break
+                            expanded_bytes += len(chunk)
+                            if expanded_bytes > maximum_expanded_bytes:
+                                raise ValueError("scratchpad archive exceeds expanded-byte limit")
+                            view = memoryview(chunk)
+                            while view:
+                                written = os.write(output_fd, view)
+                                view = view[written:]
+                if expanded_bytes < 1:
+                    raise ValueError("scratchpad archive expands to an empty stream")
+                os.fsync(output_fd)
+                os.close(output_fd)
+                output_fd = -1
+
+                archive_path_stat = os.stat(
+                    os.path.basename(archive_path),
+                    dir_fd=root_fd,
+                    follow_symlinks=False)
+                if ((archive_path_stat.st_dev, archive_path_stat.st_ino)
+                        != (archive_stat.st_dev, archive_stat.st_ino)):
+                    raise ValueError("scratchpad archive changed during bounded decompression")
+                os.close(archive_fd)
+                archive_fd = -1
+                os.unlink(os.path.basename(archive_path), dir_fd=root_fd)
+
+                extracted_root = os.path.join(os.path.dirname(output_path), "extracted")
+                members_path = os.path.join(os.path.dirname(output_path), "members.txt")
+                os.mkdir(extracted_root, 0o700)
+                seen = set()
+                entry_count = 0
+                content_bytes = 0
+                with open(members_path, "x", encoding="utf-8", newline="\n") as members_file:
+                    with tarfile.open(output_path, mode="r:") as tar_archive:
+                        while True:
+                            member = tar_archive.next()
+                            if member is None:
+                                break
+                            entry_count += 1
+                            if entry_count > maximum_entries:
+                                raise ValueError("scratchpad archive exceeds entry limit")
+                            name = member.name.removeprefix("./").rstrip("/")
+                            if name == ".":
+                                name = ""
+                            if any(ord(character) < 32 or ord(character) == 127 for character in name):
+                                raise ValueError("scratchpad archive contains a control character in a path")
+                            parts = [part for part in name.split("/") if part]
+                            if (name.startswith("/")
+                                    or any(part in (".", "..") for part in parts)
+                                    or len(parts) > maximum_path_depth):
+                                raise ValueError("scratchpad archive contains an unsafe path")
+                            normalized = name or "."
+                            if normalized in seen:
+                                raise ValueError("scratchpad archive contains duplicate paths")
+                            seen.add(normalized)
+                            if not member.isdir() and not member.isreg():
+                                raise ValueError("scratchpad archive contains an unsupported file type")
+                            members_file.write(normalized + "\n")
+                            if not name:
+                                continue
+
+                            destination = os.path.join(extracted_root, *parts)
+                            if member.isdir():
+                                os.makedirs(destination, mode=0o700, exist_ok=True)
+                                continue
+
+                            file_limit = (maximum_manifest_bytes
+                                if name in ("manifest.tsv", "manifest.txt")
+                                else maximum_file_bytes)
+                            if member.size > file_limit:
+                                raise ValueError("scratchpad archive contains an oversized file")
+                            content_bytes += member.size
+                            if content_bytes > maximum_content_bytes + 2 * maximum_manifest_bytes:
+                                raise ValueError("scratchpad archive exceeds cumulative content limit")
+                            os.makedirs(os.path.dirname(destination), mode=0o700, exist_ok=True)
+                            source = tar_archive.extractfile(member)
+                            if source is None:
+                                raise ValueError("scratchpad archive regular file cannot be read")
+                            remaining = member.size
+                            with source, open(destination, "xb") as destination_file:
+                                while remaining:
+                                    chunk = source.read(min(1024 * 1024, remaining))
+                                    if not chunk:
+                                        raise ValueError("scratchpad archive file was truncated")
+                                    destination_file.write(chunk)
+                                    remaining -= len(chunk)
+                                if source.read(1):
+                                    raise ValueError("scratchpad archive file exceeded declared size")
+            finally:
+                if output_fd >= 0:
+                    os.close(output_fd)
+                if archive_fd >= 0:
+                    os.close(archive_fd)
+                os.close(root_fd)
+            PY
+
+            extracted="$scratch_tmp/extracted"
+            manifest="$extracted/manifest.tsv"
             members="$scratch_tmp/members.txt"
-            set +e
-            tar -tzf "$archive" 2>/dev/null | head -n $((max_entries + 1)) > "$members"
-            list_status="${PIPESTATUS[0]}"
-            set -e
-            member_count="$(wc -l < "$members")"
-            if [ "$member_count" -gt "$max_entries" ]; then
-              echo "scratchpad archive entry limit exceeded" >&2
-              exit 12
-            fi
-            if [ "$list_status" -ne 0 ]; then
-              echo "scratchpad archive cannot be listed" >&2
-              exit 12
-            fi
-            if grep -Fx -- "./manifest.tsv" "$members" >/dev/null; then
-              extract_bounded "./manifest.tsv" "$manifest" $((max_manifest_bytes + 1)) >/dev/null || {
-                echo "scratchpad manifest exceeds restore limit or cannot be read" >&2
-                exit 10
-              }
-            elif grep -Fx -- "manifest.tsv" "$members" >/dev/null; then
-              extract_bounded "manifest.tsv" "$manifest" $((max_manifest_bytes + 1)) >/dev/null || {
-                echo "scratchpad manifest exceeds restore limit or cannot be read" >&2
-                exit 10
-              }
-            else
+            max_manifest_bytes={{AgentTurnScratchpadArchive.MaximumManifestBytes}}
+            max_entries={{AgentTurnScratchpadArchive.MaximumEntries}}
+            if [ ! -f "$manifest" ]; then
               # Legacy checkpoints did not carry restorable scratchpad state.
               exit 0
             fi
+            [ "$(wc -c < "$manifest")" -le "$max_manifest_bytes" ] || {
+              echo "scratchpad manifest exceeds restore limit" >&2
+              exit 10
+            }
 
-            max_file_bytes=2097152
-            max_total_bytes=26214400
-            max_depth=16
+            max_file_bytes={{AgentTurnScratchpadArchive.MaximumFileBytes}}
+            max_total_bytes={{AgentTurnScratchpadArchive.MaximumContentBytes}}
+            max_depth={{AgentTurnScratchpadArchive.MaximumPathDepth}}
             valid_rel() {
               local rel="$1"
               [ -n "$rel" ] || return 1
@@ -1448,10 +1752,21 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                 exit 12
               }
               normalized="${member#./}"
-              [[ "$normalized" != /* && "$normalized" != *"/../"* && "$normalized" != "../"* ]] || {
+              [[ "$normalized" != /* \
+                 && "$normalized" != *"/../"* \
+                 && "$normalized" != "../"* \
+                 && "$normalized" != *$'\t'* \
+                 && "$normalized" != *$'\r'* ]] || {
                 echo "scratchpad archive contains unsafe path: $member" >&2
                 exit 12
               }
+              if [ -n "$normalized" ] && [ "$normalized" != "." ]; then
+                IFS=/ read -r -a member_parts <<< "$normalized"
+                [ "${#member_parts[@]}" -le $((max_depth + 1)) ] || {
+                  echo "scratchpad archive path depth exceeded: $member" >&2
+                  exit 12
+                }
+              fi
               printf '%s\n' "$normalized" >> "$normalized_members"
               if ! grep -Fx -- "$member" "$allowed" >/dev/null \
                  && ! grep -Fx -- "$normalized" "$allowed" >/dev/null; then
@@ -1469,7 +1784,6 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             while IFS=$'\t' read -r kind scope rel; do
               valid_rel "$rel" || exit 11
               is_allowed_entry "$kind" "$rel" || exit 11
-              src="$scratch_tmp/$scope/$rel"
               case "$scope" in
                 home) dest_base="$HOME" ;;
                 work) dest_base="." ;;
@@ -1477,28 +1791,21 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
               esac
               dest="$dest_base/$rel"
               if [ "$kind" = "dir" ]; then
-                mkdir -p "$src"
                 ensure_destination "$dest_base" "$rel" dir
               elif [ "$kind" = "file" ]; then
                 member="$scope/$rel"
-                if ! grep -Fx -- "$member" "$members" >/dev/null; then
-                  member="./$scope/$rel"
-                fi
                 grep -Fx -- "$member" "$members" >/dev/null || continue
-                mkdir -p "$(dirname "$src")"
+                src="$extracted/$member"
+                [ -f "$src" ] && [ ! -L "$src" ] || {
+                  echo "scratchpad staged file is not a regular file: $member" >&2
+                  exit 14
+                }
                 remaining=$((max_total_bytes - restored_bytes))
                 [ "$remaining" -gt 0 ] || {
                   echo "scratchpad restore total byte limit exceeded" >&2
                   exit 14
                 }
-                limit=$((max_file_bytes + 1))
-                if [ "$remaining" -lt "$max_file_bytes" ]; then
-                  limit=$((remaining + 1))
-                fi
-                bytes="$(extract_bounded "$member" "$src" "$limit")" || {
-                  echo "scratchpad file exceeds restore limit or cannot be read: $member" >&2
-                  exit 14
-                }
+                bytes="$(wc -c < "$src")"
                 [ "$bytes" -le "$max_file_bytes" ] || {
                   echo "scratchpad file exceeds per-file restore limit: $member" >&2
                   exit 14
@@ -1509,7 +1816,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
                   exit 14
                 }
                 ensure_destination "$dest_base" "$rel" file
-                cp -p "$src" "$dest"
+                cp -p --no-dereference -- "$src" "$dest"
               else
                 exit 11
               fi
@@ -1517,6 +1824,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             """,
             "codeybox-resume",
             resume.ScratchpadArchivePath,
+            AgentTurnScratchpadArchive.GuestDirectory,
         };
         argv.AddRange(ScratchpadHomeDirectories);
 
@@ -1525,8 +1833,13 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             Argv = argv,
             WorkingDirectory = workingDirectory,
         }, ct);
+        if (result.ExecutionUnavailable)
+            throw new SandboxExecutionUnavailableException(result.ExitCode);
         if (!result.Success)
-            throw new InvalidOperationException($"agent scratchpad restore failed (exit {result.ExitCode}): {result.Stderr}");
+        {
+            throw new InvalidOperationException(
+                $"agent scratchpad restore failed (exit {result.ExitCode})");
+        }
     }
 
     private static string ShellQuote(string value) =>

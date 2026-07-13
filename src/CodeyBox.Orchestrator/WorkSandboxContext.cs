@@ -278,6 +278,8 @@ public sealed class WorkSandboxContext : IAsyncDisposable
             _preemptible = preemptible;
         }
         public Task StopAndPreserveAsync(CancellationToken ct = default) => _preemptible.StopAndPreserveAsync(ct);
+        public Task<SandboxRecoveryLease?> RetainForInfrastructureRecoveryAsync(CancellationToken ct = default) =>
+            _preemptible.RetainForInfrastructureRecoveryAsync(ct);
     }
 
     private sealed class ReusableSuspendableSandbox : ReusableSandbox, ISuspendableSandbox
@@ -316,6 +318,8 @@ public sealed class WorkSandboxContext : IAsyncDisposable
             _suspendable = suspendable;
         }
         public Task StopAndPreserveAsync(CancellationToken ct = default) => _preemptible.StopAndPreserveAsync(ct);
+        public Task<SandboxRecoveryLease?> RetainForInfrastructureRecoveryAsync(CancellationToken ct = default) =>
+            _preemptible.RetainForInfrastructureRecoveryAsync(ct);
         public Task SuspendAsync(CancellationToken ct = default) => _suspendable.SuspendAsync(ct);
         public bool IsSuspended => _suspendable.IsSuspended;
         public long? MemoryBytes => _suspendable.MemoryBytes;
@@ -332,6 +336,8 @@ public sealed class WorkSandboxContext : IAsyncDisposable
             _shutdown = shutdown;
         }
         public Task StopAndPreserveAsync(CancellationToken ct = default) => _preemptible.StopAndPreserveAsync(ct);
+        public Task<SandboxRecoveryLease?> RetainForInfrastructureRecoveryAsync(CancellationToken ct = default) =>
+            _preemptible.RetainForInfrastructureRecoveryAsync(ct);
         public bool IsOwnedByShutdownHandler => _shutdown.IsOwnedByShutdownHandler;
         public void MarkOwnedByShutdownHandler() => _shutdown.MarkOwnedByShutdownHandler();
     }
@@ -366,6 +372,8 @@ public sealed class WorkSandboxContext : IAsyncDisposable
             _shutdown = shutdown;
         }
         public Task StopAndPreserveAsync(CancellationToken ct = default) => _preemptible.StopAndPreserveAsync(ct);
+        public Task<SandboxRecoveryLease?> RetainForInfrastructureRecoveryAsync(CancellationToken ct = default) =>
+            _preemptible.RetainForInfrastructureRecoveryAsync(ct);
         public Task SuspendAsync(CancellationToken ct = default) => _suspendable.SuspendAsync(ct);
         public bool IsSuspended => _suspendable.IsSuspended;
         public long? MemoryBytes => _suspendable.MemoryBytes;

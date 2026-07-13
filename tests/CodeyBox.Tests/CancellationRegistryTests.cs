@@ -68,4 +68,36 @@ public sealed class CancellationRegistryTests
         Assert.False(reg.IsActive(id));
         Assert.Null(reg.GetRequestKind(id));
     }
+
+    [Fact]
+    public async Task WaitForInactive_CompletesOnlyAfterRegistrationDisposes()
+    {
+        using var reg = new CancellationRegistry(CancellationToken.None);
+        var id = WorkItemId.New();
+        var registration = reg.Register(id);
+
+        var inactive = reg.WaitForInactiveAsync(id);
+        Assert.False(inactive.IsCompleted);
+
+        registration.Dispose();
+
+        await inactive;
+        Assert.True(inactive.IsCompletedSuccessfully);
+    }
+
+    [Fact]
+    public void DisposingOldRegistrationAgain_DoesNotRemoveReplacement()
+    {
+        using var reg = new CancellationRegistry(CancellationToken.None);
+        var id = WorkItemId.New();
+        var oldRegistration = reg.Register(id);
+        oldRegistration.Dispose();
+        using var replacement = reg.Register(id);
+
+        oldRegistration.Dispose();
+
+        Assert.True(reg.IsActive(id));
+        Assert.True(reg.CancelForRecovery(id));
+        Assert.True(replacement.Token.IsCancellationRequested);
+    }
 }

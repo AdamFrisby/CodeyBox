@@ -285,7 +285,10 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
                 Success: false,
                 Summary: $"crock submit failed: exit {submit.ExitCode}",
                 Stdout: submit.Stdout,
-                Stderr: submit.Stderr);
+                Stderr: submit.Stderr)
+            {
+                ExecutionUnavailable = submit.ExecutionUnavailable,
+            };
         }
 
         var taskId = CrockStatusParser.TryExtractTaskId(submit.Stdout);
@@ -338,6 +341,18 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
             catch (OperationCanceledException)
             {
                 return CancellationResult(taskId, lastStatus);
+            }
+
+            if (lastStatus.ExecutionUnavailable)
+            {
+                return new AgentResult(
+                    Success: false,
+                    Summary: "crock status execution became unavailable",
+                    Stdout: lastStatus.Stdout,
+                    Stderr: lastStatus.Stderr)
+                {
+                    ExecutionUnavailable = true,
+                };
             }
 
             // A non-zero exit on `crock status` may be transient (daemon
@@ -406,7 +421,10 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
             Success: false,
             Summary: subject,
             Stdout: lastStatus?.Stdout,
-            Stderr: lastStatus?.Stderr);
+            Stderr: lastStatus?.Stderr)
+        {
+            ExecutionUnavailable = lastStatus?.ExecutionUnavailable ?? false,
+        };
     }
 
     private static void EmitProgress(Action<string>? sink, string message)

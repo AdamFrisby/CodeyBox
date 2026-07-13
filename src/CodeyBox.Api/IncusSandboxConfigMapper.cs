@@ -67,6 +67,8 @@ internal static class IncusSandboxConfigMapper
             ExecPidPollAttempts = incus.ExecPidPollAttempts,
             ExecControlFileCleanupAttempts = incus.ExecControlFileCleanupAttempts,
             ExecCompletionProbeAttempts = incus.ExecCompletionProbeAttempts,
+            InterruptedExecRecoveryRetryAttempts = incus.InterruptedExecRecoveryRetryAttempts,
+            InterruptedExecRecoveryRetryDelay = incus.InterruptedExecRecoveryRetryDelay,
             MaxConcurrentOperations = incus.MaxConcurrentOperations,
             MaxCliStdoutBytes = incus.MaxCliStdoutBytes,
             MaxCliStderrBytes = incus.MaxCliStderrBytes,

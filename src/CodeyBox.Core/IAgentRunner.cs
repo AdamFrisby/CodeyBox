@@ -36,6 +36,12 @@ public interface IAgentRunner
     /// </summary>
     AgentFailureClassification ClassifyFailure(AgentResult result)
     {
+        if (result.ExecutionUnavailable)
+        {
+            return new AgentFailureClassification(
+                AgentFailureKind.Infrastructure,
+                Reason: "sandbox execution was unavailable");
+        }
         if (AgentFailureClassifier.DetectAuthRequired(Kind, result.Stderr, result.Stdout) is { } authRequired)
             return authRequired.Classification;
         if (result.Success)
@@ -235,7 +241,8 @@ public interface IResumableAgentRunner : IAgentRunner
 
 public sealed record AgentResumeContext(
     string CheckpointRef,
-    string ScratchpadArchivePath = ".codeybox/preempt-scratchpad.tgz");
+    string ScratchpadArchivePath = AgentTurnScratchpadArchive.GuestArchivePath,
+    AgentNativeSessionId? NativeSessionId = null);
 
 /// <summary>
 /// Optional capability for runners that drive a CLI with a native in-process
@@ -292,6 +299,22 @@ public sealed record AgentResult(bool Success, string Summary, string? Stdout, s
     /// <c>WaitingForQuotaReset</c> instead of dead-lettering it.</para>
     /// </summary>
     public string? TerminalDiagnostic { get; init; }
+
+    /// <summary>
+    /// True only when the sandbox provider explicitly reported that execution
+    /// was unavailable. This typed signal distinguishes a dead/unreachable
+    /// sandbox from agent-produced text that merely resembles an infrastructure
+    /// failure.
+    /// </summary>
+    public bool ExecutionUnavailable { get; init; }
+
+    /// <summary>
+    /// Validated native CLI session identifier captured before a failed run.
+    /// Orchestration may persist it and supply it through
+    /// <see cref="AgentResumeContext.NativeSessionId"/> after the sandbox has
+    /// been restored or recreated.
+    /// </summary>
+    public AgentNativeSessionId? NativeSessionId { get; init; }
 }
 
 /// <summary>Maps agent kinds to runners. Loose coupling: register new runners without recompiling consumers.</summary>

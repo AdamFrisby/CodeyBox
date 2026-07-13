@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text.RegularExpressions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
 using CodeyBox.Audit;
@@ -151,7 +152,8 @@ public sealed class WorkPhaseSuggestionPickupTests : IDisposable
         // call (deleting it must fail this test).
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var agent = new PreemptBlockingAgentLogAgent();
-        using var setup = BuildPipelineWith(agent, _workspace, seed);
+        var logger = new CapturingLogger<PipelineRunner>();
+        using var setup = BuildPipelineWith(agent, _workspace, seed, logger: logger);
 
         var item = NewItem("feature/agentlog-preempt");
         await setup.Store.CreateAsync(item);
@@ -172,14 +174,26 @@ public sealed class WorkPhaseSuggestionPickupTests : IDisposable
 
         var final = await setup.Store.GetAsync(item.Id);
         Assert.False(string.IsNullOrWhiteSpace(final!.PreemptCheckpoint),
-            "expected a preempt checkpoint ref to be recorded");
+            "expected a preempt checkpoint ref to be recorded\n" + string.Join(
+                Environment.NewLine,
+                logger.Entries.Select(entry => $"[{entry.Level}] {entry.Message}: {entry.Exception}")));
+        var checkpointRef = AgentTurnCheckpointRef.Parse(final.PreemptCheckpoint!);
+        Assert.Equal(item.Id, checkpointRef.WorkItemId);
+        Assert.NotNull(final.AgentTurnResumeCheckpoint);
+
+        var privateArchive = await ((IAgentTurnScratchpadStore)setup.Store).ReadAsync(
+            item.Id,
+            checkpointRef);
+        Assert.NotNull(privateArchive);
+        Assert.Equal(checkpointRef.ArchiveSha256, privateArchive.Sha256);
 
         var barePath = Path.Combine(setup.GitRoot, item.Id + ".git");
-        var checkpointRef = $"codeybox/preempt/{item.Id}";
         var (exit, treeOutput, stderr) = await TestSupport.RunGitNoThrow(
-            barePath, "ls-tree", "-r", checkpointRef, "--name-only");
-        Assert.True(exit == 0, $"ls-tree of checkpoint ref '{checkpointRef}' failed: {stderr}");
+            barePath, "ls-tree", "-r", checkpointRef.Value, "--name-only");
+        Assert.True(exit == 0, $"ls-tree of checkpoint ref '{checkpointRef.Value}' failed: {stderr}");
         Assert.DoesNotContain(".codeybox/agent-logs", treeOutput);
+        Assert.DoesNotContain(".codeybox/preempt-scratchpad", treeOutput);
+        Assert.DoesNotContain(".codeybox/resume-scratchpad", treeOutput);
         Assert.Contains("output.txt", treeOutput); // the real change is checkpointed
     }
 
@@ -275,7 +289,11 @@ public sealed class WorkPhaseSuggestionPickupTests : IDisposable
         => BuildPipelineWith(new SuggestionEmittingAgent(SuggestionsJson), workspace, seedRepoUrl);
 
     private static SuggestionTestSetup BuildPipelineWith(
-        IAgentRunner agent, string workspace, string seedRepoUrl, IReadOnlyList<IAuditor>? auditors = null)
+        IAgentRunner agent,
+        string workspace,
+        string seedRepoUrl,
+        IReadOnlyList<IAuditor>? auditors = null,
+        ILogger<PipelineRunner>? logger = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -311,7 +329,7 @@ public sealed class WorkPhaseSuggestionPickupTests : IDisposable
             projects, new TestUpstreamFactory(), composer,
             store, webhooks,
             new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
-            NullLogger<PipelineRunner>.Instance,
+            logger ?? NullLogger<PipelineRunner>.Instance,
             suggestions: suggestionStore,
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,

@@ -3,6 +3,23 @@ using System.Text;
 namespace CodeyBox.Core;
 
 /// <summary>
+/// Signals that a sandbox command could not be dispatched or observed because
+/// the sandbox execution transport was unavailable. Unlike an ordinary
+/// non-zero command result, callers may safely classify this as infrastructure
+/// failure and retain durable recovery state.
+/// </summary>
+public sealed class SandboxExecutionUnavailableException : Exception
+{
+    public SandboxExecutionUnavailableException(int exitCode)
+        : base($"Sandbox execution was unavailable (exit {exitCode}).")
+    {
+        ExitCode = exitCode;
+    }
+
+    public int ExitCode { get; }
+}
+
+/// <summary>
 /// Lists and disposes managed sandboxes without implying the ability to create
 /// new work sandboxes. Lifecycle sweepers and operator endpoints depend on this
 /// narrower contract so composite lifecycle views do not masquerade as providers.
@@ -339,6 +356,15 @@ public interface IReleaseAdmissionOnHostLossSandbox : ISandbox
 public interface IPreemptibleSandbox : ISandbox
 {
     Task StopAndPreserveAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// Retains a stopped sandbox specifically because infrastructure prevented
+    /// publication of the normal agent-turn checkpoint. Providers that can
+    /// durably reconstruct and authenticate the sandbox after a process restart
+    /// return its lease; other preemptible providers return null.
+    /// </summary>
+    Task<SandboxRecoveryLease?> RetainForInfrastructureRecoveryAsync(
+        CancellationToken ct = default) => Task.FromResult<SandboxRecoveryLease?>(null);
 }
 
 /// <summary>
@@ -819,10 +845,10 @@ public interface ISuspendingSandboxProvider
     ///
     /// <para>Operation, executed inside the resumed VM:</para>
     /// <list type="number">
-    ///   <item>ensure <c>.codeybox/preempt-scratchpad.md</c> exists (so the
-    ///   resumable agent runner has something to restore);</item>
     ///   <item><c>git add -A</c> in <paramref name="workingDir"/> to capture
     ///   any uncommitted agent output;</item>
+    ///   <item>remove and positively guard historical repository-local agent
+    ///   scratchpad paths; provider state is private and never belongs in Git;</item>
     ///   <item><c>git commit --allow-empty</c> so the push is non-empty even
     ///   when the agent had nothing dirty;</item>
     ///   <item><c>git push origin HEAD:<paramref name="refName"/></c>.</item>
@@ -1032,6 +1058,13 @@ public sealed record SandboxSpec
     /// landed, and for providers that don't model baselines).
     /// </summary>
     public string? BaselineImageRef { get; init; }
+
+    /// <summary>
+    /// Exact provider-owned stopped sandbox to adopt instead of provisioning a
+    /// fresh sandbox. Providers must reject mismatched provider ids, ownership,
+    /// work-item context, specifications, or capability tokens.
+    /// </summary>
+    public SandboxRecoveryLease? RecoveryLease { get; init; }
 }
 
 public enum SandboxProfileFlavor

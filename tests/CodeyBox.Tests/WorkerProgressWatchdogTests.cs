@@ -195,8 +195,20 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         };
         await _store.CreateAsync(item);
         await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), item.Id);
+        using var cancellations = new CancellationRegistry();
+        using var registration = cancellations.Register(item.Id);
+        using var watchdog = new WorkerProgressWatchdog(
+            _registry,
+            _store,
+            _queue,
+            _opts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams,
+            _webhooks,
+            _slotReleaser,
+            cancellationRegistry: cancellations);
 
-        await _watchdog.RunOnceAsync(CancellationToken.None);
+        await watchdog.RunOnceAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Queued, after!.State);
@@ -1105,6 +1117,106 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         Assert.Equal(1, after.RecoveryAttempts);
     }
 
+    [Fact]
+    public async Task Watchdog_StuckReworkingWithAgentTurnCheckpoint_PreservesPairedResumeState()
+    {
+        var item = MakeItem(WorkItemState.Reworking, DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45));
+        var checkpoint = new AgentTurnResumeCheckpoint(
+            AgentKind.Claude,
+            "claude/account-a",
+            modelId: null,
+            reasoningMode: null,
+            nativeSessionId: null,
+            WorkItemState.Reworking,
+            AgentTurnResumePhase.Rework,
+            iteration: 2,
+            item.PromptRevision,
+            DateTimeOffset.UtcNow.AddMinutes(-10))
+            .ClaimDispatch(Guid.Parse("ca1db018-7196-4d4c-9e56-7bd48ea3b3a8"));
+        item = item with
+        {
+            PreemptedAt = DateTimeOffset.UtcNow.AddMinutes(-10),
+            PreemptCheckpoint = $"refs/heads/codeybox/preempt/{item.Id}",
+            AgentTurnResumeCheckpoint = checkpoint,
+        };
+        await _store.CreateAsync(item);
+        var workerId = Guid.NewGuid().ToString();
+        await _registry.RegisterAsync(WorkerForItem(workerId, item.Id));
+        using var cancellations = new CancellationRegistry(CancellationToken.None);
+        var registration = cancellations.Register(item.Id);
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, _opts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser,
+            cancellationRegistry: cancellations);
+
+        var recovery = watchdog.RunOnceAsync(CancellationToken.None);
+        try
+        {
+            await WaitUntilAsync(() => Task.FromResult(registration.Token.IsCancellationRequested));
+            Assert.Equal(CancellationRequestKind.Recovery, cancellations.GetRequestKind(item.Id));
+            Assert.False(recovery.IsCompleted);
+
+            var whileOwnerActive = await _store.GetAsync(item.Id);
+            Assert.Equal(checkpoint.DispatchClaimId, whileOwnerActive?.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        }
+        finally
+        {
+            registration.Dispose();
+        }
+        await recovery;
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(WorkItemState.Reworking, after!.State);
+        Assert.Equal(item.PreemptCheckpoint, after.PreemptCheckpoint);
+        Assert.Equal(checkpoint.AttemptCount, after.AgentTurnResumeCheckpoint?.AttemptCount);
+        Assert.Null(after.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Equal(1, _queue.Count);
+    }
+
+    [Fact]
+    public async Task Watchdog_RemoteOwnerWithDispatchClaim_FailsClosed()
+    {
+        var item = MakeItem(WorkItemState.Working, DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45));
+        var checkpoint = new AgentTurnResumeCheckpoint(
+            AgentKind.Claude,
+            "claude/account-a",
+            modelId: null,
+            reasoningMode: null,
+            nativeSessionId: null,
+            WorkItemState.Working,
+            AgentTurnResumePhase.Work,
+            iteration: 1,
+            item.PromptRevision,
+            DateTimeOffset.UtcNow.AddMinutes(-10))
+            .ClaimDispatch(Guid.Parse("93168f15-8277-449e-8424-0e44514eea44"));
+        item = item with
+        {
+            PreemptedAt = DateTimeOffset.UtcNow.AddMinutes(-10),
+            PreemptCheckpoint = $"refs/heads/codeybox/preempt/{item.Id}",
+            AgentTurnResumeCheckpoint = checkpoint,
+        };
+        await _store.CreateAsync(item);
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), item.Id);
+        using var cancellations = new CancellationRegistry(CancellationToken.None);
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, _opts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser,
+            cancellationRegistry: cancellations);
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(item.UpdatedAt, after?.UpdatedAt);
+        Assert.Equal(checkpoint.DispatchClaimId, after?.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        Assert.Empty(_slotReleaser.Releases);
+        Assert.Equal(0, _queue.Count);
+        Assert.Single(await _registry.ListAsync());
+    }
+
     // ── Off-by-default and disabled paths ────────────────────────────────────
 
     [Fact]
@@ -1543,6 +1655,64 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, after!.State);
         Assert.Equal(3, after.RecoveryAttempts);
         Assert.Null(after.PreemptCheckpoint);
+        Assert.Single(_slotReleaser.Releases);
+        Assert.Empty(await _registry.ListAsync());
+        Assert.Equal(0, _queue.Count);
+    }
+
+    [Fact]
+    public async Task Watchdog_StuckWorkingWithRetainedSandbox_AtCapPreservesOperatorRecoveryBoundary()
+    {
+        var lowCeilingOpts = new WorkerProgressWatchdogOptions
+        {
+            ProgressTimeout = TimeSpan.FromMinutes(30),
+            CheckInterval = TimeSpan.FromMinutes(1),
+            MaxRecoveryAttempts = 2,
+        };
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, lowCeilingOpts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser);
+
+        var item = MakeItem(
+            WorkItemState.Working,
+            DateTimeOffset.UtcNow - TimeSpan.FromMinutes(45)) with
+        {
+            RecoveryAttempts = 2,
+        };
+        var checkpoint = new AgentTurnResumeCheckpoint(
+            AgentKind.Claude,
+            "claude/default",
+            modelId: null,
+            reasoningMode: null,
+            nativeSessionId: null,
+            WorkItemState.Working,
+            AgentTurnResumePhase.Work,
+            iteration: null,
+            item.PromptRevision,
+            DateTimeOffset.UtcNow.AddMinutes(-10));
+        var lease = new SandboxRecoveryLease(
+            "incus",
+            $"retained-{item.Id}",
+            $"token-{item.Id}");
+        item = item with
+        {
+            PreemptedAt = DateTimeOffset.UtcNow.AddMinutes(-10),
+            AgentTurnResumeCheckpoint = checkpoint,
+            AgentTurnRecoveryLease = lease,
+        };
+        await _store.CreateAsync(item);
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), item.Id);
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, after!.State);
+        Assert.Equal(3, after.RecoveryAttempts);
+        Assert.Equal(checkpoint, after.AgentTurnResumeCheckpoint);
+        Assert.Equal(lease, after.AgentTurnRecoveryLease);
+        Assert.True(after.HasAgentTurnRecoveryBoundary);
         Assert.Single(_slotReleaser.Releases);
         Assert.Empty(await _registry.ListAsync());
         Assert.Equal(0, _queue.Count);

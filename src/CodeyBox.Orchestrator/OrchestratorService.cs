@@ -867,7 +867,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private static bool IsStillWorkerOwnedAfterRecoveryRelease(WorkItem item)
     {
         if (item.State is WorkItemState.Working or WorkItemState.Reworking
-            && !string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
+            && item.HasAgentTurnRecoveryBoundary
             && item.StartedAt is null)
             return false;
 
@@ -2047,7 +2047,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             return null;
         }
 
-        if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
+        if (item.HasAgentTurnRecoveryBoundary
             && item.State is WorkItemState.Working or WorkItemState.Reworking)
         {
             return WorkItemRecoveryPolicy.BuildPreemptCheckpointRecovery(
@@ -2070,6 +2070,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     StartedAt = null,
                     PreemptedAt = null,
                     PreemptCheckpoint = null,
+                    AgentTurnResumeCheckpoint = null,
+                    AgentTurnRecoveryLease = null,
                     UpdatedAt = _time.GetUtcNow(),
                 }, checkAttempts, item.State);
             }
@@ -2089,6 +2091,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     StartedAt = null,
                     PreemptedAt = null,
                     PreemptCheckpoint = null,
+                    AgentTurnResumeCheckpoint = null,
+                    AgentTurnRecoveryLease = null,
                     UpdatedAt = _time.GetUtcNow(),
                 }, controlAttempts, item.State);
             }
@@ -2105,6 +2109,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 StartedAt = null,
                 PreemptedAt = null,
                 PreemptCheckpoint = null,
+                AgentTurnResumeCheckpoint = null,
+                AgentTurnRecoveryLease = null,
                 UpdatedAt = _time.GetUtcNow(),
             }, WorkItemRecoveryPolicy.NextRecoveryAttempt(item), item.State);
         }
@@ -2139,6 +2145,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 StartedAt = null,
                 PreemptedAt = null,
                 PreemptCheckpoint = null,
+                AgentTurnResumeCheckpoint = null,
+                AgentTurnRecoveryLease = null,
                 UpdatedAt = _time.GetUtcNow(),
             }, newAttempts, item.State);
         }
@@ -2787,14 +2795,21 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     }
 
     private static bool ShouldResolveAgentClassAtPickup(WorkItem item)
-        => item.State is WorkItemState.Queued
+        // A durable turn checkpoint is bound to the exact runner instance and
+        // model that emitted its native session id. Re-routing a resumed
+        // Reworking item here would reserve one class member while the pipeline
+        // restores another member's transcript, defeating both quota accounting
+        // and same-session continuation. The direct-slot path below still
+        // applies the original member's concurrency/pause gates.
+        => !item.HasAgentTurnRecoveryBoundary
+        && item.State is (WorkItemState.Queued
             or WorkItemState.Planning
             or WorkItemState.PlanReview
             or WorkItemState.PlanApproved
             or WorkItemState.WorkComplete
             or WorkItemState.AuditPassed
             or WorkItemState.Reworking
-            or WorkItemState.ReworkingForConflict;
+            or WorkItemState.ReworkingForConflict);
 
     // Paused-agent parking is only relevant for states that actually invoke the
     // work agent at pickup (Queued/Reworking + planning-lifecycle). Continuation

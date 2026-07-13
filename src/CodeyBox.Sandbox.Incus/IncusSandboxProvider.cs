@@ -14,6 +14,9 @@ namespace CodeyBox.Sandbox.Incus;
 /// content-addressed <c>baseline/ready</c> snapshot on a snapshot-capable ZFS or
 /// Btrfs pool, while host directory devices explicitly require
 /// <c>io.bus=virtiofs</c> and never permit Incus's 9p fallback.
+/// The conventional <c>/work</c> tmpfs request is provider-locally backed by a
+/// private directory on the bounded VM root disk so it survives stop/start;
+/// credential storage remains a non-persistent guest tmpfs.
 ///
 /// <para>
 /// Host prerequisites: Incus 6.3 or newer, the upstream requirements for the
@@ -69,6 +72,8 @@ public sealed class IncusSandboxProvider :
     internal const string PreemptKey = "user.codeybox.preempt";
     internal const string SuspendedKey = "user.codeybox.suspended";
     internal const string BakeTokenKey = "user.codeybox.bake_token";
+    internal const string RecoveryTokenHashKey = "user.codeybox.recovery_token_sha256";
+    internal const string RecoveryManifestHashKey = "user.codeybox.recovery_manifest_sha256";
     internal const string SandboxKind = "sandbox";
     internal const string BaselineKind = "baseline";
     internal const string ReadySnapshot = "ready";
@@ -172,13 +177,27 @@ public sealed class IncusSandboxProvider :
         ValidateProvisioningMountSeparation(options, spec.Mounts);
         await EnsureHostPreflightAsync(options, ct).ConfigureAwait(false);
         var bridge = ResolveBridge(options, spec.Network.ProfileName);
-        var image = ResolveImage(options, spec.ImageReference);
-        var name = CreateInstanceName(options);
         var stagingRoot = ResolveStagingRoot(options);
-        var sandboxRoot = Path.Combine(stagingRoot, name);
         var timingStore = _timings is not null && spec.TimingWorkItemId.HasValue ? _timings : null;
         var timingItem = spec.TimingWorkItemId.GetValueOrDefault();
         var timingPhase = spec.TimingPhase ?? "work";
+        if (spec.RecoveryLease is { } recoveryLease)
+        {
+            return await AdoptRetainedSandboxAsync(
+                spec,
+                options,
+                bridge,
+                stagingRoot,
+                timingStore,
+                timingItem,
+                timingPhase,
+                recoveryLease,
+                ct).ConfigureAwait(false);
+        }
+
+        var image = ResolveImage(options, spec.ImageReference);
+        var name = CreateInstanceName(options);
+        var sandboxRoot = Path.Combine(stagingRoot, name);
         string? baselineRef = null;
         var instanceBecameVisible = false;
         var stagingInitialized = false;
@@ -255,20 +274,22 @@ public sealed class IncusSandboxProvider :
             var requestedMountPaths = spec.Mounts
                 .Select(static mount => mount.SandboxPath)
                 .ToArray();
-            var hasHostMountDevices = mountPlan.Mounts.Any(static mount => !mount.TmpfsSizeBytes.HasValue);
+            var canonicalRecoveryPaths = IncusRecoveryAuthorization.BuildCanonicalGuestPaths(
+                requestedMountPaths,
+                mountPlan.Mounts);
+            var hasHostMountDevices = mountPlan.Mounts.Any(static mount => mount.HostSource is not null);
             // Resolve guest paths before attaching any host storage. Otherwise
             // an image symlink such as /opt/alias -> /etc could cause cloud-init
             // or boot services to mutate a host-backed directory on first boot.
-            await VerifyDeviceTopologyAsync(options, name, bridge, [], ct).ConfigureAwait(false);
             await using (var startTiming = await TimingScope.BeginAsync(
                 timingStore, timingItem, timingPhase, "vm.start", log: _log).ConfigureAwait(false))
             {
-                await StartAndWaitAsync(options, name, runCloudInit: true, ct).ConfigureAwait(false);
+                await StartAndWaitAsync(options, name, bridge, [], runCloudInit: true, ct).ConfigureAwait(false);
             }
             await ValidateCanonicalProvisioningPathsAsync(
                 options,
                 name,
-                requestedMountPaths,
+                canonicalRecoveryPaths,
                 ct).ConfigureAwait(false);
             if (hasHostMountDevices)
             {
@@ -277,11 +298,16 @@ public sealed class IncusSandboxProvider :
                     timingStore, timingItem, timingPhase, "vm.mount", log: _log).ConfigureAwait(false))
                 {
                     await ApplyMountDevicesAsync(options, name, mountPlan.Mounts, ct).ConfigureAwait(false);
-                    await VerifyDeviceTopologyAsync(options, name, bridge, mountPlan.Mounts, ct).ConfigureAwait(false);
                 }
                 await using var restartTiming = await TimingScope.BeginAsync(
                     timingStore, timingItem, timingPhase, "vm.restart-after-mount", log: _log).ConfigureAwait(false);
-                await StartAndWaitAsync(options, name, runCloudInit: false, ct).ConfigureAwait(false);
+                await StartAndWaitAsync(
+                    options,
+                    name,
+                    bridge,
+                    mountPlan.Mounts,
+                    runCloudInit: false,
+                    ct).ConfigureAwait(false);
             }
             if (!canUseBaseline)
             {
@@ -294,27 +320,94 @@ public sealed class IncusSandboxProvider :
                     ct)
                     .ConfigureAwait(false);
             }
-            await ApplyGuestTmpfsMountsAsync(options, name, mountPlan.Mounts, ct).ConfigureAwait(false);
+            await ApplyGuestLocalMountsAsync(options, name, mountPlan.Mounts, ct).ConfigureAwait(false);
             await WaitForMountsAsync(options, name, mountPlan.Mounts, ct).ConfigureAwait(false);
             await CreateGuestLinksAsync(options, name, mountPlan.GuestLinks, ct).ConfigureAwait(false);
-
-            var sandbox = new IncusSandbox(
-                name,
-                sandboxRoot,
-                stagingRoot,
-                spec,
-                options,
-                _cli,
-                _log,
-                timingStore,
-                timingItem,
-                timingPhase,
-                baselineRef,
-                _resourceUsageStore,
-                MarkInactive,
-                _timeProvider,
-                _newGuid,
-                ReadOptions);
+            foreach (var executableLink in IncusRecoveryAuthorization.SnapshotExecutableLinks(options))
+            {
+                await IncusGuestLinkLifecycle.VerifyExactAsync(
+                    _cli,
+                    options,
+                    name,
+                    executableLink,
+                    ct).ConfigureAwait(false);
+            }
+            // Canonical guest paths and the exact effective topology have now
+            // both been proved by the live provider path. Preserve only the
+            // immutable authorization evidence needed to fail closed before a
+            // later interrupted-exec restart.
+            var recoveryAuthorization = IncusRecoveryAuthorization.CaptureValidated(
+                bridge,
+                mountPlan.Mounts,
+                requestedMountPaths,
+                mountPlan.GuestLinks,
+                options);
+            IncusRecoveryManifestStore? recoveryManifestStore = null;
+            var recoveryHandedOff = false;
+            IncusSandbox sandbox;
+            try
+            {
+                recoveryManifestStore = IncusRecoveryManifestStore.Acquire(sandboxRoot);
+                var recoveryToken = NextGuid("sandbox recovery capability").ToString("N");
+                var recoveryTokenHash = IncusRecoveryManifestCodec.ComputeTokenSha256(recoveryToken);
+                var sandboxRecoveryLease = new SandboxRecoveryLease(ProviderId, name, recoveryToken);
+                var recoveryManifest = IncusRecoveryManifest.Create(
+                    name,
+                    spec,
+                    options,
+                    recoveryTokenHash,
+                    baselineRef,
+                    recoveryAuthorization);
+                var recoveryManifestHash = recoveryManifestStore.Write(
+                    recoveryManifest,
+                    NextGuid("sandbox recovery manifest"));
+                // Bind the private capability and immutable authorization
+                // manifest while the daemon is healthy. Later retention needs
+                // no daemon call, which is essential when daemon loss is the
+                // infrastructure failure being recovered.
+                await SetConfigAsync(
+                    options,
+                    name,
+                    RecoveryTokenHashKey,
+                    recoveryTokenHash,
+                    ct).ConfigureAwait(false);
+                await SetConfigAsync(
+                    options,
+                    name,
+                    RecoveryManifestHashKey,
+                    recoveryManifestHash,
+                    ct).ConfigureAwait(false);
+                sandbox = new IncusSandbox(
+                    name,
+                    sandboxRoot,
+                    stagingRoot,
+                    spec,
+                    options,
+                    _cli,
+                    _log,
+                    timingStore,
+                    timingItem,
+                    timingPhase,
+                    baselineRef,
+                    _resourceUsageStore,
+                    MarkInactive,
+                    recoveryAuthorization,
+                    sandboxRecoveryLease,
+                    recoveryManifest,
+                    recoveryManifestStore,
+                    _timeProvider,
+                    _newGuid,
+                    ReadOptions);
+                recoveryHandedOff = true;
+            }
+            finally
+            {
+                if (!recoveryHandedOff)
+                {
+                    recoveryManifestStore?.Dispose();
+                    recoveryAuthorization.Dispose();
+                }
+            }
             if (spec.TimingWorkItemId is { } workItemId)
                 _activeOwners[name] = new ActiveOwner(workItemId, sandbox);
             SandboxLiveCounter.Increment();
@@ -358,6 +451,202 @@ public sealed class IncusSandboxProvider :
                 retainedSandboxName: name,
                 innerException: ex);
         }
+    }
+
+    private async Task<ISandbox> AdoptRetainedSandboxAsync(
+        SandboxSpec spec,
+        IncusSandboxOptions options,
+        string? bridge,
+        string stagingRoot,
+        ITimingStore? timingStore,
+        WorkItemId timingItem,
+        string timingPhase,
+        SandboxRecoveryLease lease,
+        CancellationToken ct)
+    {
+        if (!string.Equals(lease.ProviderId, ProviderId, StringComparison.Ordinal))
+            throw new InvalidOperationException("Incus cannot adopt a recovery lease owned by another provider.");
+        IncusInputValidation.ValidateInstanceName(lease.SandboxId, nameof(lease));
+        var name = lease.SandboxId;
+        var sandboxRoot = Path.Combine(stagingRoot, name);
+        var ownsStaging = IncusMountStaging.EnumerateOwnedTrees(stagingRoot)
+            .Any(tree => string.Equals(tree.Name, name, StringComparison.Ordinal));
+        if (!ownsStaging)
+            throw new InvalidOperationException("Incus recovery lease has no exact provider-owned staging tree.");
+
+        MarkActive(name);
+        IncusRecoveryManifestStore? manifestStore = null;
+        IncusRecoveryAuthorization? authorization = null;
+        IncusSandbox? sandbox = null;
+        var adopted = false;
+        try
+        {
+            manifestStore = IncusRecoveryManifestStore.Acquire(sandboxRoot);
+            var instance = await FindInstanceAsync(options, name, ct).ConfigureAwait(false)
+                ?? throw new InvalidOperationException("Incus recovery lease VM no longer exists.");
+            ValidateRecoveryInstanceOwnership(instance);
+            var tokenHash = IncusRecoveryManifestCodec.ComputeTokenSha256(lease.Token);
+            var manifestHash = ValidateRecoveryInstanceBinding(instance, tokenHash);
+            var baseManifest = manifestStore.Read(manifestHash);
+            ValidateRecoveryManifestIdentity(baseManifest, spec, options, name, tokenHash, bridge);
+            if (baseManifest.Retained || baseManifest.PendingExec is not null)
+                throw new InvalidDataException("Incus config-bound recovery manifest is not an immutable base manifest.");
+
+            var retainedManifest = manifestStore.ReadRetained();
+            retainedManifest.ValidatePendingExec();
+            ValidateRecoveryManifestIdentity(retainedManifest, spec, options, name, tokenHash, bridge);
+            var normalizedRetained = retainedManifest with
+            {
+                Retained = false,
+                PendingExec = null,
+            };
+            var normalizedHash = IncusRecoveryManifestCodec.ComputeSha256(
+                IncusRecoveryManifestCodec.Serialize(normalizedRetained));
+            if (!IncusRecoveryManifestCodec.FixedTimeEqualsHash(normalizedHash, manifestHash))
+            {
+                throw new InvalidDataException(
+                    "Incus retained recovery journal does not match the config-bound immutable manifest.");
+            }
+
+            // A daemon/host outage may have prevented the original process
+            // from proving the stop. The durable DB claim and host flock elect
+            // this adopter; force-stop before inspecting or mutating recovery
+            // topology, then re-read exact ownership and config binding.
+            instance = await ReadRecoveryBoundInstanceAsync(
+                options,
+                name,
+                tokenHash,
+                manifestHash,
+                ct).ConfigureAwait(false);
+            if (!string.Equals(instance.Status, "STOPPED", StringComparison.OrdinalIgnoreCase))
+            {
+                _ = await _cli.RunAllowFailureAsync(
+                    options,
+                    IncusCommandBuilder.Prefix(options, "stop", name, "--force"),
+                    stdin: null,
+                    options.VmStopTimeout + options.OperationTimeout,
+                    ct,
+                    heavyOperation: true,
+                    maxStdoutBytes: 4096,
+                    maxStderrBytes: 4096).ConfigureAwait(false);
+            }
+            instance = await ReadRecoveryBoundInstanceAsync(
+                options,
+                name,
+                tokenHash,
+                manifestHash,
+                ct).ConfigureAwait(false);
+            if (!string.Equals(instance.Status, "STOPPED", StringComparison.OrdinalIgnoreCase))
+                throw new SandboxExecutionUnavailableException(255);
+
+            authorization = retainedManifest.RestoreAuthorization(options);
+            authorization.RevalidateForRestart(spec, options, stagingRoot);
+            sandbox = new IncusSandbox(
+                name,
+                sandboxRoot,
+                stagingRoot,
+                spec,
+                options,
+                _cli,
+                _log,
+                timingStore,
+                timingItem,
+                timingPhase,
+                retainedManifest.BaselineRef,
+                _resourceUsageStore,
+                MarkInactive,
+                authorization,
+                lease,
+                retainedManifest,
+                manifestStore,
+                _timeProvider,
+                _newGuid,
+                ReadOptions);
+            authorization = null;
+            manifestStore = null;
+            await sandbox.RecoverRetainedForAdoptionAsync(ct).ConfigureAwait(false);
+            if (spec.TimingWorkItemId is { } workItemId)
+                _activeOwners[name] = new ActiveOwner(workItemId, sandbox);
+            SandboxLiveCounter.Increment();
+            adopted = true;
+            _log.LogInformation("Adopted retained Incus sandbox {SandboxName} after infrastructure recovery", name);
+            return sandbox;
+        }
+        finally
+        {
+            if (!adopted)
+            {
+                sandbox?.ReleaseFailedAdoptionHandle();
+                authorization?.Dispose();
+                manifestStore?.Dispose();
+                MarkInactive(name);
+            }
+        }
+    }
+
+    private static void ValidateRecoveryInstanceOwnership(IncusInstanceInfo instance)
+    {
+        if (!IsOwned(instance, SandboxKind))
+            throw new InvalidOperationException("Incus recovery lease VM ownership metadata changed.");
+    }
+
+    private async Task<IncusInstanceInfo> ReadRecoveryBoundInstanceAsync(
+        IncusSandboxOptions options,
+        string name,
+        string expectedTokenHash,
+        string expectedManifestHash,
+        CancellationToken ct)
+    {
+        var instance = await FindInstanceAsync(options, name, ct).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("Incus recovery lease VM disappeared during adoption fencing.");
+        ValidateRecoveryInstanceOwnership(instance);
+        _ = ValidateRecoveryInstanceBinding(instance, expectedTokenHash, expectedManifestHash);
+        return instance;
+    }
+
+    private static string ValidateRecoveryInstanceBinding(
+        IncusInstanceInfo instance,
+        string expectedTokenHash,
+        string? expectedManifestHash = null)
+    {
+        var actualTokenHash = GetConfig(instance.Config, RecoveryTokenHashKey);
+        var actualManifestHash = GetConfig(instance.Config, RecoveryManifestHashKey);
+        if (actualTokenHash is null
+            || actualManifestHash is null
+            || !IncusRecoveryManifestCodec.FixedTimeEqualsHash(actualTokenHash, expectedTokenHash)
+            || (expectedManifestHash is not null
+                && !IncusRecoveryManifestCodec.FixedTimeEqualsHash(actualManifestHash, expectedManifestHash)))
+        {
+            throw new InvalidOperationException("Incus recovery lease does not match the VM's creation-time capability binding.");
+        }
+        IncusRecoveryManifestCodec.ValidateHash(actualManifestHash, RecoveryManifestHashKey);
+        return actualManifestHash;
+    }
+
+    private static void ValidateRecoveryManifestIdentity(
+        IncusRecoveryManifest manifest,
+        SandboxSpec spec,
+        IncusSandboxOptions options,
+        string name,
+        string tokenHash,
+        string? bridge)
+    {
+        if (manifest.Version != IncusRecoveryManifest.CurrentVersion
+            || !string.Equals(manifest.ProviderId, ProviderId, StringComparison.Ordinal)
+            || !string.Equals(manifest.SandboxId, name, StringComparison.Ordinal)
+            || !string.Equals(manifest.ProjectName, options.ProjectName, StringComparison.Ordinal)
+            || !string.Equals(manifest.StoragePoolName, options.StoragePoolName, StringComparison.Ordinal)
+            || !string.Equals(manifest.GuestHome, options.GuestHome, StringComparison.Ordinal)
+            || manifest.GuestUserId != options.GuestUserId
+            || manifest.GuestGroupId != options.GuestGroupId
+            || !string.Equals(manifest.Bridge, bridge, StringComparison.Ordinal)
+            || !IncusRecoveryManifestCodec.FixedTimeEqualsHash(manifest.LeaseTokenSha256, tokenHash))
+        {
+            throw new InvalidDataException("Incus recovery manifest identity does not match the requested adoption.");
+        }
+        var specHash = IncusRecoveryManifestCodec.ComputeSpecSha256(spec);
+        if (!IncusRecoveryManifestCodec.FixedTimeEqualsHash(manifest.SpecSha256, specHash))
+            throw new InvalidDataException("Incus recovery manifest belongs to a different sandbox specification or work item.");
     }
 
     public string? ResolveBaselineRef(string? profileName, SandboxProfileFlavor flavor)
@@ -788,8 +1077,13 @@ public sealed class IncusSandboxProvider :
                     ?? throw new InvalidOperationException("A baseline requires a mapped network profile.");
                 await AddNicAsync(options, candidateName, bridge, ct).ConfigureAwait(false);
                 await SetCloudInitAsync(options, candidateName, IncusCloudInit.Build(options, flavor), ct).ConfigureAwait(false);
-                await VerifyDeviceTopologyAsync(options, candidateName, bridge, [], ct).ConfigureAwait(false);
-                await StartAndWaitAsync(options, candidateName, runCloudInit: true, ct).ConfigureAwait(false);
+                await StartAndWaitAsync(
+                    options,
+                    candidateName,
+                    bridge,
+                    [],
+                    runCloudInit: true,
+                    ct).ConfigureAwait(false);
                 await RunExtraRuncmdAsync(options, candidateName, ct).ConfigureAwait(false);
                 await RunProvisioningWithPrivateWorkspaceAsync(
                     options,
@@ -1097,30 +1391,30 @@ public sealed class IncusSandboxProvider :
     private async Task StartAndWaitAsync(
         IncusSandboxOptions options,
         string name,
+        string? bridge,
+        IReadOnlyList<IncusPreparedMount> mounts,
         bool runCloudInit,
         CancellationToken ct)
     {
-        await _cli.RunCheckedAsync(
-            "start VM",
+        await IncusGuestLifecycle.StartAndWaitForAgentAsync(
+            _cli,
             options,
-            IncusCommandBuilder.Prefix(options, "start", name),
-            stdin: null,
-            options.VmStartTimeout,
+            name,
+            _timeProvider,
+            token => VerifyDeviceTopologyAsync(options, name, bridge, mounts, token),
             ct).ConfigureAwait(false);
-        await WaitForAgentAsync(options, name, options.VmStartTimeout, ct).ConfigureAwait(false);
-        await PrepareRuntimeDirectoryAsync(options, name, ct).ConfigureAwait(false);
+        await IncusGuestLifecycle.PrepareRuntimeDirectoryAsync(
+            _cli,
+            options,
+            name,
+            ct).ConfigureAwait(false);
         if (runCloudInit)
             await WaitForCloudInitAsync(options, name, ct).ConfigureAwait(false);
-        await _cli.RunCheckedAsync(
-            "verify Incus guest exec wrapper",
+        await IncusGuestLifecycle.VerifyExecWrapperAsync(
+            _cli,
             options,
-            BuildRootExec(options, name, ["test", "-x", IncusCloudInit.ExecWrapperPath]),
-            stdin: null,
-            options.OperationTimeout,
-            ct,
-            heavyOperation: false,
-            maxStdoutBytes: 4096,
-            maxStderrBytes: 4096).ConfigureAwait(false);
+            name,
+            ct).ConfigureAwait(false);
     }
 
     private async Task WaitForCloudInitAsync(
@@ -1437,88 +1731,13 @@ public sealed class IncusSandboxProvider :
         IncusSandboxOptions options,
         string name,
         IReadOnlyList<string> mountGuestPaths,
-        CancellationToken ct)
-    {
-        ArgumentNullException.ThrowIfNull(mountGuestPaths);
-        if (mountGuestPaths.Count == 0
-            && options.PackageCacheSeeds.Count == 0
-            && options.ExecutableProvisions.Count == 0)
-        {
-            return;
-        }
-        var canonicalMounts = new List<string>(mountGuestPaths.Count);
-        foreach (var mountPath in mountGuestPaths)
-        {
-            IncusInputValidation.ValidateAbsoluteGuestPath(mountPath, nameof(mountGuestPaths));
-            var canonical = await ResolveCanonicalGuestPathAsync(
-                options,
-                name,
-                mountPath,
-                ct).ConfigureAwait(false);
-            if (!string.Equals(canonical, mountPath, StringComparison.Ordinal))
-            {
-                throw new InvalidOperationException(
-                    $"Sandbox mount path '{mountPath}' resolves through a guest filesystem alias; " +
-                    "mount destinations must be canonical paths.");
-            }
-            if (canonicalMounts.Any(existing => IncusGuestPaths.Overlap(canonical, existing)))
-            {
-                throw new InvalidOperationException(
-                    "Canonical sandbox mount paths must be distinct and non-overlapping.");
-            }
-            canonicalMounts.Add(canonical);
-        }
-
-        foreach (var target in SnapshotProvisioningTargets(options))
-        {
-            EnsureProvisioningDestinationAllowed(target.Path);
-            var canonical = await ResolveCanonicalGuestPathAsync(
-                options,
-                name,
-                target.Path,
-                ct).ConfigureAwait(false);
-            if (!string.Equals(canonical, target.Path, StringComparison.Ordinal))
-            {
-                throw new InvalidOperationException(
-                    $"{target.Name} resolves through a guest filesystem alias; " +
-                    "provisioning destinations must be canonical paths.");
-            }
-            EnsureProvisioningDestinationAllowed(canonical);
-            if (canonicalMounts.Any(mount => IncusGuestPaths.Overlap(canonical, mount)))
-            {
-                throw new InvalidOperationException(
-                    $"{target.Name} resolves into a sandbox mount; refusing root provisioning writes.");
-            }
-        }
-    }
-
-    private async Task<string> ResolveCanonicalGuestPathAsync(
-        IncusSandboxOptions options,
-        string name,
-        string guestPath,
-        CancellationToken ct)
-    {
-        var result = await _cli.RunCheckedAsync(
-            "resolve guest provisioning path",
+        CancellationToken ct) =>
+        await IncusGuestPathAuthorization.ValidateCanonicalProvisioningPathsAsync(
+            _cli,
             options,
-            BuildRootExec(options, name, ["/usr/bin/realpath", "-m", "--", guestPath]),
-            stdin: null,
-            options.OperationTimeout,
-            ct,
-            heavyOperation: false,
-            maxStdoutBytes: 8192,
-            maxStderrBytes: 4096).ConfigureAwait(false);
-        var canonical = result.Stdout.TrimEnd('\r', '\n');
-        if (canonical.Length == 0
-            || canonical.Contains('\r')
-            || canonical.Contains('\n'))
-        {
-            throw new InvalidOperationException(
-                "Guest path canonicalization returned an invalid response.");
-        }
-        IncusInputValidation.ValidateAbsoluteGuestPath(canonical, nameof(guestPath));
-        return canonical;
-    }
+            name,
+            mountGuestPaths,
+            ct).ConfigureAwait(false);
 
     private async Task VerifyProvisioningCommandsAsync(
         IncusSandboxOptions options,
@@ -1748,45 +1967,11 @@ public sealed class IncusSandboxProvider :
     }
 
     private static IReadOnlyList<(string Path, string Name)> SnapshotProvisioningTargets(
-        IncusSandboxOptions options)
-    {
-        var targets = new List<(string Path, string Name)>(
-            options.PackageCacheSeeds.Count
-            + options.ExecutableProvisions.Count * 2);
-        for (var i = 0; i < options.PackageCacheSeeds.Count; i++)
-        {
-            targets.Add((
-                options.PackageCacheSeeds[i].VmDestPath,
-                $"PackageCacheSeeds[{i}].VmDestPath"));
-        }
-        for (var i = 0; i < options.ExecutableProvisions.Count; i++)
-        {
-            var provision = options.ExecutableProvisions[i];
-            targets.Add((
-                provision.VmDestPath,
-                $"ExecutableProvisions[{i}].VmDestPath"));
-            for (var linkIndex = 0; linkIndex < provision.VmSymlinks.Count; linkIndex++)
-            {
-                targets.Add((
-                    provision.VmSymlinks[linkIndex],
-                    $"ExecutableProvisions[{i}].VmSymlinks[{linkIndex}]"));
-            }
-        }
-        return targets;
-    }
+        IncusSandboxOptions options) =>
+        IncusGuestPathAuthorization.SnapshotProvisioningTargets(options);
 
-    private static void EnsureProvisioningDestinationAllowed(string guestPath)
-    {
-        IncusInputValidation.ValidateAbsoluteGuestPath(guestPath, nameof(guestPath));
-        if (guestPath == "/"
-            || IncusCloudInit.OverlapsProviderOwnedPath(guestPath)
-            || IncusGuestPaths.IsVolatileOrPseudoFilesystemPath(guestPath))
-        {
-            throw new InvalidOperationException(
-                "Incus provisioning destinations cannot be root, volatile/pseudo filesystems, " +
-                "or provider-owned guest control paths.");
-        }
-    }
+    private static void EnsureProvisioningDestinationAllowed(string guestPath) =>
+        IncusGuestPathAuthorization.EnsureProvisioningDestinationAllowed(guestPath);
 
     private static string GetGuestParent(string guestPath)
     {
@@ -1822,246 +2007,21 @@ public sealed class IncusSandboxProvider :
             heavyOperation: false).ConfigureAwait(false);
     }
 
-    private async Task WaitForAgentAsync(
-        IncusSandboxOptions options,
-        string name,
-        TimeSpan timeout,
-        CancellationToken ct)
-    {
-        var deadline = _timeProvider.GetUtcNow() + timeout;
-        while (true)
-        {
-            ct.ThrowIfCancellationRequested();
-            var probe = await _cli.RunAllowFailureAsync(
-                options,
-                BuildRootExec(options, name, ["/bin/true"]),
-                stdin: null,
-                options.OperationTimeout,
-                ct,
-                heavyOperation: false,
-                maxStdoutBytes: 4096,
-                maxStderrBytes: 4096).ConfigureAwait(false);
-            if (probe.Success)
-                return;
-            if (_timeProvider.GetUtcNow() >= deadline)
-                throw new TimeoutException($"Incus VM '{name}' did not expose its guest agent within {timeout.TotalSeconds:F0} seconds.");
-            await Task.Delay(options.ReadinessPollInterval, _timeProvider, ct).ConfigureAwait(false);
-        }
-    }
-
-    private async Task PrepareRuntimeDirectoryAsync(IncusSandboxOptions options, string name, CancellationToken ct)
-    {
-        await _cli.RunCheckedAsync(
-            "prepare guest runtime directory",
-            options,
-            BuildRootExec(options, name,
-            [
-                "install", "-d", "-m", "0700",
-                "-o", options.GuestUserId.ToString(CultureInfo.InvariantCulture),
-                "-g", options.GuestGroupId.ToString(CultureInfo.InvariantCulture),
-                IncusCloudInit.RuntimeDirectory,
-            ]),
-            stdin: null,
-            options.OperationTimeout,
-            ct,
-            heavyOperation: false).ConfigureAwait(false);
-        await _cli.RunCheckedAsync(
-            "prepare guest exec control directory",
-            options,
-            BuildRootExec(options, name,
-            [
-                "install", "-d", "-m", "0700",
-                "-o", "0", "-g", "0",
-                IncusCloudInit.ControlDirectory,
-            ]),
-            stdin: null,
-            options.OperationTimeout,
-            ct,
-            heavyOperation: false).ConfigureAwait(false);
-        await _cli.RunCheckedAsync(
-            "verify guest exec isolation utilities",
-            options,
-            BuildRootExec(
-                options,
-                name,
-                [
-                    "test",
-                    "-x", "/usr/bin/setpriv",
-                    "-a", "-x", "/usr/bin/setsid",
-                    "-a", "-x", "/usr/bin/realpath",
-                ]),
-            stdin: null,
-            options.OperationTimeout,
-            ct,
-            heavyOperation: false).ConfigureAwait(false);
-    }
-
     private async Task WaitForMountsAsync(
         IncusSandboxOptions options,
         string name,
         IReadOnlyList<IncusPreparedMount> mounts,
-        CancellationToken ct)
-    {
-        for (var index = 0; index < mounts.Count; index++)
-        {
-            var mount = mounts[index];
-            VerifyPinnedMountSource(options, mount);
-            var deadline = _timeProvider.GetUtcNow() + options.MountReadyTimeout;
-            var lastReadinessStage = "filesystem type";
-            while (true)
-            {
-                var findMount = await _cli.RunAllowFailureAsync(
-                    options,
-                    IncusCommandBuilder.BuildExec(
-                        options,
-                        name,
-                        ["findmnt", "-n", "-o", "FSTYPE", "--target", mount.GuestPath]),
-                    stdin: null,
-                    options.OperationTimeout,
-                    ct,
-                    heavyOperation: false,
-                    maxStdoutBytes: 4096,
-                    maxStderrBytes: 4096).ConfigureAwait(false);
-                var expectedFilesystem = mount.TmpfsSizeBytes.HasValue ? "tmpfs" : "virtiofs";
-                var ready = findMount.Success
-                    && string.Equals(findMount.Stdout.Trim(), expectedFilesystem, StringComparison.Ordinal);
-                lastReadinessStage =
-                    $"filesystem type (exit={findMount.ExitCode}, match={ready})";
-                if (ready && mount.HostSource is not null)
-                {
-                    var readable = await _cli.RunAllowFailureAsync(
-                        options,
-                        IncusCommandBuilder.BuildExec(options, name, ["test", "-r", mount.GuestPath]),
-                        stdin: null,
-                        options.OperationTimeout,
-                        ct,
-                        heavyOperation: false,
-                        maxStdoutBytes: 128,
-                        maxStderrBytes: 4096).ConfigureAwait(false);
-                    var traversable = await _cli.RunAllowFailureAsync(
-                        options,
-                        IncusCommandBuilder.BuildExec(options, name, ["test", "-x", mount.GuestPath]),
-                        stdin: null,
-                        options.OperationTimeout,
-                        ct,
-                        heavyOperation: false,
-                        maxStdoutBytes: 128,
-                        maxStderrBytes: 4096).ConfigureAwait(false);
-                    ready = readable.Success && traversable.Success;
-                    lastReadinessStage =
-                        $"configured guest access (readExit={readable.ExitCode}, traverseExit={traversable.ExitCode})";
-                }
-                if (ready && mount.HostSource is not null)
-                {
-                    var mountOptions = await _cli.RunAllowFailureAsync(
-                        options,
-                        IncusCommandBuilder.BuildExec(
-                            options,
-                            name,
-                            ["findmnt", "-n", "-o", "OPTIONS", "--target", mount.GuestPath]),
-                        stdin: null,
-                        options.OperationTimeout,
-                        ct,
-                        heavyOperation: false,
-                        maxStdoutBytes: 4096,
-                        maxStderrBytes: 4096).ConfigureAwait(false);
-                    var optionSet = mountOptions.Stdout
-                        .Trim()
-                        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                        .ToHashSet(StringComparer.Ordinal);
-                    var expectedAccess = mount.ReadOnly ? "ro" : "rw";
-                    ready = mountOptions.Success && optionSet.Contains(expectedAccess);
-                    lastReadinessStage =
-                        $"mount access mode (exit={mountOptions.ExitCode}, expected={expectedAccess}, match={ready})";
-                }
-                if (ready && mount.HostSource is { } hostSource)
-                {
-                    var deviceName = BuildMountDeviceName(index);
-                    var source = await _cli.RunAllowFailureAsync(
-                        options,
-                        IncusCommandBuilder.Prefix(options, "config", "device", "get", name, deviceName, "source"),
-                        stdin: null,
-                        options.OperationTimeout,
-                        ct,
-                        heavyOperation: false,
-                        // The configured host source is path-validated but can
-                        // legitimately exceed a small diagnostic buffer once
-                        // it includes the private staging and sandbox names.
-                        maxStdoutBytes: options.MaxCliStdoutBytes,
-                        maxStderrBytes: 4096).ConfigureAwait(false);
-                    var bus = await _cli.RunAllowFailureAsync(
-                        options,
-                        IncusCommandBuilder.Prefix(options, "config", "device", "get", name, deviceName, "io.bus"),
-                        stdin: null,
-                        options.OperationTimeout,
-                        ct,
-                        heavyOperation: false,
-                        maxStdoutBytes: 128,
-                        maxStderrBytes: 4096).ConfigureAwait(false);
-                    ready = source.Success
-                        && bus.Success
-                        && string.Equals(source.Stdout.Trim(), hostSource, StringComparison.Ordinal)
-                        && string.Equals(bus.Stdout.Trim(), "virtiofs", StringComparison.Ordinal);
-                    lastReadinessStage =
-                        $"device metadata (sourceExit={source.ExitCode}, sourceMatch={string.Equals(source.Stdout.Trim(), hostSource, StringComparison.Ordinal)}, " +
-                        $"busExit={bus.ExitCode}, busMatch={string.Equals(bus.Stdout.Trim(), "virtiofs", StringComparison.Ordinal)})";
-                    if (ready && mount.ReadinessProbe is { } probe)
-                    {
-                        var guestProbePath = $"{mount.GuestPath.TrimEnd('/')}/{probe.RelativeFilePath}";
-                        var guestHash = await _cli.RunAllowFailureAsync(
-                            options,
-                            IncusCommandBuilder.BuildExec(options, name, ["sha256sum", "--", guestProbePath]),
-                            stdin: null,
-                            options.OperationTimeout,
-                            ct,
-                            heavyOperation: false,
-                            maxStdoutBytes: 512,
-                            maxStderrBytes: 4096).ConfigureAwait(false);
-                        var guestHashText = guestHash.Stdout.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
-                        ready = guestHash.Success
-                            && string.Equals(guestHashText, probe.ExpectedSha256, StringComparison.Ordinal);
-                        lastReadinessStage =
-                            $"host-to-guest identity hash (guestExit={guestHash.ExitCode}, match={string.Equals(guestHashText, probe.ExpectedSha256, StringComparison.Ordinal)})";
-                    }
-                    if (ready && mount.PinnedHostDirectory is { } pinnedDirectory)
-                    {
-                        var inode = await _cli.RunAllowFailureAsync(
-                            options,
-                            IncusCommandBuilder.BuildExec(
-                                options,
-                                name,
-                                ["stat", "-Lc", "%i", "--", mount.GuestPath]),
-                            stdin: null,
-                            options.OperationTimeout,
-                            ct,
-                            heavyOperation: false,
-                            maxStdoutBytes: 128,
-                            maxStderrBytes: 4096).ConfigureAwait(false);
-                        ready = inode.Success
-                            && ulong.TryParse(
-                                inode.Stdout.Trim(),
-                                NumberStyles.None,
-                                CultureInfo.InvariantCulture,
-                                out var guestInode)
-                            && guestInode == pinnedDirectory.Identity.Inode;
-                        lastReadinessStage =
-                            $"host-to-guest directory identity (guestExit={inode.ExitCode}, match={ready})";
-                    }
-                }
-                if (ready)
-                {
-                    VerifyPinnedMountSource(options, mount);
-                    break;
-                }
-                if (_timeProvider.GetUtcNow() >= deadline)
-                    throw new TimeoutException(
-                        $"Incus mount '{mount.GuestPath}' did not pass its {lastReadinessStage} readiness check within the configured deadline.");
-                await Task.Delay(options.ReadinessPollInterval, _timeProvider, ct).ConfigureAwait(false);
-            }
-        }
-    }
+        CancellationToken ct) =>
+        await IncusMountReadiness.WaitAsync(
+            _cli,
+            options,
+            name,
+            ResolveStagingRoot(options),
+            mounts,
+            _timeProvider,
+            ct).ConfigureAwait(false);
 
-    private async Task ApplyGuestTmpfsMountsAsync(
+    private async Task ApplyGuestLocalMountsAsync(
         IncusSandboxOptions options,
         string name,
         IReadOnlyList<IncusPreparedMount> mounts,
@@ -2069,35 +2029,35 @@ public sealed class IncusSandboxProvider :
     {
         foreach (var mount in mounts)
         {
-            if (mount.TmpfsSizeBytes is not { } size)
+            if (!mount.TmpfsSizeBytes.HasValue && !mount.RootDiskDirectory)
                 continue;
-            await _cli.RunCheckedAsync(
-                "create guest tmpfs mount point",
+            if (mount.RootDiskDirectory)
+            {
+                await _cli.RunCheckedAsync(
+                    "create persistent guest root-disk directory",
+                    options,
+                    BuildRootExec(options, name,
+                    [
+                        "install", "-d", "-m", "0700",
+                        "-o", options.GuestUserId.ToString(CultureInfo.InvariantCulture),
+                        "-g", options.GuestGroupId.ToString(CultureInfo.InvariantCulture),
+                        mount.GuestPath,
+                    ]),
+                    stdin: null,
+                    options.OperationTimeout,
+                    ct,
+                    heavyOperation: false).ConfigureAwait(false);
+                continue;
+            }
+            var tmpfsSize = mount.TmpfsSizeBytes
+                ?? throw new InvalidOperationException("A guest tmpfs mount has no size.");
+            await IncusGuestLifecycle.MountTmpfsAsync(
+                _cli,
                 options,
-                BuildRootExec(options, name,
-                [
-                    "install", "-d", "-m", "0700",
-                    "-o", options.GuestUserId.ToString(CultureInfo.InvariantCulture),
-                    "-g", options.GuestGroupId.ToString(CultureInfo.InvariantCulture),
-                    mount.GuestPath,
-                ]),
-                stdin: null,
-                options.OperationTimeout,
-                ct,
-                heavyOperation: false).ConfigureAwait(false);
-            var mountOptions = string.Join(',',
-                $"size={size.ToString(CultureInfo.InvariantCulture)}",
-                "mode=0700",
-                $"uid={options.GuestUserId.ToString(CultureInfo.InvariantCulture)}",
-                $"gid={options.GuestGroupId.ToString(CultureInfo.InvariantCulture)}");
-            await _cli.RunCheckedAsync(
-                "mount guest tmpfs",
-                options,
-                BuildRootExec(options, name, ["mount", "-t", "tmpfs", "-o", mountOptions, "tmpfs", mount.GuestPath]),
-                stdin: null,
-                options.OperationTimeout,
-                ct,
-                heavyOperation: false).ConfigureAwait(false);
+                name,
+                mount.GuestPath,
+                tmpfsSize,
+                ct).ConfigureAwait(false);
         }
     }
 
@@ -2105,33 +2065,13 @@ public sealed class IncusSandboxProvider :
         IncusSandboxOptions options,
         string name,
         IReadOnlyList<IncusGuestLink> links,
-        CancellationToken ct)
-    {
-        foreach (var link in links)
-        {
-            IncusInputValidation.ValidateAbsoluteGuestPath(link.Target, nameof(link.Target));
-            IncusInputValidation.ValidateAbsoluteGuestPath(link.LinkPath, nameof(link.LinkPath));
-            var parent = link.LinkPath[..link.LinkPath.LastIndexOf('/')];
-            if (parent.Length == 0)
-                parent = "/";
-            await _cli.RunCheckedAsync(
-                "create guest file-mount parent",
-                options,
-                IncusCommandBuilder.BuildExec(options, name, ["mkdir", "-p", "--", parent]),
-                stdin: null,
-                options.OperationTimeout,
-                ct,
-                heavyOperation: false).ConfigureAwait(false);
-            await _cli.RunCheckedAsync(
-                "create guest file-mount link",
-                options,
-                IncusCommandBuilder.BuildExec(options, name, ["ln", "-s", "--", link.Target, link.LinkPath]),
-                stdin: null,
-                options.OperationTimeout,
-                ct,
-                heavyOperation: false).ConfigureAwait(false);
-        }
-    }
+        CancellationToken ct) =>
+        await IncusGuestLinkLifecycle.CreateAsync(
+            _cli,
+            options,
+            name,
+            links,
+            ct).ConfigureAwait(false);
 
     private async Task ApplyMountDevicesAsync(
         IncusSandboxOptions options,
@@ -2142,7 +2082,7 @@ public sealed class IncusSandboxProvider :
         for (var index = 0; index < mounts.Count; index++)
         {
             var mount = mounts[index];
-            if (mount.TmpfsSizeBytes.HasValue)
+            if (mount.TmpfsSizeBytes.HasValue || mount.RootDiskDirectory)
                 continue;
             var device = BuildMountDeviceName(index);
             var source = mount.HostSource ?? throw new InvalidOperationException("Host-backed mount has no source.");
@@ -2499,23 +2439,8 @@ public sealed class IncusSandboxProvider :
         IncusSandboxOptions options,
         string name,
         IReadOnlyList<string> command,
-        string? workingDirectory = null)
-    {
-        IncusInputValidation.ValidateInstanceName(name, nameof(name));
-        if (command.Count == 0 || command.Any(item => item.Contains('\0')))
-            throw new ArgumentException("Root exec command is empty or contains NUL.", nameof(command));
-        if (workingDirectory is not null)
-            IncusInputValidation.ValidateAbsoluteGuestPath(workingDirectory, nameof(workingDirectory));
-        var argv = IncusCommandBuilder.Prefix(options, "exec", name);
-        if (workingDirectory is not null)
-        {
-            argv.Add("--cwd");
-            argv.Add(workingDirectory);
-        }
-        argv.Add("--");
-        argv.AddRange(command);
-        return argv;
-    }
+        string? workingDirectory = null) =>
+        IncusCommandBuilder.BuildRootExec(options, name, command, workingDirectory);
 
     private IncusSandboxOptions ReadOptions()
     {
@@ -2548,7 +2473,7 @@ public sealed class IncusSandboxProvider :
         return options;
     }
 
-    private static string? ResolveBridge(IncusSandboxOptions options, string? profileName)
+    internal static string? ResolveBridge(IncusSandboxOptions options, string? profileName)
     {
         if (profileName is null || profileName.Length == 0)
             return null;
@@ -2701,7 +2626,11 @@ public sealed class IncusSandboxProvider :
 
     private static string NormalizedPrefix(string prefix) => prefix.ToLowerInvariant();
 
-    private void MarkActive(string name) => _activeNames[name] = true;
+    private void MarkActive(string name)
+    {
+        if (!_activeNames.TryAdd(name, true))
+            throw new InvalidOperationException("Incus sandbox is already active or being adopted in this process.");
+    }
 
     private void MarkInactive(string name)
     {

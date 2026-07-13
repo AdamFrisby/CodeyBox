@@ -350,6 +350,8 @@ public sealed class IncusSandboxConfigMapperTests
             ExecPidPollAttempts = 7,
             ExecControlFileCleanupAttempts = 11,
             ExecCompletionProbeAttempts = 13,
+            InterruptedExecRecoveryRetryAttempts = 4,
+            InterruptedExecRecoveryRetryDelay = TimeSpan.FromSeconds(9),
             MaxTmpfsDeviceBytes = 1234,
             MaxAggregateTmpfsBytes = 5678,
             MaxSnapshotEntries = 4321,
@@ -367,6 +369,8 @@ public sealed class IncusSandboxConfigMapperTests
         Assert.Equal(7, mapped.ExecPidPollAttempts);
         Assert.Equal(11, mapped.ExecControlFileCleanupAttempts);
         Assert.Equal(13, mapped.ExecCompletionProbeAttempts);
+        Assert.Equal(4, mapped.InterruptedExecRecoveryRetryAttempts);
+        Assert.Equal(TimeSpan.FromSeconds(9), mapped.InterruptedExecRecoveryRetryDelay);
         Assert.Equal(1234, mapped.MaxTmpfsDeviceBytes);
         Assert.Equal(5678, mapped.MaxAggregateTmpfsBytes);
         Assert.Equal(4321, mapped.MaxSnapshotEntries);

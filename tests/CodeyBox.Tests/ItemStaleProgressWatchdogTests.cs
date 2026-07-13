@@ -92,6 +92,42 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
             UpdatedAt = updatedAt ?? _time.GetUtcNow().AddMinutes(-100),
         };
 
+    private WorkItem WithClaimedAgentTurnCheckpoint(WorkItem item)
+    {
+        var phase = item.State switch
+        {
+            WorkItemState.Working => AgentTurnResumePhase.Work,
+            WorkItemState.Reworking => AgentTurnResumePhase.Rework,
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(item),
+                item.State,
+                "Claimed agent-turn test checkpoints require Working or Reworking state."),
+        };
+        var checkpoint = new AgentTurnResumeCheckpoint(
+                AgentKind.Claude,
+                "claude/default",
+                modelId: null,
+                reasoningMode: null,
+                nativeSessionId: null,
+                item.State,
+                phase,
+                iteration: phase == AgentTurnResumePhase.Rework ? 1 : null,
+                item.PromptRevision,
+                _time.GetUtcNow().AddMinutes(-10))
+            .ClaimDispatch(Guid.Parse("77b7d18d-5969-4c03-9792-604c93a98ad2"));
+        var archive = new AgentTurnScratchpadArchive([0x1f, 0x8b, 0x08, 0x00]);
+        var checkpointRef = AgentTurnCheckpointRef.Create(
+            item.Id,
+            new string('a', 40),
+            archive);
+        return item with
+        {
+            PreemptedAt = _time.GetUtcNow().AddMinutes(-10),
+            PreemptCheckpoint = checkpointRef.Value,
+            AgentTurnResumeCheckpoint = checkpoint,
+        };
+    }
+
     // ── Acceptance (a): in-flight item with frozen updatedAt detected ────────
 
     [Fact]
@@ -290,6 +326,207 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
         Assert.Equal(advanced.UpdatedAt, after.UpdatedAt);
         Assert.Equal(0, after.RecoveryAttempts);
         Assert.Equal(0, _queue.Count);
+    }
+
+    [Fact]
+    public async Task RecoverItemAsync_ClaimedCheckpoint_WaitsForLocalPipelineToBecomeInactive()
+    {
+        var item = WithClaimedAgentTurnCheckpoint(MakeItem(
+            WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-100),
+            workBranch: "codeybox/claimed-local"));
+        await _store.CreateAsync(item);
+        await _registry.RegisterAsync(new WorkerRegistration
+        {
+            WorkerId = "claimed-local-worker",
+            HostName = "host",
+            ProcessId = 1001,
+            StartedAt = _time.GetUtcNow().AddMinutes(-100),
+            LastHeartbeatAt = _time.GetUtcNow(),
+            CurrentWorkItemId = item.Id.ToString(),
+        });
+
+        var registration = _cancellations.Register(item.Id);
+        var cancellationObserved = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cancellationObserver = registration.Token.Register(
+            () => cancellationObserved.TrySetResult());
+
+        var recoveryTask = _watchdog.RecoverItemAsync(
+            item,
+            "operator: fence claimed local pipeline",
+            CancellationToken.None);
+        await cancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var whilePipelineActive = await _store.GetAsync(item.Id);
+        Assert.Equal(
+            item.AgentTurnResumeCheckpoint?.DispatchClaimId,
+            whilePipelineActive?.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        Assert.Equal(0, whilePipelineActive?.RecoveryAttempts);
+        Assert.Equal(0, _queue.Count);
+        Assert.Empty(_slotReleaser.Releases);
+        Assert.Equal(CancellationRequestKind.Recovery, _cancellations.GetRequestKind(item.Id));
+
+        registration.Dispose();
+        var result = await recoveryTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(result.Recovered, result.Error);
+        var recovered = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, recovered?.State);
+        Assert.Equal(item.PreemptCheckpoint, recovered?.PreemptCheckpoint);
+        Assert.NotNull(recovered?.AgentTurnResumeCheckpoint);
+        Assert.Null(recovered!.AgentTurnResumeCheckpoint!.DispatchClaimId);
+        Assert.Equal(1, recovered.AgentTurnResumeCheckpoint.AttemptCount);
+        Assert.Equal(1, recovered.RecoveryAttempts);
+        Assert.Equal(1, _queue.Count);
+        var release = Assert.Single(_slotReleaser.Releases);
+        Assert.Equal("claimed-local-worker", release.WorkerId);
+        Assert.Empty(await _registry.ListAsync());
+    }
+
+    [Fact]
+    public async Task RecoverItemAsync_ClaimedCheckpointWithoutLocalOwner_FailsClosed()
+    {
+        var item = WithClaimedAgentTurnCheckpoint(MakeItem(
+            WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-100),
+            workBranch: "codeybox/claimed-remote"));
+        await _store.CreateAsync(item);
+        await _registry.RegisterAsync(new WorkerRegistration
+        {
+            WorkerId = "claimed-remote-worker",
+            HostName = "remote-host",
+            ProcessId = 2002,
+            StartedAt = _time.GetUtcNow().AddMinutes(-100),
+            LastHeartbeatAt = _time.GetUtcNow(),
+            CurrentWorkItemId = item.Id.ToString(),
+        });
+
+        var result = await _watchdog.RecoverItemAsync(
+            item,
+            "operator: remote claimed checkpoint",
+            CancellationToken.None);
+
+        Assert.False(result.Recovered);
+        Assert.Contains("remote or unfenceable", result.Error, StringComparison.Ordinal);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(item.State, after?.State);
+        Assert.Equal(item.UpdatedAt, after?.UpdatedAt);
+        Assert.Equal(
+            item.AgentTurnResumeCheckpoint?.DispatchClaimId,
+            after?.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        Assert.Equal(0, after?.RecoveryAttempts);
+        Assert.Equal(0, _queue.Count);
+        Assert.Empty(_slotReleaser.Releases);
+        Assert.Single(await _registry.ListAsync());
+    }
+
+    [Fact]
+    public async Task RecoverItemAsync_ClaimedCheckpointWithoutCancellationRegistry_FailsClosed()
+    {
+        var item = WithClaimedAgentTurnCheckpoint(MakeItem(
+            WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-100),
+            workBranch: "codeybox/claimed-unfenceable"));
+        await _store.CreateAsync(item);
+        using var unfenceableWatchdog = new ItemStaleProgressWatchdog(
+            _store,
+            _queue,
+            _registry,
+            _opts,
+            NullLogger<ItemStaleProgressWatchdog>.Instance,
+            _webhooks,
+            _slotReleaser,
+            cancellations: null,
+            timeProvider: _time);
+
+        var result = await unfenceableWatchdog.RecoverItemAsync(
+            item,
+            "operator: no local fencing capability",
+            CancellationToken.None);
+
+        Assert.False(result.Recovered);
+        Assert.Contains("no local cancellation registry", result.Error, StringComparison.Ordinal);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(item.UpdatedAt, after?.UpdatedAt);
+        Assert.Equal(
+            item.AgentTurnResumeCheckpoint?.DispatchClaimId,
+            after?.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        Assert.Equal(0, _queue.Count);
+        Assert.Empty(_slotReleaser.Releases);
+    }
+
+    [Fact]
+    public async Task RecoverItemAsync_ClaimedCheckpointOwnerDoesNotQuiesce_FailsClosedAtBound()
+    {
+        _opts.PostAgentTransitionTimeout = TimeSpan.FromMilliseconds(50);
+        var item = WithClaimedAgentTurnCheckpoint(MakeItem(
+            WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-100),
+            workBranch: "codeybox/claimed-timeout"));
+        await _store.CreateAsync(item);
+        var registration = _cancellations.Register(item.Id);
+
+        var result = await _watchdog.RecoverItemAsync(
+                item,
+                "operator: claimed pipeline ignores cancellation",
+                CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.False(result.Recovered);
+        Assert.Contains("did not quiesce", result.Error, StringComparison.Ordinal);
+        Assert.True(registration.Token.IsCancellationRequested);
+        Assert.Equal(CancellationRequestKind.Recovery, _cancellations.GetRequestKind(item.Id));
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(item.UpdatedAt, after?.UpdatedAt);
+        Assert.Equal(
+            item.AgentTurnResumeCheckpoint?.DispatchClaimId,
+            after?.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        Assert.Equal(0, after?.RecoveryAttempts);
+        Assert.Equal(0, _queue.Count);
+        Assert.Empty(_slotReleaser.Releases);
+
+        registration.Dispose();
+    }
+
+    [Fact]
+    public async Task RecoverItemAsync_ClaimedCheckpointAdvancesWhileQuiescing_DoesNotOverwritePipeline()
+    {
+        var item = WithClaimedAgentTurnCheckpoint(MakeItem(
+            WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-100),
+            workBranch: "codeybox/claimed-advanced"));
+        await _store.CreateAsync(item);
+        var registration = _cancellations.Register(item.Id);
+        var cancellationObserved = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cancellationObserver = registration.Token.Register(
+            () => cancellationObserved.TrySetResult());
+
+        var recoveryTask = _watchdog.RecoverItemAsync(
+            item,
+            "operator: pipeline advances during quiescence",
+            CancellationToken.None);
+        await cancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var pipelineUpdate = item with
+        {
+            AgentTurnResumeCheckpoint = item.AgentTurnResumeCheckpoint!.ReleaseDispatchClaim(),
+            UpdatedAt = _time.GetUtcNow().AddSeconds(1),
+        };
+        await _store.UpdateAsync(pipelineUpdate);
+        registration.Dispose();
+
+        var result = await recoveryTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.False(result.Recovered);
+        Assert.Contains("advanced", result.Error, StringComparison.Ordinal);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(pipelineUpdate.UpdatedAt, after?.UpdatedAt);
+        Assert.Null(after?.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        Assert.Equal(0, after?.RecoveryAttempts);
+        Assert.Equal(0, _queue.Count);
+        Assert.Empty(_slotReleaser.Releases);
     }
 
     [Fact]

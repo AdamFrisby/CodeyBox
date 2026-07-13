@@ -234,6 +234,57 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         }
     }
 
+    public async Task<WorkerRegistration?> TryClaimDeadWorkerAsync(
+        string workerId,
+        DateTimeOffset cutoff,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var tx = _conn.BeginTransaction();
+            WorkerRegistration? claimed = null;
+            using (var select = _conn.CreateCommand())
+            {
+                select.Transaction = tx;
+                select.CommandText = """
+                    SELECT *
+                    FROM worker_registry
+                    WHERE worker_id = $id
+                      AND last_heartbeat_at < $cutoff;
+                    """;
+                select.Parameters.AddWithValue("$id", workerId);
+                select.Parameters.AddWithValue("$cutoff", cutoff.ToString("O"));
+                using var reader = await select.ExecuteReaderAsync(ct);
+                if (await reader.ReadAsync(ct))
+                    claimed = Read(reader);
+            }
+
+            if (claimed is null)
+            {
+                tx.Commit();
+                return null;
+            }
+
+            using var delete = _conn.CreateCommand();
+            delete.Transaction = tx;
+            delete.CommandText = """
+                DELETE FROM worker_registry
+                WHERE worker_id = $id
+                  AND last_heartbeat_at < $cutoff;
+                """;
+            delete.Parameters.AddWithValue("$id", workerId);
+            delete.Parameters.AddWithValue("$cutoff", cutoff.ToString("O"));
+            var deleted = await delete.ExecuteNonQueryAsync(ct);
+            tx.Commit();
+            return deleted == 1 ? claimed : null;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     /// <summary>
     /// Single-row atomic claim: SELECT-then-DELETE by primary key inside an
     /// IMMEDIATE transaction. Returns the deleted row, or null when no row

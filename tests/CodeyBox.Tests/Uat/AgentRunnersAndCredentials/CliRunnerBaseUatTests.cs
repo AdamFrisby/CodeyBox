@@ -43,7 +43,7 @@ public sealed class CliRunnerBaseUatTests
     public async Task RequestPreempt_CapturesAllowlistedScratchpadAndSkipsUnsafeConfiguredPaths()
     {
         var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
-        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        await using var sandbox = await provider.CreateAsync(SandboxSpecWithAgentTurnScratchpad());
         var runner = new UatCliRunner([".uat-agent/scratch", "../outside", ".git"]);
 
         var write = await sandbox.ExecAsync(new SandboxExec
@@ -60,7 +60,7 @@ public sealed class CliRunnerBaseUatTests
 
         var archive = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["sh", "-c", "tar -tzf .codeybox/preempt-scratchpad.tgz | sort"],
+            Argv = ["sh", "-c", "tar -tzf \"$1\" | sort", "archive-list", SandboxConventions.AgentTurnScratchpadArchivePath],
             WorkingDirectory = "/work",
         });
         Assert.True(archive.Success, archive.Stderr);
@@ -69,7 +69,7 @@ public sealed class CliRunnerBaseUatTests
 
         var manifest = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["cat", ".codeybox/preempt-scratchpad.md"],
+            Argv = ["sh", "-c", "tar -xOzf \"$1\" ./manifest.txt 2>/dev/null || tar -xOzf \"$1\" manifest.txt", "manifest-read", SandboxConventions.AgentTurnScratchpadArchivePath],
             WorkingDirectory = "/work",
         });
         Assert.True(manifest.Success, manifest.Stderr);
@@ -81,7 +81,7 @@ public sealed class CliRunnerBaseUatTests
     public async Task RunResumed_RestoresScratchpadBeforeResumeInvocation()
     {
         var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
-        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        await using var sandbox = await provider.CreateAsync(SandboxSpecWithAgentTurnScratchpad());
         var runner = new UatCliRunner();
 
         var write = await sandbox.ExecAsync(new SandboxExec
@@ -107,4 +107,18 @@ public sealed class CliRunnerBaseUatTests
 
         Assert.True(result.Success, result.Stderr);
     }
+
+    private static SandboxSpec SandboxSpecWithAgentTurnScratchpad() => new()
+    {
+        ImageReference = "ignored",
+        Mounts =
+        [
+            new SandboxMount
+            {
+                SandboxPath = SandboxConventions.AgentTurnScratchpadDir,
+                Tmpfs = true,
+                SizeBytes = SandboxConventions.AgentTurnScratchpadTmpfsBytes,
+            },
+        ],
+    };
 }

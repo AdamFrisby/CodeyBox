@@ -564,7 +564,7 @@ public sealed class MultipassRemoteHostPoolTests
             };
             var transports = new HostTransportSet();
             transports["a"].ThrowTransportOnExecWhen = argv =>
-                argv.Any(arg => arg.Contains("cat >", StringComparison.Ordinal));
+                argv.Any(arg => arg.Contains("rev-parse", StringComparison.Ordinal));
             var remoteProvider = Provider(() => opts, transports);
             var admittedProvider = SandboxAdmissionControlledProvider.Wrap(
                 remoteProvider,

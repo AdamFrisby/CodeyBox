@@ -19,6 +19,16 @@ internal static class WorkItemRecoveryPolicy
             RecoveryAttemptSourceState = recoveryAttempts > 0 ? sourceState : null,
         };
 
+    /// <summary>
+    /// Releases the exclusive resume-dispatch claim only after a recovery
+    /// authority has established that the owning worker is dead or stale.
+    /// The consumed attempt remains counted.
+    /// </summary>
+    public static WorkItem ReleaseAgentTurnDispatchClaim(WorkItem item) => item with
+    {
+        AgentTurnResumeCheckpoint = item.AgentTurnResumeCheckpoint?.ReleaseDispatchClaim(),
+    };
+
     public static WorkItem ResetRecoveryAttemptsAfterRealProgress(WorkItem item, WorkItemState completedState)
         => ResetRecoveryAttemptsAfterRealProgress(item, item.State, completedState);
 
@@ -140,18 +150,29 @@ internal static class WorkItemRecoveryPolicy
     {
         if (ExceedsRecoveryAttempts(recoveryAttempts, maxRecoveryAttempts))
         {
-            return WithRecoveryAttempt(item with
-            {
-                State = WorkItemState.AbandonedAfterRecoveryAttempts,
-                LastError = exceededMessage,
-                StartedAt = null,
-                PreemptedAt = null,
-                PreemptCheckpoint = null,
-                UpdatedAt = now,
-            }, recoveryAttempts, item.State);
+            var abandoned = item.HasTypedAgentTurnRecoveryBoundary
+                ? ReleaseAgentTurnDispatchClaim(item) with
+                {
+                    State = WorkItemState.AbandonedAfterRecoveryAttempts,
+                    LastError = exceededMessage,
+                    StartedAt = null,
+                    UpdatedAt = now,
+                }
+                : item with
+                {
+                    State = WorkItemState.AbandonedAfterRecoveryAttempts,
+                    LastError = exceededMessage,
+                    StartedAt = null,
+                    PreemptedAt = null,
+                    PreemptCheckpoint = null,
+                    AgentTurnResumeCheckpoint = null,
+                    AgentTurnRecoveryLease = null,
+                    UpdatedAt = now,
+                };
+            return WithRecoveryAttempt(abandoned, recoveryAttempts, item.State);
         }
 
-        return WithRecoveryAttempt(item with
+        return WithRecoveryAttempt(ReleaseAgentTurnDispatchClaim(item) with
         {
             StartedAt = null,
             UpdatedAt = now,
@@ -161,17 +182,17 @@ internal static class WorkItemRecoveryPolicy
     public static bool RequiresPipelinePreemptCheckpointBeforeLifecycleTeardown(WorkItem item) =>
         item.JobType is not JobType.CheckAndAct and not JobType.AgentControl
         && item.State is (WorkItemState.Working or WorkItemState.Reworking)
-        && string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
+        && !item.HasAgentTurnRecoveryBoundary;
 
     public static bool IsRerunnableCheckAndActWithoutPreempt(WorkItem item) =>
         item.JobType == JobType.CheckAndAct
         && item.State == WorkItemState.Working
-        && string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
+        && !item.HasAgentTurnRecoveryBoundary;
 
     public static bool IsRerunnableAgentControlWithoutPreempt(WorkItem item) =>
         item.JobType == JobType.AgentControl
         && item.State == WorkItemState.Working
-        && string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
+        && !item.HasAgentTurnRecoveryBoundary;
 
     public static WorkItem BuildCheckAndActRerun(WorkItem item, int recoveryAttempts) =>
         WithRecoveryAttempt(item with
@@ -181,6 +202,8 @@ internal static class WorkItemRecoveryPolicy
             StartedAt = null,
             PreemptedAt = null,
             PreemptCheckpoint = null,
+            AgentTurnResumeCheckpoint = null,
+            AgentTurnRecoveryLease = null,
             UpdatedAt = DateTimeOffset.UtcNow,
         }, recoveryAttempts, item.State);
 
@@ -192,6 +215,8 @@ internal static class WorkItemRecoveryPolicy
             StartedAt = null,
             PreemptedAt = null,
             PreemptCheckpoint = null,
+            AgentTurnResumeCheckpoint = null,
+            AgentTurnRecoveryLease = null,
             UpdatedAt = DateTimeOffset.UtcNow,
         }, recoveryAttempts, item.State);
 
@@ -203,7 +228,7 @@ internal static class WorkItemRecoveryPolicy
         if (IsRerunnableCheckAndActWithoutPreempt(item)
             || IsRerunnableAgentControlWithoutPreempt(item)
             || item.State != WorkItemState.Working
-            || !string.IsNullOrWhiteSpace(item.PreemptCheckpoint))
+            || item.HasAgentTurnRecoveryBoundary)
         {
             failed = item;
             return false;
@@ -216,6 +241,8 @@ internal static class WorkItemRecoveryPolicy
             StartedAt = null,
             PreemptedAt = null,
             PreemptCheckpoint = null,
+            AgentTurnResumeCheckpoint = null,
+            AgentTurnRecoveryLease = null,
             UpdatedAt = DateTimeOffset.UtcNow,
         }, item.RecoveryAttempts + 1, item.State);
         return true;
@@ -230,7 +257,7 @@ internal static class WorkItemRecoveryPolicy
         if (!string.IsNullOrWhiteSpace(item.SuspendedVmName))
             return null;
 
-        if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
+        if (item.HasAgentTurnRecoveryBoundary
             && item.State is WorkItemState.Working or WorkItemState.Reworking)
         {
             return BuildPreemptCheckpointRecovery(
@@ -258,6 +285,8 @@ internal static class WorkItemRecoveryPolicy
                 StartedAt = null,
                 PreemptedAt = null,
                 PreemptCheckpoint = null,
+                AgentTurnResumeCheckpoint = null,
+                AgentTurnRecoveryLease = null,
                 UpdatedAt = now,
             }, attempts, item.State);
         }
@@ -276,10 +305,10 @@ internal static class WorkItemRecoveryPolicy
 
     public static WorkItem? BuildInfrastructureDeferredResumeState(WorkItem item, DateTimeOffset now)
     {
-        if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
+        if (item.HasAgentTurnRecoveryBoundary
             && item.State is WorkItemState.Working or WorkItemState.Reworking)
         {
-            return ClearInfrastructureDeferralFields(item, now) with
+            return ReleaseAgentTurnDispatchClaim(ClearInfrastructureDeferralFields(item, now)) with
             {
                 StartedAt = null,
             };
@@ -306,6 +335,8 @@ internal static class WorkItemRecoveryPolicy
                 PreserveWorkBranchOnQueuedPickup = true,
                 PreemptedAt = null,
                 PreemptCheckpoint = null,
+                AgentTurnResumeCheckpoint = null,
+                AgentTurnRecoveryLease = null,
             }, now));
         }
 
@@ -389,16 +420,28 @@ internal static class WorkItemRecoveryPolicy
         // honours.
         if (ExceedsRecoveryAttempts(attempts, maxAttempts))
         {
-            return WithRecoveryAttempt(item with
-            {
-                State = WorkItemState.NeedsOperatorInput,
-                LastError =
-                    $"{reason}; exceeded MaxRecoveryAttempts ({maxAttempts}) — operator triage required",
-                StartedAt = null,
-                PreemptedAt = null,
-                PreemptCheckpoint = null,
-                UpdatedAt = now,
-            }, attempts, item.State);
+            var parked = item.HasTypedAgentTurnRecoveryBoundary
+                ? ReleaseAgentTurnDispatchClaim(item) with
+                {
+                    State = WorkItemState.NeedsOperatorInput,
+                    LastError =
+                        $"{reason}; exceeded MaxRecoveryAttempts ({maxAttempts}) — operator triage required",
+                    StartedAt = null,
+                    UpdatedAt = now,
+                }
+                : item with
+                {
+                    State = WorkItemState.NeedsOperatorInput,
+                    LastError =
+                        $"{reason}; exceeded MaxRecoveryAttempts ({maxAttempts}) — operator triage required",
+                    StartedAt = null,
+                    PreemptedAt = null,
+                    PreemptCheckpoint = null,
+                    AgentTurnResumeCheckpoint = null,
+                    AgentTurnRecoveryLease = null,
+                    UpdatedAt = now,
+                };
+            return WithRecoveryAttempt(parked, attempts, item.State);
         }
 
         if (IsRerunnableCheckAndActWithoutPreempt(item))
@@ -414,9 +457,9 @@ internal static class WorkItemRecoveryPolicy
         }
 
         if (item.State is WorkItemState.Working or WorkItemState.Reworking
-            && !string.IsNullOrWhiteSpace(item.PreemptCheckpoint))
+            && item.HasAgentTurnRecoveryBoundary)
         {
-            return WithRecoveryAttempt(item with
+            return WithRecoveryAttempt(ReleaseAgentTurnDispatchClaim(item) with
             {
                 LastError = reason,
                 StartedAt = null,
@@ -441,6 +484,8 @@ internal static class WorkItemRecoveryPolicy
                 PreserveWorkBranchOnQueuedPickup = preserve,
                 PreemptedAt = null,
                 PreemptCheckpoint = null,
+                AgentTurnResumeCheckpoint = null,
+                AgentTurnRecoveryLease = null,
                 UpdatedAt = now,
             });
             return WithRecoveryAttempt(recoveredWorking, attempts, item.State);
@@ -454,6 +499,8 @@ internal static class WorkItemRecoveryPolicy
             StartedAt = ShouldClearStartedAtForRecoveryTarget(target) ? null : item.StartedAt,
             PreemptedAt = null,
             PreemptCheckpoint = null,
+            AgentTurnResumeCheckpoint = null,
+            AgentTurnRecoveryLease = null,
             UpdatedAt = now,
         });
         return WithRecoveryAttempt(recovered, attempts, item.State);

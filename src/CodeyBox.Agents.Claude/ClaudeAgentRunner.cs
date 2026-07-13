@@ -360,7 +360,19 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         string? modelId = null,
         string? reasoningMode = null,
         bool captureStructuredStream = false)
-        => BuildClaudeInvocation(prompt, modelId, reasoningMode, sessionIdForResume: null, captureStructuredStream);
+    {
+        _ = prompt;
+        var sessionId = resume.NativeSessionId is null
+            ? null
+            : ValidateClaudeSessionId(resume.NativeSessionId);
+        return BuildClaudeInvocation(
+            SessionResumePrompt,
+            modelId,
+            reasoningMode,
+            sessionIdForResume: sessionId,
+            captureStructuredStream,
+            resumeMostRecent: sessionId is null);
+    }
 
     /// <summary>
     /// Claude emits the resumable CLI session id only in its structured
@@ -399,24 +411,40 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     /// CLI carries the original user prompt and in-progress context.
     /// </summary>
     protected override AgentInvocation BuildSessionResumeInvocation(
-        string sessionId,
+        AgentNativeSessionId sessionId,
         string prompt,
         AgentCredential? credential,
         string? modelId = null,
         string? reasoningMode = null,
         bool captureStructuredStream = false)
     {
-        if (string.IsNullOrWhiteSpace(sessionId))
-            throw new ArgumentException("sessionId must be non-empty", nameof(sessionId));
         _ = prompt;
-        return BuildClaudeInvocation(SessionResumePrompt, modelId, reasoningMode, sessionIdForResume: sessionId, captureStructuredStream);
+        return BuildClaudeInvocation(
+            SessionResumePrompt,
+            modelId,
+            reasoningMode,
+            sessionIdForResume: ValidateClaudeSessionId(sessionId),
+            captureStructuredStream,
+            resumeMostRecent: false);
     }
 
     internal const string SessionResumePrompt =
         "Continue from the restored session after the interrupted run. Do not restart completed work or repeat the original instructions.";
 
-    private AgentInvocation BuildClaudeInvocation(string prompt, string? modelId, string? reasoningMode, string? sessionIdForResume, bool captureStructuredStream)
-        => BuildClaudeSessionInvocation(prompt, modelId, reasoningMode, cliResumeSessionId: sessionIdForResume, captureStructuredStream);
+    private AgentInvocation BuildClaudeInvocation(
+        string prompt,
+        string? modelId,
+        string? reasoningMode,
+        string? sessionIdForResume,
+        bool captureStructuredStream,
+        bool resumeMostRecent = false)
+        => BuildClaudeSessionInvocation(
+            prompt,
+            modelId,
+            reasoningMode,
+            cliResumeSessionId: sessionIdForResume,
+            resumeMostRecent,
+            captureStructuredStream);
 
     /// <summary>
     /// Builds the claude CLI argv used by <see cref="ClaudeSessionWorker"/> for
@@ -429,13 +457,21 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         string? modelId,
         string? reasoningMode,
         string? cliResumeSessionId,
+        bool resumeMostRecent,
         bool captureStructuredStream)
     {
+        var validatedResumeSessionId = cliResumeSessionId is null
+            ? null
+            : ValidateClaudeSessionId(new AgentNativeSessionId(cliResumeSessionId));
         var argv = new List<string> { Binary, "--print", "--dangerously-skip-permissions" };
-        if (!string.IsNullOrWhiteSpace(cliResumeSessionId))
+        if (validatedResumeSessionId is not null)
         {
             argv.Add("--resume");
-            argv.Add(cliResumeSessionId);
+            argv.Add(validatedResumeSessionId);
+        }
+        else if (resumeMostRecent)
+        {
+            argv.Add("--continue");
         }
         if (captureStructuredStream)
         {
@@ -455,6 +491,15 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             argv.Add(reasoningMode);
         }
 
+        if (validatedResumeSessionId is not null || resumeMostRecent)
+        {
+            // End option parsing explicitly on continuation calls. A restored
+            // session id is validated above and passed as one argv element;
+            // this delimiter also keeps any future positional additions from
+            // reinterpreting restored data as CLI flags.
+            argv.Add("--");
+        }
+
         IReadOnlyDictionary<string, string>? extraEnv = null;
         var apiTimeout = BindApiTimeout();
         if (apiTimeout.HasValue)
@@ -466,6 +511,19 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         }
 
         return new AgentInvocation(argv, ExtraEnvironment: extraEnv, Stdin: prompt);
+    }
+
+    private static string ValidateClaudeSessionId(AgentNativeSessionId sessionId)
+    {
+        ArgumentNullException.ThrowIfNull(sessionId);
+        if (!ClaudeSessionWorker.IsValidCliSessionId(sessionId.Value))
+        {
+            throw new ArgumentException(
+                "Claude native session ids may contain only ASCII letters, digits, '-' and '_', up to 128 characters.",
+                nameof(sessionId));
+        }
+
+        return sessionId.Value;
     }
 
     /// <summary>
@@ -510,7 +568,12 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             return preparation;
 
         var invocation = BuildClaudeSessionInvocation(
-            prompt, modelId, reasoningMode, cliResumeSessionId, captureStructuredStream);
+            prompt,
+            modelId,
+            reasoningMode,
+            cliResumeSessionId,
+            resumeMostRecent: false,
+            captureStructuredStream);
         var result = await ExecOnceAsync(sandbox, workingDirectory, invocation, credential, stdoutChunkCallback, ct)
             .ConfigureAwait(false);
 
@@ -561,7 +624,10 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             Success: execResult.Success,
             Summary: execResult.Success ? "ok" : $"agent exited {execResult.ExitCode}",
             Stdout: execResult.Stdout,
-            Stderr: execResult.Stderr);
+            Stderr: execResult.Stderr)
+        {
+            ExecutionUnavailable = execResult.ExecutionUnavailable,
+        };
     }
 
     private static bool ContainsUnsupportedFlagMessage(string output) =>

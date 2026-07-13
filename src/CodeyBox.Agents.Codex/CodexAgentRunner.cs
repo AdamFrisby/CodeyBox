@@ -242,6 +242,24 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
             captureStructuredStream);
     }
 
+    protected override AgentInvocation BuildResumeInvocation(
+        string prompt,
+        AgentCredential? credential,
+        AgentResumeContext resume,
+        string? modelId = null,
+        string? reasoningMode = null,
+        bool captureStructuredStream = false)
+    {
+        _ = prompt;
+        return BuildCodexInvocation(
+            SessionResumePrompt,
+            modelId,
+            reasoningMode,
+            resume.NativeSessionId,
+            captureStructuredStream,
+            resumeMostRecent: resume.NativeSessionId is null);
+    }
+
     /// <summary>
     /// Codex emits its resumable session id only in structured <c>--json</c>
     /// metadata, so orchestrator call sites must force structured output when
@@ -255,15 +273,14 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         => CodexSessionIdExtractor.Extract(stdout);
 
     protected override AgentInvocation BuildSessionResumeInvocation(
-        string sessionId,
+        AgentNativeSessionId sessionId,
         string prompt,
         AgentCredential? credential,
         string? modelId = null,
         string? reasoningMode = null,
         bool captureStructuredStream = false)
     {
-        if (string.IsNullOrWhiteSpace(sessionId))
-            throw new ArgumentException("sessionId must be non-empty", nameof(sessionId));
+        ArgumentNullException.ThrowIfNull(sessionId);
         _ = prompt;
         return BuildCodexInvocation(
             SessionResumePrompt,
@@ -280,12 +297,17 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         string prompt,
         string? modelId,
         string? reasoningMode,
-        string? sessionIdForResume,
-        bool captureStructuredStream)
+        AgentNativeSessionId? sessionIdForResume,
+        bool captureStructuredStream,
+        bool resumeMostRecent = false)
     {
         var argv = new List<string> { Binary, "exec" };
-        if (!string.IsNullOrEmpty(sessionIdForResume))
+        if (sessionIdForResume is not null || resumeMostRecent)
+        {
             argv.Add("resume");
+            if (resumeMostRecent)
+                argv.Add("--last");
+        }
 
         argv.Add("--dangerously-bypass-approvals-and-sandbox");
         if (captureStructuredStream)
@@ -345,13 +367,21 @@ public sealed class CodexAgentRunner : CliAgentRunnerBase, IStructuredStreamAgen
         // SandboxExec.Stdin is then delivered by the sandbox: attached exec uses
         // the wrapper's --keep-stdin path, while detached HTTP-ingest exec
         // bridges a supervisor-owned stdin sidecar into that same wrapper stdin.
-        if (!string.IsNullOrEmpty(sessionIdForResume))
+        if (sessionIdForResume is not null)
         {
             // `--` halts clap's option parsing so a session id that somehow
             // starts with '-' cannot be interpreted as a flag. The extractor
             // also rejects leading-'-' ids; this is defense-in-depth.
             argv.Add("--");
-            argv.Add(sessionIdForResume);
+            argv.Add(sessionIdForResume.Value);
+            argv.Add("-");
+        }
+        else if (resumeMostRecent)
+        {
+            // `--last` chooses the newest session restored from the scratchpad;
+            // `--` terminates option parsing before `-` selects stdin for the
+            // short continuation turn.
+            argv.Add("--");
             argv.Add("-");
         }
 

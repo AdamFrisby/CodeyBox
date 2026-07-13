@@ -21,6 +21,26 @@ public static class SandboxConventions
     public const long CredentialsTmpfsBytes = AgentCredentialMaterializationPolicy.MaterializationBudgetBytes;
 
     /// <summary>
+    /// Private tmpfs used for agent-turn capture, archive transfer, and restore
+    /// staging. It is deliberately outside <see cref="WorkDir"/> so provider
+    /// session state can never be swept into a Git checkpoint.
+    /// </summary>
+    public const string AgentTurnScratchpadDir = AgentTurnScratchpadArchive.GuestDirectory;
+
+    /// <summary>Private CLI archive path passed to an exact resumable runner.</summary>
+    public const string AgentTurnScratchpadArchivePath = AgentTurnScratchpadArchive.GuestArchivePath;
+
+    /// <summary>
+    /// Room for the compressed archive, one bounded uncompressed validation
+    /// stream, one extracted file, and filesystem metadata headroom.
+    /// </summary>
+    public const long AgentTurnScratchpadTmpfsBytes =
+        AgentTurnScratchpadArchive.MaximumBytes
+        + AgentTurnScratchpadArchive.MaximumExpandedBytes
+        + AgentTurnScratchpadArchive.MaximumFileBytes
+        + 2L * 1024 * 1024;
+
+    /// <summary>
     /// R8-core: directory inside the sandbox where the exec wrapper writes the
     /// active agent CLI's tee'd stdout/stderr (one file per agent invocation,
     /// named with the agent run id). Persisted to the work item as

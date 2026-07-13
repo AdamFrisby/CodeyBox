@@ -235,6 +235,10 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
     ///   <item>Refuse non-watched states (operator endpoint surfaces a 409).</item>
     ///   <item>Re-read the row and require the same active state / UpdatedAt
     ///         stamp the caller inspected.</item>
+    ///   <item>When a durable agent-turn checkpoint has an active dispatch
+    ///         claim, recovery-cancel its locally registered pipeline and wait
+    ///         for bounded quiescence. A missing local owner or a pipeline that
+    ///         does not quiesce leaves the claim and item untouched.</item>
     ///   <item>Build the next state via <see cref="WorkItemRecoveryPolicy.BuildStaleItemRecovery"/>:
     ///         preserve-branch requeue for Working/Reworking without
     ///         checkpoint, NeedsOperatorInput when MaxRecoveryAttempts is
@@ -295,6 +299,20 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
                 Error:
                     $"work item advanced from {item.State}@{item.UpdatedAt:O} to {current.State}@{current.UpdatedAt:O}; recovery skipped");
         }
+
+        var ownerFence = await FenceClaimedCheckpointOwnerAsync(current, opts, ct);
+        if (!ownerFence.CanRecover)
+        {
+            var observed = ownerFence.Current ?? current;
+            return new RecoveryResult(
+                Recovered: false,
+                FromState: observed.State,
+                NewState: null,
+                Attempt: observed.RecoveryAttempts,
+                BranchPreserved: false,
+                Error: ownerFence.Error);
+        }
+        current = ownerFence.Current!;
 
         var attempts = WorkItemRecoveryPolicy.NextRecoveryAttempt(current);
         var now = _time.GetUtcNow();
@@ -446,6 +464,118 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
             Attempt: attempts,
             BranchPreserved: branchPreserved,
             Error: null);
+    }
+
+    private readonly record struct ClaimOwnerFenceResult(
+        bool CanRecover,
+        WorkItem? Current,
+        string? Error);
+
+    /// <summary>
+    /// Fences an active durable-resume dispatch before stale recovery releases
+    /// its claim. A successful local cancellation is the ownership proof: a
+    /// missing registration could belong to another process/host, so recovery
+    /// fails closed instead of treating absence from this process as death.
+    /// Once the local registration has drained, the authoritative row is read
+    /// again and the caller's state/UpdatedAt CAS remains the final write guard.
+    /// </summary>
+    private async Task<ClaimOwnerFenceResult> FenceClaimedCheckpointOwnerAsync(
+        WorkItem current,
+        WorkerProgressWatchdogOptions opts,
+        CancellationToken ct)
+    {
+        var claimId = current.AgentTurnResumeCheckpoint?.DispatchClaimId;
+        if (claimId is null)
+            return new ClaimOwnerFenceResult(true, current, null);
+
+        if (_cancellations is null)
+        {
+            const string error =
+                "durable checkpoint dispatch is claimed, but no local cancellation registry is available; remote or unfenceable owner left intact";
+            _log.LogWarning(
+                "Item-stale recovery refused work item {ItemId}: {Reason}",
+                current.Id,
+                error);
+            return new ClaimOwnerFenceResult(false, current, error);
+        }
+
+        var quiescenceTimeout = opts.PostAgentTransitionTimeout;
+        if (quiescenceTimeout <= TimeSpan.Zero)
+        {
+            const string error =
+                "durable checkpoint dispatch is claimed, but no positive quiescence timeout is configured; owner and claim left intact";
+            _log.LogWarning(
+                "Item-stale recovery refused work item {ItemId} claim {ClaimId}: {Reason}",
+                current.Id,
+                claimId,
+                error);
+            return new ClaimOwnerFenceResult(false, current, error);
+        }
+
+        if (!_cancellations.CancelForRecovery(current.Id))
+        {
+            const string error =
+                "durable checkpoint dispatch is claimed without an active local pipeline; remote or unfenceable owner left intact";
+            _log.LogWarning(
+                "Item-stale recovery refused work item {ItemId} claim {ClaimId}: {Reason}",
+                current.Id,
+                claimId,
+                error);
+            return new ClaimOwnerFenceResult(false, current, error);
+        }
+
+        using var quiescenceCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        quiescenceCts.CancelAfter(quiescenceTimeout);
+        try
+        {
+            await _cancellations.WaitForInactiveAsync(current.Id, quiescenceCts.Token);
+        }
+        catch (OperationCanceledException) when (
+            !ct.IsCancellationRequested
+            && quiescenceCts.IsCancellationRequested)
+        {
+            var error =
+                $"active local pipeline did not quiesce within {quiescenceTimeout}; durable checkpoint claim left intact";
+            _log.LogWarning(
+                "Item-stale recovery timed out fencing work item {ItemId} claim {ClaimId} after {Timeout}",
+                current.Id,
+                claimId,
+                quiescenceTimeout);
+            return new ClaimOwnerFenceResult(false, current, error);
+        }
+
+        if (_cancellations.IsActive(current.Id))
+        {
+            const string error =
+                "a local pipeline became active after recovery quiescence; durable checkpoint claim left intact";
+            _log.LogWarning(
+                "Item-stale recovery refused work item {ItemId} claim {ClaimId}: {Reason}",
+                current.Id,
+                claimId,
+                error);
+            return new ClaimOwnerFenceResult(false, current, error);
+        }
+
+        var authoritative = await _store.GetAsync(current.Id, ct);
+        if (authoritative is null)
+        {
+            return new ClaimOwnerFenceResult(
+                false,
+                null,
+                "work item disappeared while its claimed dispatch owner was quiescing");
+        }
+
+        if (authoritative.State != current.State
+            || authoritative.UpdatedAt != current.UpdatedAt
+            || authoritative.AgentTurnResumeCheckpoint?.DispatchClaimId != claimId)
+        {
+            return new ClaimOwnerFenceResult(
+                false,
+                authoritative,
+                "work item or durable checkpoint claim advanced while its local pipeline was quiescing; recovery skipped");
+        }
+
+        return new ClaimOwnerFenceResult(true, authoritative, null);
     }
 
     private async Task<int> RestoreCascadedDependentsAsync(WorkItemId recoveredId, CancellationToken ct)

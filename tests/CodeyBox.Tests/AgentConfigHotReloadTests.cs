@@ -2556,6 +2556,7 @@ public sealed class AgentConfigHotReloadTests
                 MaxQuestionsPerWorkItem = 10,
                 AgentSuspendMaxRetries = 1,
                 AgentSessionResumeMaxAttempts = 4,
+                MaxRetainedAgentTurnSandboxes = 16,
                 AuditShortCircuitEnabled = true,
                 EmptyReworkEscalationRetries = 1,
                 AuditorIdleTimeout = TimeSpan.FromMinutes(5),
@@ -2569,6 +2570,7 @@ public sealed class AgentConfigHotReloadTests
             MaxQuestionsPerWorkItem = initial.PipelineTuning.MaxQuestionsPerWorkItem,
             AgentSuspendMaxRetries = initial.PipelineTuning.AgentSuspendMaxRetries,
             AgentSessionResumeMaxAttempts = initial.PipelineTuning.AgentSessionResumeMaxAttempts,
+            MaxRetainedAgentTurnSandboxes = initial.PipelineTuning.MaxRetainedAgentTurnSandboxes,
             AuditShortCircuitEnabled = initial.PipelineTuning.AuditShortCircuitEnabled,
             EmptyReworkEscalationRetries = initial.PipelineTuning.EmptyReworkEscalationRetries,
             AuditorIdleTimeout = initial.PipelineTuning.AuditorIdleTimeout,
@@ -2601,6 +2603,7 @@ public sealed class AgentConfigHotReloadTests
             Assert.Equal(10, snapshot.Current.MaxQuestionsPerWorkItem);
             Assert.Equal(1, snapshot.Current.AgentSuspendMaxRetries);
             Assert.Equal(4, snapshot.Current.AgentSessionResumeMaxAttempts);
+            Assert.Equal(16, snapshot.Current.MaxRetainedAgentTurnSandboxes);
             Assert.True(snapshot.Current.AuditShortCircuitEnabled);
             Assert.Equal(1, snapshot.Current.EmptyReworkEscalationRetries);
             Assert.Equal(TimeSpan.FromMinutes(5), snapshot.Current.AuditorIdleTimeout);
@@ -2619,6 +2622,7 @@ public sealed class AgentConfigHotReloadTests
                     MaxQuestionsPerWorkItem = 20,
                     AgentSuspendMaxRetries = 3,
                     AgentSessionResumeMaxAttempts = 6,
+                    MaxRetainedAgentTurnSandboxes = 7,
                     AuditShortCircuitEnabled = false,
                     EmptyReworkEscalationRetries = 3,
                     AuditorIdleTimeout = TimeSpan.Zero,
@@ -2628,6 +2632,7 @@ public sealed class AgentConfigHotReloadTests
             Assert.Equal(20, snapshot.Current.MaxQuestionsPerWorkItem);
             Assert.Equal(3, snapshot.Current.AgentSuspendMaxRetries);
             Assert.Equal(6, snapshot.Current.AgentSessionResumeMaxAttempts);
+            Assert.Equal(7, snapshot.Current.MaxRetainedAgentTurnSandboxes);
             Assert.False(snapshot.Current.AuditShortCircuitEnabled);
             Assert.Equal(3, snapshot.Current.EmptyReworkEscalationRetries);
             Assert.Equal(TimeSpan.Zero, snapshot.Current.AuditorIdleTimeout);

@@ -47,6 +47,8 @@ public sealed class IncusSandboxOptionsTests
             ExecPidPollAttempts = 0,
             ExecControlFileCleanupAttempts = IncusSandboxOptions.MaximumExecRetryAttempts + 1,
             ExecCompletionProbeAttempts = 0,
+            InterruptedExecRecoveryRetryAttempts = IncusSandboxOptions.MaximumInterruptedExecRecoveryRetryAttempts + 1,
+            InterruptedExecRecoveryRetryDelay = IncusSandboxOptions.MaximumInterruptedExecRecoveryRetryDelay + TimeSpan.FromMilliseconds(1),
             MaxConcurrentOperations = 0,
             MaxCliStdoutBytes = 1,
             MaxCliStderrBytes = int.MaxValue,
@@ -78,6 +80,8 @@ public sealed class IncusSandboxOptionsTests
         Assert.Contains(errors, error => error.StartsWith("ExecPidPollAttempts", StringComparison.Ordinal));
         Assert.Contains(errors, error => error.StartsWith("ExecControlFileCleanupAttempts", StringComparison.Ordinal));
         Assert.Contains(errors, error => error.StartsWith("ExecCompletionProbeAttempts", StringComparison.Ordinal));
+        Assert.Contains(errors, error => error.StartsWith("InterruptedExecRecoveryRetryAttempts", StringComparison.Ordinal));
+        Assert.Contains(errors, error => error.StartsWith("InterruptedExecRecoveryRetryDelay", StringComparison.Ordinal));
         Assert.Contains(errors, error => error.StartsWith("MaxConcurrentOperations", StringComparison.Ordinal));
         Assert.Contains(errors, error => error.StartsWith("MaxCliStdoutBytes", StringComparison.Ordinal));
         Assert.Contains(errors, error => error.StartsWith("MaxCliStderrBytes", StringComparison.Ordinal));

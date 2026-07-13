@@ -8,13 +8,19 @@ differently. The default teardown mode is `Stop`, which avoids the RAM snapshot
 and does not preserve in-VM process state.
 
 This document records observed behaviour and the CodeyBox mitigations that
-keep work-phase LLM calls dependable without operator intervention.
+keep work-phase LLM calls dependable without operator intervention. The same
+agent-turn recovery also covers non-shutdown infrastructure interruptions,
+including an Incus exec path that explicitly reports `ExecutionUnavailable`.
 
 ## Mitigations
 
 | Layer | Mechanism |
 |-------|-----------|
 | R8-core | `CODEYBOX_AGENT_LOG_FILE` + `.exit` sidecar so `SandboxResumeOnStartupService` can re-tail and adopt the in-VM agent after `multipass start`. |
+| CLI-native resume | Claude and Codex capture a validated session id from structured output and resume that exact session in a live sandbox with a short continuation prompt. Resume is bounded and hard quota/auth failures are excluded. |
+| Durable agent-turn checkpoint | After a remaining quota, transient-network, explicit `ExecutionUnavailable`, or exit-137 failure, CodeyBox commits only the dirty source tree to a content-addressed Git ref and stores the bounded CLI scratchpad as a host-private SQLite BLOB. The exact route can restore both in a new sandbox; Claude/Codex also reuse the exact native id when captured. |
+| Retained Incus lease | If an Incus outage prevents the durable checkpoint commands themselves from running, CodeyBox can retain the exact stopped VM under a provider-bound token and private creation manifest. A later pickup converts it to the ordinary immutable checkpoint before any agent is dispatched. |
+| Incus interrupted-exec recovery | Incus keeps `/work` on the bounded COW root disk. On an ambiguous/unavailable exec it makes one immediate bounded restart attempt of the exact owned `STOPPED` VM; configured delayed attempts run at subsequent exec boundaries while the sandbox remains poisoned. |
 | R8-resilience (shim) | `CliAgentRunnerBase` re-invokes the agent **once** only for unknown failures with a small suspend-related exit-code allowlist. See `AgentSuspendResilience` in `CodeyBox.Agents`. |
 | Orchestrator | Stranded-item recovery, transient-cancellation auto-retry, and durable transient-network auto-retry when adoption times out or the agent exits with a recoverable classification such as `AgentFailureClassifier.TransientNetworkPatterns`. |
 
@@ -22,6 +28,52 @@ The durable orchestrator retry is the preferred path for recognised transport
 failures because it persists state and applies backoff+jitter across common
 provider or network incidents. The shim stays narrow so it does not create a
 synchronised second request herd before durable scheduling takes over.
+
+### Durable turn-resume contract
+
+`CodeyBox:PipelineTuning:AgentSessionResumeMaxAttempts` is the hot-reloadable
+bound for both same-sandbox CLI-native resumes and later durable checkpoint
+re-dispatches. The two counters are independent. Every durable dispatch claims
+and increments its attempt atomically inside `PipelineRunner`, so scheduler,
+startup, and dead-worker enqueue paths cannot bypass the cap. Setting the value
+to `0` disables CLI-native resume and agent-turn re-dispatch; the separate
+legacy suspend retry, sandbox-adoption, and Git-only preempt-record paths retain
+their own behavior. A durable re-dispatch is pinned initially to the exact
+agent instance route, model, reasoning mode, phase, iteration, and prompt
+revision recorded by the failed turn. The checkpoint remains valid while that
+route is parked in `WaitingForAgentResume`; typed Git/lease evidence also
+remains available in `NeedsOperatorInput` and
+`AbandonedAfterRecoveryAttempts` for explicit operator recovery.
+
+If class fallback selects a different agent after that exact route fails, the
+fallback receives only the checkpointed source tree and a continuation prompt.
+The CLI archive is never a Git object and is loaded from host-private SQLite
+only for the exact route, so another route receives neither the archive nor the
+native session id. Prompt edits and explicit retries from a different phase
+invalidate the saved turn so stale instructions are not replayed.
+
+The checkpoint is best-effort recovery evidence, not a success result. If the
+scratchpad capture/private write fails, the source commit/push fails, or the
+content binding cannot be verified, CodeyBox preserves the original failure.
+When the cause is an Incus execution outage and one exact interrupted exec can
+be proved, it may instead atomically publish a retained-VM lease, subject to
+`MaxRetainedAgentTurnSandboxes` (16 by default). Other failures use the normal
+phase retry boundary. SQLite cleanup removes private BLOBs when checkpoint
+metadata is cleared and reconciles orphaned or no-longer-referenced rows at
+startup.
+
+Retained-VM adoption is fenced twice: an uncounted database preparation claim
+elects one pipeline, and a private host lock elects one provider process. Incus
+then verifies the lease token, creation manifest, VM identity, sandbox
+specification, guest identity, topology, inode-pinned host sources, and guest
+links before recovering it. Failure leaves the VM and lease intact and releases
+the preparation claim. Success captures the dirty tree and private CLI state,
+atomically replaces the lease with the immutable checkpoint, deletes the VM,
+and automatically enqueues the normal resumed turn. The agent never runs in
+the mutable retained VM. A missing/deleted retained VM or lost root disk cannot
+be recovered in place; after conversion, exact-route recovery in a replacement
+sandbox requires both the pushed source ref and its matching host-private
+archive.
 
 ## Behaviour matrix
 

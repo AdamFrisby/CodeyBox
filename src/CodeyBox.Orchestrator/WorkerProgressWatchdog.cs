@@ -40,6 +40,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     private readonly Func<WorkerProgressWatchdogOptions> _optsAccessor;
     private readonly ILogger<WorkerProgressWatchdog> _log;
     private readonly IStartupInitialRecoveryBarrier? _startupRecoveryBarrier;
+    private readonly CancellationRegistry? _cancellations;
     private IWorkerPoolRecoverySlotReleaser? _slotReleaser;
 
     // Tracks worker ids whose item the watchdog has already recycled in this
@@ -60,7 +61,8 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         IWebhookDispatcher? webhooks = null,
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
         IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null,
-        IWorkerProgressActivitySource? activitySource = null)
+        IWorkerProgressActivitySource? activitySource = null,
+        CancellationRegistry? cancellationRegistry = null)
     {
         _registry = registry;
         _store = store;
@@ -72,6 +74,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         _webhooks = webhooks;
         _slotReleaser = slotReleaser;
         _startupRecoveryBarrier = startupRecoveryBarrier;
+        _cancellations = cancellationRegistry;
     }
 
     public WorkerProgressWatchdog(
@@ -84,8 +87,9 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         IWebhookDispatcher? webhooks = null,
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
         IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null,
-        IWorkerProgressActivitySource? activitySource = null)
-        : this(registry, store, queue, () => opts, log, streams, webhooks, slotReleaser, startupRecoveryBarrier, activitySource) { }
+        IWorkerProgressActivitySource? activitySource = null,
+        CancellationRegistry? cancellationRegistry = null)
+        : this(registry, store, queue, () => opts, log, streams, webhooks, slotReleaser, startupRecoveryBarrier, activitySource, cancellationRegistry) { }
 
     /// <summary>
     /// Lets <see cref="OrchestratorService"/> wire itself in after-the-fact
@@ -281,6 +285,12 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     private async Task RecoverStuckWorkerAsync(
         WorkerRegistration worker, WorkItem item, long sinceProgressSeconds, CancellationToken ct)
     {
+        var hadDispatchClaim = item.AgentTurnResumeCheckpoint?.DispatchClaimId is not null;
+        var quiescedItem = await TryQuiesceDispatchClaimOwnerAsync(worker, item, _opts, ct);
+        if (quiescedItem is null)
+            return;
+        item = quiescedItem;
+
         // Atomically pull THIS wedged worker (and only this one) out of the
         // registry so a concurrent reaper or watchdog tick cannot recover the
         // same worker twice. A cutoff-based ClaimDeadWorkersAsync would also
@@ -301,7 +311,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
             return;
         }
 
-        if (claimed is null)
+        if (claimed is null && !hadDispatchClaim)
         {
             _log.LogDebug(
                 "Watchdog: wedged worker {WorkerId} row was already gone (another sweep handled it); skipping",
@@ -309,17 +319,24 @@ public sealed class WorkerProgressWatchdog : BackgroundService
             return;
         }
 
+        // A claimed durable turn is quiesced before the registry claim. Its
+        // worker can therefore deregister normally while the watchdog waits.
+        // The guarded work-item write below remains the recovery election in
+        // that case; only one concurrent sweep can win it.
+
         // Pick a recovery target. Mirror the dead-worker reaper's mapping so
         // operators see the same "from → to" transition regardless of whether
         // the wedge was a stale heartbeat or a stalled-but-heartbeating worker.
         // Working-without-preempt is special: an in-flight agent run that
         // ghosted has no checkpoint, so re-queue from Queued.
         WorkItemState target;
-        if (item.State == WorkItemState.Working && !string.IsNullOrWhiteSpace(item.PreemptCheckpoint))
+        if (item.State is WorkItemState.Working or WorkItemState.Reworking
+            && item.HasAgentTurnRecoveryBoundary)
         {
-            // The preempt-checkpoint case is recoverable mid-Working — keep
-            // the state, the next pickup will resume from the checkpoint.
-            target = WorkItemState.Working;
+            // A work/rework checkpoint is already an exact durable boundary.
+            // Keep its paired state and metadata; mapping Reworking to
+            // WorkComplete would strand the typed checkpoint without its ref.
+            target = item.State;
         }
         else if (item.State == WorkItemState.Working)
         {
@@ -343,16 +360,38 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         // looping through recovery forever and burning a slot per iteration.
         if (WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(attempts, opts.MaxRecoveryAttempts))
         {
-            var failed = WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
-            {
-                State = WorkItemState.AbandonedAfterRecoveryAttempts,
-                LastError = $"watchdog: exceeded MaxRecoveryAttempts ({opts.MaxRecoveryAttempts}); was {fromState} with no progress for {sinceProgressSeconds}s",
-                StartedAt = null,
-                PreemptedAt = null,
-                PreemptCheckpoint = null,
-                UpdatedAt = DateTimeOffset.UtcNow,
-            }, attempts, item.State);
-            await _store.UpdateAsync(failed, ct);
+            var failedAt = DateTimeOffset.UtcNow;
+            var failedBase = item.HasTypedAgentTurnRecoveryBoundary
+                ? WorkItemRecoveryPolicy.ReleaseAgentTurnDispatchClaim(item) with
+                {
+                    State = WorkItemState.AbandonedAfterRecoveryAttempts,
+                    LastError = $"watchdog: exceeded MaxRecoveryAttempts ({opts.MaxRecoveryAttempts}); was {fromState} with no progress for {sinceProgressSeconds}s",
+                    StartedAt = null,
+                    UpdatedAt = failedAt,
+                }
+                : item with
+                {
+                    State = WorkItemState.AbandonedAfterRecoveryAttempts,
+                    LastError = $"watchdog: exceeded MaxRecoveryAttempts ({opts.MaxRecoveryAttempts}); was {fromState} with no progress for {sinceProgressSeconds}s",
+                    StartedAt = null,
+                    PreemptedAt = null,
+                    PreemptCheckpoint = null,
+                    AgentTurnResumeCheckpoint = null,
+                    AgentTurnRecoveryLease = null,
+                    UpdatedAt = failedAt,
+                };
+            var failed = WorkItemRecoveryPolicy.WithRecoveryAttempt(
+                failedBase,
+                attempts,
+                item.State);
+            var wrote = await _store.TryUpdateIfStateAndUpdatedAtAsync(
+                failed,
+                item.State,
+                item.UpdatedAt,
+                ct);
+            if (!wrote)
+                return;
+            _cancellations?.CancelForRecovery(item.Id);
             _recoveredWorkers[worker.WorkerId] = 0;
             if (_slotReleaser is not null)
             {
@@ -391,9 +430,11 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         }
 
         WorkItem updated;
-        if (target == WorkItemState.Working && !string.IsNullOrWhiteSpace(item.PreemptCheckpoint))
+        if (target is WorkItemState.Working or WorkItemState.Reworking
+            && item.HasAgentTurnRecoveryBoundary)
         {
-            updated = WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
+            updated = WorkItemRecoveryPolicy.WithRecoveryAttempt(
+                WorkItemRecoveryPolicy.ReleaseAgentTurnDispatchClaim(item) with
             {
                 StartedAt = null,
                 UpdatedAt = DateTimeOffset.UtcNow,
@@ -416,12 +457,29 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                     : item.PreserveWorkBranchOnQueuedPickup,
                 PreemptedAt = target is WorkItemState.Working or WorkItemState.Reworking ? item.PreemptedAt : null,
                 PreemptCheckpoint = target is WorkItemState.Working or WorkItemState.Reworking ? item.PreemptCheckpoint : null,
+                AgentTurnResumeCheckpoint = target is WorkItemState.Working or WorkItemState.Reworking
+                    ? item.AgentTurnResumeCheckpoint
+                    : null,
+                AgentTurnRecoveryLease = target is WorkItemState.Working or WorkItemState.Reworking
+                    ? item.AgentTurnRecoveryLease
+                    : null,
                 UpdatedAt = DateTimeOffset.UtcNow,
             }, attempts, item.State);
             updated = WorkItemRecoveryPolicy.ClearPlanFieldsIfQueued(updated);
         }
 
-        await _store.UpdateAsync(updated, ct);
+        var recovered = await _store.TryUpdateIfStateAndUpdatedAtAsync(
+            updated,
+            item.State,
+            item.UpdatedAt,
+            ct);
+        if (!recovered)
+            return;
+
+        // Unclaimed legacy turns are still cancelled after the guarded write.
+        // Claimed durable turns were already cancelled and confirmed inactive
+        // before their claim was released above.
+        _cancellations?.CancelForRecovery(item.Id);
         _recoveredWorkers[worker.WorkerId] = 0;
 
         // Free the pool slot regardless of whether the underlying worker task
@@ -513,6 +571,12 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     private async Task ParkStuckItemAsync(
         WorkerRegistration worker, WorkItem item, long sinceProgressSeconds, CancellationToken ct)
     {
+        var hadDispatchClaim = item.AgentTurnResumeCheckpoint?.DispatchClaimId is not null;
+        var quiescedItem = await TryQuiesceDispatchClaimOwnerAsync(worker, item, _opts, ct);
+        if (quiescedItem is null)
+            return;
+        item = quiescedItem;
+
         // Same per-id claim shape as the recover path — see the comment there
         // for why a cutoff-based claim would wipe healthy peers.
         WorkerRegistration? claimed;
@@ -527,16 +591,20 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                 worker.WorkerId);
             return;
         }
-        if (claimed is null)
+        if (claimed is null && !hadDispatchClaim)
             return;
 
-        var parked = item with
-        {
-            State = WorkItemState.NeedsOperatorInput,
-            LastError = $"watchdog: worker made no progress for {sinceProgressSeconds}s in state {item.State}; operator triage required (auto-recover disabled)",
-            UpdatedAt = DateTimeOffset.UtcNow,
-        };
-        await _store.UpdateAsync(parked, ct);
+        var parked = item.With(
+            WorkItemState.NeedsOperatorInput,
+            $"watchdog: worker made no progress for {sinceProgressSeconds}s in state {item.State}; operator triage required (auto-recover disabled)");
+        var wrote = await _store.TryUpdateIfStateAndUpdatedAtAsync(
+            parked,
+            item.State,
+            item.UpdatedAt,
+            ct);
+        if (!wrote)
+            return;
+        _cancellations?.CancelForRecovery(item.Id);
         _recoveredWorkers[worker.WorkerId] = 0;
 
         if (_slotReleaser is not null)
@@ -548,6 +616,65 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         }
 
         AuditLog.WorkItemWatchdogParked(item.Id, worker.WorkerId, item.State);
+    }
+
+    private async Task<WorkItem?> TryQuiesceDispatchClaimOwnerAsync(
+        WorkerRegistration worker,
+        WorkItem item,
+        WorkerProgressWatchdogOptions opts,
+        CancellationToken ct)
+    {
+        var expectedClaimId = item.AgentTurnResumeCheckpoint?.DispatchClaimId;
+        if (expectedClaimId is null)
+            return item;
+
+        // CancellationRegistry is process-local. Releasing a claim owned by a
+        // different host or process would allow a new dispatch while the old
+        // CLI can still publish terminal state, so leave the claim intact for
+        // dead-worker/startup recovery or operator intervention.
+        if (!string.Equals(worker.HostName, Environment.MachineName, StringComparison.Ordinal)
+            || worker.ProcessId != Environment.ProcessId
+            || _cancellations is null)
+        {
+            _log.LogWarning(
+                "Watchdog: refusing to release dispatch claim {ClaimId} for item {ItemId}; worker {WorkerId} is not locally fenceable (host={Host}, pid={ProcessId})",
+                expectedClaimId, item.Id, worker.WorkerId, worker.HostName, worker.ProcessId);
+            return null;
+        }
+
+        if (_cancellations.IsActive(item.Id))
+        {
+            _cancellations.CancelForRecovery(item.Id);
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(opts.PostAgentTransitionTimeout);
+            try
+            {
+                await _cancellations.WaitForInactiveAsync(item.Id, timeoutCts.Token);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                _log.LogWarning(
+                    "Watchdog: item {ItemId} did not stop within {Timeout}; retaining dispatch claim {ClaimId}",
+                    item.Id, opts.PostAgentTransitionTimeout, expectedClaimId);
+                return null;
+            }
+        }
+
+        // The cancelled owner may have completed a legitimate transition while
+        // winding down. Recover only the exact snapshot whose claim we fenced.
+        var current = await _store.GetAsync(item.Id, ct);
+        if (current is null
+            || current.State != item.State
+            || current.UpdatedAt != item.UpdatedAt
+            || current.AgentTurnResumeCheckpoint?.DispatchClaimId != expectedClaimId)
+        {
+            _log.LogDebug(
+                "Watchdog: item {ItemId} advanced while dispatch claim {ClaimId} was being fenced; skipping recovery",
+                item.Id, expectedClaimId);
+            return null;
+        }
+
+        return current;
     }
 
     /// <summary>

@@ -3,6 +3,7 @@ using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
+using CodeyBox.Sandbox.Process;
 
 namespace CodeyBox.Tests;
 
@@ -301,7 +302,10 @@ public sealed class PipelineIntegrationTests : IDisposable
         Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
         Assert.DoesNotContain(final.State, WorkItemDependencies.TerminalStates);
         Assert.Equal("transient", final.FailureKind);
-        Assert.Null(final.TransientRetryFrom);
+        Assert.Equal(RetryFromPolicy.Work, final.TransientRetryFrom);
+        Assert.Equal(
+            AgentTurnResumePhase.Work,
+            Assert.IsType<AgentTurnResumeCheckpoint>(final.AgentTurnResumeCheckpoint).Phase);
         Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
         Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
         Assert.Equal(0, final.TransientRetryAttempts);
@@ -320,6 +324,229 @@ public sealed class PipelineIntegrationTests : IDisposable
         Assert.NotNull(reason);
         Assert.DoesNotContain(Secret, reason, StringComparison.Ordinal);
         Assert.Contains("***", reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WorkPhaseInfrastructureLoss_RetainsThenConvertsSandboxBeforeResumedDispatch()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var provider = new RetainableProcessSandboxProvider();
+        var involvement = new InMemoryAgentInvolvementStore();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            sandboxProvider: provider,
+            involvement: involvement);
+
+        var outageInjected = false;
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            if (outageInjected)
+                return;
+
+            var partialWrite = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/partial.txt"],
+                Stdin = "partial work survived\n",
+            }, ct);
+            Assert.True(partialWrite.Success, partialWrite.Stderr);
+            outageInjected = true;
+            provider.SetExecutionAvailable(false);
+        };
+        tp.Agent.WorkResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "sandbox transport disappeared",
+            Stdout: null,
+            Stderr: null)
+        {
+            ExecutionUnavailable = true,
+        });
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("completed.txt", "resumed work completed\n"));
+
+        var item = NewItem("feature/retained-infrastructure-recovery");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var retained = (await tp.Store.GetAsync(item.Id))!;
+        Assert.Equal(WorkItemState.Failed, retained.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, retained.FailureKind);
+        Assert.NotNull(retained.AgentTurnRecoveryLease);
+        Assert.Null(retained.PreemptCheckpoint);
+        Assert.Null(retained.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        Assert.Equal(1, provider.RetentionCount);
+        Assert.Equal(0, provider.AdoptionCount);
+
+        var retrier = new WorkItemRetrier(
+            tp.Store,
+            tp.Queue,
+            tp.GitHost,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<WorkItemRetrier>.Instance);
+        var firstRetry = await retrier.RetryAsync(retained, trigger: "test-infrastructure-restored");
+        Assert.True(firstRetry.Success, firstRetry.Error);
+        Assert.Equal(item.Id, await tp.Queue.DequeueAsync(CancellationToken.None));
+        var conversionPickup = (await tp.Store.GetAsync(item.Id))!;
+        await tp.Pipeline.RunAsync(conversionPickup, CancellationToken.None);
+
+        var checkpointed = (await tp.Store.GetAsync(item.Id))!;
+        Assert.True(
+            checkpointed.State == WorkItemState.Working,
+            $"Expected automatic checkpoint continuation; state={checkpointed.State}, failure={checkpointed.FailureKind}, error={checkpointed.LastError}");
+        Assert.Null(checkpointed.FailureKind);
+        Assert.Null(checkpointed.AgentTurnRecoveryLease);
+        Assert.NotNull(checkpointed.PreemptCheckpoint);
+        Assert.Equal(0, Assert.IsType<AgentTurnResumeCheckpoint>(
+            checkpointed.AgentTurnResumeCheckpoint).AttemptCount);
+        Assert.Equal(1, provider.AdoptionCount);
+        Assert.Equal(1, provider.RetainedSandboxDisposalCount);
+        Assert.Single(tp.Agent.WorkPrompts);
+        var afterConversionInvolvement = await involvement.ListByWorkItemAsync(item.Id);
+        Assert.Single(afterConversionInvolvement);
+        Assert.Equal(
+            AgentInvolvementOutcomes.FailureInfrastructure,
+            afterConversionInvolvement[0].Outcome);
+
+        Assert.Equal(item.Id, await tp.Queue.DequeueAsync(CancellationToken.None));
+        await tp.Pipeline.RunAsync((await tp.Store.GetAsync(item.Id))!, CancellationToken.None);
+
+        var final = (await tp.Store.GetAsync(item.Id))!;
+        Assert.Equal(WorkItemState.Done, final.State);
+        Assert.Null(final.AgentTurnRecoveryLease);
+        Assert.Null(final.PreemptCheckpoint);
+        Assert.Null(final.AgentTurnResumeCheckpoint);
+        Assert.Equal(2, tp.Agent.WorkPrompts.Count);
+        var finalInvolvement = await involvement.ListByWorkItemAsync(item.Id);
+        Assert.True(finalInvolvement.Count > afterConversionInvolvement.Count);
+        Assert.Contains(finalInvolvement, static row => row.Outcome == AgentInvolvementOutcomes.Success);
+        Assert.DoesNotContain(
+            finalInvolvement,
+            static row => row.Outcome == AgentInvolvementOutcomes.FailureAgent);
+
+        var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
+        var (_, partial, _) = await TestSupport.RunGit(barePath, "show", "main:partial.txt");
+        var (_, completed, _) = await TestSupport.RunGit(barePath, "show", "main:completed.txt");
+        Assert.Equal("partial work survived\n", partial);
+        Assert.Equal("resumed work completed\n", completed);
+    }
+
+    [Fact]
+    public async Task RetainedSandboxConversion_WhenExecutionIsStillUnavailable_ReleasesPreparationClaim()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var provider = new RetainableProcessSandboxProvider
+        {
+            RestoreExecutionOnAdoption = false,
+        };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            sandboxProvider: provider);
+
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            var partialWrite = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/partial.txt"],
+                Stdin = "still recoverable\n",
+            }, ct);
+            Assert.True(partialWrite.Success, partialWrite.Stderr);
+            provider.SetExecutionAvailable(false);
+        };
+        tp.Agent.WorkResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "sandbox transport disappeared",
+            Stdout: null,
+            Stderr: null)
+        {
+            ExecutionUnavailable = true,
+        });
+
+        var item = NewItem("feature/retained-conversion-retry");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        var retained = (await tp.Store.GetAsync(item.Id))!;
+        var originalLease = Assert.IsType<SandboxRecoveryLease>(retained.AgentTurnRecoveryLease);
+
+        var retrier = new WorkItemRetrier(
+            tp.Store,
+            tp.Queue,
+            tp.GitHost,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<WorkItemRetrier>.Instance);
+        var retry = await retrier.RetryAsync(retained, trigger: "test-provider-still-down");
+        Assert.True(retry.Success, retry.Error);
+        Assert.Equal(item.Id, await tp.Queue.DequeueAsync(CancellationToken.None));
+        await tp.Pipeline.RunAsync((await tp.Store.GetAsync(item.Id))!, CancellationToken.None);
+
+        var failedConversion = (await tp.Store.GetAsync(item.Id))!;
+        Assert.Equal(WorkItemState.Failed, failedConversion.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, failedConversion.FailureKind);
+        Assert.Equal(originalLease, failedConversion.AgentTurnRecoveryLease);
+        Assert.Null(failedConversion.PreemptCheckpoint);
+        var checkpoint = Assert.IsType<AgentTurnResumeCheckpoint>(
+            failedConversion.AgentTurnResumeCheckpoint);
+        Assert.Null(checkpoint.DispatchClaimId);
+        Assert.Null(checkpoint.DispatchClaimStage);
+        Assert.Equal(0, checkpoint.AttemptCount);
+        Assert.Equal(0, provider.RetainedSandboxDisposalCount);
+    }
+
+    [Fact]
+    public async Task RetainedSandboxAdoption_WhenProviderIsStillUnavailable_PreservesLeaseAndReleasesPreparationClaim()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var provider = new RetainableProcessSandboxProvider();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            sandboxProvider: provider);
+
+        tp.Agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            var partialWrite = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "cat > \"$0\"", $"{workingDirectory}/partial.txt"],
+                Stdin = "still recoverable before adoption\n",
+            }, ct);
+            Assert.True(partialWrite.Success, partialWrite.Stderr);
+            provider.SetExecutionAvailable(false);
+        };
+        tp.Agent.WorkResults.Enqueue(new AgentResult(
+            Success: false,
+            Summary: "sandbox transport disappeared",
+            Stdout: null,
+            Stderr: null)
+        {
+            ExecutionUnavailable = true,
+        });
+
+        var item = NewItem("feature/retained-adoption-retry");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+        var retained = (await tp.Store.GetAsync(item.Id))!;
+        var originalLease = Assert.IsType<SandboxRecoveryLease>(retained.AgentTurnRecoveryLease);
+
+        provider.FailBeforeAdoptionSandboxReturned = true;
+        var retrier = new WorkItemRetrier(
+            tp.Store,
+            tp.Queue,
+            tp.GitHost,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<WorkItemRetrier>.Instance);
+        var retry = await retrier.RetryAsync(retained, trigger: "test-provider-still-down-before-adoption");
+        Assert.True(retry.Success, retry.Error);
+        Assert.Equal(item.Id, await tp.Queue.DequeueAsync(CancellationToken.None));
+        await tp.Pipeline.RunAsync((await tp.Store.GetAsync(item.Id))!, CancellationToken.None);
+
+        var failedAdoption = (await tp.Store.GetAsync(item.Id))!;
+        Assert.Equal(WorkItemState.Failed, failedAdoption.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, failedAdoption.FailureKind);
+        Assert.Equal(originalLease, failedAdoption.AgentTurnRecoveryLease);
+        Assert.Null(failedAdoption.PreemptCheckpoint);
+        var checkpoint = Assert.IsType<AgentTurnResumeCheckpoint>(
+            failedAdoption.AgentTurnResumeCheckpoint);
+        Assert.Null(checkpoint.DispatchClaimId);
+        Assert.Null(checkpoint.DispatchClaimStage);
+        Assert.Equal(0, checkpoint.AttemptCount);
+        Assert.Equal(1, provider.AdoptionCount);
+        Assert.Equal(0, provider.RetainedSandboxDisposalCount);
     }
 
     [Fact]
@@ -409,7 +636,7 @@ public sealed class PipelineIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task WorkPhaseTransientRetry_WithExistingWorkBranch_AutoPicksAudit()
+    public async Task WorkPhaseTransientRetry_WithExistingWorkBranch_UsesDurableWorkCheckpoint()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var time = new ManualTimeProvider();
@@ -440,14 +667,17 @@ public sealed class PipelineIntegrationTests : IDisposable
         var parked = await tp.Store.GetAsync(item.Id);
         Assert.NotNull(parked);
         Assert.Equal(WorkItemState.WaitingForTransientRetry, parked!.State);
-        Assert.Null(parked.TransientRetryFrom);
+        Assert.Equal(RetryFromPolicy.Work, parked.TransientRetryFrom);
+        Assert.Equal(
+            AgentTurnResumePhase.Work,
+            Assert.IsType<AgentTurnResumeCheckpoint>(parked.AgentTurnResumeCheckpoint).Phase);
 
         time.Advance(TimeSpan.FromSeconds(31));
         await RunTransientPeriodicSweepAsync(tp.RetryScheduler!);
 
         var resumed = await tp.Store.GetAsync(item.Id);
         Assert.NotNull(resumed);
-        Assert.Equal(WorkItemState.WorkComplete, resumed!.State);
+        Assert.Equal(WorkItemState.Working, resumed!.State);
         Assert.Equal(1, resumed.TransientRetryAttempts);
         Assert.Equal(item.Id, await tp.Queue.DequeueAsync(CancellationToken.None));
     }
@@ -612,6 +842,233 @@ public sealed class PipelineIntegrationTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.NotEqual(WorkItemState.Done, final!.State);
         Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final.State);
+    }
+
+    private sealed class RetainableProcessSandboxProvider : ISandboxProvider
+    {
+        private readonly ProcessSandboxProvider _inner = new(
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ProcessSandboxProvider>.Instance);
+        private readonly object _gate = new();
+        private RetainedSandbox? _retained;
+        private volatile bool _executionAvailable = true;
+
+        public string Name => "retainable-process";
+        public int RetentionCount { get; private set; }
+        public int AdoptionCount { get; private set; }
+        public int RetainedSandboxDisposalCount { get; private set; }
+        public bool RestoreExecutionOnAdoption { get; set; } = true;
+        public bool FailBeforeAdoptionSandboxReturned { get; set; }
+
+        public void SetExecutionAvailable(bool available) => _executionAvailable = available;
+
+        public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (spec.RecoveryLease is { } requestedLease)
+            {
+                RetainedSandbox retained;
+                lock (_gate)
+                {
+                    retained = _retained
+                        ?? throw new InvalidOperationException("No retained test sandbox exists for adoption.");
+                    if (retained.Lease != requestedLease)
+                        throw new InvalidDataException("Retained test sandbox lease does not match exactly.");
+                    AdoptionCount++;
+                }
+
+                if (FailBeforeAdoptionSandboxReturned)
+                    throw new SandboxExecutionUnavailableException(255);
+
+                if (RestoreExecutionOnAdoption)
+                    _executionAvailable = true;
+                return new RetainableProcessSandbox(
+                    this,
+                    retained.Sandbox,
+                    preserveOnDispose: true,
+                    retained.ExpectedOrigin);
+            }
+
+            var sandbox = await _inner.CreateAsync(spec, ct);
+            return new RetainableProcessSandbox(
+                this,
+                sandbox,
+                preserveOnDispose: false,
+                expectedOrigin: null);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+        {
+            ct.ThrowIfCancellationRequested();
+            lock (_gate)
+            {
+                IReadOnlyList<ManagedSandboxInfo> result = _retained is null
+                    ? []
+                    :
+                    [
+                        new ManagedSandboxInfo(
+                            _retained.Sandbox.Id,
+                            CreatedAt: null,
+                            DiskBytes: null,
+                            IsTrackedActive: false,
+                            LifecycleProviderId: Name),
+                    ];
+                return Task.FromResult(result);
+            }
+        }
+
+        public async Task DisposeLeakedAsync(string name, CancellationToken ct)
+        {
+            ct.ThrowIfCancellationRequested();
+            ISandbox? sandbox = null;
+            lock (_gate)
+            {
+                if (_retained is { } retained
+                    && string.Equals(retained.Sandbox.Id, name, StringComparison.Ordinal))
+                {
+                    sandbox = retained.Sandbox;
+                    _retained = null;
+                }
+            }
+
+            if (sandbox is not null)
+                await sandbox.DisposeAsync();
+        }
+
+        private SandboxRecoveryLease Retain(RetainableProcessSandbox owner)
+        {
+            owner.EnablePreserveOnDispose();
+            lock (_gate)
+            {
+                if (_retained is { } retained)
+                {
+                    if (!ReferenceEquals(retained.Sandbox, owner.InnerSandbox))
+                        throw new InvalidOperationException("A different test sandbox is already retained.");
+                    return retained.Lease;
+                }
+
+                var lease = new SandboxRecoveryLease(
+                    Name,
+                    owner.Id,
+                    Guid.NewGuid().ToString("N"));
+                _retained = new RetainedSandbox(owner.InnerSandbox, lease, owner.ExpectedOrigin);
+                RetentionCount++;
+                return lease;
+            }
+        }
+
+        private async ValueTask DisposeInnerAsync(ISandbox sandbox)
+        {
+            lock (_gate)
+            {
+                if (_retained is { } retained
+                    && ReferenceEquals(retained.Sandbox, sandbox))
+                {
+                    _retained = null;
+                    RetainedSandboxDisposalCount++;
+                }
+            }
+
+            await sandbox.DisposeAsync();
+        }
+
+        private sealed record RetainedSandbox(
+            ISandbox Sandbox,
+            SandboxRecoveryLease Lease,
+            string? ExpectedOrigin);
+
+        private sealed class RetainableProcessSandbox :
+            IPreemptibleSandbox,
+            IPreserveOnDisposeSandbox,
+            IProviderOwnedSandbox,
+            ISandboxDecorator
+        {
+            private readonly RetainableProcessSandboxProvider _owner;
+            private bool _preserveOnDispose;
+            private int _disposed;
+            private string? _expectedOrigin;
+
+            public RetainableProcessSandbox(
+                RetainableProcessSandboxProvider owner,
+                ISandbox innerSandbox,
+                bool preserveOnDispose,
+                string? expectedOrigin)
+            {
+                _owner = owner;
+                InnerSandbox = innerSandbox;
+                _preserveOnDispose = preserveOnDispose;
+                _expectedOrigin = expectedOrigin;
+            }
+
+            public string Id => InnerSandbox.Id;
+            public string ProviderId => _owner.Name;
+            public ISandbox InnerSandbox { get; }
+            public string? ExpectedOrigin => _expectedOrigin;
+            public SandboxAgentOutputTransportKind AgentOutputTransportKind =>
+                InnerSandbox.AgentOutputTransportKind;
+            public SandboxBatchLaunchMode BatchLaunchMode => InnerSandbox.BatchLaunchMode;
+
+            public async Task<SandboxExecResult> ExecAsync(
+                SandboxExec exec,
+                CancellationToken ct = default)
+            {
+                if (!_owner._executionAvailable)
+                {
+                    return new SandboxExecResult(
+                        ExitCode: 255,
+                        Stdout: string.Empty,
+                        Stderr: "simulated sandbox transport outage",
+                        ExecutionUnavailable: true);
+                }
+
+                var result = await InnerSandbox.ExecAsync(exec, ct);
+                if (result.Success
+                    && exec.Argv.Count >= 3
+                    && string.Equals(exec.Argv[0], "git", StringComparison.Ordinal)
+                    && string.Equals(exec.Argv[1], "clone", StringComparison.Ordinal))
+                {
+                    _expectedOrigin = exec.Argv[2];
+                }
+                if (result.Success
+                    && _expectedOrigin is not null
+                    && exec.Argv.Count >= 6
+                    && string.Equals(exec.Argv[0], "git", StringComparison.Ordinal)
+                    && string.Equals(exec.Argv[3], "remote", StringComparison.Ordinal)
+                    && string.Equals(exec.Argv[4], "get-url", StringComparison.Ordinal)
+                    && string.Equals(exec.Argv[5], "origin", StringComparison.Ordinal))
+                {
+                    return result with { Stdout = _expectedOrigin + "\n" };
+                }
+
+                return result;
+            }
+
+            public Task SyncStateToHostAsync(CancellationToken ct = default) =>
+                InnerSandbox.SyncStateToHostAsync(ct);
+
+            public Task StopAndPreserveAsync(CancellationToken ct = default)
+            {
+                ct.ThrowIfCancellationRequested();
+                _ = _owner.Retain(this);
+                return Task.CompletedTask;
+            }
+
+            public Task<SandboxRecoveryLease?> RetainForInfrastructureRecoveryAsync(
+                CancellationToken ct = default)
+            {
+                ct.ThrowIfCancellationRequested();
+                return Task.FromResult<SandboxRecoveryLease?>(_owner.Retain(this));
+            }
+
+            public void DisablePreserveOnDispose() => _preserveOnDispose = false;
+            public void EnablePreserveOnDispose() => _preserveOnDispose = true;
+
+            public async ValueTask DisposeAsync()
+            {
+                if (Interlocked.Exchange(ref _disposed, 1) != 0 || _preserveOnDispose)
+                    return;
+                await _owner.DisposeInnerAsync(InnerSandbox);
+            }
+        }
     }
 
     private sealed class MainAdvancingAuditor : IAuditor

@@ -27,7 +27,7 @@ public static class WorkItemInFlight
 
     public static bool IsInFlight(WorkItem item) =>
         item.StartedAt is not null
-        && item.PreemptCheckpoint is null
+        && !item.HasAgentTurnRecoveryBoundary
         && !IsExcludedState(item.State);
 
     public static bool IsExcludedState(WorkItemState state) =>

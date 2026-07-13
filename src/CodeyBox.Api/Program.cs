@@ -2693,7 +2693,8 @@ builder.Services.AddSingleton<DeadWorkerReaper>(sp =>
         () => monitor.CurrentValue.DeadWorker,
         sp.GetRequiredService<ILogger<DeadWorkerReaper>>(),
         sp.GetRequiredService<IWebhookDispatcher>(),
-        startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>());
+        startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>(),
+        cancellationRegistry: sp.GetRequiredService<CancellationRegistry>());
 });
 
 // --- Worker progress watchdog -----------------------------------------------
@@ -2727,7 +2728,8 @@ builder.Services.AddSingleton<WorkerProgressWatchdog>(sp =>
         sp.GetService<IAgentStreamStore>(),
         sp.GetService<IWebhookDispatcher>(),
         startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>(),
-        activitySource: sp.GetRequiredService<IWorkerProgressActivitySource>());
+        activitySource: sp.GetRequiredService<IWorkerProgressActivitySource>(),
+        cancellationRegistry: sp.GetRequiredService<CancellationRegistry>());
 });
 
 // --- Per-item stale-updatedAt watchdog --------------------------------------
@@ -4227,6 +4229,12 @@ namespace CodeyBox.Api
 
         /// <summary>Attempts to read and validate a guest exec completion sentinel.</summary>
         public int ExecCompletionProbeAttempts { get; set; } = Defaults.ExecCompletionProbeAttempts;
+
+        /// <summary>Delayed recovery attempts after immediate interrupted-exec recovery fails; zero disables delayed recovery.</summary>
+        public int InterruptedExecRecoveryRetryAttempts { get; set; } = Defaults.InterruptedExecRecoveryRetryAttempts;
+
+        /// <summary>Delay before each delayed interrupted-exec recovery attempt.</summary>
+        public TimeSpan InterruptedExecRecoveryRetryDelay { get; set; } = Defaults.InterruptedExecRecoveryRetryDelay;
 
         /// <summary>Maximum number of concurrent heavy Incus lifecycle/device operations.</summary>
         public int MaxConcurrentOperations { get; set; } = Defaults.MaxConcurrentOperations;

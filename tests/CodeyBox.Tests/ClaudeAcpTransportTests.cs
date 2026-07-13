@@ -656,6 +656,65 @@ public sealed class ClaudeAcpTransportTests
     }
 
     [Fact]
+    public async Task AcpClaudeTransport_ExecutionUnavailable_DoesNotReportPartialCompleteAsSuccess()
+    {
+        var sandbox = new BridgeSandbox { BridgeExecutionUnavailable = true };
+        sandbox.NextBridgeOutput(new[]
+        {
+            "{\"type\":\"ready\",\"port\":40123}",
+            "{\"type\":\"peer_connected\"}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"acp-unavailable-1\"}}}",
+            "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}}",
+            "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
+        });
+        var transport = NewAcpTransportWithOverride();
+        var request = new ClaudeTransportOpenRequest(
+            sandbox,
+            "/work",
+            Credential: null,
+            ModelId: null,
+            ReasoningMode: null,
+            LocalSessionId: "local-unavailable");
+
+        await using var session = await transport.OpenAsync(request, CancellationToken.None);
+        var turn = await session.SendTurnAsync(
+            new ClaudeTransportTurnRequest("hello", CliResumeSessionId: null, StdoutChunkCallback: null),
+            CancellationToken.None);
+
+        Assert.False(turn.Result.Success);
+        Assert.True(turn.Result.ExecutionUnavailable);
+        Assert.Contains("execution became unavailable", turn.Result.Summary);
+    }
+
+    [Fact]
+    public async Task AcpClaudeTransport_ExecutionUnavailableWithoutTurnOutcome_ReturnsTypedFailure()
+    {
+        var sandbox = new BridgeSandbox { BridgeExecutionUnavailable = true };
+        sandbox.NextBridgeOutput(
+        [
+            "{\"type\":\"ready\",\"port\":40123}",
+            "{\"type\":\"peer_connected\"}",
+        ]);
+        var transport = NewAcpTransportWithOverride();
+        var request = new ClaudeTransportOpenRequest(
+            sandbox,
+            "/work",
+            Credential: null,
+            ModelId: null,
+            ReasoningMode: null,
+            LocalSessionId: "local-unavailable-no-outcome");
+
+        await using var session = await transport.OpenAsync(request, CancellationToken.None);
+        var turn = await session.SendTurnAsync(
+            new ClaudeTransportTurnRequest("hello", CliResumeSessionId: null, StdoutChunkCallback: null),
+            CancellationToken.None);
+
+        Assert.False(turn.Result.Success);
+        Assert.True(turn.Result.ExecutionUnavailable);
+        Assert.Contains("execution became unavailable", turn.Result.Summary);
+    }
+
+    [Fact]
     public async Task AcpClaudeTransport_BridgeLauncherScript_ExecutesPayloadAndRejectsHashMismatch()
     {
         var successRoot = Directory.CreateTempSubdirectory("cb-acp-launcher-success-").FullName;
@@ -1663,6 +1722,7 @@ printf '%s\n' '{"type":"turn_complete","stopReason":"end_turn"}'
 
         public bool FailBridgeLaunch { get; set; }
         public int BridgeExitCode { get; set; }
+        public bool BridgeExecutionUnavailable { get; set; }
         public string? SanitiserListsFile { get; set; }
         public bool SanitiserFailWrite { get; set; }
 
@@ -1709,7 +1769,11 @@ printf '%s\n' '{"type":"turn_complete","stopReason":"end_turn"}'
                     : Array.Empty<string>();
                 var stdout = string.Join("\n", envelopes) + (envelopes.Length > 0 ? "\n" : "");
                 exec.StdoutChunkCallback?.Invoke(stdout);
-                return Task.FromResult(new SandboxExecResult(BridgeExitCode, stdout, ""));
+                return Task.FromResult(new SandboxExecResult(
+                    BridgeExitCode,
+                    stdout,
+                    "",
+                    ExecutionUnavailable: BridgeExecutionUnavailable));
             }
 
             return Task.FromResult(new SandboxExecResult(0, "", ""));

@@ -144,6 +144,37 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
+    public void NativeSessionId_JsonRoundTrip_RetainsValidatedValue()
+    {
+        var expected = new AgentNativeSessionId("thread_abc123");
+
+        var json = System.Text.Json.JsonSerializer.Serialize(expected);
+        var actual = System.Text.Json.JsonSerializer.Deserialize<AgentNativeSessionId>(json);
+
+        var typed = Assert.IsType<AgentNativeSessionId>(actual);
+        Assert.Equal(expected, typed);
+        Assert.Equal("thread_abc123", typed.Value);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("-last")]
+    [InlineData("two words")]
+    [InlineData("line\nbreak")]
+    public void NativeSessionId_RejectsUnsafeValues(string value)
+    {
+        Assert.Throws<ArgumentException>(() => new AgentNativeSessionId(value));
+    }
+
+    [Fact]
+    public void NativeSessionId_RejectsOversizedValue()
+    {
+        var oversized = new string('a', AgentNativeSessionId.MaximumLength + 1);
+
+        Assert.Throws<ArgumentException>(() => new AgentNativeSessionId(oversized));
+    }
+
+    [Fact]
     public void ClaudeRunner_DeclaresSessionResumeContract()
     {
         var runner = Assert.IsAssignableFrom<ICliSessionResumableAgentRunner>(new ClaudeAgentRunner());
@@ -274,6 +305,118 @@ public sealed class AgentSessionResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task ClaudeRunner_NativeRetry_RepreparesCredentialsAfterLivenessProbe()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+        const string sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
+        var credential = new AgentCredential(
+            AgentKind.Claude,
+            new Dictionary<string, string>
+            {
+                [ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar] =
+                    """{"claudeAiOauth":{"accessToken":"token"}}""",
+            },
+            new Dictionary<string, string>
+            {
+                ["custom/auth.json"] = "custom-file-secret",
+            });
+        var sandbox = new ResumeRecordingSandbox(call => call == 1
+            ? new SandboxExecResult(
+                1,
+                $$"""{"type":"system","subtype":"init","session_id":"{{sessionId}}"}""",
+                "ECONNRESET")
+            : new SandboxExecResult(0, "ok", ""));
+
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox,
+            "/work",
+            "prompt",
+            credential,
+            captureStructuredStream: true);
+
+        Assert.True(result.Success);
+        var materializations = sandbox.AllExecs
+            .Where(exec => CredentialMaterialisationTestHelper.IsStdinMaterialisation(
+                exec,
+                ".claude/.credentials.json"))
+            .ToArray();
+        Assert.Equal(2, materializations.Length);
+        Assert.Equal("overwrite", materializations[0].Argv[7]);
+        Assert.Equal("preserve-nonempty", materializations[1].Argv[7]);
+        var directBundleMaterializations = sandbox.AllExecs.Count(exec =>
+            exec.Argv.Count >= 9
+            && exec.Argv[0] == "bash"
+            && exec.Argv[4] == SandboxConventions.CredentialsDir
+            && exec.Argv[5] == "custom/auth.json"
+            && exec.Stdin == "custom-file-secret");
+        Assert.Equal(2, directBundleMaterializations);
+
+        var livenessIndex = sandbox.AllExecs.FindIndex(exec =>
+            exec.Argv.Count > 0
+            && exec.Argv[0] == "sh"
+            && exec.Argv.Contains("codeybox-resume-liveness"));
+        var retryPreparationIndex = sandbox.AllExecs.IndexOf(materializations[1]);
+        var resumedAgentIndex = sandbox.AllExecs.IndexOf(sandbox.ClaudeExecs[1]);
+        Assert.True(livenessIndex >= 0);
+        Assert.True(livenessIndex < retryPreparationIndex);
+        Assert.True(retryPreparationIndex < resumedAgentIndex);
+        AssertFlagValue(sandbox.ClaudeInvocations[1], "--resume", sessionId);
+    }
+
+    [Fact]
+    public async Task ClaudeRunner_NativeRetryPreparationFailure_PreservesTypedRecoveryMetadata()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+        const string sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
+        var credential = new AgentCredential(
+            AgentKind.Claude,
+            new Dictionary<string, string>
+            {
+                [ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar] =
+                    """{"claudeAiOauth":{"accessToken":"token"}}""",
+            },
+            new Dictionary<string, string>());
+        var materializationCount = 0;
+        var sandbox = new ResumeRecordingSandbox(
+            _ => new SandboxExecResult(
+                1,
+                $$"""{"type":"system","subtype":"init","session_id":"{{sessionId}}"}""",
+                "ECONNRESET"),
+            exec =>
+            {
+                if (!CredentialMaterialisationTestHelper.IsStdinMaterialisation(
+                        exec,
+                        ".claude/.credentials.json"))
+                {
+                    return new SandboxExecResult(0, "", "");
+                }
+
+                materializationCount++;
+                return materializationCount == 1
+                    ? new SandboxExecResult(0, "", "")
+                    : new SandboxExecResult(
+                        1,
+                        "",
+                        "guest unavailable during credential restore",
+                        ExecutionUnavailable: true);
+            });
+
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox,
+            "/work",
+            "prompt",
+            credential,
+            captureStructuredStream: true);
+
+        Assert.False(result.Success);
+        Assert.True(result.ExecutionUnavailable);
+        Assert.Equal(sessionId, result.NativeSessionId?.Value);
+        Assert.Equal(2, materializationCount);
+        Assert.Contains("failed to materialise claude auth", result.Summary);
+        Assert.Single(sandbox.ClaudeInvocations);
+    }
+
+    [Fact]
     public async Task CodexRunner_CrashWithCapturedSessionId_RetriesWithExecResume()
     {
         SessionResumeOptions.SetMaxResumeAttempts(2);
@@ -318,6 +461,151 @@ public sealed class AgentSessionResumeTests : IDisposable
         Assert.Equal("--", second[sessionIdx - 1]);
         Assert.Equal(CodexAgentRunner.SessionResumePrompt, sandbox.ClaudeExecs[1].Stdin);
         Assert.NotEqual("prompt", sandbox.ClaudeExecs[1].Stdin);
+    }
+
+    [Fact]
+    public async Task CodexRunner_ZeroExitStructuredResult_PreservesSessionIdForNoDiffRecovery()
+    {
+        var sessionId = "019e8a0f-4c27-7b61-940f-e344bafa43d5";
+        var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(
+            0,
+            Stdout: $"{{\"type\":\"thread.started\",\"thread_id\":\"{sessionId}\"}}",
+            Stderr: ""));
+
+        var result = await new CodexAgentRunner().RunAsync(
+            sandbox,
+            "/work",
+            "prompt",
+            credential: null,
+            captureStructuredStream: true);
+
+        Assert.True(result.Success);
+        Assert.Equal(sessionId, result.NativeSessionId?.Value);
+        Assert.Single(sandbox.ClaudeInvocations);
+    }
+
+    [Fact]
+    public async Task ClaudeRunner_RunResumedAsync_WithNativeSessionId_ResumesExactSession()
+    {
+        const string originalPrompt = "repeat-sensitive original prompt";
+        const string sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
+        var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(0, "ok", ""));
+
+        var result = await new ClaudeAgentRunner().RunResumedAsync(
+            sandbox,
+            "/work",
+            originalPrompt,
+            credential: null,
+            new AgentResumeContext(
+                "refs/heads/codeybox/preempt/test",
+                NativeSessionId: new AgentNativeSessionId(sessionId)));
+
+        Assert.True(result.Success);
+        var invocation = Assert.Single(sandbox.ClaudeInvocations);
+        AssertFlagValue(invocation, "--resume", sessionId);
+        Assert.DoesNotContain("--continue", invocation);
+        Assert.Equal("--", invocation[^1]);
+        Assert.Equal(ClaudeAgentRunner.SessionResumePrompt, sandbox.ClaudeExecs[0].Stdin);
+        Assert.NotEqual(originalPrompt, sandbox.ClaudeExecs[0].Stdin);
+    }
+
+    [Fact]
+    public async Task ClaudeRunner_RunResumedAsync_UnknownNonzeroFailure_ReusesPersistedSessionId()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+        const string sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
+        var sandbox = new ResumeRecordingSandbox(call => call == 1
+            ? new SandboxExecResult(1, "", "")
+            : new SandboxExecResult(0, "ok", ""));
+
+        var result = await new ClaudeAgentRunner().RunResumedAsync(
+            sandbox,
+            "/work",
+            "original prompt",
+            credential: null,
+            new AgentResumeContext(
+                "refs/heads/codeybox/preempt/test",
+                NativeSessionId: new AgentNativeSessionId(sessionId)));
+
+        Assert.True(result.Success);
+        Assert.Equal(2, sandbox.ClaudeInvocations.Count);
+        AssertFlagValue(sandbox.ClaudeInvocations[0], "--resume", sessionId);
+        AssertFlagValue(sandbox.ClaudeInvocations[1], "--resume", sessionId);
+        Assert.All(
+            sandbox.ClaudeExecs,
+            exec => Assert.Equal(ClaudeAgentRunner.SessionResumePrompt, exec.Stdin));
+    }
+
+    [Fact]
+    public async Task ClaudeRunner_RunResumedAsync_WithoutNativeSessionId_ContinuesMostRecentSession()
+    {
+        const string originalPrompt = "repeat-sensitive original prompt";
+        var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(0, "ok", ""));
+
+        var result = await new ClaudeAgentRunner().RunResumedAsync(
+            sandbox,
+            "/work",
+            originalPrompt,
+            credential: null,
+            new AgentResumeContext("refs/heads/codeybox/preempt/test"));
+
+        Assert.True(result.Success);
+        var invocation = Assert.Single(sandbox.ClaudeInvocations);
+        Assert.Contains("--continue", invocation);
+        Assert.DoesNotContain("--resume", invocation);
+        Assert.Equal("--", invocation[^1]);
+        Assert.Equal(ClaudeAgentRunner.SessionResumePrompt, sandbox.ClaudeExecs[0].Stdin);
+        Assert.NotEqual(originalPrompt, sandbox.ClaudeExecs[0].Stdin);
+    }
+
+    [Fact]
+    public async Task CodexRunner_RunResumedAsync_WithNativeSessionId_ResumesExactSession()
+    {
+        const string originalPrompt = "repeat-sensitive original prompt";
+        const string sessionId = "thread_abc123";
+        var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(0, "ok", ""));
+
+        var result = await new CodexAgentRunner().RunResumedAsync(
+            sandbox,
+            "/work",
+            originalPrompt,
+            credential: null,
+            new AgentResumeContext(
+                "refs/heads/codeybox/preempt/test",
+                NativeSessionId: new AgentNativeSessionId(sessionId)));
+
+        Assert.True(result.Success);
+        var invocation = Assert.Single(sandbox.ClaudeInvocations);
+        Assert.Equal(["codex", "exec", "resume"], invocation.Take(3).ToArray());
+        Assert.DoesNotContain("--last", invocation);
+        var sessionIndex = IndexOf(invocation, sessionId);
+        Assert.True(sessionIndex > 0);
+        Assert.Equal("--", invocation[sessionIndex - 1]);
+        Assert.Equal("-", invocation[sessionIndex + 1]);
+        Assert.Equal(CodexAgentRunner.SessionResumePrompt, sandbox.ClaudeExecs[0].Stdin);
+        Assert.NotEqual(originalPrompt, sandbox.ClaudeExecs[0].Stdin);
+    }
+
+    [Fact]
+    public async Task CodexRunner_RunResumedAsync_WithoutNativeSessionId_ContinuesMostRecentSession()
+    {
+        const string originalPrompt = "repeat-sensitive original prompt";
+        var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(0, "ok", ""));
+
+        var result = await new CodexAgentRunner().RunResumedAsync(
+            sandbox,
+            "/work",
+            originalPrompt,
+            credential: null,
+            new AgentResumeContext("refs/heads/codeybox/preempt/test"));
+
+        Assert.True(result.Success);
+        var invocation = Assert.Single(sandbox.ClaudeInvocations);
+        Assert.Equal(["codex", "exec", "resume", "--last"], invocation.Take(4).ToArray());
+        Assert.Equal("--", invocation[^2]);
+        Assert.Equal("-", invocation[^1]);
+        Assert.Equal(CodexAgentRunner.SessionResumePrompt, sandbox.ClaudeExecs[0].Stdin);
+        Assert.NotEqual(originalPrompt, sandbox.ClaudeExecs[0].Stdin);
     }
 
     [Fact]
@@ -399,6 +687,71 @@ public sealed class AgentSessionResumeTests : IDisposable
             sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
 
         Assert.False(result.Success);
+        Assert.Single(sandbox.ClaudeInvocations);
+        Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[0]);
+    }
+
+    [Fact]
+    public async Task ClaudeRunner_ExplicitExecutionUnavailable_WithCapturedSessionId_IsResumeEligible()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+        const string sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
+        var sandbox = new ResumeRecordingSandbox(call => call == 1
+            ? new SandboxExecResult(
+                1,
+                $$"""{"type":"system","subtype":"init","session_id":"{{sessionId}}"}""",
+                "incus exec unavailable",
+                ExecutionUnavailable: true)
+            : new SandboxExecResult(0, "ok", ""));
+
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
+
+        Assert.True(result.Success);
+        Assert.Equal(2, sandbox.ClaudeInvocations.Count);
+        AssertFlagValue(sandbox.ClaudeInvocations[1], "--resume", sessionId);
+    }
+
+    [Fact]
+    public async Task ClaudeRunner_ExecutionUnavailableResult_PreservesTypedSignalAndSessionId()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(0);
+        const string sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
+        var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(
+            1,
+            $$"""{"type":"system","subtype":"init","session_id":"{{sessionId}}"}""",
+            "incus exec unavailable",
+            ExecutionUnavailable: true));
+        var runner = new ClaudeAgentRunner();
+
+        var result = await runner.RunAsync(
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
+
+        Assert.False(result.Success);
+        Assert.True(result.ExecutionUnavailable);
+        Assert.Equal(sessionId, result.NativeSessionId?.Value);
+        Assert.Equal(
+            AgentFailureKind.Infrastructure,
+            ((IAgentRunner)runner).ClassifyFailure(result).Kind);
+        Assert.Single(sandbox.ClaudeInvocations);
+    }
+
+    [Fact]
+    public async Task ClaudeRunner_TextClassifiedInfrastructure_WithoutTypedSignal_DoesNotResume()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+        const string sessionId = "e61b65a0-0f1e-4469-94f0-0be82d71b909";
+        var sandbox = new ResumeRecordingSandbox(_ => new SandboxExecResult(
+            127,
+            $$"""{"type":"system","subtype":"init","session_id":"{{sessionId}}"}""",
+            "sh: claude: command not found"));
+
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
+
+        Assert.False(result.Success);
+        Assert.False(result.ExecutionUnavailable);
+        Assert.Equal(sessionId, result.NativeSessionId?.Value);
         Assert.Single(sandbox.ClaudeInvocations);
         Assert.DoesNotContain("--resume", sandbox.ClaudeInvocations[0]);
     }
@@ -612,7 +965,33 @@ public sealed class AgentSessionResumeTests : IDisposable
             sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
 
         Assert.False(result.Success);
+        Assert.True(result.ExecutionUnavailable);
         Assert.Equal("agent exited 1", result.Summary);
+        Assert.Single(sandbox.ClaudeInvocations);
+    }
+
+    [Fact]
+    public async Task ClaudeRunner_LivenessProbeExecutionUnavailable_PreservesTypedInfrastructureSignal()
+    {
+        SessionResumeOptions.SetMaxResumeAttempts(2);
+        var sandbox = new ResumeRecordingSandbox(
+            _ => new SandboxExecResult(1,
+                Stdout: """{"type":"system","subtype":"init","session_id":"e61b65a0-0f1e-4469-94f0-0be82d71b909"}""",
+                Stderr: "ECONNRESET"),
+            exec => exec.Argv.Count > 0 && exec.Argv[0] == "sh"
+                ? new SandboxExecResult(
+                    255,
+                    string.Empty,
+                    "incus daemon unavailable",
+                    ExecutionUnavailable: true)
+                : new SandboxExecResult(0, string.Empty, string.Empty));
+
+        var result = await new ClaudeAgentRunner().RunAsync(
+            sandbox, "/work", "prompt", credential: null, captureStructuredStream: true);
+
+        Assert.False(result.Success);
+        Assert.True(result.ExecutionUnavailable);
+        Assert.Contains("sandbox-execution-unavailable", result.Stderr, StringComparison.Ordinal);
         Assert.Single(sandbox.ClaudeInvocations);
     }
 
@@ -674,6 +1053,9 @@ public sealed class AgentSessionResumeTests : IDisposable
                 sandbox, "/work", "prompt", credential: null, captureStructuredStream: true));
 
         Assert.False(ex.LastResult.Success);
+        Assert.Equal(
+            "e61b65a0-0f1e-4469-94f0-0be82d71b909",
+            ex.LastResult.NativeSessionId?.Value);
         Assert.Equal(2, ex.MaxResumeAttempts);
         // 1 original + 2 resume attempts = 3 claude invocations.
         Assert.Equal(3, sandbox.ClaudeInvocations.Count);
@@ -1008,13 +1390,13 @@ public sealed class AgentSessionResumeTests : IDisposable
             => new(["fake-agent", "run"], Stdin: prompt);
 
         protected override AgentInvocation BuildSessionResumeInvocation(
-            string sessionId,
+            AgentNativeSessionId sessionId,
             string prompt,
             AgentCredential? credential,
             string? modelId = null,
             string? reasoningMode = null,
             bool captureStructuredStream = false)
-            => new(["fake-agent", "--resume", sessionId], Stdin: SessionResumePrompt);
+            => new(["fake-agent", "--resume", sessionId.Value], Stdin: SessionResumePrompt);
 
         private sealed class NoQuotaFailureClassifier : IQuotaFailureClassifier
         {
