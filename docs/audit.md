@@ -218,12 +218,26 @@ command). The solution otherwise builds warnings-clean once the home is
 writable.
 
 The recovery must run where the gates execute, which is not necessarily the
-agent's working session: an iteration is provisioned with a fresh, root-owned
-`~/.nuget`, so healing performed only inside a prior agent turn does not carry
-forward once the next iteration re-provisions. Run `reclaim-nuget-home.sh` (or
-export a writable home) on the audit host immediately before the direct
-`dotnet` gate, not merely once during authoring — a healed home read back as a
-no-op is expected, but a re-provisioned host needs the reclaim again.
+agent's working session. Two host lifetimes occur and the reclaim is safe for
+both: a host **re-provisioned** each iteration hands the gate a fresh
+root-owned `~/.nuget`, so healing done only inside a prior agent turn does not
+carry forward and the reclaim must run again; a **persistent** host keeps the
+same `~/.nuget` across iterations, so a single reclaim heals it durably and is
+read back as a no-op thereafter. Run `reclaim-nuget-home.sh` (or export a
+writable home) on the audit host immediately before the direct `dotnet` gate,
+not merely once during authoring.
+
+Empirically observed on this deployment (iteration 19): the host is
+**persistent**, and the root-owned `~/.nuget` had never actually been
+reclaimed — it carried the original provisioning timestamp and `~` held no
+`.nuget.unwritable-backup.*` slot, proving the recovery had been committed and
+documented in prior turns but never *executed* against the host. Running the
+reclaim (renaming the root-owned `~/.nuget` aside to
+`~/.nuget.unwritable-backup.0` and recreating a writable one) turned all three
+.NET gates green with no source change. The lesson the earlier "fresh
+root-owned home each iteration" note missed: committing or documenting the
+recovery is not the same as running it — the reclaim only heals the host when
+it is actually invoked there.
 
 The recovery is encoded as `scripts/reclaim-nuget-home.sh` so it is
 discoverable and repeatable rather than tribal knowledge (run it on the host
