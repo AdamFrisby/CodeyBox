@@ -1,0 +1,3 @@
+# NuGet reads user-wide settings before project imports. Select the repository
+# configuration as an MSBuild global property so solution restore never needs them.
+-property:RestoreConfigFile=NuGet.Config

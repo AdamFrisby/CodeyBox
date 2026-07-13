@@ -1,2 +1,0 @@
-# Solution restore must receive this before it tries per-user NuGet configuration.
--property:RestoreConfigFile=%MSBuildThisFileDirectory%NuGet.Config
