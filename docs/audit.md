@@ -270,6 +270,19 @@ Prefer exporting `DOTNET_CLI_HOME` where the launcher allows it; the reclaim
 path is the fallback for a bare host-launched `dotnet` that no repo file or
 environment export can reach.
 
+**Single root cause across the .NET gates.** The `process:required-build`,
+`csharp:build-WaE`, and `csharp:test-pass` gates fail together and for one
+reason: an unwritable user-level NuGet home aborts restore before the build or
+test target runs, so the `csharp:test-pass` "argument ...dll is invalid" and the
+`csharp:build-WaE` non-zero exit are downstream symptoms of the same aborted
+restore, not independent defects. Reproduced in isolation by pointing `HOME` at a
+directory whose `.nuget/NuGet` is unreadable: `dotnet build` aborts with the
+identical `Failed to read NuGet.Config ... denied`, and making that home writable
+(reclaim or a writable `HOME`/`DOTNET_CLI_HOME`) is sufficient to turn all three
+gates green with no source change. The reclaim heals the home in place on the
+audit host's own filesystem, so healing it once before the gates run — not per
+source revision — is the operative recovery.
+
 ## Built-in auditors
 
 ### `ShellCommandAuditor` (`CodeyBox.Audit.Shell`)
