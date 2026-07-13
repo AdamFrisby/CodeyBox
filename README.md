@@ -124,8 +124,12 @@ dotnet build CodeyBox.slnx
 > The repository supplies its package sources through `Directory.Build.props` for
 > direct project builds and `Directory.Solution.props` for solution builds. Both
 > resolve `NuGet.Config` relative to the repository, so package-source selection is
-> independent of the caller's working directory. NuGet still inspects user-level
-> configuration; the invoking account therefore needs a readable home directory.
+> independent of the caller's working directory. NuGet still inspects — and creates,
+> when absent — user-level configuration under `$HOME/.nuget/NuGet/`, so the invoking
+> account needs a **writable** home directory. In locked-down environments where that
+> path is not writable (for example a home baked read-only or owned by another user),
+> point `DOTNET_CLI_HOME` at a writable directory before building; NuGet then keeps its
+> per-user config there instead.
 
 **3. Configure a project.** Drop a JSON file somewhere and point
 `CODEYBOX_EXTRA_CONFIG` at it (it hot-reloads on change):
