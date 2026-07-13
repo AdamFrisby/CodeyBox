@@ -3479,6 +3479,61 @@ os.execv(dotnet, [hostile_argv0, "exec", target, *sys.argv[3:]])
         }
     }
 
+    [Fact]
+    public async Task Bridge_NativeResource_AuthenticatesWebSocketHandshakeWithoutLoadingHostCrypto()
+    {
+        if (RuntimeInformation.ProcessArchitecture != Architecture.X64 || AcpBridgeBinary.IsPlaceholderBuild)
+            return;
+
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-native-handshake-").FullName;
+        try
+        {
+            var target = CreateNativeResourceSignalTestTarget(tmpDir);
+            var workDir = Path.Combine(tmpDir, "work");
+            var lockDir = Path.Combine(tmpDir, "locks");
+            var connectedMarker = Path.Combine(tmpDir, "connected");
+            Directory.CreateDirectory(workDir);
+            var stubPath = WriteClaudeStubThatConnectsFromDescendant(tmpDir);
+            var psi = CreateBridgeSignalTestStartInfo(
+                target,
+                tmpDir,
+                signo: 15,
+                inheritIgnoredSignal: false,
+                ignoredMarkerPath: null);
+
+            using var proc = Process.Start(psi)
+                ?? throw new InvalidOperationException("Process.Start returned null for native bridge fixture.");
+            try
+            {
+                var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
+                    + "\",\"claudeArgs\":[\"" + lockDir + "\",\"" + connectedMarker
+                    + "\"],\"workingDirectory\":\"" + workDir
+                    + "\",\"lockDir\":\"" + lockDir
+                    + "\",\"turnTimeoutSeconds\":60}";
+                await proc.StandardInput.WriteLineAsync(hello);
+                await proc.StandardInput.FlushAsync();
+
+                var lockPath = await WaitForReadyEnvelopeAsync(proc);
+                await WaitForEnvelopeTypeAsync(proc, "peer_connected");
+                Assert.True(File.Exists(connectedMarker));
+
+                await proc.StandardInput.WriteLineAsync("{\"type\":\"shutdown\"}");
+                await proc.StandardInput.FlushAsync();
+                await proc.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(15));
+                Assert.Equal(0, proc.ExitCode);
+                Assert.False(File.Exists(lockPath));
+            }
+            finally
+            {
+                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+            }
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
     private static async Task RunBridgeSignalCleanupScenarioAsync(
         int signo,
         string signalName,
@@ -3671,6 +3726,24 @@ os.execv(dotnet, [hostile_argv0, "exec", target, *sys.argv[3:]])
         }
     }
 
+    private static async Task WaitForEnvelopeTypeAsync(Process proc, string expectedType)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        while (true)
+        {
+            var line = await proc.StandardOutput.ReadLineAsync(timeout.Token);
+            Assert.NotNull(line);
+            if (string.IsNullOrEmpty(line))
+                continue;
+            using var doc = JsonDocument.Parse(line);
+            if (doc.RootElement.TryGetProperty("type", out var type)
+                && string.Equals(type.GetString(), expectedType, StringComparison.Ordinal))
+            {
+                return;
+            }
+        }
+    }
+
     private static void AssertBridgeReadyEnvelopeOrdering(IReadOnlyList<JsonDocument> envelopes)
     {
         Assert.True(envelopes.Count >= 2, "Expected at least 2 envelopes (bridge_started and ready)");
@@ -3727,7 +3800,13 @@ os.execv(dotnet, [hostile_argv0, "exec", target, *sys.argv[3:]])
         bool inheritIgnoredSignal,
         string? ignoredMarkerPath)
     {
-        var psi = new ProcessStartInfo(inheritIgnoredSignal ? "python3" : bridgeTarget.ExecutablePath)
+        var directNativeLaunch = !inheritIgnoredSignal && bridgeTarget.Mode == "native";
+        var psi = new ProcessStartInfo(
+            inheritIgnoredSignal
+                ? "python3"
+                : directNativeLaunch
+                    ? "/usr/bin/env"
+                    : bridgeTarget.ExecutablePath)
         {
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
@@ -3739,6 +3818,15 @@ os.execv(dotnet, [hostile_argv0, "exec", target, *sys.argv[3:]])
 
         if (!inheritIgnoredSignal)
         {
+            if (directNativeLaunch)
+            {
+                psi.ArgumentList.Add("--default-signal=HUP,INT,TERM");
+                psi.ArgumentList.Add(
+                    SignalBootstrap.SignalBootstrapReexecEnv + "=" +
+                    SignalBootstrap.SignalBootstrapGuardSetValue);
+                psi.ArgumentList.Add(bridgeTarget.TargetPath);
+                return psi;
+            }
             bridgeTarget.AddArguments(psi.ArgumentList);
             return psi;
         }
@@ -3772,9 +3860,21 @@ with open(marker, "w", encoding="utf-8") as handle:
     handle.write("ignored\n")
 
 if mode == "dotnet":
-    os.execvp("dotnet", ["dotnet", "exec", target])
+    os.execv("/usr/bin/env", [
+        "/usr/bin/env",
+        "--default-signal=HUP,INT,TERM",
+        "CODEYBOX_ACPBRIDGE_SIGNAL_BOOTSTRAP_REEXECED=1",
+        "dotnet",
+        "exec",
+        target,
+    ])
 if mode == "native":
-    os.execv(target, [target])
+    os.execv("/usr/bin/env", [
+        "/usr/bin/env",
+        "--default-signal=HUP,INT,TERM",
+        "CODEYBOX_ACPBRIDGE_SIGNAL_BOOTSTRAP_REEXECED=1",
+        target,
+    ])
 
 sys.exit(87)
 """);

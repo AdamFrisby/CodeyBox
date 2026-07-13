@@ -39,7 +39,7 @@ internal sealed class IncusProvisioningWorkspace : IDisposable
     internal const string DirectoryPrefix = ".codeybox-provision-";
     private const string OwnershipMarkerName = ".codeybox-incus-provision-v1";
     private const string WorkspaceLeaseName = ".codeybox-incus-provision.lease";
-    private const string CoordinationLeaseName = ".codeybox-incus-provision-coordination.lease";
+    internal const string CoordinationLeaseName = ".codeybox-incus-provision-coordination.lease";
     private const int MaximumStagingRootEntries = 4096;
     private readonly string _stagingRoot;
     private readonly object _disposeGate = new();
@@ -203,10 +203,25 @@ internal sealed class IncusProvisioningWorkspace : IDisposable
         }
     }
 
-    internal static bool RecoverStaleWorkspaces(string stagingRoot, CancellationToken ct)
+    internal static async Task<bool> RecoverStaleWorkspacesAsync(
+        string stagingRoot,
+        TimeSpan coordinationTimeout,
+        TimeSpan coordinationPollInterval,
+        CancellationToken ct,
+        TimeProvider? timeProvider = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(stagingRoot);
-        using var coordinationLease = AcquireCoordinationLease(stagingRoot);
+        if (coordinationTimeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(coordinationTimeout));
+        if (coordinationPollInterval <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(coordinationPollInterval));
+        timeProvider ??= TimeProvider.System;
+        using var coordinationLease = await AcquireCoordinationLeaseAsync(
+            stagingRoot,
+            coordinationTimeout,
+            coordinationPollInterval,
+            timeProvider,
+            ct).ConfigureAwait(false);
         var observed = 0;
         var allWorkspacesRecovered = true;
         foreach (var path in Directory.EnumerateFileSystemEntries(stagingRoot))
@@ -226,6 +241,40 @@ internal sealed class IncusProvisioningWorkspace : IDisposable
                 allWorkspacesRecovered = false;
         }
         return allWorkspacesRecovered;
+    }
+
+    private static async Task<FileStream> AcquireCoordinationLeaseAsync(
+        string stagingRoot,
+        TimeSpan timeout,
+        TimeSpan pollInterval,
+        TimeProvider timeProvider,
+        CancellationToken ct)
+    {
+        var lease = IncusSafeFile.OpenOrCreatePrivateLeaseNoFollow(
+            Path.Combine(stagingRoot, CoordinationLeaseName));
+        using var timeoutCancellation = new CancellationTokenSource(timeout, timeProvider);
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(
+            ct,
+            timeoutCancellation.Token);
+        try
+        {
+            while (!IncusSafeFile.TryAcquireExclusiveLease(lease))
+                await Task.Delay(pollInterval, timeProvider, deadline.Token).ConfigureAwait(false);
+            return lease;
+        }
+        catch (OperationCanceledException ex) when (
+            !ct.IsCancellationRequested && timeoutCancellation.IsCancellationRequested)
+        {
+            lease.Dispose();
+            throw new IOException(
+                "Another CodeyBox process is creating or recovering an Incus provisioning workspace; retry the operation.",
+                new TimeoutException("The Incus provisioning coordination lease wait timed out.", ex));
+        }
+        catch
+        {
+            lease.Dispose();
+            throw;
+        }
     }
 
     private static FileStream AcquireCoordinationLease(string stagingRoot)

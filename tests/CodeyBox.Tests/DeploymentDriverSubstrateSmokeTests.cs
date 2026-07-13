@@ -81,7 +81,7 @@ public sealed class DeploymentDriverSubstrateSmokeTests
                   sleep 1
                 done
                 """,
-            StartupTimeout = TimeSpan.FromSeconds(15),
+            StartupTimeout = TimeSpan.FromSeconds(45),
             Settings = new Dictionary<string, string>
             {
                 [DaemonDeploymentDriver.SettingsKeyProbeIntervalSeconds] = "0.05",

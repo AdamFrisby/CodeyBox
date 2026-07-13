@@ -4,7 +4,6 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
@@ -23,6 +22,8 @@ internal sealed class Bridge : IAsyncDisposable
     private const int SignalInterrupt = 2;
     private const int SignalKill = 9;
     private const int SignalTerm = 15;
+    private const int AuthTokenBytes = 24;
+    private const string SystemRandomDevice = "/dev/urandom";
     private const int ClaudeSigtermGraceMilliseconds = 5000;
     private const int ClaudeSigkillWaitMilliseconds = 500;
     // Starts after Shutdown has already run; this is only the final grace for
@@ -231,7 +232,7 @@ internal sealed class Bridge : IAsyncDisposable
         // the WebSocket handshake guard can never observe an empty
         // _authToken (which would short-circuit the check). Cheap, eliminates
         // the local race window.
-        _authToken = Convert.ToHexString(RandomNumberGenerator.GetBytes(24)).ToLowerInvariant();
+        _authToken = CreateAuthToken();
 
         try
         {
@@ -266,6 +267,20 @@ internal sealed class Bridge : IAsyncDisposable
     }
 
     private static TcpListener CreateLoopbackListener() => new(IPAddress.Loopback, 0);
+
+    private static string CreateAuthToken()
+    {
+        Span<byte> bytes = stackalloc byte[AuthTokenBytes];
+        using var random = new FileStream(
+            SystemRandomDevice,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            bufferSize: 1,
+            FileOptions.None);
+        random.ReadExactly(bytes);
+        return Convert.ToHexString(bytes).ToLowerInvariant();
+    }
 
     private async Task AcceptLoopAsync(CancellationToken ct)
     {

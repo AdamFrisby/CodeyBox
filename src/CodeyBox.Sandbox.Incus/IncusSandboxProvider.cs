@@ -1251,9 +1251,13 @@ public sealed class IncusSandboxProvider :
                 var stagingRoot = ResolveStagingRoot(options);
                 try
                 {
-                    _ = IncusProvisioningWorkspace.RecoverStaleWorkspaces(stagingRoot, ct);
+                    _ = await IncusProvisioningWorkspace.RecoverStaleWorkspacesAsync(
+                        stagingRoot,
+                        options.OperationTimeout,
+                        options.ReadinessPollInterval,
+                        ct).ConfigureAwait(false);
                 }
-                catch (IncusProvisioningLeaseContendedException contended)
+                catch (IOException contended) when (contended.InnerException is TimeoutException)
                 {
                     // Stale-workspace recovery is opportunistic cleanup guarded by a
                     // cross-process lease. A concurrent provisioning/recovery pass —

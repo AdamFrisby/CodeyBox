@@ -1329,7 +1329,7 @@ public sealed class IncusSandboxLifecycleTests
         var sandbox = CreateSandbox(
             sandboxName,
             root,
-            FastLifecycleOptions(),
+            FastLifecycleOptions() with { OperationTimeout = TimeSpan.FromSeconds(10) },
             runner,
             spec: spec,
             newGuid: () => Guid.Parse("99999999-8888-7777-6666-555555555555"));
