@@ -239,6 +239,19 @@ root-owned home each iteration" note missed: committing or documenting the
 recovery is not the same as running it — the reclaim only heals the host when
 it is actually invoked there.
 
+Re-verified (iteration 21): the iteration-19 reclaim persisted — `~/.nuget` is
+owner-writable with the `~/.nuget.unwritable-backup.0` slot still present, and
+`scripts/reclaim-nuget-home.sh` reads it back as a healthy no-op — confirming
+the persistent-host model. With the home healthy, all three .NET gates pass
+with no source change: `dotnet build ./CodeyBox.slnx` → 0 warnings/0 errors,
+`dotnet build --no-incremental /warnaserror` → 0 warnings, and
+`dotnet test --no-build` runs the suite (e.g. the `CodeyBox.Admin.Tests` and
+`CodeyBox.Cli.Tests` gates pass 244 and 274 respectively). The three findings
+that re-opened this iteration are the same host precondition read against a
+pre-reclaim gate run, not a branch defect: no committed repo file redirects a
+directly-launched `dotnet`'s NuGet home (see the operator-precondition note
+below), so the fix is the host reclaim, which is in place.
+
 The recovery is encoded as `scripts/reclaim-nuget-home.sh` so it is
 discoverable and repeatable rather than tribal knowledge (run it on the host
 before the direct `dotnet` step, or once to heal a persistent home). It is
