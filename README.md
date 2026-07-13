@@ -130,9 +130,9 @@ dotnet build CodeyBox.slnx
 > package cache while replacing only its unwritable parent:
 >
 > ```bash
-> mv "$HOME/.nuget" "$HOME/.nuget.preexisting"
-> mkdir -p "$HOME/.nuget/NuGet"
-> ln -s "$HOME/.nuget.preexisting/packages" "$HOME/.nuget/packages"
+> mv -- "$HOME/.nuget" "$HOME/.nuget.preexisting"
+> mkdir -p -- "$HOME/.nuget/NuGet"
+> ln -s -- "$HOME/.nuget.preexisting/packages" "$HOME/.nuget/packages"
 > ```
 
 **3. Configure a project.** Drop a JSON file somewhere and point
