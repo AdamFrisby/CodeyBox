@@ -26,6 +26,17 @@
          non-English resource consumers. -->
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <ResolveAssemblyReferencesFindRelatedSatellites>false</ResolveAssemblyReferencesFindRelatedSatellites>
+    <!-- NuGet's settings task otherwise merges the per-user config even when a
+         repository config is present. An explicit path keeps project graph
+         evaluation independent of the build account's home directory. -->
+    <RestoreConfigFile>$(MSBuildThisFileDirectory)nuget.config</RestoreConfigFile>
+    <!-- The initial target may redirect DOTNET_CLI_HOME solely for NuGet's
+         user-config/proxy cache. Keep packages in the caller's original
+         global cache so that redirect does not force a second package store. -->
+    <_CodeyBoxOriginalDotNetHome Condition="'$(DOTNET_CLI_HOME)' != ''">$(DOTNET_CLI_HOME)</_CodeyBoxOriginalDotNetHome>
+    <_CodeyBoxOriginalDotNetHome Condition="'$(_CodeyBoxOriginalDotNetHome)' == '' and '$(HOME)' != ''">$(HOME)</_CodeyBoxOriginalDotNetHome>
+    <_CodeyBoxOriginalDotNetHome Condition="'$(_CodeyBoxOriginalDotNetHome)' == ''">$(USERPROFILE)</_CodeyBoxOriginalDotNetHome>
+    <RestorePackagesPath Condition="'$(RestorePackagesPath)' == '' and '$(_CodeyBoxOriginalDotNetHome)' != ''">$([System.IO.Path]::Combine('$(_CodeyBoxOriginalDotNetHome)', '.nuget', 'packages'))</RestorePackagesPath>
   </PropertyGroup>
 
 </Project>
