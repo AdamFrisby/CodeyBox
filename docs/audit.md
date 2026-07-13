@@ -218,9 +218,10 @@ or reclaim a root-owned `~/.nuget` in place. Removing the stale entry is
 governed by the write bit on `$HOME` itself (the parent), not by the
 root-owned `~/.nuget`'s own permissions, so an unprivileged agent whose home
 directory is writable can move it aside non-destructively and recreate a
-writable one. The reclaim is safe to re-run — each audit iteration starts from
-a freshly re-provisioned (again root-owned) `~/.nuget`, so recovery must be
-idempotent rather than assume a clean slate:
+writable one. The reclaim is safe to re-run — the audit host may re-provision `~/.nuget`
+root-owned again between iterations, or a prior iteration's reclaim may already
+have healed it (a healed home persists on the host's filesystem and reads back
+as a no-op), so recovery must be idempotent rather than assume a clean slate:
 
 ```sh
 if [ -w "$HOME" ] && [ -e "$HOME/.nuget" ] && [ ! -w "$HOME/.nuget/NuGet" ]; then
