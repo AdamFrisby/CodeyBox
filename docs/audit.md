@@ -202,7 +202,10 @@ required-build verifier and `build.sh`. (At sandbox *creation*
 `HOME` for sibling git/tool steps that need the caller's home; the per-command
 `ApplyIfDotnetInvocation` overrides `HOME` safely because it scopes to the
 dotnet exec.) The repo-root `build.sh` applies the same writability-aware
-selection for the `process:build-script` gate.
+selection for the `process:build-script` gate, and additionally runs
+`scripts/reclaim-nuget-home.sh` best-effort first so an unwritable inherited
+`~/.nuget` is healed in place (reusing the caller's real package cache) rather
+than only redirected to an empty repo-local home.
 
 **Operator precondition (not a repo defect).** No committed repo file can
 redirect a `dotnet` process that a harness launches *outside* these seams
