@@ -69,10 +69,19 @@ chmod -R u+rwX "$HOME/.nuget"
 If the build user has no `sudo` (so `chown` on a root-owned `~/.nuget` is
 impossible) but *does* own its home directory, the root-owned tree can still be
 moved aside without elevation — renaming an entry needs write permission on the
-**parent** directory, not on the entry itself:
+**parent** directory, not on the entry itself. `scripts/prepare-nuget-home.sh`
+performs exactly this, idempotently (a no-op when `~/.nuget` is already
+writable), so it is safe to run unconditionally as a build-user pre-step:
 
 ```sh
 # Runs as the unprivileged build user; no sudo required.
+scripts/prepare-nuget-home.sh
+dotnet build ./CodeyBox.slnx
+```
+
+The script is the executable form of these manual steps:
+
+```sh
 mv "$HOME/.nuget" "$HOME/.nuget.root-owned"          # write on $HOME suffices
 mkdir -p "$HOME/.nuget"                               # fresh, build-user-owned
 ln -s "$HOME/.nuget.root-owned/packages" "$HOME/.nuget/packages"  # reuse cache
