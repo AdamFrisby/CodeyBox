@@ -121,19 +121,10 @@ cd CodeyBox
 dotnet build CodeyBox.slnx
 ```
 
-> The repository supplies its package sources through `Directory.Build.props`.
-> `MSBuild.rsp` supplies the same restore property before a solution restore
-> initializes project restore, so package-source selection is repository-local.
-> NuGet still initializes the invoking account's profile independently of package
-> source selection, so `$HOME/.nuget/NuGet` must exist and be accessible to that
-> account. If a container pre-created `$HOME/.nuget` as another user, preserve the
-> package cache while replacing only its unwritable parent:
->
-> ```bash
-> mv -- "$HOME/.nuget" "$HOME/.nuget.preexisting"
-> mkdir -p -- "$HOME/.nuget/NuGet"
-> ln -s -- "$HOME/.nuget.preexisting/packages" "$HOME/.nuget/packages"
-> ```
+> The repository supplies its package sources through `Directory.Build.props` for
+> direct project builds and `Directory.Solution.props` for solution builds. Both
+> resolve `NuGet.Config` relative to the repository, so restore remains independent
+> of the caller's working directory and inherited user-profile permissions.
 
 **3. Configure a project.** Drop a JSON file somewhere and point
 `CODEYBOX_EXTRA_CONFIG` at it (it hot-reloads on change):

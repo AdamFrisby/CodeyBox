@@ -1,3 +1,0 @@
-# Select repository package sources before solution restore evaluates projects.
-# NuGet may still read user-wide settings separately for proxy configuration.
--property:RestoreConfigFile=NuGet.Config

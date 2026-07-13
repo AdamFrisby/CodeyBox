@@ -1,9 +1,9 @@
 <Project>
 
   <PropertyGroup>
-    <!-- Project-level builds use the repository's declared package sources here.
-         MSBuild.rsp supplies the same property early enough for solution restore to
-         select those sources. NuGet still reads user-wide proxy settings separately. -->
+    <!-- Direct project restores use the repository's declared package sources here.
+         Directory.Solution.props supplies the same repository-relative property for
+         solution restores before they dispatch work to individual projects. -->
     <RestoreConfigFile>$(MSBuildThisFileDirectory)NuGet.Config</RestoreConfigFile>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
