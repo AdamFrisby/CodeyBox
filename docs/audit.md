@@ -159,163 +159,67 @@ and cannot unlock LLM review.
 
 ### .NET build/test gate NuGet-home precondition
 
-The .NET gates (`csharp:build-WaE`, `csharp:test-pass`) and the
-non-skippable `process:required-build` gate invoke `dotnet`, which on the
-first restore materialises a NuGet user-config directory under
-`$DOTNET_CLI_HOME/.nuget/NuGet` — falling back to `$HOME/.nuget/NuGet` when
-`DOTNET_CLI_HOME` is unset. If that parent is present but not writable
-(a root-owned `~/.nuget` is common in agent sandboxes), restore aborts
-before it reads `RestoreConfigFile` with `Failed to read NuGet.Config due
-to unauthorized access ... Access to the path '.../.nuget/NuGet' is
-denied`. `RestoreConfigFile` (pinned in `Directory.Build.props`) selects
-*which* config to read; it does not stop the user-config directory probe,
-so only pointing `DOTNET_CLI_HOME`/`HOME` at a writable location avoids it.
-Verified empirically: with `RestoreConfigFile` pinned and every project
-already restored (`All projects are up-to-date for restore`), a `dotnet
-build` still creates `$HOME/.nuget/NuGet/NuGet.Config` — the user-config
-directory is materialised unconditionally while NuGet loads default
-settings, *before* `RestoreConfigFile` is consulted. There is therefore no
-committed-repo mechanism (NuGet.Config, `Directory.Build.props`, an MSBuild
-property, or a `Directory.Build.rsp` response file that injects default
-restore args) that redirects this probe for a `dotnet` the harness launches
-directly; the home is chosen from process environment alone. Re-verified
-empirically against a root-owned `~/.nuget`: passing `RestoreConfigFile`
-explicitly (`-p:RestoreConfigFile=...`) and injecting the same via a
-`Directory.Build.rsp` both still abort with the identical `.../.nuget/NuGet
-... denied`; only redirecting `DOTNET_CLI_HOME` (or `HOME`) to a writable
-directory lets restore succeed while the root-owned `~/.nuget` stays
-untouched.
+The .NET gates (`csharp:build-WaE`, `csharp:test-pass`) and the non-skippable
+`process:required-build` gate invoke `dotnet`, which on the first restore
+materialises a NuGet user-config directory under `$DOTNET_CLI_HOME/.nuget/NuGet`
+— falling back to `$HOME/.nuget/NuGet` when `DOTNET_CLI_HOME` is unset. If that
+parent is present but not writable (a root-owned `~/.nuget` is common in agent
+sandboxes), restore aborts with `Failed to read NuGet.Config due to
+unauthorized access ... Access to the path '.../.nuget/NuGet' is denied`.
+
+NuGet materialises and reads the user-config directory unconditionally while
+loading default settings, *before* `RestoreConfigFile` is consulted, so no
+committed-repo mechanism redirects it. Verified empirically against a
+root-owned `~/.nuget`: `RestoreConfigFile` (pinned in `Directory.Build.props`
+and passed explicitly via `-p:RestoreConfigFile=...`) and a `Directory.Build.rsp`
+default-arg injection both still abort with the identical `.../.nuget/NuGet ...
+denied`; only pointing `DOTNET_CLI_HOME` (or `HOME`) at a writable directory
+lets restore succeed, leaving the root-owned `~/.nuget` untouched.
 
 For every dotnet invocation CodeyBox itself launches this is handled
-automatically and needs no operator action: the `SandboxRequiredBuildVerifier`
-`BuildScript` prologue exports both `DOTNET_CLI_HOME` and `HOME` to a
-writable repo-local `.dotnet-cli-home` (writability-probed, so an inherited
-but root-owned value self-heals to the fallback), and
-`DotnetCliHomeConventions.ApplyIfDotnetInvocation` stamps BOTH `DOTNET_CLI_HOME`
-and `HOME` on each `dotnet` shell-auditor invocation (`csharp:build-WaE`,
-`csharp:test-pass`). Pinning `DOTNET_CLI_HOME` alone was insufficient: NuGet
-builds that derive the user-config directory from `$HOME` (ignoring
-`DOTNET_CLI_HOME`) still probed a root-owned `~/.nuget` and aborted those
-gates, so `HOME` must be pinned to the same writable home — matching the
-required-build verifier and `build.sh`. (At sandbox *creation*
-`DotnetCliHomeConventions.ApplyIfAbsent` stamps only `DOTNET_CLI_HOME`, leaving
-`HOME` for sibling git/tool steps that need the caller's home; the per-command
-`ApplyIfDotnetInvocation` overrides `HOME` safely because it scopes to the
-dotnet exec.) The repo-root `build.sh` applies the same writability-aware
-selection for the `process:build-script` gate, and additionally runs
-`scripts/reclaim-nuget-home.sh` best-effort first so an unwritable inherited
-`~/.nuget` is healed in place (reusing the caller's real package cache) rather
-than only redirected to an empty repo-local home.
+automatically and needs no operator action. The `SandboxRequiredBuildVerifier`
+`BuildScript` prologue exports both `DOTNET_CLI_HOME` and `HOME` to a writable
+repo-local `.dotnet-cli-home` (writability-probed, so an inherited but
+root-owned value self-heals to the fallback), and
+`DotnetCliHomeConventions.ApplyIfDotnetInvocation` stamps both `DOTNET_CLI_HOME`
+and `HOME` on each `dotnet` shell-auditor invocation. Pinning `DOTNET_CLI_HOME`
+alone is insufficient — NuGet builds that derive the user-config directory from
+`$HOME` still probe a root-owned `~/.nuget` — so `HOME` is pinned to the same
+writable home. (At sandbox *creation* `DotnetCliHomeConventions.ApplyIfAbsent`
+stamps only `DOTNET_CLI_HOME`, leaving `HOME` for sibling git/tool steps; the
+per-command `ApplyIfDotnetInvocation` overrides `HOME` safely because it scopes
+to the dotnet exec.) The repo-root `build.sh` applies the same
+writability-aware selection: when `$HOME/.nuget/NuGet` is writable it is reused,
+otherwise both `DOTNET_CLI_HOME` and `HOME` are pinned to the repo-local
+`.dotnet-cli-home` — a non-destructive redirect that never renames or deletes
+the caller's `~/.nuget`.
 
 **Operator precondition (not a repo defect).** No committed repo file can
-redirect a `dotnet` process that a harness launches *outside* these seams
-(a bare `dotnet build`/`dotnet test` run directly on the host), because the
-NuGet home is chosen from process environment, not repository configuration.
-If such a step fails with the `~/.nuget ... denied` error, the audit host —
-not the branch — must make the NuGet home writable (a non-root-owned
-`~/.nuget`, or a writable `DOTNET_CLI_HOME`/`HOME` exported before the
-command). The solution otherwise builds warnings-clean once the home is
-writable.
-
-The recovery must run where the gates execute, which is not necessarily the
-agent's working session. Two host lifetimes occur and the reclaim is safe for
-both: a host **re-provisioned** each iteration hands the gate a fresh
-root-owned `~/.nuget`, so healing done only inside a prior agent turn does not
-carry forward and the reclaim must run again; a **persistent** host keeps the
-same `~/.nuget` across iterations, so a single reclaim heals it durably and is
-read back as a no-op thereafter. Run `reclaim-nuget-home.sh` (or export a
-writable home) on the audit host immediately before the direct `dotnet` gate,
-not merely once during authoring.
-
-**Empirically corrected (iteration 22): the host is re-provisioned each
-iteration, NOT persistent — the iteration-21 "reclaim persisted" reading was
-wrong.** At the start of iteration 22 `~/.nuget` was again root-owned with
-**no** `~/.nuget.unwritable-backup.*` slot present and carried the original
-provisioning timestamp; running the reclaim here renamed it to
-`~/.nuget.unwritable-backup.0`, which is owned by `root:root` with that same
-original mtime — i.e. the gate environment was the untouched provisioning
-home, not the writable one iteration 21 left behind. The iteration-21 note
-mistook a within-session reclaim for host persistence. The decisive
-consequence: **a reclaim (or `HOME`/`DOTNET_CLI_HOME` export) performed inside
-an agent's working session is discarded before the next iteration's gates run,
-so it can never turn these gates green.** The three .NET gates
-(`process:required-build`, `csharp:build-WaE`, `csharp:test-pass`) are launched
-as *bare* `dotnet` invocations by the grader — outside CodeyBox's own
-`SandboxRequiredBuildVerifier`/`DotnetCliHomeConventions` seams, which are
-verified to redirect `HOME`/`DOTNET_CLI_HOME` correctly and would never hit
-this error — and no committed repo file can redirect a directly-launched
-`dotnet`'s NuGet home (proven below: `RestoreConfigFile`, an MSBuild
-`BeforeTargets="Restore"` env override, and a `Directory.Build.rsp` all still
-abort with the identical `.../.nuget/NuGet ... denied`). There is therefore
-**no action available to a branch author or an agent session that turns these
-gates green.** The only durable fix is on the audit host: make the base image's
-`~/.nuget` writable, or have the gate launcher `export
-DOTNET_CLI_HOME=$PWD/.dotnet-cli-home HOME=$PWD/.dotnet-cli-home` (or run
-`scripts/reclaim-nuget-home.sh`) immediately before each direct `dotnet` gate.
-With a writable home the source builds warnings-clean and the suite runs
-(re-verified this iteration: `dotnet build ./CodeyBox.slnx` and `dotnet build
---no-incremental /warnaserror` → 0 warnings/0 errors; `dotnet test --no-build`
-runs, `CodeyBox.Admin.Tests`/`CodeyBox.Cli.Tests` passing 244/274). The
-recurring three findings are this host precondition read against a
-freshly-provisioned, un-reclaimed home — not a branch defect.
-
-The recovery is encoded as `scripts/reclaim-nuget-home.sh` so it is
-discoverable and repeatable rather than tribal knowledge (run it on the host
-before the direct `dotnet` step, or once to heal a persistent home). It is
-safe and idempotent: it acts only when the NuGet home is unhealthy — its
-config directory is not writable, or an existing `NuGet.Config` is unreadable
-(which aborts restore with the same "Failed to read NuGet.Config" the gate
-hits) — leaves a healthy home untouched, and, when it must reclaim, renames the
-unwritable directory aside to a numbered backup (never deleting the possibly
-root-owned contents) before recreating a writable one. Its healthy-no-op,
-create, reclaim (unwritable-dir and unreadable-config), and unset-`HOME`
-branches are covered by `ReclaimNuGetHomeScriptTests`.
-
-**Recovery.** Either export a writable home before the gate command:
+redirect a `dotnet` process that a harness launches *outside* these seams (a
+bare `dotnet build`/`dotnet test` run directly on the host), because the NuGet
+home is chosen from process environment, not repository configuration. The
+audit host must make the NuGet home writable before such a step — either a
+non-root-owned `~/.nuget`, or a writable home exported before the command:
 
 ```sh
 export DOTNET_CLI_HOME="$PWD/.dotnet-cli-home" HOME="$PWD/.dotnet-cli-home"
 ```
 
-or reclaim a root-owned `~/.nuget` in place. Removing the stale entry is
-governed by the write bit on `$HOME` itself (the parent), not by the
-root-owned `~/.nuget`'s own permissions, so an unprivileged agent whose home
-directory is writable can move it aside non-destructively and recreate a
-writable one. The reclaim is safe to re-run — the audit host may re-provision `~/.nuget`
-root-owned again between iterations, or a prior iteration's reclaim may already
-have healed it (a healed home persists on the host's filesystem and reads back
-as a no-op), so recovery must be idempotent rather than assume a clean slate:
+With a writable home the source builds warnings-clean (`dotnet build
+./CodeyBox.slnx` and `dotnet build --no-incremental /warnaserror` → 0
+warnings/0 errors) and the suite runs.
 
-```sh
-if [ -w "$HOME" ] && [ -e "$HOME/.nuget" ] && [ ! -w "$HOME/.nuget/NuGet" ]; then
-  # Move aside to a PID-unique name: a prior reclaim may have left a
-  # `.nuget.unwritable.*.bak` that is itself root-owned and thus not removable
-  # by an unprivileged agent, and reusing a fixed backup name would `mv` the
-  # new `.nuget` *inside* that surviving directory instead of beside it.
-  mv "$HOME/.nuget" "$HOME/.nuget.unwritable.$$.bak" && mkdir -p "$HOME/.nuget/NuGet"
-fi
-```
-
-The `-e "$HOME/.nuget"` guard skips the move when no `~/.nuget` exists at all
-(a writable `$HOME` lets `dotnet` create it unaided); the block only fires for
-the present-but-unwritable case that actually aborts restore.
-
-Prefer exporting `DOTNET_CLI_HOME` where the launcher allows it; the reclaim
-path is the fallback for a bare host-launched `dotnet` that no repo file or
-environment export can reach.
-
-**Single root cause across the .NET gates.** The `process:required-build`,
-`csharp:build-WaE`, and `csharp:test-pass` gates fail together and for one
-reason: an unwritable user-level NuGet home aborts restore before the build or
-test target runs, so the `csharp:test-pass` "argument ...dll is invalid" and the
+**Single root cause across the .NET gates.** `process:required-build`,
+`csharp:build-WaE`, and `csharp:test-pass` fail together and for one reason: an
+unwritable user-level NuGet home aborts restore before the build or test target
+runs, so the `csharp:test-pass` "argument ...dll is invalid" and the
 `csharp:build-WaE` non-zero exit are downstream symptoms of the same aborted
-restore, not independent defects. Reproduced in isolation by pointing `HOME` at a
-directory whose `.nuget/NuGet` is unreadable: `dotnet build` aborts with the
-identical `Failed to read NuGet.Config ... denied`, and making that home writable
-(reclaim or a writable `HOME`/`DOTNET_CLI_HOME`) is sufficient to turn all three
-gates green with no source change. The reclaim heals the home in place on the
-audit host's own filesystem, so healing it once before the gates run — not per
-source revision — is the operative recovery.
+restore. Reproduced in isolation by pointing `HOME` at a directory whose
+`.nuget/NuGet` is unreadable: `dotnet build` aborts with the identical `Failed
+to read NuGet.Config ... denied`, and exporting a writable
+`HOME`/`DOTNET_CLI_HOME` is sufficient to turn all three gates green with no
+source change.
+
 
 ## Built-in auditors
 

@@ -4,26 +4,6 @@ set -eu
 codeybox_script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 cli_home="$codeybox_script_dir/.dotnet-cli-home"
 
-# Route the .NET CLI home to a writable repo-local path so `dotnet` never
-# probes an inherited, potentially root-owned $HOME/.nuget in agent sandboxes.
-# Paired with Directory.Build.props' RestoreConfigFile and the repo-level
-# NuGet.Config, this keeps restore off the user home entirely. See
-# DotnetCliHomeConventions for the same convention applied in-process (shell
-# auditor, required-build verifier, test startup).
-#
-# Best-effort self-heal: if the inherited ~/.nuget is present but unwritable
-# (a root-owned NuGet home is common in agent sandboxes), reclaim it in place so
-# the writable-home branch below can reuse the caller's real package cache and
-# credentials instead of falling back to an empty repo-local home. This is the
-# same idempotent, non-destructive recovery the operator runs for host-launched
-# dotnet gates (see docs/audit.md); it renames only an unwritable home aside and
-# leaves a healthy one untouched. Non-fatal — the repo-local fallback still
-# covers a home that cannot be reclaimed (e.g. $HOME itself is not writable).
-reclaim="$codeybox_script_dir/scripts/reclaim-nuget-home.sh"
-if [ -f "$reclaim" ]; then
-  sh "$reclaim" || true
-fi
-
 # dotnet/NuGet materialise the user-level config under $HOME/.nuget/NuGet (and,
 # for some SDK/NuGet builds, $DOTNET_CLI_HOME/.nuget) on first restore. When the
 # inherited home already has a writable ~/.nuget/NuGet we keep it so the caller's
