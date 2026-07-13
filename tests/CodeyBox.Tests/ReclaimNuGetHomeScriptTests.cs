@@ -92,6 +92,48 @@ public sealed class ReclaimNuGetHomeScriptTests : IDisposable
     }
 
     [Fact]
+    public void RepeatReclaim_UsesNextBackupSlotWithoutClobberingPriorBackup()
+    {
+        // POSIX-only: the reclaim trigger relies on Unix directory permissions.
+        if (OperatingSystem.IsWindows())
+            return;
+        // A privileged process can write through any mode bits, so the unwritable
+        // branch is unobservable; skip rather than flake when running as root.
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        // Model the multi-iteration host state docs/audit.md promises the reclaim
+        // survives: a prior iteration already reclaimed once (leaving
+        // ".nuget.unwritable-backup.0"), and the audit host then re-provisioned an
+        // unwritable ~/.nuget. The script must move the new home to the NEXT free
+        // slot (".1") — never onto or into the surviving ".0", whose contents may be
+        // root-owned and unremovable.
+        var home = CreateHome();
+        var priorBackup = Path.Combine(home, ".nuget.unwritable-backup.0");
+        Directory.CreateDirectory(priorBackup);
+        File.WriteAllText(Path.Combine(priorBackup, "marker"), "prior-iteration");
+
+        var nugetHome = Path.Combine(home, ".nuget");
+        Directory.CreateDirectory(nugetHome);
+        File.WriteAllText(Path.Combine(nugetHome, "marker"), "current-iteration");
+        File.SetUnixFileMode(nugetHome, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+
+        var result = RunScript(home);
+
+        Assert.True(result.ExitCode == 0, $"exit {result.ExitCode}; stderr: {result.Stderr}");
+        Assert.Contains("reclaimed", result.Stdout, StringComparison.Ordinal);
+        // A fresh, writable config dir replaces the unwritable home...
+        AssertWritableDirectory(Path.Combine(home, ".nuget", "NuGet"));
+        // ...the surviving prior backup is untouched...
+        Assert.Equal("prior-iteration", File.ReadAllText(Path.Combine(priorBackup, "marker")));
+        // ...and the current home moved to the next slot rather than clobbering ".0".
+        var nextBackup = Path.Combine(home, ".nuget.unwritable-backup.1");
+        Assert.True(Directory.Exists(nextBackup), "reclaim did not use the next free backup slot");
+        Assert.Equal("current-iteration", File.ReadAllText(Path.Combine(nextBackup, "marker")));
+        Assert.Equal(2, BackupDirectories(home).Length);
+    }
+
+    [Fact]
     public void UnreadableConfigFile_IsReclaimedAndPreserved()
     {
         // POSIX-only: the trigger relies on Unix file permissions.
