@@ -759,17 +759,49 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
 
         // Single sh -c so a mid-script failure short-circuits via `set -e`
         // instead of (e.g.) pushing a stale HEAD when the commit failed. The
-        // scratchpad touch mirrors CheckpointPreemptAsync so the resumable
-        // agent runner always finds a non-empty .codeybox/preempt-scratchpad.md
-        // to restore from. `--allow-empty` lets the push succeed even when
-        // the agent had no dirty changes left after its in-VM exit.
-        var script = $@"set -e
-cd {ShellSingleQuote(workingDir)}
-mkdir -p .codeybox
-test -f .codeybox/preempt-scratchpad.md || printf '%s\n' 'No CLI scratchpad was captured before suspend-resume.' > .codeybox/preempt-scratchpad.md
-git add -A
-git commit --allow-empty -m {ShellSingleQuote(commitMessage)}
-git push origin HEAD:{refName}";
+        // Provider session state lives only in the dedicated private scratchpad
+        // mount. Strip and positively guard the legacy repository-local names
+        // before pushing this recovery ref. `--allow-empty` lets the push
+        // succeed even when the agent had no dirty changes left after its
+        // in-VM exit.
+        const string reservedTreeFilter = """
+            import sys
+            prefixes = tuple(value.encode("utf-8") for value in sys.argv[1:])
+            buffered = bytearray()
+            entries = 0
+            found = False
+            while True:
+                chunk = sys.stdin.buffer.read(65536)
+                if not chunk:
+                    break
+                buffered.extend(chunk)
+                while True:
+                    separator = buffered.find(0)
+                    if separator < 0:
+                        if len(buffered) > 4096:
+                            raise ValueError("Git tree path exceeds guard limit")
+                        break
+                    path = bytes(buffered[:separator])
+                    del buffered[:separator + 1]
+                    entries += 1
+                    if entries > 100000 or len(path) > 4096:
+                        raise ValueError("Git tree exceeds guard limits")
+                    found = found or path.startswith(prefixes)
+            if buffered:
+                raise ValueError("Git tree path stream was not NUL terminated")
+            if found:
+                raise SystemExit(1)
+            """;
+        var script = $$"""
+            set -euo pipefail
+            cd {{ShellSingleQuote(workingDir)}}
+            git add -A
+            git rm -r --cached --ignore-unmatch -- ':(glob){{AgentTurnScratchpadArchive.LegacyCapturePrefix}}*' ':(glob){{AgentTurnScratchpadArchive.LegacyCapturePrefix}}*/**' ':(glob){{AgentTurnScratchpadArchive.LegacyRestorePrefix}}*' ':(glob){{AgentTurnScratchpadArchive.LegacyRestorePrefix}}*/**'
+            test -z "$(git ls-files --cached -- ':(glob){{AgentTurnScratchpadArchive.LegacyCapturePrefix}}*' ':(glob){{AgentTurnScratchpadArchive.LegacyCapturePrefix}}*/**' ':(glob){{AgentTurnScratchpadArchive.LegacyRestorePrefix}}*' ':(glob){{AgentTurnScratchpadArchive.LegacyRestorePrefix}}*/**')"
+            git commit --allow-empty -m {{ShellSingleQuote(commitMessage)}}
+            git ls-tree -r -z --name-only HEAD -- '{{AgentTurnScratchpadArchive.LegacyRepositoryDirectory}}' | python3 -c {{ShellSingleQuote(reservedTreeFilter)}} '{{AgentTurnScratchpadArchive.LegacyCapturePrefix}}' '{{AgentTurnScratchpadArchive.LegacyRestorePrefix}}'
+            git push origin HEAD:{{refName}}
+            """;
 
         try
         {

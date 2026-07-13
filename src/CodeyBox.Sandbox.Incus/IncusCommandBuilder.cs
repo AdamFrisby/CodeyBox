@@ -311,6 +311,17 @@ internal static class IncusCommandBuilder
         return result;
     }
 
+    internal static IReadOnlyList<string> BuildDeviceRemove(
+        IncusSandboxOptions options,
+        string instance,
+        string deviceName)
+    {
+        IncusInputValidation.ValidateOptionsIdentity(options);
+        IncusInputValidation.ValidateInstanceName(instance, nameof(instance));
+        IncusInputValidation.ValidateDeviceName(deviceName, nameof(deviceName));
+        return Prefix(options, "config", "device", "remove", instance, deviceName);
+    }
+
     internal static IReadOnlyList<string> BuildNicAdd(
         IncusSandboxOptions options,
         string instance,
@@ -356,6 +367,30 @@ internal static class IncusCommandBuilder
         result.Add(options.GuestUserId.ToString(CultureInfo.InvariantCulture));
         result.Add("--group");
         result.Add(options.GuestGroupId.ToString(CultureInfo.InvariantCulture));
+        result.Add("--");
+        result.AddRange(command);
+        return result;
+    }
+
+    internal static IReadOnlyList<string> BuildRootExec(
+        IncusSandboxOptions options,
+        string instance,
+        IReadOnlyList<string> command,
+        string? workingDirectory = null)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        IncusInputValidation.ValidateOptionsIdentity(options);
+        IncusInputValidation.ValidateInstanceName(instance, nameof(instance));
+        if (command.Count == 0 || command.Any(static item => item.Contains('\0')))
+            throw new ArgumentException("Root exec command is empty or contains NUL.", nameof(command));
+        if (workingDirectory is not null)
+            IncusInputValidation.ValidateAbsoluteGuestPath(workingDirectory, nameof(workingDirectory));
+        var result = Prefix(options, "exec", instance);
+        if (workingDirectory is not null)
+        {
+            result.Add("--cwd");
+            result.Add(workingDirectory);
+        }
         result.Add("--");
         result.AddRange(command);
         return result;

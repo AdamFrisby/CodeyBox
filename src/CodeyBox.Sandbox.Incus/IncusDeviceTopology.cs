@@ -13,7 +13,9 @@ internal static class IncusDeviceTopology
         string json,
         IncusSandboxOptions options,
         string? expectedBridge,
-        IReadOnlyList<IncusPreparedMount> mounts)
+        IReadOnlyList<IncusPreparedMount> mounts,
+        string? expectedRecoveryTokenHash = null,
+        string? expectedRecoveryManifestHash = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(mounts);
@@ -23,6 +25,30 @@ internal static class IncusDeviceTopology
             throw new InvalidOperationException("Incus instance is not a virtual machine.");
         RejectUnsafeInstanceConfiguration(instance, "config");
         RejectUnsafeInstanceConfiguration(instance, "expanded_config");
+        if (expectedRecoveryTokenHash is not null || expectedRecoveryManifestHash is not null)
+        {
+            if (expectedRecoveryTokenHash is null || expectedRecoveryManifestHash is null)
+                throw new ArgumentException("Incus recovery topology binding must supply both hashes.");
+            var config = instance.GetProperty("config");
+            var actualTokenHash = ReadOptionalString(
+                config,
+                IncusSandboxProvider.RecoveryTokenHashKey);
+            var actualManifestHash = ReadOptionalString(
+                config,
+                IncusSandboxProvider.RecoveryManifestHashKey);
+            if (actualTokenHash is null
+                || actualManifestHash is null
+                || !IncusRecoveryManifestCodec.FixedTimeEqualsHash(
+                    actualTokenHash,
+                    expectedRecoveryTokenHash)
+                || !IncusRecoveryManifestCodec.FixedTimeEqualsHash(
+                    actualManifestHash,
+                    expectedRecoveryManifestHash))
+            {
+                throw new InvalidOperationException(
+                    "Incus VM recovery capability binding changed before lifecycle authorization.");
+            }
+        }
         if (!instance.TryGetProperty("profiles", out var profiles)
             || profiles.ValueKind != JsonValueKind.Array
             || profiles.GetArrayLength() != 0)
@@ -52,7 +78,7 @@ internal static class IncusDeviceTopology
         for (var index = 0; index < mounts.Count; index++)
         {
             var mount = mounts[index];
-            if (mount.TmpfsSizeBytes.HasValue)
+            if (mount.TmpfsSizeBytes.HasValue || mount.RootDiskDirectory)
                 continue;
             var deviceName = IncusSandboxProvider.BuildMountDeviceNameForVerification(index);
             expectedNames.Add(deviceName);

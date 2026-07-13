@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging;
+using CodeyBox.Agents;
 using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
@@ -181,26 +182,58 @@ public sealed class WorkItemRetrier
             }
         }
 
-        // A null/blank `from` means "operator did not specify" — auto-pick
-        // based on work-branch state. Explicit values (including from the
-        // quota auto-retry scheduler, which always passes a normalized phase)
-        // always win.
+        if (item.AgentTurnResumeCheckpoint?.DispatchClaimId is not null)
+        {
+            return new WorkItemRetryResult(
+                false,
+                "durable agent-turn checkpoint is still owned by an active dispatch; confirmed worker recovery must release it before retry",
+                null,
+                null,
+                null,
+                WorkItemRetryFailureKind.StateChangedConcurrently);
+        }
+
+        var hasUsableAgentTurnCheckpoint = TryGetUsableAgentTurnCheckpoint(
+            item,
+            out var agentTurnCheckpoint,
+            out var checkpointDiscardReason);
+        if ((item.AgentTurnResumeCheckpoint is not null || item.AgentTurnRecoveryLease is not null)
+            && !hasUsableAgentTurnCheckpoint)
+        {
+            _log.LogInformation(
+                "Discarding durable agent-turn resume checkpoint for work item {Id}: {Reason}",
+                item.Id,
+                checkpointDiscardReason);
+        }
+
+        // A null/blank `from` means "operator did not specify". A usable durable
+        // agent-turn checkpoint is the strongest available boundary because it
+        // preserves the interrupted conversation; otherwise retain the legacy
+        // branch/audit-history auto-pick policy. Explicit phases always win.
         string? autoPickReason = null;
         if (string.IsNullOrWhiteSpace(from))
         {
-            try
+            if (hasUsableAgentTurnCheckpoint)
             {
-                (from, autoPickReason) = await AutoPickRetryFromAsync(item, ct);
+                from = RetryFromFor(agentTurnCheckpoint!.Phase);
+                autoPickReason = "durable agent-turn checkpoint";
             }
-            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+            else
             {
-                _log.LogWarning(ex, "Failed to auto-pick retry phase for work item {Id}; retry aborted", item.Id);
-                return new WorkItemRetryResult(
-                    false,
-                    $"cannot auto-pick retry phase for work item {item.Id}: {ex.Message}",
-                    null,
-                    null,
-                    null);
+                try
+                {
+                    (from, autoPickReason) = await AutoPickRetryFromAsync(item, ct);
+                }
+                catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+                {
+                    _log.LogWarning(ex, "Failed to auto-pick retry phase for work item {Id}; retry aborted", item.Id);
+                    return new WorkItemRetryResult(
+                        false,
+                        $"cannot auto-pick retry phase for work item {item.Id}: {ex.Message}",
+                        null,
+                        null,
+                        null);
+                }
             }
         }
 
@@ -215,8 +248,39 @@ public sealed class WorkItemRetrier
                 null);
         }
 
-        var actualFrom = requestedFrom;
+        var checkpointRetryFrom = hasUsableAgentTurnCheckpoint
+            ? RetryFromFor(agentTurnCheckpoint!.Phase)
+            : null;
+        if (hasUsableAgentTurnCheckpoint
+            && !string.Equals(requestedFrom, checkpointRetryFrom, StringComparison.Ordinal))
+        {
+            if (item.AgentTurnRecoveryLease is not null)
+            {
+                return new WorkItemRetryResult(
+                    false,
+                    "cannot discard a retained-sandbox recovery lease by selecting another phase; retry the retained agent turn or cancel the item so provider cleanup remains authoritative",
+                    null,
+                    null,
+                    null);
+            }
+            checkpointDiscardReason = "retry requested a different phase boundary";
+            hasUsableAgentTurnCheckpoint = false;
+            agentTurnCheckpoint = null;
+            _log.LogInformation(
+                "Discarding durable agent-turn resume checkpoint for work item {Id}: {Reason}",
+                item.Id,
+                checkpointDiscardReason);
+        }
+
+        var resumingAgentTurn = hasUsableAgentTurnCheckpoint;
+        if (resumingAgentTurn)
+            resumeState = agentTurnCheckpoint!.ResumeState;
+
+        var actualFrom = resumingAgentTurn
+            ? checkpointRetryFrom!
+            : requestedFrom;
         var retryingBeforeWork = resumeState is WorkItemState.PlanReview or WorkItemState.PlanApproved;
+        var fellBackForMissingWorkBranch = false;
 
         if (ValidatePlanningResumeBoundary(item, requestedFrom) is { } planningBoundaryError)
             return new WorkItemRetryResult(false, planningBoundaryError, null, null, null);
@@ -235,24 +299,29 @@ public sealed class WorkItemRetrier
                     null);
             }
 
-            // The work branch must also exist — earlier work-phase failures can
-            // leave the item in Failed without ever producing a commit, in which
-            // case the requested post-work resume would crash the pipeline with
-            // "pathspec 'codeybox/...' did not match any file(s)". Silently
-            // re-route to the work phase so the operator doesn't need to track
-            // which phase produced commits.
-            var workBranch = item.WorkBranch;
-            var branchPresent = !string.IsNullOrEmpty(workBranch)
-                && await _gitHost.BranchExistsAsync(item.Id.ToString(), workBranch, ct);
-            if (!branchPresent)
+            // A durable turn resume restores from the pushed preempt ref; the
+            // ordinary work-branch ref may not exist when an initial turn died
+            // before publishing it. Non-checkpoint post-work retries still need
+            // the ordinary branch and retain the legacy fallback below.
+            if (!resumingAgentTurn)
             {
-                _log.LogInformation(
-                    "Retry of work item {Id} requested from='{RequestedFrom}' but work branch '{WorkBranch}' is missing in the bare repo; auto-falling back to from='work'",
-                    item.Id,
-                    requestedFrom,
-                    workBranch ?? "(unset)");
-                resumeState = WorkItemState.Queued;
-                actualFrom = "work";
+                // Earlier work-phase failures can leave the item in Failed
+                // without ever producing a commit, in which case a requested
+                // post-work resume would crash on the missing branch.
+                var workBranch = item.WorkBranch;
+                var branchPresent = !string.IsNullOrEmpty(workBranch)
+                    && await _gitHost.BranchExistsAsync(item.Id.ToString(), workBranch, ct);
+                if (!branchPresent)
+                {
+                    _log.LogInformation(
+                        "Retry of work item {Id} requested from='{RequestedFrom}' but work branch '{WorkBranch}' is missing in the bare repo; auto-falling back to from='work'",
+                        item.Id,
+                        requestedFrom,
+                        workBranch ?? "(unset)");
+                    resumeState = WorkItemState.Queued;
+                    actualFrom = "work";
+                    fellBackForMissingWorkBranch = true;
+                }
             }
         }
         var clearingQueuedPlan = resumeState == WorkItemState.Queued;
@@ -284,6 +353,39 @@ public sealed class WorkItemRetrier
             NextTerminalRetryAt = null,
             StartedAt = null
         };
+        var discardedAgentTurnRecoveryMetadata =
+            !resumingAgentTurn
+            && (item.AgentTurnResumeCheckpoint is not null || item.AgentTurnRecoveryLease is not null);
+        if (discardedAgentTurnRecoveryMetadata)
+        {
+            // WorkItem.With intentionally retains checkpoints in active agent
+            // states. This retry explicitly rejected this checkpoint, so clear
+            // the paired git ref and metadata even when the requested fresh
+            // boundary is Working or Reworking.
+            resumed = resumed with
+            {
+                PreemptedAt = null,
+                PreemptCheckpoint = null,
+                AgentTurnResumeCheckpoint = null,
+                AgentTurnRecoveryLease = null,
+            };
+        }
+        if (resumingAgentTurn)
+        {
+            resumed = resumed with
+            {
+                Agent = agentTurnCheckpoint!.Agent,
+                AgentInstanceId = agentTurnCheckpoint.AgentInstanceRoute,
+                ModelId = agentTurnCheckpoint.ModelId,
+                ReasoningMode = agentTurnCheckpoint.ReasoningMode,
+                // The pipeline claims and increments the durable dispatch
+                // generation immediately before it starts. Keeping the count
+                // unchanged here makes every enqueue path (manual retry,
+                // scheduler, dead-worker recovery, or startup sweep) converge
+                // on the same authoritative cap check.
+                AgentTurnResumeCheckpoint = agentTurnCheckpoint,
+            };
+        }
         if (clearingQueuedPlan)
         {
             resumed = WorkItemRecoveryPolicy.ClearPlanFieldsIfQueued(resumed) with
@@ -333,9 +435,11 @@ public sealed class WorkItemRetrier
             catch (Exception ex) { _log.LogWarning(ex, "Failed to delete stream summaries for work item {Id}", item.Id); }
         }
 
-        var auditFrom = actualFrom == requestedFrom
-            ? requestedFrom
-            : $"{actualFrom} (fallback from '{requestedFrom}': work branch missing)";
+        var auditFrom = fellBackForMissingWorkBranch
+            ? $"{actualFrom} (fallback from '{requestedFrom}': work branch missing)"
+            : actualFrom;
+        if (!hasUsableAgentTurnCheckpoint && checkpointDiscardReason is not null)
+            auditFrom = $"{auditFrom} (agent-turn checkpoint discarded: {checkpointDiscardReason})";
         if (autoPickReason is not null)
             auditFrom = $"{auditFrom} (auto-pick: {autoPickReason})";
         try
@@ -347,7 +451,25 @@ public sealed class WorkItemRetrier
             var reverted = false;
             try
             {
-                reverted = await _store.TryUpdateIfStateAsync(item, resumeState, CancellationToken.None);
+                // Clearing checkpoint metadata atomically deletes its private
+                // archive via the SQLite trigger. A queue failure therefore
+                // cannot restore the old metadata/ref: doing so would create a
+                // lying checkpoint whose content-addressed BLOB no longer
+                // exists. Roll back the lifecycle state while keeping that
+                // irreversible cleanup visible.
+                var rollbackItem = discardedAgentTurnRecoveryMetadata
+                    ? item with
+                    {
+                        PreemptedAt = null,
+                        PreemptCheckpoint = null,
+                        AgentTurnResumeCheckpoint = null,
+                        AgentTurnRecoveryLease = null,
+                    }
+                    : item;
+                reverted = await _store.TryUpdateIfStateAsync(
+                    rollbackItem,
+                    resumeState,
+                    CancellationToken.None);
             }
             catch (Exception rollbackEx)
             {
@@ -402,6 +524,81 @@ public sealed class WorkItemRetrier
         AuditLog.WorkItemRetried(item.Id, trigger == "manual" ? auditFrom : $"{auditFrom} (auto-retry: {trigger})");
         return new WorkItemRetryResult(true, null, resumeState, actualFrom, null);
     }
+
+    private static bool TryGetUsableAgentTurnCheckpoint(
+        WorkItem item,
+        out AgentTurnResumeCheckpoint? checkpoint,
+        out string? rejectionReason)
+    {
+        checkpoint = item.AgentTurnResumeCheckpoint;
+        rejectionReason = null;
+        if (checkpoint is null)
+        {
+            if (item.AgentTurnRecoveryLease is not null)
+                rejectionReason = "retained-sandbox recovery lease has no paired agent-turn metadata";
+            return false;
+        }
+
+        if (!AgentTurnResumeCheckpoint.CanPersistThrough(item.State, item.FailureKind))
+        {
+            rejectionReason = $"state {item.State} is not recoverable";
+            checkpoint = null;
+            return false;
+        }
+
+        if (!item.HasAgentTurnRecoveryBoundary)
+        {
+            rejectionReason = "checkpoint metadata does not have exactly one Git or retained-sandbox recovery boundary";
+            checkpoint = null;
+            return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint))
+        {
+            try
+            {
+                var parsedRef = AgentTurnCheckpointRef.Parse(item.PreemptCheckpoint);
+                if (parsedRef.WorkItemId != item.Id)
+                {
+                    rejectionReason = "paired git preempt checkpoint belongs to another work item";
+                    checkpoint = null;
+                    return false;
+                }
+            }
+            catch (FormatException)
+            {
+                rejectionReason = "paired git preempt checkpoint is invalid";
+                checkpoint = null;
+                return false;
+            }
+        }
+
+        if (checkpoint.PromptRevision != item.PromptRevision)
+        {
+            rejectionReason = "prompt revision changed after checkpoint creation";
+            checkpoint = null;
+            return false;
+        }
+
+        var configuredAttemptLimit = SessionResumeOptions.MaxResumeAttempts;
+        if (configuredAttemptLimit <= 0 || checkpoint.AttemptCount >= configuredAttemptLimit)
+        {
+            rejectionReason = configuredAttemptLimit <= 0
+                ? "durable agent-turn resume is disabled"
+                : "resume checkpoint reached its configured attempt limit";
+            checkpoint = null;
+            return false;
+        }
+
+        return true;
+    }
+
+    private static string RetryFromFor(AgentTurnResumePhase phase) => phase switch
+    {
+        AgentTurnResumePhase.Work => RetryFromPolicy.Work,
+        AgentTurnResumePhase.Rework => RetryFromPolicy.Rework,
+        _ => throw new ArgumentOutOfRangeException(nameof(phase), phase, "Unsupported agent-turn resume phase."),
+    };
 
     /// <summary>
     /// Picks a sensible default <c>from</c> phase for retries when the operator

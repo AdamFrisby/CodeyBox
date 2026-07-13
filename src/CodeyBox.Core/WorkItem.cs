@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace CodeyBox.Core;
 
 /// <summary>
@@ -137,16 +139,19 @@ public sealed record WorkItem
 
     /// <summary>
     /// Pipeline entry point the quota retry scheduler should use when the quota
-    /// window opens. Values match the manual retry API: "work", "audit",
-    /// "merge", or "upstream".
+    /// window opens. Values match the manual retry API: "work", "rework",
+    /// "audit", "merge", or "upstream". A recoverable mid-rework failure
+    /// uses "rework" only when a durable agent-turn checkpoint exists;
+    /// legacy branch-only recovery uses "audit".
     /// </summary>
     public string? QuotaRetryFrom { get; init; }
 
     /// <summary>
     /// Original pipeline phase that parked this item for quota recovery. This
-    /// remains distinct from <see cref="QuotaRetryFrom"/> because rework quota
-    /// parks resume at the audit entry point while still needing work/rework
-    /// routing capabilities when the scheduler checks whether quota returned.
+    /// remains distinct from <see cref="QuotaRetryFrom"/> because legacy
+    /// rework quota parks resume at the audit entry point while still needing
+    /// work/rework routing capabilities when the scheduler checks whether quota
+    /// returned. Durable agent-turn checkpoints use "rework" for both fields.
     /// Values: "work", "rework", "audit", "merge", or "upstream".
     /// Null for rows written before this metadata existed.
     /// </summary>
@@ -317,15 +322,20 @@ public sealed record WorkItem
 
     /// <summary>
     /// Runtime-only model override set by the quota router when a class member specifies
-    /// a ModelId. Not persisted; resolved fresh at each pickup from the chosen
-    /// <see cref="AgentMembership"/>. Passed to the agent CLI as <c>--model &lt;ModelId&gt;</c>.
+    /// a ModelId. Normally resolved fresh at each pickup from the chosen
+    /// <see cref="AgentMembership"/> rather than stored in its own column. A durable
+    /// <see cref="AgentTurnResumeCheckpoint"/> snapshots the exact model so an
+    /// interrupted turn resumes on the same route. Passed to the agent CLI
+    /// as <c>--model &lt;ModelId&gt;</c>.
     /// </summary>
     public string? ModelId { get; init; }
 
     /// <summary>
     /// Runtime-only reasoning-mode hint set by the quota router from the chosen
-    /// <see cref="AgentMembership.ReasoningMode"/>. Not persisted; resolved at
-    /// each pickup. The agent runner translates this into the appropriate CLI flag.
+    /// <see cref="AgentMembership.ReasoningMode"/>. Normally resolved at each
+    /// pickup rather than stored in its own column; durable agent-turn
+    /// checkpoints snapshot and restore it alongside the model. The agent runner
+    /// translates this into the appropriate CLI flag.
     /// </summary>
     public string? ReasoningMode { get; init; }
 
@@ -405,16 +415,71 @@ public sealed record WorkItem
     public DateTimeOffset? StartedAt { get; init; }
 
     /// <summary>
-    /// UTC timestamp when a graceful host shutdown preempted this item while an
-    /// agent was running. Null for normal and crash-recovered work.
+    /// UTC timestamp when the active agent turn was checkpointed after graceful
+    /// host shutdown or a recoverable infrastructure interruption. Null for
+    /// ordinary, never-checkpointed work.
     /// </summary>
     public DateTimeOffset? PreemptedAt { get; init; }
 
     /// <summary>
     /// Host-side git ref containing the best-effort checkpoint captured during
-    /// graceful shutdown. Null means there is no clean preemption checkpoint.
+    /// graceful shutdown or recoverable agent-turn failure. Null means there is
+    /// no clean preemption checkpoint.
     /// </summary>
     public string? PreemptCheckpoint { get; init; }
+
+    /// <summary>
+    /// Durable agent-turn routing and optional provider-native session metadata
+    /// paired with either <see cref="PreemptCheckpoint"/> or
+    /// <see cref="AgentTurnRecoveryLease"/>. The value is persisted by the
+    /// work-item store but hidden from public JSON because native session
+    /// identifiers are orchestration internals, not operator-facing work-item data.
+    /// </summary>
+    [JsonIgnore]
+    public AgentTurnResumeCheckpoint? AgentTurnResumeCheckpoint { get; init; }
+
+    /// <summary>
+    /// Provider-bound stopped sandbox retained only when infrastructure loss
+    /// prevented publication of the normal Git/private-state checkpoint.
+    /// Hidden from public JSON because its token is an internal adoption
+    /// capability. It is cleared together with the paired agent-turn metadata.
+    /// </summary>
+    [JsonIgnore]
+    public SandboxRecoveryLease? AgentTurnRecoveryLease { get; init; }
+
+    /// <summary>
+    /// True when the item has one coherent agent-turn recovery boundary. New
+    /// typed checkpoints require exactly one backing: either a published
+    /// Git/private-state checkpoint or a retained provider sandbox awaiting
+    /// publication. Legacy Git-only checkpoints remain recoverable so persisted
+    /// pre-upgrade rows and startup-adoption promotion keep their existing path.
+    /// </summary>
+    [JsonIgnore]
+    public bool HasAgentTurnRecoveryBoundary
+    {
+        get
+        {
+            var hasGitCheckpoint = !string.IsNullOrWhiteSpace(PreemptCheckpoint);
+            if (AgentTurnResumeCheckpoint is null)
+            {
+                return hasGitCheckpoint
+                    && AgentTurnRecoveryLease is null;
+            }
+
+            return HasTypedAgentTurnRecoveryBoundary;
+        }
+    }
+
+    /// <summary>
+    /// True only for the typed recovery contract whose metadata has exactly one
+    /// Git or retained-sandbox backing. Unlike a legacy Git-only checkpoint,
+    /// this boundary may remain parked in infrastructure/operator recovery states.
+    /// </summary>
+    [JsonIgnore]
+    public bool HasTypedAgentTurnRecoveryBoundary =>
+        AgentTurnResumeCheckpoint is not null
+        && (!string.IsNullOrWhiteSpace(PreemptCheckpoint)
+            != (AgentTurnRecoveryLease is not null));
 
     /// <summary>
     /// Name of the sandbox (e.g. multipass VM) suspended during graceful host
@@ -705,6 +770,14 @@ public sealed record WorkItem
             || (state == WorkItemState.Failed
                 && string.Equals(nextFailureKind, "transient-exhausted", StringComparison.OrdinalIgnoreCase));
         var preservesTransientHistory = carriesTransientHistory || ShouldPreserveTransientRetryHistory(state);
+        var carriesTypedAgentTurnRecoveryBoundary = HasTypedAgentTurnRecoveryBoundary
+            && CodeyBox.Core.AgentTurnResumeCheckpoint.CanPersistThrough(state, nextFailureKind);
+        var carriesLegacyPreemptCheckpoint = AgentTurnResumeCheckpoint is null
+            && AgentTurnRecoveryLease is null
+            && !string.IsNullOrWhiteSpace(PreemptCheckpoint)
+            && state is WorkItemState.Working or WorkItemState.Reworking;
+        var carriesAgentTurnRecoveryBoundary = carriesTypedAgentTurnRecoveryBoundary
+            || carriesLegacyPreemptCheckpoint;
 
         return this with
         {
@@ -742,8 +815,12 @@ public sealed record WorkItem
             // gone; the next pickup generates a fresh one.
             WorkBranch = state == WorkItemState.Queued && !preserveQueuedPickup ? null : WorkBranch,
             PreserveWorkBranchOnQueuedPickup = preserveQueuedPickup,
-            PreemptedAt = state is WorkItemState.Working or WorkItemState.Reworking ? PreemptedAt : null,
-            PreemptCheckpoint = state is WorkItemState.Working or WorkItemState.Reworking ? PreemptCheckpoint : null,
+            PreemptedAt = carriesAgentTurnRecoveryBoundary ? PreemptedAt : null,
+            PreemptCheckpoint = carriesAgentTurnRecoveryBoundary && !string.IsNullOrWhiteSpace(PreemptCheckpoint)
+                ? PreemptCheckpoint
+                : null,
+            AgentTurnResumeCheckpoint = carriesAgentTurnRecoveryBoundary ? AgentTurnResumeCheckpoint : null,
+            AgentTurnRecoveryLease = carriesAgentTurnRecoveryBoundary ? AgentTurnRecoveryLease : null,
         };
     }
 

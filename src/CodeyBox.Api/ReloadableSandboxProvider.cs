@@ -91,12 +91,18 @@ internal sealed class ReloadableSandboxProvider :
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(spec);
-        var selected = SelectedProvider;
+        var recoveryLease = spec.RecoveryLease;
+        var selected = recoveryLease is not null
+            ? RecoveryProvider(recoveryLease)
+            : SelectedProvider;
+        var routedSpec = recoveryLease is null
+            ? TranslateForeignBaselinePin(selected, spec)
+            : spec;
         ISandbox sandbox;
         try
         {
             sandbox = await selected.Provider
-                .CreateAsync(TranslateForeignBaselinePin(selected, spec), ct)
+                .CreateAsync(routedSpec, ct)
                 .ConfigureAwait(false);
         }
         catch (SandboxProvisioningDeferredException ex)
@@ -105,6 +111,35 @@ internal sealed class ReloadableSandboxProvider :
             throw ScopeRetainedResource(ex, selected.Id);
         }
         return await RequireCreatedSandboxOwnerAsync(selected, sandbox).ConfigureAwait(false);
+    }
+
+    private ProviderEntry RecoveryProvider(SandboxRecoveryLease lease)
+    {
+        ArgumentNullException.ThrowIfNull(lease);
+        if (!SandboxProviderIdPolicy.IsValidOpaque(lease.ProviderId)
+            || !_providersById.TryGetValue(lease.ProviderId, out var recoveryProvider))
+        {
+            throw new InvalidOperationException(
+                "The sandbox recovery lease names an unknown lifecycle provider.");
+        }
+
+        var selected = ProviderByConfiguredId(_selectedProviderId());
+        if (string.Equals(recoveryProvider.Id, selected.Id, StringComparison.Ordinal)
+            || _activatedProviders.ContainsKey(recoveryProvider.Id))
+        {
+            return Activate(recoveryProvider);
+        }
+
+        var retained = SnapshotRetainedProviders();
+        if (!retained.Any(provider => string.Equals(
+                provider.Id,
+                recoveryProvider.Id,
+                StringComparison.Ordinal)))
+        {
+            throw new InvalidOperationException(
+                "The sandbox recovery lease provider is neither selected nor retained for lifecycle recovery.");
+        }
+        return Activate(recoveryProvider);
     }
 
     public async Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)

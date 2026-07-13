@@ -36,6 +36,22 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.Contains("CodeyBox:DeepAuditFailurePersistence:RetryDelay", result.FailureMessage);
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(257)]
+    public void Validate_RejectsOutOfRangeRetainedAgentTurnSandboxCap(int configuredCap)
+    {
+        var options = ValidCodeyBoxOptions();
+        options.PipelineTuning.MaxRetainedAgentTurnSandboxes = configuredCap;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains(
+            "CodeyBox:PipelineTuning:MaxRetainedAgentTurnSandboxes must be between 1 and 256",
+            result.FailureMessage);
+    }
+
     [Fact]
     public void Validate_AllowsUniqueRegisteredRetainedSandboxProviders()
     {

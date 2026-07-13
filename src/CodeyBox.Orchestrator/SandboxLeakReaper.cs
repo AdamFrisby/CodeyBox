@@ -165,13 +165,11 @@ public sealed class SandboxLeakReaper : BackgroundService
                 .Select(static group => group.Key)
                 .ToHashSet(StringComparer.Ordinal);
 
-            // R8-core: any VM named in a work item's SuspendedVmName is being
-            // held across an orchestrator restart and MUST NOT be reaped — the
-            // startup resume handler will start it through its owning lifecycle provider
-            // (or clear the bookkeeping if the resume fails). Built fresh per
-            // sweep so a resume that completes between sweeps takes effect on
-            // the next pass without an explicit invalidation hook.
-            var suspendedNames = await BuildSuspendedVmNameSetAsync(ct);
+            // VMs named by either suspend bookkeeping or an exact retained
+            // agent-turn recovery lease are still owned by a work item and
+            // MUST NOT be reaped. Built fresh per sweep so completed recovery
+            // takes effect without an explicit invalidation hook.
+            var protectedSandboxes = await BuildProtectedSandboxSetAsync(ct);
 
             var leaks = new List<LeakedSandboxInfo>();
             foreach (var info in allManaged)
@@ -182,7 +180,10 @@ public sealed class SandboxLeakReaper : BackgroundService
                 if (duplicateNamesWithActiveSnapshot.Contains(info.Name))
                     continue;
 
-                if (suspendedNames.Contains(info.Name))
+                if (protectedSandboxes.UnscopedNames.Contains(info.Name)
+                    || protectedSandboxes.ScopedNames.Contains(new ProviderSandboxName(
+                        info.LifecycleProviderId ?? _provider.Name,
+                        info.Name)))
                     continue;
 
                 var missingCreationMetadata = !info.CreatedAt.HasValue;
@@ -310,10 +311,12 @@ public sealed class SandboxLeakReaper : BackgroundService
         }
     }
 
-    private async Task<HashSet<string>> BuildSuspendedVmNameSetAsync(CancellationToken ct)
+    private async Task<ProtectedSandboxSet> BuildProtectedSandboxSetAsync(CancellationToken ct)
     {
-        if (_store is null) return new HashSet<string>(StringComparer.Ordinal);
-        var set = new HashSet<string>(StringComparer.Ordinal);
+        var unscopedNames = new HashSet<string>(StringComparer.Ordinal);
+        var scopedNames = new HashSet<ProviderSandboxName>();
+        if (_store is null)
+            return new ProtectedSandboxSet(unscopedNames, scopedNames);
         // ListSuspendedAsync hits the partial index idx_work_items_suspended_vm
         // (suspended_vm_name WHERE NOT NULL), so this loop's cost scales with
         // the in-flight suspend count rather than the full work_items table.
@@ -332,11 +335,40 @@ public sealed class SandboxLeakReaper : BackgroundService
             if (string.IsNullOrWhiteSpace(item.SuspendedVmName)) continue;
             if (!WorkItemDependencies.TerminalStates.Contains(item.State))
             {
-                set.Add(item.SuspendedVmName!);
+                unscopedNames.Add(item.SuspendedVmName!);
             }
         }
-        return set;
+
+        // Retained agent-turn leases may deliberately survive Failed,
+        // NeedsOperatorInput, or AbandonedAfterRecoveryAttempts so an operator
+        // can retry after a prolonged provider outage. Enumerate the bounded
+        // state set rather than treating terminal state alone as evidence that
+        // the provider-owned work tree is disposable; explicit cancellation or
+        // checkpoint discard clears the lease first.
+        foreach (var state in Enum.GetValues<WorkItemState>())
+        {
+            await foreach (var item in _store.ListByStateAsync(state, ct))
+            {
+                if (item.HasTypedAgentTurnRecoveryBoundary
+                    && AgentTurnResumeCheckpoint.CanPersistThrough(
+                        item.State,
+                        item.FailureKind)
+                    && item.AgentTurnRecoveryLease is { } recoveryLease)
+                {
+                    scopedNames.Add(new ProviderSandboxName(
+                        recoveryLease.ProviderId,
+                        recoveryLease.SandboxId));
+                }
+            }
+        }
+        return new ProtectedSandboxSet(unscopedNames, scopedNames);
     }
+
+    private readonly record struct ProviderSandboxName(string ProviderId, string SandboxId);
+
+    private sealed record ProtectedSandboxSet(
+        HashSet<string> UnscopedNames,
+        HashSet<ProviderSandboxName> ScopedNames);
 
     private async Task<LeakIdentity?> DisposeSingleAsync(LeakedSandboxInfo leak, CancellationToken stoppingToken)
     {

@@ -82,6 +82,13 @@ public sealed class PipelineTuningOptions
     public int AgentSessionResumeMaxAttempts { get; set; } = Agents.SessionResumeOptions.DefaultMaxResumeAttempts;
 
     /// <summary>
+    /// Maximum provider-owned stopped sandboxes retained concurrently because
+    /// infrastructure prevented normal agent-turn checkpoint publication.
+    /// Enforced atomically in the work-item store. Default 16.
+    /// </summary>
+    public int MaxRetainedAgentTurnSandboxes { get; set; } = 16;
+
+    /// <summary>
     /// Maximum number of sequential auto-merge race recoveries the upstream-push
     /// loop will perform before parking the item. Each recovery costs a full LLM
     /// merge-phase re-invocation. When the upstream base is a moving target
@@ -264,6 +271,12 @@ public sealed class PipelineTuningOptions
         if (MaxSandboxReuses < 1)
         {
             throw new ArgumentOutOfRangeException(nameof(MaxSandboxReuses), "MaxSandboxReuses must be >= 1");
+        }
+        if (MaxRetainedAgentTurnSandboxes is < 1 or > 256)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(MaxRetainedAgentTurnSandboxes),
+                "MaxRetainedAgentTurnSandboxes must be between 1 and 256");
         }
         if (MaxSandboxLifetime <= TimeSpan.Zero)
         {

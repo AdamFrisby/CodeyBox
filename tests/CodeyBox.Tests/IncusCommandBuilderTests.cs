@@ -104,6 +104,22 @@ public sealed class IncusCommandBuilderTests
     }
 
     [Fact]
+    public void BuildDeviceRemove_UsesValidatedArgumentVector()
+    {
+        var argv = IncusCommandBuilder.BuildDeviceRemove(
+            Options,
+            "codeybox-test",
+            "m000");
+
+        Assert.Equal(
+            [
+                "/opt/incus/bin/incus", "--project", "codeybox-tests",
+                "config", "device", "remove", "codeybox-test", "m000",
+            ],
+            argv);
+    }
+
+    [Fact]
     public void BuildExec_PreservesEachArgumentAndWorkingDirectory()
     {
         var argv = IncusCommandBuilder.BuildExec(

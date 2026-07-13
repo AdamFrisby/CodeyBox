@@ -18,6 +18,10 @@ public sealed record IncusSandboxOptions
     public static readonly TimeSpan DefaultVmStartTimeout = TimeSpan.FromMinutes(5);
     public static readonly TimeSpan DefaultVmStopTimeout = TimeSpan.FromMinutes(2);
     public static readonly TimeSpan DefaultReadinessPollInterval = TimeSpan.FromSeconds(1);
+    public static readonly TimeSpan DefaultInterruptedExecRecoveryRetryDelay = TimeSpan.FromSeconds(1);
+    public static readonly TimeSpan MaximumInterruptedExecRecoveryRetryDelay = TimeSpan.FromSeconds(30);
+    public const int DefaultInterruptedExecRecoveryRetryAttempts = 3;
+    public const int MaximumInterruptedExecRecoveryRetryAttempts = 10;
     public const int DefaultMaxCliOutputBytes = 4 * 1024 * 1024;
     public const int MaximumNetworkProfiles = 128;
     public const int MaximumNetworkProfileUtf8Bytes = 64 * 1024;
@@ -139,6 +143,13 @@ public sealed record IncusSandboxOptions
     public int ExecControlFileCleanupAttempts { get; init; } = 3;
     /// <summary>Attempts to read and validate a guest exec completion sentinel.</summary>
     public int ExecCompletionProbeAttempts { get; init; } = 3;
+    /// <summary>
+    /// Delayed recovery attempts admitted by the next exec after the immediate
+    /// interrupted-exec recovery attempt fails. Zero disables delayed recovery.
+    /// </summary>
+    public int InterruptedExecRecoveryRetryAttempts { get; init; } = DefaultInterruptedExecRecoveryRetryAttempts;
+    /// <summary>Delay before each delayed interrupted-exec recovery attempt.</summary>
+    public TimeSpan InterruptedExecRecoveryRetryDelay { get; init; } = DefaultInterruptedExecRecoveryRetryDelay;
     public int MaxConcurrentOperations { get; init; } = 2;
     /// <summary>
     /// Maximum VM boots — an <c>incus start</c> plus its guest-agent readiness
@@ -257,6 +268,17 @@ public sealed record IncusSandboxOptions
         RequireRetryAttempts(options.ExecPidPollAttempts, nameof(ExecPidPollAttempts), errors);
         RequireRetryAttempts(options.ExecControlFileCleanupAttempts, nameof(ExecControlFileCleanupAttempts), errors);
         RequireRetryAttempts(options.ExecCompletionProbeAttempts, nameof(ExecCompletionProbeAttempts), errors);
+        if (options.InterruptedExecRecoveryRetryAttempts is < 0 or > MaximumInterruptedExecRecoveryRetryAttempts)
+        {
+            errors.Add(
+                $"{nameof(InterruptedExecRecoveryRetryAttempts)} must be between 0 and {MaximumInterruptedExecRecoveryRetryAttempts}.");
+        }
+        if (options.InterruptedExecRecoveryRetryDelay <= TimeSpan.Zero
+            || options.InterruptedExecRecoveryRetryDelay > MaximumInterruptedExecRecoveryRetryDelay)
+        {
+            errors.Add(
+                $"{nameof(InterruptedExecRecoveryRetryDelay)} must be positive and no greater than {MaximumInterruptedExecRecoveryRetryDelay}.");
+        }
         RequirePositiveDuration(options.ResourceMetricsCaptureTimeout, nameof(ResourceMetricsCaptureTimeout), errors);
         RequirePositiveDuration(options.ResourceMetricsSampleInterval, nameof(ResourceMetricsSampleInterval), errors);
         if (options.MaxConcurrentOperations is < 1 or > 64)

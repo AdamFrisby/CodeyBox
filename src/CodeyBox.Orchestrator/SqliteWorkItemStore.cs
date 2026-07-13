@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Data.Sqlite;
@@ -11,7 +12,11 @@ namespace CodeyBox.Orchestrator;
 /// Schema is created on first use; intentionally minimal — most fields are
 /// stored as columns so the orchestrator can query by state at startup.
 /// </summary>
-public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, IDisposable
+public sealed class SqliteWorkItemStore :
+    IWorkItemStore,
+    IAuditProgressStore,
+    IAgentTurnScratchpadStore,
+    IDisposable
 {
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web)
     {
@@ -229,6 +234,9 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             // existing rows are treated as not preempted.
             RunMigration("ALTER TABLE work_items ADD COLUMN preempted_at TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN preempt_checkpoint TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN agent_turn_resume_checkpoint_json TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN agent_turn_recovery_lease_json TEXT;");
+            CreateAgentTurnScratchpadTable();
 
             // Additive migration: VM-suspend recovery metadata (R8-core). Records the
             // name of the suspended multipass VM that holds this item's in-progress
@@ -451,6 +459,51 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
             isDeterministic: true);
     }
 
+    private void CreateAgentTurnScratchpadTable()
+    {
+        using var cmd = _conn.CreateCommand();
+        // The interpolated value is a compile-time integer bound, never input.
+        cmd.CommandText = $"""
+            CREATE TABLE IF NOT EXISTS agent_turn_scratchpads (
+                generation        INTEGER PRIMARY KEY AUTOINCREMENT,
+                work_item_id       TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                checkpoint_ref     TEXT NOT NULL,
+                source_commit_sha  TEXT NOT NULL,
+                archive_sha256     TEXT NOT NULL,
+                archive_bytes      BLOB NOT NULL
+                    CHECK(length(archive_bytes) BETWEEN 1 AND {AgentTurnScratchpadArchive.MaximumBytes}),
+                UNIQUE(work_item_id, checkpoint_ref)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_turn_scratchpads_work_item_generation
+                ON agent_turn_scratchpads(work_item_id, generation);
+
+            CREATE TRIGGER IF NOT EXISTS trg_work_items_clear_agent_turn_scratchpads
+            AFTER UPDATE OF agent_turn_resume_checkpoint_json ON work_items
+            WHEN NEW.agent_turn_resume_checkpoint_json IS NULL
+            BEGIN
+                DELETE FROM agent_turn_scratchpads WHERE work_item_id = NEW.id;
+            END;
+            """;
+        cmd.ExecuteNonQuery();
+        DeleteOrphanedAgentTurnScratchpads();
+    }
+
+    private void DeleteOrphanedAgentTurnScratchpads()
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            DELETE FROM agent_turn_scratchpads
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM work_items
+                WHERE work_items.id = agent_turn_scratchpads.work_item_id
+                  AND work_items.preempt_checkpoint = agent_turn_scratchpads.checkpoint_ref
+                  AND work_items.agent_turn_resume_checkpoint_json IS NOT NULL
+            );
+            """;
+        cmd.ExecuteNonQuery();
+    }
+
     private void ReconcileAgentRestoreRetryClaimsKey()
     {
         using var tx = _conn.BeginTransaction();
@@ -602,6 +655,654 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
     // running every chunk inside one transaction.
     private const int ClearBaselineBatchSize = 500;
 
+    // The validated fields currently serialize below 2 KiB. This larger cap
+    // leaves format headroom while rejecting a corrupt/untrusted database value
+    // before allocating an arbitrarily large managed string.
+    private const int MaximumAgentTurnResumeCheckpointJsonLength = 4096;
+    private const int MaximumAgentTurnRecoveryLeaseJsonLength = 1024;
+
+    public async Task SaveAsync(
+        WorkItemId workItemId,
+        AgentTurnCheckpointRef checkpointRef,
+        AgentTurnScratchpadArchive archive,
+        CancellationToken ct = default)
+    {
+        ValidateAgentTurnScratchpadKey(workItemId, checkpointRef);
+        ArgumentNullException.ThrowIfNull(archive);
+        if (!string.Equals(archive.Sha256, checkpointRef.ArchiveSha256, StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                "Scratchpad archive hash does not match its immutable checkpoint ref.",
+                nameof(archive));
+        }
+
+        var archiveBytes = archive.ToArray();
+        var lockHeld = false;
+        try
+        {
+            await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+            lockHeld = true;
+            using var tx = _conn.BeginTransaction();
+            using (var insert = _conn.CreateCommand())
+            {
+                insert.Transaction = tx;
+                insert.CommandText = """
+                    INSERT INTO agent_turn_scratchpads
+                        (work_item_id, checkpoint_ref, source_commit_sha, archive_sha256, archive_bytes)
+                    VALUES ($work_item_id, $checkpoint_ref, $source_commit_sha, $archive_sha256, $archive_bytes)
+                    ON CONFLICT(work_item_id, checkpoint_ref) DO NOTHING;
+                    """;
+                insert.Parameters.AddWithValue("$work_item_id", workItemId.ToString());
+                insert.Parameters.AddWithValue("$checkpoint_ref", checkpointRef.Value);
+                insert.Parameters.AddWithValue("$source_commit_sha", checkpointRef.SourceCommitSha);
+                insert.Parameters.AddWithValue("$archive_sha256", checkpointRef.ArchiveSha256);
+                insert.Parameters.Add("$archive_bytes", SqliteType.Blob).Value = archiveBytes;
+                await insert.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+
+            // INSERT is first-writer-wins for an immutable ref. Verify the row in
+            // the same transaction so an idempotent save cannot bless pre-existing
+            // corrupt or conflicting bytes as success.
+            var persisted = await ReadAgentTurnScratchpadCoreAsync(
+                    _conn,
+                    tx,
+                    workItemId,
+                    checkpointRef,
+                    ct)
+                .ConfigureAwait(false)
+                ?? throw new AgentTurnScratchpadCorruptException(
+                    workItemId,
+                    checkpointRef,
+                    "save completed without an addressable row");
+            if (!string.Equals(persisted.Sha256, archive.Sha256, StringComparison.Ordinal)
+                || persisted.SizeBytes != archive.SizeBytes)
+            {
+                throw new AgentTurnScratchpadCorruptException(
+                    workItemId,
+                    checkpointRef,
+                    "existing immutable row does not match the supplied archive");
+            }
+
+            tx.Commit();
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull(nameof(SaveAsync), sqlex);
+        }
+        finally
+        {
+            if (lockHeld)
+                _writeLock.Release();
+            CryptographicOperations.ZeroMemory(archiveBytes);
+        }
+    }
+
+    public async Task<AgentTurnScratchpadArchive?> ReadAsync(
+        WorkItemId workItemId,
+        AgentTurnCheckpointRef checkpointRef,
+        CancellationToken ct = default)
+    {
+        ValidateAgentTurnScratchpadKey(workItemId, checkpointRef);
+        using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct)
+            .ConfigureAwait(false);
+        using var readConnection = await OpenReadConnectionAsync(ct).ConfigureAwait(false);
+        return await ReadAgentTurnScratchpadCoreAsync(
+                readConnection,
+                transaction: null,
+                workItemId,
+                checkpointRef,
+                ct)
+            .ConfigureAwait(false);
+    }
+
+    public async Task<bool> TryPublishAsync(
+        WorkItem checkpointedItem,
+        WorkItemState onlyIfState,
+        DateTimeOffset onlyIfUpdatedAt,
+        AgentTurnCheckpointRef checkpointRef,
+        CancellationToken ct = default)
+    {
+        ValidateAgentTurnScratchpadPublication(checkpointedItem, onlyIfState, checkpointRef);
+        var checkpoint = checkpointedItem.AgentTurnResumeCheckpoint!;
+        var checkpointJson = JsonSerializer.Serialize(
+            checkpoint,
+            JsonOpts);
+
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var tx = _conn.BeginTransaction();
+            _ = await ReadAgentTurnScratchpadCoreAsync(
+                    _conn,
+                    tx,
+                    checkpointedItem.Id,
+                    checkpointRef,
+                    ct)
+                .ConfigureAwait(false)
+                ?? throw new AgentTurnScratchpadCorruptException(
+                    checkpointedItem.Id,
+                    checkpointRef,
+                    "checkpoint publication requires its verified archive row");
+
+            using (var publish = _conn.CreateCommand())
+            {
+                publish.Transaction = tx;
+                // Update only the fields owned by checkpoint publication. A
+                // full-row write would clobber unrelated concurrent operator
+                // edits even when the lifecycle CAS still matched.
+                publish.CommandText = """
+                    UPDATE work_items
+                    SET state = $state,
+                        agent = $agent,
+                        agent_instance_id = $agent_instance_id,
+                        work_branch = $work_branch,
+                        preempted_at = $preempted_at,
+                        preempt_checkpoint = $checkpoint_ref,
+                        agent_turn_resume_checkpoint_json = $checkpoint_json,
+                        agent_turn_recovery_lease_json = NULL,
+                        updated_at = $updated_at
+                    WHERE id = $work_item_id
+                      AND state = $only_if_state
+                      AND updated_at = $only_if_updated_at
+                      AND EXISTS (
+                          SELECT 1
+                          FROM agent_turn_scratchpads
+                          WHERE work_item_id = $work_item_id
+                            AND checkpoint_ref = $checkpoint_ref
+                            AND source_commit_sha = $source_commit_sha
+                            AND archive_sha256 = $archive_sha256
+                      );
+                    """;
+                publish.Parameters.AddWithValue("$state", (int)checkpointedItem.State);
+                publish.Parameters.AddWithValue("$agent", checkpoint.Agent.Value);
+                publish.Parameters.AddWithValue("$agent_instance_id", checkpoint.AgentInstanceRoute);
+                publish.Parameters.AddWithValue("$work_branch", checkpointedItem.WorkBranch!);
+                publish.Parameters.AddWithValue("$preempted_at", checkpointedItem.PreemptedAt!.Value.ToString("O"));
+                publish.Parameters.AddWithValue("$checkpoint_ref", checkpointRef.Value);
+                publish.Parameters.AddWithValue("$checkpoint_json", checkpointJson);
+                publish.Parameters.AddWithValue("$updated_at", checkpointedItem.UpdatedAt.ToString("O"));
+                publish.Parameters.AddWithValue("$work_item_id", checkpointedItem.Id.ToString());
+                publish.Parameters.AddWithValue("$only_if_state", (int)onlyIfState);
+                publish.Parameters.AddWithValue("$only_if_updated_at", onlyIfUpdatedAt.ToString("O"));
+                publish.Parameters.AddWithValue("$source_commit_sha", checkpointRef.SourceCommitSha);
+                publish.Parameters.AddWithValue("$archive_sha256", checkpointRef.ArchiveSha256);
+                if (await publish.ExecuteNonQueryAsync(ct).ConfigureAwait(false) != 1)
+                {
+                    tx.Rollback();
+                    return false;
+                }
+            }
+
+            using (var prune = _conn.CreateCommand())
+            {
+                prune.Transaction = tx;
+                prune.CommandText = """
+                    DELETE FROM agent_turn_scratchpads
+                    WHERE work_item_id = $work_item_id
+                      AND checkpoint_ref <> $checkpoint_ref;
+                    """;
+                prune.Parameters.AddWithValue("$work_item_id", checkpointedItem.Id.ToString());
+                prune.Parameters.AddWithValue("$checkpoint_ref", checkpointRef.Value);
+                await prune.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+
+            tx.Commit();
+            return true;
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull(nameof(TryPublishAsync), sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<bool> TryPublishRecoveryLeaseAsync(
+        WorkItem retainedItem,
+        WorkItemState onlyIfState,
+        DateTimeOffset onlyIfUpdatedAt,
+        int maximumRetainedSandboxes,
+        CancellationToken ct = default)
+    {
+        ValidateAgentTurnRecoveryLeasePublication(
+            retainedItem,
+            onlyIfState,
+            maximumRetainedSandboxes);
+        var checkpoint = retainedItem.AgentTurnResumeCheckpoint!;
+        var checkpointJson = JsonSerializer.Serialize(checkpoint, JsonOpts);
+        var recoveryLeaseJson = JsonSerializer.Serialize(
+            retainedItem.AgentTurnRecoveryLease!,
+            JsonOpts);
+
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var tx = _conn.BeginTransaction();
+            using var publish = _conn.CreateCommand();
+            publish.Transaction = tx;
+            publish.CommandText = """
+                UPDATE work_items
+                SET state = $state,
+                    agent = $agent,
+                    agent_instance_id = $agent_instance_id,
+                    work_branch = $work_branch,
+                    preempted_at = $preempted_at,
+                    preempt_checkpoint = NULL,
+                    agent_turn_resume_checkpoint_json = $checkpoint_json,
+                    agent_turn_recovery_lease_json = $recovery_lease_json,
+                    updated_at = $updated_at
+                WHERE id = $work_item_id
+                  AND state = $only_if_state
+                  AND updated_at = $only_if_updated_at
+                  AND (
+                      agent_turn_recovery_lease_json = $recovery_lease_json
+                      OR (
+                          agent_turn_recovery_lease_json IS NULL
+                          AND (
+                              SELECT COUNT(*)
+                              FROM work_items retained
+                              WHERE retained.agent_turn_recovery_lease_json IS NOT NULL
+                          ) < $maximum_retained
+                      )
+                  );
+                """;
+            publish.Parameters.AddWithValue("$state", (int)retainedItem.State);
+            publish.Parameters.AddWithValue("$agent", checkpoint.Agent.Value);
+            publish.Parameters.AddWithValue("$agent_instance_id", checkpoint.AgentInstanceRoute);
+            publish.Parameters.AddWithValue("$work_branch", retainedItem.WorkBranch!);
+            publish.Parameters.AddWithValue("$preempted_at", retainedItem.PreemptedAt!.Value.ToString("O"));
+            publish.Parameters.AddWithValue("$checkpoint_json", checkpointJson);
+            publish.Parameters.AddWithValue("$recovery_lease_json", recoveryLeaseJson);
+            publish.Parameters.AddWithValue("$updated_at", retainedItem.UpdatedAt.ToString("O"));
+            publish.Parameters.AddWithValue("$work_item_id", retainedItem.Id.ToString());
+            publish.Parameters.AddWithValue("$only_if_state", (int)onlyIfState);
+            publish.Parameters.AddWithValue("$only_if_updated_at", onlyIfUpdatedAt.ToString("O"));
+            publish.Parameters.AddWithValue("$maximum_retained", maximumRetainedSandboxes);
+            if (await publish.ExecuteNonQueryAsync(ct).ConfigureAwait(false) != 1)
+            {
+                tx.Rollback();
+                return false;
+            }
+
+            tx.Commit();
+            return true;
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull(nameof(TryPublishRecoveryLeaseAsync), sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<int> DeleteAsync(
+        WorkItemId workItemId,
+        AgentTurnCheckpointRef checkpointRef,
+        CancellationToken ct = default)
+    {
+        ValidateAgentTurnScratchpadKey(workItemId, checkpointRef);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                DELETE FROM agent_turn_scratchpads
+                WHERE work_item_id = $work_item_id
+                  AND checkpoint_ref = $checkpoint_ref
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM work_items
+                      WHERE work_items.id = $work_item_id
+                        AND work_items.preempt_checkpoint = $checkpoint_ref
+                        AND work_items.agent_turn_resume_checkpoint_json IS NOT NULL
+                  );
+                """;
+            cmd.Parameters.AddWithValue("$work_item_id", workItemId.ToString());
+            cmd.Parameters.AddWithValue("$checkpoint_ref", checkpointRef.Value);
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull(nameof(DeleteAsync), sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<int> DeleteOlderAsync(
+        WorkItemId workItemId,
+        AgentTurnCheckpointRef keepRef,
+        CancellationToken ct = default)
+    {
+        ValidateAgentTurnScratchpadKey(workItemId, keepRef);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                DELETE FROM agent_turn_scratchpads
+                WHERE work_item_id = $work_item_id
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM work_items
+                      WHERE work_items.id = $work_item_id
+                        AND work_items.preempt_checkpoint = agent_turn_scratchpads.checkpoint_ref
+                        AND work_items.agent_turn_resume_checkpoint_json IS NOT NULL
+                  )
+                  AND generation < (
+                      SELECT generation
+                      FROM agent_turn_scratchpads
+                      WHERE work_item_id = $work_item_id
+                        AND checkpoint_ref = $keep_ref
+                  );
+                """;
+            cmd.Parameters.AddWithValue("$work_item_id", workItemId.ToString());
+            cmd.Parameters.AddWithValue("$keep_ref", keepRef.Value);
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull(nameof(DeleteOlderAsync), sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<int> DeleteAllAsync(WorkItemId workItemId, CancellationToken ct = default)
+    {
+        ValidateAgentTurnScratchpadWorkItemId(workItemId);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                DELETE FROM agent_turn_scratchpads
+                WHERE work_item_id = $work_item_id
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM work_items
+                      WHERE work_items.id = $work_item_id
+                        AND work_items.preempt_checkpoint = agent_turn_scratchpads.checkpoint_ref
+                        AND work_items.agent_turn_resume_checkpoint_json IS NOT NULL
+                  );
+                """;
+            cmd.Parameters.AddWithValue("$work_item_id", workItemId.ToString());
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
+        {
+            throw HandleDiskFull(nameof(DeleteAllAsync), sqlex);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    private static void ValidateAgentTurnScratchpadKey(
+        WorkItemId workItemId,
+        AgentTurnCheckpointRef checkpointRef)
+    {
+        ValidateAgentTurnScratchpadWorkItemId(workItemId);
+        ArgumentNullException.ThrowIfNull(checkpointRef);
+        if (checkpointRef.WorkItemId != workItemId)
+        {
+            throw new ArgumentException(
+                "Agent-turn checkpoint ref belongs to a different work item.",
+                nameof(checkpointRef));
+        }
+    }
+
+    private static void ValidateAgentTurnScratchpadPublication(
+        WorkItem checkpointedItem,
+        WorkItemState onlyIfState,
+        AgentTurnCheckpointRef checkpointRef)
+    {
+        ArgumentNullException.ThrowIfNull(checkpointedItem);
+        ValidateAgentTurnScratchpadKey(checkpointedItem.Id, checkpointRef);
+        var checkpoint = checkpointedItem.AgentTurnResumeCheckpoint
+            ?? throw new ArgumentException(
+                "Checkpoint publication requires agent-turn resume metadata.",
+                nameof(checkpointedItem));
+        if (checkpointedItem.State != onlyIfState || checkpoint.ResumeState != checkpointedItem.State)
+        {
+            throw new ArgumentException(
+                "Checkpoint publication must preserve the expected active resume state.",
+                nameof(checkpointedItem));
+        }
+        if (!string.Equals(checkpointedItem.PreemptCheckpoint, checkpointRef.Value, StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                "Checkpoint publication ref does not match the immutable archive key.",
+                nameof(checkpointedItem));
+        }
+        if (checkpointedItem.AgentTurnRecoveryLease is not null)
+        {
+            throw new ArgumentException(
+                "A published Git/private-state checkpoint cannot retain a stopped-sandbox recovery lease.",
+                nameof(checkpointedItem));
+        }
+        if (checkpointedItem.PreemptedAt is null
+            || string.IsNullOrWhiteSpace(checkpointedItem.WorkBranch)
+            || checkpointedItem.Agent != checkpoint.Agent
+            || !string.Equals(
+                checkpointedItem.AgentInstanceId,
+                checkpoint.AgentInstanceRoute,
+                StringComparison.Ordinal)
+            || !string.Equals(checkpointedItem.ModelId, checkpoint.ModelId, StringComparison.Ordinal)
+            || !string.Equals(checkpointedItem.ReasoningMode, checkpoint.ReasoningMode, StringComparison.Ordinal)
+            || checkpointedItem.PromptRevision != checkpoint.PromptRevision)
+        {
+            throw new ArgumentException(
+                "Checkpoint publication is missing its bound lifecycle and agent-route fields.",
+                nameof(checkpointedItem));
+        }
+    }
+
+    private static void ValidateAgentTurnRecoveryLeasePublication(
+        WorkItem retainedItem,
+        WorkItemState onlyIfState,
+        int maximumRetainedSandboxes)
+    {
+        ArgumentNullException.ThrowIfNull(retainedItem);
+        if (maximumRetainedSandboxes is < 1 or > 256)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maximumRetainedSandboxes),
+                "Retained-sandbox maximum must be between 1 and 256.");
+        }
+
+        var checkpoint = retainedItem.AgentTurnResumeCheckpoint
+            ?? throw new ArgumentException(
+                "Retained-sandbox publication requires agent-turn metadata.",
+                nameof(retainedItem));
+        _ = retainedItem.AgentTurnRecoveryLease
+            ?? throw new ArgumentException(
+                "Retained-sandbox publication requires its provider lease.",
+                nameof(retainedItem));
+        if (!string.IsNullOrWhiteSpace(retainedItem.PreemptCheckpoint))
+            throw new ArgumentException("Retained recovery cannot also name a Git checkpoint.", nameof(retainedItem));
+        if (retainedItem.State != onlyIfState || checkpoint.ResumeState != retainedItem.State)
+            throw new ArgumentException("Retained recovery must preserve its active resume state.", nameof(retainedItem));
+        if (retainedItem.PreemptedAt is null
+            || string.IsNullOrWhiteSpace(retainedItem.WorkBranch)
+            || retainedItem.Agent != checkpoint.Agent
+            || !string.Equals(retainedItem.AgentInstanceId, checkpoint.AgentInstanceRoute, StringComparison.Ordinal)
+            || !string.Equals(retainedItem.ModelId, checkpoint.ModelId, StringComparison.Ordinal)
+            || !string.Equals(retainedItem.ReasoningMode, checkpoint.ReasoningMode, StringComparison.Ordinal)
+            || retainedItem.PromptRevision != checkpoint.PromptRevision)
+        {
+            throw new ArgumentException(
+                "Retained recovery is missing its bound lifecycle and route fields.",
+                nameof(retainedItem));
+        }
+    }
+
+    private static void ValidateAgentTurnScratchpadWorkItemId(WorkItemId workItemId)
+    {
+        if (workItemId.Value == Guid.Empty)
+            throw new ArgumentException("Scratchpad work-item id must be populated.", nameof(workItemId));
+    }
+
+    private static async Task<AgentTurnScratchpadArchive?> ReadAgentTurnScratchpadCoreAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        WorkItemId workItemId,
+        AgentTurnCheckpointRef checkpointRef,
+        CancellationToken ct)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.Transaction = transaction;
+        cmd.CommandText = """
+            SELECT length(checkpoint_ref),
+                   length(source_commit_sha),
+                   length(archive_sha256),
+                   typeof(archive_bytes),
+                   length(archive_bytes),
+                   checkpoint_ref,
+                   source_commit_sha,
+                   archive_sha256,
+                   archive_bytes
+            FROM agent_turn_scratchpads
+            WHERE work_item_id = $work_item_id
+              AND checkpoint_ref = $checkpoint_ref
+            LIMIT 1;
+            """;
+        cmd.Parameters.AddWithValue("$work_item_id", workItemId.ToString());
+        cmd.Parameters.AddWithValue("$checkpoint_ref", checkpointRef.Value);
+
+        using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await reader.ReadAsync(ct).ConfigureAwait(false))
+            return null;
+
+        byte[]? archiveBytes = null;
+        try
+        {
+            // Check SQLite-reported lengths before materializing any untrusted
+            // string or BLOB value into managed memory.
+            var checkpointRefLength = ReadRequiredLength(reader, 0, workItemId, checkpointRef, "checkpoint ref");
+            var sourceCommitLength = ReadRequiredLength(reader, 1, workItemId, checkpointRef, "source commit SHA");
+            var archiveHashLength = ReadRequiredLength(reader, 2, workItemId, checkpointRef, "archive SHA-256");
+            var archiveLength = ReadRequiredLength(reader, 4, workItemId, checkpointRef, "archive");
+
+            if (checkpointRefLength != checkpointRef.Value.Length)
+                throw Corrupt(workItemId, checkpointRef, "checkpoint ref length does not match its immutable key");
+            if (sourceCommitLength != checkpointRef.SourceCommitSha.Length)
+                throw Corrupt(workItemId, checkpointRef, "source commit SHA length is invalid");
+            if (archiveHashLength != checkpointRef.ArchiveSha256.Length)
+                throw Corrupt(workItemId, checkpointRef, "archive SHA-256 length is invalid");
+            if (archiveLength is < 1 or > AgentTurnScratchpadArchive.MaximumBytes)
+            {
+                throw Corrupt(
+                    workItemId,
+                    checkpointRef,
+                    $"archive length {archiveLength} is outside the allowed range");
+            }
+
+            if (!string.Equals(reader.GetString(3), "blob", StringComparison.Ordinal))
+                throw Corrupt(workItemId, checkpointRef, "archive value is not a SQLite BLOB");
+
+            var storedRefText = reader.GetString(5);
+            AgentTurnCheckpointRef storedRef;
+            try
+            {
+                storedRef = AgentTurnCheckpointRef.Parse(storedRefText);
+            }
+            catch (FormatException ex)
+            {
+                throw Corrupt(workItemId, checkpointRef, "stored checkpoint ref is invalid", ex);
+            }
+
+            if (!string.Equals(storedRef.Value, checkpointRef.Value, StringComparison.Ordinal)
+                || storedRef.WorkItemId != workItemId)
+            {
+                throw Corrupt(workItemId, checkpointRef, "stored checkpoint ref does not match its lookup key");
+            }
+
+            var storedCommit = reader.GetString(6);
+            var storedArchiveHash = reader.GetString(7);
+            if (!string.Equals(storedCommit, storedRef.SourceCommitSha, StringComparison.Ordinal))
+                throw Corrupt(workItemId, checkpointRef, "source commit SHA does not match the checkpoint ref");
+            if (!string.Equals(storedArchiveHash, storedRef.ArchiveSha256, StringComparison.Ordinal))
+                throw Corrupt(workItemId, checkpointRef, "archive SHA-256 does not match the checkpoint ref");
+
+            var boundedLength = checked((int)archiveLength);
+            archiveBytes = new byte[boundedLength];
+            long offset = 0;
+            while (offset < archiveLength)
+            {
+                var bytesRead = reader.GetBytes(
+                    ordinal: 8,
+                    dataOffset: offset,
+                    buffer: archiveBytes,
+                    bufferOffset: checked((int)offset),
+                    length: boundedLength - checked((int)offset));
+                if (bytesRead <= 0 || bytesRead > archiveLength - offset)
+                    throw Corrupt(workItemId, checkpointRef, "archive BLOB ended before its declared length");
+                offset += bytesRead;
+            }
+
+            var actualHash = SHA256.HashData(archiveBytes);
+            var expectedHash = Convert.FromHexString(storedRef.ArchiveSha256);
+            try
+            {
+                if (!CryptographicOperations.FixedTimeEquals(actualHash, expectedHash))
+                    throw Corrupt(workItemId, checkpointRef, "archive bytes do not match the checkpoint ref hash");
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(actualHash);
+                CryptographicOperations.ZeroMemory(expectedHash);
+            }
+
+            return new AgentTurnScratchpadArchive(archiveBytes);
+        }
+        catch (AgentTurnScratchpadCorruptException)
+        {
+            throw;
+        }
+        catch (InvalidCastException ex)
+        {
+            throw Corrupt(workItemId, checkpointRef, "persisted value has an invalid SQLite storage type", ex);
+        }
+        catch (OverflowException ex)
+        {
+            throw Corrupt(workItemId, checkpointRef, "persisted length cannot be represented safely", ex);
+        }
+        finally
+        {
+            if (archiveBytes is not null)
+                CryptographicOperations.ZeroMemory(archiveBytes);
+        }
+    }
+
+    private static long ReadRequiredLength(
+        SqliteDataReader reader,
+        int ordinal,
+        WorkItemId workItemId,
+        AgentTurnCheckpointRef checkpointRef,
+        string fieldName)
+    {
+        if (reader.IsDBNull(ordinal))
+            throw Corrupt(workItemId, checkpointRef, $"{fieldName} length is NULL");
+        return reader.GetInt64(ordinal);
+    }
+
+    private static AgentTurnScratchpadCorruptException Corrupt(
+        WorkItemId workItemId,
+        AgentTurnCheckpointRef checkpointRef,
+        string reason,
+        Exception? innerException = null) =>
+        new(workItemId, checkpointRef, reason, innerException);
+
     public async Task CreateAsync(WorkItem item, CancellationToken ct = default)
     {
         await _writeLock.WaitAsync(ct);
@@ -618,6 +1319,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
                         local_squash_sha, merged_pr_number, merged_pr_url,
                         min_model_score, cancellation_reason, recovery_attempts, recovery_attempt_source_state, release_id, preempted_at, preempt_checkpoint,
+                        agent_turn_resume_checkpoint_json, agent_turn_recovery_lease_json,
                         suspended_vm_name, suspended_at, agent_log_path,
                         failure_kind, auth_failure_scope, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from,
                         quota_retry_phase,
@@ -635,6 +1337,7 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                         $local_squash_sha, $merged_pr_number, $merged_pr_url,
                         $min_model_score, $cancellation_reason, $recovery_attempts, $recovery_attempt_source_state, $release_id, $preempted_at, $preempt_checkpoint,
+                        $agent_turn_resume_checkpoint, $agent_turn_recovery_lease,
                         $suspended_vm_name, $suspended_at, $agent_log_path,
                         $failure_kind, $auth_failure_scope, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from,
                         $quota_retry_phase,
@@ -767,6 +1470,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     release_id = $release_id,
                     preempted_at = $preempted_at,
                     preempt_checkpoint = $preempt_checkpoint,
+                    agent_turn_resume_checkpoint_json = $agent_turn_resume_checkpoint,
+                    agent_turn_recovery_lease_json = $agent_turn_recovery_lease,
                     suspended_vm_name = $suspended_vm_name,
                     suspended_at = $suspended_at,
                     agent_log_path = $agent_log_path,
@@ -853,6 +1558,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     release_id = $release_id,
                     preempted_at = $preempted_at,
                     preempt_checkpoint = $preempt_checkpoint,
+                    agent_turn_resume_checkpoint_json = $agent_turn_resume_checkpoint,
+                    agent_turn_recovery_lease_json = $agent_turn_recovery_lease,
                     suspended_vm_name = $suspended_vm_name,
                     suspended_at = $suspended_at,
                     agent_log_path = $agent_log_path,
@@ -940,6 +1647,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     release_id = $release_id,
                     preempted_at = $preempted_at,
                     preempt_checkpoint = $preempt_checkpoint,
+                    agent_turn_resume_checkpoint_json = $agent_turn_resume_checkpoint,
+                    agent_turn_recovery_lease_json = $agent_turn_recovery_lease,
                     suspended_vm_name = $suspended_vm_name,
                     suspended_at = $suspended_at,
                     agent_log_path = $agent_log_path,
@@ -1348,6 +2057,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                     release_id = $release_id,
                     preempted_at = $preempted_at,
                     preempt_checkpoint = $preempt_checkpoint,
+                    agent_turn_resume_checkpoint_json = $agent_turn_resume_checkpoint,
+                    agent_turn_recovery_lease_json = $agent_turn_recovery_lease,
                     suspended_vm_name = $suspended_vm_name,
                     suspended_at = $suspended_at,
                     agent_log_path = $agent_log_path,
@@ -1769,6 +2480,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
                         release_id = $release_id,
                         preempted_at = $preempted_at,
                         preempt_checkpoint = $preempt_checkpoint,
+                        agent_turn_resume_checkpoint_json = $agent_turn_resume_checkpoint,
+                        agent_turn_recovery_lease_json = $agent_turn_recovery_lease,
                         suspended_vm_name = $suspended_vm_name,
                         suspended_at = $suspended_at,
                         agent_log_path = $agent_log_path,
@@ -3199,6 +3912,16 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         cmd.Parameters.AddWithValue("$release_id", (object?)item.ReleaseId?.ToString() ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$preempted_at", (object?)item.PreemptedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$preempt_checkpoint", (object?)item.PreemptCheckpoint ?? DBNull.Value);
+        cmd.Parameters.AddWithValue(
+            "$agent_turn_resume_checkpoint",
+            item.AgentTurnResumeCheckpoint is null
+                ? DBNull.Value
+                : JsonSerializer.Serialize(item.AgentTurnResumeCheckpoint, JsonOpts));
+        cmd.Parameters.AddWithValue(
+            "$agent_turn_recovery_lease",
+            item.AgentTurnRecoveryLease is null
+                ? DBNull.Value
+                : JsonSerializer.Serialize(item.AgentTurnRecoveryLease, JsonOpts));
         cmd.Parameters.AddWithValue("$suspended_vm_name", (object?)item.SuspendedVmName ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$suspended_at", (object?)item.SuspendedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$agent_log_path", (object?)item.AgentLogPath ?? DBNull.Value);
@@ -3327,6 +4050,8 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         ReleaseId = ReadNullableReleaseId(r, "release_id"),
         PreemptedAt = ReadNullableDateTimeOffset(r, "preempted_at"),
         PreemptCheckpoint = r.IsDBNull(r.GetOrdinal("preempt_checkpoint")) ? null : r.GetString(r.GetOrdinal("preempt_checkpoint")),
+        AgentTurnResumeCheckpoint = ReadAgentTurnResumeCheckpoint(r),
+        AgentTurnRecoveryLease = ReadAgentTurnRecoveryLease(r),
         SuspendedVmName = ReadNullableString(r, "suspended_vm_name"),
         SuspendedAt = ReadNullableDateTimeOffset(r, "suspended_at"),
         AgentLogPath = ReadNullableString(r, "agent_log_path"),
@@ -3371,6 +4096,91 @@ public sealed class SqliteWorkItemStore : IWorkItemStore, IAuditProgressStore, I
         PlanReviewSummary = ReadNullableString(r, "plan_review_summary"),
         PlanReviewAttempts = ReadInt32OrDefault(r, "plan_review_attempts", defaultValue: 0),
     };
+
+    private static AgentTurnResumeCheckpoint? ReadAgentTurnResumeCheckpoint(SqliteDataReader reader)
+    {
+        var ordinal = reader.GetOrdinal("agent_turn_resume_checkpoint_json");
+        if (reader.IsDBNull(ordinal))
+            return null;
+
+        try
+        {
+            var length = reader.GetChars(ordinal, 0, buffer: null, bufferOffset: 0, length: 0);
+            if (length <= 0 || length > MaximumAgentTurnResumeCheckpointJsonLength)
+            {
+                throw InvalidAgentTurnResumeCheckpoint(
+                    reader,
+                    $"JSON length must be between 1 and {MaximumAgentTurnResumeCheckpointJsonLength} characters");
+            }
+
+            return JsonSerializer.Deserialize<AgentTurnResumeCheckpoint>(reader.GetString(ordinal), JsonOpts)
+                ?? throw InvalidAgentTurnResumeCheckpoint(reader, "JSON value must be an object, not null");
+        }
+        catch (InvalidDataException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is JsonException or ArgumentException or InvalidCastException)
+        {
+            throw InvalidAgentTurnResumeCheckpoint(reader, "JSON is malformed or contains invalid checkpoint fields", ex);
+        }
+    }
+
+    private static InvalidDataException InvalidAgentTurnResumeCheckpoint(
+        SqliteDataReader reader,
+        string detail,
+        Exception? innerException = null)
+    {
+        var idOrdinal = reader.GetOrdinal("id");
+        var id = reader.IsDBNull(idOrdinal) ? "(unknown)" : reader.GetString(idOrdinal);
+        return new InvalidDataException(
+            $"work item {id}: agent_turn_resume_checkpoint_json is corrupt: {detail}",
+            innerException);
+    }
+
+    private static SandboxRecoveryLease? ReadAgentTurnRecoveryLease(SqliteDataReader reader)
+    {
+        var ordinal = reader.GetOrdinal("agent_turn_recovery_lease_json");
+        if (reader.IsDBNull(ordinal))
+            return null;
+
+        try
+        {
+            var length = reader.GetChars(ordinal, 0, buffer: null, bufferOffset: 0, length: 0);
+            if (length <= 0 || length > MaximumAgentTurnRecoveryLeaseJsonLength)
+            {
+                throw InvalidAgentTurnRecoveryLease(
+                    reader,
+                    $"JSON length must be between 1 and {MaximumAgentTurnRecoveryLeaseJsonLength} characters");
+            }
+
+            return JsonSerializer.Deserialize<SandboxRecoveryLease>(reader.GetString(ordinal), JsonOpts)
+                ?? throw InvalidAgentTurnRecoveryLease(reader, "JSON value must be an object, not null");
+        }
+        catch (InvalidDataException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is JsonException or ArgumentException or InvalidCastException)
+        {
+            throw InvalidAgentTurnRecoveryLease(
+                reader,
+                "JSON is malformed or contains invalid recovery-lease fields",
+                ex);
+        }
+    }
+
+    private static InvalidDataException InvalidAgentTurnRecoveryLease(
+        SqliteDataReader reader,
+        string detail,
+        Exception? innerException = null)
+    {
+        var idOrdinal = reader.GetOrdinal("id");
+        var id = reader.IsDBNull(idOrdinal) ? "(unknown)" : reader.GetString(idOrdinal);
+        return new InvalidDataException(
+            $"work item {id}: agent_turn_recovery_lease_json is corrupt: {detail}",
+            innerException);
+    }
 
     private static IReadOnlyList<CheckVerdict> ReadReCheckVerdicts(SqliteDataReader r)
     {

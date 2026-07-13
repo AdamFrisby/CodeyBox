@@ -31,13 +31,28 @@ public static class AgentSuspendResilience
 
     /// <summary>
     /// Returns true when <paramref name="exitCode"/> matches the set of exit
-    /// shapes the suspend-resilience retry treats as transient. Exposed so
-    /// the CLI-native session-resume path can apply the same allowlist (resume
-    /// is recovery for the same family of transient blips), keeping the two
-    /// recovery policies aligned.
+    /// shapes the legacy single-shot suspend-resilience retry treats as
+    /// transient. CLI-native resume has stronger evidence (a validated session
+    /// id) and separately accepts any non-zero Normal/Unknown process exit.
     /// </summary>
     public static bool IsSuspendRelatedExitCode(int exitCode) =>
         SuspendRelatedExitCodes.Contains(exitCode);
+
+    /// <summary>
+    /// Exit codes that are direct process-termination evidence rather than an
+    /// agent-authored diagnostic. SIGKILL/OOM (137) is safe to retain as an
+    /// infrastructure-shaped durable checkpoint after live resume exhausts.
+    /// </summary>
+    public static bool IsInfrastructureProcessExitCode(int exitCode) => exitCode == 137;
+
+    /// <summary>Parses the canonical CLI-runner failure summary, or returns -1.</summary>
+    public static int ParseAgentExitCode(string? summary)
+    {
+        const string prefix = "agent exited ";
+        if (summary is null || !summary.StartsWith(prefix, StringComparison.Ordinal))
+            return -1;
+        return int.TryParse(summary.AsSpan(prefix.Length), out var code) ? code : -1;
+    }
 
     /// <summary>
     /// All built-in agent CLIs routed through <see cref="CliAgentRunnerBase"/>.
@@ -56,7 +71,7 @@ public static class AgentSuspendResilience
         if (!SupportedAgents.Contains(agent.Value))
             return false;
 
-        if (classification.Kind == AgentFailureKind.Unknown && SuspendRelatedExitCodes.Contains(exitCode))
+        if (classification.Kind == AgentFailureKind.Unknown && IsSuspendRelatedExitCode(exitCode))
             return true;
 
         return false;

@@ -146,16 +146,20 @@ public sealed class CodexAgentRunnerTests
     {
         var sandbox = new RecordingSandbox(authWriteExitCode: 7);
         var runner = new CodexAgentRunner();
+        var nativeSessionId = new AgentNativeSessionId("thread_resume_after_auth_recovery");
 
         var result = await runner.RunResumedAsync(
             sandbox,
             "/work",
             "resume prompt",
             credential: null,
-            new AgentResumeContext("refs/heads/codeybox/preempt/wi"));
+            new AgentResumeContext(
+                "refs/heads/codeybox/preempt/wi",
+                NativeSessionId: nativeSessionId));
 
         Assert.False(result.Success);
         Assert.Equal("failed to materialise codex auth: exit 7", result.Summary);
+        Assert.Equal(nativeSessionId, result.NativeSessionId);
         Assert.DoesNotContain(sandbox.Execs, exec => exec.Argv.Count > 0 && exec.Argv[0] == "codex");
     }
 

@@ -46,9 +46,10 @@ public sealed class ClaudeSessionWorkerTests
         var worker = new ClaudeSessionWorker(BuildRunner());
 
         var handle = await worker.OpenSessionAsync(sandbox, "/work", credential: null);
-        await worker.SendTurnAsync(handle, "first prompt");
+        var result = await worker.SendTurnAsync(handle, "first prompt");
 
         var argv = sandbox.AgentExec!.Argv.ToList();
+        Assert.Equal("cli-sess-1", result.NativeSessionId?.Value);
         Assert.DoesNotContain("--resume", argv);
         Assert.Contains("--output-format", argv);
         Assert.Contains("stream-json", argv);

@@ -61,7 +61,8 @@ public static class SandboxCredentialFileWriter
                 relativePath,
                 result.ExitCode,
                 result.Stdout,
-                result.Stderr);
+                result.Stderr,
+                result.ExecutionUnavailable);
         }
     }
 
@@ -599,17 +600,20 @@ public sealed class SandboxCredentialFileWriteException : Exception
         string relativePath,
         int exitCode,
         string? stdout,
-        string? stderr)
+        string? stderr,
+        bool executionUnavailable)
         : base($"Sandbox credential file write failed with exit code {exitCode}.")
     {
         RelativePath = relativePath;
         ExitCode = exitCode;
         Stdout = stdout;
         Stderr = stderr;
+        ExecutionUnavailable = executionUnavailable;
     }
 
     public string RelativePath { get; }
     public int ExitCode { get; }
     public string? Stdout { get; }
     public string? Stderr { get; }
+    public bool ExecutionUnavailable { get; }
 }

@@ -118,6 +118,113 @@ Adding them would mean implementing a streaming variant of `ISandbox.ExecAsync`
 plus a turn-loop in the runner — both are bounded scope and can be added
 without changing the orchestrator.
 
+## Recovering an interrupted one-shot turn
+
+The one-shot process may exit before the orchestrator can commit its work. For
+work and rework turns, CodeyBox has three bounded recovery layers. The third is
+currently Incus-only:
+
+| Layer | What is preserved | Resume behavior |
+|---|---|---|
+| Live-sandbox CLI resume | The current `/work` tree and, for Claude/Codex, the exact validated CLI session id captured from structured output | While the sandbox is still usable, Claude runs `--resume <id>` and Codex runs `exec resume <id>`. The resumed CLI receives a short continuation instruction rather than the original task again. |
+| Durable agent-turn checkpoint | The dirty source tree in an immutable content-addressed Git ref; a bounded CLI scratchpad archive in host-private SQLite storage; phase, prompt revision, and exact route/model/reasoning metadata; and an optional native session id | A later dispatch atomically claims an attempt and fetches the source ref into a new sandbox. The exact route receives the private archive through `RunResumedAsync`; Claude/Codex also use the exact saved session id when available. |
+| Retained Incus recovery lease | The exact stopped Incus VM and its persistent COW-root `/work`, plus a provider-bound opaque token and creation-time recovery manifest | Used only when Incus cannot execute the commands needed to create the immutable checkpoint. A later pickup adopts that exact VM under an exclusive preparation claim, converts it to the ordinary Git/private-state checkpoint without dispatching an agent, deletes the duplicate VM, and automatically queues the immutable resume. |
+
+The durable checkpoint is retained only when a work/rework result remains a
+recognised quota failure, transient-network failure, infrastructure failure
+with the sandbox provider's explicit `ExecutionUnavailable` signal, or process
+exit `137` (SIGKILL/OOM infrastructure evidence). It is not retained merely
+because stderr contains infrastructure-shaped text or a generic CLI retry
+budget was exhausted.
+
+The scratchpad archive is capped at 32 MiB and never committed to Git. It is
+captured under the private `/run/codeybox/agent-turn` tmpfs, removed from that
+tmpfs before the dirty source tree is staged, and any legacy repository-local
+scratchpad artifacts are stripped from the Git index.
+The resulting ref has the canonical shape
+`refs/heads/codeybox/preempt/<work-item-id>/<source-commit>-<archive-sha256>`;
+resume verifies that it names the same work item and resolves to the embedded
+source commit. The archive is an immutable SQLite BLOB keyed by that exact ref,
+and its bytes are verified against the embedded SHA-256 before restoration.
+This content binding lets a failed replacement capture roll back its own BLOB
+without changing an older valid checkpoint.
+
+If Incus reports execution unavailable and the immutable capture cannot run,
+CodeyBox may publish a retained-sandbox lease instead. Lease publication keeps
+the same turn metadata and is atomic with the work-item lifecycle comparison.
+It is accepted only while the global
+`CodeyBox:PipelineTuning:MaxRetainedAgentTurnSandboxes` count is below its
+configured bound (16 by default). Reaching the cap does not manufacture a
+checkpoint or success result: preservation is disarmed and the original
+failure remains authoritative.
+
+The lease is an internal capability. Incus binds its token hash and immutable
+manifest hash to the VM at creation time and keeps the manifest in its private
+host staging tree. Adoption validates the exact provider, project, instance,
+sandbox specification, storage and guest identities, network and mount
+topology, host-source inode pins, and recorded guest links. A database
+preparation claim and the provider's host file lock prevent two workers or
+processes from mutating the retained VM concurrently. A failed adoption or
+conversion leaves the VM preserved and releases that preparation claim; it
+does not consume a resumed-agent attempt.
+
+The retained VM is mutable recovery evidence, so CodeyBox never launches the
+next agent turn in it. Once infrastructure is healthy, the adopter first
+captures the CLI scratchpad and dirty tree into the normal content-bound
+checkpoint. SQLite publication atomically replaces the lease with the
+Git/private-state boundary. Only then is VM preservation disarmed, the VM
+deleted, and the item enqueued for an ordinary immutable resumed dispatch.
+
+Retry without an explicit phase automatically chooses the interrupted work or
+rework boundary. The first resumed dispatch is pinned to the exact agent
+instance route, model, and reasoning mode that created the checkpoint. If an
+agent-class fallback later selects a different member, that member may continue
+from the checkpointed source tree, but it never receives another route's
+host-private archive or native session id. Because the private bytes were never
+Git objects, the fallback cannot recover them from the worktree, Git history,
+or the mounted bare origin. This file-only fallback prevents a provider session
+from being attached across an agent/account boundary.
+
+A clean resumed invocation with no new Git diff is successful only when the
+checkpoint itself already contains meaningful source changes relative to the
+work-branch tip from before the interrupted turn. An empty checkpoint followed
+by a no-op resume follows the ordinary initial-work or rework no-diff failure
+policy; recovery does not manufacture a successful turn from an allow-empty
+checkpoint commit.
+
+`CodeyBox:PipelineTuning:AgentSessionResumeMaxAttempts` bounds both live
+CLI-native resume attempts and durable checkpoint re-dispatches; the counters
+are separate. Every durable dispatch, including direct startup/dead-worker
+re-enqueues, converges on one atomic claim in `PipelineRunner`; concurrent or
+over-budget claims fail closed. A value of `0` disables CLI-native resume and
+agent-turn re-dispatch, but does not redefine the separate legacy suspend retry,
+sandbox-adoption, or Git-only preempt-record behavior. A prompt revision change,
+an explicit retry from a different phase, successful phase completion, or
+exhaustion of the durable attempt budget discards the checkpoint instead of
+resuming stale context. The checkpoint also remains paired while an exact route
+is parked in `WaitingForAgentResume`. Typed Git or retained-lease boundaries
+also remain paired in `NeedsOperatorInput` and
+`AbandonedAfterRecoveryAttempts`, where an operator may still choose the exact
+recovery boundary. Cancellation or a lifecycle move that intentionally clears
+the boundary exposes any retained VM to the normal sandbox leak reaper.
+
+After a resumed agent returns successfully and CodeyBox pushes and syncs its
+resulting tree to the work branch, the older turn checkpoint and private archive
+are cleared before required-build or other post-agent verification. If that
+later verification is unavailable, retry starts from the durable published
+branch boundary rather than replaying the pre-turn source tree and session.
+
+This path is fail-closed. Outside the bounded Incus retained-lease fallback, a
+runner that cannot capture a checkpoint, a failed private-archive write, a
+failed Git push, or a failure before any resumable state exists follows the
+normal phase failure/retry policy. It does not manufacture a successful turn.
+Clearing checkpoint metadata deletes the paired private archives in the same
+SQLite update; startup reconciliation removes orphaned or no-longer-referenced
+archives left by a crash. A deleted retained VM or lost root disk cannot be
+reconstructed. After conversion, a replacement sandbox needs the pushed
+content-bound source ref, and exact-route session restoration additionally
+needs its matching host-private archive.
+
 ## Session-capable runners
 
 `IAgentRunner.RunAsync` remains the default one-shot contract. Runners that can
@@ -335,8 +442,14 @@ re-attempting the failed resume).
 
 **Pipeline-level restart behavior (item 3):** when a session-enabled item
 is interrupted by an orchestrator restart, the pipeline does NOT attempt
-to reattach to the orphaned worker VM from the prior process. Instead the
-recovered item degrades to the legacy one-shot path for the remainder:
+to reattach to the orphaned session-worker VM from the prior process. The
+durable one-shot-turn checkpoint described above is a separate mechanism:
+when one exists, the recovered item uses the legacy independent-phase path
+to restore its source tree and, only for the exact route, its host-private
+runner scratchpad in a new sandbox.
+
+Without a checkpoint, the recovered session-worker item degrades to the
+legacy one-shot path for the remainder:
 
 - An item picked up at `WorkComplete` or later (`skipWork=true`) doesn't
   open a new session lifecycle; the existing audit / rework / merge loop
@@ -345,11 +458,11 @@ recovered item degrades to the legacy one-shot path for the remainder:
   against a new VM. The prior VM is treated as a leak and reaped by
   `SandboxLeakReaper`.
 
-Either way the item never strands — the brief's "resumes-or-degrades"
-contract is satisfied by the degrade path. Reviving a session against an
-existing VM would require an `IAttachableSandboxProvider` hook the
-provider API does not yet expose; adding that is left for a later
-rollout.
+Either way the item never strands — it resumes from durable checkpoint
+evidence when that evidence exists, or takes the degrade path. Reviving the
+session worker against an existing VM would require an
+`IAttachableSandboxProvider` hook the provider API does not yet expose;
+agent-turn recovery intentionally does not claim to reattach that VM.
 
 Per-turn metrics are emitted as `ClaudeSessionTurnMetrics` snapshots to the
 registered `IClaudeSessionMetricsSink`. Each snapshot carries the total

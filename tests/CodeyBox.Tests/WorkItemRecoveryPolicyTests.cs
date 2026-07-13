@@ -347,10 +347,24 @@ public sealed class WorkItemRecoveryPolicyTests
     [Fact]
     public void GracefulShutdownRecovery_WorkingWithPreemptCheckpoint_PreservesResumeState()
     {
-        var item = MakeItem(WorkItemState.Working) with
+        var item = MakeItem(WorkItemState.Working);
+        var checkpoint = new AgentTurnResumeCheckpoint(
+            AgentKind.Claude,
+            "claude/default",
+            modelId: null,
+            reasoningMode: null,
+            nativeSessionId: null,
+            WorkItemState.Working,
+            AgentTurnResumePhase.Work,
+            iteration: null,
+            item.PromptRevision,
+            DateTimeOffset.UtcNow.AddMinutes(-4))
+            .ClaimDispatch(Guid.Parse("f21274ce-748f-444a-a928-4c8811b30f51"));
+        item = item with
         {
             StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
             PreemptCheckpoint = "refs/heads/codeybox/preempt/test",
+            AgentTurnResumeCheckpoint = checkpoint,
         };
 
         var recovered = WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(
@@ -363,6 +377,8 @@ public sealed class WorkItemRecoveryPolicyTests
         Assert.Null(recovered.StartedAt);
         Assert.Equal(1, recovered.RecoveryAttempts);
         Assert.Equal(item.PreemptCheckpoint, recovered.PreemptCheckpoint);
+        Assert.Equal(1, recovered.AgentTurnResumeCheckpoint?.AttemptCount);
+        Assert.Null(recovered.AgentTurnResumeCheckpoint?.DispatchClaimId);
     }
 
     [Theory]
@@ -387,6 +403,30 @@ public sealed class WorkItemRecoveryPolicyTests
         Assert.Null(recovered.PreemptCheckpoint);
     }
 
+    [Theory]
+    [InlineData(WorkItemState.Working)]
+    [InlineData(WorkItemState.Reworking)]
+    public void GracefulShutdownRecovery_WithRetainedSandbox_AtCapPreservesOperatorRecoveryBoundary(
+        WorkItemState state)
+    {
+        var item = WithRetainedSandboxBoundary(MakeItem(state)) with
+        {
+            RecoveryAttempts = 3,
+        };
+
+        var recovered = WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(
+            item,
+            DateTimeOffset.UtcNow,
+            maxRecoveryAttempts: 3);
+
+        Assert.NotNull(recovered);
+        Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, recovered!.State);
+        Assert.Equal(4, recovered.RecoveryAttempts);
+        Assert.Same(item.AgentTurnResumeCheckpoint, recovered.AgentTurnResumeCheckpoint);
+        Assert.Same(item.AgentTurnRecoveryLease, recovered.AgentTurnRecoveryLease);
+        Assert.True(recovered.HasAgentTurnRecoveryBoundary);
+    }
+
     [Fact]
     public void GracefulShutdownRecovery_NormalRecoverableState_AtCapAbandons()
     {
@@ -401,6 +441,26 @@ public sealed class WorkItemRecoveryPolicyTests
         Assert.Equal(WorkItemState.AbandonedAfterRecoveryAttempts, recovered!.State);
         Assert.Equal(4, recovered.RecoveryAttempts);
         Assert.Contains("MaxRecoveryAttempts", recovered.LastError);
+    }
+
+    [Fact]
+    public void StaleRecovery_WithRetainedSandbox_AtCapPreservesOperatorRecoveryBoundary()
+    {
+        var item = WithRetainedSandboxBoundary(MakeItem(WorkItemState.Working));
+
+        var recovered = WorkItemRecoveryPolicy.BuildStaleItemRecovery(
+            item,
+            attempts: 4,
+            maxAttempts: 3,
+            reason: "stale retained sandbox",
+            now: DateTimeOffset.UtcNow);
+
+        Assert.NotNull(recovered);
+        Assert.Equal(WorkItemState.NeedsOperatorInput, recovered!.State);
+        Assert.Equal(4, recovered.RecoveryAttempts);
+        Assert.Same(item.AgentTurnResumeCheckpoint, recovered.AgentTurnResumeCheckpoint);
+        Assert.Same(item.AgentTurnRecoveryLease, recovered.AgentTurnRecoveryLease);
+        Assert.True(recovered.HasAgentTurnRecoveryBoundary);
     }
 
     [Theory]
@@ -683,6 +743,28 @@ public sealed class WorkItemRecoveryPolicyTests
             Agent = AgentKind.Claude.Value,
             Reason = "reserve quota",
         },
+    };
+
+    private static WorkItem WithRetainedSandboxBoundary(WorkItem item) => item with
+    {
+        PreemptedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+        AgentTurnResumeCheckpoint = new AgentTurnResumeCheckpoint(
+            AgentKind.Claude,
+            "claude/default",
+            modelId: null,
+            reasoningMode: null,
+            nativeSessionId: null,
+            item.State,
+            item.State == WorkItemState.Working
+                ? AgentTurnResumePhase.Work
+                : AgentTurnResumePhase.Rework,
+            iteration: null,
+            item.PromptRevision,
+            DateTimeOffset.UtcNow.AddMinutes(-5)),
+        AgentTurnRecoveryLease = new SandboxRecoveryLease(
+            "incus",
+            $"retained-{item.Id}",
+            $"token-{item.Id}"),
     };
 
     private const string ValidPlan = """

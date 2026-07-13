@@ -1251,6 +1251,18 @@ internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox,
         ReleaseAdmissionAfterPreserve();
     }
 
+    protected async Task<SandboxRecoveryLease?> RetainInfrastructureRecoveryAndReleaseAdmissionAsync(
+        IPreemptibleSandbox preemptible,
+        CancellationToken ct)
+    {
+        var recoveryLease = await preemptible
+            .RetainForInfrastructureRecoveryAsync(ct)
+            .ConfigureAwait(false);
+        if (recoveryLease is not null)
+            ReleaseAdmissionAfterPreserve();
+        return recoveryLease;
+    }
+
     private void ReleaseAdmissionAfterPreserve()
     {
         SandboxAdmissionLease? release = null;
@@ -1287,6 +1299,9 @@ internal sealed class AdmissionControlledPreemptibleSandbox(
 {
     public Task StopAndPreserveAsync(CancellationToken ct = default) =>
         StopAndReleaseAdmissionAsync(preemptible, ct);
+
+    public Task<SandboxRecoveryLease?> RetainForInfrastructureRecoveryAsync(CancellationToken ct = default) =>
+        RetainInfrastructureRecoveryAndReleaseAdmissionAsync(preemptible, ct);
 }
 
 internal sealed class AdmissionControlledShutdownSandbox(
@@ -1337,6 +1352,9 @@ internal sealed class AdmissionControlledPreemptibleSuspendableSandbox(
     public Task StopAndPreserveAsync(CancellationToken ct = default) =>
         StopAndReleaseAdmissionAsync(preemptible, ct);
 
+    public Task<SandboxRecoveryLease?> RetainForInfrastructureRecoveryAsync(CancellationToken ct = default) =>
+        RetainInfrastructureRecoveryAndReleaseAdmissionAsync(preemptible, ct);
+
     public Task SuspendAsync(CancellationToken ct = default) =>
         suspendable.SuspendAsync(ct);
 }
@@ -1357,6 +1375,9 @@ internal sealed class AdmissionControlledPreemptibleShutdownSandbox(
 
     public Task StopAndPreserveAsync(CancellationToken ct = default) =>
         StopAndReleaseAdmissionAsync(preemptible, ct);
+
+    public Task<SandboxRecoveryLease?> RetainForInfrastructureRecoveryAsync(CancellationToken ct = default) =>
+        RetainInfrastructureRecoveryAndReleaseAdmissionAsync(preemptible, ct);
 
     public void MarkOwnedByShutdownHandler() => shutdown.MarkOwnedByShutdownHandler();
 }
@@ -1407,6 +1428,9 @@ internal sealed class AdmissionControlledFullSandbox(
 
     public Task StopAndPreserveAsync(CancellationToken ct = default) =>
         StopAndReleaseAdmissionAsync(preemptible, ct);
+
+    public Task<SandboxRecoveryLease?> RetainForInfrastructureRecoveryAsync(CancellationToken ct = default) =>
+        RetainInfrastructureRecoveryAndReleaseAdmissionAsync(preemptible, ct);
 
     public Task SuspendAsync(CancellationToken ct = default) =>
         suspendable.SuspendAsync(ct);

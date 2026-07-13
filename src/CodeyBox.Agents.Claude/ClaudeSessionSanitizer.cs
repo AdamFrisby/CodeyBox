@@ -65,7 +65,10 @@ public static class ClaudeSessionSanitizer
                 Success: false,
                 Summary: $"transcript backup script failed (exit {listResult.ExitCode})",
                 Stdout: listResult.Stdout,
-                Stderr: listResult.Stderr);
+                Stderr: listResult.Stderr)
+            {
+                ExecutionUnavailable = listResult.ExecutionUnavailable,
+            };
         }
 
         var files = listResult.Stdout
@@ -99,7 +102,10 @@ public static class ClaudeSessionSanitizer
                     Success: false,
                     Summary: $"transcript sanitisation failed writing {Path.GetFileName(file)} (exit {writeResult.ExitCode})",
                     Stdout: writeResult.Stdout,
-                    Stderr: writeResult.Stderr);
+                    Stderr: writeResult.Stderr)
+                {
+                    ExecutionUnavailable = writeResult.ExecutionUnavailable,
+                };
             }
         }
 

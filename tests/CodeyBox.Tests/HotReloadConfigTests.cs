@@ -497,6 +497,8 @@ public sealed class HotReloadConfigTests
                 ["CodeyBox:Incus:ExecPidPollAttempts"] = "7",
                 ["CodeyBox:Incus:ExecControlFileCleanupAttempts"] = "11",
                 ["CodeyBox:Incus:ExecCompletionProbeAttempts"] = "13",
+                ["CodeyBox:Incus:InterruptedExecRecoveryRetryAttempts"] = "4",
+                ["CodeyBox:Incus:InterruptedExecRecoveryRetryDelay"] = "00:00:09",
             })
             .Build();
 
@@ -508,6 +510,8 @@ public sealed class HotReloadConfigTests
         Assert.Equal(7, options.Incus.ExecPidPollAttempts);
         Assert.Equal(11, options.Incus.ExecControlFileCleanupAttempts);
         Assert.Equal(13, options.Incus.ExecCompletionProbeAttempts);
+        Assert.Equal(4, options.Incus.InterruptedExecRecoveryRetryAttempts);
+        Assert.Equal(TimeSpan.FromSeconds(9), options.Incus.InterruptedExecRecoveryRetryDelay);
     }
 
     [Fact]

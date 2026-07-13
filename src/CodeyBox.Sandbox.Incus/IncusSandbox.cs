@@ -56,16 +56,26 @@ internal sealed class IncusSandbox :
     private readonly TimeProvider _timeProvider;
     private readonly Func<Guid> _newGuid;
     private readonly Func<IncusSandboxOptions> _liveOptionsAccessor;
+    private readonly IncusRecoveryAuthorization _recoveryAuthorization;
+    private readonly SandboxRecoveryLease _recoveryLease;
+    private readonly IncusRecoveryManifestStore _recoveryManifestStore;
+    private readonly string _recoveryTokenHash;
+    private readonly string _recoveryBaseManifestHash;
+    private readonly IReadOnlyList<IncusPreparedMount> _guestTmpfsMounts;
     private readonly ConcurrentDictionary<string, bool> _activeExecs = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
     // 0 running, 1 stopping-to-preserve, 2 preserved, 3 disposing, 4 disposed,
-    // 5 VM absent but private staging cleanup is pending.
+    // 5 VM absent but private staging cleanup is pending, 6 durably retained
+    // for an infrastructure-recovery lease.
     private int _lifecycleState;
     private int _preserveOnDispose;
+    private int _infrastructureRecoveryLeaseArmed;
     private int _ownedByShutdownHandler;
     private int _execCount;
     private int _execCleanupPoisoned;
     private int _noLongerActive;
+    private PendingInterruptedExecRecovery? _pendingInterruptedExecRecovery;
+    private IncusRecoveryManifest _recoveryManifest;
 
     internal IncusSandbox(
         string id,
@@ -81,6 +91,10 @@ internal sealed class IncusSandbox :
         string? baselineRef,
         ISandboxResourceUsageStore? resourceUsageStore,
         Action<string> onDisposed,
+        IncusRecoveryAuthorization recoveryAuthorization,
+        SandboxRecoveryLease recoveryLease,
+        IncusRecoveryManifest recoveryManifest,
+        IncusRecoveryManifestStore recoveryManifestStore,
         TimeProvider? timeProvider = null,
         Func<Guid>? newGuid = null,
         Func<IncusSandboxOptions>? liveOptionsAccessor = null)
@@ -102,6 +116,45 @@ internal sealed class IncusSandbox :
         _timeProvider = timeProvider ?? TimeProvider.System;
         _newGuid = newGuid ?? Guid.NewGuid;
         _liveOptionsAccessor = liveOptionsAccessor ?? (() => _options);
+        _recoveryAuthorization = recoveryAuthorization
+            ?? throw new ArgumentNullException(nameof(recoveryAuthorization));
+        _recoveryLease = recoveryLease
+            ?? throw new ArgumentNullException(nameof(recoveryLease));
+        _recoveryManifest = recoveryManifest
+            ?? throw new ArgumentNullException(nameof(recoveryManifest));
+        _recoveryManifestStore = recoveryManifestStore
+            ?? throw new ArgumentNullException(nameof(recoveryManifestStore));
+        _recoveryTokenHash = IncusRecoveryManifestCodec.ComputeTokenSha256(_recoveryLease.Token);
+        var normalizedManifest = _recoveryManifest with
+        {
+            Retained = false,
+            PendingExec = null,
+        };
+        _recoveryBaseManifestHash = IncusRecoveryManifestCodec.ComputeSha256(
+            IncusRecoveryManifestCodec.Serialize(normalizedManifest));
+        ValidateRecoveryBinding();
+        _recoveryAuthorization.RevalidateForRestart(_spec, _options, _stagingRoot);
+        _guestTmpfsMounts = _recoveryAuthorization.GuestTmpfsMounts;
+        if (_recoveryManifest.Retained)
+        {
+            // Adoption must remain fail-closed until the orchestrator has
+            // durably published the replacement checkpoint and explicitly
+            // disarms preservation. A failed preparation attempt can then be
+            // retried by a later process with the same private capability.
+            _infrastructureRecoveryLeaseArmed = 1;
+            _preserveOnDispose = 1;
+        }
+        if (_recoveryManifest.PendingExec is { } pending)
+        {
+            _pendingInterruptedExecRecovery = new PendingInterruptedExecRecovery(
+                pending.RunId,
+                pending.EnvironmentPath,
+                pending.PidPath,
+                pending.CompletionPath,
+                pending.HostDevicesDetached);
+            _activeExecs[pending.RunId] = true;
+            _execCleanupPoisoned = 1;
+        }
     }
 
     public string Id { get; }
@@ -111,6 +164,33 @@ internal sealed class IncusSandbox :
     public bool IsOwnedByShutdownHandler => Volatile.Read(ref _ownedByShutdownHandler) != 0;
 
     public void MarkOwnedByShutdownHandler() => Interlocked.Exchange(ref _ownedByShutdownHandler, 1);
+
+    private void ValidateRecoveryBinding()
+    {
+        if (!string.Equals(_recoveryLease.ProviderId, IncusSandboxProvider.ProviderId, StringComparison.Ordinal)
+            || !string.Equals(_recoveryLease.SandboxId, Id, StringComparison.Ordinal)
+            || _recoveryManifest.Version != IncusRecoveryManifest.CurrentVersion
+            || !string.Equals(_recoveryManifest.ProviderId, IncusSandboxProvider.ProviderId, StringComparison.Ordinal)
+            || !string.Equals(_recoveryManifest.SandboxId, Id, StringComparison.Ordinal)
+            || !string.Equals(_recoveryManifest.ProjectName, _options.ProjectName, StringComparison.Ordinal)
+            || !string.Equals(_recoveryManifest.StoragePoolName, _options.StoragePoolName, StringComparison.Ordinal)
+            || !string.Equals(_recoveryManifest.GuestHome, _options.GuestHome, StringComparison.Ordinal)
+            || _recoveryManifest.GuestUserId != _options.GuestUserId
+            || _recoveryManifest.GuestGroupId != _options.GuestGroupId)
+        {
+            throw new InvalidDataException("Incus recovery lease and manifest identity do not match this sandbox.");
+        }
+        var tokenHash = IncusRecoveryManifestCodec.ComputeTokenSha256(_recoveryLease.Token);
+        if (!IncusRecoveryManifestCodec.FixedTimeEqualsHash(tokenHash, _recoveryManifest.LeaseTokenSha256))
+            throw new InvalidDataException("Incus recovery lease token does not match its manifest.");
+        var specHash = IncusRecoveryManifestCodec.ComputeSpecSha256(_spec);
+        if (!IncusRecoveryManifestCodec.FixedTimeEqualsHash(specHash, _recoveryManifest.SpecSha256))
+            throw new InvalidDataException("Incus recovery manifest does not match the sandbox specification.");
+        if (_recoveryManifest.Retained != (_recoveryManifest.PendingExec is not null))
+            throw new InvalidDataException("Incus recovery manifest has an invalid retained-state shape.");
+        if (_recoveryManifest.Retained)
+            _recoveryManifest.ValidatePendingExec();
+    }
 
     public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
@@ -129,8 +209,29 @@ internal sealed class IncusSandbox :
         {
             if (_lifecycleState != 0)
                 throw new InvalidOperationException("The Incus sandbox is stopping, preserved, or disposed.");
-            if (Volatile.Read(ref _execCleanupPoisoned) != 0)
-                throw new InvalidOperationException("The Incus sandbox has an unverified prior exec cleanup and must be disposed.");
+            if (Volatile.Read(ref _execCleanupPoisoned) != 0
+                && !await TryRecoverPendingInterruptedExecUnderGateAsync(ct).ConfigureAwait(false))
+            {
+                return new SandboxExecResult(
+                    255,
+                    string.Empty,
+                    "Incus infrastructure recovery remains unavailable after this bounded attempt window; the exact interrupted exec is retained for a later resume.\n",
+                    ExecutionUnavailable: true);
+            }
+            if (Volatile.Read(ref _infrastructureRecoveryLeaseArmed) != 0)
+            {
+                if (!_activeExecs.IsEmpty)
+                {
+                    throw new InvalidOperationException(
+                        "Incus recovery-checkpoint preparation permits only one durably journaled exec at a time.");
+                }
+                PublishRetainedPendingExec(new PendingInterruptedExecRecovery(
+                    runId,
+                    environmentPath,
+                    pidPath,
+                    completionPath,
+                    HostDevicesDetached: false));
+            }
             _activeExecs[runId] = true;
         }
         finally
@@ -185,11 +286,16 @@ internal sealed class IncusSandbox :
                     stderrChunkCallback: exec.StderrChunkCallback,
                     killOnOutputLimit: exec.KillOnOutputLimit).ConfigureAwait(false);
             }
-            catch (Exception ex) when (ex is OperationCanceledException or TimeoutException)
+            catch
             {
                 Interlocked.Exchange(ref _execCleanupPoisoned, 1);
                 _ = await TerminateAmbiguousExecAsync(runId).ConfigureAwait(false);
                 cleanupConfirmed = false;
+                _ = await RegisterAndTryRecoverInterruptedExecAsync(
+                    runId,
+                    environmentPath,
+                    pidPath,
+                    completionPath).ConfigureAwait(false);
                 throw;
             }
             if (exec.KillOnOutputLimit && (result.StdoutLimitExceeded || result.StderrLimitExceeded))
@@ -197,21 +303,36 @@ internal sealed class IncusSandbox :
                 Interlocked.Exchange(ref _execCleanupPoisoned, 1);
                 _ = await TerminateAmbiguousExecAsync(runId).ConfigureAwait(false);
                 cleanupConfirmed = false;
+                _ = await RegisterAndTryRecoverInterruptedExecAsync(
+                    runId,
+                    environmentPath,
+                    pidPath,
+                    completionPath).ConfigureAwait(false);
             }
-            if (result.ExecutionUnavailable || result.StartFailed)
+            var executionInterrupted = result.ExecutionUnavailable || result.StartFailed;
+            if (cleanupConfirmed && executionInterrupted)
             {
                 Interlocked.Exchange(ref _execCleanupPoisoned, 1);
                 _ = await TerminateAmbiguousExecAsync(runId).ConfigureAwait(false);
                 cleanupConfirmed = false;
+                _ = await RegisterAndTryRecoverInterruptedExecAsync(
+                    runId,
+                    environmentPath,
+                    pidPath,
+                    completionPath).ConfigureAwait(false);
             }
             if (cleanupConfirmed
                 && !await VerifyGuestExecCompletionAsync(completionPath, result.ExitCode).ConfigureAwait(false))
             {
+                executionInterrupted = true;
                 Interlocked.Exchange(ref _execCleanupPoisoned, 1);
                 _ = await TerminateAmbiguousExecAsync(runId).ConfigureAwait(false);
                 cleanupConfirmed = false;
-                throw new InvalidOperationException(
-                    "Incus CLI returned without a matching guest completion sentinel; the VM was stopped and must be disposed.");
+                _ = await RegisterAndTryRecoverInterruptedExecAsync(
+                    runId,
+                    environmentPath,
+                    pidPath,
+                    completionPath).ConfigureAwait(false);
             }
             sandboxResult = new SandboxExecResult(
                 result.ExitCode,
@@ -219,7 +340,7 @@ internal sealed class IncusSandbox :
                 result.Stderr,
                 result.StdoutLimitExceeded,
                 result.StderrLimitExceeded,
-                result.ExecutionUnavailable || result.StartFailed);
+                executionInterrupted);
         }
         catch (Exception ex)
         {
@@ -241,6 +362,12 @@ internal sealed class IncusSandbox :
                 {
                     Interlocked.Exchange(ref _execCleanupPoisoned, 1);
                     _ = await TerminateAmbiguousExecAsync(runId).ConfigureAwait(false);
+                    cleanupConfirmed = false;
+                    _ = await RegisterAndTryRecoverInterruptedExecAsync(
+                        runId,
+                        environmentPath,
+                        pidPath,
+                        completionPath).ConfigureAwait(false);
                     if (primaryFailure is null)
                     {
                         cleanupFailure = new InvalidOperationException(
@@ -311,6 +438,7 @@ internal sealed class IncusSandbox :
             preemptMarkerWritten = true;
             if (_options.CaptureResourceMetrics)
                 await CaptureResourceMetricsBestEffortAsync().ConfigureAwait(false);
+            await EnsureLifecycleBindingAsync(ct).ConfigureAwait(false);
             var argv = IncusCommandBuilder.Prefix(
                 _options,
                 "stop",
@@ -450,9 +578,100 @@ internal sealed class IncusSandbox :
         }
     }
 
+    public async Task<SandboxRecoveryLease?> RetainForInfrastructureRecoveryAsync(
+        CancellationToken ct = default)
+    {
+        await _lifecycleGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (_lifecycleState == 6)
+            {
+                var retainedJournal = _recoveryManifestStore.ReadRetained();
+                retainedJournal.ValidatePendingExec();
+                if (retainedJournal.PendingExec != _recoveryManifest.PendingExec)
+                    throw new InvalidDataException("Incus retained recovery journal changed after publication.");
+                Interlocked.Exchange(ref _infrastructureRecoveryLeaseArmed, 1);
+                Interlocked.Exchange(ref _preserveOnDispose, 1);
+                return _recoveryLease;
+            }
+            if (_lifecycleState != 0)
+                throw new InvalidOperationException("The Incus sandbox is stopping, preserved, or disposed.");
+            if (Volatile.Read(ref _execCleanupPoisoned) != 1
+                || _pendingInterruptedExecRecovery is not { } pending)
+            {
+                throw new InvalidOperationException(
+                    "Incus infrastructure retention requires one exact pending interrupted exec.");
+            }
+            var activeRunIds = _activeExecs.Keys.ToArray();
+            if (activeRunIds.Length != 1
+                || !string.Equals(activeRunIds[0], pending.RunId, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "Incus infrastructure retention cannot prove a sole interrupted exec owner.");
+            }
+
+            var durablePending = new IncusRecoveryPendingExec(
+                pending.RunId,
+                pending.EnvironmentPath,
+                pending.PidPath,
+                pending.CompletionPath,
+                pending.HostDevicesDetached);
+            if (_recoveryManifest.Retained
+                && _recoveryManifest.PendingExec != durablePending)
+            {
+                throw new InvalidOperationException(
+                    "Incus infrastructure retention cannot replace different pending recovery metadata.");
+            }
+            var retained = _recoveryManifest.Retain(durablePending);
+            _recoveryManifestStore.WriteRetained(
+                retained,
+                NextGuid("retained recovery manifest"));
+            _recoveryManifest = retained;
+            Interlocked.Exchange(ref _preserveOnDispose, 1);
+            Interlocked.Exchange(ref _infrastructureRecoveryLeaseArmed, 1);
+            _lifecycleState = 6;
+            return _recoveryLease;
+        }
+        finally
+        {
+            _lifecycleGate.Release();
+        }
+    }
+
+    internal async Task RecoverRetainedForAdoptionAsync(CancellationToken ct)
+    {
+        await _lifecycleGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (_lifecycleState != 0
+                || Volatile.Read(ref _execCleanupPoisoned) != 1
+                || _pendingInterruptedExecRecovery is null)
+            {
+                throw new InvalidDataException("Incus retained sandbox has no exact pending recovery to adopt.");
+            }
+            if (!await TryRecoverInterruptedExecUnderGateAsync(
+                    _pendingInterruptedExecRecovery,
+                    ct).ConfigureAwait(false))
+            {
+                throw new SandboxExecutionUnavailableException(255);
+            }
+        }
+        finally
+        {
+            _lifecycleGate.Release();
+        }
+    }
+
+    internal void ReleaseFailedAdoptionHandle()
+    {
+        _recoveryAuthorization.Dispose();
+        _recoveryManifestStore.Dispose();
+    }
+
     private async Task DeleteAfterUnsafePreservationAsync()
     {
         Interlocked.Exchange(ref _preserveOnDispose, 0);
+        Interlocked.Exchange(ref _infrastructureRecoveryLeaseArmed, 0);
         var exists = await VerifyOwnershipOrAbsenceAsync(CancellationToken.None).ConfigureAwait(false);
         if (exists)
         {
@@ -500,7 +719,11 @@ internal sealed class IncusSandbox :
         }
     }
 
-    public void DisablePreserveOnDispose() => Interlocked.Exchange(ref _preserveOnDispose, 0);
+    public void DisablePreserveOnDispose()
+    {
+        Interlocked.Exchange(ref _infrastructureRecoveryLeaseArmed, 0);
+        Interlocked.Exchange(ref _preserveOnDispose, 0);
+    }
 
     public async ValueTask DisposeAsync()
     {
@@ -512,7 +735,9 @@ internal sealed class IncusSandbox :
         {
             if (_lifecycleState is 3 or 4)
                 return;
-            if (_lifecycleState == 2 && Volatile.Read(ref _preserveOnDispose) != 0)
+            if (Volatile.Read(ref _preserveOnDispose) != 0
+                && (_lifecycleState is 2 or 6
+                    || Volatile.Read(ref _infrastructureRecoveryLeaseArmed) != 0))
             {
                 NotifyNoLongerActive();
                 return;
@@ -710,6 +935,7 @@ internal sealed class IncusSandbox :
         ProcessRunResult stop;
         try
         {
+            await EnsureLifecycleBindingAsync(CancellationToken.None).ConfigureAwait(false);
             stop = await _cli.RunAllowFailureAsync(
                 _options,
                 IncusCommandBuilder.Prefix(_options, "stop", Id, "--force"),
@@ -749,7 +975,579 @@ internal sealed class IncusSandbox :
         }
     }
 
-    private async Task<bool> EnsureGuestControlFileAbsentAsync(string path)
+    private async Task<bool> RegisterAndTryRecoverInterruptedExecAsync(
+        string runId,
+        string environmentPath,
+        string pidPath,
+        string completionPath)
+    {
+        await _lifecycleGate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        try
+        {
+            if (_lifecycleState != 0 || Volatile.Read(ref _execCleanupPoisoned) != 1)
+                return false;
+
+            var pending = new PendingInterruptedExecRecovery(
+                runId,
+                environmentPath,
+                pidPath,
+                completionPath,
+                HostDevicesDetached: false);
+            if (_pendingInterruptedExecRecovery is { } existing)
+            {
+                if (!string.Equals(existing.RunId, pending.RunId, StringComparison.Ordinal)
+                    || !string.Equals(existing.EnvironmentPath, pending.EnvironmentPath, StringComparison.Ordinal)
+                    || !string.Equals(existing.PidPath, pending.PidPath, StringComparison.Ordinal)
+                    || !string.Equals(existing.CompletionPath, pending.CompletionPath, StringComparison.Ordinal))
+                {
+                    _log.LogWarning(
+                        "Refusing to replace pending interrupted-exec recovery metadata for Incus sandbox {SandboxId}",
+                        Id);
+                }
+
+                return false;
+            }
+            _pendingInterruptedExecRecovery = pending;
+
+            return await TryRecoverInterruptedExecUnderGateAsync(
+                pending,
+                CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            _lifecycleGate.Release();
+        }
+    }
+
+    private async Task<bool> TryRecoverPendingInterruptedExecUnderGateAsync(CancellationToken ct)
+    {
+        if (_pendingInterruptedExecRecovery is not { } pending)
+            return false;
+
+        var policy = ReadInterruptedExecRecoveryPolicy();
+        var attemptsThisWindow = 0;
+        while (attemptsThisWindow < policy.MaximumRetryAttempts)
+        {
+            await Task.Delay(policy.RetryDelay, _timeProvider, ct).ConfigureAwait(false);
+            attemptsThisWindow++;
+
+            if (await TryRecoverInterruptedExecUnderGateAsync(pending, ct).ConfigureAwait(false))
+                return true;
+
+            if (_pendingInterruptedExecRecovery is not { } current
+                || !string.Equals(current.RunId, pending.RunId, StringComparison.Ordinal))
+            {
+                return false;
+            }
+            pending = current;
+        }
+
+        _log.LogWarning(
+            "Exhausted {Attempts} delayed interrupted-exec recovery attempts for Incus sandbox {SandboxId}",
+            attemptsThisWindow,
+            Id);
+        return false;
+    }
+
+    private async Task<bool> TryRecoverInterruptedExecUnderGateAsync(
+        PendingInterruptedExecRecovery pending,
+        CancellationToken ct)
+    {
+        var vmStartMayHaveOccurred = false;
+        var recoverySucceeded = false;
+        try
+        {
+            if (_lifecycleState != 0
+                || Volatile.Read(ref _execCleanupPoisoned) != 1
+                || _pendingInterruptedExecRecovery is not { } current
+                || !string.Equals(current.RunId, pending.RunId, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            var activeRunIds = _activeExecs.Keys.ToArray();
+            if (activeRunIds.Length != 1
+                || !string.Equals(activeRunIds[0], pending.RunId, StringComparison.Ordinal))
+            {
+                _log.LogWarning(
+                    "Refusing interrupted-exec recovery for Incus sandbox {SandboxId} because another exec may be active",
+                    Id);
+                return false;
+            }
+
+            var stoppedStatus = await ReadOwnedInstanceStatusAsync(ct).ConfigureAwait(false);
+            if (!string.Equals(stoppedStatus, "STOPPED", StringComparison.OrdinalIgnoreCase))
+            {
+                _log.LogWarning(
+                    "Refusing interrupted-exec recovery for Incus sandbox {SandboxId} without an exact owned STOPPED VM",
+                    Id);
+                return false;
+            }
+
+            _recoveryAuthorization.RevalidateForRestart(_spec, _options, _stagingRoot);
+            if (_recoveryAuthorization.HasHostDevices)
+            {
+                if (!pending.HostDevicesDetached)
+                {
+                    await VerifyRecoveryTopologyAsync(
+                        _recoveryAuthorization.Mounts,
+                        ct).ConfigureAwait(false);
+                    // Record ownership of the topology mutation before the
+                    // first remove. A later bounded window can then reconcile
+                    // any partial detach to the exact isolated topology.
+                    pending = UpdatePendingHostDeviceState(pending, detached: true);
+                }
+                await RemoveRecoveryHostDevicesAsync(ct).ConfigureAwait(false);
+                await VerifyRecoveryTopologyAsync([], ct).ConfigureAwait(false);
+            }
+            else
+            {
+                await VerifyRecoveryTopologyAsync(
+                    _recoveryAuthorization.Mounts,
+                    ct).ConfigureAwait(false);
+            }
+
+            // Treat even an unsuccessful start invocation as ambiguous: the
+            // daemon may have started the VM before the client lost its reply.
+            vmStartMayHaveOccurred = true;
+            await IncusGuestLifecycle.StartAndWaitForAgentAsync(
+                _cli,
+                _options,
+                Id,
+                _timeProvider,
+                token => AuthorizeRecoveryStartAsync([], token),
+                ct).ConfigureAwait(false);
+            await IncusGuestLinkLifecycle.RemoveForIsolatedValidationAsync(
+                _cli,
+                _options,
+                Id,
+                _recoveryAuthorization.GuestLinks,
+                ct).ConfigureAwait(false);
+            await IncusGuestPathAuthorization.ValidateCanonicalMountPathsAsync(
+                _cli,
+                _options,
+                Id,
+                _recoveryAuthorization.CanonicalGuestPaths,
+                ct).ConfigureAwait(false);
+            foreach (var executableLink in _recoveryAuthorization.ExecutableLinks)
+            {
+                await IncusGuestLinkLifecycle.VerifyExactAsync(
+                    _cli,
+                    _options,
+                    Id,
+                    executableLink,
+                    ct).ConfigureAwait(false);
+            }
+
+            if (_recoveryAuthorization.HasHostDevices)
+            {
+                await StopAndVerifyRecoveryVmAsync(ct).ConfigureAwait(false);
+                _recoveryAuthorization.RevalidateForRestart(_spec, _options, _stagingRoot);
+                await AddRecoveryHostDevicesAsync(ct).ConfigureAwait(false);
+                await VerifyRecoveryTopologyAsync(
+                    _recoveryAuthorization.Mounts,
+                    ct).ConfigureAwait(false);
+                pending = UpdatePendingHostDeviceState(pending, detached: false);
+                await IncusGuestLifecycle.StartAndWaitForAgentAsync(
+                    _cli,
+                    _options,
+                    Id,
+                    _timeProvider,
+                    token => AuthorizeRecoveryStartAsync(
+                        _recoveryAuthorization.Mounts,
+                        token),
+                    ct).ConfigureAwait(false);
+            }
+            var runningStatus = await ReadOwnedInstanceStatusAsync(ct).ConfigureAwait(false);
+            if (!string.Equals(runningStatus, "RUNNING", StringComparison.OrdinalIgnoreCase))
+            {
+                _log.LogWarning(
+                    "Interrupted-exec recovery for Incus sandbox {SandboxId} did not reach an exact owned RUNNING VM",
+                    Id);
+                return false;
+            }
+
+            await IncusGuestLifecycle.PrepareRuntimeDirectoryAsync(
+                _cli,
+                _options,
+                Id,
+                ct).ConfigureAwait(false);
+            await RestoreGuestTmpfsMountsAsync(ct).ConfigureAwait(false);
+            await IncusMountReadiness.WaitAsync(
+                _cli,
+                _options,
+                Id,
+                _stagingRoot,
+                _recoveryAuthorization.Mounts,
+                _timeProvider,
+                ct).ConfigureAwait(false);
+            await IncusGuestLinkLifecycle.CreateAsync(
+                _cli,
+                _options,
+                Id,
+                _recoveryAuthorization.GuestLinks,
+                ct).ConfigureAwait(false);
+            foreach (var executableLink in _recoveryAuthorization.ExecutableLinks)
+            {
+                await IncusGuestLinkLifecycle.VerifyExactAsync(
+                    _cli,
+                    _options,
+                    Id,
+                    executableLink,
+                    ct).ConfigureAwait(false);
+            }
+            await IncusGuestLifecycle.VerifyExecWrapperAsync(
+                _cli,
+                _options,
+                Id,
+                ct).ConfigureAwait(false);
+
+            runningStatus = await ReadOwnedInstanceStatusAsync(ct).ConfigureAwait(false);
+            if (!string.Equals(runningStatus, "RUNNING", StringComparison.OrdinalIgnoreCase))
+            {
+                _log.LogWarning(
+                    "Interrupted-exec cleanup for Incus sandbox {SandboxId} lost its exact owned RUNNING VM",
+                    Id);
+                return false;
+            }
+
+            var environmentAbsent = await EnsureGuestControlFileAbsentAsync(pending.EnvironmentPath, ct).ConfigureAwait(false);
+            var pidAbsent = await EnsureGuestControlFileAbsentAsync(pending.PidPath, ct).ConfigureAwait(false);
+            var completionAbsent = await EnsureGuestControlFileAbsentAsync(pending.CompletionPath, ct).ConfigureAwait(false);
+            if (!environmentAbsent || !pidAbsent || !completionAbsent)
+                return false;
+            if (!_activeExecs.TryRemove(pending.RunId, out _))
+                return false;
+            if (Interlocked.CompareExchange(ref _execCleanupPoisoned, 0, 1) != 1)
+            {
+                _activeExecs.TryAdd(pending.RunId, true);
+                Interlocked.Exchange(ref _execCleanupPoisoned, 1);
+                return false;
+            }
+            _pendingInterruptedExecRecovery = null;
+            if (_recoveryManifest.Retained)
+            {
+                _recoveryManifest = _recoveryManifest with
+                {
+                    Retained = false,
+                    PendingExec = null,
+                };
+            }
+            recoverySucceeded = true;
+            return true;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            Interlocked.Exchange(ref _execCleanupPoisoned, 1);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Exchange(ref _execCleanupPoisoned, 1);
+            _log.LogWarning(
+                ex,
+                "Bounded interrupted-exec recovery failed closed for Incus sandbox {SandboxId}",
+                Id);
+            return false;
+        }
+        finally
+        {
+            if (vmStartMayHaveOccurred && !recoverySucceeded)
+            {
+                Interlocked.Exchange(ref _execCleanupPoisoned, 1);
+                _ = await ForceStopAndVerifyOwnedVmAfterFailedRecoveryAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
+    private async Task<bool> ForceStopAndVerifyOwnedVmAfterFailedRecoveryAsync()
+    {
+        string? status;
+        try
+        {
+            status = await ReadOwnedInstanceStatusAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(
+                ex,
+                "Refusing post-recovery forced stop because exact Incus VM ownership could not be verified for sandbox {SandboxId}",
+                Id);
+            return false;
+        }
+
+        if (string.Equals(status, "STOPPED", StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (status is null)
+        {
+            _log.LogError(
+                "Could not restore a verified STOPPED state after failed recovery because owned Incus VM {SandboxId} is absent",
+                Id);
+            return false;
+        }
+
+        Exception? stopError = null;
+        int? stopExitCode = null;
+        try
+        {
+            await EnsureLifecycleBindingAsync(CancellationToken.None).ConfigureAwait(false);
+            var stop = await _cli.RunAllowFailureAsync(
+                _options,
+                IncusCommandBuilder.Prefix(_options, "stop", Id, "--force"),
+                stdin: null,
+                _options.VmStopTimeout + _options.OperationTimeout,
+                CancellationToken.None,
+                heavyOperation: true,
+                maxStdoutBytes: 4096,
+                maxStderrBytes: 4096).ConfigureAwait(false);
+            stopExitCode = stop.ExitCode;
+        }
+        catch (Exception ex)
+        {
+            stopError = ex;
+        }
+
+        try
+        {
+            status = await ReadOwnedInstanceStatusAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception verificationError)
+        {
+            if (stopError is not null)
+            {
+                _log.LogError(
+                    new AggregateException(stopError, verificationError),
+                    "Post-recovery forced stop and ownership verification both failed for Incus sandbox {SandboxId}",
+                    Id);
+            }
+            else
+            {
+                _log.LogError(
+                    verificationError,
+                    "Could not verify Incus sandbox {SandboxId} after post-recovery forced stop (exit {ExitCode})",
+                    Id,
+                    stopExitCode);
+            }
+            return false;
+        }
+
+        if (string.Equals(status, "STOPPED", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (stopError is not null)
+        {
+            _log.LogError(
+                stopError,
+                "Post-recovery forced stop failed and Incus sandbox {SandboxId} remained in status {Status}",
+                Id,
+                status);
+        }
+        else
+        {
+            _log.LogError(
+                "Incus sandbox {SandboxId} remained in status {Status} after post-recovery forced stop (exit {ExitCode})",
+                Id,
+                status,
+                stopExitCode);
+        }
+        return false;
+    }
+
+    private async Task RestoreGuestTmpfsMountsAsync(CancellationToken ct)
+    {
+        var aggregateBytes = 0L;
+        foreach (var mount in _guestTmpfsMounts)
+        {
+            if (mount.HostSource is not null
+                || mount.RootDiskDirectory
+                || mount.TmpfsSizeBytes is not { } sizeBytes)
+            {
+                throw new InvalidOperationException(
+                    "Interrupted-exec recovery received an invalid guest tmpfs descriptor.");
+            }
+            checked { aggregateBytes += sizeBytes; }
+            if (aggregateBytes > _options.MaxAggregateTmpfsBytes)
+            {
+                throw new InvalidOperationException(
+                    "Interrupted-exec recovery tmpfs mounts exceed the configured aggregate bound.");
+            }
+            await IncusGuestLifecycle.MountTmpfsAsync(
+                _cli,
+                _options,
+                Id,
+                mount.GuestPath,
+                sizeBytes,
+                ct).ConfigureAwait(false);
+            await IncusGuestLifecycle.VerifyTmpfsAsync(
+                _cli,
+                _options,
+                Id,
+                mount.GuestPath,
+                ct).ConfigureAwait(false);
+        }
+    }
+
+    private async Task VerifyRecoveryTopologyAsync(
+        IReadOnlyList<IncusPreparedMount> expectedMounts,
+        CancellationToken ct)
+    {
+        var topology = await _cli.RunCheckedAsync(
+            "verify interrupted-exec recovery topology",
+            _options,
+            [_options.BinaryPath, "query", $"/1.0/instances/{Id}?project={_options.ProjectName}"],
+            stdin: null,
+            _options.OperationTimeout,
+            ct,
+            heavyOperation: false,
+            maxStdoutBytes: _options.MaxCliStdoutBytes,
+            maxStderrBytes: 4096).ConfigureAwait(false);
+        IncusDeviceTopology.Verify(
+            topology.Stdout,
+            _options,
+            _recoveryAuthorization.Bridge,
+            expectedMounts,
+            _recoveryTokenHash,
+            _recoveryBaseManifestHash);
+    }
+
+    private async Task AuthorizeRecoveryStartAsync(
+        IReadOnlyList<IncusPreparedMount> expectedMounts,
+        CancellationToken ct)
+    {
+        _recoveryAuthorization.RevalidateForRestart(_spec, _options, _stagingRoot);
+        await VerifyRecoveryTopologyAsync(expectedMounts, ct).ConfigureAwait(false);
+    }
+
+    private async Task RemoveRecoveryHostDevicesAsync(CancellationToken ct)
+    {
+        for (var index = 0; index < _recoveryAuthorization.Mounts.Count; index++)
+        {
+            if (_recoveryAuthorization.Mounts[index].HostSource is null)
+                continue;
+            var deviceName = IncusSandboxProvider.BuildMountDeviceNameForVerification(index);
+            var remove = await _cli.RunAllowFailureAsync(
+                _options,
+                IncusCommandBuilder.BuildDeviceRemove(_options, Id, deviceName),
+                stdin: null,
+                _options.OperationTimeout,
+                ct,
+                heavyOperation: true,
+                maxStdoutBytes: 4096,
+                maxStderrBytes: 4096).ConfigureAwait(false);
+            if (!remove.Success)
+            {
+                _log.LogDebug(
+                    "Interrupted-exec recovery device removal for {SandboxId}/{Device} returned exit {ExitCode}; exact isolated topology verification will decide the result",
+                    Id,
+                    deviceName,
+                    remove.ExitCode);
+            }
+        }
+    }
+
+    private async Task AddRecoveryHostDevicesAsync(CancellationToken ct)
+    {
+        for (var index = 0; index < _recoveryAuthorization.Mounts.Count; index++)
+        {
+            var mount = _recoveryAuthorization.Mounts[index];
+            if (mount.HostSource is not { } source)
+                continue;
+            var authorizedSource = IncusMountStaging.ReauthorizeHostSource(
+                _options,
+                _stagingRoot,
+                source);
+            if (!string.Equals(authorizedSource, source, StringComparison.Ordinal))
+                throw new UnauthorizedAccessException("An Incus recovery host mount source changed canonical path before reattachment.");
+            var pinnedSource = mount.PinnedHostDirectory
+                ?? throw new InvalidOperationException("An Incus recovery host source has no retained identity pin.");
+            IncusMountStaging.EnsurePinnedHostSourceMatches(authorizedSource, pinnedSource);
+            var deviceName = IncusSandboxProvider.BuildMountDeviceNameForVerification(index);
+            var add = await _cli.RunAllowFailureAsync(
+                _options,
+                IncusCommandBuilder.BuildDeviceAdd(
+                    _options,
+                    Id,
+                    deviceName,
+                    authorizedSource,
+                    mount.GuestPath,
+                    mount.ReadOnly),
+                stdin: null,
+                _options.OperationTimeout,
+                ct,
+                heavyOperation: true,
+                maxStdoutBytes: 4096,
+                maxStderrBytes: 4096).ConfigureAwait(false);
+            if (!add.Success)
+            {
+                _log.LogDebug(
+                    "Interrupted-exec recovery device reattachment for {SandboxId}/{Device} returned exit {ExitCode}; exact full topology verification will decide the result",
+                    Id,
+                    deviceName,
+                    add.ExitCode);
+            }
+            IncusMountStaging.EnsurePinnedHostSourceMatches(authorizedSource, pinnedSource);
+        }
+    }
+
+    private async Task StopAndVerifyRecoveryVmAsync(CancellationToken ct)
+    {
+        await EnsureLifecycleBindingAsync(ct).ConfigureAwait(false);
+        var stop = await _cli.RunAllowFailureAsync(
+            _options,
+            IncusCommandBuilder.Prefix(_options, "stop", Id, "--force"),
+            stdin: null,
+            _options.VmStopTimeout + _options.OperationTimeout,
+            ct,
+            heavyOperation: true,
+            maxStdoutBytes: 4096,
+            maxStderrBytes: 4096).ConfigureAwait(false);
+        var status = await ReadOwnedInstanceStatusAsync(ct).ConfigureAwait(false);
+        if (!string.Equals(status, "STOPPED", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"Incus interrupted-exec isolated validation did not return the exact owned VM to STOPPED (stop exit {stop.ExitCode}, status {status ?? "absent"}).");
+        }
+    }
+
+    private PendingInterruptedExecRecovery UpdatePendingHostDeviceState(
+        PendingInterruptedExecRecovery expected,
+        bool detached)
+    {
+        if (_pendingInterruptedExecRecovery is not { } current
+            || !string.Equals(current.RunId, expected.RunId, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("Incus interrupted-exec recovery ownership changed during topology admission.");
+        }
+        var updated = current with { HostDevicesDetached = detached };
+        if (Volatile.Read(ref _infrastructureRecoveryLeaseArmed) != 0)
+            PublishRetainedPendingExec(updated);
+        _pendingInterruptedExecRecovery = updated;
+        return updated;
+    }
+
+    private void PublishRetainedPendingExec(PendingInterruptedExecRecovery pending)
+    {
+        var durablePending = new IncusRecoveryPendingExec(
+            pending.RunId,
+            pending.EnvironmentPath,
+            pending.PidPath,
+            pending.CompletionPath,
+            pending.HostDevicesDetached);
+        var immutableBase = _recoveryManifest with
+        {
+            Retained = false,
+            PendingExec = null,
+        };
+        var retained = immutableBase.Retain(durablePending);
+        _recoveryManifestStore.WriteRetained(
+            retained,
+            NextGuid("retained recovery manifest"));
+        _recoveryManifest = retained;
+    }
+
+    private async Task<bool> EnsureGuestControlFileAbsentAsync(
+        string path,
+        CancellationToken ct = default)
     {
         var maximumAttempts = ReadRetryAttempts(
             static options => options.ExecControlFileCleanupAttempts,
@@ -763,7 +1561,7 @@ internal sealed class IncusSandbox :
                     IncusCommandBuilder.Prefix(_options, "file", "delete", $"{Id}{path}"),
                     stdin: null,
                     _options.OperationTimeout,
-                    CancellationToken.None,
+                    ct,
                     heavyOperation: false,
                     maxStdoutBytes: 4096,
                     maxStderrBytes: 4096).ConfigureAwait(false);
@@ -774,12 +1572,16 @@ internal sealed class IncusSandbox :
                     BuildRootExec(["test", "!", "-e", path]),
                     stdin: null,
                     _options.OperationTimeout,
-                    CancellationToken.None,
+                    ct,
                     heavyOperation: false,
                     maxStdoutBytes: 128,
                     maxStderrBytes: 4096).ConfigureAwait(false);
                 if (verify.Success)
                     return true;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
             }
             catch (Exception ex)
             {
@@ -791,7 +1593,7 @@ internal sealed class IncusSandbox :
                     Id);
             }
             if (attempt + 1 < maximumAttempts)
-                await Task.Delay(_options.ReadinessPollInterval, _timeProvider, CancellationToken.None).ConfigureAwait(false);
+                await Task.Delay(_options.ReadinessPollInterval, _timeProvider, ct).ConfigureAwait(false);
         }
         _log.LogWarning(
             "Could not verify transient guest-file cleanup for Incus sandbox {SandboxId}",
@@ -870,13 +1672,21 @@ internal sealed class IncusSandbox :
             heavyOperation: false,
             maxStdoutBytes: _options.MaxCliStdoutBytes,
             maxStderrBytes: 4096).ConfigureAwait(false);
-        return ParseOwnedInstanceStatus(instances.Stdout, Id);
+        return ParseOwnedInstanceStatus(
+            instances.Stdout,
+            Id,
+            _recoveryTokenHash,
+            _recoveryBaseManifestHash);
     }
 
     internal static bool ParseOwnedInstancePresence(string json, string instanceName) =>
         ParseOwnedInstanceStatus(json, instanceName) is not null;
 
-    internal static string? ParseOwnedInstanceStatus(string json, string instanceName)
+    internal static string? ParseOwnedInstanceStatus(
+        string json,
+        string instanceName,
+        string? expectedRecoveryTokenHash = null,
+        string? expectedRecoveryManifestHash = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(instanceName);
         using var document = JsonDocument.Parse(json);
@@ -905,6 +1715,25 @@ internal sealed class IncusSandbox :
         {
             throw new InvalidOperationException("Refusing to delete an Incus instance whose ownership metadata changed.");
         }
+        if (expectedRecoveryTokenHash is not null || expectedRecoveryManifestHash is not null)
+        {
+            if (expectedRecoveryTokenHash is null
+                || expectedRecoveryManifestHash is null
+                || !config.TryGetProperty(IncusSandboxProvider.RecoveryTokenHashKey, out var tokenHash)
+                || !config.TryGetProperty(IncusSandboxProvider.RecoveryManifestHashKey, out var manifestHash)
+                || tokenHash.ValueKind != JsonValueKind.String
+                || manifestHash.ValueKind != JsonValueKind.String
+                || !IncusRecoveryManifestCodec.FixedTimeEqualsHash(
+                    tokenHash.GetString() ?? string.Empty,
+                    expectedRecoveryTokenHash)
+                || !IncusRecoveryManifestCodec.FixedTimeEqualsHash(
+                    manifestHash.GetString() ?? string.Empty,
+                    expectedRecoveryManifestHash))
+            {
+                throw new InvalidOperationException(
+                    "Refusing Incus lifecycle access because the recovery capability binding changed.");
+            }
+        }
         return exact.Value.TryGetProperty("status", out var status)
             && status.ValueKind == JsonValueKind.String
                 ? status.GetString() ?? string.Empty
@@ -913,6 +1742,7 @@ internal sealed class IncusSandbox :
 
     private async Task SetConfigAsync(string key, string value, CancellationToken ct)
     {
+        await EnsureLifecycleBindingAsync(ct).ConfigureAwait(false);
         await _cli.RunCheckedAsync(
             $"set sandbox config {key}",
             _options,
@@ -922,12 +1752,14 @@ internal sealed class IncusSandbox :
             ct).ConfigureAwait(false);
     }
 
-    private IReadOnlyList<string> BuildRootExec(IReadOnlyList<string> command)
+    private async Task EnsureLifecycleBindingAsync(CancellationToken ct)
     {
-        var argv = IncusCommandBuilder.Prefix(_options, "exec", Id, "--");
-        argv.AddRange(command);
-        return argv;
+        if (await ReadOwnedInstanceStatusAsync(ct).ConfigureAwait(false) is null)
+            throw new InvalidOperationException("Incus lifecycle target no longer exists.");
     }
+
+    private IReadOnlyList<string> BuildRootExec(IReadOnlyList<string> command)
+        => IncusCommandBuilder.BuildRootExec(_options, Id, command);
 
     private async Task CaptureResourceMetricsBestEffortAsync()
     {
@@ -1213,10 +2045,45 @@ internal sealed class IncusSandbox :
         return attempts;
     }
 
+    private InterruptedExecRecoveryPolicy ReadInterruptedExecRecoveryPolicy()
+    {
+        var liveOptions = _liveOptionsAccessor()
+            ?? throw new InvalidOperationException("The live Incus options accessor returned null.");
+        var attempts = liveOptions.InterruptedExecRecoveryRetryAttempts;
+        if (attempts is < 0 or > IncusSandboxOptions.MaximumInterruptedExecRecoveryRetryAttempts)
+        {
+            throw new InvalidOperationException(
+                $"Live Incus option {nameof(IncusSandboxOptions.InterruptedExecRecoveryRetryAttempts)} must be between 0 and {IncusSandboxOptions.MaximumInterruptedExecRecoveryRetryAttempts}.");
+        }
+
+        var delay = liveOptions.InterruptedExecRecoveryRetryDelay;
+        if (delay <= TimeSpan.Zero
+            || delay > IncusSandboxOptions.MaximumInterruptedExecRecoveryRetryDelay)
+        {
+            throw new InvalidOperationException(
+                $"Live Incus option {nameof(IncusSandboxOptions.InterruptedExecRecoveryRetryDelay)} must be positive and no greater than {IncusSandboxOptions.MaximumInterruptedExecRecoveryRetryDelay}.");
+        }
+
+        return new InterruptedExecRecoveryPolicy(attempts, delay);
+    }
+
+    private sealed record PendingInterruptedExecRecovery(
+        string RunId,
+        string EnvironmentPath,
+        string PidPath,
+        string CompletionPath,
+        bool HostDevicesDetached);
+
+    private readonly record struct InterruptedExecRecoveryPolicy(
+        int MaximumRetryAttempts,
+        TimeSpan RetryDelay);
+
     private void NotifyNoLongerActive()
     {
         if (Interlocked.Exchange(ref _noLongerActive, 1) != 0)
             return;
+        _recoveryAuthorization.Dispose();
+        _recoveryManifestStore.Dispose();
         _onDisposed(Id);
         SandboxLiveCounter.Decrement();
     }

@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.HostProcess;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Incus;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.Text.Json;
@@ -9,6 +10,217 @@ namespace CodeyBox.Tests;
 
 public sealed class IncusSandboxLifecycleTests
 {
+    [Fact]
+    public async Task GuestLinkRemoval_RejectsChangedTargetBeforeRootUnlink()
+    {
+        var removed = false;
+        var runner = new ScriptedLifecycleRunner((argv, _, _) =>
+        {
+            if (IsGuestCommand(argv, "test") && argv.Contains("-L", StringComparer.Ordinal))
+                return Task.FromResult(Success());
+            if (IsGuestCommand(argv, "readlink"))
+                return Task.FromResult(Success("/unauthorized/target\n"));
+            if (IsGuestCommand(argv, "rm"))
+            {
+                removed = true;
+                return Task.FromResult(Success());
+            }
+            throw new InvalidOperationException($"Unexpected guest-link command: {string.Join(' ', argv)}");
+        });
+
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            IncusGuestLinkLifecycle.RemoveForIsolatedValidationAsync(
+                new IncusCliRunner(runner),
+                FastLifecycleOptions(),
+                "codeybox-link-target",
+                [new IncusGuestLink("/authorized/target", "/safe/link")],
+                CancellationToken.None));
+
+        Assert.False(removed);
+    }
+
+    [Fact]
+    public async Task GuestLinkRemoval_RejectsAliasedParentBeforeRootUnlink()
+    {
+        var runner = new ScriptedLifecycleRunner(
+            (argv, _, _) => throw new InvalidOperationException(
+                $"No guest-link mutation was expected: {string.Join(' ', argv)}"),
+            canonicalPathResolver: path => string.Equals(path, "/safe", StringComparison.Ordinal)
+                ? "/redirected"
+                : path);
+
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            IncusGuestLinkLifecycle.RemoveForIsolatedValidationAsync(
+                new IncusCliRunner(runner),
+                FastLifecycleOptions(),
+                "codeybox-link-parent",
+                [new IncusGuestLink("/authorized/target", "/safe/link")],
+                CancellationToken.None));
+
+        Assert.DoesNotContain(runner.Commands, command => IsGuestCommand(command, "rm"));
+    }
+
+    [Fact]
+    public async Task GuestLinkCreation_PositivelyVerifiesExactCreatedLink()
+    {
+        var linkCreated = false;
+        var runner = new ScriptedLifecycleRunner((argv, _, _) =>
+        {
+            if (IsGuestCommand(argv, "mkdir"))
+            {
+                return Task.FromResult(Success());
+            }
+            if (IsGuestCommand(argv, "ln"))
+            {
+                linkCreated = true;
+                return Task.FromResult(Success());
+            }
+            if (IsGuestCommand(argv, "test") && argv.Contains("-L", StringComparer.Ordinal))
+            {
+                var negated = argv.Contains("!", StringComparer.Ordinal);
+                return Task.FromResult(negated == !linkCreated ? Success() : Failure());
+            }
+            if (IsGuestCommand(argv, "test") && argv.Contains("-e", StringComparer.Ordinal))
+                return Task.FromResult(!linkCreated ? Success() : Failure());
+            if (IsGuestCommand(argv, "readlink"))
+                return Task.FromResult(Success("/authorized/target\n"));
+            throw new InvalidOperationException($"Unexpected guest-link command: {string.Join(' ', argv)}");
+        });
+
+        await IncusGuestLinkLifecycle.CreateAsync(
+            new IncusCliRunner(runner),
+            FastLifecycleOptions(),
+            "codeybox-link-create",
+            [new IncusGuestLink("/authorized/target", "/safe/link")],
+            CancellationToken.None);
+
+        Assert.True(linkCreated);
+        Assert.Contains(runner.Commands, command => IsGuestCommand(command, "readlink"));
+    }
+
+    [Fact]
+    public async Task GuestLinkReconciliation_RetriesPartialRemoveAndCreateIdempotently()
+    {
+        var links = new[]
+        {
+            new IncusGuestLink("/device/one", "/safe/one"),
+            new IncusGuestLink("/device/two", "/safe/two"),
+        };
+        var present = links.ToDictionary(static link => link.LinkPath, _ => true, StringComparer.Ordinal);
+        var failSecondRemove = true;
+        var failSecondCreate = true;
+        var runner = new ScriptedLifecycleRunner((argv, _, _) =>
+        {
+            var path = argv[^1];
+            if (IsGuestCommand(argv, "test") && argv.Contains("-L", StringComparer.Ordinal))
+            {
+                var negated = argv.Contains("!", StringComparer.Ordinal);
+                return Task.FromResult(negated == !present[path] ? Success() : Failure());
+            }
+            if (IsGuestCommand(argv, "test") && argv.Contains("-e", StringComparer.Ordinal))
+                return Task.FromResult(!present[path] ? Success() : Failure());
+            if (IsGuestCommand(argv, "readlink"))
+            {
+                var target = links.Single(link => string.Equals(link.LinkPath, path, StringComparison.Ordinal)).Target;
+                return Task.FromResult(Success(target + "\n"));
+            }
+            if (IsGuestCommand(argv, "rm"))
+            {
+                if (string.Equals(path, links[1].LinkPath, StringComparison.Ordinal) && failSecondRemove)
+                {
+                    failSecondRemove = false;
+                    throw new TimeoutException("simulated interruption between link removals");
+                }
+                present[path] = false;
+                return Task.FromResult(Success());
+            }
+            if (IsGuestCommand(argv, "mkdir"))
+                return Task.FromResult(Success());
+            if (IsGuestCommand(argv, "ln"))
+            {
+                var linkPath = argv[^1];
+                if (string.Equals(linkPath, links[1].LinkPath, StringComparison.Ordinal) && failSecondCreate)
+                {
+                    failSecondCreate = false;
+                    throw new TimeoutException("simulated interruption between link creations");
+                }
+                present[linkPath] = true;
+                return Task.FromResult(Success());
+            }
+            throw new InvalidOperationException($"Unexpected link reconciliation command: {string.Join(' ', argv)}");
+        });
+        var cli = new IncusCliRunner(runner);
+        var options = FastLifecycleOptions();
+
+        var removeInterruption = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            IncusGuestLinkLifecycle.RemoveForIsolatedValidationAsync(
+                cli, options, "codeybox-link-reconcile", links, CancellationToken.None));
+        Assert.IsType<TimeoutException>(removeInterruption.InnerException);
+        await IncusGuestLinkLifecycle.RemoveForIsolatedValidationAsync(
+            cli, options, "codeybox-link-reconcile", links, CancellationToken.None);
+        Assert.All(present.Values, Assert.False);
+
+        var createInterruption = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            IncusGuestLinkLifecycle.CreateAsync(
+                cli, options, "codeybox-link-reconcile", links, CancellationToken.None));
+        Assert.IsType<TimeoutException>(createInterruption.InnerException);
+        await IncusGuestLinkLifecycle.CreateAsync(
+            cli, options, "codeybox-link-reconcile", links, CancellationToken.None);
+        Assert.All(present.Values, Assert.True);
+    }
+
+    [Fact]
+    public void RecoveryAuthorization_RejectsDeletedAndRecreatedHostSourceInode()
+    {
+        var allowedRoot = Path.Combine(
+            Path.GetTempPath(),
+            $"codeybox-incus-recovery-inode-{Guid.NewGuid():N}");
+        var source = Path.Combine(allowedRoot, "source");
+        Directory.CreateDirectory(source);
+        var options = FastLifecycleOptions() with { AllowedHostMountRoots = [allowedRoot] };
+        var spec = new SandboxSpec
+        {
+            ImageReference = "local-image",
+            Mounts =
+            [
+                new SandboxMount
+                {
+                    HostPath = source,
+                    SandboxPath = "/repo",
+                    ReadOnly = true,
+                },
+            ],
+        };
+        var authorization = IncusRecoveryAuthorization.CaptureValidated(
+            bridge: null,
+            [new IncusPreparedMount(source, "/repo", ReadOnly: true)],
+            ["/repo"],
+            guestLinks: [],
+            options);
+        var manifest = IncusRecoveryManifest.Create(
+            "codeybox-recovery-inode",
+            spec,
+            options,
+            IncusRecoveryManifestCodec.ComputeTokenSha256("private-token"),
+            baselineRef: null,
+            authorization);
+        Directory.Delete(source);
+        Directory.CreateDirectory(source);
+
+        try
+        {
+            var rejected = Assert.Throws<IOException>(() =>
+                manifest.RestoreAuthorization(options));
+
+            Assert.Contains("inode identity", rejected.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            authorization.Dispose();
+            Directory.Delete(allowedRoot, recursive: true);
+        }
+    }
+
     [Fact]
     public void OptionsAccessor_RejectsChangedProjectIdentityBeforeCallingIncus()
     {
@@ -210,16 +422,32 @@ public sealed class IncusSandboxLifecycleTests
         {
             CaptureResourceMetrics = true,
             DiskGuard = null,
+            NetworkProfiles = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["internet-only"] = "cb-net",
+            },
         };
+        var spec = new SandboxSpec
+        {
+            ImageReference = "local-image",
+            Network = new SandboxNetworkPolicy { ProfileName = "internet-only" },
+        };
+        var authorization = RecoveryAuthorization(options, spec, bridge: "cb-net");
+        var recoveryState = CreateRecoveryState(
+            sandboxRoot,
+            sandboxName,
+            spec,
+            options,
+            authorization,
+            "baseline-ref");
+        runner.SetRecoveryBinding(
+            recoveryState.Manifest.LeaseTokenSha256,
+            recoveryState.ManifestHash);
         var sandbox = new IncusSandbox(
             sandboxName,
             sandboxRoot,
             root,
-            new SandboxSpec
-            {
-                ImageReference = "local-image",
-                Network = new SandboxNetworkPolicy { ProfileName = "internet-only" },
-            },
+            spec,
             options,
             new IncusCliRunner(runner, time),
             NullLogger.Instance,
@@ -229,6 +457,10 @@ public sealed class IncusSandboxLifecycleTests
             "baseline-ref",
             store,
             _ => Interlocked.Increment(ref disposed),
+            authorization,
+            recoveryState.Lease,
+            recoveryState.Manifest,
+            recoveryState.Store,
             timeProvider: time);
         SandboxLiveCounter.Increment();
         try
@@ -271,12 +503,24 @@ public sealed class IncusSandboxLifecycleTests
         File.Delete(Path.Combine(sandboxRoot, ".codeybox-incus-owner"));
         var runner = new DeletionLifecycleRunner(sandboxName);
         var inactive = 0;
+        var options = new IncusSandboxOptions { CaptureResourceMetrics = false, DiskGuard = null };
+        var spec = new SandboxSpec { ImageReference = "local-image" };
+        var authorization = RecoveryAuthorization(options, spec);
+        var recoveryState = CreateRecoveryState(
+            sandboxRoot,
+            sandboxName,
+            spec,
+            options,
+            authorization);
+        runner.SetRecoveryBinding(
+            recoveryState.Manifest.LeaseTokenSha256,
+            recoveryState.ManifestHash);
         var sandbox = new IncusSandbox(
             sandboxName,
             sandboxRoot,
             root,
-            new SandboxSpec { ImageReference = "local-image" },
-            new IncusSandboxOptions { CaptureResourceMetrics = false, DiskGuard = null },
+            spec,
+            options,
             new IncusCliRunner(runner),
             NullLogger.Instance,
             timings: null,
@@ -284,7 +528,11 @@ public sealed class IncusSandboxLifecycleTests
             "work",
             baselineRef: null,
             resourceUsageStore: null,
-            _ => Interlocked.Increment(ref inactive));
+            _ => Interlocked.Increment(ref inactive),
+            authorization,
+            recoveryState.Lease,
+            recoveryState.Manifest,
+            recoveryState.Store);
         SandboxLiveCounter.Increment();
         try
         {
@@ -324,18 +572,30 @@ public sealed class IncusSandboxLifecycleTests
         IncusMountStaging.InitializeOwnedTree(sandboxRoot, sandboxName, DateTimeOffset.UtcNow);
         var runner = new StickyDeletionLifecycleRunner(sandboxName);
         var inactive = 0;
+        var options = new IncusSandboxOptions
+        {
+            CaptureResourceMetrics = false,
+            DiskGuard = null,
+            OperationTimeout = TimeSpan.FromMilliseconds(100),
+            ReadinessPollInterval = TimeSpan.FromMilliseconds(10),
+        };
+        var spec = new SandboxSpec { ImageReference = "local-image" };
+        var authorization = RecoveryAuthorization(options, spec);
+        var recoveryState = CreateRecoveryState(
+            sandboxRoot,
+            sandboxName,
+            spec,
+            options,
+            authorization);
+        runner.SetRecoveryBinding(
+            recoveryState.Manifest.LeaseTokenSha256,
+            recoveryState.ManifestHash);
         var sandbox = new IncusSandbox(
             sandboxName,
             sandboxRoot,
             root,
-            new SandboxSpec { ImageReference = "local-image" },
-            new IncusSandboxOptions
-            {
-                CaptureResourceMetrics = false,
-                DiskGuard = null,
-                OperationTimeout = TimeSpan.FromMilliseconds(100),
-                ReadinessPollInterval = TimeSpan.FromMilliseconds(10),
-            },
+            spec,
+            options,
             new IncusCliRunner(runner),
             NullLogger.Instance,
             timings: null,
@@ -343,7 +603,11 @@ public sealed class IncusSandboxLifecycleTests
             "work",
             baselineRef: null,
             resourceUsageStore: null,
-            _ => Interlocked.Increment(ref inactive));
+            _ => Interlocked.Increment(ref inactive),
+            authorization,
+            recoveryState.Lease,
+            recoveryState.Manifest,
+            recoveryState.Store);
         SandboxLiveCounter.Increment();
 
         await Assert.ThrowsAsync<TimeoutException>(() => sandbox.DisposeAsync().AsTask());
@@ -532,6 +796,255 @@ public sealed class IncusSandboxLifecycleTests
     }
 
     [Fact]
+    public async Task Create_WithRetainedRecoveryLease_AdoptsAcrossProcessRestartAndKeepsPreservationArmed()
+    {
+        var fixture = PrepareRetainedAdoptionFixture("codeybox-retained-adopt");
+        var runner = new RetainedAdoptionRunner(
+            fixture.Options.StagingDirectory!,
+            fixture.SandboxName,
+            fixture.Manifest.LeaseTokenSha256,
+            fixture.ManifestHash);
+        var provider = new IncusSandboxProvider(
+            () => fixture.Options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner);
+
+        try
+        {
+            var adopted = await provider.CreateAsync(fixture.RequestSpec);
+
+            Assert.Equal(fixture.SandboxName, adopted.Id);
+            Assert.Equal("RUNNING", runner.Status);
+            Assert.Equal(1, runner.ForcedStopCalls);
+            Assert.Equal(1, runner.StartCalls);
+
+            await adopted.DisposeAsync();
+
+            Assert.Equal(0, runner.DeleteCalls);
+            Assert.True(Directory.Exists(Path.Combine(
+                fixture.Options.StagingDirectory!,
+                fixture.SandboxName)));
+        }
+        finally
+        {
+            if (Directory.Exists(fixture.Options.StagingDirectory))
+                Directory.Delete(fixture.Options.StagingDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task AdoptedRecoveryLease_JournalsEachNewExecBeforeDispatchAndDeletesOnlyAfterDisarm()
+    {
+        var fixture = PrepareRetainedAdoptionFixture("codeybox-retained-exec-journal");
+        var runner = new RetainedAdoptionRunner(
+            fixture.Options.StagingDirectory!,
+            fixture.SandboxName,
+            fixture.Manifest.LeaseTokenSha256,
+            fixture.ManifestHash)
+        {
+            BlockExec = true,
+        };
+        var provider = new IncusSandboxProvider(
+            () => fixture.Options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner);
+
+        try
+        {
+            var adopted = await provider.CreateAsync(fixture.RequestSpec)
+                .WaitAsync(TimeSpan.FromSeconds(10));
+            var execTask = adopted.ExecAsync(new SandboxExec { Argv = ["git", "status"] });
+            await runner.ExecStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var wrapperCommand = runner.Commands.Single(command =>
+                IsGuestCommand(command, IncusCloudInit.ExecWrapperPath)
+                && command.Any(argument => argument.Contains("/env-", StringComparison.Ordinal)));
+            var environmentPath = wrapperCommand.Single(argument =>
+                argument.StartsWith($"{IncusCloudInit.ControlDirectory}/env-", StringComparison.Ordinal));
+            var runId = environmentPath[(environmentPath.LastIndexOf('-') + 1)..];
+            var retainedBytes = File.ReadAllBytes(Path.Combine(
+                fixture.Options.StagingDirectory!,
+                fixture.SandboxName,
+                ".codeybox-recovery-retained.json"));
+            var retained = IncusRecoveryManifestCodec.Deserialize(retainedBytes);
+
+            Assert.True(retained.Retained);
+            Assert.Equal(runId, Assert.IsType<IncusRecoveryPendingExec>(retained.PendingExec).RunId);
+
+            runner.CompleteExec(Success("checkpoint-prepared\n"));
+            var result = await execTask.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.True(result.Success, result.Stderr);
+
+            var preserve = Assert.IsAssignableFrom<IPreserveOnDisposeSandbox>(adopted);
+            preserve.DisablePreserveOnDispose();
+            await adopted.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+
+            Assert.Equal(1, runner.DeleteCalls);
+            Assert.False(Directory.Exists(Path.Combine(
+                fixture.Options.StagingDirectory!,
+                fixture.SandboxName)));
+        }
+        finally
+        {
+            runner.CompleteExec(Failure("test cleanup\n"));
+            if (Directory.Exists(fixture.Options.StagingDirectory))
+                Directory.Delete(fixture.Options.StagingDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Create_WithRetainedRecoveryLease_ExclusiveHostLeaseElectsOneAdopterAndAllowsRetry()
+    {
+        var fixture = PrepareRetainedAdoptionFixture("codeybox-retained-election");
+        var sandboxRoot = Path.Combine(
+            fixture.Options.StagingDirectory!,
+            fixture.SandboxName);
+        var runner = new RetainedAdoptionRunner(
+            fixture.Options.StagingDirectory!,
+            fixture.SandboxName,
+            fixture.Manifest.LeaseTokenSha256,
+            fixture.ManifestHash);
+        var provider = new IncusSandboxProvider(
+            () => fixture.Options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner);
+
+        try
+        {
+            using (var electedElsewhere = IncusRecoveryManifestStore.Acquire(sandboxRoot))
+            {
+                var conflict = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                    provider.CreateAsync(fixture.RequestSpec));
+
+                Assert.Contains("already owned", conflict.Message, StringComparison.Ordinal);
+                Assert.Equal(0, runner.ForcedStopCalls);
+                Assert.Equal(0, runner.StartCalls);
+            }
+
+            var adopted = await provider.CreateAsync(fixture.RequestSpec);
+
+            Assert.Equal(fixture.SandboxName, adopted.Id);
+            Assert.Equal(1, runner.StartCalls);
+            await adopted.DisposeAsync();
+            Assert.Equal(0, runner.DeleteCalls);
+        }
+        finally
+        {
+            if (Directory.Exists(fixture.Options.StagingDirectory))
+                Directory.Delete(fixture.Options.StagingDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Create_WithRetainedRecoveryLease_TopologyTamperFailsClosedAndCanBeReadopted()
+    {
+        var fixture = PrepareRetainedAdoptionFixture("codeybox-retained-topology");
+        var tamperedRunner = new RetainedAdoptionRunner(
+            fixture.Options.StagingDirectory!,
+            fixture.SandboxName,
+            fixture.Manifest.LeaseTokenSha256,
+            fixture.ManifestHash)
+        {
+            TopologyOverride = EffectiveTopologyJson(
+                mountSource: "/unexpected/source",
+                mountPath: "/repo",
+                recoveryTokenHash: fixture.Manifest.LeaseTokenSha256,
+                recoveryManifestHash: fixture.ManifestHash),
+        };
+        var provider = new IncusSandboxProvider(
+            () => fixture.Options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            tamperedRunner);
+
+        try
+        {
+            await Assert.ThrowsAsync<SandboxExecutionUnavailableException>(() =>
+                provider.CreateAsync(fixture.RequestSpec));
+
+            Assert.Equal(1, tamperedRunner.ForcedStopCalls);
+            Assert.Equal(0, tamperedRunner.StartCalls);
+            Assert.Equal(0, tamperedRunner.DeleteCalls);
+
+            var healthyRunner = new RetainedAdoptionRunner(
+                fixture.Options.StagingDirectory!,
+                fixture.SandboxName,
+                fixture.Manifest.LeaseTokenSha256,
+                fixture.ManifestHash);
+            var healthyProvider = new IncusSandboxProvider(
+                () => fixture.Options,
+                NullLogger<IncusSandboxProvider>.Instance,
+                timings: null,
+                healthyRunner);
+            var adopted = await healthyProvider.CreateAsync(fixture.RequestSpec);
+
+            Assert.Equal(fixture.SandboxName, adopted.Id);
+            Assert.Equal(1, healthyRunner.StartCalls);
+            await adopted.DisposeAsync();
+            Assert.Equal(0, healthyRunner.DeleteCalls);
+        }
+        finally
+        {
+            if (Directory.Exists(fixture.Options.StagingDirectory))
+                Directory.Delete(fixture.Options.StagingDirectory, recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Create_WithRetainedRecoveryLease_RejectsWrongCapabilityOrWorkItemWithoutMutatingVm(
+        bool changeToken)
+    {
+        var fixture = PrepareRetainedAdoptionFixture("codeybox-retained-reject");
+        var runner = new RetainedAdoptionRunner(
+            fixture.Options.StagingDirectory!,
+            fixture.SandboxName,
+            fixture.Manifest.LeaseTokenSha256,
+            fixture.ManifestHash);
+        var provider = new IncusSandboxProvider(
+            () => fixture.Options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner);
+        var request = changeToken
+            ? fixture.RequestSpec with
+            {
+                RecoveryLease = new SandboxRecoveryLease(
+                    fixture.Lease.ProviderId,
+                    fixture.Lease.SandboxId,
+                    fixture.Lease.Token + "-wrong"),
+            }
+            : fixture.RequestSpec with { TimingWorkItemId = WorkItemId.New() };
+
+        try
+        {
+            Exception rejected = changeToken
+                ? await Assert.ThrowsAsync<InvalidOperationException>(() => provider.CreateAsync(request))
+                : await Assert.ThrowsAsync<InvalidDataException>(() => provider.CreateAsync(request));
+
+            Assert.Contains(
+                changeToken ? "capability binding" : "different sandbox specification or work item",
+                rejected.Message,
+                StringComparison.Ordinal);
+            Assert.Equal(0, runner.ForcedStopCalls);
+            Assert.Equal(0, runner.StartCalls);
+            Assert.Equal(0, runner.DeleteCalls);
+            Assert.True(Directory.Exists(Path.Combine(
+                fixture.Options.StagingDirectory!,
+                fixture.SandboxName)));
+        }
+        finally
+        {
+            if (Directory.Exists(fixture.Options.StagingDirectory))
+                Directory.Delete(fixture.Options.StagingDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task BaselineBake_WhenDaemonCompletionIsUncertain_RetainsCandidateAdmission()
     {
         var runner = new UncertainCreateRunner();
@@ -580,7 +1093,8 @@ public sealed class IncusSandboxLifecycleTests
         {
             if (IsFileCommand(argv, "push"))
                 return Success();
-            if (IsGuestCommand(argv, IncusCloudInit.ExecWrapperPath))
+            if (IsGuestCommand(argv, IncusCloudInit.ExecWrapperPath)
+                && argv.Any(argument => argument.Contains("/env-", StringComparison.Ordinal)))
             {
                 wrapperExecCalls++;
                 await Task.Delay(TimeSpan.FromMilliseconds(150), ct);
@@ -875,10 +1389,1373 @@ public sealed class IncusSandboxLifecycleTests
         }
     }
 
+    [Fact]
+    public async Task Exec_ExecutionUnavailable_RecoversExactStoppedVmAndAllowsNativeResume()
+    {
+        const string sandboxName = "codeybox-exec-recovery";
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-exec-recovery-{Guid.NewGuid():N}");
+        var wrapperExecCalls = 0;
+        var forcedStopCalls = 0;
+        var startCalls = 0;
+        var restoredCredentialTmpfsCalls = 0;
+        var status = "RUNNING";
+        var options = FastLifecycleOptions();
+        var runner = new ScriptedLifecycleRunner((argv, _, _) =>
+        {
+            if (IsFileCommand(argv, "push"))
+                return Task.FromResult(Success());
+            if (IsGuestCommand(argv, IncusCloudInit.ExecWrapperPath)
+                && argv.Any(argument => argument.Contains("/env-", StringComparison.Ordinal)))
+            {
+                wrapperExecCalls++;
+                return Task.FromResult(wrapperExecCalls == 1
+                    ? new ProcessRunResult(
+                        255,
+                        "partial-agent-output\n",
+                        "guest execution transport disappeared\n",
+                        ExecutionUnavailable: true)
+                    : Success("resumed-agent-output\n"));
+            }
+            if (IsFileCommand(argv, "pull")
+                && argv.Any(argument => argument.Contains("/complete-", StringComparison.Ordinal))
+                && wrapperExecCalls > 1)
+            {
+                return Task.FromResult(Success("0\n"));
+            }
+            if (IsFileCommand(argv, "pull"))
+                return Task.FromResult(Failure());
+            if (argv.Contains("stop", StringComparer.Ordinal) && argv.Contains("--force", StringComparer.Ordinal))
+            {
+                forcedStopCalls++;
+                status = "STOPPED";
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("start", StringComparer.Ordinal))
+            {
+                startCalls++;
+                status = "RUNNING";
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("list", StringComparer.Ordinal))
+                return Task.FromResult(OwnedInstanceList(sandboxName, status));
+            if (IsGuestCommand(argv, "mount") && argv.Contains("tmpfs", StringComparer.Ordinal))
+            {
+                restoredCredentialTmpfsCalls++;
+                return Task.FromResult(Success());
+            }
+            if (IsGuestCommand(argv, "findmnt"))
+                return Task.FromResult(Success("tmpfs\n"));
+            if (IsGuestCommand(argv, "stat"))
+                return Task.FromResult(Success("1000:1000:700\n"));
+            if (IsFileCommand(argv, "delete") || IsGuestCommand(argv, "/bin/true") || IsGuestCommand(argv, "test"))
+                return Task.FromResult(Success());
+            if (IsGuestCommand(argv, "install"))
+                return Task.FromResult(Success());
+            throw new InvalidOperationException($"Unexpected Incus exec-recovery test command: {string.Join(' ', argv)}");
+        });
+        var sandbox = CreateSandbox(
+            sandboxName,
+            root,
+            options,
+            runner,
+            spec: new SandboxSpec
+            {
+                ImageReference = "local-image",
+                Mounts =
+                [
+                    new SandboxMount
+                    {
+                        SandboxPath = SandboxConventions.CredentialsDir,
+                        Tmpfs = true,
+                        SizeBytes = 1024,
+                    },
+                ],
+            },
+            newGuid: SequenceGuids(
+                Guid.Parse("11111111-1111-1111-1111-111111111111"),
+                Guid.Parse("22222222-2222-2222-2222-222222222222")),
+            recoveryMounts:
+            [
+                new IncusPreparedMount(
+                    HostSource: null,
+                    GuestPath: SandboxConventions.CredentialsDir,
+                    ReadOnly: false,
+                    TmpfsSizeBytes: 1024),
+            ]);
+
+        try
+        {
+            var interrupted = await sandbox.ExecAsync(new SandboxExec { Argv = ["agent"] });
+
+            Assert.False(interrupted.Success);
+            Assert.True(interrupted.ExecutionUnavailable);
+            Assert.Equal(255, interrupted.ExitCode);
+            Assert.Equal("partial-agent-output\n", interrupted.Stdout);
+            Assert.Equal("guest execution transport disappeared\n", interrupted.Stderr);
+            Assert.Equal(1, forcedStopCalls);
+            Assert.Equal(1, startCalls);
+            Assert.Equal(1, restoredCredentialTmpfsCalls);
+            var recoveryDeletes = runner.Commands
+                .Where(command => IsFileCommand(command, "delete"))
+                .Select(static command => command[^1])
+                .ToArray();
+            Assert.Equal(3, recoveryDeletes.Length);
+            Assert.Contains(recoveryDeletes, path => path.EndsWith(
+                "/env-11111111111111111111111111111111",
+                StringComparison.Ordinal));
+            Assert.Contains(recoveryDeletes, path => path.EndsWith(
+                "/pid-11111111111111111111111111111111",
+                StringComparison.Ordinal));
+            Assert.Contains(recoveryDeletes, path => path.EndsWith(
+                "/complete-11111111111111111111111111111111",
+                StringComparison.Ordinal));
+
+            var resumed = await sandbox.ExecAsync(new SandboxExec { Argv = ["agent", "resume"] });
+
+            Assert.True(resumed.Success, resumed.Stderr);
+            Assert.Equal("resumed-agent-output\n", resumed.Stdout);
+            Assert.Equal(2, wrapperExecCalls);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Exec_ExecutionUnavailable_DoesNotRestartWhenEffectiveBridgeChanged()
+    {
+        const string sandboxName = "codeybox-exec-recovery-bridge";
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-exec-recovery-bridge-{Guid.NewGuid():N}");
+        var status = "RUNNING";
+        var startCalls = 0;
+        var runner = new ScriptedLifecycleRunner((argv, _, _) =>
+        {
+            if (IsFileCommand(argv, "push"))
+                return Task.FromResult(Success());
+            if (IsGuestCommand(argv, IncusCloudInit.ExecWrapperPath))
+            {
+                return Task.FromResult(new ProcessRunResult(
+                    255,
+                    string.Empty,
+                    "transport unavailable\n",
+                    ExecutionUnavailable: true));
+            }
+            if (IsFileCommand(argv, "pull"))
+                return Task.FromResult(Failure());
+            if (argv.Contains("stop", StringComparer.Ordinal) && argv.Contains("--force", StringComparer.Ordinal))
+            {
+                status = "STOPPED";
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("list", StringComparer.Ordinal))
+                return Task.FromResult(OwnedInstanceList(sandboxName, status));
+            if (argv.Contains("start", StringComparer.Ordinal))
+            {
+                startCalls++;
+                status = "RUNNING";
+                return Task.FromResult(Success());
+            }
+            throw new InvalidOperationException($"Unexpected Incus bridge-recovery test command: {string.Join(' ', argv)}");
+        }, effectiveTopologyJson: () => EffectiveTopologyJson(bridge: "cb-evil"));
+        var options = FastLifecycleOptions() with
+        {
+            ExecPidPollAttempts = 1,
+            NetworkProfiles = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["restricted"] = "cb-auth",
+            },
+        };
+        var spec = new SandboxSpec
+        {
+            ImageReference = "local-image",
+            Network = new SandboxNetworkPolicy { ProfileName = "restricted" },
+        };
+        var sandbox = CreateSandbox(
+            sandboxName,
+            root,
+            options,
+            runner,
+            spec: spec,
+            recoveryBridge: "cb-auth");
+
+        try
+        {
+            var interrupted = await sandbox.ExecAsync(new SandboxExec { Argv = ["agent"] });
+
+            Assert.True(interrupted.ExecutionUnavailable);
+            Assert.Equal(0, startCalls);
+            Assert.DoesNotContain(
+                runner.Commands,
+                command => command.Contains("remove", StringComparer.Ordinal)
+                    && command.Contains("device", StringComparer.Ordinal));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Exec_ExecutionUnavailable_RevalidatesCanonicalGuestPathBeforeHostDeviceRestart()
+    {
+        const string sandboxName = "codeybox-exec-recovery-canonical";
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-exec-recovery-canonical-{Guid.NewGuid():N}");
+        var allowedRoot = Path.Combine(Path.GetTempPath(), $"codeybox-incus-exec-recovery-source-{Guid.NewGuid():N}");
+        var source = Path.Combine(allowedRoot, "repo");
+        Directory.CreateDirectory(source);
+        var status = "RUNNING";
+        var deviceAttached = true;
+        var startCalls = 0;
+        var removeCalls = 0;
+        var addCalls = 0;
+        var runner = new ScriptedLifecycleRunner((argv, _, _) =>
+        {
+            if (IsFileCommand(argv, "push"))
+                return Task.FromResult(Success());
+            if (IsGuestCommand(argv, IncusCloudInit.ExecWrapperPath)
+                && argv.Any(argument => argument.Contains("/env-", StringComparison.Ordinal)))
+            {
+                return Task.FromResult(new ProcessRunResult(
+                    255,
+                    string.Empty,
+                    "transport unavailable\n",
+                    ExecutionUnavailable: true));
+            }
+            if (IsFileCommand(argv, "pull"))
+                return Task.FromResult(Failure());
+            if (argv.Contains("stop", StringComparer.Ordinal) && argv.Contains("--force", StringComparer.Ordinal))
+            {
+                status = "STOPPED";
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("list", StringComparer.Ordinal))
+                return Task.FromResult(OwnedInstanceList(sandboxName, status));
+            if (argv.Contains("remove", StringComparer.Ordinal) && argv.Contains("device", StringComparer.Ordinal))
+            {
+                removeCalls++;
+                deviceAttached = false;
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("add", StringComparer.Ordinal) && argv.Contains("device", StringComparer.Ordinal))
+            {
+                addCalls++;
+                deviceAttached = true;
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("start", StringComparer.Ordinal))
+            {
+                startCalls++;
+                status = "RUNNING";
+                return Task.FromResult(Success());
+            }
+            if (IsGuestCommand(argv, "/bin/true"))
+                return Task.FromResult(Success());
+            throw new InvalidOperationException($"Unexpected Incus canonical-recovery test command: {string.Join(' ', argv)}");
+        },
+        effectiveTopologyJson: () => deviceAttached
+            ? EffectiveTopologyJson(mountSource: source, mountPath: "/repo")
+            : EffectiveTopologyJson(),
+        canonicalPathResolver: path => string.Equals(path, "/repo", StringComparison.Ordinal) ? "/etc" : path);
+        var options = FastLifecycleOptions() with
+        {
+            ExecPidPollAttempts = 1,
+            AllowedHostMountRoots = [allowedRoot],
+        };
+        var spec = new SandboxSpec
+        {
+            ImageReference = "local-image",
+            Mounts =
+            [
+                new SandboxMount
+                {
+                    HostPath = source,
+                    SandboxPath = "/repo",
+                    ReadOnly = true,
+                },
+            ],
+        };
+        var sandbox = CreateSandbox(
+            sandboxName,
+            root,
+            options,
+            runner,
+            spec: spec,
+            recoveryMounts: [new IncusPreparedMount(source, "/repo", ReadOnly: true)]);
+
+        try
+        {
+            var interrupted = await sandbox.ExecAsync(new SandboxExec { Argv = ["agent"] });
+
+            Assert.True(interrupted.ExecutionUnavailable);
+            Assert.Equal(1, startCalls);
+            Assert.Equal(1, removeCalls);
+            Assert.Equal(0, addCalls);
+            Assert.Equal("STOPPED", status);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+            if (Directory.Exists(allowedRoot))
+                Directory.Delete(allowedRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Exec_ExecutionUnavailable_TwoPhaseHostDeviceReadmissionAllowsResume()
+    {
+        const string sandboxName = "codeybox-exec-recovery-readmission";
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-exec-recovery-readmission-{Guid.NewGuid():N}");
+        var allowedRoot = Path.Combine(Path.GetTempPath(), $"codeybox-incus-exec-recovery-readmission-source-{Guid.NewGuid():N}");
+        var source = Path.Combine(allowedRoot, "repo");
+        Directory.CreateDirectory(source);
+        using var sourceIdentityPin = IncusSafeFile.PinDirectoryNoFollow(source);
+        var sourceInode = sourceIdentityPin.Identity.Inode;
+        var status = "RUNNING";
+        var deviceAttached = true;
+        var wrapperExecCalls = 0;
+        var startCalls = 0;
+        var removeCalls = 0;
+        var addCalls = 0;
+        var runner = new ScriptedLifecycleRunner((argv, _, _) =>
+        {
+            if (IsFileCommand(argv, "push"))
+                return Task.FromResult(Success());
+            if (IsGuestCommand(argv, IncusCloudInit.ExecWrapperPath)
+                && argv.Any(argument => argument.Contains("/env-", StringComparison.Ordinal)))
+            {
+                wrapperExecCalls++;
+                return Task.FromResult(wrapperExecCalls == 1
+                    ? new ProcessRunResult(
+                        255,
+                        "partial\n",
+                        "transport unavailable\n",
+                        ExecutionUnavailable: true)
+                    : Success("resumed-with-readmitted-mount\n"));
+            }
+            if (IsFileCommand(argv, "pull")
+                && argv.Any(argument => argument.Contains("/complete-", StringComparison.Ordinal))
+                && wrapperExecCalls > 1)
+            {
+                return Task.FromResult(Success("0\n"));
+            }
+            if (IsFileCommand(argv, "pull"))
+                return Task.FromResult(Failure());
+            if (argv.Contains("stop", StringComparer.Ordinal) && argv.Contains("--force", StringComparer.Ordinal))
+            {
+                status = "STOPPED";
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("list", StringComparer.Ordinal))
+                return Task.FromResult(OwnedInstanceList(sandboxName, status));
+            if (argv.Contains("remove", StringComparer.Ordinal) && argv.Contains("device", StringComparer.Ordinal))
+            {
+                removeCalls++;
+                deviceAttached = false;
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("add", StringComparer.Ordinal) && argv.Contains("device", StringComparer.Ordinal))
+            {
+                addCalls++;
+                deviceAttached = true;
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("start", StringComparer.Ordinal))
+            {
+                startCalls++;
+                status = "RUNNING";
+                return Task.FromResult(Success());
+            }
+            if (IsGuestCommand(argv, "findmnt") && argv.Contains("FSTYPE", StringComparer.Ordinal))
+                return Task.FromResult(Success("virtiofs\n"));
+            if (IsGuestCommand(argv, "findmnt") && argv.Contains("OPTIONS", StringComparer.Ordinal))
+                return Task.FromResult(Success("ro\n"));
+            if (argv.Contains("device", StringComparer.Ordinal)
+                && argv.Contains("get", StringComparer.Ordinal)
+                && argv.Contains("source", StringComparer.Ordinal))
+            {
+                return Task.FromResult(Success(source + "\n"));
+            }
+            if (argv.Contains("device", StringComparer.Ordinal)
+                && argv.Contains("get", StringComparer.Ordinal)
+                && argv.Contains("io.bus", StringComparer.Ordinal))
+            {
+                return Task.FromResult(Success("virtiofs\n"));
+            }
+            if (IsGuestCommand(argv, "stat") && argv.Contains("%i", StringComparer.Ordinal))
+                return Task.FromResult(Success(sourceInode.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\n"));
+            if (IsFileCommand(argv, "delete")
+                || IsGuestCommand(argv, "/bin/true")
+                || IsGuestCommand(argv, "install")
+                || IsGuestCommand(argv, "test"))
+            {
+                return Task.FromResult(Success());
+            }
+            throw new InvalidOperationException($"Unexpected Incus readmission test command: {string.Join(' ', argv)}");
+        }, effectiveTopologyJson: () => deviceAttached
+            ? EffectiveTopologyJson(mountSource: source, mountPath: "/repo")
+            : EffectiveTopologyJson());
+        var options = FastLifecycleOptions() with
+        {
+            ExecPidPollAttempts = 1,
+            AllowedHostMountRoots = [allowedRoot],
+        };
+        var spec = new SandboxSpec
+        {
+            ImageReference = "local-image",
+            Mounts =
+            [
+                new SandboxMount
+                {
+                    HostPath = source,
+                    SandboxPath = "/repo",
+                    ReadOnly = true,
+                },
+            ],
+        };
+        var sandbox = CreateSandbox(
+            sandboxName,
+            root,
+            options,
+            runner,
+            spec: spec,
+            newGuid: SequenceGuids(
+                Guid.Parse("77777777-7777-7777-7777-777777777777"),
+                Guid.Parse("88888888-8888-8888-8888-888888888888")),
+            recoveryMounts: [new IncusPreparedMount(source, "/repo", ReadOnly: true)]);
+
+        try
+        {
+            var interrupted = await sandbox.ExecAsync(new SandboxExec { Argv = ["agent"] });
+
+            Assert.True(interrupted.ExecutionUnavailable);
+            Assert.Equal(2, startCalls);
+            Assert.Equal(1, removeCalls);
+            Assert.Equal(1, addCalls);
+            Assert.True(deviceAttached);
+            Assert.Equal("RUNNING", status);
+
+            var resumed = await sandbox.ExecAsync(new SandboxExec { Argv = ["agent", "resume"] });
+
+            Assert.True(resumed.Success, resumed.Stderr);
+            Assert.Equal("resumed-with-readmitted-mount\n", resumed.Stdout);
+            Assert.Equal(2, wrapperExecCalls);
+            var topologyTransitions = runner.Commands
+                .Where(command => command.Contains("device", StringComparer.Ordinal)
+                    && (command.Contains("remove", StringComparer.Ordinal)
+                        || command.Contains("add", StringComparer.Ordinal)))
+                .Select(command => command.Contains("remove", StringComparer.Ordinal) ? "remove" : "add")
+                .ToArray();
+            Assert.Equal(["remove", "add"], topologyTransitions);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+            if (Directory.Exists(allowedRoot))
+                Directory.Delete(allowedRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Exec_ExecutionUnavailable_ReauthorizesIntentionalExecutableSymlink()
+    {
+        const string sandboxName = "codeybox-exec-recovery-tool-link";
+        const string executableTarget = "/opt/codeybox/tool";
+        const string executableLink = "/usr/local/bin/codeybox-tool";
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-exec-recovery-tool-link-{Guid.NewGuid():N}");
+        var status = "RUNNING";
+        var wrapperCalls = 0;
+        var readLinkCalls = 0;
+        var runner = new ScriptedLifecycleRunner((argv, _, _) =>
+        {
+            if (IsFileCommand(argv, "push"))
+                return Task.FromResult(Success());
+            if (IsGuestCommand(argv, IncusCloudInit.ExecWrapperPath)
+                && argv.Any(argument => argument.Contains("/env-", StringComparison.Ordinal)))
+            {
+                wrapperCalls++;
+                return Task.FromResult(wrapperCalls == 1
+                    ? new ProcessRunResult(
+                        255,
+                        string.Empty,
+                        "transport unavailable\n",
+                        ExecutionUnavailable: true)
+                    : Success("resumed\n"));
+            }
+            if (IsFileCommand(argv, "pull")
+                && argv.Any(argument => argument.Contains("/complete-", StringComparison.Ordinal))
+                && wrapperCalls > 1)
+            {
+                return Task.FromResult(Success("0\n"));
+            }
+            if (IsFileCommand(argv, "pull"))
+                return Task.FromResult(Failure());
+            if (argv.Contains("stop", StringComparer.Ordinal) && argv.Contains("--force", StringComparer.Ordinal))
+            {
+                status = "STOPPED";
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("start", StringComparer.Ordinal))
+            {
+                status = "RUNNING";
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("list", StringComparer.Ordinal))
+                return Task.FromResult(OwnedInstanceList(sandboxName, status));
+            if (IsGuestCommand(argv, "readlink"))
+            {
+                readLinkCalls++;
+                return Task.FromResult(Success(executableTarget + "\n"));
+            }
+            if (IsFileCommand(argv, "delete")
+                || IsGuestCommand(argv, "/bin/true")
+                || IsGuestCommand(argv, "install")
+                || IsGuestCommand(argv, "test"))
+            {
+                return Task.FromResult(Success());
+            }
+            throw new InvalidOperationException(
+                $"Unexpected executable-link recovery command: {string.Join(' ', argv)}");
+        });
+        var options = FastLifecycleOptions() with
+        {
+            ExecPidPollAttempts = 1,
+            ExecutableProvisions =
+            [
+                new BaselineExecutableProvision
+                {
+                    HostSourcePath = "/host/not-read-by-this-test",
+                    VmDestPath = executableTarget,
+                    VmSymlinks = [executableLink],
+                },
+            ],
+        };
+        var sandbox = CreateSandbox(
+            sandboxName,
+            root,
+            options,
+            runner,
+            newGuid: SequenceGuids(
+                Guid.Parse("12345678-1234-1234-1234-123456789001"),
+                Guid.Parse("12345678-1234-1234-1234-123456789002")));
+
+        try
+        {
+            var interrupted = await sandbox.ExecAsync(new SandboxExec { Argv = ["agent"] });
+
+            Assert.True(interrupted.ExecutionUnavailable);
+            Assert.Equal("RUNNING", status);
+            Assert.Equal(2, readLinkCalls);
+
+            var resumed = await sandbox.ExecAsync(new SandboxExec { Argv = ["agent", "resume"] });
+
+            Assert.True(resumed.Success, resumed.Stderr);
+            Assert.Equal("resumed\n", resumed.Stdout);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task Exec_OrdinaryFailureWithoutMatchingCompletionSentinel_StopsAndPoisons(
+    public async Task InfrastructureFailure_TimeoutOrUncertainEnvironmentPush_PublishesIdempotentRecoveryLease(
+        bool failEnvironmentPush)
+    {
+        const string sandboxName = "codeybox-exec-retain-timeout";
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-exec-retain-timeout-{Guid.NewGuid():N}");
+        var status = "RUNNING";
+        var runner = new ScriptedLifecycleRunner((argv, _, _) =>
+        {
+            if (IsFileCommand(argv, "push"))
+            {
+                if (failEnvironmentPush)
+                    throw new TimeoutException("environment push completion is unknown");
+                return Task.FromResult(Success());
+            }
+            if (IsGuestCommand(argv, IncusCloudInit.ExecWrapperPath))
+                throw new TimeoutException("exec transport timed out");
+            if (IsFileCommand(argv, "pull"))
+                return Task.FromResult(Failure());
+            if (IsFileCommand(argv, "delete"))
+                return Task.FromResult(Success());
+            if (argv.Contains("stop", StringComparer.Ordinal) && argv.Contains("--force", StringComparer.Ordinal))
+            {
+                status = "STOPPED";
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("list", StringComparer.Ordinal))
+                return Task.FromResult(OwnedInstanceList(sandboxName, status));
+            if (argv.Contains("start", StringComparer.Ordinal))
+                return Task.FromResult(Failure("infrastructure remains unavailable\n"));
+            if (IsGuestCommand(argv, "test"))
+            {
+                if (failEnvironmentPush
+                    && argv.Contains("!", StringComparer.Ordinal)
+                    && argv.Any(argument => argument.Contains("/env-", StringComparison.Ordinal)))
+                {
+                    return Task.FromResult(Failure());
+                }
+                return Task.FromResult(Success());
+            }
+            throw new InvalidOperationException(
+                $"Unexpected infrastructure-retention command: {string.Join(' ', argv)}");
+        });
+        var options = FastLifecycleOptions() with
+        {
+            StagingDirectory = root,
+            ExecPidPollAttempts = 1,
+            ExecControlFileCleanupAttempts = 1,
+        };
+        IncusMountStaging.EnsureOwnedStagingRoot(root);
+        var inactive = 0;
+        var sandbox = CreateSandbox(
+            sandboxName,
+            root,
+            options,
+            runner,
+            onDisposed: _ => Interlocked.Increment(ref inactive),
+            newGuid: SequenceGuids(
+                Guid.Parse("99999999-9999-9999-9999-999999999991"),
+                Guid.Parse("99999999-9999-9999-9999-999999999992")));
+        SandboxLiveCounter.Increment();
+        try
+        {
+            await Assert.ThrowsAnyAsync<Exception>(() =>
+                sandbox.ExecAsync(new SandboxExec { Argv = ["agent"] }));
+            var commandsBeforeRetention = runner.Commands.Count;
+
+            var lease = await sandbox.RetainForInfrastructureRecoveryAsync();
+            var repeatedLease = await sandbox.RetainForInfrastructureRecoveryAsync();
+
+            Assert.NotNull(lease);
+            Assert.Equal(lease, repeatedLease);
+            Assert.Equal(sandboxName, lease.SandboxId);
+            Assert.Equal(commandsBeforeRetention, runner.Commands.Count);
+
+            await sandbox.DisposeAsync();
+
+            Assert.Equal(1, inactive);
+            Assert.True(Directory.Exists(Path.Combine(root, sandboxName)));
+            Assert.DoesNotContain(
+                runner.Commands,
+                command => command.Contains("delete", StringComparer.Ordinal)
+                    && !IsFileCommand(command, "delete"));
+
+            var sandboxRoot = Path.Combine(root, sandboxName);
+            var baseManifestPath = Directory.EnumerateFiles(
+                    sandboxRoot,
+                    ".codeybox-recovery-*.json",
+                    SearchOption.TopDirectoryOnly)
+                .Single(path => !string.Equals(
+                    Path.GetFileName(path),
+                    ".codeybox-recovery-retained.json",
+                    StringComparison.Ordinal));
+            var baseManifestName = Path.GetFileName(baseManifestPath);
+            const string manifestPrefix = ".codeybox-recovery-";
+            const string manifestSuffix = ".json";
+            var manifestHash = baseManifestName.Substring(
+                manifestPrefix.Length,
+                baseManifestName.Length - manifestPrefix.Length - manifestSuffix.Length);
+            var adoptionRunner = new RetainedAdoptionRunner(
+                root,
+                sandboxName,
+                IncusRecoveryManifestCodec.ComputeTokenSha256(lease.Token),
+                manifestHash);
+            var restartedProvider = new IncusSandboxProvider(
+                () => options,
+                NullLogger<IncusSandboxProvider>.Instance,
+                timings: null,
+                adoptionRunner);
+
+            var adopted = await restartedProvider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = "local-image",
+                RecoveryLease = lease,
+            });
+
+            Assert.Equal(sandboxName, adopted.Id);
+            Assert.Equal("RUNNING", adoptionRunner.Status);
+            await adopted.DisposeAsync();
+            Assert.Equal(0, adoptionRunner.DeleteCalls);
+        }
+        finally
+        {
+            if (Volatile.Read(ref inactive) == 0)
+                SandboxLiveCounter.Decrement();
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Exec_ExecutionUnavailable_DoesNotRestartWhenAuthorizedHostSourceDisappeared()
+    {
+        const string sandboxName = "codeybox-exec-recovery-source";
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-exec-recovery-source-vm-{Guid.NewGuid():N}");
+        var allowedRoot = Path.Combine(Path.GetTempPath(), $"codeybox-incus-exec-recovery-source-host-{Guid.NewGuid():N}");
+        var source = Path.Combine(allowedRoot, "repo");
+        Directory.CreateDirectory(source);
+        var status = "RUNNING";
+        var startCalls = 0;
+        var topologyQueries = 0;
+        var runner = new ScriptedLifecycleRunner((argv, _, _) =>
+        {
+            if (IsFileCommand(argv, "push"))
+                return Task.FromResult(Success());
+            if (IsGuestCommand(argv, IncusCloudInit.ExecWrapperPath))
+            {
+                return Task.FromResult(new ProcessRunResult(
+                    255,
+                    string.Empty,
+                    "transport unavailable\n",
+                    ExecutionUnavailable: true));
+            }
+            if (IsFileCommand(argv, "pull"))
+                return Task.FromResult(Failure());
+            if (argv.Contains("stop", StringComparer.Ordinal) && argv.Contains("--force", StringComparer.Ordinal))
+            {
+                status = "STOPPED";
+                if (Directory.Exists(source))
+                    Directory.Delete(source);
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("list", StringComparer.Ordinal))
+                return Task.FromResult(OwnedInstanceList(sandboxName, status));
+            if (argv.Contains("start", StringComparer.Ordinal))
+            {
+                startCalls++;
+                return Task.FromResult(Success());
+            }
+            throw new InvalidOperationException($"Unexpected Incus source-recovery test command: {string.Join(' ', argv)}");
+        }, effectiveTopologyJson: () =>
+        {
+            topologyQueries++;
+            return EffectiveTopologyJson(mountSource: source, mountPath: "/repo");
+        });
+        var options = FastLifecycleOptions() with
+        {
+            ExecPidPollAttempts = 1,
+            AllowedHostMountRoots = [allowedRoot],
+        };
+        var spec = new SandboxSpec
+        {
+            ImageReference = "local-image",
+            Mounts =
+            [
+                new SandboxMount
+                {
+                    HostPath = source,
+                    SandboxPath = "/repo",
+                    ReadOnly = true,
+                },
+            ],
+        };
+        var sandbox = CreateSandbox(
+            sandboxName,
+            root,
+            options,
+            runner,
+            spec: spec,
+            recoveryMounts: [new IncusPreparedMount(source, "/repo", ReadOnly: true)]);
+
+        try
+        {
+            var interrupted = await sandbox.ExecAsync(new SandboxExec { Argv = ["agent"] });
+
+            Assert.True(interrupted.ExecutionUnavailable);
+            Assert.Equal(0, startCalls);
+            Assert.Equal(0, topologyQueries);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+            if (Directory.Exists(allowedRoot))
+                Directory.Delete(allowedRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Exec_ExecutionUnavailable_ImmediateRecoveryFailure_IsRetriedByNextExec()
+    {
+        const string sandboxName = "codeybox-exec-lazy-recovery";
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-exec-lazy-recovery-{Guid.NewGuid():N}");
+        var time = new ControllableTimeProvider(
+            new DateTimeOffset(2026, 7, 12, 3, 0, 0, TimeSpan.Zero));
+        var wrapperExecCalls = 0;
+        var forcedStopCalls = 0;
+        var startCalls = 0;
+        var status = "RUNNING";
+        var runner = new ScriptedLifecycleRunner((argv, _, _) =>
+        {
+            if (IsFileCommand(argv, "push"))
+                return Task.FromResult(Success());
+            if (IsGuestCommand(argv, IncusCloudInit.ExecWrapperPath)
+                && argv.Any(argument => argument.Contains("/env-", StringComparison.Ordinal)))
+            {
+                wrapperExecCalls++;
+                return Task.FromResult(wrapperExecCalls == 1
+                    ? new ProcessRunResult(
+                        255,
+                        "partial-agent-output\n",
+                        "guest execution transport disappeared\n",
+                        ExecutionUnavailable: true)
+                    : Success("resumed-agent-output\n"));
+            }
+            if (IsFileCommand(argv, "pull")
+                && argv.Any(argument => argument.Contains("/complete-", StringComparison.Ordinal))
+                && wrapperExecCalls > 1)
+            {
+                return Task.FromResult(Success("0\n"));
+            }
+            if (IsFileCommand(argv, "pull"))
+                return Task.FromResult(Failure());
+            if (argv.Contains("stop", StringComparer.Ordinal) && argv.Contains("--force", StringComparer.Ordinal))
+            {
+                forcedStopCalls++;
+                status = "STOPPED";
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("start", StringComparer.Ordinal))
+            {
+                startCalls++;
+                if (startCalls == 1)
+                    return Task.FromResult(Failure("temporary start failure\n"));
+                status = "RUNNING";
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("list", StringComparer.Ordinal))
+                return Task.FromResult(OwnedInstanceList(sandboxName, status));
+            if (IsFileCommand(argv, "delete")
+                || IsGuestCommand(argv, "/bin/true")
+                || IsGuestCommand(argv, "install")
+                || IsGuestCommand(argv, "test"))
+            {
+                return Task.FromResult(Success());
+            }
+            throw new InvalidOperationException($"Unexpected Incus lazy-recovery test command: {string.Join(' ', argv)}");
+        });
+        var liveOptions = FastLifecycleOptions() with { ExecPidPollAttempts = 1 };
+        var sandbox = CreateSandbox(
+            sandboxName,
+            root,
+            liveOptions,
+            runner,
+            timeProvider: time,
+            newGuid: SequenceGuids(
+                Guid.Parse("11111111-1111-1111-1111-111111111111"),
+                Guid.Parse("22222222-2222-2222-2222-222222222222")),
+            liveOptionsAccessor: () => liveOptions);
+
+        try
+        {
+            var interrupted = await sandbox.ExecAsync(new SandboxExec { Argv = ["agent"] });
+
+            Assert.True(interrupted.ExecutionUnavailable);
+            Assert.Equal(1, forcedStopCalls);
+            Assert.Equal(1, startCalls);
+
+            // The delayed policy is read from the live accessor at the next
+            // exec boundary, after the immediate attempt has already failed.
+            liveOptions = liveOptions with
+            {
+                InterruptedExecRecoveryRetryAttempts = 1,
+                InterruptedExecRecoveryRetryDelay = TimeSpan.FromSeconds(1),
+            };
+            var resumedTask = sandbox.ExecAsync(new SandboxExec { Argv = ["agent", "resume"] });
+            await AdvanceUntilCompletedAsync(time, resumedTask, TimeSpan.FromSeconds(1));
+            var resumed = await resumedTask;
+
+            Assert.True(resumed.Success, resumed.Stderr);
+            Assert.Equal("resumed-agent-output\n", resumed.Stdout);
+            Assert.Equal(2, startCalls);
+            Assert.Equal(2, wrapperExecCalls);
+            Assert.Contains(
+                runner.Commands,
+                command => IsFileCommand(command, "delete")
+                    && command[^1].EndsWith("/env-11111111111111111111111111111111", StringComparison.Ordinal));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Exec_ExecutionUnavailable_PostStartPreparationFailure_IsRestoppedBeforeDelayedRetry()
+    {
+        const string sandboxName = "codeybox-exec-post-start-recovery";
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-exec-post-start-recovery-{Guid.NewGuid():N}");
+        var time = new ControllableTimeProvider(
+            new DateTimeOffset(2026, 7, 12, 3, 30, 0, TimeSpan.Zero));
+        var wrapperExecCalls = 0;
+        var forcedStopCalls = 0;
+        var startCalls = 0;
+        var runtimePreparationCalls = 0;
+        var status = "RUNNING";
+        var runner = new ScriptedLifecycleRunner((argv, _, _) =>
+        {
+            if (IsFileCommand(argv, "push"))
+                return Task.FromResult(Success());
+            if (IsGuestCommand(argv, IncusCloudInit.ExecWrapperPath)
+                && argv.Any(argument => argument.Contains("/env-", StringComparison.Ordinal)))
+            {
+                wrapperExecCalls++;
+                return Task.FromResult(wrapperExecCalls == 1
+                    ? new ProcessRunResult(
+                        255,
+                        "partial-agent-output\n",
+                        "guest execution transport disappeared\n",
+                        ExecutionUnavailable: true)
+                    : Success("resumed-agent-output\n"));
+            }
+            if (IsFileCommand(argv, "pull")
+                && argv.Any(argument => argument.Contains("/complete-", StringComparison.Ordinal))
+                && wrapperExecCalls > 1)
+            {
+                return Task.FromResult(Success("0\n"));
+            }
+            if (IsFileCommand(argv, "pull"))
+                return Task.FromResult(Failure());
+            if (argv.Contains("stop", StringComparer.Ordinal) && argv.Contains("--force", StringComparer.Ordinal))
+            {
+                forcedStopCalls++;
+                status = "STOPPED";
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("start", StringComparer.Ordinal))
+            {
+                startCalls++;
+                if (!string.Equals(status, "STOPPED", StringComparison.Ordinal))
+                    return Task.FromResult(Failure("VM must be stopped before recovery start\n"));
+                status = "RUNNING";
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("list", StringComparer.Ordinal))
+                return Task.FromResult(OwnedInstanceList(sandboxName, status));
+            if (IsGuestCommand(argv, "/bin/true"))
+                return Task.FromResult(Success());
+            if (IsGuestCommand(argv, "install"))
+            {
+                runtimePreparationCalls++;
+                return Task.FromResult(runtimePreparationCalls == 1
+                    ? Failure("runtime preparation failed\n")
+                    : Success());
+            }
+            if (IsFileCommand(argv, "delete") || IsGuestCommand(argv, "test"))
+                return Task.FromResult(Success());
+            throw new InvalidOperationException($"Unexpected Incus post-start recovery test command: {string.Join(' ', argv)}");
+        });
+        var options = FastLifecycleOptions() with
+        {
+            ExecPidPollAttempts = 1,
+            InterruptedExecRecoveryRetryAttempts = 1,
+            InterruptedExecRecoveryRetryDelay = TimeSpan.FromSeconds(1),
+        };
+        var sandbox = CreateSandbox(
+            sandboxName,
+            root,
+            options,
+            runner,
+            timeProvider: time,
+            newGuid: SequenceGuids(
+                Guid.Parse("33333333-3333-3333-3333-333333333333"),
+                Guid.Parse("44444444-4444-4444-4444-444444444444")));
+
+        try
+        {
+            var interrupted = await sandbox.ExecAsync(new SandboxExec { Argv = ["agent"] });
+
+            Assert.True(interrupted.ExecutionUnavailable);
+            Assert.Equal(1, startCalls);
+            Assert.Equal(2, forcedStopCalls);
+            Assert.Equal("STOPPED", status);
+
+            var resumedTask = sandbox.ExecAsync(new SandboxExec { Argv = ["agent", "resume"] });
+            await AdvanceUntilCompletedAsync(time, resumedTask, TimeSpan.FromSeconds(1));
+            var resumed = await resumedTask;
+
+            Assert.True(resumed.Success, resumed.Stderr);
+            Assert.Equal("resumed-agent-output\n", resumed.Stdout);
+            Assert.Equal(2, startCalls);
+            Assert.Equal(2, forcedStopCalls);
+            Assert.Equal(3, runtimePreparationCalls);
+            var lifecycleTransitions = runner.Commands
+                .Where(command => command.Contains("start", StringComparer.Ordinal)
+                    || (command.Contains("stop", StringComparer.Ordinal)
+                        && command.Contains("--force", StringComparer.Ordinal)))
+                .Select(command => command.Contains("start", StringComparer.Ordinal) ? "start" : "stop")
+                .ToArray();
+            Assert.Equal(["stop", "start", "stop", "start"], lifecycleTransitions);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Exec_ExecutionUnavailable_ExhaustedWindowCanRecoverAtLaterExecBoundary()
+    {
+        const string sandboxName = "codeybox-exec-lazy-recovery-exhausted";
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-exec-lazy-recovery-exhausted-{Guid.NewGuid():N}");
+        var time = new ControllableTimeProvider(
+            new DateTimeOffset(2026, 7, 12, 4, 0, 0, TimeSpan.Zero));
+        var wrapperExecCalls = 0;
+        var startCalls = 0;
+        var infrastructureHealthy = false;
+        var status = "RUNNING";
+        var runner = new ScriptedLifecycleRunner((argv, _, _) =>
+        {
+            if (IsFileCommand(argv, "push"))
+                return Task.FromResult(Success());
+            if (IsGuestCommand(argv, IncusCloudInit.ExecWrapperPath)
+                && argv.Any(argument => argument.Contains("/env-", StringComparison.Ordinal)))
+            {
+                wrapperExecCalls++;
+                return Task.FromResult(wrapperExecCalls == 1
+                    ? new ProcessRunResult(
+                        255,
+                        "partial\n",
+                        "transport unavailable\n",
+                        ExecutionUnavailable: true)
+                    : Success("resumed-after-infrastructure-recovery\n"));
+            }
+            if (IsFileCommand(argv, "pull")
+                && argv.Any(argument => argument.Contains("/complete-", StringComparison.Ordinal))
+                && wrapperExecCalls > 1)
+            {
+                return Task.FromResult(Success("0\n"));
+            }
+            if (IsFileCommand(argv, "pull"))
+                return Task.FromResult(Failure());
+            if (argv.Contains("stop", StringComparer.Ordinal) && argv.Contains("--force", StringComparer.Ordinal))
+            {
+                status = "STOPPED";
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("start", StringComparer.Ordinal))
+            {
+                startCalls++;
+                if (!infrastructureHealthy)
+                    return Task.FromResult(Failure("start remains unavailable\n"));
+                status = "RUNNING";
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("list", StringComparer.Ordinal))
+                return Task.FromResult(OwnedInstanceList(sandboxName, status));
+            if (IsFileCommand(argv, "delete")
+                || IsGuestCommand(argv, "/bin/true")
+                || IsGuestCommand(argv, "install")
+                || IsGuestCommand(argv, "test"))
+            {
+                return Task.FromResult(Success());
+            }
+            throw new InvalidOperationException($"Unexpected Incus lazy-exhaustion test command: {string.Join(' ', argv)}");
+        });
+        var options = FastLifecycleOptions() with
+        {
+            ExecPidPollAttempts = 1,
+            InterruptedExecRecoveryRetryAttempts = 2,
+            InterruptedExecRecoveryRetryDelay = TimeSpan.FromSeconds(1),
+        };
+        var sandbox = CreateSandbox(
+            sandboxName,
+            root,
+            options,
+            runner,
+            timeProvider: time);
+
+        try
+        {
+            var interrupted = await sandbox.ExecAsync(new SandboxExec { Argv = ["agent"] });
+            Assert.True(interrupted.ExecutionUnavailable);
+            Assert.Equal(1, startCalls);
+
+            var rejectedTask = sandbox.ExecAsync(new SandboxExec { Argv = ["agent", "resume"] });
+            await AdvanceUntilCompletedAsync(time, rejectedTask, TimeSpan.FromSeconds(1));
+            var rejected = await rejectedTask;
+
+            Assert.True(rejected.ExecutionUnavailable);
+            Assert.Contains("bounded attempt window", rejected.Stderr, StringComparison.Ordinal);
+            Assert.Equal(3, startCalls);
+            Assert.Equal(1, wrapperExecCalls);
+
+            infrastructureHealthy = true;
+            var resumedTask = sandbox.ExecAsync(new SandboxExec { Argv = ["agent", "resume-again"] });
+            await AdvanceUntilCompletedAsync(time, resumedTask, TimeSpan.FromSeconds(1));
+            var resumed = await resumedTask;
+
+            Assert.True(resumed.Success, resumed.Stderr);
+            Assert.Equal("resumed-after-infrastructure-recovery\n", resumed.Stdout);
+            Assert.Equal(4, startCalls);
+            Assert.Equal(2, wrapperExecCalls);
+            Assert.DoesNotContain(
+                runner.Commands,
+                command => command.Contains("delete", StringComparer.Ordinal)
+                    && !command.Contains("file", StringComparer.Ordinal));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Exec_ExecutionUnavailable_CancelledDelayedRecovery_PreservesPendingPoison()
+    {
+        const string sandboxName = "codeybox-exec-lazy-recovery-cancelled";
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-exec-lazy-recovery-cancelled-{Guid.NewGuid():N}");
+        var time = new ControllableTimeProvider(
+            new DateTimeOffset(2026, 7, 12, 5, 0, 0, TimeSpan.Zero));
+        var startCalls = 0;
+        var status = "RUNNING";
+        var runner = new ScriptedLifecycleRunner((argv, _, _) =>
+        {
+            if (IsFileCommand(argv, "push"))
+                return Task.FromResult(Success());
+            if (IsGuestCommand(argv, IncusCloudInit.ExecWrapperPath))
+            {
+                return Task.FromResult(new ProcessRunResult(
+                    255,
+                    string.Empty,
+                    "transport unavailable\n",
+                    ExecutionUnavailable: true));
+            }
+            if (IsFileCommand(argv, "pull"))
+                return Task.FromResult(Failure());
+            if (argv.Contains("stop", StringComparer.Ordinal) && argv.Contains("--force", StringComparer.Ordinal))
+            {
+                status = "STOPPED";
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("start", StringComparer.Ordinal))
+            {
+                startCalls++;
+                return Task.FromResult(Failure("temporary start failure\n"));
+            }
+            if (argv.Contains("list", StringComparer.Ordinal))
+                return Task.FromResult(OwnedInstanceList(sandboxName, status));
+            throw new InvalidOperationException($"Unexpected Incus lazy-cancellation test command: {string.Join(' ', argv)}");
+        });
+        var liveOptions = FastLifecycleOptions() with
+        {
+            ExecPidPollAttempts = 1,
+            InterruptedExecRecoveryRetryAttempts = 2,
+            InterruptedExecRecoveryRetryDelay = TimeSpan.FromSeconds(10),
+        };
+        var sandbox = CreateSandbox(
+            sandboxName,
+            root,
+            liveOptions,
+            runner,
+            timeProvider: time,
+            liveOptionsAccessor: () => liveOptions);
+
+        try
+        {
+            var interrupted = await sandbox.ExecAsync(new SandboxExec { Argv = ["agent"] });
+            Assert.True(interrupted.ExecutionUnavailable);
+            Assert.Equal(1, startCalls);
+
+            using var cts = new CancellationTokenSource();
+            var retryTask = sandbox.ExecAsync(
+                new SandboxExec { Argv = ["agent", "resume"] },
+                cts.Token);
+            Assert.False(retryTask.IsCompleted);
+            await cts.CancelAsync();
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => retryTask);
+            Assert.Equal(1, startCalls);
+
+            liveOptions = liveOptions with { InterruptedExecRecoveryRetryAttempts = 0 };
+            var commandCount = runner.Commands.Count;
+            var stillPoisoned = await sandbox.ExecAsync(new SandboxExec { Argv = ["agent", "resume-again"] });
+            Assert.True(stillPoisoned.ExecutionUnavailable);
+            Assert.Contains("bounded attempt window", stillPoisoned.Stderr, StringComparison.Ordinal);
+            Assert.Equal(commandCount, runner.Commands.Count);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Exec_ExecutionUnavailable_RemainsPoisonedWhenRecoveredControlFileAbsenceCannotBeProved()
+    {
+        const string sandboxName = "codeybox-exec-recovery-cleanup-failure";
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-exec-recovery-cleanup-{Guid.NewGuid():N}");
+        var status = "RUNNING";
+        var environmentAbsenceChecks = 0;
+        var runner = new ScriptedLifecycleRunner((argv, _, _) =>
+        {
+            if (IsFileCommand(argv, "push"))
+                return Task.FromResult(Success());
+            if (IsGuestCommand(argv, IncusCloudInit.ExecWrapperPath)
+                && argv.Any(argument => argument.Contains("/env-", StringComparison.Ordinal)))
+            {
+                return Task.FromResult(new ProcessRunResult(
+                    255,
+                    "partial\n",
+                    "transport unavailable\n",
+                    ExecutionUnavailable: true));
+            }
+            if (IsFileCommand(argv, "pull"))
+                return Task.FromResult(Failure());
+            if (argv.Contains("stop", StringComparer.Ordinal) && argv.Contains("--force", StringComparer.Ordinal))
+            {
+                status = "STOPPED";
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("start", StringComparer.Ordinal))
+            {
+                status = "RUNNING";
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("list", StringComparer.Ordinal))
+                return Task.FromResult(OwnedInstanceList(sandboxName, status));
+            if (IsFileCommand(argv, "delete") || IsGuestCommand(argv, "/bin/true") || IsGuestCommand(argv, "install"))
+                return Task.FromResult(Success());
+            if (IsGuestCommand(argv, "test"))
+            {
+                if (argv.Contains("!", StringComparer.Ordinal)
+                    && argv.Any(argument => argument.Contains("/env-", StringComparison.Ordinal)))
+                {
+                    environmentAbsenceChecks++;
+                    return Task.FromResult(Failure());
+                }
+                return Task.FromResult(Success());
+            }
+            throw new InvalidOperationException($"Unexpected Incus cleanup-failure test command: {string.Join(' ', argv)}");
+        });
+        var options = FastLifecycleOptions() with
+        {
+            ExecPidPollAttempts = 1,
+            ExecControlFileCleanupAttempts = 2,
+        };
+        var sandbox = CreateSandbox(
+            sandboxName,
+            root,
+            options,
+            runner,
+            newGuid: SequenceGuids(
+                Guid.Parse("33333333-3333-3333-3333-333333333333"),
+                Guid.Parse("44444444-4444-4444-4444-444444444444")));
+
+        try
+        {
+            var interrupted = await sandbox.ExecAsync(new SandboxExec { Argv = ["agent"] });
+
+            Assert.True(interrupted.ExecutionUnavailable);
+            Assert.Equal("partial\n", interrupted.Stdout);
+            Assert.Equal(2, environmentAbsenceChecks);
+            var cleanupDeletes = runner.Commands
+                .Where(command => IsFileCommand(command, "delete"))
+                .Select(static command => command[^1])
+                .ToArray();
+            Assert.Equal(4, cleanupDeletes.Length);
+            Assert.Equal(2, cleanupDeletes.Count(path => path.EndsWith(
+                "/env-33333333333333333333333333333333",
+                StringComparison.Ordinal)));
+            var commandCount = runner.Commands.Count;
+
+            var poisoned = await sandbox.ExecAsync(new SandboxExec { Argv = ["agent", "resume"] });
+
+            Assert.True(poisoned.ExecutionUnavailable);
+            Assert.Contains("bounded attempt window", poisoned.Stderr, StringComparison.Ordinal);
+            Assert.Equal(commandCount, runner.Commands.Count);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Exec_ExecutionUnavailable_DoesNotRestartWhenExactInstanceOwnershipChanged()
+    {
+        const string sandboxName = "codeybox-exec-recovery-owner-change";
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-incus-exec-recovery-owner-{Guid.NewGuid():N}");
+        var startCalls = 0;
+        var runner = new ScriptedLifecycleRunner((argv, _, _) =>
+        {
+            if (IsFileCommand(argv, "push"))
+                return Task.FromResult(Success());
+            if (IsGuestCommand(argv, IncusCloudInit.ExecWrapperPath)
+                && argv.Any(argument => argument.Contains("/env-", StringComparison.Ordinal)))
+            {
+                return Task.FromResult(new ProcessRunResult(
+                    255,
+                    string.Empty,
+                    "transport unavailable\n",
+                    ExecutionUnavailable: true));
+            }
+            if (IsFileCommand(argv, "pull") || argv.Contains("stop", StringComparer.Ordinal))
+                return Task.FromResult(Failure());
+            if (argv.Contains("list", StringComparer.Ordinal))
+            {
+                return Task.FromResult(Success(
+                    $"[{{\"name\":\"{sandboxName}\",\"type\":\"virtual-machine\",\"status\":\"STOPPED\"," +
+                    $"\"config\":{{\"{IncusSandboxProvider.ManagedKey}\":\"false\"," +
+                    $"\"{IncusSandboxProvider.KindKey}\":\"{IncusSandboxProvider.SandboxKind}\"}}}}]"));
+            }
+            if (argv.Contains("start", StringComparer.Ordinal))
+            {
+                startCalls++;
+                return Task.FromResult(Success());
+            }
+            throw new InvalidOperationException($"Unexpected Incus owner-change test command: {string.Join(' ', argv)}");
+        });
+        var options = FastLifecycleOptions() with { ExecPidPollAttempts = 1 };
+        var sandbox = CreateSandbox(
+            sandboxName,
+            root,
+            options,
+            runner,
+            newGuid: SequenceGuids(
+                Guid.Parse("55555555-5555-5555-5555-555555555555"),
+                Guid.Parse("66666666-6666-6666-6666-666666666666")));
+
+        try
+        {
+            var interrupted = await sandbox.ExecAsync(new SandboxExec { Argv = ["agent"] });
+
+            Assert.True(interrupted.ExecutionUnavailable);
+            Assert.Equal(0, startCalls);
+            Assert.DoesNotContain(runner.Commands, command => IsFileCommand(command, "delete"));
+            var commandCount = runner.Commands.Count;
+
+            var poisoned = await sandbox.ExecAsync(new SandboxExec { Argv = ["agent", "resume"] });
+
+            Assert.True(poisoned.ExecutionUnavailable);
+            Assert.Contains("bounded attempt window", poisoned.Stderr, StringComparison.Ordinal);
+            Assert.Equal(commandCount, runner.Commands.Count);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Exec_OrdinaryFailureWithoutMatchingCompletionSentinel_ReturnsTypedInterruptionAndFailsClosedWhenRestartFails(
         bool returnMismatchedSentinel)
     {
         const string sandboxName = "codeybox-exec-sentinel";
@@ -887,6 +2764,7 @@ public sealed class IncusSandboxLifecycleTests
         var pidPullCalls = 0;
         var wrapperExecCalls = 0;
         var forcedStopCalls = 0;
+        var startCalls = 0;
         var stopped = false;
         var runner = new ScriptedLifecycleRunner((argv, _, _) =>
         {
@@ -914,6 +2792,11 @@ public sealed class IncusSandboxLifecycleTests
                 stopped = true;
                 return Task.FromResult(Success());
             }
+            if (argv.Contains("start", StringComparer.Ordinal))
+            {
+                startCalls++;
+                return Task.FromResult(Failure("restart unavailable\n"));
+            }
             if (argv.Contains("list", StringComparer.Ordinal))
                 return Task.FromResult(OwnedInstanceList(sandboxName, stopped ? "STOPPED" : "RUNNING"));
             throw new InvalidOperationException($"Unexpected Incus sentinel test command: {string.Join(' ', argv)}");
@@ -933,21 +2816,23 @@ public sealed class IncusSandboxLifecycleTests
 
         try
         {
-            var failure = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-                sandbox.ExecAsync(new SandboxExec { Argv = ["false"] }));
+            var interruption = await sandbox.ExecAsync(new SandboxExec { Argv = ["false"] });
 
-            Assert.Contains("completion sentinel", failure.Message, StringComparison.Ordinal);
+            Assert.False(interruption.Success);
+            Assert.True(interruption.ExecutionUnavailable);
+            Assert.Equal("ordinary command failure\n", interruption.Stderr);
             Assert.Equal(1, wrapperExecCalls);
             Assert.Equal(2, completionPullCalls);
             Assert.Equal(2, pidPullCalls);
             Assert.Equal(1, forcedStopCalls);
+            Assert.Equal(1, startCalls);
             Assert.DoesNotContain(runner.Commands, command => IsFileCommand(command, "delete"));
             var commandCount = runner.Commands.Count;
 
-            var poisoned = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-                sandbox.ExecAsync(new SandboxExec { Argv = ["true"] }));
+            var poisoned = await sandbox.ExecAsync(new SandboxExec { Argv = ["true"] });
 
-            Assert.Contains("unverified prior exec cleanup", poisoned.Message, StringComparison.Ordinal);
+            Assert.True(poisoned.ExecutionUnavailable);
+            Assert.Contains("bounded attempt window", poisoned.Stderr, StringComparison.Ordinal);
             Assert.Equal(commandCount, runner.Commands.Count);
         }
         finally
@@ -1105,7 +2990,25 @@ public sealed class IncusSandboxLifecycleTests
         ExecTimeout = TimeSpan.FromSeconds(2),
         VmStopTimeout = TimeSpan.FromMilliseconds(100),
         ReadinessPollInterval = TimeSpan.FromMilliseconds(1),
+        InterruptedExecRecoveryRetryAttempts = 0,
     };
+
+    private static async Task AdvanceUntilCompletedAsync(
+        ControllableTimeProvider time,
+        Task task,
+        TimeSpan advance)
+    {
+        const int maximumSchedulerTurns = 100;
+        for (var turn = 0; turn < maximumSchedulerTurns && !task.IsCompleted; turn++)
+        {
+            time.Advance(advance);
+            // This delay only yields to continuations released by the injected
+            // fake clock; it does not drive the recovery delay or its outcome.
+            await Task.Delay(TimeSpan.FromMilliseconds(1));
+        }
+
+        Assert.True(task.IsCompleted, "Incus delayed recovery did not complete after advancing the injected clock.");
+    }
 
     private static IncusSandbox CreateSandbox(
         string sandboxName,
@@ -1116,16 +3019,36 @@ public sealed class IncusSandboxLifecycleTests
         SandboxSpec? spec = null,
         TimeProvider? timeProvider = null,
         Func<Guid>? newGuid = null,
-        Func<IncusSandboxOptions>? liveOptionsAccessor = null)
+        Func<IncusSandboxOptions>? liveOptionsAccessor = null,
+        IReadOnlyList<IncusPreparedMount>? recoveryMounts = null,
+        string? recoveryBridge = null)
     {
         var sandboxRoot = Path.Combine(root, sandboxName);
         Directory.CreateDirectory(sandboxRoot);
         IncusMountStaging.InitializeOwnedTree(sandboxRoot, sandboxName, DateTimeOffset.UtcNow);
+        var effectiveSpec = spec ?? new SandboxSpec { ImageReference = "local-image" };
+        var authorization = RecoveryAuthorization(
+            options,
+            effectiveSpec,
+            recoveryMounts,
+            recoveryBridge);
+        var recoveryState = CreateRecoveryState(
+            sandboxRoot,
+            sandboxName,
+            effectiveSpec,
+            options,
+            authorization);
+        if (runner is ScriptedLifecycleRunner scripted)
+        {
+            scripted.SetRecoveryBinding(
+                recoveryState.Manifest.LeaseTokenSha256,
+                recoveryState.ManifestHash);
+        }
         return new IncusSandbox(
             sandboxName,
             sandboxRoot,
             root,
-            spec ?? new SandboxSpec { ImageReference = "local-image" },
+            effectiveSpec,
             options,
             new IncusCliRunner(runner, timeProvider),
             NullLogger.Instance,
@@ -1135,10 +3058,118 @@ public sealed class IncusSandboxLifecycleTests
             baselineRef: null,
             resourceUsageStore: null,
             onDisposed ?? (_ => { }),
+            authorization,
+            recoveryState.Lease,
+            recoveryState.Manifest,
+            recoveryState.Store,
             timeProvider,
             newGuid,
             liveOptionsAccessor);
     }
+
+    private static IncusRecoveryAuthorization RecoveryAuthorization(
+        IncusSandboxOptions options,
+        SandboxSpec? spec = null,
+        IReadOnlyList<IncusPreparedMount>? mounts = null,
+        string? bridge = null)
+    {
+        var effectiveSpec = spec ?? new SandboxSpec { ImageReference = "local-image" };
+        return IncusRecoveryAuthorization.CaptureValidated(
+            bridge,
+            mounts ?? [],
+            effectiveSpec.Mounts.Select(static mount => mount.SandboxPath).ToArray(),
+            [],
+            options);
+    }
+
+    private static RecoveryTestState CreateRecoveryState(
+        string sandboxRoot,
+        string sandboxName,
+        SandboxSpec spec,
+        IncusSandboxOptions options,
+        IncusRecoveryAuthorization authorization,
+        string? baselineRef = null)
+    {
+        var token = $"test-recovery-token-{sandboxName}";
+        var lease = new SandboxRecoveryLease(IncusSandboxProvider.ProviderId, sandboxName, token);
+        var manifest = IncusRecoveryManifest.Create(
+            sandboxName,
+            spec,
+            options,
+            IncusRecoveryManifestCodec.ComputeTokenSha256(token),
+            baselineRef,
+            authorization);
+        var store = IncusRecoveryManifestStore.Acquire(sandboxRoot);
+        var manifestHash = store.Write(
+            manifest,
+            Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"));
+        return new RecoveryTestState(lease, manifest, manifestHash, store);
+    }
+
+    private sealed record RecoveryTestState(
+        SandboxRecoveryLease Lease,
+        IncusRecoveryManifest Manifest,
+        string ManifestHash,
+        IncusRecoveryManifestStore Store);
+
+    private static RetainedAdoptionFixture PrepareRetainedAdoptionFixture(string sandboxName)
+    {
+        var stagingRoot = Path.Combine(
+            Path.GetTempPath(),
+            $"codeybox-incus-retained-adoption-{Guid.NewGuid():N}");
+        var options = FastLifecycleOptions() with
+        {
+            StagingDirectory = stagingRoot,
+            UseBaselineImages = false,
+        };
+        var originalSpec = SandboxConventions.WithTimingEnvironment(new SandboxSpec
+        {
+            ImageReference = "local-image",
+            TimingWorkItemId = WorkItemId.New(),
+            TimingPhase = "work",
+        });
+        IncusMountStaging.EnsureOwnedStagingRoot(stagingRoot);
+        var sandboxRoot = Path.Combine(stagingRoot, sandboxName);
+        Directory.CreateDirectory(sandboxRoot);
+        IncusMountStaging.InitializeOwnedTree(
+            sandboxRoot,
+            sandboxName,
+            DateTimeOffset.UtcNow);
+        var authorization = RecoveryAuthorization(options, originalSpec);
+        var state = CreateRecoveryState(
+            sandboxRoot,
+            sandboxName,
+            originalSpec,
+            options,
+            authorization);
+        var oldRunId = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        var retained = state.Manifest.Retain(new IncusRecoveryPendingExec(
+            oldRunId,
+            $"{IncusCloudInit.ControlDirectory}/env-{oldRunId}",
+            $"{IncusCloudInit.ControlDirectory}/pid-{oldRunId}",
+            $"{IncusCloudInit.ControlDirectory}/complete-{oldRunId}",
+            HostDevicesDetached: false));
+        state.Store.WriteRetained(
+            retained,
+            Guid.Parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"));
+        state.Store.Dispose();
+        authorization.Dispose();
+        return new RetainedAdoptionFixture(
+            sandboxName,
+            options,
+            originalSpec with { RecoveryLease = state.Lease },
+            state.Lease,
+            retained,
+            state.ManifestHash);
+    }
+
+    private sealed record RetainedAdoptionFixture(
+        string SandboxName,
+        IncusSandboxOptions Options,
+        SandboxSpec RequestSpec,
+        SandboxRecoveryLease Lease,
+        IncusRecoveryManifest Manifest,
+        string ManifestHash);
 
     private static ProcessRunResult Success(string stdout = "") =>
         new(0, stdout, string.Empty);
@@ -1146,11 +3177,114 @@ public sealed class IncusSandboxLifecycleTests
     private static ProcessRunResult Failure(string stderr = "") =>
         new(1, string.Empty, stderr);
 
+    private static Func<Guid> SequenceGuids(params Guid[] values)
+    {
+        var remaining = new Queue<Guid>(values);
+        return () => remaining.Count > 0
+            ? remaining.Dequeue()
+            : throw new InvalidOperationException("The deterministic GUID sequence was exhausted.");
+    }
+
     private static ProcessRunResult OwnedInstanceList(string sandboxName, string status) =>
         string.IsNullOrEmpty(status)
             ? Success("[]")
-            : Success(
-                $"[{{\"name\":\"{sandboxName}\",\"type\":\"virtual-machine\",\"status\":\"{status}\",\"config\":{{\"{IncusSandboxProvider.ManagedKey}\":\"true\",\"{IncusSandboxProvider.KindKey}\":\"{IncusSandboxProvider.SandboxKind}\"}}}}]");
+            : Success(OwnedInstanceJson(sandboxName, status));
+
+    private static string OwnedInstanceJson(
+        string sandboxName,
+        string status,
+        string? recoveryTokenHash = null,
+        string? recoveryManifestHash = null)
+    {
+        var config = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            [IncusSandboxProvider.ManagedKey] = "true",
+            [IncusSandboxProvider.KindKey] = IncusSandboxProvider.SandboxKind,
+        };
+        if (recoveryTokenHash is not null && recoveryManifestHash is not null)
+        {
+            config[IncusSandboxProvider.RecoveryTokenHashKey] = recoveryTokenHash;
+            config[IncusSandboxProvider.RecoveryManifestHashKey] = recoveryManifestHash;
+        }
+        return JsonSerializer.Serialize(new[]
+        {
+            new
+            {
+                name = sandboxName,
+                type = "virtual-machine",
+                status,
+                config,
+            },
+        });
+    }
+
+    private static string EffectiveTopologyJson(
+        string storagePool = "codeybox-zfs",
+        string? bridge = null,
+        string? mountSource = null,
+        string? mountPath = null,
+        string? recoveryTokenHash = null,
+        string? recoveryManifestHash = null) =>
+        JsonSerializer.Serialize(new
+        {
+            type = "virtual-machine",
+            config = RecoveryBindingConfig(recoveryTokenHash, recoveryManifestHash),
+            expanded_config = new { },
+            profiles = Array.Empty<string>(),
+            expanded_devices = BuildEffectiveDevices(storagePool, bridge, mountSource, mountPath),
+        });
+
+    private static Dictionary<string, string> RecoveryBindingConfig(
+        string? recoveryTokenHash,
+        string? recoveryManifestHash)
+    {
+        var config = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (recoveryTokenHash is not null && recoveryManifestHash is not null)
+        {
+            config[IncusSandboxProvider.RecoveryTokenHashKey] = recoveryTokenHash;
+            config[IncusSandboxProvider.RecoveryManifestHashKey] = recoveryManifestHash;
+        }
+        return config;
+    }
+
+    private static Dictionary<string, Dictionary<string, string>> BuildEffectiveDevices(
+        string storagePool,
+        string? bridge,
+        string? mountSource,
+        string? mountPath)
+    {
+        var devices = new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal)
+        {
+            ["root"] = new(StringComparer.Ordinal)
+            {
+                ["type"] = "disk",
+                ["path"] = "/",
+                ["pool"] = storagePool,
+            },
+        };
+        if (bridge is not null)
+        {
+            devices["codeybox-net"] = new(StringComparer.Ordinal)
+            {
+                ["type"] = "nic",
+                ["nictype"] = "bridged",
+                ["parent"] = bridge,
+                ["name"] = "eth0",
+            };
+        }
+        if (mountSource is not null && mountPath is not null)
+        {
+            devices["m000"] = new(StringComparer.Ordinal)
+            {
+                ["type"] = "disk",
+                ["source"] = mountSource,
+                ["path"] = mountPath,
+                ["io.bus"] = "virtiofs",
+                ["readonly"] = "true",
+            };
+        }
+        return devices;
+    }
 
     private static bool IsFileCommand(IReadOnlyList<string> argv, string verb) =>
         argv.Contains("file", StringComparer.Ordinal) && argv.Contains(verb, StringComparer.Ordinal);
@@ -1159,12 +3293,22 @@ public sealed class IncusSandboxLifecycleTests
         argv.Contains("exec", StringComparer.Ordinal) && argv.Contains(executable, StringComparer.Ordinal);
 
     private sealed class ScriptedLifecycleRunner(
-        Func<IReadOnlyList<string>, string?, CancellationToken, Task<ProcessRunResult>> handler)
+        Func<IReadOnlyList<string>, string?, CancellationToken, Task<ProcessRunResult>> handler,
+        Func<string>? effectiveTopologyJson = null,
+        Func<string, string>? canonicalPathResolver = null)
         : IProcessRunner
     {
+        private string? _recoveryTokenHash;
+        private string? _recoveryManifestHash;
         internal List<IReadOnlyList<string>> Commands { get; } = [];
 
-        public Task<ProcessRunResult> RunAsync(
+        internal void SetRecoveryBinding(string tokenHash, string manifestHash)
+        {
+            _recoveryTokenHash = tokenHash;
+            _recoveryManifestHash = manifestHash;
+        }
+
+        public async Task<ProcessRunResult> RunAsync(
             IReadOnlyList<string> argv,
             string? stdin,
             CancellationToken ct,
@@ -1177,14 +3321,60 @@ public sealed class IncusSandboxLifecycleTests
         {
             ct.ThrowIfCancellationRequested();
             Commands.Add(argv.ToArray());
-            return handler(argv, stdin, ct);
+            if (argv.Count == 3
+                && string.Equals(argv[1], "query", StringComparison.Ordinal)
+                && argv[2].StartsWith("/1.0/instances/", StringComparison.Ordinal))
+            {
+                var topology = effectiveTopologyJson?.Invoke() ?? EffectiveTopologyJson();
+                return Success(InjectRecoveryBinding(topology));
+            }
+            if (IsGuestCommand(argv, "/usr/bin/realpath"))
+            {
+                var canonical = canonicalPathResolver?.Invoke(argv[^1]) ?? argv[^1];
+                return Success(canonical + "\n");
+            }
+            var result = await handler(argv, stdin, ct);
+            return result with { Stdout = InjectRecoveryBinding(result.Stdout) };
+        }
+
+        private string InjectRecoveryBinding(string json)
+        {
+            if (_recoveryTokenHash is null
+                || _recoveryManifestHash is null
+                || string.IsNullOrEmpty(json)
+                || json.Contains(IncusSandboxProvider.RecoveryTokenHashKey, StringComparison.Ordinal))
+            {
+                return json;
+            }
+            var sandboxKind =
+                $"\"{IncusSandboxProvider.KindKey}\":\"{IncusSandboxProvider.SandboxKind}\"";
+            var withOwnedBinding = json.Replace(
+                sandboxKind,
+                sandboxKind
+                + $",\"{IncusSandboxProvider.RecoveryTokenHashKey}\":\"{_recoveryTokenHash}\""
+                + $",\"{IncusSandboxProvider.RecoveryManifestHashKey}\":\"{_recoveryManifestHash}\"",
+                StringComparison.Ordinal);
+            if (!ReferenceEquals(withOwnedBinding, json)
+                && !string.Equals(withOwnedBinding, json, StringComparison.Ordinal))
+            {
+                return withOwnedBinding;
+            }
+            return json.Replace(
+                "\"config\":{}",
+                $"\"config\":{{\"{IncusSandboxProvider.RecoveryTokenHashKey}\":\"{_recoveryTokenHash}\",\"{IncusSandboxProvider.RecoveryManifestHashKey}\":\"{_recoveryManifestHash}\"}}",
+                StringComparison.Ordinal);
         }
     }
 
     private sealed class MetricsLifecycleRunner(string sandboxName) : IProcessRunner
     {
         private bool _deleted;
+        private string? _recoveryTokenHash;
+        private string? _recoveryManifestHash;
         internal List<IReadOnlyList<string>> Commands { get; } = [];
+
+        internal void SetRecoveryBinding(string tokenHash, string manifestHash) =>
+            (_recoveryTokenHash, _recoveryManifestHash) = (tokenHash, manifestHash);
 
         public Task<ProcessRunResult> RunAsync(
             IReadOnlyList<string> argv,
@@ -1203,7 +3393,7 @@ public sealed class IncusSandboxLifecycleTests
             {
                 var json = _deleted
                     ? "[]"
-                    : $"[{{\"name\":\"{sandboxName}\",\"type\":\"virtual-machine\",\"status\":\"RUNNING\",\"config\":{{\"{IncusSandboxProvider.ManagedKey}\":\"true\",\"{IncusSandboxProvider.KindKey}\":\"{IncusSandboxProvider.SandboxKind}\"}}}}]";
+                    : OwnedInstanceJson(sandboxName, "RUNNING", _recoveryTokenHash, _recoveryManifestHash);
                 return Task.FromResult(new ProcessRunResult(0, json, string.Empty));
             }
             if (argv.Contains("exec", StringComparer.Ordinal))
@@ -1249,7 +3439,12 @@ public sealed class IncusSandboxLifecycleTests
     private sealed class DeletionLifecycleRunner(string sandboxName) : IProcessRunner
     {
         private bool _deleted;
+        private string? _recoveryTokenHash;
+        private string? _recoveryManifestHash;
         internal int DeleteCalls { get; private set; }
+
+        internal void SetRecoveryBinding(string tokenHash, string manifestHash) =>
+            (_recoveryTokenHash, _recoveryManifestHash) = (tokenHash, manifestHash);
 
         public Task<ProcessRunResult> RunAsync(
             IReadOnlyList<string> argv,
@@ -1267,7 +3462,7 @@ public sealed class IncusSandboxLifecycleTests
             {
                 var json = _deleted
                     ? "[]"
-                    : $"[{{\"name\":\"{sandboxName}\",\"type\":\"virtual-machine\",\"status\":\"RUNNING\",\"config\":{{\"{IncusSandboxProvider.ManagedKey}\":\"true\",\"{IncusSandboxProvider.KindKey}\":\"{IncusSandboxProvider.SandboxKind}\"}}}}]";
+                    : OwnedInstanceJson(sandboxName, "RUNNING", _recoveryTokenHash, _recoveryManifestHash);
                 return Task.FromResult(new ProcessRunResult(0, json, string.Empty));
             }
             if (argv.Contains("delete", StringComparer.Ordinal))
@@ -1283,8 +3478,13 @@ public sealed class IncusSandboxLifecycleTests
     private sealed class StickyDeletionLifecycleRunner(string sandboxName) : IProcessRunner
     {
         private bool _deleted;
+        private string? _recoveryTokenHash;
+        private string? _recoveryManifestHash;
         internal bool CompleteDeletion { get; set; }
         internal int DeleteCalls { get; private set; }
+
+        internal void SetRecoveryBinding(string tokenHash, string manifestHash) =>
+            (_recoveryTokenHash, _recoveryManifestHash) = (tokenHash, manifestHash);
 
         public Task<ProcessRunResult> RunAsync(
             IReadOnlyList<string> argv,
@@ -1302,7 +3502,7 @@ public sealed class IncusSandboxLifecycleTests
             {
                 var json = _deleted
                     ? "[]"
-                    : $"[{{\"name\":\"{sandboxName}\",\"type\":\"virtual-machine\",\"status\":\"RUNNING\",\"config\":{{\"{IncusSandboxProvider.ManagedKey}\":\"true\",\"{IncusSandboxProvider.KindKey}\":\"{IncusSandboxProvider.SandboxKind}\"}}}}]";
+                    : OwnedInstanceJson(sandboxName, "RUNNING", _recoveryTokenHash, _recoveryManifestHash);
                 return Task.FromResult(new ProcessRunResult(0, json, string.Empty));
             }
             if (argv.Contains("delete", StringComparer.Ordinal))
@@ -1428,6 +3628,127 @@ public sealed class IncusSandboxLifecycleTests
         {
             metadata = new { name = "codeybox", config },
         });
+    }
+
+    private sealed class RetainedAdoptionRunner(
+        string stagingRoot,
+        string sandboxName,
+        string tokenHash,
+        string manifestHash) : IProcessRunner
+    {
+        private bool _deleted;
+        private readonly TaskCompletionSource _execStarted = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<ProcessRunResult> _execCompletion = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        internal string Status { get; private set; } = "RUNNING";
+        internal int ForcedStopCalls { get; private set; }
+        internal int StartCalls { get; private set; }
+        internal int DeleteCalls { get; private set; }
+        internal bool BlockExec { get; init; }
+        internal string? TopologyOverride { get; init; }
+        internal TaskCompletionSource ExecStarted => _execStarted;
+        internal List<IReadOnlyList<string>> Commands { get; } = [];
+
+        internal void CompleteExec(ProcessRunResult result) =>
+            _execCompletion.TrySetResult(result);
+
+        public Task<ProcessRunResult> RunAsync(
+            IReadOnlyList<string> argv,
+            string? stdin,
+            CancellationToken ct,
+            Action<string>? stdoutChunkCallback = null,
+            Action<string>? stderrChunkCallback = null,
+            int? maxStdoutBytes = null,
+            int? maxStderrBytes = null,
+            IReadOnlyDictionary<string, string>? environment = null,
+            bool killOnOutputLimit = true)
+        {
+            ct.ThrowIfCancellationRequested();
+            Commands.Add(argv.ToArray());
+            if (argv.SequenceEqual(["incus", "query", "/1.0"]))
+            {
+                return Task.FromResult(Success(
+                    "{\"metadata\":{\"api_extensions\":[\"disk_io_bus_cache_filesystem\",\"projects_restrictions\"]," +
+                    "\"environment\":{\"kernel_version\":\"6.14.0-test\"}}}"));
+            }
+            if (argv.SequenceEqual(["incus", "project", "list", "--format=json"]))
+                return Task.FromResult(Success("[{\"name\":\"codeybox\"}]"));
+            if (argv.SequenceEqual(["incus", "query", "/1.0/projects/codeybox"]))
+                return Task.FromResult(Success(ManagedProjectQuery(stagingRoot)));
+            if (argv.Contains("storage", StringComparer.Ordinal)
+                && argv.Contains("list", StringComparer.Ordinal))
+            {
+                return Task.FromResult(Success(
+                    "[{\"name\":\"codeybox-zfs\",\"driver\":\"zfs\",\"config\":{}}]"));
+            }
+            if (argv.Count == 3
+                && string.Equals(argv[1], "query", StringComparison.Ordinal)
+                && argv[2].StartsWith("/1.0/instances/", StringComparison.Ordinal))
+            {
+                return Task.FromResult(Success(
+                    TopologyOverride
+                    ?? EffectiveTopologyJson(
+                        recoveryTokenHash: tokenHash,
+                        recoveryManifestHash: manifestHash)));
+            }
+            if (argv.Contains("list", StringComparer.Ordinal))
+            {
+                return Task.FromResult(_deleted
+                    ? Success("[]")
+                    : Success(OwnedInstanceJson(
+                        sandboxName,
+                        Status,
+                        tokenHash,
+                        manifestHash)));
+            }
+            if (argv.Contains("stop", StringComparer.Ordinal)
+                && argv.Contains("--force", StringComparer.Ordinal))
+            {
+                ForcedStopCalls++;
+                Status = "STOPPED";
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("start", StringComparer.Ordinal))
+            {
+                StartCalls++;
+                Status = "RUNNING";
+                return Task.FromResult(Success());
+            }
+            if (IsFileCommand(argv, "push"))
+                return Task.FromResult(Success());
+            if (IsGuestCommand(argv, IncusCloudInit.ExecWrapperPath)
+                && argv.Any(argument => argument.Contains("/env-", StringComparison.Ordinal))
+                && argv.Contains("git", StringComparer.Ordinal)
+                && argv.Contains("status", StringComparer.Ordinal)
+                && BlockExec)
+            {
+                _execStarted.TrySetResult();
+                return _execCompletion.Task;
+            }
+            if (IsFileCommand(argv, "pull")
+                && argv.Any(argument => argument.Contains("/complete-", StringComparison.Ordinal)))
+            {
+                return Task.FromResult(Success("0\n"));
+            }
+            if (IsFileCommand(argv, "pull"))
+                return Task.FromResult(Failure());
+            if (IsFileCommand(argv, "delete")
+                || IsGuestCommand(argv, "/bin/true")
+                || IsGuestCommand(argv, "install")
+                || IsGuestCommand(argv, "test"))
+            {
+                return Task.FromResult(Success());
+            }
+            if (argv.Contains("delete", StringComparer.Ordinal))
+            {
+                DeleteCalls++;
+                _deleted = true;
+                return Task.FromResult(Success());
+            }
+            throw new InvalidOperationException(
+                $"Unexpected retained-adoption command: {string.Join(' ', argv)}");
+        }
     }
 
     private sealed class UncertainCreateRunner : IProcessRunner

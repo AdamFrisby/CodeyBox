@@ -636,6 +636,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
                 null,
                 false,
                 false,
+                false,
                 tp.Agent,
             ]));
 
@@ -782,6 +783,11 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
 
         var workSpec = Assert.Single(recorder.SpecsForPhase("work"));
         Assert.DoesNotContain(workSpec.Mounts, m => m.SandboxPath == AuditDotnetShimDir);
+        Assert.Contains(
+            workSpec.Mounts,
+            mount => mount.Tmpfs
+                && mount.SandboxPath == SandboxConventions.AgentTurnScratchpadDir
+                && mount.SizeBytes == SandboxConventions.AgentTurnScratchpadTmpfsBytes);
         if (workSpec.Environment.TryGetValue("PATH", out var workPath))
             Assert.DoesNotContain(AuditDotnetShimDir, workPath, StringComparison.Ordinal);
     }

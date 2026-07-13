@@ -183,6 +183,64 @@ public sealed class ReloadableSandboxProviderTests
     }
 
     [Fact]
+    public async Task CreateAsync_RecoveryLeaseRoutesToExactProviderAfterLiveCutover()
+    {
+        var context = CreateDefaultRouter("alpha");
+        context.Monitor.Set(Options("beta"));
+        var lease = new SandboxRecoveryLease("alpha", "alpha-retained", "private-token");
+        var recoverySpec = CreateSpec("alpha-original-baseline") with
+        {
+            RecoveryLease = lease,
+        };
+
+        var recovered = await context.Router.CreateAsync(recoverySpec);
+
+        Assert.Same(context.Alpha, Assert.IsType<TestSandbox>(recovered).Owner);
+        Assert.Equal(1, context.Alpha.CreateCalls);
+        Assert.Equal(0, context.Beta.CreateCalls);
+        Assert.Same(lease, Assert.Single(context.Alpha.CreatedSpecs).RecoveryLease);
+        Assert.Equal("alpha-original-baseline", context.Alpha.CreatedSpecs[0].BaselineImageRef);
+    }
+
+    [Fact]
+    public async Task CreateAsync_RecoveryLeaseActivatesExplicitRetainedProviderAfterRestart()
+    {
+        var monitor = new MutableOptionsMonitor(Options("beta", "alpha"));
+        var alpha = new SuspendingTestProvider("alpha", "alpha-");
+        var beta = new TestProvider("beta", "beta-");
+        var router = CreateRouter(monitor, alpha, beta);
+        var lease = new SandboxRecoveryLease("alpha", "alpha-retained", "private-token");
+
+        var recovered = await router.CreateAsync(CreateSpec() with { RecoveryLease = lease });
+
+        Assert.Same(alpha, Assert.IsType<TestSandbox>(recovered).Owner);
+        Assert.Equal(1, alpha.CreateCalls);
+        Assert.Equal(0, beta.CreateCalls);
+    }
+
+    [Theory]
+    [InlineData("beta", "neither selected nor retained")]
+    [InlineData("BETA", "unknown lifecycle provider")]
+    [InlineData("unknown", "unknown lifecycle provider")]
+    public async Task CreateAsync_RecoveryLeaseFailsClosedForUnavailableProvider(
+        string leaseProviderId,
+        string expectedMessage)
+    {
+        var context = CreateDefaultRouter("alpha");
+        var lease = new SandboxRecoveryLease(
+            leaseProviderId,
+            "retained-sandbox",
+            "private-token");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            context.Router.CreateAsync(CreateSpec() with { RecoveryLease = lease }));
+
+        Assert.Contains(expectedMessage, exception.Message, StringComparison.Ordinal);
+        Assert.Equal(0, context.Alpha.CreateCalls);
+        Assert.Equal(0, context.Beta.CreateCalls);
+    }
+
+    [Fact]
     public async Task HistoricalIncusPrefix_TranslatesQueuedPinAfterProviderCutover()
     {
         var incus = new TestProvider("incus", "unused-") { CurrentBaselineRef = "new-incus-current" };

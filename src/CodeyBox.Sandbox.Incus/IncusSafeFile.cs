@@ -7,8 +7,10 @@ namespace CodeyBox.Sandbox.Incus;
 internal static partial class IncusSafeFile
 {
     private const int OpenReadOnly = 0;
+    private const int OpenWriteOnly = 1;
     private const int OpenReadWrite = 2;
     private const int OpenCreate = 0x40;
+    private const int OpenExclusive = 0x80;
     private const int OpenNonBlock = 0x800;
     private const int OpenDirectory = 0x10000;
     private const int OpenNoFollow = 0x20000;
@@ -277,6 +279,95 @@ internal static partial class IncusSafeFile
         }
     }
 
+    internal static FileStream CreatePrivateChildFileNoFollow(
+        IncusPinnedDirectory directory,
+        string name)
+    {
+        ArgumentNullException.ThrowIfNull(directory);
+        name = ValidateEntryName(name);
+        const uint ownerReadWriteMode = 0x180; // 0600
+        var descriptor = OpenAtWithMode(
+            directory.Descriptor,
+            name,
+            OpenWriteOnly | OpenCreate | OpenExclusive | OpenNoFollow | OpenCloseOnExec,
+            ownerReadWriteMode);
+        if (descriptor < 0)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            throw new IOException("Unable to create a private pinned-directory file.", new Win32Exception(error));
+        }
+        SafeFileHandle? handle = new((nint)descriptor, ownsHandle: true);
+        try
+        {
+            var status = ReadStatus(handle, RegularFileType, "private pinned-directory file");
+            var identity = IncusHostIdentity.GetEffectiveIdentity();
+            if (status.UserId != identity.UserId || status.GroupId != identity.GroupId)
+                throw new InvalidOperationException("A private pinned-directory file has unexpected ownership.");
+            if (SetFileMode(descriptor, ownerReadWriteMode) != 0)
+            {
+                var error = Marshal.GetLastPInvokeError();
+                throw new IOException("Unable to set private pinned-directory file mode.", new Win32Exception(error));
+            }
+            var result = new FileStream(handle, FileAccess.Write, bufferSize: 64 * 1024, isAsync: false);
+            handle = null;
+            return result;
+        }
+        finally
+        {
+            handle?.Dispose();
+        }
+    }
+
+    internal static void ReplaceChildFileAtomically(
+        IncusPinnedDirectory directory,
+        string temporaryName,
+        string finalName)
+    {
+        ArgumentNullException.ThrowIfNull(directory);
+        temporaryName = ValidateEntryName(temporaryName);
+        finalName = ValidateEntryName(finalName);
+        if (RenameAt(directory.Descriptor, temporaryName, directory.Descriptor, finalName) != 0)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            throw new IOException("Unable to publish a private pinned-directory file atomically.", new Win32Exception(error));
+        }
+        FlushDirectory(directory);
+    }
+
+    internal static void FlushDirectory(IncusPinnedDirectory directory)
+    {
+        ArgumentNullException.ThrowIfNull(directory);
+        var descriptor = OpenAt(
+            directory.Descriptor,
+            ".",
+            OpenReadOnly | OpenDirectory | OpenNoFollow | OpenCloseOnExec);
+        if (descriptor < 0)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            throw new IOException("Unable to open a pinned directory for durable flush.", new Win32Exception(error));
+        }
+        using var handle = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+        if (FlushFile(descriptor) != 0)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            throw new IOException("Unable to durably flush a pinned directory.", new Win32Exception(error));
+        }
+    }
+
+    internal static void DeleteChildFileNoFollow(
+        IncusPinnedDirectory directory,
+        string name)
+    {
+        ArgumentNullException.ThrowIfNull(directory);
+        name = ValidateEntryName(name);
+        if (UnlinkAt(directory.Descriptor, name, 0) == 0)
+            return;
+        var error = Marshal.GetLastPInvokeError();
+        if (error == 2) // ENOENT
+            return;
+        throw new IOException("Unable to delete a private pinned-directory file.", new Win32Exception(error));
+    }
+
     internal static string ReadChildSymbolicLinkNoFollow(
         IncusPinnedDirectory directory,
         string name)
@@ -363,6 +454,19 @@ internal static partial class IncusSafeFile
     [LibraryImport("libc", EntryPoint = "openat", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
     private static partial int OpenAt(int directoryDescriptor, string path, int flags);
 
+    [LibraryImport("libc", EntryPoint = "openat", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
+    private static partial int OpenAtWithMode(int directoryDescriptor, string path, int flags, uint mode);
+
+    [LibraryImport("libc", EntryPoint = "renameat", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
+    private static partial int RenameAt(
+        int oldDirectoryDescriptor,
+        string oldPath,
+        int newDirectoryDescriptor,
+        string newPath);
+
+    [LibraryImport("libc", EntryPoint = "unlinkat", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
+    private static partial int UnlinkAt(int directoryDescriptor, string path, int flags);
+
     [LibraryImport("libc", EntryPoint = "statx", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
     private static partial int Statx(
         int directoryDescriptor,
@@ -379,6 +483,9 @@ internal static partial class IncusSafeFile
 
     [LibraryImport("libc", EntryPoint = "flock", SetLastError = true)]
     private static partial int AcquireFileLock(int descriptor, int operation);
+
+    [LibraryImport("libc", EntryPoint = "fsync", SetLastError = true)]
+    private static partial int FlushFile(int descriptor);
 
     [StructLayout(LayoutKind.Explicit, Size = 256)]
     private struct StatxBuffer

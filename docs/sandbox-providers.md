@@ -78,11 +78,21 @@ directories are attached as Incus `disk` devices with
 `io.bus=virtiofs` explicitly selected—`auto` is not used, so the provider never
 falls back to 9p.
 
-Only host-backed paths use virtiofs. Incus 7.0's `source=tmpfs:` disk-device
-form is container-only, so `SandboxMount.Tmpfs` paths such as `/work` and the
-credential directory are mounted after VM boot with the guest kernel's real
-`tmpfs`. Per-device and aggregate logical sizes are bounded by
-`MaxTmpfsDeviceBytes` and `MaxAggregateTmpfsBytes`.
+Only host-backed paths use virtiofs. The conventional writable
+`SandboxMount.Tmpfs` request for `/work` is an Incus-specific exception: the
+provider creates `/work` as a private mode-`0700` directory on that VM's COW
+root disk. Agent edits therefore survive an Incus stop/start cycle and remain
+bounded by `SandboxSpec.Limits.DiskBytes`. An explicit `/work` `SizeBytes` may
+not exceed that root-disk limit; it does not create a second per-directory
+quota inside the root filesystem.
+
+Incus 7.0's `source=tmpfs:` disk-device form is container-only, so every other
+`SandboxMount.Tmpfs` request is mounted after VM boot with the guest kernel's
+real `tmpfs`. In particular, `/run/codeybox/creds` remains non-persistent and
+is recreated empty after an interrupted-exec restart so credentials must be
+materialised again through the normal credential path. These real tmpfs mounts
+remain subject to `MaxTmpfsDeviceBytes` and `MaxAggregateTmpfsBytes`; `/work`
+does not consume those memory-backed allocations.
 
 Before any host-backed device is attached, the VM completes an initial boot
 without host storage and resolves every requested guest mount path with
@@ -100,6 +110,70 @@ created, the provider replaces user-data with an empty cloud config and runs
 state from entering every clone. `ExtraCloudInit` is still operator-visible
 configuration and may be retained on a full-launch instance: never put secrets
 in it.
+
+If `incus exec` explicitly reports execution unavailable, returns without the
+exact completion sentinel, exceeds an output bound, or throws before command
+completion can be proved (including an uncertain environment push, timeout, or
+caller cancellation), the sandbox treats that exact guest run as ambiguous. It
+first attempts to force-stop the VM, records the run id and its environment, PID, and
+completion-file paths, and makes one bounded recovery attempt. A result-shaped
+transport interruption is reported as `ExecutionUnavailable` while preserving
+any bounded stdout/stderr already captured; thrown cancellation/timeout keeps
+its original exception semantics. If immediate recovery fails, the pending run
+remains attached to the poisoned sandbox. Before the next exec is admitted,
+Incus waits the cancellation-aware
+`InterruptedExecRecoveryRetryDelay` and makes up to the live
+`InterruptedExecRecoveryRetryAttempts` follow-up attempts (three by default,
+ten maximum) in that recovery window. If the window is exhausted, a later exec
+boundary may open another bounded window for the same pending run after the
+infrastructure condition is repaired; no unbounded background loop is started.
+Recovery is admitted only for the exact managed `STOPPED` VM when that recorded
+run is still the sole active exec. It starts the VM, waits for the guest agent,
+recreates non-persistent tmpfs mounts, and deletes plus positively verifies the
+absence of that run's exact control files. Only after all checks pass are the
+pending metadata and exec-cleanup poison cleared, allowing the runner's bounded
+same-turn resume to reuse the durable `/work` tree. Ownership, start, readiness,
+cleanup, cancellation, or exhausted-budget uncertainty leaves the sandbox
+poisoned. Normal disposal force-deletes the VM only after exact ownership is
+positively re-verified; changed or unverifiable ownership remains fail-closed
+for operator reconciliation.
+
+Incus `/work` durability is complementary to orchestrator-level agent-turn
+checkpoints. The dirty source tree is pushed through Git, but the bounded CLI
+scratchpad is a host-private SQLite BLOB and never part of the Git ref. A new
+Incus VM receives that BLOB only when dispatch is resuming the exact saved
+agent route; a class fallback receives only the source tree.
+
+When the interrupted exec also prevents those checkpoint commands from
+running, Incus is the first provider with a durable retained-sandbox fallback.
+Every created sandbox receives a random recovery capability and immutable
+manifest before agent execution. The VM stores only the token and manifest
+hashes; the manifest itself and an exclusive lock file live in the private,
+fsync-published staging tree. A recoverable failure can then publish the opaque
+lease to the work-item database without another daemon call. Publication is
+atomic with the work-item lifecycle check and the global
+`PipelineTuning.MaxRetainedAgentTurnSandboxes` cap.
+
+A retained pickup is not an agent dispatch. An uncounted database preparation
+claim elects one pipeline, and the staging lock elects one Incus process. The
+provider force-stops and re-reads the exact token/manifest-bound instance at the
+lifecycle sink, reconstructs inode pins for host sources, verifies creation-time
+storage/guest identity and guest links, and performs the same isolated
+detach/start/path-check/reattach/readiness sequence used for interrupted-exec
+recovery. Token, manifest, specification, topology, link, ownership, or
+readiness mismatch fails closed, keeps the lease for a later exact retry, and
+makes a best-effort authoritative force-stop if a VM start may have occurred.
+
+After successful adoption, the orchestrator validates the retained branch and
+Git origin and converts the dirty tree plus private CLI scratchpad into the
+ordinary content-bound Git/SQLite checkpoint. Only that atomic publication
+disarms VM preservation. Disposal then deletes the duplicate VM, and the item
+is automatically queued to resume in a fresh sandbox. No agent runs inside the
+mutable retained VM. A queue failure leaves the already-published immutable
+checkpoint on an infrastructure-shaped failed item. Clearing or cancelling the lease makes the VM eligible for
+`SandboxLeakReaper`; while the lease remains referenced—even in
+`NeedsOperatorInput` or `AbandonedAfterRecoveryAttempts`—the reaper protects its
+exact provider/name identity.
 
 Incus settings and provisioning are independent from Multipass. Switching the
 provider does not reuse `MultipassExtraRuncmd`, `MultipassExtraCloudInit`,
@@ -238,14 +312,18 @@ Incus operational settings other than the restart-only `ProjectName` and
 effective `StagingDirectory`, plus the shared network-profile map, are read for
 subsequent provider operations. Existing sandbox handles retain their
 provisioning option snapshot, while the Incus CLI cleanup deadline/poll and
-the bounded guest-exec PID/control-file/completion attempt counts are read
-live at their next use. An attempt count includes the initial attempt. A
+the bounded guest-exec PID/control-file/completion attempt counts and delayed
+interrupted-exec recovery policy are read live at their next use. Ordinary
+cleanup attempt counts include their initial attempt; the interrupted-exec
+retry count is explicitly the follow-up budget after its immediate attempt. A
 process started with `multipass` or `incus` may hot-switch between those two
 providers: in-progress creations
 continue on their original provider and existing handles keep their owner.
-Each new creation invokes only the currently selected backend; a failure is
-propagated and never retried through the other provider. Selecting any other
-provider still requires a restart. See
+Each ordinary new creation invokes only the currently selected backend; a
+failure is propagated and never retried through the other provider. A durable
+recovery lease is the explicit exception: it is routed to the exact registered
+provider named by the lease even if selection changed after the outage.
+Selecting any other provider still requires a restart. See
 [`configuration.md`](configuration.md#incus) for every key and bound.
 
 Queued Incus baseline pins survive both prefix edits and restarts: the cutover

@@ -283,6 +283,67 @@ public sealed class IncusMountAndCloudInitTests
     }
 
     [Fact]
+    public void Prepare_UsesRootDiskForConventionalWorkMountAndKeepsCredentialsOnBoundedTmpfs()
+    {
+        using var fixture = new MountFixture();
+        const long rootDiskBytes = 8L * 1024 * 1024;
+        var options = fixture.Options(fixture.Root) with
+        {
+            MaxTmpfsDeviceBytes = 1024 * 1024,
+            MaxAggregateTmpfsBytes = 1024 * 1024,
+        };
+
+        using var plan = IncusMountStaging.Prepare(
+            options,
+            fixture.StagingRoot,
+            fixture.SandboxRoot,
+            [
+                new SandboxMount
+                {
+                    SandboxPath = SandboxConventions.WorkDir,
+                    Tmpfs = true,
+                    SizeBytes = rootDiskBytes,
+                },
+                new SandboxMount
+                {
+                    SandboxPath = SandboxConventions.CredentialsDir,
+                    Tmpfs = true,
+                    SizeBytes = 1024 * 1024,
+                },
+            ],
+            rootDiskBytes);
+
+        var work = Assert.Single(
+            plan.Mounts,
+            mount => string.Equals(mount.GuestPath, SandboxConventions.WorkDir, StringComparison.Ordinal));
+        Assert.True(work.RootDiskDirectory);
+        Assert.Null(work.HostSource);
+        Assert.Null(work.TmpfsSizeBytes);
+
+        var credentials = Assert.Single(
+            plan.Mounts,
+            mount => string.Equals(mount.GuestPath, SandboxConventions.CredentialsDir, StringComparison.Ordinal));
+        Assert.False(credentials.RootDiskDirectory);
+        Assert.Equal(1024 * 1024, credentials.TmpfsSizeBytes);
+
+        var oversizedWork = Assert.Throws<InvalidOperationException>(() =>
+            IncusMountStaging.Prepare(
+                options,
+                fixture.StagingRoot,
+                fixture.SandboxRoot,
+                [
+                    new SandboxMount
+                    {
+                        SandboxPath = SandboxConventions.WorkDir,
+                        Tmpfs = true,
+                        SizeBytes = rootDiskBytes + 1,
+                    },
+                ],
+                rootDiskBytes));
+        Assert.Contains("root-disk limit", oversizedWork.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Prepare_StagesReadOnlyCredentialFileInsideCredentialsTmpfs()
     {
         using var fixture = new MountFixture();

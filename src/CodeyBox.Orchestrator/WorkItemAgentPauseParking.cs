@@ -30,9 +30,10 @@ internal static class WorkItemAgentPauseParking
         // column rather than overloading quota_retry_from: agent-pause parking
         // is not quota recovery, and the WorkItemDto / scheduler boundary keeps
         // the two deferral mechanisms cleanly separated.
-        var next = current.With(
-            WorkItemState.WaitingForAgentResume,
-            $"waiting: agent paused: {normalizedReason}") with
+        var next = WorkItemRecoveryPolicy.ReleaseAgentTurnDispatchClaim(
+            current.With(
+                WorkItemState.WaitingForAgentResume,
+                $"waiting: agent paused: {normalizedReason}")) with
         {
             FailureKind = null,
             QuotaResetAt = null,

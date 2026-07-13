@@ -64,6 +64,10 @@ Hot-reloadable today:
   constructors at startup.
 - `DeadWorker.MaxRecoveryAttempts` and `DeadWorker.DeadWorkerThreshold` —
   re-read on every reaper sweep.
+- `PipelineTuning.AgentSessionResumeMaxAttempts` and
+  `PipelineTuning.MaxRetainedAgentTurnSandboxes` — re-read at the next resume
+  claim or retained-lease publication respectively. Existing claims and leases
+  are not rewritten by a reload.
 - `SqliteWriteGate.{AcquisitionTimeout,MaxHoldDuration,MaxQueuedWaiters,MaxConcurrentReadConnections}`
   — sampled on each subsequent SQLite gate/read-slot acquisition. Edits do not
   alter a holder already inside the gate. Values have defensive upper bounds:
@@ -73,10 +77,12 @@ Hot-reloadable today:
   `WorkerProgressWatchdog.AutoRecover`,
   `WorkerProgressWatchdog.MaxRecoveryAttempts`,
   `WorkerProgressWatchdog.PostAgentTransitionTimeout`,
+  `WorkerProgressWatchdog.ItemStaleTimeout`,
+  `WorkerProgressWatchdog.ItemStaleMaxRecoveryAttempts`,
   `WorkerProgressWatchdog.ProcessCpuProgressSignalEnabled`, and
   `WorkerProgressWatchdog.ActiveSandboxProgressSignalEnabled` — re-read on
-  every watchdog sweep. `WorkerProgressWatchdog.CheckInterval` is sampled once
-  at startup.
+  every watchdog sweep. `WorkerProgressWatchdog.CheckInterval` and
+  `WorkerProgressWatchdog.ItemStaleCheckInterval` are sampled once at startup.
 - `Shutdown.SandboxResumeMode`, `Shutdown.SandboxResumeTimeout`, and
   `Shutdown.SandboxAdoptionDeadlineSeconds` — re-read by the startup resume
   service. In the default background mode, the API listener is not held offline
@@ -98,7 +104,11 @@ Hot-reloadable today:
   retain their owning provider. This is routing, not failover: a selected
   provider failure is propagated and is never retried through the other
   backend. Changes to or from any other provider remain restart-only and are
-  rejected on reload.
+  rejected on reload. A durable recovery lease is routed to its exact recorded
+  provider rather than the current ordinary-creation selection. If that
+  selection changed across a process restart, keep the lease's provider in
+  `SandboxProviderCutover:RetainedInventoryProviders` until its retained
+  resources have been recovered or cleaned up.
 - `SandboxLeak.LeakAgeThreshold` / `PreemptRetention` / `AutoDispose` /
   `MaxConcurrentAutoDispose` — re-read on every reaper sweep. `Enabled` and
   `CheckInterval` are sampled once at startup (PeriodicTimer cadence is fixed).
@@ -246,6 +256,8 @@ snapshot before using a pin.
   "InstanceNamePrefix": "codeybox-",
   "BaselineNamePrefix": "cb-incus-baseline-",
   "UseBaselineImages": true,
+  "InterruptedExecRecoveryRetryAttempts": 3,
+  "InterruptedExecRecoveryRetryDelay": "00:00:01",
   "PackageCacheSeeds": [],
   "ExecutableProvisions": []
 }
@@ -275,13 +287,15 @@ snapshot before using a pin.
 | `VmStartTimeout` | TimeSpan | `00:05:00` | Deadline for VM boot and guest-agent readiness. |
 | `VmStopTimeout` | TimeSpan | `00:02:00` | Deadline for graceful VM stop. |
 | `CloudInitTimeout` | TimeSpan | `00:05:00` | Deadline for cloud-init completion. |
-| `MountReadyTimeout` | TimeSpan | `00:05:00` | Deadline for a configured virtiofs mount to become usable in the guest. |
+| `MountReadyTimeout` | TimeSpan | `00:05:00` | Deadline for a configured virtiofs/tmpfs mount or the Incus-persistent `/work` root-disk directory to pass its guest readiness checks. |
 | `ReadinessPollInterval` | TimeSpan | `00:00:01` | Delay between bounded readiness probes. |
 | `CliProcessCleanupTimeout` | TimeSpan | `00:00:05` | Independent deadline for terminating an Incus CLI process tree and draining its redirected streams after cancellation or failure; valid through 5 minutes. Read live for each CLI invocation. |
 | `CliProcessGroupExitPollInterval` | TimeSpan | `00:00:00.010` | Delay between Linux process-group absence probes during Incus CLI cleanup; must be positive, at most 1 second, and no greater than `CliProcessCleanupTimeout`. Read live for each CLI invocation. |
 | `ExecPidPollAttempts` | int | `5` | Attempts to obtain an active guest exec process-group ID before forced cleanup; valid range 1–100 and read live. |
 | `ExecControlFileCleanupAttempts` | int | `3` | Attempts to delete and verify absence of each transient guest exec control file; valid range 1–100 and read live. |
 | `ExecCompletionProbeAttempts` | int | `3` | Attempts to read and validate a guest exec completion sentinel; valid range 1–100 and read live. |
+| `InterruptedExecRecoveryRetryAttempts` | int | `3` | Delayed follow-up attempts in one recovery window at the next exec boundary after the immediate interrupted-exec recovery attempt failed. Valid range 0–10 and read live. A later exec boundary may open another bounded window for the same pending run after infrastructure is repaired; `0` disables delayed follow-up windows without disabling the immediate attempt. |
+| `InterruptedExecRecoveryRetryDelay` | TimeSpan | `00:00:01` | Cancellation-aware delay before each delayed interrupted-exec recovery attempt. Must be positive and no greater than 30 seconds; read live. |
 | `MaxConcurrentOperations` | int | `2` | Concurrent heavy Incus lifecycle/device operations; valid range 1–64. |
 | `MaxCliStdoutBytes` | int | `4194304` | Maximum retained stdout from one Incus CLI invocation. |
 | `MaxCliStderrBytes` | int | `4194304` | Maximum retained stderr from one Incus CLI invocation. |
@@ -299,8 +313,8 @@ snapshot before using a pin.
 | `MaxSnapshotBytes` | long | `17179869184` | Maximum aggregate bytes copied into private staging across all `SnapshotForIsolation` and individual-file mounts in one sandbox. |
 | `MaxSnapshotEntries` | int | `100000` | Maximum aggregate number of files, directories, and links copied into private staging for one sandbox. |
 | `MaxReadinessProbeEntries` | int | `4096` | Maximum direct-mount entries inspected while selecting a bounded host/guest identity probe file. |
-| `MaxTmpfsDeviceBytes` | long | `17179869184` | Maximum logical size of one guest tmpfs mount (16 GiB). |
-| `MaxAggregateTmpfsBytes` | long | `34359738368` | Maximum aggregate logical size of all guest tmpfs mounts in one sandbox (32 GiB). |
+| `MaxTmpfsDeviceBytes` | long | `17179869184` | Maximum logical size of one memory-backed guest tmpfs mount (16 GiB). Incus maps the conventional `/work` request to its bounded VM root disk instead, so this setting still governs credentials and other real tmpfs mounts but not `/work`. |
+| `MaxAggregateTmpfsBytes` | long | `34359738368` | Maximum aggregate logical size of all memory-backed guest tmpfs mounts in one sandbox (32 GiB), excluding Incus's root-disk-backed `/work`. |
 
 See [Sandbox providers](sandbox-providers.md#incus--cow-vms-with-virtiofs) for
 Incus installation, project, ZFS/Btrfs pool, and security prerequisites. Incus
@@ -309,6 +323,17 @@ also derives its pool and host-volume preflight from the shared
 settings. The effective Incus staging path is added automatically.
 `CodeyBox:DiskGuard:MultipassDataPath` remains Multipass-only and is never read
 by Incus.
+
+If Incus cannot execute the commands required to create the ordinary durable
+agent-turn checkpoint, it may retain the exact stopped VM and publish a
+provider-bound internal lease. The token is never exposed by the public API;
+Incus stores only its hash and an immutable manifest hash on the VM. A retry
+must match the creation-time project, pool, guest identity, sandbox
+specification, network/topology, inode-pinned host sources, and guest links.
+The retry first converts the VM to the ordinary Git/private-state checkpoint
+under an exclusive preparation claim, then deletes it and automatically queues
+the immutable resumed dispatch. See [Recovery](recovery.md#retained-incus-adoption-and-conversion)
+for the lifecycle and failure behavior.
 
 When `UseBaselineImages=true`, the API derives Incus post-bake verification
 commands from the provider-neutral `IInVmSmokeProbe` catalog and the configured
@@ -362,6 +387,7 @@ Hot-reloadable retry and recovery bounds used by pipeline execution.
 "PipelineTuning": {
   "AgentSuspendMaxRetries": 1,
   "AgentSessionResumeMaxAttempts": 2,
+  "MaxRetainedAgentTurnSandboxes": 16,
   "EmptyReworkEscalationRetries": 1,
   "BlockRedundantDotnetBuildTestInAuditSandbox": true
 }
@@ -370,11 +396,24 @@ Hot-reloadable retry and recovery bounds used by pipeline execution.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `AgentSuspendMaxRetries` | `1` | Legacy same-command retry count for unknown failures with suspend-related exit codes. Classified transient-network failures use the durable scheduler instead. |
-| `AgentSessionResumeMaxAttempts` | `2` | CLI-native same-session resume attempts after a transient non-zero agent crash with a captured session id and a live sandbox including `/repo`. Set to `0` to disable session resume. |
+| `AgentSessionResumeMaxAttempts` | `2` | Bound used independently for CLI-native resumes in a live sandbox and atomically claimed durable agent-turn re-dispatches. An exact route receives its host-private SQLite scratchpad even without a native id; Claude/Codex reuse the exact validated id when captured. Set to `0` to disable these resume paths. `AgentSuspendMaxRetries`, sandbox adoption, and legacy Git-only preempt records remain separate. |
+| `MaxRetainedAgentTurnSandboxes` | `16` | Global database-enforced cap on Incus VMs retained because infrastructure prevented creation of the normal immutable agent-turn checkpoint. Valid range 1–256 and read at lease publication. The compare-and-set publication and cap check are one SQLite statement, so concurrent workers and processes cannot exceed the configured count. This is independent of the resumed-dispatch attempt limit. |
 | `EmptyReworkEscalationRetries` | `1` | Extra rework dispatches after a genuine no-diff audit rework when audit history shows convergence. Set to `0` to park immediately for operator review. |
 | `BlockRedundantDotnetBuildTestInAuditSandbox` | `true` | Prepends an audit-sandbox-only `dotnet` shim that immediately succeeds `dotnet build` and `dotnet test` with a notice because the deterministic build/test gate already ran. Other `dotnet` subcommands pass through unchanged; work, merge, and conflict-resolution sandboxes are unaffected. |
 | `CSharpTestPassAuditorIdleTimeout` | unset | Test-runner-specific idle guard for the `csharp:test-pass` (dotnet test) auditor, applied in place of `AuditorIdleTimeout`. Sourced through `DotnetTestAuditor` (an `ITestRunnerAuditor`). Unset means the generic `AuditorIdleTimeout` applies. |
 | `CSharpTestPassBlameHangTimeout` | unset | Per-test hang-dump timeout injected into the `csharp:test-pass` command as `--blame-hang --blame-hang-timeout`. Unset omits blame-hang, keeping the command byte-identical to the legacy path. |
+
+Durable agent-turn scratchpad archives have a non-configurable 32 MiB safety
+cap. They are stored as content-verified, host-private SQLite BLOBs and are
+never included in the content-addressed Git checkpoint. Clearing checkpoint
+metadata deletes the paired BLOBs, and startup reconciliation removes orphaned
+or no-longer-referenced rows left by an interrupted capture.
+
+The retained-sandbox cap applies only to the Incus fallback used when the VM
+cannot execute the commands needed to publish that Git/private-state
+checkpoint. A retained lease is provider-bound internal metadata, not an
+additional retry attempt. Cancellation or any lifecycle transition that clears
+the lease makes the VM eligible for the normal sandbox leak reaper.
 
 ---
 
@@ -418,7 +457,10 @@ CPU signal, and active sandbox ownership signal are all stale for
   "ProcessCpuProgressSignalEnabled": true,
   "ActiveSandboxProgressSignalEnabled": true,
   "PostAgentTransitionTimeout": "00:10:00",
-  "MaxRecoveryAttempts": 10
+  "MaxRecoveryAttempts": 10,
+  "ItemStaleTimeout": "01:15:00",
+  "ItemStaleCheckInterval": "00:05:00",
+  "ItemStaleMaxRecoveryAttempts": 3
 }
 ```
 
@@ -429,8 +471,11 @@ CPU signal, and active sandbox ownership signal are all stale for
 | `AutoRecover` | `true` | Recycle the worker and requeue the item from the nearest recoverable state. When false, park the item at `NeedsOperatorInput`. |
 | `ProcessCpuProgressSignalEnabled` | `true` | Count item-owned host processes whose CPU ticks advance between observations as progress. Sandbox providers derive `CODEYBOX_WORK_ITEM_ID` from `TimingWorkItemId` so the probe is scoped to the work item. |
 | `ActiveSandboxProgressSignalEnabled` | `true` | Count provider-tracked active sandbox ownership as progress. This covers VM-backed providers whose guest CPU is not visible from host `/proc`; providers should omit sandboxes no longer actively owned by a work item. |
-| `PostAgentTransitionTimeout` | `00:10:00` | Bound the post-agent commit, push, and state-transition step. |
+| `PostAgentTransitionTimeout` | `00:10:00` | Bound the post-agent commit, push, and state-transition step. The item-stale watchdog also uses this bound while waiting for a recovery-cancelled local owner of a claimed durable checkpoint to quiesce. |
 | `MaxRecoveryAttempts` | `10` | Bounded automatic recoveries before transitioning the item to `AbandonedAfterRecoveryAttempts`; `0` means unlimited. |
+| `ItemStaleTimeout` | `01:15:00` | Window in which an active item's `UpdatedAt` must advance before the item-centric watchdog considers it wedged. Set `00:00:00` to disable this detector. |
+| `ItemStaleCheckInterval` | `00:05:00` | Item-centric stale sweep cadence. Sampled at startup; restart to change. |
+| `ItemStaleMaxRecoveryAttempts` | `3` | Bounded item-stale recoveries before parking at `NeedsOperatorInput`; `0` means unlimited. |
 
 ---
 

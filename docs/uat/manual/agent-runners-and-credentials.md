@@ -16,7 +16,7 @@ Use this checklist for the scenarios that require real vendor CLIs, real OAuth/A
 
 1. Start a long-running work item with a CLI that writes resumable state under its documented scratchpad directory.
 2. Send orchestrator shutdown or work-item cancellation while the agent is running.
-3. Verify the matching process receives TERM, `.codeybox/preempt-scratchpad.tgz` is created, and only allowlisted scratchpad paths are archived.
+3. Verify the matching process receives TERM, `/run/codeybox/agent-turn/scratchpad.tgz` is created, and its `manifest.tsv` lists only allowlisted scratchpad paths.
 4. Restart the orchestrator and resume the work item.
 5. Verify the resumed run can see the restored scratchpad and unrelated credentials such as SSH config, OAuth auth files outside the allowlist, and `.git` data are absent from the archive.
 

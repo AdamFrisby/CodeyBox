@@ -354,7 +354,12 @@ public sealed class ClaudeSessionWorker : IScopedSessionAgentRunner, ICredential
             EmitMetrics(state, turn, usedResume: resumeId is not null);
 
             state.TurnsCompleted++;
-            return turn.Result;
+            var nativeSessionId = state.FallbackToFresh
+                ? null
+                : AgentNativeSessionId.TryCreate(state.CapturedSessionId);
+            return nativeSessionId is null
+                ? turn.Result
+                : turn.Result with { NativeSessionId = nativeSessionId };
         }
         finally
         {

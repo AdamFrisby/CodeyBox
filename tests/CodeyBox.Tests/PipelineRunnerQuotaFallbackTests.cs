@@ -880,8 +880,11 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         Assert.NotNull(parked);
         Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
         Assert.Equal("quota", parked.FailureKind);
-        Assert.Equal("audit", parked.QuotaRetryFrom);
+        Assert.Equal("rework", parked.QuotaRetryFrom);
         Assert.Equal("rework", parked.QuotaRetryPhase);
+        Assert.Equal(
+            AgentTurnResumePhase.Rework,
+            Assert.IsType<AgentTurnResumeCheckpoint>(parked.AgentTurnResumeCheckpoint).Phase);
         Assert.NotNull(parked.NextQuotaRetryAt);
 
         var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
@@ -918,8 +921,11 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var parked = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.NotNull(parked);
         Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
-        Assert.Equal("audit", parked.QuotaRetryFrom);
+        Assert.Equal("rework", parked.QuotaRetryFrom);
         Assert.Equal("rework", parked.QuotaRetryPhase);
+        Assert.Equal(
+            AgentTurnResumePhase.Rework,
+            Assert.IsType<AgentTurnResumeCheckpoint>(parked.AgentTurnResumeCheckpoint).Phase);
         Assert.Contains(await fix.Store.GetIterationsAsync(item.Id), i => i.Iteration == 2);
         Assert.DoesNotContain(
             await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None),
@@ -931,7 +937,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             fix.GitHost,
             NullLogger<WorkItemRetrier>.Instance,
             auditProgress: fix.Store);
-        var retry = await retrier.RetryAsync(parked, from: "audit", trigger: "test-quota-return");
+        var retry = await retrier.RetryAsync(parked, from: "rework", trigger: "test-quota-return");
         Assert.True(retry.Success, retry.Error);
 
         fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "reworked"));

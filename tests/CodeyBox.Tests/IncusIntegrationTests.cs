@@ -193,6 +193,12 @@ public sealed class IncusIntegrationTests
                     },
                     new SandboxMount
                     {
+                        SandboxPath = SandboxConventions.AgentTurnScratchpadDir,
+                        Tmpfs = true,
+                        SizeBytes = 4L * 1024 * 1024,
+                    },
+                    new SandboxMount
+                    {
                         HostPath = writableSource,
                         SandboxPath = "/integration-rw",
                         ReadOnly = false,
@@ -378,12 +384,18 @@ public sealed class IncusIntegrationTests
             Assert.True(singleFileRead.Success, singleFileRead.Stderr);
             Assert.Equal("single-file\n", singleFileRead.Stdout);
 
-            var tmpfs = await sandbox.ExecAsync(new SandboxExec
+            var workBacking = await sandbox.ExecAsync(new SandboxExec
             {
-                Argv = ["findmnt", "-n", "-o", "FSTYPE", "--target", "/work"],
+                Argv = ["findmnt", "-n", "-o", "TARGET", "--target", "/work"],
             });
-            Assert.True(tmpfs.Success, tmpfs.Stderr);
-            Assert.Equal("tmpfs", tmpfs.Stdout.Trim());
+            Assert.True(workBacking.Success, workBacking.Stderr);
+            Assert.Equal("/", workBacking.Stdout.Trim());
+            var persistentWorkMarker = $"incus-work-persists-{token}\n";
+            var writePersistentWork = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "printf '%s' \"$1\" > /work/incus-stop-start-marker", "--", persistentWorkMarker],
+            });
+            Assert.True(writePersistentWork.Success, writePersistentWork.Stderr);
 
             var devices = await RunCheckedAsync(
                 [
@@ -399,8 +411,83 @@ public sealed class IncusIntegrationTests
             Assert.Contains($"parent: {settings.Bridge}", devices.Result.Stdout, StringComparison.Ordinal);
             Assert.Contains("name: eth0", devices.Result.Stdout, StringComparison.Ordinal);
 
+            var privateTmpfsMarker = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "sh", "-c",
+                    $"printf private > {SandboxConventions.AgentTurnScratchpadDir}/must-not-survive-restart",
+                ],
+            });
+            Assert.True(privateTmpfsMarker.Success, privateTmpfsMarker.Stderr);
+
+            var interruptedExec = sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "sh", "-c",
+                    "printf durable > /work/interrupted-exec-marker; sleep 300; printf should-not-run",
+                ],
+            });
+            await WaitForGuestCommandAsync(
+                settings,
+                sandbox.Id,
+                ["test", "-f", "/work/interrupted-exec-marker"],
+                TimeSpan.FromMinutes(1));
+            await RunCheckedAsync(
+                [
+                    settings.IncusBinary, "--project", settings.Project,
+                    "stop", sandbox.Id, "--force",
+                ],
+                TimeSpan.FromMinutes(2));
+
+            var interruptedResult = await interruptedExec.WaitAsync(TimeSpan.FromMinutes(7));
+            Assert.False(interruptedResult.Success);
+            Assert.True(
+                interruptedResult.ExecutionUnavailable,
+                $"Forced VM stop was not surfaced as execution-unavailable: exit={interruptedResult.ExitCode} stderr={interruptedResult.Stderr}");
+
+            var recoveredExec = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "sh", "-c",
+                    $"set -eu; test \"$(cat /work/interrupted-exec-marker)\" = durable; " +
+                    $"test ! -e {SandboxConventions.AgentTurnScratchpadDir}/must-not-survive-restart; " +
+                    $"test \"$(findmnt -n -o FSTYPE --target {SandboxConventions.AgentTurnScratchpadDir})\" = tmpfs",
+                ],
+            });
+            Assert.True(
+                recoveredExec.Success,
+                $"First exec after interrupted-exec recovery failed: exit={recoveredExec.ExitCode} stderr={recoveredExec.Stderr}");
+
+            var recoveredHostMountRead = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["cat", "/integration-rw/from-host.txt"],
+            });
+            Assert.True(recoveredHostMountRead.Success, recoveredHostMountRead.Stderr);
+            Assert.Equal("host-to-guest\n", recoveredHostMountRead.Stdout);
+
+            var recoveredHostMountWrite = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "printf 'after-recovery\\n' > /integration-rw/after-recovery.txt"],
+            });
+            Assert.True(recoveredHostMountWrite.Success, recoveredHostMountWrite.Stderr);
+            Assert.Equal(
+                "after-recovery\n",
+                await File.ReadAllTextAsync(Path.Combine(writableSource, "after-recovery.txt")));
+
             var preemptible = Assert.IsAssignableFrom<IPreemptibleSandbox>(sandbox);
             await preemptible.StopAndPreserveAsync();
+            await RunCheckedAsync(
+                [settings.IncusBinary, "--project", settings.Project, "start", sandbox.Id],
+                TimeSpan.FromMinutes(2));
+            var persistedWork = await WaitForGuestCommandAsync(
+                settings,
+                sandbox.Id,
+                ["cat", "/work/incus-stop-start-marker"],
+                TimeSpan.FromMinutes(2));
+            Assert.Equal(persistentWorkMarker, persistedWork.Stdout);
             var preserved = Assert.Single(
                 await provider.ListAllManagedAsync(CancellationToken.None),
                 managed => string.Equals(managed.Name, sandbox.Id, StringComparison.Ordinal));
@@ -807,6 +894,40 @@ public sealed class IncusIntegrationTests
         if (result.Result.StdoutLimitExceeded || result.Result.StderrLimitExceeded)
             throw new InvalidOperationException("Host command exceeded the integration test's output bound.");
         return result;
+    }
+
+    private static async Task<ProcessRunResult> WaitForGuestCommandAsync(
+        IncusIntegrationSettings settings,
+        string instanceName,
+        IReadOnlyList<string> guestArgv,
+        TimeSpan timeout)
+    {
+        IncusInputValidation.ValidateInstanceName(instanceName, nameof(instanceName));
+        if (guestArgv.Count == 0)
+            throw new ArgumentException("Guest integration command must not be empty.", nameof(guestArgv));
+        var deadline = Stopwatch.StartNew();
+        ProcessRunResult last = default;
+        while (deadline.Elapsed < timeout)
+        {
+            var argv = new List<string>(guestArgv.Count + 6)
+            {
+                settings.IncusBinary,
+                "--project",
+                settings.Project,
+                "exec",
+                instanceName,
+                "--",
+            };
+            argv.AddRange(guestArgv);
+            var attempt = await RunAllowFailureAsync(argv, TimeSpan.FromSeconds(10));
+            last = attempt.Result;
+            if (last.Success)
+                return last;
+            await Task.Delay(TimeSpan.FromSeconds(1));
+        }
+        throw new TimeoutException(
+            $"Incus guest command did not become available within {timeout.TotalSeconds:F0} seconds: " +
+            $"stderr={DiagnosticText(last.Stderr)}; stdout={DiagnosticText(last.Stdout)}");
     }
 
     private static async Task<TimedProcessResult> RunAllowFailureAsync(

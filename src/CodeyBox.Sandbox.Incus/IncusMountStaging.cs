@@ -11,7 +11,8 @@ internal sealed record IncusPreparedMount(
     bool ReadOnly,
     long? TmpfsSizeBytes = null,
     IncusMountReadinessProbe? ReadinessProbe = null,
-    IncusPinnedDirectory? PinnedHostDirectory = null);
+    IncusPinnedDirectory? PinnedHostDirectory = null,
+    bool RootDiskDirectory = false);
 
 internal sealed record IncusMountReadinessProbe(string RelativeFilePath, string ExpectedSha256);
 
@@ -279,6 +280,23 @@ internal static class IncusMountStaging
                     var size = mount.SizeBytes ?? defaultTmpfsSizeBytes;
                     if (size <= 0)
                         throw new InvalidOperationException($"Tmpfs mount '{mount.SandboxPath}' must have a positive size.");
+                    if (string.Equals(
+                            mount.SandboxPath,
+                            SandboxConventions.WorkDir,
+                            StringComparison.Ordinal))
+                    {
+                        if (size > defaultTmpfsSizeBytes)
+                        {
+                            throw new InvalidOperationException(
+                                "The Incus /work allocation cannot exceed the sandbox root-disk limit.");
+                        }
+                        prepared.Add(new IncusPreparedMount(
+                            HostSource: null,
+                            GuestPath: mount.SandboxPath,
+                            ReadOnly: false,
+                            RootDiskDirectory: true));
+                        continue;
+                    }
                     if (size > options.MaxTmpfsDeviceBytes)
                         throw new InvalidOperationException($"Tmpfs mount '{mount.SandboxPath}' exceeds the configured per-device limit.");
                     checked { aggregateTmpfsBytes += size; }
@@ -695,7 +713,7 @@ internal static class IncusMountStaging
         }
     }
 
-    private static void ValidateGuestLinks(
+    internal static void ValidateGuestLinks(
         IReadOnlyList<IncusPreparedMount> mounts,
         IReadOnlyList<IncusGuestLink> links)
     {
