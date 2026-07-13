@@ -92,6 +92,41 @@ public sealed class ReclaimNuGetHomeScriptTests : IDisposable
     }
 
     [Fact]
+    public void UnreadableConfigFile_IsReclaimedAndPreserved()
+    {
+        // POSIX-only: the trigger relies on Unix file permissions.
+        if (OperatingSystem.IsWindows())
+            return;
+        // A privileged process reads through any mode bits, so an unreadable file
+        // is unobservable; skip rather than flake when running as root.
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        var home = CreateHome();
+        var configDir = Path.Combine(home, ".nuget", "NuGet");
+        Directory.CreateDirectory(configDir);
+        // A writable directory holding an UNREADABLE NuGet.Config: NuGet reads this
+        // file while loading settings, so restore aborts with the same
+        // "Failed to read NuGet.Config" the gate hits — the dir being writable does
+        // not make the home healthy. The recovery must reclaim, not no-op.
+        var config = Path.Combine(configDir, "NuGet.Config");
+        File.WriteAllText(config, "<configuration/>");
+        File.SetUnixFileMode(config, UnixFileMode.None);
+
+        var result = RunScript(home);
+
+        Assert.True(result.ExitCode == 0, $"exit {result.ExitCode}; stderr: {result.Stderr}");
+        Assert.Contains("reclaimed", result.Stdout, StringComparison.Ordinal);
+        // A fresh, writable config dir now exists (no unreadable file blocks it)...
+        AssertWritableDirectory(Path.Combine(home, ".nuget", "NuGet"));
+        // ...and the unreadable config was preserved in the backup, not destroyed.
+        var backup = Assert.Single(BackupDirectories(home));
+        Assert.True(
+            File.Exists(Path.Combine(backup, "NuGet", "NuGet.Config")),
+            "backup lost the preserved NuGet.Config");
+    }
+
+    [Fact]
     public void UnsetHome_FailsCleanlyWithoutReclaiming()
     {
         // Empty HOME exercises the same "${HOME:-}" guard as a genuinely unset

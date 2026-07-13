@@ -201,12 +201,14 @@ writable.
 The recovery is encoded as `scripts/reclaim-nuget-home.sh` so it is
 discoverable and repeatable rather than tribal knowledge (run it on the host
 before the direct `dotnet` step, or once to heal a persistent home). It is
-safe and idempotent: it acts only when `$HOME/.nuget/NuGet` is not writable,
-leaves a healthy home untouched, and — when it must reclaim — renames the
+safe and idempotent: it acts only when the NuGet home is unhealthy — its
+config directory is not writable, or an existing `NuGet.Config` is unreadable
+(which aborts restore with the same "Failed to read NuGet.Config" the gate
+hits) — leaves a healthy home untouched, and, when it must reclaim, renames the
 unwritable directory aside to a numbered backup (never deleting the possibly
 root-owned contents) before recreating a writable one. Its healthy-no-op,
-create, reclaim, and unset-`HOME` branches are covered by
-`ReclaimNuGetHomeScriptTests`.
+create, reclaim (unwritable-dir and unreadable-config), and unset-`HOME`
+branches are covered by `ReclaimNuGetHomeScriptTests`.
 
 **Recovery.** Either export a writable home before the gate command:
 

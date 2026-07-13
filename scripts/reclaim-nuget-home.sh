@@ -42,16 +42,28 @@ fi
 
 nuget_home="$home/.nuget"
 nuget_config_dir="$nuget_home/NuGet"
+# NuGet's user-level settings file. NuGet READS this while loading default
+# settings on restore, so it must be readable — not merely present under a
+# writable directory. A root-owned, unreadable file here reproduces the same
+# "Failed to read NuGet.Config due to unauthorized access" gate failure as an
+# inaccessible directory, so the health check below treats it as unhealthy too.
+nuget_config_file="$nuget_config_dir/NuGet.Config"
 
-# Fast path: if the user-config directory already exists (or can be created) and
-# is writable, the home is healthy — do nothing. This is the idempotent no-op
-# that keeps a legitimate ~/.nuget intact.
-if mkdir -p "$nuget_config_dir" 2>/dev/null && [ -w "$nuget_config_dir" ]; then
-  echo "reclaim-nuget-home: $nuget_config_dir is writable; no action needed."
+# Fast path: the home is healthy — and left untouched — only when the user-config
+# directory exists (or can be created) AND is writable AND any existing config
+# file is readable. Checking readability of the file (not just writability of the
+# directory) closes a hole where a writable directory holding an unreadable
+# NuGet.Config would be falsely reported healthy while restore still aborts on the
+# unreadable file. This is the idempotent no-op that keeps a legitimate ~/.nuget
+# intact.
+if mkdir -p "$nuget_config_dir" 2>/dev/null \
+  && [ -w "$nuget_config_dir" ] \
+  && { [ ! -e "$nuget_config_file" ] || [ -r "$nuget_config_file" ]; }; then
+  echo "reclaim-nuget-home: $nuget_config_dir is healthy; no action needed."
   exit 0
 fi
 
-# mkdir failed. If the home does not exist at all, then $HOME itself is not
+# The home is unhealthy. If it does not exist at all, then $HOME itself is not
 # writable and there is nothing this script can safely do.
 if [ ! -e "$nuget_home" ]; then
   echo "reclaim-nuget-home: cannot create $nuget_config_dir and $home is not writable." >&2
