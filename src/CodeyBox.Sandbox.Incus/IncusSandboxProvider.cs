@@ -1709,6 +1709,17 @@ public sealed class IncusSandboxProvider :
         catch (Exception ex)
         {
             cleanupFailure = ex;
+            try
+            {
+                workspace?.ReleaseLeaseForRecovery();
+            }
+            catch (Exception releaseFailure)
+            {
+                cleanupFailure = new AggregateException(
+                    "Incus workspace deletion failed and its recovery lease could not be released.",
+                    ex,
+                    releaseFailure);
+            }
         }
         try
         {

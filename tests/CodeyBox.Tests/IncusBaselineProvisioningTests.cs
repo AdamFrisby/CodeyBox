@@ -1227,6 +1227,9 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
 
         Assert.Throws<InvalidOperationException>(workspace.Dispose);
         Assert.True(Directory.Exists(root));
+        using var competingLease = IncusSafeFile.OpenOrCreatePrivateLeaseNoFollow(
+            Path.Combine(root, IncusProvisioningWorkspace.WorkspaceLeaseName));
+        Assert.False(IncusSafeFile.TryAcquireExclusiveLease(competingLease));
 
         File.WriteAllText(marker, Path.GetFileName(root) + "\n");
         if (OperatingSystem.IsLinux())

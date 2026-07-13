@@ -14,6 +14,7 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     private static readonly ProjectId BrokenProjectId = new("broken-project");
     private readonly string _workspace = Directory.CreateTempSubdirectory("codeybox-quota-audit-").FullName;
     private readonly TestSink _sink = new();
+    private readonly Serilog.Core.Logger _auditLogger;
 
     // A dedicated, injected Serilog logger keeps this test's audit events off the
     // process-global Serilog.Log.Logger, so a concurrent host bootstrap that
@@ -51,23 +52,13 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     }
 
     [Fact]
-    public async Task Retry_UsesAuditLoggerCapturedWhenSchedulerIsConstructed()
+    public async Task Retry_UsesInjectedAuditLogger()
     {
         using var fixture = BuildScheduler(BuildRouter(availablePct: 0), BuildProjects());
         var item = CreateQuotaItem(WorkItemState.WaitingForQuotaReset);
         await fixture.Store.CreateAsync(item);
-        var capturedLogger = Log.Logger;
-        using var replacementLogger = new LoggerConfiguration().CreateLogger();
 
-        try
-        {
-            Log.Logger = replacementLogger;
-            await InvokeTryRetryAsync(fixture.Scheduler, item, "periodic", CancellationToken.None);
-        }
-        finally
-        {
-            Log.Logger = capturedLogger;
-        }
+        await InvokeTryRetryAsync(fixture.Scheduler, item, "periodic", CancellationToken.None);
 
         AssertQuotaAttempt(
             item,

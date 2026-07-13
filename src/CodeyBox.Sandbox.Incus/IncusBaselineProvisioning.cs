@@ -1,6 +1,5 @@
 using System.Formats.Tar;
 using System.Globalization;
-using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
 using System.Text;
 using CodeyBox.Sandbox;
@@ -39,7 +38,7 @@ internal sealed class IncusProvisioningWorkspace : IDisposable
     // directories to enter regardless of InstanceNamePrefix truncation.
     internal const string DirectoryPrefix = ".codeybox-provision-";
     private const string OwnershipMarkerName = ".codeybox-incus-provision-v1";
-    private const string WorkspaceLeaseName = ".codeybox-incus-provision.lease";
+    internal const string WorkspaceLeaseName = ".codeybox-incus-provision.lease";
     internal const string CoordinationLeaseName = ".codeybox-incus-provision-coordination.lease";
     private const int MaximumStagingRootEntries = 4096;
     private readonly string _stagingRoot;
@@ -184,35 +183,23 @@ internal sealed class IncusProvisioningWorkspace : IDisposable
             var root = _workspaceRoot;
             if (root is null)
                 return;
-            var lease = _lease;
+            var lease = _lease
+                ?? throw new InvalidOperationException("The Incus provisioning workspace lost its active lease.");
+            if (!TryDeleteVerifiedWorkspace(_stagingRoot, root, lease))
+                throw new IOException("The owned Incus provisioning workspace lease was not active during disposal.");
+            _workspaceRoot = null;
             _lease = null;
-            Exception? deletionFailure = null;
-            try
-            {
-                if (!TryDeleteVerifiedWorkspace(_stagingRoot, root, lease))
-                    throw new IOException("The owned Incus provisioning workspace lease was not active during disposal.");
-                _workspaceRoot = null;
-            }
-            catch (Exception ex)
-            {
-                deletionFailure = ex;
-            }
-            try
-            {
-                // A validation or deletion failure intentionally leaves the
-                // workspace for a later verified recovery pass, but it must
-                // never retain the lease that prevents that recovery.
-                lease?.Dispose();
-            }
-            catch (Exception releaseFailure) when (deletionFailure is not null)
-            {
-                throw new AggregateException(
-                    "Incus workspace deletion failed and its recovery lease could not be released.",
-                    deletionFailure,
-                    releaseFailure);
-            }
-            if (deletionFailure is not null)
-                ExceptionDispatchInfo.Capture(deletionFailure).Throw();
+            lease.Dispose();
+        }
+    }
+
+    internal void ReleaseLeaseForRecovery()
+    {
+        lock (_disposeGate)
+        {
+            _lease?.Dispose();
+            _lease = null;
+            _workspaceRoot = null;
         }
     }
 
