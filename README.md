@@ -121,10 +121,13 @@ cd CodeyBox
 dotnet build CodeyBox.slnx
 ```
 
-> The repository supplies its NuGet source configuration through
-> `Directory.Build.props`. Restore therefore does not depend on the invoking
-> account's per-user NuGet configuration, which is important in audit and
-> sandbox environments that inherit a home directory they cannot traverse.
+> The repository supplies its package sources through `Directory.Build.props`,
+> but NuGet still initializes `$HOME/.nuget/NuGet` before evaluating that
+> project property. The build account therefore needs a readable and writable
+> NuGet profile directory. If a container seeded `$HOME/.nuget` as another
+> user, repair its ownership before building; otherwise restore fails before
+> any project is evaluated and `dotnet test --no-build` subsequently has no
+> valid test assemblies to run.
 
 **3. Configure a project.** Drop a JSON file somewhere and point
 `CODEYBOX_EXTRA_CONFIG` at it (it hot-reloads on change):
