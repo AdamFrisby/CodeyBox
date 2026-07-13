@@ -1210,6 +1210,31 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
     }
 
     [Fact]
+    public void ExclusiveLeaseRelease_IsImmediateEvenWhileSafeHandleHasAnOutstandingReference()
+    {
+        var leasePath = Path.Combine(CreateDirectory("explicit-lease-release"), "lease");
+        using var first = IncusSafeFile.OpenOrCreatePrivateLeaseNoFollow(leasePath);
+        Assert.True(IncusSafeFile.TryAcquireExclusiveLease(first));
+
+        var handle = first.SafeFileHandle;
+        var referenceAdded = false;
+        handle.DangerousAddRef(ref referenceAdded);
+        try
+        {
+            IncusSafeFile.ReleaseExclusiveLease(first);
+            first.Dispose();
+
+            using var second = IncusSafeFile.OpenOrCreatePrivateLeaseNoFollow(leasePath);
+            Assert.True(IncusSafeFile.TryAcquireExclusiveLease(second));
+        }
+        finally
+        {
+            if (referenceAdded)
+                handle.DangerousRelease();
+        }
+    }
+
+    [Fact]
     public void ProvisioningWorkspace_DisposeCanRetryAfterValidationFailure()
     {
         var stagingRoot = CreateDirectory("staging-dispose-retry");

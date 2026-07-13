@@ -241,7 +241,6 @@ public sealed class AgenticConflictResolver
         Serilog.ILogger? auditLogger = null)
     {
         _options = options ?? new AgenticConflictResolverOptionsSnapshot();
-        _auditLogger = auditLogger;
         _log = log ?? (ILogger)Microsoft.Extensions.Logging.Abstractions.NullLogger<AgenticConflictResolver>.Instance;
         // Optional hook the orchestrator wires in so a cross-kind candidate's
         // AgentCredential.Files land in the sandbox before the candidate's CLI

@@ -463,8 +463,15 @@ internal sealed class IncusRecoveryManifestStore : IDisposable
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
-        _lease.Dispose();
-        _sandboxRoot.Dispose();
+        try
+        {
+            IncusSafeFile.ReleaseExclusiveLease(_lease);
+        }
+        finally
+        {
+            _lease.Dispose();
+            _sandboxRoot.Dispose();
+        }
     }
 
     private static string ManifestName(string hash) => $"{ManifestPrefix}{hash}.json";

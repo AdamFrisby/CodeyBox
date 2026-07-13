@@ -27,6 +27,7 @@ internal static partial class IncusSafeFile
     private const int WouldBlock = 11;
     private const int LockExclusive = 2;
     private const int LockNonBlocking = 4;
+    private const int LockUnlock = 8;
 
     internal static bool TryCreateDirectoryExclusive(string path)
     {
@@ -116,6 +117,19 @@ internal static partial class IncusSafeFile
         if (error == WouldBlock)
             return false;
         throw new IOException("Unable to acquire the private Incus provisioning lease.", new Win32Exception(error));
+    }
+
+    internal static void ReleaseExclusiveLease(FileStream lease)
+    {
+        ArgumentNullException.ThrowIfNull(lease);
+        if (AcquireFileLock(
+                lease.SafeFileHandle.DangerousGetHandle().ToInt32(),
+                LockUnlock) == 0)
+        {
+            return;
+        }
+        var error = Marshal.GetLastPInvokeError();
+        throw new IOException("Unable to release the private Incus provisioning lease.", new Win32Exception(error));
     }
 
     /// <summary>
