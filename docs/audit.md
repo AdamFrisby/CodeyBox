@@ -256,6 +256,33 @@ the audit reuses the same home the rework wrote to. Once a CodeyBox carrying
 these seams is itself the deployed auditor, the gate self-heals for every
 project with no per-repo action.
 
+**Every repo-side escape hatch is closed (verified, not assumed).** Because a
+committed file is the only lever a rework agent controls, each candidate for
+redirecting the *bare* `dotnet` the deployed auditor launches was tried against
+the real root-owned `~/.nuget` with the inherited `HOME`, and each fails for a
+structural reason — so no source change can turn the gate green:
+
+- `NuGet.Config` `RestoreConfigFile` (present) and an explicit `dotnet restore
+  --configfile <repo NuGet.Config>` both still abort with the identical `Failed
+  to read NuGet.Config ... /home/…/.nuget/NuGet … denied`. Restore loads the
+  machine+user settings hierarchy (and materialises the user-level config dir)
+  *before* `RestoreConfigFile` narrows the set, so pinning the config file does
+  not stop the user-dir probe.
+- `Directory.Build.props` **is** evaluated at the very start of restore (before
+  the probe), but MSBuild property functions are read-only by design: both
+  `[System.Environment]::SetEnvironmentVariable('HOME', …)` and
+  `[System.IO.Directory]::CreateDirectory(…)` are rejected at evaluation with
+  `error MSB4185: The function … is not available for execution as an MSBuild
+  property function`. So a props file can neither re-point `HOME`/`DOTNET_CLI_HOME`
+  in-process nor create/reclaim the NuGet home.
+- An `<Exec>` target (e.g. an `mkdir`/reclaim before restore) cannot help: the
+  restore graph aborts during solution restore, before any project target —
+  including `BeforeTargets="Restore"` hooks — runs.
+
+The bare `dotnet` therefore derives its NuGet home solely from the process
+`HOME` it inherits, which no committed file sets. That leaves only the
+operator/environment actions (a)–(c) above; there is no fourth, repo-only path.
+
 
 ## Built-in auditors
 
