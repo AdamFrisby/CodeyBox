@@ -1353,8 +1353,13 @@ public sealed class IncusSandboxLifecycleTests
             {
                 ["OPENAI_API_KEY"] = execSecret,
                 ["REMOVE_ME"] = "exec-value",
+                [IncusCloudInit.DotnetCliHomeEnvironmentVariable] = "/tmp/caller-override",
             },
-            EnvironmentVariablesToUnset = ["REMOVE_ME"],
+            EnvironmentVariablesToUnset =
+            [
+                "REMOVE_ME",
+                IncusCloudInit.DotnetCliHomeEnvironmentVariable,
+            ],
             EnvironmentContainsSecrets = true,
         };
 
@@ -1374,7 +1379,9 @@ public sealed class IncusSandboxLifecycleTests
             }
 
             Assert.Equal(
-                $"CODEYBOX_SPEC_SECRET={specSecret}\0OPENAI_API_KEY={execSecret}\0",
+                $"CODEYBOX_SPEC_SECRET={specSecret}\0" +
+                $"{IncusCloudInit.DotnetCliHomeEnvironmentVariable}={IncusCloudInit.DotnetCliHome}\0" +
+                $"OPENAI_API_KEY={execSecret}\0",
                 Assert.Single(pushedPayloads));
             Assert.DoesNotContain(
                 runner.Commands.SelectMany(static command => command),

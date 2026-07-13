@@ -1873,11 +1873,20 @@ internal sealed class IncusSandbox :
         if (extra is not null)
             ValidateEnvironment(extra, nameof(extra));
 
-        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        // Put the provider-owned entry in every per-exec payload as well as the
+        // current cloud-init wrapper. COW clones can inherit an older baked
+        // wrapper, but their environment payload is always produced by the
+        // current provider. Keeping this invariant here isolates dotnet from an
+        // inherited, potentially unwritable user NuGet profile on those clones.
+        var result = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            [IncusCloudInit.DotnetCliHomeEnvironmentVariable] = IncusCloudInit.DotnetCliHome,
+        };
         AddEntries(baseline);
         if (extra is not null)
             AddEntries(extra);
         exec.ApplyEnvironmentRemovals(name => result.Remove(name));
+        result[IncusCloudInit.DotnetCliHomeEnvironmentVariable] = IncusCloudInit.DotnetCliHome;
         return result;
 
         void AddEntries(IReadOnlyDictionary<string, string> source)
