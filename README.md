@@ -123,8 +123,9 @@ dotnet build CodeyBox.slnx
 
 > The repository supplies its package sources through `Directory.Build.props`.
 > `MSBuild.rsp` supplies the same restore property before a solution restore
-> initializes NuGet, so the build does not depend on access to the invoking
-> account's NuGet configuration.
+> initializes project restore, so package-source selection is repository-local.
+> NuGet also reads user-wide proxy settings, so the invoking account still needs
+> read access to its NuGet profile directory.
 
 **3. Configure a project.** Drop a JSON file somewhere and point
 `CODEYBOX_EXTRA_CONFIG` at it (it hot-reloads on change):
