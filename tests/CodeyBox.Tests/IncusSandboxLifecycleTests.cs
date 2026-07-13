@@ -571,6 +571,7 @@ public sealed class IncusSandboxLifecycleTests
         Directory.CreateDirectory(sandboxRoot);
         IncusMountStaging.InitializeOwnedTree(sandboxRoot, sandboxName, DateTimeOffset.UtcNow);
         var runner = new StickyDeletionLifecycleRunner(sandboxName);
+        var time = new ControllableTimeProvider(DateTimeOffset.UtcNow);
         var inactive = 0;
         var options = new IncusSandboxOptions
         {
@@ -596,7 +597,7 @@ public sealed class IncusSandboxLifecycleTests
             root,
             spec,
             options,
-            new IncusCliRunner(runner),
+            new IncusCliRunner(runner, time),
             NullLogger.Instance,
             timings: null,
             WorkItemId.New(),
@@ -607,10 +608,14 @@ public sealed class IncusSandboxLifecycleTests
             authorization,
             recoveryState.Lease,
             recoveryState.Manifest,
-            recoveryState.Store);
+            recoveryState.Store,
+            timeProvider: time);
         SandboxLiveCounter.Increment();
 
-        await Assert.ThrowsAsync<TimeoutException>(() => sandbox.DisposeAsync().AsTask());
+        var firstDispose = sandbox.DisposeAsync().AsTask();
+        await runner.DeleteStarted.WaitAsync(TimeSpan.FromSeconds(5));
+        await AdvanceUntilCompletedAsync(time, firstDispose, TimeSpan.FromMilliseconds(10));
+        await Assert.ThrowsAsync<TimeoutException>(() => firstDispose);
 
         Assert.True(Directory.Exists(sandboxRoot));
         Assert.Equal(0, inactive);
@@ -3586,8 +3591,11 @@ public sealed class IncusSandboxLifecycleTests
         private bool _deleted;
         private string? _recoveryTokenHash;
         private string? _recoveryManifestHash;
+        private readonly TaskCompletionSource _deleteStarted = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
         internal bool CompleteDeletion { get; set; }
         internal int DeleteCalls { get; private set; }
+        internal Task DeleteStarted => _deleteStarted.Task;
 
         internal void SetRecoveryBinding(string tokenHash, string manifestHash) =>
             (_recoveryTokenHash, _recoveryManifestHash) = (tokenHash, manifestHash);
@@ -3614,6 +3622,7 @@ public sealed class IncusSandboxLifecycleTests
             if (argv.Contains("delete", StringComparer.Ordinal))
             {
                 DeleteCalls++;
+                _deleteStarted.TrySetResult();
                 _deleted = CompleteDeletion;
                 return Task.FromResult(new ProcessRunResult(0, string.Empty, string.Empty));
             }

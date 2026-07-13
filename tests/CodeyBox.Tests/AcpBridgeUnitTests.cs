@@ -45,6 +45,7 @@ namespace CodeyBox.Tests;
 public sealed class AcpBridgeUnitTests
 {
     private const int SignalCleanupPollAttempts = 100;
+    private const int BridgeDiagnosticStderrCharacters = 16 * 1024;
     private static readonly TimeSpan SignalCleanupPollDelay = TimeSpan.FromMilliseconds(50);
     private static readonly TimeSpan TimedOutProcessKillWait = TimeSpan.FromSeconds(5);
     private static readonly SemaphoreSlim EnvironmentVariableGate = new(1, 1);
@@ -777,6 +778,25 @@ public sealed class AcpBridgeUnitTests
     }
 
     // ── Bridge.RunAsync end-to-end ─────────────────────────────────────────────
+
+    [Fact]
+    public async Task Bridge_RunAsync_ShutdownWhileStdinReadIsPending_HandlesConsoleStyleNotSupportedException()
+    {
+        using var stdin = new ShutdownRaceInputStream();
+        using var stdoutCapture = new MemoryStream();
+        using var emitterScope = Emitter.OverrideStreamForTests(stdoutCapture);
+        await using var bridge = new Bridge(stdin);
+        var runTask = bridge.RunAsync();
+        await stdin.ReadStarted.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var shutdown = typeof(Bridge).GetMethod(
+            "Shutdown",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        Assert.NotNull(shutdown);
+        shutdown.Invoke(bridge, [0]);
+
+        Assert.Equal(0, await runTask.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
 
     [Fact]
     public async Task Bridge_RunAsync_EmitsBridgeStartedReadyAndClaudeExitInOrder()
@@ -3570,6 +3590,7 @@ os.execv(dotnet, [hostile_argv0, "exec", target, *sys.argv[3:]])
 
             using var proc = Process.Start(psi)
                 ?? throw new InvalidOperationException("Process.Start returned null for bridge signal fixture.");
+            var stderrTask = CaptureBridgeStderrAsync(proc);
 
             try
             {
@@ -3605,7 +3626,10 @@ os.execv(dotnet, [hostile_argv0, "exec", target, *sys.argv[3:]])
                 // ran Shutdown(0). Exit codes 128+signo (143 / 130 / 129)
                 // indicate the default action ran — the handler is missing
                 // or didn't set ctx.Cancel.
-                Assert.Equal(0, proc.ExitCode);
+                var bridgeStderr = await stderrTask;
+                Assert.True(
+                    proc.ExitCode == 0,
+                    $"Bridge exited with code {proc.ExitCode} after {signalName}. stderr: {bridgeStderr}");
 
                 // The Shutdown handler also deletes the lockfile. A regression
                 // that calls Shutdown(0) but skips the lockfile delete still
@@ -3621,6 +3645,7 @@ os.execv(dotnet, [hostile_argv0, "exec", target, *sys.argv[3:]])
             finally
             {
                 try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+                try { await stderrTask.WaitAsync(TimeSpan.FromSeconds(5)); } catch { }
             }
         }
         finally
@@ -3785,6 +3810,26 @@ os.execv(dotnet, [hostile_argv0, "exec", target, *sys.argv[3:]])
             catch (IOException) { }
             catch (ObjectDisposedException) { }
         });
+    }
+
+    private static async Task<string> CaptureBridgeStderrAsync(Process proc)
+    {
+        var captured = new StringBuilder(BridgeDiagnosticStderrCharacters);
+        var buffer = new char[4096];
+        while (true)
+        {
+            var read = await proc.StandardError.ReadAsync(buffer.AsMemory());
+            if (read == 0)
+                return captured.ToString();
+
+            for (var i = 0; i < read && captured.Length < BridgeDiagnosticStderrCharacters; i++)
+            {
+                var value = buffer[i];
+                captured.Append(char.IsControl(value) && value is not '\r' and not '\n' and not '\t'
+                    ? ' '
+                    : value);
+            }
+        }
     }
 
     private static async Task AssertClaudeStubExitedAsync(int rootPid, int childPid, string signalName)
@@ -4420,6 +4465,54 @@ wait "$child"
                 await _signal.WaitAsync(TimeSpan.FromMilliseconds(Math.Min(remainingMs, 250)))
                     .ConfigureAwait(false);
             }
+        }
+    }
+
+    private sealed class ShutdownRaceInputStream : Stream
+    {
+        private readonly TaskCompletionSource<int> _pendingRead = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _readStarted = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal Task ReadStarted => _readStarted.Task;
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) =>
+            throw new NotSupportedException("Synchronous reads are not supported by this fixture.");
+
+        public override Task<int> ReadAsync(
+            byte[] buffer,
+            int offset,
+            int count,
+            CancellationToken cancellationToken)
+        {
+            _readStarted.TrySetResult();
+            return _pendingRead.Task;
+        }
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _pendingRead.TrySetException(
+                    new NotSupportedException("Stream does not support reading."));
+            }
+            base.Dispose(disposing);
         }
     }
 

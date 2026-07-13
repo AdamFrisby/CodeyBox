@@ -10,9 +10,11 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Serilog;
 
 namespace CodeyBox.Tests;
 
+[Collection("GlobalSerilog")]
 public sealed class DeploymentProgramWiringTests
 {
     [Fact]
@@ -96,6 +98,7 @@ public sealed class DeploymentProgramWiringTests
 
     private sealed class DeploymentProgramWiringFactory : WebApplicationFactory<Program>
     {
+        private readonly Serilog.ILogger _previousLogger = Log.Logger;
         private readonly string _dbPath = Path.Combine(
             Path.GetTempPath(), $"codeybox-deployment-wiring-{Guid.NewGuid():N}.db");
 
@@ -168,9 +171,22 @@ public sealed class DeploymentProgramWiringTests
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            base.Dispose(disposing);
+            try
+            {
+                base.Dispose(disposing);
+            }
+            finally
+            {
+                if (disposing)
+                {
+                    // Program closes its process-global logger when the test
+                    // host stops. Restore the logger that belonged to the
+                    // surrounding test so later audit assertions retain their
+                    // sink even when xUnit constructs collection members early.
+                    Log.Logger = _previousLogger;
+                    try { File.Delete(_dbPath); } catch { /* best-effort */ }
+                }
+            }
         }
     }
 }
