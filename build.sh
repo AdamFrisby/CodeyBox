@@ -40,13 +40,16 @@ if [ -n "$cli_home" ]; then
                 if nuget_home_writable; then
                     rm -f "$probe" 2>/dev/null || true
                     healed=1
-                    # Reuse the quarantined package cache when it is still
-                    # writable, so the heal does not force a full re-download
-                    # (which would fail in an offline/credential-free sandbox).
-                    # NuGet writes new packages through the symlink into the
-                    # existing cache; a read-only cache is left untouched so a
-                    # fresh, writable one is populated instead.
-                    if [ -d "$quarantine/packages" ] && [ -w "$quarantine/packages" ] \
+                    # Reuse the quarantined package cache so the heal does not
+                    # force a full re-download (which would fail in an offline or
+                    # credential-free sandbox). Symlink it even when it is
+                    # read-only: the account that baked $HOME/.nuget as root also
+                    # left its populated cache root-owned, and NuGet only READS an
+                    # already-extracted package (it checks the .nupkg.metadata
+                    # marker and skips extraction), so a read-only full cache
+                    # satisfies every restore. A writable cache additionally lets
+                    # NuGet add any package the baseline lacks.
+                    if [ -d "$quarantine/packages" ] \
                         && [ ! -e "$nuget_root/packages" ]; then
                         ln -s "$quarantine/packages" "$nuget_root/packages" 2>/dev/null || true
                     fi
