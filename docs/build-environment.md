@@ -55,8 +55,10 @@ A repository `nuget.config`, an MSBuild `RestoreConfigFile`
 (`Directory.Build.props`), and the `NUGET_CONFIG_FILE` environment variable
 were all verified to still fail on their own, because NuGet touches the
 per-user settings directory during settings load, ahead of every override.
-Only a writable NuGet home (or a redirected per-user home, see the gate/
-`build.sh` sections below) fixes it.
+Only relocating the user-settings home fixes it — own/`chown` `~/.nuget`, move
+it aside, or point `DOTNET_CLI_HOME` at a writable directory (all three
+remediations are shown below, and the gate / `build.sh` sections cover the
+`DOTNET_CLI_HOME` route in particular).
 
 ### Operator remediation
 
