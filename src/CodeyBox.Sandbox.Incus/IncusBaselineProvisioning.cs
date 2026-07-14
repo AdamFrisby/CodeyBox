@@ -232,7 +232,7 @@ internal sealed class IncusProvisioningWorkspace : IDisposable
     {
         var lease = IncusSafeFile.OpenOrCreatePrivateLeaseNoFollow(
             Path.Combine(stagingRoot, CoordinationLeaseName));
-        if (IncusSafeFile.TryAcquireExclusiveLease(lease))
+        if (IncusSafeFile.TryAcquireExclusiveLeaseWithBackoff(lease))
             return lease;
         lease.Dispose();
         throw new IncusProvisioningLeaseContendedException(

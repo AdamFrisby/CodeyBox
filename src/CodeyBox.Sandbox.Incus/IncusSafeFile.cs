@@ -118,6 +118,49 @@ internal static partial class IncusSafeFile
         throw new IOException("Unable to acquire the private Incus provisioning lease.", new Win32Exception(error));
     }
 
+    // A concurrent fork/exec anywhere in this process momentarily duplicates every
+    // open lease descriptor into the forked child; the duplicate keeps the advisory
+    // flock alive until the child reaches exec and O_CLOEXEC closes it. During that
+    // window a freshly opened handle to the same lease path observes the lock as
+    // held even though no process genuinely owns the lease. CodeyBox spawns
+    // subprocesses continuously (agent CLIs, git, incus), so a caller that expects
+    // to win a lease must tolerate this transient contention. These bounds let such
+    // a caller retry the non-blocking flock long enough for a fork/exec window to
+    // clear (worst case ~2 s) while a lease a peer genuinely holds stays contended
+    // for the whole budget and the call reports failure.
+    internal const int DefaultExclusiveLeaseRetryAttempts = 100;
+    internal static readonly TimeSpan DefaultExclusiveLeaseRetryDelay = TimeSpan.FromMilliseconds(20);
+
+    /// <summary>
+    /// Acquires the advisory exclusive lease, retrying the non-blocking flock across
+    /// a bounded budget so that transient contention from a concurrent fork/exec
+    /// window (see the retry-bound constants) clears. Returns <c>true</c> once the
+    /// lease is held, or <c>false</c> if it remains contended for the whole budget —
+    /// i.e. a peer genuinely owns it. <paramref name="sleep"/> defaults to
+    /// <see cref="Thread.Sleep(TimeSpan)"/>; tests inject a no-op to keep the loop
+    /// deterministic.
+    /// </summary>
+    internal static bool TryAcquireExclusiveLeaseWithBackoff(
+        FileStream lease,
+        int maxAttempts = DefaultExclusiveLeaseRetryAttempts,
+        TimeSpan? retryDelay = null,
+        Action<TimeSpan>? sleep = null)
+    {
+        ArgumentNullException.ThrowIfNull(lease);
+        if (maxAttempts < 1)
+            throw new ArgumentOutOfRangeException(nameof(maxAttempts));
+        var delay = retryDelay ?? DefaultExclusiveLeaseRetryDelay;
+        var sleepFor = sleep ?? Thread.Sleep;
+        for (var attempt = 1; ; attempt++)
+        {
+            if (TryAcquireExclusiveLease(lease))
+                return true;
+            if (attempt >= maxAttempts)
+                return false;
+            sleepFor(delay);
+        }
+    }
+
     /// <summary>
     /// Pins the exact directory inode reached by an already-canonical host path.
     /// Each path component is opened relative to its pinned parent with

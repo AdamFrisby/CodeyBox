@@ -3069,9 +3069,17 @@ public sealed class IncusSandboxLifecycleTests
     {
         CaptureResourceMetrics = false,
         DiskGuard = null,
-        OperationTimeout = TimeSpan.FromMilliseconds(250),
+        // OperationTimeout/VmStopTimeout are wall-clock anti-hang guards against the
+        // in-memory fake runners these tests drive; the runners return in microseconds,
+        // so no assertion depends on the guard firing (tests that exercise the timeout
+        // path set their own sub-second values on bespoke options). The former 250 ms /
+        // 100 ms values were tight enough that thread-pool starvation on the fully-loaded
+        // 6-vCPU verify VM could cancel a probe before the fake runner was even scheduled,
+        // producing spurious "exceeded its 0-second deadline" timeouts. Size them
+        // generously so only a genuine hang trips them.
+        OperationTimeout = TimeSpan.FromSeconds(30),
         ExecTimeout = TimeSpan.FromSeconds(2),
-        VmStopTimeout = TimeSpan.FromMilliseconds(100),
+        VmStopTimeout = TimeSpan.FromSeconds(30),
         ReadinessPollInterval = TimeSpan.FromMilliseconds(1),
         InterruptedExecRecoveryRetryAttempts = 0,
     };
