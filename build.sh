@@ -6,26 +6,61 @@ set -eu
 # DOTNET_CLI_HOME, or $HOME when that is unset. In locked-down environments the
 # inherited directory can be owned by another account or mounted read-only, so
 # `dotnet` aborts restore before the build with an unauthorized-access error
-# (e.g. "Failed to read NuGet.Config due to unauthorized access").
-#
-# There is no in-tree NuGet setting that suppresses that read, so when the
-# inherited location is not usable, redirect the .NET CLI home to a writable
-# scratch directory. NuGet then keeps its per-user config there and the build
-# stays hermetic instead of failing. When the inherited location is fine we
-# leave the environment untouched.
+# (e.g. "Failed to read NuGet.Config due to unauthorized access"). There is no
+# in-tree NuGet setting that suppresses that read, so recover it here.
 cli_home="${DOTNET_CLI_HOME:-${HOME:-}}"
 if [ -n "$cli_home" ]; then
     nuget_user_dir="$cli_home/.nuget/NuGet"
     probe="$nuget_user_dir/.codeybox-writable-probe"
-    # Use touch (a plain command) rather than a shell redirect for the write
-    # probe: a failed redirection is a fatal shell error under `set -e`, which
-    # would abort instead of taking the relocation branch.
-    if mkdir -p "$nuget_user_dir" 2>/dev/null && touch "$probe" 2>/dev/null; then
+
+    # Probe with touch (a real command) rather than a shell redirect: a failed
+    # redirection is a fatal error under `set -e` and would abort before the
+    # recovery branches run.
+    nuget_home_writable() {
+        mkdir -p "$nuget_user_dir" 2>/dev/null && touch "$probe" 2>/dev/null
+    }
+
+    if nuget_home_writable; then
         rm -f "$probe" 2>/dev/null || true
     else
-        scratch_home="$(mktemp -d "${TMPDIR:-/tmp}/codeybox-dotnet-home.XXXXXX")"
-        DOTNET_CLI_HOME="$scratch_home"
-        export DOTNET_CLI_HOME
+        # The inherited per-user NuGet directory is not writable — e.g. an image
+        # baked $HOME/.nuget owned by root. When the cli-home itself is writable,
+        # relocate the broken directory aside and recreate a writable one. This
+        # heals the real cli-home so EVERY later `dotnet` invocation in this
+        # environment can write its per-user config, not just this script's own
+        # build: a process-local DOTNET_CLI_HOME override would not, because the
+        # deterministic build/test gates invoke `dotnet` directly. The rename
+        # preserves the old tree instead of deleting it, and only runs when the
+        # directory is genuinely unusable.
+        healed=0
+        if [ -w "$cli_home" ]; then
+            nuget_root="$cli_home/.nuget"
+            quarantine="$nuget_root.codeybox-unwritable.$$"
+            if [ ! -e "$nuget_root" ] || mv "$nuget_root" "$quarantine" 2>/dev/null; then
+                if nuget_home_writable; then
+                    rm -f "$probe" 2>/dev/null || true
+                    healed=1
+                    # Reuse the quarantined package cache when it is still
+                    # writable, so the heal does not force a full re-download
+                    # (which would fail in an offline/credential-free sandbox).
+                    # NuGet writes new packages through the symlink into the
+                    # existing cache; a read-only cache is left untouched so a
+                    # fresh, writable one is populated instead.
+                    if [ -d "$quarantine/packages" ] && [ -w "$quarantine/packages" ] \
+                        && [ ! -e "$nuget_root/packages" ]; then
+                        ln -s "$quarantine/packages" "$nuget_root/packages" 2>/dev/null || true
+                    fi
+                fi
+            fi
+        fi
+
+        if [ "$healed" -eq 0 ]; then
+            # The cli-home itself is not writable: keep the build hermetic by
+            # redirecting the .NET CLI home to a writable scratch directory.
+            scratch_home="$(mktemp -d "${TMPDIR:-/tmp}/codeybox-dotnet-home.XXXXXX")"
+            DOTNET_CLI_HOME="$scratch_home"
+            export DOTNET_CLI_HOME
+        fi
     fi
 fi
 
