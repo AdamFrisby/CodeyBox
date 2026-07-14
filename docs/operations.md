@@ -163,6 +163,23 @@ needs.
   build uid (e.g. `chown "$uid" ~/.nuget`, or create it owned by that uid)
   while keeping the package cache in place.
 
+  When `chown` is unavailable (no root, `no_new_privs` set) but the build uid
+  owns `$HOME`, remediate in place without a provisioning change: rename the
+  foreign-owned tree aside, recreate `~/.nuget` (and its `NuGet` settings
+  subdirectory) owned by the build uid, and re-expose the pre-warmed cache —
+
+      mv ~/.nuget ~/.nuget.foreign-owned
+      mkdir -p ~/.nuget/NuGet
+      ln -s ~/.nuget.foreign-owned/packages ~/.nuget/packages
+
+  Directory entries under `$HOME` can be renamed by its owner even when the
+  entry itself is owned by another uid, so this needs no elevated privilege.
+  The cache dir stays uid-owned and writable through the symlink, so restore
+  still resolves offline. A direct `dotnet build ./CodeyBox.slnx` (and
+  `dotnet test`) then restores normally, because `~/.nuget/NuGet` is now
+  creatable. This lives in `$HOME`, independent of the git worktree, so it
+  survives a branch checkout / re-audit of the same sandbox.
+
 ## Backups
 
 Two things to back up:
