@@ -1163,13 +1163,14 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
 
         var foreign = Path.Combine(stagingRoot, $"{IncusProvisioningWorkspace.DirectoryPrefix}{Guid.NewGuid():N}");
         Directory.CreateDirectory(foreign);
-        // Pin a foreign mode explicitly: recovery deletes only owner-only (0700)
-        // workspaces, so the extra group/other bits here make the rejection fire
-        // deterministically regardless of the ambient umask. A bare Directory.CreateDirectory
-        // inherits the umask, which under a hardened 0077 umask would yield exactly 0700 and
-        // let the entry be legitimately deleted -- masking the foreign-mode guard under test.
         if (OperatingSystem.IsLinux())
         {
+            // Recovery only deletes a reserved-prefix entry whose mode is the
+            // provider's private 0700 (created via TryCreateDirectoryExclusive);
+            // any other mode reads as foreign and must be rejected + preserved.
+            // A plain Directory.CreateDirectory yields 0700 under a 077 umask and
+            // 0755 under 022, so set a group/other-readable mode explicitly to
+            // exercise the foreign-mode rejection independent of the ambient umask.
             File.SetUnixFileMode(
                 foreign,
                 UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
