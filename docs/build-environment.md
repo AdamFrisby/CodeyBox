@@ -1,64 +1,74 @@
 # Build & verify-VM environment prerequisites
 
-The solution builds warnings-clean and its test suite passes on any correctly
-provisioned .NET 10 host. This note records the **provisioning** prerequisites
-that are external to the source tree — because they have recurred as build-gate
-failures when the build / audit ("verify") VM is misconfigured — together with
-the in-repo mitigations that make raw `dotnet build` survive those
-misconfigurations where possible.
+The CodeyBox solution builds warnings-clean under .NET 10 with a normally
+provisioned developer or CI account. A root-owned NuGet home — the most common
+verify-VM misconfiguration — is now **self-healed by the build itself** (see §1).
+The remaining host prerequisites the repository cannot fully satisfy are
+temp-disk headroom (§2) and host tooling / native-runtime availability for the
+full test suite (§3). Getting those wrong produces failures that look like
+source defects but are purely environmental.
 
 ## Verify-VM provisioning checklist
 
-Before running `dotnet build ./CodeyBox.slnx` or `dotnet test`, confirm both of
-the following as the unprivileged build user (neither can be fixed from inside
-this repository):
+Before running `dotnet build ./CodeyBox.slnx` or `dotnet test`, confirm the
+following as the unprivileged build user:
 
-1. **Writable NuGet home** — `test -w "$HOME/.nuget"` succeeds *and* any existing
-   `$HOME/.nuget/NuGet` settings subdirectory is readable/writable, or
-   `$HOME/.nuget` is absent so dotnet can recreate it. A `root`-created
-   `~/.nuget` (or a `root`-created `~/.nuget/NuGet` under an otherwise-writable
-   home) aborts every restore/build/test before source is even compiled
-   (see §1). `scripts/prepare-nuget-home.sh` checks both levels.
+1. **NuGet home — auto-remediated, one caveat.** The build's pre-restore
+   `PrepareNuGetHome` target (`Directory.Build.targets` → `scripts/prepare-nuget-home.sh`)
+   relocates a `root`-created `~/.nuget` (or a `root`-created `~/.nuget/NuGet`
+   settings subdirectory) out of the way and recreates a writable one before
+   NuGet reads its settings, so no manual step is normally needed (see §1). The
+   **one** thing the repository still cannot do without elevation is repair a
+   `~` that is itself root-owned/unwritable: the relocation needs write
+   permission on `$HOME`. Provision `$HOME` owned by the build user (the usual
+   case) and the build self-heals; if `$HOME` itself is not writable, an operator
+   must `chown` it (see §1).
 2. **Temp headroom** — `Path.GetTempPath()` (`$TMPDIR`, default `/tmp`) is a real
    disk with several GiB free, not a small RAM tmpfs. The parallel test suite
    needs concurrent scratch space even though it now cleans up deterministically
    (see §2).
 
-Reproduced on this VM: with a writable NuGet home the exact gate command
-`dotnet build ./CodeyBox.slnx -c Debug` reports `0 Warning(s), 0 Error(s)` and
-the temp-artifact cleanup tests pass — confirming the recurring build/test gate
-failures are the host prerequisites below, not a source defect.
+Reproduced on this VM: the exact gate command `dotnet build ./CodeyBox.slnx -c
+Debug` reports `0 Warning(s), 0 Error(s)` — both with a healthy NuGet home and
+against a deliberately `root`-owned/unreadable `~/.nuget/NuGet` (the self-heal
+relocates it and restore reuses the cached packages) — and the temp-artifact
+cleanup tests pass.
 
-## 1. The build user must own a writable NuGet home
+## 1. A root-owned NuGet home is self-healed before restore
 
-`dotnet build` / `dotnet restore` / `dotnet test` unconditionally read — and,
-when absent, **create** — the per-user NuGet settings directory at
-`$HOME/.nuget/NuGet/` (holding `NuGet.Config`) before any project-, solution-,
-or `RestoreConfigFile`-level configuration is honoured. The build user must be
-able to read and write that directory.
-
-If the container / VM image is baked such that `$HOME/.nuget` (or
-`$HOME/.nuget/NuGet`) is owned by a different user (e.g. `root`, from a
-provisioning step that ran privileged before the unprivileged build user did)
-and not writable by the build user, every project fails restore with:
+`dotnet build` (and every `dotnet restore` / `dotnet test`) loads the
+user-global NuGet settings from `$HOME/.nuget/NuGet/NuGet.Config` **before** it
+consults any repository-level configuration. If that path exists but is not
+readable by the build user, NuGet aborts settings loading with:
 
 ```
 error : Failed to read NuGet.Config due to unauthorized access.
-        Path: '$HOME/.nuget/NuGet/NuGet.Config'.
-        Access to the path '$HOME/.nuget/NuGet' is denied.
+        Path: '<home>/.nuget/NuGet/NuGet.Config'.
+        Access to the path '<home>/.nuget/NuGet' is denied. Permission denied
 ```
 
 and, because no assemblies are produced, `dotnet test --no-build` then reports
 each test DLL path as an "invalid argument".
 
-A repository `nuget.config`, an MSBuild `RestoreConfigFile`
-(`Directory.Build.props`), and the `NUGET_CONFIG_FILE` environment variable
-were all verified to still fail on their own, because NuGet touches the
-per-user settings directory during settings load, ahead of every override.
-Only relocating the user-settings home fixes it — own/`chown` `~/.nuget`, move
-it aside, or point `DOTNET_CLI_HOME` at a writable directory (all three
-remediations are shown below, and the gate / `build.sh` sections cover the
-`DOTNET_CLI_HOME` route in particular).
+This happens when a provisioning step runs as `root` and creates `~/.nuget/`
+before the unprivileged build user runs. No committed build **input** can
+redirect that read — a repo `nuget.config`, an MSBuild `RestoreConfigFile`
+(`Directory.Build.props`), and the `NUGET_CONFIG_FILE`/`--configfile` options
+were all verified to still fail, because NuGet ensures its user-settings
+*directory* exists during settings load, ahead of every such override.
+
+A committed **target**, however, runs before the read. `Directory.Build.targets`
+defines `PrepareNuGetHome`, wired `BeforeTargets` the restore/settings targets,
+which invokes `scripts/prepare-nuget-home.sh` to relocate an unusable home and
+recreate a writable one — so an ordinarily-provisioned verify VM builds without
+any manual pre-step. The helper is idempotent and a fast no-op when `~/.nuget`
+is already usable (the normal developer / CI case), and the invocation is
+best-effort: if the home is genuinely unremediable (e.g. `$HOME` itself is not
+writable, so the relocation cannot proceed without elevation) the build falls
+through to NuGet's own clear error above rather than masking it.
+
+The remaining operator remediations below are only needed for that
+unremediable case (root-owned `$HOME`), or to repair a home outside a build.
 
 ### Operator remediation
 
@@ -97,7 +107,8 @@ The world-traversable `packages/` cache under the old tree stays readable, so
 restore reuses it instead of re-downloading, while NuGet can now create its
 `~/.nuget/NuGet/NuGet.Config` in the writable home. This was verified to make
 `dotnet build ./CodeyBox.slnx` and `dotnet test` succeed on this VM. The
-in-repo self-heal below automates this same rename-aside strategy.
+in-repo `PrepareNuGetHome` target described above automates this same
+rename-aside strategy as an unconditional pre-restore step.
 
 If touching the filesystem is undesirable, the same result is achievable purely
 via the environment: point `DOTNET_CLI_HOME` at a writable directory before the
@@ -122,12 +133,20 @@ so `dotnet` recreates it) as part of VM baking, not at first build.
 
 ### In-repo self-heal: `Directory.Build.targets`
 
-`Directory.Build.targets` runs `scripts/ensure-writable-nuget-home.sh` as an
-`InitialTargets` step before any project targets. When `$HOME/.nuget` exists
-but is not writable, the script renames it aside (the build user owns `$HOME`,
-so the rename does not need root), recreates a writable `$HOME/.nuget`, and
-preserves any pre-baked `packages` cache via symlink. Concurrent MSBuild nodes
-share a lock so solution builds do not race.
+`Directory.Build.targets` defines the `PrepareNuGetHome` target and wires it
+`BeforeTargets="Restore;_GenerateRestoreGraph;_GenerateRestoreGraphProjectEntry;_GetRestoreSettings;CollectPackageReferences"`
+so the repair runs before NuGet reads user settings. The target invokes
+`scripts/prepare-nuget-home.sh`, which relocates an unusable `$HOME/.nuget`
+(or its `NuGet` settings subdirectory) to a PID-unique sidelined path,
+recreates a writable `$HOME/.nuget`, and preserves any pre-baked `packages`
+cache via symlink. Because a solution restore fans the target out across
+projects that MSBuild may run in parallel, the script tolerates a lost `mv`
+race (only one run can move the single source; losers skip) and closes with an
+idempotent `mkdir -p`, so a writable home always exists afterwards regardless
+of which run won. The invocation itself is best-effort (`|| true`) rather than
+using MSBuild `ContinueOnError`, so no `/warnaserror`-promoted warning is
+emitted on a genuinely unremediable host — the build simply falls through to
+NuGet's own "unauthorized access" error instead of masking it.
 
 This is the operative remediation for auditors that invoke `dotnet` **raw**
 (`process:required-build`, `csharp:build-WaE`) against a misprovisioned image:
@@ -149,7 +168,7 @@ cache (`NUGET_PACKAGES`) so offline images keep restoring. A root-owned
 than via tracked config files because NuGet touches the per-user settings
 directory before honouring a repository `nuget.config`,
 `-p:RestoreConfigFile`, or `Directory.Build.props` — each was verified not to
-avoid the failure on its own. The `Directory.Build.targets` InitialTargets
+avoid the failure on its own. The `Directory.Build.targets` `PrepareNuGetHome`
 repair above is the complementary, branch-controlled path that helps when the
 running orchestrator still embeds an older build script.)
 

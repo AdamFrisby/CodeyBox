@@ -72,23 +72,34 @@ if [[ ! -w "$HOME" ]]; then
     exit 1
 fi
 
+# Relocate the not-usable home out of the way, then recreate a writable one.
+#
+# This must be safe under concurrent invocation: the build wires this script in
+# as a pre-restore step (see Directory.Build.targets), and a solution restore
+# fans the target out across projects that MSBuild may run in parallel. So:
+#   - each run moves the original aside to a PID-unique path (concurrent runs
+#     never collide on the destination);
+#   - a lost `mv` race is tolerated — only one run can move the single source,
+#     and losers see `mv` fail (source already gone) and simply skip;
+#   - the closing `mkdir -p` is idempotent, so a writable home always exists
+#     afterwards regardless of which run won.
 # Renaming needs write on the parent dir ($HOME), not on the root-owned entry.
-# Pick a fresh, unused sidelined name so re-runs after a partial failure are safe.
-sidelined="$nuget_home.root-owned"
-if [[ -e "$sidelined" ]]; then
-    sidelined="$nuget_home.root-owned.$$"
+sidelined="$nuget_home.root-owned.$$"
+
+if mv -- "$nuget_home" "$sidelined" 2>/dev/null; then
+    # We won the relocation race. Reuse the already-populated, world-readable
+    # package cache from the sidelined tree so restore does not re-download
+    # every package.
+    sidelined_packages="$sidelined/packages"
+    if [[ -d "$sidelined_packages" ]]; then
+        mkdir -p -- "$nuget_home"
+        ln -s -- "$sidelined_packages" "$nuget_home/packages" 2>/dev/null || true
+    fi
+    echo "prepare-nuget-home: relocated not-usable '$nuget_home' to '$sidelined';" \
+         "fresh build-user-owned home created (package cache reused if present)."
 fi
 
-mv -- "$nuget_home" "$sidelined"
+# Ensure a writable home exists whether we won the race above or a concurrent
+# run did; mkdir -p is a no-op if it already exists.
 mkdir -p -- "$nuget_home"
-
-# Reuse the already-populated, world-readable package cache from the sidelined
-# tree so restore does not re-download every package.
-sidelined_packages="$sidelined/packages"
-if [[ -d "$sidelined_packages" ]]; then
-    ln -s -- "$sidelined_packages" "$nuget_home/packages"
-fi
-
-echo "prepare-nuget-home: relocated not-usable '$nuget_home' to '$sidelined';" \
-     "fresh build-user-owned home created (package cache reused if present)."
 exit 0
