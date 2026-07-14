@@ -15,6 +15,54 @@ namespace CodeyBox.Core;
 public static class AuditLog
 {
     /// <summary>
+    /// Optional per-control-flow override for the sink audit events are written
+    /// to. When set (via <see cref="PushLogger"/>) it takes precedence over the
+    /// global <see cref="Log.Logger"/>; when unset the global logger is used.
+    /// Being an <see cref="AsyncLocal{T}"/>, an override installed on one async
+    /// flow is invisible to every other flow, so a caller that must observe the
+    /// exact events a pipeline emits can redirect them without a process-wide
+    /// mutation that races concurrent flows (e.g. a parallel host that installs
+    /// its own global <see cref="Log.Logger"/>).
+    /// </summary>
+    private static readonly AsyncLocal<Serilog.ILogger?> AmbientLoggerOverride = new();
+
+    /// <summary>
+    /// Redirects audit events emitted on the current async control flow — and
+    /// any flow it subsequently awaits into — to <paramref name="logger"/>
+    /// instead of the global <see cref="Log.Logger"/>. Dispose the returned
+    /// scope to restore the previously installed ambient logger (or the global
+    /// default when none was installed). Scopes nest.
+    ///
+    /// The override is flow-local: concurrent flows that never call this keep
+    /// using <see cref="Log.Logger"/>, so installing one here cannot divert
+    /// another flow's audit events. Production code that never opens a scope is
+    /// unaffected.
+    /// </summary>
+    public static IDisposable PushLogger(Serilog.ILogger logger)
+    {
+        ArgumentNullException.ThrowIfNull(logger);
+        var previous = AmbientLoggerOverride.Value;
+        AmbientLoggerOverride.Value = logger;
+        return new AmbientLoggerScope(previous);
+    }
+
+    private sealed class AmbientLoggerScope : IDisposable
+    {
+        private readonly Serilog.ILogger? _previous;
+        private bool _disposed;
+
+        internal AmbientLoggerScope(Serilog.ILogger? previous) => _previous = previous;
+
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+            AmbientLoggerOverride.Value = _previous;
+            _disposed = true;
+        }
+    }
+
+    /// <summary>
     /// Pushes <c>WorkItemId</c> into the ambient log context for the lifetime
     /// of the returned scope. Dispose the scope to remove the property.
     /// </summary>
@@ -1542,7 +1590,7 @@ public static class AuditLog
     // ── Internal helper ──────────────────────────────────────────────────────
 
     private static Serilog.ILogger Audit(string eventName) =>
-        Audit(Log.Logger, eventName);
+        Audit(AmbientLoggerOverride.Value ?? Log.Logger, eventName);
 
     // A null logger falls back to the process-global Serilog logger. Callers that
     // hold their own audit logger (so their events are immune to a concurrent
