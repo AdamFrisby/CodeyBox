@@ -13,17 +13,31 @@ namespace CodeyBox.Core;
 /// gate for reasons unrelated to the diff under review. NuGet resolves the
 /// user-settings path from <c>$HOME</c> unconditionally, so neither a
 /// repo-committed <c>nuget.config</c>, a <c>--configfile</c>, nor an MSBuild
-/// property can redirect that read; the only reliable lever is <c>$HOME</c>.</para>
+/// property can redirect that read; the only reliable lever is the filesystem
+/// state of <c>$HOME/.nuget</c> (which the build uid owns via <c>$HOME</c>) or
+/// <c>$HOME</c> itself.</para>
 ///
-/// <para>The preamble probes the actual operation NuGet performs (create the
+/// <para>Two complementary strategies exist:</para>
+/// <list type="bullet">
+///   <item><description><see cref="RelocationPreamble"/> relocates <c>$HOME</c>
+///   to a writable scratch directory for the CURRENT shell. Non-destructive,
+///   but its effect is confined to the shell that runs it.</description></item>
+///   <item><description><see cref="InPlaceRepairPreamble"/> repairs the shared
+///   <c>$HOME/.nuget</c> itself (renames the foreign-owned directory aside and
+///   recreates it uid-owned). Its effect is visible to EVERY sibling
+///   <c>dotnet</c> invocation in the same sandbox -- including a later gate that
+///   runs raw, without any preamble -- which relocation cannot achieve. Prepend
+///   it before <see cref="RelocationPreamble"/> so relocation remains the
+///   fallback when the home cannot be repaired without root.</description></item>
+/// </list>
+///
+/// <para>Both preambles probe the actual operation NuGet performs (create the
 /// settings directory and write a file inside it) rather than inferring
-/// usability from permission bits, then relocates <c>$HOME</c> to a writable
-/// scratch directory when the probe fails, reusing any pre-populated package
-/// cache so the relocated restore stays offline. It is idempotent and a no-op
-/// when the real NuGet home is already usable, so it is safe to prepend to any
-/// <c>dotnet</c> command. It assumes <c>set -u</c> semantics are tolerable (all
-/// variable reads are guarded) and is safe under <c>set -e</c> (every command
-/// that may fail runs inside a condition or is neutralised with <c>|| true</c>).</para>
+/// usability from permission bits, reuse any pre-populated package cache so the
+/// restore stays offline, are idempotent and a no-op when the real NuGet home
+/// is already usable, and are safe under <c>set -eu</c> (every read is guarded;
+/// every command that may fail runs inside a condition or is neutralised with
+/// <c>|| true</c>).</para>
 /// </summary>
 public static class NuGetHomeGuard
 {
@@ -101,6 +115,71 @@ public static class NuGetHomeGuard
                 printf '%s\n' '</configuration>'
               } > "$codeybox_fallback_settings/NuGet.Config" 2>/dev/null || true
             fi
+          fi
+        fi
+        """;
+
+    /// <summary>
+    /// Shell preamble that repairs a foreign-owned <c>$HOME/.nuget</c> IN PLACE
+    /// rather than relocating <c>$HOME</c>. When the build uid owns <c>$HOME</c>
+    /// (the usual case even if <c>.nuget</c> itself is foreign-owned) it can
+    /// rename the unusable directory aside and recreate it uid-owned, preserving
+    /// the pre-populated package cache via symlink so restores stay offline.
+    ///
+    /// <para>Unlike <see cref="RelocationPreamble"/>, whose effect is confined to
+    /// the shell that runs it, an in-place repair heals the shared home for every
+    /// sibling <c>dotnet</c> invocation in the same sandbox -- e.g. a required-build
+    /// gate followed by separate build-warnings-as-errors / test gates that each
+    /// run their own <c>dotnet</c> without a preamble. Prepend it before
+    /// <see cref="RelocationPreamble"/>: when the home cannot be repaired without
+    /// root (e.g. <c>$HOME</c> is not writable) this is a no-op and relocation
+    /// takes over. Empty/missing user settings after the repair are fine -- NuGet
+    /// falls back to its built-in nuget.org default source.</para>
+    ///
+    /// <para>Idempotent and a strict no-op when <c>$HOME/.nuget</c> is already
+    /// usable. Safe under <c>set -eu</c>. Never emits secret material.</para>
+    /// </summary>
+    public const string InPlaceRepairPreamble = """
+        # Repair a foreign-owned $HOME/.nuget IN PLACE so every sibling dotnet
+        # invocation in this sandbox -- not just the current shell -- sees a
+        # usable NuGet home. Probe the real first-restore operation (create the
+        # settings dir + write a file in it, and read any existing config) rather
+        # than inferring usability from permission bits.
+        codeybox_repair_home="${HOME:-/nonexistent}/.nuget"
+        codeybox_repair_settings="$codeybox_repair_home/NuGet"
+        codeybox_repair_config="$codeybox_repair_settings/NuGet.Config"
+        codeybox_repair_probe="$codeybox_repair_settings/.codeybox-repair-probe.$$"
+        codeybox_repair_usable=1
+        if mkdir -p "$codeybox_repair_settings" 2>/dev/null \
+           && touch "$codeybox_repair_probe" 2>/dev/null; then
+          rm -f "$codeybox_repair_probe" 2>/dev/null || true
+          if [ -e "$codeybox_repair_config" ] && [ ! -r "$codeybox_repair_config" ]; then
+            codeybox_repair_usable=0
+          fi
+        else
+          codeybox_repair_usable=0
+        fi
+        if [ "$codeybox_repair_usable" -eq 0 ] && [ -n "${HOME:-}" ]; then
+          # Rename the foreign-owned home aside (needs only a writable $HOME, which
+          # the build uid owns) and recreate it uid-owned. Best-effort under set -e:
+          # any failure leaves the tree as-is for the relocation fallback to handle.
+          if [ -e "$codeybox_repair_home" ] || [ -L "$codeybox_repair_home" ]; then
+            codeybox_repair_aside="$codeybox_repair_home.codeybox-foreign-owned.$$"
+            if mv "$codeybox_repair_home" "$codeybox_repair_aside" 2>/dev/null; then
+              if mkdir -p "$codeybox_repair_settings" 2>/dev/null; then
+                echo "CodeyBox: repaired unusable $codeybox_repair_home in place (foreign-owned tree renamed aside)." >&2
+                # Preserve the pre-populated package cache so restores stay offline.
+                if [ -d "$codeybox_repair_aside/packages" ] \
+                   && [ ! -e "$codeybox_repair_home/packages" ]; then
+                  ln -s "$codeybox_repair_aside/packages" "$codeybox_repair_home/packages" 2>/dev/null || true
+                fi
+              else
+                # Could not recreate: restore the original so nothing is lost.
+                mv "$codeybox_repair_aside" "$codeybox_repair_home" 2>/dev/null || true
+              fi
+            fi
+          else
+            mkdir -p "$codeybox_repair_settings" 2>/dev/null || true
           fi
         fi
         """;

@@ -95,10 +95,15 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
           exit "$dotnet_command_not_found_exit"
         fi
 
-        # Relocate HOME off an unusable NuGet user-settings directory before any
-        # dotnet restore. Shared verbatim with the audit tool auditors so both
-        # the required-build gate and the csharp:build-WaE / csharp:test-pass
-        # gates survive the same broken-sandbox shape. See NuGetHomeGuard.
+        # Make the NuGet user-settings directory usable before any dotnet restore.
+        # First REPAIR $HOME/.nuget in place when it is foreign-owned: this gate
+        # runs first, so healing the shared home here lets the separate
+        # csharp:build-WaE / csharp:test-pass gates -- which each run their own
+        # raw dotnet in this same sandbox -- succeed without a preamble of their
+        # own. Then RELOCATE HOME as a fallback for the shapes an in-place repair
+        # cannot fix without root. Both are no-ops on a healthy home. See
+        # NuGetHomeGuard.
+        {{NuGetHomeGuard.InPlaceRepairPreamble}}
         {{NuGetHomeGuard.RelocationPreamble}}
 
         tmp_root="${TMPDIR:-/tmp}"
