@@ -508,11 +508,12 @@ public sealed class AuditTests
 
         Assert.False(result.Passed);
         Assert.NotNull(formatExec);
-        // The format-check gate self-heals a root-owned ~/.nuget, so the exec is
-        // wrapped; assert on the effective (unwrapped) dotnet command.
+        // The format-check gate wraps the exec in the NuGet-home guard (via
+        // ExecPreamble) or the self-heal fallback; either way, assert on the
+        // effective (unwrapped) dotnet command. DotnetGuardWrapper unwraps both.
         Assert.Equal(
             ["dotnet", "format", "--verify-no-changes", "--verbosity", "diagnostic"],
-            TestSupport.EffectiveArgv(formatExec!));
+            DotnetGuardWrapper.EffectiveArgv(formatExec!));
     }
 
     [Fact]
@@ -1314,9 +1315,11 @@ public sealed class AuditTests
         exec.Argv[0] == "sh" &&
         exec.Argv[1] == "-c" &&
         !exec.Argv[2].Contains("command -v", StringComparison.Ordinal) &&
-        // The NuGet-home self-heal wrapper is also `sh -c <script> sh <cmd...>`;
-        // it is the real command, not a marker probe.
-        !exec.Argv[2].Contains("nuget_home_broken", StringComparison.Ordinal);
+        // A guarded dotnet command (either NuGet-home guard preamble or the
+        // self-heal wrapper) is also `sh -c <script> sh <cmd...>`; it is the
+        // audited command, not the marker-discovery probe. DotnetGuardWrapper
+        // detects both wrappings.
+        !DotnetGuardWrapper.IsGuardWrapped(exec.Argv);
 
     private static SandboxExecResult GitAttributionSetupResult(SandboxExec exec)
     {

@@ -147,21 +147,26 @@ needs.
   for the resolved IPs and re-run `setup-host-networks.sh` if a CDN has
   rotated. See [`host-firewall.md`](host-firewall.md) troubleshooting.
 * **NuGet restore fails with "unauthorized access" before any project
-  builds.** The `.NET` build gates (`process:required-build`,
-  `csharp:build-WaE`, `csharp:test-pass`) all abort with
-  `Failed to read NuGet.Config due to unauthorized access. Path:
-  '<home>/.nuget/NuGet/NuGet.Config' ... Permission denied` when the audit
-  sandbox ships `~/.nuget` owned by another uid (e.g. root-owned mode 755)
-  so the build uid cannot create the `NuGet` settings subdirectory on first
-  restore. NuGet resolves the user-settings path unconditionally, so neither
-  `--configfile` nor a repo-level `nuget.config` avoids it; the only lever is
-  `$HOME`. `build.sh` and the `SandboxRequiredBuildVerifier` build script both
-  detect this and relocate `HOME` to a writable scratch directory (reusing the
-  pre-warmed `~/.nuget/packages` cache), so they build green unaided — but a
-  harness that invokes `dotnet` *directly*, bypassing those entrypoints, does
-  not benefit. When provisioning the sandbox, make `~/.nuget` writable by the
-  build uid (e.g. `chown "$uid" ~/.nuget`, or create it owned by that uid)
-  while keeping the package cache in place.
+  builds.** Symptom: `Failed to read NuGet.Config due to unauthorized access.
+  Path: '<home>/.nuget/NuGet/NuGet.Config' ... Permission denied` when the
+  audit sandbox ships `~/.nuget` owned by another uid (e.g. root-owned mode
+  755) so the build uid cannot create the `NuGet` settings subdirectory on
+  first restore. NuGet resolves the user-settings path unconditionally, so
+  neither `--configfile` nor a repo-level `nuget.config` avoids it; the only
+  lever is `$HOME`. All three CodeyBox `.NET` build gates carry the shared
+  relocation guard (`NuGetHomeGuard.RelocationPreamble`): the
+  `process:required-build` gate (`SandboxRequiredBuildVerifier`) embeds it, and
+  the `csharp:build-WaE` / `csharp:test-pass` tool auditors run their `dotnet`
+  command through it (see `ShellCommandAuditor.ExecPreamble`). The guard probes
+  whether `~/.nuget/NuGet` is usable and, if not, relocates `HOME` to a
+  writable scratch directory — reusing a writable `~/.nuget/packages` cache as
+  the global packages folder, or a read-only one as a fallback package folder —
+  so all three gates build green unaided. `build.sh` carries the same guard for
+  local runs. A harness that invokes `dotnet` *directly*, bypassing every
+  CodeyBox entrypoint, still does not benefit; for that case, when provisioning
+  the sandbox make `~/.nuget` writable by the build uid (e.g. `chown "$uid"
+  ~/.nuget`, or create it owned by that uid) while keeping the package cache in
+  place.
 
   When `chown` is unavailable (no root, `no_new_privs` set) but the build uid
   owns `$HOME`, remediate in place without a provisioning change: rename the

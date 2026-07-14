@@ -89,10 +89,16 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
         // Delegate the run to a ShellCommandAuditor built from the current
         // invocation so the tool-presence probe, missing-tool handling and
         // result classification stay identical to the generic shell path.
+        var invocation = BuildInvocation(TestSelection.All, CurrentRunOptions);
         var inner = new ShellCommandAuditor(new ShellCommandAuditorOptions
         {
             Name = _opts.Name,
-            Argv = BuildInvocation(TestSelection.All, CurrentRunOptions),
+            Argv = invocation,
+            // dotnet test performs a NuGet restore (even with --no-build it reads
+            // the settings), so it needs the same NuGet-home relocation the
+            // required-build gate carries when the sandbox ships an unusable
+            // $HOME/.nuget.
+            ExecPreamble = NuGetHomeGuard.PreambleForCommand(invocation),
             ResultClassifier = _classifier,
             CanShortCircuitOnBlockingFinding = _opts.CanShortCircuitOnBlockingFinding,
             Role = _opts.Role,

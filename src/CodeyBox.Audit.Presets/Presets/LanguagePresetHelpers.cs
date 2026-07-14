@@ -41,6 +41,10 @@ internal static class LanguagePresetHelpers
             {
                 Name = name,
                 Argv = argv,
+                // dotnet build/format restore packages and so touch the NuGet
+                // user-settings directory; relocate HOME first when the sandbox
+                // ships it unusable, matching the required-build gate.
+                ExecPreamble = NuGetHomeGuard.PreambleForCommand(argv),
                 ResultClassifier = ResultClassifierFor(language, name, argv),
                 MissingToolSeverity = missingToolSeverity,
                 Required = required,

@@ -435,9 +435,10 @@ public sealed class PresetCatalogTests
                 return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
             }
 
-            // The test-pass gate self-heals a root-owned ~/.nuget, so the exec may
-            // be wrapped; match on the effective (unwrapped) dotnet command.
-            var effective = TestSupport.EffectiveArgv(exec);
+            // The test-pass gate wraps the exec in the NuGet-home guard (via
+            // ExecPreamble) or the SelfHealNuGetHome fallback; match on the
+            // effective (unwrapped) dotnet command. DotnetGuardWrapper unwraps both.
+            var effective = DotnetGuardWrapper.EffectiveArgv(exec);
             if (effective.Count >= 2 && effective[0] == "dotnet" && effective[1] == "test")
                 return new SandboxExecResult(1, output, "");
 

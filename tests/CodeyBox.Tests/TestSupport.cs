@@ -1091,3 +1091,24 @@ internal sealed class CapturingWebhookDispatcher : IWebhookDispatcher
             : OnPublishAsync(evt, ct);
     }
 }
+
+/// <summary>
+/// Test helper mirroring <c>ShellCommandAuditor</c>'s <c>ExecPreamble</c>
+/// wrapping. A guarded dotnet auditor command is dispatched as
+/// <c>sh -c "&lt;preamble&gt;\nexec \"$@\"" sh &lt;cmd...&gt;</c> so the NuGet-home
+/// relocation runs before the real command. Fakes that classify a sandbox exec
+/// by its real command unwrap it here to see the command as configured.
+/// </summary>
+internal static class DotnetGuardWrapper
+{
+    public static bool IsGuardWrapped(IReadOnlyList<string> argv)
+        => argv.Count >= 5
+           && argv[0] == "sh"
+           && argv[1] == "-c"
+           && argv[2].EndsWith("exec \"$@\"", StringComparison.Ordinal)
+           && argv[3] == "sh";
+
+    /// <summary>The real command argv, unwrapped from the guard if present.</summary>
+    public static IReadOnlyList<string> EffectiveArgv(SandboxExec exec)
+        => IsGuardWrapped(exec.Argv) ? [.. exec.Argv.Skip(4)] : exec.Argv;
+}
