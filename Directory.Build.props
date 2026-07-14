@@ -63,4 +63,9 @@
           StandardErrorImportance="Low" />
   </Target>
 
+  <!-- Repair a foreign-owned $HOME/.nuget before NuGet restore reads it, so a raw
+       `dotnet build`/`dotnet test` of this solution survives an audit/CI sandbox
+       whose NuGet home is owned by another uid. See build/NuGetHome.targets. -->
+  <Import Project="$(MSBuildThisFileDirectory)build/NuGetHome.targets" />
+
 </Project>
