@@ -15,12 +15,21 @@ if [ -n "$cli_home" ]; then
 
     # Probe with touch (a real command) rather than a shell redirect: a failed
     # redirection is a fatal error under `set -e` and would abort before the
-    # recovery branches run.
-    nuget_home_writable() {
-        mkdir -p "$nuget_user_dir" 2>/dev/null && touch "$probe" 2>/dev/null
+    # recovery branches run. Writability is necessary but not sufficient: an
+    # inherited NuGet.Config file that is present but unreadable (e.g. baked
+    # mode 0600 under another account, inside a directory we can still write)
+    # reproduces the exact "Failed to read NuGet.Config due to unauthorized
+    # access" abort, so treat that as unusable too and let the heal recreate it.
+    nuget_home_usable() {
+        mkdir -p "$nuget_user_dir" 2>/dev/null || return 1
+        if [ -e "$nuget_user_dir/NuGet.Config" ] \
+            && [ ! -r "$nuget_user_dir/NuGet.Config" ]; then
+            return 1
+        fi
+        touch "$probe" 2>/dev/null
     }
 
-    if nuget_home_writable; then
+    if nuget_home_usable; then
         rm -f "$probe" 2>/dev/null || true
     else
         # The inherited per-user NuGet directory is not writable — e.g. an image
@@ -37,7 +46,7 @@ if [ -n "$cli_home" ]; then
             nuget_root="$cli_home/.nuget"
             quarantine="$nuget_root.codeybox-unwritable.$$"
             if [ ! -e "$nuget_root" ] || mv "$nuget_root" "$quarantine" 2>/dev/null; then
-                if nuget_home_writable; then
+                if nuget_home_usable; then
                     rm -f "$probe" 2>/dev/null || true
                     healed=1
                     # Reuse the quarantined package cache so the heal does not
