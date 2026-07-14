@@ -13,9 +13,12 @@ Before running `dotnet build ./CodeyBox.slnx` or `dotnet test`, confirm both of
 the following as the unprivileged build user (neither can be fixed from inside
 this repository):
 
-1. **Writable NuGet home** — `test -w "$HOME/.nuget"` succeeds, or `$HOME/.nuget`
-   is absent so dotnet can recreate it. A `root`-created `~/.nuget` aborts every
-   restore/build/test before source is even compiled (see §1).
+1. **Writable NuGet home** — `test -w "$HOME/.nuget"` succeeds *and* any existing
+   `$HOME/.nuget/NuGet` settings subdirectory is readable/writable, or
+   `$HOME/.nuget` is absent so dotnet can recreate it. A `root`-created
+   `~/.nuget` (or a `root`-created `~/.nuget/NuGet` under an otherwise-writable
+   home) aborts every restore/build/test before source is even compiled
+   (see §1). `scripts/prepare-nuget-home.sh` checks both levels.
 2. **Temp headroom** — `Path.GetTempPath()` (`$TMPDIR`, default `/tmp`) is a real
    disk with several GiB free, not a small RAM tmpfs. The parallel test suite
    needs concurrent scratch space even though it now cleans up deterministically
@@ -71,7 +74,8 @@ impossible) but *does* own its home directory, the root-owned tree can still be
 moved aside without elevation — renaming an entry needs write permission on the
 **parent** directory, not on the entry itself. `scripts/prepare-nuget-home.sh`
 performs exactly this, idempotently (a no-op when `~/.nuget` is already
-writable), so it is safe to run unconditionally as a build-user pre-step:
+usable — top level writable and any `NuGet` settings subdirectory accessible),
+so it is safe to run unconditionally as a build-user pre-step:
 
 ```sh
 # Runs as the unprivileged build user; no sudo required.

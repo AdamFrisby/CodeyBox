@@ -36,15 +36,38 @@
 set -euo pipefail
 
 nuget_home="${HOME:?HOME must be set}/.nuget"
+# NuGet loads user settings from "$nuget_home/NuGet/NuGet.Config"; the failure
+# this script remediates is reported against that subdirectory
+# ("Access to the path '<home>/.nuget/NuGet' is denied"), not only "$nuget_home"
+# itself. Check both so a home that is writable at the top level but whose
+# settings subdirectory was created root-owned is still detected and repaired.
+nuget_settings_dir="$nuget_home/NuGet"
 
-if [[ -w "$nuget_home" || ! -e "$nuget_home" ]]; then
-    # Writable already, or absent so dotnet will recreate it writable. Nothing to do.
+nuget_home_usable() {
+    # Absent entirely: dotnet recreates it writable, so nothing to do.
+    [[ ! -e "$nuget_home" ]] && return 0
+
+    # The home must be writable so NuGet can create its settings subdirectory
+    # when missing.
+    [[ -w "$nuget_home" ]] || return 1
+
+    # If the settings subdirectory already exists it must be traversable,
+    # readable, and writable by this user; a root-owned one aborts settings
+    # load even when "$nuget_home" is writable.
+    if [[ -e "$nuget_settings_dir" ]]; then
+        [[ -r "$nuget_settings_dir" && -w "$nuget_settings_dir" && -x "$nuget_settings_dir" ]] || return 1
+    fi
+
+    return 0
+}
+
+if nuget_home_usable; then
     echo "prepare-nuget-home: '$nuget_home' is usable by $(id -un); no action needed."
     exit 0
 fi
 
 if [[ ! -w "$HOME" ]]; then
-    echo "prepare-nuget-home: '$nuget_home' is not writable and '$HOME' is not writable either;" >&2
+    echo "prepare-nuget-home: '$nuget_home' is not usable and '$HOME' is not writable either;" >&2
     echo "  cannot relocate without elevation. Run as root: chown -R \"\$(id -un):\$(id -gn)\" '$nuget_home'" >&2
     exit 1
 fi
@@ -66,6 +89,6 @@ if [[ -d "$sidelined_packages" ]]; then
     ln -s -- "$sidelined_packages" "$nuget_home/packages"
 fi
 
-echo "prepare-nuget-home: relocated root-owned '$nuget_home' to '$sidelined';" \
+echo "prepare-nuget-home: relocated not-usable '$nuget_home' to '$sidelined';" \
      "fresh build-user-owned home created (package cache reused if present)."
 exit 0
