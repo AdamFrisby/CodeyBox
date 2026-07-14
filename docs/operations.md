@@ -182,8 +182,21 @@ needs.
   The cache dir stays uid-owned and writable through the symlink, so restore
   still resolves offline. A direct `dotnet build ./CodeyBox.slnx` (and
   `dotnet test`) then restores normally, because `~/.nuget/NuGet` is now
-  creatable. This lives in `$HOME`, independent of the git worktree, so it
-  survives a branch checkout / re-audit of the same sandbox.
+  creatable.
+
+  This in-place remedy only helps a harness that reuses the *same* `$HOME` for
+  both the agent session and the subsequent `.NET` gate run. It is **not**
+  durable across a re-provisioned sandbox: an audit harness that mounts a fresh
+  home (root-owned `~/.nuget`) for each iteration discards the rename, so the
+  next `dotnet build ./CodeyBox.slnx` fails identically. When the gate keeps
+  failing after an in-place fix, `~/.nuget` is being re-provisioned root-owned
+  every iteration and the only reliable remedy is at provisioning time: bake
+  `~/.nuget` owned by the build uid into the sandbox image, or run the direct
+  `dotnet` gate commands with a writable `$HOME` (or `NuGetHomeGuard`'s
+  relocation preamble prepended). No repo-committed file — `nuget.config`,
+  `--configfile`, `Directory.Build.props`, or a `BeforeTargets="Restore"` task —
+  can redirect the read, because NuGet resolves and reads the user-settings path
+  from `$HOME` before any project target the repo could hook executes.
 
 ## Backups
 
