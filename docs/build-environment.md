@@ -27,6 +27,11 @@ following as the unprivileged build user:
    disk with several GiB free, not a small RAM tmpfs. The parallel test suite
    needs concurrent scratch space even though it now cleans up deterministically
    (see §2).
+3. **Fixture tools on `PATH`** — a small set of process/serialization tests shell
+   out to standard host tools (notably `file`, alongside the usual coreutils) and
+   run the prebuilt native ACP bridge binary. A minimal image missing these makes
+   those specific tests fail with `Required test tool not found on PATH` or a
+   missing bridge `ready` envelope — environmental, not a source defect (see §3).
 
 Reproduced on this VM: the exact gate command `dotnet build ./CodeyBox.slnx -c
 Debug` reports `0 Warning(s), 0 Error(s)` — both with a healthy NuGet home and
