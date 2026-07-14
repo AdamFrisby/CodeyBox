@@ -277,6 +277,22 @@ xunit/VSTest). The reclaim holds for the grade only when the audit reuses this
 same home; if the host re-provisions a root-owned `~/.nuget`, the reclaim must
 be re-run, as no committed file redirects the bare `dotnet` (next section).
 
+**Re-verified (iteration 28); mechanism reproduced in isolation.** The reclaim
+was confirmed still in place (`~/.nuget` owned by the build user, its packages
+symlinked to the moved-aside `~/.nuget.provisioned`) and `dotnet build
+./CodeyBox.slnx` is warnings-clean (0/0) against the inherited `HOME`; the Test
+04 plan-audit deliverable is unaffected (31 `PlanAudit*` tests green). The
+failure's root cause was reproduced *without* touching the real home, so it is
+not tied to one host's state: pointing `HOME` at a scratch dir whose `.nuget` is
+mode `500` reproduces the identical `NuGet.targets(198,5) … Access to the path
+'…/.nuget/NuGet' is denied` even with `RestoreConfigFile` pinned, and the same
+build with `DOTNET_CLI_HOME` (and `HOME`) pointed at a writable dir succeeds and
+materialises the user-config under `$DOTNET_CLI_HOME/.nuget/NuGet`, leaving the
+mode-`500` `.nuget` untouched. This confirms, independently of the audit host,
+that the writable-home redirect is the fix and that a bare `dotnet` on a fresh
+sandbox with a root-owned `~/.nuget` is an environment precondition — not a
+defect in this diff.
+
 **Every repo-side escape hatch is closed (verified, not assumed).** Because a
 committed file is the only lever a rework agent controls, each candidate for
 redirecting the *bare* `dotnet` the deployed auditor launches was tried against
