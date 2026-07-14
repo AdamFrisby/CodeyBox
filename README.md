@@ -135,6 +135,24 @@ dotnet build CodeyBox.slnx
 > to a fresh scratch directory for that build. A bare `dotnet build CodeyBox.slnx`
 > (or an IDE build) does not run that probe, so for those either keep the home
 > writable or set `DOTNET_CLI_HOME` to a writable directory yourself.
+>
+> CI and audit gates invoke `dotnet build`/`dotnet test` directly rather than
+> through `./build.sh`, and NuGet performs the fatal user-config read during
+> restore-graph generation — before any repository `Directory.Build.props` target
+> or MSBuild hook can run — so there is no in-tree setting that heals it for those
+> gates. When a baseline image bakes `$HOME/.nuget` owned by another account (the
+> directory itself unwritable, so NuGet cannot even create `NuGet/NuGet.Config`),
+> heal it at the environment/baseline level so every clone that COW-inherits the
+> baseline starts from a writable home:
+>
+> ```sh
+> # $HOME is writable even when $HOME/.nuget is not, so rename the broken tree
+> # aside (no root needed) and recreate a writable one, preserving the populated
+> # package cache via symlink so restore stays offline-safe.
+> mv "$HOME/.nuget" "$HOME/.nuget.unwritable" \
+>   && mkdir -p "$HOME/.nuget" \
+>   && ln -s "$HOME/.nuget.unwritable/packages" "$HOME/.nuget/packages"
+> ```
 
 **3. Configure a project.** Drop a JSON file somewhere and point
 `CODEYBOX_EXTRA_CONFIG` at it (it hot-reloads on change):
