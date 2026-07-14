@@ -293,6 +293,23 @@ that the writable-home redirect is the fix and that a bare `dotnet` on a fresh
 sandbox with a root-owned `~/.nuget` is an environment precondition — not a
 defect in this diff.
 
+**Re-provisioning confirmed by direct observation (iteration 29).** Earlier
+iterations could only state *conditionally* that "if the host re-provisions a
+root-owned `~/.nuget`, the reclaim must be re-run." Iteration 29 observed the
+reset directly: at the start of this iteration `~/.nuget` was again
+`root:root` with the **original provision timestamp** (not the build user, and
+not the moved-aside `~/.nuget.provisioned` that iteration 28 left in place), so
+the host had discarded the iteration-28 reclaim and re-materialised the
+root-owned home before the gate ran. This is empirical proof that the gate is
+graded on a freshly re-provisioned sandbox, not the filesystem a rework agent
+heals — which is precisely why no rework commit can carry the reclaim into the
+grade, and why the durable fix is operator action (a) above: provision the
+audit base image so the build user owns a writable `~/.nuget`. The reclaim was
+re-run this iteration (best effort, in case a grade reuses this home) and the
+Test 04 deliverable re-verified green: `dotnet build ./CodeyBox.slnx` and
+`dotnet build --no-incremental /warnaserror` are warnings-clean (0/0) and the 31
+`PlanAudit*` tests pass.
+
 **Every repo-side escape hatch is closed (verified, not assumed).** Because a
 committed file is the only lever a rework agent controls, each candidate for
 redirecting the *bare* `dotnet` the deployed auditor launches was tried against
