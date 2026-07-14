@@ -21425,14 +21425,6 @@ internal sealed class AuditorIdleTimeoutException : TimeoutException
         Timeout = timeout;
     }
 
-    public AuditorIdleTimeoutException(string auditorName, TimeSpan timeout)
-        : base($"auditor '{auditorName}' produced no output or verdict within {timeout}")
-    {
-        AuditorName = auditorName;
-        AgentKind = new AgentKind("unknown");
-        Timeout = timeout;
-    }
-
     public string AuditorName { get; }
     public AgentKind AgentKind { get; }
     public TimeSpan Timeout { get; }
