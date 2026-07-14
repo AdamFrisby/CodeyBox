@@ -62,6 +62,20 @@ if [ -n "$cli_home" ]; then
                         && [ ! -e "$nuget_root/packages" ]; then
                         ln -s "$quarantine/packages" "$nuget_root/packages" 2>/dev/null || true
                     fi
+                    # Seed a minimal, readable user config into the fresh home. The
+                    # fatal gate error is a *read* failure ("Failed to read
+                    # NuGet.Config due to unauthorized access"); leaving the healed
+                    # directory empty makes the next `dotnet` create the file on
+                    # first use, so a readable file guarantees the read succeeds
+                    # without depending on that creation. Repository package sources
+                    # come from RestoreConfigFile, so an empty user config adds no
+                    # overrides and clears no sources.
+                    if [ ! -e "$nuget_user_dir/NuGet.Config" ]; then
+                        printf '%s\n' \
+                            '<?xml version="1.0" encoding="utf-8"?>' \
+                            '<configuration />' \
+                            > "$nuget_user_dir/NuGet.Config" 2>/dev/null || true
+                    fi
                 fi
             fi
         fi

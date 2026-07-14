@@ -119,6 +119,14 @@ public sealed class BuildScriptNuGetHealTests
             var probe = Path.Combine(newNuGetDir, "writable-probe");
             await File.WriteAllTextAsync(probe, "ok"); // throws if the new home is not writable
 
+            // A readable user config is seeded into the fresh home so the next
+            // `dotnet`'s user-config *read* (the exact operation the broken home
+            // fails) succeeds without depending on first-run creation.
+            var healedConfig = Path.Combine(newNuGetDir, "NuGet.Config");
+            Assert.True(File.Exists(healedConfig), "heal must seed a user NuGet.Config");
+            var seeded = await File.ReadAllTextAsync(healedConfig); // throws if unreadable
+            Assert.Contains("<configuration", seeded, StringComparison.Ordinal);
+
             // The populated offline package cache survives through the preserved symlink,
             // so restore stays offline-safe.
             var healedMarker = Path.Combine(home, ".nuget", "packages", "pkg", "marker.txt");
