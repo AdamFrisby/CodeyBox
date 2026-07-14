@@ -337,6 +337,26 @@ The bare `dotnet` therefore derives its NuGet home solely from the process
 `HOME` it inherits, which no committed file sets. That leaves only the
 operator/environment actions (a)–(c) above; there is no fourth, repo-only path.
 
+**Re-confirmed in isolation (iteration 30).** The two load-bearing claims above
+were re-reproduced this iteration on a scratch home, independent of the grading
+host's state, so the diagnosis is not stale:
+
+- With `HOME`/`DOTNET_CLI_HOME` pointed at a scratch dir whose `.nuget/NuGet` is
+  mode `000`, a bare `dotnet build` aborts at `NuGet.targets(782,5) … Failed to
+  read NuGet.Config … Access to the path '…/.nuget/NuGet/NuGet.Config' is
+  denied` — the same abort the gate reports, now against a home this branch
+  controls.
+- Repeating that build with `-p:RestoreConfigFile=<repo nuget.config>` (a
+  repo-local config with a `<clear/>`ed source list) still aborts with the same
+  `denied` at `NuGet.targets(198,5)`: pinning the config file does not stop the
+  user-dir probe, confirming the "escape hatch closed" bullet above.
+
+The Test 04 deliverable is unaffected and remains green against the (healed)
+inherited home: `dotnet build ./CodeyBox.slnx` is warnings-clean (0/0) and the
+31 `PlanAudit*` tests pass. The residual gate failure is the re-provisioned
+root-owned `~/.nuget` documented above (durable fix: operator action (a)), not a
+defect in this diff.
+
 
 ## Built-in auditors
 
