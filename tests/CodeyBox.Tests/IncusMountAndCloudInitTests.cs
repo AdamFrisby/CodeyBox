@@ -104,6 +104,63 @@ public sealed class IncusMountAndCloudInitTests
     }
 
     [Fact]
+    public async Task PrepareDotnetHomesScript_ReownsNuGetHomePreservingCacheAndLinksCliHome()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+        var runner = new DefaultProcessRunner();
+        var uid = (await runner.RunAsync(
+            ["id", "-u"], null, CancellationToken.None,
+            maxStdoutBytes: 64, maxStderrBytes: 64)).Stdout.Trim();
+        var gid = (await runner.RunAsync(
+            ["id", "-g"], null, CancellationToken.None,
+            maxStdoutBytes: 64, maxStderrBytes: 64)).Stdout.Trim();
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-dotnet-home-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        try
+        {
+            var guestHome = Path.Combine(root, "home");
+            var cliHome = Path.Combine(root, "cli-home");
+            Directory.CreateDirectory(guestHome);
+            // Seed a populated NuGet cache to prove the re-own preserves it
+            // rather than discarding the baked offline packages.
+            var cacheMarker = Path.Combine(guestHome, ".nuget", "packages", "pkg", "marker.txt");
+            Directory.CreateDirectory(Path.GetDirectoryName(cacheMarker)!);
+            await File.WriteAllTextAsync(cacheMarker, "cached");
+
+            var result = await runner.RunAsync(
+                ["/bin/sh", "-s", "--", guestHome, uid, gid, cliHome],
+                IncusSandboxProvider.PrepareDotnetHomesScript,
+                CancellationToken.None,
+                maxStdoutBytes: 4096,
+                maxStderrBytes: 4096);
+
+            Assert.True(result.Success, result.Stderr);
+            Assert.True(Directory.Exists(cliHome));
+            Assert.True(File.Exists(cacheMarker), "baked package cache must be preserved");
+            var link = new DirectoryInfo(Path.Combine(cliHome, ".nuget"));
+            Assert.True(link.Exists);
+            Assert.Equal(Path.Combine(guestHome, ".nuget"), link.LinkTarget);
+
+            // Idempotent: a re-run (tree already guest-owned, link already present)
+            // still succeeds and leaves the cache intact.
+            var rerun = await runner.RunAsync(
+                ["/bin/sh", "-s", "--", guestHome, uid, gid, cliHome],
+                IncusSandboxProvider.PrepareDotnetHomesScript,
+                CancellationToken.None,
+                maxStdoutBytes: 4096,
+                maxStderrBytes: 4096);
+            Assert.True(rerun.Success, rerun.Stderr);
+            Assert.True(File.Exists(cacheMarker));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task ExecWrapper_IsValidBashAndKeepsUtilityOptionBoundaries()
     {
         var result = await new DefaultProcessRunner().RunAsync(

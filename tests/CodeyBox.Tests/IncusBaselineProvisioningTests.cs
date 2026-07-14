@@ -1318,19 +1318,27 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
             && command.Contains("-d", StringComparer.Ordinal)
             && command.Contains(options.GuestUserId.ToString(), StringComparer.Ordinal)
             && command.Contains("/home/ubuntu/.local/bin", StringComparer.Ordinal));
-        var dotnetCliHomePreparation = Assert.Single(commands, command =>
-            command.Contains("install", StringComparer.Ordinal)
-            && command.Contains(IncusCloudInit.DotnetCliHome, StringComparer.Ordinal));
-        var dotnetCliHomeInstallIndex = IndexOf(dotnetCliHomePreparation, "install");
-        Assert.True(dotnetCliHomeInstallIndex >= 0);
+        var dotnetHomePreparation = Assert.Single(
+            runner.Invocations,
+            invocation => invocation.Argv.Contains("/bin/sh", StringComparer.Ordinal)
+                && invocation.Argv.Contains(IncusCloudInit.DotnetCliHome, StringComparer.Ordinal));
+        var dotnetHomeShellIndex = IndexOf(dotnetHomePreparation.Argv, "/bin/sh");
+        Assert.True(dotnetHomeShellIndex >= 0);
         Assert.Equal(
             [
-                "install", "-d", "-m", "0700",
-                "-o", options.GuestUserId.ToString(),
-                "-g", options.GuestGroupId.ToString(),
+                "/bin/sh", "-s", "--",
+                options.GuestHome,
+                options.GuestUserId.ToString(),
+                options.GuestGroupId.ToString(),
                 IncusCloudInit.DotnetCliHome,
             ],
-            dotnetCliHomePreparation.Skip(dotnetCliHomeInstallIndex));
+            dotnetHomePreparation.Argv.Skip(dotnetHomeShellIndex));
+        // The preparation re-owns the inherited NuGet home to the guest (keeping
+        // the baked offline cache) and links DOTNET_CLI_HOME's NuGet home at it.
+        Assert.NotNull(dotnetHomePreparation.Stdin);
+        Assert.Contains("chown -R", dotnetHomePreparation.Stdin!, StringComparison.Ordinal);
+        Assert.Contains("/.nuget", dotnetHomePreparation.Stdin!, StringComparison.Ordinal);
+        Assert.Contains("ln -sfn", dotnetHomePreparation.Stdin!, StringComparison.Ordinal);
         Assert.DoesNotContain(commands, command =>
             command.Contains("snapshot", StringComparer.Ordinal)
             && command.Contains("create", StringComparer.Ordinal));

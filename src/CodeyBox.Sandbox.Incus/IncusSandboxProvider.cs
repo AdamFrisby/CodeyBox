@@ -2090,6 +2090,37 @@ public sealed class IncusSandboxProvider :
             heavyOperation: false).ConfigureAwait(false);
     }
 
+    // Runs as root on every boot (baseline and COW clones). Positional
+    // arguments: $1 guest home, $2 guest uid, $3 guest gid, $4 DOTNET_CLI_HOME.
+    // The baseline image ships a populated, offline NuGet package cache under
+    // the guest home. When any of it was created by root during warm-up the
+    // unprivileged guest user cannot read its config or extend it, so
+    // `dotnet build`/`dotnet test` abort restore with "Failed to read
+    // NuGet.Config due to unauthorized access". Re-own the whole tree to the
+    // guest instead of discarding it, preserving the cache so offline restores
+    // still resolve. The re-own is recursive (not just the top directory)
+    // because ownership is mixed in practice — the observed failure traversed
+    // ".nuget" but was denied ".nuget/NuGet" — and idempotent, so repeated
+    // boots of an already-owned tree are harmless. DOTNET_CLI_HOME relocates
+    // dotnet's per-user state onto tmpfs, recreated empty each boot; link its
+    // NuGet home at the guest's cache-populated one so restores reuse the baked
+    // packages instead of trying to re-download them offline.
+    internal const string PrepareDotnetHomesScript = """
+        set -eu
+        guest_home=$1
+        guest_uid=$2
+        guest_gid=$3
+        cli_home=$4
+        install -d -m 0700 -o "$guest_uid" -g "$guest_gid" "$cli_home"
+        nuget_home="$guest_home/.nuget"
+        if [ -e "$nuget_home" ]; then
+          chown -R "$guest_uid:$guest_gid" "$nuget_home"
+        else
+          install -d -m 0700 -o "$guest_uid" -g "$guest_gid" "$nuget_home"
+        fi
+        ln -sfn "$nuget_home" "$cli_home/.nuget"
+        """;
+
     private async Task PrepareDotnetCliHomeAsync(
         IncusSandboxOptions options,
         string name,
@@ -2100,12 +2131,13 @@ public sealed class IncusSandboxProvider :
             options,
             BuildRootExec(options, name,
             [
-                "install", "-d", "-m", "0700",
-                "-o", options.GuestUserId.ToString(CultureInfo.InvariantCulture),
-                "-g", options.GuestGroupId.ToString(CultureInfo.InvariantCulture),
+                "/bin/sh", "-s", "--",
+                options.GuestHome,
+                options.GuestUserId.ToString(CultureInfo.InvariantCulture),
+                options.GuestGroupId.ToString(CultureInfo.InvariantCulture),
                 IncusCloudInit.DotnetCliHome,
             ]),
-            stdin: null,
+            PrepareDotnetHomesScript,
             options.OperationTimeout,
             ct,
             heavyOperation: false).ConfigureAwait(false);
