@@ -1386,6 +1386,15 @@ public sealed class SqliteWorkItemStore :
         {
             _writeLock.Release();
         }
+
+        // A work item can be inserted directly in a failure/park state (e.g. a
+        // replay seeded from a prior failure, or an import). That is an ENTRY
+        // into failure with no prior row, so it must be logged here too. Reaching
+        // this point means the INSERT committed (the catch arms above rethrow);
+        // with no previous snapshot the helper emits iff the created state is a
+        // failure/park state. Runs after the write gate is released, mirroring
+        // the update-path hooks.
+        await EmitFailureEventIfEnteringFailureAsync(previous: null, item, ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1428,12 +1437,16 @@ public sealed class SqliteWorkItemStore :
     // ── Failure/park event history ───────────────────────────────────────────
     // The single mutable failure fields on a work item are overwritten by the
     // next retry, so there is no durable record of past failures. Every persist
-    // method that writes a state transition captures the pre-write failure
-    // snapshot (below) and, after releasing the write gate, emits ONE
-    // failure_events row when the transition ENTERS a failure/park state (or the
-    // kind/error changed while already in one). The emit runs OUTSIDE the write
-    // gate because the failure store shares this file's gate and re-acquiring it
-    // while held would trip the gate's re-entrancy guard.
+    // method that writes a work-item row (UpdateAsync, TryUpdateIfStateAsync,
+    // TryUpdateIfStateAndUpdatedAtAsync, and CreateAsync) emits ONE failure_events
+    // row, after releasing the write gate, when the write ENTERS a failure/park
+    // state (or the kind/error changed while already in one). The update-family
+    // methods capture the pre-write failure snapshot (below) to detect entry and
+    // suppress duplicates; CreateAsync has no prior row and passes a null
+    // snapshot, so it emits iff the inserted state is itself a failure/park state.
+    // The emit runs OUTSIDE the write gate because the failure store shares this
+    // file's gate and re-acquiring it while held would trip the gate's
+    // re-entrancy guard.
 
     private readonly record struct FailureStateSnapshot(WorkItemState State, string? FailureKind, string? LastError);
 

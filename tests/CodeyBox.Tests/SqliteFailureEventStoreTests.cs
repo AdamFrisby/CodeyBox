@@ -217,6 +217,37 @@ public sealed class SqliteFailureEventStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task Create_DirectlyIntoFailureState_EmitsOneRow()
+    {
+        var dbPath = NewDbPath();
+        SqliteFailureEventStore? failureStore = null;
+        using var workStore = new SqliteWorkItemStore(dbPath, failureEventStore: () => failureStore);
+        using var fStore = new SqliteFailureEventStore(dbPath);
+        failureStore = fStore;
+
+        // A replay/import can persist a brand-new row already in a failure state.
+        // That is an entry into failure with no prior row and must be logged.
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("proj"),
+            Title = "t",
+            Prompt = "p",
+            Agent = AgentKind.Claude,
+            SuspendedVmName = "vm-9",
+        }.With(WorkItemState.Failed, "boom", failureKind: "agent");
+
+        await workStore.CreateAsync(item);
+
+        var row = Assert.Single(await fStore.QueryAsync(null, null, 200));
+        Assert.Equal(item.Id, row.WorkItemId);
+        Assert.Equal("agent", row.FailureKind);
+        Assert.Equal("boom", row.ErrorMessage);
+        Assert.Equal(WorkItemState.Failed.ToString(), row.Phase);
+        Assert.Equal("vm-9", row.SandboxName);
+    }
+
+    [Fact]
     public async Task Transition_NeedsOperatorInput_IsNotRecordedAsFailure()
     {
         var dbPath = NewDbPath();
