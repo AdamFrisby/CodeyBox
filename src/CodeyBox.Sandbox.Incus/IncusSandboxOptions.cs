@@ -18,6 +18,8 @@ public sealed record IncusSandboxOptions
     public static readonly TimeSpan DefaultVmStartTimeout = TimeSpan.FromMinutes(5);
     public static readonly TimeSpan DefaultVmStopTimeout = TimeSpan.FromMinutes(2);
     public static readonly TimeSpan DefaultReadinessPollInterval = TimeSpan.FromSeconds(1);
+    public static readonly TimeSpan DefaultMaxReadinessPollInterval = TimeSpan.FromSeconds(5);
+    public static readonly TimeSpan DefaultProvisioningRetryRecheckIn = TimeSpan.FromSeconds(30);
     public static readonly TimeSpan DefaultInterruptedExecRecoveryRetryDelay = TimeSpan.FromSeconds(1);
     public static readonly TimeSpan MaximumInterruptedExecRecoveryRetryDelay = TimeSpan.FromSeconds(30);
     public const int DefaultInterruptedExecRecoveryRetryAttempts = 3;
@@ -142,6 +144,20 @@ public sealed record IncusSandboxOptions
     public TimeSpan CloudInitTimeout { get; init; } = DefaultVmStartTimeout;
     public TimeSpan MountReadyTimeout { get; init; } = DefaultVmStartTimeout;
     public TimeSpan ReadinessPollInterval { get; init; } = DefaultReadinessPollInterval;
+    /// <summary>
+    /// Upper bound for the guest-agent readiness poll interval. The wait starts
+    /// at <see cref="ReadinessPollInterval"/> and backs off exponentially up to
+    /// this cap so a concurrent boot storm does not hammer incusd with a probe
+    /// every <see cref="ReadinessPollInterval"/> across every booting VM.
+    /// </summary>
+    public TimeSpan MaxReadinessPollInterval { get; init; } = DefaultMaxReadinessPollInterval;
+    /// <summary>
+    /// Delay before the recovery stack re-attempts a sandbox creation that was
+    /// deferred because an Incus liveness deadline (guest-agent readiness or a
+    /// CLI operation) tripped under concurrent boot load. Kept short so the item
+    /// retries soon after the boot storm clears rather than being parked.
+    /// </summary>
+    public TimeSpan ProvisioningRetryRecheckIn { get; init; } = DefaultProvisioningRetryRecheckIn;
     /// <summary>Independent deadline for terminating and draining one Incus CLI process tree.</summary>
     public TimeSpan CliProcessCleanupTimeout { get; init; } = DefaultProcessRunnerOptions.DefaultCleanupTimeout;
     /// <summary>Delay between Linux Incus CLI process-group absence probes during cleanup.</summary>
@@ -269,6 +285,10 @@ public sealed record IncusSandboxOptions
         RequirePositiveDuration(options.CloudInitTimeout, nameof(CloudInitTimeout), errors);
         RequirePositiveDuration(options.MountReadyTimeout, nameof(MountReadyTimeout), errors);
         RequirePositiveDuration(options.ReadinessPollInterval, nameof(ReadinessPollInterval), errors);
+        RequirePositiveDuration(options.MaxReadinessPollInterval, nameof(MaxReadinessPollInterval), errors);
+        if (options.MaxReadinessPollInterval < options.ReadinessPollInterval)
+            errors.Add($"{nameof(MaxReadinessPollInterval)} must be at least {nameof(ReadinessPollInterval)}.");
+        RequirePositiveDuration(options.ProvisioningRetryRecheckIn, nameof(ProvisioningRetryRecheckIn), errors);
         try
         {
             DefaultProcessRunnerOptions.Validate(new DefaultProcessRunnerOptions

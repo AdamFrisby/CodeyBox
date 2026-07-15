@@ -27,6 +27,35 @@ public sealed class IncusSandboxOptionsTests
     }
 
     [Fact]
+    public void Validate_RejectsMaxReadinessPollIntervalBelowBase()
+    {
+        var errors = IncusSandboxOptions.Validate(new IncusSandboxOptions
+        {
+            ReadinessPollInterval = TimeSpan.FromSeconds(2),
+            MaxReadinessPollInterval = TimeSpan.FromSeconds(1),
+        });
+
+        Assert.Contains(
+            errors,
+            error => error.StartsWith("MaxReadinessPollInterval must be at least", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-5)]
+    public void Validate_RejectsNonPositiveProvisioningRetryRecheckIn(int seconds)
+    {
+        var errors = IncusSandboxOptions.Validate(new IncusSandboxOptions
+        {
+            ProvisioningRetryRecheckIn = TimeSpan.FromSeconds(seconds),
+        });
+
+        Assert.Contains(
+            errors,
+            error => error.StartsWith("ProvisioningRetryRecheckIn", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void Validate_RejectsUnsafeNamesPathsAndLimits()
     {
         var options = new IncusSandboxOptions

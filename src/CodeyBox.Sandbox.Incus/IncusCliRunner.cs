@@ -59,7 +59,8 @@ internal sealed class IncusCliRunner
             }
             catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && timeoutCancellation.IsCancellationRequested)
             {
-                throw new TimeoutException(
+                throw new IncusTransientTimeoutException(
+                    operation,
                     $"Incus {operation} exceeded its {operationTimeout.TotalSeconds:F0}-second deadline.",
                     ex);
             }
@@ -128,8 +129,10 @@ internal sealed class IncusCliRunner
             }
             catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && timeoutCancellation.IsCancellationRequested)
             {
-                throw new TimeoutException(
-                    $"Incus CLI operation exceeded its {operationTimeout.TotalSeconds:F0}-second deadline.",
+                var subcommand = DescribeSubcommand(argv);
+                throw new IncusTransientTimeoutException(
+                    subcommand,
+                    $"Incus CLI operation [{subcommand}] exceeded its {operationTimeout.TotalSeconds:F0}-second deadline.",
                     ex);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -143,6 +146,48 @@ internal sealed class IncusCliRunner
         {
             gateLease?.Dispose();
         }
+    }
+
+    // incus command groups whose second token is part of the subcommand
+    // (e.g. `incus file push`, `incus config device`). Kept small and matched
+    // exactly so an unrelated argument can never widen the emitted label.
+    private static readonly HashSet<string> SubcommandGroups = new(StringComparer.Ordinal)
+    {
+        "file", "config", "network", "storage", "project", "profile",
+        "image", "cluster", "snapshot", "operation", "remote",
+    };
+
+    /// <summary>
+    /// Best-effort human label naming which incus subcommand a bounded argv
+    /// invokes, for diagnostics only. argv[0] is the binary path; the verbs
+    /// follow. Only lowercase verb tokens are emitted — never instance names,
+    /// paths, or other untrusted argument values — so the label cannot leak or
+    /// be spoofed by caller input.
+    /// </summary>
+    internal static string DescribeSubcommand(IReadOnlyList<string> argv)
+    {
+        ArgumentNullException.ThrowIfNull(argv);
+        // A verb is a bare lowercase token; a leading '-' marks a flag, never a
+        // subcommand, so flags fall through to the "operation" fallback rather
+        // than being emitted as if they named the hung call.
+        static bool IsVerb(string token) =>
+            token.Length is > 0 and <= 32
+            && token[0] != '-'
+            && token.All(static c => c is (>= 'a' and <= 'z') or '-');
+
+        // argv[0] is the binary path. IncusCommandBuilder.Prefix emits a global
+        // `--project <name>` before the subcommand; skip it. Direct argv that
+        // omit the prefix start their verb at index 1.
+        var start = 1;
+        if (start + 1 < argv.Count && string.Equals(argv[start], "--project", StringComparison.Ordinal))
+            start += 2;
+
+        if (start >= argv.Count || !IsVerb(argv[start]))
+            return "operation";
+        var primary = argv[start];
+        if (SubcommandGroups.Contains(primary) && start + 1 < argv.Count && IsVerb(argv[start + 1]))
+            return $"{primary} {argv[start + 1]}";
+        return primary;
     }
 
     private static string SanitizeError(string error)
