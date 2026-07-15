@@ -146,17 +146,27 @@ dotnet build CodeyBox.slnx
 > baseline starts from a writable home:
 >
 > ```sh
-> # $HOME is writable even when $HOME/.nuget is not, so rename the broken tree
-> # aside (no root needed) and recreate a writable one, preserving the populated
-> # package cache via symlink so restore stays offline-safe. Seed a readable
-> # user config too: the fatal gate error is a *read* failure, so pre-writing the
-> # file guarantees the read succeeds without relying on NuGet creating it later.
-> # This mirrors `./build.sh`'s in-place heal, so both share one recovery recipe.
-> mv "$HOME/.nuget" "$HOME/.nuget.unwritable" \
->   && mkdir -p "$HOME/.nuget/NuGet" \
->   && ln -s "$HOME/.nuget.unwritable/packages" "$HOME/.nuget/packages" \
->   && printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<configuration />' \
->        > "$HOME/.nuget/NuGet/NuGet.Config"
+> # Probe first and only heal when the home is genuinely unusable, exactly like
+> # `./build.sh`, so the recipe is safe to re-run (a second pass on an
+> # already-healed home is a no-op instead of quarantining the good tree). $HOME
+> # is writable even when $HOME/.nuget is not, so rename the broken tree aside
+> # (no root needed) into a unique, PID-suffixed name — never a fixed one that a
+> # re-run would move the recovered tree into — recreate a writable one, and
+> # preserve the populated package cache via symlink so restore stays
+> # offline-safe. Seed a readable user config too: the fatal gate error is a
+> # *read* failure, so pre-writing the file guarantees the read succeeds without
+> # relying on NuGet creating it later.
+> if ! ( mkdir -p "$HOME/.nuget/NuGet" \
+>          && [ ! -e "$HOME/.nuget/NuGet/NuGet.Config" -o -r "$HOME/.nuget/NuGet/NuGet.Config" ] \
+>          && touch "$HOME/.nuget/NuGet/.probe" ) 2>/dev/null; then
+>   quarantine="$HOME/.nuget.unwritable.$$" \
+>     && mv "$HOME/.nuget" "$quarantine" \
+>     && mkdir -p "$HOME/.nuget/NuGet" \
+>     && ln -s "$quarantine/packages" "$HOME/.nuget/packages" \
+>     && printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<configuration />' \
+>          > "$HOME/.nuget/NuGet/NuGet.Config"
+> fi
+> rm -f "$HOME/.nuget/NuGet/.probe" 2>/dev/null || true
 > ```
 >
 > The CI/audit gates invoke `dotnet` directly and do not source this repository,
