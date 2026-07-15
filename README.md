@@ -148,11 +148,21 @@ dotnet build CodeyBox.slnx
 > ```sh
 > # $HOME is writable even when $HOME/.nuget is not, so rename the broken tree
 > # aside (no root needed) and recreate a writable one, preserving the populated
-> # package cache via symlink so restore stays offline-safe.
+> # package cache via symlink so restore stays offline-safe. Seed a readable
+> # user config too: the fatal gate error is a *read* failure, so pre-writing the
+> # file guarantees the read succeeds without relying on NuGet creating it later.
+> # This mirrors `./build.sh`'s in-place heal, so both share one recovery recipe.
 > mv "$HOME/.nuget" "$HOME/.nuget.unwritable" \
->   && mkdir -p "$HOME/.nuget" \
->   && ln -s "$HOME/.nuget.unwritable/packages" "$HOME/.nuget/packages"
+>   && mkdir -p "$HOME/.nuget/NuGet" \
+>   && ln -s "$HOME/.nuget.unwritable/packages" "$HOME/.nuget/packages" \
+>   && printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<configuration />' \
+>        > "$HOME/.nuget/NuGet/NuGet.Config"
 > ```
+>
+> The CI/audit gates invoke `dotnet` directly and do not source this repository,
+> so this heal must run at environment/baseline provisioning time (it was applied
+> and verified this way — `dotnet build CodeyBox.slnx` is 0 warnings / 0 errors and
+> the solution-level `dotnet test --no-build` runs clean once the home is writable).
 
 **3. Configure a project.** Drop a JSON file somewhere and point
 `CODEYBOX_EXTRA_CONFIG` at it (it hot-reloads on change):
