@@ -32,6 +32,40 @@ _codeybox_nuget_home_usable() {
     touch "$_codeybox_nuget_probe" 2>/dev/null
 }
 
+# Make a freshly created per-user NuGet home usable for the next `dotnet`: link
+# in an inherited package cache (so restore stays offline-safe without a
+# re-download) and seed a minimal readable user config (so the fatal user-config
+# *read* succeeds without depending on first-run creation). $1 is the
+# ".../.nuget/NuGet" directory; $2, when non-empty and existing, is the package
+# cache to reuse as the sibling global-packages folder. Every step is
+# best-effort so a failure can never abort a `set -e` caller. Shared by the
+# in-place and DOTNET_CLI_HOME-redirect recovery paths so both stay offline-safe.
+_codeybox_seed_nuget_home() {
+    _codeybox_seed_user_dir="$1"
+    _codeybox_seed_cache_src="$2"
+    mkdir -p "$_codeybox_seed_user_dir" 2>/dev/null || return 0
+    # Strip the trailing "/NuGet" to address the .nuget root that owns the
+    # global-packages folder alongside the user config directory.
+    _codeybox_seed_root="${_codeybox_seed_user_dir%/NuGet}"
+    # NuGet only READS an already-extracted package (it checks the
+    # .nupkg.metadata marker and skips extraction), so a read-only inherited
+    # cache satisfies every restore; a writable one additionally lets NuGet add
+    # packages the baseline lacks.
+    if [ -n "$_codeybox_seed_cache_src" ] \
+        && [ -e "$_codeybox_seed_cache_src" ] \
+        && [ ! -e "$_codeybox_seed_root/packages" ]; then
+        ln -s "$_codeybox_seed_cache_src" "$_codeybox_seed_root/packages" 2>/dev/null || true
+    fi
+    # Repository package sources come from RestoreConfigFile, so an empty user
+    # config adds no overrides and clears no sources.
+    if [ ! -e "$_codeybox_seed_user_dir/NuGet.Config" ]; then
+        printf '%s\n' \
+            '<?xml version="1.0" encoding="utf-8"?>' \
+            '<configuration />' \
+            > "$_codeybox_seed_user_dir/NuGet.Config" 2>/dev/null || true
+    fi
+}
+
 codeybox_heal_nuget_home() {
     _codeybox_cli_home="${DOTNET_CLI_HOME:-${HOME:-}}"
     [ -n "$_codeybox_cli_home" ] || return 0
@@ -56,39 +90,29 @@ codeybox_heal_nuget_home() {
             || mv "$_codeybox_nuget_root" "$_codeybox_quarantine" 2>/dev/null; then
             if _codeybox_nuget_home_usable; then
                 rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
-                # Reuse the quarantined package cache so the heal does not force a
-                # full re-download (which would fail offline). NuGet only READS an
-                # already-extracted package (it checks the .nupkg.metadata marker
-                # and skips extraction), so a read-only inherited cache satisfies
-                # every restore; a writable one additionally lets NuGet add
-                # packages the baseline lacks.
-                if [ -d "$_codeybox_quarantine/packages" ] \
-                    && [ ! -e "$_codeybox_nuget_root/packages" ]; then
-                    ln -s "$_codeybox_quarantine/packages" \
-                        "$_codeybox_nuget_root/packages" 2>/dev/null || true
-                fi
-                # Seed a minimal, readable user config so the next `dotnet`'s
-                # user-config *read* (the exact operation the broken home fails)
-                # succeeds without depending on first-run creation. Repository
-                # package sources come from RestoreConfigFile, so an empty user
-                # config adds no overrides and clears no sources.
-                if [ ! -e "$_codeybox_nuget_user_dir/NuGet.Config" ]; then
-                    printf '%s\n' \
-                        '<?xml version="1.0" encoding="utf-8"?>' \
-                        '<configuration />' \
-                        > "$_codeybox_nuget_user_dir/NuGet.Config" 2>/dev/null || true
-                fi
+                # Reuse the quarantined package cache and seed a readable user
+                # config so the next `dotnet`'s user-config *read* (the exact
+                # operation the broken home fails) succeeds and restore stays
+                # offline-safe.
+                _codeybox_seed_nuget_home "$_codeybox_nuget_user_dir" \
+                    "$_codeybox_quarantine/packages"
                 return 0
             fi
         fi
     fi
 
-    # The cli-home itself is not writable: keep the build hermetic by redirecting
-    # the .NET CLI home to a writable scratch directory for this process tree.
+    # The cli-home itself is not writable (e.g. an inherited read-only mount that
+    # cannot be relocated aside): keep the build hermetic by redirecting the .NET
+    # CLI home to a writable scratch directory for this process tree. Seed that
+    # scratch home the same way as the in-place path — a readable user config so
+    # the fatal read succeeds, and a symlink to the inherited (still readable but
+    # unwritable) package cache so restore stays offline-safe there too.
     _codeybox_scratch_home="$(mktemp -d "${TMPDIR:-/tmp}/codeybox-dotnet-home.XXXXXX")" \
         || return 0
     DOTNET_CLI_HOME="$_codeybox_scratch_home"
     export DOTNET_CLI_HOME
+    _codeybox_seed_nuget_home "$_codeybox_scratch_home/.nuget/NuGet" \
+        "$_codeybox_cli_home/.nuget/packages"
     return 0
 }
 

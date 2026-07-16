@@ -316,6 +316,73 @@ public sealed class BuildScriptNuGetHealTests
     }
 
     [Fact]
+    public async Task HealScript_RedirectsCliHomeWhenHomeUnwritable_PreservingCache()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        Directory.CreateDirectory(home);
+        try
+        {
+            // An inherited home whose .nuget cannot be relocated aside (the home
+            // itself is a read-only mount) forces the DOTNET_CLI_HOME-redirect
+            // fallback. The inherited package cache is still readable, so the
+            // scratch home must link it in to stay offline-safe.
+            var cacheMarker = Path.Combine(home, ".nuget", "packages", "pkg", "marker.txt");
+            Directory.CreateDirectory(Path.GetDirectoryName(cacheMarker)!);
+            await File.WriteAllTextAsync(cacheMarker, "cached");
+            await ChmodAsync("555", Path.Combine(home, ".nuget")); // unusable: cannot create NuGet/ or write config
+            await ChmodAsync("555", home);                          // unwritable: cannot quarantine .nuget aside
+
+            var sentinel = Path.Combine(root, "cli-home");
+            var repoRoot = HealScriptRepoRoot();
+            var env = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["HOME"] = home,
+                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                ["TMPDIR"] = root,
+            };
+            // Dot-source the heal, then record the exported DOTNET_CLI_HOME so the
+            // test can inspect the scratch home the fallback redirected dotnet to.
+            var result = await new DefaultProcessRunner().RunAsync(
+                [
+                    "/bin/sh", "-c",
+                    "cd \"$1\" && . ./scripts/nuget-home-heal.sh && printf '%s' \"$DOTNET_CLI_HOME\" > \"$2\"",
+                    "sh", repoRoot, sentinel,
+                ],
+                null,
+                CancellationToken.None,
+                maxStdoutBytes: 65536,
+                maxStderrBytes: 65536,
+                environment: env);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            var scratchHome = await File.ReadAllTextAsync(sentinel);
+            Assert.False(string.IsNullOrEmpty(scratchHome), "fallback must export a scratch DOTNET_CLI_HOME");
+            Assert.NotEqual(home, scratchHome);
+
+            // The scratch home carries a readable user config so the fatal
+            // user-config read succeeds against it.
+            var scratchConfig = Path.Combine(scratchHome, ".nuget", "NuGet", "NuGet.Config");
+            Assert.Contains("<configuration", await File.ReadAllTextAsync(scratchConfig), StringComparison.Ordinal);
+
+            // The inherited cache is linked in, so restore under the scratch home
+            // stays offline-safe without a re-download.
+            var scratchMarker = Path.Combine(scratchHome, ".nuget", "packages", "pkg", "marker.txt");
+            Assert.Equal("cached", await File.ReadAllTextAsync(scratchMarker));
+        }
+        finally
+        {
+            // Restore write bits so the fixture can be removed.
+            await ChmodAsync("755", home);
+            await ChmodAsync("755", Path.Combine(home, ".nuget"));
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task HealScript_DirectDotSource_LeavesWritableHomeIntact()
     {
         if (!OperatingSystem.IsLinux())
