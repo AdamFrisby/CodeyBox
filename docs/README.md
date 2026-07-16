@@ -88,6 +88,12 @@ at anything that matters.
 | [manual UAT](development/manual-uat/) | operator checklists for what automated tests cannot cover |
 | [`AGENTS.md`](../AGENTS.md) | the engineering contract every change is graded against |
 
+## Evaluations — spikes
+
+| Page | What it covers |
+|---|---|
+| [caveman evaluation](caveman-evaluation.md) | spike: evaluating the `caveman` output-compression skill as a token-saving layer over existing agents — capture/parse compatibility gate, measured savings, per-agent opt-in design |
+
 ## The other clients
 
 The **admin dashboard** ([`tools/CodeyBox.Admin/`](../tools/CodeyBox.Admin/README.md))
