@@ -12,6 +12,21 @@ internal sealed record IncusStagedExecutable(
     string ContentSha256);
 
 /// <summary>
+/// Raised when the per-staging-root coordination lease is momentarily held by
+/// another concurrent provisioning/recovery pass. Distinct from a genuine I/O
+/// fault so callers can treat opportunistic recovery contention as retryable
+/// rather than fatal. Subclasses <see cref="IOException"/> to preserve the
+/// existing broad contract.
+/// </summary>
+internal sealed class IncusProvisioningLeaseContendedException : IOException
+{
+    internal IncusProvisioningLeaseContendedException(string message)
+        : base(message)
+    {
+    }
+}
+
+/// <summary>
 /// Private, bounded host-side inputs for one Incus provisioning pass. Executable
 /// digests are computed while copying from no-follow descriptors, and the exact
 /// staged files carrying those digests are the files later pushed to the VM.
@@ -220,7 +235,7 @@ internal sealed class IncusProvisioningWorkspace : IDisposable
         if (IncusSafeFile.TryAcquireExclusiveLease(lease))
             return lease;
         lease.Dispose();
-        throw new IOException(
+        throw new IncusProvisioningLeaseContendedException(
             "Another CodeyBox process is creating or recovering an Incus provisioning workspace; retry the operation.");
     }
 

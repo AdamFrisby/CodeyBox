@@ -156,6 +156,15 @@ public sealed class MsBuildNuGetHealTests
                 ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1",
                 ["DOTNET_SKIP_FIRST_TIME_EXPERIENCE"] = "1",
                 ["DOTNET_NOLOGO"] = "1",
+                // A default `dotnet build` leaves persistent, CPU- and RAM-hungry
+                // MSBuild worker nodes plus a Roslyn VBCSCompiler server alive for
+                // minutes (node reuse). Because this collection runs in xUnit's
+                // sequential non-parallel phase alongside other timing-sensitive
+                // audit tests, those lingering servers would saturate the host and
+                // flake them. Disable every persistent server so the build spawns
+                // nothing that outlives it.
+                ["MSBUILDDISABLENODEREUSE"] = "1",
+                ["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0",
             };
 
             var result = await new DefaultProcessRunner().RunAsync(
@@ -164,6 +173,8 @@ public sealed class MsBuildNuGetHealTests
                     "build",
                     Path.Combine(root, "app.slnx"),
                     "--configuration", "Debug",
+                    "-nodeReuse:false",
+                    "-p:UseSharedCompilation=false",
                     "-p:RestoreConfigFile=" + offlineConfig,
                 ],
                 null,

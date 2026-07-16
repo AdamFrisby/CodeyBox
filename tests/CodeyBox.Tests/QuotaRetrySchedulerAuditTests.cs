@@ -448,7 +448,11 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
         Assert.Equal(WorkItemState.Merged, retried!.State);
         Assert.Equal(workBranch, retried.WorkBranch);
         Assert.Equal(1, retried.QuotaRetryAttempts);
-        var evt = AssertQuotaAttempt(item, "startup", "retried", "WaitingForQuotaReset");
+        // The audit event is emitted through the global Serilog pipeline, whose
+        // delivery to the in-memory sink can lag the awaited state transition
+        // under load. Poll for it rather than reading the sink once.
+        var evt = await WaitForQuotaAttemptAsync(item, "startup", "retried");
+        Assert.Equal("WaitingForQuotaReset", GetScalar<string>(evt, "State"));
         Assert.Equal("from=upstream", GetScalar<string>(evt, "Reason"));
     }
 

@@ -1214,7 +1214,20 @@ public sealed class IncusSandboxProvider :
                 || File.Exists(stagingRootPath))
             {
                 var stagingRoot = ResolveStagingRoot(options);
-                _ = IncusProvisioningWorkspace.RecoverStaleWorkspaces(stagingRoot, ct);
+                try
+                {
+                    _ = IncusProvisioningWorkspace.RecoverStaleWorkspaces(stagingRoot, ct);
+                }
+                catch (IncusProvisioningLeaseContendedException contended)
+                {
+                    // Stale-workspace recovery is opportunistic cleanup guarded by a
+                    // cross-process lease. A concurrent provisioning/recovery pass —
+                    // or a transient lease hold from an unrelated fork inheriting the
+                    // descriptor — must not fail preflight; the next operation retries.
+                    _log.LogDebug(
+                        contended,
+                        "Skipping Incus provisioning-workspace recovery this pass; the coordination lease is held.");
+                }
             }
             var server = await _cli.RunCheckedAsync(
                 "server API probe",

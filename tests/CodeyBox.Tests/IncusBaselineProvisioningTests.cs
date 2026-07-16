@@ -1129,9 +1129,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         {
             var activeRoot = workspace.Root;
             File.WriteAllText(Path.Combine(activeRoot, "large-partial"), "partial");
-            Assert.False(IncusProvisioningWorkspace.RecoverStaleWorkspaces(
-                stagingRoot,
-                CancellationToken.None));
+            Assert.False(RecoverWithLeaseRetry(stagingRoot));
             Assert.True(Directory.Exists(activeRoot));
         }
 
@@ -1140,8 +1138,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         File.WriteAllText(sentinel, "keep");
         var deceptive = Path.Combine(stagingRoot, $"{IncusProvisioningWorkspace.DirectoryPrefix}{Guid.NewGuid():N}");
         Directory.CreateSymbolicLink(deceptive, external);
-        Assert.Throws<InvalidOperationException>(() =>
-            IncusProvisioningWorkspace.RecoverStaleWorkspaces(stagingRoot, CancellationToken.None));
+        Assert.Throws<InvalidOperationException>(() => RecoverWithLeaseRetry(stagingRoot));
         Assert.True(File.Exists(sentinel));
         Directory.Delete(deceptive);
 
@@ -1153,8 +1150,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         File.WriteAllText(marker, "not-this-workspace\n");
         if (OperatingSystem.IsLinux())
             File.SetUnixFileMode(marker, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-        Assert.Throws<InvalidOperationException>(() =>
-            IncusProvisioningWorkspace.RecoverStaleWorkspaces(stagingRoot, CancellationToken.None));
+        Assert.Throws<InvalidOperationException>(() => RecoverWithLeaseRetry(stagingRoot));
         Assert.DoesNotContain(
             Directory.EnumerateFileSystemEntries(mismatchedMarker),
             path => Path.GetFileName(path).Contains("lease", StringComparison.Ordinal));
@@ -1174,17 +1170,34 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
                 UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
                     | UnixFileMode.GroupRead | UnixFileMode.GroupExecute);
         }
-        Assert.ThrowsAny<Exception>(() =>
-            IncusProvisioningWorkspace.RecoverStaleWorkspaces(stagingRoot, CancellationToken.None));
+        Assert.ThrowsAny<Exception>(() => RecoverWithLeaseRetry(stagingRoot));
         Assert.True(Directory.Exists(foreign));
         Directory.Delete(foreign);
 
         var partial = Path.Combine(stagingRoot, $"{IncusProvisioningWorkspace.DirectoryPrefix}{Guid.NewGuid():N}");
         Assert.True(IncusSafeFile.TryCreateDirectoryExclusive(partial));
-        Assert.True(IncusProvisioningWorkspace.RecoverStaleWorkspaces(
-            stagingRoot,
-            CancellationToken.None));
+        Assert.True(RecoverWithLeaseRetry(stagingRoot));
         Assert.False(Directory.Exists(partial));
+    }
+
+    // Honors RecoverStaleWorkspaces' own documented contract: its coordination
+    // lease can be transiently held by a concurrent recovery pass or by an
+    // unrelated fork inheriting the descriptor, and the thrown error explicitly
+    // says to retry. Retry only that transient contention with a bounded budget;
+    // any other outcome (success/false or a rejection) propagates unchanged.
+    private static bool RecoverWithLeaseRetry(string stagingRoot)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                return IncusProvisioningWorkspace.RecoverStaleWorkspaces(stagingRoot, CancellationToken.None);
+            }
+            catch (IncusProvisioningLeaseContendedException) when (attempt < 100)
+            {
+                Thread.Sleep(20);
+            }
+        }
     }
 
     [Fact]
