@@ -7,16 +7,28 @@
 # sandboxes the inherited directory can be owned by another account or mounted
 # read-only, so `dotnet` aborts restore before the build with an
 # unauthorized-access error ("Failed to read NuGet.Config due to unauthorized
-# access"). NuGet performs that user-config read during restore-graph
-# generation, before any in-tree Directory.Build.props / NuGet.Config /
-# RestoreConfigFile / MSBuild BeforeTargets="Restore" hook can run, so the home
-# has to be healed on disk before `dotnet` starts.
+# access"). NuGet performs that user-config read during restore, so neither an
+# in-tree NuGet.Config / RestoreConfigFile (which only redirect package sources,
+# not the fatal user-config read) nor a late MSBuild BeforeTargets="Restore" hook
+# can heal it — the home must be repaired on disk before that read. An
+# InitialTargets hook runs early enough (see below); every call site repairs the
+# home, none merely reconfigures sources.
 #
 # DOT-SOURCE this file (`. scripts/nuget-home-heal.sh`) BEFORE invoking dotnet.
 # It is a strict no-op when the home is already usable, never fails the caller
 # (safe under `set -e`), and — because it is dot-sourced — can export a fallback
 # DOTNET_CLI_HOME into the caller's environment. build.sh and the audit
 # build/test gates all source this rather than re-implementing the recovery.
+#
+# It is ALSO run from MSBuild via an InitialTargets hook (see
+# Directory.NuGetHomeHeal.targets, wired into Directory.Build.props and
+# Directory.Solution.props). InitialTargets fires at the very start of every
+# MSBuild invocation, before NuGet's user-config read, so a plain `dotnet build`
+# / `dotnet test` / `dotnet build <solution>` heals itself without any wrapper
+# script or orchestrator change — verified before both solution- and
+# project-level restore. That MSBuild path relies only on the on-disk repair (an
+# exported DOTNET_CLI_HOME would not survive back to the parent `dotnet`), which
+# the in-place quarantine below performs whenever the cli-home is writable.
 
 # Writability is necessary but not sufficient: an inherited NuGet.Config that is
 # present but unreadable (e.g. baked mode 0600 under another account, inside a

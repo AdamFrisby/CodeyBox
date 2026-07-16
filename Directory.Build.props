@@ -1,4 +1,10 @@
-<Project>
+<Project InitialTargets="CodeyBoxHealNuGetHome">
+
+  <!-- Heal an unwritable inherited per-user NuGet home before restore reads it.
+       InitialTargets runs this at the start of every project MSBuild invocation,
+       before NuGet's user-config read; the target lives in one shared file so the
+       solution- and project-level hooks stay identical. -->
+  <Import Project="$(MSBuildThisFileDirectory)Directory.NuGetHomeHeal.targets" />
 
   <PropertyGroup>
     <!-- Direct project restores use the repository's declared package sources here.

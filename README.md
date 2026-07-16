@@ -130,29 +130,34 @@ dotnet build CodeyBox.slnx
 > inherited path is not writable (for example a home baked read-only or owned by
 > another user), NuGet otherwise aborts restore with an unauthorized-access error.
 >
-> `./build.sh` guards against this automatically: it probes the inherited
-> `.nuget/NuGet` directory and, when it is not writable, quarantines it aside and
-> recreates a writable one (falling back to a scratch `DOTNET_CLI_HOME` only when
-> `$HOME` itself is unwritable). It then forwards any arguments straight to
-> `dotnet`, so every gate command runs through the same heal — for example
-> `./build.sh build --no-incremental -warnaserror` or `./build.sh test --no-build
-> CodeyBox.slnx`; with no arguments it builds the whole solution. A bare
-> `dotnet build CodeyBox.slnx` (or an IDE build) does not run that probe, so for
-> those either keep the home writable or set `DOTNET_CLI_HOME` to a writable
-> directory yourself.
+> The repository heals this automatically for **any** `dotnet` invocation, including
+> the bare `dotnet build`/`dotnet test` the CI and audit gates run directly.
+> `Directory.Build.props` and `Directory.Solution.props` carry an MSBuild
+> `InitialTargets` hook (defined once in `Directory.NuGetHomeHeal.targets`) that runs
+> at the very start of every MSBuild invocation — before NuGet's user-config read, at
+> both the solution and project level. When it finds the inherited `.nuget/NuGet`
+> unusable it quarantines it aside and recreates a writable one, preserving the baked
+> package cache via symlink so restore stays offline-safe; when the home is already
+> usable it is a no-op. So `dotnet build CodeyBox.slnx`, `dotnet build
+> --no-incremental /warnaserror`, and `dotnet test --no-build` all self-heal with no
+> wrapper or environment override. (The hook is POSIX-shell based and conditioned to
+> Unix; on Windows keep the home writable.)
 >
-> CI and audit gates invoke `dotnet build`/`dotnet test` directly rather than
-> through `./build.sh`, and NuGet performs the fatal user-config read during
-> restore-graph generation — before any repository `Directory.Build.props` target
-> or MSBuild hook can run — so there is no in-tree setting that heals it for those
-> gates. When a baseline image bakes `$HOME/.nuget` owned by another account (the
-> directory itself unwritable, so NuGet cannot even create `NuGet/NuGet.Config`),
-> heal it at the environment/baseline level so every clone that COW-inherits the
-> baseline starts from a writable home:
+> `./build.sh` applies the same recovery for non-MSBuild callers: it probes the
+> inherited `.nuget/NuGet` directory and, when it is not writable, quarantines it
+> aside and recreates a writable one (falling back to a scratch `DOTNET_CLI_HOME` only
+> when `$HOME` itself is unwritable), then forwards any arguments straight to `dotnet`
+> — for example `./build.sh build --no-incremental -warnaserror` or `./build.sh test
+> --no-build CodeyBox.slnx`; with no arguments it builds the whole solution. The heal
+> logic in both paths is the single source of truth in `scripts/nuget-home-heal.sh`.
+>
+> If you would rather fix the condition at its source — a baseline image that bakes
+> `$HOME/.nuget` owned by another account, so every COW clone inherits it — heal it
+> once at environment/baseline provisioning time instead:
 >
 > ```sh
-> # Probe first and only heal when the home is genuinely unusable, exactly like
-> # `./build.sh`, so the recipe is safe to re-run (a second pass on an
+> # Probe first and only heal when the home is genuinely unusable, exactly like the
+> # in-tree recovery, so the recipe is safe to re-run (a second pass on an
 > # already-healed home is a no-op instead of quarantining the good tree). $HOME
 > # is writable even when $HOME/.nuget is not, so rename the broken tree aside
 > # (no root needed) into a unique, PID-suffixed name — never a fixed one that a
@@ -174,10 +179,9 @@ dotnet build CodeyBox.slnx
 > rm -f "$HOME/.nuget/NuGet/.probe" 2>/dev/null || true
 > ```
 >
-> The CI/audit gates invoke `dotnet` directly and do not source this repository,
-> so this heal must run at environment/baseline provisioning time (it was applied
-> and verified this way — `dotnet build CodeyBox.slnx` is 0 warnings / 0 errors and
-> the solution-level `dotnet test --no-build` runs clean once the home is writable).
+> Verified both ways: with the home healed (in-tree or at the baseline)
+> `dotnet build CodeyBox.slnx` is 0 warnings / 0 errors and the solution-level
+> `dotnet test --no-build` runs clean.
 
 **3. Configure a project.** Drop a JSON file somewhere and point
 `CODEYBOX_EXTRA_CONFIG` at it (it hot-reloads on change):

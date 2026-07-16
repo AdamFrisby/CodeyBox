@@ -4,13 +4,16 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// Exercises the per-user NuGet-home recovery block in the repository's build.sh
-/// against real filesystem fixtures. That block is the load-bearing remedy that
-/// lets the direct <c>dotnet build</c>/<c>dotnet test</c> gates run in environments
-/// that COW-inherited an unreadable or unwritable NuGet home: NuGet performs a fatal
-/// user-config read during restore-graph generation, before any in-tree MSBuild hook
-/// can execute, so the home has to be healed on disk before <c>dotnet</c> starts.
-/// These tests fail if the recovery stops detecting a broken home, stops quarantining
-/// it aside, or stops preserving the baked offline package cache.
+/// against real filesystem fixtures. That block is one call site of the shared
+/// recovery that lets the direct <c>dotnet build</c>/<c>dotnet test</c> gates run in
+/// environments that COW-inherited an unreadable or unwritable NuGet home. NuGet
+/// performs a fatal user-config read during restore, so the home has to be healed on
+/// disk first; the primary hook is the MSBuild <c>InitialTargets</c> in
+/// Directory.Build.props / Directory.Solution.props (covered by
+/// <see cref="MsBuildNuGetHealTests"/>), and build.sh dot-sources the same recovery
+/// for callers that route through it. These tests fail if the recovery stops
+/// detecting a broken home, stops quarantining it aside, or stops preserving the
+/// baked offline package cache.
 /// </summary>
 public sealed class BuildScriptNuGetHealTests
 {
