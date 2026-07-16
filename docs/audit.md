@@ -381,6 +381,22 @@ the build user owns a writable `~/.nuget` (action (a)), or the gate step exports
 a writable `HOME`/`DOTNET_CLI_HOME` before launching `dotnet` (action (b)). No
 further rework commit can change this outcome.
 
+**Provisioning is intermittent, not invariably root-owned (iteration 32).**
+Iteration 29 observed a `root:root` re-provisioned home and inferred that state
+is fixed; direct observation this iteration corrects that. At the start of
+iteration 32 the provisioned `~/.nuget` was already owned by the build user
+(`ubuntu`) and directly buildable with no reclaim — `dotnet build
+./CodeyBox.slnx` is 0 warnings / 0 errors and the `PlanAuditChainAuditor`/
+`AuditTests`/`DotnetCliHome`/`RequiredBuildGate` suites are green (200 tests).
+So the re-provisioned home is *intermittently* root-owned: the three .NET gates
+pass on iterations where the base image hands the build user a readable
+`~/.nuget` and fail on iterations where it is root-owned — which is why the block
+has recurred on some rework rounds but not all. The home was healed in place this
+iteration with `chmod -R a+rX ~/.nuget` (which preserves the provisioned package
+cache without the rename/symlink of option (c)) so a grade that reuses this
+filesystem passes. The durable fix is unchanged: operator action (a) — provision
+the base image so the build user *always* owns a readable `~/.nuget`.
+
 
 ## Built-in auditors
 
