@@ -3128,6 +3128,14 @@ public sealed class IncusSandboxLifecycleTests
         {
             StagingDirectory = stagingRoot,
             UseBaselineImages = false,
+            // This fixture drives the real filesystem preflight and recovery
+            // adoption against a synchronous mock CLI, so the operation deadline
+            // only guards against a hang — it is never expected to elapse. The
+            // 250 ms FastLifecycleOptions default is a real wall-clock timer, and
+            // under full-suite CPU starvation it can fire between arming the
+            // deadline and the mock returning, aborting a correct run. Give it
+            // generous headroom; no assertion here depends on the timeout value.
+            OperationTimeout = TimeSpan.FromSeconds(30),
         };
         var originalSpec = SandboxConventions.WithTimingEnvironment(new SandboxSpec
         {

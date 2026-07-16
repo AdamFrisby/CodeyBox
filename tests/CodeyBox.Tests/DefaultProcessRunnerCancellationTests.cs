@@ -107,7 +107,7 @@ public sealed class DefaultProcessRunnerCancellationTests
 
         cancellation.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => run.WaitAsync(IsolatedRunCompletionBudget));
+            () => run.WaitAsync(RunCompletionBudget));
 
         await AssertProcessesGoneAsync(rootPid, descendantPid);
     }
@@ -153,7 +153,7 @@ public sealed class DefaultProcessRunnerCancellationTests
             CancellationToken.None,
             stderrChunkCallback: transcript.Append,
             maxStdoutBytes: 1024,
-            maxStderrBytes: 4096).WaitAsync(IsolatedRunCompletionBudget);
+            maxStderrBytes: 4096).WaitAsync(RunCompletionBudget);
         var descendantPid = await transcript.ChildPid.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.True(result.StdoutLimitExceeded);
@@ -181,7 +181,7 @@ public sealed class DefaultProcessRunnerCancellationTests
         var descendantPid = await transcript.ChildPid.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         cancellation.Cancel();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run.WaitAsync(IsolatedRunCompletionBudget));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run.WaitAsync(RunCompletionBudget));
 
         await AssertProcessesGoneAsync(descendantPid);
     }
@@ -200,7 +200,7 @@ public sealed class DefaultProcessRunnerCancellationTests
                 $"yes x | head -c {outputBytes.ToString(CultureInfo.InvariantCulture)}",
             ],
             stdin: null,
-            CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+            CancellationToken.None).WaitAsync(RunCompletionBudget);
 
         Assert.Equal(0, result.ExitCode);
         Assert.False(result.StdoutLimitExceeded);
@@ -214,10 +214,11 @@ public sealed class DefaultProcessRunnerCancellationTests
     // assertions (process gone, limit exceeded) are unchanged.
     private static readonly TimeSpan IsolatedRunnerCleanupTimeout = TimeSpan.FromSeconds(60);
 
-    // Anti-hang guard for awaiting an isolated run to complete. It must exceed
+    // Anti-hang guard for awaiting a run to complete (isolated teardown runs and
+    // the shared-runner unbounded-output run alike). It must exceed
     // IsolatedRunnerCleanupTimeout so a slow-but-correct teardown under load
     // reports its real outcome instead of tripping the guard first.
-    private static readonly TimeSpan IsolatedRunCompletionBudget = TimeSpan.FromSeconds(90);
+    private static readonly TimeSpan RunCompletionBudget = TimeSpan.FromSeconds(90);
 
     private static DefaultProcessRunner NewIsolatedRunner() => new(
         new DefaultProcessRunnerOptions
