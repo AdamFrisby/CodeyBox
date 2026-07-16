@@ -6,6 +6,11 @@ internal static class DotnetTestFailureAttributionRunner
 {
     private const int CommandNotFoundExitCode = 127;
 
+    // Scratch location (inside the sandbox) for the detached base-branch worktree
+    // used to re-run failing tests against the merge base. A unique suffix is
+    // appended per attribution run so concurrent audits never collide.
+    private const string BaseWorktreePathPrefix = "/tmp/codeybox-test-attribution-";
+
     public static async Task<IReadOnlyList<TestFailureAttributionResult>> AttributeAsync(
         ISandbox sandbox,
         string workingDirectory,
@@ -105,7 +110,7 @@ internal static class DotnetTestFailureAttributionRunner
                 "merge-base",
                 "HEAD",
                 baseRef);
-            worktreePath = $"/tmp/codeybox-test-attribution-{Guid.NewGuid():N}";
+            worktreePath = $"{BaseWorktreePathPrefix}{Guid.NewGuid():N}";
             var add = await RunGitAsync(
                 sandbox,
                 repoRoot,
