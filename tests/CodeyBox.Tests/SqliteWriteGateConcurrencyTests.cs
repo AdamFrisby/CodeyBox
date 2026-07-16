@@ -14,6 +14,8 @@ namespace CodeyBox.Tests;
 public sealed class SqliteWriteGateConcurrencyTests : IDisposable
 {
     private static readonly TimeSpan PostReleaseCompletionTimeout = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan DiagnosticLogPollInterval = TimeSpan.FromMilliseconds(25);
+    private const int DiagnosticLogPollAttempts = 1200;
     private const int WorkerCount = 4;
     private const int PostWorkItemCount = 4;
     private const int TimingWriteCount = 4;
@@ -59,12 +61,12 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
             var timeout = await Assert.ThrowsAsync<SqliteWriteGateAcquisitionTimeoutException>(
                 () => waiter.WaitAsync(TimeSpan.FromSeconds(5)));
             Assert.Contains(nameof(HoldGateAcrossBlockedAwaitAsync), timeout.CurrentHolder);
-            Assert.Contains(
-                loggerFactory.Messages,
+            await AssertLoggedEventuallyAsync(
+                loggerFactory,
                 message => message.Contains("exceeded the configured maximum hold duration", StringComparison.Ordinal)
                     && message.Contains(nameof(HoldGateAcrossBlockedAwaitAsync), StringComparison.Ordinal));
-            Assert.Contains(
-                loggerFactory.Messages,
+            await AssertLoggedEventuallyAsync(
+                loggerFactory,
                 message => message.Contains("Timed out", StringComparison.Ordinal)
                     && message.Contains(nameof(WaitAndReleaseAsync), StringComparison.Ordinal));
         }
@@ -454,6 +456,25 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
         {
             gate.Release();
         }
+    }
+
+    // The acquisition-timeout diagnostic is intentionally logged off the hot
+    // path via the thread pool (see SqliteDatabaseWriteGate.CreateAcquisitionTimeout),
+    // so it can lag the observed timeout exception under load. Poll until it
+    // lands (bounded, ~30 s) before asserting so a starved thread pool does not
+    // produce a false negative; the predicate still asserts the real message.
+    private static async Task AssertLoggedEventuallyAsync(
+        RecordingLoggerFactory loggerFactory,
+        Func<string, bool> predicate)
+    {
+        for (var attempt = 0; attempt < DiagnosticLogPollAttempts; attempt++)
+        {
+            if (loggerFactory.Messages.Any(predicate))
+                return;
+            await Task.Delay(DiagnosticLogPollInterval);
+        }
+
+        Assert.Contains(loggerFactory.Messages, new Predicate<string>(predicate));
     }
 
     private static async Task WaitForReleasedWritersAsync(
