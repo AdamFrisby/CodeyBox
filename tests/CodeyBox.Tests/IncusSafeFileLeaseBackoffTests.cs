@@ -16,33 +16,29 @@ public sealed class IncusSafeFileLeaseBackoffTests
     [Fact]
     public void Backoff_RetriesUntilTransientHolderReleases()
     {
-        if (!OperatingSystem.IsLinux())
-            return;
-
         using var temp = TestTempDirectory.Create("codeybox-lease-backoff-");
-        var leasePath = Path.Combine(temp.Root, "lease");
+        using var lease = File.Create(Path.Combine(temp.Root, "lease"));
 
-        // A second open of the same path is a distinct open file description, so its
-        // flock genuinely conflicts — this is exactly what a fork-duplicated
-        // descriptor looks like to a fresh acquirer.
-        using var transientHolder = IncusSafeFile.OpenOrCreatePrivateLeaseNoFollow(leasePath);
-        Assert.True(IncusSafeFile.TryAcquireExclusiveLease(transientHolder));
-
-        using var contender = IncusSafeFile.OpenOrCreatePrivateLeaseNoFollow(leasePath);
+        // Model a transient fork-duplicated descriptor by reporting the lease as
+        // held for the first few non-blocking flock attempts and free thereafter.
+        // Injecting the acquire step keeps the retry-until-success behaviour under
+        // test deterministic: the real-flock variant here raced a concurrent
+        // fork/exec elsewhere in the loaded parallel suite, which duplicated the
+        // holder's descriptor and kept the lock alive past Dispose until the child
+        // reached exec — long after a no-op spin exhausted its attempt budget.
+        const int heldForAttempts = 3;
+        var attempts = 0;
         var sleeps = 0;
         var acquired = IncusSafeFile.TryAcquireExclusiveLeaseWithBackoff(
-            contender,
+            lease,
             maxAttempts: 20,
             retryDelay: TimeSpan.Zero,
-            sleep: _ =>
-            {
-                sleeps++;
-                if (sleeps == 3)
-                    transientHolder.Dispose(); // the transient descriptor reaches exec and closes
-            });
+            sleep: _ => sleeps++,
+            tryAcquire: _ => ++attempts > heldForAttempts);
 
         Assert.True(acquired);
-        Assert.True(sleeps >= 3, $"expected at least 3 retries before release, saw {sleeps}");
+        Assert.Equal(heldForAttempts + 1, attempts); // wins on the attempt after release
+        Assert.Equal(heldForAttempts, sleeps);       // one inter-attempt sleep per contended attempt
     }
 
     [Fact]

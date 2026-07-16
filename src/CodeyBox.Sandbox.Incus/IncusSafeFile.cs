@@ -145,23 +145,27 @@ internal static partial class IncusSafeFile
     /// window (see the retry-bound constants) clears. Returns <c>true</c> once the
     /// lease is held, or <c>false</c> if it remains contended for the whole budget —
     /// i.e. a peer genuinely owns it. <paramref name="sleep"/> defaults to
-    /// <see cref="Thread.Sleep(TimeSpan)"/>; tests inject a no-op to keep the loop
-    /// deterministic.
+    /// <see cref="Thread.Sleep(TimeSpan)"/> and <paramref name="tryAcquire"/> to the
+    /// real non-blocking flock (<see cref="TryAcquireExclusiveLease"/>); tests inject
+    /// substitutes to exercise the retry loop deterministically, without depending on
+    /// real flock release timing under a concurrently-forking process.
     /// </summary>
     internal static bool TryAcquireExclusiveLeaseWithBackoff(
         FileStream lease,
         int maxAttempts = DefaultExclusiveLeaseRetryAttempts,
         TimeSpan? retryDelay = null,
-        Action<TimeSpan>? sleep = null)
+        Action<TimeSpan>? sleep = null,
+        Func<FileStream, bool>? tryAcquire = null)
     {
         ArgumentNullException.ThrowIfNull(lease);
         if (maxAttempts < 1)
             throw new ArgumentOutOfRangeException(nameof(maxAttempts));
         var delay = retryDelay ?? DefaultExclusiveLeaseRetryDelay;
         var sleepFor = sleep ?? Thread.Sleep;
+        var acquire = tryAcquire ?? TryAcquireExclusiveLease;
         for (var attempt = 1; ; attempt++)
         {
-            if (TryAcquireExclusiveLease(lease))
+            if (acquire(lease))
                 return true;
             if (attempt >= maxAttempts)
                 return false;
