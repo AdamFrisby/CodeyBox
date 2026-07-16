@@ -166,6 +166,10 @@ public sealed class UnboundConfigKeyValidatorTests
             ["CodeyBox:Presets:ProjectRoot"] = "/etc/codeybox/presets",
             ["CodeyBox:Mutation:Enabled"] = "true",
             ["CodeyBox:Mutation:ChangedCodeThresholdPercent"] = "80",
+            ["CodeyBox:Audit:Coverage:Mode"] = "blocking",
+            ["CodeyBox:Audit:Coverage:Exclusions:0:File"] = "src/Gen.cs",
+            ["CodeyBox:Audit:Coverage:Exclusions:0:Line"] = "5",
+            ["CodeyBox:Audit:Coverage:Exclusions:0:Justification"] = "generated",
             ["CodeyBox:CheckAndActCompletion:Enabled"] = "true",
             ["CodeyBox:CheckAndActCompletion:GeminiModel"] = "gemini-2.5-pro",
             // Plugins: typed properties bind…
@@ -227,6 +231,21 @@ public sealed class UnboundConfigKeyValidatorTests
         var report = Assert.Single(reports);
         Assert.Equal("CodeyBox:Mutation:Enabld", report.Path);
         Assert.Equal("Enabled", report.NearestProperty);
+    }
+
+    [Fact]
+    public void Inspect_FlagsTypoInsideSeparatelyBoundSection_AuditCoverage()
+    {
+        var config = BuildConfig(new()
+        {
+            ["CodeyBox:Audit:Coverage:Mdoe"] = "blocking",
+        });
+
+        var reports = UnboundConfigKeyHostedValidator.Inspect(config);
+
+        var report = Assert.Single(reports);
+        Assert.Equal("CodeyBox:Audit:Coverage:Mdoe", report.Path);
+        Assert.Equal("Mode", report.NearestProperty);
     }
 
     [Fact]

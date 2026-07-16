@@ -33,41 +33,42 @@ public sealed class GraphicalSmokeWiringTests
         var composed = composer.Compose(project, new ScriptedAgent([]));
 
         // gui:smoke is composed FIRST (prepended for graphical projects); the
-        // always-on prompt-revision trailer, build-script, and mutation-rigor
-        // auditors are appended after preset auditors (all auto-included when
-        // registered), then the config-enabled-by-default plan-adherence
+        // always-on prompt-revision trailer, build-script, mutation-rigor, and
+        // coverage auditors are appended after preset auditors (all auto-included
+        // when registered), then the config-enabled-by-default plan-adherence
         // reviewer and the plan-audit chain (TEST 01, TEST 02, TEST 03, TEST 04,
         // TEST 05, TEST 06, TEST 07, TEST 08, TEST 09, then TEST 10) auditors are appended last,
         // in chain order. With no language/auditType presets this project ends up with all
-        // fifteen registered always-on auditors composed. (The plan-audit auditors are
+        // sixteen registered always-on auditors composed. (The plan-audit auditors are
         // Plan-target only, so ComposeForTarget(Code) filters them out; the
         // untargeted Compose here returns the full set.)
-        Assert.Equal(15, composed.Count);
+        Assert.Equal(16, composed.Count);
         Assert.IsType<GraphicalSmokeAuditor>(composed[0]);
         Assert.IsType<PromptRevisionTrailerAuditor>(composed[1]);
         Assert.IsType<BuildScriptAuditor>(composed[2]);
         Assert.Equal("tests:mutation-rigor", composed[3].Name);
-        Assert.Equal("plan:adherence", composed[4].Name);
+        Assert.Equal(CoverageAuditor.AuditorName, composed[4].Name);
+        Assert.Equal("plan:adherence", composed[5].Name);
         Assert.Equal(
-            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test01AuditorName, composed[5].Name);
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test01AuditorName, composed[6].Name);
         Assert.Equal(
-            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test02AuditorName, composed[6].Name);
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test02AuditorName, composed[7].Name);
         Assert.Equal(
-            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test03AuditorName, composed[7].Name);
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test03AuditorName, composed[8].Name);
         Assert.Equal(
-            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test04AuditorName, composed[8].Name);
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test04AuditorName, composed[9].Name);
         Assert.Equal(
-            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test05AuditorName, composed[9].Name);
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test05AuditorName, composed[10].Name);
         Assert.Equal(
-            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test06AuditorName, composed[10].Name);
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test06AuditorName, composed[11].Name);
         Assert.Equal(
-            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test07AuditorName, composed[11].Name);
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test07AuditorName, composed[12].Name);
         Assert.Equal(
-            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test08AuditorName, composed[12].Name);
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test08AuditorName, composed[13].Name);
         Assert.Equal(
-            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test09AuditorName, composed[13].Name);
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test09AuditorName, composed[14].Name);
         Assert.Equal(
-            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test10AuditorName, composed[14].Name);
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test10AuditorName, composed[15].Name);
     }
 
     [Fact]
@@ -90,31 +91,32 @@ public sealed class GraphicalSmokeWiringTests
 
         var composed = composer.Compose(project, new ScriptedAgent([]));
 
-        Assert.Equal(14, composed.Count);
+        Assert.Equal(15, composed.Count);
         Assert.IsType<PromptRevisionTrailerAuditor>(composed[0]);
         Assert.IsType<BuildScriptAuditor>(composed[1]);
         Assert.Equal("tests:mutation-rigor", composed[2].Name);
-        Assert.Equal("plan:adherence", composed[3].Name);
+        Assert.Equal(CoverageAuditor.AuditorName, composed[3].Name);
+        Assert.Equal("plan:adherence", composed[4].Name);
         Assert.Equal(
-            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test01AuditorName, composed[4].Name);
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test01AuditorName, composed[5].Name);
         Assert.Equal(
-            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test02AuditorName, composed[5].Name);
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test02AuditorName, composed[6].Name);
         Assert.Equal(
-            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test03AuditorName, composed[6].Name);
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test03AuditorName, composed[7].Name);
         Assert.Equal(
-            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test04AuditorName, composed[7].Name);
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test04AuditorName, composed[8].Name);
         Assert.Equal(
-            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test05AuditorName, composed[8].Name);
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test05AuditorName, composed[9].Name);
         Assert.Equal(
-            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test06AuditorName, composed[9].Name);
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test06AuditorName, composed[10].Name);
         Assert.Equal(
-            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test07AuditorName, composed[10].Name);
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test07AuditorName, composed[11].Name);
         Assert.Equal(
-            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test08AuditorName, composed[11].Name);
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test08AuditorName, composed[12].Name);
         Assert.Equal(
-            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test09AuditorName, composed[12].Name);
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test09AuditorName, composed[13].Name);
         Assert.Equal(
-            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test10AuditorName, composed[13].Name);
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test10AuditorName, composed[14].Name);
         Assert.Contains(composed, a => a.Name == BuildScriptAuditor.AuditorName);
         Assert.DoesNotContain(composed, a => a.Name == "gui:smoke");
     }

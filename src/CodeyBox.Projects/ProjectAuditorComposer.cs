@@ -194,6 +194,17 @@ public sealed class ProjectAuditorComposer
             IncludeRegisteredAuditor("tests:mutation-rigor", auditors, prepend: false);
         }
 
+        // Always include the deterministic coverage gate when registered. Like
+        // mutation-rigor it is config-gated: the auditor no-ops to a pass off the
+        // .NET path or on an empty diff, and its report-only default never blocks.
+        // A project skips it by listing the name under ExcludedAuditors.
+        if (_registeredAuditorsByName.ContainsKey(CoverageAuditor.AuditorName)
+            && !auditors.Any(a => a.Name.Equals(
+                CoverageAuditor.AuditorName, StringComparison.OrdinalIgnoreCase)))
+        {
+            IncludeRegisteredAuditor(CoverageAuditor.AuditorName, auditors, prepend: false);
+        }
+
         // Plan-adherence reviewer: a code-target LLM auditor that checks the diff
         // against the approved plan. Config-gated by CodeyBox:PlanAdherence and
         // composed with the resolving project's agent (like the preset LLM
