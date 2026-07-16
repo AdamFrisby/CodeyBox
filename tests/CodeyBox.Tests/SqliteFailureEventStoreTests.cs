@@ -298,6 +298,48 @@ public sealed class SqliteFailureEventStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task Transition_ConditionalUpdate_ThatApplies_IntoFailure_EmitsOneRow()
+    {
+        var dbPath = NewDbPath();
+        SqliteFailureEventStore? failureStore = null;
+        using var workStore = new SqliteWorkItemStore(dbPath, failureEventStore: () => failureStore);
+        using var fStore = new SqliteFailureEventStore(dbPath);
+        failureStore = fStore;
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("proj"),
+            Title = "t",
+            Prompt = "p",
+            Agent = AgentKind.Claude,
+            SuspendedVmName = "vm-7",
+        };
+        await workStore.CreateAsync(item); // persisted state = Queued
+        Assert.Empty(await fStore.QueryAsync(null, null, 200));
+
+        // The state-only CAS is the third hooked persist method. A successful
+        // guarded transition into a failure state must emit exactly one row —
+        // the positive counterpart to the non-applying case above.
+        var failed = item.With(WorkItemState.Failed, "boom", failureKind: "agent");
+        var applied = await workStore.TryUpdateIfStateAsync(failed, WorkItemState.Queued);
+
+        Assert.True(applied);
+        var row = Assert.Single(await fStore.QueryAsync(null, null, 200));
+        Assert.Equal(item.Id, row.WorkItemId);
+        Assert.Equal("agent", row.FailureKind);
+        Assert.Equal("boom", row.ErrorMessage);
+        Assert.Equal(WorkItemState.Failed.ToString(), row.Phase);
+        Assert.Equal("vm-7", row.SandboxName);
+
+        // A repeated apply that leaves state + kind + error unchanged must not
+        // duplicate the row (dedup on the conditional-update path).
+        var reapplied = await workStore.TryUpdateIfStateAsync(failed, WorkItemState.Failed);
+        Assert.True(reapplied);
+        Assert.Single(await fStore.QueryAsync(null, null, 200));
+    }
+
+    [Fact]
     public async Task Transition_StampedConditionalUpdate_IntoFailure_EmitsOneRow()
     {
         var dbPath = NewDbPath();
