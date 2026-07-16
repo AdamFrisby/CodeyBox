@@ -296,4 +296,51 @@ public sealed class SqliteFailureEventStoreTests : IDisposable
         Assert.False(applied);
         Assert.Empty(await fStore.QueryAsync(null, null, 200));
     }
+
+    [Fact]
+    public async Task Transition_StampedConditionalUpdate_IntoFailure_EmitsOneRow()
+    {
+        var dbPath = NewDbPath();
+        SqliteFailureEventStore? failureStore = null;
+        using var workStore = new SqliteWorkItemStore(dbPath, failureEventStore: () => failureStore);
+        using var fStore = new SqliteFailureEventStore(dbPath);
+        failureStore = fStore;
+
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("proj"),
+            Title = "t",
+            Prompt = "p",
+            Agent = AgentKind.Claude,
+            SuspendedVmName = "vm-11",
+        };
+        await workStore.CreateAsync(item); // persisted state = Queued
+        var persisted = await workStore.GetAsync(item.Id);
+        Assert.NotNull(persisted);
+        Assert.Empty(await fStore.QueryAsync(null, null, 200));
+
+        // The recovery/quota path persists via the (state, updated_at)-stamped CAS.
+        // A successful stamped transition into a failure state must emit exactly one
+        // row, exercising the fourth hooked persist method end-to-end.
+        var failed = persisted! with
+        {
+            State = WorkItemState.Failed,
+            LastError = "boom",
+            FailureKind = "agent",
+            UpdatedAt = persisted.UpdatedAt.AddSeconds(1),
+        };
+        var applied = await workStore.TryUpdateIfStateAndUpdatedAtAsync(
+            failed,
+            WorkItemState.Queued,
+            persisted.UpdatedAt);
+
+        Assert.True(applied);
+        var row = Assert.Single(await fStore.QueryAsync(null, null, 200));
+        Assert.Equal(item.Id, row.WorkItemId);
+        Assert.Equal("agent", row.FailureKind);
+        Assert.Equal("boom", row.ErrorMessage);
+        Assert.Equal(WorkItemState.Failed.ToString(), row.Phase);
+        Assert.Equal("vm-11", row.SandboxName);
+    }
 }
