@@ -94,6 +94,27 @@ public sealed class SqliteFailureEventStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task AppendThenQuery_NormalisesNonUtcOffsetToSameUtcInstant()
+    {
+        var dbPath = NewDbPath();
+        var id = new WorkItemId(Guid.NewGuid());
+        SeedWorkItemRow(dbPath, id);
+        using var store = new SqliteFailureEventStore(dbPath);
+
+        // A caller in a +05:30 zone: the stored ISO text must be normalised to UTC
+        // (offset 0) so occurred_at sorts and range-filters lexicographically, and
+        // the read must yield the SAME absolute instant. A production regression
+        // dropping the UTC normalisation would leave this the only failing test.
+        var offsetInstant = new DateTimeOffset(2026, 7, 16, 9, 15, 0, TimeSpan.FromHours(5.5));
+        await store.AppendAsync(Rec(id, "quota", offsetInstant));
+
+        var r = Assert.Single(await store.QueryAsync(since: null, kind: null, limit: 200));
+        Assert.Equal(TimeSpan.Zero, r.OccurredAt.Offset);
+        Assert.Equal(offsetInstant.ToUniversalTime(), r.OccurredAt);
+        Assert.Equal(offsetInstant.UtcDateTime, r.OccurredAt.UtcDateTime);
+    }
+
+    [Fact]
     public async Task Append_NullableFields_StoreAndReadBackAsNull()
     {
         var dbPath = NewDbPath();
