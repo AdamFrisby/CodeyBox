@@ -385,4 +385,69 @@ public sealed class SqliteFailureEventStoreTests : IDisposable
         Assert.Equal(WorkItemState.Failed.ToString(), row.Phase);
         Assert.Equal("vm-11", row.SandboxName);
     }
+
+    [Fact]
+    public async Task Transition_AgentRestoreRetryClaim_IntoFailure_EmitsOneRow()
+    {
+        var dbPath = NewDbPath();
+        SqliteFailureEventStore? failureStore = null;
+        using var workStore = new SqliteWorkItemStore(dbPath, failureEventStore: () => failureStore);
+        using var fStore = new SqliteFailureEventStore(dbPath);
+        failureStore = fStore;
+
+        // The agent-restore retry path persists via the fifth hooked method,
+        // TryUpdateIfStateAndUpdatedAtWithAgentRestoreRetryClaimAsync. It requires
+        // the current row to be Failed (its CAS guard and stale-claim check), so
+        // the item is created already Failed — that INSERT logs one entry row.
+        var outageStart = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("proj"),
+            Title = "t",
+            Prompt = "p",
+            Agent = AgentKind.Claude,
+            SuspendedVmName = "vm-restore",
+            State = WorkItemState.Failed,
+            FailureKind = "agent",
+            LastError = "agent down",
+            UpdatedAt = outageStart.AddMinutes(2),
+        };
+        await workStore.CreateAsync(item);
+        Assert.Single(await fStore.QueryAsync(null, null, 200));
+
+        var restoredAt = DateTimeOffset.UtcNow;
+        Assert.True(await workStore.TryClaimAgentRestoreRetryAsync(
+            item.Id, AgentKind.Claude, outageStart, restoredAt));
+
+        // Retry the claimed item straight INTO another failure/park state. The
+        // real retrier moves items OUT of failure, but a future caller must not be
+        // able to slip a failure entry past the log through this persist path, so
+        // an applied transition into WaitingForQuotaReset must emit exactly one
+        // more row carrying the new kind/error.
+        var requeuedIntoFailure = item with
+        {
+            State = WorkItemState.WaitingForQuotaReset,
+            FailureKind = "quota",
+            LastError = "still throttled",
+            UpdatedAt = item.UpdatedAt.AddSeconds(1),
+        };
+        var applied = await workStore.TryUpdateIfStateAndUpdatedAtWithAgentRestoreRetryClaimAsync(
+            requeuedIntoFailure,
+            WorkItemState.Failed,
+            item.UpdatedAt,
+            AgentKind.Claude,
+            outageStart,
+            restoredAt);
+
+        Assert.True(applied);
+        var rows = await fStore.QueryAsync(null, null, 200);
+        Assert.Equal(2, rows.Count);
+        var latest = rows[0]; // occurred_at desc — the requeue entry is newest
+        Assert.Equal(item.Id, latest.WorkItemId);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset.ToString(), latest.Phase);
+        Assert.Equal("quota", latest.FailureKind);
+        Assert.Equal("still throttled", latest.ErrorMessage);
+        Assert.Equal("vm-restore", latest.SandboxName);
+    }
 }

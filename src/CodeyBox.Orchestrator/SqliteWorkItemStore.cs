@@ -1438,10 +1438,11 @@ public sealed class SqliteWorkItemStore :
     // The single mutable failure fields on a work item are overwritten by the
     // next retry, so there is no durable record of past failures. Every persist
     // method that writes a work-item row (UpdateAsync, TryUpdateIfStateAsync,
-    // TryUpdateIfStateAndUpdatedAtAsync, and CreateAsync) emits ONE failure_events
-    // row, after releasing the write gate, when the write ENTERS a failure/park
-    // state (or the kind/error changed while already in one). The update-family
-    // methods capture the pre-write failure snapshot (below) to detect entry and
+    // TryUpdateIfStateAndUpdatedAtAsync, TryUpdateIfStateAndUpdatedAtWithAgentRestoreRetryClaimAsync,
+    // and CreateAsync) emits ONE failure_events row, after releasing the write
+    // gate, when the write ENTERS a failure/park state (or the kind/error changed
+    // while already in one). The update-family methods capture the pre-write
+    // failure snapshot (below) to detect entry and
     // suppress duplicates; CreateAsync has no prior row and passes a null
     // snapshot, so it emits iff the inserted state is itself a failure/park state.
     // The emit runs OUTSIDE the write gate because the failure store shares this
@@ -2544,9 +2545,15 @@ public sealed class SqliteWorkItemStore :
         DateTimeOffset restoredAt,
         CancellationToken ct = default)
     {
+        FailureStateSnapshot? previousFailureSnapshot = null;
+        bool applied = false;
         await _writeLock.WaitAsync(ct);
         try
         {
+            // Pre-write failure snapshot, captured before the transaction opens so
+            // it observes the committed current state (a Microsoft.Data.Sqlite
+            // command cannot run outside the connection's active transaction).
+            previousFailureSnapshot = await ReadFailureSnapshotForTransitionAsync(item, ct).ConfigureAwait(false);
             using var tx = _conn.BeginTransaction();
             using (var stale = _conn.CreateCommand())
             {
@@ -2681,7 +2688,7 @@ public sealed class SqliteWorkItemStore :
             }
 
             tx.Commit();
-            return true;
+            applied = true;
         }
         catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
         {
@@ -2691,6 +2698,16 @@ public sealed class SqliteWorkItemStore :
         {
             _writeLock.Release();
         }
+
+        // Fifth work-item state-persist path: like its four siblings it writes
+        // state + last_error from caller input, so it carries the same
+        // failure-event guard. This agent-restore retry path today moves an item
+        // OUT of failure (so the helper no-ops), but the hook preserves the
+        // invariant that every APPLIED transition into a failure/park state is
+        // recorded, even if a future caller retries into one.
+        if (applied)
+            await EmitFailureEventIfEnteringFailureAsync(previousFailureSnapshot, item, ct).ConfigureAwait(false);
+        return applied;
     }
 
     public async Task ReleaseAgentRestoreRetryClaimAsync(
