@@ -10,6 +10,21 @@ namespace CodeyBox.Tests;
 
 public sealed class IncusSandboxLifecycleTests
 {
+    // The "delete reports success but the VM persists" scenarios reuse
+    // OperationTimeout for two purposes: the per-CLI-call deadline AND the
+    // WaitForInstanceAbsence poll budget. A 100 ms budget was fine for the
+    // absence wait but far too tight for the per-call deadline on the loaded
+    // 6-vCPU verify VM: an instant mock verification call (config get / list)
+    // that runs after the deadline's timer has already fired — because the
+    // thread was starved between the timeout CTS's creation and the call — is
+    // surfaced as a TimeoutException *before* the delete runs, leaving
+    // DeleteCalls off by one. Size the budget generously so only the genuine
+    // "VM still present" wait can time out, never a starved pre-delete call.
+    // The absence wait still terminates deterministically because the mock
+    // keeps reporting the VM present until CompleteDeletion is set.
+    private static readonly TimeSpan PersistingDeletionOperationTimeout = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan PersistingDeletionPollInterval = TimeSpan.FromMilliseconds(10);
+
     [Fact]
     public async Task GuestLinkRemoval_RejectsChangedTargetBeforeRootUnlink()
     {
@@ -576,8 +591,8 @@ public sealed class IncusSandboxLifecycleTests
         {
             CaptureResourceMetrics = false,
             DiskGuard = null,
-            OperationTimeout = TimeSpan.FromMilliseconds(100),
-            ReadinessPollInterval = TimeSpan.FromMilliseconds(10),
+            OperationTimeout = PersistingDeletionOperationTimeout,
+            ReadinessPollInterval = PersistingDeletionPollInterval,
         };
         var spec = new SandboxSpec { ImageReference = "local-image" };
         var authorization = RecoveryAuthorization(options, spec);
@@ -639,18 +654,8 @@ public sealed class IncusSandboxLifecycleTests
             {
                 StagingDirectory = root,
                 DiskGuard = null,
-                // OperationTimeout is a REAL-CLOCK per-command deadline as well as the
-                // absence-poll deadline. The intended phase-1 TimeoutException comes from
-                // WaitForInstanceAbsenceAsync (the fake VM never disappears while
-                // CompleteDeletion is false). A very short deadline (e.g. 100ms) also
-                // covers each instant fake command, so under a starved thread pool the
-                // deadline could fire before the `delete` command even runs — the first
-                // DisposeLeakedAsync would then throw before DeleteCalls is incremented,
-                // and the final Assert.Equal(2, DeleteCalls) would see 1. Use a generous
-                // deadline so the delete always issues first; absence is still never
-                // observed, so the poll still times out as the test requires.
-                OperationTimeout = TimeSpan.FromSeconds(2),
-                ReadinessPollInterval = TimeSpan.FromMilliseconds(25),
+                OperationTimeout = PersistingDeletionOperationTimeout,
+                ReadinessPollInterval = PersistingDeletionPollInterval,
             },
             NullLogger<IncusSandboxProvider>.Instance,
             timings: null,
