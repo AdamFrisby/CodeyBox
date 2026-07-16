@@ -173,8 +173,14 @@ committed-repo mechanism redirects it. Verified empirically against a
 root-owned `~/.nuget`: `RestoreConfigFile` (pinned in `Directory.Build.props`
 and passed explicitly via `-p:RestoreConfigFile=...`) and a `Directory.Build.rsp`
 default-arg injection both still abort with the identical `.../.nuget/NuGet ...
-denied`; only pointing `DOTNET_CLI_HOME` (or `HOME`) at a writable directory
-lets restore succeed, leaving the root-owned `~/.nuget` untouched.
+denied`. A `Directory.Build.props` side-effect that tries to repoint the home
+from inside evaluation — `$([System.Environment]::SetEnvironmentVariable('DOTNET_CLI_HOME', ...))`
+— cannot work either: MSBuild rejects it at evaluation with `MSB4185: The
+function "SetEnvironmentVariable" ... is not available for execution as an
+MSBuild property function` (env mutation is not on MSBuild's property-function
+allowlist), so the build fails before restore even starts. Only pointing
+`DOTNET_CLI_HOME` (or `HOME`) at a writable directory *in the process
+environment* lets restore succeed, leaving the root-owned `~/.nuget` untouched.
 
 For every dotnet invocation CodeyBox itself launches this is handled
 automatically and needs no operator action. The `SandboxRequiredBuildVerifier`
