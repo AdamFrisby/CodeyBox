@@ -976,7 +976,10 @@ a live call returns 429). The probe surfaces structured
 lockout pins `ResetAt` to the exact reset moment and the work item parks
 in `WaitingForQuotaReset` until then instead of churning.
 
-**Quota failure detector:** recognises `RESOURCE_EXHAUSTED`,
+**Quota failure detector:** recognises `RESOURCE_EXHAUSTED`, the rendered
+Google-API 429 message `Resource has been exhausted (e.g. check quota).`
+(agy logs the human-readable message form, which carries neither the
+screaming-snake status token nor the phrase `quota exceeded`),
 `quota exceeded`, `weekly limit reached`, `account locked until …`, and
 the structured `quota_metadata.lockout_until` envelope. Distinguishes
 hard weekly lockouts (`QuotaFailureKind.LimitReached`) from transient

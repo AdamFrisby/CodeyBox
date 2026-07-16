@@ -85,6 +85,61 @@ public sealed class AntigravityQuotaFailureDetectorTests
     }
 
     [Fact]
+    public void Detect_RenderedGoogleApi429Message_ClassifiesRateLimit()
+    {
+        // REGRESSION (hidden 429): agy renders the cloudcode-pa / Generative
+        // Language 429 as the canonical Google-API error MESSAGE — "Resource has
+        // been exhausted (e.g. check quota)." — which carries neither the
+        // "RESOURCE_EXHAUSTED" status token nor the phrase "quota exceeded"
+        // ("check quota" != "quota exceeded"). Before this shape was recognised,
+        // a real hidden 429 slipped through Detect as null and the run terminated
+        // as a generic "agent exited 1" failure with no quota record / no park.
+        var detection = _detector.Detect(
+            stderr: "Error: Resource has been exhausted (e.g. check quota).",
+            stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+    }
+
+    [Fact]
+    public void Detect_GrpcResourceExhaustedStatus_ClassifiesRateLimit()
+    {
+        // The camel-case gRPC status string ("code = ResourceExhausted") does not
+        // contain the screaming-snake "RESOURCE_EXHAUSTED" token, so it needs its
+        // own marker to be classified rather than falling through as a generic
+        // failure.
+        var detection = _detector.Detect(
+            stderr: "rpc error: code = ResourceExhausted desc = quota",
+            stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+    }
+
+    [Fact]
+    public void ExtractTerminalErrorRegion_RenderedGoogleApi429Message_IsSurfaced()
+    {
+        // The SAME marker set gates the glog->Stderr fold. A terminal agy 429 that
+        // logs only the rendered Google-API message must be extracted so the
+        // runner folds it into result.Stderr and the pipeline can park it — before
+        // the message shape was a marker, this returned null and the fold produced
+        // nothing.
+        var glog = "Model resolved: gemini-3.5-flash\n"
+            + "applyAuthResult: authMethod=consumer\n"
+            + "Error: Resource has been exhausted (e.g. check quota).";
+
+        var region = AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(glog);
+
+        Assert.NotNull(region);
+        Assert.Contains("Resource has been exhausted", region!);
+        Assert.DoesNotContain("Model resolved", region);
+        var detection = _detector.Detect(stderr: region, stdout: null);
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+    }
+
+    [Fact]
     public void Detect_ResourceExhaustedWithoutResetDuration_ClassifiesWithNullReset()
     {
         // A RESOURCE_EXHAUSTED 429 that carries NO parseable reset duration must

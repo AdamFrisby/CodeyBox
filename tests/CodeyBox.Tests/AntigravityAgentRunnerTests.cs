@@ -717,6 +717,42 @@ public sealed class AntigravityAgentRunnerTests
     }
 
     [Fact]
+    public async Task RunAsync_FailedRun_RenderedGoogleApi429Message_FoldsTerminalErrorIntoStderr()
+    {
+        // REGRESSION guard for the glog->result.Stderr surfacing of a HIDDEN 429.
+        // agy frequently logs the cloudcode-pa 429 as the rendered Google-API
+        // MESSAGE — "Resource has been exhausted (e.g. check quota)." — not the
+        // raw JSON envelope, so neither the "RESOURCE_EXHAUSTED" token nor the
+        // phrase "quota exceeded" appears. If that message is not a recognised
+        // marker the terminal region is empty, NOTHING is folded into Stderr, and
+        // the pipeline terminal-fails the run as a generic "agent exited 1" with
+        // no quota record and no WaitingForQuotaReset park. This test fails if the
+        // marker/pattern set stops covering the rendered-message shape.
+        var sandbox = new AntigravityLogCapturingSandbox(
+            logFileContent: "Model resolved: gemini-3.5-flash\n"
+                + "applyAuthResult: authMethod=consumer\n"
+                + "Error: Resource has been exhausted (e.g. check quota).",
+            agyExitCode: 1);
+        var runner = new AntigravityAgentRunner();
+
+        var result = await runner.RunAsync(
+            sandbox, "/work", "do something", credential: null,
+            captureStructuredStream: false);
+
+        // The terminal 429 message IS folded into the classifier-facing Stderr so
+        // the quota detector sees it; agy's own process stderr is preserved ahead.
+        Assert.Contains("Resource has been exhausted", result.Stderr ?? string.Empty);
+        Assert.Contains("agy failed", result.Stderr ?? string.Empty);
+        Assert.DoesNotContain("Model resolved: gemini-3.5-flash", result.Stderr ?? string.Empty);
+
+        // And the folded Stderr is genuinely quota-classifiable end-to-end through
+        // the real detector the pipeline consults.
+        var detection = new AntigravityQuotaFailureDetector().Detect(result.Stderr, result.Stdout);
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+    }
+
+    [Fact]
     public async Task RunAsync_FailedRun_RecoveredEarly429ThenNonQuotaFailure_DoesNotFoldIntoStderr()
     {
         // Classifier-safety, the exact false-positive the design guards against: agy
