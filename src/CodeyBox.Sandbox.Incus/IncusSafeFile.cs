@@ -131,6 +131,14 @@ internal static partial class IncusSafeFile
     internal const int DefaultExclusiveLeaseRetryAttempts = 100;
     internal static readonly TimeSpan DefaultExclusiveLeaseRetryDelay = TimeSpan.FromMilliseconds(20);
 
+    // Reclaiming a *leaked* workspace lease (its owner already released it) only has
+    // to outlast the same fork/exec duplication window, but — unlike the coordination
+    // or retained-sandbox lease — a peer that genuinely holds this lease is mid-bake
+    // and legitimately in use, so recovery must skip it promptly rather than stall on
+    // it. This short budget clears a transient duplicate (~0.3 s) yet abandons a
+    // genuinely-owned workspace quickly.
+    internal const int RecoveryDeleteLeaseRetryAttempts = 16;
+
     /// <summary>
     /// Acquires the advisory exclusive lease, retrying the non-blocking flock across
     /// a bounded budget so that transient contention from a concurrent fork/exec

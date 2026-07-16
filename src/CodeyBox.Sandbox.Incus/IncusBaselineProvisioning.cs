@@ -294,7 +294,14 @@ internal sealed class IncusProvisioningWorkspace : IDisposable
         {
             acquiredLease = IncusSafeFile.OpenOrCreatePrivateLeaseNoFollow(
                 Path.Combine(workspaceRoot, WorkspaceLeaseName));
-            if (!IncusSafeFile.TryAcquireExclusiveLease(acquiredLease))
+            // Retry briefly across the fork/exec contention window (see
+            // RecoveryDeleteLeaseRetryAttempts): recovery of a leaked workspace whose
+            // owner already released its lease must not be defeated by a transient
+            // duplicate descriptor from an unrelated subprocess spawn, yet must still
+            // skip a workspace a peer genuinely holds mid-bake without stalling.
+            if (!IncusSafeFile.TryAcquireExclusiveLeaseWithBackoff(
+                acquiredLease,
+                IncusSafeFile.RecoveryDeleteLeaseRetryAttempts))
             {
                 acquiredLease.Dispose();
                 return false;

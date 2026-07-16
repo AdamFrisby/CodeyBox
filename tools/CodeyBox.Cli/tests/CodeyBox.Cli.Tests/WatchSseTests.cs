@@ -494,6 +494,12 @@ public sealed class WatchSseTests
     public async Task TryWatchWorkItemEventsAsync_SlowConnect_RequiresInfiniteSseTimeout()
     {
         // Regression guard: production uses a dedicated _sseHttp with infinite timeout.
+        // The short-timeout client's /events connect never completes on its own, so its
+        // fallback is driven solely by the SSE timeout firing — no wall-clock race
+        // between a finite timeout and a handler delay, which would flake under load
+        // when timer starvation pushes the timeout past the delay. The infinite-timeout
+        // client uses a separate handler whose brief connect delay always completes,
+        // proving an infinite SSE timeout tolerates a slow connect.
         var config = new ResolvedConfig
         {
             ApiBaseUrl = "http://localhost:5036",
