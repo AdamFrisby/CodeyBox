@@ -240,4 +240,108 @@ public sealed class BuildScriptNuGetHealTests
             Directory.Delete(root, recursive: true);
         }
     }
+
+    // The audit build/test gates that cannot route through build.sh — the
+    // required-build BuildScript and the tool-audit sandbox setup — dot-source the
+    // shared recovery directly as `. ./scripts/nuget-home-heal.sh` from the
+    // repository root. That invocation form (cwd-relative, no `$0`) differs from
+    // build.sh's `dirname $0` resolution, so exercise it explicitly against a
+    // broken home and assert the same on-disk recovery.
+    private static string HealScriptRepoRoot()
+        => FindAncestorContaining(AppContext.BaseDirectory, "build.sh")
+            ?? throw new InvalidOperationException(
+                "Cannot locate the repository root from " + AppContext.BaseDirectory);
+
+    private static async Task<ProcessRunResult> DotSourceHealAsync(string root, string home)
+    {
+        var repoRoot = HealScriptRepoRoot();
+        Assert.True(
+            File.Exists(Path.Combine(repoRoot, "scripts", "nuget-home-heal.sh")),
+            "the shared heal script must exist for the gate call sites to source it");
+
+        var env = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["HOME"] = home,
+            ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            ["TMPDIR"] = root,
+        };
+        // Mirror the gate call sites verbatim: cd into the checkout, then dot-source
+        // the repository-relative recovery.
+        return await new DefaultProcessRunner().RunAsync(
+            ["/bin/sh", "-c", "cd \"$1\" && . ./scripts/nuget-home-heal.sh", "sh", repoRoot],
+            null,
+            CancellationToken.None,
+            maxStdoutBytes: 65536,
+            maxStderrBytes: 65536,
+            environment: env);
+    }
+
+    [Fact]
+    public async Task HealScript_DirectDotSource_HealsBrokenNuGetHome_PreservingCache()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        Directory.CreateDirectory(home);
+        try
+        {
+            var nugetDir = Path.Combine(home, ".nuget", "NuGet");
+            Directory.CreateDirectory(nugetDir);
+            var config = Path.Combine(nugetDir, "NuGet.Config");
+            await File.WriteAllTextAsync(config, "<configuration/>");
+            await ChmodAsync("000", config); // present-but-unreadable reproduces the fatal read
+            var marker = Path.Combine(home, ".nuget", "packages", "pkg", "marker.txt");
+            Directory.CreateDirectory(Path.GetDirectoryName(marker)!);
+            await File.WriteAllTextAsync(marker, "cached");
+
+            var result = await DotSourceHealAsync(root, home);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            // Broken tree quarantined aside (preserved), fresh writable home created.
+            Assert.Single(Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
+            var probe = Path.Combine(home, ".nuget", "NuGet", "writable-probe");
+            await File.WriteAllTextAsync(probe, "ok"); // throws if not writable
+            var healedConfig = Path.Combine(home, ".nuget", "NuGet", "NuGet.Config");
+            Assert.Contains("<configuration", await File.ReadAllTextAsync(healedConfig), StringComparison.Ordinal);
+            // Populated offline cache survives through the preserved symlink.
+            Assert.Equal("cached", await File.ReadAllTextAsync(
+                Path.Combine(home, ".nuget", "packages", "pkg", "marker.txt")));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task HealScript_DirectDotSource_LeavesWritableHomeIntact()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        Directory.CreateDirectory(home);
+        try
+        {
+            var marker = Path.Combine(home, ".nuget", "packages", "pkg", "marker.txt");
+            Directory.CreateDirectory(Path.GetDirectoryName(marker)!);
+            await File.WriteAllTextAsync(marker, "cached");
+
+            var result = await DotSourceHealAsync(root, home);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            // A usable home is untouched: no quarantine, no leftover probe, real cache intact.
+            Assert.Empty(Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
+            Assert.False(File.Exists(
+                Path.Combine(home, ".nuget", "NuGet", ".codeybox-writable-probe")));
+            Assert.Equal("cached", await File.ReadAllTextAsync(marker));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
 }
