@@ -45,10 +45,14 @@ public sealed class BuildScriptNuGetHealTests
 
     // Runs the real build.sh with an isolated HOME and a stub `dotnet` on PATH, so
     // the heal block executes against the fixture while build.sh's trailing
-    // `dotnet build` returns without a real build. The stub drops a sentinel that
-    // proves the heal fell through to the build step rather than aborting.
+    // `dotnet` invocation returns without a real build. The stub records the exact
+    // argument vector it received, which both proves the heal fell through to the
+    // build step rather than aborting and lets callers assert argument forwarding.
     private static async Task<(ProcessRunResult Result, string Home, string Sentinel)>
-        RunBuildScriptAsync(string root, Func<string, Task> seedHomeAsync)
+        RunBuildScriptAsync(
+            string root,
+            Func<string, Task> seedHomeAsync,
+            IReadOnlyList<string>? scriptArgs = null)
     {
         var home = Path.Combine(root, "home");
         var stubDir = Path.Combine(root, "stub-bin");
@@ -57,7 +61,10 @@ public sealed class BuildScriptNuGetHealTests
 
         var sentinel = Path.Combine(root, "dotnet-invoked");
         var stub = Path.Combine(stubDir, "dotnet");
-        await File.WriteAllTextAsync(stub, "#!/bin/sh\nprintf ran > '" + sentinel + "'\nexit 0\n");
+        // NUL-separate the recorded argv so an argument containing whitespace is
+        // still unambiguous when the test reads it back.
+        await File.WriteAllTextAsync(
+            stub, "#!/bin/sh\nprintf '%s\\0' \"$@\" > '" + sentinel + "'\nexit 0\n");
         await ChmodAsync("755", stub);
 
         await seedHomeAsync(home);
@@ -71,14 +78,23 @@ public sealed class BuildScriptNuGetHealTests
             ["TMPDIR"] = root,
         };
 
+        var argv = new List<string> { "/bin/sh", BuildScriptPath() };
+        if (scriptArgs is not null)
+            argv.AddRange(scriptArgs);
         var result = await new DefaultProcessRunner().RunAsync(
-            ["/bin/sh", BuildScriptPath()],
+            argv,
             null,
             CancellationToken.None,
             maxStdoutBytes: 65536,
             maxStderrBytes: 65536,
             environment: env);
         return (result, home, sentinel);
+    }
+
+    private static async Task<IReadOnlyList<string>> ReadRecordedArgvAsync(string sentinel)
+    {
+        var raw = await File.ReadAllTextAsync(sentinel);
+        return raw.Split('\0', StringSplitOptions.RemoveEmptyEntries);
     }
 
     [Fact]
@@ -165,6 +181,59 @@ public sealed class BuildScriptNuGetHealTests
                 Path.Combine(home, ".nuget", "NuGet", ".codeybox-writable-probe")));
             var marker = Path.Combine(home, ".nuget", "packages", "pkg", "marker.txt");
             Assert.Equal("cached", await File.ReadAllTextAsync(marker));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task BuildScript_ForwardsGateArgumentsThroughHeal()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-buildsh-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        try
+        {
+            // The audit gates invoke `dotnet test --no-build` (and other commands)
+            // directly; routing them through build.sh must apply the same NuGet-home
+            // heal and then run the requested command verbatim, not the default build.
+            string[] gateArgs = ["test", "--no-build", "CodeyBox.slnx"];
+            var (result, _, sentinel) = await RunBuildScriptAsync(
+                root,
+                seededHome => Task.CompletedTask,
+                gateArgs);
+
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+            var forwarded = await ReadRecordedArgvAsync(sentinel);
+            Assert.Equal(gateArgs, forwarded);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task BuildScript_WithoutArguments_BuildsTheSolution()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-buildsh-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        try
+        {
+            var (result, _, sentinel) = await RunBuildScriptAsync(
+                root,
+                seededHome => Task.CompletedTask);
+
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+            var forwarded = await ReadRecordedArgvAsync(sentinel);
+            Assert.Equal(["build", "CodeyBox.slnx"], forwarded);
         }
         finally
         {

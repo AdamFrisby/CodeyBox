@@ -90,4 +90,12 @@ if [ -n "$cli_home" ]; then
     fi
 fi
 
-dotnet build CodeyBox.slnx
+# Forward any explicit arguments straight to `dotnet` so every gate command —
+# `build CodeyBox.slnx`, `build --no-incremental -warnaserror`, `test --no-build`
+# — runs through the NuGet-home heal above, not just the default build. With no
+# arguments, keep the historical behaviour of building the whole solution.
+if [ "$#" -gt 0 ]; then
+    dotnet "$@"
+else
+    dotnet build CodeyBox.slnx
+fi

@@ -131,10 +131,15 @@ dotnet build CodeyBox.slnx
 > another user), NuGet otherwise aborts restore with an unauthorized-access error.
 >
 > `./build.sh` guards against this automatically: it probes the inherited
-> `.nuget/NuGet` directory and, when it is not writable, redirects `DOTNET_CLI_HOME`
-> to a fresh scratch directory for that build. A bare `dotnet build CodeyBox.slnx`
-> (or an IDE build) does not run that probe, so for those either keep the home
-> writable or set `DOTNET_CLI_HOME` to a writable directory yourself.
+> `.nuget/NuGet` directory and, when it is not writable, quarantines it aside and
+> recreates a writable one (falling back to a scratch `DOTNET_CLI_HOME` only when
+> `$HOME` itself is unwritable). It then forwards any arguments straight to
+> `dotnet`, so every gate command runs through the same heal — for example
+> `./build.sh build --no-incremental -warnaserror` or `./build.sh test --no-build
+> CodeyBox.slnx`; with no arguments it builds the whole solution. A bare
+> `dotnet build CodeyBox.slnx` (or an IDE build) does not run that probe, so for
+> those either keep the home writable or set `DOTNET_CLI_HOME` to a writable
+> directory yourself.
 >
 > CI and audit gates invoke `dotnet build`/`dotnet test` directly rather than
 > through `./build.sh`, and NuGet performs the fatal user-config read during
