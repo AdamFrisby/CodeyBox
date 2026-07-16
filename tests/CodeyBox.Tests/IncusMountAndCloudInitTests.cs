@@ -153,6 +153,26 @@ public sealed class IncusMountAndCloudInitTests
                 maxStderrBytes: 4096);
             Assert.True(rerun.Success, rerun.Stderr);
             Assert.True(File.Exists(cacheMarker));
+
+            // A CLI home that a prior boot left as a real .nuget directory (not
+            // the fresh tmpfs the deployment usually supplies) must still be
+            // relinked to the cache-populated guest home, not have the link
+            // silently nested inside the stale directory.
+            Directory.Delete(Path.Combine(cliHome, ".nuget"));
+            Directory.CreateDirectory(Path.Combine(cliHome, ".nuget", "stale-state"));
+            var relink = await runner.RunAsync(
+                ["/bin/sh", "-s", "--", guestHome, uid, gid, cliHome],
+                IncusSandboxProvider.PrepareDotnetHomesScript,
+                CancellationToken.None,
+                maxStdoutBytes: 4096,
+                maxStderrBytes: 4096);
+            Assert.True(relink.Success, relink.Stderr);
+            var relinked = new DirectoryInfo(Path.Combine(cliHome, ".nuget"));
+            Assert.Equal(Path.Combine(guestHome, ".nuget"), relinked.LinkTarget);
+            Assert.False(
+                Directory.Exists(Path.Combine(cliHome, ".nuget", ".nuget")),
+                "the link must replace the stale directory, not nest inside it");
+            Assert.True(File.Exists(cacheMarker));
         }
         finally
         {

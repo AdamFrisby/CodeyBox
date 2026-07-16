@@ -2118,6 +2118,18 @@ public sealed class IncusSandboxProvider :
         else
           install -d -m 0700 -o "$guest_uid" -g "$guest_gid" "$nuget_home"
         fi
+        # Point the CLI-home NuGet dir at the cache-populated guest one. ln -sfn
+        # replaces an existing symlink or file, but when the target path is a
+        # real directory it silently creates the link INSIDE it
+        # ($cli_home/.nuget/.nuget) instead of replacing it, leaving
+        # DOTNET_CLI_HOME with an empty .nuget that misses the baked offline
+        # packages. Drop a pre-existing real (non-symlink) directory first so the
+        # link always resolves to the cache, keeping the re-own idempotent across
+        # boots that start from either an empty tmpfs CLI home or one a prior boot
+        # already populated.
+        if [ -d "$cli_home/.nuget" ] && [ ! -L "$cli_home/.nuget" ]; then
+          rm -rf "$cli_home/.nuget"
+        fi
         ln -sfn "$nuget_home" "$cli_home/.nuget"
         """;
 
