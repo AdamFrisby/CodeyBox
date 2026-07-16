@@ -15,6 +15,7 @@ namespace CodeyBox.Tests;
 /// detecting a broken home, stops quarantining it aside, or stops preserving the
 /// baked offline package cache.
 /// </summary>
+[Collection("Real build toolchain")]
 public sealed class BuildScriptNuGetHealTests
 {
     private static string BuildScriptPath()

@@ -18,6 +18,7 @@ namespace CodeyBox.Tests;
 /// NuGet's user-config read, i.e. if a plain <c>dotnet build</c> no longer heals
 /// itself — the regression that forced the gates offline.
 /// </summary>
+[Collection("Real build toolchain")]
 public sealed class MsBuildNuGetHealTests
 {
     private static string? FindAncestorContaining(string start, string fileName)
