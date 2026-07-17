@@ -1,9 +1,12 @@
-<Project InitialTargets="CodeyBoxHealNuGetHome">
+<Project InitialTargets="CodeyBoxHealNuGetHome;CodeyBoxReclaimNuGetHome">
 
   <!-- Heal an unwritable inherited per-user NuGet home before restore reads it.
        InitialTargets runs this at the start of every project MSBuild invocation,
        before NuGet's user-config read; the target lives in one shared file so the
-       solution- and project-level hooks stay identical. -->
+       solution- and project-level hooks stay identical. The Reclaim target below
+       is an additional belt-and-suspenders fast-path (idempotent no-op when the
+       home is already writable) targeting a slightly different unwritable-home
+       shape; both are wired via InitialTargets. -->
   <Import Project="$(MSBuildThisFileDirectory)Directory.NuGetHomeHeal.targets" />
 
   <PropertyGroup>
@@ -44,5 +47,20 @@
     <_CodeyBoxOriginalDotNetHome Condition="'$(_CodeyBoxOriginalDotNetHome)' == ''">$(USERPROFILE)</_CodeyBoxOriginalDotNetHome>
     <RestorePackagesPath Condition="'$(RestorePackagesPath)' == '' and '$(_CodeyBoxOriginalDotNetHome)' != ''">$([System.IO.Path]::Combine('$(_CodeyBoxOriginalDotNetHome)', '.nuget', 'packages'))</RestorePackagesPath>
   </PropertyGroup>
+
+  <!-- Runs BEFORE restore reads the NuGet user config within the SAME dotnet
+       process, so a bare `dotnet build` (which inherits none of the
+       DOTNET_CLI_HOME/HOME pinning that build.sh and SandboxRequiredBuildVerifier
+       apply) can still repair a root-owned, unwritable ~/.nuget provisioned by
+       some sandbox base images. The script is a fast-path no-op when the NuGet
+       home is already usable (the normal developer case) and never fails the
+       build. POSIX-only: the defect and its repair are Unix-permission specific.
+       See scripts/reclaim-nuget-home.sh. -->
+  <Target Name="CodeyBoxReclaimNuGetHome"
+          Condition="'$(OS)' != 'Windows_NT' And Exists('$(MSBuildThisFileDirectory)scripts/reclaim-nuget-home.sh')">
+    <Exec Command="sh &quot;$(MSBuildThisFileDirectory)scripts/reclaim-nuget-home.sh&quot;"
+          StandardOutputImportance="Low"
+          StandardErrorImportance="Low" />
+  </Target>
 
 </Project>

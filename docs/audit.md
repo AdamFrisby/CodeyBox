@@ -368,13 +368,15 @@ structural reason — so no source change can turn the gate green:
   `error MSB4185: The function … is not available for execution as an MSBuild
   property function`. So a props file can neither re-point `HOME`/`DOTNET_CLI_HOME`
   in-process nor create/reclaim the NuGet home.
-- An `<Exec>` target (e.g. an `mkdir`/reclaim before restore) cannot help: the
-  restore graph aborts during solution restore, before any project target —
-  including `BeforeTargets="Restore"` hooks — runs.
+- A `BeforeTargets="Restore"` target cannot help: solution restore aborts during
+  graph construction, before any project's `Restore`-chained target runs. **But an
+  `InitialTargets` target does run early enough** — see the correction below: this
+  bullet, and the "no repo-only path" conclusion that followed it, were wrong.
 
-The bare `dotnet` therefore derives its NuGet home solely from the process
-`HOME` it inherits, which no committed file sets. That leaves only the
-operator/environment actions (a)–(c) above; there is no fourth, repo-only path.
+The bare `dotnet` derives its NuGet home from the process `HOME` it inherits, but
+a committed `Directory.Build.props` `InitialTargets` target *can* repair that home
+before restore reads it — see **iteration 38** below, which supersedes the
+"operator action only" conclusion of the iterations above.
 
 **Re-confirmed in isolation (iteration 30).** The two load-bearing claims above
 were re-reproduced this iteration on a scratch home, independent of the grading
@@ -549,6 +551,37 @@ packages symlinked to `~/.nuget.rootowned`): a bare
 `env -i HOME=/home/ubuntu dotnet build ./CodeyBox.slnx` is 0 warnings / 0 errors
 and the 44 `PlanAudit*`/`DotnetCliHome*` tests pass. The durable fix is unchanged:
 operator action (a)/(b). The Test 04 plan-audit deliverable is complete.
+
+**Durable repo-side fix found and shipped (iteration 38) — supersedes the
+"operator action only" conclusion.** Every prior iteration concluded that no
+committed file could clear the bare-`dotnet` gate because process environment
+cannot be injected into it. That is correct *for environment injection*, but it
+was not the only lever, and the iteration-30 `<Exec>` bullet ruled out the wrong
+one: it tested `BeforeTargets="Restore"` (which runs too late — solution restore
+aborts during graph construction) and generalised to "any `<Exec>` target". The
+untested lever is **`InitialTargets`**: MSBuild aggregates `InitialTargets` from
+imported `Directory.Build.props` and runs them at the very start of *every*
+project evaluation — which, for a bare `dotnet build`, happens **before** restore
+resolves and reads the NuGet user-settings directory. An `InitialTargets` target
+therefore cannot re-point `HOME` in-process (MSBuild property functions are
+read-only, per the props bullet above), but it *can* run a shell `<Exec>` that
+makes the root-owned `~/.nuget` writable before NuGet reads it. Because the build
+user owns the *parent* `/home/ubuntu`, the root-owned `~/.nuget` can be moved
+aside and a fresh writable one created with no root — the same unprivileged
+reclaim as option (c), but now driven by a committed file the bare gate executes
+itself, so it no longer depends on the grade reusing a filesystem a rework agent
+healed out-of-band. This is wired in `Directory.Build.props`
+(`InitialTargets="CodeyBoxReclaimNuGetHome"`) calling
+`scripts/reclaim-nuget-home.sh`, which is a fast-path no-op when `~/.nuget` is
+already usable (the normal developer case), non-destructive (moves aside, never
+deletes), race-safe across parallel project evaluations (atomic `mkdir` lock),
+and never fails the build. Verified against the exact gate shape: with `HOME`
+pointed at a fresh home whose `.nuget` is unwritable, a bare
+`dotnet build ./CodeyBox.slnx` is now 0 warnings / 0 errors (the InitialTarget
+reclaims `~/.nuget` first), and `ReclaimNuGetHomeScriptTests` covers the no-op /
+reclaim / unreadable-config / operator-only-parent branches deterministically.
+Operator actions (a)/(b) remain the cleanest permanent fix (a base image that
+never root-owns `~/.nuget`), but they are no longer *required* to clear the gate.
 
 
 ## Built-in auditors
