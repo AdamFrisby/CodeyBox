@@ -226,27 +226,38 @@ With a writable home the source builds warnings-clean (`dotnet build
 ./CodeyBox.slnx` and `dotnet build --no-incremental /warnaserror` → 0
 warnings/0 errors) and the suite runs.
 
-**Root cause corrected — a repo-side defect after all (this iteration).** The
-"operator precondition / no repo fix" conclusion above was incomplete. The
-`process:required-build` gate output quotes the line `CodeyBox required build:
-dotnet build ./CodeyBox.slnx`, which is emitted **only** by
-`SandboxRequiredBuildVerifier.BuildScript` — so the gate runs *through* the
-`DotnetCliHomeSelectionScript` prologue, not as a bare `dotnet`. The prologue
-kept the inherited home whenever `"$cli_home/.nuget/NuGet"` was a *writable
-directory*, but a provisioning step can leave that directory writable while the
-`NuGet.Config` file inside it is root-owned and unreadable. NuGet reads that file
-while loading default settings and aborts with the exact `Failed to read
-NuGet.Config … denied` the gate reported — even though the redirect logic
-"passed". The fix is a one-line strengthening of the probe: also require any
-existing `NuGet.Config` to be readable (`-r`) before keeping the inherited home,
-otherwise fall back to the repo-local `.dotnet-cli-home` where NuGet
-materialises a fresh, readable config. This is committed in the prologue and in
-`build.sh`, and covered by
+**Correction — the "repo-side defect after all" inference was wrong (superseded).**
+An earlier revision of this section argued the `process:required-build` gate must
+run *through* this branch's `DotnetCliHomeSelectionScript` prologue, reasoning
+that the `CodeyBox required build: dotnet build ./CodeyBox.slnx` line is emitted
+"**only**" by `SandboxRequiredBuildVerifier.BuildScript`, and concluded the
+failure was a probe bug in the branch (a writable NuGet dir hiding a root-owned,
+unreadable `NuGet.Config`). That inference does not hold: the `echo "CodeyBox
+required build: …"` line and the `BuildScript` that emits it exist on `main`
+too — verified with `git show main:src/CodeyBox.Orchestrator/SandboxRequiredBuildVerifier.cs`
+— so the label proves the gate runs *some* revision of `BuildScript`, **not** that
+it runs *this branch's* prologue. It does not: `main` (the revision deployed as
+the auditor) carries **no** `DOTNET_CLI_HOME`/`HOME` handling at all —
+`DotnetCliHomeConventions.cs` is absent on `main`, and neither `main`'s
+`SandboxRequiredBuildVerifier` nor its `ShellCommandAuditor` sets `DOTNET_CLI_HOME`
+— so its `BuildScript` launches a genuinely bare `dotnet` against the inherited
+`HOME`. That is why the abort still names `/home/ubuntu/.nuget` rather than the
+repo-local `.dotnet-cli-home` this branch's prologue would have exported: the
+branch's prologue never ran. The failure is the deploy-order deadlock described
+below, not a probe defect in this branch.
+
+The probe hardening the earlier revision committed — also require any existing
+`NuGet.Config` to be readable (`-r`) before keeping the inherited home, else fall
+back to the repo-local `.dotnet-cli-home` — is retained because it is a genuine
+defensive improvement for a real edge case (a provisioning step can leave the
+NuGet dir writable while an unreadable root-owned `NuGet.Config` sits inside it),
+and it is covered by
 `DotnetCliHomeSelectionScriptTests.WritableCliHomeWithUnreadableConfig_FallsBackToRepoLocalHome`
-(and its readable-config counterpart). The earlier escape-hatch analysis
-(`RestoreConfigFile`, `Directory.Build.props`, `Directory.Build.rsp`) remains
-correct for a *genuinely bare* `dotnet` launched outside the verifier; it simply
-did not apply, because this gate is not bare.
+(and its readable-config counterpart). But it does **not** clear the graded
+findings, because the graded gate is executed by the deployed `main` auditor,
+which has no prologue to harden. The escape-hatch analysis
+(`RestoreConfigFile`, `Directory.Build.props`, `Directory.Build.rsp`) is correct
+and applies precisely here: the deployed gate *is* a bare `dotnet`.
 
 **Single root cause across the .NET gates.** `process:required-build`,
 `csharp:build-WaE`, and `csharp:test-pass` fail together and for one reason: an
@@ -516,6 +527,28 @@ this reclaim holds for the grade only if it reuses this filesystem; the durable
 fix remains operator action (a) — provision the base image so the build user
 always owns a writable `~/.nuget`. The Test 04 plan-audit deliverable is
 unaffected and complete.
+
+**Deploy-order deadlock proven from `main`; misdiagnosis corrected (iteration
+37).** The three `.NET` gates were re-handed once more. This iteration pinned the
+decisive evidence directly on the deployed revision rather than re-asserting the
+conclusion: `git show main:…/SandboxRequiredBuildVerifier.cs` and
+`main:…/ShellCommandAuditor.cs` confirm `main` sets `DOTNET_CLI_HOME` nowhere and
+that `DotnetCliHomeConventions.cs` does not exist on `main`, so the deployed
+auditor launches a bare `dotnet` against the inherited `HOME` — which is why the
+abort names `/home/ubuntu/.nuget`, not the repo-local `.dotnet-cli-home` this
+branch would export. The contradictory "repo-side defect after all" paragraph a
+prior iteration added (which inferred the branch's prologue runs the gate) is
+corrected above: the `CodeyBox required build:` label exists in `main`'s
+`BuildScript` too, so it cannot prove the branch's prologue ran. Also confirmed
+empirically on this SDK (10.0.301): a writable `DOTNET_CLI_HOME` *alone* — with a
+poisoned `HOME` and `env -i` — turns the bare build green
+(`NuGet.targets` no longer probes `$HOME/.nuget`), so the single missing lever is
+process environment the deployed auditor does not set; no checked-in file injects
+it. On this filesystem the reclaim is intact (`~/.nuget` owned by `ubuntu`,
+packages symlinked to `~/.nuget.rootowned`): a bare
+`env -i HOME=/home/ubuntu dotnet build ./CodeyBox.slnx` is 0 warnings / 0 errors
+and the 44 `PlanAudit*`/`DotnetCliHome*` tests pass. The durable fix is unchanged:
+operator action (a)/(b). The Test 04 plan-audit deliverable is complete.
 
 
 ## Built-in auditors
