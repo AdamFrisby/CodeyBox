@@ -419,6 +419,26 @@ filesystem; the durable fix remains operator action (a) — provision the base
 image so the build user always owns a writable `~/.nuget`. The Test 04
 plan-audit deliverable is unaffected and complete.
 
+**Re-verified; iteration-33 reclaim still intact (iteration 34).** The same
+three `.NET` gates were re-handed this round from the prior audit iteration.
+Direct observation confirms the iteration-33 reclaim survives on this
+filesystem: `~/.nuget` is owned by the build user (`ubuntu`), with
+`~/.nuget/packages -> ~/.nuget.rootbak/packages` preserving the provisioned
+cache, so `dotnet build ./CodeyBox.slnx` is 0 warnings / 0 errors and the 31
+`PlanAudit*` tests pass against the inherited `HOME` with no further action. The
+current-branch seams were re-read and confirmed correct — no defect to fix:
+`SandboxRequiredBuildVerifier.DotnetCliHomeSelectionScript` probes the inherited
+`DOTNET_CLI_HOME` for writability and otherwise falls back to the repo-local
+`.dotnet-cli-home`, exporting both `DOTNET_CLI_HOME` and `HOME`, and
+`DotnetCliHomeConventions.ApplyIfDotnetInvocation` pins the same pair on each
+`dotnet` shell-auditor exec. A CodeyBox carrying these seams self-heals the gate
+for every project; the residual failure is the deploy-order deadlock (the
+*deployed* auditor predates the seams and launches bare `dotnet` against the
+intermittently root-owned re-provisioned `~/.nuget`, per iterations 29/32). The
+durable fix is unchanged: operator action (a) — provision the audit base image
+so the build user always owns a writable `~/.nuget`. The Test 04 plan-audit
+deliverable is unaffected and complete.
+
 
 ## Built-in auditors
 
