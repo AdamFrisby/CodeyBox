@@ -41,6 +41,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     private readonly ILogger<WorkerProgressWatchdog> _log;
     private readonly IStartupInitialRecoveryBarrier? _startupRecoveryBarrier;
     private readonly CancellationRegistry? _cancellations;
+    private readonly TimeProvider _time;
     private IWorkerPoolRecoverySlotReleaser? _slotReleaser;
 
     // Tracks worker ids whose item the watchdog has already recycled in this
@@ -62,7 +63,8 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
         IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null,
         IWorkerProgressActivitySource? activitySource = null,
-        CancellationRegistry? cancellationRegistry = null)
+        CancellationRegistry? cancellationRegistry = null,
+        TimeProvider? timeProvider = null)
     {
         _registry = registry;
         _store = store;
@@ -75,6 +77,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         _slotReleaser = slotReleaser;
         _startupRecoveryBarrier = startupRecoveryBarrier;
         _cancellations = cancellationRegistry;
+        _time = timeProvider ?? TimeProvider.System;
     }
 
     public WorkerProgressWatchdog(
@@ -88,8 +91,9 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
         IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null,
         IWorkerProgressActivitySource? activitySource = null,
-        CancellationRegistry? cancellationRegistry = null)
-        : this(registry, store, queue, () => opts, log, streams, webhooks, slotReleaser, startupRecoveryBarrier, activitySource, cancellationRegistry) { }
+        CancellationRegistry? cancellationRegistry = null,
+        TimeProvider? timeProvider = null)
+        : this(registry, store, queue, () => opts, log, streams, webhooks, slotReleaser, startupRecoveryBarrier, activitySource, cancellationRegistry, timeProvider) { }
 
     /// <summary>
     /// Lets <see cref="OrchestratorService"/> wire itself in after-the-fact
@@ -143,7 +147,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
             var workers = await _registry.ListAsync(ct);
             if (workers.Count == 0) return;
 
-            var now = DateTimeOffset.UtcNow;
+            var now = _time.GetUtcNow();
 
             foreach (var worker in workers)
             {
@@ -385,7 +389,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         // looping through recovery forever and burning a slot per iteration.
         if (WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(attempts, opts.MaxRecoveryAttempts))
         {
-            var failedAt = DateTimeOffset.UtcNow;
+            var failedAt = _time.GetUtcNow();
             var failedBase = item.HasTypedAgentTurnRecoveryBoundary
                 ? WorkItemRecoveryPolicy.ReleaseAgentTurnDispatchClaim(item) with
                 {
@@ -462,7 +466,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                 WorkItemRecoveryPolicy.ReleaseAgentTurnDispatchClaim(item) with
             {
                 StartedAt = null,
-                UpdatedAt = DateTimeOffset.UtcNow,
+                UpdatedAt = _time.GetUtcNow(),
             }, attempts, item.State);
         }
         else
@@ -488,7 +492,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                 AgentTurnRecoveryLease = target is WorkItemState.Working or WorkItemState.Reworking
                     ? item.AgentTurnRecoveryLease
                     : null,
-                UpdatedAt = DateTimeOffset.UtcNow,
+                UpdatedAt = _time.GetUtcNow(),
             }, attempts, item.State);
             updated = WorkItemRecoveryPolicy.ClearPlanFieldsIfQueued(updated);
         }
@@ -577,7 +581,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                 LastError = null,
                 StartedAt = null,
                 WorkBranch = null,
-                UpdatedAt = DateTimeOffset.UtcNow,
+                UpdatedAt = _time.GetUtcNow(),
             };
 
             var wrote = await _store.TryUpdateIfStateAsync(requeued, WorkItemState.Cancelled, ct);

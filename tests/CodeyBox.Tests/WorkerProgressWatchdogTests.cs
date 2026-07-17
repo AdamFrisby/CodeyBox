@@ -1913,6 +1913,63 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         Assert.Single(_slotReleaser.Releases);
     }
 
+    [Fact]
+    public async Task Watchdog_PerAgentOverride_CrockSurvivesSimulatedBatchWaitThenRecoversPastCeiling()
+    {
+        // Deterministic proof of the headline crock acceptance criterion using
+        // an injected clock (no real delay, no backdated timestamp): a crock
+        // item legitimately waiting on a minutes-to-hours batch is NOT recovered
+        // while inside the per-agent override window — even well past the
+        // 60-minute synchronous-agent default the watchdog would otherwise apply
+        // — and IS recovered once the wait exceeds the operator-sized ceiling.
+        // The watchdog reads its sweep clock from the injected TimeProvider, so
+        // Advance() moves the whole >60-minute wait forward without wall-clock.
+        var time = new ManualTimeProvider();
+        var opts = new WorkerProgressWatchdogOptions
+        {
+            ProgressTimeout = TimeSpan.FromMinutes(30),
+            CheckInterval = TimeSpan.FromMinutes(1),
+            AutoRecover = true,
+            PerAgent =
+            {
+                ["crock"] = new AgentWatchdogOverride
+                {
+                    ProgressTimeout = TimeSpan.FromHours(8),
+                },
+            },
+        };
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, opts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser,
+            timeProvider: time);
+
+        var crockItem = MakeItem(WorkItemState.Working, time.GetUtcNow())
+            with
+        { Agent = AgentKind.Crock };
+        await _store.CreateAsync(crockItem);
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), crockItem.Id);
+
+        // 90 simulated minutes — well past the 30-minute global default but
+        // inside the 8h crock override. The batch is still pending; the item
+        // must live.
+        time.Advance(TimeSpan.FromMinutes(90));
+        await watchdog.RunOnceAsync(CancellationToken.None);
+        var mid = await _store.GetAsync(crockItem.Id);
+        Assert.Equal(WorkItemState.Working, mid!.State);
+        Assert.Equal(0, mid.RecoveryAttempts);
+        Assert.Empty(_slotReleaser.Releases);
+
+        // Cross the 8h ceiling. Now the wait is genuinely pathological and the
+        // watchdog recovers the worker's slot.
+        time.Advance(TimeSpan.FromHours(8));
+        await watchdog.RunOnceAsync(CancellationToken.None);
+        var after = await _store.GetAsync(crockItem.Id);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Single(_slotReleaser.Releases);
+    }
+
     // ── Test doubles ─────────────────────────────────────────────────────────
 
     private static DiagProcess StartBusyProcess(WorkItemId itemId)
