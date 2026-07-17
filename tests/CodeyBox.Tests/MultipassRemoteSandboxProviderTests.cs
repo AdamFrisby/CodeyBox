@@ -587,8 +587,13 @@ public sealed class MultipassRemoteSandboxProviderTests
 
         var first = Task.Run(() => provider.CreateAsync(new SandboxSpec { ImageReference = "ignored", BaselineImageRef = baseline }));
         var second = Task.Run(() => provider.CreateAsync(new SandboxSpec { ImageReference = "ignored", BaselineImageRef = baseline }));
-        await using var firstSandbox = await first.WaitAsync(TimeSpan.FromSeconds(5));
-        await using var secondSandbox = await second.WaitAsync(TimeSpan.FromSeconds(5));
+        // The heavy-op fakes block a pool thread via Thread.Sleep, so when the full
+        // suite saturates the thread pool the two serialized CreateAsync chains can be
+        // scheduled slowly. This WaitAsync is only a liveness backstop against a genuine
+        // deadlock (the assertion below proves serialization), so give it generous
+        // headroom rather than a tight 5s that flakes under a starved pool.
+        await using var firstSandbox = await first.WaitAsync(TimeSpan.FromSeconds(60));
+        await using var secondSandbox = await second.WaitAsync(TimeSpan.FromSeconds(60));
 
         Assert.Equal(1, maxHeavy);
     }
