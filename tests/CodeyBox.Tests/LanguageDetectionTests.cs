@@ -564,12 +564,15 @@ public sealed class LanguageDetectionTests
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
-            var command = string.Join(' ', exec.Argv);
+            // dotnet gate auditors self-heal a root-owned ~/.nuget, so unwrap to
+            // the logical command for recording and matching.
+            var argv = TestSupport.EffectiveArgv(exec);
+            var command = string.Join(' ', argv);
             Commands.Add(command);
             if (exec.WorkingDirectory is not null)
                 WorkingDirectories.Add(exec.WorkingDirectory);
 
-            if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
+            if (argv.Count >= 3 && argv[0] == "sh" && argv[1] == "-c")
             {
                 var directories = Enumerable.Range(0, 40).Select(i => $"./project-{i}");
                 if (_includeRootMarker)
@@ -595,17 +598,19 @@ public sealed class LanguageDetectionTests
             if (exec.WorkingDirectory is not null)
                 WorkingDirectories.Add(exec.WorkingDirectory);
 
-            if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
+            // dotnet gate auditors self-heal a root-owned ~/.nuget; unwrap first.
+            var argv = TestSupport.EffectiveArgv(exec);
+            if (argv.Count >= 3 && argv[0] == "sh" && argv[1] == "-c")
             {
-                if (exec.Argv[2].Contains("command -v", StringComparison.Ordinal))
+                if (argv[2].Contains("command -v", StringComparison.Ordinal))
                     return Task.FromResult(new SandboxExecResult(0, "/usr/bin/dotnet\n", ""));
 
                 return Task.FromResult(new SandboxExecResult(0, "./project-ok\n./project-unverified\n", ""));
             }
 
-            if (exec.Argv.Count >= 2 &&
-                exec.Argv[0] == "dotnet" &&
-                exec.Argv[1] == "test" &&
+            if (argv.Count >= 2 &&
+                argv[0] == "dotnet" &&
+                argv[1] == "test" &&
                 exec.WorkingDirectory?.EndsWith("/project-unverified", StringComparison.Ordinal) == true)
             {
                 const string output = """
@@ -632,16 +637,19 @@ public sealed class LanguageDetectionTests
 
         public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
-            var command = string.Join(' ', exec.Argv);
+            // dotnet gate auditors self-heal a root-owned ~/.nuget, so unwrap to
+            // the logical command for recording and dispatch.
+            var argv = TestSupport.EffectiveArgv(exec);
+            var command = string.Join(' ', argv);
             var workingDirectory = exec.WorkingDirectory ?? Environment.CurrentDirectory;
             Invocations.Add((command, workingDirectory));
 
-            if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
+            if (argv.Count >= 3 && argv[0] == "sh" && argv[1] == "-c")
             {
-                if (exec.Argv[2].Contains("command -v", StringComparison.Ordinal))
-                    return new SandboxExecResult(0, "/usr/bin/" + exec.Argv[^1] + "\n", "");
+                if (argv[2].Contains("command -v", StringComparison.Ordinal))
+                    return new SandboxExecResult(0, "/usr/bin/" + argv[^1] + "\n", "");
 
-                return await RunShellAsync(exec.Argv[2], workingDirectory, ct);
+                return await RunShellAsync(argv[2], workingDirectory, ct);
             }
 
             return new SandboxExecResult(0, "", "");

@@ -27,6 +27,23 @@ namespace CodeyBox.Tests;
 /// </summary>
 internal static class TestSupport
 {
+    /// <summary>
+    /// Returns the logical command a sandbox exec represents, unwrapping the
+    /// <see cref="NuGetHomeSelfHeal"/> self-heal wrapper
+    /// (<c>["sh","-c",script,"sh", ...original]</c>) that dotnet gate auditors
+    /// apply. Non-wrapped execs are returned unchanged. Lets a fake sandbox match
+    /// on the real command regardless of whether self-heal is enabled.
+    /// </summary>
+    public static IReadOnlyList<string> EffectiveArgv(SandboxExec exec) => EffectiveArgv(exec.Argv);
+
+    /// <inheritdoc cref="EffectiveArgv(SandboxExec)"/>
+    public static IReadOnlyList<string> EffectiveArgv(IReadOnlyList<string> argv) =>
+        argv.Count >= 4
+        && argv[0] == "sh" && argv[1] == "-c" && argv[3] == "sh"
+        && argv[2].Contains("nuget_home_broken", StringComparison.Ordinal)
+            ? [.. argv.Skip(4)]
+            : argv;
+
     public static WorkItemTerminalTransition CreateTerminalTransition(
         IWorkItemStore store,
         IWebhookDispatcher? webhooks,

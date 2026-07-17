@@ -97,6 +97,7 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
             CanShortCircuitOnBlockingFinding = _opts.CanShortCircuitOnBlockingFinding,
             Role = _opts.Role,
             BuildTestGateEvidence = _opts.BuildTestGateEvidence,
+            SelfHealNuGetHome = _opts.SelfHealNuGetHome,
         });
         return inner.RunAsync(sandbox, workingDirectory, context, ct);
     }
@@ -141,6 +142,13 @@ public sealed record DotnetTestAuditorOptions
     public bool CanShortCircuitOnBlockingFinding { get; init; }
     public AuditorRole Role { get; init; } = AuditorRole.None;
     public BuildTestGateEvidence BuildTestGateEvidence { get; init; } = BuildTestGateEvidence.None;
+
+    /// <summary>
+    /// Forwarded to the delegated <see cref="ShellCommandAuditor"/> so a
+    /// <c>dotnet test</c> run self-heals a root-owned <c>~/.nuget</c>. Off by
+    /// default; see <see cref="ShellCommandAuditorOptions.SelfHealNuGetHome"/>.
+    /// </summary>
+    public bool SelfHealNuGetHome { get; init; }
 
     /// <summary>
     /// Live accessor for hot-reloadable run options (blame-hang / idle-timeout).

@@ -18,6 +18,12 @@ internal static class LanguagePresetHelpers
         AuditCapabilities required = AuditCapabilities.None,
         Func<TestRunOptions>? testRunOptions = null)
     {
+        // Any dotnet-driven language gate restores on first use, so it must
+        // survive a root-owned ~/.nuget on unprivileged build hosts. Enable the
+        // shared self-heal for dotnet invocations (build/test/format); it is a
+        // no-op on a healthy home and untouched for every other tool.
+        var selfHealNuGetHome = argv.Length > 0 && string.Equals(argv[0], "dotnet", StringComparison.Ordinal);
+
         var inner = IsDotnetTestPass(language, name)
             ? (IAuditor)new DotnetTestAuditor(new DotnetTestAuditorOptions
             {
@@ -27,6 +33,7 @@ internal static class LanguagePresetHelpers
                 Role = role,
                 BuildTestGateEvidence = gateEvidence,
                 RunOptionsAccessor = testRunOptions,
+                SelfHealNuGetHome = selfHealNuGetHome,
             })
             : new ShellCommandAuditor(new ShellCommandAuditorOptions
             {
@@ -38,6 +45,7 @@ internal static class LanguagePresetHelpers
                 CanShortCircuitOnBlockingFinding = canShortCircuitOnBlockingFinding,
                 Role = role,
                 BuildTestGateEvidence = gateEvidence,
+                SelfHealNuGetHome = selfHealNuGetHome,
             });
 
         return new LanguagePresetAuditor(language, markerDescription, markerScript, inner);

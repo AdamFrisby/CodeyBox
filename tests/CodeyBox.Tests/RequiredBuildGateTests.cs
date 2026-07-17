@@ -55,7 +55,7 @@ public sealed class RequiredBuildGateTests : IDisposable
 
             Assert.Equal(0, exit);
             Assert.Equal(
-                Path.Combine(tmp, "codeybox-required-build-nuget-home"),
+                Path.Combine(tmp, NuGetHomeSelfHeal.WritableHomeLeaf),
                 dotnetCliHome);
             Assert.True(Directory.Exists(dotnetCliHome));
         }
@@ -93,7 +93,7 @@ public sealed class RequiredBuildGateTests : IDisposable
     {
         var script =
             "set -eu\n"
-            + SandboxRequiredBuildVerifier.NuGetHomeSelfHealPreamble
+            + NuGetHomeSelfHeal.Preamble
             + "\nprintf '%s' \"${DOTNET_CLI_HOME:-}\"\n";
 
         var psi = new System.Diagnostics.ProcessStartInfo("/bin/sh")
