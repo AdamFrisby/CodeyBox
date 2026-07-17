@@ -3101,7 +3101,14 @@ public sealed class IncusSandboxLifecycleTests
         Task task,
         TimeSpan advance)
     {
-        const int maximumSchedulerTurns = 100;
+        // 2000 (not 100): under the full audit suite every host-spinning test
+        // class runs in parallel, so a continuation released by the injected
+        // clock can sit on a starved thread-pool ready-queue for many turns
+        // before it runs. This is only the "give the released continuation a
+        // chance to run" bound — the production recovery logic caps the actual
+        // retry attempts, so extra turns cannot change the asserted outcome;
+        // they only stop a starved pool from prematurely failing the wait.
+        const int maximumSchedulerTurns = 2000;
         for (var turn = 0; turn < maximumSchedulerTurns && !task.IsCompleted; turn++)
         {
             time.Advance(advance);
@@ -3227,10 +3234,13 @@ public sealed class IncusSandboxLifecycleTests
             // This fixture drives the real filesystem preflight and recovery
             // adoption against a synchronous mock CLI, so the operation deadline
             // only guards against a hang — it is never expected to elapse. The
-            // 250 ms FastLifecycleOptions default is a real wall-clock timer, and
-            // under full-suite CPU starvation it can fire between arming the
-            // deadline and the mock returning, aborting a correct run. Give it
-            // generous headroom; no assertion here depends on the timeout value.
+            // 250 ms FastLifecycleOptions default is a real wall-clock timer,
+            // and under full-suite CPU starvation it can fire before the mock's
+            // continuation is even scheduled, surfacing as a spurious "0-second
+            // deadline" or, if a partly acquired lease lingers, as an "already
+            // owned" failure. Give it generous headroom; no assertion here
+            // depends on the timeout value.
+
             OperationTimeout = TimeSpan.FromSeconds(30),
         };
         var originalSpec = SandboxConventions.WithTimingEnvironment(new SandboxSpec
