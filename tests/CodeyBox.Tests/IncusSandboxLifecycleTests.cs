@@ -3076,7 +3076,15 @@ public sealed class IncusSandboxLifecycleTests
     {
         CaptureResourceMetrics = false,
         DiskGuard = null,
-        OperationTimeout = TimeSpan.FromMilliseconds(250),
+        // Generous real-clock liveness backstop, not a behavioural bound: the fake
+        // process runner answers every command synchronously, so no lifecycle op
+        // here ever legitimately runs long. A tight value (formerly 250ms) only
+        // flaked -- under full-suite thread-pool starvation the injected CLI
+        // deadline could elapse before an instant Task.FromResult continuation was
+        // scheduled, failing e.g. the retained-adoption "server API probe". Tests
+        // that actually exercise the timeout path set their own short
+        // OperationTimeout locally, so widening this base changes no assertion.
+        OperationTimeout = TimeSpan.FromSeconds(30),
         ExecTimeout = TimeSpan.FromSeconds(2),
         VmStopTimeout = TimeSpan.FromMilliseconds(100),
         ReadinessPollInterval = TimeSpan.FromMilliseconds(1),
