@@ -573,6 +573,13 @@ public sealed class IncusSandboxLifecycleTests
         var runner = new StickyDeletionLifecycleRunner(sandboxName);
         var time = new ControllableTimeProvider(DateTimeOffset.UtcNow);
         var inactive = 0;
+        // Drive the delete-verification deadline off an injected clock instead of
+        // a 100 ms real-wall-clock window: a saturated audit host can let that
+        // window lapse before the first "list" verification even runs, so the
+        // first Dispose would time out having issued zero delete calls and the
+        // total would come up one short. With the fake clock the single delete +
+        // its deterministic timeout are load-independent.
+        var time = new ControllableTimeProvider(DateTimeOffset.UtcNow);
         var options = new IncusSandboxOptions
         {
             CaptureResourceMetrics = false,
@@ -619,6 +626,7 @@ public sealed class IncusSandboxLifecycleTests
 
         Assert.True(Directory.Exists(sandboxRoot));
         Assert.Equal(0, inactive);
+        Assert.Equal(1, runner.DeleteCalls);
         runner.CompleteDeletion = true;
 
         await sandbox.DisposeAsync();

@@ -203,6 +203,14 @@ public sealed class DefaultProcessRunnerCancellationTests
         const int outputBytes = (16 * 1024 * 1024) + 1;
         var runner = new DefaultProcessRunner();
 
+        // RunCompletionBudget (not the 10s prior default): under the full audit
+        // suite this real-process test races dozens of other process-spawning
+        // tests on a saturated host, so pumping 16 MiB through the child's
+        // stdout pipe and draining it can exceed 10s of wall-clock. This
+        // WaitAsync is only a harness guard against a genuine hang; no assertion
+        // checks elapsed time, so widening it weakens nothing (the exit code,
+        // both limit flags, and the exact byte count are asserted below
+        // regardless of how long the copy took).
         var result = await runner.RunAsync(
             [
                 "/bin/sh", "-c",

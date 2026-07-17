@@ -119,6 +119,58 @@ internal static partial class IncusSafeFile
         throw new IOException("Unable to acquire the private Incus provisioning lease.", new Win32Exception(error));
     }
 
+    // A process that forks a child (every Incus/git/dotnet subprocess spawn does)
+    // briefly shares all of its open file descriptors with that child between
+    // fork() and execve(). Our lease descriptors are O_CLOEXEC, so the share
+    // ends at exec — but on a saturated host the fork→exec window can last a few
+    // milliseconds, and during it an exclusive flock this process has already
+    // released still appears held via the child's inherited descriptor. That
+    // transient surfaces as a spurious "owned by another process" the instant an
+    // unrelated concurrent spawn overlaps a lease hand-off. A short, bounded,
+    // backed-off retry rides out exactly that window. It does NOT weaken mutual
+    // exclusion: a lease a genuinely-live owner holds stays held across every
+    // attempt (see Create_WithRetainedRecoveryLease_ExclusiveHostLeaseElects...),
+    // so a real conflict still fails after the budget is exhausted.
+    internal const int ExclusiveLeaseAcquireAttempts = 12;
+    internal static readonly TimeSpan ExclusiveLeaseAcquireRetryDelay = TimeSpan.FromMilliseconds(15);
+
+    internal static bool TryAcquireExclusiveLeaseWithRetry(FileStream lease)
+    {
+        ArgumentNullException.ThrowIfNull(lease);
+        return TryAcquireExclusiveLeaseWithRetry(
+            () => TryAcquireExclusiveLease(lease),
+            ExclusiveLeaseAcquireAttempts,
+            ExclusiveLeaseAcquireRetryDelay,
+            static delay => Thread.Sleep(delay));
+    }
+
+    /// <summary>
+    /// Pure retry core: re-invokes <paramref name="tryAcquire"/> until it reports
+    /// success or the <paramref name="maxAttempts"/> budget is spent, sleeping
+    /// <paramref name="retryDelay"/> between attempts and never after the last
+    /// one. Returns the final <paramref name="tryAcquire"/> result. Factored out
+    /// so the fork/exec-window resilience can be verified without touching real
+    /// file locks or wall-clock time.
+    /// </summary>
+    internal static bool TryAcquireExclusiveLeaseWithRetry(
+        Func<bool> tryAcquire,
+        int maxAttempts,
+        TimeSpan retryDelay,
+        Action<TimeSpan> sleep)
+    {
+        ArgumentNullException.ThrowIfNull(tryAcquire);
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxAttempts, 1);
+        ArgumentNullException.ThrowIfNull(sleep);
+        for (var attempt = 1; ; attempt++)
+        {
+            if (tryAcquire())
+                return true;
+            if (attempt >= maxAttempts)
+                return false;
+            sleep(retryDelay);
+        }
+    }
+
     internal static void ReleaseExclusiveLease(FileStream lease)
     {
         ArgumentNullException.ThrowIfNull(lease);
