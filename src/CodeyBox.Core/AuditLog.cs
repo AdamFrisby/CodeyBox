@@ -310,8 +310,9 @@ public static class AuditLog
         WorkItemId workItemId,
         string operation,
         int attempt,
-        string errorClass) =>
-        Audit("sandbox.provisioning_transient_retry")
+        string errorClass,
+        Serilog.ILogger? logger = null) =>
+        Audit(logger, "sandbox.provisioning_transient_retry")
             .Information(
                 "Sandbox provisioning transient failure for work item {WorkItemId}; operation={Operation}; retry {Attempt}; errorClass={ErrorClass}",
                 workItemId.ToString(), operation, attempt, errorClass);
