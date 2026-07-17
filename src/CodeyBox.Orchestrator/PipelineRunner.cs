@@ -15740,11 +15740,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 if (iteration is not null) invSpan.SetTag("codeybox.iteration", iteration.Value.ToString());
             }
             var outcome = "error";
+            // Per-agent circuit-breaker outcome for this dispatch attempt: true on
+            // success (resets the breaker), false on a genuine failure of ANY kind
+            // (feeds the windowed counter), left null for host/operator
+            // cancellations which are not the agent's fault and must not bench it.
+            bool? breakerSuccess = null;
             try
             {
                 var result = await invoker(runner, trialItem, attemptCt);
                 await FinalizeInvolvementAsync(involvementId, AgentInvolvementOutcomes.Success);
                 outcome = AgentInvolvementOutcomes.Success;
+                breakerSuccess = true;
                 return result;
             }
             catch (OperationCanceledException oce) when (
@@ -15758,6 +15764,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     || phaseCancellation.Source is not null)
                     throw phaseCancellation.Wrap(oce);
 
+                // A real per-attempt timeout (not a host/phase cancellation) is a
+                // genuine dispatch failure — feed the breaker.
+                breakerSuccess = false;
                 throw new AgentAttemptTimeoutException(
                     phaseCancellation.Phase,
                     runner.Kind,
@@ -15772,6 +15781,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
             catch (AgentSessionResumeExhaustedException ex)
             {
+                // Every path out of this catch throws a terminal failure for the
+                // attempt (auth, quota, transient, infrastructure, or agent) — all
+                // genuine dispatch failures the breaker counts.
+                breakerSuccess = false;
                 if (await TryConvertResumeExhaustionToAuthRequiredAsync(runner, trialItem, ex, attemptCt)
                     .ConfigureAwait(false) is { } authEx)
                 {
@@ -15828,11 +15841,23 @@ public sealed partial class PipelineRunner : IPipelineRunner
             }
             catch (Exception ex)
             {
+                // Any non-cancellation exception (agent error, quota, infrastructure,
+                // terminal quota) is a genuine dispatch failure for the breaker.
+                breakerSuccess = false;
                 await FinalizeInvolvementAsync(involvementId, OutcomeForFailure(ex));
                 throw;
             }
             finally
             {
+                // Feed the per-agent failure circuit breaker with this attempt's
+                // outcome, keyed by the SAME canonical route key the router's
+                // dispatch gate reads. Null (host/operator cancellation) is not the
+                // agent's fault and is skipped so it neither opens nor resets it.
+                if (breakerSuccess is { } dispatchOutcome)
+                    _classRouter?.RecordDispatchOutcome(
+                        runner.Kind,
+                        CanonicalAgentRouteKey(runner.Kind, trialItem.AgentInstanceId),
+                        dispatchOutcome);
                 invSpan?.SetTag("codeybox.outcome", outcome);
                 CodeyBoxMeters.AgentInvocations.Add(1,
                     new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),

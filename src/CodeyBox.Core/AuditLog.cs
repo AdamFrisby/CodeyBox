@@ -1371,6 +1371,21 @@ public static class AuditLog
                 id.ToString(), agent.Value, running, cap);
 
     /// <summary>
+    /// Emitted when the per-agent dispatch circuit breaker changes phase
+    /// (Closed→Open on repeated failures, Open→HalfOpen after cooldown,
+    /// HalfOpen→Closed on a recovery success, or HalfOpen→Open when a trial
+    /// fails). Independent of quota classification — it fires for failures of
+    /// ANY kind so operators can see an agent being benched by the safety net.
+    /// </summary>
+    public static void AgentCircuitBreakerTransition(
+        AgentKind agent, string routeKey, string from, string to, string reason, int failureCount) =>
+        Audit("agent_circuit_breaker.transition")
+            .Warning(
+                "Agent circuit breaker: {Agent} instance={RouteKey} {From} → {To} " +
+                "(failures={FailureCount}; {Reason})",
+                agent.Value, routeKey, from, to, failureCount, reason);
+
+    /// <summary>
     /// Emitted when the router's rate-aware gate refuses a member because adding
     /// another concurrent burn would not fit in the remaining quota window —
     /// even though the raw <c>availablePct</c> is still above the MinQuotaPct

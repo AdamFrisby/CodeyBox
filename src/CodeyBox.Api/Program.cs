@@ -1993,7 +1993,8 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
         sp.GetService<AgentConcurrencySnapshot>(),
         configuredSmokeTarget,
         sp.GetService<IAgentDispatchAvailability>(),
-        sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>());
+        sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>(),
+        sp.GetService<AgentCircuitBreaker>());
 });
 
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------
@@ -2007,6 +2008,20 @@ builder.Services.AddSingleton<AgentConcurrencyOptions>(sp =>
 // PipelineRunner would keep gating against the pre-reload caps until restart.
 builder.Services.AddSingleton<AgentConcurrencySnapshot>(sp =>
     new AgentConcurrencySnapshot(sp.GetRequiredService<AgentConcurrencyOptions>()));
+
+// AgentCircuitBreakerSnapshot — shared swappable holder for the per-agent
+// dispatch failure breaker tuning. The router's dispatch gate and PipelineRunner's
+// outcome feed both read the single AgentCircuitBreaker built over this snapshot;
+// AgentConfigHotReload publishes new tuning via Replace so an edit to
+// CodeyBox:AgentCircuitBreaker takes effect on the next gate/outcome read without
+// a process restart. Same pattern as AgentConcurrencySnapshot.
+builder.Services.AddSingleton<AgentCircuitBreakerSnapshot>(sp =>
+    new AgentCircuitBreakerSnapshot(
+        sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AgentCircuitBreaker));
+builder.Services.AddSingleton<AgentCircuitBreaker>(sp =>
+    new AgentCircuitBreaker(
+        sp.GetRequiredService<AgentCircuitBreakerSnapshot>(),
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger<AgentCircuitBreaker>()));
 
 // IncrementalRebaseSnapshot — hot-reloadable feature flag for the
 // between-iteration incremental rebase. Same swappable-singleton pattern as
@@ -3806,6 +3821,7 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         incrementalRebase: sp.GetRequiredService<IncrementalRebaseSnapshot>(),
         pipelineTuning: sp.GetRequiredService<PipelineTuningSnapshot>(),
         budgetDeferralRecheck: sp.GetRequiredService<BudgetDeferralRecheckSnapshot>(),
+        circuitBreaker: sp.GetRequiredService<AgentCircuitBreakerSnapshot>(),
         quotaRouterOptions: sp.GetRequiredService<QuotaRouterOptions>(),
         coverage: sp.GetService<IInVmSmokeCoveragePolicy>(),
         smokeOptions: sp.GetRequiredService<SmokeOptionsSnapshot>(),
@@ -5226,6 +5242,14 @@ namespace CodeyBox.Api
 
         /// <summary>Per-agent concurrency caps (codex/claude/gemini/...) layered on top of WorkerPool.</summary>
         public AgentConcurrencyOptions AgentConcurrency { get; set; } = new();
+
+        /// <summary>
+        /// Per-agent dispatch failure circuit breaker: benches an agent that
+        /// fails dispatch repeatedly (any kind of failure) within a rolling
+        /// window, independent of quota classification. Hot-reloads via
+        /// <see cref="AgentCircuitBreakerSnapshot"/>.
+        /// </summary>
+        public AgentCircuitBreakerOptions AgentCircuitBreaker { get; set; } = new();
 
         /// <summary>Per-agent burn-rate estimator config (rate-aware dispatch gate).</summary>
         public AgentBurnEstimatorOptions AgentBurnEstimator { get; set; } = new();

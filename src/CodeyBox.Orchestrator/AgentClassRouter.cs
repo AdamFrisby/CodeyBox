@@ -54,6 +54,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     private readonly AgentConcurrencySnapshot? _concurrencySnapshot;
     private readonly InVmSmokeSandboxTarget? _configuredSmokeTarget;
     private readonly IAgentDispatchAvailability? _dispatchAvailability;
+    // Per-(agent[,instance]) failure circuit breaker. Composes with the quota
+    // gate: a member is dispatchable only when BOTH this breaker and
+    // QuotaGatePolicy allow. Null keeps legacy behaviour (no breaker gating).
+    private readonly AgentCircuitBreaker? _circuitBreaker;
     private readonly IAgentQuotaAvailabilityPublisher? _quotaAvailabilityPublisher;
     private readonly AgentQuotaAvailabilityBroadcaster? _localQuotaAvailability;
     // Default fit when no historical samples exist (spec: "fits 2 concurrent
@@ -102,7 +106,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         AgentConcurrencySnapshot? concurrencySnapshot = null,
         InVmSmokeSandboxTarget? configuredSmokeTarget = null,
         IAgentDispatchAvailability? dispatchAvailability = null,
-        IAgentQuotaAvailabilityPublisher? quotaAvailabilityPublisher = null)
+        IAgentQuotaAvailabilityPublisher? quotaAvailabilityPublisher = null,
+        AgentCircuitBreaker? circuitBreaker = null)
     {
         _routingConfig = new RoutingConfig(
             catalog.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase),
@@ -122,6 +127,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         _concurrencySnapshot = concurrencySnapshot;
         _configuredSmokeTarget = configuredSmokeTarget;
         _dispatchAvailability = dispatchAvailability;
+        _circuitBreaker = circuitBreaker;
         _quotaAvailabilityPublisher = quotaAvailabilityPublisher;
         if (quotaAvailabilityPublisher is not IAgentQuotaAvailabilitySignal)
             _localQuotaAvailability = new AgentQuotaAvailabilityBroadcaster();
@@ -539,6 +545,18 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var atCapAgents = new List<AgentKind>();
         var atCapMembers = new List<AgentMembership>();
 
+        // Members the per-agent failure circuit breaker is currently benching
+        // (Open within cooldown, or all half-open trials outstanding). Excluded
+        // BEFORE the quota probe so a benched agent burns no probe round-trip,
+        // and skipped by the PayPerApi fire-anyway fallthrough below — the
+        // breaker gates a known-failing binary the same way the smoke gate does.
+        // earliestBreakerRetry drives the defer interval so a benched agent is
+        // rechecked as soon as its cooldown elapses rather than on the longer
+        // quota-recheck cadence.
+        var breakerExcluded = new HashSet<AgentMembership>();
+        var subscriptionBreakerExcluded = 0;
+        DateTimeOffset? earliestBreakerRetry = null;
+
         // Step 4: probe quota in sorted order; pick the first viable member.
         foreach (var entry in ordered)
         {
@@ -604,6 +622,29 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 smokeExcluded.Add((member.Agent, member.ModelId));
                 if (member.Billing == AgentBilling.Subscription)
                     subscriptionSmokeExcluded++;
+                continue;
+            }
+            // Per-agent failure circuit breaker — composes with the quota gate
+            // as an independent AND-gate (dispatchable only if breaker AND quota
+            // both allow). Peek is non-mutating so spilling past a benched member
+            // and readiness checks never consume a half-open trial; the trial is
+            // consumed at the dispatch-commit point below. A quota-retry admission
+            // for this exact member bypasses the breaker so an operator-scheduled
+            // retry can probe recovery, mirroring the recent-failure precheck.
+            if (_circuitBreaker is not null
+                && !quotaRetryAdmissionMatches
+                && !_circuitBreaker.IsDispatchAllowed(member, nowUtc))
+            {
+                var breakerReason = "circuit breaker open (repeated dispatch failures)";
+                if (commitDispatchSideEffects)
+                    LogMemberExcluded(item.Id, member, breakerReason);
+                rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, breakerReason));
+                breakerExcluded.Add(member);
+                if (member.Billing == AgentBilling.Subscription)
+                    subscriptionBreakerExcluded++;
+                if (_circuitBreaker.NextRetryAt(member, nowUtc) is { } retryAt
+                    && (earliestBreakerRetry is null || retryAt < earliestBreakerRetry.Value))
+                    earliestBreakerRetry = retryAt;
                 continue;
             }
             if (!bypassRecentFailurePrecheck
@@ -706,6 +747,31 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                     rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, capReason));
                     atCapAgents.Add(member.Agent);
                     atCapMembers.Add(member);
+                    continue;
+                }
+
+                // Commit the half-open trial / Open→HalfOpen transition for the
+                // circuit breaker now that quota AND the slot are both secured.
+                // The earlier peek already excluded a fully-open breaker; this
+                // only fails on the rare race where a concurrent dispatch
+                // consumed the last half-open trial between the peek and here —
+                // release the just-reserved slot and spill so we never dispatch
+                // to a member the breaker refuses. Only on the committing path:
+                // a readiness check must never consume a trial.
+                if (_circuitBreaker is not null
+                    && commitDispatchSideEffects
+                    && !_circuitBreaker.TryBeginDispatch(member, nowUtc))
+                {
+                    slotGate?.Release(member);
+                    var breakerReason = "circuit breaker open (repeated dispatch failures)";
+                    LogMemberExcluded(item.Id, member, breakerReason);
+                    rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, breakerReason));
+                    breakerExcluded.Add(member);
+                    if (member.Billing == AgentBilling.Subscription)
+                        subscriptionBreakerExcluded++;
+                    if (_circuitBreaker.NextRetryAt(member, nowUtc) is { } retryAt
+                        && (earliestBreakerRetry is null || retryAt < earliestBreakerRetry.Value))
+                        earliestBreakerRetry = retryAt;
                     continue;
                 }
 
@@ -822,6 +888,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 && !r.RejectReason.StartsWith("per-agent cap:", StringComparison.Ordinal));
             var allSmokeExcluded = subscriptionTotal > 0 && subscriptionSmokeExcluded == subscriptionTotal;
             var allExhaustionCacheExcluded = subscriptionTotal > 0 && subscriptionExhaustionCacheExcluded == subscriptionTotal;
+            var allBreakerExcluded = subscriptionTotal > 0 && subscriptionBreakerExcluded == subscriptionTotal;
             string reason;
             TimeSpan suggested;
             if (capBlocked && hasNonCapRejection)
@@ -846,6 +913,13 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 reason = $"all subscription members of class '{classId}' are suppressed by the in-process exhaustion cache;{expiry} "
                          + "quota retry recheck will probe current availability";
                 suggested = _opts.QuotaRecheckInterval;
+            }
+            else if (allBreakerExcluded)
+            {
+                var retry = earliestBreakerRetry is { } r ? $" earliest breaker recheck {r:O};" : "";
+                reason = $"all subscription members of class '{classId}' are benched by the failure circuit breaker;{retry} "
+                         + "waiting for the breaker cooldown to admit a half-open trial";
+                suggested = TightenToBreakerRetry(_opts.QuotaRecheckInterval, earliestBreakerRetry, nowUtc);
             }
             else
             {
@@ -891,11 +965,30 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             if (capSaturatedMembers.Contains(candidate.Member)) continue;
             if (smokeExcluded.Contains((candidate.Member.Agent, candidate.Member.ModelId))) continue;
             if (pausedMembers.Contains(candidate.Member)) continue;
+            // A benched circuit breaker gates PayPerApi members too: the
+            // "fire despite low quota" fallback overrides probe inaccuracy, not a
+            // binary that has failed dispatch N times in a row.
+            if (breakerExcluded.Contains(candidate.Member)) continue;
             var fallback = candidate.Member;
             if (slotGate is not null && !slotGate.TryReserve(fallback))
             {
                 atCapAgents.Add(fallback.Agent);
                 atCapMembers.Add(fallback);
+                continue;
+            }
+
+            // Consume the half-open trial for the PayPerApi fire-anyway path too,
+            // so an Open breaker that just became half-open eligible admits at
+            // most its configured trial count here as well.
+            if (_circuitBreaker is not null
+                && commitDispatchSideEffects
+                && !_circuitBreaker.TryBeginDispatch(fallback, nowUtc))
+            {
+                slotGate?.Release(fallback);
+                breakerExcluded.Add(fallback);
+                if (_circuitBreaker.NextRetryAt(fallback, nowUtc) is { } retryAt
+                    && (earliestBreakerRetry is null || retryAt < earliestBreakerRetry.Value))
+                    earliestBreakerRetry = retryAt;
                 continue;
             }
 
@@ -966,6 +1059,34 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 .OrderBy(a => a.Value, StringComparer.OrdinalIgnoreCase)
                 .ToList(),
         };
+    }
+
+    /// <summary>
+    /// Records a completed dispatch's outcome for the per-agent failure circuit
+    /// breaker. Called from the pipeline's agent-invocation chokepoint on every
+    /// terminal attempt — <paramref name="success"/> resets the breaker, any
+    /// failure feeds the windowed counter that opens it. A no-op when no breaker
+    /// is wired. Independent of quota classification by design: a websocket 1006,
+    /// an agent exit, or a hidden 429 all count equally. <paramref name="routeKey"/>
+    /// must be the canonical member route key so the outcome lands on the same
+    /// breaker state the dispatch gate reads.
+    /// </summary>
+    public void RecordDispatchOutcome(AgentKind agent, string routeKey, bool success) =>
+        _circuitBreaker?.RecordOutcome(agent, routeKey, success, _time.GetUtcNow());
+
+    /// <summary>
+    /// Shrinks <paramref name="baseInterval"/> to the breaker's next-retry time
+    /// when that is sooner, so a breaker-benched class is rechecked as its
+    /// cooldown elapses rather than on the longer quota-recheck cadence. Never
+    /// returns a non-positive interval.
+    /// </summary>
+    private static TimeSpan TightenToBreakerRetry(
+        TimeSpan baseInterval, DateTimeOffset? breakerRetry, DateTimeOffset nowUtc)
+    {
+        if (breakerRetry is not { } retry) return baseInterval;
+        var until = retry - nowUtc;
+        if (until <= TimeSpan.Zero) return baseInterval;
+        return until < baseInterval ? until : baseInterval;
     }
 
     /// <summary>
