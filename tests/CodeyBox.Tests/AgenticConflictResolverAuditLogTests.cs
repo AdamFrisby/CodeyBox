@@ -27,7 +27,7 @@ namespace CodeyBox.Tests;
 public sealed class AgenticConflictResolverAuditLogTests : IDisposable
 {
     private readonly TestSink _sink = new();
-    private readonly Serilog.ILogger _previousLogger;
+    private readonly IDisposable _auditScope;
 
     // Captured by reference and threaded into every resolver under test so the audit
     // emission lands in _sink even if a parallel test collection reassigns the global
@@ -37,35 +37,31 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
 
     public AgenticConflictResolverAuditLogTests()
     {
-        _previousLogger = Log.Logger;
         _auditLogger = new LoggerConfiguration()
             .Enrich.FromLogContext()
             .Enrich.With<SensitiveDataRedactionEnricher>()
             .WriteTo.Sink(_sink)
             .CreateLogger();
-        ConfigureAuditSink();
-    }
 
-    private void ConfigureAuditSink() => Log.Logger = _auditLogger;
+        // Pin this test's audit emission to our sink for the whole async flow
+        // rather than relying on the process-global Log.Logger staying put: the
+        // audit suite runs WebApplicationFactory<Program> host boots (which
+        // rebuild Log.Logger) concurrently in other collections, and one landing
+        // between an action here and its inline audit emission would otherwise
+        // steal the event — leaving the sink empty. The AsyncLocal override flows
+        // into every call below and is immune to those global swaps.
+        _auditScope = AuditLog.PushScopedLogger(Log.Logger);
+    }
 
     public void Dispose()
     {
-        // A parallel test collection may have swapped Log.Logger out from
-        // under us — dispose that displaced instance before we restore the
-        // previous one so we don't leak it.
-        if (!ReferenceEquals(Log.Logger, _auditLogger)
-            && Log.Logger is IDisposable currentDisposable)
-        {
-            currentDisposable.Dispose();
-        }
+        _auditScope.Dispose();
         _auditLogger.Dispose();
-        Log.Logger = _previousLogger;
     }
 
     [Fact]
     public async Task ResolveAsync_AgentThrows_EmitsAttemptFailedAuditWithExceptionTrace()
     {
-        ConfigureAuditSink();
         var sandbox = new AgenticConflictResolverTests.ConflictSandbox();
         sandbox.AddConflictedFile("conflict.txt",
             "<<<<<<< HEAD\nm\n=======\nw\n>>>>>>> feature\n");
@@ -107,7 +103,6 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
     [Fact]
     public async Task ResolveAsync_AgentReportsFailure_EmitsAttemptFailedAuditWithStdoutAndStderr()
     {
-        ConfigureAuditSink();
         var sandbox = new AgenticConflictResolverTests.ConflictSandbox();
         sandbox.AddConflictedFile("conflict.txt",
             "<<<<<<< HEAD\nm\n=======\nw\n>>>>>>> feature\n");
@@ -225,7 +220,6 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
     [Fact]
     public async Task ResolveAsync_AgentReportsFailure_TruncatesAuditStdoutAndStderrTails()
     {
-        ConfigureAuditSink();
         var sandbox = new AgenticConflictResolverTests.ConflictSandbox();
         sandbox.AddConflictedFile("conflict.txt",
             "<<<<<<< HEAD\nm\n=======\nw\n>>>>>>> feature\n");
@@ -274,7 +268,6 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
     [Fact]
     public async Task ResolveAsync_VerificationFails_EmitsAttemptFailedAuditWithStdoutAndStderr()
     {
-        ConfigureAuditSink();
         var sandbox = new AgenticConflictResolverTests.ConflictSandbox();
         sandbox.AddConflictedFile("conflict.txt",
             "<<<<<<< HEAD\nm\n=======\nw\n>>>>>>> feature\n");

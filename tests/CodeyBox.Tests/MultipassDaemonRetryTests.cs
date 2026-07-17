@@ -577,6 +577,8 @@ public sealed class MultipassDaemonRetryTests
 public sealed class MultipassDaemonRetryAuditTests : IDisposable
 {
     private readonly TestSink _sink = new();
+    private readonly IDisposable _auditScope;
+
     private readonly Serilog.Core.Logger _auditLogger;
 
     public MultipassDaemonRetryAuditTests()
@@ -586,10 +588,22 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
             .Enrich.With<SensitiveDataRedactionEnricher>()
             .WriteTo.Sink(_sink)
             .CreateLogger();
-        Log.Logger = _auditLogger;
+
+        // Pin this test's audit emission to our sink for the whole async flow
+        // rather than relying on the process-global Log.Logger staying put: the
+        // audit suite runs WebApplicationFactory<Program> host boots (which
+        // rebuild Log.Logger) concurrently in other collections, and one landing
+        // between a retry here and its inline audit emission would otherwise
+        // steal the event — leaving the sink empty. The AsyncLocal override flows
+        // into every call below and is immune to those global swaps.
+        _auditScope = AuditLog.PushScopedLogger(Log.Logger);
     }
 
-    public void Dispose() => _auditLogger.Dispose();
+    public void Dispose()
+    {
+        _auditScope.Dispose();
+        _auditLogger.Dispose();
+    }
 
     private static IReadOnlyList<string> Argv(string command, params string[] rest) =>
         ["/usr/bin/multipass", command, .. rest];
