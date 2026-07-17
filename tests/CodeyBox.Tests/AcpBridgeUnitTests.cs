@@ -3625,7 +3625,9 @@ os.execv(dotnet, [hostile_argv0, "exec", target, *sys.argv[3:]])
                 // Exit code 0 means our handler suppressed the default and
                 // ran Shutdown(0). Exit codes 128+signo (143 / 130 / 129)
                 // indicate the default action ran — the handler is missing
-                // or didn't set ctx.Cancel.
+                // or didn't set ctx.Cancel. Exit 134 (SIGABRT) means an
+                // unhandled exception escaped RunAsync during shutdown — the
+                // parked stdin read must be torn down cleanly, not crash.
                 var bridgeStderr = await stderrTask;
                 Assert.True(
                     proc.ExitCode == 0,
