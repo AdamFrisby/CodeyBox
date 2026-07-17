@@ -939,6 +939,72 @@ public sealed class IncusSandboxLifecycleTests
     }
 
     [Fact]
+    public async Task RecoveryLease_Acquire_RetriesTransientContentionThenSucceedsWhenReleased()
+    {
+        var (stagingRoot, sandboxRoot) = PrepareOwnedSandboxRoot("codeybox-lease-retry-transient");
+        try
+        {
+            var held = IncusRecoveryManifestStore.Acquire(sandboxRoot);
+            // Model an unrelated fork that briefly holds an inherited copy of the
+            // O_CLOEXEC lease descriptor and then drops it. A generous attempt
+            // budget keeps this deterministic even under CPU starvation.
+            var releaser = Task.Run(async () =>
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(120));
+                held.Dispose();
+            });
+
+            using var acquired = IncusRecoveryManifestStore.Acquire(
+                sandboxRoot,
+                maxAttempts: 400,
+                retryDelay: TimeSpan.FromMilliseconds(25));
+
+            await releaser;
+            Assert.NotNull(acquired);
+        }
+        finally
+        {
+            if (Directory.Exists(stagingRoot))
+                Directory.Delete(stagingRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void RecoveryLease_Acquire_ThrowsWhenLeaseIsGenuinelyHeldForTheWholeBudget()
+    {
+        var (stagingRoot, sandboxRoot) = PrepareOwnedSandboxRoot("codeybox-lease-retry-held");
+        try
+        {
+            using var held = IncusRecoveryManifestStore.Acquire(sandboxRoot);
+
+            var rejected = Assert.Throws<InvalidOperationException>(() =>
+                IncusRecoveryManifestStore.Acquire(
+                    sandboxRoot,
+                    maxAttempts: 3,
+                    retryDelay: TimeSpan.FromMilliseconds(5)));
+
+            Assert.Contains("already owned", rejected.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            if (Directory.Exists(stagingRoot))
+                Directory.Delete(stagingRoot, recursive: true);
+        }
+    }
+
+    private static (string StagingRoot, string SandboxRoot) PrepareOwnedSandboxRoot(string sandboxName)
+    {
+        var stagingRoot = Path.Combine(
+            Path.GetTempPath(),
+            $"codeybox-incus-lease-{Guid.NewGuid():N}");
+        IncusMountStaging.EnsureOwnedStagingRoot(stagingRoot);
+        var sandboxRoot = Path.Combine(stagingRoot, sandboxName);
+        Directory.CreateDirectory(sandboxRoot);
+        IncusMountStaging.InitializeOwnedTree(sandboxRoot, sandboxName, DateTimeOffset.UtcNow);
+        return (stagingRoot, sandboxRoot);
+    }
+
+    [Fact]
     public async Task Create_WithRetainedRecoveryLease_TopologyTamperFailsClosedAndCanBeReadopted()
     {
         var fixture = PrepareRetainedAdoptionFixture("codeybox-retained-topology");

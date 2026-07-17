@@ -22,6 +22,15 @@ public sealed record IncusSandboxOptions
     public static readonly TimeSpan MaximumInterruptedExecRecoveryRetryDelay = TimeSpan.FromSeconds(30);
     public const int DefaultInterruptedExecRecoveryRetryAttempts = 3;
     public const int MaximumInterruptedExecRecoveryRetryAttempts = 10;
+    // A retained-recovery flock can be reported busy for a sub-exec instant when
+    // an unrelated concurrent process fork()s and momentarily inherits the
+    // O_CLOEXEC lease descriptor before its exec() drops it. That contention is
+    // transient, so acquisition retries a bounded number of times at this cadence
+    // before concluding the lease is genuinely held by another live owner.
+    public const int DefaultRecoveryLeaseAcquireAttempts = 40;
+    public const int MaximumRecoveryLeaseAcquireAttempts = 200;
+    public static readonly TimeSpan DefaultRecoveryLeaseAcquireRetryDelay = TimeSpan.FromMilliseconds(50);
+    public static readonly TimeSpan MaximumRecoveryLeaseAcquireRetryDelay = TimeSpan.FromSeconds(2);
     public const int DefaultMaxCliOutputBytes = 4 * 1024 * 1024;
     public const int MaximumNetworkProfiles = 128;
     public const int MaximumNetworkProfileUtf8Bytes = 64 * 1024;
@@ -150,6 +159,15 @@ public sealed record IncusSandboxOptions
     public int InterruptedExecRecoveryRetryAttempts { get; init; } = DefaultInterruptedExecRecoveryRetryAttempts;
     /// <summary>Delay before each delayed interrupted-exec recovery attempt.</summary>
     public TimeSpan InterruptedExecRecoveryRetryDelay { get; init; } = DefaultInterruptedExecRecoveryRetryDelay;
+    /// <summary>
+    /// Bounded attempts to acquire the exclusive retained-recovery flock before
+    /// concluding it is genuinely held by another live process. Tolerates the
+    /// transient contention window where an unrelated fork briefly inherits the
+    /// O_CLOEXEC lease descriptor. Must be at least 1.
+    /// </summary>
+    public int RecoveryLeaseAcquireAttempts { get; init; } = DefaultRecoveryLeaseAcquireAttempts;
+    /// <summary>Delay between retained-recovery flock acquisition attempts.</summary>
+    public TimeSpan RecoveryLeaseAcquireRetryDelay { get; init; } = DefaultRecoveryLeaseAcquireRetryDelay;
     public int MaxConcurrentOperations { get; init; } = 2;
     /// <summary>
     /// Maximum VM boots — an <c>incus start</c> plus its guest-agent readiness
@@ -278,6 +296,17 @@ public sealed record IncusSandboxOptions
         {
             errors.Add(
                 $"{nameof(InterruptedExecRecoveryRetryDelay)} must be positive and no greater than {MaximumInterruptedExecRecoveryRetryDelay}.");
+        }
+        if (options.RecoveryLeaseAcquireAttempts is < 1 or > MaximumRecoveryLeaseAcquireAttempts)
+        {
+            errors.Add(
+                $"{nameof(RecoveryLeaseAcquireAttempts)} must be between 1 and {MaximumRecoveryLeaseAcquireAttempts}.");
+        }
+        if (options.RecoveryLeaseAcquireRetryDelay <= TimeSpan.Zero
+            || options.RecoveryLeaseAcquireRetryDelay > MaximumRecoveryLeaseAcquireRetryDelay)
+        {
+            errors.Add(
+                $"{nameof(RecoveryLeaseAcquireRetryDelay)} must be positive and no greater than {MaximumRecoveryLeaseAcquireRetryDelay}.");
         }
         RequirePositiveDuration(options.ResourceMetricsCaptureTimeout, nameof(ResourceMetricsCaptureTimeout), errors);
         RequirePositiveDuration(options.ResourceMetricsSampleInterval, nameof(ResourceMetricsSampleInterval), errors);

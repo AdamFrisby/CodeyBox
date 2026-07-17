@@ -357,7 +357,10 @@ public sealed class IncusSandboxProvider :
             IncusSandbox sandbox;
             try
             {
-                recoveryManifestStore = IncusRecoveryManifestStore.Acquire(sandboxRoot);
+                recoveryManifestStore = IncusRecoveryManifestStore.Acquire(
+                    sandboxRoot,
+                    options.RecoveryLeaseAcquireAttempts,
+                    options.RecoveryLeaseAcquireRetryDelay);
                 var recoveryToken = NextGuid("sandbox recovery capability").ToString("N");
                 var recoveryTokenHash = IncusRecoveryManifestCodec.ComputeTokenSha256(recoveryToken);
                 var sandboxRecoveryLease = new SandboxRecoveryLease(ProviderId, name, recoveryToken);
@@ -491,7 +494,10 @@ public sealed class IncusSandboxProvider :
         var adopted = false;
         try
         {
-            manifestStore = IncusRecoveryManifestStore.Acquire(sandboxRoot);
+            manifestStore = IncusRecoveryManifestStore.Acquire(
+                sandboxRoot,
+                options.RecoveryLeaseAcquireAttempts,
+                options.RecoveryLeaseAcquireRetryDelay);
             var instance = await FindInstanceAsync(options, name, ct).ConfigureAwait(false)
                 ?? throw new InvalidOperationException("Incus recovery lease VM no longer exists.");
             ValidateRecoveryInstanceOwnership(instance);

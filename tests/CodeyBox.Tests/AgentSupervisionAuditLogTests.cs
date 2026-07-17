@@ -5,27 +5,33 @@ using Serilog.Events;
 
 namespace CodeyBox.Tests;
 
-[Collection("GlobalSerilog")]
 public sealed class AgentSupervisionAuditLogTests : IDisposable
 {
     private readonly TestSink _sink = new();
 
+    // A dedicated, injected Serilog logger keeps this test's audit events off the
+    // process-global Serilog.Log.Logger, so a concurrent host bootstrap that
+    // reassigns the global static cannot reroute them away from _sink. This is
+    // why the class no longer needs the GlobalSerilog serialization collection.
+    private readonly Serilog.Core.Logger _auditLogger;
+
     public AgentSupervisionAuditLogTests()
     {
-        Log.Logger = new LoggerConfiguration()
+        _auditLogger = new LoggerConfiguration()
             .Enrich.FromLogContext()
             .Enrich.With<SensitiveDataRedactionEnricher>()
             .WriteTo.Sink(_sink)
             .CreateLogger();
     }
 
-    public void Dispose() => Log.CloseAndFlush();
+    public void Dispose() => _auditLogger.Dispose();
 
     [Fact]
     public async Task HumanInjection_EmitsQueuedStartedCompletedAuditEventsWithRedaction()
     {
         var service = new AgentSupervisionService(
-            () => new AgentSupervisionOptions { Enabled = true, InjectionQueueCapacity = 4 });
+            () => new AgentSupervisionOptions { Enabled = true, InjectionQueueCapacity = 4 },
+            auditLogger: _auditLogger);
         await using var scope = await service.TryStartSessionAsync(Start())
             ?? throw new InvalidOperationException("expected supervision scope");
 

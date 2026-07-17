@@ -8,7 +8,6 @@ using Serilog.Events;
 
 namespace CodeyBox.Tests;
 
-[Collection("GlobalSerilog")]
 public sealed class QuotaRetrySchedulerAuditTests : IDisposable
 {
     private static readonly ProjectId TestProjectId = new("test-project");
@@ -16,9 +15,15 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     private readonly string _workspace = Directory.CreateTempSubdirectory("codeybox-quota-audit-").FullName;
     private readonly TestSink _sink = new();
 
+    // A dedicated, injected Serilog logger keeps this test's audit events off the
+    // process-global Serilog.Log.Logger, so a concurrent host bootstrap that
+    // reassigns the global static cannot reroute them away from _sink. This is
+    // why the class no longer needs the GlobalSerilog serialization collection.
+    private readonly Serilog.Core.Logger _auditLogger;
+
     public QuotaRetrySchedulerAuditTests()
     {
-        Log.Logger = new LoggerConfiguration()
+        _auditLogger = new LoggerConfiguration()
             .Enrich.FromLogContext()
             .WriteTo.Sink(_sink)
             .CreateLogger();
@@ -26,7 +31,7 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
 
     public void Dispose()
     {
-        Log.CloseAndFlush();
+        _auditLogger.Dispose();
         try { Directory.Delete(_workspace, recursive: true); } catch { }
     }
 
@@ -773,7 +778,8 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
             projects,
             queueController,
             webhooks,
-            time);
+            time,
+            auditLogger: _auditLogger);
         return new SchedulerFixture(store, gitHost, scheduler);
     }
 

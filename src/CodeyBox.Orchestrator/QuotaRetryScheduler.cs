@@ -30,6 +30,11 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
     private readonly TimeProvider _time;
     private readonly IBaselineImageResolver _baselineResolver;
     private readonly ILogger<QuotaRetryScheduler> _log;
+    // Audit events are emitted through this Serilog logger rather than the static
+    // global so a concurrent reassignment of Serilog.Log.Logger (e.g. another
+    // component's logging bootstrap) cannot silently reroute them. Captured at
+    // construction from the process-global logger when none is injected.
+    private readonly Serilog.ILogger _auditLogger;
     // A single wake-up task serves every signal that can make a parked item
     // routable again (quota refill, operator pause/resume, etc.). Generic
     // signals use the bounded global priority batch; member/agent recovery
@@ -81,9 +86,11 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         Func<AutoRetryOnQuotaFailureOptions>? autoRetryOptionsAccessor = null,
         IAgentQuotaAvailabilitySignal? quotaAvailabilitySignal = null,
         IAgentAvailabilityRecoverySignal? agentAvailabilityRecoverySignal = null,
-        IAgentPauseSignal? pauseSignal = null)
+        IAgentPauseSignal? pauseSignal = null,
+        Serilog.ILogger? auditLogger = null)
     {
         _store = store;
+        _auditLogger = auditLogger ?? Serilog.Log.Logger;
         _retrier = retrier;
         _opts = opts;
         _autoRetryOptionsAccessor = autoRetryOptionsAccessor ?? (() => _opts.AutoRetryOnQuotaFailure);
@@ -322,7 +329,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                 outcome = await PerformRetryAsync(item, "startup", ct);
             }
 
-            AuditLog.QuotaRetryAttempted(item.Id, "startup", outcome.Outcome, item.State.ToString(), outcome.Reason);
+            AuditLog.QuotaRetryAttempted(item.Id, "startup", outcome.Outcome, item.State.ToString(), outcome.Reason, _auditLogger);
             return outcome;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -331,7 +338,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         }
         catch (Exception ex)
         {
-            AuditLog.QuotaRetryAttempted(item.Id, "startup", "error", item.State.ToString(), ex.Message);
+            AuditLog.QuotaRetryAttempted(item.Id, "startup", "error", item.State.ToString(), ex.Message, _auditLogger);
             throw;
         }
     }
@@ -679,7 +686,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         try
         {
             var outcome = await TryRetryCoreAsync(item, source, ct, requireAutoRetryEnabled);
-            AuditLog.QuotaRetryAttempted(item.Id, source, outcome.Outcome, item.State.ToString(), outcome.Reason);
+            AuditLog.QuotaRetryAttempted(item.Id, source, outcome.Outcome, item.State.ToString(), outcome.Reason, _auditLogger);
             return outcome;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -688,7 +695,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         }
         catch (Exception ex)
         {
-            AuditLog.QuotaRetryAttempted(item.Id, source, "error", item.State.ToString(), ex.Message);
+            AuditLog.QuotaRetryAttempted(item.Id, source, "error", item.State.ToString(), ex.Message, _auditLogger);
             throw;
         }
     }
