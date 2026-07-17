@@ -14,6 +14,7 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     private static readonly ProjectId BrokenProjectId = new("broken-project");
     private readonly string _workspace = Directory.CreateTempSubdirectory("codeybox-quota-audit-").FullName;
     private readonly TestSink _sink = new();
+    private readonly IDisposable _auditScope;
 
     // A dedicated, injected Serilog logger keeps this test's audit events off the
     // process-global Serilog.Log.Logger, so a concurrent host bootstrap that
@@ -27,10 +28,20 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
             .Enrich.FromLogContext()
             .WriteTo.Sink(_sink)
             .CreateLogger();
+
+        // Route this test's audit events to our sink for the whole flow rather
+        // than relying on the process-global Log.Logger staying put: the audit
+        // suite runs WebApplicationFactory<Program> host boots (which rebuild
+        // Log.Logger) concurrently in other collections, and one landing between
+        // a scheduler call and its audit emission would otherwise steal the event
+        // — leaving the sink empty. The AsyncLocal override flows into every
+        // scheduler method invoked below and is immune to those global swaps.
+        _auditScope = AuditLog.PushScopedLogger(Log.Logger);
     }
 
     public void Dispose()
     {
+        _auditScope.Dispose();
         _auditLogger.Dispose();
         try { Directory.Delete(_workspace, recursive: true); } catch { }
     }
@@ -469,8 +480,7 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
         Assert.Equal(WorkItemState.Merged, retried!.State);
         Assert.Equal(workBranch, retried.WorkBranch);
         Assert.Equal(1, retried.QuotaRetryAttempts);
-        // The audit event is emitted through the global Serilog pipeline, whose
-        // delivery to the in-memory sink can lag the awaited state transition
+        // Delivery to the in-memory sink can lag the awaited state transition
         // under load — a single immediate read then sees an empty collection.
         // Poll via WaitForQuotaAttemptAsync instead; its predicate is identical
         // to AssertQuotaAttempt, so this weakens nothing.

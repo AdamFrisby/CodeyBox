@@ -144,6 +144,15 @@ public sealed class DefaultProcessRunnerCancellationTests
             return;
         var transcript = new PidTranscript();
         var runner = NewIsolatedRunner();
+        // RunCompletionBudget (not the 5 s default): under the full audit suite
+        // this real-process test races dozens of other process-spawning tests
+        // for CPU, so detecting the stdout-limit breach, killing the orphaned
+        // writer's process group, and draining its pipes can exceed 5 s of
+        // wall-clock on a starved scheduler. These WaitAsync deadlines are only
+        // harness guards against a genuine hang; no assertion checks elapsed
+        // time, so widening them weakens nothing the test proves
+        // (StdoutLimitExceeded and the process being reaped are still asserted
+        // below).
         var result = await runner.RunAsync(
             [
                 "/bin/sh", "-c",
@@ -154,7 +163,7 @@ public sealed class DefaultProcessRunnerCancellationTests
             stderrChunkCallback: transcript.Append,
             maxStdoutBytes: 1024,
             maxStderrBytes: 4096).WaitAsync(RunCompletionBudget);
-        var descendantPid = await transcript.ChildPid.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var descendantPid = await transcript.ChildPid.Task.WaitAsync(RunCompletionBudget);
 
         Assert.True(result.StdoutLimitExceeded);
         await AssertProcessesGoneAsync(descendantPid);

@@ -1540,10 +1540,58 @@ public static class AuditLog
                 "Operator baseline migration: scanned={Scanned} migrated={Migrated} truncated={Truncated} projectFilter={ProjectFilter} baselineFilter={BaselineFilter}",
                 scanned, migrated, truncated, projectFilter ?? "", baselineFilter ?? "");
 
+    // ── Scoped sink override ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// Optional per-async-flow override of the audit sink. When set, audit
+    /// events emitted on the current control flow (and flows it spawns, since
+    /// the value rides <see cref="ExecutionContext"/>) route here instead of the
+    /// process-global <see cref="Log.Logger"/>.
+    /// </summary>
+    private static readonly AsyncLocal<Serilog.ILogger?> ScopedLogger = new();
+
+    /// <summary>
+    /// Routes audit events emitted on the current async control flow to
+    /// <paramref name="logger"/> until the returned scope is disposed, restoring
+    /// whatever override was previously in effect. Because the override is
+    /// carried by <see cref="AsyncLocal{T}"/> it flows across <c>await</c>
+    /// boundaries and <c>Task.Run</c> continuations but never leaks to other
+    /// concurrent flows.
+    ///
+    /// This exists so a consumer that must observe its own audit events
+    /// deterministically (notably tests that assert on emitted events) is not
+    /// disturbed by other flows rebuilding the process-global
+    /// <see cref="Log.Logger"/> — for example a <c>WebApplicationFactory</c>
+    /// host boot running concurrently. Not a substitute for global
+    /// configuration: production still logs through <see cref="Log.Logger"/>
+    /// whenever no scope is active.
+    /// </summary>
+    /// <exception cref="ArgumentNullException"><paramref name="logger"/> is null.</exception>
+    public static IDisposable PushScopedLogger(Serilog.ILogger logger)
+    {
+        ArgumentNullException.ThrowIfNull(logger);
+        var previous = ScopedLogger.Value;
+        ScopedLogger.Value = logger;
+        return new ScopedLoggerReset(previous);
+    }
+
+    private sealed class ScopedLoggerReset(Serilog.ILogger? previous) : IDisposable
+    {
+        private bool _disposed;
+
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+            _disposed = true;
+            ScopedLogger.Value = previous;
+        }
+    }
+
     // ── Internal helper ──────────────────────────────────────────────────────
 
     private static Serilog.ILogger Audit(string eventName) =>
-        Audit(Log.Logger, eventName);
+        Audit(ScopedLogger.Value ?? Log.Logger, eventName);
 
     // A null logger falls back to the process-global Serilog logger. Callers that
     // hold their own audit logger (so their events are immune to a concurrent

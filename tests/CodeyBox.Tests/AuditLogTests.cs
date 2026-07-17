@@ -658,6 +658,101 @@ public sealed class AuditLogTests : IDisposable
         Assert.Equal(3, GetScalar<int>(evt, "SkippedCount"));
     }
 
+    // ── Scoped sink override ─────────────────────────────────────────────────
+
+    [Fact]
+    public void PushScopedLogger_routes_events_to_scoped_sink_not_global()
+    {
+        var scoped = new TestSink();
+        using var scopedLogger = new LoggerConfiguration().WriteTo.Sink(scoped).CreateLogger();
+
+        using (AuditLog.PushScopedLogger(scopedLogger))
+            AuditLog.AgentStarted(AgentKind.Claude, "vm-scoped", "work");
+
+        // Assert on the unique marker rather than global emptiness: unrelated
+        // tests in other collections may emit audit events into the global sink
+        // concurrently, but none of them use this sandbox name.
+        Assert.DoesNotContain(_sink.Events, e => GetScalar<string>(e, "Sandbox") == "vm-scoped");
+        var evt = Assert.Single(scoped.Events);
+        Assert.Equal("agent.started", GetScalar<string>(evt, "EventName"));
+        Assert.Equal("vm-scoped", GetScalar<string>(evt, "Sandbox"));
+    }
+
+    [Fact]
+    public void PushScopedLogger_restores_previous_target_on_dispose()
+    {
+        var scoped = new TestSink();
+        using var scopedLogger = new LoggerConfiguration().WriteTo.Sink(scoped).CreateLogger();
+
+        using (AuditLog.PushScopedLogger(scopedLogger))
+            AuditLog.AgentStarted(AgentKind.Claude, "vm-inside", "work");
+
+        AuditLog.AgentStarted(AgentKind.Claude, "vm-outside", "work");
+
+        Assert.Equal("vm-inside", GetScalar<string>(Assert.Single(scoped.Events), "Sandbox"));
+        Assert.Single(_sink.Events, e => GetScalar<string>(e, "Sandbox") == "vm-outside");
+        Assert.DoesNotContain(_sink.Events, e => GetScalar<string>(e, "Sandbox") == "vm-inside");
+    }
+
+    [Fact]
+    public void PushScopedLogger_nested_scopes_restore_to_outer_scope()
+    {
+        var outer = new TestSink();
+        var inner = new TestSink();
+        using var outerLogger = new LoggerConfiguration().WriteTo.Sink(outer).CreateLogger();
+        using var innerLogger = new LoggerConfiguration().WriteTo.Sink(inner).CreateLogger();
+
+        using (AuditLog.PushScopedLogger(outerLogger))
+        {
+            using (AuditLog.PushScopedLogger(innerLogger))
+                AuditLog.AgentStarted(AgentKind.Claude, "vm-inner", "work");
+
+            AuditLog.AgentStarted(AgentKind.Claude, "vm-outer", "work");
+        }
+
+        Assert.Equal("vm-inner", GetScalar<string>(Assert.Single(inner.Events), "Sandbox"));
+        Assert.Equal("vm-outer", GetScalar<string>(Assert.Single(outer.Events), "Sandbox"));
+        Assert.DoesNotContain(
+            _sink.Events,
+            e => GetScalar<string>(e, "Sandbox") is "vm-inner" or "vm-outer");
+    }
+
+    [Fact]
+    public async Task PushScopedLogger_isolates_concurrent_flows_from_each_other()
+    {
+        // The reason this override exists: each async flow must capture only its
+        // own audit events even while another concurrent flow has a different
+        // scope active. Interleave two flows so that both scopes overlap in time
+        // and each emits while the other's scope is live; if the override were a
+        // shared field rather than AsyncLocal, the events would cross over.
+        var sinkA = new TestSink();
+        var sinkB = new TestSink();
+        using var loggerA = new LoggerConfiguration().WriteTo.Sink(sinkA).CreateLogger();
+        using var loggerB = new LoggerConfiguration().WriteTo.Sink(sinkB).CreateLogger();
+
+        using var bothScoped = new Barrier(2);
+
+        async Task EmitUnder(Serilog.ILogger logger, string sandbox)
+        {
+            using (AuditLog.PushScopedLogger(logger))
+            {
+                bothScoped.SignalAndWait();
+                await Task.Yield();
+                AuditLog.AgentStarted(AgentKind.Claude, sandbox, "work");
+            }
+        }
+
+        await Task.WhenAll(
+            Task.Run(() => EmitUnder(loggerA, "vm-flow-a")),
+            Task.Run(() => EmitUnder(loggerB, "vm-flow-b")));
+
+        Assert.Equal("vm-flow-a", GetScalar<string>(Assert.Single(sinkA.Events), "Sandbox"));
+        Assert.Equal("vm-flow-b", GetScalar<string>(Assert.Single(sinkB.Events), "Sandbox"));
+        Assert.DoesNotContain(
+            _sink.Events,
+            e => GetScalar<string>(e, "Sandbox") is "vm-flow-a" or "vm-flow-b");
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static T? GetScalar<T>(LogEvent evt, string key)
