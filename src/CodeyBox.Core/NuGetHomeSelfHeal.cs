@@ -23,10 +23,16 @@ namespace CodeyBox.Core;
 public static class NuGetHomeSelfHeal
 {
     /// <summary>
-    /// The writable fallback home directory leaf created under <c>$TMPDIR</c> (or
-    /// <c>/tmp</c>) when the real NuGet home is unusable. A fixed leaf keeps
-    /// concurrent audits sharing one healed home rather than multiplying temp dirs;
-    /// NuGet manages its own settings-dir creation within it.
+    /// Base name of the writable fallback home directory created under
+    /// <c>$TMPDIR</c> (or <c>/tmp</c>) when the real NuGet home is unusable. The
+    /// preamble appends the current numeric UID (<c>{leaf}-$(id -u)</c>) so
+    /// concurrent audits by the same user share one healed home (reusing its
+    /// package cache) while different principals never collide on one predictable
+    /// path. That shared per-user dir is reused only when it already exists, is
+    /// owned by the current user, and is writable; otherwise the preamble falls
+    /// back to a private <c>mktemp</c> dir (<c>{leaf}.XXXXXX</c>) so a squatted or
+    /// root-left directory in a world-writable temp cannot make the healed home
+    /// itself unusable. NuGet manages its own settings-dir creation within it.
     /// </summary>
     public const string WritableHomeLeaf = "codeybox-nuget-home";
 
@@ -53,8 +59,11 @@ public static class NuGetHomeSelfHeal
           nuget_home_broken=1
         fi
         if [ "$nuget_home_broken" -eq 1 ]; then
-          writable_home="${TMPDIR:-/tmp}/{{WritableHomeLeaf}}"
-          mkdir -p "$writable_home"
+          writable_home="${TMPDIR:-/tmp}/{{WritableHomeLeaf}}-$(id -u)"
+          mkdir -p "$writable_home" 2>/dev/null || true
+          if [ ! -d "$writable_home" ] || [ ! -O "$writable_home" ] || [ ! -w "$writable_home" ]; then
+            writable_home="$(mktemp -d "${TMPDIR:-/tmp}/{{WritableHomeLeaf}}.XXXXXX")"
+          fi
           export DOTNET_CLI_HOME="$writable_home"
           existing_packages="${nuget_root}/packages"
           if [ -z "${NUGET_PACKAGES:-}" ] && [ -d "$existing_packages" ] && [ -w "$existing_packages" ]; then

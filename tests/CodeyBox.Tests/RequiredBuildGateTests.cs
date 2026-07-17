@@ -54,7 +54,10 @@ public sealed class RequiredBuildGateTests : IDisposable
             var (exit, dotnetCliHome) = await RunSelfHealPreambleAsync(home, tmp);
 
             Assert.Equal(0, exit);
-            Assert.Equal(
+            // Redirected to a writable fallback derived from the leaf (the per-user
+            // "{leaf}-<uid>" dir, or a "{leaf}.XXXXXX" mktemp dir if that is
+            // unusable) under TMPDIR — never the broken home.
+            Assert.StartsWith(
                 Path.Combine(tmp, NuGetHomeSelfHeal.WritableHomeLeaf),
                 dotnetCliHome);
             Assert.True(Directory.Exists(dotnetCliHome));

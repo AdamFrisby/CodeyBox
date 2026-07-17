@@ -51,32 +51,101 @@ public sealed class NuGetHomeSelfHealTests
         if (OperatingSystem.IsWindows())
             return;
 
-        var root = Directory.CreateTempSubdirectory("codeybox-selfheal-").FullName;
-        try
+        using var fixture = new BrokenHomeFixture();
+        var (stdout, exitCode) = await fixture.RunWrappedDotnetAsync();
+
+        Assert.Equal(0, exitCode);
+        // Home was redirected to the writable per-user fallback, not the broken one.
+        var uid = await CurrentUidAsync();
+        Assert.Equal(
+            Path.Combine(fixture.Tmp, NuGetHomeSelfHeal.WritableHomeLeaf + "-" + uid),
+            ParseRedirectedHome(stdout));
+        // Original arguments reached dotnet unchanged.
+        Assert.Contains("ARGS=build --no-incremental /warnaserror", stdout);
+    }
+
+    // When the predictable per-user home already exists but is NOT a usable dir the
+    // current user owns (here: squatted as a plain file), the preamble must not
+    // point dotnet at it; it falls back to a private mktemp dir so the healed home
+    // is always usable. Simulates a root-left / cross-principal collision in a
+    // world-writable temp without needing another uid.
+    [Fact]
+    public async Task WrapDotnetInvocation_FallsBackToMktemp_WhenPerUserHomeUnusable()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        using var fixture = new BrokenHomeFixture();
+        var uid = await CurrentUidAsync();
+        // Squat the per-user path as a regular file: `[ -d ]` fails -> mktemp branch.
+        var squatted = Path.Combine(fixture.Tmp, NuGetHomeSelfHeal.WritableHomeLeaf + "-" + uid);
+        File.WriteAllText(squatted, "not a directory");
+
+        var (stdout, exitCode) = await fixture.RunWrappedDotnetAsync();
+
+        Assert.Equal(0, exitCode);
+        var redirected = ParseRedirectedHome(stdout);
+        Assert.NotEqual(squatted, redirected);
+        // A private mktemp dir under tmp, named from the same leaf, and a real dir.
+        Assert.StartsWith(
+            Path.Combine(fixture.Tmp, NuGetHomeSelfHeal.WritableHomeLeaf + "."),
+            redirected);
+        Assert.True(Directory.Exists(redirected));
+    }
+
+    private static string ParseRedirectedHome(string stdout)
+    {
+        var line = stdout.Split('\n').Single(l => l.StartsWith("HOME=", StringComparison.Ordinal));
+        return line["HOME=".Length..].Trim();
+    }
+
+    private static async Task<string> CurrentUidAsync()
+    {
+        var psi = new ProcessStartInfo("id", "-u") { RedirectStandardOutput = true, UseShellExecute = false };
+        using var p = Process.Start(psi)!;
+        var uid = (await p.StandardOutput.ReadToEndAsync()).Trim();
+        await p.WaitForExitAsync();
+        return uid;
+    }
+
+    // Fake NuGet home whose user-config is unreadable (the exact audit failure mode),
+    // plus a fake `dotnet` on PATH echoing DOTNET_CLI_HOME and its args, in an
+    // isolated temp tree that is cleaned up (restoring perms) on Dispose.
+    private sealed class BrokenHomeFixture : IDisposable
+    {
+        private readonly string _root;
+        public string Home { get; }
+        public string Tmp { get; }
+        private readonly string _binDir;
+
+        public BrokenHomeFixture()
         {
-            var home = Path.Combine(root, "home");
-            var settingsDir = Path.Combine(home, ".nuget", "NuGet");
+            _root = Directory.CreateTempSubdirectory("codeybox-selfheal-").FullName;
+            Home = Path.Combine(_root, "home");
+            var settingsDir = Path.Combine(Home, ".nuget", "NuGet");
             Directory.CreateDirectory(settingsDir);
             var config = Path.Combine(settingsDir, "NuGet.Config");
             File.WriteAllText(config, "<configuration/>");
-            // The exact failure mode: a user-config the current user cannot read.
-            File.SetUnixFileMode(config, UnixFileMode.None);
+            if (!OperatingSystem.IsWindows())
+                File.SetUnixFileMode(config, UnixFileMode.None);
 
-            var tmp = Path.Combine(root, "tmp");
-            Directory.CreateDirectory(tmp);
+            Tmp = Path.Combine(_root, "tmp");
+            Directory.CreateDirectory(Tmp);
 
-            // Fake dotnet: prints the (possibly redirected) DOTNET_CLI_HOME, then a
-            // marker line with every arg it received, so we can assert both.
-            var binDir = Path.Combine(root, "bin");
-            Directory.CreateDirectory(binDir);
-            var fakeDotnet = Path.Combine(binDir, "dotnet");
+            _binDir = Path.Combine(_root, "bin");
+            Directory.CreateDirectory(_binDir);
+            var fakeDotnet = Path.Combine(_binDir, "dotnet");
             File.WriteAllText(
                 fakeDotnet,
                 "#!/bin/sh\nprintf 'HOME=%s\\n' \"${DOTNET_CLI_HOME:-}\"\nprintf 'ARGS=%s\\n' \"$*\"\n");
-            File.SetUnixFileMode(
-                fakeDotnet,
-                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            if (!OperatingSystem.IsWindows())
+                File.SetUnixFileMode(
+                    fakeDotnet,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
 
+        public async Task<(string Stdout, int ExitCode)> RunWrappedDotnetAsync()
+        {
             var wrapped = NuGetHomeSelfHeal.WrapDotnetInvocation(
                 ["dotnet", "build", "--no-incremental", "/warnaserror"]);
 
@@ -88,31 +157,24 @@ public sealed class NuGetHomeSelfHealTests
             };
             foreach (var arg in wrapped.Skip(1))
                 psi.ArgumentList.Add(arg);
-            psi.Environment["HOME"] = home;
-            psi.Environment["TMPDIR"] = tmp;
-            psi.Environment["PATH"] = binDir + ":" + Environment.GetEnvironmentVariable("PATH");
+            psi.Environment["HOME"] = Home;
+            psi.Environment["TMPDIR"] = Tmp;
+            psi.Environment["PATH"] = _binDir + ":" + Environment.GetEnvironmentVariable("PATH");
             psi.Environment.Remove("DOTNET_CLI_HOME");
             psi.Environment.Remove("NUGET_PACKAGES");
 
             using var process = Process.Start(psi)!;
             var stdout = await process.StandardOutput.ReadToEndAsync();
             await process.WaitForExitAsync();
-
-            Assert.Equal(0, process.ExitCode);
-            // Home was redirected to the writable fallback (not the broken one).
-            Assert.Contains(
-                "HOME=" + Path.Combine(tmp, NuGetHomeSelfHeal.WritableHomeLeaf),
-                stdout);
-            // Original arguments reached dotnet unchanged.
-            Assert.Contains("ARGS=build --no-incremental /warnaserror", stdout);
+            return (stdout, process.ExitCode);
         }
-        finally
+
+        public void Dispose()
         {
-            // Restore readability so the temp tree can be deleted.
-            var config = Path.Combine(root, "home", ".nuget", "NuGet", "NuGet.Config");
-            if (File.Exists(config))
+            var config = Path.Combine(Home, ".nuget", "NuGet", "NuGet.Config");
+            if (File.Exists(config) && !OperatingSystem.IsWindows())
                 File.SetUnixFileMode(config, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-            try { Directory.Delete(root, recursive: true); } catch { }
+            try { Directory.Delete(_root, recursive: true); } catch { }
         }
     }
 }
