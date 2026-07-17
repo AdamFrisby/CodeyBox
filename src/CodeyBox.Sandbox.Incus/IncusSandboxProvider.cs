@@ -357,7 +357,10 @@ public sealed class IncusSandboxProvider :
             IncusSandbox sandbox;
             try
             {
-                recoveryManifestStore = IncusRecoveryManifestStore.Acquire(sandboxRoot);
+                recoveryManifestStore = IncusRecoveryManifestStore.Acquire(
+                    sandboxRoot,
+                    options.RecoveryLeaseAcquireAttempts,
+                    options.RecoveryLeaseAcquireRetryDelay);
                 var recoveryToken = NextGuid("sandbox recovery capability").ToString("N");
                 var recoveryTokenHash = IncusRecoveryManifestCodec.ComputeTokenSha256(recoveryToken);
                 var sandboxRecoveryLease = new SandboxRecoveryLease(ProviderId, name, recoveryToken);
@@ -491,7 +494,10 @@ public sealed class IncusSandboxProvider :
         var adopted = false;
         try
         {
-            manifestStore = IncusRecoveryManifestStore.Acquire(sandboxRoot);
+            manifestStore = IncusRecoveryManifestStore.Acquire(
+                sandboxRoot,
+                options.RecoveryLeaseAcquireAttempts,
+                options.RecoveryLeaseAcquireRetryDelay);
             var instance = await FindInstanceAsync(options, name, ct).ConfigureAwait(false)
                 ?? throw new InvalidOperationException("Incus recovery lease VM no longer exists.");
             ValidateRecoveryInstanceOwnership(instance);
@@ -1214,7 +1220,20 @@ public sealed class IncusSandboxProvider :
                 || File.Exists(stagingRootPath))
             {
                 var stagingRoot = ResolveStagingRoot(options);
-                _ = IncusProvisioningWorkspace.RecoverStaleWorkspaces(stagingRoot, ct);
+                try
+                {
+                    _ = IncusProvisioningWorkspace.RecoverStaleWorkspaces(stagingRoot, ct);
+                }
+                catch (IncusProvisioningLeaseContendedException contended)
+                {
+                    // Stale-workspace recovery is opportunistic cleanup guarded by a
+                    // cross-process lease. A concurrent provisioning/recovery pass —
+                    // or a transient lease hold from an unrelated fork inheriting the
+                    // descriptor — must not fail preflight; the next operation retries.
+                    _log.LogDebug(
+                        contended,
+                        "Skipping Incus provisioning-workspace recovery this pass; the coordination lease is held.");
+                }
             }
             var server = await _cli.RunCheckedAsync(
                 "server API probe",
@@ -1489,6 +1508,7 @@ public sealed class IncusSandboxProvider :
             options,
             name,
             ct).ConfigureAwait(false);
+        await PrepareDotnetCliHomeAsync(options, name, ct).ConfigureAwait(false);
         if (runCloudInit)
             await WaitForCloudInitAsync(options, name, ct).ConfigureAwait(false);
         await IncusGuestLifecycle.VerifyExecWrapperAsync(
@@ -2010,6 +2030,7 @@ public sealed class IncusSandboxProvider :
             "-i",
             "--",
             $"HOME={options.GuestHome}",
+            $"DOTNET_CLI_HOME={IncusCloudInit.DotnetCliHome}",
             $"PATH={IncusCloudInit.NonLoginPath}",
             "LANG=C.UTF-8",
         };
@@ -2047,7 +2068,7 @@ public sealed class IncusSandboxProvider :
         }
     }
 
-    private static IReadOnlyList<(string Path, string Name)> SnapshotProvisioningTargets(
+    private static IReadOnlyList<IncusGuestPathAuthorization.ProvisioningTarget> SnapshotProvisioningTargets(
         IncusSandboxOptions options) =>
         IncusGuestPathAuthorization.SnapshotProvisioningTargets(options);
 
@@ -2083,6 +2104,71 @@ public sealed class IncusSandboxProvider :
             options,
             BuildRootExec(options, name, ["cloud-init", "clean", "--logs", "--machine-id"]),
             stdin: null,
+            options.OperationTimeout,
+            ct,
+            heavyOperation: false).ConfigureAwait(false);
+    }
+
+    // Runs as root on every boot (baseline and COW clones). Positional
+    // arguments: $1 guest home, $2 guest uid, $3 guest gid, $4 DOTNET_CLI_HOME.
+    // The baseline image ships a populated, offline NuGet package cache under
+    // the guest home. When any of it was created by root during warm-up the
+    // unprivileged guest user cannot read its config or extend it, so
+    // `dotnet build`/`dotnet test` abort restore with "Failed to read
+    // NuGet.Config due to unauthorized access". Re-own the whole tree to the
+    // guest instead of discarding it, preserving the cache so offline restores
+    // still resolve. The re-own is recursive (not just the top directory)
+    // because ownership is mixed in practice — the observed failure traversed
+    // ".nuget" but was denied ".nuget/NuGet" — and idempotent, so repeated
+    // boots of an already-owned tree are harmless. DOTNET_CLI_HOME relocates
+    // dotnet's per-user state onto tmpfs, recreated empty each boot; link its
+    // NuGet home at the guest's cache-populated one so restores reuse the baked
+    // packages instead of trying to re-download them offline.
+    internal const string PrepareDotnetHomesScript = """
+        set -eu
+        guest_home=$1
+        guest_uid=$2
+        guest_gid=$3
+        cli_home=$4
+        install -d -m 0700 -o "$guest_uid" -g "$guest_gid" "$cli_home"
+        nuget_home="$guest_home/.nuget"
+        if [ -e "$nuget_home" ]; then
+          chown -R "$guest_uid:$guest_gid" "$nuget_home"
+        else
+          install -d -m 0700 -o "$guest_uid" -g "$guest_gid" "$nuget_home"
+        fi
+        # Point the CLI-home NuGet dir at the cache-populated guest one. ln -sfn
+        # replaces an existing symlink or file, but when the target path is a
+        # real directory it silently creates the link INSIDE it
+        # ($cli_home/.nuget/.nuget) instead of replacing it, leaving
+        # DOTNET_CLI_HOME with an empty .nuget that misses the baked offline
+        # packages. Drop a pre-existing real (non-symlink) directory first so the
+        # link always resolves to the cache, keeping the re-own idempotent across
+        # boots that start from either an empty tmpfs CLI home or one a prior boot
+        # already populated.
+        if [ -d "$cli_home/.nuget" ] && [ ! -L "$cli_home/.nuget" ]; then
+          rm -rf "$cli_home/.nuget"
+        fi
+        ln -sfn "$nuget_home" "$cli_home/.nuget"
+        """;
+
+    private async Task PrepareDotnetCliHomeAsync(
+        IncusSandboxOptions options,
+        string name,
+        CancellationToken ct)
+    {
+        await _cli.RunCheckedAsync(
+            "prepare guest dotnet CLI home",
+            options,
+            BuildRootExec(options, name,
+            [
+                "/bin/sh", "-s", "--",
+                options.GuestHome,
+                options.GuestUserId.ToString(CultureInfo.InvariantCulture),
+                options.GuestGroupId.ToString(CultureInfo.InvariantCulture),
+                IncusCloudInit.DotnetCliHome,
+            ]),
+            PrepareDotnetHomesScript,
             options.OperationTimeout,
             ct,
             heavyOperation: false).ConfigureAwait(false);

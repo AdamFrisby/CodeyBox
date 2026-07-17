@@ -207,7 +207,11 @@ public sealed class DeepAuditFailureTests : IDisposable
             persisted = await _releaseStore.GetAsync(release.Id);
             if (persisted?.State == ReleaseState.Failed)
                 break;
-            await Task.Yield();
+            // The retry runs as a background continuation off the advanced timer.
+            // A bare Task.Yield() re-queues immediately and hot-spins the thread
+            // pool, starving that continuation under load; a short real delay
+            // yields actual wall-clock time for it to complete and persist.
+            await Task.Delay(TimeSpan.FromMilliseconds(25));
         }
 
         Assert.Equal(ReleaseState.Failed, persisted?.State);

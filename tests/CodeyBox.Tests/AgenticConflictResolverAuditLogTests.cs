@@ -62,7 +62,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             CancellationToken.None);
 
         Assert.False(result.Success);
-        var evt = AssertSingleAttemptFailedEvent(workItemId);
+        var evt = await AssertSingleAttemptFailedEvent(workItemId);
         Assert.Contains("threw InvalidOperationException", GetScalar<string>(evt, "Reason") ?? "", StringComparison.Ordinal);
         Assert.Contains("agent CLI exploded with diagnostics",
             GetScalar<string>(evt, "Reason") ?? "", StringComparison.Ordinal);
@@ -104,7 +104,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             CancellationToken.None);
 
         Assert.False(result.Success);
-        var evt = AssertSingleAttemptFailedEvent(workItemId);
+        var evt = await AssertSingleAttemptFailedEvent(workItemId);
         Assert.Equal("agent exited 1", GetScalar<string>(evt, "Reason"));
         Assert.Equal("agent printed a startup banner before exiting", GetScalar<string>(evt, "StdoutTail"));
         Assert.Equal("missing ANTHROPIC_API_KEY; refusing to run", GetScalar<string>(evt, "StderrTail"));
@@ -183,7 +183,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             CancellationToken.None);
 
         Assert.False(result.Success);
-        var evt = AssertSingleAttemptFailedEvent(workItemId);
+        var evt = await AssertSingleAttemptFailedEvent(workItemId);
         var stdoutTail = GetScalar<string>(evt, "StdoutTail") ?? "";
         var stderrTail = GetScalar<string>(evt, "StderrTail") ?? "";
         Assert.DoesNotContain(StdoutToken, stdoutTail, StringComparison.Ordinal);
@@ -216,7 +216,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             CancellationToken.None);
 
         Assert.False(result.Success);
-        var evt = AssertSingleAttemptFailedEvent(workItemId);
+        var evt = await AssertSingleAttemptFailedEvent(workItemId);
         var stdoutTail = GetScalar<string>(evt, "StdoutTail") ?? "";
         var stderrTail = GetScalar<string>(evt, "StderrTail") ?? "";
         Assert.Equal(2049, stdoutTail.Length);
@@ -268,7 +268,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             CancellationToken.None);
 
         Assert.False(result.Success);
-        var evt = AssertSingleAttemptFailedEvent(workItemId);
+        var evt = await AssertSingleAttemptFailedEvent(workItemId);
         var reason = GetScalar<string>(evt, "Reason") ?? "";
         Assert.StartsWith("verification:", reason, StringComparison.Ordinal);
         Assert.Contains("conflict markers remain", reason, StringComparison.Ordinal);
@@ -312,7 +312,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             CancellationToken.None);
 
         Assert.False(result.Success);
-        var evt = AssertSingleAttemptFailedEvent(workItemId);
+        var evt = await AssertSingleAttemptFailedEvent(workItemId);
         var stdoutTail = GetScalar<string>(evt, "StdoutTail") ?? "";
         var stderrTail = GetScalar<string>(evt, "StderrTail") ?? "";
         Assert.DoesNotContain("ghp_", stdoutTail, StringComparison.Ordinal);
@@ -321,11 +321,22 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
         Assert.Contains("***", stderrTail, StringComparison.Ordinal);
     }
 
-    private LogEvent AssertSingleAttemptFailedEvent(WorkItemId workItemId)
+    private async Task<LogEvent> AssertSingleAttemptFailedEvent(WorkItemId workItemId)
     {
-        var attemptFailed = _sink.Events
-            .Where(e => GetScalar<string>(e, "EventName") == "agentic_conflict_resolver.attempt_failed")
-            .ToList();
+        // The audit event reaches the in-memory sink through the global Serilog
+        // pipeline, whose delivery can lag the awaited ResolveAsync completion
+        // under load. Poll for it rather than reading the sink once.
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(3);
+        List<LogEvent> attemptFailed;
+        while (true)
+        {
+            attemptFailed = _sink.Events
+                .Where(e => GetScalar<string>(e, "EventName") == "agentic_conflict_resolver.attempt_failed")
+                .ToList();
+            if (attemptFailed.Count > 0 || DateTimeOffset.UtcNow >= deadline)
+                break;
+            await Task.Delay(25);
+        }
         var match = Assert.Single(attemptFailed);
         Assert.True(GetScalar<bool>(match, "Audit"));
         Assert.Equal(LogEventLevel.Warning, match.Level);

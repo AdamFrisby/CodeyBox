@@ -1251,8 +1251,9 @@ public static class AuditLog
         string source,
         string outcome,
         string state,
-        string? reason = null) =>
-        Audit("quota_retry_attempted")
+        string? reason = null,
+        Serilog.ILogger? logger = null) =>
+        Audit(logger, "quota_retry_attempted")
             .ForContext("Reason", reason ?? "")
             .Information(
                 "Quota retry attempted for work item {WorkItemId}: source={Source} outcome={Outcome} state={State} reason={Reason}",
@@ -1464,9 +1465,10 @@ public static class AuditLog
         AgentKind agent,
         string actor,
         string injectionId,
-        string message)
+        string message,
+        Serilog.ILogger? logger = null)
     {
-        Audit("agent.supervision_injection_queued")
+        Audit(logger, "agent.supervision_injection_queued")
             .ForContext("InjectionText", TruncateAuditTail(RawChunkRedactor.Redact(message)))
             .Information(
                 "Live supervision injection {InjectionId} queued by {Actor} for work item {WorkItemId} session {SessionId} phase={Phase} agent={Agent}",
@@ -1484,8 +1486,9 @@ public static class AuditLog
         string phase,
         AgentKind agent,
         string actor,
-        string injectionId) =>
-        Audit("agent.supervision_injection_started")
+        string injectionId,
+        Serilog.ILogger? logger = null) =>
+        Audit(logger, "agent.supervision_injection_started")
             .Information(
                 "Live supervision injection {InjectionId} started for work item {WorkItemId} session {SessionId} phase={Phase} agent={Agent} actor={Actor}",
                 injectionId,
@@ -1503,9 +1506,10 @@ public static class AuditLog
         string actor,
         string injectionId,
         bool success,
-        string summary)
+        string summary,
+        Serilog.ILogger? logger = null)
     {
-        Audit("agent.supervision_injection_completed")
+        Audit(logger, "agent.supervision_injection_completed")
             .ForContext("Summary", TruncateAuditTail(RawChunkRedactor.Redact(summary)))
             .Information(
                 "Live supervision injection {InjectionId} completed for work item {WorkItemId} session {SessionId} phase={Phase} agent={Agent} actor={Actor} success={Success}",
@@ -1539,8 +1543,11 @@ public static class AuditLog
     private static Serilog.ILogger Audit(string eventName) =>
         Audit(Log.Logger, eventName);
 
-    private static Serilog.ILogger Audit(Serilog.ILogger logger, string eventName) =>
-        logger
+    // A null logger falls back to the process-global Serilog logger. Callers that
+    // hold their own audit logger (so their events are immune to a concurrent
+    // reassignment of the global static) pass it explicitly.
+    private static Serilog.ILogger Audit(Serilog.ILogger? logger, string eventName) =>
+        (logger ?? Log.Logger)
             .ForContext("Audit", true)
             .ForContext("EventName", eventName);
 }

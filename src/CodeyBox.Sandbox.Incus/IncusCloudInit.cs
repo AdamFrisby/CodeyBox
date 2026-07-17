@@ -7,6 +7,8 @@ internal static class IncusCloudInit
 {
     internal const string ExecWrapperPath = "/usr/local/bin/codeybox-incus-exec";
     internal const string RuntimeDirectory = "/run/codeybox";
+    internal const string DotnetCliHomeEnvironmentVariable = "DOTNET_CLI_HOME";
+    internal const string DotnetCliHome = RuntimeDirectory + "/dotnet-cli-home";
     internal const string ControlDirectory = "/run/codeybox-control";
     internal const string PeakRamPath = "/run/codeybox-peak-ram-bytes";
     internal const string PeakRamSamplerPath = "/usr/local/sbin/codeybox-peak-ram-sampler";
@@ -37,6 +39,7 @@ internal static class IncusCloudInit
         fi
         environment=(
           "HOME=$guest_home"
+          "{{DotnetCliHomeEnvironmentVariable}}={{DotnetCliHome}}"
           "PATH={{NonLoginPath}}"
           "LANG=C.UTF-8"
         )
@@ -124,6 +127,13 @@ internal static class IncusCloudInit
             .Append(options.GuestGroupId)
             .Append("', ")
             .Append(RuntimeDirectory)
+            .AppendLine(" ]");
+        result.Append("  - [ install, -d, -m, '0700', -o, '")
+            .Append(options.GuestUserId)
+            .Append("', -g, '")
+            .Append(options.GuestGroupId)
+            .Append("', ")
+            .Append(DotnetCliHome)
             .AppendLine(" ]");
         result.Append("  - [ install, -d, -m, '0700', -o, '0', -g, '0', ")
             .Append(ControlDirectory)

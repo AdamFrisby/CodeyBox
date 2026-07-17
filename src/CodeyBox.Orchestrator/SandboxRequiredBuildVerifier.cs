@@ -83,6 +83,18 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
           exit "$no_required_build_target_exit"
         fi
 
+        # Heal an inherited, non-writable per-user NuGet home before restore so a
+        # COW-inherited root-owned $HOME/.nuget cannot abort the build with
+        # "Failed to read NuGet.Config due to unauthorized access". The recovery
+        # is repository-owned (scripts/nuget-home-heal.sh) and dot-sourced so its
+        # fallback DOTNET_CLI_HOME propagates to the dotnet invocations below; it
+        # is a no-op when the home is usable and is skipped when the repository
+        # does not ship it. This adds no capability the gate lacks — it already
+        # runs the branch's arbitrary build logic via `dotnet build`.
+        if [ -f scripts/nuget-home-heal.sh ]; then
+          . ./scripts/nuget-home-heal.sh
+        fi
+
         while IFS= read -r target; do
           [ -n "$target" ] || continue
           echo "CodeyBox required build: dotnet build $target"

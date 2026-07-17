@@ -107,7 +107,7 @@ public sealed class DefaultProcessRunnerCancellationTests
 
         cancellation.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => run.WaitAsync(TimeSpan.FromSeconds(5)));
+            () => run.WaitAsync(RunCompletionBudget));
 
         await AssertProcessesGoneAsync(rootPid, descendantPid);
     }
@@ -153,7 +153,7 @@ public sealed class DefaultProcessRunnerCancellationTests
             CancellationToken.None,
             stderrChunkCallback: transcript.Append,
             maxStdoutBytes: 1024,
-            maxStderrBytes: 4096).WaitAsync(TimeSpan.FromSeconds(5));
+            maxStderrBytes: 4096).WaitAsync(RunCompletionBudget);
         var descendantPid = await transcript.ChildPid.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.True(result.StdoutLimitExceeded);
@@ -181,7 +181,7 @@ public sealed class DefaultProcessRunnerCancellationTests
         var descendantPid = await transcript.ChildPid.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         cancellation.Cancel();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run.WaitAsync(TimeSpan.FromSeconds(5)));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run.WaitAsync(RunCompletionBudget));
 
         await AssertProcessesGoneAsync(descendantPid);
     }
@@ -200,7 +200,7 @@ public sealed class DefaultProcessRunnerCancellationTests
                 $"yes x | head -c {outputBytes.ToString(CultureInfo.InvariantCulture)}",
             ],
             stdin: null,
-            CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+            CancellationToken.None).WaitAsync(RunCompletionBudget);
 
         Assert.Equal(0, result.ExitCode);
         Assert.False(result.StdoutLimitExceeded);
@@ -208,8 +208,24 @@ public sealed class DefaultProcessRunnerCancellationTests
         Assert.Equal(outputBytes, Encoding.UTF8.GetByteCount(result.Stdout));
     }
 
+    // These teardown tests verify that orphaned writers are killed and their
+    // pipes drained — not how fast. On a saturated host the real kill+drain can
+    // exceed the 5 s default cleanup budget, so give it generous headroom; the
+    // assertions (process gone, limit exceeded) are unchanged.
+    private static readonly TimeSpan IsolatedRunnerCleanupTimeout = TimeSpan.FromSeconds(60);
+
+    // Anti-hang guard for awaiting a run to complete (isolated teardown runs and
+    // the shared-runner unbounded-output run alike). It must exceed
+    // IsolatedRunnerCleanupTimeout so a slow-but-correct teardown under load
+    // reports its real outcome instead of tripping the guard first.
+    private static readonly TimeSpan RunCompletionBudget = TimeSpan.FromSeconds(90);
+
     private static DefaultProcessRunner NewIsolatedRunner() => new(
-        new DefaultProcessRunnerOptions { IsolateLinuxProcessGroup = true });
+        new DefaultProcessRunnerOptions
+        {
+            IsolateLinuxProcessGroup = true,
+            CleanupTimeout = IsolatedRunnerCleanupTimeout,
+        });
 
     private static async Task AssertProcessesGoneAsync(params int[] processIds)
     {

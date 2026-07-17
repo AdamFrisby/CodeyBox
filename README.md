@@ -121,6 +121,68 @@ cd CodeyBox
 dotnet build CodeyBox.slnx
 ```
 
+> The repository supplies its package sources through `Directory.Build.props` for
+> direct project builds and `Directory.Solution.props` for solution builds. Both
+> resolve `NuGet.Config` relative to the repository, so package-source selection is
+> independent of the caller's working directory. NuGet still inspects — and creates,
+> when absent — user-level configuration under `$HOME/.nuget/NuGet/`, so it needs a
+> **writable** location for that directory. In locked-down environments where the
+> inherited path is not writable (for example a home baked read-only or owned by
+> another user), NuGet otherwise aborts restore with an unauthorized-access error.
+>
+> The repository heals this automatically for **any** `dotnet` invocation, including
+> the bare `dotnet build`/`dotnet test` the CI and audit gates run directly.
+> `Directory.Build.props` and `Directory.Solution.props` carry an MSBuild
+> `InitialTargets` hook (defined once in `Directory.NuGetHomeHeal.targets`) that runs
+> at the very start of every MSBuild invocation — before NuGet's user-config read, at
+> both the solution and project level. When it finds the inherited `.nuget/NuGet`
+> unusable it quarantines it aside and recreates a writable one, preserving the baked
+> package cache via symlink so restore stays offline-safe; when the home is already
+> usable it is a no-op. So `dotnet build CodeyBox.slnx`, `dotnet build
+> --no-incremental /warnaserror`, and `dotnet test --no-build` all self-heal with no
+> wrapper or environment override. (The hook is POSIX-shell based and conditioned to
+> Unix; on Windows keep the home writable.)
+>
+> `./build.sh` applies the same recovery for non-MSBuild callers: it probes the
+> inherited `.nuget/NuGet` directory and, when it is not writable, quarantines it
+> aside and recreates a writable one (falling back to a scratch `DOTNET_CLI_HOME` only
+> when `$HOME` itself is unwritable), then forwards any arguments straight to `dotnet`
+> — for example `./build.sh build --no-incremental -warnaserror` or `./build.sh test
+> --no-build CodeyBox.slnx`; with no arguments it builds the whole solution. The heal
+> logic in both paths is the single source of truth in `scripts/nuget-home-heal.sh`.
+>
+> If you would rather fix the condition at its source — a baseline image that bakes
+> `$HOME/.nuget` owned by another account, so every COW clone inherits it — heal it
+> once at environment/baseline provisioning time instead:
+>
+> ```sh
+> # Probe first and only heal when the home is genuinely unusable, exactly like the
+> # in-tree recovery, so the recipe is safe to re-run (a second pass on an
+> # already-healed home is a no-op instead of quarantining the good tree). $HOME
+> # is writable even when $HOME/.nuget is not, so rename the broken tree aside
+> # (no root needed) into a unique, PID-suffixed name — never a fixed one that a
+> # re-run would move the recovered tree into — recreate a writable one, and
+> # preserve the populated package cache via symlink so restore stays
+> # offline-safe. Seed a readable user config too: the fatal gate error is a
+> # *read* failure, so pre-writing the file guarantees the read succeeds without
+> # relying on NuGet creating it later.
+> if ! ( mkdir -p "$HOME/.nuget/NuGet" \
+>          && [ ! -e "$HOME/.nuget/NuGet/NuGet.Config" -o -r "$HOME/.nuget/NuGet/NuGet.Config" ] \
+>          && touch "$HOME/.nuget/NuGet/.probe" ) 2>/dev/null; then
+>   quarantine="$HOME/.nuget.unwritable.$$" \
+>     && mv "$HOME/.nuget" "$quarantine" \
+>     && mkdir -p "$HOME/.nuget/NuGet" \
+>     && ln -s "$quarantine/packages" "$HOME/.nuget/packages" \
+>     && printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<configuration />' \
+>          > "$HOME/.nuget/NuGet/NuGet.Config"
+> fi
+> rm -f "$HOME/.nuget/NuGet/.probe" 2>/dev/null || true
+> ```
+>
+> Verified both ways: with the home healed (in-tree or at the baseline)
+> `dotnet build CodeyBox.slnx` is 0 warnings / 0 errors and the solution-level
+> `dotnet test --no-build` runs clean.
+
 **3. Configure a project.** Drop a JSON file somewhere and point
 `CODEYBOX_EXTRA_CONFIG` at it (it hot-reloads on change):
 

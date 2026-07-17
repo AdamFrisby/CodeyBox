@@ -8,7 +8,6 @@ using Serilog.Events;
 
 namespace CodeyBox.Tests;
 
-[Collection("GlobalSerilog")]
 public sealed class QuotaRetrySchedulerAuditTests : IDisposable
 {
     private static readonly ProjectId TestProjectId = new("test-project");
@@ -16,9 +15,15 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     private readonly string _workspace = Directory.CreateTempSubdirectory("codeybox-quota-audit-").FullName;
     private readonly TestSink _sink = new();
 
+    // A dedicated, injected Serilog logger keeps this test's audit events off the
+    // process-global Serilog.Log.Logger, so a concurrent host bootstrap that
+    // reassigns the global static cannot reroute them away from _sink. This is
+    // why the class no longer needs the GlobalSerilog serialization collection.
+    private readonly Serilog.Core.Logger _auditLogger;
+
     public QuotaRetrySchedulerAuditTests()
     {
-        Log.Logger = new LoggerConfiguration()
+        _auditLogger = new LoggerConfiguration()
             .Enrich.FromLogContext()
             .WriteTo.Sink(_sink)
             .CreateLogger();
@@ -26,7 +31,7 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
 
     public void Dispose()
     {
-        Log.CloseAndFlush();
+        _auditLogger.Dispose();
         try { Directory.Delete(_workspace, recursive: true); } catch { }
     }
 
@@ -448,7 +453,11 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
         Assert.Equal(WorkItemState.Merged, retried!.State);
         Assert.Equal(workBranch, retried.WorkBranch);
         Assert.Equal(1, retried.QuotaRetryAttempts);
-        var evt = AssertQuotaAttempt(item, "startup", "retried", "WaitingForQuotaReset");
+        // The audit event is emitted through the global Serilog pipeline, whose
+        // delivery to the in-memory sink can lag the awaited state transition
+        // under load. Poll for it rather than reading the sink once.
+        var evt = await WaitForQuotaAttemptAsync(item, "startup", "retried");
+        Assert.Equal("WaitingForQuotaReset", GetScalar<string>(evt, "State"));
         Assert.Equal("from=upstream", GetScalar<string>(evt, "Reason"));
     }
 
@@ -769,7 +778,8 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
             projects,
             queueController,
             webhooks,
-            time);
+            time,
+            auditLogger: _auditLogger);
         return new SchedulerFixture(store, gitHost, scheduler);
     }
 

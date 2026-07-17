@@ -90,6 +90,96 @@ public sealed class IncusMountAndCloudInitTests
             Directory.Delete(root, recursive: true);
         }
     }
+
+    [Fact]
+    public void CloudInit_CreatesDotnetCliHomeForGuest()
+    {
+        var options = new IncusSandboxOptions();
+        var cloudInit = IncusCloudInit.Build(options, SandboxProfileFlavor.Headless);
+
+        Assert.Contains(
+            $"[ install, -d, -m, '0700', -o, '{options.GuestUserId}', -g, '{options.GuestGroupId}', {IncusCloudInit.DotnetCliHome} ]",
+            cloudInit,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PrepareDotnetHomesScript_ReownsNuGetHomePreservingCacheAndLinksCliHome()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+        var runner = new DefaultProcessRunner();
+        var uid = (await runner.RunAsync(
+            ["id", "-u"], null, CancellationToken.None,
+            maxStdoutBytes: 64, maxStderrBytes: 64)).Stdout.Trim();
+        var gid = (await runner.RunAsync(
+            ["id", "-g"], null, CancellationToken.None,
+            maxStdoutBytes: 64, maxStderrBytes: 64)).Stdout.Trim();
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-dotnet-home-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        try
+        {
+            var guestHome = Path.Combine(root, "home");
+            var cliHome = Path.Combine(root, "cli-home");
+            Directory.CreateDirectory(guestHome);
+            // Seed a populated NuGet cache to prove the re-own preserves it
+            // rather than discarding the baked offline packages.
+            var cacheMarker = Path.Combine(guestHome, ".nuget", "packages", "pkg", "marker.txt");
+            Directory.CreateDirectory(Path.GetDirectoryName(cacheMarker)!);
+            await File.WriteAllTextAsync(cacheMarker, "cached");
+
+            var result = await runner.RunAsync(
+                ["/bin/sh", "-s", "--", guestHome, uid, gid, cliHome],
+                IncusSandboxProvider.PrepareDotnetHomesScript,
+                CancellationToken.None,
+                maxStdoutBytes: 4096,
+                maxStderrBytes: 4096);
+
+            Assert.True(result.Success, result.Stderr);
+            Assert.True(Directory.Exists(cliHome));
+            Assert.True(File.Exists(cacheMarker), "baked package cache must be preserved");
+            var link = new DirectoryInfo(Path.Combine(cliHome, ".nuget"));
+            Assert.True(link.Exists);
+            Assert.Equal(Path.Combine(guestHome, ".nuget"), link.LinkTarget);
+
+            // Idempotent: a re-run (tree already guest-owned, link already present)
+            // still succeeds and leaves the cache intact.
+            var rerun = await runner.RunAsync(
+                ["/bin/sh", "-s", "--", guestHome, uid, gid, cliHome],
+                IncusSandboxProvider.PrepareDotnetHomesScript,
+                CancellationToken.None,
+                maxStdoutBytes: 4096,
+                maxStderrBytes: 4096);
+            Assert.True(rerun.Success, rerun.Stderr);
+            Assert.True(File.Exists(cacheMarker));
+
+            // A CLI home that a prior boot left as a real .nuget directory (not
+            // the fresh tmpfs the deployment usually supplies) must still be
+            // relinked to the cache-populated guest home, not have the link
+            // silently nested inside the stale directory.
+            Directory.Delete(Path.Combine(cliHome, ".nuget"));
+            Directory.CreateDirectory(Path.Combine(cliHome, ".nuget", "stale-state"));
+            var relink = await runner.RunAsync(
+                ["/bin/sh", "-s", "--", guestHome, uid, gid, cliHome],
+                IncusSandboxProvider.PrepareDotnetHomesScript,
+                CancellationToken.None,
+                maxStdoutBytes: 4096,
+                maxStderrBytes: 4096);
+            Assert.True(relink.Success, relink.Stderr);
+            var relinked = new DirectoryInfo(Path.Combine(cliHome, ".nuget"));
+            Assert.Equal(Path.Combine(guestHome, ".nuget"), relinked.LinkTarget);
+            Assert.False(
+                Directory.Exists(Path.Combine(cliHome, ".nuget", ".nuget")),
+                "the link must replace the stale directory, not nest inside it");
+            Assert.True(File.Exists(cacheMarker));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     [Fact]
     public async Task ExecWrapper_IsValidBashAndKeepsUtilityOptionBoundaries()
     {
@@ -105,6 +195,10 @@ public sealed class IncusMountAndCloudInitTests
         Assert.Contains("-- env -i --", IncusCloudInit.ExecWrapper, StringComparison.Ordinal);
         Assert.Contains("--clear-groups", IncusCloudInit.ExecWrapper, StringComparison.Ordinal);
         Assert.Contains("--no-new-privs", IncusCloudInit.ExecWrapper, StringComparison.Ordinal);
+        Assert.Contains(
+            $"DOTNET_CLI_HOME={IncusCloudInit.DotnetCliHome}",
+            IncusCloudInit.ExecWrapper,
+            StringComparison.Ordinal);
         var cleanup = IncusCloudInit.ExecWrapper.IndexOf("rm -f -- \"$env_file\"", StringComparison.Ordinal);
         var launch = IncusCloudInit.ExecWrapper.IndexOf("setsid -- setpriv", StringComparison.Ordinal);
         Assert.True(cleanup >= 0 && cleanup < launch, "secret environment file must be removed before the agent starts");

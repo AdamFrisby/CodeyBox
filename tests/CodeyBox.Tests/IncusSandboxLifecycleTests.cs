@@ -939,6 +939,72 @@ public sealed class IncusSandboxLifecycleTests
     }
 
     [Fact]
+    public async Task RecoveryLease_Acquire_RetriesTransientContentionThenSucceedsWhenReleased()
+    {
+        var (stagingRoot, sandboxRoot) = PrepareOwnedSandboxRoot("codeybox-lease-retry-transient");
+        try
+        {
+            var held = IncusRecoveryManifestStore.Acquire(sandboxRoot);
+            // Model an unrelated fork that briefly holds an inherited copy of the
+            // O_CLOEXEC lease descriptor and then drops it. A generous attempt
+            // budget keeps this deterministic even under CPU starvation.
+            var releaser = Task.Run(async () =>
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(120));
+                held.Dispose();
+            });
+
+            using var acquired = IncusRecoveryManifestStore.Acquire(
+                sandboxRoot,
+                maxAttempts: 400,
+                retryDelay: TimeSpan.FromMilliseconds(25));
+
+            await releaser;
+            Assert.NotNull(acquired);
+        }
+        finally
+        {
+            if (Directory.Exists(stagingRoot))
+                Directory.Delete(stagingRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void RecoveryLease_Acquire_ThrowsWhenLeaseIsGenuinelyHeldForTheWholeBudget()
+    {
+        var (stagingRoot, sandboxRoot) = PrepareOwnedSandboxRoot("codeybox-lease-retry-held");
+        try
+        {
+            using var held = IncusRecoveryManifestStore.Acquire(sandboxRoot);
+
+            var rejected = Assert.Throws<InvalidOperationException>(() =>
+                IncusRecoveryManifestStore.Acquire(
+                    sandboxRoot,
+                    maxAttempts: 3,
+                    retryDelay: TimeSpan.FromMilliseconds(5)));
+
+            Assert.Contains("already owned", rejected.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            if (Directory.Exists(stagingRoot))
+                Directory.Delete(stagingRoot, recursive: true);
+        }
+    }
+
+    private static (string StagingRoot, string SandboxRoot) PrepareOwnedSandboxRoot(string sandboxName)
+    {
+        var stagingRoot = Path.Combine(
+            Path.GetTempPath(),
+            $"codeybox-incus-lease-{Guid.NewGuid():N}");
+        IncusMountStaging.EnsureOwnedStagingRoot(stagingRoot);
+        var sandboxRoot = Path.Combine(stagingRoot, sandboxName);
+        Directory.CreateDirectory(sandboxRoot);
+        IncusMountStaging.InitializeOwnedTree(sandboxRoot, sandboxName, DateTimeOffset.UtcNow);
+        return (stagingRoot, sandboxRoot);
+    }
+
+    [Fact]
     public async Task Create_WithRetainedRecoveryLease_TopologyTamperFailsClosedAndCanBeReadopted()
     {
         var fixture = PrepareRetainedAdoptionFixture("codeybox-retained-topology");
@@ -1353,8 +1419,13 @@ public sealed class IncusSandboxLifecycleTests
             {
                 ["OPENAI_API_KEY"] = execSecret,
                 ["REMOVE_ME"] = "exec-value",
+                [IncusCloudInit.DotnetCliHomeEnvironmentVariable] = "/tmp/caller-override",
             },
-            EnvironmentVariablesToUnset = ["REMOVE_ME"],
+            EnvironmentVariablesToUnset =
+            [
+                "REMOVE_ME",
+                IncusCloudInit.DotnetCliHomeEnvironmentVariable,
+            ],
             EnvironmentContainsSecrets = true,
         };
 
@@ -1374,7 +1445,9 @@ public sealed class IncusSandboxLifecycleTests
             }
 
             Assert.Equal(
-                $"CODEYBOX_SPEC_SECRET={specSecret}\0OPENAI_API_KEY={execSecret}\0",
+                $"CODEYBOX_SPEC_SECRET={specSecret}\0" +
+                $"{IncusCloudInit.DotnetCliHomeEnvironmentVariable}={IncusCloudInit.DotnetCliHome}\0" +
+                $"OPENAI_API_KEY={execSecret}\0",
                 Assert.Single(pushedPayloads));
             Assert.DoesNotContain(
                 runner.Commands.SelectMany(static command => command),
@@ -3121,6 +3194,14 @@ public sealed class IncusSandboxLifecycleTests
         {
             StagingDirectory = stagingRoot,
             UseBaselineImages = false,
+            // This fixture drives the real filesystem preflight and recovery
+            // adoption against a synchronous mock CLI, so the operation deadline
+            // only guards against a hang — it is never expected to elapse. The
+            // 250 ms FastLifecycleOptions default is a real wall-clock timer, and
+            // under full-suite CPU starvation it can fire between arming the
+            // deadline and the mock returning, aborting a correct run. Give it
+            // generous headroom; no assertion here depends on the timeout value.
+            OperationTimeout = TimeSpan.FromSeconds(30),
         };
         var originalSpec = SandboxConventions.WithTimingEnvironment(new SandboxSpec
         {

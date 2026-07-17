@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading;
 using CodeyBox.Core;
 
 namespace CodeyBox.Sandbox.Incus;
@@ -340,20 +341,47 @@ internal sealed class IncusRecoveryManifestStore : IDisposable
         _lease = lease;
     }
 
-    internal static IncusRecoveryManifestStore Acquire(string sandboxRoot)
+    internal static IncusRecoveryManifestStore Acquire(string sandboxRoot) =>
+        Acquire(
+            sandboxRoot,
+            IncusSandboxOptions.DefaultRecoveryLeaseAcquireAttempts,
+            IncusSandboxOptions.DefaultRecoveryLeaseAcquireRetryDelay);
+
+    /// <summary>
+    /// Opens and exclusively flocks the retained-recovery lease under
+    /// <paramref name="sandboxRoot"/>. <c>flock(LOCK_EX|LOCK_NB)</c> can report
+    /// spurious contention for a sub-exec instant when an unrelated concurrent
+    /// process <c>fork()</c>s and momentarily inherits this O_CLOEXEC descriptor
+    /// before its <c>exec()</c> drops it, so acquisition is retried up to
+    /// <paramref name="maxAttempts"/> times spaced by <paramref name="retryDelay"/>
+    /// before concluding the lease is genuinely held by another live owner.
+    /// </summary>
+    internal static IncusRecoveryManifestStore Acquire(
+        string sandboxRoot,
+        int maxAttempts,
+        TimeSpan retryDelay)
     {
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxAttempts, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(retryDelay, TimeSpan.Zero);
         var pinnedRoot = IncusSafeFile.PinDirectoryNoFollow(sandboxRoot);
         FileStream? lease = null;
         try
         {
             lease = IncusSafeFile.OpenOrCreatePrivateLeaseNoFollow(Path.Combine(sandboxRoot, LeaseFileName));
             IncusMountStaging.EnsurePinnedHostSourceMatches(sandboxRoot, pinnedRoot);
-            if (!IncusSafeFile.TryAcquireExclusiveLease(lease))
-                throw new InvalidOperationException("Incus retained sandbox is already owned by another process.");
-            var result = new IncusRecoveryManifestStore(pinnedRoot, lease);
-            lease = null;
-            pinnedRoot = null!;
-            return result;
+            for (var attempt = 1; ; attempt++)
+            {
+                if (IncusSafeFile.TryAcquireExclusiveLease(lease))
+                {
+                    var result = new IncusRecoveryManifestStore(pinnedRoot, lease);
+                    lease = null;
+                    pinnedRoot = null!;
+                    return result;
+                }
+                if (attempt >= maxAttempts)
+                    throw new InvalidOperationException("Incus retained sandbox is already owned by another process.");
+                Thread.Sleep(retryDelay);
+            }
         }
         finally
         {

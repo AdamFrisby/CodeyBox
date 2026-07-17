@@ -466,6 +466,142 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
     }
 
     [Fact]
+    public async Task ProvisioningValidation_AcceptsBenignAlreadyProvisionedSymlinkAndRejectsHostileAlias()
+    {
+        const string destination = "/home/ubuntu/.local/bin/agy";
+        const string symlink = "/usr/local/bin/agy";
+        var options = BaseOptions() with
+        {
+            ExecutableProvisions =
+            [
+                new BaselineExecutableProvision
+                {
+                    HostSourcePath = "/host/source-not-read-for-validation",
+                    VmDestPath = destination,
+                    VmSymlinks = [symlink],
+                },
+            ],
+        };
+
+        // A COW-inherited baseline (or a re-bake) already has the symlink in place,
+        // so realpath resolves it to the very executable destination we would point
+        // it at. That is benign and must not be rejected as a hostile alias.
+        var benignRunner = new BaselineBakeRunner(
+            Path.Combine(_root, "benign-symlink-staging"),
+            verificationExitCode: 0,
+            canonicalizeGuestPath: path => path == symlink ? destination : path,
+            readSymlinkTarget: path => path == symlink ? destination : null);
+        var benignProvider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            benignRunner,
+            environmentVariableReader: EnvironmentReader(_root));
+        await benignProvider.ValidateCanonicalProvisioningPathsAsync(
+            options,
+            "codeybox-test-instance",
+            mountGuestPaths: [],
+            CancellationToken.None);
+
+        // A symlink resolving anywhere other than its intended destination is a
+        // genuine alias redirect and must still be rejected.
+        var hostileRunner = new BaselineBakeRunner(
+            Path.Combine(_root, "hostile-symlink-staging"),
+            verificationExitCode: 0,
+            canonicalizeGuestPath: path => path == symlink ? "/opt/evil/agy" : path);
+        var hostileProvider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            hostileRunner,
+            environmentVariableReader: EnvironmentReader(_root));
+        var hostile = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            hostileProvider.ValidateCanonicalProvisioningPathsAsync(
+                options,
+                "codeybox-test-instance",
+                mountGuestPaths: [],
+                CancellationToken.None));
+        Assert.Contains("filesystem alias", hostile.Message, StringComparison.Ordinal);
+
+        // Resolving to the intended destination is insufficient when the literal
+        // link points through an intermediate alias. Provisioning creates a direct,
+        // absolute link, so an inherited chain is not an already-satisfied link.
+        var chainedRunner = new BaselineBakeRunner(
+            Path.Combine(_root, "chained-symlink-staging"),
+            verificationExitCode: 0,
+            canonicalizeGuestPath: path => path == symlink ? destination : path,
+            readSymlinkTarget: path => path == symlink ? "/opt/intermediate/agy" : null);
+        var chainedProvider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            chainedRunner,
+            environmentVariableReader: EnvironmentReader(_root));
+        var chained = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            chainedProvider.ValidateCanonicalProvisioningPathsAsync(
+                options,
+                "codeybox-test-instance",
+                mountGuestPaths: [],
+                CancellationToken.None));
+        Assert.Contains("filesystem alias", chained.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("/usr/local/bin/agy", "/opt/second/agy")]
+    [InlineData("/opt/second/agy", "/usr/local/bin/agy")]
+    public async Task ProvisioningValidation_RejectsHostileSymlinkEvenWhenSiblingIsBenign(
+        string firstSymlink,
+        string secondSymlink)
+    {
+        // Per-symlink evaluation must be independent: a benign already-provisioned
+        // symlink tolerance is granted only for the sibling that resolves to the
+        // destination, and must never let a hostile sibling be skipped. Ordering the
+        // benign link first or last must not change the verdict.
+        const string destination = "/home/ubuntu/.local/bin/agy";
+        const string benignSymlink = "/usr/local/bin/agy";
+        var hostileSymlink = firstSymlink == benignSymlink ? secondSymlink : firstSymlink;
+        var options = BaseOptions() with
+        {
+            ExecutableProvisions =
+            [
+                new BaselineExecutableProvision
+                {
+                    HostSourcePath = "/host/source-not-read-for-validation",
+                    VmDestPath = destination,
+                    VmSymlinks = [firstSymlink, secondSymlink],
+                },
+            ],
+        };
+
+        // The benign symlink resolves to the provisioned destination; the hostile one
+        // resolves into an unrelated location, i.e. an alias redirect.
+        var runner = new BaselineBakeRunner(
+            Path.Combine(_root, "mixed-symlink-staging"),
+            verificationExitCode: 0,
+            canonicalizeGuestPath: path => path switch
+            {
+                _ when path == benignSymlink => destination,
+                _ when path == hostileSymlink => "/opt/evil/agy",
+                _ => path,
+            },
+            readSymlinkTarget: path => path == benignSymlink ? destination : null);
+        var provider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner,
+            environmentVariableReader: EnvironmentReader(_root));
+
+        var rejected = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            provider.ValidateCanonicalProvisioningPathsAsync(
+                options,
+                "codeybox-test-instance",
+                mountGuestPaths: [],
+                CancellationToken.None));
+        Assert.Contains("filesystem alias", rejected.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task FullLaunch_RejectsProvisioningMountOverlapBeforeIncusRuns()
     {
         var options = BaseOptions() with
@@ -993,9 +1129,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         {
             var activeRoot = workspace.Root;
             File.WriteAllText(Path.Combine(activeRoot, "large-partial"), "partial");
-            Assert.False(IncusProvisioningWorkspace.RecoverStaleWorkspaces(
-                stagingRoot,
-                CancellationToken.None));
+            Assert.False(RecoverWithLeaseRetry(stagingRoot));
             Assert.True(Directory.Exists(activeRoot));
         }
 
@@ -1004,8 +1138,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         File.WriteAllText(sentinel, "keep");
         var deceptive = Path.Combine(stagingRoot, $"{IncusProvisioningWorkspace.DirectoryPrefix}{Guid.NewGuid():N}");
         Directory.CreateSymbolicLink(deceptive, external);
-        Assert.Throws<InvalidOperationException>(() =>
-            IncusProvisioningWorkspace.RecoverStaleWorkspaces(stagingRoot, CancellationToken.None));
+        Assert.Throws<InvalidOperationException>(() => RecoverWithLeaseRetry(stagingRoot));
         Assert.True(File.Exists(sentinel));
         Directory.Delete(deceptive);
 
@@ -1017,8 +1150,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         File.WriteAllText(marker, "not-this-workspace\n");
         if (OperatingSystem.IsLinux())
             File.SetUnixFileMode(marker, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-        Assert.Throws<InvalidOperationException>(() =>
-            IncusProvisioningWorkspace.RecoverStaleWorkspaces(stagingRoot, CancellationToken.None));
+        Assert.Throws<InvalidOperationException>(() => RecoverWithLeaseRetry(stagingRoot));
         Assert.DoesNotContain(
             Directory.EnumerateFileSystemEntries(mismatchedMarker),
             path => Path.GetFileName(path).Contains("lease", StringComparison.Ordinal));
@@ -1026,17 +1158,46 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
 
         var foreign = Path.Combine(stagingRoot, $"{IncusProvisioningWorkspace.DirectoryPrefix}{Guid.NewGuid():N}");
         Directory.CreateDirectory(foreign);
-        Assert.ThrowsAny<Exception>(() =>
-            IncusProvisioningWorkspace.RecoverStaleWorkspaces(stagingRoot, CancellationToken.None));
+        // Pin a foreign mode explicitly: recovery deletes only owner-only (0700)
+        // workspaces, so the group bits here make the rejection fire deterministically
+        // regardless of the ambient umask. A bare Directory.CreateDirectory inherits the
+        // umask, which under a hardened 0077 umask would yield exactly 0700 and let the
+        // entry be legitimately deleted -- masking the foreign-mode guard under test.
+        if (OperatingSystem.IsLinux())
+        {
+            File.SetUnixFileMode(
+                foreign,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                    | UnixFileMode.GroupRead | UnixFileMode.GroupExecute);
+        }
+        Assert.ThrowsAny<Exception>(() => RecoverWithLeaseRetry(stagingRoot));
         Assert.True(Directory.Exists(foreign));
         Directory.Delete(foreign);
 
         var partial = Path.Combine(stagingRoot, $"{IncusProvisioningWorkspace.DirectoryPrefix}{Guid.NewGuid():N}");
         Assert.True(IncusSafeFile.TryCreateDirectoryExclusive(partial));
-        Assert.True(IncusProvisioningWorkspace.RecoverStaleWorkspaces(
-            stagingRoot,
-            CancellationToken.None));
+        Assert.True(RecoverWithLeaseRetry(stagingRoot));
         Assert.False(Directory.Exists(partial));
+    }
+
+    // Honors RecoverStaleWorkspaces' own documented contract: its coordination
+    // lease can be transiently held by a concurrent recovery pass or by an
+    // unrelated fork inheriting the descriptor, and the thrown error explicitly
+    // says to retry. Retry only that transient contention with a bounded budget;
+    // any other outcome (success/false or a rejection) propagates unchanged.
+    private static bool RecoverWithLeaseRetry(string stagingRoot)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                return IncusProvisioningWorkspace.RecoverStaleWorkspaces(stagingRoot, CancellationToken.None);
+            }
+            catch (IncusProvisioningLeaseContendedException) when (attempt < 100)
+            {
+                Thread.Sleep(20);
+            }
+        }
     }
 
     [Fact]
@@ -1141,6 +1302,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         Assert.Contains($"--reuid={options.GuestUserId}", verification);
         Assert.Contains($"--regid={options.GuestGroupId}", verification);
         Assert.Contains($"PATH={IncusCloudInit.NonLoginPath}", verification);
+        Assert.Contains($"DOTNET_CLI_HOME={IncusCloudInit.DotnetCliHome}", verification);
         var verificationBoundary = IndexOf(verification, "--");
         Assert.True(verificationBoundary >= 0);
         Assert.Equal(
@@ -1157,6 +1319,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
                 "-i",
                 "--",
                 $"HOME={options.GuestHome}",
+                $"DOTNET_CLI_HOME={IncusCloudInit.DotnetCliHome}",
                 $"PATH={IncusCloudInit.NonLoginPath}",
                 "LANG=C.UTF-8",
                 "probe-tool",
@@ -1168,6 +1331,27 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
             && command.Contains("-d", StringComparer.Ordinal)
             && command.Contains(options.GuestUserId.ToString(), StringComparer.Ordinal)
             && command.Contains("/home/ubuntu/.local/bin", StringComparer.Ordinal));
+        var dotnetHomePreparation = Assert.Single(
+            runner.Invocations,
+            invocation => invocation.Argv.Contains("/bin/sh", StringComparer.Ordinal)
+                && invocation.Argv.Contains(IncusCloudInit.DotnetCliHome, StringComparer.Ordinal));
+        var dotnetHomeShellIndex = IndexOf(dotnetHomePreparation.Argv, "/bin/sh");
+        Assert.True(dotnetHomeShellIndex >= 0);
+        Assert.Equal(
+            [
+                "/bin/sh", "-s", "--",
+                options.GuestHome,
+                options.GuestUserId.ToString(),
+                options.GuestGroupId.ToString(),
+                IncusCloudInit.DotnetCliHome,
+            ],
+            dotnetHomePreparation.Argv.Skip(dotnetHomeShellIndex));
+        // The preparation re-owns the inherited NuGet home to the guest (keeping
+        // the baked offline cache) and links DOTNET_CLI_HOME's NuGet home at it.
+        Assert.NotNull(dotnetHomePreparation.Stdin);
+        Assert.Contains("chown -R", dotnetHomePreparation.Stdin!, StringComparison.Ordinal);
+        Assert.Contains("/.nuget", dotnetHomePreparation.Stdin!, StringComparison.Ordinal);
+        Assert.Contains("ln -sfn", dotnetHomePreparation.Stdin!, StringComparison.Ordinal);
         Assert.DoesNotContain(commands, command =>
             command.Contains("snapshot", StringComparer.Ordinal)
             && command.Contains("create", StringComparer.Ordinal));
@@ -1967,6 +2151,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         private readonly Action? _onFilePush;
         private readonly Action? _onStart;
         private readonly Func<string, string> _canonicalizeGuestPath;
+        private readonly Func<string, string?> _readSymlinkTarget;
         private readonly Action? _onCanonicalization;
         private string? _instanceName;
         private string _instanceStatus = "STOPPED";
@@ -1984,7 +2169,8 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
             Action? onFilePush = null,
             Action? onStart = null,
             Func<string, string>? canonicalizeGuestPath = null,
-            Action? onCanonicalization = null)
+            Action? onCanonicalization = null,
+            Func<string, string?>? readSymlinkTarget = null)
         {
             _stagingRoot = stagingRoot;
             _verificationExitCode = verificationExitCode;
@@ -1994,6 +2180,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
             _onStart = onStart;
             _canonicalizeGuestPath = canonicalizeGuestPath ?? (static path => path);
             _onCanonicalization = onCanonicalization;
+            _readSymlinkTarget = readSymlinkTarget ?? (static _ => null);
             if (existingPinnedName is not null)
             {
                 _instanceName = existingPinnedName;
@@ -2091,6 +2278,14 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
                 {
                     _onCanonicalization?.Invoke();
                     return Success(_canonicalizeGuestPath(argv[^1]) + "\n");
+                }
+                var readlinkIndex = IndexOf(argv, "/usr/bin/readlink");
+                if (readlinkIndex >= 0)
+                {
+                    var target = _readSymlinkTarget(argv[^1]);
+                    return target is null
+                        ? Task.FromResult(new ProcessRunResult(1, string.Empty, "not a symbolic link"))
+                        : Success(target + "\n");
                 }
                 if (argv.Contains("setpriv", StringComparer.Ordinal))
                 {

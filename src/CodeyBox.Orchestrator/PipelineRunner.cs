@@ -12561,6 +12561,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                     SandboxConventions.WorkDir,
                                     "checkout",
                                     ctx.WorkBranch);
+                                // Heal an inherited root-owned $HOME/.nuget once, before
+                                // this shared sandbox's dotnet build/test/format gates run.
+                                await HealAuditNuGetHomeAsync(setupSandbox, setupCt);
                             },
                             ct);
                         return prepared;
@@ -19430,6 +19433,33 @@ Original merge-phase failure (JSON string, for context only):
         if (!r.Success)
             throw new InvalidOperationException($"command failed (exit {r.ExitCode}): {string.Join(' ', argv)}\n{r.Stderr}");
     }
+
+    // Best-effort recovery of a COW-inherited, root-owned per-user NuGet home run
+    // once when preparing a tool-audit sandbox, before its `dotnet build`/`test`/
+    // `format` gates. A broken home otherwise aborts restore with "Failed to read
+    // NuGet.Config due to unauthorized access". The branch's MSBuild InitialTargets
+    // hook (Directory.NuGetHomeHeal.targets) already heals every `dotnet build`/
+    // `test` invocation on its own; this setup step is a complementary safety net
+    // that also covers gate commands which do not evaluate those props (e.g. a bare
+    // `dotnet restore` or `dotnet format`) and does the repair once so the shared
+    // sandbox's later gates inherit a healthy home. It dot-sources the checked-out
+    // branch's own repository-owned recovery (scripts/nuget-home-heal.sh), whose
+    // on-disk repair persists for every gate sharing the sandbox; the trailing
+    // `true` keeps the step best-effort so a missing script or unhealable home
+    // never masks the real gate error. This adds no capability the audit sandbox
+    // lacks — it already runs the branch's arbitrary build logic via `dotnet build`
+    // in this same credential-free sandbox — and is a no-op when the home is
+    // already usable.
+    private static Task HealAuditNuGetHomeAsync(ISandbox sandbox, CancellationToken ct)
+        => RunWithCancellation(
+            sandbox,
+            ct,
+            "sh",
+            "-c",
+            "cd \"$1\" 2>/dev/null && [ -f scripts/nuget-home-heal.sh ] && "
+                + ". ./scripts/nuget-home-heal.sh; true",
+            "sh",
+            SandboxConventions.WorkDir);
 
     private static void ThrowIfExecutionUnavailable(SandboxExecResult result)
     {
