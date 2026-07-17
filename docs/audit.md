@@ -226,6 +226,28 @@ With a writable home the source builds warnings-clean (`dotnet build
 ./CodeyBox.slnx` and `dotnet build --no-incremental /warnaserror` → 0
 warnings/0 errors) and the suite runs.
 
+**Root cause corrected — a repo-side defect after all (this iteration).** The
+"operator precondition / no repo fix" conclusion above was incomplete. The
+`process:required-build` gate output quotes the line `CodeyBox required build:
+dotnet build ./CodeyBox.slnx`, which is emitted **only** by
+`SandboxRequiredBuildVerifier.BuildScript` — so the gate runs *through* the
+`DotnetCliHomeSelectionScript` prologue, not as a bare `dotnet`. The prologue
+kept the inherited home whenever `"$cli_home/.nuget/NuGet"` was a *writable
+directory*, but a provisioning step can leave that directory writable while the
+`NuGet.Config` file inside it is root-owned and unreadable. NuGet reads that file
+while loading default settings and aborts with the exact `Failed to read
+NuGet.Config … denied` the gate reported — even though the redirect logic
+"passed". The fix is a one-line strengthening of the probe: also require any
+existing `NuGet.Config` to be readable (`-r`) before keeping the inherited home,
+otherwise fall back to the repo-local `.dotnet-cli-home` where NuGet
+materialises a fresh, readable config. This is committed in the prologue and in
+`build.sh`, and covered by
+`DotnetCliHomeSelectionScriptTests.WritableCliHomeWithUnreadableConfig_FallsBackToRepoLocalHome`
+(and its readable-config counterpart). The earlier escape-hatch analysis
+(`RestoreConfigFile`, `Directory.Build.props`, `Directory.Build.rsp`) remains
+correct for a *genuinely bare* `dotnet` launched outside the verifier; it simply
+did not apply, because this gate is not bare.
+
 **Single root cause across the .NET gates.** `process:required-build`,
 `csharp:build-WaE`, and `csharp:test-pass` fail together and for one reason: an
 unwritable user-level NuGet home aborts restore before the build or test target

@@ -6,18 +6,23 @@ cli_home="$codeybox_script_dir/.dotnet-cli-home"
 
 # dotnet/NuGet materialise the user-level config under $HOME/.nuget/NuGet (and,
 # for some SDK/NuGet builds, $DOTNET_CLI_HOME/.nuget) on first restore. When the
-# inherited home already has a writable ~/.nuget/NuGet we keep it so the caller's
-# real package cache and credentials are reused (and respect an explicit
-# DOTNET_CLI_HOME override so callers pinning a different home — e.g. CI caches
-# — still win); otherwise (root-owned or unwritable, common in agent sandboxes)
-# we pin both DOTNET_CLI_HOME and HOME to a writable repo-local home so restore
-# never probes a root-owned ~/.nuget. Pinning HOME as well as DOTNET_CLI_HOME
-# mirrors SandboxRequiredBuildVerifier's DotnetCliHomeSelectionScript, whose
-# comment explains why DOTNET_CLI_HOME alone is insufficient for NuGet builds
-# that derive the config dir from HOME.
+# inherited home already has a writable ~/.nuget/NuGet whose NuGet.Config (if any)
+# is readable we keep it so the caller's real package cache and credentials are
+# reused (and respect an explicit DOTNET_CLI_HOME override so callers pinning a
+# different home — e.g. CI caches — still win); otherwise (root-owned or unwritable
+# dir, or an unreadable root-owned NuGet.Config left inside a writable dir — both
+# common in agent sandboxes) we pin both DOTNET_CLI_HOME and HOME to a writable
+# repo-local home so restore never probes a root-owned ~/.nuget. The NuGet.Config
+# readability check matters because NuGet reads that file while loading default
+# settings and aborts with "Failed to read NuGet.Config ... denied" even when the
+# directory itself is writable. Pinning HOME as well as DOTNET_CLI_HOME mirrors
+# SandboxRequiredBuildVerifier's DotnetCliHomeSelectionScript, whose comment
+# explains why DOTNET_CLI_HOME alone is insufficient for NuGet builds that derive
+# the config dir from HOME.
 if [ -n "${HOME:-}" ] \
   && mkdir -p "$HOME/.nuget/NuGet" 2>/dev/null \
-  && [ -w "$HOME/.nuget/NuGet" ]; then
+  && [ -w "$HOME/.nuget/NuGet" ] \
+  && { [ ! -e "$HOME/.nuget/NuGet/NuGet.Config" ] || [ -r "$HOME/.nuget/NuGet/NuGet.Config" ]; }; then
   export DOTNET_CLI_HOME="${DOTNET_CLI_HOME:-$cli_home}"
 else
   export DOTNET_CLI_HOME="$cli_home"

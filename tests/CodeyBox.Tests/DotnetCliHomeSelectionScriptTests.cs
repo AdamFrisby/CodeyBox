@@ -87,6 +87,65 @@ public sealed class DotnetCliHomeSelectionScriptTests : IDisposable
         }
     }
 
+    [Fact]
+    public void WritableCliHomeWithUnreadableConfig_FallsBackToRepoLocalHome()
+    {
+        // POSIX-only: the readability probe relies on Unix file permissions.
+        if (OperatingSystem.IsWindows())
+            return;
+        // A privileged process can read any file, so an unreadable NuGet.Config
+        // still probes readable and the fallback branch is unobservable. Skip
+        // rather than flake when the suite runs as root.
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        // Regression for the failing .NET gate: a provisioning step can leave
+        // "$cli_home/.nuget/NuGet" a writable directory while the NuGet.Config
+        // file inside it is root-owned and unreadable. The directory-writability
+        // probe alone passes, so the prologue would keep that home and dotnet
+        // would abort reading the unreadable file with "Failed to read
+        // NuGet.Config ... denied". The readability probe must reject it instead.
+        var home = Path.Combine(_workspace, "writable-with-poisoned-config");
+        var nugetDir = Path.Combine(home, ".nuget", "NuGet");
+        Directory.CreateDirectory(nugetDir);
+        var config = Path.Combine(nugetDir, "NuGet.Config");
+        File.WriteAllText(config, "<configuration/>");
+        // Deny all access to the config file; the directory stays writable.
+        File.SetUnixFileMode(config, UnixFileMode.None);
+        try
+        {
+            var resolved = RunSelection(presetCliHome: home, workingDirectory: _workspace);
+
+            var expected = Path.Combine(_workspace, DotnetCliHomeConventions.DirectoryName);
+            Assert.Equal(expected, resolved.CliHome);
+            Assert.Equal(expected, resolved.Home);
+        }
+        finally
+        {
+            // Restore read/write so Dispose can delete the tree.
+            File.SetUnixFileMode(
+                config,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+    }
+
+    [Fact]
+    public void WritableCliHomeWithReadableConfig_IsPreserved()
+    {
+        // The inherited home has a real, readable NuGet.Config (the common case
+        // where the caller's package cache and credentials should be reused).
+        // The readability probe must NOT reject it.
+        var home = Path.Combine(_workspace, "writable-with-readable-config");
+        var nugetDir = Path.Combine(home, ".nuget", "NuGet");
+        Directory.CreateDirectory(nugetDir);
+        File.WriteAllText(Path.Combine(nugetDir, "NuGet.Config"), "<configuration/>");
+
+        var resolved = RunSelection(presetCliHome: home, workingDirectory: _workspace);
+
+        Assert.Equal(home, resolved.CliHome);
+        Assert.Equal(home, resolved.Home);
+    }
+
     private readonly record struct SelectionResult(string CliHome, string Home);
 
     private static SelectionResult RunSelection(string? presetCliHome, string workingDirectory)

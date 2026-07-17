@@ -56,13 +56,22 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
     // probe a root-owned ~/.nuget. Overriding HOME is safe here because the
     // prologue runs immediately before dotnet inside the build step — the git
     // clone/checkout that need the caller's HOME run as separate execs before it.
-    // Exposed internally so a deterministic shell test can exercise the unset /
-    // writable / non-writable branches directly.
+    // A writable user-config DIRECTORY is not sufficient: a provisioning step can
+    // leave "$cli_home/.nuget/NuGet" writable (so the mkdir/-w probe passes) while
+    // the NuGet.Config FILE inside it is root-owned and unreadable. NuGet reads
+    // that file unconditionally while loading default settings and aborts with the
+    // exact "Failed to read NuGet.Config ... denied" seen in the failing gate, so
+    // we additionally require any existing NuGet.Config to be readable (-r) before
+    // keeping the inherited home; otherwise we fall back to the repo-local home,
+    // where NuGet materialises a fresh, readable config. Exposed internally so a
+    // deterministic shell test can exercise the unset / writable / non-writable /
+    // unreadable-config branches directly.
     internal static readonly string DotnetCliHomeSelectionScript = $$"""
         cli_home="${DOTNET_CLI_HOME:-}"
         if [ -n "$cli_home" ] \
           && mkdir -p "$cli_home/.nuget/NuGet" 2>/dev/null \
-          && [ -w "$cli_home/.nuget/NuGet" ]; then
+          && [ -w "$cli_home/.nuget/NuGet" ] \
+          && { [ ! -e "$cli_home/.nuget/NuGet/NuGet.Config" ] || [ -r "$cli_home/.nuget/NuGet/NuGet.Config" ]; }; then
           :
         else
           cli_home="$(pwd)/{{DotnetCliHomeConventions.DirectoryName}}"
