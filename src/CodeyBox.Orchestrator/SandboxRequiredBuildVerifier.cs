@@ -38,10 +38,48 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
     // execution exceeding the required-build budget.
     private const int BuildTimeoutExitCode = 124;
 
+    // Self-heal preamble for an unusable NuGet user-settings home. On an
+    // unprivileged build host a root-provisioned ~/.nuget makes NuGet's user
+    // settings unreadable, so a plain `dotnet build` fails during restore for
+    // *every* project with "Failed to read NuGet.Config due to unauthorized
+    // access" -- a repo NuGet.Config or --configfile does not help because NuGet
+    // still probes the user settings directory. This mirrors ./build.sh: when any
+    // level of the settings hierarchy is unusable by the current user, redirect
+    // DOTNET_CLI_HOME to a writable temp dir (reusing the existing package cache)
+    // so restore succeeds. It is a no-op on a healthy home. Kept in sync with the
+    // ./build.sh entrypoint, which cannot be shared across these two shell
+    // execution contexts (standalone script vs. sandboxed gate command).
+    // Assumes the enclosing script already ran `set -eu`; the [ ... ] && flag
+    // idioms are set -e-safe because a failing test is a non-final AND-OR member.
+    internal const string NuGetHomeSelfHealPreamble = """
+        nuget_home="${DOTNET_CLI_HOME:-$HOME}"
+        nuget_root="${nuget_home}/.nuget"
+        nuget_settings_dir="${nuget_root}/NuGet"
+        nuget_settings_file="${nuget_settings_dir}/NuGet.Config"
+        nuget_home_broken=0
+        if [ -d "$nuget_settings_dir" ]; then
+          { [ ! -w "$nuget_settings_dir" ]; } && nuget_home_broken=1
+          { [ -e "$nuget_settings_file" ] && [ ! -r "$nuget_settings_file" ]; } && nuget_home_broken=1
+        elif [ -d "$nuget_root" ] && [ ! -w "$nuget_root" ]; then
+          nuget_home_broken=1
+        fi
+        if [ "$nuget_home_broken" -eq 1 ]; then
+          writable_home="${TMPDIR:-/tmp}/codeybox-required-build-nuget-home"
+          mkdir -p "$writable_home"
+          export DOTNET_CLI_HOME="$writable_home"
+          existing_packages="${nuget_root}/packages"
+          if [ -z "${NUGET_PACKAGES:-}" ] && [ -d "$existing_packages" ] && [ -w "$existing_packages" ]; then
+            export NUGET_PACKAGES="$existing_packages"
+          fi
+          echo "required build: '${nuget_root}' is not usable by $(id -un) (root-owned NuGet home?); redirecting DOTNET_CLI_HOME=${DOTNET_CLI_HOME}${NUGET_PACKAGES:+ (reusing package cache ${NUGET_PACKAGES})}" >&2
+        fi
+        """;
+
     // Exposed to tests so the actual gate script — the exact artifact the
     // sandbox executes via `sh -c` — can be run under a controlled shell.
     internal static readonly string BuildScript = $$"""
         set -eu
+        {{NuGetHomeSelfHealPreamble}}
         dotnet_command_not_found_exit={{DotnetCommandNotFoundExitCode}}
         no_required_build_target_exit={{NoRequiredBuildTargetExitCode}}
 

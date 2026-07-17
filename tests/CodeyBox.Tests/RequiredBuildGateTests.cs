@@ -26,6 +26,97 @@ public sealed class RequiredBuildGateTests : IDisposable
         catch { }
     }
 
+    // The required-build gate runs `dotnet build` directly (not via build.sh), so
+    // its script carries a NuGet-home self-heal for unprivileged hosts whose
+    // ~/.nuget is root-owned. These exercise the real production shell string.
+    [Fact]
+    public async Task NuGetHomeSelfHeal_RedirectsDotnetCliHome_WhenUserConfigUnreadable()
+    {
+        // The self-heal and this /bin/sh-driven check are POSIX-only (the gate
+        // runs on Linux build hosts); the Unix file-mode API is unavailable on
+        // Windows, so skip there rather than assert against it.
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var home = Path.Combine(_workspace, "broken-home");
+        var settingsDir = Path.Combine(home, ".nuget", "NuGet");
+        Directory.CreateDirectory(settingsDir);
+        var config = Path.Combine(settingsDir, "NuGet.Config");
+        File.WriteAllText(config, "<configuration/>");
+        // Simulate a NuGet.Config the current (unprivileged) user cannot read,
+        // the exact failure the audit build hit on a root-owned ~/.nuget.
+        File.SetUnixFileMode(config, UnixFileMode.None);
+        var tmp = Path.Combine(_workspace, "broken-tmp");
+        Directory.CreateDirectory(tmp);
+
+        try
+        {
+            var (exit, dotnetCliHome) = await RunSelfHealPreambleAsync(home, tmp);
+
+            Assert.Equal(0, exit);
+            Assert.Equal(
+                Path.Combine(tmp, "codeybox-required-build-nuget-home"),
+                dotnetCliHome);
+            Assert.True(Directory.Exists(dotnetCliHome));
+        }
+        finally
+        {
+            File.SetUnixFileMode(config, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+    }
+
+    [Fact]
+    public async Task NuGetHomeSelfHeal_LeavesDotnetCliHomeUnset_OnHealthyHome()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var home = Path.Combine(_workspace, "healthy-home");
+        var settingsDir = Path.Combine(home, ".nuget", "NuGet");
+        Directory.CreateDirectory(settingsDir);
+        File.WriteAllText(Path.Combine(settingsDir, "NuGet.Config"), "<configuration/>");
+        var tmp = Path.Combine(_workspace, "healthy-tmp");
+        Directory.CreateDirectory(tmp);
+
+        var (exit, dotnetCliHome) = await RunSelfHealPreambleAsync(home, tmp);
+
+        Assert.Equal(0, exit);
+        Assert.Equal(string.Empty, dotnetCliHome);
+    }
+
+    // Runs the production self-heal preamble under `set -eu` (matching the gate's
+    // BuildScript) with an isolated HOME/TMPDIR and reports the resulting
+    // DOTNET_CLI_HOME, so the assertions reflect the real shell's behavior.
+    private static async Task<(int ExitCode, string DotnetCliHome)> RunSelfHealPreambleAsync(
+        string home,
+        string tmpDir)
+    {
+        var script =
+            "set -eu\n"
+            + SandboxRequiredBuildVerifier.NuGetHomeSelfHealPreamble
+            + "\nprintf '%s' \"${DOTNET_CLI_HOME:-}\"\n";
+
+        var psi = new System.Diagnostics.ProcessStartInfo("/bin/sh")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add(script);
+        // Force a deterministic, isolated NuGet home + temp root; strip any
+        // inherited DOTNET_CLI_HOME so the preamble decides from HOME alone.
+        psi.Environment["HOME"] = home;
+        psi.Environment["TMPDIR"] = tmpDir;
+        psi.Environment.Remove("DOTNET_CLI_HOME");
+        psi.Environment.Remove("NUGET_PACKAGES");
+
+        using var process = System.Diagnostics.Process.Start(psi)!;
+        var stdout = await process.StandardOutput.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        return (process.ExitCode, stdout.Trim());
+    }
+
     [Fact]
     public async Task BuildScript_RestoresGreen_WhenPerUserNuGetHomeIsNotWritable()
     {
