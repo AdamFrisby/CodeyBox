@@ -11,7 +11,17 @@ namespace CodeyBox.Tests;
 /// no-op), <see cref="AgentCircuitBreakerOptions"/> resolution/clamping, and
 /// the <see cref="AgentClassRouter"/> gate composition (a benched member is
 /// excluded and routing spills to the next healthy member).
+///
+/// <para>
+/// Joined to the <see cref="GlobalSerilogCollection"/>: opening/half-opening/
+/// closing a breaker emits an <c>agent_circuit_breaker.transition</c> audit
+/// event through the static <see cref="Serilog.Log.Logger"/>. Running in
+/// parallel with the WebApplicationFactory-based collection tests that own that
+/// static logger would interleave those emissions into their sinks, so this
+/// class must be serialized alongside every other static-logger test.
+/// </para>
 /// </summary>
+[Collection("GlobalSerilog")]
 public sealed class AgentCircuitBreakerTests
 {
     private static readonly DateTimeOffset T0 =
@@ -396,6 +406,12 @@ public sealed class AgentCircuitBreakerTests
                 QuotaRecheckInterval = TimeSpan.FromMinutes(5),
             },
             NullLogger<AgentClassRouter>.Instance,
+            // Inject a fixed clock a couple of seconds past the seeded failures so
+            // the router evaluates the breaker at the same instant the breaker was
+            // opened at — otherwise the router would fall back to wall-clock, the
+            // cooldown would have elapsed, and an Open breaker would already admit
+            // a half-open trial (rule 8: injected clock, no wall-clock).
+            timeProvider: new FakeTimeProvider(T0.AddSeconds(2)),
             circuitBreaker: breaker);
 
     private static AgentMembership Sub(AgentKind kind, int score = 100) =>
