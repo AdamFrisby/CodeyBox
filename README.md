@@ -128,7 +128,10 @@ dotnet build CodeyBox.slnx
 > when absent — user-level configuration under `$HOME/.nuget/NuGet/`, so it needs a
 > **writable** location for that directory. In locked-down environments where the
 > inherited path is not writable (for example a home baked read-only or owned by
-> another user), NuGet otherwise aborts restore with an unauthorized-access error.
+> another user), NuGet otherwise aborts restore with an unauthorized-access error
+> (`Failed to read NuGet.Config due to unauthorized access`) for every project — a
+> checked-in `NuGet.Config` or `--configfile` does not help, because NuGet still
+> probes the user settings directory regardless.
 >
 > The repository heals this automatically for **any** `dotnet` invocation, including
 > the bare `dotnet build`/`dotnet test` the CI and audit gates run directly.
@@ -153,7 +156,9 @@ dotnet build CodeyBox.slnx
 >
 > If you would rather fix the condition at its source — a baseline image that bakes
 > `$HOME/.nuget` owned by another account, so every COW clone inherits it — heal it
-> once at environment/baseline provisioning time instead:
+> once at environment/baseline provisioning time instead (fixing ownership with
+> `chown -R "$(id -u):$(id -g)" ~/.nuget`, pointing `DOTNET_CLI_HOME` at a writable
+> directory, or applying the following probe-then-quarantine recipe):
 >
 > ```sh
 > # Probe first and only heal when the home is genuinely unusable, exactly like the
