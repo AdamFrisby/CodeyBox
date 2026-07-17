@@ -288,9 +288,10 @@ public static class AuditLog
         int maxAttempts,
         string reason,
         string? stdoutTail = null,
-        string? stderrTail = null)
+        string? stderrTail = null,
+        Serilog.ILogger? logger = null)
     {
-        var log = Audit("agentic_conflict_resolver.attempt_failed");
+        var log = Audit(logger, "agentic_conflict_resolver.attempt_failed");
         if (stdoutTail is not null) log = log.ForContext("StdoutTail", TruncateAuditTail(stdoutTail));
         if (stderrTail is not null) log = log.ForContext("StderrTail", TruncateAuditTail(stderrTail));
         log.Warning(

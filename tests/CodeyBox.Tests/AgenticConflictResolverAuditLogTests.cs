@@ -24,21 +24,28 @@ namespace CodeyBox.Tests;
 /// emission, so asserting only on result.Summary does not cover the audit
 /// channel that operators actually rely on for retrospective triage.
 /// </summary>
-[Collection("GlobalSerilog")]
 public sealed class AgenticConflictResolverAuditLogTests : IDisposable
 {
     private readonly TestSink _sink = new();
 
+    // A dedicated, injected Serilog logger keeps this resolver's audit events on
+    // our own sink, decoupled from the process-global Serilog.Log.Logger. A
+    // concurrent host bootstrap that reassigns the global static (as happens in
+    // parallel test collections) can no longer reroute the emission away from
+    // _sink, so this class needs neither the GlobalSerilog serialization
+    // collection nor a Log.Logger assignment.
+    private readonly Serilog.Core.Logger _auditLogger;
+
     public AgenticConflictResolverAuditLogTests()
     {
-        Log.Logger = new LoggerConfiguration()
+        _auditLogger = new LoggerConfiguration()
             .Enrich.FromLogContext()
             .Enrich.With<SensitiveDataRedactionEnricher>()
             .WriteTo.Sink(_sink)
             .CreateLogger();
     }
 
-    public void Dispose() => Log.CloseAndFlush();
+    public void Dispose() => _auditLogger.Dispose();
 
     [Fact]
     public async Task ResolveAsync_AgentThrows_EmitsAttemptFailedAuditWithExceptionTrace()
@@ -50,7 +57,8 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
         var runner = new ThrowingAgentRunner(new InvalidOperationException("agent CLI exploded with diagnostics"));
         var resolver = new AgenticConflictResolver(
             new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 2 }),
-            NullLogger<AgenticConflictResolver>.Instance);
+            NullLogger<AgenticConflictResolver>.Instance,
+            auditLogger: _auditLogger);
 
         var workItemId = WorkItemId.New();
         var result = await resolver.ResolveAsync(
@@ -92,7 +100,8 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             stderr: "missing ANTHROPIC_API_KEY; refusing to run");
         var resolver = new AgenticConflictResolver(
             new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1, MaxAttemptsPerAgent = 1 }),
-            NullLogger<AgenticConflictResolver>.Instance);
+            NullLogger<AgenticConflictResolver>.Instance,
+            auditLogger: _auditLogger);
 
         var workItemId = WorkItemId.New();
         var result = await resolver.ResolveAsync(
@@ -155,7 +164,9 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
     [Fact]
     public async Task ResolveAsync_AgentReportsFailure_RedactsSecretLikeStdoutAndStderrBeforeAudit()
     {
-        Log.Logger = new LoggerConfiguration()
+        // No SensitiveDataRedactionEnricher on this logger: redaction must have
+        // already happened inside the resolver before the audit is emitted.
+        using var noEnricherLogger = new LoggerConfiguration()
             .Enrich.FromLogContext()
             .WriteTo.Sink(_sink)
             .CreateLogger();
@@ -171,7 +182,8 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             stderr: $"agent stderr leaked {StderrToken}");
         var resolver = new AgenticConflictResolver(
             new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1, MaxAttemptsPerAgent = 1 }),
-            NullLogger<AgenticConflictResolver>.Instance);
+            NullLogger<AgenticConflictResolver>.Instance,
+            auditLogger: noEnricherLogger);
 
         var workItemId = WorkItemId.New();
         var result = await resolver.ResolveAsync(
@@ -204,7 +216,8 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             stderr: string.Join('\n', Enumerable.Range(0, 700).Select(static i => $"stderr line {i:D4} value")));
         var resolver = new AgenticConflictResolver(
             new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1, MaxAttemptsPerAgent = 1 }),
-            NullLogger<AgenticConflictResolver>.Instance);
+            NullLogger<AgenticConflictResolver>.Instance,
+            auditLogger: _auditLogger);
 
         var workItemId = WorkItemId.New();
         var result = await resolver.ResolveAsync(
@@ -256,7 +269,8 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             stderr: "warning: incomplete model output");
         var resolver = new AgenticConflictResolver(
             new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1, MaxAttemptsPerAgent = 1 }),
-            NullLogger<AgenticConflictResolver>.Instance);
+            NullLogger<AgenticConflictResolver>.Instance,
+            auditLogger: _auditLogger);
 
         var workItemId = WorkItemId.New();
         var result = await resolver.ResolveAsync(
@@ -279,7 +293,9 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
     [Fact]
     public async Task ResolveAsync_SessionResumeExhausted_RedactsAuditStdoutAndStderrWithoutLoggerEnricher()
     {
-        Log.Logger = new LoggerConfiguration()
+        // No SensitiveDataRedactionEnricher on this logger: redaction must have
+        // already happened inside the resolver before the audit is emitted.
+        using var noEnricherLogger = new LoggerConfiguration()
             .Enrich.FromLogContext()
             .WriteTo.Sink(_sink)
             .CreateLogger();
@@ -300,7 +316,8 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
         { Kind = new AgentKind("resumable") };
         var resolver = new AgenticConflictResolver(
             new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }),
-            NullLogger<AgenticConflictResolver>.Instance);
+            NullLogger<AgenticConflictResolver>.Instance,
+            auditLogger: noEnricherLogger);
 
         var workItemId = WorkItemId.New();
         var result = await resolver.ResolveAsync(
