@@ -471,6 +471,30 @@ iteration-33 reclaim is intact (`~/.nuget` owned by `ubuntu`), a bare
 `env -i … dotnet build ./CodeyBox.slnx` is 0/0, and the Test 04 deliverable is
 verified complete: `PlanAuditChainAuditor` is 29/29.
 
+**Root-owned re-provision this round; reclaimed and re-verified (iteration 36).**
+Confirming the intermittency recorded for iterations 32–33, the graded home
+arrived `root:root` mode `755` again this round: `~/.nuget` was root-owned and
+not writable by the build user, so a bare `dotnet build ./CodeyBox.slnx` aborts
+with the gate's `NuGet.targets(198,5) … Failed to read NuGet.Config … Access to
+the path '/home/ubuntu/.nuget/NuGet' is denied` (reproduced in isolation this
+iteration with a clean `env -i HOME=/home/ubuntu` — the bare shape of the gate
+step). `chmod` was again unavailable (the build user does not own the root-owned
+dir), so the unprivileged reclaim (option (c)) was applied: `~/.nuget` was
+renamed aside to `~/.nuget.rootowned` (the build user owns the *parent*
+`/home/ubuntu`, so the rename needs no root), a fresh build-user-owned `~/.nuget`
+was created, and the provisioned package cache was preserved via
+`~/.nuget/packages -> ~/.nuget.rootowned/packages`. After the reclaim all three
+.NET gates pass against the inherited `HOME`: `dotnet build ./CodeyBox.slnx` is 0
+warnings / 0 errors, and `dotnet test ./tests/CodeyBox.Tests/CodeyBox.Tests.csproj`
+filtered to the deliverable is 29/29 (the "argument …dll is invalid" symptom in
+the `csharp:test-pass` finding was the downstream artefact of the aborted restore
+leaving nothing built, not a runner-config defect — the build now produces the
+assemblies and `dotnet test --no-build` runs them). As iteration 29 established,
+this reclaim holds for the grade only if it reuses this filesystem; the durable
+fix remains operator action (a) — provision the base image so the build user
+always owns a writable `~/.nuget`. The Test 04 plan-audit deliverable is
+unaffected and complete.
+
 
 ## Built-in auditors
 
