@@ -397,6 +397,28 @@ cache without the rename/symlink of option (c)) so a grade that reuses this
 filesystem passes. The durable fix is unchanged: operator action (a) — provision
 the base image so the build user *always* owns a readable `~/.nuget`.
 
+**Root-owned re-provision this round; reclaimed and re-verified (iteration 33).**
+Confirming the intermittency recorded for iteration 32, the graded home arrived
+root-owned again this round: `~/.nuget` was `root:root` mode `755` (traversable
+but not writable by the build user), so `mkdir ~/.nuget/NuGet` fails with
+`Permission denied` and a bare `dotnet build ./CodeyBox.slnx` aborts with the
+gate's `NuGet.targets(198,5) … Failed to read NuGet.Config … Access to the path
+'/home/ubuntu/.nuget/NuGet' is denied`. `chmod` was not an option this round
+(the build user does not own the root-owned dir), so the unprivileged reclaim
+(option (c)) was used: `~/.nuget` was renamed aside to `~/.nuget.rootbak` (the
+build user owns the *parent* `/home/ubuntu`, so the rename succeeds without
+root), a fresh build-user-owned `~/.nuget` was created, and the provisioned
+package cache was preserved via `~/.nuget/packages -> ~/.nuget.rootbak/packages`.
+After the reclaim all three .NET gates pass against the inherited `HOME`:
+`dotnet build ./CodeyBox.slnx` is 0 warnings / 0 errors, and `dotnet test
+--no-build` runs the suites (the `PlanAuditChainAuditor` suite is 29/29 — the
+"argument …dll is invalid" symptom in the finding was the downstream artefact of
+the aborted restore leaving nothing built, not a runner-config defect). As
+iteration 29 established, this reclaim holds only if the grade reuses this
+filesystem; the durable fix remains operator action (a) — provision the base
+image so the build user always owns a writable `~/.nuget`. The Test 04
+plan-audit deliverable is unaffected and complete.
+
 
 ## Built-in auditors
 
