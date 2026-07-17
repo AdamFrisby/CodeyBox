@@ -26,6 +26,13 @@
          non-English resource consumers. -->
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <ResolveAssemblyReferencesFindRelatedSatellites>false</ResolveAssemblyReferencesFindRelatedSatellites>
+    <!-- Pin restore to the checked-in repo NuGet.Config so it never depends on
+         the user-/machine-level config hierarchy. Under concurrent restore this
+         host can race the first-run bootstrap of ~/.nuget/NuGet/NuGet.Config and
+         fail every project with an unauthorized-access read error; pinning makes
+         the build self-contained. $(MSBuildThisFileDirectory) is the repo root
+         (this props file's directory), imported by every project. -->
+    <RestoreConfigFile>$(MSBuildThisFileDirectory)NuGet.Config</RestoreConfigFile>
   </PropertyGroup>
 
 </Project>
