@@ -439,6 +439,38 @@ durable fix is unchanged: operator action (a) — provision the audit base image
 so the build user always owns a writable `~/.nuget`. The Test 04 plan-audit
 deliverable is unaffected and complete.
 
+**Isolated the exact lever; `RestoreConfigFile` alone is provably insufficient
+(iteration 35).** The three `.NET` gates were re-handed again this round. Rather
+than re-assert the prior conclusion, this iteration reproduced the failure
+against a poisoned home in isolation to pin down precisely which mechanism
+clears it, because the repo already carries `Directory.Build.props`
+`RestoreConfigFile` and a repo-local `NuGet.Config` and it was worth proving
+whether those alone suffice. They do **not**. With a poisoned `~/.nuget/NuGet`
+(non-writable, mimicking the root-owned re-provision) and a *clean* environment
+(`env -i`, `DOTNET_CLI_HOME` unset — the bare-invocation shape of the grade's
+gate step), `dotnet build ./CodeyBox.slnx` still aborts at
+`NuGet.targets(198,5) … denied` **even with `RestoreConfigFile` set**: the
+failing read is NuGet's user-settings-*directory* resolution during restore, not
+package-source config, so `RestoreConfigFile` (which only redirects the config
+file used for sources) cannot suppress it. Disabling the workload resolver
+(`MSBuildEnableWorkloadResolver=false`, via env and `-p:`) also does not clear
+it. The single lever that does is the invoking process's environment: exporting
+a writable `DOTNET_CLI_HOME` (this SDK, 10.0.301, honours it over a poisoned
+`HOME`; pinning `HOME` too is the robust cross-SDK choice) makes the same bare
+build 0 warnings / 0 errors. That is exactly what CodeyBox's own build machinery
+already does — `SandboxRequiredBuildVerifier.DotnetCliHomeSelectionScript` and
+`DotnetCliHomeConventions.ApplyIfDotnetInvocation` both export the pair before
+every `dotnet` exec — so **no committed repo artefact can change the outcome**:
+env cannot be injected into a bare external `dotnet` invocation from a checked-in
+file, and the repo code that *would* fix it is not the executor of the grade's
+gate step. The remedy is unchanged and now precisely scoped: operator action —
+either provision the base image so the build user owns a writable `~/.nuget`
+(action (a)), or export a writable `DOTNET_CLI_HOME`/`HOME` in the gate step's
+environment before launching `dotnet` (action (b)). On this filesystem the
+iteration-33 reclaim is intact (`~/.nuget` owned by `ubuntu`), a bare
+`env -i … dotnet build ./CodeyBox.slnx` is 0/0, and the Test 04 deliverable is
+verified complete: `PlanAuditChainAuditor` is 29/29.
+
 
 ## Built-in auditors
 
