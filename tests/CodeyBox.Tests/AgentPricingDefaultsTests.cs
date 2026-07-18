@@ -273,6 +273,38 @@ public sealed class AgentPricingDefaultsTests : IDisposable
     }
 
     [Fact]
+    public void Merge_PreservesBundledDefaultRates_WhenOperatorSilent()
+    {
+        var bundled = MakeBaseline(("claude", "claude-opus-4-7", 5.0, 0.5, 25.0));
+        bundled.DefaultRates["crock"] =
+            new() { InputPerMillion = 2.50, CachedInputPerMillion = 0.25, OutputPerMillion = 12.50 };
+
+        var merged = AgentPricingMerge.Merge(bundled, new AgentPricingOptions());
+
+        Assert.Equal(2.50, merged.Options.DefaultRates["crock"].InputPerMillion);
+        Assert.Equal(12.50, merged.Options.DefaultRates["crock"].OutputPerMillion);
+    }
+
+    [Fact]
+    public void Merge_OperatorDefaultRate_OverridesBundledPerAgent()
+    {
+        var bundled = MakeBaseline(("claude", "claude-opus-4-7", 5.0, 0.5, 25.0));
+        bundled.DefaultRates["crock"] =
+            new() { InputPerMillion = 2.50, CachedInputPerMillion = 0.25, OutputPerMillion = 12.50 };
+        var operatorOpts = new AgentPricingOptions
+        {
+            DefaultRates = new()
+            {
+                ["crock"] = new() { InputPerMillion = 9.0, CachedInputPerMillion = 0.9, OutputPerMillion = 45.0 }
+            }
+        };
+
+        var merged = AgentPricingMerge.Merge(bundled, operatorOpts);
+
+        Assert.Equal(9.0, merged.Options.DefaultRates["crock"].InputPerMillion);
+    }
+
+    [Fact]
     public void Merge_ReplacingDictionarySlot_DoesNotAffectMergedSnapshot()
     {
         var bundled = MakeBaseline(("claude", "claude-opus-4-7", 5.0, 0.5, 25.0));
@@ -355,6 +387,14 @@ public sealed class AgentPricingDefaultsTests : IDisposable
         Assert.True(snapshot.Baseline.Rates["gemini"].ContainsKey("gemini-3-flash-preview"),
             "shipped gemini defaults must include default AgentClasses model");
         Assert.NotEmpty(snapshot.Baseline.Rates["claude"]);
+
+        // The bundled DefaultRates block must actually load into the baseline: the
+        // crock unknown-model fallback (Opus-tier upper bound) is documented as the
+        // price for any un-enumerated Claude id, so it must not be silently dropped.
+        Assert.True(snapshot.Baseline.DefaultRates.ContainsKey("crock"),
+            "shipped defaults must load DefaultRates.crock as the crock unknown-model fallback");
+        Assert.Equal(2.50, snapshot.Baseline.DefaultRates["crock"].InputPerMillion);
+        Assert.Equal(12.50, snapshot.Baseline.DefaultRates["crock"].OutputPerMillion);
     }
 
     [Fact]
