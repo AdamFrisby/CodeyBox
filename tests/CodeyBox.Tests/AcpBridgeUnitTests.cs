@@ -1802,6 +1802,92 @@ public sealed class AcpBridgeUnitTests
     }
 
     [Fact]
+    public async Task Bridge_Shutdown_DisposesStdinMidRead_SwallowsUnreadableStreamFault()
+    {
+        // Regression: Shutdown() disposes _stdinStream from a signal/timer
+        // thread to unblock the parked stdin ReadLineAsync. A disposed
+        // ConsoleStream reports CanRead=false, so the read in flight surfaces as
+        // NotSupportedException ("Stream does not support reading") — NOT
+        // ObjectDisposedException or IOException. Before the fix that escaped
+        // ReadStdinAsync as an unhandled exception, aborting the bridge with
+        // SIGABRT (exit 134) instead of the clean Shutdown(0) exit the POSIX
+        // signal path intends. This stream reproduces that exact disposal→read
+        // fault deterministically, no wall-clock and no real signal.
+        var stdin = new ShutdownDisposedStdinStream();
+        await using var bridge = new Bridge(stdin);
+
+        var runTask = bridge.RunAsync();
+
+        // Wait until the bridge's stdin read is genuinely parked inside the
+        // stream before disposing it — that is the race the fix guards.
+        await stdin.ReadParked.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Drive Shutdown from this thread (the read loop runs on another),
+        // mirroring the POSIX-signal handler that disposes stdin under a live
+        // read. Shutdown disposes _stdinStream, faulting the parked read.
+        var shutdown = typeof(Bridge).GetMethod("Shutdown",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+        shutdown.Invoke(bridge, new object[] { 0 });
+
+        // The bridge must return its clean exit code, not fault: the parked
+        // read's NotSupportedException is swallowed because ShutdownStarted.
+        var exit = await runTask.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(0, exit);
+    }
+
+    /// <summary>
+    /// A stdin stream whose parked read faults with <see cref="NotSupportedException"/>
+    /// once disposed — the observable behaviour of a real <c>ConsoleStream</c>
+    /// that <see cref="Bridge"/>.Shutdown disposes out from under an in-flight
+    /// <c>ReadLineAsync</c>. <see cref="ReadParked"/> completes once the read is
+    /// actually parked so the test can dispose at the precise racing moment.
+    /// </summary>
+    private sealed class ShutdownDisposedStdinStream : Stream
+    {
+        private readonly TaskCompletionSource _readParked =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _disposed =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private volatile bool _canRead = true;
+
+        internal Task ReadParked => _readParked.Task;
+
+        public override bool CanRead => _canRead;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            _readParked.TrySetResult();
+            await _disposed.Task.ConfigureAwait(false);
+            throw new NotSupportedException("Stream does not support reading.");
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            _canRead = false;
+            _disposed.TrySetResult();
+            base.Dispose(disposing);
+        }
+
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) =>
+            throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) =>
+            throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) =>
+            throw new NotSupportedException();
+    }
+
+    [Fact]
     public async Task Bridge_Shutdown_ConcurrentCauses_ClaudeExitEmittedExactlyOnceAndLockfileGone()
     {
         // End-to-end fixture exercising two Shutdown causes back-to-back:
