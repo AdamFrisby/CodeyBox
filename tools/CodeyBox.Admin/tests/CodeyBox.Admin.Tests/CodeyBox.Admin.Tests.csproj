@@ -21,19 +21,19 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- GHSA-pgww-w46g-26qg (NU1902): AngleSharp < 1.5.0 has an mXSS flaw when
-         parsing UNTRUSTED HTML through the annotation-xml integration point.
-         AngleSharp arrives here only transitively via bunit 1.37.7. No compatible
-         patched build exists: every AngleSharp >= 1.5.0 removed the
-         IHtmlCollection<T> indexer that bunit's RefreshableElementCollection binds
-         to (MissingMethodException at runtime), and even the newest bunit (2.6.2)
-         still pins AngleSharp 1.4.0 — also < 1.5.0 — so a bunit upgrade cannot
-         clear the advisory either. The exploit precondition (untrusted HTML) is
-         absent: bunit parses only the DOM of our own Blazor components rendered in
-         these tests, never external input. Suppression is scoped to this single
-         advisory in this test-only project, so solution-wide vulnerability auditing
-         stays enforced everywhere else. Revisit when bunit ships against AngleSharp
-         >= 1.5.0. -->
+    <!-- GHSA-pgww-w46g-26qg / CVE-2026-54570 (NU1902): AngleSharp < 1.5.0 has an
+         mXSS sanitizer bypass when parsing UNTRUSTED HTML through the MathML
+         annotation-xml integration point. AngleSharp arrives here only transitively
+         via bunit 1.37.7 (bunit.web -> AngleSharp). No compatible patched build
+         exists: AngleSharp 1.5.0 removed the IHtmlCollection<T>.get_Item indexer
+         that bunit's RefreshableElementCollection binds to (MissingMethodException
+         at runtime), and even the newest bunit (2.6.2) still pins AngleSharp
+         < 1.5.0, so a bunit upgrade cannot clear the advisory either. The exploit
+         precondition (untrusted HTML) is absent: bunit parses only the DOM of our
+         own Blazor components rendered in these tests, never external input.
+         Suppression is scoped to this single advisory in this test-only project, so
+         solution-wide vulnerability auditing stays enforced everywhere else.
+         Revisit when bunit ships against AngleSharp >= 1.5.0. -->
     <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-pgww-w46g-26qg" />
   </ItemGroup>
 
