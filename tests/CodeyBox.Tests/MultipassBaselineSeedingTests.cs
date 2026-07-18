@@ -260,8 +260,14 @@ public sealed class MultipassBaselineSeedingTests : IDisposable
         // 4. tar extract
         Assert.Contains(flatCalls, c => c.Contains("exec") && c.Contains("tar -xf") && c.Contains("-C /home/ubuntu/.nuget/packages"));
 
-        // 5. chown
+        // 5. chown packages leaf
         Assert.Contains(flatCalls, c => c.Contains("exec") && c.Contains("sudo chown -R ubuntu:ubuntu /home/ubuntu/.nuget/packages"));
+
+        // 5b. chown .nuget parent so NuGet can create its per-user settings dir
+        Assert.Contains(flatCalls, c =>
+            c.Contains("exec")
+            && c.Contains("sudo chown ubuntu:ubuntu /home/ubuntu/.nuget")
+            && !c.Contains("/home/ubuntu/.nuget/packages"));
 
         // 6. rm
         Assert.Contains(flatCalls, c => c.Contains("exec") && c.Contains("rm -f"));

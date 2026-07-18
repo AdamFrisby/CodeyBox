@@ -579,10 +579,13 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
     private ReplayDriverInput ToReplayDriverInput(E2eReplayArtifact artifact, ReplayEgressPolicy egressPolicy)
     {
         var allowed = CurrentAllowedOrigins();
+        var fillSecrets = _options?.CurrentValue.FillSecrets
+            ?? new Dictionary<string, string>(StringComparer.Ordinal);
+        var resolvedSteps = E2eReplaySensitiveValueRedaction.ResolveStepSecrets(artifact.Steps, fillSecrets);
         return new ReplayDriverInput(
             artifact.Name,
             artifact.Readiness,
-            artifact.Steps,
+            resolvedSteps,
             artifact.Assertions,
             allowed
                 .Where(static origin => Uri.TryCreate(origin, UriKind.Absolute, out _))
@@ -817,7 +820,7 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
           return rules.length > 0 ? rules.join(',') : null;
         }
 
-        async function performStep(page, step, allowedOrigins) {
+        async function performStep(page, step, allowedOrigins, artifact) {
           const action = String(step.action || '').toLowerCase();
           if (action === 'navigate') {
             ensureAllowedUrl(step.target, allowedOrigins, 'navigate target');
@@ -915,7 +918,7 @@ public sealed class E2eReplayRuntime : IE2eReplayRuntime
             const page = await context.newPage();
             for (let i = 0; i < (artifact.steps || []).length; i++) {
               try {
-                await performStep(page, artifact.steps[i], allowedOrigins);
+                await performStep(page, artifact.steps[i], allowedOrigins, artifact);
                 stepResults.push(okStep());
               } catch (error) {
                 stepResults.push(failStep(error));

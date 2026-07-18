@@ -1,0 +1,21 @@
+<Project InitialTargets="EnsureWritableNuGetUserSettings">
+
+  <!--
+    NuGet unconditionally creates/reads $HOME/.nuget/NuGet before honouring any
+    project-, solution-, or RestoreConfigFile-level config. Sandbox images that
+    leave $HOME/.nuget root-owned (common when a package cache is seeded under
+    $HOME/.nuget/packages as root) make every raw `dotnet build` fail restore.
+    Repair that environmental fault before any project targets run so auditors
+    that invoke `dotnet` directly (process:required-build, csharp:build-WaE)
+    succeed without depending on DOTNET_CLI_HOME redirects in the host
+    orchestrator binary. See scripts/ensure-writable-nuget-home.sh and
+    docs/build-environment.md.
+  -->
+  <Target Name="EnsureWritableNuGetUserSettings">
+    <Exec
+      Command="sh &quot;$(MSBuildThisFileDirectory)scripts/ensure-writable-nuget-home.sh&quot;"
+      Condition="'$(OS)' != 'Windows_NT'"
+      IgnoreStandardErrorWarningFormat="true" />
+  </Target>
+
+</Project>

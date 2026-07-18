@@ -1777,6 +1777,14 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         Assert.Contains(commands, command => command.Contains("install", StringComparer.Ordinal)
             && command.Contains("-d", StringComparer.Ordinal)
             && command.Contains("/home/ubuntu/.nuget/packages", StringComparer.Ordinal));
+        Assert.Contains(commands, command =>
+            command.Contains("chown", StringComparer.Ordinal)
+            && command.Contains("/home/ubuntu/.nuget/packages", StringComparer.Ordinal));
+        // Parent .nuget must be guest-owned so NuGet can create its settings dir.
+        Assert.Contains(commands, command =>
+            command.Contains("chown", StringComparer.Ordinal)
+            && command.Contains("/home/ubuntu/.nuget", StringComparer.Ordinal)
+            && !command.Contains("/home/ubuntu/.nuget/packages", StringComparer.Ordinal));
         Assert.DoesNotContain(commands, command => command.Contains("copy", StringComparer.Ordinal));
         Assert.DoesNotContain(commands, command => command.Contains("snapshot", StringComparer.Ordinal));
         Assert.DoesNotContain(commands, command => command.Contains("move", StringComparer.Ordinal));

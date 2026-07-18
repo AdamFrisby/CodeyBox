@@ -38,7 +38,9 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
     // execution exceeding the required-build budget.
     private const int BuildTimeoutExitCode = 124;
 
-    private static readonly string BuildScript = $$"""
+    // Exposed to tests so the actual gate script — the exact artifact the
+    // sandbox executes via `sh -c` — can be run under a controlled shell.
+    internal static readonly string BuildScript = $$"""
         set -eu
         dotnet_command_not_found_exit={{DotnetCommandNotFoundExitCode}}
         no_required_build_target_exit={{NoRequiredBuildTargetExitCode}}
@@ -48,9 +50,37 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
           exit "$dotnet_command_not_found_exit"
         fi
 
-        targets_file="${TMPDIR:-/tmp}/codeybox-required-build-targets-$$"
-        cleanup() { rm -f "$targets_file"; }
+        tmp_root="${TMPDIR:-/tmp}"
+        targets_file="$tmp_root/codeybox-required-build-targets-$$"
+
+        # The build gate must survive sandbox images whose per-user home is not
+        # writable by the build user. `dotnet build` reads — and, when absent,
+        # creates — the per-user NuGet settings directory ($HOME/.nuget/NuGet)
+        # before honouring any repo-, solution-, or RestoreConfigFile-level
+        # configuration, so an image whose $HOME (or $HOME/.nuget) is owned by
+        # another user (e.g. root) fails every restore with
+        # "Failed to read NuGet.Config ... Permission denied" and produces no
+        # assemblies. Redirect the CLI/NuGet per-user home to a directory this
+        # script owns so the gate no longer depends on $HOME being writable.
+        dotnet_home="$tmp_root/codeybox-dotnet-home-$$"
+
+        cleanup() { rm -rf "$targets_file" "$dotnet_home"; }
         trap cleanup EXIT INT TERM
+
+        mkdir -p "$dotnet_home"
+        export DOTNET_CLI_HOME="$dotnet_home"
+        export DOTNET_NOLOGO=1
+        export DOTNET_CLI_TELEMETRY_OPTOUT=1
+
+        # Relocating DOTNET_CLI_HOME also relocates the NuGet global-packages
+        # folder ($DOTNET_CLI_HOME/.nuget/packages). Images that pre-bake their
+        # package cache under the original per-user home would then restore
+        # against an empty folder and require network access. Preserve that
+        # cache (read access is sufficient — restore never writes to an
+        # already-extracted package) so offline/pinned images keep working.
+        if [ -z "${NUGET_PACKAGES:-}" ] && [ -n "${HOME:-}" ] && [ -d "$HOME/.nuget/packages" ]; then
+          export NUGET_PACKAGES="$HOME/.nuget/packages"
+        fi
 
         find . -maxdepth 1 -type f \( -name '*.slnx' -o -name '*.sln' \) | sort > "$targets_file"
 

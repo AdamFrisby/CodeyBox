@@ -2087,6 +2087,27 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                     throw new InvalidOperationException($"Failed to change VM directory ownership: {chownResult.Stderr}");
                 }
 
+                // 5b. When the seed lands under $HOME/.nuget/..., also chown the
+                // .nuget parent. mkdir -p as root leaves that directory
+                // root-owned; NuGet then cannot create $HOME/.nuget/NuGet and
+                // every raw `dotnet build` fails restore. Chown the directory
+                // inode only — packages was already reassigned with -R above.
+                var nugetHome = NuGetPackageCacheGuestPaths.TryGetNuGetHomeDirectory(
+                    vmDestPath,
+                    "/home/ubuntu");
+                if (nugetHome is not null)
+                {
+                    var nugetHomeChown = await RunAsync(
+                        opts,
+                        [opts.MultipassBinary, "exec", baselineName, "--", "sudo", "chown", "ubuntu:ubuntu", nugetHome],
+                        stdin: null, ct: ct, workItemId: workItemId).ConfigureAwait(false);
+                    if (nugetHomeChown.ExitCode != 0)
+                    {
+                        throw new InvalidOperationException(
+                            $"Failed to change VM NuGet home ownership: {nugetHomeChown.Stderr}");
+                    }
+                }
+
                 // 6. Clean up the tarball inside the VM
                 var rmResult = await RunAsync(
                     opts,
@@ -6506,15 +6527,19 @@ while True:
         // regardless of host load, so tests assert exit 86 off that internal
         // deadline, not a host-scheduling race.
         sb.AppendLine("codeybox_http_ready() {");
+        // The outer `timeout 4` is the hard backstop for a slow interpreter
+        // startup under parallel CI. The inner socket read timeout (2.5s, below)
+        // is what actually governs how long we wait for the ingest server's
+        // response: a 1s read timeout could miss a loopback accept/response
+        // continuation delayed by thread-pool contention, false-failing the
+        // preflight (exit 86). Both stay under the negative-path callers' 5s
+        // readiness-latency assertion.
+        sb.AppendLine("timeout 4 env \\");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_URL=\"$codeybox_output_url\" \\");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_TOKEN=\"$codeybox_output_token\" \\");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_RUN_ID=\"$codeybox_output_run_id\" \\");
         sb.AppendLine("python3 - <<'PY'");
-        sb.AppendLine("import os, signal, sys, urllib.error, urllib.parse, urllib.request");
-        sb.AppendLine("def codeybox_timeout(_signum, _frame):");
-        sb.AppendLine("    raise TimeoutError('ready probe timed out')");
-        sb.AppendLine("signal.signal(signal.SIGALRM, codeybox_timeout)");
-        sb.AppendLine("signal.alarm(2)");
+        sb.AppendLine("import os, sys, urllib.error, urllib.parse, urllib.request");
         sb.AppendLine("base = os.environ.get('CODEYBOX_AGENT_OUTPUT_URL', '').rstrip('/')");
         sb.AppendLine("run_id = os.environ.get('CODEYBOX_AGENT_OUTPUT_RUN_ID', '')");
         sb.AppendLine("token = os.environ.get('CODEYBOX_AGENT_OUTPUT_TOKEN', '')");
@@ -6528,7 +6553,7 @@ while True:
         sb.AppendLine("    method='POST',");
         sb.AppendLine("    headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/octet-stream'})");
         sb.AppendLine("try:");
-        sb.AppendLine("    with opener.open(req, timeout=1.0) as resp:");
+        sb.AppendLine("    with opener.open(req, timeout=2.5) as resp:");
         sb.AppendLine("        code = resp.getcode()");
         sb.AppendLine("        sys.exit(0 if 200 <= code < 300 else 1)");
         sb.AppendLine("except urllib.error.HTTPError:");

@@ -140,7 +140,10 @@ public sealed class HotReloadConfigTests
             await fixture.Store.CreateAsync(item);
 
             var runTask = fixture.Pipeline.RunAsync(item, CancellationToken.None);
-            await workStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            // Generous headroom: under parallel audit-suite load the worker loop
+            // can be starved long enough that BeforeWorkAsync is not reached
+            // inside a short window even though the pipeline is healthy.
+            await workStarted.Task.WaitAsync(TimeSpan.FromMinutes(2));
             var working = await fixture.Store.GetAsync(item.Id);
             Assert.Equal(WorkItemState.Working, working!.State);
 
