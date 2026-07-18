@@ -21,13 +21,9 @@ export MSBUILDDISABLENODEREUSE=1
 # `build CodeyBox.slnx`, `build --no-incremental -warnaserror`, `test --no-build`
 # — runs through the NuGet-home heal and hardening exports above, not just the
 # default build. With no arguments, keep the historical behaviour of building
-# the whole solution with the hardened flags.
+# the whole solution verbatim (the exports above harden this path too).
 if [ "$#" -gt 0 ]; then
     dotnet "$@"
 else
-    dotnet build CodeyBox.slnx \
-      --configuration Debug \
-      --disable-build-servers \
-      --nologo \
-      -maxcpucount:1
+    dotnet build CodeyBox.slnx
 fi
