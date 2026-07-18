@@ -214,6 +214,11 @@ public sealed class AgenticConflictResolver
     private readonly Func<ISandbox, AgentCredential, CancellationToken, Task>? _credentialFileMaterialiser;
     private readonly IAgentSupervisionService? _agentSupervision;
     private readonly IAgentAuthFailureClassifier _authFailureClassifier;
+    // Dedicated Serilog logger for the structured attempt_failed audit. Null =
+    // the process-global Serilog.Log.Logger (production wiring). Tests inject
+    // their own so a concurrent host bootstrap that reassigns/flushes the global
+    // static cannot reroute the audit events off their sink.
+    private readonly Serilog.ILogger? _auditLogger;
 
     /// <summary>
     /// Serilog sink for the per-attempt <c>agentic_conflict_resolver.attempt_failed</c>
