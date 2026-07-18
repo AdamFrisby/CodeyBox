@@ -436,3 +436,61 @@ public sealed class AgentCircuitBreakerTests
         AgentClassId = "frontier",
     };
 }
+
+/// <summary>
+/// Pure-function tests for <see cref="PipelineRunner.ClassifyDispatchOutcome"/>,
+/// the single classifier every dispatch-attempt path feeds into
+/// <see cref="AgentClassRouter.RecordDispatchOutcome"/>. It emits nothing, so
+/// unlike <see cref="AgentCircuitBreakerTests"/> it does not join the serialized
+/// static-logger collection and runs in parallel.
+/// </summary>
+public sealed class ClassifyDispatchOutcomeTests
+{
+    [Fact]
+    public void Success_ResetsBreaker()
+    {
+        // No terminal exception → the attempt succeeded (true resets the window).
+        Assert.Equal(true, PipelineRunner.ClassifyDispatchOutcome(error: null, genuineAttemptTimeout: false));
+    }
+
+    [Fact]
+    public void GenuineAttemptTimeout_IsFailure()
+    {
+        // A real per-attempt timeout surfaces as an OCE but is the agent's fault.
+        Assert.Equal(
+            false,
+            PipelineRunner.ClassifyDispatchOutcome(
+                new OperationCanceledException(), genuineAttemptTimeout: true));
+    }
+
+    [Fact]
+    public void HostOrPhaseCancellation_IsSkipped()
+    {
+        // An OCE that is NOT a genuine per-attempt timeout is a host/operator/phase
+        // cancellation — null so it neither opens nor resets the breaker.
+        Assert.Null(
+            PipelineRunner.ClassifyDispatchOutcome(
+                new OperationCanceledException(), genuineAttemptTimeout: false));
+    }
+
+    [Fact]
+    public void NonCancellationException_IsFailure()
+    {
+        // Every other terminal exception (agent/quota/infrastructure) is a real
+        // dispatch failure that feeds the windowed counter.
+        Assert.Equal(
+            false,
+            PipelineRunner.ClassifyDispatchOutcome(
+                new InvalidOperationException("agent error"), genuineAttemptTimeout: false));
+    }
+
+    [Fact]
+    public void DerivedCancellationException_IsSkipped()
+    {
+        // Subtypes of OperationCanceledException (e.g. TaskCanceledException) that
+        // are not genuine attempt timeouts are still host-side cancellations.
+        Assert.Null(
+            PipelineRunner.ClassifyDispatchOutcome(
+                new TaskCanceledException(), genuineAttemptTimeout: false));
+    }
+}

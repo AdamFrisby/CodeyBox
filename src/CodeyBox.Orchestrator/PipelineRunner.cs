@@ -15647,6 +15647,36 @@ public sealed partial class PipelineRunner : IPipelineRunner
     }
 
     /// <summary>
+    /// Classifies one completed dispatch attempt into its per-agent circuit-breaker
+    /// outcome, independent of quota classification. The router's dispatch gate only
+    /// ever opens because this decision feeds <see cref="AgentClassRouter.RecordDispatchOutcome"/>:
+    /// <list type="bullet">
+    ///   <item><c>true</c> — the attempt succeeded; resets the breaker's failure window.</item>
+    ///   <item><c>false</c> — a genuine agent-side dispatch failure of ANY kind (a real
+    ///     per-attempt timeout, resume-exhaustion, or any agent/quota/infrastructure
+    ///     error); feeds the windowed failure counter that opens the breaker.</item>
+    ///   <item><c>null</c> — a host/operator/phase cancellation that is not the agent's
+    ///     fault; it neither opens nor resets the breaker and must be skipped.</item>
+    /// </list>
+    /// Pure: a total function of the terminal exception (<c>null</c> on success) and
+    /// whether it was a genuine per-attempt timeout (as opposed to a host/phase
+    /// cancellation that merely surfaced as an <see cref="OperationCanceledException"/>).
+    /// </summary>
+    internal static bool? ClassifyDispatchOutcome(Exception? error, bool genuineAttemptTimeout)
+    {
+        if (error is null)
+            return true;
+        if (genuineAttemptTimeout)
+            return false;
+        // Any remaining OperationCanceledException is a host/operator/phase
+        // cancellation — not the agent's fault, so it must not move the breaker.
+        if (error is OperationCanceledException)
+            return null;
+        // Every other terminal exception is a real dispatch failure.
+        return false;
+    }
+
+    /// <summary>
     /// Runs <paramref name="invoker"/> with the work item's chosen agent runner;
     /// if the invocation classifies as <see cref="AgentFailureKind.QuotaExhausted"/>
     /// (signalled here as <see cref="TerminalQuotaError"/> from the inner phase),
@@ -15750,7 +15780,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 var result = await invoker(runner, trialItem, attemptCt);
                 await FinalizeInvolvementAsync(involvementId, AgentInvolvementOutcomes.Success);
                 outcome = AgentInvolvementOutcomes.Success;
-                breakerSuccess = true;
+                breakerSuccess = ClassifyDispatchOutcome(error: null, genuineAttemptTimeout: false);
                 return result;
             }
             catch (OperationCanceledException oce) when (
@@ -15762,11 +15792,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 outcome = "canceled";
                 if (phaseCancellation.Token.IsCancellationRequested
                     || phaseCancellation.Source is not null)
+                {
+                    // Host/phase cancellation surfaced as a timeout — not the
+                    // agent's fault; classify as skip (null) so it never benches it.
+                    breakerSuccess = ClassifyDispatchOutcome(oce, genuineAttemptTimeout: false);
                     throw phaseCancellation.Wrap(oce);
+                }
 
                 // A real per-attempt timeout (not a host/phase cancellation) is a
                 // genuine dispatch failure — feed the breaker.
-                breakerSuccess = false;
+                breakerSuccess = ClassifyDispatchOutcome(oce, genuineAttemptTimeout: true);
                 throw new AgentAttemptTimeoutException(
                     phaseCancellation.Phase,
                     runner.Kind,
@@ -15777,6 +15812,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
             {
                 await FinalizeInvolvementAsync(involvementId, OutcomeForFailure(ex));
                 outcome = "canceled";
+                // Host/operator cancellation — classify as skip (null) so it neither
+                // opens nor resets the breaker.
+                breakerSuccess = ClassifyDispatchOutcome(ex, genuineAttemptTimeout: false);
                 throw;
             }
             catch (AgentSessionResumeExhaustedException ex)
@@ -15784,7 +15822,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 // Every path out of this catch throws a terminal failure for the
                 // attempt (auth, quota, transient, infrastructure, or agent) — all
                 // genuine dispatch failures the breaker counts.
-                breakerSuccess = false;
+                breakerSuccess = ClassifyDispatchOutcome(ex, genuineAttemptTimeout: false);
                 if (await TryConvertResumeExhaustionToAuthRequiredAsync(runner, trialItem, ex, attemptCt)
                     .ConfigureAwait(false) is { } authEx)
                 {
@@ -15843,7 +15881,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             {
                 // Any non-cancellation exception (agent error, quota, infrastructure,
                 // terminal quota) is a genuine dispatch failure for the breaker.
-                breakerSuccess = false;
+                breakerSuccess = ClassifyDispatchOutcome(ex, genuineAttemptTimeout: false);
                 await FinalizeInvolvementAsync(involvementId, OutcomeForFailure(ex));
                 throw;
             }
