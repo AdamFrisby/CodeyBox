@@ -111,6 +111,23 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
     protected override IReadOnlyList<EnvBackedCredentialFile> EnvBackedCredentialFiles => [ConfigCredentialFile];
 
     /// <summary>
+    /// The daemon-socket path env var (<see cref="CrockSandboxOptions.DaemonSocketEnvVar"/>,
+    /// default <see cref="CrockSandboxOptions.DefaultDaemonSocketEnvVar"/>) is a
+    /// plain in-sandbox path the in-VM CLI reads directly from its environment —
+    /// NOT a file-backed payload. When a host daemon socket is configured,
+    /// <see cref="CrockEnvironmentCredentialProvider"/> adds this var to the
+    /// credential bundle alongside the daemon bind-mount, so the runner MUST
+    /// classify it here as a direct credential env var: otherwise
+    /// <see cref="CodeyBox.Sandbox.SandboxEnvironmentVariablePolicy.SelectDirectCredentialEnvironment"/>
+    /// throws (every credential env var must be exactly one of direct or
+    /// file-backed) and no crock run can be dispatched. Resolved from the same
+    /// hot-reloadable options the provider uses so the SET and CLASSIFY names
+    /// never drift.
+    /// </summary>
+    protected override IReadOnlyList<string> DirectCredentialEnvironmentVariables =>
+        [SandboxOptions().ResolveDaemonSocketEnvVar()];
+
+    /// <summary>
     /// Hot-reloadable accessor for the sandbox-side options
     /// (<see cref="CrockSandboxOptions.HostDaemonSocketPath"/> and friends).
     /// Defaults to the type's defaults (no daemon socket) so existing tests

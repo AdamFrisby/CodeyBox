@@ -139,9 +139,7 @@ public sealed class CrockEnvironmentCredentialProvider : ICredentialProvider
                     ReadOnly = true,
                 });
 
-                var daemonEnvVar = string.IsNullOrWhiteSpace(opts.DaemonSocketEnvVar)
-                    ? CrockSandboxOptions.DefaultDaemonSocketEnvVar
-                    : opts.DaemonSocketEnvVar;
+                var daemonEnvVar = opts.ResolveDaemonSocketEnvVar();
                 env[daemonEnvVar] = sandboxSocketPath;
 
                 _log?.LogDebug(

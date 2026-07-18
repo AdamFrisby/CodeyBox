@@ -783,7 +783,7 @@ public sealed class CrockAgentRunnerTests
             // Daemon-socket env var present at the in-VM path.
             Assert.Equal("/run/vm/crock-daemon.sock",
                 cred.EnvironmentVariables["CROCK_DAEMON_SOCKET"]);
-            // A read-write bind-mount maps the socket's PARENT DIRECTORY.
+            // A read-only bind-mount maps the socket's PARENT DIRECTORY.
             // Mounting the socket file itself would be rejected by Multipass
             // (multipass mount --type=native requires a directory source);
             // virtiofs/9p passthrough faithfully exposes the socket node
@@ -831,6 +831,78 @@ public sealed class CrockAgentRunnerTests
             Environment.SetEnvironmentVariable(
                 CrockEnvironmentCredentialProvider.HostConfigEnvVar, previous);
         }
+    }
+
+    [Fact]
+    public async Task CrockCredential_DaemonConfigured_RoutesThroughSelectDirectEnvironment()
+    {
+        // Regression: the daemon-socket env var the credential provider adds
+        // (CROCK_DAEMON_SOCKET) must be classified by the runner as a DIRECT
+        // credential env var. SelectDirectCredentialEnvironment requires every
+        // credential env var to be exactly one of direct or file-backed and
+        // throws otherwise, so a missing classification would make EVERY
+        // daemon-configured crock dispatch fail at sandbox construction. This
+        // drives the REAL provider -> REAL runner classification -> REAL policy
+        // path the unit-scoped runner/provider tests bypass.
+        var previous = Environment.GetEnvironmentVariable(
+            CrockEnvironmentCredentialProvider.HostConfigEnvVar);
+        try
+        {
+            Environment.SetEnvironmentVariable(
+                CrockEnvironmentCredentialProvider.HostConfigEnvVar,
+                "{\"anthropic_api_key\":\"sk-test\"}");
+            var options = new CrockSandboxOptions
+            {
+                HostDaemonSocketPath = "/run/host/crock-daemon.sock",
+                SandboxDaemonSocketPath = "/run/vm/crock-daemon.sock",
+            };
+            var provider = new CrockEnvironmentCredentialProvider(() => options);
+            var cred = await provider.GetAsync(AgentKind.Crock);
+            Assert.NotNull(cred);
+            Assert.True(cred!.EnvironmentVariables.ContainsKey(
+                CrockSandboxOptions.DefaultDaemonSocketEnvVar));
+
+            var runner = new CrockAgentRunner { SandboxOptions = () => options };
+
+            var direct = CodeyBox.Sandbox.SandboxEnvironmentVariablePolicy
+                .SelectDirectCredentialEnvironment(cred, runner, nameof(cred.EnvironmentVariables));
+
+            // The daemon socket path is a direct CLI env var...
+            Assert.Equal("/run/vm/crock-daemon.sock",
+                direct[CrockSandboxOptions.DefaultDaemonSocketEnvVar]);
+            // ...while the config JSON stays file-backed (never copied into
+            // ambient process env), so it is absent from the direct selection.
+            Assert.False(direct.ContainsKey(CrockAgentRunner.ConfigEnvVar));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(
+                CrockEnvironmentCredentialProvider.HostConfigEnvVar, previous);
+        }
+    }
+
+    [Fact]
+    public void CrockCredential_CustomDaemonEnvVarName_ClassifiedAsDirect()
+    {
+        // The classify name must track the config-driven DaemonSocketEnvVar so
+        // an operator renaming the env var keeps the SET (provider) and CLASSIFY
+        // (runner) names in lockstep through the single shared resolver.
+        const string customName = "CROCK_SOCK_ALT";
+        var options = new CrockSandboxOptions { DaemonSocketEnvVar = customName };
+        var runner = new CrockAgentRunner { SandboxOptions = () => options };
+        var cred = new AgentCredential(
+            AgentKind.Crock,
+            new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [CrockAgentRunner.ConfigEnvVar] = "{}",
+                [customName] = "/run/vm/crock-daemon.sock",
+            },
+            new Dictionary<string, string>());
+
+        var direct = CodeyBox.Sandbox.SandboxEnvironmentVariablePolicy
+            .SelectDirectCredentialEnvironment(cred, runner, nameof(cred.EnvironmentVariables));
+
+        Assert.Equal("/run/vm/crock-daemon.sock", direct[customName]);
     }
 
     [Fact]

@@ -100,4 +100,19 @@ public sealed class CrockSandboxOptions
     /// <see cref="DefaultDaemonSocketEnvVar"/>.
     /// </summary>
     public string DaemonSocketEnvVar { get; set; } = DefaultDaemonSocketEnvVar;
+
+    /// <summary>
+    /// The env var name the in-VM CLI reads to find the daemon socket, falling
+    /// back to <see cref="DefaultDaemonSocketEnvVar"/> when
+    /// <see cref="DaemonSocketEnvVar"/> is unset/blank. Single source of truth
+    /// shared by <see cref="CrockEnvironmentCredentialProvider"/> (which SETS the
+    /// var on the credential bundle) and <see cref="CrockAgentRunner"/> (which
+    /// must CLASSIFY the same name as a direct credential env var, or
+    /// <see cref="CodeyBox.Sandbox.SandboxEnvironmentVariablePolicy.SelectDirectCredentialEnvironment"/>
+    /// rejects the whole bundle) so the two cannot drift.
+    /// </summary>
+    public string ResolveDaemonSocketEnvVar() =>
+        string.IsNullOrWhiteSpace(DaemonSocketEnvVar)
+            ? DefaultDaemonSocketEnvVar
+            : DaemonSocketEnvVar;
 }
