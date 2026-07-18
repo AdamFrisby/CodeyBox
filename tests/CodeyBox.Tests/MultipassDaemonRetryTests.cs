@@ -596,7 +596,7 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
         // between a retry here and its inline audit emission would otherwise
         // steal the event — leaving the sink empty. The AsyncLocal override flows
         // into every call below and is immune to those global swaps.
-        _auditScope = AuditLog.PushScopedLogger(Log.Logger);
+        _auditScope = AuditLog.PushScopedLogger(_auditLogger);
     }
 
     public void Dispose()

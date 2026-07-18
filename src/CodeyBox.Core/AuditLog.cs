@@ -321,6 +321,9 @@ public static class AuditLog
             .Information("Sandbox {VmName} created with network profile {NetworkProfile}",
                 vmName, networkProfile);
 
+    // <paramref name="logger"/> lets callers that hold their own audit logger
+    // (e.g. a per-test sink) emit immune to a concurrent reassignment of the
+    // global static; null falls back to the process-global Serilog logger.
     public static void SandboxProvisioningTransientRetry(
         WorkItemId workItemId,
         string operation,

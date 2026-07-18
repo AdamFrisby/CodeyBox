@@ -5009,7 +5009,8 @@ internal static class MultipassDaemonRetry
         }
     }
 
-    private static void AuditTransientRetry(WorkItemId? workItemId, string operation, int attempt, string errorClass, Serilog.ILogger? auditLogger)
+    private static void AuditTransientRetry(
+        WorkItemId? workItemId, string operation, int attempt, string errorClass, Serilog.ILogger? auditLogger)
     {
         if (workItemId.HasValue)
             AuditLog.SandboxProvisioningTransientRetry(workItemId.Value, operation, attempt, errorClass, auditLogger);
