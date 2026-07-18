@@ -350,7 +350,12 @@ public sealed class MetricsEmissionTests
             await Task.Delay(50);
             Assert.False(blockedWrite.IsCompleted);
             workerGate.SetResult();
-            await blockedWrite.WaitAsync(TimeSpan.FromSeconds(2));
+            // Generous real-time ceiling: once the gate opens the worker drains
+            // the single-slot channel and the blocked writer proceeds within
+            // microseconds, but the ceiling only guards against a hang -- it must
+            // absorb an arbitrary scheduling delay before the worker/writer
+            // continuations get a turn, not assume a tight bound.
+            await blockedWrite.WaitAsync(TimeSpan.FromSeconds(30));
             await capture.DisposeAsync();
 
             AssertEventuallyContains(measurements, measurement =>
