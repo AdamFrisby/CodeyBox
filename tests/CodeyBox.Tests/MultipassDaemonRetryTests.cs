@@ -579,8 +579,6 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
     private readonly TestSink _sink = new();
     private readonly Serilog.Core.Logger _auditLogger;
 
-    private readonly Serilog.ILogger _auditLogger;
-
     public MultipassDaemonRetryAuditTests()
     {
         _auditLogger = new LoggerConfiguration()

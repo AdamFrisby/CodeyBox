@@ -14,7 +14,6 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     private static readonly ProjectId BrokenProjectId = new("broken-project");
     private readonly string _workspace = Directory.CreateTempSubdirectory("codeybox-quota-audit-").FullName;
     private readonly TestSink _sink = new();
-    private readonly Serilog.Core.Logger _auditLogger;
 
     // A dedicated, injected Serilog logger keeps this test's audit events off the
     // process-global Serilog.Log.Logger, so a concurrent host bootstrap that
