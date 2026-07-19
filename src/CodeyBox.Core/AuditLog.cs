@@ -294,6 +294,9 @@ public static class AuditLog
     /// logger pass it explicitly so a concurrent reassignment of the global
     /// static cannot reroute these events off their sink.
     /// </summary>
+    // <paramref name="logger"/> lets a caller that holds its own audit logger
+    // (e.g. a per-test sink) emit this event immune to a concurrent
+    // reassignment of the process-global Serilog static; null falls back to it.
     public static void AgenticConflictResolverAttemptFailed(
         WorkItemId workItemId,
         AgentKind agent,
