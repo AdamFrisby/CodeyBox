@@ -1801,19 +1801,35 @@ public sealed class AcpBridgeUnitTests
         Assert.Equal(17, await forcedExit.Task.WaitAsync(TimeSpan.FromSeconds(5)));
     }
 
-    [Fact]
-    public async Task Bridge_Shutdown_DisposesStdinMidRead_SwallowsUnreadableStreamFault()
+    public static IEnumerable<object[]> ShutdownDisposalFaults() => new[]
+    {
+        // A disposed ConsoleStream reports CanRead=false → the in-flight read
+        // surfaces as NotSupportedException ("Stream does not support reading").
+        new object[] { new NotSupportedException("Stream does not support reading.") },
+        // A stream disposed mid-read commonly reports IOException.
+        new object[] { new IOException("The read operation failed.") },
+        // StreamReader's own reentrancy/closed guards can throw
+        // InvalidOperationException when the underlying stream vanishes mid-read.
+        new object[] { new InvalidOperationException("The stream is currently in use by a previous operation.") },
+    };
+
+    [Theory]
+    [MemberData(nameof(ShutdownDisposalFaults))]
+    public async Task Bridge_Shutdown_DisposesStdinMidRead_SwallowsAnyStreamFault(Exception faultOnRead)
     {
         // Regression: Shutdown() disposes _stdinStream from a signal/timer
-        // thread to unblock the parked stdin ReadLineAsync. A disposed
-        // ConsoleStream reports CanRead=false, so the read in flight surfaces as
-        // NotSupportedException ("Stream does not support reading") — NOT
-        // ObjectDisposedException or IOException. Before the fix that escaped
-        // ReadStdinAsync as an unhandled exception, aborting the bridge with
-        // SIGABRT (exit 134) instead of the clean Shutdown(0) exit the POSIX
-        // signal path intends. This stream reproduces that exact disposal→read
-        // fault deterministically, no wall-clock and no real signal.
-        var stdin = new ShutdownDisposedStdinStream();
+        // thread to unblock the parked stdin ReadLineAsync. Disposing the stream
+        // out from under an in-flight read is racy and surfaces as any of several
+        // fault types — NotSupportedException (disposed ConsoleStream reports
+        // CanRead=false), IOException, or InvalidOperationException from
+        // StreamReader's reentrancy/closed guards. Before the fix these escaped
+        // ReadStdinAsync as an unhandled exception, aborting the whole process
+        // with SIGABRT (exit 134) instead of the clean Shutdown(0) exit the POSIX
+        // signal path intends. The read loop now swallows ANY fault once shutdown
+        // is underway, so every one of these must yield the clean exit. This
+        // stream reproduces the exact disposal→read race deterministically, with
+        // no wall-clock and no real signal.
+        var stdin = new ShutdownDisposedStdinStream(faultOnRead);
         await using var bridge = new Bridge(stdin);
 
         var runTask = bridge.RunAsync();
@@ -1830,16 +1846,20 @@ public sealed class AcpBridgeUnitTests
         shutdown.Invoke(bridge, new object[] { 0 });
 
         // The bridge must return its clean exit code, not fault: the parked
-        // read's NotSupportedException is swallowed because ShutdownStarted.
+        // read's fault is swallowed because ShutdownStarted, whatever its type.
         var exit = await runTask.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Equal(0, exit);
     }
 
     /// <summary>
-    /// A stdin stream whose parked read faults with <see cref="NotSupportedException"/>
+    /// A stdin stream whose parked read faults with a caller-chosen exception
     /// once disposed — the observable behaviour of a real <c>ConsoleStream</c>
     /// that <see cref="Bridge"/>.Shutdown disposes out from under an in-flight
-    /// <c>ReadLineAsync</c>. <see cref="ReadParked"/> completes once the read is
+    /// <c>ReadLineAsync</c>. Disposing a stream mid-read is racy and can surface
+    /// as several fault types (<see cref="NotSupportedException"/>,
+    /// <see cref="IOException"/>, <see cref="InvalidOperationException"/>), so the
+    /// fault is parameterised to prove ReadStdinAsync unwinds cleanly for any of
+    /// them during shutdown. <see cref="ReadParked"/> completes once the read is
     /// actually parked so the test can dispose at the precise racing moment.
     /// </summary>
     private sealed class ShutdownDisposedStdinStream : Stream
@@ -1848,7 +1868,11 @@ public sealed class AcpBridgeUnitTests
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _disposed =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly Exception _faultOnRead;
         private volatile bool _canRead = true;
+
+        internal ShutdownDisposedStdinStream(Exception faultOnRead) =>
+            _faultOnRead = faultOnRead;
 
         internal Task ReadParked => _readParked.Task;
 
@@ -1867,7 +1891,7 @@ public sealed class AcpBridgeUnitTests
         {
             _readParked.TrySetResult();
             await _disposed.Task.ConfigureAwait(false);
-            throw new NotSupportedException("Stream does not support reading.");
+            throw _faultOnRead;
         }
 
         protected override void Dispose(bool disposing)
