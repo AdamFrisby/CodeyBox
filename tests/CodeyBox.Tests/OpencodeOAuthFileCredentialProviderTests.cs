@@ -22,7 +22,7 @@ public sealed class OpencodeOAuthFileCredentialProviderTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_workspace, recursive: true); } catch { }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace);
     }
 
     private string WriteAuthFile(string content)

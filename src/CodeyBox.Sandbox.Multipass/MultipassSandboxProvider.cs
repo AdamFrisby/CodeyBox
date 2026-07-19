@@ -6420,6 +6420,21 @@ while True:
     attempt += 1
 """;
 
+        static void AppendCloseInheritedStreamFdsFunction(StringBuilder sb)
+        {
+            sb.AppendLine("codeybox_close_inherited_stream_fds() {");
+            sb.AppendLine("    local codeybox_fd codeybox_target");
+            sb.AppendLine("    for codeybox_fd in /proc/$$/fd/*; do");
+            sb.AppendLine("        codeybox_fd=${codeybox_fd##*/}");
+            sb.AppendLine("        case \"$codeybox_fd\" in ''|*[!0-9]*|0|1|2) continue ;; esac");
+            sb.AppendLine("        codeybox_target=$(readlink \"/proc/$$/fd/$codeybox_fd\" 2>/dev/null || true)");
+            sb.AppendLine("        case \"$codeybox_target\" in");
+            sb.AppendLine("            pipe:*|socket:*) eval \"exec $codeybox_fd>&-\" ;;");
+            sb.AppendLine("        esac");
+            sb.AppendLine("    done");
+            sb.AppendLine("}");
+        }
+
         var sb = new StringBuilder();
         sb.AppendLine("#!/bin/bash");
         sb.AppendLine("set -e");
@@ -6471,6 +6486,7 @@ while True:
         sb.AppendLine("codeybox_drain_stdin() {");
         sb.AppendLine("    cat >/dev/null 2>/dev/null || true");
         sb.AppendLine("}");
+        AppendCloseInheritedStreamFdsFunction(sb);
         sb.AppendLine("if [ -f \"$codeybox_pgid_marker\" ]; then codeybox_drain_stdin; exit 0; fi");
         sb.AppendLine("if ! codeybox_root_sh 'mkdir -p \"$1\" && { chown root:root \"$1\" 2>/dev/null || true; } && chmod 0700 \"$1\"' \"$codeybox_supervisor_dir\"; then");
         sb.AppendLine("    echo \"codeybox-detached: failed to prepare supervisor directory\" >&2");
@@ -6621,17 +6637,7 @@ while True:
         sb.AppendLine("set +e");
         sb.AppendLine("exec </dev/null >/dev/null 2>/dev/null");
         sb.AppendLine("rm -f \"$0\" 2>/dev/null || true");
-        sb.AppendLine("codeybox_close_inherited_stream_fds() {");
-        sb.AppendLine("    local codeybox_fd codeybox_target");
-        sb.AppendLine("    for codeybox_fd in /proc/$$/fd/*; do");
-        sb.AppendLine("        codeybox_fd=${codeybox_fd##*/}");
-        sb.AppendLine("        case \"$codeybox_fd\" in ''|*[!0-9]*|0|1|2) continue ;; esac");
-        sb.AppendLine("        codeybox_target=$(readlink \"/proc/$$/fd/$codeybox_fd\" 2>/dev/null || true)");
-        sb.AppendLine("        case \"$codeybox_target\" in");
-        sb.AppendLine("            pipe:*|socket:*) eval \"exec $codeybox_fd>&-\" ;;");
-        sb.AppendLine("        esac");
-        sb.AppendLine("    done");
-        sb.AppendLine("}");
+        AppendCloseInheritedStreamFdsFunction(sb);
         sb.AppendLine("codeybox_pgid_marker=$1");
         sb.AppendLine("codeybox_child_status_file=$2");
         sb.AppendLine("codeybox_child_pgid_file=$3");
@@ -6747,6 +6753,7 @@ while True:
         sb.AppendLine("chmod 0700 \"$codeybox_child_script\"");
         sb.AppendLine("(");
         sb.AppendLine("    exec </dev/null >/dev/null 2>/dev/null");
+        sb.AppendLine("    codeybox_close_inherited_stream_fds");
         sb.Append("    exec setsid /bin/bash \"$codeybox_child_script\" \"$codeybox_pgid_marker\" \"$codeybox_child_status_file\" \"$codeybox_child_pgid_file\" \"$codeybox_stdin_file\" \"$codeybox_env_file\" \"$codeybox_exit_token_file\"");
         foreach (var arg in command)
             sb.Append(' ').Append(MultipassSandboxProvider.ShellSingleQuote(arg));

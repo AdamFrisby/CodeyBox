@@ -100,7 +100,7 @@ public sealed class FleetSummaryGracefulDegradationTests : IDisposable
 /// been created (cost-reporting work item not landed). The endpoint must catch
 /// the exception and return null budget fields rather than propagating the error.
 /// </summary>
-internal sealed class ThrowingCostStoreFleetFactory : WebApplicationFactory<Program>
+internal sealed class ThrowingCostStoreFleetFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-fleet-deg-{Guid.NewGuid():N}.db");
@@ -117,7 +117,7 @@ internal sealed class ThrowingCostStoreFleetFactory : WebApplicationFactory<Prog
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -147,14 +147,7 @@ internal sealed class ThrowingCostStoreFleetFactory : WebApplicationFactory<Prog
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            Store.Dispose();
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath, Store.Dispose);
 }
 
 /// <summary>

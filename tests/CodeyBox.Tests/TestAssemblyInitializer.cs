@@ -23,6 +23,14 @@ internal static class TestAssemblyInitializer
     private const long RecommendedInotifyMaxUserWatches = 524_288;
     private const long RecommendedInotifyMaxUserInstances = 1_024;
 
+    // Full-suite runs create a GUID SQLite DB (+ -wal/-shm) and git/log/agent-stream
+    // temp trees per test under Path.GetTempPath(). On a small or RAM-backed /tmp the
+    // filesystem fills and SQLite can no longer create tables, producing cascading
+    // "no such table: work_items" failures across parallel WebApplicationFactory tests.
+    // Warn (never fail) when the temp drive lacks headroom so the operator can point
+    // TMPDIR at a spacious disk before running the suite.
+    internal const long RecommendedTempFreeBytes = 2L * 1024 * 1024 * 1024;
+
     [ModuleInitializer]
     public static void Init()
     {
@@ -40,6 +48,8 @@ internal static class TestAssemblyInitializer
 
         if (!UsePollingFileWatcher())
             WarnOnLowInotifyLimits(Console.Error);
+
+        WarnOnLowTempDiskHeadroom(Console.Error);
 
         TestFileSystemWatcherLeakTracker.Install();
 
@@ -106,6 +116,57 @@ internal static class TestAssemblyInitializer
         catch (UnauthorizedAccessException)
         {
         }
+    }
+
+    internal static void WarnOnLowTempDiskHeadroom(TextWriter writer)
+    {
+        try
+        {
+            var tempPath = Path.GetTempPath();
+            var root = Path.GetPathRoot(Path.GetFullPath(tempPath));
+            if (string.IsNullOrEmpty(root))
+                return;
+
+            var drive = new DriveInfo(root);
+            if (!drive.IsReady)
+                return;
+
+            var message = DescribeLowTempDiskHeadroom(
+                tempPath,
+                drive.AvailableFreeSpace,
+                RecommendedTempFreeBytes);
+            if (message is not null)
+                writer.WriteLine(message);
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+        catch (ArgumentException)
+        {
+        }
+    }
+
+    /// <summary>
+    /// Pure headroom decision: returns a warning message when the temp filesystem's
+    /// <paramref name="availableFreeBytes"/> is below <paramref name="recommendedFreeBytes"/>,
+    /// otherwise <c>null</c>. Sizes are in bytes; the message reports MiB.
+    /// </summary>
+    internal static string? DescribeLowTempDiskHeadroom(
+        string tempPath,
+        long availableFreeBytes,
+        long recommendedFreeBytes)
+    {
+        if (availableFreeBytes >= recommendedFreeBytes)
+            return null;
+
+        const long bytesPerMiB = 1024 * 1024;
+        return $"warning: temp filesystem for '{tempPath}' has {availableFreeBytes / bytesPerMiB} MiB free " +
+            $"(recommended >= {recommendedFreeBytes / bytesPerMiB} MiB). CodeyBox full-suite tests write a per-test " +
+            "SQLite database and git/log/agent-stream temp trees; a small or RAM-backed temp directory can fill and " +
+            "yield cascading 'no such table' failures. Point TMPDIR at a spacious disk before `dotnet test CodeyBox.slnx`.";
     }
 }
 

@@ -68,7 +68,7 @@ public sealed class AgentPricingEndpointTests : IClassFixture<AgentPricingApiFac
     }
 }
 
-public sealed class AgentPricingApiFactory : WebApplicationFactory<Program>
+public sealed class AgentPricingApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-pricing-httptest-{Guid.NewGuid():N}.db");
@@ -84,7 +84,7 @@ public sealed class AgentPricingApiFactory : WebApplicationFactory<Program>
                 .ToList();
             foreach (var s in jsonSources) cfg.Sources.Remove(s);
 
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -165,11 +165,5 @@ public sealed class AgentPricingApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
 }

@@ -13,7 +13,7 @@ public sealed class QueueControllerTests : IDisposable
 
     public void Dispose()
     {
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     private SqliteQueueController Make() => new(_dbPath, NullLogger<SqliteQueueController>.Instance);

@@ -308,13 +308,12 @@ public sealed class WorkItemTimelineEndpointTests : IDisposable
 /// WebApplicationFactory variant that points the AuditLogTimelineReader at an
 /// isolated temp directory so tests can write synthetic CLEF events.
 /// </summary>
-internal sealed class TimelineApiFactory : WebApplicationFactory<Program>
+internal sealed class TimelineApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-tltest-{Guid.NewGuid():N}.db");
+    private readonly string _dbPath;
+    private readonly string _gitRoot;
 
-    public string AuditDir { get; } = Path.Combine(
-        Path.GetTempPath(), $"codeybox-tlogs-{Guid.NewGuid():N}");
+    public string AuditDir { get; }
 
     public string TodayAuditFile => Path.Combine(AuditDir, $"audit-{DateTime.UtcNow:yyyyMMdd}.json");
 
@@ -322,6 +321,10 @@ internal sealed class TimelineApiFactory : WebApplicationFactory<Program>
 
     public TimelineApiFactory()
     {
+        _dbPath = TempDatabasePath("tltest");
+        _gitRoot = Temp.NewDirectoryPath("test-git-");
+        AuditDir = Temp.NewDirectoryPath("tlogs-");
+
         Directory.CreateDirectory(AuditDir);
         Store = new SqliteWorkItemStore(_dbPath);
     }
@@ -335,7 +338,7 @@ internal sealed class TimelineApiFactory : WebApplicationFactory<Program>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(Path.GetTempPath(), $"test-git-{Guid.NewGuid():N}"),
+                ["CodeyBox:GitRootDirectory"] = _gitRoot,
                 ["CodeyBox:AuditLog:Path"] = Path.Combine(AuditDir, "log-.json"),
                 ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(AuditDir, "audit-.json"),
             });
@@ -357,13 +360,5 @@ internal sealed class TimelineApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            Store.Dispose();
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            try { Directory.Delete(AuditDir, recursive: true); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath, Store.Dispose);
 }

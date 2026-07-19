@@ -478,7 +478,8 @@ public sealed class CodexStreamParserTests
     public async Task ParseAsync_UsesCodexTimingFieldsWhenEventsDoNotHaveTopLevelTimestamps()
     {
         var parser = new CodexStreamParser();
-        var root = Path.Combine(Path.GetTempPath(), $"codeybox-codex-stream-{Guid.NewGuid():N}");
+        using var temp = TestTempDirectory.Create("codeybox-codex-stream-");
+        var root = temp.NewDirectoryPath("streams-");
         var itemId = WorkItemId.New();
         var store = new AgentStreamStore(new AgentStreamsOptions { Path = root }, NullLogger<AgentStreamStore>.Instance);
 
@@ -518,7 +519,7 @@ public sealed class CodexStreamParserTests
         }
         finally
         {
-            try { Directory.Delete(root, recursive: true); } catch { }
+            TestTempArtifacts.DeleteDirectory(root);
         }
     }
 
@@ -1080,8 +1081,9 @@ public sealed class ThinkingVsExecutingSplitTests
 
 public sealed class StreamAnalysisServiceTests : IDisposable
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-stream-analysis-{Guid.NewGuid():N}.db");
-    private readonly string _streamRoot = Path.Combine(Path.GetTempPath(), $"codeybox-stream-analysis-{Guid.NewGuid():N}");
+    private readonly TestTempDirectory _temp = TestTempDirectory.Create("codeybox-stream-analysis-");
+    private readonly string _dbPath;
+    private readonly string _streamRoot;
     private readonly SqliteWorkItemStore _workItems;
     private readonly AgentStreamStore _streams;
     private readonly SqliteAgentStreamSummaryStore _summaries;
@@ -1089,6 +1091,9 @@ public sealed class StreamAnalysisServiceTests : IDisposable
 
     public StreamAnalysisServiceTests()
     {
+        _dbPath = _temp.NewDatabasePath("state");
+        _streamRoot = _temp.NewDirectoryPath("streams-");
+
         _workItems = new SqliteWorkItemStore(_dbPath);
         _streams = new AgentStreamStore(new AgentStreamsOptions { Path = _streamRoot }, NullLogger<AgentStreamStore>.Instance);
         _summaries = new SqliteAgentStreamSummaryStore(_dbPath);
@@ -1507,11 +1512,13 @@ public sealed class StreamAnalysisServiceTests : IDisposable
 
     public void Dispose()
     {
-        _summaries.Dispose();
-        _costs.Dispose();
-        _workItems.Dispose();
-        try { File.Delete(_dbPath); } catch { }
-        try { Directory.Delete(_streamRoot, recursive: true); } catch { }
+        TestTempArtifacts.CleanupAll(
+            _summaries.Dispose,
+            _costs.Dispose,
+            _workItems.Dispose,
+            () => TestTempArtifacts.DeleteSqliteDatabase(_dbPath),
+            () => TestTempArtifacts.DeleteDirectory(_streamRoot),
+            _temp.Dispose);
     }
 }
 
@@ -2156,10 +2163,13 @@ public sealed class OnDemandAnalysisEndpointTests
     }
 }
 
-public sealed class AgentStreamAnalysisApiFactory : WebApplicationFactory<Program>
+public sealed class AgentStreamAnalysisApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
-    private readonly string _dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-stream-analysis-api-{Guid.NewGuid():N}.db");
-    private readonly string _streamRoot = Path.Combine(Path.GetTempPath(), $"codeybox-stream-analysis-api-{Guid.NewGuid():N}");
+    private readonly string _dbPath;
+    private readonly string _streamRoot;
+    private readonly string _gitRoot;
+    private readonly string _logPath;
+    private readonly string _auditPath;
 
     public SqliteWorkItemStore Store { get; }
     public SqliteAgentStreamSummaryStore Summaries { get; }
@@ -2167,6 +2177,12 @@ public sealed class AgentStreamAnalysisApiFactory : WebApplicationFactory<Progra
 
     public AgentStreamAnalysisApiFactory()
     {
+        _dbPath = TempDatabasePath("stream-analysis-api");
+        _streamRoot = Temp.NewDirectoryPath("stream-analysis-api-");
+        _gitRoot = Temp.NewDirectoryPath("test-git-");
+        _logPath = Temp.NewLogPath("test-log");
+        _auditPath = Temp.NewLogPath("test-audit");
+
         Store = new SqliteWorkItemStore(_dbPath);
         Summaries = new SqliteAgentStreamSummaryStore(_dbPath);
         Streams = new RecordingAgentStreamStore(new AgentStreamStore(
@@ -2183,9 +2199,9 @@ public sealed class AgentStreamAnalysisApiFactory : WebApplicationFactory<Progra
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(Path.GetTempPath(), $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(Path.GetTempPath(), $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(Path.GetTempPath(), $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitRootDirectory"] = _gitRoot,
+                ["CodeyBox:AuditLog:Path"] = _logPath,
+                ["CodeyBox:AuditLog:AuditPath"] = _auditPath,
                 ["CodeyBox:AgentStreams:Path"] = _streamRoot,
             });
         });
@@ -2225,16 +2241,7 @@ public sealed class AgentStreamAnalysisApiFactory : WebApplicationFactory<Progra
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            Summaries.Dispose();
-            Store.Dispose();
-            try { File.Delete(_dbPath); } catch { }
-            try { Directory.Delete(_streamRoot, recursive: true); } catch { }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath, Summaries.Dispose, Store.Dispose);
 }
 
 public sealed class RecordingAgentStreamStore : IAgentStreamStore

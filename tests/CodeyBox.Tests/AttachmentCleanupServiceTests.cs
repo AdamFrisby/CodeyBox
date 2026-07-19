@@ -50,8 +50,8 @@ public sealed class AttachmentCleanupServiceTests : IDisposable
     {
         _store.Dispose();
         _rawConn.Dispose();
-        try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        try { if (Directory.Exists(_rootDir)) Directory.Delete(_rootDir, recursive: true); } catch { /* best-effort */ }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
+        TestTempArtifacts.DeleteDirectory(_rootDir);
     }
 
     private static WorkItemId NewId() => new(Guid.NewGuid());

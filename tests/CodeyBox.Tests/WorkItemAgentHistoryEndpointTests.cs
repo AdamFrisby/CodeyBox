@@ -229,7 +229,7 @@ public sealed class WorkItemAgentHistoryEndpointTests : IDisposable
 /// WebApplicationFactory that swaps the real SQLite-backed involvement store
 /// for the in-memory variant so tests can pre-seed entries without disk.
 /// </summary>
-internal sealed class AgentHistoryApiFactory : WebApplicationFactory<Program>
+internal sealed class AgentHistoryApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-ahtest-{Guid.NewGuid():N}.db");
@@ -247,7 +247,7 @@ internal sealed class AgentHistoryApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -277,14 +277,7 @@ internal sealed class AgentHistoryApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            Store.Dispose();
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath, Store.Dispose);
 }
 
 /// <summary>
@@ -357,7 +350,7 @@ public sealed class WorkItemAgentHistoryDisabledEndpointTests : IDisposable
 /// endpoints' optional <c>IAgentInvolvementStore?</c> parameter binds to null,
 /// driving the feature-disabled branches.
 /// </summary>
-internal sealed class AgentHistoryDisabledApiFactory : WebApplicationFactory<Program>
+internal sealed class AgentHistoryDisabledApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-ahdis-{Guid.NewGuid():N}.db");
@@ -374,7 +367,7 @@ internal sealed class AgentHistoryDisabledApiFactory : WebApplicationFactory<Pro
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -404,13 +397,5 @@ internal sealed class AgentHistoryDisabledApiFactory : WebApplicationFactory<Pro
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            Store.Dispose();
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath, Store.Dispose);
 }
-

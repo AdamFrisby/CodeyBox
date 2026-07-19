@@ -84,7 +84,7 @@ internal static class PluginsUatHelpers
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions);
 
-        return new PluginPipelineContext(pipeline, store, agent, gitHost, gitRoot);
+        return new PluginPipelineContext(pipeline, store, agent, gitHost, gitRoot, stateDb);
     }
 
     public static UpstreamRemoteFactory UpstreamFactory(
@@ -104,27 +104,36 @@ internal static class PluginsUatHelpers
 
 internal sealed class PluginPipelineContext : IDisposable
 {
+    private readonly OwnedPipelineArtifacts _artifacts;
+
     public PluginPipelineContext(
         PipelineRunner pipeline,
         SqliteWorkItemStore store,
         ScriptedAgent agent,
         LocalGitHost gitHost,
-        string gitRoot)
+        string gitRoot,
+        string stateDbPath)
     {
         Pipeline = pipeline;
         Store = store;
         Agent = agent;
         GitHost = gitHost;
-        GitRoot = gitRoot;
+        _artifacts = new OwnedPipelineArtifacts(gitRoot, stateDbPath);
     }
 
     public PipelineRunner Pipeline { get; }
     public SqliteWorkItemStore Store { get; }
     public ScriptedAgent Agent { get; }
     public LocalGitHost GitHost { get; }
-    public string GitRoot { get; }
+    public string GitRoot => _artifacts.GitRoot;
+    public string StateDbPath => _artifacts.RequiredStateDbPath;
 
-    public void Dispose() => Store.Dispose();
+    public void Dispose()
+    {
+        TestTempArtifacts.CleanupAll(
+            Store.Dispose,
+            _artifacts.Dispose);
+    }
 }
 
 internal sealed class CapturingLogger<T> : ILogger<T>

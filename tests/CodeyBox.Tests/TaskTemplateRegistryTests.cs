@@ -11,7 +11,7 @@ public sealed class TaskTemplateRegistryTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_templateDir, recursive: true); } catch { }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_templateDir);
     }
 
     [Fact]

@@ -15,8 +15,7 @@ public sealed class LocalGitHostFetchRefreshTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_workspace, recursive: true); }
-        catch { }
+        TestTempArtifacts.DeleteDirectory(_workspace);
     }
 
     [Fact]

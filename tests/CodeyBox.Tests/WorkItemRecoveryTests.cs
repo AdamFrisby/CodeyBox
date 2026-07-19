@@ -24,7 +24,7 @@ public sealed class WorkItemRecoveryTests : IDisposable
     public void Dispose()
     {
         _store.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     private static WorkItem Item(WorkItemState state, int recoveryAttempts = 0) => new()

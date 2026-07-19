@@ -89,10 +89,10 @@ public sealed class DiffTruncationTests : IClassFixture<DiffApiFactory>
         string gitRoot, WorkItemId id, string baseBranch, string workBranch, int targetBytes)
     {
         var barePath = Path.Combine(gitRoot, id + ".git");
-        var tempWork = Path.Combine(Path.GetTempPath(), $"diff-trunc-{Guid.NewGuid():N}");
+        var tempDir = TestTempDirectory.Create("codeybox-diff-trunc-");
+        var tempWork = tempDir.Root;
         try
         {
-            Directory.CreateDirectory(tempWork);
             await TestSupport.RunGit(tempWork, "init", "-b", baseBranch);
             await TestSupport.RunGit(tempWork, "config", "user.email", "test@test.com");
             await TestSupport.RunGit(tempWork, "config", "user.name", "Test");
@@ -119,7 +119,7 @@ public sealed class DiffTruncationTests : IClassFixture<DiffApiFactory>
         }
         finally
         {
-            Directory.Delete(tempWork, recursive: true);
+            tempDir.Dispose();
         }
     }
 }

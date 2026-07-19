@@ -24,7 +24,7 @@ public sealed class AutoRetryOnStuckTests : IDisposable
         => _workspace = Directory.CreateTempSubdirectory("codeybox-autoretry-").FullName;
 
     public void Dispose()
-    { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 

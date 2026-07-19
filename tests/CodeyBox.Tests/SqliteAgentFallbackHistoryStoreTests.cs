@@ -17,7 +17,7 @@ public sealed class SqliteAgentFallbackHistoryStoreTests : IDisposable
     public SqliteAgentFallbackHistoryStoreTests() =>
         _workspace = Directory.CreateTempSubdirectory("codeybox-fallbackdb-").FullName;
 
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     [Fact]
     public async Task RecordAndList_PopulatedRecord_RoundTripsAllFields()

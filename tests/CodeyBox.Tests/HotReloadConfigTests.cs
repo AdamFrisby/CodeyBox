@@ -167,7 +167,7 @@ public sealed class HotReloadConfigTests
         }
         finally
         {
-            try { Directory.Delete(workspace, recursive: true); } catch { }
+            TestTempArtifacts.DeleteDirectory(workspace);
         }
     }
 
@@ -242,14 +242,15 @@ public sealed class HotReloadConfigTests
     [Fact]
     public void CodeyBoxOptionsMonitor_KeepsStartupValue_AfterRejectedStateDatabasePathReload()
     {
-        var startupPath = Path.Combine(Path.GetTempPath(), $"codeybox-startup-{Guid.NewGuid():N}.db");
-        var rejectedPath = Path.Combine(Path.GetTempPath(), $"codeybox-rejected-{Guid.NewGuid():N}.db");
+        using var temp = TestTempDirectory.Create("codeybox-options-monitor-");
+        var startupPath = temp.NewDatabasePath("startup");
+        var rejectedPath = temp.NewDatabasePath("rejected");
         var values = new Dictionary<string, string?>
         {
             ["CodeyBox:SandboxProvider"] = "multipass",
             ["CodeyBox:StateDatabasePath"] = startupPath,
-            ["CodeyBox:GitRootDirectory"] = Path.Combine(Path.GetTempPath(), "codeybox-repos"),
-            ["CodeyBox:AgentStreams:Path"] = Path.Combine(Path.GetTempPath(), "codeybox-agent-streams"),
+            ["CodeyBox:GitRootDirectory"] = temp.NewDirectoryPath("repos-"),
+            ["CodeyBox:AgentStreams:Path"] = temp.NewDirectoryPath("agent-streams-"),
         };
         var config = new ConfigurationBuilder()
             .AddInMemoryCollection(values)
@@ -652,7 +653,7 @@ public sealed class HotReloadConfigTests
         }
         finally
         {
-            try { File.Delete(dbPath); } catch { }
+            TestTempArtifacts.DeleteSqliteDatabase(dbPath);
         }
     }
 
@@ -750,7 +751,7 @@ public sealed class HotReloadConfigTests
         }
         finally
         {
-            try { Directory.Delete(tempDir.FullName, recursive: true); } catch { }
+            TestTempArtifacts.DeleteDirectory(tempDir.FullName);
         }
     }
 

@@ -3,7 +3,6 @@ using System.Net.Http.Json;
 using System.Text.Json;
 using CodeyBox.Core;
 using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -116,10 +115,22 @@ public sealed class ResetAdviceEndpointTests : IClassFixture<ResetAdviceEndpoint
 
     // ── Test fixtures ─────────────────────────────────────────────────────────
 
-    public sealed class ResetAdviceApiFactory : WebApplicationFactory<Program>
+    public sealed class ResetAdviceApiFactory : CodeyBoxWebApplicationFactory
     {
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(), $"codeybox-resetadvice-endpoint-{Guid.NewGuid():N}.db");
+        private readonly string _dbPath;
+        private readonly string _gitRoot;
+        private readonly string _auditLogPath;
+        private readonly string _auditPath;
+        private readonly string _agentStreamsPath;
+
+        public ResetAdviceApiFactory()
+        {
+            _dbPath = TempDatabasePath("codeybox-resetadvice-endpoint");
+            _gitRoot = Temp.NewDirectoryPath("resetadvice-git-");
+            _auditLogPath = Temp.NewLogPath("resetadvice-log");
+            _auditPath = Temp.NewLogPath("resetadvice-audit");
+            _agentStreamsPath = Temp.NewDirectoryPath("resetadvice-streams-");
+        }
 
         public RecordingAdvisor Advisor { get; } = new();
 
@@ -128,15 +139,14 @@ public sealed class ResetAdviceEndpointTests : IClassFixture<ResetAdviceEndpoint
             builder.UseEnvironment("Development");
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
-                var tmp = Path.GetTempPath();
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"resetadvice-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"resetadvice-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"resetadvice-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"resetadvice-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:GitRootDirectory"] = _gitRoot,
+                    ["CodeyBox:AuditLog:Path"] = _auditLogPath,
+                    ["CodeyBox:AuditLog:AuditPath"] = _auditPath,
+                    ["CodeyBox:AgentStreams:Path"] = _agentStreamsPath,
                 });
             });
             builder.ConfigureTestServices(services =>
@@ -145,34 +155,38 @@ public sealed class ResetAdviceEndpointTests : IClassFixture<ResetAdviceEndpoint
                 services.AddSingleton<IResetOptimalityAdvisor>(Advisor);
             });
         }
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            base.Dispose(disposing);
-        }
     }
 
-    public sealed class BareResetAdviceApiFactory : WebApplicationFactory<Program>
+    public sealed class BareResetAdviceApiFactory : CodeyBoxWebApplicationFactory
     {
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(), $"codeybox-resetadvice-bare-{Guid.NewGuid():N}.db");
+        private readonly string _dbPath;
+        private readonly string _gitRoot;
+        private readonly string _auditLogPath;
+        private readonly string _auditPath;
+        private readonly string _agentStreamsPath;
+
+        public BareResetAdviceApiFactory()
+        {
+            _dbPath = TempDatabasePath("codeybox-resetadvice-bare");
+            _gitRoot = Temp.NewDirectoryPath("resetadvice-bare-git-");
+            _auditLogPath = Temp.NewLogPath("resetadvice-bare-log");
+            _auditPath = Temp.NewLogPath("resetadvice-bare-audit");
+            _agentStreamsPath = Temp.NewDirectoryPath("resetadvice-bare-streams-");
+        }
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             builder.UseEnvironment("Development");
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
-                var tmp = Path.GetTempPath();
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"resetadvice-bare-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"resetadvice-bare-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"resetadvice-bare-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"resetadvice-bare-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:GitRootDirectory"] = _gitRoot,
+                    ["CodeyBox:AuditLog:Path"] = _auditLogPath,
+                    ["CodeyBox:AuditLog:AuditPath"] = _auditPath,
+                    ["CodeyBox:AgentStreams:Path"] = _agentStreamsPath,
                 });
             });
             builder.ConfigureTestServices(services =>
@@ -180,13 +194,6 @@ public sealed class ResetAdviceEndpointTests : IClassFixture<ResetAdviceEndpoint
                 services.RemoveAll<IHostedService>();
                 services.RemoveAll<IResetOptimalityAdvisor>();
             });
-        }
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            base.Dispose(disposing);
         }
     }
 

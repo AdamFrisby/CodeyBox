@@ -586,21 +586,22 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox, IPreserveOnDisposeSa
     {
         foreach (var entry in Directory.EnumerateFileSystemEntries(path))
         {
-            var info = new FileInfo(entry);
-            if (info.LinkTarget is not null)
+            var isDir = Directory.Exists(entry);
+            FileSystemInfo info = isDir ? new DirectoryInfo(entry) : new FileInfo(entry);
+            if (info.LinkTarget is not null || info.Attributes.HasFlag(FileAttributes.ReparsePoint))
             {
                 // Symlink — delete the link, not the target.
-                File.Delete(entry);
+                info.Delete();
                 continue;
             }
-            if (Directory.Exists(entry))
+            if (isDir)
             {
                 RemoveTreeSafely(entry);
             }
             else
             {
                 try { File.SetAttributes(entry, FileAttributes.Normal); } catch { /* best-effort */ }
-                File.Delete(entry);
+                info.Delete();
             }
         }
         Directory.Delete(path);

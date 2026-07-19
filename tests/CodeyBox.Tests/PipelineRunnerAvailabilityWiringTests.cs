@@ -36,7 +36,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
     public PipelineRunnerAvailabilityWiringTests() =>
         _workspace = Directory.CreateTempSubdirectory("codeybox-availwiring-").FullName;
 
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() => TestTempArtifacts.DeleteDirectory(_workspace);
 
     [Theory]
     [InlineData("agent exited 127", "env: 'codex': No such file or directory")]
@@ -2166,7 +2166,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(clone, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(clone);
         }
     }
 
@@ -2201,7 +2201,7 @@ public sealed class PipelineRunnerAvailabilityWiringTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(clone, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(clone);
         }
     }
 

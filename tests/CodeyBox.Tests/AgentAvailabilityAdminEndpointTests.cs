@@ -260,7 +260,7 @@ public sealed class AgentAvailabilityAdminEndpointTests
     /// <see cref="ControllableSmokeProbe"/> so /admin/agent/{name}/smoke
     /// returns a known result without making a live API call.
     /// </summary>
-    public sealed class AvailabilityAdminApiFactory : WebApplicationFactory<Program>
+    public sealed class AvailabilityAdminApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly string _dbPath = Path.Combine(
             Path.GetTempPath(), $"codeybox-availability-admin-{Guid.NewGuid():N}.db");
@@ -298,7 +298,7 @@ public sealed class AgentAvailabilityAdminEndpointTests
             builder.UseEnvironment("Development");
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = DisableAuth ? "true" : "false",
@@ -338,13 +338,7 @@ public sealed class AgentAvailabilityAdminEndpointTests
         }
 
         protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-            {
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            }
-            base.Dispose(disposing);
-        }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
     }
 
     /// <summary>

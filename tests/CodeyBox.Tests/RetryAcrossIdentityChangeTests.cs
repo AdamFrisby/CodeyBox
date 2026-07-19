@@ -16,7 +16,7 @@ public sealed class RetryAcrossIdentityChangeTests : IDisposable
     private readonly string _workspace;
     public RetryAcrossIdentityChangeTests()
         => _workspace = Directory.CreateTempSubdirectory("codeybox-idchange-").FullName;
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     private static WorkItem NewItem(string workBranch) => new()
     {

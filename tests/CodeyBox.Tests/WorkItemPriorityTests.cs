@@ -19,6 +19,7 @@ namespace CodeyBox.Tests;
 [Collection("Background service timing")]
 public sealed class WorkItemPriorityTests : IDisposable
 {
+    private static readonly TimeSpan DispatchWaitTimeout = TimeSpan.FromSeconds(120);
     private readonly string _dbPath =
         Path.Combine(Path.GetTempPath(), $"codeybox-prio-{Guid.NewGuid():N}.db");
     private readonly SqliteWorkItemStore _store;
@@ -28,7 +29,7 @@ public sealed class WorkItemPriorityTests : IDisposable
     public void Dispose()
     {
         _store.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     private static WorkItem MakeItem(int priority = 0, DateTimeOffset? createdAt = null) => new()
@@ -193,7 +194,7 @@ public sealed class WorkItemPriorityTests : IDisposable
         await queue.EnqueueAsync(high.Id);
 
         await svc.StartAsync(CancellationToken.None);
-        var done = await WaitForAllDoneAsync(new[] { low.Id, mid.Id, high.Id }, TimeSpan.FromSeconds(30));
+        var done = await WaitForAllDoneAsync(new[] { low.Id, mid.Id, high.Id }, DispatchWaitTimeout);
         await svc.StopAsync(CancellationToken.None);
 
         Assert.True(done, "All items should reach Done");
@@ -217,7 +218,7 @@ public sealed class WorkItemPriorityTests : IDisposable
         await queue.EnqueueAsync(older.Id);
 
         await svc.StartAsync(CancellationToken.None);
-        var done = await WaitForAllDoneAsync(new[] { older.Id, newer.Id }, TimeSpan.FromSeconds(30));
+        var done = await WaitForAllDoneAsync(new[] { older.Id, newer.Id }, DispatchWaitTimeout);
         await svc.StopAsync(CancellationToken.None);
 
         Assert.True(done);

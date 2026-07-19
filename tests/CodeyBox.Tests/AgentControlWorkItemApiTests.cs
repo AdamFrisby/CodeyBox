@@ -2,14 +2,8 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Agents;
 using CodeyBox.Core;
-using CodeyBox.Git;
-using CodeyBox.Orchestrator;
-using CodeyBox.Projects;
-using CodeyBox.Sandbox.Process;
-using CodeyBox.Webhooks;
 
 namespace CodeyBox.Tests;
 
@@ -92,7 +86,11 @@ public sealed class AgentControlWorkItemApiTests : IDisposable
         Assert.Equal(JobType.AgentControl, item!.JobType);
 
         var webhooks = new CapturingWebhookDispatcher();
-        var pipeline = BuildRealAgentControlPipeline(_factory.Store, pauses, webhooks);
+        using var pipeline = TestSupport.BuildAgentControlPipeline(
+            _factory.Store,
+            pauses,
+            webhooks,
+            "codeybox-agent-control-api-git-");
 
         await pipeline.RunAsync(item, CancellationToken.None);
 
@@ -272,41 +270,22 @@ public sealed class AgentControlWorkItemApiTests : IDisposable
         Assert.Equal(HttpStatusCode.BadRequest, conflictingDuration.StatusCode);
     }
 
-    private static PipelineRunner BuildRealAgentControlPipeline(
-        IWorkItemStore store,
-        IAgentPauseController pauses,
-        IWebhookDispatcher webhooks)
+    [Fact]
+    public void AgentControlPipelineFixture_Dispose_RemovesGitRoot()
     {
-        var gitRoot = Path.Combine(Path.GetTempPath(), $"codeybox-agent-control-api-git-{Guid.NewGuid():N}");
-        var gitHost = new LocalGitHost(
-            new LocalGitHostOptions { RootDirectory = gitRoot },
-            NullLogger<LocalGitHost>.Instance);
-        var projects = ProjectRepo();
-        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
-        return new PipelineRunner(
-            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
-            gitHost,
-            new AgentRegistry([new ScriptedAgent([MergeStrategy.RealMerge])]),
-            new StaticCredentialProvider(),
-            new InMemoryPullRequestService(),
-            projects,
-            new TestUpstreamFactory(),
-            new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
-            store,
-            webhooks,
-            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
-            NullLogger<PipelineRunner>.Instance,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
-            agentPauseController: pauses,
-            terminalTransitions: terminalTransitions,
-            terminalRevisionBuilder: terminalTransitions);
+        var pauses = _factory.Services.GetRequiredService<IAgentPauseController>();
+        var pipeline = TestSupport.BuildAgentControlPipeline(
+            _factory.Store,
+            pauses,
+            new CapturingWebhookDispatcher(),
+            "codeybox-agent-control-api-git-");
+        var gitRoot = pipeline.GitRoot;
+        Directory.CreateDirectory(gitRoot);
+        File.WriteAllText(Path.Combine(gitRoot, "repo.txt"), "repo");
+
+        pipeline.Dispose();
+
+        Assert.False(Directory.Exists(gitRoot));
     }
 
-    private static IProjectRepository ProjectRepo() =>
-        new InMemoryProjectRepository(new Project
-        {
-            Id = new ProjectId("test-project"),
-            DisplayName = "Test",
-            RepositoryUrl = "http://fake",
-        });
 }

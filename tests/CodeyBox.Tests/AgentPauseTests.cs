@@ -4,20 +4,21 @@ using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
-using CodeyBox.Sandbox.Process;
 using CodeyBox.Webhooks;
 
 namespace CodeyBox.Tests;
 
 public sealed class AgentPauseTests : IDisposable
 {
+    private const string AgentControlGitRootPrefix = "codeybox-agent-control-git-";
+
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(),
         $"codeybox-agent-pause-{Guid.NewGuid():N}.db");
 
     public void Dispose()
     {
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     [Fact]
@@ -624,7 +625,7 @@ public sealed class AgentPauseTests : IDisposable
         using var store = new SqliteWorkItemStore(_dbPath);
         var queue = new InMemoryTaskQueue();
         var webhooks = new CapturingWebhookDispatcher();
-        var pipeline = BuildRealAgentControlPipeline(store, pauses, webhooks);
+        using var pipeline = TestSupport.BuildAgentControlPipeline(store, pauses, webhooks, AgentControlGitRootPrefix, ProjectRepo());
         var item = Item(classId: null) with
         {
             JobType = JobType.AgentControl,
@@ -664,7 +665,7 @@ public sealed class AgentPauseTests : IDisposable
         using var pauses = MakeController();
         using var store = new SqliteWorkItemStore(_dbPath);
         var webhooks = new CapturingWebhookDispatcher();
-        var pipeline = BuildRealAgentControlPipeline(store, pauses, webhooks);
+        using var pipeline = TestSupport.BuildAgentControlPipeline(store, pauses, webhooks, AgentControlGitRootPrefix, ProjectRepo());
         var item = Item(classId: null) with
         {
             JobType = JobType.AgentControl,
@@ -695,7 +696,7 @@ public sealed class AgentPauseTests : IDisposable
     {
         using var pauses = MakeController();
         using var store = new SqliteWorkItemStore(_dbPath);
-        var pipeline = BuildRealAgentControlPipeline(store, pauses, new ThrowingWebhookDispatcher());
+        using var pipeline = TestSupport.BuildAgentControlPipeline(store, pauses, new ThrowingWebhookDispatcher(), AgentControlGitRootPrefix, ProjectRepo());
         var item = Item(classId: null) with
         {
             JobType = JobType.AgentControl,
@@ -723,7 +724,7 @@ public sealed class AgentPauseTests : IDisposable
     {
         using var store = new SqliteWorkItemStore(_dbPath);
         var webhooks = new CapturingWebhookDispatcher();
-        var pipeline = BuildRealAgentControlPipeline(store, pauses: null, webhooks);
+        using var pipeline = TestSupport.BuildAgentControlPipeline(store, null, webhooks, AgentControlGitRootPrefix, ProjectRepo());
         var item = Item(classId: null) with
         {
             JobType = JobType.AgentControl,
@@ -750,7 +751,7 @@ public sealed class AgentPauseTests : IDisposable
         using var pauses = MakeController();
         using var store = new SqliteWorkItemStore(_dbPath);
         var webhooks = new CapturingWebhookDispatcher();
-        var pipeline = BuildRealAgentControlPipeline(store, pauses, webhooks);
+        using var pipeline = TestSupport.BuildAgentControlPipeline(store, pauses, webhooks, AgentControlGitRootPrefix, ProjectRepo());
         var item = Item(classId: null) with
         {
             JobType = JobType.AgentControl,
@@ -772,7 +773,7 @@ public sealed class AgentPauseTests : IDisposable
         using var pauses = MakeController();
         using var store = new SqliteWorkItemStore(_dbPath);
         var webhooks = new CapturingWebhookDispatcher();
-        var pipeline = BuildRealAgentControlPipeline(store, pauses, webhooks);
+        using var pipeline = TestSupport.BuildAgentControlPipeline(store, pauses, webhooks, AgentControlGitRootPrefix, ProjectRepo());
         var item = Item(classId: null) with
         {
             JobType = JobType.AgentControl,
@@ -799,7 +800,7 @@ public sealed class AgentPauseTests : IDisposable
         using var pauses = MakeController();
         using var store = new SqliteWorkItemStore(_dbPath);
         var webhooks = new CapturingWebhookDispatcher();
-        var pipeline = BuildRealAgentControlPipeline(store, pauses, webhooks);
+        using var pipeline = TestSupport.BuildAgentControlPipeline(store, pauses, webhooks, AgentControlGitRootPrefix, ProjectRepo());
         var item = Item(classId: null) with
         {
             JobType = JobType.AgentControl,
@@ -826,7 +827,7 @@ public sealed class AgentPauseTests : IDisposable
         using var pauses = MakeController();
         using var store = new SqliteWorkItemStore(_dbPath);
         var webhooks = new CapturingWebhookDispatcher();
-        var pipeline = BuildRealAgentControlPipeline(store, pauses, webhooks);
+        using var pipeline = TestSupport.BuildAgentControlPipeline(store, pauses, webhooks, AgentControlGitRootPrefix, ProjectRepo());
         var item = Item(classId: null) with
         {
             JobType = JobType.AgentControl,
@@ -853,7 +854,7 @@ public sealed class AgentPauseTests : IDisposable
         using var pauses = MakeController();
         using var store = new SqliteWorkItemStore(_dbPath);
         var webhooks = new CapturingWebhookDispatcher();
-        var pipeline = BuildRealAgentControlPipeline(store, pauses, webhooks);
+        using var pipeline = TestSupport.BuildAgentControlPipeline(store, pauses, webhooks, AgentControlGitRootPrefix, ProjectRepo());
         var item = Item(classId: null) with
         {
             JobType = JobType.AgentControl,
@@ -880,7 +881,7 @@ public sealed class AgentPauseTests : IDisposable
         using var pauses = MakeController();
         using var store = new SqliteWorkItemStore(_dbPath);
         var webhooks = new CapturingWebhookDispatcher();
-        var pipeline = BuildRealAgentControlPipeline(store, pauses, webhooks);
+        using var pipeline = TestSupport.BuildAgentControlPipeline(store, pauses, webhooks, AgentControlGitRootPrefix, ProjectRepo());
         var item = Item(classId: null) with
         {
             JobType = JobType.AgentControl,
@@ -908,7 +909,7 @@ public sealed class AgentPauseTests : IDisposable
         using var pauses = MakeController();
         using var store = new SqliteWorkItemStore(_dbPath);
         var webhooks = new CapturingWebhookDispatcher();
-        var pipeline = BuildRealAgentControlPipeline(store, pauses, webhooks);
+        using var pipeline = TestSupport.BuildAgentControlPipeline(store, pauses, webhooks, AgentControlGitRootPrefix, ProjectRepo());
         var item = Item(classId: null) with
         {
             JobType = JobType.AgentControl,
@@ -937,7 +938,7 @@ public sealed class AgentPauseTests : IDisposable
         using var pauses = MakeController();
         using var store = new SqliteWorkItemStore(_dbPath);
         var webhooks = new CapturingWebhookDispatcher();
-        var pipeline = BuildRealAgentControlPipeline(store, pauses, webhooks);
+        using var pipeline = TestSupport.BuildAgentControlPipeline(store, pauses, webhooks, AgentControlGitRootPrefix, ProjectRepo());
         var item = Item(classId: null) with
         {
             JobType = JobType.AgentControl,
@@ -1286,34 +1287,19 @@ public sealed class AgentPauseTests : IDisposable
         Assert.Equal(resumeState, AgentPauseResumeMapper.ResumeStateForRetryFrom(retryFrom));
     }
 
-    private static PipelineRunner BuildRealAgentControlPipeline(
-        IWorkItemStore store,
-        IAgentPauseController? pauses,
-        IWebhookDispatcher webhooks)
+    [Fact]
+    public void AgentControlPipelineFixture_Dispose_RemovesGitRoot()
     {
-        var gitRoot = Path.Combine(Path.GetTempPath(), $"codeybox-agent-control-git-{Guid.NewGuid():N}");
-        var gitHost = new LocalGitHost(
-            new LocalGitHostOptions { RootDirectory = gitRoot },
-            NullLogger<LocalGitHost>.Instance);
-        var projects = ProjectRepo();
-        var terminalTransitions = TestSupport.CreateTerminalTransition(store, webhooks, projects);
-        return new PipelineRunner(
-            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
-            gitHost,
-            new AgentRegistry([new ScriptedAgent([MergeStrategy.RealMerge])]),
-            new StaticCredentialProvider(),
-            new InMemoryPullRequestService(),
-            projects,
-            new TestUpstreamFactory(),
-            new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
-            store,
-            webhooks,
-            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
-            NullLogger<PipelineRunner>.Instance,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
-            agentPauseController: pauses,
-            terminalTransitions: terminalTransitions,
-            terminalRevisionBuilder: terminalTransitions);
+        using var store = new SqliteWorkItemStore(_dbPath);
+        using var pauses = MakeController();
+        var pipeline = TestSupport.BuildAgentControlPipeline(store, pauses, new CapturingWebhookDispatcher(), AgentControlGitRootPrefix, ProjectRepo());
+        var gitRoot = pipeline.GitRoot;
+        Directory.CreateDirectory(gitRoot);
+        File.WriteAllText(Path.Combine(gitRoot, "repo.txt"), "repo");
+
+        pipeline.Dispose();
+
+        Assert.False(Directory.Exists(gitRoot));
     }
 
     private SqliteAgentPauseController MakeController(TimeProvider? timeProvider = null) =>

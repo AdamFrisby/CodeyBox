@@ -28,7 +28,7 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_dir, recursive: true); } catch (IOException) { }
+        TestTempArtifacts.DeleteDirectory(_dir);
     }
 
     private string WriteCreds(string fileName, string json)

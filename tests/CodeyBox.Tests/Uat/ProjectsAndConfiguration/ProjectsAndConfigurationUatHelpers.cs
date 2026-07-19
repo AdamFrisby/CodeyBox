@@ -1,6 +1,7 @@
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
+using CodeyBox.Tests;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -12,15 +13,13 @@ using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Tests.Uat.ProjectsAndConfiguration;
 
-internal sealed class ProjectsAndConfigurationApiFactory : WebApplicationFactory<Program>
+internal sealed class ProjectsAndConfigurationApiFactory : CodeyBoxWebApplicationFactory
 {
     private readonly string _environment;
     private readonly bool _disableAuth;
     private readonly Dictionary<string, string?> _configuration;
     private readonly IProjectRepository? _projects;
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(),
-        $"codeybox-projects-config-uat-{Guid.NewGuid():N}.db");
+    private readonly string _dbPath;
 
     public ProjectsAndConfigurationApiFactory(
         string environment = "Development",
@@ -32,6 +31,7 @@ internal sealed class ProjectsAndConfigurationApiFactory : WebApplicationFactory
         _disableAuth = disableAuth;
         _configuration = configuration ?? [];
         _projects = projects;
+        _dbPath = TempDatabasePath("codeybox-projects-config-uat");
         WorkItemStore = new SqliteWorkItemStore(_dbPath);
         ReleaseStore = new SqliteReleaseStore(_dbPath);
     }
@@ -45,16 +45,15 @@ internal sealed class ProjectsAndConfigurationApiFactory : WebApplicationFactory
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
             cfg.Sources.Clear();
-            var tmp = Path.GetTempPath();
             var config = new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = _disableAuth ? "true" : "false",
                 ["CodeyBox:SandboxProvider"] = "process",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                ["CodeyBox:GitRootDirectory"] = Temp.NewDirectoryPath("test-git-"),
+                ["CodeyBox:AuditLog:Path"] = Temp.NewLogPath("test-log"),
+                ["CodeyBox:AuditLog:AuditPath"] = Temp.NewLogPath("test-audit"),
+                ["CodeyBox:AgentStreams:Path"] = Temp.NewDirectoryPath("test-agent-streams-"),
                 ["CodeyBox:Changelog:Enabled"] = "false",
             };
 
@@ -81,15 +80,11 @@ internal sealed class ProjectsAndConfigurationApiFactory : WebApplicationFactory
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            WorkItemStore.Dispose();
-            ReleaseStore.Dispose();
-            try { File.Delete(_dbPath); } catch { }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(
+            disposing,
+            _dbPath,
+            WorkItemStore.Dispose,
+            ReleaseStore.Dispose);
 }
 
 internal sealed class UatLogCapture : ILogger

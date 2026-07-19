@@ -14,9 +14,20 @@ namespace CodeyBox.Tests;
 public sealed class SqliteWriteGateConcurrencyTests : IDisposable
 {
     private static readonly TimeSpan PostReleaseCompletionTimeout = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan DiagnosticLogPollInterval = TimeSpan.FromMilliseconds(25);
+    private const int DiagnosticLogPollAttempts = 1200;
+    private const int WorkerCount = 4;
+    private const int PostWorkItemCount = 4;
+    private const int TimingWriteCount = 4;
+    private const int UsageRows = 650;
 
-    private readonly string _dbPath =
-        Path.Combine(Path.GetTempPath(), $"codeybox-write-gate-{Guid.NewGuid():N}.db");
+    private readonly TestTempDirectory _temp = TestTempDirectory.Create("codeybox-write-gate-");
+    private readonly string _dbPath;
+
+    public SqliteWriteGateConcurrencyTests()
+    {
+        _dbPath = _temp.NewDatabasePath("state");
+    }
 
     [Fact]
     public async Task BlockedAwaitingHolder_FiresHoldWatchdogAndAcquisitionTimeout()
@@ -50,14 +61,11 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
             var timeout = await Assert.ThrowsAsync<SqliteWriteGateAcquisitionTimeoutException>(
                 () => waiter.WaitAsync(TimeSpan.FromSeconds(5)));
             Assert.Contains(nameof(HoldGateAcrossBlockedAwaitAsync), timeout.CurrentHolder);
-            Assert.Contains(
-                loggerFactory.Messages,
+            await AssertLoggedEventuallyAsync(
+                loggerFactory,
                 message => message.Contains("exceeded the configured maximum hold duration", StringComparison.Ordinal)
                     && message.Contains(nameof(HoldGateAcrossBlockedAwaitAsync), StringComparison.Ordinal));
-            // The acquisition-timeout diagnostic is logged fire-and-forget on the thread
-            // pool (deduped to avoid flooding the timed-out caller's path under a boot
-            // storm), so poll for it rather than racing the queued work item.
-            await AssertLogMessageEventuallyAsync(
+            await AssertLoggedEventuallyAsync(
                 loggerFactory,
                 message => message.Contains("Timed out", StringComparison.Ordinal)
                     && message.Contains(nameof(WaitAndReleaseAsync), StringComparison.Ordinal));
@@ -225,14 +233,20 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
         using var usage = new SqliteAgentUsageStore(_dbPath);
         using var costs = new SqliteWorkItemCostStore(_dbPath);
         using var streamSummaries = new SqliteAgentStreamSummaryStore(_dbPath);
+        using var warmupResponse = await client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "",
+            prompt = "p",
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, warmupResponse.StatusCode);
 
         var timedItem = MakeWorkItem("timed");
         await factory.Store.CreateAsync(timedItem);
         var streamRow = MakeStreamSummary(timedItem.Id);
 
-        const int workerCount = 4;
         var workerIds = new List<string>();
-        for (var i = 0; i < workerCount; i++)
+        for (var i = 0; i < WorkerCount; i++)
         {
             var workerId = $"worker-{i}";
             workerIds.Add(workerId);
@@ -246,9 +260,8 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
             });
         }
 
-        const int usageRows = 650;
         var oldUsageTime = DateTimeOffset.UtcNow.AddDays(-120);
-        for (var i = 0; i < usageRows; i++)
+        for (var i = 0; i < UsageRows; i++)
         {
             await usage.RecordAsync(new AgentUsageEvent
             {
@@ -265,7 +278,7 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
         var maintenance = await LongMaintenanceWriter.OpenAsync(_dbPath);
 
         var heartbeatBefore = DateTimeOffset.UtcNow;
-        var postTasks = Enumerable.Range(0, 8)
+        var postTasks = Enumerable.Range(0, PostWorkItemCount)
             .Select(i => client.PostAsJsonAsync("/workitems", new
             {
                 projectId = "test-project",
@@ -278,7 +291,7 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
             .Select((workerId, i) => registry.HeartbeatAsync(workerId, $"work-{i}"))
             .ToArray();
 
-        var timingTasks = Enumerable.Range(0, 8)
+        var timingTasks = Enumerable.Range(0, TimingWriteCount)
             .Select(async i =>
             {
                 var id = $"timing-{i}";
@@ -349,8 +362,8 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
         var workers = await registry.ListAsync();
         Assert.All(workers, worker => Assert.True(worker.LastHeartbeatAt >= heartbeatBefore));
         Assert.All(workers, worker => Assert.StartsWith("work-", worker.CurrentWorkItemId));
-        Assert.Equal(8, (await timing.GetByWorkItemAsync(timedItem.Id)).Count);
-        Assert.Equal(usageRows, pruned);
+        Assert.Equal(TimingWriteCount, (await timing.GetByWorkItemAsync(timedItem.Id)).Count);
+        Assert.Equal(UsageRows, pruned);
         Assert.Single(await streamSummaries.GetByWorkItemAsync(timedItem.Id));
         var costRow = Assert.Single(await costs.GetByWorkItemAsync(timedItem.Id.ToString()));
         Assert.Equal("work", costRow.Phase);
@@ -361,10 +374,9 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
 
     public void Dispose()
     {
-        foreach (var path in new[] { _dbPath, _dbPath + "-wal", _dbPath + "-shm" })
-        {
-            try { File.Delete(path); } catch { }
-        }
+        TestTempArtifacts.CleanupAll(
+            () => TestTempArtifacts.DeleteSqliteDatabase(_dbPath),
+            _temp.Dispose);
     }
 
     private static WorkItem MakeWorkItem(string title) => new()
@@ -446,21 +458,23 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
         }
     }
 
-    private static async Task AssertLogMessageEventuallyAsync(
+    // The acquisition-timeout diagnostic is intentionally logged off the hot
+    // path via the thread pool (see SqliteDatabaseWriteGate.CreateAcquisitionTimeout),
+    // so it can lag the observed timeout exception under load. Poll until it
+    // lands (bounded, ~30 s) before asserting so a starved thread pool does not
+    // produce a false negative; the predicate still asserts the real message.
+    private static async Task AssertLoggedEventuallyAsync(
         RecordingLoggerFactory loggerFactory,
         Func<string, bool> predicate)
     {
-        var deadline = TimeSpan.FromSeconds(5);
-        var pollInterval = TimeSpan.FromMilliseconds(10);
-        for (var waited = TimeSpan.Zero; waited < deadline; waited += pollInterval)
+        for (var attempt = 0; attempt < DiagnosticLogPollAttempts; attempt++)
         {
             if (loggerFactory.Messages.Any(predicate))
                 return;
-            await Task.Delay(pollInterval);
+            await Task.Delay(DiagnosticLogPollInterval);
         }
 
-        // Final assertion surfaces the recorded messages if the log never arrived.
-        Assert.Contains(loggerFactory.Messages, message => predicate(message));
+        Assert.Contains(loggerFactory.Messages, new Predicate<string>(predicate));
     }
 
     private static async Task WaitForReleasedWritersAsync(

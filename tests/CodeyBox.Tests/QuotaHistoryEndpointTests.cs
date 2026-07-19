@@ -132,7 +132,7 @@ public sealed class QuotaHistoryEndpointTests
             => Task.FromResult<IReadOnlyList<QuotaRawSnapshotRow>>(_raw);
     }
 
-    private sealed class QuotaHistoryApiFactory : WebApplicationFactory<Program>
+    private sealed class QuotaHistoryApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly IQuotaTimeSeriesStore? _store;
         private readonly string _dbPath = Path.Combine(
@@ -150,7 +150,7 @@ public sealed class QuotaHistoryEndpointTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 var config = new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -179,12 +179,6 @@ public sealed class QuotaHistoryEndpointTests
         }
 
         protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-            {
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            }
-            base.Dispose(disposing);
-        }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
     }
 }

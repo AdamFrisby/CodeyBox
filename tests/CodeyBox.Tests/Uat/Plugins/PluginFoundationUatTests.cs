@@ -159,7 +159,7 @@ public sealed class PluginEndpointUatTests : IDisposable
     private sealed record PluginDto(string PluginId, string DisplayName);
 }
 
-internal sealed class PluginEndpointFactory : WebApplicationFactory<Program>
+internal sealed class PluginEndpointFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = System.IO.Path.Combine(
         System.IO.Path.GetTempPath(),
@@ -170,7 +170,7 @@ internal sealed class PluginEndpointFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = System.IO.Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -202,13 +202,7 @@ internal sealed class PluginEndpointFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            try { File.Delete(_dbPath); } catch { }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
 }
 
 internal sealed class StaticPluginLoader(IReadOnlyList<LoadedPlugin> plugins) : IPluginLoader

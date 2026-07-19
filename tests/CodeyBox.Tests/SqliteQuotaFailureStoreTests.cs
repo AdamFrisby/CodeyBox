@@ -13,11 +13,9 @@ public sealed class SqliteQuotaFailureStoreTests : IDisposable
 
     public void Dispose()
     {
-        _store.Dispose();
-        foreach (var path in new[] { _dbPath, _dbPath + "-wal", _dbPath + "-shm" })
-        {
-            try { File.Delete(path); } catch { }
-        }
+        TestTempArtifacts.CleanupAll(
+            _store.Dispose,
+            () => TestTempArtifacts.DeleteSqliteDatabase(_dbPath));
     }
 
     [Fact]

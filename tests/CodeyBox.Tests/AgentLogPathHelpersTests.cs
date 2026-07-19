@@ -27,7 +27,7 @@ public sealed class AgentLogPathHelpersTests : IDisposable
     public void Dispose()
     {
         _store.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     private static WorkItem MakeItem() => new()

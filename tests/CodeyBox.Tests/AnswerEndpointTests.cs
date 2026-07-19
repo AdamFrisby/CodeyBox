@@ -325,7 +325,7 @@ public sealed class AnswerEndpointTests : IDisposable
     }
 }
 
-internal sealed class AnswerEndpointFactory : WebApplicationFactory<Program>
+internal sealed class AnswerEndpointFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     public const string ProjectId = "test-project";
 
@@ -346,7 +346,7 @@ internal sealed class AnswerEndpointFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -381,13 +381,9 @@ internal sealed class AnswerEndpointFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            WorkItemStore.Dispose();
-            QuestionStore.Dispose();
-            try { File.Delete(_dbPath); } catch { }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(
+            disposing,
+            _dbPath,
+            WorkItemStore.Dispose,
+            QuestionStore.Dispose);
 }

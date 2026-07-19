@@ -223,7 +223,7 @@ public sealed class WorkItemRecoveryPolicyTests
     public void OrchestratorRecovery_AgentControlWorkingWithoutCheckpoint_Requeues()
     {
         var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-agent-control-recovery-{Guid.NewGuid():N}.db");
-        using var store = new SqliteWorkItemStore(dbPath);
+        var store = new SqliteWorkItemStore(dbPath);
         try
         {
             var svc = new OrchestratorService(
@@ -249,7 +249,8 @@ public sealed class WorkItemRecoveryPolicyTests
         }
         finally
         {
-            try { File.Delete(dbPath); } catch { }
+            store.Dispose();
+            TestTempArtifacts.DeleteSqliteDatabase(dbPath);
         }
     }
 
@@ -257,7 +258,7 @@ public sealed class WorkItemRecoveryPolicyTests
     public void OrchestratorRecovery_AgentControlWorkingWithoutCheckpoint_AtCapAbandons()
     {
         var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-agent-control-recovery-cap-{Guid.NewGuid():N}.db");
-        using var store = new SqliteWorkItemStore(dbPath);
+        var store = new SqliteWorkItemStore(dbPath);
         try
         {
             var svc = new OrchestratorService(
@@ -288,7 +289,8 @@ public sealed class WorkItemRecoveryPolicyTests
         }
         finally
         {
-            try { File.Delete(dbPath); } catch { }
+            store.Dispose();
+            TestTempArtifacts.DeleteSqliteDatabase(dbPath);
         }
     }
 

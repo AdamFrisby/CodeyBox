@@ -302,7 +302,7 @@ public sealed class WorkerPoolHotReloadTests
         public void Dispose()
         {
             _store?.Dispose();
-            if (_dbPath is not null) { try { File.Delete(_dbPath); } catch { } }
+            if (_dbPath is not null) { TestTempArtifacts.DeleteSqliteDatabase(_dbPath); }
         }
     }
 
@@ -366,7 +366,7 @@ public sealed class WorkerPoolHotReloadTests
         {
             await _coordinator.StopAsync(CancellationToken.None);
             _store.Dispose();
-            try { File.Delete(_dbPath); } catch { }
+            TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
         }
     }
 

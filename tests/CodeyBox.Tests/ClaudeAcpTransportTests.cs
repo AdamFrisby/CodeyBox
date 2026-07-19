@@ -742,7 +742,7 @@ public sealed class ClaudeAcpTransportTests
         }
         finally
         {
-            try { Directory.Delete(successRoot, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(successRoot);
         }
 
         var mismatchRoot = Directory.CreateTempSubdirectory("cb-acp-launcher-mismatch-").FullName;
@@ -772,7 +772,7 @@ public sealed class ClaudeAcpTransportTests
         }
         finally
         {
-            try { Directory.Delete(mismatchRoot, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(mismatchRoot);
         }
     }
 
@@ -892,7 +892,7 @@ public sealed class ClaudeAcpTransportTests
         }
         finally
         {
-            try { Directory.Delete(root, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(root);
         }
     }
 
