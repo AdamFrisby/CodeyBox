@@ -2118,8 +2118,47 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         };
         psi.ArgumentList.Add("10");
         psi.Environment[SandboxConventions.WorkItemIdEnvironmentVariable] = itemId.ToString();
-        return DiagProcess.Start(psi)
+        var process = DiagProcess.Start(psi)
             ?? throw new InvalidOperationException("failed to start idle test process");
+
+        // A freshly exec'd process is transiently in the 'R' (running) state
+        // before it issues its first blocking syscall and settles into 'S'
+        // (interruptible sleep). The idle-process contract under test is "a
+        // sleeping tagged process is not CPU progress", so wait for that settle
+        // before observing — otherwise the exec-transient R-state races the
+        // first probe and reports process-cpu on an otherwise idle worker.
+        WaitForSleepingState(process);
+        return process;
+    }
+
+    // Polls the child's /proc stat until it leaves the 'R' (running) state, so
+    // idle-process tests exercise the real /proc reader deterministically rather
+    // than racing the freshly-exec'd process's transient run state. Bounded so a
+    // pathological host cannot hang the suite; /bin/sleep reaches 'S' as soon as
+    // it enters nanosleep, well within this window.
+    private static void WaitForSleepingState(DiagProcess process)
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var statPath = $"/proc/{process.Id}/stat";
+        var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(5);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            string stat;
+            try { stat = File.ReadAllText(statPath); }
+            catch { return; }
+
+            var close = stat.LastIndexOf(')');
+            if (close >= 0 && close + 2 < stat.Length)
+            {
+                var state = stat[close + 2];
+                if (state != 'R')
+                    return;
+            }
+
+            Thread.Sleep(10);
+        }
     }
 
     // Poll until the process leaves the running (R) state, i.e. it has parked in
