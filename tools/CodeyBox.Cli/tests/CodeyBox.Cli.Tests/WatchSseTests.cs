@@ -499,24 +499,34 @@ public sealed class WatchSseTests
             ApiBaseUrl = "http://localhost:5036",
             ApiKey = "test-key",
         };
-        var handler = new SseTestHttp.DelayingEventsHandler(
-            TimeSpan.FromMilliseconds(150),
+        Func<HttpRequestMessage, HttpResponseMessage> respond =
             req => req.RequestUri?.AbsolutePath.EndsWith("/events", StringComparison.Ordinal) == true
                 ? SampleData.SseEventsResponse("Done")
-                : SampleData.WorkItemResponse());
+                : SampleData.WorkItemResponse();
         var baseUri = new Uri(config.ApiBaseUrl);
 
+        // Short-timeout client: the server holds the /events response open until
+        // the request is cancelled, so the sole possible outcome is the 50ms
+        // HttpClient timeout firing -> ShouldFallback. Blocking-until-cancelled
+        // (rather than racing a fixed wall-clock delay against the timeout) keeps
+        // this deterministic even when a loaded test host fires timers late.
+        var blockingHandler = new SseTestHttp.DelayingEventsHandler(
+            Timeout.InfiniteTimeSpan, respond);
         var shortSseClient = new CodeyBoxClient(
-            new HttpClient(handler) { BaseAddress = baseUri, Timeout = TimeSpan.FromSeconds(30) },
-            new HttpClient(handler)
+            new HttpClient(blockingHandler) { BaseAddress = baseUri, Timeout = TimeSpan.FromSeconds(30) },
+            new HttpClient(blockingHandler)
             {
                 BaseAddress = baseUri,
                 Timeout = TimeSpan.FromMilliseconds(50),
             });
 
+        // Infinite-timeout client: a genuinely slow but finite connect that the
+        // client patiently waits out and completes.
+        var slowHandler = new SseTestHttp.DelayingEventsHandler(
+            TimeSpan.FromMilliseconds(150), respond);
         var infiniteSseClient = new CodeyBoxClient(
-            new HttpClient(handler) { BaseAddress = baseUri, Timeout = TimeSpan.FromSeconds(30) },
-            new HttpClient(handler) { BaseAddress = baseUri, Timeout = Timeout.InfiniteTimeSpan });
+            new HttpClient(slowHandler) { BaseAddress = baseUri, Timeout = TimeSpan.FromSeconds(30) },
+            new HttpClient(slowHandler) { BaseAddress = baseUri, Timeout = Timeout.InfiniteTimeSpan });
 
         var shortResult = await shortSseClient.TryWatchWorkItemEventsAsync(
             "aabbccdd-0000-0000-0000-000000000000", _ => { });

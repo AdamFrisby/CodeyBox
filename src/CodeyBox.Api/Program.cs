@@ -2516,7 +2516,10 @@ builder.Services.AddSingleton<SqliteWorkItemStore>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteWorkItemStore(
         opts.StateDatabasePath,
-        writeGateFactory: sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
+        writeGateFactory: sp.GetRequiredService<SqliteDatabaseWriteGateFactory>(),
+        // Lazy accessor: the failure-event store points at the same file and is
+        // resolved on demand so the two stores have no construction-order coupling.
+        failureEventStore: () => sp.GetService<IFailureEventStore>());
 });
 builder.Services.AddSingleton<IWorkItemStore>(sp => sp.GetRequiredService<SqliteWorkItemStore>());
 builder.Services.AddSingleton<IAuditProgressStore>(sp => sp.GetRequiredService<SqliteWorkItemStore>());
@@ -2601,6 +2604,13 @@ builder.Services.AddSingleton<ITimingStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteTimingStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
+});
+builder.Services.AddSingleton<IFailureEventStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteFailureEventStore(
         opts.StateDatabasePath,
         sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
@@ -3626,6 +3636,7 @@ E2eRunEndpoints.Map(app);
 WorkItemAttachmentEndpoints.Map(app);
 TaskTemplateEndpoints.Map(app);
 WorkItemTimingsEndpoints.Map(app);
+WorkItemFailureEventsEndpoints.Map(app);
 WorkItemCostsEndpoints.Map(app);
 AgentPricingEndpoints.Map(app);
 ProjectBudgetEndpoints.Map(app);

@@ -31,13 +31,20 @@ public sealed class SqliteWorkItemStore :
     // connections are not safe for overlapping commands from dispatcher and
     // worker tasks, even when WAL permits file-level read/write concurrency.
     private readonly SqliteDatabaseWriteGate _writeLock;
+    // Lazy accessor for the append-only failure/park event log. Resolved lazily
+    // (mirroring the Func<IReleaseStore?> registration) so the two same-file
+    // stores have no construction-order coupling. Null when failure history is
+    // not wired (e.g. legacy tests) — the hook then no-ops.
+    private readonly Func<IFailureEventStore?>? _failureEventStore;
     private int _disposed;
 
     public SqliteWorkItemStore(
         string path,
         Serilog.ILogger? auditLogger = null,
-        SqliteDatabaseWriteGateFactory? writeGateFactory = null)
+        SqliteDatabaseWriteGateFactory? writeGateFactory = null,
+        Func<IFailureEventStore?>? failureEventStore = null)
     {
+        _failureEventStore = failureEventStore;
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
@@ -1379,6 +1386,15 @@ public sealed class SqliteWorkItemStore :
         {
             _writeLock.Release();
         }
+
+        // A work item can be inserted directly in a failure/park state (e.g. a
+        // replay seeded from a prior failure, or an import). That is an ENTRY
+        // into failure with no prior row, so it must be logged here too. Reaching
+        // this point means the INSERT committed (the catch arms above rethrow);
+        // with no previous snapshot the helper emits iff the created state is a
+        // failure/park state. Runs after the write gate is released, mirroring
+        // the update-path hooks.
+        await EmitFailureEventIfEnteringFailureAsync(previous: null, item, ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1418,11 +1434,128 @@ public sealed class SqliteWorkItemStore :
         ex.Message.Contains("work_items.origin_check_work_item_id", StringComparison.OrdinalIgnoreCase)
         || ex.Message.Contains("idx_work_items_origin_check_unique", StringComparison.OrdinalIgnoreCase);
 
+    // ── Failure/park event history ───────────────────────────────────────────
+    // The single mutable failure fields on a work item are overwritten by the
+    // next retry, so there is no durable record of past failures. Every persist
+    // method that writes a work-item row (UpdateAsync, TryUpdateIfStateAsync,
+    // TryUpdateIfStateAndUpdatedAtAsync, TryUpdateIfStateAndUpdatedAtWithAgentRestoreRetryClaimAsync,
+    // and CreateAsync) emits ONE failure_events row, after releasing the write
+    // gate, when the write ENTERS a failure/park state (or the kind/error changed
+    // while already in one). The update-family methods capture the pre-write
+    // failure snapshot (below) to detect entry and
+    // suppress duplicates; CreateAsync has no prior row and passes a null
+    // snapshot, so it emits iff the inserted state is itself a failure/park state.
+    // The emit runs OUTSIDE the write gate because the failure store shares this
+    // file's gate and re-acquiring it while held would trip the gate's
+    // re-entrancy guard.
+
+    private readonly record struct FailureStateSnapshot(WorkItemState State, string? FailureKind, string? LastError);
+
+    /// <summary>
+    /// States whose ENTRY is recorded as a failure/park event. NeedsOperatorInput
+    /// is deliberately excluded: it is an operator park (a question awaiting an
+    /// answer), not a failure, so it does not belong in failure-rate analysis.
+    /// Cancelled and the non-terminal transient/agent-resume parks are likewise
+    /// out of scope per the failure-history contract.
+    /// </summary>
+    private static bool IsFailureEventState(WorkItemState state) =>
+        state is WorkItemState.Failed
+            or WorkItemState.MergeConflictResolutionFailed
+            or WorkItemState.WaitingForQuotaReset
+            or WorkItemState.AbandonedAfterRecoveryAttempts;
+
+    /// <summary>
+    /// Reads the pre-write failure snapshot for a pending transition, but only
+    /// when the pending state is itself a failure/park state (otherwise no event
+    /// can be emitted and the extra read is skipped). Caller must hold
+    /// <see cref="_writeLock"/> so the snapshot and the subsequent write are
+    /// consistent. Returns null when no snapshot is needed or the row is absent.
+    /// </summary>
+    private async Task<FailureStateSnapshot?> ReadFailureSnapshotForTransitionAsync(
+        WorkItem pending,
+        CancellationToken ct)
+    {
+        if (_failureEventStore is null || !IsFailureEventState(pending.State))
+            return null;
+
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT state, failure_kind, last_error FROM work_items WHERE id = $id;";
+        cmd.Parameters.AddWithValue("$id", pending.Id.ToString());
+        using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await reader.ReadAsync(ct).ConfigureAwait(false))
+            return null;
+
+        var state = (WorkItemState)reader.GetInt32(0);
+        var kind = reader.IsDBNull(1) ? null : reader.GetString(1);
+        var error = reader.IsDBNull(2) ? null : reader.GetString(2);
+        return new FailureStateSnapshot(state, kind, error);
+    }
+
+    /// <summary>
+    /// Emits a single failure event when <paramref name="next"/> represents an
+    /// entry into a failure/park state, or a changed failure kind/error while
+    /// already in one. No-op when the failure store is unwired, the next state
+    /// is not a failure/park state, or a repeated persist leaves state + kind +
+    /// error unchanged. Best-effort: a failure-log write must never break the
+    /// primary state transition it records. Call ONLY after the write gate is
+    /// released and ONLY when the primary write actually applied.
+    /// </summary>
+    private async Task EmitFailureEventIfEnteringFailureAsync(
+        FailureStateSnapshot? previous,
+        WorkItem next,
+        CancellationToken ct)
+    {
+        var store = _failureEventStore?.Invoke();
+        if (store is null || !IsFailureEventState(next.State))
+            return;
+
+        if (previous is { } p && IsFailureEventState(p.State)
+            && p.State == next.State
+            && string.Equals(p.FailureKind, next.FailureKind, StringComparison.Ordinal)
+            && string.Equals(p.LastError, next.LastError, StringComparison.Ordinal))
+        {
+            // Repeated persist into the same failure state with the same kind and
+            // error — already logged on entry; do not duplicate.
+            return;
+        }
+
+        var record = new FailureEventRecord
+        {
+            WorkItemId = next.Id,
+            Agent = next.Agent?.Value,
+            // The persisted lifecycle state is the failure "phase"; the work item
+            // row carries no separate pipeline-phase or per-iteration counter.
+            Phase = next.State.ToString(),
+            Iteration = null,
+            FailureKind = next.FailureKind,
+            ErrorMessage = next.LastError,
+            SandboxName = next.SuspendedVmName,
+            Provider = null,
+            OccurredAt = next.UpdatedAt,
+        };
+
+        try
+        {
+            await store.AppendAsync(record, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _auditLogger.Warning(
+                ex,
+                "Failed to append failure event for work item {WorkItemId} entering {State}",
+                next.Id,
+                next.State);
+        }
+    }
+
     public async Task UpdateAsync(WorkItem item, CancellationToken ct = default)
     {
+        FailureStateSnapshot? previousFailureSnapshot = null;
+        int rowsAffected;
         await _writeLock.WaitAsync(ct);
         try
         {
+            previousFailureSnapshot = await ReadFailureSnapshotForTransitionAsync(item, ct).ConfigureAwait(false);
             using var cmd = _conn.CreateCommand();
             // prompt / prompt_revision / priority / audit budget / external_id(s) / knobs are excluded
             // from this UPDATE. Callers commonly pass a STALE in-memory WorkItem
@@ -1516,7 +1649,7 @@ public sealed class SqliteWorkItemStore :
             cmd.Parameters.AddWithValue("$planning_state", (int)WorkItemState.Planning);
             cmd.Parameters.AddWithValue("$plan_review_state", (int)WorkItemState.PlanReview);
             cmd.Parameters.AddWithValue("$plan_approved_state", (int)WorkItemState.PlanApproved);
-            await cmd.ExecuteNonQueryAsync(ct);
+            rowsAffected = await cmd.ExecuteNonQueryAsync(ct);
         }
         catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
         {
@@ -1526,13 +1659,19 @@ public sealed class SqliteWorkItemStore :
         {
             _writeLock.Release();
         }
+
+        if (rowsAffected > 0)
+            await EmitFailureEventIfEnteringFailureAsync(previousFailureSnapshot, item, ct).ConfigureAwait(false);
     }
 
     public async Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default)
     {
+        FailureStateSnapshot? previousFailureSnapshot = null;
+        bool applied;
         await _writeLock.WaitAsync(ct);
         try
         {
+            previousFailureSnapshot = await ReadFailureSnapshotForTransitionAsync(item, ct).ConfigureAwait(false);
             using var cmd = _conn.CreateCommand();
             // See UpdateAsync — prompt / prompt_revision / priority / audit budget / external_id(s) / knobs
             // are excluded from the full-row UPDATE to avoid stale-snapshot clobber.
@@ -1602,7 +1741,7 @@ public sealed class SqliteWorkItemStore :
                 """;
             Bind(cmd, item);
             cmd.Parameters.AddWithValue("$only_if_state", (int)onlyIfState);
-            return await cmd.ExecuteNonQueryAsync(ct) > 0;
+            applied = await cmd.ExecuteNonQueryAsync(ct) > 0;
         }
         catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
         {
@@ -1612,6 +1751,10 @@ public sealed class SqliteWorkItemStore :
         {
             _writeLock.Release();
         }
+
+        if (applied)
+            await EmitFailureEventIfEnteringFailureAsync(previousFailureSnapshot, item, ct).ConfigureAwait(false);
+        return applied;
     }
 
     public async Task<bool> TryUpdateIfStateAndUpdatedAtAsync(
@@ -1620,9 +1763,12 @@ public sealed class SqliteWorkItemStore :
         DateTimeOffset onlyIfUpdatedAt,
         CancellationToken ct = default)
     {
+        FailureStateSnapshot? previousFailureSnapshot = null;
+        bool applied;
         await _writeLock.WaitAsync(ct);
         try
         {
+            previousFailureSnapshot = await ReadFailureSnapshotForTransitionAsync(item, ct).ConfigureAwait(false);
             using var cmd = _conn.CreateCommand();
             // Same full-row field set as UpdateAsync / TryUpdateIfStateAsync,
             // guarded by the exact snapshot stamp the recovery path inspected.
@@ -1692,7 +1838,7 @@ public sealed class SqliteWorkItemStore :
             Bind(cmd, item);
             cmd.Parameters.AddWithValue("$only_if_state", (int)onlyIfState);
             cmd.Parameters.AddWithValue("$only_if_updated_at", onlyIfUpdatedAt.ToString("O"));
-            return await cmd.ExecuteNonQueryAsync(ct) > 0;
+            applied = await cmd.ExecuteNonQueryAsync(ct) > 0;
         }
         catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
         {
@@ -1702,6 +1848,10 @@ public sealed class SqliteWorkItemStore :
         {
             _writeLock.Release();
         }
+
+        if (applied)
+            await EmitFailureEventIfEnteringFailureAsync(previousFailureSnapshot, item, ct).ConfigureAwait(false);
+        return applied;
     }
 
     /// <summary>
@@ -2395,9 +2545,15 @@ public sealed class SqliteWorkItemStore :
         DateTimeOffset restoredAt,
         CancellationToken ct = default)
     {
+        FailureStateSnapshot? previousFailureSnapshot = null;
+        bool applied = false;
         await _writeLock.WaitAsync(ct);
         try
         {
+            // Pre-write failure snapshot, captured before the transaction opens so
+            // it observes the committed current state (a Microsoft.Data.Sqlite
+            // command cannot run outside the connection's active transaction).
+            previousFailureSnapshot = await ReadFailureSnapshotForTransitionAsync(item, ct).ConfigureAwait(false);
             using var tx = _conn.BeginTransaction();
             using (var stale = _conn.CreateCommand())
             {
@@ -2532,7 +2688,7 @@ public sealed class SqliteWorkItemStore :
             }
 
             tx.Commit();
-            return true;
+            applied = true;
         }
         catch (SqliteException sqlex) when (sqlex.SqliteErrorCode == SQLITE_FULL)
         {
@@ -2542,6 +2698,16 @@ public sealed class SqliteWorkItemStore :
         {
             _writeLock.Release();
         }
+
+        // Fifth work-item state-persist path: like its four siblings it writes
+        // state + last_error from caller input, so it carries the same
+        // failure-event guard. This agent-restore retry path today moves an item
+        // OUT of failure (so the helper no-ops), but the hook preserves the
+        // invariant that every APPLIED transition into a failure/park state is
+        // recorded, even if a future caller retries into one.
+        if (applied)
+            await EmitFailureEventIfEnteringFailureAsync(previousFailureSnapshot, item, ct).ConfigureAwait(false);
+        return applied;
     }
 
     public async Task ReleaseAgentRestoreRetryClaimAsync(

@@ -215,6 +215,13 @@ public sealed class AgenticConflictResolver
     private readonly IAgentSupervisionService? _agentSupervision;
     private readonly IAgentAuthFailureClassifier _authFailureClassifier;
 
+    // Optional dedicated audit sink. When null, attempt-failed audits resolve
+    // Serilog.Log.Logger at emission time (the production default). Injecting a
+    // logger lets a test capture this resolver's audit events on its own sink
+    // without racing a concurrent host bootstrap that reassigns the global
+    // static — the same pattern AgentSupervisionService uses.
+    private readonly Serilog.ILogger? _auditLogger;
+
     private enum AuthRequiredAttemptFailure
     {
         SessionResumeExhausted,
@@ -228,7 +235,8 @@ public sealed class AgenticConflictResolver
         ILogger<AgenticConflictResolver>? log = null,
         Func<ISandbox, AgentCredential, CancellationToken, Task>? credentialFileMaterialiser = null,
         IAgentSupervisionService? agentSupervision = null,
-        IAgentAuthFailureClassifier? authFailureClassifier = null)
+        IAgentAuthFailureClassifier? authFailureClassifier = null,
+        Serilog.ILogger? auditLogger = null)
     {
         _options = options ?? new AgenticConflictResolverOptionsSnapshot();
         _log = log ?? (ILogger)Microsoft.Extensions.Logging.Abstractions.NullLogger<AgenticConflictResolver>.Instance;
@@ -240,6 +248,7 @@ public sealed class AgenticConflictResolver
         _credentialFileMaterialiser = credentialFileMaterialiser;
         _agentSupervision = agentSupervision;
         _authFailureClassifier = authFailureClassifier ?? new AgentAuthFailureClassifier();
+        _auditLogger = auditLogger;
     }
 
     /// <summary>
@@ -397,7 +406,8 @@ public sealed class AgenticConflictResolver
                 attemptNumber, maxAttemptsPerAgent,
                 $"{trailLabel}: {authReason}",
                 stdoutTail: RedactAuditTail(resultForFailureClassification.Stdout),
-                stderrTail: RedactAuditTail(resultForFailureClassification.Stderr));
+                stderrTail: RedactAuditTail(resultForFailureClassification.Stderr),
+                logger: _auditLogger);
             attemptTrail.Add($"{authRunner.Kind.Value}#{attemptNumber}({trailLabel}: {Truncate(authReason, 120)})");
             lastFailureRunner = authRunner;
             lastFailureCredential = authCredential;
@@ -606,7 +616,8 @@ public sealed class AgenticConflictResolver
                         attempt, maxAttemptsPerAgent,
                         $"session resume exhausted: {RedactText(ex.LastResult.Summary)}",
                         stdoutTail: RedactAuditTail(ex.LastResult.Stdout),
-                        stderrTail: RedactAuditTail(ex.LastResult.Stderr));
+                        stderrTail: RedactAuditTail(ex.LastResult.Stderr),
+                        logger: _auditLogger);
                     attemptTrail.Add(
                         $"{runner.Kind.Value}#{attempt}(session resume exhausted: {RedactAndTruncate(ex.LastResult.Summary, 120)}; stderr: {RedactAndTruncate(ex.LastResult.Stderr, 200)})");
                     RecordFailureForClassification(runner, candidate.Credential, ex.LastResult, allowTransientBackoff: true);
@@ -622,7 +633,8 @@ public sealed class AgenticConflictResolver
                         attempt, maxAttemptsPerAgent,
                         $"threw {ex.GetType().Name}: {RedactText(ex.Message)}",
                         stdoutTail: null,
-                        stderrTail: RedactAuditTail(ex.ToString()));
+                        stderrTail: RedactAuditTail(ex.ToString()),
+                        logger: _auditLogger);
                     attemptTrail.Add($"{runner.Kind.Value}#{attempt}(threw: {RedactAndTruncate(ex.Message, 200)})");
                     RecordFailureForClassification(
                         runner,
@@ -697,7 +709,8 @@ public sealed class AgenticConflictResolver
                         attempt, maxAttemptsPerAgent,
                         redactedSummary,
                         stdoutTail: RedactAuditTail(agentResult.Stdout),
-                        stderrTail: RedactAuditTail(agentResult.Stderr));
+                        stderrTail: RedactAuditTail(agentResult.Stderr),
+                        logger: _auditLogger);
                     attemptTrail.Add(
                         $"{runner.Kind.Value}#{attempt}(agent failed: {RedactAndTruncate(agentResult.Summary, 120)}; stderr: {RedactAndTruncate(agentResult.Stderr, 200)})");
                     RecordFailureForClassification(runner, candidate.Credential, agentResult, allowTransientBackoff: true);
@@ -750,7 +763,8 @@ public sealed class AgenticConflictResolver
                     attempt, maxAttemptsPerAgent,
                     $"verification: {redactedVerificationReason}",
                     stdoutTail: RedactAuditTail(agentResult.Stdout),
-                    stderrTail: RedactAuditTail(agentResult.Stderr));
+                    stderrTail: RedactAuditTail(agentResult.Stderr),
+                    logger: _auditLogger);
                 _log.LogInformation(
                     "Agentic conflict resolver: verification failed for agent '{Agent}' attempt {Attempt}/{Max} on {WorkItemId} (sandbox {Sandbox}): {Reason}",
                     runner.Kind.Value, attempt, maxAttemptsPerAgent, workItemId, sandbox.Id, redactedVerificationReason);

@@ -639,8 +639,18 @@ public sealed class IncusSandboxLifecycleTests
             {
                 StagingDirectory = root,
                 DiskGuard = null,
-                OperationTimeout = TimeSpan.FromMilliseconds(100),
-                ReadinessPollInterval = TimeSpan.FromMilliseconds(10),
+                // OperationTimeout is a REAL-CLOCK per-command deadline as well as the
+                // absence-poll deadline. The intended phase-1 TimeoutException comes from
+                // WaitForInstanceAbsenceAsync (the fake VM never disappears while
+                // CompleteDeletion is false). A very short deadline (e.g. 100ms) also
+                // covers each instant fake command, so under a starved thread pool the
+                // deadline could fire before the `delete` command even runs — the first
+                // DisposeLeakedAsync would then throw before DeleteCalls is incremented,
+                // and the final Assert.Equal(2, DeleteCalls) would see 1. Use a generous
+                // deadline so the delete always issues first; absence is still never
+                // observed, so the poll still times out as the test requires.
+                OperationTimeout = TimeSpan.FromSeconds(2),
+                ReadinessPollInterval = TimeSpan.FromMilliseconds(25),
             },
             NullLogger<IncusSandboxProvider>.Instance,
             timings: null,
