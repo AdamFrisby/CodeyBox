@@ -369,6 +369,26 @@ public sealed class TransitionHealthClassifierTests
     }
 
     [Fact]
+    public void Terminal_failed_e2e_replay_is_not_counted_as_infra()
+    {
+        // failureKind="e2e-replay" comes from E2eReplayGateBlockedException — a
+        // declared e2e capability whose committed replay could not be made green
+        // by the WorkItemE2eReplayGate. Like "build" this is the gate catching a
+        // work-quality failure (the agent's change did not deliver a working
+        // capability), NOT infra health. Must fall through to not-scored.
+        var snapshot = Snapshot(terminals: [TerminalFailure(
+            state: (int)WorkItemState.Failed,
+            failureKind: "e2e-replay",
+            updatedAt: Now.AddMinutes(-1))]);
+
+        var report = TransitionHealthClassifier.Compute(snapshot, Now, DefaultOptions());
+
+        Assert.Equal(0, report.TotalTransitions);
+        Assert.Equal(0, report.InfraFailureTransitions);
+        Assert.False(report.InfraByKind.ContainsKey("e2e-replay"));
+    }
+
+    [Fact]
     public void Conflict_rework_semantic_incompatible_is_skipped_not_infra()
     {
         // PipelineRunner finalises the conflict-rework involvement with

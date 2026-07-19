@@ -179,6 +179,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
     // tests that don't exercise the emit path; when null, plan approval simply
     // skips test-case emission (the plan itself is still approved).
     private readonly ITestCaseStore? _testCaseStore;
+    // Optional post-implementation e2e-replay authoring/verification gate. Null
+    // in compositions/tests that don't exercise it; when null the gate is a
+    // no-op. It is also internally disabled unless its own knob is on.
+    private readonly WorkItemE2eReplayGate? _e2eReplayGate;
     private readonly IMergeScopeResolver _mergeScopeResolver;
     private readonly Func<Guid> _dispatchClaimIdFactory;
     private readonly string _disabledHostHooksPath;
@@ -321,6 +325,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
         ITestCaseStore? testCaseStore = null,
         IMergeScopeResolver? mergeScopeResolver = null,
         IAgentQuotaAvailabilityPublisher? quotaAvailabilityPublisher = null,
+        // Optional post-implementation gate ensuring every declared e2e-replay
+        // test case ends up with a committed replay that re-runs green. Null
+        // disables it; when wired it self-gates on its own knob.
+        WorkItemE2eReplayGate? e2eReplayGate = null,
         Func<Guid>? dispatchClaimIdFactory = null)
     {
         _sandboxes = sandboxes;
@@ -395,6 +403,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _promptPreprocessors = promptPreprocessors ?? AgentPromptPreprocessorChain.Empty;
         _knobRegistry = knobRegistry;
         _testCaseStore = testCaseStore;
+        _e2eReplayGate = e2eReplayGate;
         _mergeScopeResolver = mergeScopeResolver ?? NullMergeScopeResolver.Instance;
         _availability = availability;
         // Prefer the DI-injected handler when supplied: keeps the registry
@@ -2857,6 +2866,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     auditGateConfigured,
                     currentRunAuditPass,
                     ct);
+
+                // Post-implementation e2e-replay gate: every declared e2e-replay
+                // test case must end this pickup with a committed replay that
+                // re-runs green. A block throws E2eReplayGateBlockedException,
+                // caught below and mapped to a work-quality failure. No-op when
+                // the gate is unwired or its own knob is off.
+                await EnforceE2eReplayGateBeforeMergeAsync(item, ct);
             }
 
             // Open PR record (local metadata) AFTER the audit converges.
@@ -3253,6 +3269,15 @@ public sealed partial class PipelineRunner : IPipelineRunner
         {
             _log.LogWarning(ex, "Work item {Id} could not verify audit gate", item.Id);
             await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "infrastructure");
+        }
+        catch (E2eReplayGateBlockedException ex)
+        {
+            // A declared e2e-replay capability could not be made green even after
+            // the gate's own cheap-model (re-)authoring — a work-quality failure,
+            // the gate working as designed. Kind "e2e-replay" mirrors "build":
+            // not scored as infra health by TransitionHealthClassifier.
+            _log.LogWarning(ex, "Work item {Id} failed the e2e-replay merge gate", item.Id);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: "e2e-replay");
         }
         catch (AuditHistoryLoadFailedException ex)
         {
@@ -11707,6 +11732,34 @@ public sealed partial class PipelineRunner : IPipelineRunner
             throw new AuditUnavailableException(
                 $"work item {item.Id} cannot merge because latest audit report iteration {latest.Iteration} contains review-agent infrastructure failure results");
         }
+    }
+
+    /// <summary>
+    /// Runs the post-implementation e2e-replay gate for the work item and throws
+    /// <see cref="E2eReplayGateBlockedException"/> when a declared e2e-replay case
+    /// could not be made green. A no-op when no gate is wired; the gate itself is
+    /// a no-op when its <c>Enabled</c> knob is off (returns a disabled result).
+    /// </summary>
+    private async Task EnforceE2eReplayGateBeforeMergeAsync(WorkItem item, CancellationToken ct)
+    {
+        if (_e2eReplayGate is null)
+            return;
+
+        var result = await _e2eReplayGate.EvaluateAsync(item.Id, ct);
+        if (!result.Enabled)
+            return;
+
+        if (result.Blocked)
+        {
+            var detail = string.Join("; ", result.Blockers.Select(b => $"'{b.Name}' ({b.TestCaseId}): {b.Reason}"));
+            throw new E2eReplayGateBlockedException(
+                $"work item {item.Id} cannot merge because {result.Blockers.Count} declared e2e-replay case(s) lack a working committed replay: {detail}");
+        }
+
+        if (result.VerifiedCaseIds.Count > 0)
+            _log.LogInformation(
+                "E2E replay gate cleared work item {WorkItemId}: {VerifiedCount} declared e2e case(s) have a green committed replay.",
+                item.Id, result.VerifiedCaseIds.Count);
     }
 
     private static IReadOnlyList<string> MissingCompletedAuditors(
@@ -21138,6 +21191,17 @@ internal sealed class AuditFailedException : Exception
 internal sealed class RequiredBuildFailedException : Exception
 {
     public RequiredBuildFailedException(string message) : base(message) { }
+}
+
+/// <summary>
+/// A declared e2e-replay capability could not be made green by the
+/// post-implementation replay gate (missing/broken replay that authoring +
+/// verification could not resolve). Like <see cref="RequiredBuildFailedException"/>
+/// this is a work-quality failure — the gate working as designed — not infra.
+/// </summary>
+internal sealed class E2eReplayGateBlockedException : Exception
+{
+    public E2eReplayGateBlockedException(string message) : base(message) { }
 }
 
 internal sealed class RequiredBuildVerificationUnavailableException : Exception
