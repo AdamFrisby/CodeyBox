@@ -288,6 +288,23 @@ builder.Services.AddOptions<E2eExecutionOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox:E2eExecution"))
     .Validate(static opts => IsValidE2eExecutionOptions(opts), "CodeyBox:E2eExecution is invalid")
     .Validate(opts => IsValidE2eExecutionOptionsForConfig(opts, builder.Configuration), "CodeyBox:E2eExecution remote pool prerequisites are invalid");
+// Post-implementation e2e-replay authoring/verification gate config. Bound
+// through AddOptions so IOptionsMonitor<E2eReplayAuthoringOptions> hot-reloads
+// the Enabled switch and thresholds without restart. Disabled by default; the
+// gate is a no-op until a deployment opts in AND wires a cheap-model authoring
+// driver (IE2eReplayAuthoringDriver).
+builder.Services.AddOptions<E2eReplayAuthoringOptions>()
+    .Bind(builder.Configuration.GetSection("CodeyBox:E2eReplayAuthoring"))
+    .Validate(
+        static opts => opts.MaxReauthorAttempts >= E2eReplayAuthoringOptions.MinReauthorAttempts
+            && opts.MaxReauthorAttempts <= E2eReplayAuthoringOptions.MaxAllowedReauthorAttempts,
+        "CodeyBox:E2eReplayAuthoring:MaxReauthorAttempts is out of range")
+    .Validate(
+        static opts => opts.VerificationTimeout > TimeSpan.Zero && opts.VerificationPollInterval > TimeSpan.Zero,
+        "CodeyBox:E2eReplayAuthoring verification timeout/poll interval must be positive")
+    .Validate(
+        static opts => !string.IsNullOrWhiteSpace(opts.AuthorModelId),
+        "CodeyBox:E2eReplayAuthoring:AuthorModelId is required");
 // Register ProjectsOptions through AddOptions so IOptionsMonitor<ProjectsOptions>
 // is wired into the framework's reload pipeline. PostConfigure layers our custom
 // map-shaped binding (audit-type / language overrides / profile inheritance) on
@@ -2593,6 +2610,23 @@ builder.Services.AddSingleton<E2eRunCancellationRegistry>();
 // for development only.
 builder.Services.AddSingleton<IE2eExecutionPool>(BuildE2eExecutionPool);
 builder.Services.AddHostedService<E2eRunDispatcher>();
+// Post-implementation e2e-replay gate. The verifier enqueues a replay run and
+// observes it via the same IE2eRunStore the dispatcher drains (cheap-CPU E2E
+// pool, never the coding fleet). The gate authors missing replays through the
+// optional IE2eReplayAuthoringDriver seam — resolved via GetService so the gate
+// degrades to fail-closed (a declared case with no working replay blocks) when
+// no deployment-specific driver is wired. Both are consumed by PipelineRunner
+// and self-gate on E2eReplayAuthoringOptions.Enabled (off by default).
+builder.Services.AddSingleton<IE2eReplayVerifier>(sp => new E2eRunReplayVerifier(
+    sp.GetRequiredService<IE2eRunStore>(),
+    sp.GetRequiredService<IOptionsMonitor<E2eReplayAuthoringOptions>>(),
+    logger: sp.GetRequiredService<ILogger<E2eRunReplayVerifier>>()));
+builder.Services.AddSingleton<WorkItemE2eReplayGate>(sp => new WorkItemE2eReplayGate(
+    sp.GetRequiredService<ITestCaseStore>(),
+    sp.GetRequiredService<IE2eReplayVerifier>(),
+    sp.GetRequiredService<IOptionsMonitor<E2eReplayAuthoringOptions>>(),
+    driver: sp.GetService<IE2eReplayAuthoringDriver>(),
+    logger: sp.GetRequiredService<ILogger<WorkItemE2eReplayGate>>()));
 builder.Services.AddSingleton<IAuditReportStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -3070,7 +3104,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     authRequiredReader: sp.GetRequiredService<IAgentAuthRequiredAvailabilityReader>(),
     testCaseStore: sp.GetService<ITestCaseStore>(),
     mergeScopeResolver: sp.GetRequiredService<IMergeScopeResolver>(),
-    quotaAvailabilityPublisher: sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>()));
+    quotaAvailabilityPublisher: sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>(),
+    e2eReplayGate: sp.GetService<WorkItemE2eReplayGate>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(

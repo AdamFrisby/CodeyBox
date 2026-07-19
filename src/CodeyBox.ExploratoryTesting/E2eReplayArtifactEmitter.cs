@@ -172,6 +172,17 @@ public static class E2eReplayArtifactEmitter
         E2eReplayEmitOptions? options = null)
         => JsonSerializer.Serialize(EmitFromTrace(trace, assertions, options), JsonOptions);
 
+    /// <summary>
+    /// Serializes an already-emitted artifact to the canonical replay JSON — the
+    /// exact shape persisted in <see cref="TestCase.ExecutableArtifactJson"/>.
+    /// Centralised here so every producer uses one set of JSON options.
+    /// </summary>
+    public static string SerializeArtifact(E2eReplayArtifact artifact)
+    {
+        ArgumentNullException.ThrowIfNull(artifact);
+        return JsonSerializer.Serialize(artifact, JsonOptions);
+    }
+
     public static TestCase BuildTestCase(
         string id,
         string name,
