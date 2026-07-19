@@ -4226,6 +4226,12 @@ namespace CodeyBox.Api
         /// <summary>Delay between VM/agent readiness probes.</summary>
         public TimeSpan ReadinessPollInterval { get; set; } = Defaults.ReadinessPollInterval;
 
+        /// <summary>Upper bound for the guest-agent readiness poll interval; the poll backs off exponentially from <see cref="ReadinessPollInterval"/> to this cap so a boot storm does not hammer incusd.</summary>
+        public TimeSpan MaxReadinessPollInterval { get; set; } = Defaults.MaxReadinessPollInterval;
+
+        /// <summary>Delay before the recovery stack re-attempts a sandbox creation deferred because an Incus liveness deadline tripped under concurrent boot load.</summary>
+        public TimeSpan ProvisioningRetryRecheckIn { get; set; } = Defaults.ProvisioningRetryRecheckIn;
+
         /// <summary>Independent deadline for terminating and draining one Incus CLI process tree.</summary>
         public TimeSpan CliProcessCleanupTimeout { get; set; } = Defaults.CliProcessCleanupTimeout;
 

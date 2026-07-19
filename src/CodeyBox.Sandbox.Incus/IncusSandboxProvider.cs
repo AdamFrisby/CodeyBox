@@ -453,6 +453,8 @@ public sealed class IncusSandboxProvider :
                         ex,
                         cleanupError);
                 }
+                if (TryBuildTransientProvisioningDeferral(ex, options) is { } transientDeferral)
+                    throw transientDeferral;
                 throw;
             }
             throw new SandboxProvisioningDeferredException(
@@ -464,6 +466,33 @@ public sealed class IncusSandboxProvider :
                 retainedSandboxName: name,
                 innerException: ex);
         }
+    }
+
+    /// <summary>
+    /// Re-shapes a transient Incus liveness timeout (guest-agent readiness or a
+    /// CLI operation deadline that tripped under concurrent boot load) into a
+    /// <see cref="SandboxProvisioningDeferredException"/> so the recovery stack
+    /// re-enqueues the work item as RETRYABLE transient infrastructure. Without
+    /// this the raw <see cref="IncusTransientTimeoutException"/> would reach the
+    /// orchestrator's catch-all and be stamped as an unclassified failure and
+    /// parked for an operator instead of auto-retried. Returns <c>null</c> for
+    /// any non-transient failure, which is rethrown unchanged.
+    /// </summary>
+    internal static SandboxProvisioningDeferredException? TryBuildTransientProvisioningDeferral(
+        Exception ex,
+        IncusSandboxOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(ex);
+        ArgumentNullException.ThrowIfNull(options);
+        if (ex is not IncusTransientTimeoutException transient)
+            return null;
+        return new SandboxProvisioningDeferredException(
+            ProviderId,
+            transient.Operation,
+            "incus-liveness-timeout",
+            transient.Message,
+            options.ProvisioningRetryRecheckIn,
+            innerException: ex);
     }
 
     private async Task<ISandbox> AdoptRetainedSandboxAsync(

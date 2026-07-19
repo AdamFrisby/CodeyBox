@@ -147,11 +147,62 @@ public sealed class IncusCliRunnerTests
         await processStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         time.Advance(TimeSpan.FromSeconds(30));
-        var exception = await Assert.ThrowsAsync<TimeoutException>(() =>
+        var exception = await Assert.ThrowsAsync<IncusTransientTimeoutException>(() =>
             operation.WaitAsync(TimeSpan.FromSeconds(5)));
 
+        Assert.Equal("start", exception.Operation);
         Assert.Contains("Incus start exceeded its", exception.Message, StringComparison.Ordinal);
         Assert.IsAssignableFrom<OperationCanceledException>(exception.InnerException);
+    }
+
+    [Fact]
+    public async Task RunAllowFailureAsync_DeadlineThrowsTransientTimeoutNamingSubcommand()
+    {
+        var time = new ControllableTimeProvider();
+        var processStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var runner = new IncusCliRunner(new StubProcessRunner(async (_, _, ct) =>
+        {
+            processStarted.SetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            return new ProcessRunResult(0, "", "");
+        }), time);
+
+        var operation = runner.RunAllowFailureAsync(
+            Options,
+            ["incus", "--project", "codeybox", "exec", "codeybox-test", "--", "/bin/true"],
+            stdin: null,
+            timeout: TimeSpan.FromSeconds(30),
+            CancellationToken.None);
+        await processStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        time.Advance(TimeSpan.FromSeconds(30));
+        var exception = await Assert.ThrowsAsync<IncusTransientTimeoutException>(() =>
+            operation.WaitAsync(TimeSpan.FromSeconds(5)));
+
+        // The derived label names the hung subcommand without leaking argv.
+        Assert.Equal("exec", exception.Operation);
+        Assert.Contains("[exec] exceeded its", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("codeybox-test", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    // Direct argv (no global prefix).
+    [InlineData(new[] { "incus", "start", "codeybox-test" }, "start")]
+    [InlineData(new[] { "incus", "file", "push", "/host/x", "codeybox-test/x" }, "file push")]
+    [InlineData(new[] { "incus", "config", "device", "add", "codeybox-test" }, "config device")]
+    // Real argv from IncusCommandBuilder.Prefix: the global `--project <name>`
+    // prefix must be skipped, never mistaken for the subcommand.
+    [InlineData(new[] { "incus", "--project", "codeybox", "exec", "codeybox-test", "--", "/bin/true" }, "exec")]
+    [InlineData(new[] { "incus", "--project", "codeybox", "start", "codeybox-test" }, "start")]
+    [InlineData(new[] { "incus", "--project", "codeybox", "file", "push", "/host/x", "vm/x" }, "file push")]
+    // Degenerate / untrusted-looking argv falls back without leaking values.
+    [InlineData(new[] { "incus" }, "operation")]
+    [InlineData(new[] { "incus", "/absolute/path" }, "operation")]
+    [InlineData(new[] { "incus", "Start" }, "operation")]
+    [InlineData(new[] { "incus", "--project", "codeybox", "/absolute/path" }, "operation")]
+    public void DescribeSubcommand_EmitsOnlyLeadingVerbTokens(string[] argv, string expected)
+    {
+        Assert.Equal(expected, IncusCliRunner.DescribeSubcommand(argv));
     }
 
     [Fact]

@@ -482,7 +482,11 @@ public sealed class AuditTests
 
         Assert.False(result.Passed);
         Assert.NotNull(formatExec);
-        Assert.Equal(["dotnet", "format", "--verify-no-changes", "--verbosity", "diagnostic"], formatExec!.Argv);
+        // The format-check gate self-heals a root-owned ~/.nuget, so the exec is
+        // wrapped; assert on the effective (unwrapped) dotnet command.
+        Assert.Equal(
+            ["dotnet", "format", "--verify-no-changes", "--verbosity", "diagnostic"],
+            TestSupport.EffectiveArgv(formatExec!));
     }
 
     [Fact]
@@ -509,6 +513,39 @@ public sealed class AuditTests
         Assert.Equal("dotnet format command failed", finding.Title);
         Assert.Contains("CS0103", finding.Description);
         Assert.DoesNotContain("Run `dotnet format`", finding.Description);
+    }
+
+    // The build/test gates fail for every project when ~/.nuget is root-owned on
+    // an unprivileged build host. The preset-resolved dotnet gates must run through
+    // the NuGet-home self-heal wrapper so restore survives that; the effective
+    // command is still the byte-identical dotnet invocation.
+    [Theory]
+    [InlineData("csharp:build-WaE", new[] { "dotnet", "build", "--no-incremental", "/warnaserror" })]
+    [InlineData("csharp:test-pass", new[] { "dotnet", "test", "--no-build" })]
+    public async Task CSharpDotnetGate_RunsThroughNuGetHomeSelfHeal(string auditorName, string[] expectedCommand)
+    {
+        var auditor = new PresetCatalog()
+            .ResolveLanguage("csharp", new PresetContext(new ScriptedAgent([MergeStrategy.RealMerge])))
+            .Single(a => a.Name == auditorName);
+        SandboxExec? gateExec = null;
+        var sandbox = new FakeSandbox(exec =>
+        {
+            if (IsToolProbe(exec))
+                return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
+            if (IsLanguageMarkerProbe(exec))
+                return new SandboxExecResult(0, ".\n", "");
+            gateExec = exec;
+            return new SandboxExecResult(0, "", "");
+        });
+
+        await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.NotNull(gateExec);
+        // Raw argv is the self-heal wrapper (sh -c <preamble> sh <cmd...>)...
+        Assert.Equal("sh", gateExec!.Argv[0]);
+        Assert.Contains("nuget_home_broken", gateExec.Argv[2]);
+        // ...whose effective command is the unchanged dotnet gate invocation.
+        Assert.Equal(expectedCommand, TestSupport.EffectiveArgv(gateExec));
     }
 
     [Fact]
@@ -1158,7 +1195,10 @@ public sealed class AuditTests
         exec.Argv.Count >= 3 &&
         exec.Argv[0] == "sh" &&
         exec.Argv[1] == "-c" &&
-        !exec.Argv[2].Contains("command -v", StringComparison.Ordinal);
+        !exec.Argv[2].Contains("command -v", StringComparison.Ordinal) &&
+        // The NuGet-home self-heal wrapper is also `sh -c <script> sh <cmd...>`;
+        // it is the real command, not a marker probe.
+        !exec.Argv[2].Contains("nuget_home_broken", StringComparison.Ordinal);
 
     private static string BuildRepeatedDotnetFailureOutput(int count)
     {

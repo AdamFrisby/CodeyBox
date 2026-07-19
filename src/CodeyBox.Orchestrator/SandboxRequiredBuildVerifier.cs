@@ -42,6 +42,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
     // sandbox executes via `sh -c` — can be run under a controlled shell.
     internal static readonly string BuildScript = $$"""
         set -eu
+        {{NuGetHomeSelfHeal.Preamble}}
         dotnet_command_not_found_exit={{DotnetCommandNotFoundExitCode}}
         no_required_build_target_exit={{NoRequiredBuildTargetExitCode}}
 

@@ -173,9 +173,18 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         string toolName,
         CancellationToken ct)
     {
+        // Opt-in NuGet-home self-heal: a dotnet command restores on first use and
+        // fails for every project when ~/.nuget is root-owned on an unprivileged
+        // build host. When enabled, run the shared preamble first (no-op on a
+        // healthy home). Off by default so generic shell commands are untouched;
+        // only dotnet build/test/format gate auditors enable it. The finding title
+        // below still reports the original (unwrapped) argv.
+        var argv = _opts.SelfHealNuGetHome
+            ? NuGetHomeSelfHeal.WrapDotnetInvocation(_opts.Argv)
+            : _opts.Argv;
         var result = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = _opts.Argv,
+            Argv = argv,
             WorkingDirectory = workingDirectory,
             ExtraEnvironment = environment,
         }, ct);
@@ -333,4 +342,12 @@ public sealed record ShellCommandAuditorOptions
     public bool CanShortCircuitOnBlockingFinding { get; init; }
     public AuditorRole Role { get; init; } = AuditorRole.None;
     public BuildTestGateEvidence BuildTestGateEvidence { get; init; } = BuildTestGateEvidence.None;
+
+    /// <summary>
+    /// When true and the command is a <c>dotnet</c> invocation, wrap it in the
+    /// shared <see cref="NuGetHomeSelfHeal"/> preamble so restore survives a
+    /// root-owned <c>~/.nuget</c> on unprivileged build hosts. Off by default; a
+    /// no-op on a healthy home and for non-dotnet commands.
+    /// </summary>
+    public bool SelfHealNuGetHome { get; init; }
 }
