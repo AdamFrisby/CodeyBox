@@ -26,6 +26,13 @@ internal static class TestAssemblyInitializer
     [ModuleInitializer]
     public static void Init()
     {
+        // Re-home all temp usage into a single per-run root before anything else
+        // resolves Path.GetTempPath(), so the per-test-case scratch dirs created
+        // by LeakTrackingTestFramework — and the process-exit backstop below —
+        // can bound and reclaim temp-disk usage across the run.
+        TestTempWorkspace.Initialize(Path.GetTempPath());
+        AppDomain.CurrentDomain.ProcessExit += static (_, _) => TestTempWorkspace.WipeRunRoot();
+
         if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS")))
             Environment.SetEnvironmentVariable("ASPNETCORE_URLS", "http://127.0.0.1:0");
 
