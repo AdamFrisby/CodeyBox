@@ -12,10 +12,10 @@ using CodeyBox.Projects;
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Minimal test host for the CodeyBox API. Each instance gets an isolated
-/// in-memory SQLite store so test methods don't share state. Dispose to clean up.
+/// Minimal test host for the CodeyBox API. By default each instance owns an isolated
+/// file-backed SQLite store under its temp root; a caller-supplied database path remains caller-owned.
 /// </summary>
-internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
+internal sealed class WorkItemApiFactory : CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath;
     private readonly bool _ownsDbPath;
@@ -29,8 +29,7 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
 
     public WorkItemApiFactory(string? dbPath = null, params Project[] projects)
     {
-        _dbPath = dbPath ?? Path.Combine(
-            Path.GetTempPath(), $"codeybox-httptest-{Guid.NewGuid():N}.db");
+        _dbPath = dbPath ?? TempDatabasePath("codeybox-httptest");
         _ownsDbPath = dbPath is null;
         _projects = projects.Length > 0
             ? projects
@@ -57,17 +56,16 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
             var values = new Dictionary<string, string?>
             {
                 // Disable bearer-token auth so tests don't need to supply a key.
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 // Temp paths so we don't need /var/lib/codeybox to exist.
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                ["CodeyBox:GitRootDirectory"] = Temp.NewDirectoryPath("test-git-"),
+                ["CodeyBox:AuditLog:Path"] = Temp.NewLogPath("test-log"),
+                ["CodeyBox:AuditLog:AuditPath"] = Temp.NewLogPath("test-audit"),
+                ["CodeyBox:AgentStreams:Path"] = Temp.NewDirectoryPath("test-agent-streams-"),
                 ["CodeyBox:TemplateDirectory"] = TemplateDirectory,
             };
             if (MaxTemplateChecks is { } maxTemplateChecks)
@@ -97,12 +95,19 @@ internal sealed class WorkItemApiFactory : WebApplicationFactory<Program>
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
+        if (!disposing)
         {
-            Store.Dispose();
-            if (_ownsDbPath)
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
+            base.Dispose(disposing);
+            return;
         }
-        base.Dispose(disposing);
+
+        TestTempArtifacts.CleanupAll(
+            Store.Dispose,
+            () => base.Dispose(disposing),
+            () =>
+            {
+                if (_ownsDbPath)
+                    TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
+            });
     }
 }

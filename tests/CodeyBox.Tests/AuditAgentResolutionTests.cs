@@ -32,7 +32,7 @@ public sealed class AuditAgentResolutionTests : IDisposable
     public AuditAgentResolutionTests() =>
         _workspace = Directory.CreateTempSubdirectory("codeybox-audit-res-").FullName;
 
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     // ── No override → work agent passes through ──────────────────────────────
 

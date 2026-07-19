@@ -302,7 +302,7 @@ public sealed class AuditReportsEndpointTests : IDisposable
 /// A WebApplicationFactory that replaces both <see cref="IWorkItemStore"/> and
 /// <see cref="IAuditReportStore"/> with isolated in-memory/SQLite instances.
 /// </summary>
-internal sealed class AuditReportApiFactory : WebApplicationFactory<Program>
+internal sealed class AuditReportApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-audit-api-{Guid.NewGuid():N}.db");
@@ -321,7 +321,7 @@ internal sealed class AuditReportApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -344,13 +344,9 @@ internal sealed class AuditReportApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            WorkItemStore.Dispose();
-            AuditReportStore.Dispose();
-            try { File.Delete(_dbPath); } catch { }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(
+            disposing,
+            _dbPath,
+            WorkItemStore.Dispose,
+            AuditReportStore.Dispose);
 }

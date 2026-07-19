@@ -183,7 +183,7 @@ public sealed class AgentNetworkToleranceProgramWiringTests
         Assert.True(predicate(), "Timed out waiting for AgentNetworkTolerance hot reload to update the shared snapshot.");
     }
 
-    private sealed class AgentNetworkToleranceWiringFactory : WebApplicationFactory<Program>
+    private sealed class AgentNetworkToleranceWiringFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly string _dbPath = Path.Combine(
             Path.GetTempPath(), $"codeybox-network-tolerance-wiring-{Guid.NewGuid():N}.db");
@@ -191,7 +191,7 @@ public sealed class AgentNetworkToleranceProgramWiringTests
 
         public AgentNetworkToleranceWiringFactory()
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             _config.Data = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -241,11 +241,7 @@ public sealed class AgentNetworkToleranceProgramWiringTests
         }
 
         protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            base.Dispose(disposing);
-        }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
     }
 
     private sealed class AcpProgramWiringSandbox : ISandbox

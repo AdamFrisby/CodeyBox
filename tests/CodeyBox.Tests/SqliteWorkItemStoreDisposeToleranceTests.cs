@@ -249,7 +249,7 @@ public sealed class SqliteConnectionDisposalTests
         }
         finally
         {
-            try { File.Delete(path); } catch { }
+            TestTempArtifacts.DeleteSqliteDatabase(path);
         }
     }
 

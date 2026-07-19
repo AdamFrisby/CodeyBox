@@ -75,7 +75,7 @@ internal static class PipelineLifecycleUatHelpers
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions);
 
-        return new UatPipelineContext(pipeline, store, agent, gitHost, gitRoot, webhooks);
+        return new UatPipelineContext(pipeline, store, agent, gitHost, gitRoot, stateDb, webhooks);
     }
 
     public static ProjectId TestProjectId { get; } = new("test-project");
@@ -166,19 +166,22 @@ internal static class PipelineLifecycleUatHelpers
 
 internal sealed class UatPipelineContext : IDisposable
 {
+    private readonly OwnedPipelineArtifacts _artifacts;
+
     public UatPipelineContext(
         PipelineRunner pipeline,
         SqliteWorkItemStore store,
         ScriptedAgent agent,
         LocalGitHost gitHost,
         string gitRoot,
+        string stateDbPath,
         CapturingWebhookDispatcher webhooks)
     {
         Pipeline = pipeline;
         Store = store;
         Agent = agent;
         GitHost = gitHost;
-        GitRoot = gitRoot;
+        _artifacts = new OwnedPipelineArtifacts(gitRoot, stateDbPath);
         Webhooks = webhooks;
     }
 
@@ -186,10 +189,16 @@ internal sealed class UatPipelineContext : IDisposable
     public SqliteWorkItemStore Store { get; }
     public ScriptedAgent Agent { get; }
     public LocalGitHost GitHost { get; }
-    public string GitRoot { get; }
+    public string GitRoot => _artifacts.GitRoot;
+    public string StateDbPath => _artifacts.RequiredStateDbPath;
     public CapturingWebhookDispatcher Webhooks { get; }
 
-    public void Dispose() => Store.Dispose();
+    public void Dispose()
+    {
+        TestTempArtifacts.CleanupAll(
+            Store.Dispose,
+            _artifacts.Dispose);
+    }
 }
 
 internal sealed class PassingAuditor(string name = "uat:pass") : IAuditor

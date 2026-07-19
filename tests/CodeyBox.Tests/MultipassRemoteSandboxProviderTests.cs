@@ -785,7 +785,7 @@ public sealed class MultipassRemoteSandboxProviderTests
         }
         finally
         {
-            try { Directory.Delete(hostTemp, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(hostTemp);
         }
     }
 
@@ -893,7 +893,7 @@ public sealed class MultipassRemoteSandboxProviderTests
         }
         finally
         {
-            try { Directory.Delete(hostTemp, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(hostTemp);
         }
     }
 

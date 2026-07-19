@@ -32,7 +32,7 @@ public sealed class OrchestratorDiskDeferredTests : IDisposable
     {
         Log.CloseAndFlush();
         _store.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     [Fact]

@@ -23,7 +23,7 @@ public sealed class BaselineImageReaperTests : IDisposable
     public void Dispose()
     {
         _store.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     private static WorkItem WorkItem(string? baselineRef, WorkItemState state) => new()

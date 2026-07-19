@@ -70,7 +70,7 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
         _store.Dispose();
         _registry.Dispose();
         _cancellations.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     private WorkItem MakeItem(

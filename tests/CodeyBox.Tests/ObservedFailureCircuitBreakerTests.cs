@@ -23,7 +23,7 @@ public sealed class ObservedFailureCircuitBreakerTests : IDisposable
     public void Dispose()
     {
         _failures.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     [Fact]

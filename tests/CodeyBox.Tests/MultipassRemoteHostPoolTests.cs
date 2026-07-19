@@ -486,7 +486,7 @@ public sealed class MultipassRemoteHostPoolTests
         var dbPath = Path.Combine(
             Path.GetTempPath(),
             $"codeybox-remote-worker-cap-{Guid.NewGuid():N}.db");
-        using var store = new SqliteWorkItemStore(dbPath);
+        var store = new SqliteWorkItemStore(dbPath);
         var queue = new InMemoryTaskQueue();
         var pipeline = new HoldingSandboxPipeline(provider, store, expectedHeld: workerCap);
         var service = new OrchestratorService(
@@ -545,7 +545,10 @@ public sealed class MultipassRemoteHostPoolTests
             pipeline.Release();
             await service.StopAsync(CancellationToken.None);
             service.Dispose();
-            try { File.Delete(dbPath); } catch { }
+            // Dispose the store before deleting its files so SQLite releases the
+            // -wal/-shm sidecars; DeleteSqliteDatabase removes all three together.
+            store.Dispose();
+            TestTempArtifacts.DeleteSqliteDatabase(dbPath);
         }
     }
 

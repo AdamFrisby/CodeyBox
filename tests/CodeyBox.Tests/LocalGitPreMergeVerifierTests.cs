@@ -22,8 +22,7 @@ public sealed class LocalGitPreMergeVerifierTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_workspace, recursive: true); }
-        catch { /* best-effort */ }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace);
     }
 
     /// <summary>
@@ -62,6 +61,51 @@ public sealed class LocalGitPreMergeVerifierTests : IDisposable
 
         Assert.True(result.Success);
         Assert.Equal(PreMergeVerifyFailureMode.None, result.FailureMode);
+    }
+
+    [Fact]
+    public async Task RealVerifier_DisablesRepositoryHooksWhenAddingWorktree()
+    {
+        var (gitHost, repoId, mergeSha) = await SetupBareRepoWithCommitAsync();
+        var bareRepoPath = gitHost.GetRepoPath(repoId);
+        var hookMarkerPath = InstallFailingPostCheckoutHook(bareRepoPath);
+        var controlWorktreePath = Path.Combine(
+            _workspace,
+            "control-hook-worktree-" + Guid.NewGuid().ToString("N")[..8]);
+
+        try
+        {
+            var control = await TestSupport.RunGitNoThrow(
+                bareRepoPath,
+                "worktree", "add", "--detach", controlWorktreePath, mergeSha);
+
+            Assert.True(
+                File.Exists(hookMarkerPath),
+                $"control worktree add did not execute post-checkout hook; exit={control.code}; stderr={control.stderr}");
+        }
+        finally
+        {
+            await RemoveWorktreeIfPresentAsync(bareRepoPath, controlWorktreePath);
+            TestTempArtifacts.DeleteFile(hookMarkerPath);
+        }
+
+        var verifier = new LocalGitPreMergeVerifier(
+            gitHost,
+            NullLogger<LocalGitPreMergeVerifier>.Instance);
+
+        var result = await verifier.VerifyAsync(new PreMergeVerifyRequest
+        {
+            WorkItemId = WorkItemId.New(),
+            ProjectId = new ProjectId("test"),
+            RepositoryId = repoId,
+            BaseBranch = "main",
+            WorkBranch = "feature/x",
+            MergeSha = mergeSha,
+            Argv = ["/usr/bin/true"],
+        }, CancellationToken.None);
+
+        Assert.True(result.Success, result.FailureReason ?? "verifier failed without a reason");
+        Assert.False(File.Exists(hookMarkerPath));
     }
 
     [Fact]
@@ -612,6 +656,42 @@ public sealed class LocalGitPreMergeVerifierTests : IDisposable
         var repoId = await gitHost.EnsureRepositoryAsync(id, seed);
         var mergeSha = await gitHost.ResolveCommitAsync(repoId, "main", CancellationToken.None);
         return (gitHost, repoId, mergeSha);
+    }
+
+    private static string InstallFailingPostCheckoutHook(string bareRepoPath)
+    {
+        var hooksDir = Path.Combine(bareRepoPath, "hooks");
+        Directory.CreateDirectory(hooksDir);
+        var hookMarkerPath = Path.Combine(hooksDir, "post-checkout-fired");
+        TestTempArtifacts.DeleteFile(hookMarkerPath);
+
+        var hookPath = Path.Combine(hooksDir, "post-checkout");
+        File.WriteAllText(
+            hookPath,
+            """
+            #!/bin/sh
+            printf 'post-checkout hook fired\n' > "$(dirname "$0")/post-checkout-fired"
+            exit 42
+            """);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                hookPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+        return hookMarkerPath;
+    }
+
+    private static async Task RemoveWorktreeIfPresentAsync(string bareRepoPath, string worktreePath)
+    {
+        if (!Directory.Exists(worktreePath))
+            return;
+
+        var remove = await TestSupport.RunGitNoThrow(
+            bareRepoPath,
+            "worktree", "remove", "--force", worktreePath);
+        if (remove.code != 0 && Directory.Exists(worktreePath))
+            TestTempArtifacts.DeleteDirectory(worktreePath);
     }
 }
 

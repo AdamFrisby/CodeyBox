@@ -479,8 +479,7 @@ public sealed class FileSizeLimitsAuditorPluginTests
 
         public void Dispose()
         {
-            try { Directory.Delete(Path, recursive: true); }
-            catch { }
+            TestTempArtifacts.DeleteDirectory(Path);
         }
     }
 }

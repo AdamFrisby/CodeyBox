@@ -42,7 +42,7 @@ public sealed class OrchestratorServiceProgressClockTests : IDisposable
     {
         _store.Dispose();
         _registry.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     private static WorkItem NewItem() => new()

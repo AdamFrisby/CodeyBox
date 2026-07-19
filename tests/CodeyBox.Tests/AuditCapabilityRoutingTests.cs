@@ -39,7 +39,7 @@ public sealed class AuditCapabilityRoutingTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_workspace, recursive: true); } catch { }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace);
     }
 
     // ── AC: codex exhausted, claude (audit-capable) takes over ──────────────

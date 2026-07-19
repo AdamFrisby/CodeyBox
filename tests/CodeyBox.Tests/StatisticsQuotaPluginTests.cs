@@ -16,28 +16,19 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class StatisticsQuotaPluginTests : IDisposable
 {
-    private readonly string _tempDir;
+    private readonly TestTempDirectory _temp;
     private readonly string _dbPath;
 
     public StatisticsQuotaPluginTests()
     {
-        _tempDir = Path.Combine(Path.GetTempPath(), "codeybox-stats-tests-" + Guid.NewGuid().ToString("n"));
-        Directory.CreateDirectory(_tempDir);
-        _dbPath = Path.Combine(_tempDir, "stats.db");
+        _temp = TestTempDirectory.Create("codeybox-stats-tests-");
+        _dbPath = _temp.NewDatabasePath("stats");
     }
 
     public void Dispose()
-    {
-        try
-        {
-            if (Directory.Exists(_tempDir))
-                Directory.Delete(_tempDir, recursive: true);
-        }
-        catch
-        {
-            // Best-effort — the next test creates a unique temp dir, leaks are reaped by /tmp cleanup.
-        }
-    }
+        => TestTempArtifacts.CleanupAll(
+            () => TestTempArtifacts.DeleteSqliteDatabase(_dbPath),
+            _temp.Dispose);
 
     [Fact]
     public async Task SampleOnce_ExpandsSnapshotIntoOverallPlusPerWindowRows()

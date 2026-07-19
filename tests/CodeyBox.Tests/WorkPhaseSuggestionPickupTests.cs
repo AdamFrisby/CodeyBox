@@ -32,7 +32,7 @@ public sealed class WorkPhaseSuggestionPickupTests : IDisposable
     public WorkPhaseSuggestionPickupTests()
         => _workspace = Directory.CreateTempSubdirectory("codeybox-suggestions-pickup-").FullName;
 
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { /* best-effort */ } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     private const string SuggestionsJson = """
         {

@@ -501,7 +501,7 @@ public sealed class ResumeEndpointTests : IDisposable
 /// (so resume tests can toggle bare-repo + work-branch presence per test
 /// without touching the filesystem) and a capturing webhook dispatcher.
 /// </summary>
-internal sealed class ResumeApiFactory : WebApplicationFactory<Program>
+internal sealed class ResumeApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"cb-resume-http-{Guid.NewGuid():N}.db");
@@ -524,7 +524,7 @@ internal sealed class ResumeApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -571,15 +571,11 @@ internal sealed class ResumeApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            AuditReports.Dispose();
-            Store.Dispose();
-            try { File.Delete(_dbPath); } catch { }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(
+            disposing,
+            _dbPath,
+            AuditReports.Dispose,
+            Store.Dispose);
 }
 
 /// <summary>

@@ -37,6 +37,44 @@ internal static class TestSupport
             projects,
             NullLogger<WorkItemTerminalTransition>.Instance);
 
+    public static AgentControlPipelineFixture BuildAgentControlPipeline(
+        IWorkItemStore store,
+        IAgentPauseController? pauses,
+        IWebhookDispatcher webhooks,
+        string gitRootPrefix,
+        IProjectRepository? projects = null)
+    {
+        var gitRoot = Path.Combine(Path.GetTempPath(), $"{gitRootPrefix}{Guid.NewGuid():N}");
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = gitRoot },
+            NullLogger<LocalGitHost>.Instance);
+        projects ??= new InMemoryProjectRepository(new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "Test",
+            RepositoryUrl = "http://fake",
+        });
+        var terminalTransitions = CreateTerminalTransition(store, webhooks, projects);
+        var pipeline = new PipelineRunner(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance),
+            gitHost,
+            new AgentRegistry([new ScriptedAgent([MergeStrategy.RealMerge])]),
+            new StaticCredentialProvider(),
+            new InMemoryPullRequestService(),
+            projects,
+            new TestUpstreamFactory(),
+            new ProjectAuditorComposer(new ScriptedAuditorCatalog([])),
+            store,
+            webhooks,
+            new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
+            NullLogger<PipelineRunner>.Instance,
+            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            agentPauseController: pauses,
+            terminalTransitions: terminalTransitions,
+            terminalRevisionBuilder: terminalTransitions);
+        return new AgentControlPipelineFixture(pipeline, gitRoot);
+    }
+
     public static async Task<string> CreateSeedRepoAsync(string root, string name = "seed")
     {
         var seed = Path.Combine(root, name + "-" + Guid.NewGuid().ToString("N")[..8]);
@@ -155,6 +193,7 @@ internal static class TestSupport
         IReadOnlyDictionary<string, string>? projectKnobs = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
+        var ownsStateDb = stateDbPathOverride is null;
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
 
         var store = new SqliteWorkItemStore(stateDb);
@@ -337,6 +376,8 @@ internal static class TestSupport
             agent,
             realGitHost,
             gitRoot,
+            stateDb,
+            ownsStateDb,
             queue,
             involvement,
             transientRetryScheduler,
@@ -347,17 +388,20 @@ internal static class TestSupport
 /// <summary>Bundle of resources returned by <see cref="TestSupport.BuildPipeline"/>.</summary>
 internal sealed class TestPipeline : IDisposable
 {
+    private readonly OwnedPipelineArtifacts _artifacts;
+    private readonly QuotaRetryScheduler? _quotaRetryScheduler;
+
     public PipelineRunner Pipeline { get; }
     public SqliteWorkItemStore Store { get; }
     public ScriptedAgent Agent { get; }
     public LocalGitHost GitHost { get; }
-    public string GitRoot { get; }
+    public string GitRoot => _artifacts.GitRoot;
+    public string? StateDbPath => _artifacts.StateDbPath;
     public ITaskQueue Queue { get; }
     public IAgentInvolvementStore? Involvement { get; }
     public TransientRetryScheduler? RetryScheduler { get; }
-    private readonly QuotaRetryScheduler? _quotaRetryScheduler;
 
-    public TestPipeline(PipelineRunner pipeline, SqliteWorkItemStore store, ScriptedAgent agent, LocalGitHost gitHost, string gitRoot,
+    public TestPipeline(PipelineRunner pipeline, SqliteWorkItemStore store, ScriptedAgent agent, LocalGitHost gitHost, string gitRoot, string? stateDbPath = null, bool ownsStateDbPath = false,
         ITaskQueue? queue = null,
         IAgentInvolvementStore? involvement = null,
         TransientRetryScheduler? retryScheduler = null,
@@ -367,7 +411,7 @@ internal sealed class TestPipeline : IDisposable
         Store = store;
         Agent = agent;
         GitHost = gitHost;
-        GitRoot = gitRoot;
+        _artifacts = new OwnedPipelineArtifacts(gitRoot, stateDbPath, ownsStateDbPath);
         Queue = queue ?? new InMemoryTaskQueue();
         Involvement = involvement;
         RetryScheduler = retryScheduler;
@@ -376,10 +420,32 @@ internal sealed class TestPipeline : IDisposable
 
     public void Dispose()
     {
-        RetryScheduler?.Dispose();
-        _quotaRetryScheduler?.Dispose();
-        Store.Dispose();
+        TestTempArtifacts.CleanupAll(
+            () => RetryScheduler?.Dispose(),
+            () => _quotaRetryScheduler?.Dispose(),
+            Store.Dispose,
+            _artifacts.Dispose);
     }
+}
+
+internal sealed class AgentControlPipelineFixture : IPipelineRunner, IDisposable
+{
+    private readonly OwnedPipelineArtifacts _artifacts;
+
+    public AgentControlPipelineFixture(PipelineRunner pipeline, string gitRoot)
+    {
+        Pipeline = pipeline;
+        _artifacts = new OwnedPipelineArtifacts(gitRoot, ownsStateDbPath: false);
+    }
+
+    public PipelineRunner Pipeline { get; }
+    public string GitRoot => _artifacts.GitRoot;
+
+    public Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
+        => Pipeline.RunAsync(item, ct, hostShutdownToken);
+
+    public void Dispose()
+        => _artifacts.Dispose();
 }
 
 internal sealed class StaticCredentialProvider : ICredentialProvider

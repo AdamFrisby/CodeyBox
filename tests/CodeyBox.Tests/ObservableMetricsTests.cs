@@ -17,7 +17,7 @@ public sealed class ObservableMetricsTests : IDisposable
 
     public void Dispose()
     {
-        try { if (File.Exists(_dbPath)) File.Delete(_dbPath); } catch { /* best effort */ }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     private static WorkItem Item(WorkItemState state) => new()

@@ -29,7 +29,7 @@ public sealed class DeepAuditFailureTests : IDisposable
     {
         _workItemStore.Dispose();
         _releaseStore.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     [Fact]
@@ -200,12 +200,24 @@ public sealed class DeepAuditFailureTests : IDisposable
         await service.OnWorkItemTerminalAsync(release.Id, default);
         await releaseStore.FirstTerminalTransitionFailure.WaitAsync(TimeSpan.FromSeconds(5));
 
+        // The reconcile coroutine fails attempt 1, then awaits Task.Delay(retryDelay,
+        // timeProvider) before attempt 2. There is an unavoidable scheduling gap between
+        // the first-attempt failure signal (awaited above) and the moment that delay timer
+        // is registered against the injected clock, so a fixed burst of advances can all
+        // land before the timer exists and never fire it. Re-advance in a loop bounded by a
+        // wall-clock backstop, yielding/pausing so the continuation and the second
+        // transition can run; the injected clock — not the wall clock — is what fires the
+        // retry, so this stays deterministic while surviving scheduling delays under load.
         Release? persisted = null;
-        for (var iteration = 0; iteration < 100; iteration++)
+        var backstop = DateTime.UtcNow.AddSeconds(30);
+        while (true)
         {
             timeProvider.Advance(retryDelay);
+            await Task.Yield();
             persisted = await _releaseStore.GetAsync(release.Id);
             if (persisted?.State == ReleaseState.Failed)
+                break;
+            if (DateTime.UtcNow > backstop)
                 break;
             // The retry runs as a background continuation off the advanced timer.
             // A bare Task.Yield() re-queues immediately and hot-spins the thread

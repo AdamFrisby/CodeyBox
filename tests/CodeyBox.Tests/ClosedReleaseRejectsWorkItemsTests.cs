@@ -282,7 +282,7 @@ public sealed class ForceBeginReviewAuthTests : IDisposable
     }
 }
 
-internal sealed class ReleaseWorkItemApiFactory : WebApplicationFactory<Program>
+internal sealed class ReleaseWorkItemApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"cb-rel-http-{Guid.NewGuid():N}.db");
@@ -301,7 +301,7 @@ internal sealed class ReleaseWorkItemApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -334,18 +334,14 @@ internal sealed class ReleaseWorkItemApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            WorkItemStore.Dispose();
-            ReleaseStore.Dispose();
-            try { File.Delete(_dbPath); } catch { }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(
+            disposing,
+            _dbPath,
+            WorkItemStore.Dispose,
+            ReleaseStore.Dispose);
 }
 
-internal sealed class DisabledReleaseApiFactory : WebApplicationFactory<Program>
+internal sealed class DisabledReleaseApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"cb-rel-disabled-{Guid.NewGuid():N}.db");
@@ -362,7 +358,7 @@ internal sealed class DisabledReleaseApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -392,12 +388,5 @@ internal sealed class DisabledReleaseApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            ReleaseStore.Dispose();
-            try { File.Delete(_dbPath); } catch { }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath, ReleaseStore.Dispose);
 }

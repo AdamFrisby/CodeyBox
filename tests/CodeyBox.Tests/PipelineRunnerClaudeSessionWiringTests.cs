@@ -32,7 +32,7 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_workspace, recursive: true); } catch { }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace);
     }
 
     [Fact]

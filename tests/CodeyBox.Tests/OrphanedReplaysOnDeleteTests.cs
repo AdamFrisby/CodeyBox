@@ -109,9 +109,9 @@ public sealed class OrphanedReplaysOnDeleteTests : IDisposable
     {
         // Test the store method directly (without going through HTTP cancel).
         var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-orphan-{Guid.NewGuid():N}.db");
-        using var store = new SqliteWorkItemStore(dbPath);
         try
         {
+            using var store = new SqliteWorkItemStore(dbPath);
             var sourceId = WorkItemId.New();
             var source = new WorkItem
             {
@@ -146,7 +146,7 @@ public sealed class OrphanedReplaysOnDeleteTests : IDisposable
         }
         finally
         {
-            try { File.Delete(dbPath); } catch { }
+            TestTempArtifacts.DeleteSqliteDatabase(dbPath);
         }
     }
 

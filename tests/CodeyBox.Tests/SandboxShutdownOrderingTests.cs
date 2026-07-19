@@ -53,7 +53,7 @@ public sealed class SandboxShutdownOrderingTests : IDisposable
     public void Dispose()
     {
         _store.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     private static WorkItem MakeItem(WorkItemState state = WorkItemState.Working) => new()
@@ -1589,7 +1589,7 @@ public sealed class SandboxShutdownProgramWiringTests
         return options;
     }
 
-    private sealed class SandboxShutdownProgramFactory : WebApplicationFactory<Program>
+    private sealed class SandboxShutdownProgramFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly string _dbPath = Path.Combine(
             Path.GetTempPath(), $"codeybox-shutdown-program-{Guid.NewGuid():N}.db");
@@ -1608,7 +1608,7 @@ public sealed class SandboxShutdownProgramWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -1651,7 +1651,7 @@ public sealed class SandboxShutdownProgramWiringTests
                 if (disposing)
                 {
                     Store.Dispose();
-                    try { File.Delete(_dbPath); } catch { /* best-effort */ }
+                    TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
                 }
             }
         }

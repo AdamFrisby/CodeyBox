@@ -10,6 +10,21 @@ namespace CodeyBox.Tests;
 
 public sealed class IncusSandboxLifecycleTests
 {
+    // The "delete reports success but the VM persists" scenarios reuse
+    // OperationTimeout for two purposes: the per-CLI-call deadline AND the
+    // WaitForInstanceAbsence poll budget. A 100 ms budget was fine for the
+    // absence wait but far too tight for the per-call deadline on the loaded
+    // 6-vCPU verify VM: an instant mock verification call (config get / list)
+    // that runs after the deadline's timer has already fired — because the
+    // thread was starved between the timeout CTS's creation and the call — is
+    // surfaced as a TimeoutException *before* the delete runs, leaving
+    // DeleteCalls off by one. Size the budget generously so only the genuine
+    // "VM still present" wait can time out, never a starved pre-delete call.
+    // The absence wait still terminates deterministically because the mock
+    // keeps reporting the VM present until CompleteDeletion is set.
+    private static readonly TimeSpan PersistingDeletionOperationTimeout = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan PersistingDeletionPollInterval = TimeSpan.FromMilliseconds(10);
+
     [Fact]
     public async Task GuestLinkRemoval_RejectsChangedTargetBeforeRootUnlink()
     {
@@ -576,8 +591,8 @@ public sealed class IncusSandboxLifecycleTests
         {
             CaptureResourceMetrics = false,
             DiskGuard = null,
-            OperationTimeout = TimeSpan.FromMilliseconds(100),
-            ReadinessPollInterval = TimeSpan.FromMilliseconds(10),
+            OperationTimeout = PersistingDeletionOperationTimeout,
+            ReadinessPollInterval = PersistingDeletionPollInterval,
         };
         var spec = new SandboxSpec { ImageReference = "local-image" };
         var authorization = RecoveryAuthorization(options, spec);
@@ -3076,9 +3091,17 @@ public sealed class IncusSandboxLifecycleTests
     {
         CaptureResourceMetrics = false,
         DiskGuard = null,
-        OperationTimeout = TimeSpan.FromMilliseconds(250),
+        // OperationTimeout/VmStopTimeout are wall-clock anti-hang guards against the
+        // in-memory fake runners these tests drive; the runners return in microseconds,
+        // so no assertion depends on the guard firing (tests that exercise the timeout
+        // path set their own sub-second values on bespoke options). The former 250 ms /
+        // 100 ms values were tight enough that thread-pool starvation on the fully-loaded
+        // 6-vCPU verify VM could cancel a probe before the fake runner was even scheduled,
+        // producing spurious "exceeded its 0-second deadline" timeouts. Size them
+        // generously so only a genuine hang trips them.
+        OperationTimeout = TimeSpan.FromSeconds(30),
         ExecTimeout = TimeSpan.FromSeconds(2),
-        VmStopTimeout = TimeSpan.FromMilliseconds(100),
+        VmStopTimeout = TimeSpan.FromSeconds(30),
         ReadinessPollInterval = TimeSpan.FromMilliseconds(1),
         InterruptedExecRecoveryRetryAttempts = 0,
     };

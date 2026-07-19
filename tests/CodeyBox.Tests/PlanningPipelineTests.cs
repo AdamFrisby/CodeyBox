@@ -28,7 +28,7 @@ public sealed class PlanningPipelineTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_workspace, recursive: true); } catch { /* best-effort */ }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace);
     }
 
     [Fact]

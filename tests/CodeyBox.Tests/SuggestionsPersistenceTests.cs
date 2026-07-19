@@ -14,7 +14,7 @@ public sealed class SuggestionsPersistenceTests : IDisposable
     public void Dispose()
     {
         _store.Dispose();
-        try { File.Delete(_dbPath); } catch { /* best-effort */ }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     private static Suggestion Make(

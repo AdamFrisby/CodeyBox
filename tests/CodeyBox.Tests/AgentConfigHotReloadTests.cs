@@ -38,6 +38,23 @@ public sealed class AgentConfigHotReloadTests
         "{\"type\":\"acp_recv\",\"payload\":{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}}\n" +
         "{\"type\":\"turn_complete\",\"stopReason\":\"end_turn\"}\n";
 
+    private static async Task StopCoordinatorAndDisposePauseStoreAsync(
+        AgentConfigHotReload coordinator,
+        SqliteAgentPauseController pauses,
+        string dbPath)
+    {
+        try
+        {
+            await coordinator.StopAsync(CancellationToken.None);
+        }
+        finally
+        {
+            TestTempArtifacts.CleanupAll(
+                pauses.Dispose,
+                () => TestTempArtifacts.DeleteSqliteDatabase(dbPath));
+        }
+    }
+
     [Fact]
     public void Constructor_WithCalculatorButWithoutPricingState_Throws()
     {
@@ -279,7 +296,7 @@ public sealed class AgentConfigHotReloadTests
             new InertCostStore(), new AgentBurnEstimatorOptions(),
             NullLogger<AgentBurnEstimator>.Instance);
         var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-config-pauses-{Guid.NewGuid():N}.db");
-        using var pauses = new SqliteAgentPauseController(
+        var pauses = new SqliteAgentPauseController(
             dbPath,
             NullLogger<SqliteAgentPauseController>.Instance);
 
@@ -314,8 +331,7 @@ public sealed class AgentConfigHotReloadTests
         }
         finally
         {
-            await coordinator.StopAsync(CancellationToken.None);
-            try { File.Delete(dbPath); } catch { }
+            await StopCoordinatorAndDisposePauseStoreAsync(coordinator, pauses, dbPath);
         }
     }
 
@@ -340,7 +356,7 @@ public sealed class AgentConfigHotReloadTests
             new InertCostStore(), new AgentBurnEstimatorOptions(),
             NullLogger<AgentBurnEstimator>.Instance);
         var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-startup-pauses-{Guid.NewGuid():N}.db");
-        using var pauses = new SqliteAgentPauseController(
+        var pauses = new SqliteAgentPauseController(
             dbPath,
             NullLogger<SqliteAgentPauseController>.Instance);
 
@@ -359,8 +375,7 @@ public sealed class AgentConfigHotReloadTests
         }
         finally
         {
-            await coordinator.StopAsync(CancellationToken.None);
-            try { File.Delete(dbPath); } catch { }
+            await StopCoordinatorAndDisposePauseStoreAsync(coordinator, pauses, dbPath);
         }
     }
 
@@ -379,7 +394,7 @@ public sealed class AgentConfigHotReloadTests
             new InertCostStore(), new AgentBurnEstimatorOptions(),
             NullLogger<AgentBurnEstimator>.Instance);
         var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-off-entry-{Guid.NewGuid():N}.db");
-        using var pauses = new SqliteAgentPauseController(
+        var pauses = new SqliteAgentPauseController(
             dbPath,
             NullLogger<SqliteAgentPauseController>.Instance);
 
@@ -403,8 +418,7 @@ public sealed class AgentConfigHotReloadTests
         }
         finally
         {
-            await coordinator.StopAsync(CancellationToken.None);
-            try { File.Delete(dbPath); } catch { }
+            await StopCoordinatorAndDisposePauseStoreAsync(coordinator, pauses, dbPath);
         }
     }
 
@@ -423,7 +437,7 @@ public sealed class AgentConfigHotReloadTests
             new InertCostStore(), new AgentBurnEstimatorOptions(),
             NullLogger<AgentBurnEstimator>.Instance);
         var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-runtime-takeover-{Guid.NewGuid():N}.db");
-        using var pauses = new SqliteAgentPauseController(
+        var pauses = new SqliteAgentPauseController(
             dbPath,
             NullLogger<SqliteAgentPauseController>.Instance);
 
@@ -458,8 +472,7 @@ public sealed class AgentConfigHotReloadTests
         }
         finally
         {
-            await coordinator.StopAsync(CancellationToken.None);
-            try { File.Delete(dbPath); } catch { }
+            await StopCoordinatorAndDisposePauseStoreAsync(coordinator, pauses, dbPath);
         }
     }
 
@@ -2250,7 +2263,7 @@ public sealed class AgentConfigHotReloadTests
         public void Dispose()
         {
             _store?.Dispose();
-            if (_dbPath is not null) { try { File.Delete(_dbPath); } catch { } }
+            if (_dbPath is not null) { TestTempArtifacts.DeleteSqliteDatabase(_dbPath); }
         }
     }
 

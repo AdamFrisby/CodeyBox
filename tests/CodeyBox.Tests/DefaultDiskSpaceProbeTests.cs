@@ -20,7 +20,7 @@ public sealed class DefaultDiskSpaceProbeTests : IDisposable
         Directory.CreateDirectory(_root);
     }
 
-    public void Dispose() { try { Directory.Delete(_root, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_root); }
 
     [Theory]
     [InlineData(null)]

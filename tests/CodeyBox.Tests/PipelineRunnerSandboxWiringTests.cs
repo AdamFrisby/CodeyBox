@@ -49,7 +49,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_workspace, recursive: true); } catch { }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace);
     }
 
     [Fact]
@@ -197,7 +197,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         var classRouter = BuildResolverClassRouter(primary, cursor);
         var project = NewResolverProject(seed, AgentKind.Codex);
 
-        var run = await RunPickupRebaseConflictAsync(
+        using var run = await RunPickupRebaseConflictAsync(
             seed,
             project,
             new ResolverCredentialProvider(),
@@ -263,7 +263,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         var credentials = new TrackingResolverCredentialProvider();
         var project = NewResolverProject(seed, AgentKind.Codex);
 
-        var run = await RunPickupRebaseConflictAsync(
+        using var run = await RunPickupRebaseConflictAsync(
             seed,
             project,
             credentials,
@@ -292,7 +292,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         var cursor = new CursorAgentRunner { Binary = await InstallFakeCursorAgentAsync("cursor-primary") };
         var project = NewResolverProject(seed, AgentKind.Cursor, defaultAgentClass: null);
 
-        var run = await RunPickupRebaseConflictAsync(
+        using var run = await RunPickupRebaseConflictAsync(
             seed,
             project,
             new ResolverCredentialProvider(),
@@ -320,7 +320,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         var classRouter = BuildResolverClassRouter(primary, fallback);
         var project = NewResolverProject(seed, AgentKind.Codex);
 
-        var run = await RunPickupRebaseConflictAsync(
+        using var run = await RunPickupRebaseConflictAsync(
             seed,
             project,
             new ResolverCredentialProvider(),
@@ -352,7 +352,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         var classRouter = BuildResolverClassRouter(primary, fallback);
         var project = NewResolverProject(seed, AgentKind.Claude);
 
-        var run = await RunPickupRebaseConflictAsync(
+        using var run = await RunPickupRebaseConflictAsync(
             seed,
             project,
             new ResolverCredentialProvider(),
@@ -381,7 +381,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
             AgentKind.Claude, ClaudeApiKeyEnvKey, ClaudeApiKeyValue);
         var project = NewResolverProject(seed, AgentKind.Claude, defaultAgentClass: null);
 
-        var run = await RunPickupRebaseAsync(
+        using var run = await RunPickupRebaseAsync(
             seed,
             project,
             credentials,
@@ -408,7 +408,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
             AgentKind.Codex, CodexApiKeyEnvKey, CodexApiKeyValue);
         var project = NewResolverProject(seed, AgentKind.Codex, defaultAgentClass: null);
 
-        var run = await RunPickupRebaseConflictAsync(
+        using var run = await RunPickupRebaseConflictAsync(
             seed,
             project,
             credentials,
@@ -468,7 +468,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         var classRouter = BuildResolverClassRouter(primary, fallback);
         var project = NewResolverProject(seed, AgentKind.Codex);
 
-        var run = await RunPickupRebaseAsync(
+        using var run = await RunPickupRebaseAsync(
             seed,
             project,
             credentials,
@@ -502,7 +502,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         var classRouter = BuildResolverClassRouter(primary, fallback);
         var project = NewResolverProject(seed, AgentKind.Codex);
 
-        var run = await RunPickupRebaseConflictAsync(
+        using var run = await RunPickupRebaseConflictAsync(
             seed,
             project,
             credentials,
@@ -1041,7 +1041,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         finally
         {
             RestoreFixtureDirectoryForCleanup(shimDir);
-            Directory.Delete(fixture, recursive: true);
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(fixture);
         }
     }
 
@@ -1092,7 +1092,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         finally
         {
             RestoreFixtureDirectoryForCleanup(shimDir);
-            Directory.Delete(fixture, recursive: true);
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(fixture);
         }
     }
 
@@ -1139,7 +1139,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         finally
         {
             RestoreFixtureDirectoryForCleanup(shimDir);
-            Directory.Delete(fixture, recursive: true);
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(fixture);
         }
     }
 
@@ -1189,7 +1189,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         finally
         {
             RestoreFixtureDirectoryForCleanup(shimDir);
-            Directory.Delete(fixture, recursive: true);
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(fixture);
         }
     }
 
@@ -1403,7 +1403,7 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
         if (agentOverride is null && !additionalRunners.Any(runner => ReferenceEquals(runner, primaryRunner)))
             additionalRunners.Insert(0, primaryRunner);
 
-        using var tp = TestSupport.BuildPipeline(
+        var tp = TestSupport.BuildPipeline(
             _workspace,
             seed,
             projectRepository: new InMemoryProjectRepository(project),
@@ -1418,33 +1418,44 @@ public sealed class PipelineRunnerSandboxWiringTests : IDisposable
                 AgentAllowedHosts = [],
             });
 
-        var itemId = WorkItemId.New();
-        var item = NewItem($"codeybox/{itemId.ToString()[..8]}") with
+        try
         {
-            Id = itemId,
-            Agent = project.DefaultAgent,
-            AgentClassId = project.DefaultAgentClass,
-            State = WorkItemState.WorkComplete,
-        };
-        var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed);
-        var barePath = tp.GitHost.GetRepoPath(repoId);
-        await CommitToBareBranchAsync(
-            barePath,
-            item.WorkBranch!,
-            workPath,
-            workContents,
-            "work branch changes");
-        await CommitToSeedAsync(seed, mainPath, mainContents, "main branch changes");
+            var itemId = WorkItemId.New();
+            var item = NewItem($"codeybox/{itemId.ToString()[..8]}") with
+            {
+                Id = itemId,
+                Agent = project.DefaultAgent,
+                AgentClassId = project.DefaultAgentClass,
+                State = WorkItemState.WorkComplete,
+            };
+            var repoId = await tp.GitHost.EnsureRepositoryAsync(item.Id, seed);
+            var barePath = tp.GitHost.GetRepoPath(repoId);
+            await CommitToBareBranchAsync(
+                barePath,
+                item.WorkBranch!,
+                workPath,
+                workContents,
+                "work branch changes");
+            await CommitToSeedAsync(seed, mainPath, mainContents, "main branch changes");
 
-        await tp.Store.CreateAsync(item);
-        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+            await tp.Store.CreateAsync(item);
+            await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
-        var final = await tp.Store.GetAsync(item.Id);
-        Assert.NotNull(final);
-        return new PickupRebaseRunResult(final!, barePath, item.WorkBranch!);
+            var final = await tp.Store.GetAsync(item.Id);
+            Assert.NotNull(final);
+            return new PickupRebaseRunResult(final!, barePath, item.WorkBranch!, tp);
+        }
+        catch
+        {
+            tp.Dispose();
+            throw;
+        }
     }
 
-    private sealed record PickupRebaseRunResult(WorkItem Final, string BarePath, string WorkBranch);
+    private sealed record PickupRebaseRunResult(WorkItem Final, string BarePath, string WorkBranch, TestPipeline Pipeline) : IDisposable
+    {
+        public void Dispose() => Pipeline.Dispose();
+    }
 
     private static AgentClassRouter BuildResolverClassRouter(params IAgentRunner[] runners)
     {

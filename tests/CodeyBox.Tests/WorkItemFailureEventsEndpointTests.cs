@@ -169,16 +169,16 @@ public sealed class WorkItemFailureEventsEndpointTests : IClassFixture<FailureEv
 /// Test host exposing a work item store and a failure-event store backed by the
 /// same temp database, mirroring <see cref="TimingsApiFactory"/>.
 /// </summary>
-public sealed class FailureEventsApiFactory : WebApplicationFactory<Program>
+public sealed class FailureEventsApiFactory : CodeyBoxWebApplicationFactory
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-failureevents-httptest-{Guid.NewGuid():N}.db");
+    private readonly string _dbPath;
 
     public SqliteWorkItemStore Store { get; }
     public SqliteFailureEventStore FailureEventStore { get; }
 
     public FailureEventsApiFactory()
     {
+        _dbPath = TempDatabasePath("failureevents-httptest");
         Store = new SqliteWorkItemStore(_dbPath);
         FailureEventStore = new SqliteFailureEventStore(_dbPath);
     }
@@ -188,7 +188,7 @@ public sealed class FailureEventsApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -211,13 +211,9 @@ public sealed class FailureEventsApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            FailureEventStore.Dispose();
-            Store.Dispose();
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(
+            disposing,
+            _dbPath,
+            FailureEventStore.Dispose,
+            Store.Dispose);
 }

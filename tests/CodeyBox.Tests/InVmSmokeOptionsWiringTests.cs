@@ -78,7 +78,7 @@ public sealed class InVmSmokeOptionsWiringTests
         Assert.Null(opts.NetworkProfile);
     }
 
-    private sealed class InVmSmokeOptionsWiringFactory : WebApplicationFactory<Program>
+    private sealed class InVmSmokeOptionsWiringFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly Dictionary<string, string?> _extraConfig;
         private readonly string _dbPath = Path.Combine(
@@ -95,7 +95,7 @@ public sealed class InVmSmokeOptionsWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 var baseConfig = new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -118,10 +118,6 @@ public sealed class InVmSmokeOptionsWiringTests
         }
 
         protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            base.Dispose(disposing);
-        }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
     }
 }

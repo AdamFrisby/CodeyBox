@@ -32,7 +32,7 @@ public sealed class PipelineRunnerCursorQuotaFallbackTests : IDisposable
     public PipelineRunnerCursorQuotaFallbackTests() =>
         _workspace = Directory.CreateTempSubdirectory("codeybox-cursor-fallback-").FullName;
 
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     private const string CursorOutOfUsageStderr =
         "You're out of usage. Switch to Auto, or ask your admin to increase your limit to continue.";

@@ -15,7 +15,7 @@ public sealed class StreamPersistenceTests : IDisposable
 
     public void Dispose()
     {
-        try { if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true); } catch { }
+        TestTempArtifacts.DeleteDirectory(_root);
     }
 
     private AgentStreamStore Store(int maxFileSizeMb = 32, int retainedDays = 14, bool enabled = true) =>
@@ -90,7 +90,7 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_workspace, recursive: true); } catch { }
+        TestTempArtifacts.DeleteDirectory(_workspace);
     }
 
     [Fact]
@@ -587,7 +587,7 @@ public sealed class PipelineAgentStreamPersistenceTests : IDisposable
 public sealed class RedactionAppliedToStreamTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), $"codeybox-agent-streams-{Guid.NewGuid():N}");
-    public void Dispose() { try { if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true); } catch { } }
+    public void Dispose() => TestTempArtifacts.DeleteDirectory(_root);
 
     [Fact]
     public async Task SecretValuePatterns_AreRedactedBeforePersistence()
@@ -744,9 +744,10 @@ public sealed class ReleaseDeepAuditAgentStreamPersistenceTests : IDisposable
 
     public void Dispose()
     {
-        _workItemStore.Dispose();
-        _releaseStore.Dispose();
-        try { Directory.Delete(_workspace, recursive: true); } catch { }
+        TestTempArtifacts.CleanupAll(
+            _workItemStore.Dispose,
+            _releaseStore.Dispose,
+            () => TestTempArtifacts.DeleteDirectory(_workspace));
     }
 
     [Fact]
@@ -957,7 +958,7 @@ public sealed class ReleaseDeepAuditAgentStreamPersistenceTests : IDisposable
 public sealed class AgentStreamRetentionSweepTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), $"codeybox-agent-streams-{Guid.NewGuid():N}");
-    public void Dispose() { try { if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true); } catch { } }
+    public void Dispose() => TestTempArtifacts.DeleteDirectory(_root);
 
     [Fact]
     public async Task Sweep_RemovesFilesOlderThanRetainedDays()
@@ -984,7 +985,7 @@ public sealed class AgentStreamRetentionSweepTests : IDisposable
 public sealed class MaxSizeTruncationTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), $"codeybox-agent-streams-{Guid.NewGuid():N}");
-    public void Dispose() { try { if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true); } catch { } }
+    public void Dispose() => TestTempArtifacts.DeleteDirectory(_root);
 
     [Fact]
     public async Task StreamLargerThanCap_IsTruncatedWithMarkerLine()
@@ -1058,7 +1059,7 @@ public sealed class MaxSizeTruncationTests : IDisposable
 public sealed class StreamBackpressureTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), $"codeybox-agent-streams-{Guid.NewGuid():N}");
-    public void Dispose() { try { if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true); } catch { } }
+    public void Dispose() => TestTempArtifacts.DeleteDirectory(_root);
 
     [Fact]
     public async Task BurstOfMoreThanPriorQueueLimit_IsPersistedLosslesslyBelowCap()
@@ -1090,7 +1091,7 @@ public sealed class StreamBackpressureTests : IDisposable
 public sealed class MultiplePhasesPerWorkItemTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), $"codeybox-agent-streams-{Guid.NewGuid():N}");
-    public void Dispose() { try { if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true); } catch { } }
+    public void Dispose() => TestTempArtifacts.DeleteDirectory(_root);
 
     [Fact]
     public async Task WorkAuditsReworkAndMerge_ProduceExpectedFileSet()
@@ -1115,7 +1116,7 @@ public sealed class MultiplePhasesPerWorkItemTests : IDisposable
 public sealed class RetryProducesNewFileTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), $"codeybox-agent-streams-{Guid.NewGuid():N}");
-    public void Dispose() { try { if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true); } catch { } }
+    public void Dispose() => TestTempArtifacts.DeleteDirectory(_root);
 
     [Fact]
     public async Task SamePhaseAndIteration_DoesNotOverwritePriorAttempt()
@@ -1137,7 +1138,7 @@ public sealed class RetryProducesNewFileTests : IDisposable
 public sealed class AgentStreamsDisabledTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), $"codeybox-agent-streams-{Guid.NewGuid():N}");
-    public void Dispose() { try { if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true); } catch { } }
+    public void Dispose() => TestTempArtifacts.DeleteDirectory(_root);
 
     [Fact]
     public async Task BeginCapture_WhenDisabled_ReturnsNullAndDoesNotCreateFiles()

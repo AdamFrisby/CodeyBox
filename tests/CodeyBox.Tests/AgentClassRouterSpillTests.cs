@@ -247,9 +247,9 @@ public sealed class AgentClassRouterSpillTests
             Sub(Claude, score: 90),
             Sub(Codex, score: 80));
         var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-spill-failures-{Guid.NewGuid():N}.db");
-        using var failures = new SqliteQuotaFailureStore(dbPath);
         try
         {
+            using var failures = new SqliteQuotaFailureStore(dbPath);
             await failures.RecordAsync(Claude, modelId: null,
                 QuotaFailureKind.LimitReached, DateTimeOffset.UtcNow);
             var router = BuildRouter(cls,
@@ -277,7 +277,7 @@ public sealed class AgentClassRouterSpillTests
         }
         finally
         {
-            try { File.Delete(dbPath); } catch { }
+            TestTempArtifacts.DeleteSqliteDatabase(dbPath);
         }
     }
 

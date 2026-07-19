@@ -25,7 +25,7 @@ public sealed class TaskTemplateApiTests : IDisposable
     {
         _client.Dispose();
         _factory.Dispose();
-        try { Directory.Delete(_templateDir, recursive: true); } catch { }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_templateDir);
     }
 
     [Fact]

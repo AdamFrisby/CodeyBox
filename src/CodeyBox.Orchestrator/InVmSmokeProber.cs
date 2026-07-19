@@ -723,25 +723,25 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
     /// ("probe provisioning timed out") distinct from per-step exec timeouts.
     /// Non-positive disables the timeout (tests with synthetic clocks).
     ///
-    /// <para>The timeout is a wall-clock bound on the <em>returned Task</em>,
-    /// not a cooperative-cancel signal: once <see cref="ISandboxProvider.CreateAsync"/>
-    /// has handed back a Task, a wedged multipass daemon (the production hang
-    /// this method exists for) cannot stall this method beyond
-    /// <paramref name="provisionTimeout"/> — the <see cref="Task.WhenAny(Task[])"/>
-    /// race against a wall-clock delay still fires. This does NOT guard against
-    /// a provider that blocks synchronously <em>before</em> returning a Task
-    /// (we'd be inside the <c>_provider.CreateAsync</c> call and have not yet
-    /// armed the timer); the production <c>MultipassSandboxProvider</c> returns
-    /// a Task around its CLI waits, so this is not a real boundary, but the
-    /// wrapper alone cannot bound a synchronously-blocking provider. The orphaned create task is handed to
+    /// <para>The timeout has two guards: the provider token is cancelled at the
+    /// deadline for cooperative implementations, and a <see cref="Task.WhenAny(Task[])"/>
+    /// race against a wall-clock delay still bounds a returned Task that ignores
+    /// cancellation. This does NOT guard against a provider that blocks
+    /// synchronously <em>before</em> returning a Task and ignores the token; the
+    /// production <c>MultipassSandboxProvider</c> returns a Task around its CLI
+    /// waits, so this is not a real boundary, but the wrapper alone cannot bound
+    /// that shape. The orphaned create task is handed to
     /// <see cref="ObserveOrphanedSandboxCreateAsync"/>, which disposes any
     /// sandbox the provider eventually yields so a late-arriving VM does not
-    /// leak. The linked/provisioning CTS pair and local delay CTSes are
-    /// disposed before we walk away from a non-cooperative create. The token's
-    /// cancelled state is preserved after dispose (so a cooperative provider
-    /// still observes the cancel), while disposing unregisters linked sources
-    /// from the parent worker token so repeated probes cannot accumulate
-    /// registrations against <paramref name="ct"/> for the process lifetime.</para>
+    /// leak. A sandbox result delivered after the provisioning token has fired
+    /// is treated the same way: the dispatch keeps its deadline and the sandbox
+    /// is disposed in the orphan observer. The linked/provisioning CTS pair and
+    /// local delay CTSes are disposed before we walk away from a non-cooperative
+    /// create. The token's cancelled state is preserved after dispose (so a
+    /// cooperative provider still observes the cancel), while disposing
+    /// unregisters linked sources from the parent worker token so repeated
+    /// probes cannot accumulate registrations against <paramref name="ct"/> for
+    /// the process lifetime.</para>
     /// </summary>
     private async Task<ISandbox> CreateSandboxWithProvisionTimeoutAsync(
         SandboxSpec spec, CancellationToken ct)
@@ -752,6 +752,7 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         var provisionTimeout = TimeSpan.FromSeconds(_opts.ProvisionTimeoutSeconds);
         var provisionCts = new CancellationTokenSource();
         var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, provisionCts.Token);
+        provisionCts.CancelAfter(provisionTimeout);
 
         // ISandboxProvider.CreateAsync is not required to be an async state
         // machine — it can throw synchronously before returning a Task. Without
@@ -763,6 +764,12 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         {
             createTask = _provider.CreateAsync(spec, linked.Token);
         }
+        catch (OperationCanceledException) when (provisionCts.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            linked.Dispose();
+            provisionCts.Dispose();
+            throw CreateProvisioningTimeoutException(provisionTimeout);
+        }
         catch
         {
             linked.Dispose();
@@ -772,9 +779,15 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
 
         if (createTask.IsCompleted)
         {
-            linked.Dispose();
-            provisionCts.Dispose();
-            return await createTask;
+            try
+            {
+                return await AwaitCompletedCreateAsync(createTask, provisionCts, ct, provisionTimeout);
+            }
+            finally
+            {
+                linked.Dispose();
+                provisionCts.Dispose();
+            }
         }
 
         using var timeoutCts = new CancellationTokenSource();
@@ -786,12 +799,11 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         {
             try
             {
-                return await createTask;
+                return await AwaitCompletedCreateAsync(createTask, provisionCts, ct, provisionTimeout);
             }
             catch (OperationCanceledException) when (provisionCts.IsCancellationRequested && !ct.IsCancellationRequested)
             {
-                throw new TimeoutException(
-                    $"in-VM smoke: VM provisioning exceeded {(int)provisionTimeout.TotalSeconds}s");
+                throw CreateProvisioningTimeoutException(provisionTimeout);
             }
             finally
             {
@@ -824,9 +836,38 @@ public sealed class InVmSmokeProber : IInVmSmokeGate
         // distinguishable from a provisioning hang.
         if (winner == cancellationTask)
             ct.ThrowIfCancellationRequested();
-        throw new TimeoutException(
-            $"in-VM smoke: VM provisioning exceeded {(int)provisionTimeout.TotalSeconds}s");
+        throw CreateProvisioningTimeoutException(provisionTimeout);
     }
+
+    private async Task<ISandbox> AwaitCompletedCreateAsync(
+        Task<ISandbox> createTask,
+        CancellationTokenSource provisionCts,
+        CancellationToken callerToken,
+        TimeSpan provisionTimeout)
+    {
+        ISandbox sandbox;
+        try
+        {
+            sandbox = await createTask;
+        }
+        catch (OperationCanceledException) when (provisionCts.IsCancellationRequested && !callerToken.IsCancellationRequested)
+        {
+            throw CreateProvisioningTimeoutException(provisionTimeout);
+        }
+
+        if (!provisionCts.IsCancellationRequested || callerToken.IsCancellationRequested)
+            return sandbox;
+
+        // The timeout token fired before this create result reached the wrapper.
+        // Treat the sandbox as a post-timeout orphan so dispatch keeps the hard
+        // provisioning deadline even when thread-pool scheduling delivers both
+        // completions late under full-suite load.
+        _ = ObserveOrphanedSandboxCreateAsync(Task.FromResult(sandbox));
+        throw CreateProvisioningTimeoutException(provisionTimeout);
+    }
+
+    private static TimeoutException CreateProvisioningTimeoutException(TimeSpan provisionTimeout) =>
+        new($"in-VM smoke: VM provisioning exceeded {(int)provisionTimeout.TotalSeconds}s");
 
     /// <summary>
     /// Owns the post-timeout cleanup for a sandbox-create task we walked away

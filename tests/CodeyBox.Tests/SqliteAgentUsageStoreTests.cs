@@ -18,7 +18,7 @@ public sealed class SqliteAgentUsageStoreTests : IDisposable
     public void Dispose()
     {
         _store.Dispose();
-        try { File.Delete(_dbPath); } catch { /* best-effort */ }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     private static AgentUsageEvent Event(
@@ -202,7 +202,7 @@ public sealed class SqliteAgentUsageStoreTests : IDisposable
         }
         finally
         {
-            try { File.Delete(dbPath); } catch { /* best-effort */ }
+            TestTempArtifacts.DeleteSqliteDatabase(dbPath);
         }
     }
 

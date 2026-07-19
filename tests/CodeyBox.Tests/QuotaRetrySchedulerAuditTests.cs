@@ -32,7 +32,7 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     public void Dispose()
     {
         _auditLogger.Dispose();
-        try { Directory.Delete(_workspace, recursive: true); } catch { }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace);
     }
 
     [Fact]

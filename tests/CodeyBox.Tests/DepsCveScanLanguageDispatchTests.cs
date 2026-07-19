@@ -369,7 +369,7 @@ public sealed class DepsCveScanLanguageDispatchTests
         }
         finally
         {
-            try { Directory.Delete(root, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(root);
         }
     }
 
@@ -572,7 +572,7 @@ public sealed class DepsCveScanLanguageDispatchTests
         }
         finally
         {
-            try { Directory.Delete(root, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(root);
         }
     }
 
@@ -753,7 +753,7 @@ public sealed class DepsCveScanLanguageDispatchTests
         }
         finally
         {
-            try { Directory.Delete(root, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(root);
         }
     }
 
@@ -899,7 +899,7 @@ public sealed class DepsCveScanLanguageDispatchTests
         }
         finally
         {
-            try { Directory.Delete(root, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(root);
         }
     }
 

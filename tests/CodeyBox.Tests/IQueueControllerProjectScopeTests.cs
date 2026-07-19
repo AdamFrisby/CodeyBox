@@ -14,7 +14,7 @@ public sealed class IQueueControllerProjectScopeTests : IDisposable
 
     public void Dispose()
     {
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     private SqliteQueueController Make() =>

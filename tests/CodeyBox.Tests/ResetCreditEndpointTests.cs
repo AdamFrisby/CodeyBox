@@ -3,7 +3,6 @@ using System.Net.Http.Json;
 using System.Text.Json;
 using CodeyBox.Core;
 using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -116,10 +115,22 @@ public sealed class ResetCreditEndpointTests : IClassFixture<ResetCreditEndpoint
 
     // ── Test fixtures ─────────────────────────────────────────────────────────
 
-    public sealed class ResetCreditApiFactory : WebApplicationFactory<Program>
+    public sealed class ResetCreditApiFactory : CodeyBoxWebApplicationFactory
     {
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(), $"codeybox-resetcredit-endpoint-{Guid.NewGuid():N}.db");
+        private readonly string _dbPath;
+        private readonly string _gitRoot;
+        private readonly string _auditLogPath;
+        private readonly string _auditPath;
+        private readonly string _agentStreamsPath;
+
+        public ResetCreditApiFactory()
+        {
+            _dbPath = TempDatabasePath("codeybox-resetcredit-endpoint");
+            _gitRoot = Temp.NewDirectoryPath("resetcredit-git-");
+            _auditLogPath = Temp.NewLogPath("resetcredit-log");
+            _auditPath = Temp.NewLogPath("resetcredit-audit");
+            _agentStreamsPath = Temp.NewDirectoryPath("resetcredit-streams-");
+        }
 
         public RecordingEstimator Estimator { get; } = new();
 
@@ -128,15 +139,14 @@ public sealed class ResetCreditEndpointTests : IClassFixture<ResetCreditEndpoint
             builder.UseEnvironment("Development");
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
-                var tmp = Path.GetTempPath();
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"resetcredit-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"resetcredit-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"resetcredit-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"resetcredit-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:GitRootDirectory"] = _gitRoot,
+                    ["CodeyBox:AuditLog:Path"] = _auditLogPath,
+                    ["CodeyBox:AuditLog:AuditPath"] = _auditPath,
+                    ["CodeyBox:AgentStreams:Path"] = _agentStreamsPath,
                 });
             });
             builder.ConfigureTestServices(services =>
@@ -145,34 +155,38 @@ public sealed class ResetCreditEndpointTests : IClassFixture<ResetCreditEndpoint
                 services.AddSingleton<IResetCreditExpiryEstimator>(Estimator);
             });
         }
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            base.Dispose(disposing);
-        }
     }
 
-    public sealed class BareResetCreditApiFactory : WebApplicationFactory<Program>
+    public sealed class BareResetCreditApiFactory : CodeyBoxWebApplicationFactory
     {
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(), $"codeybox-resetcredit-bare-{Guid.NewGuid():N}.db");
+        private readonly string _dbPath;
+        private readonly string _gitRoot;
+        private readonly string _auditLogPath;
+        private readonly string _auditPath;
+        private readonly string _agentStreamsPath;
+
+        public BareResetCreditApiFactory()
+        {
+            _dbPath = TempDatabasePath("codeybox-resetcredit-bare");
+            _gitRoot = Temp.NewDirectoryPath("resetcredit-bare-git-");
+            _auditLogPath = Temp.NewLogPath("resetcredit-bare-log");
+            _auditPath = Temp.NewLogPath("resetcredit-bare-audit");
+            _agentStreamsPath = Temp.NewDirectoryPath("resetcredit-bare-streams-");
+        }
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             builder.UseEnvironment("Development");
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
-                var tmp = Path.GetTempPath();
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"resetcredit-bare-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"resetcredit-bare-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"resetcredit-bare-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"resetcredit-bare-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:GitRootDirectory"] = _gitRoot,
+                    ["CodeyBox:AuditLog:Path"] = _auditLogPath,
+                    ["CodeyBox:AuditLog:AuditPath"] = _auditPath,
+                    ["CodeyBox:AgentStreams:Path"] = _agentStreamsPath,
                 });
             });
             builder.ConfigureTestServices(services =>
@@ -180,13 +194,6 @@ public sealed class ResetCreditEndpointTests : IClassFixture<ResetCreditEndpoint
                 services.RemoveAll<IHostedService>();
                 services.RemoveAll<IResetCreditExpiryEstimator>();
             });
-        }
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            base.Dispose(disposing);
         }
     }
 

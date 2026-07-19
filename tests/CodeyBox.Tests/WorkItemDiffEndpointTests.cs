@@ -162,10 +162,10 @@ public sealed class WorkItemDiffEndpointTests : IClassFixture<DiffApiFactory>
         string gitRoot, WorkItemId id, string baseBranch, string workBranch)
     {
         var barePath = Path.Combine(gitRoot, id + ".git");
-        var tempWork = Path.Combine(Path.GetTempPath(), $"diff-test-{Guid.NewGuid():N}");
+        var tempDir = TestTempDirectory.Create("codeybox-diff-test-");
+        var tempWork = tempDir.Root;
         try
         {
-            Directory.CreateDirectory(tempWork);
             await TestSupport.RunGit(tempWork, "init", "-b", baseBranch);
             await TestSupport.RunGit(tempWork, "config", "user.email", "test@test.com");
             await TestSupport.RunGit(tempWork, "config", "user.name", "Test");
@@ -184,7 +184,7 @@ public sealed class WorkItemDiffEndpointTests : IClassFixture<DiffApiFactory>
         }
         finally
         {
-            Directory.Delete(tempWork, recursive: true);
+            tempDir.Dispose();
         }
     }
 
@@ -193,10 +193,10 @@ public sealed class WorkItemDiffEndpointTests : IClassFixture<DiffApiFactory>
         string gitRoot, WorkItemId id, string baseBranch, string workBranch)
     {
         var barePath = Path.Combine(gitRoot, id + ".git");
-        var tempWork = Path.Combine(Path.GetTempPath(), $"diff-test-{Guid.NewGuid():N}");
+        var tempDir = TestTempDirectory.Create("codeybox-diff-test-");
+        var tempWork = tempDir.Root;
         try
         {
-            Directory.CreateDirectory(tempWork);
             await TestSupport.RunGit(tempWork, "init", "-b", baseBranch);
             await TestSupport.RunGit(tempWork, "config", "user.email", "test@test.com");
             await TestSupport.RunGit(tempWork, "config", "user.name", "Test");
@@ -212,7 +212,7 @@ public sealed class WorkItemDiffEndpointTests : IClassFixture<DiffApiFactory>
         }
         finally
         {
-            Directory.Delete(tempWork, recursive: true);
+            tempDir.Dispose();
         }
     }
 
@@ -221,10 +221,10 @@ public sealed class WorkItemDiffEndpointTests : IClassFixture<DiffApiFactory>
         string gitRoot, WorkItemId id, string baseBranch, string workBranch)
     {
         var barePath = Path.Combine(gitRoot, id + ".git");
-        var tempWork = Path.Combine(Path.GetTempPath(), $"diff-test-{Guid.NewGuid():N}");
+        var tempDir = TestTempDirectory.Create("codeybox-diff-test-");
+        var tempWork = tempDir.Root;
         try
         {
-            Directory.CreateDirectory(tempWork);
             await TestSupport.RunGit(tempWork, "init", "-b", baseBranch);
             await TestSupport.RunGit(tempWork, "config", "user.email", "test@test.com");
             await TestSupport.RunGit(tempWork, "config", "user.name", "Test");
@@ -245,7 +245,7 @@ public sealed class WorkItemDiffEndpointTests : IClassFixture<DiffApiFactory>
         }
         finally
         {
-            Directory.Delete(tempWork, recursive: true);
+            tempDir.Dispose();
         }
     }
 }
@@ -254,18 +254,19 @@ public sealed class WorkItemDiffEndpointTests : IClassFixture<DiffApiFactory>
 /// Isolated WebApplicationFactory for diff endpoint tests.
 /// Exposes <see cref="GitRootDir"/> so tests can populate bare repos.
 /// </summary>
-public sealed class DiffApiFactory : WebApplicationFactory<Program>
+public sealed class DiffApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-diff-test-{Guid.NewGuid():N}.db");
+    private readonly string _dbPath;
 
-    public readonly string GitRootDir = Path.Combine(
-        Path.GetTempPath(), $"diff-git-{Guid.NewGuid():N}");
+    public readonly string GitRootDir;
 
     public SqliteWorkItemStore Store { get; }
 
     public DiffApiFactory()
     {
+        _dbPath = TempDatabasePath("diff-test");
+        GitRootDir = Temp.NewDirectoryPath("diff-git-");
+
         Store = new SqliteWorkItemStore(_dbPath);
         Directory.CreateDirectory(GitRootDir);
     }
@@ -275,7 +276,7 @@ public sealed class DiffApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -303,13 +304,5 @@ public sealed class DiffApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            Store.Dispose();
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            try { Directory.Delete(GitRootDir, recursive: true); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath, Store.Dispose);
 }

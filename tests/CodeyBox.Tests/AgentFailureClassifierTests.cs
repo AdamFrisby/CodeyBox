@@ -677,7 +677,7 @@ public sealed class AgentFailureClassifierTests
         finally
         {
             AgentFailureClassifier.SetAdditionalTransientNetworkPatterns(null);
-            try { Directory.Delete(root, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(root);
         }
     }
 
@@ -802,7 +802,7 @@ public sealed class AgentFailureClassifierTests
         ["CodeyBox:TransientNetworkFailurePatterns:0"] = pattern,
     };
 
-    private sealed class TransientPatternWiringFactory : WebApplicationFactory<Program>
+    private sealed class TransientPatternWiringFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly ReloadableMemorySource _source;
 
