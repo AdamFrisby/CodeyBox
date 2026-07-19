@@ -124,15 +124,28 @@ internal sealed class Bridge : IAsyncDisposable
         // CoreCLR remembered an ignored startup disposition before RunAsync
         // got control, re-exec once before publishing stdout envelopes so the
         // runtime starts from the now-default dispositions.
-        _shutdownSignalRegistrations = SignalBootstrap.RegisterShutdownHandlers(
-            ctx =>
-            {
-                ctx.Cancel = true;
-                Shutdown(0);
-                ScheduleForceExitAfterSignal();
-            },
-            enableReexec: _stdinOverride is null);
-        AppDomain.CurrentDomain.ProcessExit += (_, _) => Shutdown(0);
+        //
+        // Only the standalone bridge process (production, or the subprocess
+        // signal fixtures) installs these PROCESS-WIDE handlers. An in-process
+        // test seam (_stdinOverride set) shares the test runner's process and
+        // must NOT mutate its global signal / exit disposition: a hosted bridge
+        // that registered SIGTERM/SIGINT/SIGHUP would set ctx.Cancel=true and
+        // swallow a signal the test host itself needs to observe — turning a
+        // clean harness stop into a SIGKILL (surfacing as an MSBuild "child node
+        // exited prematurely"). The signal-shutdown contract is exercised by the
+        // standalone-subprocess fixtures, never this seam.
+        if (_stdinOverride is null)
+        {
+            _shutdownSignalRegistrations = SignalBootstrap.RegisterShutdownHandlers(
+                ctx =>
+                {
+                    ctx.Cancel = true;
+                    Shutdown(0);
+                    ScheduleForceExitAfterSignal();
+                },
+                enableReexec: true);
+            AppDomain.CurrentDomain.ProcessExit += (_, _) => Shutdown(0);
+        }
 
         Emitter.Emit("bridge_started", w => w.WriteNumber("pid", Environment.ProcessId));
 

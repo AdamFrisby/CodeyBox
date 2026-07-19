@@ -1888,6 +1888,34 @@ public sealed class AcpBridgeUnitTests
     }
 
     [Fact]
+    public async Task Bridge_RunAsync_InProcessSeam_DoesNotInstallProcessWideSignalHandlers()
+    {
+        // Regression: an in-process bridge (the _stdinOverride test seam that
+        // BridgeRunHandle / the MemoryStream fixtures use) shares the test
+        // runner's process. RunAsync used to register PROCESS-WIDE
+        // SIGTERM/SIGINT/SIGHUP handlers unconditionally, so every in-process
+        // bridge instance hijacked the test host's signal disposition for the
+        // duration of the test. Those handlers set ctx.Cancel=true, which
+        // SWALLOWS a SIGTERM the harness may send the host to stop it — turning
+        // a clean stop into an escalated SIGKILL that MSBuild reports as a
+        // "child node exited prematurely" abnormal termination. The seam must
+        // leave the host's global signal disposition untouched; the real
+        // signal-shutdown contract is verified by the standalone-subprocess
+        // fixtures below. Before the fix _shutdownSignalRegistrations had length
+        // 3 here; after, it is empty.
+        await using var ctx = new BridgeRunHandle();
+
+        // bridge_started is emitted immediately AFTER the (now-skipped) signal
+        // registration block, so once we observe it the decision has been made.
+        await ctx.WaitForEnvelopeAsync("bridge_started");
+
+        var registrationsField = typeof(Bridge).GetField(
+            "_shutdownSignalRegistrations", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var registrations = (Array)registrationsField.GetValue(ctx.Bridge)!;
+        Assert.Empty(registrations);
+    }
+
+    [Fact]
     public async Task Bridge_Shutdown_ConcurrentCauses_ClaudeExitEmittedExactlyOnceAndLockfileGone()
     {
         // End-to-end fixture exercising two Shutdown causes back-to-back:
