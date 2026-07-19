@@ -28,12 +28,10 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
 {
     private readonly TestSink _sink = new();
 
-    // A dedicated, injected Serilog logger keeps this resolver's audit events on
-    // our own sink, decoupled from the process-global Serilog.Log.Logger. A
-    // concurrent host bootstrap that reassigns the global static (as happens in
-    // parallel test collections) can no longer reroute the emission away from
-    // _sink, so this class needs neither the GlobalSerilog serialization
-    // collection nor a Log.Logger assignment.
+    // Captured by reference and threaded into every resolver under test so the audit
+    // emission lands in _sink even if a parallel test collection reassigns the global
+    // Serilog.Log.Logger mid-run (matching the MultipassDaemonRetryPolicy.AuditLogger
+    // deflake pattern). Concrete Logger (not ILogger) so Dispose() can be called.
     private readonly Serilog.Core.Logger _auditLogger;
 
     public AgenticConflictResolverAuditLogTests()
@@ -43,6 +41,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             .Enrich.With<SensitiveDataRedactionEnricher>()
             .WriteTo.Sink(_sink)
             .CreateLogger();
+        Log.Logger = _auditLogger;
     }
 
     public void Dispose() => _auditLogger.Dispose();
@@ -138,7 +137,8 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
         var logger = new CapturingLogger<AgenticConflictResolver>();
         var resolver = new AgenticConflictResolver(
             new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1, MaxAttemptsPerAgent = 1 }),
-            logger);
+            logger,
+            auditLogger: _auditLogger);
 
         var result = await resolver.ResolveAsync(
             sandbox,

@@ -2087,6 +2087,119 @@ public sealed class AcpBridgeUnitTests
         Assert.Contains("listener boom", fatalEnv.GetProperty("detail").GetString());
     }
 
+    // ── Bridge stdin-read teardown during shutdown must not abort ───────────────
+    //
+    // Regression for the "passes in isolation, SIGABRT (exit 134) under parallel
+    // load" flake in the posix-signal cleanup fixtures. Shutdown() disposes the
+    // stdin stream on a background thread (posix signal handler / ProcessExit /
+    // turn-deadline / claude-exited) to unblock the in-flight ReadLineAsync.
+    // Tearing a StreamReader/FileStream down mid-read is not thread-safe and,
+    // besides IOException, can surface OTHER exception types from torn async
+    // buffer state under load (e.g. InvalidOperationException). ReadStdinAsync's
+    // catch used to be gated on `IOException when (ShutdownStarted)`, so such a
+    // type escaped RunAsync -> Main -> CoreCLR abort() (128+6 = 134). This
+    // reproduces the race deterministically: a parked read that faults with a
+    // non-IOException the instant the stream is disposed by a Shutdown, and
+    // asserts the bridge returns its clean exit code instead of letting the fault
+    // escape. Fails (RunAsync throws) on a single-statement revert of the
+    // broadened catch.
+
+    [Fact]
+    public async Task Bridge_StdinReadFaultsNonIoExceptionDuringShutdownDispose_ExitsCleanlyNotAbort()
+    {
+        using var stdin = new FaultOnDisposeMidReadStream(
+            new InvalidOperationException("torn stdin buffer under concurrent shutdown dispose"));
+        using var stdoutCapture = new MemoryStream();
+        var bridge = new Bridge(stdin);
+        try
+        {
+            int exit;
+            using (Emitter.OverrideStreamForTests(stdoutCapture))
+            {
+                var run = bridge.RunAsync();
+
+                // Wait until ReadStdinAsync has parked inside the read, so the
+                // dispose genuinely tears the stream down mid-operation.
+                await stdin.ReadParked.WaitAsync(TimeSpan.FromSeconds(10));
+
+                // Drive the exact shutdown seam the posix signal handler uses
+                // (Bridge.cs: signal ctx -> Shutdown(0) -> _stdinStream.Dispose()).
+                // Shutdown sets ShutdownStarted before disposing, so the parked
+                // read faults with InvalidOperationException while shutdown is in
+                // progress — the previously-unhandled type.
+                var shutdown = typeof(Bridge).GetMethod(
+                    "Shutdown", BindingFlags.NonPublic | BindingFlags.Instance)!;
+                shutdown.Invoke(bridge, new object?[] { 0 });
+
+                exit = await run.WaitAsync(TimeSpan.FromSeconds(10));
+            }
+
+            Assert.Equal(0, exit);
+        }
+        finally
+        {
+            await bridge.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// A read-only stream whose async read parks until the stream is disposed,
+    /// then faults that in-flight read with a caller-supplied exception —
+    /// modelling a StreamReader/FileStream torn down mid-<c>ReadLineAsync</c> by
+    /// a concurrent shutdown. Disposal is idempotent.
+    /// </summary>
+    private sealed class FaultOnDisposeMidReadStream : Stream
+    {
+        private readonly Exception _faultOnDisposeDuringRead;
+        private readonly TaskCompletionSource _readParked =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<int> _readCompletion =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public FaultOnDisposeMidReadStream(Exception faultOnDisposeDuringRead) =>
+            _faultOnDisposeDuringRead = faultOnDisposeDuringRead;
+
+        /// <summary>Completes once the async read has parked awaiting disposal.</summary>
+        public Task ReadParked => _readParked.Task;
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            _readParked.TrySetResult();
+            // Intentionally NOT observing cancellationToken: models a native
+            // read() parked in a syscall that ignores managed cancellation, so
+            // only the stream dispose can unblock it (Bridge.cs documents this).
+            return await _readCompletion.Task.ConfigureAwait(false);
+        }
+
+        public override Task<int> ReadAsync(
+            byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+                _readCompletion.TrySetException(_faultOnDisposeDuringRead);
+            base.Dispose(disposing);
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) =>
+            throw new NotSupportedException("Asynchronous reads only.");
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
     [Fact]
     public void Bridge_Fatal_StartupFailed_EmitsEnvelopeWithMessageDetailAndShutsDownWithCode2()
     {

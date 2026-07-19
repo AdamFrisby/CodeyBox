@@ -493,40 +493,39 @@ public sealed class WatchSseTests
     [Fact]
     public async Task TryWatchWorkItemEventsAsync_SlowConnect_RequiresInfiniteSseTimeout()
     {
-        // Regression guard: production uses a dedicated _sseHttp with infinite timeout.
+        // Regression guard: production uses a dedicated _sseHttp with an infinite
+        // timeout so a slow SSE connect is not killed. Proven WITHOUT a wall-clock
+        // race between two live timers: a finite SSE timeout is the only thing that
+        // can end a connect that never answers (so it must fall back), while an
+        // infinite timeout lets a prompt connect run to a terminal event. Outcome
+        // is deterministic under any thread-pool load.
         var config = new ResolvedConfig
         {
             ApiBaseUrl = "http://localhost:5036",
             ApiKey = "test-key",
         };
-        Func<HttpRequestMessage, HttpResponseMessage> respond =
-            req => req.RequestUri?.AbsolutePath.EndsWith("/events", StringComparison.Ordinal) == true
-                ? SampleData.SseEventsResponse("Done")
-                : SampleData.WorkItemResponse();
         var baseUri = new Uri(config.ApiBaseUrl);
 
-        // Short-timeout client: the server holds the /events response open until
-        // the request is cancelled, so the sole possible outcome is the 50ms
-        // HttpClient timeout firing -> ShouldFallback. Blocking-until-cancelled
-        // (rather than racing a fixed wall-clock delay against the timeout) keeps
-        // this deterministic even when a loaded test host fires timers late.
-        var blockingHandler = new SseTestHttp.DelayingEventsHandler(
-            Timeout.InfiniteTimeSpan, respond);
+        // Never returns response headers until its request is cancelled — the only
+        // exit for the short-timeout connect is the SSE timeout firing.
+        var stallingHandler = new SseTestHttp.NeverCompletesHandler();
         var shortSseClient = new CodeyBoxClient(
-            new HttpClient(blockingHandler) { BaseAddress = baseUri, Timeout = TimeSpan.FromSeconds(30) },
-            new HttpClient(blockingHandler)
+            new HttpClient(stallingHandler) { BaseAddress = baseUri, Timeout = TimeSpan.FromSeconds(30) },
+            new HttpClient(stallingHandler)
             {
                 BaseAddress = baseUri,
                 Timeout = TimeSpan.FromMilliseconds(50),
             });
 
-        // Infinite-timeout client: a genuinely slow but finite connect that the
-        // client patiently waits out and completes.
-        var slowHandler = new SseTestHttp.DelayingEventsHandler(
-            TimeSpan.FromMilliseconds(150), respond);
+        // Answers immediately with a terminal event — the infinite timeout never
+        // interferes, so this must run to completion.
+        var promptHandler = new FakeHttpMessageHandler(
+            req => req.RequestUri?.AbsolutePath.EndsWith("/events", StringComparison.Ordinal) == true
+                ? SampleData.SseEventsResponse("Done")
+                : SampleData.WorkItemResponse());
         var infiniteSseClient = new CodeyBoxClient(
-            new HttpClient(slowHandler) { BaseAddress = baseUri, Timeout = TimeSpan.FromSeconds(30) },
-            new HttpClient(slowHandler) { BaseAddress = baseUri, Timeout = Timeout.InfiniteTimeSpan });
+            new HttpClient(promptHandler) { BaseAddress = baseUri, Timeout = TimeSpan.FromSeconds(30) },
+            new HttpClient(promptHandler) { BaseAddress = baseUri, Timeout = Timeout.InfiniteTimeSpan });
 
         var shortResult = await shortSseClient.TryWatchWorkItemEventsAsync(
             "aabbccdd-0000-0000-0000-000000000000", _ => { });

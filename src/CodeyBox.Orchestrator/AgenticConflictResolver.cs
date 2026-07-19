@@ -215,11 +215,13 @@ public sealed class AgenticConflictResolver
     private readonly IAgentSupervisionService? _agentSupervision;
     private readonly IAgentAuthFailureClassifier _authFailureClassifier;
 
-    // Optional dedicated audit sink. When null, attempt-failed audits resolve
-    // Serilog.Log.Logger at emission time (the production default). Injecting a
-    // logger lets a test capture this resolver's audit events on its own sink
-    // without racing a concurrent host bootstrap that reassigns the global
-    // static — the same pattern AgentSupervisionService uses.
+    /// <summary>
+    /// Serilog sink for the per-attempt <c>agentic_conflict_resolver.attempt_failed</c>
+    /// audit events. Captured by reference at construction so emission is immune to a
+    /// concurrent reassignment of the global <see cref="Serilog.Log.Logger"/> (which
+    /// parallel test collections do — same pattern as <c>AgentSupervisionService</c>).
+    /// Null falls back to the process-global logger.
+    /// </summary>
     private readonly Serilog.ILogger? _auditLogger;
 
     private enum AuthRequiredAttemptFailure
@@ -239,6 +241,7 @@ public sealed class AgenticConflictResolver
         Serilog.ILogger? auditLogger = null)
     {
         _options = options ?? new AgenticConflictResolverOptionsSnapshot();
+        _auditLogger = auditLogger;
         _log = log ?? (ILogger)Microsoft.Extensions.Logging.Abstractions.NullLogger<AgenticConflictResolver>.Instance;
         // Optional hook the orchestrator wires in so a cross-kind candidate's
         // AgentCredential.Files land in the sandbox before the candidate's CLI

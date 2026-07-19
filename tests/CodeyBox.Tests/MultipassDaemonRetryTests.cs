@@ -583,13 +583,16 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
 {
     private readonly TestSink _sink = new();
 
+    private readonly Serilog.ILogger _auditLogger;
+
     public MultipassDaemonRetryAuditTests()
     {
-        Log.Logger = new LoggerConfiguration()
+        _auditLogger = new LoggerConfiguration()
             .Enrich.FromLogContext()
             .Enrich.With<SensitiveDataRedactionEnricher>()
             .WriteTo.Sink(_sink)
             .CreateLogger();
+        Log.Logger = _auditLogger;
     }
 
     public void Dispose() => Log.CloseAndFlush();
@@ -600,9 +603,12 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
     private static Task<MultipassDaemonHealthProbeResult> Healthy(CancellationToken _) =>
         Task.FromResult(MultipassDaemonHealthProbeResult.Healthy());
 
-    private static MultipassDaemonRetryPolicy InstantPolicy() => new()
+    // Pass the sink logger by reference so the audit emission lands in _sink even if a
+    // parallel test collection reassigns the global Serilog.Log.Logger mid-run.
+    private MultipassDaemonRetryPolicy InstantPolicy() => new()
     {
         Delay = (_, _) => Task.CompletedTask,
+        AuditLogger = _auditLogger,
     };
 
     [Fact]

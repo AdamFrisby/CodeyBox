@@ -634,30 +634,37 @@ public sealed class IncusSandboxLifecycleTests
         Directory.CreateDirectory(sandboxRoot);
         IncusMountStaging.InitializeOwnedTree(sandboxRoot, sandboxName, DateTimeOffset.UtcNow);
         var runner = new StickyProviderDeletionRunner(sandboxName, root);
+        var operationTimeout = TimeSpan.FromMilliseconds(100);
+        var pollInterval = TimeSpan.FromMilliseconds(10);
+        var clock = new ControllableTimeProvider(DateTimeOffset.UtcNow);
         var provider = new IncusSandboxProvider(
             () => new IncusSandboxOptions
             {
                 StagingDirectory = root,
                 DiskGuard = null,
-                // OperationTimeout is a REAL-CLOCK per-command deadline as well as the
-                // absence-poll deadline. The intended phase-1 TimeoutException comes from
-                // WaitForInstanceAbsenceAsync (the fake VM never disappears while
-                // CompleteDeletion is false). A very short deadline (e.g. 100ms) also
-                // covers each instant fake command, so under a starved thread pool the
-                // deadline could fire before the `delete` command even runs — the first
-                // DisposeLeakedAsync would then throw before DeleteCalls is incremented,
-                // and the final Assert.Equal(2, DeleteCalls) would see 1. Use a generous
-                // deadline so the delete always issues first; absence is still never
-                // observed, so the poll still times out as the test requires.
-                OperationTimeout = TimeSpan.FromSeconds(2),
-                ReadinessPollInterval = TimeSpan.FromMilliseconds(25),
+                OperationTimeout = operationTimeout,
+                ReadinessPollInterval = pollInterval,
             },
             NullLogger<IncusSandboxProvider>.Instance,
             timings: null,
-            runner);
+            runner,
+            timeProvider: clock);
 
-        await Assert.ThrowsAsync<TimeoutException>(() =>
-            provider.DisposeLeakedAsync(sandboxName, CancellationToken.None));
+        // First reap: delete reports success but the VM persists, so absence
+        // verification must time out. Drive the injected clock deterministically
+        // instead of racing a wall-clock deadline against provider preflight (which
+        // flakes under parallel load): hold time frozen until the delete has been
+        // issued — so no preflight step can spuriously time out before it — then
+        // advance past the absence-verification deadline to force the TimeoutException.
+        var firstReap = provider.DisposeLeakedAsync(sandboxName, CancellationToken.None);
+        while (runner.DeleteCalls < 1 && !firstReap.IsCompleted)
+            await Task.Yield();
+        while (!firstReap.IsCompleted)
+        {
+            clock.Advance(operationTimeout + pollInterval);
+            await Task.Yield();
+        }
+        await Assert.ThrowsAsync<TimeoutException>(() => firstReap);
 
         Assert.True(Directory.Exists(sandboxRoot));
         runner.CompleteDeletion = true;

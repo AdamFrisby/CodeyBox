@@ -1467,7 +1467,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
             CancellationToken.None);
 
         Assert.NotNull(baseline);
-        Assert.False(Directory.Exists(leakedWorkspace));
+        await AssertLeakedWorkspaceRecoveredByPreflightAsync(provider, leakedWorkspace);
     }
 
     [Fact]
@@ -1537,6 +1537,39 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
             CancellationToken.None);
 
         Assert.NotNull(baseline);
+        await AssertLeakedWorkspaceRecoveredByPreflightAsync(provider, leakedWorkspace);
+    }
+
+    /// <summary>
+    /// Asserts a leaked provisioning workspace is cleaned up by the provider's
+    /// host-preflight stale-workspace recovery.
+    ///
+    /// <para>That recovery is opportunistic cleanup guarded by a cross-process
+    /// coordination lease: <see cref="IncusSandboxProvider"/> swallows
+    /// <c>IncusProvisioningLeaseContendedException</c> and defers to the next
+    /// preflight pass. Under heavy parallel test load a concurrently-spawned
+    /// subprocess can inherit an <c>O_CLOEXEC</c> lease descriptor for its
+    /// fork→exec window and transiently hold that flock, so a single preflight
+    /// pass may legitimately skip recovery. The production contract is that the
+    /// NEXT preflight cleans up, so this asserts that eventual guarantee with a
+    /// bounded retry of the real recovery path rather than a single pass —
+    /// otherwise the assertion flakes spuriously.</para>
+    /// </summary>
+    private static async Task AssertLeakedWorkspaceRecoveredByPreflightAsync(
+        IncusSandboxProvider provider,
+        string leakedWorkspace)
+    {
+        const int maxRecoveryPasses = 50;
+        for (var pass = 0; Directory.Exists(leakedWorkspace) && pass < maxRecoveryPasses; pass++)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(20));
+            _ = await provider.EnsureBaselineImageAsync(
+                "internet-only",
+                SandboxProfileFlavor.Headless,
+                pinnedBaselineRef: null,
+                CancellationToken.None);
+        }
+
         Assert.False(Directory.Exists(leakedWorkspace));
     }
 

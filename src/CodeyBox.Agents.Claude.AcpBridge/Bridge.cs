@@ -166,16 +166,20 @@ internal sealed class Bridge : IAsyncDisposable
             try { line = await stdin.ReadLineAsync(ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { return; }
             catch (ObjectDisposedException) { return; }
-            catch (IOException) when (ShutdownStarted) { return; }
-            // Shutdown(0) disposes _stdinStream to unblock this read. When the
-            // dispose races an in-flight ReadLineAsync, the queued read observes
-            // the now-closed ConsoleStream and throws NotSupportedException
-            // ("Stream does not support reading") from ConsoleStream.ValidateRead
-            // rather than ObjectDisposedException. Treat it as the same benign
-            // shutdown-time unblock; without this the exception escapes RunAsync
-            // and aborts the process (SIGABRT/134) instead of exiting 0. The
-            // ShutdownStarted guard keeps a genuine non-shutdown fault observable.
-            catch (NotSupportedException) when (ShutdownStarted) { return; }
+            // Shutdown() (posix signal, ProcessExit, claude-exited, turn deadline,
+            // peer-closed) disposes _stdinStream (Bridge.cs Shutdown) to unblock
+            // this in-flight read. Tearing down a StreamReader/FileStream mid
+            // ReadLineAsync is not thread-safe: besides IOException it can surface
+            // other exception types from torn async-buffer state under load — e.g.
+            // NotSupportedException ("Stream does not support reading") from
+            // ConsoleStream.ValidateRead when a queued read observes the closed
+            // stream, or InvalidOperationException from a racing async-buffer
+            // swap. Once shutdown or cancellation is in progress the unread line
+            // is irrelevant, so treat ANY such fault as expected teardown and stop
+            // reading — never let it escape RunAsync -> Main -> CoreCLR abort()
+            // (SIGABRT / exit 134). Genuine read faults outside shutdown still
+            // propagate.
+            catch (Exception) when (ShutdownStarted || ct.IsCancellationRequested) { return; }
             if (line is null) return; // EOF
             if (line.Length == 0) continue;
             DispatchEnvelope(line);

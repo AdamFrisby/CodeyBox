@@ -4618,6 +4618,14 @@ internal sealed class MultipassDaemonRetryPolicy
     public TimeSpan ExhaustedRequeueDelay { get; init; } = TimeSpan.FromSeconds(30);
     public Func<TimeSpan, CancellationToken, Task> Delay { get; init; } =
         static (delay, ct) => Task.Delay(delay, ct);
+
+    /// <summary>
+    /// Serilog sink for the transient-retry audit events. Captured by reference at
+    /// policy construction so emission is immune to a concurrent reassignment of the
+    /// global <see cref="Serilog.Log.Logger"/> (which parallel test collections do).
+    /// Null falls back to the process-global logger.
+    /// </summary>
+    public Serilog.ILogger? AuditLogger { get; init; }
 }
 
 internal readonly record struct MultipassDaemonHealthProbeResult(bool IsHealthy, string Error)
@@ -4685,7 +4693,7 @@ internal static class MultipassDaemonRetry
             var retryOrdinal = attempt;
             var probe = await healthProbe(ct).ConfigureAwait(false);
             var delay = policy.Backoffs[attempt - 1];
-            AuditTransientRetry(workItemId, operation, retryOrdinal, errorClass);
+            AuditTransientRetry(workItemId, operation, retryOrdinal, errorClass, policy.AuditLogger);
 
             if (retryOrdinal == 1)
             {
@@ -4810,10 +4818,10 @@ internal static class MultipassDaemonRetry
         }
     }
 
-    private static void AuditTransientRetry(WorkItemId? workItemId, string operation, int attempt, string errorClass)
+    private static void AuditTransientRetry(WorkItemId? workItemId, string operation, int attempt, string errorClass, Serilog.ILogger? auditLogger)
     {
         if (workItemId.HasValue)
-            AuditLog.SandboxProvisioningTransientRetry(workItemId.Value, operation, attempt, errorClass);
+            AuditLog.SandboxProvisioningTransientRetry(workItemId.Value, operation, attempt, errorClass, auditLogger);
     }
 
     private static string Describe(IReadOnlyList<string> argv)
