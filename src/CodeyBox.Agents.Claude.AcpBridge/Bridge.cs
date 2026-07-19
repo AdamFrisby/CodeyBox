@@ -167,6 +167,15 @@ internal sealed class Bridge : IAsyncDisposable
             catch (OperationCanceledException) { return; }
             catch (ObjectDisposedException) { return; }
             catch (IOException) when (ShutdownStarted) { return; }
+            // Shutdown(0) disposes _stdinStream to unblock this read. When the
+            // dispose races an in-flight ReadLineAsync, the queued read observes
+            // the now-closed ConsoleStream and throws NotSupportedException
+            // ("Stream does not support reading") from ConsoleStream.ValidateRead
+            // rather than ObjectDisposedException. Treat it as the same benign
+            // shutdown-time unblock; without this the exception escapes RunAsync
+            // and aborts the process (SIGABRT/134) instead of exiting 0. The
+            // ShutdownStarted guard keeps a genuine non-shutdown fault observable.
+            catch (NotSupportedException) when (ShutdownStarted) { return; }
             if (line is null) return; // EOF
             if (line.Length == 0) continue;
             DispatchEnvelope(line);
