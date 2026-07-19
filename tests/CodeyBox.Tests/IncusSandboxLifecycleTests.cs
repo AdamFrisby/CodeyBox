@@ -571,7 +571,6 @@ public sealed class IncusSandboxLifecycleTests
         Directory.CreateDirectory(sandboxRoot);
         IncusMountStaging.InitializeOwnedTree(sandboxRoot, sandboxName, DateTimeOffset.UtcNow);
         var runner = new StickyDeletionLifecycleRunner(sandboxName);
-        var time = new ControllableTimeProvider(DateTimeOffset.UtcNow);
         var inactive = 0;
         // Drive the delete-verification deadline off an injected clock instead of
         // a 100 ms real-wall-clock window: a saturated audit host can let that
