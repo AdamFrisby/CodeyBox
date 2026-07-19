@@ -194,11 +194,15 @@ alone is insufficient — NuGet builds that derive the user-config directory fro
 writable home. (At sandbox *creation* `DotnetCliHomeConventions.ApplyIfAbsent`
 stamps only `DOTNET_CLI_HOME`, leaving `HOME` for sibling git/tool steps; the
 per-command `ApplyIfDotnetInvocation` overrides `HOME` safely because it scopes
-to the dotnet exec.) The repo-root `build.sh` applies the same
-writability-aware selection: when `$HOME/.nuget/NuGet` is writable it is reused,
-otherwise both `DOTNET_CLI_HOME` and `HOME` are pinned to the repo-local
-`.dotnet-cli-home` — a non-destructive redirect that never renames or deletes
-the caller's `~/.nuget`.
+to the dotnet exec.) The repo-root `build.sh` inherits whichever
+`DOTNET_CLI_HOME`/`HOME` these seams stamped and then dot-sources the shared
+`scripts/nuget-home-heal.sh` recovery against it: an already-usable per-user
+NuGet home is reused untouched; an inherited-but-broken one (root-owned or an
+unreadable `NuGet.Config`) is quarantined aside and recreated in place when the
+home is writable, or redirected to a scratch `DOTNET_CLI_HOME` when it is not —
+in every case preserving the caller's package cache and never deleting it. The
+heal script is the single source of truth for that recovery; `build.sh` adds no
+selection logic of its own.
 
 **Operator precondition (not a repo defect).** No committed repo file can
 redirect a `dotnet` process that a harness launches *outside* these seams (a

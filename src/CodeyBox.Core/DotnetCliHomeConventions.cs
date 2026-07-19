@@ -45,8 +45,10 @@ public static class DotnetCliHomeConventions
     /// NuGet.Config ... denied" even though <c>DOTNET_CLI_HOME</c> is writable.
     /// Matching <c>HOME</c> to the same directory lands every NuGet resolution
     /// strategy on one writable home. This mirrors
-    /// <c>SandboxRequiredBuildVerifier.DotnetCliHomeSelectionScript</c> and
-    /// <c>build.sh</c>, which pin both for the same reason.
+    /// <c>SandboxRequiredBuildVerifier.DotnetCliHomeSelectionScript</c>, which
+    /// pins both for the same reason. <c>build.sh</c> instead inherits this
+    /// stamped <c>HOME</c>/<c>DOTNET_CLI_HOME</c> and repairs whichever it
+    /// resolves via the shared <c>scripts/nuget-home-heal.sh</c> recovery.
     /// <para>Unlike <see cref="ApplyIfAbsent"/> (used at sandbox creation, where
     /// overriding <c>HOME</c> would disturb sibling git/tool steps that need the
     /// caller's home), this is safe to override <c>HOME</c> because callers apply
