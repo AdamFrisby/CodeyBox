@@ -94,15 +94,16 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
         {
             Name = _opts.Name,
             Argv = invocation,
-            // dotnet test performs a NuGet restore (even with --no-build it reads
-            // the settings), so it needs the same NuGet-home relocation the
-            // required-build gate carries when the sandbox ships an unusable
-            // $HOME/.nuget.
-            ExecPreamble = NuGetHomeGuard.PreambleForCommand(invocation),
             ResultClassifier = _classifier,
             CanShortCircuitOnBlockingFinding = _opts.CanShortCircuitOnBlockingFinding,
             Role = _opts.Role,
             BuildTestGateEvidence = _opts.BuildTestGateEvidence,
+            // dotnet test performs a NuGet restore (even with --no-build it reads
+            // the settings), so it self-heals an unusable $HOME/.nuget through the
+            // single SelfHealNuGetHome mechanism (NuGetHomeSelfHeal wrapper). It does
+            // NOT also set ExecPreamble: carrying two self-heal sources on one
+            // auditor is a redundant fork, and ExecPreamble would win and bypass the
+            // self-heal wrapper the test gate is verified to run through.
             SelfHealNuGetHome = _opts.SelfHealNuGetHome,
             TestFailureAttributionOptions = _opts.TestFailureAttributionOptions,
         });
