@@ -1,3 +1,5 @@
+using System.Globalization;
+
 namespace CodeyBox.Tests;
 
 /// <summary>
@@ -36,12 +38,21 @@ internal static class TestTempWorkspace
     /// these live on every call, so redirecting them re-homes all temp usage.</summary>
     private static readonly string[] TempEnvironmentVariables = ["TMPDIR", "TMP", "TEMP"];
 
-    private const string RunRootPrefix = "codeybox-test-run-";
+    // Names are kept deliberately short. The redirected temp root becomes the
+    // parent of every per-test temp artifact, so its length is charged against
+    // OS path limits that some artifacts hit — most sharply the 108-character
+    // Unix-domain-socket path cap. Two 32-char GUID levels (run root + case)
+    // plus a nested CreateTempSubdirectory blew past that cap; a short prefix and
+    // a monotonic case counter keep the whole chain well inside it.
+    private const string RunRootPrefix = "cbx-run-";
+    private const int RunRootTokenLength = 6;
+    private const string CaseDirectoryPrefix = "c";
     private const int DeleteAttempts = 5;
     private const int DeleteRetryDelayMs = 25;
 
     private static string _runRoot = string.Empty;
     private static int _initialized;
+    private static long _caseCounter;
 
     /// <summary>The per-run temp root, or empty before <see cref="Initialize"/> runs.</summary>
     internal static string RunRoot => _runRoot;
@@ -58,7 +69,13 @@ internal static class TestTempWorkspace
         if (Interlocked.Exchange(ref _initialized, 1) == 1)
             return _runRoot;
 
-        var root = Path.Combine(baseTempDirectory, RunRootPrefix + Guid.NewGuid().ToString("N"));
+        var root = Path.Combine(
+            baseTempDirectory,
+            // Process id disambiguates concurrent test-run processes that share
+            // the base temp directory; the short random suffix avoids reusing a
+            // stale root left by a dead process that recycled the same pid.
+            RunRootPrefix + Environment.ProcessId.ToString(CultureInfo.InvariantCulture)
+                + "-" + Guid.NewGuid().ToString("N")[..RunRootTokenLength]);
         Directory.CreateDirectory(root);
         _runRoot = root;
         PointTempEnvironmentAt(root);
@@ -120,10 +137,20 @@ internal static class TestTempWorkspace
             TryDeleteDirectory(root);
     }
 
-    /// <summary>Creates and returns a fresh GUID-named subdirectory of <paramref name="runRoot"/>.</summary>
+    /// <summary>
+    /// Creates and returns a fresh subdirectory of <paramref name="runRoot"/> for
+    /// one test case. The name is a short, monotonically increasing counter rather
+    /// than a GUID: cases run strictly sequentially, so the counter is collision-free
+    /// (each value is minted once and never reused, even against undeleted residue),
+    /// and it keeps the path short enough that nested per-test artifacts — including
+    /// Unix domain sockets, capped at 108 characters — still fit.
+    /// </summary>
     internal static string CreateTestCaseDirectory(string runRoot)
     {
-        var dir = Path.Combine(runRoot, Guid.NewGuid().ToString("N"));
+        var ordinal = Interlocked.Increment(ref _caseCounter);
+        var dir = Path.Combine(
+            runRoot,
+            CaseDirectoryPrefix + ordinal.ToString(CultureInfo.InvariantCulture));
         Directory.CreateDirectory(dir);
         return dir;
     }

@@ -1,3 +1,5 @@
+using System.Net.Sockets;
+
 namespace CodeyBox.Tests;
 
 /// <summary>
@@ -73,6 +75,46 @@ public sealed class TestTempWorkspaceTests
         {
             TestTempWorkspace.PointTempEnvironmentAt(originalTemp);
             TestTempWorkspace.TryDeleteDirectory(runRoot);
+        }
+    }
+
+    [Fact]
+    public void NestedTempArtifactsFitWithinUnixDomainSocketPathLimit()
+    {
+        // Regression: the per-run + per-case temp nesting must stay short enough
+        // that a Unix domain socket bound under a further CreateTempSubdirectory
+        // (as IncusBaselineProvisioningTests does when probing special-file
+        // rejection) still fits the OS 108-character path cap. Long GUID names at
+        // both levels previously overflowed it and failed unrelated tests.
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        const int UnixDomainSocketPathLimit = 108;
+
+        var caseDir = TestTempWorkspace.CreateTestCaseDirectory(TestTempWorkspace.RunRoot);
+        var originalTemp = Path.GetTempPath();
+        try
+        {
+            // Model the provisioning workspace: a CreateTempSubdirectory rooted at
+            // the redirected per-case temp dir, holding a cache source directory.
+            TestTempWorkspace.PointTempEnvironmentAt(caseDir);
+            var provisionDir = Directory.CreateTempSubdirectory("codeybox-incus-provision-").FullName;
+            var cacheSource = Directory.CreateDirectory(Path.Combine(provisionDir, "cache-source")).FullName;
+            var socketPath = Path.Combine(cacheSource, "cache.sock");
+
+            Assert.True(
+                socketPath.Length <= UnixDomainSocketPathLimit,
+                $"socket path is {socketPath.Length} chars (limit {UnixDomainSocketPathLimit}): {socketPath}");
+
+            // Prove it end-to-end: the bind that previously threw now succeeds.
+            using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+            socket.Bind(new UnixDomainSocketEndPoint(socketPath));
+
+            TestTempWorkspace.TryDeleteDirectory(provisionDir);
+        }
+        finally
+        {
+            TestTempWorkspace.PointTempEnvironmentAt(originalTemp);
         }
     }
 
