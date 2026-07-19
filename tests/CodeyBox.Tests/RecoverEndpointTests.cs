@@ -117,7 +117,7 @@ public sealed class RecoverEndpointTests : IDisposable
     }
 }
 
-internal sealed class RecoverApiFactory : WebApplicationFactory<Program>
+internal sealed class RecoverApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"cb-recover-http-{Guid.NewGuid():N}.db");
@@ -134,7 +134,7 @@ internal sealed class RecoverApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -167,12 +167,5 @@ internal sealed class RecoverApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            Store.Dispose();
-            try { File.Delete(_dbPath); } catch { }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath, Store.Dispose);
 }

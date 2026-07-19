@@ -22,9 +22,10 @@ namespace CodeyBox.Tests.Uat.SandboxProviders;
 /// constrains the path, but the provider re-checks because the persistence
 /// layer is between the orchestrator and the multipass call.</para>
 /// </summary>
-public sealed class MultipassAdoptionTests
+public sealed class MultipassAdoptionTests : IDisposable
 {
     private const string ValidLogPath = "/work/.codeybox/agent-logs/wi123-work-i0.log";
+    private readonly List<string> _stagingDirectories = [];
 
     // ── IsValidAgentLogPath ──────────────────────────────────────────────────
 
@@ -594,9 +595,16 @@ public sealed class MultipassAdoptionTests
         return long.Parse(script[start..end], System.Globalization.CultureInfo.InvariantCulture);
     }
 
-    private static MultipassSandboxProvider NewProviderWithRunner(IProcessRunner runner)
+    public void Dispose()
+    {
+        TestTempArtifacts.CleanupAll(
+            _stagingDirectories.Select<string, Action>(path => () => TestTempArtifacts.DeleteDirectory(path)).ToArray());
+    }
+
+    private MultipassSandboxProvider NewProviderWithRunner(IProcessRunner runner)
     {
         var staging = Directory.CreateTempSubdirectory("codeybox-adopt-").FullName;
+        _stagingDirectories.Add(staging);
         var options = new MultipassSandboxOptions
         {
             MultipassBinary = "/bin/false",

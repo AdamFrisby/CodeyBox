@@ -162,7 +162,7 @@ public sealed class GeminiReasoningValidationTests
 /// container resolution (and startup validation within factory lambdas)
 /// is exercised.
 /// </summary>
-internal sealed class ValidationTestFactory : WebApplicationFactory<Program>
+internal sealed class ValidationTestFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly Dictionary<string, string?> _extraConfig;
 
@@ -180,7 +180,7 @@ internal sealed class ValidationTestFactory : WebApplicationFactory<Program>
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
             cfg.Sources.Clear();
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             var baseConfig = new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -201,11 +201,5 @@ internal sealed class ValidationTestFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
 }

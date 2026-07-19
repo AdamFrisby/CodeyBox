@@ -75,7 +75,7 @@ public sealed class AgentPricingHotReloadEndpointTests : IClassFixture<AgentPric
     }
 }
 
-public sealed class AgentPricingHotReloadApiFactory : WebApplicationFactory<Program>
+public sealed class AgentPricingHotReloadApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-pricing-hotreload-{Guid.NewGuid():N}.db");
@@ -91,7 +91,7 @@ public sealed class AgentPricingHotReloadApiFactory : WebApplicationFactory<Prog
                 .ToList();
             foreach (var s in jsonSources) cfg.Sources.Remove(s);
 
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -105,11 +105,5 @@ public sealed class AgentPricingHotReloadApiFactory : WebApplicationFactory<Prog
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
 }

@@ -17,8 +17,7 @@ public sealed class BuildScriptAuditorTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_workspace, recursive: true); }
-        catch { }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace);
     }
 
     [Fact]
@@ -777,7 +776,7 @@ public sealed class BuildScriptAuditorTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(clone, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(clone);
         }
     }
 
@@ -805,7 +804,7 @@ public sealed class BuildScriptAuditorTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(clone, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(clone);
         }
     }
 

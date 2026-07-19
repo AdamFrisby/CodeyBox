@@ -149,7 +149,7 @@ public sealed class PrometheusEndpointTests
         Assert.Equal(HttpStatusCode.Unauthorized, defaultPath.StatusCode);
     }
 
-    private sealed class PrometheusFactory : WebApplicationFactory<Program>
+    private sealed class PrometheusFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly Dictionary<string, string?> _configuration;
         private readonly string _dbPath = Path.Combine(
@@ -184,7 +184,7 @@ public sealed class PrometheusEndpointTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 var config = new Dictionary<string, string?>
                 {
                     // Default to disabled auth; individual tests opt back in to
@@ -226,16 +226,15 @@ public sealed class PrometheusEndpointTests
         }
 
         protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-            {
-                WorkItemStore.Dispose();
-                foreach (var scope in _envScopes)
-                    scope.Dispose();
-                try { File.Delete(_dbPath); } catch { /* best effort */ }
-            }
-            base.Dispose(disposing);
-        }
+            => DisposeHostThenDeleteSqliteDatabase(
+                disposing,
+                _dbPath,
+                WorkItemStore.Dispose,
+                () =>
+                {
+                    foreach (var scope in _envScopes)
+                        scope.Dispose();
+                });
 
         private sealed class EnvScope : IDisposable
         {

@@ -3,7 +3,6 @@ using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Projects;
 using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -100,14 +99,24 @@ public sealed class TestRunnerAuditorProgramWiringTests
         Assert.DoesNotContain("420s", argv);
     }
 
-    private sealed class WiringFactory : WebApplicationFactory<Program>
+    private sealed class WiringFactory : CodeyBoxWebApplicationFactory
     {
-        private readonly string _dbPath = Path.Combine(
-            Path.GetTempPath(), $"codeybox-testrunner-wiring-{Guid.NewGuid():N}.db");
+        private readonly string _dbPath;
+        private readonly string _gitRoot;
+        private readonly string _auditLogPath;
+        private readonly string _auditPath;
+        private readonly string _agentStreamsPath;
         private readonly IReadOnlyDictionary<string, string?> _extra;
 
         public WiringFactory(IReadOnlyDictionary<string, string?>? extra = null)
-            => _extra = extra ?? new Dictionary<string, string?>();
+        {
+            _dbPath = TempDatabasePath("codeybox-testrunner-wiring");
+            _gitRoot = Temp.NewDirectoryPath("test-git-");
+            _auditLogPath = Temp.NewLogPath("test-log");
+            _auditPath = Temp.NewLogPath("test-audit");
+            _agentStreamsPath = Temp.NewDirectoryPath("test-agent-streams-");
+            _extra = extra ?? new Dictionary<string, string?>();
+        }
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
@@ -115,28 +124,20 @@ public sealed class TestRunnerAuditorProgramWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
                 var settings = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
                     ["CodeyBox:StateDatabasePath"] = _dbPath,
-                    ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                    ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
-                    ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                    ["CodeyBox:GitRootDirectory"] = _gitRoot,
+                    ["CodeyBox:AuditLog:Path"] = _auditLogPath,
+                    ["CodeyBox:AuditLog:AuditPath"] = _auditPath,
+                    ["CodeyBox:AgentStreams:Path"] = _agentStreamsPath,
                 };
                 foreach (var kv in _extra)
                     settings[kv.Key] = kv.Value;
                 cfg.AddInMemoryCollection(settings);
             });
             builder.ConfigureTestServices(services => services.RemoveAll<IHostedService>());
-        }
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            base.Dispose(disposing);
         }
     }
 }

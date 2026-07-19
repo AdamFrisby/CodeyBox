@@ -68,7 +68,7 @@ public sealed class PromptRevisionTrailerAuditorTests
         }
         finally
         {
-            try { Directory.Delete(repo, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(repo);
         }
     }
 

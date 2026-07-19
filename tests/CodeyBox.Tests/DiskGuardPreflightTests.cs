@@ -26,7 +26,7 @@ public sealed class DiskGuardPreflightTests : IDisposable
         _stagingRoot = Path.Combine(Path.GetTempPath(), $"cb-diskguard-{Guid.NewGuid():N}");
     }
 
-    public void Dispose() { try { Directory.Delete(_stagingRoot, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_stagingRoot); }
 
     [Fact]
     public async Task CreateAsync_ThrowsSandboxDiskDeferredException_WhenAnyMountBelowThreshold()

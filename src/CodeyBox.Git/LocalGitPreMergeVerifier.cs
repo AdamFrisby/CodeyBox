@@ -127,9 +127,10 @@ public sealed class LocalGitPreMergeVerifier : IPreMergeVerifier
             // --detach keeps the worktree HEAD on the merge sha without
             // claiming a branch ref, so we don't compete with other parts of
             // the pipeline that may also want a worktree on this repo.
+            var disabledHooksPath = _gitHost.GetDisabledHooksPath(request.RepositoryId);
             var add = await RunProcessAsync(
                 "git",
-                ["-c", $"core.hooksPath={DisabledHooksPath(bareRepoPath)}",
+                ["-c", $"core.hooksPath={disabledHooksPath}",
                  "worktree", "add", "--detach", worktreePath, request.MergeSha],
                 workdir: bareRepoPath,
                 ct,
@@ -205,25 +206,6 @@ public sealed class LocalGitPreMergeVerifier : IPreMergeVerifier
                 }
             }
         }
-    }
-
-    /// <summary>
-    /// Reuse LocalGitHost's disabled-hooks directory so worktree creation
-    /// doesn't trip user-installed bare-repo hooks. The directory is created
-    /// by LocalGitHost on construction at <c>{rootDirectory}/.codeybox-disabled-hooks</c>;
-    /// when present, pointing <c>core.hooksPath</c> at that empty directory
-    /// makes git see no hooks for the duration of this command. If it is
-    /// not present, we fall back to <c>/dev/null</c> — on Linux (the only
-    /// supported host OS) git treats that as a non-directory hooks path
-    /// and the lookup for any hook name fails, which is the behaviour we
-    /// want here. POSIX-only; if this verifier ever needs to run on
-    /// Windows the fallback should become a verifier-managed empty
-    /// directory instead.
-    /// </summary>
-    private static string DisabledHooksPath(string bareRepoPath)
-    {
-        var path = Path.Combine(bareRepoPath, "..", ".codeybox-disabled-hooks");
-        return Directory.Exists(path) ? path : "/dev/null";
     }
 
     private static string SummariseOutput(string text)

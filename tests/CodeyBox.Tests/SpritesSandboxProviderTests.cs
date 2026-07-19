@@ -1392,8 +1392,7 @@ public sealed class SpritesSandboxProviderTests
 
         public void Dispose()
         {
-            try { Directory.Delete(Path, recursive: true); }
-            catch { }
+            TestTempArtifacts.DeleteDirectory(Path);
         }
     }
 

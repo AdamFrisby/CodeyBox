@@ -28,7 +28,7 @@ public sealed class AuditAgentClassQuotaRoutingTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_workspace, recursive: true); } catch { }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace);
     }
 
     // ── Acceptance #1: gemini exhausted, codex OK → codex runs the auditor ─

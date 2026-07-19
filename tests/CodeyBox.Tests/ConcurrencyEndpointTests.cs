@@ -147,7 +147,7 @@ public sealed class ConcurrencyEndpointTests : IClassFixture<ConcurrencyEndpoint
     /// known caps and an in-memory burn estimator so the assertions can pin
     /// concrete values.
     /// </summary>
-    public sealed class ConcurrencyApiFactory : WebApplicationFactory<Program>
+    public sealed class ConcurrencyApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly string _dbPath = Path.Combine(
             Path.GetTempPath(), $"codeybox-concurrency-{Guid.NewGuid():N}.db");
@@ -164,7 +164,7 @@ public sealed class ConcurrencyEndpointTests : IClassFixture<ConcurrencyEndpoint
             builder.UseEnvironment("Development");
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -199,14 +199,7 @@ public sealed class ConcurrencyEndpointTests : IClassFixture<ConcurrencyEndpoint
         }
 
         protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-            {
-                Store.Dispose();
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            }
-            base.Dispose(disposing);
-        }
+            => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath, Store.Dispose);
     }
 
     private sealed class StubBurnEstimator : IAgentBurnEstimator

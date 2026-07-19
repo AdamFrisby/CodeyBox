@@ -118,6 +118,61 @@ internal static partial class IncusSafeFile
         throw new IOException("Unable to acquire the private Incus provisioning lease.", new Win32Exception(error));
     }
 
+    // A concurrent fork/exec anywhere in this process momentarily duplicates every
+    // open lease descriptor into the forked child; the duplicate keeps the advisory
+    // flock alive until the child reaches exec and O_CLOEXEC closes it. During that
+    // window a freshly opened handle to the same lease path observes the lock as
+    // held even though no process genuinely owns the lease. CodeyBox spawns
+    // subprocesses continuously (agent CLIs, git, incus), so a caller that expects
+    // to win a lease must tolerate this transient contention. These bounds let such
+    // a caller retry the non-blocking flock long enough for a fork/exec window to
+    // clear (worst case ~2 s) while a lease a peer genuinely holds stays contended
+    // for the whole budget and the call reports failure.
+    internal const int DefaultExclusiveLeaseRetryAttempts = 100;
+    internal static readonly TimeSpan DefaultExclusiveLeaseRetryDelay = TimeSpan.FromMilliseconds(20);
+
+    // Reclaiming a *leaked* workspace lease (its owner already released it) only has
+    // to outlast the same fork/exec duplication window, but — unlike the coordination
+    // or retained-sandbox lease — a peer that genuinely holds this lease is mid-bake
+    // and legitimately in use, so recovery must skip it promptly rather than stall on
+    // it. This short budget clears a transient duplicate (~0.3 s) yet abandons a
+    // genuinely-owned workspace quickly.
+    internal const int RecoveryDeleteLeaseRetryAttempts = 16;
+
+    /// <summary>
+    /// Acquires the advisory exclusive lease, retrying the non-blocking flock across
+    /// a bounded budget so that transient contention from a concurrent fork/exec
+    /// window (see the retry-bound constants) clears. Returns <c>true</c> once the
+    /// lease is held, or <c>false</c> if it remains contended for the whole budget —
+    /// i.e. a peer genuinely owns it. <paramref name="sleep"/> defaults to
+    /// <see cref="Thread.Sleep(TimeSpan)"/> and <paramref name="tryAcquire"/> to the
+    /// real non-blocking flock (<see cref="TryAcquireExclusiveLease"/>); tests inject
+    /// substitutes to exercise the retry loop deterministically, without depending on
+    /// real flock release timing under a concurrently-forking process.
+    /// </summary>
+    internal static bool TryAcquireExclusiveLeaseWithBackoff(
+        FileStream lease,
+        int maxAttempts = DefaultExclusiveLeaseRetryAttempts,
+        TimeSpan? retryDelay = null,
+        Action<TimeSpan>? sleep = null,
+        Func<FileStream, bool>? tryAcquire = null)
+    {
+        ArgumentNullException.ThrowIfNull(lease);
+        if (maxAttempts < 1)
+            throw new ArgumentOutOfRangeException(nameof(maxAttempts));
+        var delay = retryDelay ?? DefaultExclusiveLeaseRetryDelay;
+        var sleepFor = sleep ?? Thread.Sleep;
+        var acquire = tryAcquire ?? TryAcquireExclusiveLease;
+        for (var attempt = 1; ; attempt++)
+        {
+            if (acquire(lease))
+                return true;
+            if (attempt >= maxAttempts)
+                return false;
+            sleepFor(delay);
+        }
+    }
+
     /// <summary>
     /// Pins the exact directory inode reached by an already-canonical host path.
     /// Each path component is opened relative to its pinned parent with

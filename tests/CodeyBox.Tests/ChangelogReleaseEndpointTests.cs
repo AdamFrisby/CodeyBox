@@ -106,7 +106,7 @@ public sealed class ChangelogReleaseEndpointTests : IDisposable
 
 // ── Test factory ──────────────────────────────────────────────────────────────
 
-internal sealed class ChangelogApiFactory : WebApplicationFactory<Program>
+internal sealed class ChangelogApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = System.IO.Path.Combine(
         System.IO.Path.GetTempPath(), $"codeybox-changelog-test-{Guid.NewGuid():N}.db");
@@ -116,7 +116,7 @@ internal sealed class ChangelogApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = System.IO.Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -169,13 +169,7 @@ internal sealed class ChangelogApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            try { System.IO.File.Delete(_dbPath); } catch { }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
 }
 
 internal sealed class StubPullRequestEnumerator : IPullRequestEnumerator

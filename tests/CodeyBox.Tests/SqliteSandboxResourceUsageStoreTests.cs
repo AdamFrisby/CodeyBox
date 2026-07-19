@@ -19,9 +19,7 @@ public sealed class SqliteSandboxResourceUsageStoreTests : IDisposable
     public void Dispose()
     {
         _store.Dispose();
-        try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        try { File.Delete(_dbPath + "-wal"); } catch { /* best-effort */ }
-        try { File.Delete(_dbPath + "-shm"); } catch { /* best-effort */ }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     [Fact]

@@ -348,7 +348,7 @@ public sealed class SseEndpointsTests : IDisposable
 /// isolated database, no orchestrator background services, and a short
 /// SSE heartbeat interval so the idle-heartbeat test doesn't wait 15s.
 /// </summary>
-internal sealed class SseApiFactory : WebApplicationFactory<Program>
+internal sealed class SseApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-ssetest-{Guid.NewGuid():N}.db");
@@ -362,7 +362,7 @@ internal sealed class SseApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -390,12 +390,5 @@ internal sealed class SseApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            Store.Dispose();
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath, Store.Dispose);
 }

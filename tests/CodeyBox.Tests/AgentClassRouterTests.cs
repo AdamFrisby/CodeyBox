@@ -696,24 +696,34 @@ public sealed class AgentClassRouterTests
         var now = DateTimeOffset.UtcNow;
         var pausedReset = now.AddMinutes(10);
         var activeReset = now.AddHours(2);
-        using var pauses = new SqliteAgentPauseController(
-            Path.Combine(Path.GetTempPath(), $"codeybox-router-pauses-{Guid.NewGuid():N}.db"),
+        var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-router-pauses-{Guid.NewGuid():N}.db");
+        var pauses = new SqliteAgentPauseController(
+            dbPath,
             NullLogger<SqliteAgentPauseController>.Instance);
-        await pauses.PauseAsync(Claude, "reserve for oversight", "test");
+        try
+        {
+            await pauses.PauseAsync(Claude, "reserve for oversight", "test");
 
-        var cls = FrontierClass(Sub(Claude), Sub(Codex));
-        var router = BuildRouter(
-            [cls],
-            [
-                new FakeProbe(Claude, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = pausedReset }),
-                new FakeProbe(Codex, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = activeReset }),
-            ],
-            dispatchAvailability: new AgentDispatchAvailability(pauses: pauses));
+            var cls = FrontierClass(Sub(Claude), Sub(Codex));
+            var router = BuildRouter(
+                [cls],
+                [
+                    new FakeProbe(Claude, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = pausedReset }),
+                    new FakeProbe(Codex, new AgentQuotaSnapshot { AvailablePct = 0, ResetAt = activeReset }),
+                ],
+                dispatchAvailability: new AgentDispatchAvailability(pauses: pauses));
 
-        var earliest = await router.ComputeEarliestExhaustedResetAsync(
-            MakeItem("frontier"), null, CancellationToken.None);
+            var earliest = await router.ComputeEarliestExhaustedResetAsync(
+                MakeItem("frontier"), null, CancellationToken.None);
 
-        Assert.Equal(activeReset, earliest);
+            Assert.Equal(activeReset, earliest);
+        }
+        finally
+        {
+            TestTempArtifacts.CleanupAll(
+                pauses.Dispose,
+                () => TestTempArtifacts.DeleteSqliteDatabase(dbPath));
+        }
     }
 
     [Fact]

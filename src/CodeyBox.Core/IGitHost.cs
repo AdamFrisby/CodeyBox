@@ -48,6 +48,18 @@ public interface IGitHost
     }
 
     /// <summary>
+    /// Returns a <c>core.hooksPath</c> value that disables repository hooks
+    /// for host-side git subprocesses. Callers that run git directly against
+    /// <see cref="GetRepoPath"/> should pass this value with <c>git -c</c>
+    /// adjacent to process start, so the host owns the hook-disabling policy.
+    /// </summary>
+    string GetDisabledHooksPath(string repositoryId)
+    {
+        _ = repositoryId;
+        return OperatingSystem.IsWindows() ? "NUL" : "/dev/null";
+    }
+
+    /// <summary>
     /// Returns the host directory where the merge / conflict-rework phase
     /// should stage an isolated bare clone. The contract is provider-agnostic:
     /// the returned directory MUST be usable as a bind-mount source by

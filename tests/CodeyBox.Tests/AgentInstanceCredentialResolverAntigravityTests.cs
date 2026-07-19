@@ -26,7 +26,7 @@ public sealed class AgentInstanceCredentialResolverAntigravityTests : IDisposabl
 
     public void Dispose()
     {
-        try { Directory.Delete(_tempDir, recursive: true); } catch { /* best-effort */ }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_tempDir);
     }
 
     [Fact]

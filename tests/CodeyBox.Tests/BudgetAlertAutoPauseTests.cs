@@ -14,7 +14,7 @@ public sealed class BudgetAlertAutoPauseTests : IDisposable
 
     public void Dispose()
     {
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     private static readonly ProjectId ProjectB = new("proj-b");

@@ -29,8 +29,8 @@ public sealed class AgentClassRouterTests : IDisposable
     {
         _items.Dispose();
         _failures.Dispose();
-        File.Delete(_dbPath);
-        File.Delete(_workDbPath);
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
+        TestTempArtifacts.DeleteSqliteDatabase(_workDbPath);
     }
 
     [Fact]

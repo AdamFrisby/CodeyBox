@@ -260,16 +260,15 @@ internal sealed class NullSandboxProvider : ISandboxProvider
     public Task DisposeLeakedAsync(string name, CancellationToken ct) => Task.CompletedTask;
 }
 
-internal sealed class UatChangelogApiFactory : WebApplicationFactory<Program>
+internal sealed class UatChangelogApiFactory : CodeyBoxWebApplicationFactory
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(),
-        $"codeybox-uat-changelog-{Guid.NewGuid():N}.db");
+    private readonly string _dbPath;
     private readonly Project _project;
 
     public UatChangelogApiFactory(Project project)
     {
         _project = project;
+        _dbPath = TempDatabasePath("codeybox-uat-changelog");
         WorkItems = new SqliteWorkItemStore(_dbPath);
         PullRequests = new CapturingPullRequestEnumerator();
         Generator = new CapturingChangelogGenerator();
@@ -286,14 +285,13 @@ internal sealed class UatChangelogApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitRootDirectory"] = Temp.NewDirectoryPath("test-git-"),
+                ["CodeyBox:AuditLog:Path"] = Temp.NewLogPath("test-log"),
+                ["CodeyBox:AuditLog:AuditPath"] = Temp.NewLogPath("test-audit"),
                 ["CodeyBox:Changelog:Enabled"] = "true",
                 ["CodeyBox:Changelog:GitHubWebhookSecretEnvVar"] = "UAT_CHANGELOG_WEBHOOK_SECRET",
             });
@@ -320,14 +318,7 @@ internal sealed class UatChangelogApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            WorkItems.Dispose();
-            try { File.Delete(_dbPath); } catch { }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath, WorkItems.Dispose);
 }
 
 internal sealed class CapturingPullRequestEnumerator : IPullRequestEnumerator

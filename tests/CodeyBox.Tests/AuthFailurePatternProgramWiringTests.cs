@@ -24,8 +24,7 @@ public sealed class AuthFailurePatternProgramWiringTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_workspace, recursive: true); }
-        catch { /* best-effort */ }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace);
     }
 
     [Fact]
@@ -72,7 +71,7 @@ public sealed class AuthFailurePatternProgramWiringTests : IDisposable
         Assert.Equal(0, factory.InVmSmoke.ForceProbeCalls);
     }
 
-    private sealed class AuthPatternPipelineFactory : WebApplicationFactory<Program>
+    private sealed class AuthPatternPipelineFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly string _seedRepoUrl;
         private readonly string _dbPath = Path.Combine(
@@ -90,7 +89,7 @@ public sealed class AuthFailurePatternProgramWiringTests : IDisposable
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -139,11 +138,7 @@ public sealed class AuthFailurePatternProgramWiringTests : IDisposable
         }
 
         protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            base.Dispose(disposing);
-        }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
     }
 
     public sealed class CorroboratingInVmSmokeGate : IInVmSmokeGate

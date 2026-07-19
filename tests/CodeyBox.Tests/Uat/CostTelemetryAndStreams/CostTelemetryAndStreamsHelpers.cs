@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Tests;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -14,20 +15,18 @@ namespace CodeyBox.Tests.Uat.CostTelemetryAndStreams;
 
 internal sealed class CostTelemetryWorkspace : IDisposable
 {
-    public string Root { get; } = Directory.CreateTempSubdirectory("codeybox-uat-cost-telemetry-").FullName;
+    private readonly TestTempDirectory _temp = TestTempDirectory.Create("codeybox-uat-cost-telemetry-");
+
+    public string Root => _temp.Root;
 
     public string NewDatabasePath() => Path.Combine(Root, $"state-{Guid.NewGuid():N}.db");
 
     public string NewStreamRoot() => Path.Combine(Root, $"streams-{Guid.NewGuid():N}");
 
-    public void Dispose()
-    {
-        if (Directory.Exists(Root))
-            Directory.Delete(Root, recursive: true);
-    }
+    public void Dispose() => _temp.Dispose();
 }
 
-internal sealed class CostTelemetryApiFactory : WebApplicationFactory<Program>
+internal sealed class CostTelemetryApiFactory : CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath;
     private readonly string _streamRoot;
@@ -61,9 +60,9 @@ internal sealed class CostTelemetryApiFactory : WebApplicationFactory<Program>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(Path.GetTempPath(), $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(Path.GetTempPath(), $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(Path.GetTempPath(), $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitRootDirectory"] = Temp.NewDirectoryPath("test-git-"),
+                ["CodeyBox:AuditLog:Path"] = Temp.NewLogPath("test-log"),
+                ["CodeyBox:AuditLog:AuditPath"] = Temp.NewLogPath("test-audit"),
                 ["CodeyBox:AgentStreams:Path"] = _streamRoot,
             });
         });
@@ -99,15 +98,18 @@ internal sealed class CostTelemetryApiFactory : WebApplicationFactory<Program>
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
+        if (!disposing)
         {
-            StreamSummaries.Dispose();
-            Timings.Dispose();
-            Costs.Dispose();
-            WorkItems.Dispose();
+            base.Dispose(disposing);
+            return;
         }
 
-        base.Dispose(disposing);
+        TestTempArtifacts.CleanupAll(
+            StreamSummaries.Dispose,
+            Timings.Dispose,
+            Costs.Dispose,
+            WorkItems.Dispose,
+            () => base.Dispose(disposing));
     }
 }
 

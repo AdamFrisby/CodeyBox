@@ -27,7 +27,7 @@ public sealed class CrossReviewIntegrationTests : IDisposable
     public CrossReviewIntegrationTests() =>
         _workspace = Directory.CreateTempSubdirectory("codeybox-crossrev-").FullName;
 
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     // ── Core cross-review scenario ────────────────────────────────────────────
 

@@ -369,7 +369,7 @@ public sealed class SuggestionsApiTests : IDisposable
 /// WebApplicationFactory variant that injects an isolated SqliteSuggestionStore
 /// and SqliteWorkItemStore backed by the same temp database.
 /// </summary>
-internal sealed class SuggestionsApiFactory : WebApplicationFactory<Program>
+internal sealed class SuggestionsApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     public const string ProjectId = "test-project";
 
@@ -390,7 +390,7 @@ internal sealed class SuggestionsApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -424,13 +424,9 @@ internal sealed class SuggestionsApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            SuggestionStore.Dispose();
-            WorkItemStore.Dispose();
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(
+            disposing,
+            _dbPath,
+            SuggestionStore.Dispose,
+            WorkItemStore.Dispose);
 }

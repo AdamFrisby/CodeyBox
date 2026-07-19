@@ -60,7 +60,7 @@ public sealed class DiskFullApiBoundaryTests
         }
         finally
         {
-            try { File.Delete(dbPath); } catch { }
+            TestTempArtifacts.DeleteSqliteDatabase(dbPath);
         }
     }
 
@@ -125,7 +125,7 @@ public sealed class DiskFullApiBoundaryTests
         Assert.Equal(0, disk.GetArrayLength());
     }
 
-    private sealed class DiskFullApiFactory : WebApplicationFactory<Program>
+    private sealed class DiskFullApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly string _dbPath;
         private readonly bool _ownsDbPath;
@@ -146,7 +146,7 @@ public sealed class DiskFullApiBoundaryTests
             builder.UseEnvironment("Development");
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -174,10 +174,12 @@ public sealed class DiskFullApiBoundaryTests
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing && _ownsDbPath)
+            if (_ownsDbPath)
             {
-                try { File.Delete(_dbPath); } catch { }
+                DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
+                return;
             }
+
             base.Dispose(disposing);
         }
     }

@@ -222,7 +222,7 @@ public sealed class FleetTransitionHealthEndpointTests : IDisposable
     /// WebApplicationFactory that swaps in a stub <see cref="ITransitionHealthDataSource"/>
     /// and a live <see cref="TransitionHealthOptionsSnapshot"/> the test can mutate.
     /// </summary>
-    private sealed class TransitionHealthApiFactory : WebApplicationFactory<Program>
+    private sealed class TransitionHealthApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         public StubTransitionHealthDataSource DataSource { get; } = new();
 
@@ -244,7 +244,7 @@ public sealed class FleetTransitionHealthEndpointTests : IDisposable
             builder.UseEnvironment("Development");
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",

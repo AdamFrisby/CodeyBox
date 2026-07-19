@@ -369,19 +369,12 @@ internal sealed class IncusRecoveryManifestStore : IDisposable
         {
             lease = IncusSafeFile.OpenOrCreatePrivateLeaseNoFollow(Path.Combine(sandboxRoot, LeaseFileName));
             IncusMountStaging.EnsurePinnedHostSourceMatches(sandboxRoot, pinnedRoot);
-            for (var attempt = 1; ; attempt++)
-            {
-                if (IncusSafeFile.TryAcquireExclusiveLease(lease))
-                {
-                    var result = new IncusRecoveryManifestStore(pinnedRoot, lease);
-                    lease = null;
-                    pinnedRoot = null!;
-                    return result;
-                }
-                if (attempt >= maxAttempts)
-                    throw new InvalidOperationException("Incus retained sandbox is already owned by another process.");
-                Thread.Sleep(retryDelay);
-            }
+            if (!IncusSafeFile.TryAcquireExclusiveLeaseWithBackoff(lease, maxAttempts, retryDelay))
+                throw new InvalidOperationException("Incus retained sandbox is already owned by another process.");
+            var result = new IncusRecoveryManifestStore(pinnedRoot, lease);
+            lease = null;
+            pinnedRoot = null!;
+            return result;
         }
         finally
         {

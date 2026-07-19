@@ -32,7 +32,7 @@ public sealed class SqliteWorkItemAttachmentStoreTests : IDisposable
     {
         _store.Dispose();
         _rawConn.Dispose();
-        try { File.Delete(_dbPath); } catch { /* best-effort */ }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     private static WorkItemId NewId() => new(Guid.NewGuid());

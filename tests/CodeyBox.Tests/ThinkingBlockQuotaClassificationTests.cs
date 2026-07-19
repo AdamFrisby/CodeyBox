@@ -53,27 +53,32 @@ public sealed class ThinkingBlockQuotaClassificationTests
     public async Task RecordIfQuotaFailure_ThinkingBlock400_DoesNotPersistObservedFailure()
     {
         var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-thinking-quota-{Guid.NewGuid():N}.db");
-        using var failures = new SqliteQuotaFailureStore(dbPath);
-        var now = DateTimeOffset.UtcNow;
+        try
+        {
+            using var failures = new SqliteQuotaFailureStore(dbPath);
+            var now = DateTimeOffset.UtcNow;
 
-        await _classifier.RecordIfQuotaFailureAsync(
-            failures,
-            AgentKind.Claude,
-            "claude-opus-4-8",
-            summary: "agent exited 1",
-            stderr: null,
-            now,
-            TimeSpan.FromMinutes(30),
-            CancellationToken.None,
-            stdout: ClaudeThinkingBlockStreamJson);
+            await _classifier.RecordIfQuotaFailureAsync(
+                failures,
+                AgentKind.Claude,
+                "claude-opus-4-8",
+                summary: "agent exited 1",
+                stderr: null,
+                now,
+                TimeSpan.FromMinutes(30),
+                CancellationToken.None,
+                stdout: ClaudeThinkingBlockStreamJson);
 
-        Assert.False(await failures.HasRecentAsync(
-            AgentKind.Claude,
-            "claude-opus-4-8",
-            TimeSpan.FromMinutes(10),
-            now));
-
-        try { File.Delete(dbPath); } catch { }
+            Assert.False(await failures.HasRecentAsync(
+                AgentKind.Claude,
+                "claude-opus-4-8",
+                TimeSpan.FromMinutes(10),
+                now));
+        }
+        finally
+        {
+            TestTempArtifacts.DeleteSqliteDatabase(dbPath);
+        }
     }
 
     [Fact]

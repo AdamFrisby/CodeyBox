@@ -30,7 +30,7 @@ public sealed class MissingAuditAgentCredentialTests : IDisposable
     public MissingAuditAgentCredentialTests() =>
         _workspace = Directory.CreateTempSubdirectory("codeybox-cred-").FullName;
 
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     // ── Startup path: AuditAgentStartupValidationService warns ───────────────
 

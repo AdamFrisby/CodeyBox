@@ -24,7 +24,7 @@ public sealed class NeedsOperatorInputTransitionTests : IDisposable
     private readonly string _workspace;
     public NeedsOperatorInputTransitionTests() =>
         _workspace = Directory.CreateTempSubdirectory("codeybox-q-transition-").FullName;
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     private TestPipelineWithQuestions BuildWithQuestions(
         string seedRepoUrl,

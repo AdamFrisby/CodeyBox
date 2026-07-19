@@ -1160,9 +1160,10 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         Directory.CreateDirectory(foreign);
         // Pin a foreign mode explicitly: recovery deletes only owner-only (0700)
         // workspaces, so the extra group/other bits here make the rejection fire
-        // deterministically regardless of the ambient umask. A bare Directory.CreateDirectory
-        // inherits the umask, which under a hardened 0077 umask would yield exactly 0700 and
-        // let the entry be legitimately deleted -- masking the foreign-mode guard under test.
+        // deterministically regardless of the ambient umask. A bare
+        // Directory.CreateDirectory inherits the umask, which under a hardened
+        // 0077 umask would yield exactly 0700 and let the entry be legitimately
+        // deleted -- masking the foreign-mode guard under test.
         if (OperatingSystem.IsLinux())
         {
             File.SetUnixFileMode(

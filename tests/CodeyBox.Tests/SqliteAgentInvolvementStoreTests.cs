@@ -18,7 +18,7 @@ public sealed class SqliteAgentInvolvementStoreTests : IDisposable
     public SqliteAgentInvolvementStoreTests() =>
         _workspace = Directory.CreateTempSubdirectory("codeybox-involvementdb-").FullName;
 
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     [Fact]
     public async Task RecordStartAndList_PopulatedRecord_RoundTripsAllFields()

@@ -24,7 +24,7 @@ public sealed class BubblewrapIntegrationTests : IDisposable
         _bwrapAvailable = File.Exists("/usr/bin/bwrap") || File.Exists("/usr/local/bin/bwrap");
     }
 
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     private BubblewrapSandboxProvider NewProvider() => new(
         new BubblewrapSandboxOptions(),

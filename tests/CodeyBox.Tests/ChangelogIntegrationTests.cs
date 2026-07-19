@@ -117,7 +117,7 @@ public sealed class ChangelogIntegrationTests : IDisposable
     }
 }
 
-internal sealed class ChangelogIntegrationFactory : WebApplicationFactory<Program>
+internal sealed class ChangelogIntegrationFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = System.IO.Path.Combine(
         System.IO.Path.GetTempPath(), $"codeybox-integ-{Guid.NewGuid():N}.db");
@@ -134,7 +134,7 @@ internal sealed class ChangelogIntegrationFactory : WebApplicationFactory<Progra
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = System.IO.Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -178,12 +178,5 @@ internal sealed class ChangelogIntegrationFactory : WebApplicationFactory<Progra
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            WorkItemStore.Dispose();
-            try { System.IO.File.Delete(_dbPath); } catch { }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath, WorkItemStore.Dispose);
 }
