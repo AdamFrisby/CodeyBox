@@ -210,6 +210,14 @@ public sealed record Project
     /// </summary>
     public IReadOnlyDictionary<string, string> Knobs { get; init; }
         = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Optional ephemeral-deployment recipe used by the verification-deployment
+    /// pipeline (see <see cref="DeploymentRecipe"/>). Null when the project
+    /// does not opt into deployment verification — the pipeline simply skips
+    /// the deployment phase in that case.
+    /// </summary>
+    public DeploymentRecipe? Deployment { get; init; }
 }
 
 /// <summary>

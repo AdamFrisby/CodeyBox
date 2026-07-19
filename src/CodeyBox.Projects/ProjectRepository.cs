@@ -45,6 +45,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
     private readonly ILogger<ProjectRepository> _logger;
     private readonly PresetCatalogOptions? _presetCatalogOptions;
     private readonly IKnobRegistry _knobRegistry;
+    private readonly IDeploymentDriverRegistry? _deploymentDrivers;
     private readonly IDisposable? _changeSubscription;
     private readonly Lock _reloadGate = new();
     private Snapshot _snapshot;
@@ -68,11 +69,13 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         IOptions<ProjectsOptions> options,
         ILogger<ProjectRepository> logger,
         PresetCatalogOptions? presetCatalogOptions,
-        IKnobRegistry? knobRegistry = null)
+        IKnobRegistry? knobRegistry = null,
+        IDeploymentDriverRegistry? deploymentDrivers = null)
     {
         _logger = logger;
         _presetCatalogOptions = presetCatalogOptions;
         _knobRegistry = knobRegistry ?? EmptyKnobRegistry;
+        _deploymentDrivers = deploymentDrivers;
         _snapshot = Build(options.Value, presetCatalogOptions);
         _lastObservedHash = ComputeContentHash(options.Value);
     }
@@ -81,12 +84,14 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         IOptionsMonitor<ProjectsOptions> monitor,
         ILogger<ProjectRepository> logger,
         PresetCatalogOptions? presetCatalogOptions = null,
-        IKnobRegistry? knobRegistry = null)
+        IKnobRegistry? knobRegistry = null,
+        IDeploymentDriverRegistry? deploymentDrivers = null)
     {
         ArgumentNullException.ThrowIfNull(monitor);
         _logger = logger;
         _presetCatalogOptions = presetCatalogOptions;
         _knobRegistry = knobRegistry ?? EmptyKnobRegistry;
+        _deploymentDrivers = deploymentDrivers;
         var initial = monitor.CurrentValue;
         _snapshot = Build(initial, presetCatalogOptions);
         _lastObservedHash = ComputeContentHash(initial);
@@ -337,7 +342,38 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
                 Enabled = pc.ClaudeSession?.Enabled ?? false,
             },
             Knobs = ResolveKnobs(pc.Id, pc.Knobs, defaults.Knobs),
+            Deployment = ResolveDeployment(pc.Id, pc.Deployment),
         };
+    }
+
+    /// <summary>
+    /// Binds the project's deployment recipe and, when a driver registry is
+    /// available, asks the matching driver to validate the per-driver fields
+    /// (RunCommand / Ports / HealthEndpoint / ArtifactPath / BuildCommand) at
+    /// config-load time. This surfaces misconfigurations during startup or
+    /// IOptionsMonitor reload rather than at first-dispatch time, matching the
+    /// contract on <see cref="CodeyBox.Core.IDeploymentDriver.ValidateRecipe"/>.
+    /// </summary>
+    private DeploymentRecipe? ResolveDeployment(string projectId, DeploymentRecipeConfig? cfg)
+    {
+        var recipe = DeploymentRecipeBinder.ToRecipe(cfg);
+        if (recipe is null) return null;
+        if (_deploymentDrivers is null) return recipe;
+
+        if (!_deploymentDrivers.TryGet(recipe.Kind, out var driver))
+            throw new InvalidOperationException(
+                $"Project '{projectId}' deployment recipe references unknown Kind '{recipe.Kind}'. " +
+                $"Registered: [{string.Join(", ", _deploymentDrivers.AvailableKinds)}]");
+        try
+        {
+            driver.ValidateRecipe(recipe);
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+        {
+            throw new InvalidOperationException(
+                $"Project '{projectId}' deployment recipe (kind '{recipe.Kind}') failed driver validation: {ex.Message}", ex);
+        }
+        return recipe;
     }
 
     /// <summary>

@@ -2,7 +2,9 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Formats.Tar;
 using System.Text;
+using System.Text.Json;
 using CodeyBox.Core;
+using CodeyBox.Deployment;
 using CodeyBox.HostProcess;
 using CodeyBox.Sandbox.MultipassRemote;
 using Microsoft.Extensions.Logging;
@@ -113,6 +115,308 @@ public sealed class MultipassRemoteSandboxProviderTests
     }
 
     [Fact]
+    public async Task CreateAsync_does_not_expose_remote_private_vm_ip_as_routable_host_address()
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport), "10.55.0.9");
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            WorkingDirectory = "/work",
+        });
+
+        Assert.False(sb is IRoutableSandbox);
+        var publisher = Assert.IsAssignableFrom<ISandboxPortPublisher>(sb);
+        Assert.False(publisher.CanPublishPort(8080));
+
+        await sb.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task CreateAsync_without_remote_vm_ip_cannot_publish_deployment_endpoint()
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            WorkingDirectory = "/work",
+        });
+
+        var publisher = Assert.IsAssignableFrom<ISandboxPortPublisher>(sb);
+        Assert.False(publisher.CanPublishPort(8080));
+
+        await sb.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task PublishEndpoint_starts_ssh_local_forward_and_returns_loopback_endpoint()
+    {
+        var opts = DefaultOptions() with
+        {
+            NetworkProfiles = new Dictionary<string, string> { ["deploy-isolated"] = "cb-deploy" },
+        };
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(
+                VmNameFromLastLaunch(transport),
+                "10.42.0.9",
+                "10.55.0.9");
+            if (argv.Count >= 7 && argv[0] == "ip" && argv[5] == "dev" && argv[6] == "cb-deploy")
+                return BridgeAddress("10.55.0.1/24");
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        await using var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            WorkingDirectory = "/work",
+            Network = new SandboxNetworkPolicy { ProfileName = "deploy-isolated" },
+        });
+        var substrate = new SandboxDeploymentSubstrate(sb);
+
+        var endpoint = substrate.PublishEndpoint(new DeploymentEndpointRequest
+        {
+            Kind = DeploymentEndpointKind.Http,
+            Scheme = "http",
+            Port = 8080,
+            Path = "/health",
+            Metadata = new Dictionary<string, string> { ["deployment"] = "test" },
+        });
+
+        Assert.Equal(DeploymentEndpointKind.Http, endpoint.Kind);
+        Assert.Equal("127.0.0.1", endpoint.Host);
+        Assert.InRange(endpoint.Port.GetValueOrDefault(), 1, 65535);
+        Assert.Equal($"http://127.0.0.1:{endpoint.Port}/health", endpoint.Url);
+        Assert.Equal("test", endpoint.Metadata["deployment"]);
+        Assert.Equal("ssh-local-forward", endpoint.Metadata["endpoint.scope"]);
+        Assert.Equal("10.55.0.9", endpoint.Metadata["endpoint.remote-vm-host"]);
+        Assert.Equal("8080", endpoint.Metadata["endpoint.remote-vm-port"]);
+
+        var forward = Assert.Single(transport.LocalForwardCalls);
+        Assert.Equal("127.0.0.1", forward.LocalHost);
+        Assert.Equal(endpoint.Port, forward.LocalPort);
+        Assert.Equal("10.55.0.9", forward.RemoteHost);
+        Assert.Equal(8080, forward.RemotePort);
+    }
+
+    [Fact]
+    public async Task PublishEndpoint_supports_tcp_local_forward()
+    {
+        var opts = DefaultOptions() with
+        {
+            NetworkProfiles = new Dictionary<string, string> { ["deploy-isolated"] = "cb-deploy" },
+        };
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(
+                VmNameFromLastLaunch(transport),
+                "10.42.0.9",
+                "10.55.0.9");
+            if (argv.Count >= 7 && argv[0] == "ip" && argv[5] == "dev" && argv[6] == "cb-deploy")
+                return BridgeAddress("10.55.0.1/24");
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        await using var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            WorkingDirectory = "/work",
+            Network = new SandboxNetworkPolicy { ProfileName = "deploy-isolated" },
+        });
+        var substrate = new SandboxDeploymentSubstrate(sb);
+
+        var endpoint = substrate.PublishEndpoint(new DeploymentEndpointRequest
+        {
+            Kind = DeploymentEndpointKind.Tcp,
+            Port = 5432,
+            Metadata = new Dictionary<string, string> { ["deployment"] = "daemon" },
+        });
+
+        Assert.Equal(DeploymentEndpointKind.Tcp, endpoint.Kind);
+        Assert.Equal("127.0.0.1", endpoint.Host);
+        Assert.InRange(endpoint.Port.GetValueOrDefault(), 1, 65535);
+        Assert.Null(endpoint.Url);
+        Assert.Equal("daemon", endpoint.Metadata["deployment"]);
+        Assert.Equal("ssh-local-forward", endpoint.Metadata["endpoint.scope"]);
+        Assert.Equal("10.55.0.9", endpoint.Metadata["endpoint.remote-vm-host"]);
+        Assert.Equal("5432", endpoint.Metadata["endpoint.remote-vm-port"]);
+
+        var forward = Assert.Single(transport.LocalForwardCalls);
+        Assert.Equal("127.0.0.1", forward.LocalHost);
+        Assert.Equal(endpoint.Port, forward.LocalPort);
+        Assert.Equal("10.55.0.9", forward.RemoteHost);
+        Assert.Equal(5432, forward.RemotePort);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_stops_published_endpoint_tunnels()
+    {
+        var opts = DefaultOptions() with
+        {
+            NetworkProfiles = new Dictionary<string, string> { ["deploy-isolated"] = "cb-deploy" },
+        };
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(
+                VmNameFromLastLaunch(transport),
+                "10.42.0.9",
+                "10.55.0.9");
+            if (argv.Count >= 7 && argv[0] == "ip" && argv[5] == "dev" && argv[6] == "cb-deploy")
+                return BridgeAddress("10.55.0.1/24");
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            WorkingDirectory = "/work",
+            Network = new SandboxNetworkPolicy { ProfileName = "deploy-isolated" },
+        });
+        var substrate = new SandboxDeploymentSubstrate(sb);
+        substrate.PublishEndpoint(new DeploymentEndpointRequest
+        {
+            Kind = DeploymentEndpointKind.Http,
+            Port = 8080,
+        });
+
+        var forward = Assert.Single(transport.LocalForwards);
+        Assert.Equal(0, forward.DisposeCallCount);
+
+        await sb.DisposeAsync();
+
+        Assert.Equal(1, forward.DisposeCallCount);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_tunnel_stop_failure_throws_and_can_retry()
+    {
+        var opts = DefaultOptions() with
+        {
+            NetworkProfiles = new Dictionary<string, string> { ["deploy-isolated"] = "cb-deploy" },
+        };
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(
+                VmNameFromLastLaunch(transport),
+                "10.42.0.9",
+                "10.55.0.9");
+            if (argv.Count >= 7 && argv[0] == "ip" && argv[5] == "dev" && argv[6] == "cb-deploy")
+                return BridgeAddress("10.55.0.1/24");
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            WorkingDirectory = "/work",
+            Network = new SandboxNetworkPolicy { ProfileName = "deploy-isolated" },
+        });
+        var substrate = new SandboxDeploymentSubstrate(sb);
+        substrate.PublishEndpoint(new DeploymentEndpointRequest
+        {
+            Kind = DeploymentEndpointKind.Http,
+            Port = 8080,
+        });
+
+        transport.LocalForwardDisposeThrows = true;
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await sb.DisposeAsync());
+
+        transport.LocalForwardDisposeThrows = false;
+        await sb.DisposeAsync();
+        Assert.Equal(2, Assert.Single(transport.LocalForwards).DisposeCallCount);
+    }
+
+    [Fact]
+    public async Task PublishEndpoint_tunnel_start_failure_throws_without_returning_endpoint()
+    {
+        var opts = DefaultOptions() with
+        {
+            NetworkProfiles = new Dictionary<string, string> { ["deploy-isolated"] = "cb-deploy" },
+        };
+        var transport = new FakeRemoteHostTransport
+        {
+            StartLocalForwardThrows = true,
+        };
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(
+                VmNameFromLastLaunch(transport),
+                "10.42.0.9",
+                "10.55.0.9");
+            if (argv.Count >= 7 && argv[0] == "ip" && argv[5] == "dev" && argv[6] == "cb-deploy")
+                return BridgeAddress("10.55.0.1/24");
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        await using var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            Network = new SandboxNetworkPolicy { ProfileName = "deploy-isolated" },
+        });
+        var substrate = new SandboxDeploymentSubstrate(sb);
+
+        var ex = Assert.Throws<InvalidOperationException>(() => substrate.PublishEndpoint(new DeploymentEndpointRequest
+        {
+            Kind = DeploymentEndpointKind.Http,
+            Port = 8080,
+        }));
+        Assert.Contains("simulated tunnel start failure", ex.Message);
+        Assert.Empty(transport.LocalForwards);
+    }
+
+    [Fact]
     public async Task CreateAsync_attaches_configured_network_profile_bridge()
     {
         var opts = DefaultOptions() with
@@ -160,6 +464,41 @@ public sealed class MultipassRemoteSandboxProviderTests
 
         Assert.Contains("Network profile 'missing-profile' is not configured", ex.Message);
         Assert.DoesNotContain(transport.RecordedCalls, c => c.Argv.Contains("launch"));
+    }
+
+    [Fact]
+    public async Task CreateAsync_marks_vm_active_before_remote_launch_returns()
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        MultipassRemoteSandboxProvider? provider = null;
+        var observedActiveDuringLaunch = false;
+        var workItemId = new WorkItemId(Guid.NewGuid());
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch"))
+            {
+                observedActiveDuringLaunch = provider!
+                    .SnapshotActiveSandboxProgress()
+                    .Any(p => p.WorkItemId.Equals(workItemId));
+                return ProcessRunOk();
+            }
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+
+        provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            TimingWorkItemId = workItemId,
+        });
+
+        Assert.True(observedActiveDuringLaunch);
+        await sb.DisposeAsync();
     }
 
     [Fact]
@@ -420,14 +759,21 @@ public sealed class MultipassRemoteSandboxProviderTests
         var provider = new MultipassRemoteSandboxProvider(
             opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
 
+        var workItemId = new WorkItemId(Guid.NewGuid());
         var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
-            await provider.CreateAsync(new SandboxSpec { ImageReference = "bogus" }));
+            await provider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = "bogus",
+                TimingWorkItemId = workItemId,
+            }));
         Assert.Equal("placement", ex.Operation);
         Assert.Equal("all-hosts-unavailable", ex.ErrorClass);
 
         // Cleanup must have tried to delete the would-be VM.
         Assert.Contains(transport.RecordedCalls, c =>
             c.Argv.Contains("delete") && c.Argv.Contains("--purge"));
+        Assert.Empty(provider.SnapshotActiveSandboxProgress());
+        Assert.Empty(provider.SnapshotActiveSandboxes());
     }
 
     [Theory]
@@ -746,6 +1092,118 @@ public sealed class MultipassRemoteSandboxProviderTests
         var info = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
 
         Assert.Equal(createdAt, info.CreatedAt);
+    }
+
+    [Fact]
+    public async Task DeploymentPurposeMarker_IsWrittenAndReadBack()
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        var markerByPath = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        transport.OnRun = (argv, _) =>
+        {
+            if (Contains(argv, "launch")) return ProcessRunOk();
+            if (Contains(argv, "info")) return RunningInfoJson(VmNameFromLastLaunch(transport));
+            if (Contains(argv, "list"))
+            {
+                var vm = VmNameFromLastLaunch(transport);
+                return new ProcessRunResult(0, $$"""
+                    {
+                      "list": [
+                        { "name": "{{vm}}", "state": "Running" }
+                      ]
+                    }
+                    """, "");
+            }
+            if (argv is ["sh", "-c", var script] && script.Contains(".codeybox-purpose", StringComparison.Ordinal))
+            {
+                if (script.StartsWith("printf %s ", StringComparison.Ordinal))
+                {
+                    var markerValue = ExtractFirstQuotedPath(script[..script.IndexOf(" > ", StringComparison.Ordinal)]);
+                    var markerPath = ExtractQuotedPathAfterRedirect(script);
+                    markerByPath[markerPath] = markerValue;
+                    return ProcessRunOk();
+                }
+                if (script.StartsWith("find ", StringComparison.Ordinal))
+                {
+                    // Emulate the real `find … | while read` scan in
+                    // ReadRemotePurposeMarkersAsync: for each marker written
+                    // under RemoteStagingRoot/<vm>/.codeybox-purpose it emits a
+                    // tab-separated "<vm>\t<value>" line keyed by the parent dir.
+                    var scan = new StringBuilder();
+                    foreach (var (markerPath, markerValue) in markerByPath)
+                    {
+                        scan.Append(ParentDirectoryName(markerPath))
+                            .Append('\t')
+                            .Append(markerValue)
+                            .Append('\n');
+                    }
+
+                    return new ProcessRunResult(0, scan.ToString(), "");
+                }
+            }
+            if (Contains(argv, "delete")) return ProcessRunOk();
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var sb = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            Purpose = SandboxPurpose.Deployment,
+        });
+
+        var managed = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
+        Assert.Equal(sb.Id, managed.Name);
+        Assert.Equal(SandboxPurpose.Deployment, managed.Purpose);
+
+        await sb.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task CreateAsync_marker_write_failure_removes_remote_staging_and_does_not_leave_active()
+    {
+        var opts = DefaultOptions();
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            if (argv is ["sh", "-c", var script]
+                && script.StartsWith("printf %s ", StringComparison.Ordinal)
+                && script.Contains(".codeybox-purpose", StringComparison.Ordinal))
+            {
+                return new ProcessRunResult(1, "", "permission denied");
+            }
+            return ProcessRunOk();
+        };
+
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        // A per-sandbox staging-marker write failure is classified as a
+        // host-runtime failure (isHostRuntimeFailure: true), identical to the
+        // created-at marker. With the single default host exhausted, placement
+        // surfaces the canonical deferred exception wrapping the host failure.
+        var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(async () =>
+            await provider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = "24.04",
+                Purpose = SandboxPurpose.Deployment,
+            }));
+
+        var hostFailure = Assert.IsType<RemoteHostProvisioningException>(ex.InnerException);
+        Assert.Equal("staging-purpose", hostFailure.Operation);
+
+        Assert.Contains(transport.RecordedCalls, c =>
+            c.Argv.Count >= 4
+            && c.Argv[0] == "rm"
+            && c.Argv[1] == "-rf"
+            && c.Argv[2] == "--"
+            && c.Argv[3].Contains(opts.RemoteStagingRoot, StringComparison.Ordinal));
+        Assert.DoesNotContain(transport.RecordedCalls, c => c.Argv.Contains("launch"));
+        Assert.Empty(provider.SnapshotActiveSandboxProgress());
+        Assert.Empty(provider.SnapshotActiveSandboxes());
     }
 
     [Fact]
@@ -1265,6 +1723,39 @@ public sealed class MultipassRemoteSandboxProviderTests
         Assert.False(host.RuntimeHealthy);
         Assert.Contains("metadata ssh dropped", host.RuntimeUnhealthyReason);
         Assert.False(inventory.IsComplete);
+    }
+
+    [Fact]
+    public async Task DisposeLeakedAsync_throws_and_keeps_staging_when_remote_delete_fails()
+    {
+        var opts = DefaultOptions();
+        var vmName = opts.VmNamePrefix + "abc123";
+        var transport = new FakeRemoteHostTransport();
+        transport.OnRun = (argv, _) =>
+        {
+            // `multipass delete --purge` fails, and the VM is still present on
+            // the subsequent liveness probe — cleanup must NOT be able to prove
+            // the instance is gone, so it must surface the failure rather than
+            // silently reclaim the staging directory.
+            if (Contains(argv, "list"))
+                return new ProcessRunResult(
+                    0, $"{{\"list\":[{{\"name\":\"{vmName}\",\"state\":\"Running\"}}]}}", "");
+            if (Contains(argv, "delete")) return new ProcessRunResult(1, "", "still busy");
+            return ProcessRunOk();
+        };
+        var provider = new MultipassRemoteSandboxProvider(
+            opts, transport, NullLogger<MultipassRemoteSandboxProvider>.Instance);
+
+        var ex = await Assert.ThrowsAsync<RemoteHostProvisioningException>(async () =>
+            await provider.DisposeLeakedAsync(vmName, CancellationToken.None));
+
+        Assert.Equal("delete", ex.Operation);
+        Assert.Contains(vmName, ex.Message, StringComparison.Ordinal);
+        Assert.Contains("still busy", ex.Message, StringComparison.Ordinal);
+        // Staging is retained (no rm -rf) so a later reaper sweep can retry once
+        // the VM is truly gone; deleting staging under a live VM would orphan it.
+        Assert.DoesNotContain(transport.RecordedCalls, c =>
+            c.Argv.Count >= 2 && c.Argv[0] == "rm" && c.Argv[1] == "-rf");
     }
 
     [Fact]
@@ -1807,6 +2298,60 @@ public sealed class MultipassRemoteSandboxProviderTests
         }
     }
 
+    [Fact]
+    public void OpenSshCliTransport_BuildLocalForwardArgv_emits_correct_forward_spec_and_flags()
+    {
+        // This is the real host-routable Expose path for the remote substrate.
+        // The -L spec field order is load-bearing: it MUST be
+        // localHost:localPort:remoteHost:remotePort, and the forward MUST use
+        // ExitOnForwardFailure=yes (so ssh exits rather than forwarding to the
+        // wrong target) and -N (no remote command — this is a pure tunnel).
+        var opts = DefaultOptions();
+        var argv = OpenSshCliTransport.BuildLocalForwardArgv(
+            opts, "127.0.0.1", 54321, "10.55.0.9", 8080);
+
+        // -L spec: exact field order, no transposition.
+        var lIndex = argv.ToList().IndexOf("-L");
+        Assert.True(lIndex >= 0, "argv must contain -L");
+        Assert.Equal("127.0.0.1:54321:10.55.0.9:8080", argv[lIndex + 1]);
+
+        // ExitOnForwardFailure=yes must be present as an -o option value.
+        Assert.Contains("ExitOnForwardFailure=yes", argv);
+
+        // -N (no remote command) must be present.
+        Assert.Contains("-N", argv);
+
+        // The SSH target is the final positional argument.
+        Assert.Equal(opts.SshTarget, argv[^1]);
+
+        // The ssh binary leads the argv.
+        Assert.Equal(opts.SshBinary, argv[0]);
+    }
+
+    [Theory]
+    [InlineData("", "10.55.0.9")]
+    [InlineData("   ", "10.55.0.9")]
+    [InlineData("127.0.0.1", "")]
+    [InlineData("127.0.0.1", "   ")]
+    public void OpenSshCliTransport_BuildLocalForwardArgv_rejects_blank_hosts(string localHost, string remoteHost)
+    {
+        var opts = DefaultOptions();
+        Assert.Throws<ArgumentException>(() =>
+            OpenSshCliTransport.BuildLocalForwardArgv(opts, localHost, 54321, remoteHost, 8080));
+    }
+
+    [Theory]
+    [InlineData(0, 8080)]
+    [InlineData(70000, 8080)]
+    [InlineData(54321, 0)]
+    [InlineData(54321, 70000)]
+    public void OpenSshCliTransport_BuildLocalForwardArgv_rejects_out_of_range_ports(int localPort, int remotePort)
+    {
+        var opts = DefaultOptions();
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            OpenSshCliTransport.BuildLocalForwardArgv(opts, "127.0.0.1", localPort, "10.55.0.9", remotePort));
+    }
+
     // ----- helpers ---------------------------------------------------
 
     private static bool Contains(IReadOnlyList<string> argv, string token)
@@ -1924,9 +2469,11 @@ public sealed class MultipassRemoteSandboxProviderTests
             && Interlocked.CompareExchange(ref target, value, existing) != existing);
     }
 
-    private static ProcessRunResult RunningInfoJson(string vm) => new(
+    private static ProcessRunResult RunningInfoJson(string vm, params string[] ipv4) => new(
         0,
-        $"{{\"info\":{{\"{vm}\":{{\"state\":\"Running\"}}}}}}",
+        ipv4.Length == 0
+            ? $"{{\"info\":{{\"{vm}\":{{\"state\":\"Running\"}}}}}}"
+            : $"{{\"info\":{{\"{vm}\":{{\"state\":\"Running\",\"ipv4\":{JsonSerializer.Serialize(ipv4)}}}}}}}",
         "");
 
     private static ProcessRunResult InfoJson(string vm, string state) => new(
@@ -1938,6 +2485,48 @@ public sealed class MultipassRemoteSandboxProviderTests
     {
         var idx = argv.ToList().IndexOf("info");
         return idx >= 0 && idx + 1 < argv.Count ? argv[idx + 1] : "unknown";
+    }
+
+    private static async Task<List<string>> ReadStubArgsAsync(string argsFile)
+    {
+        for (var attempt = 0; attempt < 50; attempt++)
+        {
+            if (File.Exists(argsFile))
+                return (await File.ReadAllLinesAsync(argsFile)).ToList();
+            await Task.Delay(20);
+        }
+        throw new TimeoutException("Timed out waiting for SSH stub argv file.");
+    }
+
+    private static ProcessRunResult BridgeAddress(string cidr) => new(
+        0,
+        $"2: cb-deploy    inet {cidr} brd 10.55.0.255 scope global cb-deploy\n",
+        "");
+
+    private static string ExtractQuotedPathAfterRedirect(string script)
+    {
+        var redirect = script.IndexOf(" > ", StringComparison.Ordinal);
+        Assert.True(redirect >= 0, $"expected redirect in script: {script}");
+        return ExtractFirstQuotedPath(script[(redirect + 3)..]);
+    }
+
+    // Basename of the directory containing a remote marker file — mirrors the
+    // real scan's `d=${f%/marker}; n=${d##*/}` derivation of the sandbox name.
+    private static string ParentDirectoryName(string markerPath)
+    {
+        var lastSlash = markerPath.LastIndexOf('/');
+        var parent = lastSlash < 0 ? markerPath : markerPath[..lastSlash];
+        var parentSlash = parent.LastIndexOf('/');
+        return parentSlash < 0 ? parent : parent[(parentSlash + 1)..];
+    }
+
+    private static string ExtractFirstQuotedPath(string script)
+    {
+        var start = script.IndexOf('\'');
+        Assert.True(start >= 0, $"expected quoted path in script: {script}");
+        var end = script.IndexOf('\'', start + 1);
+        Assert.True(end > start, $"expected closing quote in script: {script}");
+        return script[(start + 1)..end];
     }
 
     private static string VmNameFromLastLaunch(FakeRemoteHostTransport transport)
@@ -1958,6 +2547,7 @@ public sealed class MultipassRemoteSandboxProviderTests
     internal sealed record StageInCall(string HostPath, string RemotePath);
     internal sealed record StageOutCall(string RemotePath, string HostPath);
     public sealed record TarSpec(TarEntryType Type, string Name, string? Content = null, string? LinkName = null);
+    internal sealed record LocalForwardCall(string LocalHost, int LocalPort, string RemoteHost, int RemotePort);
 
     private sealed class CapturingLogger<T> : ILogger<T>
     {
@@ -2003,7 +2593,7 @@ public sealed class MultipassRemoteSandboxProviderTests
         }
     }
 
-    internal sealed class FakeRemoteHostTransport : IRemoteHostTransport
+    internal sealed class FakeRemoteHostTransport : IRemotePortForwardTransport
     {
         public string DiagnosticId => "fake";
         public ConcurrentQueue<RecordedCall> RecordedCallsQueue { get; } = new();
@@ -2012,6 +2602,10 @@ public sealed class MultipassRemoteSandboxProviderTests
         public List<StageOutCall> StageOutCalls { get; } = new();
         public bool ThrowOnStageOut { get; set; }
         public Action<string, string, CancellationToken>? OnStageOut { get; set; }
+        public List<LocalForwardCall> LocalForwardCalls { get; } = new();
+        public List<FakeRemotePortForward> LocalForwards { get; } = new();
+        public bool StartLocalForwardThrows { get; set; }
+        public bool LocalForwardDisposeThrows { get; set; }
         public Func<IReadOnlyList<string>, StreamSinks, ProcessRunResult> OnRun { get; set; } =
             (_, _) => new ProcessRunResult(0, "", "");
 
@@ -2052,6 +2646,28 @@ public sealed class MultipassRemoteSandboxProviderTests
                 throw new RemoteSshTransportException("stage-out failed");
             StageOutCalls.Add(new StageOutCall(remotePath, hostPath));
             return Task.CompletedTask;
+        }
+
+        public IRemotePortForward StartLocalForward(string localHost, int localPort, string remoteHost, int remotePort)
+        {
+            if (StartLocalForwardThrows)
+                throw new InvalidOperationException("simulated tunnel start failure");
+            LocalForwardCalls.Add(new LocalForwardCall(localHost, localPort, remoteHost, remotePort));
+            var forward = new FakeRemotePortForward(this);
+            LocalForwards.Add(forward);
+            return forward;
+        }
+    }
+
+    internal sealed class FakeRemotePortForward(FakeRemoteHostTransport owner) : IRemotePortForward
+    {
+        public int DisposeCallCount { get; private set; }
+
+        public void Dispose()
+        {
+            DisposeCallCount++;
+            if (owner.LocalForwardDisposeThrows)
+                throw new InvalidOperationException("simulated tunnel stop failure");
         }
     }
 

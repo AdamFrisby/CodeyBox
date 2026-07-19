@@ -29,6 +29,27 @@ public sealed class SandboxAdmissionControlledProviderTests
     }
 
     [Fact]
+    public async Task CreateAsync_ForwardsRoutableSandboxHostAddress()
+    {
+        var inner = new RoutableProvider();
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+
+        await using var sandbox = await provider.CreateAsync(Spec());
+
+        var routable = Assert.IsAssignableFrom<IRoutableSandbox>(sandbox);
+        Assert.Equal("10.10.0.42", routable.HostAddress);
+        var publisher = Assert.IsAssignableFrom<ISandboxPortPublisher>(sandbox);
+        Assert.True(publisher.CanPublishPort(8080));
+        var endpoint = publisher.PublishPort(8080);
+        Assert.Equal("10.10.0.42", endpoint.Host);
+        Assert.Equal(8080, endpoint.Port);
+
+        var lease = Assert.IsAssignableFrom<IActiveSandboxLease>(sandbox);
+        lease.ReleaseActiveTracking();
+        Assert.True(inner.LastSandbox?.ActiveTrackingReleased);
+    }
+
+    [Fact]
     public async Task Stress_MultipleItemsFanOutAuditors_DrainsBelowFanoutBudget()
     {
         const int itemCount = 5;
@@ -1832,6 +1853,49 @@ public sealed class SandboxAdmissionControlledProviderTests
                 throw new InvalidOperationException("ensure baseline failed");
             return "baseline";
         }
+    }
+
+    private sealed class RoutableProvider : ISandboxProvider
+    {
+        public string Name => "routable";
+        public RoutableSandbox? LastSandbox { get; private set; }
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            LastSandbox = new RoutableSandbox();
+            return Task.FromResult<ISandbox>(LastSandbox);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) =>
+            Task.CompletedTask;
+    }
+
+    private sealed class RoutableSandbox : IRoutableSandbox, ISandboxPortPublisher, IActiveSandboxLease
+    {
+        public string Id { get; } = "routable-1";
+        public string? HostAddress => "10.10.0.42";
+        public bool ActiveTrackingReleased { get; private set; }
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
+            Task.FromResult(new SandboxExecResult(0, "", ""));
+
+        public bool CanPublishPort(int port) => port is >= 1 and <= 65535;
+
+        public SandboxPublishedPort PublishPort(int port)
+            => new(
+                HostAddress!,
+                port,
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["endpoint.scope"] = "host-routable",
+                });
+
+        public void ReleaseActiveTracking() => ActiveTrackingReleased = true;
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private sealed class CountingSandbox(

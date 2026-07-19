@@ -51,6 +51,22 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
     }
 
     [Fact]
+    public async Task Retry_UsesInjectedAuditLogger()
+    {
+        using var fixture = BuildScheduler(BuildRouter(availablePct: 0), BuildProjects());
+        var item = CreateQuotaItem(WorkItemState.WaitingForQuotaReset);
+        await fixture.Store.CreateAsync(item);
+
+        await InvokeTryRetryAsync(fixture.Scheduler, item, "periodic", CancellationToken.None);
+
+        AssertQuotaAttempt(
+            item,
+            "periodic",
+            "skipped:quota-still-gated",
+            "WaitingForQuotaReset");
+    }
+
+    [Fact]
     public async Task PeriodicSweep_AuditParkedItem_RechecksOnlyAuditCapablePool()
     {
         var router = new AgentClassRouter(

@@ -989,6 +989,73 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task DetachedProcessGroupPoll_IgnoresZombieProcesses()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var marker = Path.Combine(_workspace, "zombie-only.pgid");
+        var ready = Path.Combine(_workspace, "zombie-only.ready");
+        var script = Path.Combine(_workspace, "zombie-only.py");
+        await File.WriteAllTextAsync(script, """
+            import os
+            import sys
+            import time
+
+            marker = sys.argv[1]
+            ready = sys.argv[2]
+            pid = os.fork()
+            if pid == 0:
+                os.setsid()
+                with open(marker, "w", encoding="utf-8") as f:
+                    f.write(str(os.getpgrp()) + "\n")
+                with open(ready, "w", encoding="utf-8") as f:
+                    f.write("ready\n")
+                os._exit(0)
+
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                time.sleep(0.25)
+            """);
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = "python3",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add(script);
+        psi.ArgumentList.Add(marker);
+        psi.ArgumentList.Add(ready);
+
+        using var parent = Process.Start(psi)!;
+        try
+        {
+            await WaitForFileAsync(ready, TimeSpan.FromSeconds(5));
+            await Task.Delay(100);
+
+            var (exit, stdout, stderr) = await RunLocalProcessAsync(
+                "/bin/sh",
+                ["-c", MultipassSandbox.DetachedProcessGroupPollCommand, "codeybox-zombie-poll", marker],
+                CancellationToken.None);
+
+            Assert.Equal(0, exit);
+            Assert.StartsWith("exited ", stdout, StringComparison.Ordinal);
+            Assert.DoesNotContain("alive", stdout, StringComparison.Ordinal);
+            Assert.Equal("", stderr);
+        }
+        finally
+        {
+            try { parent.Kill(entireProcessTree: true); }
+            catch { }
+
+            try { await parent.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5)); }
+            catch { }
+        }
+    }
+
+    [Fact]
     public async Task ExecAsync_DetachedBatchPreservesWrapperDiagnosticsBeforeHttpStreaming()
     {
         if (OperatingSystem.IsWindows())
@@ -4000,7 +4067,70 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task DisposeAsync_DeleteFailureUntracksActiveSandboxWithoutMaskingCompletedPhase()
+    public void MultipassSandbox_PublishesDeploymentEndpointFromProfileBridgeAddress()
+    {
+        var sandbox = new MultipassSandbox(
+            "codeybox-publish",
+            Path.Combine(_workspace, "publish-root"),
+            new SandboxSpec
+            {
+                ImageReference = "ignored",
+                Network = new SandboxNetworkPolicy { ProfileName = "deploy" },
+            },
+            new MultipassSandboxOptions
+            {
+                MultipassBinary = "/bin/false",
+                NetworkProfiles = new Dictionary<string, string> { ["deploy"] = "cb-deploy" },
+            },
+            NullLogger<MultipassSandboxProvider>.Instance,
+            runner: new RecordingMultipassRunner((_, _, _) =>
+                Task.FromResult(new ProcessRunResult(0, "", ""))),
+            daemonRetryPolicy: InstantDaemonRetryPolicy(),
+            hostAddress: "10.99.2.7");
+        var publisher = Assert.IsAssignableFrom<ISandboxPortPublisher>(sandbox);
+        var request = new DeploymentEndpointRequest
+        {
+            Kind = DeploymentEndpointKind.Http,
+            Scheme = "http",
+            Port = 8080,
+            Path = "/health",
+        };
+
+        Assert.True(publisher.CanPublishPort(8080));
+        var endpoint = DeploymentEndpointPublisher.ForPublishedPort(request, publisher.PublishPort(8080));
+
+        Assert.Equal("http://10.99.2.7:8080/health", endpoint.Url);
+        Assert.Equal("10.99.2.7", endpoint.Host);
+        Assert.Equal(8080, endpoint.Port);
+        Assert.Equal("host-routable", endpoint.Metadata["endpoint.scope"]);
+    }
+
+    [Fact]
+    public void MultipassSandbox_PublishEndpointRejectsMissingProfileEvenWithHostAddress()
+    {
+        var sandbox = new MultipassSandbox(
+            "codeybox-no-publish",
+            Path.Combine(_workspace, "no-publish-root"),
+            new SandboxSpec { ImageReference = "ignored" },
+            new MultipassSandboxOptions { MultipassBinary = "/bin/false" },
+            NullLogger<MultipassSandboxProvider>.Instance,
+            runner: new RecordingMultipassRunner((_, _, _) =>
+                Task.FromResult(new ProcessRunResult(0, "", ""))),
+            daemonRetryPolicy: InstantDaemonRetryPolicy(),
+            hostAddress: "10.99.2.7");
+        var publisher = Assert.IsAssignableFrom<ISandboxPortPublisher>(sandbox);
+        var request = new DeploymentEndpointRequest
+        {
+            Kind = DeploymentEndpointKind.Tcp,
+            Port = 5432,
+        };
+
+        Assert.False(publisher.CanPublishPort(5432));
+        Assert.Throws<NotSupportedException>(() => publisher.PublishPort(5432));
+    }
+
+    [Fact]
+    public async Task DisposeAsync_DeleteFailureThrowsAndKeepsSandboxRetryable()
     {
         var disposedNames = new List<string>();
         var noLongerActiveNames = new List<string>();
@@ -4028,16 +4158,18 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             runner: runner,
             daemonRetryPolicy: InstantDaemonRetryPolicy());
 
-        await sandbox.DisposeAsync();
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await sandbox.DisposeAsync());
 
+        Assert.Contains("multipass delete --purge codeybox-deletefail failed", ex.Message);
         Assert.Equal(1, deleteCalls);
         Assert.Empty(disposedNames);
         Assert.Equal(["codeybox-deletefail"], noLongerActiveNames);
 
         await sandbox.DisposeAsync();
 
-        Assert.Equal(1, deleteCalls);
-        Assert.Empty(disposedNames);
+        Assert.Equal(2, deleteCalls);
+        Assert.Equal(["codeybox-deletefail"], disposedNames);
+        Assert.Equal(["codeybox-deletefail"], noLongerActiveNames);
     }
 
     [Fact]
@@ -4075,7 +4207,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     }
 
     [Fact]
-    public async Task ProviderCreatedSandbox_DeleteFailureUntracksActiveCacheAndReaperDisposes()
+    public async Task ProviderCreatedSandbox_DeleteFailureReleasesActiveTrackingForLeakReaperRetry()
     {
         var staging = Path.Combine(_workspace, "provider-delete-fail-staging");
         var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
@@ -4166,13 +4298,14 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var active = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
         Assert.True(active.IsTrackedActive);
 
-        await sandbox.DisposeAsync();
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await sandbox.DisposeAsync());
+        Assert.Contains("transient delete failure", failure.Message, StringComparison.Ordinal);
 
         Assert.Equal(1, deleteCalls);
-        var untracked = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
-        Assert.Equal(name, untracked.Name);
-        Assert.False(untracked.IsTrackedActive);
-        Assert.Equal(2, listCalls);
+        var stillActive = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
+        Assert.Equal(name, stillActive.Name);
+        Assert.False(stillActive.IsTrackedActive);
 
         var reaper = new SandboxLeakReaper(
             provider,
@@ -4191,6 +4324,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal(2, deleteCalls);
         Assert.Empty(states);
         Assert.Empty(reaper.GetLatestLeaks());
+        Assert.Empty(await provider.ListAllManagedAsync(CancellationToken.None));
     }
 
     [Fact]
@@ -4424,6 +4558,70 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var managed = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
 
         Assert.Equal(expectedFlag, managed.IsSuspendLifecycleOrFrozen);
+    }
+
+    [Fact]
+    public async Task CreateAsync_WritesPurposeMarker_AndListAllManagedReadsIt()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var staging = Path.Combine(_workspace, "staging-purpose-marker");
+        var provider = NewProvider(
+            stagingDirectory: staging,
+            runner: BuildSuccessfulCreateRunner(states));
+
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            Purpose = SandboxPurpose.Deployment,
+        });
+
+        var markerPath = Path.Combine(staging, sandbox.Id, ".codeybox-purpose");
+        Assert.Equal("Deployment", File.ReadAllText(markerPath).Trim());
+
+        var managed = Assert.Single(await provider.ListAllManagedAsync(CancellationToken.None));
+        Assert.Equal(sandbox.Id, managed.Name);
+        Assert.Equal(SandboxPurpose.Deployment, managed.Purpose);
+    }
+
+    [Fact]
+    public async Task CreateAsync_WithoutNetworkProfile_DoesNotExposeMultipassManagementIpv4()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var provider = NewProvider(
+            stagingDirectory: Path.Combine(_workspace, "staging-host-address"),
+            runner: BuildSuccessfulCreateRunner(states));
+
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+        });
+
+        var routable = Assert.IsAssignableFrom<IRoutableSandbox>(sandbox);
+        Assert.Null(routable.HostAddress);
+    }
+
+    [Fact]
+    public async Task CreateAsync_WithNetworkProfile_PassesProfileBridgeIpv4ToRoutableSandbox()
+    {
+        var states = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var provider = NewProvider(
+            stagingDirectory: Path.Combine(_workspace, "staging-profile-host-address"),
+            runner: BuildSuccessfulCreateRunner(states, ["10.42.0.88", "172.31.8.88"]),
+            networkProfiles: new Dictionary<string, string> { ["deploy"] = "cb-deploy" },
+            bridgeSubnetResolver: bridge => bridge == "cb-deploy"
+                ? new MultipassSandboxProvider.Ipv4Subnet(
+                    IPAddress.Parse("172.31.8.1"),
+                    IPAddress.Parse("255.255.255.0"))
+                : null);
+
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "24.04",
+            Network = new SandboxNetworkPolicy { ProfileName = "deploy" },
+        });
+
+        var routable = Assert.IsAssignableFrom<IRoutableSandbox>(sandbox);
+        Assert.Equal("172.31.8.88", routable.HostAddress);
     }
 
     [Fact]
@@ -5976,7 +6174,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         TimeSpan? vmStartTimeout = null,
         TimeSpan? vmStopTimeout = null,
         int? maxConcurrentBoots = null,
-        TimeSpan? bootLaunchDelay = null)
+        TimeSpan? bootLaunchDelay = null,
+        Func<string, MultipassSandboxProvider.Ipv4Subnet?>? bridgeSubnetResolver = null)
     {
         var options = new MultipassSandboxOptions
         {
@@ -6009,7 +6208,8 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 resolvedLogger,
                 null,
                 runner,
-                daemonRetryPolicy);
+                daemonRetryPolicy,
+                bridgeSubnetResolver: bridgeSubnetResolver);
     }
 
     private MultipassSandbox NewMultipassSandbox(
@@ -6237,7 +6437,22 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         {
             var probe = await RunLocalProcessAsync(
                 "/bin/sh",
-                ["-c", "kill -0 \"-$1\" 2>/dev/null", "codeybox-pgid-gone", pgid]);
+                ["-c", """
+                    codeybox_pgid=$1
+                    if [ -d /proc ]; then
+                        awk -v pgid="$codeybox_pgid" '
+                            {
+                                line = $0
+                                sub(/^[^)]*\) /, "", line)
+                                split(line, fields, " ")
+                                if (fields[3] == pgid && fields[1] != "Z") found = 1
+                            }
+                            END { exit found ? 0 : 1 }
+                        ' /proc/[0-9]*/stat 2>/dev/null
+                        exit $?
+                    fi
+                    kill -0 "-$codeybox_pgid" 2>/dev/null
+                    """, "codeybox-pgid-gone", pgid]);
             if (probe.Exit != 0)
                 return;
             if (DateTimeOffset.UtcNow >= deadline)
@@ -6450,7 +6665,6 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
     private sealed class LocalDetachedVm
     {
-        private const int DetachedProcessGroupMalformedExitCode = 73;
         private const string VmExecDir = "/home/ubuntu/.codeybox-exec/";
         private const string VmExecEnvDir = "/home/ubuntu/.codeybox-exec-env/";
         private const string VmExecStdinDir = "/home/ubuntu/.codeybox-exec-stdin/";
@@ -6538,37 +6752,11 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         public async Task<ProcessRunResult> PollProcessGroupAsync(string vmProcessGroupMarker, CancellationToken ct)
         {
             var marker = MapVmPath(vmProcessGroupMarker);
-            if (!File.Exists(marker))
-                return new ProcessRunResult(0, "missing\n", "");
-
-            var text = (await File.ReadAllTextAsync(marker, ct)).Trim();
-            if (!int.TryParse(text, out var pgid) || pgid <= 0)
-            {
-                return new ProcessRunResult(
-                    DetachedProcessGroupMalformedExitCode,
-                    "",
-                    $"detached exec process group marker {vmProcessGroupMarker} was malformed: {text}\n");
-            }
-
-            var (exit, _, _) = await RunLocalProcessAsync(
+            var (exit, stdout, stderr) = await RunLocalProcessAsync(
                 "/bin/sh",
-                ["-c", "kill -0 \"-$1\" 2>/dev/null", "codeybox-local-poll", text],
+                ["-c", MultipassSandbox.DetachedProcessGroupPollCommand, "codeybox-local-poll", marker],
                 ct);
-            if (exit == 0)
-                return new ProcessRunResult(0, $"alive {pgid}\n", "");
-
-            // Process group is gone. Mirror the real poll script: if the
-            // diagnostic exit-code sidecar exists, include it in the poll
-            // shape. The host still requires authenticated HTTP completion.
-            var exitFile = MapVmPath(vmProcessGroupMarker + ".exit");
-            if (File.Exists(exitFile))
-            {
-                var exitCodeText = (await File.ReadAllTextAsync(exitFile, ct)).Trim();
-                if (int.TryParse(exitCodeText, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out _))
-                    return new ProcessRunResult(0, $"exited {pgid} {exitCodeText} gone\n", "");
-            }
-
-            return new ProcessRunResult(0, $"exited {pgid}\n", "");
+            return new ProcessRunResult(exit, stdout, stderr);
         }
 
         public async Task<ProcessRunResult> ReadOutputSidecarAsync(string vmPath, CancellationToken ct)
@@ -8163,13 +8351,23 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     /// the lifecycle (registry population, etc.) rather than the lifecycle
     /// itself.
     /// </summary>
-    private static RecordingMultipassRunner BuildSuccessfulCreateRunner(ConcurrentDictionary<string, string> states)
+    private static RecordingMultipassRunner BuildSuccessfulCreateRunner(
+        ConcurrentDictionary<string, string> states,
+        IReadOnlyList<string>? ipv4Addresses = null)
     {
+        ipv4Addresses ??= ["10.42.0.88", "10.99.2.88"];
         return new RecordingMultipassRunner((argv, _, ct) =>
         {
             ct.ThrowIfCancellationRequested();
             if (argv is [_, "version"])
                 return Task.FromResult(new ProcessRunResult(0, "multipass 1.16.0", ""));
+            if (argv is [_, "list", "--format=json"] || argv is [_, "list", "--format", "json"])
+            {
+                var list = states.Keys
+                    .Select(name => new Dictionary<string, object> { ["name"] = name })
+                    .ToArray();
+                return Task.FromResult(new ProcessRunResult(0, JsonSerializer.Serialize(new { list }), ""));
+            }
             if (argv.Count >= 4 && argv[1] == "launch" && argv[2] == "--name")
             {
                 states[argv[3]] = "Running";
@@ -8178,6 +8376,23 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             if (argv is [_, "info", var csvName, "--format=csv"])
                 return Task.FromResult(new ProcessRunResult(
                     0, states.TryGetValue(csvName, out var current) ? current : "Running", ""));
+            if (argv.Count >= 5 && argv[1] == "info" && argv[2] == "--format" && argv[3] == "json")
+            {
+                var info = argv.Skip(4).ToDictionary(
+                    name => name,
+                    name => (object)new
+                    {
+                        state = states.TryGetValue(name, out var current) ? current : "Running",
+                        memory = new { total = 17179869184L },
+                        disks = new Dictionary<string, object>(),
+                        ipv4 = ipv4Addresses,
+                    },
+                    StringComparer.Ordinal);
+                return Task.FromResult(new ProcessRunResult(
+                    0,
+                    JsonSerializer.Serialize(new { info }),
+                    ""));
+            }
             if (argv is [_, "info", var jsonName, "--format=json"])
             {
                 var state = states.TryGetValue(jsonName, out var current) ? current : "Running";
@@ -8190,6 +8405,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                             state,
                             memory = new { total = 17179869184L },
                             disks = new Dictionary<string, object>(),
+                            ipv4 = ipv4Addresses,
                         },
                     },
                 });

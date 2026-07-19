@@ -169,7 +169,13 @@ public sealed class AcpClaudeTransport : IClaudeTransport
             "[ -f \"$bridge\" ] || fail \"ACP bridge payload is not a regular file\"\n" +
             "actual_sha=$(sha256sum \"$bridge\" | awk '{print $1}') || fail \"failed to hash ACP bridge payload\"\n" +
             "[ \"$actual_sha\" = \"$expected_sha\" ] || fail \"ACP bridge payload hash mismatch: expected $expected_sha got $actual_sha\"\n" +
-            "\"$bridge\"\n";
+            // Reset inherited ignored shutdown signals before NativeAOT starts.
+            // CoreCLR can repair them with a one-time re-exec, but NativeAOT
+            // caches SIGINT during runtime startup and cannot repair it later.
+            // The guard prevents the CoreCLR-only re-exec path in the static
+            // bridge after the launcher has already reset every disposition.
+            "CODEYBOX_ACPBRIDGE_SIGNAL_BOOTSTRAP_REEXECED=1 " +
+            "/usr/bin/env --default-signal=HUP,INT,TERM -- \"$bridge\"\n";
     }
 
     private static string ShellSingleQuote(string value)
@@ -253,7 +259,7 @@ public sealed class AcpClaudeTransport : IClaudeTransport
                 WorkingDirectory = _open.WorkingDirectory,
                 Stdin = launcherStdin,
                 StdoutChunkCallback = aggregator,
-                ExtraEnvironment = extraEnv.Count > 0 ? extraEnv : null
+                ExtraEnvironment = extraEnv.Count > 0 ? extraEnv : null,
             };
 
             SandboxExecResult exec_result;

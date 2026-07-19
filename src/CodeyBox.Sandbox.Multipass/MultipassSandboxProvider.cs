@@ -1,6 +1,9 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -50,6 +53,9 @@ namespace CodeyBox.Sandbox.Multipass;
 public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IActiveSandboxProgressProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner, IResourceMetricsCapturingProvider
 {
     public const string ProviderId = "multipass";
+
+    private const string PurposeMarkerFile = ".codeybox-purpose";
+
     // Options are resolved through a delegate once per public operation so an
     // operator can edit ExtraRuncmd / ExtraCloudInit / NetworkProfiles /
     // UseBaselineImages in appsettings.json and have the change land on the next
@@ -65,6 +71,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     private readonly ITimingStore? _timings;
     private readonly ISandboxResourceUsageStore? _resourceUsageStore;
     private readonly IDiskSpaceProbe _diskProbe;
+    private readonly Func<string, Ipv4Subnet?> _bridgeSubnetResolver;
     // Per-baseline-name semaphore: serialises bake operations so two
     // concurrent CreateAsync calls for the same profile don't both try to
     // launch the same baseline VM. Lazily populated.
@@ -118,6 +125,29 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     private SemaphoreSlim? _bootGate;
     private int _bootGateCapacity;
 
+    internal readonly record struct Ipv4Subnet(IPAddress Address, IPAddress Mask)
+    {
+        public bool Contains(string candidate)
+            => IPAddress.TryParse(candidate, out var parsed)
+                && parsed.AddressFamily == AddressFamily.InterNetwork
+                && Contains(parsed);
+
+        public bool Contains(IPAddress candidate)
+        {
+            if (candidate.AddressFamily != AddressFamily.InterNetwork)
+                return false;
+            var candidateBytes = candidate.GetAddressBytes();
+            var addressBytes = Address.GetAddressBytes();
+            var maskBytes = Mask.GetAddressBytes();
+            if (candidateBytes.Length != 4 || addressBytes.Length != 4 || maskBytes.Length != 4)
+                return false;
+            for (var i = 0; i < 4; i++)
+                if ((candidateBytes[i] & maskBytes[i]) != (addressBytes[i] & maskBytes[i]))
+                    return false;
+            return true;
+        }
+    }
+
     public MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log,
         ITimingStore? timings = null, ISandboxResourceUsageStore? resourceUsageStore = null)
         : this(() => opts, log, timings, new DefaultProcessRunner(), resourceUsageStore: resourceUsageStore)
@@ -133,8 +163,10 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
 
     internal MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log,
         ITimingStore? timings, IProcessRunner runner, MultipassDaemonRetryPolicy? daemonRetryPolicy = null,
-        IDiskSpaceProbe? diskProbe = null, ISandboxResourceUsageStore? resourceUsageStore = null)
-        : this(() => opts, log, timings, runner, daemonRetryPolicy, diskProbe, resourceUsageStore)
+        IDiskSpaceProbe? diskProbe = null,
+        ISandboxResourceUsageStore? resourceUsageStore = null,
+        Func<string, Ipv4Subnet?>? bridgeSubnetResolver = null)
+        : this(() => opts, log, timings, runner, daemonRetryPolicy, diskProbe, resourceUsageStore, bridgeSubnetResolver)
     {
     }
 
@@ -142,7 +174,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         ILogger<MultipassSandboxProvider> log, ITimingStore? timings, IProcessRunner runner,
         MultipassDaemonRetryPolicy? daemonRetryPolicy = null,
         IDiskSpaceProbe? diskProbe = null,
-        ISandboxResourceUsageStore? resourceUsageStore = null)
+        ISandboxResourceUsageStore? resourceUsageStore = null,
+        Func<string, Ipv4Subnet?>? bridgeSubnetResolver = null)
     {
         _optsAccessor = optionsAccessor;
         _log = log;
@@ -151,6 +184,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         _timings = timings;
         _resourceUsageStore = resourceUsageStore;
         _diskProbe = diskProbe ?? new DefaultDiskSpaceProbe();
+        _bridgeSubnetResolver = bridgeSubnetResolver ?? TryResolveBridgeSubnet;
         // StagingDirectory is captured once: the provider keeps the directory open
         // for the lifetime of the process. Re-binding it at runtime would orphan
         // already-staged sandboxes.
@@ -318,6 +352,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
 
         try
         {
+            await WriteSandboxPurposeMarkerAsync(sandboxRoot, spec.Purpose, ct).ConfigureAwait(false);
+
             // Track ownership before the VM becomes host-visible. A slow launch,
             // clone, cloud-init wait, mount, or environment transfer can overlap a
             // leak-reaper sweep; once multipass lists this name, it must already be
@@ -416,6 +452,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
 
             await TransferEnvAsync(opts, name, spec.Environment, sandboxRoot, workItemId, ct);
             AuditLog.SandboxCreated(name, spec.Network.ProfileName);
+            var hostAddress = await ResolveSandboxHostAddressAsync(opts, name, spec.Network.ProfileName, workItemId, ct).ConfigureAwait(false);
             // The exec wrapper is installed by cloud-init at boot
             // (see BuildCloudInit's write_files); on the clone path it's
             // already baked into the source VM's filesystem, so the clone
@@ -434,7 +471,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                 // multipass daemon.
                 opGateAcquirer: (argv, ct) => EnterMultipassOpGateAsync(ReadOptions(), argv, ct),
                 resourceUsageStore: _resourceUsageStore,
-                baselineRef: clonedFromBaselineRef);
+                baselineRef: clonedFromBaselineRef,
+                hostAddress: hostAddress);
             // Register in the owner index ONLY when a work-item ID is present.
             // Sandboxes created without one (some tests) have no orchestrator-side
             // owner to suspend back into, so skip them.
@@ -1128,13 +1166,41 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                 createdAt = details.CreatedAt;
             var isActive = _activeSandboxNames.ContainsKey(name);
             var hasPreemptMarker = File.Exists(Path.Combine(stagingDir, ".codeybox-preempt"));
+            var purpose = ReadSandboxPurposeMarker(stagingDir);
             var diskBytes = detailsByName.TryGetValue(name, out details) ? details.DiskBytes : null;
             var state = detailsByName.TryGetValue(name, out details) ? details.State : null;
             infos.Add(new ManagedSandboxInfo(
                 name, createdAt, diskBytes > 0 ? diskBytes : null, isActive, hasPreemptMarker,
-                IsSuspendLifecycleState(state)));
+                IsSuspendLifecycleState(state),
+                Purpose: purpose));
         }
         return infos;
+    }
+
+    private static async Task WriteSandboxPurposeMarkerAsync(string sandboxRoot, SandboxPurpose purpose, CancellationToken ct)
+    {
+        await File.WriteAllTextAsync(
+            Path.Combine(sandboxRoot, PurposeMarkerFile),
+            purpose.ToString(),
+            ct).ConfigureAwait(false);
+    }
+
+    private static SandboxPurpose ReadSandboxPurposeMarker(string stagingDir)
+    {
+        var path = Path.Combine(stagingDir, PurposeMarkerFile);
+        if (!File.Exists(path))
+            return SandboxPurpose.WorkItem;
+        try
+        {
+            var value = File.ReadAllText(path).Trim();
+            return Enum.TryParse<SandboxPurpose>(value, ignoreCase: true, out var purpose)
+                ? purpose
+                : SandboxPurpose.WorkItem;
+        }
+        catch
+        {
+            return SandboxPurpose.WorkItem;
+        }
     }
 
     /// <summary>
@@ -1157,12 +1223,13 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     private async Task<Dictionary<string, MultipassSandboxDetails>> FetchSandboxDetailsAsync(
         MultipassSandboxOptions opts,
         List<string> names,
-        CancellationToken ct)
+        CancellationToken ct,
+        WorkItemId? workItemId = null)
     {
         var argv = new List<string> { opts.MultipassBinary, "info", "--format", "json" };
         argv.AddRange(names);
 
-        var run = await RunAsync(opts, argv, stdin: null, ct: ct);
+        var run = await RunAsync(opts, argv, stdin: null, ct: ct, workItemId: workItemId);
         if (run.ExitCode != 0)
         {
             _log.LogWarning("multipass info failed (exit {ExitCode}): {Stderr}", run.ExitCode, run.Stderr);
@@ -1201,7 +1268,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                 result[vmEntry.Name] = new MultipassSandboxDetails(
                     diskBytes,
                     TryReadCreatedAt(vmEntry.Value),
-                    state);
+                    state,
+                    TryReadIpv4Addresses(vmEntry.Value));
             }
         }
         catch (JsonException ex)
@@ -1209,6 +1277,34 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
             _log.LogWarning(ex, "Failed to parse multipass info output; sandbox details will be omitted");
         }
         return result;
+    }
+
+    private async Task<string?> ResolveSandboxHostAddressAsync(
+        MultipassSandboxOptions opts,
+        string name,
+        string? networkProfile,
+        WorkItemId? workItemId,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(networkProfile))
+            return null;
+        if (!opts.NetworkProfiles.TryGetValue(networkProfile, out var bridge))
+            return null;
+
+        var detailsByName = await FetchSandboxDetailsAsync(opts, [name], ct, workItemId).ConfigureAwait(false);
+        if (!detailsByName.TryGetValue(name, out var details))
+            return null;
+
+        var subnet = _bridgeSubnetResolver(bridge);
+        if (subnet is null)
+        {
+            _log.LogWarning(
+                "Sandbox {Name}: cannot identify IPv4 subnet for network profile {Profile} bridge {Bridge}; endpoint publishing disabled",
+                name, networkProfile, bridge);
+            return null;
+        }
+
+        return details.Ipv4Addresses.FirstOrDefault(subnet.Value.Contains);
     }
 
     private static DateTimeOffset? TryReadCreatedAt(JsonElement vmInfo)
@@ -1223,6 +1319,71 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                 DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
                 out var parsed))
                 return parsed;
+        }
+
+        return null;
+    }
+
+    private static IReadOnlyList<string> TryReadIpv4Addresses(JsonElement vmInfo)
+    {
+        if (!vmInfo.TryGetProperty("ipv4", out var ipv4El))
+            return [];
+
+        if (ipv4El.ValueKind == JsonValueKind.Array)
+        {
+            var result = new List<string>();
+            foreach (var value in ipv4El.EnumerateArray())
+            {
+                foreach (var parsed in ParseIpv4s(value.GetString()))
+                    result.Add(parsed);
+            }
+            return result;
+        }
+
+        return ipv4El.ValueKind == JsonValueKind.String
+            ? ParseIpv4s(ipv4El.GetString()).ToList()
+            : [];
+    }
+
+    private static IEnumerable<string> ParseIpv4s(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            yield break;
+        foreach (var token in value.Split([' ', ',', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (IPAddress.TryParse(token, out var address) && address.AddressFamily == AddressFamily.InterNetwork)
+                yield return address.ToString();
+        }
+    }
+
+    private static Ipv4Subnet? TryResolveBridgeSubnet(string bridgeName)
+    {
+        if (string.IsNullOrWhiteSpace(bridgeName))
+            return null;
+
+        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (!string.Equals(nic.Name, bridgeName, StringComparison.Ordinal))
+                continue;
+
+            foreach (var address in nic.GetIPProperties().UnicastAddresses)
+            {
+                if (address.Address.AddressFamily != AddressFamily.InterNetwork)
+                    continue;
+                try
+                {
+                    if (address.IPv4Mask is { AddressFamily: AddressFamily.InterNetwork } mask)
+                        return new Ipv4Subnet(address.Address, mask);
+                }
+                catch (PlatformNotSupportedException)
+                {
+                    return null;
+                }
+                catch (NetworkInformationException)
+                {
+                    return null;
+                }
+            }
         }
 
         return null;
@@ -4605,7 +4766,25 @@ test "$work" = present && test "$exec_wrapper" = present
     }
 }
 
-internal readonly record struct MultipassSandboxDetails(long? DiskBytes, DateTimeOffset? CreatedAt, string? State = null);
+internal readonly record struct MultipassSandboxDetails
+{
+    public MultipassSandboxDetails(
+        long? diskBytes,
+        DateTimeOffset? createdAt,
+        string? state = null,
+        IReadOnlyList<string>? ipv4Addresses = null)
+    {
+        DiskBytes = diskBytes;
+        CreatedAt = createdAt;
+        State = state;
+        Ipv4Addresses = ipv4Addresses ?? [];
+    }
+
+    public long? DiskBytes { get; }
+    public DateTimeOffset? CreatedAt { get; }
+    public string? State { get; }
+    public IReadOnlyList<string> Ipv4Addresses { get; }
+}
 
 internal sealed class MultipassDaemonRetryPolicy
 {
@@ -4662,7 +4841,8 @@ internal static class MultipassDaemonRetry
         ILogger log,
         WorkItemId? workItemId,
         CancellationToken ct,
-        MultipassDaemonRetryPolicy? policy = null)
+        MultipassDaemonRetryPolicy? policy = null,
+        Serilog.ILogger? auditLogger = null)
     {
         ArgumentNullException.ThrowIfNull(argv);
         ArgumentNullException.ThrowIfNull(action);
@@ -4670,6 +4850,7 @@ internal static class MultipassDaemonRetry
         ArgumentNullException.ThrowIfNull(log);
 
         policy ??= MultipassDaemonRetryPolicy.Default;
+        auditLogger ??= Serilog.Log.Logger;
         if (policy.MaxAttempts < 1) throw new ArgumentOutOfRangeException(nameof(policy.MaxAttempts));
         if (policy.Backoffs.Count < policy.MaxAttempts - 1)
             throw new ArgumentException("Backoffs must contain one delay per retry.", nameof(policy));
@@ -4693,7 +4874,7 @@ internal static class MultipassDaemonRetry
             var retryOrdinal = attempt;
             var probe = await healthProbe(ct).ConfigureAwait(false);
             var delay = policy.Backoffs[attempt - 1];
-            AuditTransientRetry(workItemId, operation, retryOrdinal, errorClass, policy.AuditLogger);
+            AuditTransientRetry(workItemId, operation, retryOrdinal, errorClass, policy.AuditLogger ?? auditLogger);
 
             if (retryOrdinal == 1)
             {
@@ -5252,7 +5433,7 @@ public sealed record MultipassDiskGuardOptions
     public TimeSpan RecheckIn { get; init; } = TimeSpan.FromMinutes(5);
 }
 
-internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDisposeSandbox, ISuspendableSandbox, IShutdownTeardownSandbox, IProviderOwnedSandbox, IPrivilegedGuestFileHardeningSandbox, IResourceMetricsCapturingSandbox
+internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDisposeSandbox, ISuspendableSandbox, IShutdownTeardownSandbox, IProviderOwnedSandbox, IPrivilegedGuestFileHardeningSandbox, IResourceMetricsCapturingSandbox, IRoutableSandbox, ISandboxPortPublisher, IActiveSandboxLease
 {
     internal const int ArgvBytesWarningThreshold = 64 * 1024;
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
@@ -5266,8 +5447,67 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private const int DetachedProcessGroupMalformedExitCode = 73;
     private const int DetachedSupervisorSetupFailedExitCode = 88;
     private const int DetachedPollFailureLimit = 5;
+    // Once the process group is observed gone without a captured authenticated
+    // exit, re-check the ingest listener this many times before declaring the
+    // completion lost. The wrapper posts its authenticated exit as its final
+    // act (after stdout has already streamed), so a gone-PG almost always means
+    // the exit POST is in flight or the liveness probe raced the still-draining
+    // wrapper under host load — a bounded grace closes that window without
+    // masking a genuine crash.
+    private const int DetachedAuthenticatedExitGraceAttempts = 25;
     private static readonly TimeSpan DetachedAuthenticatedExitCleanupTimeout = TimeSpan.FromSeconds(5);
     private const string DetachedSupervisorDirectory = "/run/codeybox-exec";
+    internal const string DetachedProcessGroupPollCommand = """
+            codeybox_pgid_marker=$1
+            codeybox_process_group_alive() {
+                codeybox_probe_pgid=$1
+                if [ -d /proc ]; then
+                    awk -v pgid="$codeybox_probe_pgid" '
+                        {
+                            line = $0
+                            sub(/^[^)]*\) /, "", line)
+                            split(line, fields, " ")
+                            if (fields[3] == pgid && fields[1] != "Z") found = 1
+                        }
+                        END { exit found ? 0 : 1 }
+                    ' /proc/[0-9]*/stat 2>/dev/null
+                    return $?
+                fi
+                kill -0 "-$codeybox_probe_pgid" 2>/dev/null
+            }
+            if ! test -f "$codeybox_pgid_marker"; then
+                printf 'missing\n'
+                exit 0
+            fi
+            codeybox_pgid=$(cat -- "$codeybox_pgid_marker" 2>/dev/null || true)
+            case "$codeybox_pgid" in
+                ''|*[!0-9]*|0)
+                    printf 'detached exec process group marker %s was malformed: %s\n' "$codeybox_pgid_marker" "$codeybox_pgid" >&2
+                    exit 73
+                    ;;
+            esac
+            codeybox_alive=gone
+            if codeybox_process_group_alive "$codeybox_pgid"; then
+                codeybox_alive=alive
+            fi
+            codeybox_exit_file="${codeybox_pgid_marker}.exit"
+            if test -f "$codeybox_exit_file"; then
+                codeybox_exit_code=$(cat -- "$codeybox_exit_file" 2>/dev/null || true)
+                case "$codeybox_exit_code" in
+                    ''|*[!0-9-]*)
+                        printf 'exited %s\n' "$codeybox_pgid"
+                        ;;
+                    *)
+                        printf 'exited %s %s %s\n' "$codeybox_pgid" "$codeybox_exit_code" "$codeybox_alive"
+                        ;;
+                esac
+            elif [ "$codeybox_alive" = "alive" ]; then
+                printf 'alive %s\n' "$codeybox_pgid"
+            else
+                printf 'exited %s\n' "$codeybox_pgid"
+            fi
+            exit 0
+            """;
 
     // Test seam: override the WaitForDetachedCompletionAsync poll interval.
     // Production polls every 2s; tests set a small value so the loop is not
@@ -5312,6 +5552,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private readonly Action<string>? _onNoLongerTrackedActive;
     private readonly Func<IReadOnlyList<string>, CancellationToken, Task<IDisposable>>? _opGateAcquirer;
     private readonly AgentOutputHttpIngestSessionStarter _agentOutputIngestSessionStarter;
+    private readonly string? _hostAddress;
     private readonly int _maxScreenshotPngBytes;
     private readonly int _maxScreenshotBase64StdoutBytes;
     private readonly int _maxScreenshotStderrBytes;
@@ -5321,6 +5562,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private bool _preserveOnDispose;
     private bool _isSuspended;
     private bool _ownedByShutdownHandler;
+    private int _activeTrackingReleased;
     private long _activeProgressVersion;
     private string _activeProgressStatus = "active";
 
@@ -5369,7 +5611,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         Func<IReadOnlyList<string>, CancellationToken, Task<IDisposable>>? opGateAcquirer = null,
         AgentOutputHttpIngestSessionStarter? agentOutputIngestSessionStarter = null,
         ISandboxResourceUsageStore? resourceUsageStore = null,
-        string? baselineRef = null)
+        string? baselineRef = null,
+        string? hostAddress = null)
     {
         _name = name;
         _sandboxRoot = sandboxRoot;
@@ -5393,6 +5636,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         _opGateAcquirer = opGateAcquirer;
         _agentOutputIngestSessionStarter = agentOutputIngestSessionStarter
             ?? MultipassAgentOutputHttpIngestSession.TryStartAsync;
+        _hostAddress = hostAddress;
         _maxScreenshotPngBytes = maxScreenshotPngBytes ?? MaxScreenshotPngBytes;
         _maxScreenshotStderrBytes = maxScreenshotStderrBytes ?? MaxScreenshotStderrBytes;
         if (_maxScreenshotPngBytes <= 0)
@@ -5406,6 +5650,40 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     public string Id { get; }
     public string ProviderId => MultipassSandboxProvider.ProviderId;
     public bool CapturesResourceMetrics => _opts.CaptureResourceMetrics;
+    public string? HostAddress => _hostAddress;
+
+    public bool CanPublishPort(int port)
+        => !string.IsNullOrWhiteSpace(_hostAddress)
+            && !string.IsNullOrWhiteSpace(_spec.Network.ProfileName)
+            && _opts.NetworkProfiles.ContainsKey(_spec.Network.ProfileName)
+            && port is >= 1 and <= 65535;
+
+    public SandboxPublishedPort PublishPort(int port)
+    {
+        if (!CanPublishPort(port))
+            throw new NotSupportedException($"Multipass sandbox '{Id}' cannot publish port {port}.");
+        return new SandboxPublishedPort(
+            _hostAddress!,
+            port,
+            new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["endpoint.scope"] = "host-routable",
+            });
+    }
+
+    public void ReleaseActiveTracking()
+    {
+        if (Interlocked.Exchange(ref _activeTrackingReleased, 1) != 0)
+            return;
+        try
+        {
+            _onNoLongerTrackedActive?.Invoke(_name);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Failed to release active tracking for multipass VM {Name}", _name);
+        }
+    }
 
     internal ActiveSandboxProgress SnapshotActiveProgress(WorkItemId workItemId)
     {
@@ -6718,7 +6996,6 @@ while True:
         sb.AppendLine("    \"$@\" </dev/null >\"$codeybox_stdout_file\" 2>\"$codeybox_stderr_file\"");
         sb.AppendLine("    codeybox_wrapper_rc=$?");
         sb.AppendLine("fi");
-        sb.AppendLine("codeybox_http_exit \"$codeybox_wrapper_rc\" || true");
         sb.AppendLine("if ! codeybox_root_sh 'marker=$1");
         sb.AppendLine("stdout_file=$2");
         sb.AppendLine("stderr_file=$3");
@@ -6742,6 +7019,7 @@ while True:
         sb.AppendLine("    exit \"$codeybox_wrapper_rc\"");
         sb.AppendLine("fi");
         sb.AppendLine("rm -f \"$codeybox_stdout_file\" \"$codeybox_stderr_file\"");
+        sb.AppendLine("codeybox_http_exit \"$codeybox_wrapper_rc\" || true");
         sb.AppendLine("exit \"$codeybox_wrapper_rc\"");
         sb.AppendLine("CODEYBOX_DETACHED_CHILD");
         sb.AppendLine("chmod 0700 \"$codeybox_child_script\"");
@@ -6987,15 +7265,49 @@ while True:
                 if (state.ProcessGroupAlive)
                     continue;
 
-                // PG is gone but the wrapper never delivered the host-authenticated
-                // completion. The wrapper crashed, was killed, or could not reach
-                // the ingest listener — surface a diagnostic rather than guessing.
+                // PG reported gone but the authenticated exit is not yet visible.
+                // The wrapper posts that exit as its last act before the group
+                // dies, and stdout has already streamed over the same channel, so
+                // this is almost always an in-flight exit POST (or a liveness
+                // probe that raced the still-draining wrapper under host load).
+                // Give the authenticated completion a bounded grace to land
+                // before concluding the wrapper crashed without delivering it.
+                if (await WaitForAuthenticatedExitAfterProcessGroupGoneAsync(ingest, ct).ConfigureAwait(false)
+                    is { } gracedExitCode)
+                {
+                    var reapError = await EnsureDetachedProcessGroupReapedAfterAuthenticatedExitAsync(processGroupMarker).ConfigureAwait(false);
+                    return new DetachedExitResult(gracedExitCode, reapError);
+                }
+
+                // Grace elapsed with still no authenticated completion. The
+                // wrapper crashed, was killed, or could not reach the ingest
+                // listener — surface a diagnostic rather than guessing.
                 return new DetachedExitResult(
                     1,
                     "agent output transport produced nothing / detached run reported no exit: " +
                     $"detached exec process group {state.ProcessGroupId} exited without authenticated exit completion\n");
             }
         }
+    }
+
+    // Re-check the ingest listener for the authenticated exit after the process
+    // group is observed gone, giving an in-flight exit POST (or a raced liveness
+    // probe) a bounded window to resolve. Returns the exit code once captured,
+    // or null if the grace elapses with no authenticated completion.
+    private async Task<int?> WaitForAuthenticatedExitAfterProcessGroupGoneAsync(
+        MultipassAgentOutputHttpIngestSession ingest,
+        CancellationToken ct)
+    {
+        var graceInterval = DetachedPollIntervalOverride ?? TimeSpan.FromMilliseconds(200);
+        for (var attempt = 0; attempt < DetachedAuthenticatedExitGraceAttempts; attempt++)
+        {
+            if (ingest.TryGetExitCode(out var exitCode))
+                return exitCode;
+            ct.ThrowIfCancellationRequested();
+            await Task.Delay(graceInterval, ct).ConfigureAwait(false);
+        }
+
+        return ingest.TryGetExitCode(out var finalExitCode) ? finalExitCode : null;
     }
 
     private async Task<string?> EnsureDetachedProcessGroupReapedAfterAuthenticatedExitAsync(string processGroupMarker)
@@ -7131,43 +7443,8 @@ while True:
         // single multipass exec yields both liveness and (when available)
         // the wrapper-written exit code — no separate `cat` round-trip and no
         // additional host-side multipass spin.
-        const string pollCommand = """
-            codeybox_pgid_marker=$1
-            if ! test -f "$codeybox_pgid_marker"; then
-                printf 'missing\n'
-                exit 0
-            fi
-            codeybox_pgid=$(cat -- "$codeybox_pgid_marker" 2>/dev/null || true)
-            case "$codeybox_pgid" in
-                ''|*[!0-9]*|0)
-                    printf 'detached exec process group marker %s was malformed: %s\n' "$codeybox_pgid_marker" "$codeybox_pgid" >&2
-                    exit 73
-                    ;;
-            esac
-            codeybox_alive=gone
-            if kill -0 "-$codeybox_pgid" 2>/dev/null; then
-                codeybox_alive=alive
-            fi
-            codeybox_exit_file="${codeybox_pgid_marker}.exit"
-            if test -f "$codeybox_exit_file"; then
-                codeybox_exit_code=$(cat -- "$codeybox_exit_file" 2>/dev/null || true)
-                case "$codeybox_exit_code" in
-                    ''|*[!0-9-]*)
-                        printf 'exited %s\n' "$codeybox_pgid"
-                        ;;
-                    *)
-                        printf 'exited %s %s %s\n' "$codeybox_pgid" "$codeybox_exit_code" "$codeybox_alive"
-                        ;;
-                esac
-            elif [ "$codeybox_alive" = "alive" ]; then
-                printf 'alive %s\n' "$codeybox_pgid"
-            else
-                printf 'exited %s\n' "$codeybox_pgid"
-            fi
-            exit 0
-            """;
         var result = await RunMultipassAsync(
-            [_opts.MultipassBinary, "exec", _name, "--", "sudo", "-n", "sh", "-c", pollCommand, "codeybox-detached-poll", processGroupMarker],
+            [_opts.MultipassBinary, "exec", _name, "--", "sudo", "-n", "sh", "-c", DetachedProcessGroupPollCommand, "codeybox-detached-poll", processGroupMarker],
             stdin: null,
             ct: ct,
             maxStdoutBytes: 128,
@@ -7231,6 +7508,22 @@ while True:
     {
         const string killCommand = """
             codeybox_pgid_marker=$1
+            codeybox_process_group_alive() {
+                codeybox_probe_pgid=$1
+                if [ -d /proc ]; then
+                    awk -v pgid="$codeybox_probe_pgid" '
+                        {
+                            line = $0
+                            sub(/^[^)]*\) /, "", line)
+                            split(line, fields, " ")
+                            if (fields[3] == pgid && fields[1] != "Z") found = 1
+                        }
+                        END { exit found ? 0 : 1 }
+                    ' /proc/[0-9]*/stat 2>/dev/null
+                    return $?
+                fi
+                kill -0 "-$codeybox_probe_pgid" 2>/dev/null
+            }
             codeybox_wait_i=0
             while ! test -f "$codeybox_pgid_marker"; do
                 if [ "$codeybox_wait_i" -ge 50 ]; then
@@ -7246,7 +7539,7 @@ while True:
             kill -TERM "-$codeybox_pgid" 2>/dev/null || true
             codeybox_i=0
             while [ "$codeybox_i" -lt 20 ]; do
-                if ! kill -0 "-$codeybox_pgid" 2>/dev/null; then
+                if ! codeybox_process_group_alive "$codeybox_pgid"; then
                     exit 0
                 fi
                 sleep 0.1
@@ -7414,15 +7707,6 @@ while True:
         if (_preserveOnDispose)
             return;
 
-        try
-        {
-            _onNoLongerTrackedActive?.Invoke(_name);
-        }
-        catch (Exception callbackEx)
-        {
-            _log.LogWarning(callbackEx, "Failed to release active tracking for multipass VM {Name}", _name);
-        }
-
         var metrics = await EnsureResourceMetricsCapturedAsync(CancellationToken.None).ConfigureAwait(false);
 
         await using var disposeScope = await TimingScope.BeginAsync(
@@ -7440,10 +7724,16 @@ while True:
         catch (Exception ex)
         {
             _log.LogWarning(ex, "Failed to delete multipass VM {Name}", _name);
-            if (_ownedByShutdownHandler)
-                throw;
-            return;
+            ReleaseActiveTracking();
+            // The purge did not prove the VM gone. Re-arm the dispose guards so a
+            // later DisposeAsync (explicit retry) or the leak reaper can re-attempt
+            // deletion instead of silently orphaning the VM, and surface the failure
+            // so the caller learns the sandbox is still retryable rather than gone.
+            Volatile.Write(ref _disposed, 0);
+            Volatile.Write(ref _disposeStarted, 0);
+            throw;
         }
+        ReleaseActiveTracking();
         _onDisposed?.Invoke(_name);
         AuditLog.SandboxDisposed(_name, metrics);
         try { Directory.Delete(_sandboxRoot, recursive: true); }

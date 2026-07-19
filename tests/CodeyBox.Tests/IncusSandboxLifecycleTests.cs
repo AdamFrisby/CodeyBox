@@ -571,6 +571,7 @@ public sealed class IncusSandboxLifecycleTests
         Directory.CreateDirectory(sandboxRoot);
         IncusMountStaging.InitializeOwnedTree(sandboxRoot, sandboxName, DateTimeOffset.UtcNow);
         var runner = new StickyDeletionLifecycleRunner(sandboxName);
+        var time = new ControllableTimeProvider(DateTimeOffset.UtcNow);
         var inactive = 0;
         var options = new IncusSandboxOptions
         {
@@ -596,7 +597,7 @@ public sealed class IncusSandboxLifecycleTests
             root,
             spec,
             options,
-            new IncusCliRunner(runner),
+            new IncusCliRunner(runner, time),
             NullLogger.Instance,
             timings: null,
             WorkItemId.New(),
@@ -607,10 +608,14 @@ public sealed class IncusSandboxLifecycleTests
             authorization,
             recoveryState.Lease,
             recoveryState.Manifest,
-            recoveryState.Store);
+            recoveryState.Store,
+            timeProvider: time);
         SandboxLiveCounter.Increment();
 
-        await Assert.ThrowsAsync<TimeoutException>(() => sandbox.DisposeAsync().AsTask());
+        var firstDispose = sandbox.DisposeAsync().AsTask();
+        await runner.AbsenceProbeStarted.WaitAsync(TimeSpan.FromSeconds(5));
+        await AdvanceUntilCompletedAsync(time, firstDispose, TimeSpan.FromMilliseconds(10));
+        await Assert.ThrowsAsync<TimeoutException>(() => firstDispose);
 
         Assert.True(Directory.Exists(sandboxRoot));
         Assert.Equal(0, inactive);
@@ -1329,7 +1334,7 @@ public sealed class IncusSandboxLifecycleTests
         var sandbox = CreateSandbox(
             sandboxName,
             root,
-            FastLifecycleOptions(),
+            FastLifecycleOptions() with { OperationTimeout = TimeSpan.FromSeconds(10) },
             runner,
             spec: spec,
             newGuid: () => Guid.Parse("99999999-8888-7777-6666-555555555555"));
@@ -3586,8 +3591,12 @@ public sealed class IncusSandboxLifecycleTests
         private bool _deleted;
         private string? _recoveryTokenHash;
         private string? _recoveryManifestHash;
+        private bool _deleteIssued;
+        private readonly TaskCompletionSource _absenceProbeStarted = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
         internal bool CompleteDeletion { get; set; }
         internal int DeleteCalls { get; private set; }
+        internal Task AbsenceProbeStarted => _absenceProbeStarted.Task;
 
         internal void SetRecoveryBinding(string tokenHash, string manifestHash) =>
             (_recoveryTokenHash, _recoveryManifestHash) = (tokenHash, manifestHash);
@@ -3606,6 +3615,8 @@ public sealed class IncusSandboxLifecycleTests
             ct.ThrowIfCancellationRequested();
             if (argv.Contains("list", StringComparer.Ordinal))
             {
+                if (_deleteIssued)
+                    _absenceProbeStarted.TrySetResult();
                 var json = _deleted
                     ? "[]"
                     : OwnedInstanceJson(sandboxName, "RUNNING", _recoveryTokenHash, _recoveryManifestHash);
@@ -3614,6 +3625,7 @@ public sealed class IncusSandboxLifecycleTests
             if (argv.Contains("delete", StringComparer.Ordinal))
             {
                 DeleteCalls++;
+                _deleteIssued = true;
                 _deleted = CompleteDeletion;
                 return Task.FromResult(new ProcessRunResult(0, string.Empty, string.Empty));
             }

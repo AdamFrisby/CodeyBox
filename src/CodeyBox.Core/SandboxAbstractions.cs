@@ -198,7 +198,18 @@ public sealed record ManagedSandboxInfo(
     bool HasPreemptMarker = false,
     bool IsSuspendLifecycleOrFrozen = false,
     string? LifecycleProviderId = null,
-    string? HostId = null);
+    string? HostId = null,
+    SandboxPurpose Purpose = SandboxPurpose.WorkItem);
+
+/// <summary>
+/// Broad owner category for a sandbox. Providers persist this where possible
+/// so post-restart leak reapers only sweep sandboxes they own.
+/// </summary>
+public enum SandboxPurpose
+{
+    WorkItem = 0,
+    Deployment = 1,
+}
 
 public sealed class ManagedSandboxInventory : IReadOnlyList<ManagedSandboxInfo>
 {
@@ -346,6 +357,45 @@ public interface IReleaseAdmissionOnHostLossSandbox : ISandbox
     /// normal cleanup failures where a live sandbox may still consume capacity.
     /// </summary>
     bool ReleaseAdmissionAfterHostLoss { get; }
+}
+
+/// <summary>
+/// Optional capability for sandbox implementations that can expose an address
+/// reachable from the orchestrator host. Deployment drivers use this for
+/// caller-facing endpoints; sandbox-local loopback addresses stay internal.
+/// </summary>
+public interface IRoutableSandbox : ISandbox
+{
+    string? HostAddress { get; }
+}
+
+
+/// <summary>
+/// Optional sandbox-level capability for publishing a sandbox TCP port to the
+/// orchestrator host. Implementations may expose the port directly when the
+/// sandbox has a host-routable address, or return a local tunnel endpoint.
+/// Deployment adapters translate this sandbox capability into deployment
+/// endpoint DTOs; sandbox providers do not depend on deployment APIs.
+/// </summary>
+public interface ISandboxPortPublisher : ISandbox
+{
+    bool CanPublishPort(int port);
+    SandboxPublishedPort PublishPort(int port);
+}
+
+public sealed record SandboxPublishedPort(
+    string Host,
+    int Port,
+    IReadOnlyDictionary<string, string>? Metadata = null);
+
+/// <summary>
+/// Optional sandbox capability for releasing provider-side active tracking
+/// without claiming the sandbox was successfully disposed. Used by deployment
+/// cleanup after a failed delete so leak reapers can retry in-process.
+/// </summary>
+public interface IActiveSandboxLease
+{
+    void ReleaseActiveTracking();
 }
 
 /// <summary>
@@ -1029,6 +1079,7 @@ public sealed class NullBaselineImageResolver : IBaselineImageResolver
 public sealed record SandboxSpec
 {
     public required string ImageReference { get; init; }
+    public SandboxPurpose Purpose { get; init; } = SandboxPurpose.WorkItem;
     public IReadOnlyList<SandboxMount> Mounts { get; init; } = [];
     public IReadOnlyDictionary<string, string> Environment { get; init; } = new Dictionary<string, string>();
     public SandboxResourceLimits Limits { get; init; } = SandboxResourceLimits.Default;

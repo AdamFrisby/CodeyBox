@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
@@ -80,6 +82,8 @@ namespace CodeyBox.Sandbox.MultipassRemote;
 /// </summary>
 public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IActiveSandboxProgressProvider, ISandboxHostPoolSnapshot
 {
+    private const string PurposeMarkerFile = ".codeybox-purpose";
+
     private readonly Func<MultipassRemoteSandboxOptions> _optsAccessor;
     private readonly Func<MultipassRemoteSandboxOptions, IRemoteHostTransport> _transportFactory;
     private readonly ILogger<MultipassRemoteSandboxProvider> _log;
@@ -297,6 +301,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         // 1) Prepare the per-sandbox staging directory on the remote host.
         await EnsureRemoteStagingDirAsync(opts, transport, remoteSandboxRoot, ct).ConfigureAwait(false);
         await WriteRemoteCreatedAtAsync(opts, transport, remoteSandboxRoot, DateTimeOffset.UtcNow, ct).ConfigureAwait(false);
+        await WriteRemotePurposeMarkerAsync(opts, transport, remoteSandboxRoot, spec.Purpose, ct).ConfigureAwait(false);
 
         // 2) Stage each bind-mount source. Writable mounts get tracked so we
         //    can sync them back at dispose; tmpfs mounts get an empty remote
@@ -393,6 +398,13 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
 
             await WaitForVmStateAsync(opts, transport, vmName, "Running", opts.VmStartTimeout, ct).ConfigureAwait(false);
 
+            // Publish the VM's IPv4 address to the sandbox so deployment
+            // drivers can open an SSH local-forward endpoint into the guest.
+            // The lookup is best-effort — a missing address leaves the sandbox
+            // non-publishing rather than failing placement.
+            var vmAddress = await ResolveRemoteVmAddressAsync(opts, transport, vmName, spec.Network.ProfileName, ct).ConfigureAwait(false);
+            sandbox.RegisterVmAddress(vmAddress);
+
             // 4) Apply environment via a stamped /etc/environment fragment.
             //    multipass exec is per-call by default; environment from the
             //    spec needs to be visible to subsequent ExecAsync calls.
@@ -413,6 +425,11 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         }
         catch
         {
+            // Drop the in-progress tracking entry; authoritative remote cleanup
+            // (VM delete + staging removal + reservation handling) is owned by
+            // the placement loop's RollBackCreateFailureAsync, which runs for
+            // every exception path out of this method. Deleting here too would
+            // double-issue `multipass delete`/`rm -rf` on the same target.
             _active.TryRemove(new RemoteSandboxIdentity(opts.HostId, vmName), out _);
             throw;
         }
@@ -491,7 +508,8 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             try
             {
                 var createdAtByName = await ReadRemoteCreatedAtMetadataAsync(opts, transport, ct).ConfigureAwait(false);
-                AddManagedFromListJson(infos, opts, result.Stdout, createdAtByName);
+                var purposeByName = await ReadRemotePurposeMarkersAsync(opts, transport, ct).ConfigureAwait(false);
+                AddManagedFromListJson(infos, opts, result.Stdout, createdAtByName, purposeByName);
                 inventoriedHostIds.Add(opts.HostId);
             }
             catch (RemoteSshTransportException ex)
@@ -929,6 +947,70 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                 isHostRuntimeFailure: true);
     }
 
+    private async Task WriteRemotePurposeMarkerAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        string remoteSandboxRoot,
+        SandboxPurpose purpose,
+        CancellationToken ct)
+    {
+        var path = JoinRemote(remoteSandboxRoot, PurposeMarkerFile);
+        var cmd = $"printf %s {OpenSshCliTransport.QuoteShellWord(purpose.ToString())} > {OpenSshCliTransport.QuoteShellWord(path)}";
+        var r = await RunRemoteControlAsync(opts, transport, ["sh", "-c", cmd], ct).ConfigureAwait(false);
+        if (r.ExitCode != 0)
+            throw new RemoteHostProvisioningException(
+                opts.HostId,
+                "staging-purpose",
+                $"Failed to write remote sandbox purpose marker '{path}' (exit {r.ExitCode}): {TruncateForLog(r.Stderr)}",
+                isHostRuntimeFailure: true);
+    }
+
+    private async Task<IReadOnlyDictionary<string, SandboxPurpose>> ReadRemotePurposeMarkersAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        CancellationToken ct)
+    {
+        var root = OpenSshCliTransport.QuoteShellWord(opts.RemoteStagingRoot);
+        var script =
+            $"find {root} -mindepth 2 -maxdepth 2 -name {OpenSshCliTransport.QuoteShellWord(PurposeMarkerFile)} -type f -print 2>/dev/null " +
+            $"| while IFS= read -r f; do d=${{f%/{PurposeMarkerFile}}}; n=${{d##*/}}; printf '%s\\t' \"$n\"; head -n 1 \"$f\"; printf '\\n'; done || true";
+        ProcessRunResultLike result;
+        try
+        {
+            result = await RunRemoteInventoryAsync(opts, transport, ["sh", "-c", script], ct).ConfigureAwait(false);
+        }
+        catch (RemoteSshTransportException ex)
+        {
+            MarkRuntimeUnhealthy(opts, ex);
+            throw;
+        }
+
+        if (result.ExitCode != 0)
+        {
+            _log.LogWarning(
+                "Remote sandbox purpose-marker scan on host {HostId} exited {ExitCode}: {Stderr}",
+                opts.HostId,
+                result.ExitCode,
+                TruncateForLog(result.Stderr));
+            return new Dictionary<string, SandboxPurpose>(StringComparer.Ordinal);
+        }
+
+        var purposes = new Dictionary<string, SandboxPurpose>(StringComparer.Ordinal);
+        using var reader = new StringReader(result.Stdout);
+        while (reader.ReadLine() is { } line)
+        {
+            var tab = line.IndexOf('\t');
+            if (tab <= 0 || tab == line.Length - 1)
+                continue;
+            var name = line[..tab];
+            var raw = line[(tab + 1)..].Trim();
+            if (Enum.TryParse<SandboxPurpose>(raw, ignoreCase: true, out var purpose))
+                purposes[name] = purpose;
+        }
+
+        return purposes;
+    }
+
     private async Task ApplyVmEnvironmentAsync(
         MultipassRemoteSandboxOptions opts,
         IRemoteHostTransport transport,
@@ -994,6 +1076,80 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         }
     }
 
+    internal async Task<string?> ResolveRemoteVmAddressAsync(
+        MultipassRemoteSandboxOptions opts,
+        IRemoteHostTransport transport,
+        string vmName,
+        string? networkProfile,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(networkProfile))
+            return null;
+        if (!opts.NetworkProfiles.TryGetValue(networkProfile, out var bridge))
+            return null;
+
+        ProcessRunResultLike r;
+        try
+        {
+            r = await RunRemoteInventoryAsync(
+                opts,
+                transport,
+                [opts.RemoteMultipassPath, "info", vmName, "--format", "json"],
+                ct).ConfigureAwait(false);
+        }
+        catch (RemoteSshTransportException ex)
+        {
+            _log.LogWarning(ex,
+                "Remote VM {Vm}: SSH transport failure reading multipass info for deployment endpoint publishing on host {HostId}",
+                vmName, opts.HostId);
+            return null;
+        }
+        catch (RemoteHostProvisioningException ex) when (ex.IsHostRuntimeFailure)
+        {
+            _log.LogWarning(ex,
+                "Remote VM {Vm}: multipass info failed on host {HostId} for deployment endpoint publishing",
+                vmName, opts.HostId);
+            return null;
+        }
+        if (r.ExitCode != 0)
+        {
+            _log.LogWarning(
+                "Remote VM {Vm}: multipass info exit {ExitCode} on host {HostId} for deployment endpoint publishing: {Stderr}",
+                vmName, r.ExitCode, opts.HostId, TruncateForLog(r.Stderr));
+            return null;
+        }
+
+        var addresses = TryParseVmAddresses(r.Stdout, vmName);
+        if (addresses.Count == 0)
+            return null;
+
+        var bridgeSubnet = await ResolveRemoteBridgeSubnetAsync(bridge, ct).ConfigureAwait(false);
+        if (bridgeSubnet is null)
+        {
+            _log.LogWarning(
+                "Remote VM {Vm}: cannot identify IPv4 subnet for network profile {Profile} bridge {Bridge}; endpoint publishing disabled",
+                vmName, networkProfile, bridge);
+            return null;
+        }
+
+        return addresses.FirstOrDefault(bridgeSubnet.Value.Contains);
+    }
+
+    private async Task<Ipv4Subnet?> ResolveRemoteBridgeSubnetAsync(string bridge, CancellationToken ct)
+    {
+        var r = await RunRemoteAsync(["ip", "-4", "-o", "addr", "show", "dev", bridge], ct)
+            .ConfigureAwait(false);
+        if (r.ExitCode != 0)
+        {
+            _log.LogWarning(
+                "Remote bridge {Bridge}: failed to read IPv4 address for endpoint publishing (exit {ExitCode}): {Stderr}",
+                bridge, r.ExitCode, TruncateForLog(r.Stderr));
+            return null;
+        }
+
+        return TryParseIpv4Subnet(r.Stdout);
+    }
+
     private static bool TryParseVmState(string json, string vmName, out string state)
     {
         state = "";
@@ -1015,35 +1171,93 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         }
     }
 
-    internal Task BestEffortRemoteDeleteAsync(string vmName, string remoteSandboxRoot)
+    private static IReadOnlyList<string> TryParseVmAddresses(string json, string vmName)
     {
-        var opts = ResolveHosts()[0];
-        return BestEffortRemoteDeleteAsync(opts, _transportFactory(opts), vmName, remoteSandboxRoot, CancellationToken.None);
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("info", out var info)) return [];
+            if (!info.TryGetProperty(vmName, out var entry)) return [];
+            if (!entry.TryGetProperty("ipv4", out var ipv4)) return [];
+            if (ipv4.ValueKind == JsonValueKind.String)
+                return ParseIpv4s(ipv4.GetString()).ToList();
+            if (ipv4.ValueKind != JsonValueKind.Array) return [];
+
+            var addresses = new List<string>();
+            foreach (var item in ipv4.EnumerateArray())
+            {
+                if (item.ValueKind == JsonValueKind.String)
+                    addresses.AddRange(ParseIpv4s(item.GetString()));
+            }
+            return addresses;
+        }
+        catch (JsonException)
+        {
+            return [];
+        }
     }
 
-    internal async Task BestEffortRemoteDeleteAsync(string vmName, string remoteSandboxRoot, CancellationToken ct)
+    private static IEnumerable<string> ParseIpv4s(string? value)
     {
-        var opts = ResolveHosts()[0];
-        await BestEffortRemoteDeleteAsync(opts, _transportFactory(opts), vmName, remoteSandboxRoot, ct).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(value))
+            yield break;
+        foreach (var token in value.Split([' ', ',', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (IPAddress.TryParse(token, out var address) && address.AddressFamily == AddressFamily.InterNetwork)
+                yield return address.ToString();
+        }
     }
 
-    internal Task BestEffortRemoteDeleteAsync(
-        MultipassRemoteSandboxOptions opts,
-        IRemoteHostTransport transport,
-        string vmName,
-        string remoteSandboxRoot)
-        => BestEffortRemoteDeleteAsync(opts, transport, vmName, remoteSandboxRoot, CancellationToken.None);
-
-    internal async Task BestEffortRemoteDeleteAsync(
-        MultipassRemoteSandboxOptions opts,
-        IRemoteHostTransport transport,
-        string vmName,
-        string remoteSandboxRoot,
-        CancellationToken ct)
+    private static Ipv4Subnet? TryParseIpv4Subnet(string output)
     {
-        await BuildCleanup(opts, transport)
-            .TryDeleteVmAndStagingAsync(vmName, remoteSandboxRoot, ct)
-            .ConfigureAwait(false);
+        foreach (var token in output.Split([' ', '\t', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!token.Contains('/', StringComparison.Ordinal))
+                continue;
+            var parts = token.Split('/', 2);
+            if (!IPAddress.TryParse(parts[0], out var address) || address.AddressFamily != AddressFamily.InterNetwork)
+                continue;
+            if (!int.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out var prefix) || prefix is < 0 or > 32)
+                continue;
+            return new Ipv4Subnet(address, PrefixToMask(prefix));
+        }
+
+        return null;
+    }
+
+    private static IPAddress PrefixToMask(int prefix)
+    {
+        var mask = prefix == 0 ? 0u : uint.MaxValue << (32 - prefix);
+        return new IPAddress(new[]
+        {
+            (byte)(mask >> 24),
+            (byte)(mask >> 16),
+            (byte)(mask >> 8),
+            (byte)mask,
+        });
+    }
+
+    private readonly record struct Ipv4Subnet(IPAddress Address, IPAddress Mask)
+    {
+        public bool Contains(string candidate)
+            => IPAddress.TryParse(candidate, out var parsed)
+                && parsed.AddressFamily == AddressFamily.InterNetwork
+                && Contains(parsed);
+
+        public bool Contains(IPAddress candidate)
+        {
+            if (candidate.AddressFamily != AddressFamily.InterNetwork)
+                return false;
+            var candidateBytes = candidate.GetAddressBytes();
+            var addressBytes = Address.GetAddressBytes();
+            var maskBytes = Mask.GetAddressBytes();
+            if (candidateBytes.Length != 4 || addressBytes.Length != 4 || maskBytes.Length != 4)
+                return false;
+            for (var i = 0; i < 4; i++)
+                if ((candidateBytes[i] & maskBytes[i]) != (addressBytes[i] & maskBytes[i]))
+                    return false;
+            return true;
+        }
     }
 
     internal async Task DeleteRemoteStateOrThrowAsync(
@@ -1458,7 +1672,8 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
         List<ManagedSandboxInfo> infos,
         MultipassRemoteSandboxOptions opts,
         string json,
-        IReadOnlyDictionary<string, DateTimeOffset> createdAtByName)
+        IReadOnlyDictionary<string, DateTimeOffset> createdAtByName,
+        IReadOnlyDictionary<string, SandboxPurpose> purposeByName)
     {
         using var doc = JsonDocument.Parse(json);
         if (!doc.RootElement.TryGetProperty("list", out var list) || list.ValueKind != JsonValueKind.Array)
@@ -1476,6 +1691,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
             var state = entry.TryGetProperty("state", out var st) && st.ValueKind == JsonValueKind.String ? st.GetString() : null;
             var isSuspendOrFreezing = state is "Suspended" or "Suspending" or "Freezing";
             createdAtByName.TryGetValue(name, out var createdAt);
+            var purpose = purposeByName.TryGetValue(name, out var p) ? p : SandboxPurpose.WorkItem;
 
             infos.Add(new ManagedSandboxInfo(
                 Name: name,
@@ -1484,7 +1700,8 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
                 IsTrackedActive: isTrackedActive,
                 HasPreemptMarker: false,
                 IsSuspendLifecycleOrFrozen: isSuspendOrFreezing,
-                HostId: opts.HostId));
+                HostId: opts.HostId,
+                Purpose: purpose));
         }
     }
 

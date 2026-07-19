@@ -22,6 +22,7 @@ using CodeyBox.Audit.Llm.PlanAudit;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
+using CodeyBox.Deployment;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
@@ -2179,7 +2180,8 @@ builder.Services.AddSingleton<IProjectRepository>(sp => new ProjectRepository(
     sp.GetRequiredService<IOptionsMonitor<ProjectsOptions>>(),
     sp.GetRequiredService<ILogger<ProjectRepository>>(),
     sp.GetService<PresetCatalogOptions>(),
-    sp.GetRequiredService<IKnobRegistry>()));
+    sp.GetRequiredService<IKnobRegistry>(),
+    sp.GetService<IDeploymentDriverRegistry>()));
 builder.Services.AddSingleton<IUpstreamRemoteFactory, UpstreamRemoteFactory>();
 builder.Services.AddSingleton(_ =>
 {
@@ -2508,7 +2510,8 @@ builder.Services.AddSingleton<IAgentSupervisionNotifier>(sp =>
 builder.Services.AddSingleton<IAgentSupervisionService>(sp => new AgentSupervisionService(
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.AgentSupervision,
     sp.GetRequiredService<IAgentSupervisionNotifier>(),
-    sp.GetRequiredService<ILogger<AgentSupervisionService>>()));
+    sp.GetRequiredService<ILogger<AgentSupervisionService>>(),
+    Log.Logger));
 
 // --- Audit timeline reader ---------------------------------------------------
 builder.Services.AddSingleton(sp =>
@@ -3131,7 +3134,8 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
     },
     quotaAvailabilitySignal: sp.GetRequiredService<IAgentQuotaAvailabilitySignal>(),
     agentAvailabilityRecoverySignal: sp.GetRequiredService<IAgentAvailabilityRecoverySignal>(),
-    pauseSignal: sp.GetRequiredService<IAgentPauseSignal>()));
+    pauseSignal: sp.GetRequiredService<IAgentPauseSignal>(),
+    auditLogger: Log.Logger));
 builder.Services.AddSingleton<TransientRetryScheduler>(sp => new TransientRetryScheduler(
     sp.GetRequiredService<IWorkItemStore>(),
     sp.GetRequiredService<WorkItemRetrier>(),
@@ -3550,6 +3554,58 @@ builder.Services.AddSingleton<SandboxLeakReaper>(sp =>
         leakSink: sp.GetRequiredService<LeakDetectionSink>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<SandboxLeakReaper>());
+
+// --- Verification deployment drivers + manager -------------------------------
+// Built ONLY as the deployment abstraction (chain link 1) — no pipeline/audit
+// integration yet. Drivers are DI-resolved by their Kind via
+// DeploymentDriverRegistry, so a new kind is one new IDeploymentDriver
+// registration + recipe schema entry with zero core changes (per AGENTS.md
+// declared-capability pattern). The leak reaper sweeps managed sandboxes
+// whose deployment owner no longer exists in the manager's active set
+// (orchestrator restart, aborted deploy) — sibling to SandboxLeakReaper.
+builder.Services.AddSingleton<IDeploymentDriver, WebAppDeploymentDriver>();
+builder.Services.AddSingleton<IDeploymentDriver, DaemonDeploymentDriver>();
+builder.Services.AddSingleton<IDeploymentDriver, CliDeploymentDriver>();
+builder.Services.AddSingleton<IDeploymentDriver, LibraryDeploymentDriver>();
+builder.Services.AddSingleton<SandboxDeploymentSubstrateProvider>(sp =>
+    new SandboxDeploymentSubstrateProvider(sp.GetRequiredService<ISandboxProvider>()));
+builder.Services.AddSingleton<IDeploymentSubstrateProvider>(sp =>
+    sp.GetRequiredService<SandboxDeploymentSubstrateProvider>());
+builder.Services.AddSingleton<IDeploymentCleanupProvider>(sp =>
+    sp.GetRequiredService<SandboxDeploymentSubstrateProvider>());
+builder.Services.AddSingleton<IDeploymentDriverRegistry, DeploymentDriverRegistry>();
+builder.Services.AddSingleton<IDeploymentManager>(sp => new DeploymentManager(
+    sp.GetRequiredService<IDeploymentDriverRegistry>(),
+    sp.GetRequiredService<ILogger<DeploymentManager>>()));
+builder.Services.AddSingleton<DeploymentLeakReaper>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    // The work-item store holds the authoritative SuspendedVmName index — every
+    // VM the startup resume handler is going to multipass-start back to Running
+    // after an orchestrator restart. Without this filter, the deployment reaper
+    // would purge those VMs at LeakAgeThreshold even though SandboxLeakReaper
+    // explicitly preserves them via the same index.
+    var store = sp.GetRequiredService<IWorkItemStore>();
+    Func<CancellationToken, Task<IReadOnlySet<string>>> suspendedNames = async ct =>
+    {
+        var set = new HashSet<string>(StringComparer.Ordinal);
+        await foreach (var item in store.ListSuspendedAsync(ct).ConfigureAwait(false))
+        {
+            if (string.IsNullOrWhiteSpace(item.SuspendedVmName)) continue;
+            if (WorkItemDependencies.TerminalStates.Contains(item.State)) continue;
+            set.Add(item.SuspendedVmName!);
+        }
+        return set;
+    };
+    return new DeploymentLeakReaper(
+        sp.GetRequiredService<IDeploymentCleanupProvider>(),
+        sp.GetRequiredService<IDeploymentManager>(),
+        () => monitor.CurrentValue.DeploymentLeak,
+        sp.GetRequiredService<ILogger<DeploymentLeakReaper>>(),
+        clock: null,
+        suspendedNameProvider: suspendedNames);
+});
+builder.Services.AddHostedService(sp => sp.GetRequiredService<DeploymentLeakReaper>());
 
 // --- B1 baseline-image reaper ------------------------------------------------
 // Reference-counted GC for content-hashed Multipass baseline VMs. The reaper
@@ -4525,6 +4581,14 @@ namespace CodeyBox.Api
         /// treated as one legacy host named "default".
         /// </summary>
         public IList<MultipassRemoteExecutorHostConfig>? ExecutorHosts { get; set; }
+
+        /// <summary>
+        /// Maps logical network-profile names to bridge names on the remote
+        /// Multipass host(s). When omitted (null/empty), the remote provider
+        /// falls back to the global <c>SandboxNetworkProfiles</c> map for
+        /// backward compatibility.
+        /// </summary>
+        public Dictionary<string, string>? NetworkProfiles { get; set; }
     }
 
     public sealed class MultipassRemoteExecutorHostConfig
@@ -5198,6 +5262,15 @@ namespace CodeyBox.Api
         /// (or optionally auto-disposes) them. See docs/sandbox-leaks.md.
         /// </summary>
         public SandboxLeakOptions SandboxLeak { get; set; } = new();
+
+        /// <summary>
+        /// Verification-deployment leak reaper configuration. Sweeps managed
+        /// sandboxes that outlived an <see cref="IDeploymentManager"/>-tracked
+        /// deployment (orchestrator crash / aborted deploy). Same pattern as
+        /// <see cref="SandboxLeak"/>; running both is safe — each scopes to
+        /// its own concern.
+        /// </summary>
+        public DeploymentLeakOptions DeploymentLeak { get; set; } = new();
 
         /// <summary>
         /// B1 baseline-image reaper configuration. Reference-counted GC for

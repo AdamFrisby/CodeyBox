@@ -2,6 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\CodeyBox.Core\CodeyBox.Core.csproj" />
+    <ProjectReference Include="..\CodeyBox.Deployment\CodeyBox.Deployment.csproj" />
     <ProjectReference Include="..\CodeyBox.Orchestrator\CodeyBox.Orchestrator.csproj" />
     <ProjectReference Include="..\CodeyBox.Sandbox.Process\CodeyBox.Sandbox.Process.csproj" />
     <ProjectReference Include="..\CodeyBox.Agents.Claude\CodeyBox.Agents.Claude.csproj" />

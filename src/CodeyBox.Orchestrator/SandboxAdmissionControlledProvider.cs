@@ -1126,10 +1126,13 @@ internal sealed class SandboxAdmissionLease : IDisposable
     }
 }
 
-internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox, IHostQualifiedSandbox, ISandboxDecorator
+internal class AdmissionControlledSandbox : IRoutableSandbox, IPreserveOnDisposeSandbox, IHostQualifiedSandbox, ISandboxPortPublisher, ISandboxDecorator, IActiveSandboxLease
 {
     private readonly ISandbox _inner;
+    private readonly IRoutableSandbox? _routable;
+    private readonly ISandboxPortPublisher? _portPublisher;
     private readonly IPreserveOnDisposeSandbox? _preserveOnDispose;
+    private readonly IActiveSandboxLease? _activeLease;
     private readonly Func<AdmissionControlledSandbox, SandboxAdmissionLease, bool, bool, Exception?, ValueTask> _onDisposed;
     private readonly Action<AdmissionControlledSandbox> _onPreserved;
     private readonly ILogger _log;
@@ -1151,7 +1154,10 @@ internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox,
         ArgumentNullException.ThrowIfNull(onPreserved);
         ArgumentNullException.ThrowIfNull(log);
         _inner = inner;
+        _routable = inner as IRoutableSandbox;
+        _portPublisher = inner as ISandboxPortPublisher;
         _preserveOnDispose = inner as IPreserveOnDisposeSandbox;
+        _activeLease = inner as IActiveSandboxLease;
         _lease = lease;
         _onDisposed = onDisposed;
         _onPreserved = onPreserved;
@@ -1162,6 +1168,7 @@ internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox,
     public string Id => _inner.Id;
     public string HostId { get; }
     public ISandbox InnerSandbox => _inner;
+    public string? HostAddress => _routable?.HostAddress;
     public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
     public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
     public SandboxResourceMetrics? ResourceMetrics => _inner.ResourceMetrics;
@@ -1186,6 +1193,15 @@ internal class AdmissionControlledSandbox : ISandbox, IPreserveOnDisposeSandbox,
 
     public Task<string?> GetAccessibilityTreeJsonAsync(CancellationToken ct = default) =>
         _inner.GetAccessibilityTreeJsonAsync(ct);
+
+    public bool CanPublishPort(int port) => _portPublisher?.CanPublishPort(port) == true;
+
+    public SandboxPublishedPort PublishPort(int port)
+        => _portPublisher is not null && _portPublisher.CanPublishPort(port)
+            ? _portPublisher.PublishPort(port)
+            : throw new NotSupportedException($"Sandbox '{Id}' does not support publishing port {port}.");
+
+    public void ReleaseActiveTracking() => _activeLease?.ReleaseActiveTracking();
 
     public async ValueTask DisposeAsync()
     {

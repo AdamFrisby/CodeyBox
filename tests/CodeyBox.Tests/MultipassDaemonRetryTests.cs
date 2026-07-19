@@ -571,19 +571,13 @@ public sealed class MultipassDaemonRetryTests
 /// <summary>
 /// Pins the AuditLog.SandboxProvisioningTransientRetry emission on retry to a real
 /// Serilog sink. The unit-only tests above use the Microsoft.Extensions.Logging
-/// ILogger which is independent of Serilog's static <c>Log.Logger</c>, so the
-/// surface contract — the audit pipeline ACTUALLY fires for each retry with
-/// the correct workItemId/attempt/errorClass — is only verified here.
-///
-/// Wired into the GlobalSerilog collection because it mutates the static
-/// Serilog logger that other tests also touch.
+/// ILogger, so the surface contract — the audit pipeline ACTUALLY fires for each
+/// retry with the correct workItemId/attempt/errorClass — is only verified here.
 /// </summary>
-[Collection("GlobalSerilog")]
 public sealed class MultipassDaemonRetryAuditTests : IDisposable
 {
     private readonly TestSink _sink = new();
-
-    private readonly Serilog.ILogger _auditLogger;
+    private readonly Serilog.Core.Logger _auditLogger;
 
     public MultipassDaemonRetryAuditTests()
     {
@@ -595,7 +589,7 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
         Log.Logger = _auditLogger;
     }
 
-    public void Dispose() => Log.CloseAndFlush();
+    public void Dispose() => _auditLogger.Dispose();
 
     private static IReadOnlyList<string> Argv(string command, params string[] rest) =>
         ["/usr/bin/multipass", command, .. rest];
@@ -622,7 +616,8 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
             NullLogger.Instance,
             workItemId,
             CancellationToken.None,
-            InstantPolicy());
+            InstantPolicy(),
+            _auditLogger);
 
         var retryEvents = _sink.Events
             .Where(e => GetScalar<string>(e, "EventName") == "sandbox.provisioning_transient_retry")
@@ -656,7 +651,8 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
             NullLogger.Instance,
             WorkItemId.New(),
             CancellationToken.None,
-            InstantPolicy());
+            InstantPolicy(),
+            _auditLogger);
 
         Assert.DoesNotContain(_sink.Events, e =>
             GetScalar<string>(e, "EventName") == "sandbox.provisioning_transient_retry");
@@ -674,7 +670,8 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
             NullLogger.Instance,
             workItemId: null,
             CancellationToken.None,
-            InstantPolicy());
+            InstantPolicy(),
+            _auditLogger);
 
         Assert.DoesNotContain(_sink.Events, e =>
             GetScalar<string>(e, "EventName") == "sandbox.provisioning_transient_retry");
