@@ -564,10 +564,9 @@ public sealed class LanguageDetectionTests
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
-            // dotnet gate auditors wrap the command in the NuGet-home guard
-            // (via ExecPreamble) or the SelfHealNuGetHome fallback; unwrap to the
-            // logical command for recording and matching. DotnetGuardWrapper
-            // handles both wrappings.
+            // dotnet gate auditors wrap the command in the NuGet-home self-heal
+            // (SelfHealNuGetHome); unwrap to the logical command for recording
+            // and matching. DotnetGuardWrapper handles the self-heal wrapping.
             var argv = DotnetGuardWrapper.EffectiveArgv(exec);
             Commands.Add(string.Join(' ', argv));
             if (exec.WorkingDirectory is not null)
@@ -603,10 +602,10 @@ public sealed class LanguageDetectionTests
             if (exec.WorkingDirectory is not null)
                 WorkingDirectories.Add(exec.WorkingDirectory);
 
-            // dotnet gate auditors wrap the command (via ExecPreamble or the
-            // SelfHealNuGetHome fallback); unwrap to the logical command so
-            // genuine sh -c probes (tool presence / marker discovery) can be
-            // matched. The wrapped dotnet test command is handled below.
+            // dotnet gate auditors wrap the command in the NuGet-home self-heal
+            // (SelfHealNuGetHome); unwrap to the logical command so genuine
+            // sh -c probes (tool presence / marker discovery) can be matched.
+            // The wrapped dotnet test command is handled below.
             var argv = DotnetGuardWrapper.EffectiveArgv(exec);
             if (!DotnetGuardWrapper.IsGuardWrapped(exec.Argv)
                 && argv.Count >= 3 && argv[0] == "sh" && argv[1] == "-c")
@@ -648,9 +647,9 @@ public sealed class LanguageDetectionTests
         {
             var workingDirectory = exec.WorkingDirectory ?? Environment.CurrentDirectory;
             // Record the real command as configured; dotnet auditor commands
-            // arrive wrapped in the NuGet-home guard (via ExecPreamble) or the
-            // SelfHealNuGetHome fallback (sh -c "<preamble>" sh cmd...).
-            // DotnetGuardWrapper unwraps both to the logical command.
+            // arrive wrapped in the NuGet-home self-heal (SelfHealNuGetHome:
+            // sh -c "<preamble>" sh cmd...). DotnetGuardWrapper unwraps it to
+            // the logical command.
             var argv = DotnetGuardWrapper.EffectiveArgv(exec);
             Invocations.Add((string.Join(' ', argv), workingDirectory));
 

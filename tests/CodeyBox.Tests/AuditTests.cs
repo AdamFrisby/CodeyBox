@@ -508,9 +508,9 @@ public sealed class AuditTests
 
         Assert.False(result.Passed);
         Assert.NotNull(formatExec);
-        // The format-check gate wraps the exec in the NuGet-home guard (via
-        // ExecPreamble) or the self-heal fallback; either way, assert on the
-        // effective (unwrapped) dotnet command. DotnetGuardWrapper unwraps both.
+        // The format-check gate wraps the exec in the NuGet-home self-heal
+        // (SelfHealNuGetHome); assert on the effective (unwrapped) dotnet
+        // command. DotnetGuardWrapper unwraps the self-heal wrapper.
         Assert.Equal(
             ["dotnet", "format", "--verify-no-changes", "--verbosity", "diagnostic"],
             DotnetGuardWrapper.EffectiveArgv(formatExec!));

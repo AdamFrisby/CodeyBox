@@ -223,36 +223,20 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
     }
 
     /// <summary>
-    /// The argv actually dispatched to the sandbox. Without an
-    /// <see cref="ShellCommandAuditorOptions.ExecPreamble"/> (and without
-    /// <see cref="ShellCommandAuditorOptions.SelfHealNuGetHome"/>) this is the
-    /// configured argv verbatim. With <see cref="ShellCommandAuditorOptions.ExecPreamble"/>,
-    /// the command runs after the preamble in a single <c>sh -c</c> shell --
-    /// <c>exec "$@"</c> replaces the shell with the real command so its exit code
-    /// and stdout/stderr pass through unchanged. When only
-    /// <see cref="ShellCommandAuditorOptions.SelfHealNuGetHome"/> is set (a
-    /// dotnet-specific opt-in fallback), the argv is wrapped by
-    /// <see cref="NuGetHomeSelfHeal.WrapDotnetInvocation"/> so restore survives a
-    /// root-owned <c>~/.nuget</c>. Both mechanisms remedy the same class of failure;
-    /// <c>ExecPreamble</c> takes precedence because it is the more general form
-    /// (any preamble, not just NuGet). The configured argv (not the wrapped form)
-    /// is what findings and the result classifier report, so wrapping is invisible
-    /// to callers.
+    /// The argv actually dispatched to the sandbox. Without
+    /// <see cref="ShellCommandAuditorOptions.SelfHealNuGetHome"/> this is the
+    /// configured argv verbatim. When it is set (a dotnet-specific opt-in), the
+    /// argv is wrapped by <see cref="NuGetHomeSelfHeal.WrapDotnetInvocation"/> so
+    /// restore survives a root-owned <c>~/.nuget</c> -- a single <c>sh -c</c> that
+    /// runs the self-heal preamble then <c>exec "$@"</c>s the real command with
+    /// its arguments intact. The configured argv (not the wrapped form) is what
+    /// findings and the result classifier report, so wrapping is invisible to
+    /// callers.
     /// </summary>
     private IReadOnlyList<string> BuildExecArgv()
-    {
-        if (!string.IsNullOrEmpty(_opts.ExecPreamble))
-        {
-            // "$0" is the placeholder shell name; "$@" is _opts.Argv, so exec runs
-            // the configured command with every argument preserved.
-            return ["sh", "-c", _opts.ExecPreamble + "\nexec \"$@\"", "sh", .. _opts.Argv];
-        }
-
-        if (_opts.SelfHealNuGetHome)
-            return NuGetHomeSelfHeal.WrapDotnetInvocation(_opts.Argv);
-
-        return _opts.Argv;
-    }
+        => _opts.SelfHealNuGetHome
+            ? NuGetHomeSelfHeal.WrapDotnetInvocation(_opts.Argv)
+            : _opts.Argv;
 
     private string BuildPlanArtifactPath(AuditContext context)
     {
@@ -371,14 +355,6 @@ public sealed record ShellCommandAuditorOptions
     public required string Name { get; init; }
     public required IReadOnlyList<string> Argv { get; init; }
 
-    /// <summary>
-    /// Optional POSIX-shell snippet run in the same shell immediately before
-    /// <see cref="Argv"/>, which is then <c>exec</c>'d with its arguments intact.
-    /// Used to prepare the environment (e.g. the NuGet-home relocation for
-    /// <c>dotnet</c> commands) without the generic runner knowing the command.
-    /// Null (the default) dispatches <see cref="Argv"/> directly.
-    /// </summary>
-    public string? ExecPreamble { get; init; }
     public string? ToolName { get; init; }
     public bool? TreatExit127AsMissingTool { get; init; }
     public IAuditResultClassifier? ResultClassifier { get; init; }

@@ -1970,6 +1970,110 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         Assert.Single(_slotReleaser.Releases);
     }
 
+    [Fact]
+    public async Task Watchdog_StreamLastActivity_KeepsCrockItemAliveWhenCaptureAndUpdatedAtAreStale()
+    {
+        // Deliverable #1, second half: the CrockAgentRunner poll loop appends a
+        // per-poll chunk to its stream file while the batch is pending, which
+        // advances the file's LastActivityAt (last-write). The watchdog counts
+        // that as liveness — it reads LastActivityAt, NOT CapturedAt (immutable
+        // creation) nor a frozen UpdatedAt. Prove it: a crock item whose
+        // UpdatedAt AND stream CapturedAt are both stale well past the override
+        // ceiling survives because its stream LastActivityAt is fresh. A
+        // regression that read CapturedAt (or dropped the stream heartbeat) would
+        // recover — and kill — an actively-polling batch, so this fails red on
+        // that mutation.
+        var now = DateTimeOffset.UtcNow;
+        var overrideOpts = new WorkerProgressWatchdogOptions
+        {
+            ProgressTimeout = TimeSpan.FromMinutes(30),
+            CheckInterval = TimeSpan.FromMinutes(1),
+            AutoRecover = true,
+            PerAgent =
+            {
+                ["crock"] = new AgentWatchdogOverride
+                {
+                    ProgressTimeout = TimeSpan.FromHours(2),
+                },
+            },
+        };
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, overrideOpts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser);
+
+        // UpdatedAt 3h ago — past the 2h crock ceiling, so nothing but a fresh
+        // stream heartbeat can keep the item alive.
+        var crockItem = MakeItem(WorkItemState.Working, now - TimeSpan.FromHours(3))
+            with
+        { Agent = AgentKind.Crock };
+        await _store.CreateAsync(crockItem);
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), crockItem.Id);
+
+        // Stream file created 3h ago (stale CapturedAt) but last appended one
+        // minute ago (fresh LastActivityAt) — the batch poll heartbeat.
+        _streams.StampActivity(
+            crockItem.Id,
+            capturedAt: now - TimeSpan.FromHours(3),
+            lastActivityAt: now - TimeSpan.FromMinutes(1));
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(crockItem.Id);
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Equal(0, after.RecoveryAttempts);
+        Assert.Empty(_slotReleaser.Releases);
+        Assert.Single(await _registry.ListAsync());
+        Assert.Equal(0, _queue.Count);
+    }
+
+    [Fact]
+    public async Task Watchdog_StreamStaleLastActivity_RecoversCrockItemPastCeiling()
+    {
+        // Companion to the liveness test above: prove the assertion is meaningful
+        // (not decorative). When the stream's LastActivityAt is ALSO stale — the
+        // poll loop stopped heartbeating — the same crock item past the override
+        // ceiling IS recovered. This flips red exactly when the liveness path is
+        // wrongly keeping a dead item alive.
+        var now = DateTimeOffset.UtcNow;
+        var overrideOpts = new WorkerProgressWatchdogOptions
+        {
+            ProgressTimeout = TimeSpan.FromMinutes(30),
+            CheckInterval = TimeSpan.FromMinutes(1),
+            AutoRecover = true,
+            PerAgent =
+            {
+                ["crock"] = new AgentWatchdogOverride
+                {
+                    ProgressTimeout = TimeSpan.FromHours(2),
+                },
+            },
+        };
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, overrideOpts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser);
+
+        var crockItem = MakeItem(WorkItemState.Working, now - TimeSpan.FromHours(3))
+            with
+        { Agent = AgentKind.Crock };
+        await _store.CreateAsync(crockItem);
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), crockItem.Id);
+
+        // Both CapturedAt and LastActivityAt stale — no fresh heartbeat.
+        _streams.StampActivity(
+            crockItem.Id,
+            capturedAt: now - TimeSpan.FromHours(3),
+            lastActivityAt: now - TimeSpan.FromHours(3) + TimeSpan.FromMinutes(2));
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(crockItem.Id);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Single(_slotReleaser.Releases);
+    }
+
     // ── Test doubles ─────────────────────────────────────────────────────────
 
     private static DiagProcess StartBusyProcess(WorkItemId itemId)
@@ -2115,16 +2219,26 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
 
     /// <summary>
     /// Lets the test stamp synthetic stream-file activity per work item.
-    /// Honours only the API the watchdog reads: <see cref="ListAsync"/>
-    /// with file CapturedAt timestamps.
+    /// Honours only the API the watchdog reads: <see cref="ListAsync"/>. A file
+    /// carries both a CapturedAt (creation) and a LastActivityAt (last append);
+    /// the watchdog's liveness signal is LastActivityAt, so the two can differ.
     /// </summary>
     private sealed class StaleStreamStore : IAgentStreamStore
     {
-        private readonly Dictionary<WorkItemId, DateTimeOffset> _activity = [];
+        private readonly Dictionary<WorkItemId, (DateTimeOffset CapturedAt, DateTimeOffset LastActivityAt)> _activity = [];
 
         public AgentStreamsOptions Options { get; } = new() { Enabled = true, Path = "/tmp/codeybox-test-streams" };
 
-        public void StampActivity(WorkItemId id, DateTimeOffset at) => _activity[id] = at;
+        public void StampActivity(WorkItemId id, DateTimeOffset at) => _activity[id] = (at, at);
+
+        /// <summary>
+        /// Stamp a file whose creation (<paramref name="capturedAt"/>) and last
+        /// append (<paramref name="lastActivityAt"/>) differ — the shape a
+        /// long-batch crock run produces as it appends per-poll heartbeats to a
+        /// file created once at dispatch.
+        /// </summary>
+        public void StampActivity(WorkItemId id, DateTimeOffset capturedAt, DateTimeOffset lastActivityAt)
+            => _activity[id] = (capturedAt, lastActivityAt);
 
         public Task<AgentStreamCapture?> BeginCaptureAsync(WorkItemId workItemId, string phase, int iteration, CancellationToken ct = default)
             => Task.FromResult<AgentStreamCapture?>(null);
@@ -2133,11 +2247,11 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
             WorkItemId workItemId, int limit = AgentStreamStore.DefaultListLimit,
             bool includeLineCount = false, CancellationToken ct = default)
         {
-            if (!_activity.TryGetValue(workItemId, out var at))
+            if (!_activity.TryGetValue(workItemId, out var stamps))
                 return Task.FromResult<IReadOnlyList<AgentStreamFile>>([]);
             IReadOnlyList<AgentStreamFile> files =
             [
-                new AgentStreamFile("work-1-abc123.jsonl", "work", 1, 1, null, at),
+                new AgentStreamFile("work-1-abc123.jsonl", "work", 1, 1, null, stamps.CapturedAt, stamps.LastActivityAt),
             ];
             return Task.FromResult(files);
         }

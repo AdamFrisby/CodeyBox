@@ -44,9 +44,8 @@ internal static class LanguagePresetHelpers
                 // NuGet-home self-heal for dotnet build/format is applied via the
                 // single SelfHealNuGetHome mechanism below (see the comment above);
                 // it wraps the invocation in NuGetHomeSelfHeal so restore survives an
-                // unusable ~/.nuget. Do not also set ExecPreamble here: two self-heal
-                // sources on one auditor is a redundant fork, and ExecPreamble would
-                // take precedence and bypass the self-heal wrapper.
+                // unusable ~/.nuget. This is the one NuGet-home heal source every
+                // .NET gate shares.
                 ResultClassifier = ResultClassifierFor(language, name, argv),
                 MissingToolSeverity = missingToolSeverity,
                 Required = required,

@@ -80,10 +80,8 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         export HOME="$cli_home"
         """;
 
-    // Exposed to tests (internal, not private) so the actual gate script --
-    // the exact artifact the sandbox executes via `sh -c`, including the
-    // NuGet-home relocation guard below -- can be exercised directly by tests
-    // through a real shell rather than only end-to-end through a sandbox.
+    // Exposed to tests so the actual gate script — the exact artifact the
+    // sandbox executes via `sh -c` — can be run under a controlled shell.
     internal static readonly string BuildScript = $$"""
         set -eu
         {{NuGetHomeSelfHeal.Preamble}}
@@ -94,17 +92,6 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
           echo "dotnet is not available in the sandbox PATH" >&2
           exit "$dotnet_command_not_found_exit"
         fi
-
-        # Make the NuGet user-settings directory usable before any dotnet restore.
-        # First REPAIR $HOME/.nuget in place when it is foreign-owned: this gate
-        # runs first, so healing the shared home here lets the separate
-        # csharp:build-WaE / csharp:test-pass gates -- which each run their own
-        # raw dotnet in this same sandbox -- succeed without a preamble of their
-        # own. Then RELOCATE HOME as a fallback for the shapes an in-place repair
-        # cannot fix without root. Both are no-ops on a healthy home. See
-        # NuGetHomeGuard.
-        {{NuGetHomeGuard.InPlaceRepairPreamble}}
-        {{NuGetHomeGuard.RelocationPreamble}}
 
         tmp_root="${TMPDIR:-/tmp}"
         targets_file="$tmp_root/codeybox-required-build-targets-$$"

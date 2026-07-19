@@ -100,10 +100,8 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
             BuildTestGateEvidence = _opts.BuildTestGateEvidence,
             // dotnet test performs a NuGet restore (even with --no-build it reads
             // the settings), so it self-heals an unusable $HOME/.nuget through the
-            // single SelfHealNuGetHome mechanism (NuGetHomeSelfHeal wrapper). It does
-            // NOT also set ExecPreamble: carrying two self-heal sources on one
-            // auditor is a redundant fork, and ExecPreamble would win and bypass the
-            // self-heal wrapper the test gate is verified to run through.
+            // single SelfHealNuGetHome mechanism (NuGetHomeSelfHeal wrapper) — the
+            // one NuGet-home heal source every .NET gate shares.
             SelfHealNuGetHome = _opts.SelfHealNuGetHome,
             TestFailureAttributionOptions = _opts.TestFailureAttributionOptions,
         });

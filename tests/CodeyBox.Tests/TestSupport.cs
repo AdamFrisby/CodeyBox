@@ -1093,7 +1093,7 @@ internal sealed class CapturingWebhookDispatcher : IWebhookDispatcher
 }
 
 /// <summary>
-/// Test helper mirroring <c>ShellCommandAuditor</c>'s <c>ExecPreamble</c>
+/// Test helper mirroring <c>ShellCommandAuditor</c>'s <c>SelfHealNuGetHome</c>
 /// wrapping. A guarded dotnet auditor command is dispatched as
 /// <c>sh -c "&lt;preamble&gt;\nexec \"$@\"" sh &lt;cmd...&gt;</c> so the NuGet-home
 /// relocation runs before the real command. Fakes that classify a sandbox exec

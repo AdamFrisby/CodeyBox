@@ -161,9 +161,11 @@ internal static class AuditTypePresets
         {
             Name = name,
             Argv = argv,
-            // A dotnet audit command restores packages; relocate HOME first when
-            // the sandbox ships an unusable $HOME/.nuget (no-op otherwise).
-            ExecPreamble = NuGetHomeGuard.PreambleForCommand(argv),
+            // A dotnet audit command restores packages and fails for every
+            // project when the sandbox ships an unusable $HOME/.nuget. Route it
+            // through the single NuGet-home self-heal source (NuGetHomeSelfHeal);
+            // a no-op on a healthy home and for non-dotnet commands.
+            SelfHealNuGetHome = true,
             MissingToolSeverity = missingToolSeverity,
             Required = required,
             Targets = targets,
