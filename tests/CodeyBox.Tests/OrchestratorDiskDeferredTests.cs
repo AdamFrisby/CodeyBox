@@ -111,12 +111,14 @@ public sealed class OrchestratorDiskDeferredTests : IDisposable
 
             // Recheck-and-requeue: ScheduleDeferredRequeue uses Task.Delay(recheckIn),
             // after which the item is enqueued again. Observe by waiting for the
-            // pipeline to be invoked a second time.
+            // second invocation to FINISH recording its fields — not merely for
+            // CallCount to reach 2, which is incremented at method entry and would
+            // let us read SecondCallState/SecondCallWorkBranch mid-write.
             var requeueDeadline = DateTimeOffset.UtcNow.AddSeconds(60);
-            while (pipeline.CallCount < 2 && DateTimeOffset.UtcNow < requeueDeadline)
+            while (!pipeline.SecondCallRecorded && DateTimeOffset.UtcNow < requeueDeadline)
                 await Task.Delay(20);
 
-            Assert.True(pipeline.CallCount >= 2,
+            Assert.True(pipeline.SecondCallRecorded,
                 $"expected re-enqueue after recheckIn={recheckIn}, but pipeline was called {pipeline.CallCount} time(s)");
             Assert.Equal(WorkItemState.WorkComplete, pipeline.SecondCallState);
             Assert.Equal(pipeline.WorkBranch, pipeline.SecondCallWorkBranch);
@@ -156,10 +158,24 @@ public sealed class OrchestratorDiskDeferredTests : IDisposable
             _recheckIn = recheckIn;
         }
 
+        private int _secondCallRecorded;
+
         public int CallCount => _callCount;
         public string WorkBranch => _workBranch;
         public WorkItemState? SecondCallState { get; private set; }
         public string? SecondCallWorkBranch { get; private set; }
+
+        /// <summary>
+        /// True once the second invocation has finished recording
+        /// <see cref="SecondCallState"/> and <see cref="SecondCallWorkBranch"/>.
+        /// This is the signal the test must wait on before reading those fields:
+        /// <see cref="CallCount"/> is incremented at method entry, so polling it
+        /// races with the field writes below (a reader can observe CallCount==2
+        /// after State is set but before WorkBranch is). The release-store here,
+        /// paired with the acquire-load in the property, establishes the
+        /// happens-before edge that makes both field writes visible.
+        /// </summary>
+        public bool SecondCallRecorded => Volatile.Read(ref _secondCallRecorded) != 0;
 
         public async Task RunAsync(WorkItem item, CancellationToken ct, CancellationToken hostShutdownToken = default)
         {
@@ -182,6 +198,9 @@ public sealed class OrchestratorDiskDeferredTests : IDisposable
             {
                 SecondCallState = item.State;
                 SecondCallWorkBranch = item.WorkBranch;
+                // Publish the recorded fields only after both writes complete, so
+                // the test never observes a half-recorded snapshot.
+                Volatile.Write(ref _secondCallRecorded, 1);
                 await _store.UpdateAsync(item.With(WorkItemState.Done), ct);
             }
         }
