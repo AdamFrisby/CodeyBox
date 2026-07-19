@@ -1,5 +1,6 @@
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Tests;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -7,16 +8,14 @@ namespace CodeyBox.Tests.Uat.PersistenceAndRecovery;
 
 internal sealed class PersistenceAndRecoveryWorkspace : IDisposable
 {
-    public string Root { get; } = Directory.CreateTempSubdirectory("codeybox-uat-persistence-").FullName;
+    private readonly TestTempDirectory _temp = TestTempDirectory.Create("codeybox-uat-persistence-");
+
+    public string Root => _temp.Root;
 
     public string NewDatabasePath(string name = "state")
         => Path.Combine(Root, $"{name}-{Guid.NewGuid():N}.db");
 
-    public void Dispose()
-    {
-        if (Directory.Exists(Root))
-            Directory.Delete(Root, recursive: true);
-    }
+    public void Dispose() => _temp.Dispose();
 }
 
 internal static class PersistenceAndRecoveryHelpers

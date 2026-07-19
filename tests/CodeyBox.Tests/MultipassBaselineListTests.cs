@@ -25,7 +25,7 @@ public sealed class MultipassBaselineListTests : IDisposable
     public void Dispose()
     {
         if (Directory.Exists(_workspace))
-            try { Directory.Delete(_workspace, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace);
     }
 
     /// <summary>

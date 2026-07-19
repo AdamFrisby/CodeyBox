@@ -51,11 +51,11 @@ public sealed class DefaultProcessRunnerCancellationTests
             stdoutChunkCallback: transcript.Append,
             maxStdoutBytes: 4096,
             maxStderrBytes: 4096);
-        _ = await transcript.RootPid.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        _ = await transcript.RootPid.Task.WaitAsync(LoadedTeardownCompletionGuard);
 
         cancellation.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
-            run.WaitAsync(TimeSpan.FromSeconds(5)));
+            run.WaitAsync(LoadedTeardownCompletionGuard));
 
         Assert.Contains(TimeSpan.FromSeconds(17), time.TimerDueTimes);
     }
@@ -102,8 +102,8 @@ public sealed class DefaultProcessRunnerCancellationTests
             stdoutChunkCallback: transcript.Append,
             maxStdoutBytes: 4096,
             maxStderrBytes: 4096);
-        var rootPid = await transcript.RootPid.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        var descendantPid = await transcript.ChildPid.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var rootPid = await transcript.RootPid.Task.WaitAsync(LoadedTeardownCompletionGuard);
+        var descendantPid = await transcript.ChildPid.Task.WaitAsync(LoadedTeardownCompletionGuard);
 
         cancellation.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
@@ -129,10 +129,10 @@ public sealed class DefaultProcessRunnerCancellationTests
             stdoutChunkCallback: transcript.Append,
             maxStdoutBytes: 4096,
             maxStderrBytes: 4096);
-        var rootPid = await transcript.RootPid.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        var descendantPid = await transcript.ChildPid.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var rootPid = await transcript.RootPid.Task.WaitAsync(LoadedTeardownCompletionGuard);
+        var descendantPid = await transcript.ChildPid.Task.WaitAsync(LoadedTeardownCompletionGuard);
 
-        await Assert.ThrowsAnyAsync<IOException>(() => run.WaitAsync(TimeSpan.FromSeconds(5)));
+        await Assert.ThrowsAnyAsync<IOException>(() => run.WaitAsync(LoadedTeardownCompletionGuard));
 
         await AssertProcessesGoneAsync(rootPid, descendantPid);
     }
@@ -154,7 +154,7 @@ public sealed class DefaultProcessRunnerCancellationTests
             stderrChunkCallback: transcript.Append,
             maxStdoutBytes: 1024,
             maxStderrBytes: 4096).WaitAsync(RunCompletionBudget);
-        var descendantPid = await transcript.ChildPid.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var descendantPid = await transcript.ChildPid.Task.WaitAsync(LoadedTeardownCompletionGuard);
 
         Assert.True(result.StdoutLimitExceeded);
         await AssertProcessesGoneAsync(descendantPid);
@@ -178,13 +178,26 @@ public sealed class DefaultProcessRunnerCancellationTests
             stderrChunkCallback: transcript.Append,
             maxStdoutBytes: 4096,
             maxStderrBytes: 4096);
-        var descendantPid = await transcript.ChildPid.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var descendantPid = await transcript.ChildPid.Task.WaitAsync(LoadedTeardownCompletionGuard);
 
         cancellation.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run.WaitAsync(RunCompletionBudget));
 
         await AssertProcessesGoneAsync(descendantPid);
     }
+
+    // Every "wait for a pid line to be parsed / for a completed inner task"
+    // guard in these tests is a hang detector, not a behavioural deadline. In
+    // isolation each completes in well under a second, but inside the full
+    // parallel suite on the 6-vCPU verify VM reader/kill threads are heavily
+    // starved: draining the bounded output, observing the stdout limit, reaping
+    // the isolated process group and parsing pid lines can all exceed a tight
+    // 5 s window without anything actually being wedged. Size this guard
+    // generously so only a genuine hang fails it; the value/exit-code/
+    // process-gone assertions that follow are unchanged and still do the real
+    // checking. Anti-hang guards on the outer run itself use RunCompletionBudget
+    // below, which must exceed IsolatedRunnerCleanupTimeout.
+    private static readonly TimeSpan LoadedTeardownCompletionGuard = TimeSpan.FromSeconds(60);
 
     [Fact]
     public async Task MissingExplicitOutputLimit_PreservesUnboundedSharedRunnerBehavior()

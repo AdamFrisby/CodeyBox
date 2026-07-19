@@ -31,9 +31,7 @@ public sealed class MultipassResourceMetricsTests : IDisposable
     public void Dispose()
     {
         Log.CloseAndFlush();
-        try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        try { File.Delete(_dbPath + "-wal"); } catch { /* best-effort */ }
-        try { File.Delete(_dbPath + "-shm"); } catch { /* best-effort */ }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     [Fact]
@@ -348,7 +346,7 @@ public sealed class MultipassResourceMetricsTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(root);
         }
     }
 
@@ -396,7 +394,7 @@ public sealed class MultipassResourceMetricsTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(root);
         }
     }
 

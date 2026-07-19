@@ -13,7 +13,7 @@ public sealed class HostGitIdentityReaderTests : IDisposable
 {
     private readonly string _home;
     public HostGitIdentityReaderTests() => _home = Directory.CreateTempSubdirectory("codeybox-git-home-").FullName;
-    public void Dispose() { try { Directory.Delete(_home, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_home); }
 
     private void WriteGitConfig(string content)
         => File.WriteAllText(Path.Combine(_home, ".gitconfig"), content);

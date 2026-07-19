@@ -26,7 +26,7 @@ public sealed class StuckRecoveryTests : IDisposable
         => _workspace = Directory.CreateTempSubdirectory("codeybox-stuck-").FullName;
 
     public void Dispose()
-    { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 

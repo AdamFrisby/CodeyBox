@@ -1,21 +1,40 @@
-<Project InitialTargets="EnsureWritableNuGetUserSettings">
+<Project>
 
   <!--
-    NuGet unconditionally creates/reads $HOME/.nuget/NuGet before honouring any
-    project-, solution-, or RestoreConfigFile-level config. Sandbox images that
-    leave $HOME/.nuget root-owned (common when a package cache is seeded under
-    $HOME/.nuget/packages as root) make every raw `dotnet build` fail restore.
-    Repair that environmental fault before any project targets run so auditors
-    that invoke `dotnet` directly (process:required-build, csharp:build-WaE)
-    succeed without depending on DOTNET_CLI_HOME redirects in the host
-    orchestrator binary. See scripts/ensure-writable-nuget-home.sh and
-    docs/build-environment.md.
+    Self-heal a root-owned NuGet home before restore reads user settings.
+
+    Some verify / CI hosts provision "$HOME/.nuget" (or its "NuGet" settings
+    subdirectory) owned by root before the unprivileged build user runs. NuGet
+    loads the user-global settings from "$HOME/.nuget/NuGet/NuGet.Config" during
+    restore — ahead of any repository nuget.config, MSBuild RestoreConfigFile, or
+    environment override — so an unreadable one aborts every `dotnet restore` /
+    `build` / `test` before a single source file compiles:
+
+      error : Failed to read NuGet.Config due to unauthorized access.
+              Path: '<home>/.nuget/NuGet/NuGet.Config'.
+              Access to the path '<home>/.nuget/NuGet' is denied. Permission denied
+
+    No committed build *input* can redirect that read, but a target that runs
+    *before* the read can repair the home. This target invokes the vetted,
+    idempotent scripts/prepare-nuget-home.sh to relocate an unusable home so the
+    build user gets a writable one. It is a fast no-op when the home is already
+    usable (the normal developer / CI case). The invocation is best-effort
+    (`|| true`): a genuinely unremediable host (e.g. "$HOME" itself not writable,
+    where the script exits non-zero for its operator callers) then falls through
+    to NuGet's own clear "unauthorized access" error instead of failing the build
+    on the helper. `|| true` — rather than MSBuild ContinueOnError — is used so
+    the step never emits an MSBuild warning that `/warnaserror` would promote to
+    an error. See docs/build-environment.md §1.
+
+    Scoped to non-Windows because the script and the "$HOME/.nuget" layout it
+    repairs are POSIX-specific; Windows uses %APPDATA%\NuGet.
   -->
-  <Target Name="EnsureWritableNuGetUserSettings">
-    <Exec
-      Command="sh &quot;$(MSBuildThisFileDirectory)scripts/ensure-writable-nuget-home.sh&quot;"
-      Condition="'$(OS)' != 'Windows_NT'"
-      IgnoreStandardErrorWarningFormat="true" />
+  <Target Name="PrepareNuGetHome"
+          Condition="'$(OS)' != 'Windows_NT'"
+          BeforeTargets="Restore;_GenerateRestoreGraph;_GenerateRestoreGraphProjectEntry;_GetRestoreSettings;CollectPackageReferences">
+    <Exec Command="bash &quot;$(MSBuildThisFileDirectory)scripts/prepare-nuget-home.sh&quot; || true"
+          StandardOutputImportance="Low"
+          StandardErrorImportance="Low" />
   </Target>
 
 </Project>

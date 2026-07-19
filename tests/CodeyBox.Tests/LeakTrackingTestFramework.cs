@@ -171,6 +171,11 @@ public sealed class LeakTrackingTestFramework : XunitTestFramework
 
         protected override async Task<RunSummary> RunTestCaseAsync(IXunitTestCase testCase)
         {
+            // Give this case its own temp scratch dir (safe because the suite is
+            // strictly sequential) and wipe it afterwards, so per-test SQLite
+            // .db/-wal/-shm files and git/log/agent-stream dirs cannot accumulate
+            // and exhaust a space-constrained temp filesystem mid-run.
+            var tempCaseDir = TestTempWorkspace.BeginTestCase();
             var scope = TestFileSystemWatcherLeakTracker.BeginTestCase(testCase.DisplayName);
             try
             {
@@ -189,6 +194,14 @@ public sealed class LeakTrackingTestFramework : XunitTestFramework
                 finally
                 {
                     scope.Dispose();
+                    if (!TestTempWorkspace.EndTestCase(tempCaseDir))
+                    {
+                        var line =
+                            $"warning: temp scratch directory for '{testCase.DisplayName}' " +
+                            $"could not be fully deleted: {tempCaseDir}";
+                        MessageBus.QueueMessage(new DiagnosticMessage(line));
+                        Console.Error.WriteLine(line);
+                    }
                 }
             }
         }

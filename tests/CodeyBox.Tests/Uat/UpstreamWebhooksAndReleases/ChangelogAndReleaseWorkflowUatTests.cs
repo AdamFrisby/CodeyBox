@@ -91,44 +91,50 @@ public sealed class ChangelogAndReleaseWorkflowUatTests
     public async Task ReleaseClose_WithFailedLinkedItem_EmitsOperatorWebhookAndKeepsReleaseClosed()
     {
         var dbPath = Path.Combine(Path.GetTempPath(), $"codeybox-uat-release-{Guid.NewGuid():N}.db");
-        using var releaseStore = new SqliteReleaseStore(dbPath);
-        using var workItemStore = new SqliteWorkItemStore(dbPath);
-        var webhooks = new CapturingWebhookDispatcher();
-        var service = ReleaseTestHelper.BuildService(
-            releaseStore,
-            workItemStore,
-            new InMemoryProjectRepository(Project() with
+        try
+        {
+            using var releaseStore = new SqliteReleaseStore(dbPath);
+            using var workItemStore = new SqliteWorkItemStore(dbPath);
+            var webhooks = new CapturingWebhookDispatcher();
+            var service = ReleaseTestHelper.BuildService(
+                releaseStore,
+                workItemStore,
+                new InMemoryProjectRepository(Project() with
+                {
+                    ReleaseConfig = new ProjectReleaseConfig { Enabled = true },
+                }),
+                webhooks);
+            var release = new Release
             {
-                ReleaseConfig = new ProjectReleaseConfig { Enabled = true },
-            }),
-            webhooks);
-        var release = new Release
-        {
-            Id = ReleaseId.New(),
-            ProjectId = new ProjectId("release-uat"),
-            Name = "v1.3.0",
-            State = ReleaseState.Open,
-            CreatedAt = DateTimeOffset.UtcNow,
-        };
-        await releaseStore.CreateAsync(release);
-        await workItemStore.CreateAsync(new WorkItem
-        {
-            Id = WorkItemId.New(),
-            ProjectId = release.ProjectId,
-            ReleaseId = release.Id,
-            Title = "failed release item",
-            Prompt = "p",
-            State = WorkItemState.Failed,
-        });
+                Id = ReleaseId.New(),
+                ProjectId = new ProjectId("release-uat"),
+                Name = "v1.3.0",
+                State = ReleaseState.Open,
+                CreatedAt = DateTimeOffset.UtcNow,
+            };
+            await releaseStore.CreateAsync(release);
+            await workItemStore.CreateAsync(new WorkItem
+            {
+                Id = WorkItemId.New(),
+                ProjectId = release.ProjectId,
+                ReleaseId = release.Id,
+                Title = "failed release item",
+                Prompt = "p",
+                State = WorkItemState.Failed,
+            });
 
-        var (success, error) = await service.CloseAsync(release.Id, CancellationToken.None);
+            var (success, error) = await service.CloseAsync(release.Id, CancellationToken.None);
 
-        Assert.True(success, error);
-        var stored = await releaseStore.GetAsync(release.Id);
-        Assert.Equal(ReleaseState.Closed, stored!.State);
-        Assert.Contains(webhooks.Events, e => e.Event == "release.closed");
-        Assert.Contains(webhooks.Events, e => e.Event == "release.has_failed_work_items");
-        try { File.Delete(dbPath); } catch { }
+            Assert.True(success, error);
+            var stored = await releaseStore.GetAsync(release.Id);
+            Assert.Equal(ReleaseState.Closed, stored!.State);
+            Assert.Contains(webhooks.Events, e => e.Event == "release.closed");
+            Assert.Contains(webhooks.Events, e => e.Event == "release.has_failed_work_items");
+        }
+        finally
+        {
+            TestTempArtifacts.DeleteSqliteDatabase(dbPath);
+        }
     }
 
     private static Project Project() => new()

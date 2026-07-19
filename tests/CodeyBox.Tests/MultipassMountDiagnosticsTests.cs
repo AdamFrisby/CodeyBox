@@ -27,7 +27,7 @@ public sealed class MultipassMountDiagnosticsTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_workspace, recursive: true); } catch { /* best-effort */ }
+        TestTempArtifacts.DeleteDirectory(_workspace);
     }
 
     // ── DescribeMountSourceState branches ──────────────────────────────────

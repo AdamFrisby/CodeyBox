@@ -78,11 +78,57 @@ public sealed class MultipassIntegrationTests : IDisposable
             ? Path.Combine(snapCommon, "codeybox-tests")
             : Path.GetTempPath();
         Directory.CreateDirectory(baseDir);
-        _workspace = Path.Combine(baseDir, $"mp-test-{Guid.NewGuid():N}"[..16]);
+        _workspace = Path.Combine(baseDir, $"codeybox-mp-test-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_workspace);
     }
 
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { DeleteOwnedWorkspace(_workspace); }
+
+    private static void DeleteOwnedWorkspace(string workspace)
+    {
+        if (IsUnderDirectory(workspace, Path.GetTempPath()))
+        {
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(workspace);
+            return;
+        }
+
+        var home = Environment.GetEnvironmentVariable("HOME")
+            ?? throw new ArgumentException("Multipass integration workspace cleanup requires HOME.", nameof(workspace));
+        var snapTestsRoot = Path.Combine(home, "snap", "multipass", "common", "codeybox-tests");
+        var fullPath = Path.GetFullPath(workspace);
+        var leafName = Path.GetFileName(fullPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+        if (!IsUnderDirectory(fullPath, snapTestsRoot)
+            || !leafName.StartsWith("codeybox-mp-test-", StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                "Multipass integration workspace cleanup path must be a CodeyBox-owned directory under the Multipass snap test root.",
+                nameof(workspace));
+        }
+
+        CodeyBox.Tests.TestTempArtifacts.Retry(() =>
+        {
+            if (Directory.Exists(fullPath))
+                Directory.Delete(fullPath, recursive: true);
+        });
+    }
+
+    private static bool IsUnderDirectory(string path, string root)
+    {
+        var fullPath = Path.GetFullPath(path);
+        var fullRoot = EnsureTrailingSeparator(Path.GetFullPath(root));
+        var comparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        return fullPath.StartsWith(fullRoot, comparison) && fullPath.Length > fullRoot.Length;
+    }
+
+    private static string EnsureTrailingSeparator(string path)
+    {
+        if (path.EndsWith(Path.DirectorySeparatorChar) || path.EndsWith(Path.AltDirectorySeparatorChar))
+            return path;
+
+        return path + Path.DirectorySeparatorChar;
+    }
 
     private MultipassSandboxProvider NewProvider() => new(
         new MultipassSandboxOptions(),

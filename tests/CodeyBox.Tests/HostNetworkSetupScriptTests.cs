@@ -238,7 +238,7 @@ exit 0
 
         public void Dispose()
         {
-            try { Directory.Delete(Path, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(Path);
         }
     }
 }

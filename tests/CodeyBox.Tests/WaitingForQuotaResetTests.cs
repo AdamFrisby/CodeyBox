@@ -23,7 +23,7 @@ public sealed class WaitingForQuotaResetTests : IDisposable
     public WaitingForQuotaResetTests() =>
         _workspace = Directory.CreateTempSubdirectory("codeybox-waiting-").FullName;
 
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     [Fact]
     public void WorkItemWith_TransitionToWaitingForQuotaReset_PreservesQuotaFields()

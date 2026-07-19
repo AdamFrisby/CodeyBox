@@ -24,7 +24,7 @@ public sealed class PatchWorkItemTests : IDisposable
     public void Dispose()
     {
         _store.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     private static WorkItem Sample(WorkItemState state = WorkItemState.Queued) => new()

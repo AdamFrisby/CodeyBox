@@ -10,9 +10,11 @@ public sealed class SqliteReleaseStoreDisposeTests
     public async Task Dispose_IsIdempotentAndReleasesWriteGate()
     {
         var path = Path.Combine(Path.GetTempPath(), $"codeybox-release-dispose-{Guid.NewGuid():N}.db");
+        SqliteReleaseStore? store = null;
+        SqliteReleaseStore? reopened = null;
         try
         {
-            var store = new SqliteReleaseStore(path);
+            store = new SqliteReleaseStore(path);
             Assert.True(WriteGateEntryExists(path));
 
             store.Dispose();
@@ -20,7 +22,7 @@ public sealed class SqliteReleaseStoreDisposeTests
 
             Assert.False(WriteGateEntryExists(path));
 
-            using var reopened = await Task.Run(() => new SqliteReleaseStore(path))
+            reopened = await Task.Run(() => new SqliteReleaseStore(path))
                 .WaitAsync(TimeSpan.FromSeconds(10));
 
             var release = ReleaseTestHelper.SeedRelease(ReleaseState.Open);
@@ -32,10 +34,10 @@ public sealed class SqliteReleaseStoreDisposeTests
         }
         finally
         {
-            foreach (var candidate in new[] { path, path + "-wal", path + "-shm" })
-            {
-                try { File.Delete(candidate); } catch { }
-            }
+            TestTempArtifacts.CleanupAll(
+                () => reopened?.Dispose(),
+                () => store?.Dispose(),
+                () => TestTempArtifacts.DeleteSqliteDatabase(path));
         }
     }
 

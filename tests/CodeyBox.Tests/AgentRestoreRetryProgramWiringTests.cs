@@ -122,7 +122,7 @@ public sealed class AgentRestoreRetryProgramWiringTests
         Assert.Equal(AgentKind.Claude, requeued.Agent);
     }
 
-    private sealed class RestoreRetryWiringFactory : WebApplicationFactory<Program>
+    private sealed class RestoreRetryWiringFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly string _dbPath = Path.Combine(
             Path.GetTempPath(), $"codeybox-restore-retry-wiring-{Guid.NewGuid():N}.db");
@@ -133,7 +133,7 @@ public sealed class AgentRestoreRetryProgramWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -155,16 +155,11 @@ public sealed class AgentRestoreRetryProgramWiringTests
             });
         }
 
+        // Disposes the host first (closing SQLite connections and checkpointing
+        // the -wal/-shm sidecars away) before deleting the .db, then wipes the
+        // owned temp root holding the git/log/audit/stream directories.
         protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-            {
-                try { File.Delete(_dbPath); } catch { }
-                try { File.Delete(_dbPath + "-wal"); } catch { }
-                try { File.Delete(_dbPath + "-shm"); } catch { }
-            }
-            base.Dispose(disposing);
-        }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
     }
 
     private sealed class RecordingTaskQueue : ITaskQueue

@@ -32,7 +32,7 @@ public sealed class AgentRestoreRetrySchedulerTests : IDisposable
     public void Dispose()
     {
         Log.CloseAndFlush();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     [Fact]

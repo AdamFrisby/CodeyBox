@@ -351,7 +351,7 @@ public sealed class HostShutdownTimeoutWiringTests
         Assert.Equal(TimeSpan.FromSeconds(45), hostOptions.ShutdownTimeout);
     }
 
-    private sealed class HostOptionsWiringFactory : WebApplicationFactory<Program>
+    private sealed class HostOptionsWiringFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly ISandboxProvider _provider;
         private readonly int _graceSeconds;
@@ -378,7 +378,7 @@ public sealed class HostShutdownTimeoutWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 var values = new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -408,14 +408,10 @@ public sealed class HostShutdownTimeoutWiringTests
         }
 
         protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            base.Dispose(disposing);
-        }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
     }
 
-    private sealed class SandboxShutdownServiceWiringFactory : WebApplicationFactory<Program>
+    private sealed class SandboxShutdownServiceWiringFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly ISandboxProvider _provider;
         private readonly SandboxTeardownMode? _teardownMode;
@@ -439,7 +435,7 @@ public sealed class HostShutdownTimeoutWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 var values = new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -503,11 +499,7 @@ public sealed class HostShutdownTimeoutWiringTests
         }
 
         protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            base.Dispose(disposing);
-        }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
     }
 
     private sealed class FakeSuspendingProvider : ISandboxProvider, IActiveSandboxProvider, ISuspendingSandboxProvider

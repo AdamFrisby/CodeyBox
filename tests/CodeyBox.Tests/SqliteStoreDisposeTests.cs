@@ -19,7 +19,7 @@ public sealed class SqliteStoreDisposeTests
         }
         finally
         {
-            try { File.Delete(dbPath); } catch { }
+            TestTempArtifacts.DeleteSqliteDatabase(dbPath);
         }
     }
 
@@ -41,7 +41,7 @@ public sealed class SqliteStoreDisposeTests
         }
         finally
         {
-            try { File.Delete(dbPath); } catch { }
+            TestTempArtifacts.DeleteSqliteDatabase(dbPath);
         }
     }
 
@@ -60,7 +60,7 @@ public sealed class SqliteStoreDisposeTests
         }
         finally
         {
-            try { File.Delete(dbPath); } catch { }
+            TestTempArtifacts.DeleteSqliteDatabase(dbPath);
         }
     }
 }

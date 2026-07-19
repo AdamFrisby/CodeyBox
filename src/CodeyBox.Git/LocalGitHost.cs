@@ -697,6 +697,12 @@ public sealed class LocalGitHost : IGitHost
         SanitizeAlternates(path);
     }
 
+    public string GetDisabledHooksPath(string repositoryId)
+    {
+        _ = repositoryId;
+        return _disabledHooksPath;
+    }
+
     public void SanitizeRepositoryAlternates(string repositoryId)
         => PrepareRepositoryForHostGitOperations(repositoryId);
 

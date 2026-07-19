@@ -32,7 +32,7 @@ public sealed class PipelineRunnerInfrastructureAuditSignalTests : IDisposable
     public void Dispose()
     {
         Log.CloseAndFlush();
-        try { Directory.Delete(_workspace, recursive: true); } catch { }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace);
     }
 
     [Fact]
@@ -216,7 +216,7 @@ public sealed class PipelineRunnerInfrastructureAuditSignalTests : IDisposable
         }
         finally
         {
-            try { Directory.Delete(clone, recursive: true); } catch { }
+            CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(clone);
         }
     }
 

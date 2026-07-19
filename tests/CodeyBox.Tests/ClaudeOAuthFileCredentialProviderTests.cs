@@ -15,7 +15,7 @@ public sealed class ClaudeOAuthFileCredentialProviderTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_tempDir, recursive: true); } catch { }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_tempDir);
     }
 
     private string WriteCredFile(string content)

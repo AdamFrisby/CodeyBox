@@ -575,27 +575,38 @@ public sealed class MultipassDaemonRetryTests
 /// surface contract — the audit pipeline ACTUALLY fires for each retry with
 /// the correct workItemId/attempt/errorClass — is only verified here.
 ///
-/// Wired into the GlobalSerilog collection because it mutates the static
-/// Serilog logger that other tests also touch.
+/// Captures audit events via a flow-local override (<see cref="AuditLog.PushLogger"/>)
+/// rather than clobbering the global <c>Log.Logger</c>: WebApplicationFactory
+/// host tests in other collections run in parallel and install their own global
+/// logger, so a process-wide swap here races them and drops our events. The
+/// override is scoped to this test's async flow, keeping the assertions
+/// deterministic regardless of what any concurrent flow does to <c>Log.Logger</c>.
 /// </summary>
 [Collection("GlobalSerilog")]
 public sealed class MultipassDaemonRetryAuditTests : IDisposable
 {
     private readonly TestSink _sink = new();
+    private readonly Serilog.Core.Logger _logger;
+    private readonly IDisposable _loggerScope;
 
     private readonly Serilog.ILogger _auditLogger;
 
     public MultipassDaemonRetryAuditTests()
     {
-        _auditLogger = new LoggerConfiguration()
+        _logger = new LoggerConfiguration()
             .Enrich.FromLogContext()
             .Enrich.With<SensitiveDataRedactionEnricher>()
             .WriteTo.Sink(_sink)
             .CreateLogger();
-        Log.Logger = _auditLogger;
+        _auditLogger = _logger;
+        _loggerScope = AuditLog.PushLogger(_logger);
     }
 
-    public void Dispose() => Log.CloseAndFlush();
+    public void Dispose()
+    {
+        _loggerScope.Dispose();
+        _logger.Dispose();
+    }
 
     private static IReadOnlyList<string> Argv(string command, params string[] rest) =>
         ["/usr/bin/multipass", command, .. rest];

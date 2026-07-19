@@ -48,7 +48,7 @@ public sealed class MechanicalFixerProgramWiringTests
         Assert.IsType<DotnetFormatMechanicalFixerInputProvider>(Assert.Single(wiredInputProviders));
     }
 
-    private sealed class MechanicalFixerWiringFactory : WebApplicationFactory<Program>
+    private sealed class MechanicalFixerWiringFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly string _dbPath = Path.Combine(
             Path.GetTempPath(), $"codeybox-mechanical-wiring-{Guid.NewGuid():N}.db");
@@ -59,7 +59,7 @@ public sealed class MechanicalFixerProgramWiringTests
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 cfg.Sources.Clear();
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -80,10 +80,6 @@ public sealed class MechanicalFixerProgramWiringTests
         }
 
         protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            base.Dispose(disposing);
-        }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
     }
 }

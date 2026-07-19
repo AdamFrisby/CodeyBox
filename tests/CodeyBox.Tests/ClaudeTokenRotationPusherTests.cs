@@ -36,7 +36,7 @@ public sealed class ClaudeTokenRotationPusherTests : IDisposable
     public void Dispose()
     {
         Log.CloseAndFlush();
-        try { Directory.Delete(_tempDir, recursive: true); } catch { }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_tempDir);
     }
 
     private string WriteCredFile(string content)

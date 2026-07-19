@@ -803,7 +803,7 @@ public sealed class AgentClassesOverrideResolverTests
         }
     }
 
-    private sealed class AgentClassesWiringFactory : WebApplicationFactory<Program>
+    private sealed class AgentClassesWiringFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly Dictionary<string, string?> _override;
         private readonly string _dbPath = Path.Combine(
@@ -823,7 +823,7 @@ public sealed class AgentClassesOverrideResolverTests
                 // frontier-coding base) — that is the base shape the audit
                 // finding was about. The override sits on top as the highest-
                 // precedence layer, mirroring how CODEYBOX_EXTRA_CONFIG works.
-                var tmp = Path.GetTempPath();
+                var tmp = Temp.Root;
                 cfg.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -844,11 +844,7 @@ public sealed class AgentClassesOverrideResolverTests
         }
 
         protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-                try { File.Delete(_dbPath); } catch { /* best-effort */ }
-            base.Dispose(disposing);
-        }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath);
     }
 
     private sealed class ListLogger : ILogger

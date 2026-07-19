@@ -244,7 +244,7 @@ public sealed class WorkItemEndpointIncludesUsageTests : IClassFixture<CostsApiF
 /// pin the "best-effort, return 200 with usage absent" contract on both the
 /// single-item and list endpoints.
 /// </summary>
-public sealed class ThrowingCostStoreApiFactory : WebApplicationFactory<Program>
+public sealed class ThrowingCostStoreApiFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-throwing-cost-httptest-{Guid.NewGuid():N}.db");
@@ -261,7 +261,7 @@ public sealed class ThrowingCostStoreApiFactory : WebApplicationFactory<Program>
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -284,14 +284,7 @@ public sealed class ThrowingCostStoreApiFactory : WebApplicationFactory<Program>
     }
 
     protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            Store.Dispose();
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
+        => DisposeHostThenDeleteSqliteDatabase(disposing, _dbPath, Store.Dispose);
 
     private sealed class ThrowingCostStore : IWorkItemCostStore
     {

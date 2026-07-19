@@ -17,7 +17,7 @@ public sealed class MultipassArgvOverflowTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_sandboxRoot, recursive: true); } catch { }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_sandboxRoot);
     }
 
     [Fact]

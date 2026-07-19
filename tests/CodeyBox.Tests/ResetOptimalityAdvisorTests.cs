@@ -19,28 +19,19 @@ public sealed class ResetOptimalityAdvisorTests : IDisposable
 {
     private static readonly DateTimeOffset T0 = DateTimeOffset.Parse("2026-06-01T00:00:00Z");
 
-    private readonly string _tempDir;
+    private readonly TestTempDirectory _temp;
     private readonly string _dbPath;
 
     public ResetOptimalityAdvisorTests()
     {
-        _tempDir = Path.Combine(Path.GetTempPath(), "codeybox-resetadvice-tests-" + Guid.NewGuid().ToString("n"));
-        Directory.CreateDirectory(_tempDir);
-        _dbPath = Path.Combine(_tempDir, "stats.db");
+        _temp = TestTempDirectory.Create("codeybox-resetadvice-tests-");
+        _dbPath = _temp.NewDatabasePath("stats");
     }
 
     public void Dispose()
-    {
-        try
-        {
-            if (Directory.Exists(_tempDir))
-                Directory.Delete(_tempDir, recursive: true);
-        }
-        catch
-        {
-            // Best-effort temp cleanup.
-        }
-    }
+        => TestTempArtifacts.CleanupAll(
+            () => TestTempArtifacts.DeleteSqliteDatabase(_dbPath),
+            _temp.Dispose);
 
     [Fact]
     public async Task Advise_UsableQuotaAboveDust_ReportsBurnFirst()

@@ -9,7 +9,6 @@ using CodeyBox.Projects;
 using CodeyBox.Sandbox.MultipassRemote;
 using CodeyBox.Sandbox.Process;
 using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -638,47 +637,78 @@ public sealed class E2eRunApiTests : IDisposable
     }
 }
 
-internal sealed class E2ePoolWiringFactory(
-    string poolKind,
-    string? globalRemoteTarget = null,
-    IReadOnlyList<string>? globalRemoteExtraSshOptions = null,
-    string? e2eRemoteTarget = "codeybox@e2e.example",
-    IReadOnlyList<string>? e2eRemoteExtraSshOptions = null,
-    int? e2eRemoteMaxConcurrent = null,
-    bool e2eEnabled = false,
-    string? baselineImageRef = "cb-e2e-baseline",
-    string? networkProfile = null,
-    IReadOnlyList<string>? e2eRemoteTargets = null,
-    string environment = "Development") : WebApplicationFactory<Program>
+internal sealed class E2ePoolWiringFactory : CodeyBoxWebApplicationFactory
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-e2epool-{Guid.NewGuid():N}.db");
-    private readonly IReadOnlyList<string>? _e2eRemoteTargets = e2eRemoteTargets;
-    private readonly IReadOnlyList<string>? _globalRemoteExtraSshOptions = globalRemoteExtraSshOptions;
-    private readonly IReadOnlyList<string>? _e2eRemoteExtraSshOptions = e2eRemoteExtraSshOptions;
+    private readonly string _poolKind;
+    private readonly string? _globalRemoteTarget;
+    private readonly IReadOnlyList<string>? _e2eRemoteTargets;
+    private readonly IReadOnlyList<string>? _globalRemoteExtraSshOptions;
+    private readonly string? _e2eRemoteTarget;
+    private readonly IReadOnlyList<string>? _e2eRemoteExtraSshOptions;
+    private readonly int? _e2eRemoteMaxConcurrent;
+    private readonly bool _e2eEnabled;
+    private readonly string? _baselineImageRef;
+    private readonly string? _networkProfile;
+    private readonly string _environment;
+    private readonly string _dbPath;
+    private readonly string _gitRoot;
+    private readonly string _auditLogPath;
+    private readonly string _auditPath;
+    private readonly string _agentStreamsPath;
+
+    public E2ePoolWiringFactory(
+        string poolKind,
+        string? globalRemoteTarget = null,
+        IReadOnlyList<string>? globalRemoteExtraSshOptions = null,
+        string? e2eRemoteTarget = "codeybox@e2e.example",
+        IReadOnlyList<string>? e2eRemoteExtraSshOptions = null,
+        int? e2eRemoteMaxConcurrent = null,
+        bool e2eEnabled = false,
+        string? baselineImageRef = "cb-e2e-baseline",
+        string? networkProfile = null,
+        IReadOnlyList<string>? e2eRemoteTargets = null,
+        string environment = "Development")
+    {
+        _poolKind = poolKind;
+        _globalRemoteTarget = globalRemoteTarget;
+        _globalRemoteExtraSshOptions = globalRemoteExtraSshOptions;
+        _e2eRemoteTarget = e2eRemoteTarget;
+        _e2eRemoteExtraSshOptions = e2eRemoteExtraSshOptions;
+        _e2eRemoteMaxConcurrent = e2eRemoteMaxConcurrent;
+        _e2eEnabled = e2eEnabled;
+        _baselineImageRef = baselineImageRef;
+        _networkProfile = networkProfile;
+        _e2eRemoteTargets = e2eRemoteTargets;
+        _environment = environment;
+        _dbPath = TempDatabasePath("codeybox-e2epool");
+        _gitRoot = Temp.NewDirectoryPath("test-git-");
+        _auditLogPath = Temp.NewLogPath("test-log");
+        _auditPath = Temp.NewLogPath("test-audit");
+        _agentStreamsPath = Temp.NewDirectoryPath("test-agent-streams-");
+    }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
-        builder.UseEnvironment(environment);
+        builder.UseEnvironment(_environment);
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
             var values = new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:DangerouslyAllowProcessSandbox"] = "true",
                 ["CodeyBox:SandboxProvider"] = "process",
-                ["CodeyBox:E2eExecution:PoolKind"] = poolKind,
-                ["CodeyBox:E2eExecution:Enabled"] = e2eEnabled.ToString(),
-                ["CodeyBox:E2eExecution:BaselineImageRef"] = baselineImageRef,
-                ["CodeyBox:E2eExecution:NetworkProfile"] = networkProfile,
+                ["CodeyBox:E2eExecution:PoolKind"] = _poolKind,
+                ["CodeyBox:E2eExecution:Enabled"] = _e2eEnabled.ToString(),
+                ["CodeyBox:E2eExecution:BaselineImageRef"] = _baselineImageRef,
+                ["CodeyBox:E2eExecution:NetworkProfile"] = _networkProfile,
                 ["CodeyBox:Changelog:Enabled"] = "false",
                 ["CodeyBox:Changelog:GitHubWebhookSecretEnvVar"] = "TEST_CHANGELOG_SECRET",
-                ["CodeyBox:MultipassRemoteSandbox:SshTarget"] = globalRemoteTarget,
+                ["CodeyBox:MultipassRemoteSandbox:SshTarget"] = _globalRemoteTarget,
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitRootDirectory"] = _gitRoot,
+                ["CodeyBox:AuditLog:Path"] = _auditLogPath,
+                ["CodeyBox:AuditLog:AuditPath"] = _auditPath,
+                ["CodeyBox:AgentStreams:Path"] = _agentStreamsPath,
             };
             if (_globalRemoteExtraSshOptions is { Count: > 0 })
             {
@@ -695,8 +725,8 @@ internal sealed class E2ePoolWiringFactory(
             }
             else
             {
-                values["CodeyBox:E2eMultipassRemoteSandbox:SshTarget"] = e2eRemoteTarget;
-                values["CodeyBox:E2eMultipassRemoteSandbox:MaxConcurrent"] = e2eRemoteMaxConcurrent?.ToString();
+                values["CodeyBox:E2eMultipassRemoteSandbox:SshTarget"] = _e2eRemoteTarget;
+                values["CodeyBox:E2eMultipassRemoteSandbox:MaxConcurrent"] = _e2eRemoteMaxConcurrent?.ToString();
                 if (_e2eRemoteExtraSshOptions is { Count: > 0 })
                 {
                     for (var i = 0; i < _e2eRemoteExtraSshOptions.Count; i++)
@@ -721,28 +751,30 @@ internal sealed class E2ePoolWiringFactory(
                 }));
         });
     }
-
-    protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
-    }
 }
 
-internal sealed class E2eHostedServiceWiringFactory : WebApplicationFactory<Program>
+internal sealed class E2eHostedServiceWiringFactory : CodeyBoxWebApplicationFactory
 {
-    private readonly string _dbPath = Path.Combine(
-        Path.GetTempPath(), $"codeybox-e2ehosted-{Guid.NewGuid():N}.db");
+    private readonly string _dbPath;
+    private readonly string _gitRoot;
+    private readonly string _auditLogPath;
+    private readonly string _auditPath;
+    private readonly string _agentStreamsPath;
+
+    public E2eHostedServiceWiringFactory()
+    {
+        _dbPath = TempDatabasePath("codeybox-e2ehosted");
+        _gitRoot = Temp.NewDirectoryPath("test-git-");
+        _auditLogPath = Temp.NewLogPath("test-log");
+        _auditPath = Temp.NewLogPath("test-audit");
+        _agentStreamsPath = Temp.NewDirectoryPath("test-agent-streams-");
+    }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Development");
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
-            var tmp = Path.GetTempPath();
             cfg.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
@@ -751,9 +783,10 @@ internal sealed class E2eHostedServiceWiringFactory : WebApplicationFactory<Prog
                 ["CodeyBox:E2eExecution:Enabled"] = "false",
                 ["CodeyBox:E2eExecution:PoolKind"] = "local",
                 ["CodeyBox:StateDatabasePath"] = _dbPath,
-                ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
-                ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
-                ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitRootDirectory"] = _gitRoot,
+                ["CodeyBox:AuditLog:Path"] = _auditLogPath,
+                ["CodeyBox:AuditLog:AuditPath"] = _auditPath,
+                ["CodeyBox:AgentStreams:Path"] = _agentStreamsPath,
             });
         });
         builder.ConfigureTestServices(services =>
@@ -769,14 +802,5 @@ internal sealed class E2eHostedServiceWiringFactory : WebApplicationFactory<Prog
                     DefaultBaseBranch = "main",
                 }));
         });
-    }
-
-    protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            try { File.Delete(_dbPath); } catch { /* best-effort */ }
-        }
-        base.Dispose(disposing);
     }
 }

@@ -26,7 +26,7 @@ public sealed class PickupTransactionTests : IDisposable
     {
         _store.Dispose();
         _registry.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     [Fact]

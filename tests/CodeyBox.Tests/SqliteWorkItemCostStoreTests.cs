@@ -32,7 +32,7 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
     {
         _store.Dispose();
         _rawConn.Dispose();
-        try { File.Delete(_dbPath); } catch { /* best-effort */ }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     private void SeedWorkItem(string id, string projectId = "test-project", WorkItemState state = WorkItemState.Queued)
@@ -531,7 +531,7 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         }
         finally
         {
-            try { File.Delete(dbPath); } catch { /* best-effort */ }
+            TestTempArtifacts.DeleteSqliteDatabase(dbPath);
         }
     }
 
@@ -796,7 +796,7 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         }
         finally
         {
-            try { File.Delete(dbPath); } catch { /* best-effort */ }
+            TestTempArtifacts.DeleteSqliteDatabase(dbPath);
         }
     }
 
@@ -892,7 +892,7 @@ public sealed class SqliteWorkItemCostStoreTests : IDisposable
         }
         finally
         {
-            try { File.Delete(dbPath); } catch { /* best-effort */ }
+            TestTempArtifacts.DeleteSqliteDatabase(dbPath);
         }
     }
 

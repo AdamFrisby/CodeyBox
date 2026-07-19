@@ -63,7 +63,7 @@ public sealed class StartupStrandedItemSweepTests : IDisposable
     {
         _store.Dispose();
         _registry.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        TestTempArtifacts.DeleteSqliteDatabase(_dbPath);
     }
 
     private static WorkItem MakeItem(WorkItemState state, int recoveryAttempts = 0, string? preemptCheckpoint = null) => new()

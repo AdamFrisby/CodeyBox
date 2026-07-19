@@ -29,7 +29,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
     }
 
     public void Dispose()
-    { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     private sealed class FakeTimeProvider : TimeProvider
     {

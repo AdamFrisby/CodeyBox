@@ -277,7 +277,7 @@ public sealed class StartupResumeApiAvailabilityTests
             TaskCreationOptions.DenyChildAttach | TaskCreationOptions.LongRunning,
             TaskScheduler.Default);
 
-    private sealed class StartupResumeFullHostFactory : WebApplicationFactory<Program>
+    private sealed class StartupResumeFullHostFactory : CodeyBox.Tests.CodeyBoxWebApplicationFactory
     {
         private readonly string _behavior;
         private readonly SandboxResumeMode _mode;
@@ -388,21 +388,15 @@ public sealed class StartupResumeApiAvailabilityTests
                 StringComparison.Ordinal);
 
         protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-            {
-                base.Dispose(disposing);
-                Store.Dispose();
-                Registry.Dispose();
-                try { File.Delete(_dbPath); } catch { }
-                return;
-            }
-            base.Dispose(disposing);
-        }
+            => DisposeHostThenDeleteSqliteDatabase(
+                disposing,
+                _dbPath,
+                Store.Dispose,
+                Registry.Dispose);
 
         private Dictionary<string, string?> BuildInitialConfig()
         {
-            var tmp = Path.GetTempPath();
+            var tmp = Temp.Root;
             var values = new Dictionary<string, string?>
             {
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",

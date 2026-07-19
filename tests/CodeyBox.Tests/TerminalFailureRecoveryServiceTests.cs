@@ -25,7 +25,7 @@ public sealed class TerminalFailureRecoveryServiceTests : IDisposable
     public void Dispose()
     {
         Log.CloseAndFlush();
-        try { Directory.Delete(_workspace, recursive: true); } catch { }
+        CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace);
     }
 
     [Fact]

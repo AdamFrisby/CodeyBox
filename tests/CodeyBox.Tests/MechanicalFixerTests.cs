@@ -24,8 +24,7 @@ public sealed class MechanicalFixerTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(_workspace, recursive: true); }
-        catch { }
+        TestTempArtifacts.DeleteDirectory(_workspace);
     }
 
     [Fact]

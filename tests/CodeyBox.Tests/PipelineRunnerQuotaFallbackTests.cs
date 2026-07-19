@@ -31,7 +31,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     public PipelineRunnerQuotaFallbackTests() =>
         _workspace = Directory.CreateTempSubdirectory("codeybox-fallback-").FullName;
 
-    public void Dispose() { try { Directory.Delete(_workspace, recursive: true); } catch { } }
+    public void Dispose() { CodeyBox.Tests.TestTempArtifacts.DeleteDirectory(_workspace); }
 
     [Fact]
     public async Task Codex_HitsQuota_FallsBackToClaude_EmitsFallbackAndInvocationMetrics()
