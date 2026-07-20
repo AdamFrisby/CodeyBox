@@ -70,6 +70,9 @@ public static class PlanAuditTests
     /// <summary>Stable name of the TEST 04 auditor (referenced by DI + composition).</summary>
     public const string Test04AuditorName = "plan:invariants-contracts-migrations";
 
+    /// <summary>Stable name of the TEST 05 auditor (referenced by DI + composition).</summary>
+    public const string Test05AuditorName = "plan:security-privacy-supply-chain";
+
     /// <summary>
     /// TEST 01 — PLAN INTEGRITY AND EVIDENCE CLASSIFICATION. Determines whether
     /// the plan is grounded in the actual system rather than hallucinated
@@ -334,10 +337,112 @@ public static class PlanAuditTests
     };
 
     /// <summary>
+    /// TEST 05 — SECURITY, PRIVACY, ABUSE CASES, SUPPLY CHAIN, CONFIGURATION, AND
+    /// SECRETS. Determines whether the plan identifies the assets, trust
+    /// boundaries, and attacker-controlled inputs the change touches; enforces
+    /// authorization on the authoritative path (never in UI/client, prompts, or
+    /// comments); handles sensitive-data flow, retention, redaction, deletion, and
+    /// audit logging; and — for LLM/agent/RAG/tooling features — addresses prompt
+    /// injection, untrusted context, excessive agency, tool permissions, secret
+    /// exposure, repository exfiltration, poisoned files, and operator/human
+    /// approval gates. It also checks that new dependencies are justified
+    /// (purpose, maintenance, LICENSE, vulnerability, transitive and alternative
+    /// risk) and that config values and secrets are named, stored securely,
+    /// rotated, validated at startup, and handled safely when missing. This is a
+    /// GENERAL, project-agnostic gate: the full criteria set is kept for every
+    /// project (per-project relevance is the auditor on/off toggle); a specific
+    /// plan that genuinely does not touch an area self-skips just those criteria
+    /// as NOT_APPLICABLE.
+    /// </summary>
+    public static PlanAuditTest Test05 { get; } = new()
+    {
+        Id = "05",
+        AuditorName = Test05AuditorName,
+        Title = "SECURITY, PRIVACY, ABUSE CASES, SUPPLY CHAIN, CONFIGURATION, AND SECRETS",
+        Objective =
+            "Determine whether the plan identifies assets, trust boundaries, attacker-controlled " +
+            "inputs, permissions, dependency risks, and secret/config handling.",
+        ReviewGuidance = """
+            - What assets, trust boundaries, and new inputs does the change affect?
+            - What can a malicious, compromised, or confused actor control (network input, argv, env,
+              file/stream contents, IPC/RPC peers, another tenant's data, model/agent/tool output)?
+            - Is auth/authz enforced on the server-side / authoritative path and centralized to avoid
+              bypass — never only in the UI, client, prompt, or comment?
+            - Does every handler acting on a client-supplied id re-verify ownership/role at the moment
+              of action, comparing credentials by exact equality?
+            - How are sensitive-data flows handled: retention, minimization, logging, redaction, deletion?
+            - Are there audit logs for security-relevant actions (authz decisions, admin/privileged
+              operations, data access/exports)?
+            - FOR LLM / AGENT / RAG / TOOLING FEATURES: does the plan address prompt injection, untrusted
+              context, EXCESSIVE AGENCY, tool permissions/scoping, secret exposure, repository
+              exfiltration, poisoned files, and operator/human approval gates for high-impact actions?
+            - Are new dependencies justified by purpose, maintenance, LICENSE, known vulnerabilities,
+              transitive-risk, and alternatives considered?
+            - Are config values and secrets named, stored securely, rotated, validated at startup, and
+              handled safely when missing or malformed?
+            - Are input sizes, loop/recursion depth, buffers, queues, retries, concurrency, and
+              decompression ratios bounded before buffering?
+            """,
+        PassCriteria =
+            "A concrete threat model appropriate to the change (assets, trust boundaries, attacker " +
+            "inputs, abuse cases, mitigations); controls live in enforceable code paths, not " +
+            "conventions; privacy and audit logging are explicit where relevant; and dependencies, " +
+            "config, and secrets are justified and managed (stored securely, validated, safe when missing).",
+        FailCriteria =
+            "Generic security language ('add validation', 'handle securely') with no named boundary or " +
+            "control; authorization placed only in UI / client; abuse cases omitted for " +
+            "admin / integration / AI-agent / cross-trust flows; secrets hardcoded or vaguely handled; " +
+            "or a new dependency added without justification.",
+        AutomaticBlocker = """
+            Treat as an automatic BLOCKER when the plan:
+            - touches auth, permissions, user data, admin operations, files, external integrations, or
+              LLM tools WITHOUT a concrete threat model (assets, trust boundaries, attacker inputs,
+              abuse cases, mitigations); or
+            - relies on LLM behavior, prompt wording, code comments, developer/agent discipline, or
+              UI-hiding as a SECURITY boundary (a real boundary is an enforced check in an
+              authoritative code path); or
+            - risks leaking secrets or sensitive data (committing credentials, logging secrets or
+              unredacted sensitive data, exposing them to an untrusted model/tool, or exfiltrating the
+              repository).
+            """,
+        RequiredFixes = """
+            - Add a threat model: assets, trust boundaries, attacker-controlled inputs, abuse cases,
+              and the mitigation for each.
+            - Name the exact authorization checks and the authoritative enforcement point for each
+              (server-side / domain path, re-verified per action, exact-equality credential compares).
+            - Add negative security tests (rejected-unauthorized, injection-blocked, oversized-input-bounded).
+            - Add audit logging for security-relevant actions.
+            - Justify each new dependency (purpose, maintenance, LICENSE, vulnerabilities, transitive
+              risk, alternatives) and define config/secret handling (named, stored securely, rotated,
+              validated at startup, safe when missing).
+            - For LLM/agent features: scope tool permissions to least privilege, isolate untrusted
+              context from trusted instructions, bound agent authority, and add operator/human approval
+              gates for high-impact or irreversible actions.
+            """,
+        Criteria =
+        [
+            "assets-trust-boundaries",     // assets, trust boundaries, and new inputs are identified
+            "attacker-control",            // what a malicious/compromised/confused actor can control
+            "authz-enforcement",           // authz server-side/authoritative-path, centralized, per-action re-check
+            "sensitive-data-handling",     // data flow, retention, minimization, deletion of sensitive data
+            "logging-redaction",           // no secrets/unredacted sensitive data in logs
+            "audit-logging",               // audit logs for security-relevant actions
+            "input-bounding",              // input sizes/depth/buffers/retries/concurrency bounded before buffering
+            "prompt-injection",            // prompt injection + untrusted context isolated from instructions
+            "excessive-agency",            // tool permissions least-privilege, agent authority bounded
+            "repo-exfiltration",           // secret exposure, repository exfiltration, poisoned files
+            "human-approval-gates",        // operator/human approval gates for high-impact/irreversible actions
+            "dependency-justification",    // new deps justified: purpose/maintenance/LICENSE/vuln/transitive/alternatives
+            "config-secret-handling",      // config/secrets named, stored securely, rotated, validated, safe-when-missing
+            "negative-security-tests",     // negative security tests (unauthorized/injection/oversized)
+        ],
+    };
+
+    /// <summary>
     /// Every built-in plan-audit chain test, in chain order. The DI registration
     /// and <c>ProjectAuditorComposer</c> auto-inclusion both iterate this list,
     /// so adding a chain test here wires it everywhere without touching either
     /// call site (one source of truth for the chain membership).
     /// </summary>
-    public static IReadOnlyList<PlanAuditTest> All { get; } = [Test01, Test02, Test03, Test04];
+    public static IReadOnlyList<PlanAuditTest> All { get; } = [Test01, Test02, Test03, Test04, Test05];
 }
