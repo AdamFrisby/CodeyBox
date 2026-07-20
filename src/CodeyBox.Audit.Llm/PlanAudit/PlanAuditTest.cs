@@ -76,6 +76,9 @@ public static class PlanAuditTests
     /// <summary>Stable name of the TEST 06 auditor (referenced by DI + composition).</summary>
     public const string Test06AuditorName = "plan:reliability-failure-concurrency";
 
+    /// <summary>Stable name of the TEST 07 auditor (referenced by DI + composition).</summary>
+    public const string Test07AuditorName = "plan:test-strategy-evidence";
+
     /// <summary>
     /// TEST 01 — PLAN INTEGRITY AND EVIDENCE CLASSIFICATION. Determines whether
     /// the plan is grounded in the actual system rather than hallucinated
@@ -537,10 +540,103 @@ public static class PlanAuditTests
     };
 
     /// <summary>
+    /// TEST 07 — TEST STRATEGY AND EVIDENCE QUALITY. Determines whether the plan
+    /// provides risk-mapped evidence that the change is correct, secure,
+    /// compatible, and maintainable — tests are mapped to specific
+    /// risks / invariants / contracts / failure-modes rather than a bare "add
+    /// tests"; pure decision logic has unit tests; persistence / boundaries /
+    /// queues / jobs have integration tests; public and internal
+    /// APIs / events / SDKs / webhooks have contract tests; schema / data changes
+    /// have migration / backfill tests; the abuse surface (authz, validation,
+    /// duplicate processing, malformed input, expired tokens, unsafe LLM / tool
+    /// output) has negative + abuse tests; E2E is scoped to critical journeys
+    /// rather than substituting for lower-level coverage; scale-sensitive paths
+    /// have performance / load tests; test data is deterministic and not coupled
+    /// to implementation detail; the plan names which existing tests to update and
+    /// which regressions to prevent; and explicit, automated done-criteria connect
+    /// the deliverables to the tests that verify them before deployment. This
+    /// reviews only whether the plan DECLARES an adequate strategy — actual test
+    /// existence / execution is a code-stage concern. This is a GENERAL,
+    /// project-agnostic gate: the full criteria set is kept for every project
+    /// (per-project relevance is the auditor on/off toggle); a specific plan that
+    /// genuinely does not touch an area self-skips just those criteria as
+    /// NOT_APPLICABLE with a one-line reason.
+    /// </summary>
+    public static PlanAuditTest Test07 { get; } = new()
+    {
+        Id = "07",
+        AuditorName = Test07AuditorName,
+        Title = "TEST STRATEGY AND EVIDENCE QUALITY",
+        Objective =
+            "Determine whether the plan provides risk-mapped evidence that the change is correct, " +
+            "secure, compatible, and maintainable. Review only whether the plan DECLARES an adequate " +
+            "strategy — actual test execution/existence is code-stage.",
+        ReviewGuidance = """
+            - Are tests mapped to specific risks / invariants / contracts / failure-modes, or does the
+              plan just say "add tests" without naming what each test pins down?
+            - Are there unit tests for pure decision logic?
+            - Are there integration tests for persistence / boundaries / queues / jobs (through the real
+              component, not a mock asserting its own calls)?
+            - Are there contract tests for public and internal APIs / events / SDKs / webhooks?
+            - Are there migration / backfill tests for schema / data changes?
+            - Are there negative + abuse tests (authz rejection, input validation, duplicate processing,
+              malformed input, expired / invalid tokens, unsafe LLM / tool output) for the relevant risks?
+            - Is E2E testing limited to critical journeys rather than used as a substitute for
+              lower-level unit / integration / contract coverage?
+            - Are there performance / load tests where scale or throughput is a concern?
+            - Is the test data deterministic (injected clock, seeded randomness, isolated fixtures) and
+              free of brittle implementation-detail assertions?
+            - Does the plan name which existing tests to update and which regressions to prevent?
+            - Does the plan define explicit, objectively-checkable done-criteria that connect the
+              deliverables to the tests / checks / metrics that verify them before deployment?
+            """,
+        PassCriteria =
+            "Tests are specific and risk-based, covering positive, negative, compatibility, migration, " +
+            "and failure cases; the main invariants and contracts have direct test evidence (a named " +
+            "test that would fail if that behavior broke); and the plan defines how completion is " +
+            "verified through automated checks rather than a human sign-off.",
+        FailCriteria =
+            "The plan merely says 'add tests'; the tests only verify implementation details; " +
+            "negative / security / migration / failure tests are missing despite relevant risks; or " +
+            "there are no acceptance criteria connected to tests.",
+        AutomaticBlocker = """
+            Treat as an automatic BLOCKER when the plan:
+            - leaves a critical business, security, data-integrity, or contract risk with NO direct
+              test evidence (no named test that would fail if that specific behavior broke); or
+            - cannot say how correctness is verified before deployment (no acceptance / done criteria
+              connected to concrete tests, checks, or metrics).
+            """,
+        RequiredFixes = """
+            - Add a test matrix mapping each test to the specific risk / invariant / contract /
+              failure-mode it verifies.
+            - Add negative + abuse tests (authz rejection, validation, duplicate processing, malformed
+              input, expired tokens, unsafe LLM / tool output) for the relevant risks.
+            - Add the missing migration / contract / integration tests for the persistence, schema, and
+              boundary changes the plan makes.
+            - Add explicit, automated done-criteria that connect each deliverable to the test, check, or
+              metric that verifies it before deployment.
+            """,
+        Criteria =
+        [
+            "risk-mapped-tests",              // each test mapped to a specific risk/invariant/contract/failure-mode
+            "unit-tests-pure-logic",          // unit tests for pure decision logic
+            "integration-tests",              // integration tests for persistence/boundaries/queues/jobs
+            "contract-tests",                 // contract tests for public/internal APIs/events/SDKs/webhooks
+            "migration-tests",                // migration/backfill tests for schema/data changes
+            "negative-abuse-tests",           // negative+abuse tests (authz/validation/duplicate/malformed/expired/unsafe-LLM)
+            "e2e-scoping",                    // E2E limited to critical journeys, not a substitute for lower-level coverage
+            "performance-load-tests",         // performance/load tests where scale is a concern
+            "deterministic-test-data",        // deterministic data, no brittle implementation-detail assertions
+            "existing-tests-and-regressions", // which existing tests to update, which regressions to prevent
+            "done-criteria",                  // explicit automated done-criteria connecting deliverables to tests
+        ],
+    };
+
+    /// <summary>
     /// Every built-in plan-audit chain test, in chain order. The DI registration
     /// and <c>ProjectAuditorComposer</c> auto-inclusion both iterate this list,
     /// so adding a chain test here wires it everywhere without touching either
     /// call site (one source of truth for the chain membership).
     /// </summary>
-    public static IReadOnlyList<PlanAuditTest> All { get; } = [Test01, Test02, Test03, Test04, Test05, Test06];
+    public static IReadOnlyList<PlanAuditTest> All { get; } = [Test01, Test02, Test03, Test04, Test05, Test06, Test07];
 }
