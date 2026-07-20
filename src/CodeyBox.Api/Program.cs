@@ -279,6 +279,16 @@ builder.Services.AddSingleton(sp => new SqliteDatabaseWriteGateFactory(
     sp.GetRequiredService<ILoggerFactory>(),
     TimeProvider.System));
 builder.Services.Configure<BuildScriptAuditorOptions>(builder.Configuration.GetSection("CodeyBox:BuildScriptAudit"));
+// Regression-test-selection mode (Audit:TestSelection:Mode). Bound through
+// AddOptions so IOptionsMonitor<TestSelectionOptions> hot-reloads the mode
+// without a restart, with a fail-fast validator rejecting an unrecognised value
+// at load rather than silently narrowing at audit time. Default 'all' keeps the
+// emitted dotnet-test command byte-identical to today.
+builder.Services.AddOptions<TestSelectionOptions>()
+    .Bind(builder.Configuration.GetSection(TestSelectionOptions.SectionName))
+    .Validate(
+        static opts => TestSelectionModeParser.TryParse(opts.Mode, out _),
+        $"{TestSelectionOptions.SectionName}:Mode must be one of: all");
 builder.Services.Configure<NotificationsOptions>(builder.Configuration.GetSection("CodeyBox:Notifications"));
 // E2eExecutionOptions binds as a standalone section so the pool / dispatcher can
 // take IOptionsMonitor<E2eExecutionOptions> directly without dragging the whole
@@ -2245,6 +2255,25 @@ builder.Services.AddSingleton<ITestRunnerAuditor>(sp => new DotnetTestAuditor(ne
     RunOptionsAccessor = sp.GetRequiredService<Func<TestRunOptions>>(),
     TestFailureAttributionOptions = sp.GetRequiredService<TestFailureAttributionOptionsSnapshot>(),
 }));
+
+// Test-selection seam. ConfiguredTestSelector reads Audit:TestSelection:Mode live
+// from IOptionsMonitor on every call (hot-reload) and dispatches to the selector
+// registered for that mode; the default 'all' maps to RunAllTestSelector, whose
+// TestSelection.All keeps the emitted dotnet-test command byte-identical to the
+// legacy path. The merge/release verification path (IRequiredBuildVerifier /
+// process:required-build) deliberately takes NO dependency on this seam: it always
+// verifies the full build/test surface regardless of Mode.
+builder.Services.AddSingleton<ITestSelector>(sp =>
+{
+    var modeMonitor = sp.GetRequiredService<IOptionsMonitor<TestSelectionOptions>>();
+    var selectorsByMode = new Dictionary<TestSelectionMode, ITestSelector>
+    {
+        [TestSelectionMode.All] = new RunAllTestSelector(),
+    };
+    return new ConfiguredTestSelector(
+        () => TestSelectionModeParser.Parse(modeMonitor.CurrentValue.Mode),
+        selectorsByMode);
+});
 builder.Services.AddSingleton<IAuditor, GraphicalSmokeAuditor>();
 builder.Services.AddSingleton<IAuditor>(sp => new BuildScriptAuditor(
     () => sp.GetRequiredService<IOptionsMonitor<BuildScriptAuditorOptions>>().CurrentValue));
