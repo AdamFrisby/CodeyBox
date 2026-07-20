@@ -63,20 +63,4 @@
           StandardErrorImportance="Low" />
   </Target>
 
-  <!-- Second-line heal wired via BeforeTargets=Restore rather than InitialTargets
-       so it also catches a root-owned, non-writable ~/.nuget that only becomes
-       observable once the Restore target starts (see scripts/repair-nuget-home.sh
-       for the full rationale). Preserves any user NuGet.Config and symlinks the
-       baked packages cache so cache-only restores keep working. The script is a
-       no-op on a healthy (writable/absent) ~/.nuget, so developer and CI machines
-       are untouched. Non-Windows only: the defect and the userspace rename fix
-       are POSIX-specific. -->
-  <Target Name="RepairUnwritableNuGetHome"
-          BeforeTargets="Restore;CollectPackageReferences;_GenerateRestoreProjectSpec"
-          Condition="!$([MSBuild]::IsOSPlatform('Windows'))">
-    <Exec Command="sh &quot;$(MSBuildThisFileDirectory)scripts/repair-nuget-home.sh&quot;"
-          StandardOutputImportance="Low"
-          ContinueOnError="true" />
-  </Target>
-
 </Project>
