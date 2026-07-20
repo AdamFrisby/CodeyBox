@@ -85,6 +85,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
             ["CODEYBOX_AUDIT_TARGET"] = context.EffectiveTarget.Value,
             ["CODEYBOX_WORK_ITEM_ID"] = context.WorkItemId.ToString(),
         };
+        DotnetCliHomeConventions.ApplyIfDotnetInvocation(_opts.Argv, workingDirectory, environment);
 
         // Dispatch on the explicit review strategy; an unhandled future target is
         // rejected in Classify rather than silently run as a code audit.

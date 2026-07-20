@@ -7,11 +7,7 @@ set -eu
 # source of truth in scripts/nuget-home-heal.sh (shared with the audit
 # build/test gates); source it relative to THIS script so it resolves regardless
 # of the caller's working directory, and only when present so a partial checkout
-# still runs the build. The shared script subsumes the earlier inline
-# temp-collision hardening: it uses `mktemp -d` for the DOTNET_CLI_HOME redirect
-# (never a predictable /tmp leaf), and additionally quarantines the broken
-# ~/.nuget in place when the cli-home is writable, so the whole environment is
-# healed rather than just the current process.
+# still runs the build.
 codeybox_script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 if [ -f "$codeybox_script_dir/scripts/nuget-home-heal.sh" ]; then
     . "$codeybox_script_dir/scripts/nuget-home-heal.sh"

@@ -2181,6 +2181,9 @@ public sealed class RequiredBuildGateTests : IDisposable
         Assert.Equal("baseline-pin:abcdef0123", spec.BaselineImageRef);
         Assert.Equal(item.Id, spec.TimingWorkItemId);
         Assert.Equal(item.Id.ToString(), spec.Environment[SandboxConventions.WorkItemIdEnvironmentVariable]);
+        Assert.Equal(
+            DotnetCliHomeConventions.ResolvePath(SandboxConventions.WorkDir),
+            spec.Environment["DOTNET_CLI_HOME"]);
     }
 
     [Fact]

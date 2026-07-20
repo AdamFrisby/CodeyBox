@@ -37,3 +37,9 @@ src/CodeyBox.Api/logs/
 
 # Local rubric annotation workspace (operator notes on audit prompts; not source of truth)
 rubric-annotations/
+
+# Repo-local NuGet package cache (see NuGet.Config globalPackagesFolder).
+.nuget/
+
+# Repo-local dotnet CLI home (DOTNET_CLI_HOME for sandboxed builds).
+.dotnet-cli-home/

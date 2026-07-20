@@ -134,6 +134,32 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public async Task ShellCommandAuditor_DotnetInvocation_SetsDotnetCliHome()
+    {
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "csharp:build-WaE",
+            Argv = ["dotnet", "build", "--no-incremental", "/warnaserror"],
+        });
+        SandboxExec? commandExec = null;
+        var sandbox = new FakeSandbox(exec =>
+        {
+            if (IsToolProbe(exec))
+                return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
+
+            commandExec = exec;
+            return new SandboxExecResult(0, "", "");
+        });
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.NotNull(commandExec);
+        Assert.NotNull(commandExec!.ExtraEnvironment);
+        Assert.Equal("/work/.dotnet-cli-home", commandExec.ExtraEnvironment!["DOTNET_CLI_HOME"]);
+    }
+
+    [Fact]
     public async Task ShellCommandAuditor_PassOnZeroExit()
     {
         var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions

@@ -67,6 +67,9 @@ public static class PlanAuditTests
     /// <summary>Stable name of the TEST 03 auditor (referenced by DI + composition).</summary>
     public const string Test03AuditorName = "plan:architecture-boundary";
 
+    /// <summary>Stable name of the TEST 04 auditor (referenced by DI + composition).</summary>
+    public const string Test04AuditorName = "plan:invariants-contracts-migrations";
+
     /// <summary>
     /// TEST 01 — PLAN INTEGRITY AND EVIDENCE CLASSIFICATION. Determines whether
     /// the plan is grounded in the actual system rather than hallucinated
@@ -257,10 +260,84 @@ public static class PlanAuditTests
     };
 
     /// <summary>
+    /// TEST 04 — DOMAIN INVARIANTS, DATA OWNERSHIP, CONTRACTS, AND MIGRATIONS.
+    /// Verifies the plan protects the correctness of business rules, state,
+    /// schemas, APIs, events, and cross-version compatibility — every domain
+    /// invariant has a named enforcement point, each important fact has one source
+    /// of truth (with invalidation defined for any derived/cached/duplicated data),
+    /// schema/API/event changes are backward-compatible or justified, migrations
+    /// and backfills are idempotent/observable/reversible, and rolling-deploy mixed
+    /// versions (old-code/new-schema, new-code/old-data) and duplicate/out-of-order
+    /// events are handled rather than assumed away.
+    /// </summary>
+    public static PlanAuditTest Test04 { get; } = new()
+    {
+        Id = "04",
+        AuditorName = Test04AuditorName,
+        Title = "DOMAIN INVARIANTS, DATA OWNERSHIP, CONTRACTS, AND MIGRATIONS",
+        Objective =
+            "Verify the plan protects correctness of business rules, state, schemas, APIs, events, " +
+            "and cross-version compatibility.",
+        ReviewGuidance = """
+            - What domain invariants must hold, and where is each one enforced?
+            - What is the single source of truth for each important fact?
+            - What data is derived / cached / duplicated / denormalized, and how is invalidation handled?
+            - Are schema changes additive, backward-compatible, and safely deployable?
+            - Is an expand-contract (add → backfill → switch → remove) migration used where a breaking
+              change is otherwise required?
+            - Are migrations and backfills idempotent, resumable, observable, and safe for large datasets?
+            - Are public and internal interfaces, events, queues, SDKs, clients, and webhooks kept
+              backward-compatible (or is the break explicitly justified with a compatibility path)?
+            - What are the transactional boundaries and consistency expectations?
+            - Does the plan account for mixed-version operation during a rolling deploy — old code on a
+              new schema, and new code on old data — rather than assuming an atomic deploy?
+            - Are duplicate events, ordering, idempotency, and replay handled?
+            """,
+        PassCriteria =
+            "Invariants and their enforcement points are explicit; each important fact has one source " +
+            "of truth with invalidation defined for derived data; schema/API/event changes are " +
+            "backward-compatible or justified; migration/backfill is safe, observable, and reversible; " +
+            "and consistency and idempotency rules are clear.",
+        FailCriteria =
+            "The plan changes persistent data without migration details; duplicates state without an " +
+            "invalidation strategy; changes a contract without a compatibility analysis; assumes atomic " +
+            "deploys; or ignores old-code/new-schema and new-code/old-data operation.",
+        AutomaticBlocker = """
+            Treat as an automatic BLOCKER when the plan:
+            - risks data corruption, lost records, an irreversible destructive migration, or a broken
+              contract that it does not address; or
+            - modifies persistent state (on-disk format, DB schema, durable events/logs) without a
+              rollback, forward-fix, or compatibility strategy.
+            """,
+        RequiredFixes = """
+            - Name each domain invariant and the exact point at which it is enforced.
+            - Identify the source of truth for each important fact and mark what is derived / cached.
+            - Add a schema / API / event compatibility plan (additive or expand-contract, or a justified
+              break with a compatibility path).
+            - Add a migration / backfill / rollback plan that is idempotent, observable, and reversible.
+            - State the idempotency and consistency rules (transactional boundaries, duplicate/ordering/replay).
+            """,
+        Criteria =
+        [
+            "domain-invariants",           // each invariant named with its enforcement point
+            "source-of-truth",             // one authoritative source per important fact
+            "derived-data-invalidation",   // derived/cached/duplicated/denormalized data has invalidation
+            "schema-compatibility",        // schema changes additive/backward-compatible/safely-deployable
+            "expand-contract-migration",   // expand-contract used where a breaking change is otherwise needed
+            "migration-safety",            // migration/backfill idempotent, resumable, observable, large-data safe
+            "migration-reversibility",     // rollback / forward-fix path for the migration
+            "contract-compatibility",      // API/event/queue/SDK/client/webhook backward-compatible or justified
+            "transactional-consistency",   // transactional boundaries + consistency expectations explicit
+            "mixed-version-operation",     // old-code/new-schema + new-code/old-data during rolling deploys
+            "idempotency-ordering",        // duplicate events, ordering, idempotency, replay handled
+        ],
+    };
+
+    /// <summary>
     /// Every built-in plan-audit chain test, in chain order. The DI registration
     /// and <c>ProjectAuditorComposer</c> auto-inclusion both iterate this list,
     /// so adding a chain test here wires it everywhere without touching either
     /// call site (one source of truth for the chain membership).
     /// </summary>
-    public static IReadOnlyList<PlanAuditTest> All { get; } = [Test01, Test02, Test03];
+    public static IReadOnlyList<PlanAuditTest> All { get; } = [Test01, Test02, Test03, Test04];
 }

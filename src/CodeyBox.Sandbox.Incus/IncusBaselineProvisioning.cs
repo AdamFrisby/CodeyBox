@@ -281,7 +281,7 @@ internal sealed class IncusProvisioningWorkspace : IDisposable
     {
         var lease = IncusSafeFile.OpenOrCreatePrivateLeaseNoFollow(
             Path.Combine(stagingRoot, CoordinationLeaseName));
-        if (IncusSafeFile.TryAcquireExclusiveLease(lease))
+        if (IncusSafeFile.TryAcquireExclusiveLeaseWithRetry(lease))
             return lease;
         lease.Dispose();
         throw new IncusProvisioningLeaseContendedException(
@@ -343,7 +343,7 @@ internal sealed class IncusProvisioningWorkspace : IDisposable
         {
             acquiredLease = IncusSafeFile.OpenOrCreatePrivateLeaseNoFollow(
                 Path.Combine(workspaceRoot, WorkspaceLeaseName));
-            if (!IncusSafeFile.TryAcquireExclusiveLease(acquiredLease))
+            if (!IncusSafeFile.TryAcquireExclusiveLeaseWithRetry(acquiredLease))
             {
                 acquiredLease.Dispose();
                 return false;

@@ -3625,7 +3625,9 @@ os.execv(dotnet, [hostile_argv0, "exec", target, *sys.argv[3:]])
                 // Exit code 0 means our handler suppressed the default and
                 // ran Shutdown(0). Exit codes 128+signo (143 / 130 / 129)
                 // indicate the default action ran — the handler is missing
-                // or didn't set ctx.Cancel.
+                // or didn't set ctx.Cancel. Exit 134 (SIGABRT) means an
+                // unhandled exception escaped RunAsync during shutdown — the
+                // parked stdin read must be torn down cleanly, not crash.
                 var bridgeStderr = await stderrTask;
                 Assert.True(
                     proc.ExitCode == 0,
@@ -4778,13 +4780,15 @@ exit 9
         return tools;
     }
 
-    // Standard host tools the no-multipass publish path shells out to. Minimal
-    // hosts do not always ship all of them (e.g. `file` is frequently absent);
-    // the scenario is skipped rather than failed when the host cannot supply
-    // them, matching the environmental guards on the other process-driven
-    // fixtures in this file.
+    // Standard host tools the no-multipass publish path shells out to and
+    // requires. Minimal hosts do not always ship all of them; the scenario is
+    // skipped rather than failed when the host cannot supply them, matching
+    // the environmental guards on the other process-driven fixtures in this
+    // file. `file` is intentionally excluded: the publish script treats it as
+    // optional (`... || true`), so this test must not depend on that
+    // diagnostic tool being installed on the host.
     private static readonly string[] NoMultipassHostTools =
-        ["bash", "dirname", "mkdir", "rm", "cp", "chmod", "ls", "file", "mktemp", "cat"];
+        ["bash", "dirname", "mkdir", "rm", "cp", "chmod", "ls", "mktemp", "cat"];
 
     private static string RequireExecutableOnPath(string name)
     {
