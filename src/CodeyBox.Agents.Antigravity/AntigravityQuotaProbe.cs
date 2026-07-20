@@ -3,6 +3,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
+using CodeyBox.Agents;
 using CodeyBox.Core;
 
 namespace CodeyBox.Agents.Antigravity;
@@ -248,7 +249,7 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
 
             if (response.StatusCode == HttpStatusCode.TooManyRequests)
             {
-                var reset = TryParseRetryAfter(response, _timeProvider.GetUtcNow())
+                var reset = HttpQuotaRetryPolicy.TryGetRetryAfterReset(response.Headers, _timeProvider.GetUtcNow())
                     ?? await TryParseStructuredResetAsync(response, ct).ConfigureAwait(false);
                 var perModel0 = string.IsNullOrEmpty(modelId)
                     ? new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase)
@@ -322,15 +323,6 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
             root.TryGetProperty(name, out var t) && t.ValueKind == JsonValueKind.Object
                 ? TryGetString(t, "id")
                 : null;
-    }
-
-    private static DateTimeOffset? TryParseRetryAfter(HttpResponseMessage response, DateTimeOffset now)
-    {
-        var ra = response.Headers.RetryAfter;
-        if (ra is null) return null;
-        if (ra.Delta is { } delta) return now + delta;
-        if (ra.Date is { } when) return when;
-        return null;
     }
 
     private async Task<DateTimeOffset?> TryParseStructuredResetAsync(HttpResponseMessage response, CancellationToken ct)

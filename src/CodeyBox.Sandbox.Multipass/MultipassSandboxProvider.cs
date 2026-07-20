@@ -7018,6 +7018,7 @@ while True:
         sb.AppendLine("    codeybox_http_exit \"$codeybox_wrapper_rc\" \"codeybox-detached: failed to publish output sidecars\" || true");
         sb.AppendLine("    exit \"$codeybox_wrapper_rc\"");
         sb.AppendLine("fi");
+        sb.AppendLine("codeybox_http_exit \"$codeybox_wrapper_rc\" || true");
         sb.AppendLine("rm -f \"$codeybox_stdout_file\" \"$codeybox_stderr_file\"");
         sb.AppendLine("codeybox_http_exit \"$codeybox_wrapper_rc\" || true");
         sb.AppendLine("exit \"$codeybox_wrapper_rc\"");

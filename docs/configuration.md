@@ -613,6 +613,8 @@ Tuning knobs for the quota probe and deferred-requeue logic.
   },
   "QuotaRecheckIntervalSeconds": 300,
   "QuotaCacheTtlSeconds": 60,
+  "PausedQuotaCacheTtlSeconds": 3600,
+  "PausedProbeMaxStalenessSeconds": 5400,
   "UnknownPolicy": "UseObservedFailures",
   "IntraKindRoutingPolicy": "MostQuotaFirst",
   "DrainAggressiveness": 1.0,
@@ -627,6 +629,7 @@ Tuning knobs for the quota probe and deferred-requeue logic.
   "ObservedFailureRetentionMinutes": 30,
   "ProbeMaxRetries": 2,
   "ProbeRetryInitialDelayMs": 250,
+  "ProbeRetryMaxDelaySeconds": 300,
   "ProbeMaxConsecutiveFailures": 3,
   "ProbeMaxStalenessSeconds": 300
 }
@@ -641,6 +644,8 @@ Tuning knobs for the quota probe and deferred-requeue logic.
 | `FloorByAgent` | `{}` | Optional per-agent overrides keyed by agent kind, e.g. `codex` or `claude`. Each entry may set `StartFloorPct`, `EndFloorPct`, `MinQuotaPct`, and `RampWindowSeconds`; omitted fields inherit global values, and omitted agents use the global ramp. |
 | `QuotaRecheckIntervalSeconds` | `300` | Seconds to wait before re-probing when all Subscription members are exhausted. |
 | `QuotaCacheTtlSeconds` | `60` | Seconds to cache a quota probe result (per probe instance). |
+| `PausedQuotaCacheTtlSeconds` | `3600` | Seconds to cache quota snapshots while an agent is operator-paused. Active/routable agents keep using `QuotaCacheTtlSeconds`. Hot-reloadable. |
+| `PausedProbeMaxStalenessSeconds` | `5400` | Maximum age of a retained last-known-good quota snapshot while an agent is operator-paused. Keep this greater than or equal to `PausedQuotaCacheTtlSeconds` so paused agents serve the last reading between hourly probes instead of falling to unknown. Hot-reloadable. |
 | `UnknownPolicy` | `UseObservedFailures` | How to treat unknown probe snapshots: `UseObservedFailures`, `FailCautious`, or opt-in `FailOpen`. |
 | `IntraKindRoutingPolicy` | `MostQuotaFirst` | Routing policy for eligible class members: `MostQuotaFirst` maximizes runway within same-kind ties, `RoundRobin` spreads wear, `Sticky` keeps a work item on its existing instance, and `DeadlineAwareDrain` orders quality-eligible members by quota headroom at risk before the nearest known or expected reset. Hot-reloadable. |
 | `DrainAggressiveness` | `1.0` | Multiplier used only by `DeadlineAwareDrain`. Values above `1.0` run ahead of the even per-rate-window pace; invalid or non-positive values are treated as `1.0`. Hot-reloadable. |
@@ -649,6 +654,7 @@ Tuning knobs for the quota probe and deferred-requeue logic.
 | `ObservedFailureRetentionMinutes` | `30` | Minutes observed quota failures remain in `state.db`. |
 | `ProbeMaxRetries` | `2` | Additional retries on a transient probe failure (network error / timeout / 5xx) before recording the failure. Hot-reloadable; currently honoured by the Claude probe. |
 | `ProbeRetryInitialDelayMs` | `250` | Base retry backoff in milliseconds; doubles each attempt. Hot-reloadable. |
+| `ProbeRetryMaxDelaySeconds` | `300` | Maximum between-retry delay, including provider `Retry-After` values on Anthropic OAuth usage requests. Hot-reloadable. |
 | `ProbeMaxConsecutiveFailures` | `3` | Consecutive probe failures tolerated before the probe stops returning the retained last-known-good snapshot. A single transient blip cannot silently disable the `MinQuotaPct` floor. Hot-reloadable. |
 | `ProbeMaxStalenessSeconds` | `300` | Maximum age of a retained last-known-good snapshot before it is dropped in favour of `AvailablePct=-1` (unknown). Hot-reloadable. |
 

@@ -2895,6 +2895,26 @@ public sealed class QuotaRouterOptions
     /// </summary>
     public TimeSpan QuotaCacheTtl { get; set; } = TimeSpan.FromSeconds(60);
 
+    /// <summary>
+    /// How long to cache quota snapshots for operator-paused agents. This
+    /// applies only while a member is paused; active/routable agents keep using
+    /// <see cref="QuotaCacheTtl"/>. Default 1 hour.
+    /// </summary>
+    public TimeSpan PausedQuotaCacheTtl { get; set; } = TimeSpan.FromHours(1);
+
+    /// <summary>
+    /// Maximum age of a retained last-known-good quota snapshot while a member
+    /// is operator-paused. Kept separate from active-agent staleness so hourly
+    /// paused probing can serve a real value between probes. Default 90 minutes.
+    /// </summary>
+    public TimeSpan PausedProbeMaxStaleness { get; set; } = TimeSpan.FromMinutes(90);
+
+    /// <summary>
+    /// Maximum number of paused route cache entries retained in memory by the
+    /// paused quota probe wrapper. Default 1024.
+    /// </summary>
+    public int PausedQuotaMaxCacheEntries { get; set; } = 1024;
+
     public QuotaUnknownPolicy UnknownPolicy { get; set; } = QuotaUnknownPolicy.UseObservedFailures;
 
     public TimeSpan ObservedFailureWindow { get; set; } = TimeSpan.FromMinutes(10);

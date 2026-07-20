@@ -1563,22 +1563,73 @@ builder.Services.AddSingleton<IGeminiQuotaTokenSource>(sp =>
         cliTokenRefresher: GeminiOauthCredentialFileRefresher.TryCreateCliRefreshHandler());
 });
 
-// Every quota probe is wrapped so a transient blip serves the most recent real
-// reading (bounded by ProbeMaxStalenessSeconds + the reading's own reset) rather
-// than collapsing to unknown and letting the router fall open. Discard-on-
+// Every quota probe is wrapped so paused members use a longer polling cadence,
+// then transient blips serve the most recent real reading (bounded by the
+// active or paused staleness ceiling plus the reading's own reset). Discard-on-
 // Permanent/NoCredential is driven by the probe's QuotaUnknownReason.
-static IAgentQuotaProbe WrapLastKnownGood(IAgentQuotaProbe inner, IServiceProvider sp)
+static IAgentQuotaProbe WrapQuotaProbe(IAgentQuotaProbe inner, IServiceProvider sp)
 {
     var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
     var lf = sp.GetRequiredService<ILoggerFactory>();
-    return new LastKnownGoodQuotaProbe(
+    var routerOptions = sp.GetRequiredService<QuotaRouterOptions>();
+    var pauses = sp.GetRequiredService<IAgentPauseController>();
+    var timeProvider = sp.GetService<TimeProvider>();
+    var paused = new PausedAgentQuotaProbe(
         inner,
-        () => new LastKnownGoodQuotaOptions
+        pauses,
+        () => new PausedAgentQuotaProbeOptions
         {
-            MaxStaleness = TimeSpan.FromSeconds(monitor.CurrentValue.QuotaRouter.ProbeMaxStalenessSeconds),
+            CacheTtl = routerOptions.PausedQuotaCacheTtl,
+            MaxCacheEntries = routerOptions.PausedQuotaMaxCacheEntries,
         },
+        lf.CreateLogger<PausedAgentQuotaProbe>(),
+        timeProvider);
+    return new LastKnownGoodQuotaProbe(
+        paused,
+        (member, ct) => BuildLastKnownGoodQuotaOptionsAsync(member, ct, pauses, monitor, routerOptions),
         lf.CreateLogger<LastKnownGoodQuotaProbe>(),
-        sp.GetService<TimeProvider>());
+        timeProvider);
+}
+
+static async ValueTask<LastKnownGoodQuotaOptions> BuildLastKnownGoodQuotaOptionsAsync(
+    AgentMembership member,
+    CancellationToken ct,
+    IAgentPauseController pauses,
+    IOptionsMonitor<CodeyBoxOptions> monitor,
+    QuotaRouterOptions routerOptions)
+{
+    var pause = await pauses.GetAgentStateAsync(member.Agent, ct, member.InstanceId)
+        .ConfigureAwait(false);
+    var maxStaleness = pause is null
+        ? TimeSpan.FromSeconds(monitor.CurrentValue.QuotaRouter.ProbeMaxStalenessSeconds)
+        : routerOptions.PausedProbeMaxStaleness;
+    return new LastKnownGoodQuotaOptions { MaxStaleness = maxStaleness };
+}
+
+static ClaudeQuotaProbeResilienceOptions BuildClaudeQuotaProbeResilienceOptions(
+    IOptionsMonitor<CodeyBoxOptions> optionsMonitor)
+{
+    var qr = optionsMonitor.CurrentValue.QuotaRouter;
+    return new ClaudeQuotaProbeResilienceOptions
+    {
+        MaxRetries = qr.ProbeMaxRetries,
+        RetryInitialDelay = TimeSpan.FromMilliseconds(qr.ProbeRetryInitialDelayMs),
+        MaxRetryDelay = TimeSpan.FromSeconds(qr.ProbeRetryMaxDelaySeconds),
+        MaxConsecutiveFailures = qr.ProbeMaxConsecutiveFailures,
+        MaxStaleness = TimeSpan.FromSeconds(qr.ProbeMaxStalenessSeconds),
+    };
+}
+
+// A credential-source token update invalidates the credential-scoped quota
+// state (retained last-known-good + provider response cache) so a rotated
+// token is never gated by the prior credential's learned quota.
+static IAgentQuotaProbe WireQuotaProbeTokenInvalidation(
+    IAgentQuotaProbe probe,
+    CredentialFileSource source)
+{
+    if (probe is IAgentQuotaCacheInvalidator invalidator)
+        source.TokenUpdated += invalidator.InvalidateCredentialState;
+    return probe;
 }
 
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
@@ -1605,21 +1656,9 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
         // Resilience knobs are read on every probe call so values bound from
         // CodeyBox:QuotaRouter hot-reload through IOptionsMonitor without
         // restarting the process.
-        resilienceProvider: () =>
-        {
-            var qr = optionsMonitor.CurrentValue.QuotaRouter;
-            return new ClaudeQuotaProbeResilienceOptions
-            {
-                MaxRetries = qr.ProbeMaxRetries,
-                RetryInitialDelay = TimeSpan.FromMilliseconds(qr.ProbeRetryInitialDelayMs),
-                MaxConsecutiveFailures = qr.ProbeMaxConsecutiveFailures,
-                MaxStaleness = TimeSpan.FromSeconds(qr.ProbeMaxStalenessSeconds),
-            };
-        },
-        timeProvider: null);
-    var wrapped = WrapLastKnownGood(probe, sp);
-    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
-    return wrapped;
+        resilienceProvider: () => BuildClaudeQuotaProbeResilienceOptions(optionsMonitor),
+        timeProvider: sp.GetService<TimeProvider>());
+    return WireQuotaProbeTokenInvalidation(WrapQuotaProbe(probe, sp), source);
 });
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
@@ -1639,9 +1678,7 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
         }) ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<CodexQuotaProbe>());
-    var wrapped = WrapLastKnownGood(probe, sp);
-    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
-    return wrapped;
+    return WireQuotaProbeTokenInvalidation(WrapQuotaProbe(probe, sp), source);
 });
 // Gemini OAuth-subscription path (Code Assist Individual / AI Pro / AI Ultra).
 // API-key (PayPerApi) and Vertex paths have no analogous endpoint and stay
@@ -1662,9 +1699,7 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
             ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<GeminiQuotaProbe>());
-    var wrapped = WrapLastKnownGood(probe, sp);
-    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
-    return wrapped;
+    return WireQuotaProbeTokenInvalidation(WrapQuotaProbe(probe, sp), source);
 });
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
@@ -1681,21 +1716,19 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
             ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<CursorQuotaProbe>());
-    var wrapped = WrapLastKnownGood(probe, sp);
-    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
-    return wrapped;
+    return WireQuotaProbeTokenInvalidation(WrapQuotaProbe(probe, sp), source);
 });
 
 // opencode: no verified usage endpoint at integration time. The probe ships
 // as Unknown-only so the router falls onto its QuotaUnknownPolicy
 // (UseObservedFailures) for opencode members. Replace with a real
 // HTTP-backed probe once an endpoint is confirmed.
-builder.Services.AddSingleton<IAgentQuotaProbe>(sp => WrapLastKnownGood(new OpencodeQuotaProbe(), sp));
+builder.Services.AddSingleton<IAgentQuotaProbe>(sp => WrapQuotaProbe(new OpencodeQuotaProbe(), sp));
 // Crock: ships as Unknown-only. Cost/usage accounting against Anthropic's
 // Message Batches API is part of the dependent follow-up; until then the
 // router falls onto its QuotaUnknownPolicy (UseObservedFailures) for any
 // crock member operators opt in.
-builder.Services.AddSingleton<IAgentQuotaProbe>(sp => WrapLastKnownGood(new CrockQuotaProbe(), sp));
+builder.Services.AddSingleton<IAgentQuotaProbe>(sp => WrapQuotaProbe(new CrockQuotaProbe(), sp));
 // Antigravity: the agy gateway exposes NO readable per-model quota meter
 // (daily-cloudcode-pa :retrieveUserQuota* return 403), so the probe uses
 // :loadCodeAssist as a free authorization/tier liveness read (200 ⇒ available)
@@ -1721,9 +1754,7 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
             ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
         loggerFactory.CreateLogger<AntigravityQuotaProbe>());
-    var wrapped = WrapLastKnownGood(probe, sp);
-    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
-    return wrapped;
+    return WireQuotaProbeTokenInvalidation(WrapQuotaProbe(probe, sp), source);
 });
 
 // --- Agent class router ------------------------------------------------------
@@ -1899,9 +1930,15 @@ builder.Services.AddSingleton<IAgentRoutingReadiness>(sp =>
 // directly probeable). The in-VM probe covers binary-presence verification,
 // see CopilotInVmSmokeProbe registered below.
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
-    new ClaudeSmokeProbe(
+{
+    var optionsMonitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    return new ClaudeSmokeProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
-        sp.GetRequiredService<ILoggerFactory>().CreateLogger<ClaudeSmokeProbe>()));
+        loggerFactory.CreateLogger<ClaudeSmokeProbe>(),
+        sp.GetService<TimeProvider>(),
+        () => TimeSpan.FromSeconds(optionsMonitor.CurrentValue.QuotaRouter.ProbeRetryMaxDelaySeconds));
+});
 builder.Services.AddSingleton<IAgentSmokeProbe>(sp =>
     new CodexSmokeProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
@@ -6286,6 +6323,22 @@ namespace CodeyBox.Api
             QuotaRouterDefaults.DefaultQuotaRecoveryProbeEligibilityScanLimit;
         /// <summary>Seconds to cache a probe result. Default 60.</summary>
         public int QuotaCacheTtlSeconds { get; set; } = 60;
+        /// <summary>
+        /// Seconds to cache quota snapshots while an agent is operator-paused.
+        /// Active/routable agents still use <see cref="QuotaCacheTtlSeconds"/>.
+        /// Default 3600 (1 hour). Hot-reloadable.
+        /// </summary>
+        public int PausedQuotaCacheTtlSeconds { get; set; } = 3600;
+        /// <summary>
+        /// Maximum age in seconds of a retained last-known-good snapshot while
+        /// an agent is operator-paused. Default 5400 (90 min). Hot-reloadable.
+        /// </summary>
+        public int PausedProbeMaxStalenessSeconds { get; set; } = 5400;
+        /// <summary>
+        /// Maximum number of paused route quota snapshots retained in memory.
+        /// Default 1024. Hot-reloadable.
+        /// </summary>
+        public int PausedQuotaMaxCacheEntries { get; set; } = 1024;
         /// <summary>How the router treats unknown probe snapshots. Default UseObservedFailures.</summary>
         public QuotaUnknownPolicy UnknownPolicy { get; set; } = QuotaUnknownPolicy.UseObservedFailures;
         /// <summary>Minutes a recent quota-shaped failure blocks the same agent/model. Default 10.</summary>
@@ -6338,6 +6391,11 @@ namespace CodeyBox.Api
         /// Hot-reloadable.
         /// </summary>
         public int ProbeRetryInitialDelayMs { get; set; } = 250;
+        /// <summary>
+        /// Maximum between-retry delay in seconds, including provider
+        /// Retry-After values. Default 300 (5 min). Hot-reloadable.
+        /// </summary>
+        public int ProbeRetryMaxDelaySeconds { get; set; } = 300;
         /// <summary>
         /// Consecutive probe failures tolerated before the probe stops returning
         /// the retained last-known-good snapshot. Default 3. Hot-reloadable.

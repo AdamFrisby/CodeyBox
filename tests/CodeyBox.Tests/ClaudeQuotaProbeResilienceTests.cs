@@ -33,7 +33,7 @@ public sealed class ClaudeQuotaProbeResilienceTests
     private static IAgentQuotaProbe BuildProbe(
         HttpMessageHandler handler,
         ClaudeQuotaProbeResilienceOptions options,
-        TestTimeProvider time,
+        TimeProvider time,
         TimeSpan? cacheTtl = null)
     {
         var factory = new QuotaFakeHttpClientFactory("agent-quota", handler);
@@ -223,6 +223,116 @@ public sealed class ClaudeQuotaProbeResilienceTests
         Assert.Equal(60, snap.AvailablePct, precision: 5);
         Assert.Equal(3, handler.CallCount);
     }
+
+    [Fact]
+    public async Task Transient429_WithRetryAfter_WaitsAtLeastServerDelayBeforeRetry()
+    {
+        var time = new CapturingDelayTimeProvider(DateTimeOffset.UtcNow);
+        var handler = new RetryAfterSequenceHandler(
+            new RetryAfterResponse(HttpStatusCode.TooManyRequests, "", TimeSpan.FromSeconds(12)),
+            new RetryAfterResponse(HttpStatusCode.OK, Rollup(40), null));
+        var probe = BuildProbe(
+            handler,
+            new ClaudeQuotaProbeResilienceOptions
+            {
+                MaxRetries = 1,
+                RetryInitialDelay = TimeSpan.FromMilliseconds(250),
+                MaxRetryDelay = TimeSpan.FromMinutes(5),
+                MaxConsecutiveFailures = 3,
+                MaxStaleness = TimeSpan.FromMinutes(5),
+            },
+            time,
+            cacheTtl: TimeSpan.Zero);
+
+        var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+
+        Assert.Equal(60, snap.AvailablePct, precision: 5);
+        Assert.Equal(2, handler.CallCount);
+        var delay = Assert.Single(time.Delays);
+        Assert.True(delay >= TimeSpan.FromSeconds(12), $"delay was {delay}");
+    }
+
+    public static IEnumerable<object?[]> RetryAfterBackoffCases()
+    {
+        var now = new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        yield return new object?[]
+        {
+            "http-date",
+            HttpStatusCode.TooManyRequests,
+            (TimeSpan?)null,
+            now.AddSeconds(17),
+            TimeSpan.FromMilliseconds(250),
+            TimeSpan.FromMinutes(5),
+            TimeSpan.FromSeconds(17),
+        };
+        yield return new object?[]
+        {
+            "503 retry-after",
+            HttpStatusCode.ServiceUnavailable,
+            TimeSpan.FromSeconds(9),
+            (DateTimeOffset?)null,
+            TimeSpan.FromMilliseconds(250),
+            TimeSpan.FromMinutes(5),
+            TimeSpan.FromSeconds(9),
+        };
+        yield return new object?[]
+        {
+            "exponential wins",
+            HttpStatusCode.TooManyRequests,
+            TimeSpan.FromSeconds(5),
+            (DateTimeOffset?)null,
+            TimeSpan.FromSeconds(20),
+            TimeSpan.FromMinutes(5),
+            TimeSpan.FromSeconds(20),
+        };
+        yield return new object?[]
+        {
+            "server delay capped",
+            HttpStatusCode.TooManyRequests,
+            TimeSpan.FromMinutes(10),
+            (DateTimeOffset?)null,
+            TimeSpan.FromMilliseconds(250),
+            TimeSpan.FromSeconds(30),
+            TimeSpan.FromSeconds(30),
+        };
+    }
+
+    [Theory]
+    [MemberData(nameof(RetryAfterBackoffCases))]
+    public async Task TransientRetryAfter_BackoffContract(
+        string _,
+        HttpStatusCode status,
+        TimeSpan? retryAfterDelta,
+        DateTimeOffset? retryAfterDate,
+        TimeSpan initialDelay,
+        TimeSpan maxDelay,
+        TimeSpan expectedDelay)
+    {
+        var now = new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var time = new CapturingDelayTimeProvider(now);
+        var handler = new RetryAfterSequenceHandler(
+            new RetryAfterResponse(status, "", retryAfterDelta, retryAfterDate),
+            new RetryAfterResponse(HttpStatusCode.OK, Rollup(40), null));
+        var probe = BuildProbe(
+            handler,
+            new ClaudeQuotaProbeResilienceOptions
+            {
+                MaxRetries = 1,
+                RetryInitialDelay = initialDelay,
+                MaxRetryDelay = maxDelay,
+                MaxConsecutiveFailures = 3,
+                MaxStaleness = TimeSpan.FromMinutes(5),
+            },
+            time,
+            cacheTtl: TimeSpan.Zero);
+
+        var snap = await probe.GetAvailabilityAsync(AnyMember, CancellationToken.None);
+
+        Assert.Equal(60, snap.AvailablePct, precision: 5);
+        Assert.Equal(2, handler.CallCount);
+        Assert.Equal(expectedDelay, Assert.Single(time.Delays));
+    }
+
 
     [Fact]
     public async Task PermanentFailure_NotRetried_DoesNotRetainStale()

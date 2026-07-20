@@ -380,19 +380,19 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     {
         if (_quotaRouterOptions is null) return;
 
-        var next = SerializeQuotaRouter(opts.QuotaRouter);
-        if (string.Equals(_lastQuotaRouter, next, StringComparison.Ordinal))
-            return;
-
         var prev = _lastQuotaRouter;
         try
         {
+            var next = SerializeQuotaRouter(opts.QuotaRouter);
+            if (string.Equals(_lastQuotaRouter, next, StringComparison.Ordinal))
+                return;
+
             // Mutate the shared singleton in place. The router holds the same
             // QuotaRouterOptions reference and reads its properties on every
             // gate decision, so the new values take effect on the next pickup
-            // attempt without a process restart. Probe-side knobs (cache TTL
-            // bound at construction) are NOT reloaded here — they have their
-            // own IOptionsMonitor-driven resilience-provider delegate.
+            // attempt without a process restart. Active provider cache TTL is
+            // constructor-bound; paused-probe cadence and resilience knobs are
+            // read through live delegates and update here.
             QuotaRouterConfigMapper.ApplyHotReload(_quotaRouterOptions, opts.QuotaRouter);
 
             _lastQuotaRouter = next;
@@ -1028,6 +1028,9 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.QuotaRecheckIntervalSeconds,
                 opts.QuotaRecoveryProbeIntervalSeconds,
                 opts.MaxQuotaRecoveryProbeEligibilityScan,
+                opts.PausedQuotaCacheTtlSeconds,
+                opts.PausedProbeMaxStalenessSeconds,
+                opts.PausedQuotaMaxCacheEntries,
                 UnknownPolicy = opts.UnknownPolicy.ToString(),
                 opts.ObservedFailureWindowMinutes,
                 opts.ObservedFailureRetentionMinutes,
