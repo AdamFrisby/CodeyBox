@@ -73,6 +73,52 @@ internal sealed class CodeyBoxClient
         return await resp.Content.ReadFromJsonAsync(CliJsonContext.Default.WorkItemDto, ct);
     }
 
+    internal async Task<string> GetWorkItemTimelineAsync(string id, CancellationToken ct = default)
+    {
+        return await GetRawAsync($"/workitems/{Uri.EscapeDataString(id)}/timeline", ct);
+    }
+
+    internal async Task<string> GetWorkItemCostsAsync(string id, CancellationToken ct = default)
+    {
+        return await GetRawAsync($"/workitems/{Uri.EscapeDataString(id)}/costs", ct);
+    }
+
+    internal async Task<List<WorkItemDto>> GetWorkItemDependentsAsync(string id, CancellationToken ct = default)
+    {
+        var resp = await SendAsync(
+            token => _http.GetAsync($"/workitems/{Uri.EscapeDataString(id)}/dependents", token), ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
+        return await resp.Content.ReadFromJsonAsync(CliJsonContext.Default.ListWorkItemDto, ct) ?? [];
+    }
+
+    internal async Task<string> GetWorkItemStdoutTailAsync(string id, CancellationToken ct = default)
+    {
+        return await GetRawAsync($"/workitems/{Uri.EscapeDataString(id)}/stdout-tail", ct);
+    }
+
+    /// <summary>
+    /// Fetches a work item's diff. Returns <c>null</c> when the server responds 204 No Content
+    /// (bare repo not yet created, work branch not pushed, or no changes on it). The
+    /// <c>/workitems/{id}/diff</c> endpoint content-negotiates on <c>Accept</c>: with
+    /// <c>application/json</c> it returns a structured summary + diff body; otherwise raw
+    /// <c>git diff</c> text. This method always requests JSON so callers get the summary fields.
+    /// </summary>
+    internal async Task<string?> GetWorkItemDiffAsync(string id, CancellationToken ct = default)
+    {
+        var resp = await SendAsync(
+            token =>
+            {
+                var req = new HttpRequestMessage(
+                    HttpMethod.Get, $"/workitems/{Uri.EscapeDataString(id)}/diff");
+                req.Headers.Accept.ParseAdd("application/json");
+                return _http.SendAsync(req, token);
+            },
+            ct);
+        if (resp.StatusCode == HttpStatusCode.NoContent) return null;
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
+        return await resp.Content.ReadAsStringAsync(ct);
+    }
+
     internal async Task<WorkItemDto> CreateWorkItemAsync(CreateWorkItemRequest req, CancellationToken ct = default)
     {
         var resp = await SendAsync(
