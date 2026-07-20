@@ -73,6 +73,9 @@ public static class PlanAuditTests
     /// <summary>Stable name of the TEST 05 auditor (referenced by DI + composition).</summary>
     public const string Test05AuditorName = "plan:security-privacy-supply-chain";
 
+    /// <summary>Stable name of the TEST 06 auditor (referenced by DI + composition).</summary>
+    public const string Test06AuditorName = "plan:reliability-failure-concurrency";
+
     /// <summary>
     /// TEST 01 — PLAN INTEGRITY AND EVIDENCE CLASSIFICATION. Determines whether
     /// the plan is grounded in the actual system rather than hallucinated
@@ -439,10 +442,105 @@ public static class PlanAuditTests
     };
 
     /// <summary>
+    /// TEST 06 — RELIABILITY, FAILURE MODES, CONCURRENCY, AND DEGRADATION.
+    /// Verifies the plan handles real-world failure rather than assuming the happy
+    /// path: primary failure modes are named with mitigations; every external call
+    /// is timeout-bounded and retries are capped and backed off; multi-step work is
+    /// idempotent (or has a recovery/state model) so it can be safely retried after
+    /// a partial success and tolerates duplicate delivery (duplicate message /
+    /// duplicate webhook / resubmission); concurrent and duplicate processing,
+    /// ordering, and locking / optimistic-concurrency are addressed rather than
+    /// assumed away; there is no hidden global or mutable shared state, and no
+    /// unsafe singleton lifecycle, without concurrency semantics; background jobs
+    /// are retryable, cancellable, observable, and poison-safe with a
+    /// dead-letter / repair path; resilience patterns (circuit breakers, rate
+    /// limits, bulkheads, queues, fallbacks) are used where needed; and degraded /
+    /// user-visible behavior under a dependency outage, slowdown, invalid response,
+    /// timeout, or rate-limit is defined. This is a GENERAL, project-agnostic gate:
+    /// the full criteria set is kept for every project (per-project relevance is
+    /// the auditor on/off toggle); a specific plan that genuinely does not touch an
+    /// area self-skips just those criteria as NOT_APPLICABLE with a one-line reason.
+    /// </summary>
+    public static PlanAuditTest Test06 { get; } = new()
+    {
+        Id = "06",
+        AuditorName = Test06AuditorName,
+        Title = "RELIABILITY, FAILURE MODES, CONCURRENCY, AND DEGRADATION",
+        Objective =
+            "Verify the plan handles real-world failure, partial completion, retries, concurrency, " +
+            "and dependency instability rather than assuming the happy path.",
+        ReviewGuidance = """
+            - What are the primary failure modes of this change, and what mitigates each?
+            - What happens if each step only partially succeeds — can the workflow resume, roll back,
+              or reconcile, or does it leave inconsistent state behind?
+            - Are all external / cross-process calls given explicit timeouts (never unbounded waits)?
+            - Are retries bounded, backed off, and jittered — never unbounded or tight-looping?
+            - Are operations idempotent under retry, duplicate message, duplicate webhook, and
+              resubmission (so a repeat does not double-apply an effect)?
+            - Are circuit breakers, rate limits, bulkheads, queues, or fallbacks needed anywhere,
+              and does the plan add them where they are?
+            - Is user-visible degraded behavior defined (what the caller sees when a dependency is
+              down, slow, or rate-limited)?
+            - Are background / async jobs retryable, cancellable, observable, and poison-safe, with a
+              dead-letter or manual-repair path for messages that never succeed?
+            - Are race conditions, locking, optimistic concurrency, duplicate processing, and ordering
+              addressed for anything that mutates shared or persistent state?
+            - Does the plan avoid hidden global state, unsafe singleton lifecycle, and mutable shared
+              state without concurrency semantics?
+            - What is the behavior under dependency outage, slowness, invalid response, timeout, or
+              rate-limit?
+            """,
+        PassCriteria =
+            "Failure modes and their mitigations are explicit; every external interaction is " +
+            "timeout-bounded and retry-safe (bounded, backed-off, idempotent); partial-failure " +
+            "recovery and concurrency control are addressed; and degraded / user-visible behavior " +
+            "under dependency instability is defined.",
+        FailCriteria =
+            "The plan assumes the happy path; uses unbounded retries or has no timeout on an external " +
+            "call; cannot safely retry after a partial failure; ignores duplicate delivery or " +
+            "concurrent updates; or lacks a fallback / user-facing failure behavior.",
+        AutomaticBlocker = """
+            Treat as an automatic BLOCKER when the plan:
+            - lets a security-sensitive, destructive, or persistent-mutation workflow be
+              repeated or partially applied unsafely (no idempotency key, no recovery/state
+              model, no atomicity); or
+            - lets an external dependency failure hang a critical request indefinitely (an
+              external / cross-process call with no timeout or bounded wait); or
+            - introduces unsafe concurrent mutation of shared or persistent state (no locking,
+              optimistic concurrency, or other concurrency control).
+            """,
+        RequiredFixes = """
+            - Add explicit timeout, bounded+backed-off retry, idempotency, and fallback semantics for
+              every external / cross-process interaction.
+            - Add a state machine or recovery model for multi-step workflows so a partial failure can
+              resume, roll back, or reconcile rather than leaving inconsistent state.
+            - Add a concurrency-control or locking strategy (lock, optimistic concurrency, or
+              single-writer ownership) for anything that mutates shared or persistent state.
+            - Add a dead-letter / poison-message / manual-repair path for background jobs, and define
+              the degraded, user-visible behavior under a dependency outage/slow/invalid/timeout/rate-limit.
+            """,
+        Criteria =
+        [
+            "failure-modes",           // primary failure modes named, each with a mitigation
+            "partial-failure",         // partial-success recovery/rollback/reconcile for multi-step work
+            "external-timeouts",       // every external/cross-process call is timeout-bounded
+            "bounded-retries",         // retries capped, backed off, jittered — never unbounded/tight-loop
+            "retry-idempotency",       // idempotent under retry/duplicate-message/duplicate-webhook/resubmission
+            "resilience-patterns",     // circuit breakers/rate limits/bulkheads/queues/fallbacks where needed
+            "degraded-behavior",       // user-visible degraded behavior under dependency failure defined
+            "background-jobs",         // background jobs retryable/cancellable/observable/poison-safe
+            "dead-letter-repair",      // dead-letter / poison-message / manual-repair path
+            "concurrency-control",     // races/locking/optimistic-concurrency/duplicate-processing/ordering
+            "shared-state-safety",     // no hidden global/mutable shared state or unsafe singleton lifecycle
+            "dependency-degradation",  // behavior under dependency outage/slow/invalid/timeout/rate-limit
+        ],
+    };
+
+    /// <summary>
     /// Every built-in plan-audit chain test, in chain order. The DI registration
     /// and <c>ProjectAuditorComposer</c> auto-inclusion both iterate this list,
     /// so adding a chain test here wires it everywhere without touching either
     /// call site (one source of truth for the chain membership).
     /// </summary>
-    public static IReadOnlyList<PlanAuditTest> All { get; } = [Test01, Test02, Test03, Test04, Test05];
+    public static IReadOnlyList<PlanAuditTest> All { get; } = [Test01, Test02, Test03, Test04, Test05, Test06];
 }

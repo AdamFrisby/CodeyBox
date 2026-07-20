@@ -37,12 +37,12 @@ public sealed class GraphicalSmokeWiringTests
         // auditors are appended after preset auditors (all auto-included when
         // registered), then the config-enabled-by-default plan-adherence
         // reviewer and the plan-audit chain (TEST 01, TEST 02, TEST 03, TEST 04,
-        // then TEST 05) auditors are appended last, in chain order. With no
-        // language/auditType presets this project ends up with all ten registered
+        // TEST 05, then TEST 06) auditors are appended last, in chain order. With no
+        // language/auditType presets this project ends up with all eleven registered
         // always-on auditors composed. (The plan-audit auditors are Plan-target
         // only, so ComposeForTarget(Code) filters them out; the untargeted Compose
         // here returns the full set.)
-        Assert.Equal(10, composed.Count);
+        Assert.Equal(11, composed.Count);
         Assert.IsType<GraphicalSmokeAuditor>(composed[0]);
         Assert.IsType<PromptRevisionTrailerAuditor>(composed[1]);
         Assert.IsType<BuildScriptAuditor>(composed[2]);
@@ -58,6 +58,8 @@ public sealed class GraphicalSmokeWiringTests
             CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test04AuditorName, composed[8].Name);
         Assert.Equal(
             CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test05AuditorName, composed[9].Name);
+        Assert.Equal(
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test06AuditorName, composed[10].Name);
     }
 
     [Fact]
@@ -80,7 +82,7 @@ public sealed class GraphicalSmokeWiringTests
 
         var composed = composer.Compose(project, new ScriptedAgent([]));
 
-        Assert.Equal(9, composed.Count);
+        Assert.Equal(10, composed.Count);
         Assert.IsType<PromptRevisionTrailerAuditor>(composed[0]);
         Assert.IsType<BuildScriptAuditor>(composed[1]);
         Assert.Equal("tests:mutation-rigor", composed[2].Name);
