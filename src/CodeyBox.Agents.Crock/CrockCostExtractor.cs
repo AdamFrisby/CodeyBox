@@ -1,5 +1,4 @@
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using CodeyBox.Agents;
 using CodeyBox.Core;
 
@@ -43,25 +42,6 @@ public sealed class CrockCostExtractor : IAgentCostExtractor
     /// </summary>
     public ModelRateConfig? DefaultPricing => null;
 
-    private static readonly Regex InputPattern = new(
-        @"(\d[\d,]*)\s+input\s+tokens?",
-        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-    private static readonly Regex OutputPattern = new(
-        @"(\d[\d,]*)\s+output\s+tokens?",
-        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-    private static readonly Regex CachedPattern = new(
-        @"(\d[\d,]*)\s+cached(?:\s+input)?\s+tokens?",
-        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-    private static readonly Regex TotalInputPattern = new(
-        @"(?:Total\s+)?[Ii]nput\s+tokens?[:\s]+(\d[\d,]*)",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
-    private static readonly Regex TotalOutputPattern = new(
-        @"(?:Total\s+)?[Oo]utput\s+tokens?[:\s]+(\d[\d,]*)",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
-    private static readonly Regex TotalCachedPattern = new(
-        @"[Cc]ache(?:d)?\s+(?:input\s+)?tokens?[:\s]+(\d[\d,]*)",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
-
     public AgentCostSnapshot? TryExtract(string? agentStdout, string? agentStderr)
     {
         if (string.IsNullOrWhiteSpace(agentStdout) && string.IsNullOrWhiteSpace(agentStderr))
@@ -70,7 +50,8 @@ public sealed class CrockCostExtractor : IAgentCostExtractor
         var ndJson = TryParseNdJson(agentStdout);
         if (ndJson is not null) return ndJson;
 
-        return TryParseHumanReadable(agentStdout) ?? TryParseHumanReadable(agentStderr);
+        return AnthropicUsageParsing.TryParseHumanReadable(agentStdout)
+            ?? AnthropicUsageParsing.TryParseHumanReadable(agentStderr);
     }
 
     private static AgentCostSnapshot? TryParseNdJson(string? stdout)
@@ -104,7 +85,7 @@ public sealed class CrockCostExtractor : IAgentCostExtractor
 
                 if (isResult && root.TryGetProperty("usage", out var typedUsage))
                 {
-                    ExtractUsageCounts(typedUsage, out var input, out var output, out var cached);
+                    AnthropicUsageParsing.ExtractUsageCounts(typedUsage, out var input, out var output, out var cached);
                     resultInput = input;
                     resultOutput = output;
                     resultCached = cached;
@@ -114,7 +95,7 @@ public sealed class CrockCostExtractor : IAgentCostExtractor
                     && root.TryGetProperty("usage", out var bareUsage)
                     && bareUsage.ValueKind == JsonValueKind.Object)
                 {
-                    ExtractUsageCounts(bareUsage, out var input, out var output, out var cached);
+                    AnthropicUsageParsing.ExtractUsageCounts(bareUsage, out var input, out var output, out var cached);
                     bareInput = input;
                     bareOutput = output;
                     bareCached = cached;
@@ -145,75 +126,5 @@ public sealed class CrockCostExtractor : IAgentCostExtractor
         if (sawBareUsage)
             return new AgentCostSnapshot(bareInput, bareCached, bareOutput, modelId);
         return null;
-    }
-
-    private static void ExtractUsageCounts(
-        JsonElement usage, out int inputTokens, out int outputTokens, out int cachedTokens)
-    {
-        // Terminal crock stdout is less-trusted agent/dependency output, so
-        // every counter is clamped non-negative and the fresh+cache-creation
-        // sum saturates rather than wrapping — a forged negative or an
-        // Int32-overflowing pair cannot produce a small/negative total that
-        // would false-pass a downstream budget gate.
-        var freshInput = ReadNonNegativeInt(usage, "input_tokens");
-        var cacheCreation = ReadNonNegativeInt(usage, "cache_creation_input_tokens");
-        var cacheRead = ReadNonNegativeInt(usage, "cache_read_input_tokens");
-        var output = ReadNonNegativeInt(usage, "output_tokens");
-
-        // Cache-creation (write) tokens are folded into the fresh-input bucket
-        // and therefore billed at the base input rate. Anthropic charges a
-        // 1.25x-2x premium on cache writes that ModelRateConfig has no bucket
-        // for, so this is a conservative estimate (mirrors ClaudeCostExtractor);
-        // the pricing metadata documents the result as an estimate, not exact
-        // spend.
-        inputTokens = SaturatingAdd(freshInput, cacheCreation);
-        outputTokens = output;
-        cachedTokens = cacheRead;
-    }
-
-    private static int ReadNonNegativeInt(JsonElement usage, string propertyName)
-        => usage.TryGetProperty(propertyName, out var el) && el.TryGetInt32(out var v) && v > 0 ? v : 0;
-
-    private static int SaturatingAdd(int a, int b)
-    {
-        var sum = (long)a + b;
-        return sum > int.MaxValue ? int.MaxValue : (int)sum;
-    }
-
-    private static AgentCostSnapshot? TryParseHumanReadable(string? text)
-    {
-        if (string.IsNullOrWhiteSpace(text)) return null;
-
-        var inputM = InputPattern.Match(text);
-        var outputM = OutputPattern.Match(text);
-        if (inputM.Success && outputM.Success)
-        {
-            var input = ParseTokenCount(inputM.Groups[1].Value);
-            var output = ParseTokenCount(outputM.Groups[1].Value);
-            var cachedM = CachedPattern.Match(text);
-            var cached = cachedM.Success ? ParseTokenCount(cachedM.Groups[1].Value) : 0;
-            if (input > 0 || output > 0)
-                return new AgentCostSnapshot(TokenUsageAccounting.FreshInputTokens(input, cached), cached, output, null);
-        }
-
-        var tiM = TotalInputPattern.Match(text);
-        var toM = TotalOutputPattern.Match(text);
-        if (tiM.Success && toM.Success)
-        {
-            var input = ParseTokenCount(tiM.Groups[1].Value);
-            var output = ParseTokenCount(toM.Groups[1].Value);
-            var tcM = TotalCachedPattern.Match(text);
-            var cached = tcM.Success ? ParseTokenCount(tcM.Groups[1].Value) : 0;
-            if (input > 0 || output > 0)
-                return new AgentCostSnapshot(TokenUsageAccounting.FreshInputTokens(input, cached), cached, output, null);
-        }
-
-        return null;
-    }
-
-    private static int ParseTokenCount(string s)
-    {
-        var cleaned = s.Replace(",", "", StringComparison.Ordinal);
-        return int.TryParse(cleaned, out var v) ? v : 0;
     }
 }
