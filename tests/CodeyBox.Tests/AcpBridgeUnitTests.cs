@@ -799,6 +799,79 @@ public sealed class AcpBridgeUnitTests
     }
 
     [Fact]
+    public async Task Bridge_RunAsync_StdinDisposedUnderParkedReadDuringShutdown_ExitsCleanly()
+    {
+        // Regression: Shutdown() disposes the stdin stream to unblock a
+        // ReadLineAsync parked in a Linux read() that ignores managed
+        // cancellation. A real console stdin, once disposed, reports the
+        // in-flight read as NotSupportedException ("Stream does not support
+        // reading") — NOT ObjectDisposedException — so ReadStdinAsync must
+        // swallow that type too. Before the fix the exception escaped
+        // ReadStdinAsync -> RunAsync -> Main unobserved and aborted the bridge
+        // process with SIGABRT (128+6 = 134) instead of the clean signal-driven
+        // exit, a load-sensitive flake under the audit host's oversubscription.
+        //
+        // This drives the exact production path deterministically: a console-like
+        // stdin double that parks its second read and then throws
+        // NotSupportedException once Shutdown disposes it, and a claude stub that
+        // exits only after that read has parked — so claude-exit -> MaybeFinish ->
+        // Shutdown(0) disposes stdin precisely while the read is parked.
+        if (!File.Exists("/bin/bash"))
+            return;
+
+        var tmpDir = Directory.CreateTempSubdirectory("cb-acp-stdin-race-").FullName;
+        try
+        {
+            var workDir = Path.Combine(tmpDir, "work");
+            var lockDir = Path.Combine(tmpDir, "ide-locks");
+            Directory.CreateDirectory(workDir);
+            var releaseMarker = Path.Combine(tmpDir, "claude-may-exit");
+
+            // claude exits 0 the moment the release marker appears; the test
+            // creates it only after the stdin read has parked.
+            var stubPath = Path.Combine(tmpDir, "claude-marker-wait-stub.sh");
+            File.WriteAllText(stubPath,
+                "#!/bin/bash\n" +
+                "while [ ! -e \"" + releaseMarker + "\" ]; do sleep 0.01; done\n" +
+                "exit 0\n");
+            File.SetUnixFileMode(stubPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+
+            var hello = "{\"type\":\"hello\",\"claudeBinary\":\"" + stubPath
+                + "\",\"workingDirectory\":\"" + workDir
+                + "\",\"lockDir\":\"" + lockDir
+                + "\",\"turnTimeoutSeconds\":60}";
+
+            using var stdin = new ConsoleLikeParkingStdinStream(hello);
+            using var stdoutCapture = new MemoryStream();
+            int exitCode;
+            using (Emitter.OverrideStreamForTests(stdoutCapture))
+            {
+                await using var bridge = new Bridge(stdin);
+                var run = bridge.RunAsync();
+
+                // Wait until the second read (post-hello) is parked, then let
+                // claude exit so Shutdown disposes stdin under the parked read.
+                await stdin.Parked.WaitAsync(TimeSpan.FromSeconds(15));
+                File.WriteAllText(releaseMarker, "go");
+
+                // With the fix, RunAsync returns the claude exit code cleanly.
+                // Without it, this await rethrows the NotSupportedException that
+                // aborted the real process.
+                exitCode = await run.WaitAsync(TimeSpan.FromSeconds(15));
+            }
+
+            Assert.Equal(0, exitCode);
+            var envelopes = ParseEnvelopes(stdoutCapture.ToArray());
+            Assert.Contains(envelopes, e => e.GetProperty("type").GetString() == "claude_exit");
+        }
+        finally
+        {
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Bridge_RunAsync_EmitsBridgeStartedReadyAndClaudeExitInOrder()
     {
         // End-to-end fixture pinning the JS-bridge-parity envelope sequence:
@@ -3695,8 +3768,12 @@ os.execv(dotnet, [hostile_argv0, "exec", target, *sys.argv[3:]])
             "sleep 60 &\n" +
             "child=$!\n" +
             "trap 'kill \"$child\" 2>/dev/null || true; wait \"$child\" 2>/dev/null || true; exit 0' TERM INT HUP\n" +
-            "echo $$ > \"$ROOT_PID_FILE\"\n" +
-            "echo \"$child\" > \"$CHILD_PID_FILE\"\n" +
+            // Write each pid via a temp file + rename so the reader never observes
+            // the target path in the truncated-but-empty window a bare `>` redirect
+            // leaves open (POSIX rename is atomic). Otherwise File.Exists can win the
+            // race against the echo and int.Parse chokes on an empty string.
+            "echo $$ > \"$ROOT_PID_FILE.tmp\" && mv \"$ROOT_PID_FILE.tmp\" \"$ROOT_PID_FILE\"\n" +
+            "echo \"$child\" > \"$CHILD_PID_FILE.tmp\" && mv \"$CHILD_PID_FILE.tmp\" \"$CHILD_PID_FILE\"\n" +
             "wait \"$child\"\n");
         File.SetUnixFileMode(stubPath,
             UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
@@ -4345,6 +4422,83 @@ wait "$child"
             catch { }
             try { _emitterScope.Dispose(); } catch { }
             try { await _bridge.DisposeAsync().ConfigureAwait(false); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// Console-stdin double for the disposal-race regression: serves one framed
+    /// line, then parks every later read until the stream is disposed, and —
+    /// mirroring how a real <see cref="Stream"/> over console stdin behaves once
+    /// Dispose clears its CanRead flag — surfaces the post-dispose read as a
+    /// <see cref="NotSupportedException"/> ("Stream does not support reading")
+    /// rather than an <see cref="ObjectDisposedException"/>.
+    /// </summary>
+    private sealed class ConsoleLikeParkingStdinStream : Stream
+    {
+        private readonly byte[] _firstLine;
+        private int _firstOffset;
+        private readonly SemaphoreSlim _release = new(0, 1);
+        private readonly TaskCompletionSource _parked =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private volatile bool _disposed;
+
+        public ConsoleLikeParkingStdinStream(string firstLine) =>
+            _firstLine = Encoding.UTF8.GetBytes(firstLine + "\n");
+
+        /// <summary>Completes once a read has parked awaiting shutdown-disposal.</summary>
+        public Task Parked => _parked.Task;
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override int Read(byte[] buffer, int offset, int count) =>
+            ReadBlocking(buffer.AsMemory(offset, count));
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct) =>
+            Task.Run(() => ReadBlocking(buffer.AsMemory(offset, count)), ct);
+
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default) =>
+            new(Task.Run(() => ReadBlocking(buffer), ct));
+
+        private int ReadBlocking(Memory<byte> buffer)
+        {
+            ThrowIfDisposed();
+            if (_firstOffset < _firstLine.Length)
+            {
+                var n = Math.Min(buffer.Length, _firstLine.Length - _firstOffset);
+                _firstLine.AsSpan(_firstOffset, n).CopyTo(buffer.Span);
+                _firstOffset += n;
+                return n;
+            }
+            _parked.TrySetResult();
+            _release.Wait();
+            ThrowIfDisposed();
+            return 0; // Unreached in the fixture: Dispose throws before any EOF.
+        }
+
+        private void ThrowIfDisposed()
+        {
+            if (_disposed)
+                throw new NotSupportedException("Stream does not support reading.");
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            _disposed = true;
+            try { _release.Release(); }
+            catch (SemaphoreFullException) { }
+            base.Dispose(disposing);
         }
     }
 

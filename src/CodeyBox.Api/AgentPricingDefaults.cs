@@ -60,7 +60,27 @@ internal static class AgentPricingDefaults
                 $"AgentPricing: bundled defaults file at '{path}' has null Rates");
         }
 
+        if (parsed.DefaultRates is null)
+        {
+            throw new InvalidOperationException(
+                $"AgentPricing: bundled defaults file at '{path}' has null DefaultRates");
+        }
+
         var baseline = new AgentPricingOptions();
+        foreach (var (agentKey, rate) in parsed.DefaultRates)
+        {
+            AgentPricingOptions.ValidateRateNotNull(rate, agentKey, "(default)", "bundled");
+            if (rate.InputPerMillion < 0 || rate.CachedInputPerMillion < 0 || rate.OutputPerMillion < 0)
+                throw new InvalidOperationException(
+                    $"AgentPricing: bundled default rate has negative value for agent '{agentKey}'");
+            baseline.DefaultRates[agentKey] = new ModelRateConfig
+            {
+                InputPerMillion = rate.InputPerMillion,
+                CachedInputPerMillion = rate.CachedInputPerMillion,
+                OutputPerMillion = rate.OutputPerMillion,
+            };
+        }
+
         foreach (var (agentKey, modelMap) in parsed.Rates)
         {
             if (modelMap is null)

@@ -26,13 +26,40 @@ public interface IAgentStreamStore
     Task<int> SweepAsync(DateTimeOffset now, CancellationToken ct = default);
 }
 
+/// <param name="CapturedAt">When the stream file was first created (its
+/// creation timestamp). Stable for the lifetime of the file — cost-window
+/// correlation and "most recently captured file" selection rely on this being
+/// the capture instant, not the last append.</param>
+/// <param name="LastActivityAt">Timestamp of the most recent append to the
+/// file (its last-write time), never earlier than <paramref name="CapturedAt"/>.
+/// This is the liveness signal the progress watchdog reads: a long-running
+/// batch agent (e.g. crock) appends a per-poll chunk while waiting, which
+/// advances this stamp without changing <paramref name="CapturedAt"/>.</param>
 public sealed record AgentStreamFile(
     string FileName,
     string Phase,
     int Iteration,
     long SizeBytes,
     long? LineCount,
-    DateTimeOffset CapturedAt);
+    DateTimeOffset CapturedAt,
+    DateTimeOffset LastActivityAt)
+{
+    /// <summary>
+    /// Convenience overload for callers that have a single timestamp (a file
+    /// with no separate append activity): <see cref="LastActivityAt"/> defaults
+    /// to <paramref name="CapturedAt"/>.
+    /// </summary>
+    public AgentStreamFile(
+        string FileName,
+        string Phase,
+        int Iteration,
+        long SizeBytes,
+        long? LineCount,
+        DateTimeOffset CapturedAt)
+        : this(FileName, Phase, Iteration, SizeBytes, LineCount, CapturedAt, CapturedAt)
+    {
+    }
+}
 
 public sealed class AgentStreamStore : IAgentStreamStore
 {
@@ -289,13 +316,28 @@ public sealed class AgentStreamStore : IAgentStreamStore
         if (!TryParseFileName(info.Name, out var phase, out var iteration))
             return null;
 
+        // CapturedAt is the stable creation instant (used by cost-window
+        // correlation and most-recent-capture selection). LastActivityAt is
+        // Max(creation, lastWrite) so each per-poll append to the same .jsonl
+        // advances the liveness stamp the progress watchdog reads. Long-batch
+        // agents (notably crock) append a stream chunk per status poll while
+        // waiting on an Anthropic Message Batches API task; the watchdog reads
+        // LastActivityAt so those heartbeats count as progress, while the
+        // capture-time consumers keep an immutable timestamp. (Clamp so a
+        // filesystem whose lastWrite precedes creation can never move
+        // LastActivityAt before CapturedAt.)
+        var createdAt = info.CreationTimeUtc;
+        var lastActivity = info.LastWriteTimeUtc > createdAt
+            ? info.LastWriteTimeUtc
+            : createdAt;
         return new AgentStreamFile(
             info.Name,
             phase,
             iteration,
             info.Length,
             includeLineCount ? CountLines(info.FullName, ct) : null,
-            new DateTimeOffset(info.CreationTimeUtc, TimeSpan.Zero));
+            new DateTimeOffset(createdAt, TimeSpan.Zero),
+            new DateTimeOffset(lastActivity, TimeSpan.Zero));
     }
 
     private static long CountLines(string path, CancellationToken ct)

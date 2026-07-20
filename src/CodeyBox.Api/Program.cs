@@ -1061,11 +1061,15 @@ builder.Services.AddSingleton<IAgentRunner>(_ => new AntigravityAgentRunner
     PrintTimeout = TimeSpan.FromMinutes(
         builder.Configuration.GetValue<int?>("CodeyBox:Antigravity:PrintTimeoutMinutes") ?? 20),
 });
-// Crock: scaffolded and registered, but DISABLED in shipped agent-class config.
-// Operators opt in by adding `crock` to an AgentClass member list once the
-// dependent follow-up (cost/usage accounting, watchdog accommodation,
-// credential/tunnel provisioning) lands. See docs/agents.md (TBD section).
-builder.Services.AddSingleton<IAgentRunner, CrockAgentRunner>();
+// Crock: registered, but DISABLED in shipped agent-class config. Operators opt
+// in by adding `crock` to an AgentClass member list AND setting
+// CodeyBox:Crock:HostDaemonSocketPath to the on-host `crock daemon` Unix
+// socket. See the CrockCode section of docs/agents.md and CrockSandboxOptions
+// for the tunnel-model rationale and operator setup.
+builder.Services.AddSingleton<IAgentRunner>(sp => new CrockAgentRunner
+{
+    SandboxOptions = () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Crock,
+});
 builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 builder.Services.AddOptions<AgentPromptPreprocessingOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox:PromptPreprocessing"));
@@ -1427,6 +1431,10 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // when an operator wants to inject the JSON directly via env var
         // without an on-host credential file.
         new AgentCredentialMapping(AgentKind.Cursor, "CODEYBOX_CURSOR_AUTH_JSON", "CODEYBOX_CURSOR_AUTH_JSON"),
+        // Note: Crock is NOT in this verbatim mapping. The crock provider needs to
+        // attach a bind-mount (the host crock daemon Unix socket) alongside the
+        // config env var, which only CrockEnvironmentCredentialProvider (registered
+        // separately) can do.
         // Note: no OPENCODE_API_KEY mapping. The opencode subscription IS the
         // credential path; auth flows exclusively through the auth.json file
         // materialised by OpencodeOAuthFileCredentialProvider. See the brief
@@ -1444,6 +1452,15 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
     // strip the refresh_token — agy has no other in-VM refresh path.)
     builtInLast.Add(new AntigravityEnvironmentCredentialProvider(
         sp.GetService<ILogger<AntigravityEnvironmentCredentialProvider>>()));
+    // Crock: pay-per-token Anthropic API key path. The dedicated provider ships
+    // the full CrockCode config JSON into the sandbox AND attaches a bind-mount
+    // for the host-side `crock daemon` Unix socket (in-VM tunnels are
+    // fundamentally incompatible with the sandbox network model — see
+    // CrockSandboxOptions for the full rationale). The accessor is resolved per
+    // pickup so hot-reloading CodeyBox:Crock takes effect without restarting.
+    builtInLast.Add(new CrockEnvironmentCredentialProvider(
+        sandboxOptions: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Crock,
+        sp.GetService<ILogger<CrockEnvironmentCredentialProvider>>()));
     builtInLast.Add(new EnvironmentCredentialProvider(new[]
     {
         // Also accept the conventional OpenAI SDK variable. This keeps Codex
@@ -1701,11 +1718,31 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 // (UseObservedFailures) for opencode members. Replace with a real
 // HTTP-backed probe once an endpoint is confirmed.
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp => WrapLastKnownGood(new OpencodeQuotaProbe(), sp));
-// Crock: ships as Unknown-only. Cost/usage accounting against Anthropic's
-// Message Batches API is part of the dependent follow-up; until then the
-// router falls onto its QuotaUnknownPolicy (UseObservedFailures) for any
-// crock member operators opt in.
-builder.Services.AddSingleton<IAgentQuotaProbe>(sp => WrapLastKnownGood(new CrockQuotaProbe(), sp));
+// Crock: pay-per-token Anthropic API key (with ~50% batch discount applied at
+// billing time). Anthropic exposes no per-key remaining-credit endpoint, so the
+// probe hits the token-free `GET /v1/models` to validate the key and surfaces
+// 100% / 0% / Unknown based on the HTTP shape. Spend gating lives in the
+// configured AgentBudgetProvider; the router takes MIN(probe, budget).
+//
+// IMPORTANT: this path uses the configured CrockCode API key only. There is no
+// fallback to a subscription OAuth token — calling api.anthropic.com with a
+// subscription token would (a) charge against the wrong account and (b)
+// surface a different quota meter than the one the dispatch actually rides.
+builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
+{
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var probe = new CrockQuotaProbe(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        member => AgentInstanceCredentialResolver.ResolveQuotaCredentials(
+            member,
+            () => new AgentQuotaCredentials(
+                CrockQuotaProbe.TryExtractApiKey(
+                    Environment.GetEnvironmentVariable("CODEYBOX_CROCK_CONFIG_JSON"))))
+            ?? new AgentQuotaCredentials(null),
+        sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
+        loggerFactory.CreateLogger<CrockQuotaProbe>());
+    return WrapLastKnownGood(probe, sp);
+});
 // Antigravity: the agy gateway exposes NO readable per-model quota meter
 // (daily-cloudcode-pa :retrieveUserQuota* return 403), so the probe uses
 // :loadCodeAssist as a free authorization/tier liveness read (200 ⇒ available)
@@ -2022,6 +2059,12 @@ builder.Services.AddSingleton<IAgentModelListProbe, CursorModelListProbe>();
 // :retrieveUserQuota* and :fetchAvailableModels). The curated
 // AntigravityKnownModels list is authoritative, so the probe just returns it.
 builder.Services.AddSingleton<IAgentModelListProbe, AntigravityModelListProbe>();
+// Crock model-list probe: the crock CLI does not expose a `crock models`
+// command and Anthropic's /v1/models returns the on-demand catalog (not the
+// batch-eligible subset CrockCode supports), so the probe returns the curated
+// CrockKnownModels list. Operator-configured ids that are absent surface as
+// a startup warning, not a hard reject.
+builder.Services.AddSingleton<IAgentModelListProbe, CrockModelListProbe>();
 builder.Services.AddHostedService<AgentClassConfigValidator>();
 
 builder.Services.AddSingleton<SmokeOptions>(sp =>
@@ -2881,6 +2924,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Opencode] = new OpencodeCostExtractor(),
         [AgentKind.Copilot] = new CopilotCostExtractor(),
         [AgentKind.Antigravity] = new AntigravityCostExtractor(),
+        [AgentKind.Crock] = new CrockCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
     foreach (var kind in registry.Available)
@@ -4963,6 +5007,16 @@ namespace CodeyBox.Api
         public const int DefaultMaxBulkItems = 1000;
         public const int MaximumMaxBulkItems = 10_000;
         public int MaxBulkItems { get; set; } = DefaultMaxBulkItems;
+
+        /// <summary>
+        /// Crock agent sandbox wiring — most importantly the host
+        /// <c>crock daemon</c> socket path. The runner refuses to dispatch
+        /// when <c>HostDaemonSocketPath</c> is unset because the public
+        /// tunnel-in-VM shape is incompatible with the sandbox network model.
+        /// Hot-reloadable through <c>IOptionsMonitor</c>.
+        /// </summary>
+        public CrockSandboxOptions Crock { get; set; } = new();
+
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
         public double PhaseAbsoluteTimeoutMultiplier { get; set; } = 3.0;

@@ -53,8 +53,42 @@ public sealed class MultipassSandboxProviderTests : IDisposable
 
     public void Dispose()
     {
-        if (Directory.Exists(_workspace))
-            Directory.Delete(_workspace, recursive: true);
+        DeleteWorkspaceTreeWithRetry(_workspace);
+    }
+
+    // Detached-launch tests fork a `setsid` supervisor process group that writes
+    // sidecar files into the workspace and is only reaped after each test waits
+    // for the group to exit. Even once the group is gone, the recursive delete
+    // can observe a transient ENOTEMPTY: on Linux the directory entries the just-
+    // exited group unlinked are not always reflected in the readdir snapshot that
+    // Directory.Delete(recursive) walks, so a single pass can raise "Directory
+    // not empty" for a directory that is racing toward empty. Retrying the whole
+    // recursive delete a bounded number of times converges deterministically
+    // (each pass removes whatever the previous snapshot missed) without masking a
+    // genuine leak — a genuinely non-empty tree would still fail after the last
+    // attempt and surface the IOException.
+    private const int WorkspaceDeleteAttempts = 8;
+    private static readonly TimeSpan WorkspaceDeleteRetryDelay = TimeSpan.FromMilliseconds(25);
+
+    private static void DeleteWorkspaceTreeWithRetry(string workspace)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                if (Directory.Exists(workspace))
+                    Directory.Delete(workspace, recursive: true);
+                return;
+            }
+            catch (IOException) when (attempt < WorkspaceDeleteAttempts)
+            {
+                Thread.Sleep(WorkspaceDeleteRetryDelay);
+            }
+            catch (UnauthorizedAccessException) when (attempt < WorkspaceDeleteAttempts)
+            {
+                Thread.Sleep(WorkspaceDeleteRetryDelay);
+            }
+        }
     }
 
     public static IEnumerable<object[]> AccessibilityProbeNullResults()

@@ -29,10 +29,15 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
     private readonly TestSink _sink = new();
     private readonly IDisposable _auditScope;
 
-    // Captured by reference and threaded into every resolver under test so the audit
-    // emission lands in _sink even if a parallel test collection reassigns the global
-    // Serilog.Log.Logger mid-run (matching the MultipassDaemonRetryPolicy.AuditLogger
-    // deflake pattern). Concrete Logger (not ILogger) so Dispose() can be called.
+    // A dedicated Serilog logger wired to this class's own sink, threaded into
+    // every resolver under test so the audit emission lands in _sink even if a
+    // concurrent host bootstrap (e.g. a WebApplicationFactory test in a sibling
+    // collection) reassigns/flushes the process-global Serilog.Log.Logger
+    // mid-run — which previously rerouted these events off _sink and left the
+    // poll in AssertSingleAttemptFailedEvent empty. That injection is why this
+    // class no longer joins the GlobalSerilog serialization collection, matching
+    // the MultipassDaemonRetryPolicy.AuditLogger deflake pattern. Concrete
+    // Logger (not ILogger) so Dispose() can be called.
     private readonly Serilog.Core.Logger _auditLogger;
 
     public AgenticConflictResolverAuditLogTests()
@@ -58,6 +63,16 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
         _auditScope.Dispose();
         _auditLogger.Dispose();
     }
+
+    // A logger wired to the same sink but WITHOUT the SensitiveDataRedactionEnricher,
+    // for the cases that prove redaction must have already happened inside the
+    // resolver BEFORE the audit is emitted — rather than leaning on the sink-side
+    // enricher to cover for it.
+    private Serilog.Core.Logger CreateUnredactedAuditLogger() =>
+        new LoggerConfiguration()
+            .Enrich.FromLogContext()
+            .WriteTo.Sink(_sink)
+            .CreateLogger();
 
     [Fact]
     public async Task ResolveAsync_AgentThrows_EmitsAttemptFailedAuditWithExceptionTrace()
@@ -177,12 +192,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
     [Fact]
     public async Task ResolveAsync_AgentReportsFailure_RedactsSecretLikeStdoutAndStderrBeforeAudit()
     {
-        // No SensitiveDataRedactionEnricher on this logger: redaction must have
-        // already happened inside the resolver before the audit is emitted.
-        using var noEnricherLogger = new LoggerConfiguration()
-            .Enrich.FromLogContext()
-            .WriteTo.Sink(_sink)
-            .CreateLogger();
+        using var unredacted = CreateUnredactedAuditLogger();
 
         var sandbox = new AgenticConflictResolverTests.ConflictSandbox();
         sandbox.AddConflictedFile("conflict.txt",
@@ -196,7 +206,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
         var resolver = new AgenticConflictResolver(
             new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1, MaxAttemptsPerAgent = 1 }),
             NullLogger<AgenticConflictResolver>.Instance,
-            auditLogger: noEnricherLogger);
+            auditLogger: unredacted);
 
         var workItemId = WorkItemId.New();
         var result = await resolver.ResolveAsync(
@@ -306,12 +316,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
     [Fact]
     public async Task ResolveAsync_SessionResumeExhausted_RedactsAuditStdoutAndStderrWithoutLoggerEnricher()
     {
-        // No SensitiveDataRedactionEnricher on this logger: redaction must have
-        // already happened inside the resolver before the audit is emitted.
-        using var noEnricherLogger = new LoggerConfiguration()
-            .Enrich.FromLogContext()
-            .WriteTo.Sink(_sink)
-            .CreateLogger();
+        using var unredacted = CreateUnredactedAuditLogger();
 
         var sandbox = new AgenticConflictResolverTests.ConflictSandbox();
         sandbox.AddConflictedFile("conflict.txt",
@@ -330,7 +335,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
         var resolver = new AgenticConflictResolver(
             new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }),
             NullLogger<AgenticConflictResolver>.Instance,
-            auditLogger: noEnricherLogger);
+            auditLogger: unredacted);
 
         var workItemId = WorkItemId.New();
         var result = await resolver.ResolveAsync(

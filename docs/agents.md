@@ -1006,6 +1006,66 @@ variant has its own canonical `--model` string), so
 `AgentMembership.ReasoningMode` is informational only on this runner —
 the same shape Gemini uses.
 
+### CrockCode CLI (`crock`)
+
+CrockCode (`github.com/AdamFrisby/CrockCode`) is an **asynchronous / batch**
+coding agent: it submits work to Anthropic's Message Batches API (submit →
+poll `crock status`, latency **minutes-to-hours**) rather than streaming a
+synchronous session. It is registered as **light-duty overflow** and is not a
+member of any shipped `AgentClass`; operators opt it in by wiring the items
+below. The submit/poll wire shapes the runner parses are documented in
+`CrockAgentRunner`/`CrockStatusParser`; they have not been verified against a
+live binary in this environment, so treat model/reasoning plumbing and the
+exact CLI flags as provisional (the runner logs and status parser are the
+source of truth for what is actually accepted).
+
+**Billing — pay-per-token, NOT a subscription.** CrockCode uses a real
+Anthropic **API key** (`anthropic_api_key` in its config) billed per token at
+the ~50% Message Batches discount. `CrockQuotaProbe` validates the key with a
+token-free `GET /v1/models` (there is no per-key remaining-credit endpoint for
+raw API keys); the spend gate lives in the budget provider. Rates are in
+`agent-pricing-defaults.json` under the `crock` bucket (post-batch-discount
+effective rates) plus a `DefaultRates.crock` Opus-tier fallback. Cost
+attribution is an **estimate**, not exact spend: cache-write tokens are folded
+into fresh input at the base rate (the Anthropic 1.25×/2× cache-write premium
+is not represented, matching the `claude` bucket).
+
+**Credential provisioning.** Stage the CrockCode `config.json` (containing the
+API key) into the host env var **`CODEYBOX_CROCK_CONFIG_JSON`**;
+`CrockEnvironmentCredentialProvider` ships it into the sandbox as
+`CROCK_CONFIG_JSON` and the runner materialises it to
+`~/.crockcode/config.json` (mode 0600) inside the VM. This is a host-env → in-VM
+materialisation, the same shape every other agent uses — **the key is present
+inside the ephemeral, internet-only sandbox** (it is not a "credential never
+leaves the host" design). A per-instance member `CredentialReference` ships the
+member's own config so quota routing and batch execution bill the **same** key.
+The key never appears in any log line.
+
+**Batch-latency liveness.** A crock item legitimately waits minutes-to-hours on
+a batch. The default `WorkerProgressWatchdog:ProgressTimeout` (60 min) would
+kill it, so seed a per-agent override under
+`CodeyBox:WorkerProgressWatchdog:PerAgent:crock`
+(`ProgressTimeout`/`ItemStaleTimeout`) — the shipped `appsettings.json` does
+this. The poll loop also emits a per-poll progress chunk through the agent
+stream; the watchdog reads each stream file's **last-activity** timestamp
+(distinct from its immutable capture time) so a non-terminal poll counts as
+progress against the override.
+
+**Tunnel incompatibility → host-side daemon.** CrockCode's batch worker calls
+back into local MCP tools via a public tunnel (cloudflared/ngrok). A public
+tunnel inside CodeyBox's outbound-allow-list sandbox is incompatible with the
+network model (see `CrockSandboxOptions` for the full rationale), so the
+supported shape is a **host-side `crock daemon`** the sandbox submits to. Set
+`CodeyBox:Crock:HostDaemonSocketPath` to an absolute socket path under a
+directory **dedicated** to the daemon socket (e.g.
+`/run/codeybox/crock-daemon.sock`). The credential provider bind-mounts that
+socket's parent directory **read-only**; the path is canonicalised (`..`
+segments and symlinks collapsed) and rejected if it resolves to a shared system
+root, so a misconfiguration fails as an Infrastructure error rather than a
+catastrophic host mount. Only sandbox providers that preserve a live local Unix
+socket support this fallback. The daemon owns the tunnel + MCP tools and, if
+configured with its own key, is what bills the batch.
+
 ## Credential smoke test
 
 Before spending sandbox resources on a work item, CodeyBox performs a

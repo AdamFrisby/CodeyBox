@@ -27,15 +27,20 @@ internal static class AgentPricingMerge
 
         var merged = new AgentPricingOptions
         {
-            DefaultRates = operatorOpts.DefaultRates.ToDictionary(
-                kv => kv.Key,
-                kv =>
-                {
-                    AgentPricingOptions.ValidateRateNotNull(kv.Value, kv.Key, "(default)", "operator");
-                    return CloneRate(kv.Value);
-                },
-                StringComparer.Ordinal),
+            DefaultRates = new Dictionary<string, ModelRateConfig>(StringComparer.Ordinal),
         };
+
+        // Bundled per-agent fallbacks first, then let operator entries win per agent kind.
+        foreach (var (agentKey, rate) in baseline.DefaultRates)
+        {
+            AgentPricingOptions.ValidateRateNotNull(rate, agentKey, "(default)", "bundled");
+            merged.DefaultRates[agentKey] = CloneRate(rate);
+        }
+        foreach (var (agentKey, rate) in operatorOpts.DefaultRates)
+        {
+            AgentPricingOptions.ValidateRateNotNull(rate, agentKey, "(default)", "operator");
+            merged.DefaultRates[agentKey] = CloneRate(rate);
+        }
 
         int bundledCount = 0;
         int operatorCount = 0;

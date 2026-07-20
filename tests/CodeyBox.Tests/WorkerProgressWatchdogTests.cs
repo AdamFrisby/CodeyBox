@@ -1746,6 +1746,334 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         Assert.Equal(1000, after.RecoveryAttempts);
     }
 
+    // ── Per-agent ProgressTimeout overrides (crock batch-latency liveness) ───
+
+    [Fact]
+    public async Task Watchdog_PerAgentProgressOverride_SavesCrockItemFromGlobalCutoff()
+    {
+        // The headline acceptance criterion for crock runtime-enablement:
+        // a crock work item legitimately waiting on a minutes-to-hours batch
+        // must NOT be killed by the synchronous-agent default ProgressTimeout
+        // window. The per-agent override under
+        // CodeyBox:WorkerProgressWatchdog:PerAgent:crock:ProgressTimeout
+        // extends the per-worker liveness window for crock items only;
+        // every other kind keeps the default.
+        var overrideOpts = new WorkerProgressWatchdogOptions
+        {
+            ProgressTimeout = TimeSpan.FromMinutes(30),
+            CheckInterval = TimeSpan.FromMinutes(1),
+            AutoRecover = true,
+            PerAgent =
+            {
+                ["crock"] = new AgentWatchdogOverride
+                {
+                    ProgressTimeout = TimeSpan.FromHours(8),
+                },
+            },
+        };
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, overrideOpts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser);
+
+        // Stale 90 minutes — well past the global default but inside the
+        // 8h crock override. The watchdog must leave it alone.
+        var crockItem = MakeItem(WorkItemState.Working, DateTimeOffset.UtcNow - TimeSpan.FromMinutes(90))
+            with
+        { Agent = AgentKind.Crock };
+        await _store.CreateAsync(crockItem);
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), crockItem.Id);
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(crockItem.Id);
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Equal(0, after.RecoveryAttempts);
+        Assert.Empty(_slotReleaser.Releases);
+        Assert.Single(await _registry.ListAsync());
+        Assert.Equal(0, _queue.Count);
+    }
+
+    [Fact]
+    public async Task Watchdog_PerAgentProgressOverride_StillRecoversCrockItemPastOverrideCeiling()
+    {
+        // Defence-in-depth: the per-agent override extends but does not
+        // disable the watchdog. A crock item stale past the override window
+        // still gets recovered — operators sized the override to the
+        // realistic batch latency, not to "never kill crock".
+        var overrideOpts = new WorkerProgressWatchdogOptions
+        {
+            ProgressTimeout = TimeSpan.FromMinutes(30),
+            CheckInterval = TimeSpan.FromMinutes(1),
+            AutoRecover = true,
+            PerAgent =
+            {
+                ["crock"] = new AgentWatchdogOverride
+                {
+                    ProgressTimeout = TimeSpan.FromHours(2),
+                },
+            },
+        };
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, overrideOpts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser);
+
+        var crockItem = MakeItem(WorkItemState.Working, DateTimeOffset.UtcNow - TimeSpan.FromHours(3))
+            with
+        { Agent = AgentKind.Crock };
+        await _store.CreateAsync(crockItem);
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), crockItem.Id);
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(crockItem.Id);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Single(_slotReleaser.Releases);
+    }
+
+    [Fact]
+    public async Task Watchdog_PerAgentProgressOverride_DoesNotApplyToOtherAgents()
+    {
+        // The override is scoped to the configured kind. A Claude (or any
+        // non-crock) item stale past the global default still gets recovered
+        // even though a crock override is configured — defending against a
+        // bug where an override entry silently widens the window for every
+        // kind.
+        var overrideOpts = new WorkerProgressWatchdogOptions
+        {
+            ProgressTimeout = TimeSpan.FromMinutes(30),
+            CheckInterval = TimeSpan.FromMinutes(1),
+            AutoRecover = true,
+            PerAgent =
+            {
+                ["crock"] = new AgentWatchdogOverride
+                {
+                    ProgressTimeout = TimeSpan.FromHours(8),
+                },
+            },
+        };
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, overrideOpts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser);
+
+        var claudeItem = MakeItem(WorkItemState.Working, DateTimeOffset.UtcNow - TimeSpan.FromMinutes(90))
+            with
+        { Agent = AgentKind.Claude };
+        await _store.CreateAsync(claudeItem);
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), claudeItem.Id);
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(claudeItem.Id);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Single(_slotReleaser.Releases);
+    }
+
+    [Fact]
+    public async Task Watchdog_GlobalProgressTimeoutZero_PerAgentOverrideStillFires()
+    {
+        // Off-by-default + per-agent opt-in: the global ProgressTimeout=0
+        // would normally short-circuit the sweep entirely. The per-agent
+        // override is the explicit opt-in for the kind, so the sweep must
+        // still execute when one is configured. The non-crock branch of the
+        // short-circuit is covered by Watchdog_DisabledByZeroTimeout above.
+        var optInOpts = new WorkerProgressWatchdogOptions
+        {
+            ProgressTimeout = TimeSpan.Zero,
+            CheckInterval = TimeSpan.FromMinutes(1),
+            AutoRecover = true,
+            PerAgent =
+            {
+                ["crock"] = new AgentWatchdogOverride
+                {
+                    ProgressTimeout = TimeSpan.FromHours(2),
+                },
+            },
+        };
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, optInOpts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser);
+
+        // Crock item stale past the override → should be recovered.
+        var crockItem = MakeItem(WorkItemState.Working, DateTimeOffset.UtcNow - TimeSpan.FromHours(3))
+            with
+        { Agent = AgentKind.Crock };
+        await _store.CreateAsync(crockItem);
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), crockItem.Id);
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(crockItem.Id);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Single(_slotReleaser.Releases);
+    }
+
+    [Fact]
+    public async Task Watchdog_PerAgentOverride_CrockSurvivesSimulatedBatchWaitThenRecoversPastCeiling()
+    {
+        // Deterministic proof of the headline crock acceptance criterion using
+        // an injected clock (no real delay, no backdated timestamp): a crock
+        // item legitimately waiting on a minutes-to-hours batch is NOT recovered
+        // while inside the per-agent override window — even well past the
+        // 60-minute synchronous-agent default the watchdog would otherwise apply
+        // — and IS recovered once the wait exceeds the operator-sized ceiling.
+        // The watchdog reads its sweep clock from the injected TimeProvider, so
+        // Advance() moves the whole >60-minute wait forward without wall-clock.
+        var time = new ManualTimeProvider();
+        var opts = new WorkerProgressWatchdogOptions
+        {
+            ProgressTimeout = TimeSpan.FromMinutes(30),
+            CheckInterval = TimeSpan.FromMinutes(1),
+            AutoRecover = true,
+            PerAgent =
+            {
+                ["crock"] = new AgentWatchdogOverride
+                {
+                    ProgressTimeout = TimeSpan.FromHours(8),
+                },
+            },
+        };
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, opts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser,
+            timeProvider: time);
+
+        var crockItem = MakeItem(WorkItemState.Working, time.GetUtcNow())
+            with
+        { Agent = AgentKind.Crock };
+        await _store.CreateAsync(crockItem);
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), crockItem.Id);
+
+        // 90 simulated minutes — well past the 30-minute global default but
+        // inside the 8h crock override. The batch is still pending; the item
+        // must live.
+        time.Advance(TimeSpan.FromMinutes(90));
+        await watchdog.RunOnceAsync(CancellationToken.None);
+        var mid = await _store.GetAsync(crockItem.Id);
+        Assert.Equal(WorkItemState.Working, mid!.State);
+        Assert.Equal(0, mid.RecoveryAttempts);
+        Assert.Empty(_slotReleaser.Releases);
+
+        // Cross the 8h ceiling. Now the wait is genuinely pathological and the
+        // watchdog recovers the worker's slot.
+        time.Advance(TimeSpan.FromHours(8));
+        await watchdog.RunOnceAsync(CancellationToken.None);
+        var after = await _store.GetAsync(crockItem.Id);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Single(_slotReleaser.Releases);
+    }
+
+    [Fact]
+    public async Task Watchdog_StreamLastActivity_KeepsCrockItemAliveWhenCaptureAndUpdatedAtAreStale()
+    {
+        // Deliverable #1, second half: the CrockAgentRunner poll loop appends a
+        // per-poll chunk to its stream file while the batch is pending, which
+        // advances the file's LastActivityAt (last-write). The watchdog counts
+        // that as liveness — it reads LastActivityAt, NOT CapturedAt (immutable
+        // creation) nor a frozen UpdatedAt. Prove it: a crock item whose
+        // UpdatedAt AND stream CapturedAt are both stale well past the override
+        // ceiling survives because its stream LastActivityAt is fresh. A
+        // regression that read CapturedAt (or dropped the stream heartbeat) would
+        // recover — and kill — an actively-polling batch, so this fails red on
+        // that mutation.
+        var now = DateTimeOffset.UtcNow;
+        var overrideOpts = new WorkerProgressWatchdogOptions
+        {
+            ProgressTimeout = TimeSpan.FromMinutes(30),
+            CheckInterval = TimeSpan.FromMinutes(1),
+            AutoRecover = true,
+            PerAgent =
+            {
+                ["crock"] = new AgentWatchdogOverride
+                {
+                    ProgressTimeout = TimeSpan.FromHours(2),
+                },
+            },
+        };
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, overrideOpts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser);
+
+        // UpdatedAt 3h ago — past the 2h crock ceiling, so nothing but a fresh
+        // stream heartbeat can keep the item alive.
+        var crockItem = MakeItem(WorkItemState.Working, now - TimeSpan.FromHours(3))
+            with
+        { Agent = AgentKind.Crock };
+        await _store.CreateAsync(crockItem);
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), crockItem.Id);
+
+        // Stream file created 3h ago (stale CapturedAt) but last appended one
+        // minute ago (fresh LastActivityAt) — the batch poll heartbeat.
+        _streams.StampActivity(
+            crockItem.Id,
+            capturedAt: now - TimeSpan.FromHours(3),
+            lastActivityAt: now - TimeSpan.FromMinutes(1));
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(crockItem.Id);
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Equal(0, after.RecoveryAttempts);
+        Assert.Empty(_slotReleaser.Releases);
+        Assert.Single(await _registry.ListAsync());
+        Assert.Equal(0, _queue.Count);
+    }
+
+    [Fact]
+    public async Task Watchdog_StreamStaleLastActivity_RecoversCrockItemPastCeiling()
+    {
+        // Companion to the liveness test above: prove the assertion is meaningful
+        // (not decorative). When the stream's LastActivityAt is ALSO stale — the
+        // poll loop stopped heartbeating — the same crock item past the override
+        // ceiling IS recovered. This flips red exactly when the liveness path is
+        // wrongly keeping a dead item alive.
+        var now = DateTimeOffset.UtcNow;
+        var overrideOpts = new WorkerProgressWatchdogOptions
+        {
+            ProgressTimeout = TimeSpan.FromMinutes(30),
+            CheckInterval = TimeSpan.FromMinutes(1),
+            AutoRecover = true,
+            PerAgent =
+            {
+                ["crock"] = new AgentWatchdogOverride
+                {
+                    ProgressTimeout = TimeSpan.FromHours(2),
+                },
+            },
+        };
+        var watchdog = new WorkerProgressWatchdog(
+            _registry, _store, _queue, overrideOpts,
+            NullLogger<WorkerProgressWatchdog>.Instance,
+            _streams, _webhooks, _slotReleaser);
+
+        var crockItem = MakeItem(WorkItemState.Working, now - TimeSpan.FromHours(3))
+            with
+        { Agent = AgentKind.Crock };
+        await _store.CreateAsync(crockItem);
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), crockItem.Id);
+
+        // Both CapturedAt and LastActivityAt stale — no fresh heartbeat.
+        _streams.StampActivity(
+            crockItem.Id,
+            capturedAt: now - TimeSpan.FromHours(3),
+            lastActivityAt: now - TimeSpan.FromHours(3) + TimeSpan.FromMinutes(2));
+
+        await watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(crockItem.Id);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Single(_slotReleaser.Releases);
+    }
+
     // ── Test doubles ─────────────────────────────────────────────────────────
 
     private static DiagProcess StartBusyProcess(WorkItemId itemId)
@@ -1891,16 +2219,26 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
 
     /// <summary>
     /// Lets the test stamp synthetic stream-file activity per work item.
-    /// Honours only the API the watchdog reads: <see cref="ListAsync"/>
-    /// with file CapturedAt timestamps.
+    /// Honours only the API the watchdog reads: <see cref="ListAsync"/>. A file
+    /// carries both a CapturedAt (creation) and a LastActivityAt (last append);
+    /// the watchdog's liveness signal is LastActivityAt, so the two can differ.
     /// </summary>
     private sealed class StaleStreamStore : IAgentStreamStore
     {
-        private readonly Dictionary<WorkItemId, DateTimeOffset> _activity = [];
+        private readonly Dictionary<WorkItemId, (DateTimeOffset CapturedAt, DateTimeOffset LastActivityAt)> _activity = [];
 
         public AgentStreamsOptions Options { get; } = new() { Enabled = true, Path = "/tmp/codeybox-test-streams" };
 
-        public void StampActivity(WorkItemId id, DateTimeOffset at) => _activity[id] = at;
+        public void StampActivity(WorkItemId id, DateTimeOffset at) => _activity[id] = (at, at);
+
+        /// <summary>
+        /// Stamp a file whose creation (<paramref name="capturedAt"/>) and last
+        /// append (<paramref name="lastActivityAt"/>) differ — the shape a
+        /// long-batch crock run produces as it appends per-poll heartbeats to a
+        /// file created once at dispatch.
+        /// </summary>
+        public void StampActivity(WorkItemId id, DateTimeOffset capturedAt, DateTimeOffset lastActivityAt)
+            => _activity[id] = (capturedAt, lastActivityAt);
 
         public Task<AgentStreamCapture?> BeginCaptureAsync(WorkItemId workItemId, string phase, int iteration, CancellationToken ct = default)
             => Task.FromResult<AgentStreamCapture?>(null);
@@ -1909,11 +2247,11 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
             WorkItemId workItemId, int limit = AgentStreamStore.DefaultListLimit,
             bool includeLineCount = false, CancellationToken ct = default)
         {
-            if (!_activity.TryGetValue(workItemId, out var at))
+            if (!_activity.TryGetValue(workItemId, out var stamps))
                 return Task.FromResult<IReadOnlyList<AgentStreamFile>>([]);
             IReadOnlyList<AgentStreamFile> files =
             [
-                new AgentStreamFile("work-1-abc123.jsonl", "work", 1, 1, null, at),
+                new AgentStreamFile("work-1-abc123.jsonl", "work", 1, 1, null, stamps.CapturedAt, stamps.LastActivityAt),
             ];
             return Task.FromResult(files);
         }

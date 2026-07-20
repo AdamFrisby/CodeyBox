@@ -5,6 +5,14 @@ using CodeyBox.Core;
 namespace CodeyBox.Agents.Crock;
 
 /// <summary>
+/// Resolver for the runner's hot-reloadable sandbox options. Wrapped behind a
+/// delegate so the runner DI registration does not depend on
+/// <c>IOptionsMonitor</c> directly — keeps the agents assembly free of
+/// Microsoft.Extensions.Options.
+/// </summary>
+public delegate CrockSandboxOptions CrockSandboxOptionsAccessor();
+
+/// <summary>
 /// Drives the <c>crock</c> CLI from <c>github.com/AdamFrisby/CrockCode</c>: a
 /// headless C# coding agent that runs tasks ASYNCHRONOUSLY against Anthropic's
 /// Message Batches API. Submit-then-poll, NOT a synchronous attached stream.
@@ -18,35 +26,37 @@ namespace CodeyBox.Agents.Crock;
 /// <para>Per-task latency is minutes-to-hours (vs. seconds-to-minutes for the
 /// other registered agents), so this runner is registered as light-duty
 /// overflow only. It is NOT a member of any shipped <c>AgentClass</c>;
-/// operators opt it in via host config once the dependent follow-up
-/// (cost/usage accounting, watchdog accommodation, credential/tunnel
-/// provisioning) lands.</para>
+/// operators opt it in via host config after wiring the per-agent watchdog
+/// override, the host-side crock daemon, and the Anthropic API key.</para>
 ///
-/// <para>DESIGN NOTE — DEPENDENT FOLLOW-UP MUST SOLVE BEFORE ENABLING:</para>
+/// <para>OPERATOR WIRING (required to dispatch crock work):</para>
 /// <list type="bullet">
 ///   <item>
-///     <c>WorkerProgressWatchdog</c>'s default ProgressTimeout (~60 minutes)
-///     is shorter than crock's worst-case per-task latency. The poll loop
-///     here emits a per-poll heartbeat through the agent stream (via the
-///     <see cref="IAgentRunner.RunAsync"/> <c>stdoutChunkCallback</c>) so
-///     liveness is observable; but the watchdog must either (a) recognise
-///     those heartbeats as live progress or (b) be reconfigured per-agent
-///     with a crock-appropriate ProgressTimeout. Without that change a long
-///     batch looks stalled and gets killed mid-flight.
+///     <c>WorkerProgressWatchdog</c>'s default ProgressTimeout (60 minutes)
+///     is shorter than crock's batch latency. The shipped <c>appsettings.json</c>
+///     seeds <c>CodeyBox:WorkerProgressWatchdog:PerAgent:crock</c> with
+///     batch-appropriate <c>ProgressTimeout</c> / <c>ItemStaleTimeout</c>
+///     overrides; the poll loop also emits per-poll progress chunks through
+///     the agent stream so the watchdog reads each poll as live progress
+///     against the override.
 ///   </item>
 ///   <item>
-///     crock needs BOTH an Anthropic API key (so the batch model can run)
-///     AND a public tunnel (cloudflared/ngrok) so the batch worker can call
-///     back to local MCP tools in the sandbox. Provisioning a per-sandbox
-///     ephemeral tunnel — and authorising the callback path without
-///     widening the sandbox's network policy beyond what its
-///     internet-only profile already allows — is the harder half of the
-///     follow-up. The shared preparation lifecycle here only materialises
-///     the credential file; the tunnel side is intentionally NOT wired.
+///     crock needs an Anthropic API key (so the batch model can run) AND a
+///     public tunnel so the batch worker can call back to local MCP tools.
+///     The "public tunnel inside the sandbox" shape is fundamentally
+///     incompatible with CodeyBox's outbound allow-list sandbox network
+///     model — see <see cref="CrockSandboxOptions"/> for the full rationale.
+///     Resolution: operators run <c>crock daemon</c> on the host (with the
+///     tunnel + MCP tools), and the sandbox bind-mounts the daemon's Unix
+///     socket so the in-VM <c>crock submit</c> connects to the host daemon
+///     instead of running its own tunnel. The runner refuses to dispatch
+///     when <see cref="CrockSandboxOptions.HostDaemonSocketPath"/> is unset
+///     so an operator misconfiguration surfaces as a clear failure rather
+///     than a hung batch with no callback path.
 ///   </item>
 ///   <item>
-///     <see cref="RunResumedAsync"/> is overridden to fail-explicit until
-///     a checkpoint shape (task-id persistence + re-attach via
+///     <see cref="RunResumedAsync"/> is overridden to fail-explicit until a
+///     checkpoint shape (task-id persistence + re-attach via
 ///     <c>crock status</c>) is wired. Without that override the base class
 ///     would call <see cref="BuildInvocation"/> directly, which would
 ///     re-SUBMIT a fresh Anthropic batch on every resume and report success
@@ -66,12 +76,13 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
     public const string DefaultBinary = "crock";
 
     /// <summary>
-    /// Credential env var read by the in-sandbox materialisation script. The
-    /// host-side credential provider is expected to fetch this from
-    /// <c>CODEYBOX_CROCK_CONFIG_JSON</c> (or an equivalent host-namespaced
-    /// source) and ship it inside the credential bundle. The follow-up will
-    /// add an explicit <c>AgentCredentialMapping</c> alongside the
-    /// other agents' mappings in <c>Program.cs</c>.
+    /// Credential env var read by the in-sandbox materialisation script.
+    /// <see cref="CrockEnvironmentCredentialProvider"/> fetches the config JSON
+    /// from <c>CODEYBOX_CROCK_CONFIG_JSON</c> on the host (or the per-instance
+    /// member <c>CredentialReference</c>) and ships it inside the credential
+    /// bundle under this name; the runner materialises it to
+    /// <c>~/.crockcode/config.json</c>. See <c>docs/agents.md</c> (CrockCode
+    /// section) for the operator setup.
     /// </summary>
     public const string ConfigEnvVar = "CROCK_CONFIG_JSON";
 
@@ -98,6 +109,34 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
     public string Binary { get; init; } = DefaultBinary;
 
     protected override IReadOnlyList<EnvBackedCredentialFile> EnvBackedCredentialFiles => [ConfigCredentialFile];
+
+    /// <summary>
+    /// The daemon-socket path env var (<see cref="CrockSandboxOptions.DaemonSocketEnvVar"/>,
+    /// default <see cref="CrockSandboxOptions.DefaultDaemonSocketEnvVar"/>) is a
+    /// plain in-sandbox path the in-VM CLI reads directly from its environment —
+    /// NOT a file-backed payload. When a host daemon socket is configured,
+    /// <see cref="CrockEnvironmentCredentialProvider"/> adds this var to the
+    /// credential bundle alongside the daemon bind-mount, so the runner MUST
+    /// classify it here as a direct credential env var: otherwise
+    /// <see cref="CodeyBox.Sandbox.SandboxEnvironmentVariablePolicy.SelectDirectCredentialEnvironment"/>
+    /// throws (every credential env var must be exactly one of direct or
+    /// file-backed) and no crock run can be dispatched. Resolved from the same
+    /// hot-reloadable options the provider uses so the SET and CLASSIFY names
+    /// never drift.
+    /// </summary>
+    protected override IReadOnlyList<string> DirectCredentialEnvironmentVariables =>
+        [SandboxOptions().ResolveDaemonSocketEnvVar()];
+
+    /// <summary>
+    /// Hot-reloadable accessor for the sandbox-side options
+    /// (<see cref="CrockSandboxOptions.HostDaemonSocketPath"/> and friends).
+    /// Defaults to the type's defaults (no daemon socket) so existing tests
+    /// that construct the runner with no DI graph continue to compile;
+    /// production wiring supplies an accessor backed by
+    /// <c>IOptionsMonitor&lt;CrockSandboxOptions&gt;</c>.
+    /// </summary>
+    public CrockSandboxOptionsAccessor SandboxOptions { get; init; } =
+        static () => new CrockSandboxOptions();
 
     /// <summary>
     /// Initial delay before the first <c>crock status</c> poll, and the floor
@@ -151,7 +190,7 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
     /// than letting the CLI crash on its own missing-config error — keeps the
     /// failure shape consistent with the other subscription runners.
     /// </summary>
-    protected override Task<AgentResult?> PrepareAgentSandboxAsync(
+    protected override async Task<AgentResult?> PrepareAgentSandboxAsync(
         ISandbox sandbox,
         string workingDirectory,
         AgentCredential? credential,
@@ -162,15 +201,63 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
             || !credential.EnvironmentVariables.TryGetValue(ConfigEnvVar, out var json)
             || string.IsNullOrWhiteSpace(json))
         {
-            return Task.FromResult<AgentResult?>(new AgentResult(
+            return new AgentResult(
                 Success: false,
                 Summary: MissingCredentialMarker,
                 Stdout: null,
-                Stderr: MissingCredentialMarker));
+                Stderr: MissingCredentialMarker);
         }
 
-        return Task.FromResult<AgentResult?>(null);
+        // Hard pre-flight: dispatching crock without a usable host-side daemon
+        // would leave the Anthropic batch worker with no callback path (the
+        // public tunnel-in-VM shape is incompatible with the sandbox network
+        // model; see CrockSandboxOptions for the full rationale). Validate the
+        // SAME way the credential provider decides whether to mount the socket:
+        // unset OR an unsafe/uncanonicalisable path both fail fast here as a
+        // daemon (Infrastructure) failure — never as a missing credential —
+        // instead of letting the batch hang for hours.
+        var opts = SandboxOptions();
+        if (!CrockEnvironmentCredentialProvider.TryResolveMountParent(
+                opts.HostDaemonSocketPath, out _, out var daemonReason))
+        {
+            var marker = BuildMissingHostDaemonMarker(daemonReason);
+            return new AgentResult(
+                Success: false,
+                Summary: marker,
+                Stdout: null,
+                Stderr: marker);
+        }
+
+        var write = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["bash", "-c", ConfigMaterialiseScript],
+        }, ct);
+        if (!write.Success)
+        {
+            return new AgentResult(
+                Success: false,
+                Summary: $"failed to materialise crock config: exit {write.ExitCode}",
+                Stdout: write.Stdout,
+                Stderr: write.Stderr);
+        }
+        return null;
     }
+
+    /// <summary>
+    /// Builds the unavailability marker surfaced when the host-side
+    /// <c>crock daemon</c> socket is unusable (unset, non-absolute, or resolving
+    /// to a shared system directory). The leading <c>"failed to materialise "</c>
+    /// prefix is load-bearing: it makes
+    /// <see cref="AgentFailureClassifier.IsMaterialisationFailure"/> match, which
+    /// classifies the failure as <see cref="AgentFailureKind.Infrastructure"/> —
+    /// not a transient quota wait or a missing credential — so the work item
+    /// routes to operator triage. The <paramref name="reason"/> is a
+    /// non-sensitive structured phrase (never the raw path).
+    /// </summary>
+    private static string BuildMissingHostDaemonMarker(string reason) =>
+        "failed to materialise crock host daemon socket mount " +
+        $"(CodeyBox:Crock:HostDaemonSocketPath is unusable: {reason}); " +
+        "in-VM public tunnels are not supported by this sandbox model";
 
     /// <summary>
     /// Builds the <c>crock submit</c> argv. The prompt is delivered via stdin

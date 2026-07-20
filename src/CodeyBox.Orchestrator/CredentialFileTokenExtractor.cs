@@ -103,6 +103,16 @@ public static class CredentialFileTokenExtractor
         return null;
     }
 
+    /// <summary>
+    /// Extracts an Anthropic API key from a CrockCode <c>config.json</c>
+    /// payload of shape <c>{ "anthropic_api_key": "sk-…", "tunnel_provider": "…" }</c>.
+    /// Tolerant of leading/trailing whitespace and the camelCase /
+    /// SCREAMING_SNAKE_CASE variants operators sometimes hand-write. Returns
+    /// null on any parse failure or when the key is missing/blank.
+    /// </summary>
+    public static string? ExtractCrockAnthropicApiKey(string? rawContents)
+        => CodeyBox.Agents.CrockConfigParser.TryGetAnthropicApiKey(rawContents);
+
     public static string? ExtractGeminiAccessToken(string? rawContents)
     {
         if (string.IsNullOrWhiteSpace(rawContents))

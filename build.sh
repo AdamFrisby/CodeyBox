@@ -13,10 +13,15 @@ if [ -f "$codeybox_script_dir/scripts/nuget-home-heal.sh" ]; then
     . "$codeybox_script_dir/scripts/nuget-home-heal.sh"
 fi
 
+export DOTNET_CLI_TELEMETRY_OPTOUT=1
+export DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
+export MSBUILDDISABLENODEREUSE=1
+
 # Forward any explicit arguments straight to `dotnet` so every gate command —
 # `build CodeyBox.slnx`, `build --no-incremental -warnaserror`, `test --no-build`
-# — runs through the NuGet-home heal above, not just the default build. With no
-# arguments, keep the historical behaviour of building the whole solution.
+# — runs through the NuGet-home heal and hardening exports above, not just the
+# default build. With no arguments, keep the historical behaviour of building
+# the whole solution verbatim (the exports above harden this path too).
 if [ "$#" -gt 0 ]; then
     dotnet "$@"
 else

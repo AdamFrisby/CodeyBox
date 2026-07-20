@@ -278,6 +278,11 @@ public static class AuditLog
     /// attempt counter so operators can diagnose without trawling logs. Emitted
     /// at <c>Warning</c> because every emission represents an iteration that
     /// either burned a retry slot or ended a candidate.
+    ///
+    /// <paramref name="logger"/> defaults to the process-global Serilog logger
+    /// (production sets it once at startup). Callers holding their own audit
+    /// logger pass it explicitly so a concurrent reassignment of the global
+    /// static cannot reroute these events off their sink.
     /// </summary>
     public static void AgenticConflictResolverAttemptFailed(
         WorkItemId workItemId,

@@ -70,6 +70,60 @@ public sealed class StreamPersistenceTests : IDisposable
         Assert.False(parsed.RootElement.TryGetProperty("created_at", out _));
     }
 
+    [Fact]
+    public async Task ListAsync_LastActivityAt_ReflectsLastWriteAdvancingPastCreation()
+    {
+        // Deliverable #1 (crock batch-latency liveness) depends on the store
+        // mapping LastActivityAt to the file's LAST-WRITE, not its creation
+        // instant: a crock run appends a per-poll chunk to a SINGLE .jsonl while
+        // waiting on the Anthropic Message Batches API, so only the last-write
+        // advances. The progress watchdog reads LastActivityAt as the liveness
+        // signal, so a mapping that pinned it to creation would let the watchdog
+        // kill an actively-polling batch. Drive the real store, advance the
+        // file's last-write past its creation instant, and assert the mapping
+        // surfaces that as LastActivityAt while CapturedAt stays at creation.
+        var itemId = WorkItemId.New();
+        var store = Store();
+
+        await using (var capture = await store.BeginCaptureAsync(itemId, "work", 1))
+            capture!.WriteChunk("{\"type\":\"assistant\"}\n");
+
+        var before = Assert.Single(await store.ListAsync(itemId));
+        // A single-append file: last-write == creation, so the two stamps agree.
+        Assert.Equal(before.CapturedAt, before.LastActivityAt);
+
+        // A later per-poll append advances the file's last-write beyond creation.
+        var path = Path.Combine(_root, itemId.ToString(), before.FileName);
+        var advanced = before.CapturedAt.UtcDateTime.AddMinutes(10);
+        File.SetLastWriteTimeUtc(path, advanced);
+
+        var after = Assert.Single(await store.ListAsync(itemId));
+        Assert.True(
+            after.LastActivityAt > after.CapturedAt,
+            $"LastActivityAt ({after.LastActivityAt:O}) must advance past CapturedAt ({after.CapturedAt:O})");
+        Assert.Equal(new DateTimeOffset(advanced, TimeSpan.Zero), after.LastActivityAt);
+    }
+
+    [Fact]
+    public async Task ListAsync_LastActivityAt_ClampsToCreationWhenLastWritePrecedesIt()
+    {
+        // Defensive clamp: a filesystem (or a manual mtime rewind) whose
+        // last-write precedes the creation instant must never move the liveness
+        // stamp BEFORE CapturedAt, which would make a fresh file look stale.
+        var itemId = WorkItemId.New();
+        var store = Store();
+
+        await using (var capture = await store.BeginCaptureAsync(itemId, "work", 1))
+            capture!.WriteChunk("{\"type\":\"assistant\"}\n");
+
+        var before = Assert.Single(await store.ListAsync(itemId));
+        var path = Path.Combine(_root, itemId.ToString(), before.FileName);
+        File.SetLastWriteTimeUtc(path, before.CapturedAt.UtcDateTime.AddMinutes(-10));
+
+        var after = Assert.Single(await store.ListAsync(itemId));
+        Assert.Equal(after.CapturedAt, after.LastActivityAt);
+    }
+
     private static string ReadType(string line)
     {
         using var parsed = JsonDocument.Parse(line);

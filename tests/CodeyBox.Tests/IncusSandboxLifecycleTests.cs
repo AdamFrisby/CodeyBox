@@ -3108,23 +3108,40 @@ public sealed class IncusSandboxLifecycleTests
         Task task,
         TimeSpan advance)
     {
-        // 2000 (not 100): under the full audit suite every host-spinning test
-        // class runs in parallel, so a continuation released by the injected
-        // clock can sit on a starved thread-pool ready-queue for many turns
-        // before it runs. This is only the "give the released continuation a
-        // chance to run" bound — the production recovery logic caps the actual
-        // retry attempts, so extra turns cannot change the asserted outcome;
-        // they only stop a starved pool from prematurely failing the wait.
-        const int maximumSchedulerTurns = 2000;
-        for (var turn = 0; turn < maximumSchedulerTurns && !task.IsCompleted; turn++)
+        // The task completes only once the injected clock is advanced past the
+        // recovery delay(s); each fake-clock timer that fires releases its
+        // continuation onto the thread pool (the recovery awaits with
+        // ConfigureAwait(false)). We therefore advance the clock and then hand
+        // the scheduler a real slot to run those continuations, looping until
+        // the task settles.
+        //
+        // The bound is a generous REAL wall-clock ceiling rather than a fixed
+        // turn count: on a saturated 2-core audit host the thread pool can lag
+        // the fake-clock timer callback far past a handful of 1 ms turns, which
+        // is a scheduling latency, not a hang — a fixed turn budget turned that
+        // latency into a spurious failure. Advancing more than the recovery
+        // needs is harmless (the loop is bounded by attempt count, not the
+        // clock), so over-advancing under load cannot change the outcome, only
+        // shorten the wait. Await each step through WhenAny so a settled task is
+        // observed the instant its continuation runs.
+        var deadline = Environment.TickCount64 + (long)TimeSpan.FromSeconds(30).TotalMilliseconds;
+        while (!task.IsCompleted && Environment.TickCount64 < deadline)
         {
             time.Advance(advance);
-            // This delay only yields to continuations released by the injected
-            // fake clock; it does not drive the recovery delay or its outcome.
-            await Task.Delay(TimeSpan.FromMilliseconds(1));
+            var settled = await Task.WhenAny(task, Task.Delay(TimeSpan.FromMilliseconds(5)))
+                .ConfigureAwait(false);
+            if (settled == task)
+                break;
         }
 
         Assert.True(task.IsCompleted, "Incus delayed recovery did not complete after advancing the injected clock.");
+        // Mark any fault observed so a faulted recovery does not surface as an
+        // unobserved-task finalizer warning. We must NOT re-throw here: every
+        // caller re-awaits the task itself to assert on its outcome — a success
+        // value, or an EXPECTED fault such as the delete-absence TimeoutException
+        // that Dispose_WhenDeleteReportsSuccessButVmPersists... asserts via
+        // Assert.ThrowsAsync. Re-throwing would pre-empt those assertions.
+        _ = task.Exception;
     }
 
     private static IncusSandbox CreateSandbox(

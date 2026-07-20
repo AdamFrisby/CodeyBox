@@ -131,6 +131,30 @@ public static class AgentInstanceCredentialResolver
             return true;
         }
 
+        if (agent == AgentKind.Crock)
+        {
+            // Ship the MEMBER'S own CrockCode config (its Anthropic key) as the
+            // sandbox-side CROCK_CONFIG_JSON so EXECUTION bills the SAME key the
+            // quota probe routed on (see TryExtractQuotaCredentials below) —
+            // otherwise a member admitted on key A would submit under the global
+            // key B. The sandbox-global daemon bind-mount is a separate concern
+            // that only the kind-scoped CrockEnvironmentCredentialProvider can
+            // build (it alone sees CrockSandboxOptions); the caller grafts that
+            // provider's mounts onto this env-only bundle. Requires a real key
+            // in the member config, else fall through to the global provider.
+            var key = CredentialFileTokenExtractor.ExtractCrockAnthropicApiKey(raw);
+            if (string.IsNullOrWhiteSpace(key))
+                return false;
+            credential = new AgentCredential(
+                AgentKind.Crock,
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["CROCK_CONFIG_JSON"] = raw,
+                },
+                new Dictionary<string, string>());
+            return true;
+        }
+
         return false;
     }
 
@@ -208,6 +232,20 @@ public static class AgentInstanceCredentialResolver
             // gemini-cli; reuse the Gemini extractor so a single per-instance
             // file works for either CLI.
             var token = CredentialFileTokenExtractor.ExtractGeminiAccessToken(raw);
+            if (string.IsNullOrWhiteSpace(token)) return false;
+            credentials = new AgentQuotaCredentials(token);
+            return true;
+        }
+
+        if (agent == AgentKind.Crock)
+        {
+            // CrockCode's config.json carries an Anthropic API key under
+            // `anthropic_api_key`. The Crock quota probe is keyed by token, so a
+            // per-instance file (two crock members with distinct keys) MUST
+            // resolve to its own AgentQuotaCredentials rather than silently
+            // collapsing onto the shared CODEYBOX_CROCK_CONFIG_JSON env-var key
+            // (which would defeat per-instance routing and pool-with-yourself).
+            var token = CredentialFileTokenExtractor.ExtractCrockAnthropicApiKey(raw);
             if (string.IsNullOrWhiteSpace(token)) return false;
             credentials = new AgentQuotaCredentials(token);
             return true;

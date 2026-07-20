@@ -146,6 +146,61 @@ needs.
 * **VM can't reach allowed host.** Check `nft list table inet codeybox`
   for the resolved IPs and re-run `setup-host-networks.sh` if a CDN has
   rotated. See [`host-firewall.md`](host-firewall.md) troubleshooting.
+* **NuGet restore fails with "unauthorized access" before any project
+  builds.** Symptom: `Failed to read NuGet.Config due to unauthorized access.
+  Path: '<home>/.nuget/NuGet/NuGet.Config' ... Permission denied` when the
+  audit sandbox ships `~/.nuget` owned by another uid (e.g. root-owned mode
+  755) so the build uid cannot create the `NuGet` settings subdirectory on
+  first restore. NuGet resolves the user-settings path unconditionally, so
+  neither `--configfile` nor a repo-level `nuget.config` avoids it; the only
+  levers are `$HOME`/`DOTNET_CLI_HOME`. All three CodeyBox `.NET` build gates
+  self-heal through the single NuGet-home source, `NuGetHomeSelfHeal`: the
+  `process:required-build` gate (`SandboxRequiredBuildVerifier.BuildScript`)
+  embeds `NuGetHomeSelfHeal.Preamble`, and the `csharp:build-WaE` /
+  `csharp:test-pass` tool auditors opt in via `SelfHealNuGetHome`, which wraps
+  the `dotnet` invocation in `NuGetHomeSelfHeal.WrapDotnetInvocation`. The
+  self-heal probes whether `~/.nuget/NuGet` is usable and, if not, redirects
+  `DOTNET_CLI_HOME` to a writable scratch directory — reusing an existing,
+  writable `~/.nuget/packages` cache as the global packages folder — so all
+  three gates build green unaided. `build.sh` and the MSBuild
+  `Directory.NuGetHomeHeal.targets` InitialTargets hook both source the
+  repository-owned `scripts/nuget-home-heal.sh`, which performs the same probe
+  and additionally repairs `~/.nuget` *in place* when `$HOME` is writable. A
+  harness that invokes `dotnet` *directly*, bypassing every CodeyBox entrypoint
+  and the MSBuild hook, does not benefit; for that case, when provisioning the
+  sandbox make `~/.nuget` writable by the build uid (e.g. `chown "$uid"
+  ~/.nuget`, or create it owned by that uid) while keeping the package cache in
+  place.
+
+  When `chown` is unavailable (no root, `no_new_privs` set) but the build uid
+  owns `$HOME`, remediate in place without a provisioning change: rename the
+  foreign-owned tree aside, recreate `~/.nuget` (and its `NuGet` settings
+  subdirectory) owned by the build uid, and re-expose the pre-warmed cache —
+
+      mv ~/.nuget ~/.nuget.foreign-owned
+      mkdir -p ~/.nuget/NuGet
+      ln -s ~/.nuget.foreign-owned/packages ~/.nuget/packages
+
+  Directory entries under `$HOME` can be renamed by its owner even when the
+  entry itself is owned by another uid, so this needs no elevated privilege.
+  The cache dir stays uid-owned and writable through the symlink, so restore
+  still resolves offline. A direct `dotnet build ./CodeyBox.slnx` (and
+  `dotnet test`) then restores normally, because `~/.nuget/NuGet` is now
+  creatable.
+
+  This in-place remedy only helps a harness that reuses the *same* `$HOME` for
+  both the agent session and the subsequent `.NET` gate run. It is **not**
+  durable across a re-provisioned sandbox: an audit harness that mounts a fresh
+  home (root-owned `~/.nuget`) for each iteration discards the rename, so the
+  next `dotnet build ./CodeyBox.slnx` fails identically. When the gate keeps
+  failing after an in-place fix, `~/.nuget` is being re-provisioned root-owned
+  every iteration and the only reliable remedy is at provisioning time: bake
+  `~/.nuget` owned by the build uid into the sandbox image, or run the direct
+  `dotnet` gate commands with a writable `$HOME` (or `NuGetHomeSelfHeal`'s
+  `DOTNET_CLI_HOME` redirect preamble prepended). No repo-committed file — `nuget.config`,
+  `--configfile`, `Directory.Build.props`, or a `BeforeTargets="Restore"` task —
+  can redirect the read, because NuGet resolves and reads the user-settings path
+  from `$HOME` before any project target the repo could hook executes.
 
 ## Backups
 

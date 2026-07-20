@@ -175,18 +175,9 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         string toolName,
         CancellationToken ct)
     {
-        // Opt-in NuGet-home self-heal: a dotnet command restores on first use and
-        // fails for every project when ~/.nuget is root-owned on an unprivileged
-        // build host. When enabled, run the shared preamble first (no-op on a
-        // healthy home). Off by default so generic shell commands are untouched;
-        // only dotnet build/test/format gate auditors enable it. The finding title
-        // below still reports the original (unwrapped) argv.
-        var argv = _opts.SelfHealNuGetHome
-            ? NuGetHomeSelfHeal.WrapDotnetInvocation(_opts.Argv)
-            : _opts.Argv;
         var result = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = argv,
+            Argv = BuildExecArgv(),
             WorkingDirectory = workingDirectory,
             ExtraEnvironment = environment,
         }, ct);
@@ -230,6 +221,22 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
 
         return new AuditResult(false, [finding], RawOutput: combinedOutput);
     }
+
+    /// <summary>
+    /// The argv actually dispatched to the sandbox. Without
+    /// <see cref="ShellCommandAuditorOptions.SelfHealNuGetHome"/> this is the
+    /// configured argv verbatim. When it is set (a dotnet-specific opt-in), the
+    /// argv is wrapped by <see cref="NuGetHomeSelfHeal.WrapDotnetInvocation"/> so
+    /// restore survives a root-owned <c>~/.nuget</c> -- a single <c>sh -c</c> that
+    /// runs the self-heal preamble then <c>exec "$@"</c>s the real command with
+    /// its arguments intact. The configured argv (not the wrapped form) is what
+    /// findings and the result classifier report, so wrapping is invisible to
+    /// callers.
+    /// </summary>
+    private IReadOnlyList<string> BuildExecArgv()
+        => _opts.SelfHealNuGetHome
+            ? NuGetHomeSelfHeal.WrapDotnetInvocation(_opts.Argv)
+            : _opts.Argv;
 
     private string BuildPlanArtifactPath(AuditContext context)
     {
@@ -347,6 +354,7 @@ public sealed record ShellCommandAuditorOptions
 {
     public required string Name { get; init; }
     public required IReadOnlyList<string> Argv { get; init; }
+
     public string? ToolName { get; init; }
     public bool? TreatExit127AsMissingTool { get; init; }
     public IAuditResultClassifier? ResultClassifier { get; init; }

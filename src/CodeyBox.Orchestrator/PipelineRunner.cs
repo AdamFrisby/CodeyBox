@@ -15313,7 +15313,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         {
             var credential = await AgentInstanceCredentialResolver.ResolveCredentialAsync(member, ct).ConfigureAwait(false);
             if (credential is not null)
-                return credential;
+                return await GraftSandboxGlobalMountsAsync(credential, kind, project, ct).ConfigureAwait(false);
         }
 
         return _credentials is IProjectAwareCredentialProvider pac
@@ -15330,10 +15330,41 @@ public sealed partial class PipelineRunner : IPipelineRunner
         {
             var credential = await AgentInstanceCredentialResolver.ResolveCredentialAsync(member, ct).ConfigureAwait(false);
             if (credential is not null)
-                return credential;
+                return await GraftSandboxGlobalMountsAsync(credential, member.Agent, project, ct).ConfigureAwait(false);
         }
 
         return await ResolveAgentCredentialAsync(member.Agent, project, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// A member-scoped credential carries its own secret material but not the
+    /// sandbox-global bind-mounts a kind-scoped provider adds (e.g. the Crock
+    /// host-daemon socket, which only <c>CrockEnvironmentCredentialProvider</c>
+    /// can build from <c>CrockSandboxOptions</c>). When the member credential
+    /// defines no mounts, graft the kind provider's mounts onto it so execution
+    /// gets the member's key AND the shared host adjunct. A no-op for agents
+    /// whose kind provider has no mounts.
+    /// </summary>
+    private async Task<AgentCredential> GraftSandboxGlobalMountsAsync(
+        AgentCredential memberCredential, AgentKind kind, Project project, CancellationToken ct)
+    {
+        if (memberCredential.Mounts.Count > 0)
+            return memberCredential;
+
+        var kindCredential = _credentials is IProjectAwareCredentialProvider pac
+            ? await pac.GetAsync(kind, project.CredentialProviderPriority, ct).ConfigureAwait(false)
+            : await _credentials.GetAsync(kind, ct).ConfigureAwait(false);
+        if (kindCredential is null || kindCredential.Mounts.Count == 0)
+            return memberCredential;
+
+        return new AgentCredential(
+            memberCredential.Agent,
+            memberCredential.EnvironmentVariables,
+            memberCredential.Files)
+        {
+            Mounts = kindCredential.Mounts,
+            ExpiresAt = memberCredential.ExpiresAt,
+        };
     }
 
     private async Task<AgentCredential?> ResolveAgentCredentialForInvocationAsync(
