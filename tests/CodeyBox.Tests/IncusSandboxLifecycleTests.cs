@@ -3135,9 +3135,13 @@ public sealed class IncusSandboxLifecycleTests
         }
 
         Assert.True(task.IsCompleted, "Incus delayed recovery did not complete after advancing the injected clock.");
-        // Observe the task so a faulted/cancelled recovery surfaces its own
-        // exception here rather than as an unobserved-task finalizer warning.
-        await task.ConfigureAwait(false);
+        // Mark any fault observed so a faulted recovery does not surface as an
+        // unobserved-task finalizer warning. We must NOT re-throw here: every
+        // caller re-awaits the task itself to assert on its outcome — a success
+        // value, or an EXPECTED fault such as the delete-absence TimeoutException
+        // that Dispose_WhenDeleteReportsSuccessButVmPersists... asserts via
+        // Assert.ThrowsAsync. Re-throwing would pre-empt those assertions.
+        _ = task.Exception;
     }
 
     private static IncusSandbox CreateSandbox(
