@@ -3768,8 +3768,12 @@ os.execv(dotnet, [hostile_argv0, "exec", target, *sys.argv[3:]])
             "sleep 60 &\n" +
             "child=$!\n" +
             "trap 'kill \"$child\" 2>/dev/null || true; wait \"$child\" 2>/dev/null || true; exit 0' TERM INT HUP\n" +
-            "echo $$ > \"$ROOT_PID_FILE\"\n" +
-            "echo \"$child\" > \"$CHILD_PID_FILE\"\n" +
+            // Write each pid via a temp file + rename so the reader never observes
+            // the target path in the truncated-but-empty window a bare `>` redirect
+            // leaves open (POSIX rename is atomic). Otherwise File.Exists can win the
+            // race against the echo and int.Parse chokes on an empty string.
+            "echo $$ > \"$ROOT_PID_FILE.tmp\" && mv \"$ROOT_PID_FILE.tmp\" \"$ROOT_PID_FILE\"\n" +
+            "echo \"$child\" > \"$CHILD_PID_FILE.tmp\" && mv \"$CHILD_PID_FILE.tmp\" \"$CHILD_PID_FILE\"\n" +
             "wait \"$child\"\n");
         File.SetUnixFileMode(stubPath,
             UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
