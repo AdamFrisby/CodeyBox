@@ -185,6 +185,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
     // in compositions/tests that don't exercise it; when null the gate is a
     // no-op. It is also internally disabled unless its own knob is on.
     private readonly WorkItemE2eReplayGate? _e2eReplayGate;
+    // Optional best-effort JobTrack test-case exporter. Null in
+    // compositions/tests that don't wire it; when null, no propagation runs.
+    // Gated per-project (Project.JobTrackExport.Enabled) even when wired.
+    private readonly IJobTrackTestCaseExporter? _jobTrackExporter;
     private readonly IMergeScopeResolver _mergeScopeResolver;
     private readonly Func<Guid> _dispatchClaimIdFactory;
     private readonly string _disabledHostHooksPath;
@@ -331,7 +335,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // test case ends up with a committed replay that re-runs green. Null
         // disables it; when wired it self-gates on its own knob.
         WorkItemE2eReplayGate? e2eReplayGate = null,
-        Func<Guid>? dispatchClaimIdFactory = null)
+        Func<Guid>? dispatchClaimIdFactory = null,
+        // Optional best-effort exporter that propagates a completed item's test
+        // cases to JobTrack. Null disables propagation; when wired it self-gates
+        // on each project's JobTrackExport.Enabled opt-in.
+        IJobTrackTestCaseExporter? jobTrackExporter = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -406,6 +414,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         _knobRegistry = knobRegistry;
         _testCaseStore = testCaseStore;
         _e2eReplayGate = e2eReplayGate;
+        _jobTrackExporter = jobTrackExporter;
         _mergeScopeResolver = mergeScopeResolver ?? NullMergeScopeResolver.Instance;
         _availability = availability;
         // Prefer the DI-injected handler when supplied: keeps the registry
@@ -20123,6 +20132,40 @@ Original merge-phase failure (JSON string, for context only):
             RevisionAtCompletion = revision?.RevisionAtCompletion,
             RevisionMatches = revision?.RevisionMatches,
         }, CancellationToken.None);
+
+        if (state == WorkItemState.Done)
+            await PropagateTestCasesToJobTrackBestEffortAsync(item, project, ct);
+    }
+
+    /// <summary>
+    /// On the terminal <see cref="WorkItemState.Done"/> transition, propagates the
+    /// item's CodeyBox test cases to JobTrack when the project has opted in.
+    /// Strictly best-effort: gated by an injected exporter (null = disabled) and
+    /// wrapped so any failure — including a bug in the exporter — is logged and
+    /// swallowed rather than failing the already-completed item. Cancellation is
+    /// swallowed too: the item is already Done and persisted.
+    /// </summary>
+    private async Task PropagateTestCasesToJobTrackBestEffortAsync(
+        WorkItem item, Project project, CancellationToken ct)
+    {
+        if (_jobTrackExporter is null || !project.JobTrackExport.Enabled)
+            return;
+
+        try
+        {
+            var summary = await _jobTrackExporter.ExportForWorkItemAsync(item, project, ct);
+            if (summary.Failed > 0)
+                _log.LogWarning(
+                    "JobTrack export for work item {WorkItemId} completed with {Failed} failed case(s); item unaffected.",
+                    item.Id, summary.Failed);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "JobTrack export for work item {WorkItemId} threw; item is already Done and is unaffected.",
+                item.Id);
+        }
     }
 
     private async Task ResetRecoveryAttemptsAfterRealProgressEventAsync(

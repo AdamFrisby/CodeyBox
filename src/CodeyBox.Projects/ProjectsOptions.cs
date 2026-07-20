@@ -78,6 +78,32 @@ public sealed class ProjectConfig
     /// into deployment verification.
     /// </summary>
     public DeploymentRecipeConfig? Deployment { get; set; }
+
+    /// <summary>
+    /// Per-project JobTrack test-case export config. Null = the project does not
+    /// export its test cases to JobTrack. Maps to
+    /// <see cref="CodeyBox.Core.ProjectJobTrackExport"/> after resolution.
+    /// </summary>
+    public ProjectJobTrackExportConfig? JobTrackExport { get; set; }
+}
+
+/// <summary>
+/// Config-binding shape for <see cref="CodeyBox.Core.ProjectJobTrackExport"/>.
+/// Lives under <c>CodeyBox:Projects:&lt;id&gt;:JobTrackExport</c>. All fields are
+/// nullable; missing fields take the defaults on the resolved record.
+/// </summary>
+public sealed class ProjectJobTrackExportConfig
+{
+    public bool? Enabled { get; set; }
+    public string? BaseUrl { get; set; }
+    public string? ImportPath { get; set; }
+    public string? TokenEnvVar { get; set; }
+    public string? ExternalIdNamespace { get; set; }
+    public string? DefaultSurfaceArea { get; set; }
+    public int? MaxAttempts { get; set; }
+
+    /// <summary>Base retry back-off in milliseconds. Null = default (250); 0 = no delay.</summary>
+    public int? RetryBaseDelayMs { get; set; }
 }
 
 /// <summary>

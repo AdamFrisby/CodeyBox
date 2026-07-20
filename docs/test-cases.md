@@ -119,11 +119,12 @@ hierarchy fields**. Those are JobTrack-app concerns, applied at propagation
 time — not data the orchestrator or any executor needs.
 
 The propagation contract is single-field: CodeyBox's `SourceWorkItemId` is the
-analogue of JobTrack's `SourceTaskId`. The pair lets a future propagation
-item export a CodeyBox case to JobTrack, where JobTrack maps it into its own
-SurfaceArea + hierarchy on its side. Because `SourceWorkItemId` is the only
-stable link, the API rejects attempts to change it on an existing test case
-(PUT requests with a different `SourceWorkItemId` return HTTP 400).
+analogue of JobTrack's `SourceTaskId`. The pair lets the propagation exporter
+(see [Export to JobTrack](#export-to-jobtrack)) push a CodeyBox case to
+JobTrack, where JobTrack maps it into its own SurfaceArea + hierarchy on its
+side. Because `SourceWorkItemId` is the only stable link, the API rejects
+attempts to change it on an existing test case (PUT requests with a different
+`SourceWorkItemId` return HTTP 400).
 
 | Concern | CodeyBox | JobTrack |
 |---|---|---|
@@ -133,6 +134,39 @@ stable link, the API rejects attempts to change it on an existing test case
 | Executable artifact | `ExecutableArtifactJson` (opaque, executor-defined) | — |
 | Conformance condition | `ConformanceJson` (opaque, mutation-gate-defined) | — |
 
+## Export to JobTrack
+
+When a work item reaches the terminal `Done` state, its linked test cases are
+propagated to JobTrack — **opt-in per project and strictly best-effort**. The
+export is wired through `IJobTrackTestCaseExporter` and never fails the
+already-completed item: on any transport/HTTP error a case is retried (bounded,
+backed off) then counted as failed, and even a bug in the exporter is logged
+and swallowed. Propagation is **idempotent**: JobTrack upserts on the case's
+`ExternalSourceId` (the CodeyBox `TestCase.Id`), so re-export updates the
+existing JobTrack row instead of creating a duplicate.
+
+The `SourceTaskId` is read from the work item's external-id namespace
+(`ExternalIdNamespace`, default `jobtrack`); an item without a JobTrack task id
+in that namespace is skipped. CodeyBox's `AutomationKind` enum maps to JobTrack
+tokens (`Manual→manual`, `Unit→unit`, `Integration→integration`,
+`E2eReplay→e2e-replay`); the hierarchy fields are never sent (JobTrack-owned).
+
+### Configuration
+
+Per project under `CodeyBox:Projects:<id>:JobTrackExport` (all fields
+hot-reloadable; a project with no `JobTrackExport` block exports nothing):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `Enabled` | `false` | Master opt-in. When true, `BaseUrl` is required and validated at config load. |
+| `BaseUrl` | — | Absolute http(s) base URL of the JobTrack instance. |
+| `ImportPath` | `/api/test-cases/import` | Import endpoint path appended to `BaseUrl`. |
+| `TokenEnvVar` | — | Name of the env var holding the JobTrack bearer token. Only the **name** is stored; the value is read at export time, sent per-request, never persisted. Null → unauthenticated. |
+| `ExternalIdNamespace` | `jobtrack` | Work-item external-id namespace holding the owning JobTrack task id. |
+| `DefaultSurfaceArea` | — | Optional default SurfaceArea placement; null lets JobTrack apply its own. |
+| `MaxAttempts` | `3` | Upsert attempts per case before it counts as failed (≥ 1). |
+| `RetryBaseDelayMs` | `250` | Base back-off; the nth retry waits `n × RetryBaseDelayMs`. `0` disables the delay. |
+
 ## Out of scope
 
 This data model is the foundation only. The following land as separate items:
@@ -140,5 +174,3 @@ This data model is the foundation only. The following land as separate items:
 - **Executing** test cases on cheap cloud VMs (E2E infra).
 - The mutation / regression gates that use `ConformanceJson` to score
   coverage.
-- The propagation worker that exports cases to JobTrack and consumes
-  `SourceWorkItemId` as the cross-system mapping key.

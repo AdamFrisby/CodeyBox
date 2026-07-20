@@ -2717,6 +2717,20 @@ builder.Services.AddSingleton<WorkItemE2eReplayGate>(sp => new WorkItemE2eReplay
     sp.GetRequiredService<IOptionsMonitor<E2eReplayAuthoringOptions>>(),
     driver: sp.GetService<IE2eReplayAuthoringDriver>(),
     logger: sp.GetRequiredService<ILogger<WorkItemE2eReplayGate>>()));
+// Best-effort JobTrack test-case export: an item's CodeyBox test cases are
+// pushed to JobTrack on the terminal Done transition, but only for projects that
+// opt in (Project.JobTrackExport.Enabled). The HTTP client is a named factory
+// client so its handler/timeout are shared and the bearer token stays per-request.
+builder.Services.AddHttpClient(HttpJobTrackTestCaseClient.HttpClientName, client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(30);
+});
+builder.Services.AddSingleton<IJobTrackTestCaseClient>(sp => new HttpJobTrackTestCaseClient(
+    sp.GetRequiredService<IHttpClientFactory>()));
+builder.Services.AddSingleton<IJobTrackTestCaseExporter>(sp => new JobTrackTestCaseExporter(
+    sp.GetRequiredService<ITestCaseStore>(),
+    sp.GetRequiredService<IJobTrackTestCaseClient>(),
+    sp.GetRequiredService<ILogger<JobTrackTestCaseExporter>>()));
 builder.Services.AddSingleton<IAuditReportStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -3196,7 +3210,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     testCaseStore: sp.GetService<ITestCaseStore>(),
     mergeScopeResolver: sp.GetRequiredService<IMergeScopeResolver>(),
     quotaAvailabilityPublisher: sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>(),
-    e2eReplayGate: sp.GetService<WorkItemE2eReplayGate>()));
+    e2eReplayGate: sp.GetService<WorkItemE2eReplayGate>(),
+    jobTrackExporter: sp.GetService<IJobTrackTestCaseExporter>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
