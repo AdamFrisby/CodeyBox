@@ -15,11 +15,12 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// Verifies hot-reload of <c>CodeyBox:AgentConcurrency</c>,
-/// <c>CodeyBox:AgentClasses</c>, <c>CodeyBox:AgentBurnEstimator</c>, and
-/// <c>CodeyBox:AgentPricing</c>: edits to these blocks of the layered config
-/// land in the running router / orchestrator / burn estimator / cost
-/// calculator without a restart, and in-flight items already past the
-/// dispatch gate keep the snapshot they started on.
+/// <c>CodeyBox:AgentClasses</c>, <c>CodeyBox:AgentBurnEstimator</c>,
+/// <c>CodeyBox:AgentPricing</c>, and snapshot-backed runtime knobs: edits to
+/// these blocks of the layered config land in the running router /
+/// orchestrator / burn estimator / cost calculator without a restart, and
+/// in-flight items already past the dispatch gate keep the snapshot they
+/// started on.
 /// </summary>
 [Collection("GlobalSerilog")]
 public sealed class AgentConfigHotReloadTests
@@ -112,6 +113,50 @@ public sealed class AgentConfigHotReloadTests
         Assert.False(smoke.Enabled);
         Assert.Equal(15, smoke.Current.CacheTtlMinutes);
         Assert.Equal(3, smoke.Current.StartupTimeoutSeconds);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task TestFailureAttributionHotReload_SwapsLiveSnapshotOnChange()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            TestFailureAttribution = new TestFailureAttributionOptions
+            {
+                Enabled = false,
+            },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(new AgentConcurrencyOptions());
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), new AgentBurnEstimatorOptions(),
+            NullLogger<AgentBurnEstimator>.Instance);
+        var attribution = new TestFailureAttributionOptionsSnapshot(new TestFailureAttributionOptions
+        {
+            Enabled = false,
+        });
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            testFailureAttribution: attribution);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            TestFailureAttribution = new TestFailureAttributionOptions
+            {
+                Enabled = true,
+            },
+        });
+
+        Assert.True(attribution.Enabled);
 
         await coordinator.StopAsync(CancellationToken.None);
     }

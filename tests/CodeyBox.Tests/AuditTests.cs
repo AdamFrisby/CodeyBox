@@ -781,6 +781,95 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public async Task CSharpTestPass_AttributionEnabled_BasePassesAndDiffFails_ClassifiesDiffAttributable()
+    {
+        var options = new TestFailureAttributionOptionsSnapshot(new TestFailureAttributionOptions { Enabled = true });
+        var auditor = CSharpTestPassAuditor(options);
+        var output = """
+              Failed JobTrack.Tests.Unit.InvoiceTests.CalculatesTotals [12 ms]
+              Error Message:
+               Assert.Equal() Failure: Values differ
+               Expected: 1
+               Actual:   2
+              Stack Trace:
+                 at JobTrack.Tests.Unit.InvoiceTests.CalculatesTotals() in /work/tests/InvoiceTests.cs:line 42
+
+            Failed!  - Failed: 1, Passed: 98, Skipped: 0, Total: 99, Duration: 4 s
+            """;
+        var filteredDotnetInvocations = new List<IReadOnlyList<string>>();
+        var sandbox = new FakeSandbox(exec =>
+        {
+            if (IsToolProbe(exec))
+                return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
+
+            if (exec.Argv.Count >= 2 && exec.Argv[0] == "dotnet" && exec.Argv[1] == "test")
+            {
+                if (exec.Argv.Contains("--filter"))
+                {
+                    filteredDotnetInvocations.Add(exec.Argv.ToArray());
+                    return new SandboxExecResult(0, "Passed!\n", "");
+                }
+
+                return new SandboxExecResult(1, output, "");
+            }
+
+            return GitAttributionSetupResult(exec);
+        });
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.False(result.Passed);
+        var attribution = Assert.Single(result.TestFailureAttributions);
+        Assert.Equal("JobTrack.Tests.Unit.InvoiceTests.CalculatesTotals", attribution.TestName);
+        Assert.Equal(TestFailureRunOutcome.Passed, attribution.BaseRun);
+        Assert.Equal(TestFailureRunOutcome.Failed, attribution.DiffRun);
+        Assert.Equal(TestFailureAttribution.DiffAttributable, attribution.Attribution);
+        var filtered = Assert.Single(filteredDotnetInvocations);
+        Assert.Contains("--filter", filtered);
+        Assert.Contains("FullyQualifiedName=JobTrack.Tests.Unit.InvoiceTests.CalculatesTotals", filtered);
+        Assert.DoesNotContain("--no-build", filtered);
+    }
+
+    [Fact]
+    public async Task CSharpTestPass_AttributionEnabled_BaseRerunUnavailable_FailsClosedToDiffAttributable()
+    {
+        var options = new TestFailureAttributionOptionsSnapshot(new TestFailureAttributionOptions { Enabled = true });
+        var auditor = CSharpTestPassAuditor(options);
+        var output = """
+              Failed JobTrack.Tests.Unit.InvoiceTests.CalculatesTotals [12 ms]
+              Error Message:
+               Assert.Equal() Failure: Values differ
+               Expected: 1
+               Actual:   2
+              Stack Trace:
+                 at JobTrack.Tests.Unit.InvoiceTests.CalculatesTotals() in /work/tests/InvoiceTests.cs:line 42
+
+            Failed!  - Failed: 1, Passed: 98, Skipped: 0, Total: 99, Duration: 4 s
+            """;
+        var sandbox = new FakeSandbox(exec =>
+        {
+            if (IsToolProbe(exec))
+                return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
+
+            if (exec.Argv.Count >= 2 && exec.Argv[0] == "dotnet" && exec.Argv[1] == "test")
+                return new SandboxExecResult(1, output, "");
+
+            if (exec.Argv.Count >= 3 && exec.Argv[0] == "git" && exec.Argv[1] == "rev-parse" && exec.Argv[2] == "--show-toplevel")
+                return new SandboxExecResult(128, "", "fatal: not a git repository");
+
+            return new SandboxExecResult(0, "", "");
+        });
+
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        var attribution = Assert.Single(result.TestFailureAttributions);
+        Assert.Equal(TestFailureAttribution.DiffAttributable, attribution.Attribution);
+        Assert.Equal(TestFailureRunOutcome.Unavailable, attribution.BaseRun);
+        Assert.Equal(TestFailureRunOutcome.Failed, attribution.DiffRun);
+        Assert.Equal(TestFailureAttributionSkipReason.BaseRerunUnavailable, attribution.SkipReason);
+    }
+
+    [Fact]
     public async Task CSharpTestPass_AllUnrunnableFastFailuresProducesNoErrorFindings()
     {
         var auditor = CSharpTestPassAuditor();
@@ -1051,6 +1140,7 @@ public sealed class AuditTests
         Assert.Equal<string[]>(["dotnet", "test", "--no-build"], [.. auditor.Argv]);
     }
 
+
     [Fact]
     public void DotnetTestAuditor_BlameHangTimeout_AppendsBlameHangArgs()
     {
@@ -1201,11 +1291,13 @@ public sealed class AuditTests
         Assert.Equal(BuildTestGateEvidence.None, auditor.BuildTestGateEvidence);
     }
 
-    private static DotnetTestAuditor CSharpTestPassAuditor() =>
+    private static DotnetTestAuditor CSharpTestPassAuditor(
+        TestFailureAttributionOptionsSnapshot? testFailureAttributionOptions = null) =>
         new(new DotnetTestAuditorOptions
         {
             Name = "csharp:test-pass",
             BaseArgv = ["dotnet", "test", "--no-build"],
+            TestFailureAttributionOptions = testFailureAttributionOptions,
         });
 
     private static AuditContext FakeContext() =>
@@ -1225,6 +1317,27 @@ public sealed class AuditTests
         // The NuGet-home self-heal wrapper is also `sh -c <script> sh <cmd...>`;
         // it is the real command, not a marker probe.
         !exec.Argv[2].Contains("nuget_home_broken", StringComparison.Ordinal);
+
+    private static SandboxExecResult GitAttributionSetupResult(SandboxExec exec)
+    {
+        if (exec.Argv.Count >= 3 && exec.Argv[0] == "git" && exec.Argv[1] == "rev-parse")
+        {
+            if (exec.Argv[2] == "--show-toplevel")
+                return new SandboxExecResult(0, "/work\n", "");
+            if (exec.Argv[2] == "--show-prefix")
+                return new SandboxExecResult(0, "", "");
+            if (exec.Argv[2] == "--verify")
+                return new SandboxExecResult(0, "base-sha\n", "");
+        }
+
+        if (exec.Argv.Count >= 2 && exec.Argv[0] == "git" && exec.Argv[1] == "merge-base")
+            return new SandboxExecResult(0, "base-sha\n", "");
+
+        if (exec.Argv.Count >= 3 && exec.Argv[0] == "git" && exec.Argv[1] == "worktree")
+            return new SandboxExecResult(0, "", "");
+
+        return new SandboxExecResult(0, "", "");
+    }
 
     private static string BuildRepeatedDotnetFailureOutput(int count)
     {

@@ -1390,6 +1390,32 @@ public static class AuditLog
             .Information("Configuration reloaded: block={Block} oldValue={OldValue} newValue={NewValue}",
                 block, oldValue, newValue);
 
+    // ── Test failure attribution ────────────────────────────────────────────
+
+    public static void TestFailureAttributionSkipped(
+        WorkItemId workItemId,
+        string auditorName,
+        string reason,
+        int testCount) =>
+        Audit("test_failure_attribution_skipped")
+            .Warning(
+                "Test failure attribution skipped for work item {WorkItemId} auditor={AuditorName} tests={TestCount}: {Reason}",
+                workItemId.ToString(),
+                auditorName,
+                testCount,
+                reason);
+
+    public static void TestFailureAttributionPartial(
+        WorkItemId workItemId,
+        string auditorName,
+        string reason) =>
+        Audit("test_failure_attribution_partial")
+            .Warning(
+                "Test failure attribution partially completed for work item {WorkItemId} auditor={AuditorName}: {Reason}",
+                workItemId.ToString(),
+                auditorName,
+                reason);
+
     // ── Transcript sanitisation ──────────────────────────────────────────────
 
     /// <summary>

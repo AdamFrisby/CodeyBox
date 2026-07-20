@@ -121,6 +121,12 @@ Hot-reloadable today:
   stopping the process, and that shutdown uses the updated mode.
 - `Smoke.Enabled` — hot-reloaded through `SmokeOptionsSnapshot`; disables the
   pickup credential gate, router smoke exclusions, and in-VM smoke gate.
+- `TestFailureAttribution.Enabled` — hot-reloaded through
+  `TestFailureAttributionOptionsSnapshot`; when enabled, parsed `dotnet test`
+  failures are rerun against the merge-base/base checkout in the same sandbox
+  and reported as diff-attributable only when base passes and the diff fails.
+  When disabled, or when the base rerun is unavailable, attribution fails
+  closed to diff-attributable and logs the skip reason.
 - `TransitionHealth.{Enabled,WindowHours,MaxTransitions}` — hot-reloaded through
   `TransitionHealthOptionsSnapshot`; controls the `/fleet/transition-health`
   endpoint's rolling window and "last N transitions" cap.
