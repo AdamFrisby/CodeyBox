@@ -37,12 +37,12 @@ public sealed class GraphicalSmokeWiringTests
         // auditors are appended after preset auditors (all auto-included when
         // registered), then the config-enabled-by-default plan-adherence
         // reviewer and the plan-audit chain (TEST 01, TEST 02, TEST 03, TEST 04,
-        // TEST 05, TEST 06, TEST 07, TEST 08, then TEST 09) auditors are appended last,
+        // TEST 05, TEST 06, TEST 07, TEST 08, TEST 09, then TEST 10) auditors are appended last,
         // in chain order. With no language/auditType presets this project ends up with all
-        // fourteen registered always-on auditors composed. (The plan-audit auditors are
+        // fifteen registered always-on auditors composed. (The plan-audit auditors are
         // Plan-target only, so ComposeForTarget(Code) filters them out; the
         // untargeted Compose here returns the full set.)
-        Assert.Equal(14, composed.Count);
+        Assert.Equal(15, composed.Count);
         Assert.IsType<GraphicalSmokeAuditor>(composed[0]);
         Assert.IsType<PromptRevisionTrailerAuditor>(composed[1]);
         Assert.IsType<BuildScriptAuditor>(composed[2]);
@@ -66,6 +66,8 @@ public sealed class GraphicalSmokeWiringTests
             CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test08AuditorName, composed[12].Name);
         Assert.Equal(
             CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test09AuditorName, composed[13].Name);
+        Assert.Equal(
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test10AuditorName, composed[14].Name);
     }
 
     [Fact]
@@ -88,7 +90,7 @@ public sealed class GraphicalSmokeWiringTests
 
         var composed = composer.Compose(project, new ScriptedAgent([]));
 
-        Assert.Equal(13, composed.Count);
+        Assert.Equal(14, composed.Count);
         Assert.IsType<PromptRevisionTrailerAuditor>(composed[0]);
         Assert.IsType<BuildScriptAuditor>(composed[1]);
         Assert.Equal("tests:mutation-rigor", composed[2].Name);
@@ -111,6 +113,8 @@ public sealed class GraphicalSmokeWiringTests
             CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test08AuditorName, composed[11].Name);
         Assert.Equal(
             CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test09AuditorName, composed[12].Name);
+        Assert.Equal(
+            CodeyBox.Audit.Llm.PlanAudit.PlanAuditTests.Test10AuditorName, composed[13].Name);
         Assert.Contains(composed, a => a.Name == BuildScriptAuditor.AuditorName);
         Assert.DoesNotContain(composed, a => a.Name == "gui:smoke");
     }
