@@ -181,6 +181,7 @@ public sealed class RecoveryCancellationPipelineTests : IDisposable
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var registry = new CancellationRegistry(CancellationToken.None);
         var webhooks = new RecordingWebhookDispatcher();
+        var agent = new BlockingAgentRunner();
         // Inject a one-shot race ONLY when the work item is in Working state
         // (the typical state when the cancel handler runs) and the race has been
         // armed via SetArmed(true). The wrapper returns the pre-race snapshot
@@ -191,7 +192,7 @@ public sealed class RecoveryCancellationPipelineTests : IDisposable
 
         using var harness = BuildPipeline(
             seed,
-            new BlockingAgentRunner(),
+            agent,
             registry,
             webhooks,
             storeDecorator: raceFactory);
@@ -208,6 +209,7 @@ public sealed class RecoveryCancellationPipelineTests : IDisposable
             harness.Pipeline.RunAsync(item, registration.Token, hostShutdownCts.Token));
 
         await WaitForStateAsync(harness.Store, item.Id, WorkItemState.Working, TimeSpan.FromSeconds(30));
+        await agent.Started.Task.WaitAsync(TimeSpan.FromSeconds(30));
 
         // Arm the race: the NEXT GetAsync that returns a Working row (the one
         // inside HandleOperatorCancelAsync) will silently advance the persisted
@@ -247,11 +249,12 @@ public sealed class RecoveryCancellationPipelineTests : IDisposable
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var registry = new CancellationRegistry(CancellationToken.None);
         var webhooks = new RecordingWebhookDispatcher();
+        var agent = new BlockingAgentRunner();
         var raceFactory = (SqliteWorkItemStore inner) => new RaceAdvancingStore(inner);
 
         using var harness = BuildPipeline(
             seed,
-            new BlockingAgentRunner(),
+            agent,
             registry,
             webhooks,
             storeDecorator: raceFactory);
@@ -268,6 +271,7 @@ public sealed class RecoveryCancellationPipelineTests : IDisposable
             harness.Pipeline.RunAsync(item, registration.Token, hostShutdownCts.Token));
 
         await WaitForStateAsync(harness.Store, item.Id, WorkItemState.Working, TimeSpan.FromSeconds(30));
+        await agent.Started.Task.WaitAsync(TimeSpan.FromSeconds(30));
 
         raceStore.ArmRace();
         var staleSnapshot = await raceStore.GetAsync(item.Id);
@@ -544,6 +548,8 @@ internal sealed class RaceAdvancingStore : IWorkItemStore
     public Task UpdateAsync(WorkItem item, CancellationToken ct = default) => _inner.UpdateAsync(item, ct);
     public Task<bool> TryUpdateIfStateAsync(WorkItem item, WorkItemState onlyIfState, CancellationToken ct = default) =>
         _inner.TryUpdateIfStateAsync(item, onlyIfState, ct);
+    public Task<bool> TryUpdateIfStateAndUpdatedAtAsync(WorkItem item, WorkItemState onlyIfState, DateTimeOffset onlyIfUpdatedAt, CancellationToken ct = default) =>
+        _inner.TryUpdateIfStateAndUpdatedAtAsync(item, onlyIfState, onlyIfUpdatedAt, ct);
     public Task<PriorityUpdateResult> UpdatePriorityAsync(WorkItemId id, int priority, DateTimeOffset updatedAt, CancellationToken ct = default) =>
         _inner.UpdatePriorityAsync(id, priority, updatedAt, ct);
     public Task<DependsOnUpdateResult> UpdateDependsOnAsync(WorkItemId id, IReadOnlyList<WorkItemId> dependsOn, DateTimeOffset updatedAt, CancellationToken ct = default) =>

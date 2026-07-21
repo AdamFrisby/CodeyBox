@@ -18200,18 +18200,19 @@ public sealed partial class PipelineRunner : IPipelineRunner
     /// <summary>
     /// Persists <paramref name="agentLogPath"/> on <paramref name="id"/> BEFORE
     /// the agent runs so a SIGTERM mid-invocation lets the shutdown teardown
-    /// handler read the path out of the store. Re-reads the latest row so we
-    /// do not regress a concurrent update from another worker thread on the
-    /// same item (priority bump, prompt edit, etc).
+    /// handler read the path out of the store. The write is guarded by the
+    /// state and update stamp from the row read here so it cannot restore a
+    /// stale lifecycle snapshot over concurrent recovery or cancellation.
     /// </summary>
     private Task PersistAgentLogPathAsync(WorkItemId id, string agentLogPath, CancellationToken ct) =>
         PersistAgentLogPathAsync(_store, _log, id, agentLogPath, ct);
 
     /// <summary>
     /// Static testable core of <see cref="PersistAgentLogPathAsync(WorkItemId,string,CancellationToken)"/>.
-    /// Returns true when a write was issued, false when short-circuited (item
-    /// missing, path already matches) or swallowed (store exception). Cancellation
-    /// is propagated; every other exception is logged at warning and absorbed.
+    /// Returns true when the guarded write succeeds, false when short-circuited
+    /// (item missing, path already matches), the row changes concurrently, or a
+    /// store exception is swallowed. Cancellation is propagated; every other
+    /// exception is logged at warning and absorbed.
     /// </summary>
     internal static async Task<bool> PersistAgentLogPathAsync(
         IWorkItemStore store,
@@ -18226,12 +18227,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
             if (fresh is null) return false;
             if (string.Equals(fresh.AgentLogPath, agentLogPath, StringComparison.Ordinal))
                 return false;
-            await store.UpdateAsync(fresh with
+            return await store.TryUpdateIfStateAndUpdatedAtAsync(fresh with
             {
                 AgentLogPath = agentLogPath,
                 UpdatedAt = DateTimeOffset.UtcNow,
-            }, ct);
-            return true;
+            }, fresh.State, fresh.UpdatedAt, ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

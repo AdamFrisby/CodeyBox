@@ -127,6 +127,26 @@ public sealed class AgentLogPathHelpersTests : IDisposable
     }
 
     [Fact]
+    public async Task Persist_DoesNotRestoreStaleStateOverConcurrentRecovery()
+    {
+        var item = MakeItem();
+        await _store.CreateAsync(item);
+        var racingStore = new RaceAdvancingStore(_store);
+        racingStore.ArmRace();
+
+        var wrote = await PipelineRunner.PersistAgentLogPathAsync(
+            racingStore, NullLogger.Instance, item.Id,
+            "/work/.codeybox/agent-logs/raced.log", CancellationToken.None);
+
+        Assert.False(wrote);
+        Assert.True(racingStore.RaceInjected);
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Null(after.AgentLogPath);
+    }
+
+    [Fact]
     public async Task Persist_ReturnsFalse_WhenItemMissing()
     {
         var wrote = await PipelineRunner.PersistAgentLogPathAsync(
@@ -182,6 +202,8 @@ public sealed class AgentLogPathHelpersTests : IDisposable
                 State = WorkItemState.Working,
             });
         public Task UpdateAsync(WorkItem item, CancellationToken ct = default) =>
+            throw new InvalidOperationException("simulated store hiccup");
+        public Task<bool> TryUpdateIfStateAndUpdatedAtAsync(WorkItem item, WorkItemState onlyIfState, DateTimeOffset onlyIfUpdatedAt, CancellationToken ct = default) =>
             throw new InvalidOperationException("simulated store hiccup");
 
         // ── unused ──
