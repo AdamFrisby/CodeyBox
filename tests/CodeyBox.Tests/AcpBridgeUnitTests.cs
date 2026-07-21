@@ -5069,10 +5069,6 @@ exit 9
             TryLinkOrCopyExecutable(source, dest);
         }
 
-        var file = FindExecutableOnPath("file");
-        if (file is not null)
-            TryLinkOrCopyExecutable(file, Path.Combine(tools, "file"));
-
         return tools;
     }
 
@@ -5088,12 +5084,6 @@ exit 9
 
     private static string RequireExecutableOnPath(string name)
     {
-        return FindExecutableOnPath(name)
-            ?? throw new InvalidOperationException("Required test tool not found on PATH: " + name);
-    }
-
-    private static string? FindExecutableOnPath(string name)
-    {
         var path = Environment.GetEnvironmentVariable("PATH") ?? "";
         foreach (var dir in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
         {
@@ -5101,7 +5091,7 @@ exit 9
             if (File.Exists(candidate))
                 return candidate;
         }
-        return null;
+        throw new InvalidOperationException("Required test tool not found on PATH: " + name);
     }
 
     private static void TryLinkOrCopyExecutable(string source, string dest)

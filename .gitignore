@@ -13,7 +13,6 @@ obj/
 
 # Per-developer dev/test helpers (see local/README.md after creation).
 /local/
-/.dotnet-home/
 
 # Runtime preempt scratchpads emitted by the codeybox agent harness.
 .codeybox/

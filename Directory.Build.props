@@ -9,8 +9,6 @@
        shape; both are wired via InitialTargets. -->
   <Import Project="$(MSBuildThisFileDirectory)Directory.NuGetHomeHeal.targets" />
 
-  <Import Project="$(MSBuildThisFileDirectory)eng/RepositoryBuildEnvironment.props" />
-
   <PropertyGroup>
     <!-- Direct project restores use the repository's declared package sources here.
          Directory.Solution.props supplies the same repository-relative property for
