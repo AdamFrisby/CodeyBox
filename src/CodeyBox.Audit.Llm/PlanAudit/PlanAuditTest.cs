@@ -82,6 +82,9 @@ public static class PlanAuditTests
     /// <summary>Stable name of the TEST 08 auditor (referenced by DI + composition).</summary>
     public const string Test08AuditorName = "plan:observability-operations-repair";
 
+    /// <summary>Stable name of the TEST 09 auditor (referenced by DI + composition).</summary>
+    public const string Test09AuditorName = "plan:delivery-rollout-rollback";
+
     /// <summary>
     /// TEST 01 — PLAN INTEGRITY AND EVIDENCE CLASSIFICATION. Determines whether
     /// the plan is grounded in the actual system rather than hallucinated
@@ -736,10 +739,109 @@ public static class PlanAuditTests
     };
 
     /// <summary>
+    /// TEST 09 — DELIVERY, DEPLOYMENT ORDER, ROLLOUT, FEATURE FLAGS, AND ROLLBACK.
+    /// Determines whether the plan can be safely delivered through a real deployment
+    /// with mixed versions, feature control, and recovery options: the implementation
+    /// is broken into reviewable, independently deployable steps that each compile and
+    /// pass tests; refactors are separated from behavior changes; deployment order is
+    /// explicit; the change is safe while old and new versions run together during the
+    /// rollout; DB / API / event / worker / client changes are sequenced so neither the
+    /// old nor the new version breaks mid-deploy; a production-impacting change has a
+    /// rollout path (staged / gated) rather than assuming an atomic deploy; any feature
+    /// flag has a defined lifecycle (default-state, an owning removal / expiry trigger,
+    /// a both-states test matrix, and a cleanup task); rollback is safe after new code
+    /// has written data, or a forward-fix is defined where rollback would corrupt or
+    /// orphan newly-written data; and old paths, deprecated fields, flags, and shims
+    /// have cleanup tasks. This reviews only whether the plan DECLARES a safe delivery /
+    /// rollout / rollback strategy — actual deployment execution is a code / ops-stage
+    /// concern. This is a GENERAL, project-agnostic gate: the full criteria set is kept
+    /// for every project (per-project relevance is the auditor on/off toggle); a
+    /// specific plan that genuinely does not touch an area — e.g. a single-process app
+    /// with no rolling deploy, no client versioning, and no feature flag — self-skips
+    /// just those criteria as NOT_APPLICABLE with a one-line reason. The human-process
+    /// framing of a feature-flag "owner" is reframed to the autonomous-factory
+    /// equivalent: an owning component or automated expiry / removal trigger, not a
+    /// human owner who must remember to remove the flag.
+    /// </summary>
+    public static PlanAuditTest Test09 { get; } = new()
+    {
+        Id = "09",
+        AuditorName = Test09AuditorName,
+        Title = "DELIVERY, DEPLOYMENT ORDER, ROLLOUT, FEATURE FLAGS, AND ROLLBACK",
+        Objective =
+            "Determine whether the plan can be safely delivered through a real deployment with mixed " +
+            "versions, feature control, and recovery options.",
+        ReviewGuidance = """
+            - Is the implementation broken into reviewable, independently deployable steps, and does each
+              step compile and pass tests on its own rather than only at the end?
+            - Are refactors separated from behavior changes, rather than combining a large refactor and a
+              behavior change in one step?
+            - Is the deployment order explicit (which parts deploy in which order)?
+            - Does the plan handle mixed-version operation — old and new code / data / clients running at
+              the same time during a rolling deploy — rather than assuming an atomic cut-over?
+            - Are DB / API / event / worker / client changes sequenced so that neither the old nor the new
+              version breaks at any point during the deployment?
+            - Is a feature flag needed, and if one is used are its default state, its owning removal /
+              expiry trigger, its cleanup task, and a test matrix covering BOTH flag states all defined?
+            - Is rollback safe after the new code has already written data, or does the plan define a
+              forward-fix where a rollback would corrupt or orphan newly-written data?
+            - Is the rollback-vs-forward-fix decision defined for each production-impacting change?
+            - Are there cleanup tasks for old paths, deprecated fields, feature flags, and compatibility
+              shims, so they are not left dangling?
+            """,
+        PassCriteria =
+            "Delivery is incremental, reviewable, and reversible where practical; deployment order and " +
+            "mixed-version behavior are explicit; a production-impacting change has a realistic rollback " +
+            "or forward-fix path; feature flags have lifecycle management (default state, an owning " +
+            "removal / expiry trigger, a both-states test matrix, and a cleanup task); and old paths / " +
+            "deprecated fields / flags / shims have cleanup tasks.",
+        FailCriteria =
+            "The plan assumes an atomic deployment; combines a large refactor and a behavior change in " +
+            "one step; lacks a rollback or cleanup path; or introduces a permanent feature flag with no " +
+            "owning removal / expiry trigger.",
+        AutomaticBlocker = """
+            Treat as an automatic BLOCKER when the plan:
+            - ships a production-impacting change with no rollout or rollback path (no way to gate,
+              stage, or reverse it); or
+            - makes a schema / API / event / client change that can break old or new versions during
+              deployment (the change is not sequenced for mixed-version operation); or
+            - would have a rollback corrupt or orphan newly-written data with no forward-fix defined.
+            """,
+        RequiredFixes = """
+            - Add an explicit deployment sequence — the order each part (DB / API / event / worker /
+              client) deploys in, split into reviewable, independently deployable steps that each build
+              and pass tests.
+            - Add mixed-version compatibility: sequence schema / API / event / client changes so neither
+              the old nor the new version breaks while both run during the rollout.
+            - Add a rollback or forward-fix path for each production-impacting change — and where a
+              rollback would corrupt or orphan newly-written data, define the forward-fix instead.
+            - Add feature-flag lifecycle management: a default state, a test matrix covering both states,
+              a cleanup task, and an owning removal / expiry trigger that is
+              an automated condition, not a human who must remember to remove the flag.
+            - Split refactors from behavior changes into separate steps, and add cleanup tasks for old
+              paths, deprecated fields, flags, and compatibility shims.
+            """,
+        Criteria =
+        [
+            "incremental-delivery",          // broken into reviewable, independently deployable steps
+            "step-buildability",             // each step compiles and passes tests on its own
+            "refactor-behavior-separation",  // refactors separated from behavior changes (not one bundled step)
+            "deployment-order",              // explicit order the parts deploy in
+            "change-sequencing",             // DB/API/event/worker/client changes sequenced so neither version breaks
+            "mixed-version-compatibility",   // safe while old+new code/data/clients run together during rollout
+            "rollout-strategy",              // production-impacting change has a rollout path, not an atomic-deploy assumption
+            "feature-flag-lifecycle",        // flag default-state / owning-removal-or-expiry-trigger / both-states test matrix / cleanup
+            "rollback-safety",               // rollback safe after new code writes data (no corrupt/orphan)
+            "rollback-vs-forward-fix",       // rollback-vs-forward-fix decision defined where rollback is unsafe
+            "cleanup-tasks",                 // cleanup for old paths / deprecated fields / flags / shims
+        ],
+    };
+
+    /// <summary>
     /// Every built-in plan-audit chain test, in chain order. The DI registration
     /// and <c>ProjectAuditorComposer</c> auto-inclusion both iterate this list,
     /// so adding a chain test here wires it everywhere without touching either
     /// call site (one source of truth for the chain membership).
     /// </summary>
-    public static IReadOnlyList<PlanAuditTest> All { get; } = [Test01, Test02, Test03, Test04, Test05, Test06, Test07, Test08];
+    public static IReadOnlyList<PlanAuditTest> All { get; } = [Test01, Test02, Test03, Test04, Test05, Test06, Test07, Test08, Test09];
 }
