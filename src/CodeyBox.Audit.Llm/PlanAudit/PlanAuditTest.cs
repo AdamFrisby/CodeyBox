@@ -79,6 +79,9 @@ public static class PlanAuditTests
     /// <summary>Stable name of the TEST 07 auditor (referenced by DI + composition).</summary>
     public const string Test07AuditorName = "plan:test-strategy-evidence";
 
+    /// <summary>Stable name of the TEST 08 auditor (referenced by DI + composition).</summary>
+    public const string Test08AuditorName = "plan:observability-operations-repair";
+
     /// <summary>
     /// TEST 01 — PLAN INTEGRITY AND EVIDENCE CLASSIFICATION. Determines whether
     /// the plan is grounded in the actual system rather than hallucinated
@@ -633,10 +636,110 @@ public static class PlanAuditTests
     };
 
     /// <summary>
+    /// TEST 08 — OBSERVABILITY, OPERATIONS, DEBUGGABILITY, AND REPAIRABILITY.
+    /// Verifies the plan makes production behavior observable, diagnosable,
+    /// supportable, and repairable without ad-hoc heroics: logs added / changed are
+    /// structured, tied to the changed behavior, and free of sensitive-data leakage;
+    /// success / failure / latency / throughput / retries / queue-depth / error-rate
+    /// have metrics where the change affects them; traces or correlation IDs follow a
+    /// request / job across services, jobs, and external calls; the critical failure
+    /// modes have alerts; support / operators can inspect stuck / failed / in-flight
+    /// state without manual database spelunking and can safely retry / cancel /
+    /// repair / reconcile a workflow that sticks or partially fails; security / admin /
+    /// data-sensitive actions emit audit events; migration / backfill progress and
+    /// correctness are verifiable; no critical failure path is silent; and the recovery
+    /// steps for common failures are discoverable and automated or operator-facing.
+    /// This reviews only whether the plan DECLARES adequate observability and
+    /// operability — actual log / metric emission is a code-stage concern. This is a
+    /// GENERAL, project-agnostic gate: the full criteria set is kept for every project
+    /// (per-project relevance is the auditor on/off toggle); a specific plan that
+    /// genuinely does not touch an area self-skips just those criteria as
+    /// NOT_APPLICABLE with a one-line reason. The human-process framing of a "runbook"
+    /// is reframed to the autonomous-factory equivalent: discoverable, self-documenting
+    /// recovery that is automated or operator-facing, never reliant on a human
+    /// remembering tribal knowledge.
+    /// </summary>
+    public static PlanAuditTest Test08 { get; } = new()
+    {
+        Id = "08",
+        AuditorName = Test08AuditorName,
+        Title = "OBSERVABILITY, OPERATIONS, DEBUGGABILITY, AND REPAIRABILITY",
+        Objective =
+            "Verify production behavior can be observed, diagnosed, supported, and repaired without " +
+            "ad hoc heroics.",
+        ReviewGuidance = """
+            - What logs are added or changed — are they structured (queryable, not free-text), tied to
+              the changed behavior, and safe from sensitive-data leakage?
+            - Are there metrics for success / failure / latency / throughput / retries / queue-depth /
+              error-rate where this change introduces or affects them?
+            - Are there traces or correlation IDs that follow a request / job across services, jobs, and
+              external calls?
+            - Are there alerts for the critical failure modes this change introduces?
+            - Can support / operators inspect stuck, failed, or in-flight state without manual database
+              spelunking?
+            - Can operators safely retry, cancel, repair, or reconcile a workflow that sticks or
+              partially fails?
+            - Are there audit events for security-relevant, admin, and data-sensitive actions?
+            - If the change includes a migration / backfill, how is its progress and correctness verified?
+            - What does failure look like in production — is every critical failure path observable rather
+              than silent?
+            - Are the recovery steps for common failures discoverable and automated or operator-facing,
+              rather than tribal knowledge a human must remember?
+            """,
+        PassCriteria =
+            "Observability signals (structured logs, metrics, traces / correlation IDs, alerts) are tied " +
+            "to the changed behavior and its failure modes; workflows that can stick or partially fail " +
+            "have an operator inspect + retry / cancel / repair / reconcile path; audit events cover " +
+            "security / admin / data-sensitive actions; and logs and diagnostics are useful and " +
+            "privacy-safe.",
+        FailCriteria =
+            "There is no way to know whether the change works in production; debugging a failure requires " +
+            "manual database spelunking; security- or billing-relevant actions lack auditability; there " +
+            "is no repair path for partial failure; or sensitive data would be logged or exposed through " +
+            "diagnostics.",
+        AutomaticBlocker = """
+            Treat as an automatic BLOCKER when the plan:
+            - lets a critical workflow fail silently (a failure path with no log, metric, alert, or other
+              signal that would reveal it in production); or
+            - leaves operators unable to detect or repair stuck / partially-applied / provisioning /
+              user-impacting state (no way to inspect it and no safe retry / cancel / reconcile / repair
+              path); or
+            - would log or expose sensitive data through diagnostics (secrets or unredacted sensitive data
+              in logs, traces, error responses, or debug endpoints).
+            """,
+        RequiredFixes = """
+            - Add structured logs, metrics, and traces / correlation IDs tied to the changed behavior and
+              its failure modes (success / failure / latency / throughput / retries / queue-depth /
+              error-rate), plus alerts for the critical failure modes.
+            - Add audit events for security-relevant, admin, and data-sensitive actions.
+            - Add an admin / operator repair path to inspect and safely retry / cancel / reconcile stuck
+              or partially-applied state.
+            - Define discoverable recovery steps for common failures — self-documenting and automated or
+              operator-facing detection + recovery, not reliant on a human remembering a runbook.
+            - Make migration / backfill progress and correctness verifiable, and ensure no failure path is
+              silent or leaks sensitive data through diagnostics.
+            """,
+        Criteria =
+        [
+            "structured-logs",            // logs added/changed are structured, queryable, tied to changed behavior
+            "diagnostic-privacy-safety",  // logs/traces/error-responses/debug endpoints never leak secrets/sensitive data
+            "metrics",                    // success/failure/latency/throughput/retries/queue-depth/error-rate metrics
+            "tracing-correlation",        // traces or correlation IDs across services/jobs/external calls
+            "alerting",                   // alerts for the critical failure modes the change introduces
+            "state-inspection",           // support/operators can inspect stuck/failed/in-flight state (no db spelunking)
+            "repair-reconcile",           // safe operator retry/cancel/repair/reconcile for stuck/partial state
+            "audit-events",               // audit events for security/admin/data-sensitive actions
+            "migration-observability",    // migration/backfill progress + correctness are verifiable
+            "silent-failure-visibility",  // no critical failure path is silent; failure is observable in production
+            "recovery-procedure",         // discoverable, automated-or-operator-facing recovery for common failures
+        ],
+    };
+
+    /// <summary>
     /// Every built-in plan-audit chain test, in chain order. The DI registration
     /// and <c>ProjectAuditorComposer</c> auto-inclusion both iterate this list,
     /// so adding a chain test here wires it everywhere without touching either
     /// call site (one source of truth for the chain membership).
     /// </summary>
-    public static IReadOnlyList<PlanAuditTest> All { get; } = [Test01, Test02, Test03, Test04, Test05, Test06, Test07];
+    public static IReadOnlyList<PlanAuditTest> All { get; } = [Test01, Test02, Test03, Test04, Test05, Test06, Test07, Test08];
 }
