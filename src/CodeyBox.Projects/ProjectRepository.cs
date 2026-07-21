@@ -343,6 +343,74 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             },
             Knobs = ResolveKnobs(pc.Id, pc.Knobs, defaults.Knobs),
             Deployment = ResolveDeployment(pc.Id, pc.Deployment),
+            JobTrackExport = ResolveJobTrackExport(pc.Id, pc.JobTrackExport),
+        };
+    }
+
+    /// <summary>
+    /// Binds and validates the per-project JobTrack export config. When the
+    /// project opts in (<c>Enabled=true</c>) the base URL must be an absolute
+    /// http(s) URL and the external-id namespace must be a valid namespace key;
+    /// invalid config fails config load/reload here rather than silently
+    /// producing a broken exporter at pipeline time. Disabled or absent config
+    /// resolves to the disabled sentinel with no validation.
+    /// </summary>
+    private static ProjectJobTrackExport ResolveJobTrackExport(string projectId, ProjectJobTrackExportConfig? c)
+    {
+        if (c is null)
+            return ProjectJobTrackExport.Disabled;
+
+        var enabled = c.Enabled ?? false;
+        var baseUrl = c.BaseUrl?.Trim() ?? string.Empty;
+        var importPath = string.IsNullOrWhiteSpace(c.ImportPath)
+            ? ProjectJobTrackExport.DefaultImportPath
+            : c.ImportPath.Trim();
+        var externalIdNamespace = string.IsNullOrWhiteSpace(c.ExternalIdNamespace)
+            ? ProjectJobTrackExport.DefaultExternalIdNamespace
+            : c.ExternalIdNamespace.Trim();
+        var maxAttempts = c.MaxAttempts ?? ProjectJobTrackExport.DefaultMaxAttempts;
+        var retryBaseDelayMs = c.RetryBaseDelayMs ?? 250;
+
+        if (maxAttempts < 1)
+            throw new InvalidOperationException(
+                $"Project '{projectId}' JobTrackExport.MaxAttempts must be >= 1 (got {maxAttempts})");
+        if (retryBaseDelayMs < 0)
+            throw new InvalidOperationException(
+                $"Project '{projectId}' JobTrackExport.RetryBaseDelayMs must be >= 0 (got {retryBaseDelayMs})");
+
+        if (enabled)
+        {
+            if (string.IsNullOrWhiteSpace(baseUrl))
+                throw new InvalidOperationException(
+                    $"Project '{projectId}' JobTrackExport.Enabled=true requires a BaseUrl");
+            if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri)
+                || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+                throw new InvalidOperationException(
+                    $"Project '{projectId}' JobTrackExport.BaseUrl '{baseUrl}' must be an absolute http(s) URL");
+            try
+            {
+                Validation.ValidateExternalIdNamespace(
+                    externalIdNamespace, $"projects[{projectId}].JobTrackExport.ExternalIdNamespace");
+            }
+            catch (ArgumentException ex)
+            {
+                // Surface as a config-load failure (like the other checks here),
+                // preserving the validator's precise message as the cause.
+                throw new InvalidOperationException(
+                    $"Project '{projectId}' JobTrackExport.ExternalIdNamespace is invalid: {ex.Message}", ex);
+            }
+        }
+
+        return new ProjectJobTrackExport
+        {
+            Enabled = enabled,
+            BaseUrl = baseUrl,
+            ImportPath = importPath,
+            TokenEnvVar = string.IsNullOrWhiteSpace(c.TokenEnvVar) ? null : c.TokenEnvVar.Trim(),
+            ExternalIdNamespace = externalIdNamespace,
+            DefaultSurfaceArea = string.IsNullOrWhiteSpace(c.DefaultSurfaceArea) ? null : c.DefaultSurfaceArea.Trim(),
+            MaxAttempts = maxAttempts,
+            RetryBaseDelay = TimeSpan.FromMilliseconds(retryBaseDelayMs),
         };
     }
 

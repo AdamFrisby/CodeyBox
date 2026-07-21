@@ -218,6 +218,86 @@ public sealed record Project
     /// the deployment phase in that case.
     /// </summary>
     public DeploymentRecipe? Deployment { get; init; }
+
+    /// <summary>
+    /// Per-project JobTrack test-case export configuration. Disabled by default:
+    /// only projects that explicitly opt in propagate their CodeyBox test cases
+    /// to JobTrack. See <see cref="ProjectJobTrackExport"/> and
+    /// <c>docs/test-cases.md</c>.
+    /// </summary>
+    public ProjectJobTrackExport JobTrackExport { get; init; } = ProjectJobTrackExport.Disabled;
+}
+
+/// <summary>
+/// Per-project opt-in for exporting CodeyBox test cases to JobTrack's test-case
+/// store. Disabled by default; a project participates only after an operator sets
+/// <see cref="Enabled"/> and a valid <see cref="BaseUrl"/>. Export is best-effort
+/// and idempotent — see <see cref="IJobTrackTestCaseExporter"/>.
+/// </summary>
+public sealed record ProjectJobTrackExport
+{
+    /// <summary>The disabled sentinel used when a project supplies no JobTrack config.</summary>
+    public static ProjectJobTrackExport Disabled { get; } = new();
+
+    /// <summary>Default import endpoint path, relative to <see cref="BaseUrl"/>.</summary>
+    public const string DefaultImportPath = "/api/test-cases/import";
+
+    /// <summary>Default external-id namespace holding the work item's JobTrack task id.</summary>
+    public const string DefaultExternalIdNamespace = "jobtrack";
+
+    /// <summary>Default cap on upsert attempts per test case (initial try + retries).</summary>
+    public const int DefaultMaxAttempts = 3;
+
+    /// <summary>
+    /// When true, the project's test cases are exported to JobTrack. Default
+    /// false — the project sees zero export behaviour until it opts in.
+    /// </summary>
+    public bool Enabled { get; init; }
+
+    /// <summary>
+    /// Absolute http(s) base URL of the JobTrack instance. Required (and validated
+    /// at config-load time) when <see cref="Enabled"/> is true.
+    /// </summary>
+    public string BaseUrl { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Import endpoint path appended to <see cref="BaseUrl"/>. Config knob rather
+    /// than a hardcoded literal so a JobTrack deployment can relocate the route.
+    /// </summary>
+    public string ImportPath { get; init; } = DefaultImportPath;
+
+    /// <summary>
+    /// Name of the env var holding the JobTrack API bearer token. Null means the
+    /// JobTrack instance accepts unauthenticated imports. Only the env var NAME is
+    /// stored; the token value is read at export time and never persisted.
+    /// </summary>
+    public string? TokenEnvVar { get; init; }
+
+    /// <summary>
+    /// External-id namespace (on the work item's <see cref="WorkItem.ExternalIds"/>)
+    /// whose value is the owning JobTrack task id used as the case's
+    /// <c>SourceTaskId</c>. Defaults to <see cref="DefaultExternalIdNamespace"/>.
+    /// </summary>
+    public string ExternalIdNamespace { get; init; } = DefaultExternalIdNamespace;
+
+    /// <summary>
+    /// Optional default SurfaceArea placement assigned on the JobTrack side. Null
+    /// lets JobTrack apply its own default (CodeyBox does not model SurfaceArea).
+    /// </summary>
+    public string? DefaultSurfaceArea { get; init; }
+
+    /// <summary>
+    /// Maximum upsert attempts per test case before it is counted as failed
+    /// (best-effort). Minimum 1; defaults to <see cref="DefaultMaxAttempts"/>.
+    /// Upserts are idempotent, so retrying is safe.
+    /// </summary>
+    public int MaxAttempts { get; init; } = DefaultMaxAttempts;
+
+    /// <summary>
+    /// Base back-off delay between retries; the nth retry waits
+    /// <c>n × RetryBaseDelay</c>. Zero disables the delay (used in tests).
+    /// </summary>
+    public TimeSpan RetryBaseDelay { get; init; } = TimeSpan.FromMilliseconds(250);
 }
 
 /// <summary>
