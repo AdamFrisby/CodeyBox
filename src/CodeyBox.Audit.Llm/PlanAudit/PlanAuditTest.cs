@@ -85,6 +85,9 @@ public static class PlanAuditTests
     /// <summary>Stable name of the TEST 09 auditor (referenced by DI + composition).</summary>
     public const string Test09AuditorName = "plan:delivery-rollout-rollback";
 
+    /// <summary>Stable name of the TEST 10 auditor (referenced by DI + composition).</summary>
+    public const string Test10AuditorName = "plan:decision-quality-maintainability";
+
     /// <summary>
     /// TEST 01 — PLAN INTEGRITY AND EVIDENCE CLASSIFICATION. Determines whether
     /// the plan is grounded in the actual system rather than hallucinated
@@ -838,10 +841,117 @@ public static class PlanAuditTests
     };
 
     /// <summary>
+    /// TEST 10 — DECISION QUALITY, TRADE-OFFS, OWNERSHIP, AND MAINTAINABILITY.
+    /// Assesses whether the plan makes mature design decisions the next agent can
+    /// understand and maintain: significant architectural choices are recorded
+    /// ADR-style (context, decision, rationale); alternatives — including the
+    /// simplest viable option — are considered with their rejection reasons;
+    /// trade-offs, consequences, and reversibility (reversible vs one-way) are
+    /// explicit; the chosen design is justified against THIS codebase's own
+    /// conventions and constraints rather than fashion; new
+    /// modules / APIs / jobs / dependencies / flags / alerts / recovery procedures
+    /// carry a defined lifecycle and cleanup that is self-documenting and
+    /// discoverable for the next agent; existing naming / error-handling /
+    /// validation / dependency / folder conventions are preserved; the change adds
+    /// no second way to do something the codebase already does one way; the
+    /// documentation updates it requires are named; any temporary compatibility
+    /// code has a cleanup path and a removal trigger; and it avoids speculative
+    /// machinery not justified by a current requirement. This is a GENERAL,
+    /// project-agnostic gate: the full criteria set is kept for every project
+    /// (per-project relevance is the auditor on/off toggle); a specific plan that
+    /// genuinely does not touch an area self-skips just those criteria as
+    /// NOT_APPLICABLE with a one-line reason. The human-process framing of
+    /// "ownership" is reframed to the autonomous-factory equivalent: there is no
+    /// human to assign as an owner, so an "owned" module is one with a defined
+    /// lifecycle and cleanup whose state is discoverable by the next agent — not a
+    /// human owner who must remember to maintain or remove it.
+    /// </summary>
+    public static PlanAuditTest Test10 { get; } = new()
+    {
+        Id = "10",
+        AuditorName = Test10AuditorName,
+        Title = "DECISION QUALITY, TRADE-OFFS, OWNERSHIP, AND MAINTAINABILITY",
+        Objective =
+            "Assess whether the plan makes mature design decisions future maintainers can understand " +
+            "and own.",
+        ReviewGuidance = """
+            - Does the plan record its meaningful architectural decisions ADR-style — the context, the
+              decision, and the rationale — rather than jumping to an approach with no stated reasoning?
+            - Are alternatives considered, INCLUDING the simplest viable option, each with the reason it
+              was rejected?
+            - Are the trade-offs and consequences of the chosen design made explicit?
+            - Does the plan explain why the chosen design fits THIS codebase (its existing patterns,
+              constraints, and conventions) rather than being justified by fashion or generic best practice?
+            - Are the decisions reversible or one-way, and are the one-way / hard-to-reverse choices called
+              out as such?
+            - Do new modules / APIs / jobs / dependencies / flags / dashboards / alerts / recovery
+              procedures have a defined LIFECYCLE and cleanup — self-documenting and discoverable for the
+              next agent — rather than being left dangling with no owner and no removal path?
+            - Does the plan preserve the existing naming, error-handling, validation, dependency, and
+              folder / module conventions?
+            - Does it avoid introducing a SECOND way to do something the codebase already does one way (a
+              parallel / duplicate mechanism, config system, or abstraction)?
+            - Are the documentation updates the change requires named where they are needed?
+            - Does any temporary compatibility code (shim, adapter, dual-write, flag) have a defined
+              cleanup path and a concrete removal trigger?
+            - Does the plan avoid speculative machinery — abstraction, configurability, indirection, or
+              infrastructure not justified by a CURRENT requirement?
+            """,
+        PassCriteria =
+            "Important choices have rationale, alternatives (including the simplest viable option), " +
+            "trade-offs, consequences, and reversibility; the design is justified against this codebase's " +
+            "existing conventions and introduces no second way to do the same thing; new " +
+            "modules / dependencies / jobs / flags and any temporary compatibility code have a defined " +
+            "lifecycle and cleanup discoverable by the next agent; needed documentation updates are named; " +
+            "and a future maintainer can understand why the design exists.",
+        FailCriteria =
+            "The plan chooses a technology or pattern with no rationale; ignores existing conventions; " +
+            "adds an unowned module / dependency / job / flag with no defined lifecycle or cleanup; " +
+            "introduces a second way to do the same thing; adds speculative machinery no current " +
+            "requirement justifies; or leaves temporary compatibility code with no cleanup plan.",
+        AutomaticBlocker = """
+            Treat as an automatic BLOCKER when the plan:
+            - introduces major architectural complexity (a new module, service, dependency, framework, or
+              cross-cutting pattern) WITHOUT considering alternatives — including the simplest viable
+              option — or analyzing the trade-offs; or
+            - adds a new production-critical module, job, dependency, or process with NO defined lifecycle
+              or cleanup — nothing that states how it is maintained, superseded, or removed, and no
+              discoverable state for the next agent (there is no human owner to fall back on).
+            """,
+        RequiredFixes = """
+            - Add ADR-style decision notes for each significant choice: the context, the decision, and the
+              rationale for why it fits THIS codebase's conventions and constraints.
+            - Add the alternatives considered — including the simplest viable option — with the reason each
+              was rejected, plus the trade-offs, consequences, and whether the choice is reversible or one-way.
+            - Add a defined lifecycle and cleanup for every new module / API / job / dependency / flag /
+              alert / recovery procedure — self-documenting and discoverable for the next agent, not a
+              human owner assigned to remember it.
+            - Add the documentation updates the change requires, and a cleanup path plus a concrete removal
+              trigger for any temporary compatibility code.
+            - Remove speculative machinery no current requirement justifies, preserve the existing
+              conventions, and collapse any second way to do the same thing back into the existing one.
+            """,
+        Criteria =
+        [
+            "decision-record",          // significant decisions recorded ADR-style (context/decision/rationale)
+            "alternatives-considered",  // alternatives incl. the simplest viable option, each with a rejection reason
+            "tradeoffs-consequences",   // trade-offs and consequences of the chosen design are explicit
+            "codebase-fit",             // design justified against THIS codebase's conventions/constraints, not fashion
+            "reversibility",            // reversible vs one-way decisions identified; hard-to-reverse ones called out
+            "lifecycle-ownership",      // new module/api/job/dep/flag/alert has defined lifecycle+cleanup, discoverable
+            "convention-adherence",     // preserves naming/error-handling/validation/dependency/folder conventions
+            "no-duplicate-mechanism",   // no second way to do something the codebase already does one way
+            "documentation-updates",    // documentation updates named where the change needs them
+            "temporary-code-cleanup",   // temporary compatibility code has a cleanup path + removal trigger
+            "no-speculative-machinery", // no abstraction/config/indirection unjustified by a current requirement
+        ],
+    };
+
+    /// <summary>
     /// Every built-in plan-audit chain test, in chain order. The DI registration
     /// and <c>ProjectAuditorComposer</c> auto-inclusion both iterate this list,
     /// so adding a chain test here wires it everywhere without touching either
     /// call site (one source of truth for the chain membership).
     /// </summary>
-    public static IReadOnlyList<PlanAuditTest> All { get; } = [Test01, Test02, Test03, Test04, Test05, Test06, Test07, Test08, Test09];
+    public static IReadOnlyList<PlanAuditTest> All { get; } = [Test01, Test02, Test03, Test04, Test05, Test06, Test07, Test08, Test09, Test10];
 }
