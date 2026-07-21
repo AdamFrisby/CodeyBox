@@ -1193,23 +1193,14 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         var timeoutEvent = webhooks.Events.FirstOrDefault(e => e.Event == "audit.auditor_timed_out");
         Assert.NotNull(timeoutEvent);
         Assert.Equal("1.5", timeoutEvent.EventSchemaVersion);
-        var details = timeoutEvent.Details;
-        Assert.NotNull(details);
+        var details = Assert.IsType<AuditAuditorTimedOutDetails>(timeoutEvent.Details);
 
-        var type = details.GetType();
-        var workItemIdProp = type.GetProperty("WorkItemId")?.GetValue(details)?.ToString();
-        var auditorProp = type.GetProperty("Auditor")?.GetValue(details)?.ToString();
-        var agentProp = type.GetProperty("Agent")?.GetValue(details)?.ToString();
-        var iterationProp = type.GetProperty("Iteration")?.GetValue(details);
-        var sandboxIdProp = type.GetProperty("SandboxId")?.GetValue(details)?.ToString();
-
-        Assert.Equal(item.Id.ToString(), workItemIdProp);
-        Assert.Equal("my-credentialed-auditor", auditorProp);
-        Assert.Equal("codex", agentProp);
-        Assert.Equal(1, iterationProp);
-        Assert.NotNull(sandboxIdProp);
-        Assert.NotEmpty(sandboxIdProp);
-
+        Assert.Equal(item.Id.ToString(), details.WorkItemId);
+        Assert.Equal("my-credentialed-auditor", details.Auditor);
+        Assert.Equal("codex", details.Agent);
+        Assert.Equal(1, details.Iteration);
+        Assert.NotNull(details.SandboxId);
+        Assert.NotEmpty(details.SandboxId);
     }
 
     [Fact]
@@ -1262,16 +1253,13 @@ public sealed class BuildTestGateOrderingTests : IDisposable
         var timeoutEvent = webhooks.Events.FirstOrDefault(e => e.Event == "audit.auditor_timed_out");
         Assert.NotNull(timeoutEvent);
         Assert.Equal("1.5", timeoutEvent.EventSchemaVersion);
-        var details = timeoutEvent.Details;
-        Assert.NotNull(details);
+        var details = Assert.IsType<AuditAuditorTimedOutDetails>(timeoutEvent.Details);
 
-        var type = details.GetType();
-        Assert.Equal(item.Id.ToString(), type.GetProperty("WorkItemId")?.GetValue(details)?.ToString());
-        Assert.Equal("launch-timeout-auditor", type.GetProperty("Auditor")?.GetValue(details)?.ToString());
-        Assert.Equal("codex", type.GetProperty("Agent")?.GetValue(details)?.ToString());
-        Assert.Equal(1, type.GetProperty("Iteration")?.GetValue(details));
-        Assert.Equal("(launch-timeout)", type.GetProperty("SandboxId")?.GetValue(details)?.ToString());
-
+        Assert.Equal(item.Id.ToString(), details.WorkItemId);
+        Assert.Equal("launch-timeout-auditor", details.Auditor);
+        Assert.Equal("codex", details.Agent);
+        Assert.Equal(1, details.Iteration);
+        Assert.Equal("(launch-timeout)", details.SandboxId);
     }
 
     [Fact]
