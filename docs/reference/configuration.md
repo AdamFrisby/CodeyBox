@@ -134,6 +134,11 @@ Hot-reloadable today:
 - `PromptPreprocessing.ProjectRulesPath` — re-read before every agent
   invocation; changes affect the next work/rework/audit/merge/check-and-act
   prompt.
+- `AgentStreams.{MaxFileSizeMb,RetainedDays,MaxTotalSizeMb}` — the
+  `AgentStreamStore` reads options live via `IOptionsMonitor`, so per-file caps,
+  the retention window, and the total-size backstop all take effect on the next
+  capture / retention sweep. `AgentStreams.Path` remains startup-only (see the
+  guarded list below).
 
 Not hot-reloadable (rejected by `IValidateOptions<CodeyBoxOptions>` if changed):
 
@@ -154,8 +159,6 @@ Not hot-reloadable (consumer captures the value at construction; restart require
 - `Changelog.*` — `ClaudeChangelogGenerator` snapshots its config at construction.
 - `AuditLog.Path` / `AuditLog.AuditPath` / `AuditLog.MaxFileSizeBytes` — bound
   into Serilog rolling-file sinks at startup.
-- `AgentStreams.*` (besides `Path` which is also rejected) — bound into the
-  `AgentStreamStore` singleton at startup.
 - `AgentStreamAnalysis.*` — bound into the `AgentStreamParserOptions` singleton
   at startup.
 - `SandboxImageReference`, `AgentAllowedHosts`, `AuditToolAllowedHosts`,
@@ -976,7 +979,8 @@ and API endpoints.
   "Enabled": true,
   "Path": "logs/agents",
   "MaxFileSizeMb": 32,
-  "RetainedDays": 14
+  "RetainedDays": 14,
+  "MaxTotalSizeMb": 2048
 }
 ```
 
@@ -985,7 +989,8 @@ and API endpoints.
 | `Enabled` | `true` | Request structured stream mode from supported agent CLIs and persist stdout JSONL. |
 | `Path` | `logs/agents` | Root directory for per-work-item stream files. Must be writable at startup. |
 | `MaxFileSizeMb` | `32` | Per-file cap. Must be ≥ 1. |
-| `RetainedDays` | `14` | Daily sweep deletes older files. `0` keeps forever. |
+| `RetainedDays` | `14` | Daily sweep deletes files older than this by **last-write** time. `0` disables age-based eviction. |
+| `MaxTotalSizeMb` | `2048` | Total-bytes backstop across all stream files; oldest-first eviction once exceeded. Runs independently of `RetainedDays`. `0` disables. Must be ≥ 0. |
 
 ## `AgentSupervision`
 
