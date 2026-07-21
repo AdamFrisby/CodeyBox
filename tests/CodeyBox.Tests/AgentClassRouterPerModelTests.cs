@@ -1,4 +1,6 @@
+using System.Net;
 using Microsoft.Extensions.Logging.Abstractions;
+using CodeyBox.Agents.Codex;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 
@@ -85,7 +87,16 @@ public sealed class AgentClassRouterPerModelTests
             ],
         };
 
-        var codexSnapshot = CodeyBox.Agents.Codex.CodexQuotaProbe.ParseResponse("""
+        // Drive the REAL codex probe so the config-sourced subscription-bucket
+        // alias in ApplyMemberGate runs: the WHAM response reports the Codex
+        // subscription's usage under the "GPT-5.3-Codex-Spark" display bucket
+        // (exhausted, used_percent=100), not the model the CLI routes to. With
+        // the routed default configured as gpt-5.5 (matching the class member),
+        // the probe aliases that exhausted bucket onto gpt-5.5 — so codex is
+        // skipped even though the account-wide overall (used_percent=40) has
+        // headroom. No hardcoded routing id is involved; the alias target is
+        // sourced from CodeyBox:AgentDefaults[codex].
+        var codexBody = """
         {
           "rate_limit": { "primary_window": { "used_percent": 40 } },
           "additional_rate_limits": [
@@ -95,11 +106,19 @@ public sealed class AgentClassRouterPerModelTests
             }
           ]
         }
-        """);
+        """;
+        var codexHandler = new QuotaCapturingHandler(HttpStatusCode.OK, codexBody, _ => { });
+        var codexProbe = new CodexQuotaProbe(
+            new QuotaFakeHttpClientFactory("agent-quota", codexHandler),
+            (AgentMembership _) => new AgentQuotaCredentials("test-token"),
+            cacheTtl: TimeSpan.FromMinutes(1),
+            NullLogger<CodexQuotaProbe>.Instance,
+            defaults: new AgentDefaultsSnapshot(
+                new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase) { ["codex"] = "gpt-5.5" }));
 
         var router = new AgentClassRouter(
             [cls],
-            [new FakeProbe(AgentKind.Codex, codexSnapshot), new FakeProbe(AgentKind.Claude, 80)],
+            [codexProbe, new FakeProbe(AgentKind.Claude, 80)],
             new QuotaRouterOptions { MinQuotaPct = 10 },
             NullLogger<AgentClassRouter>.Instance);
 

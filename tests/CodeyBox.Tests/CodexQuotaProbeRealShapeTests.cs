@@ -18,9 +18,11 @@ public sealed class CodexQuotaProbeRealShapeTests
         // can deny calls account-wide, so per-model availability tracks overall.
         Assert.Equal(63, snapshot.AvailablePct);
         Assert.True(snapshot.PerModel.ContainsKey("GPT-5.3-Codex-Spark"));
-        Assert.True(snapshot.PerModel.ContainsKey(CodexQuotaProbe.DefaultRoutedModelId));
         Assert.Equal(63, snapshot.PerModel["GPT-5.3-Codex-Spark"].AvailablePct);
-        Assert.Equal(63, snapshot.PerModel[CodexQuotaProbe.DefaultRoutedModelId].AvailablePct);
+        // ParseResponse maps the raw shape only; no routing-alias key is
+        // synthesised at parse time (aliasing onto a configured model is a
+        // member-gate concern, sourced from config).
+        Assert.False(snapshot.PerModel.ContainsKey("gpt-5.5"));
         Assert.Contains("capped by overall", snapshot.PerModel["GPT-5.3-Codex-Spark"].Window);
         Assert.NotNull(snapshot.ResetAt);
     }

@@ -755,48 +755,79 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
     }
 
     [Fact]
-    public void ResolveAuditUsageModelId_SameKind_KeepsContextModel()
+    public void ResolveAuditModelId_SameKind_KeepsContextModel()
     {
-        // PostProcessAuditorRunAsync records audit spend under the model the
-        // auditor actually dispatched on. ExecAuditorAsync keeps ctx.ModelId for a
-        // same-kind auditor, so usage must bucket on ctx.ModelId — the same window
-        // EvaluateAuditCandidateQuotaAsync gates. Returning null here would
-        // understate the gated window and fail-open its cap.
+        // A same-kind auditor keeps ctx.ModelId (the work member's model), so both
+        // dispatch and usage bucket on the same window EvaluateAuditCandidateQuotaAsync
+        // gates. The auditor member model is ignored on the same-kind branch.
         var auditRunner = new ClaudeAgentRunner(new AgentDefaultsSnapshot(
             new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase) { ["claude"] = "claude-opus-4-8" }));
-        var resolved = PipelineRunner.ResolveAuditUsageModelId(
-            auditRunner, workRunnerKind: AgentKind.Claude, ctxModelId: "claude-opus-4-7");
+        var resolved = PipelineRunner.ResolveAuditModelId(
+            auditRunner, workRunnerKind: AgentKind.Claude, ctxModelId: "claude-opus-4-7",
+            auditorMemberModelId: "claude-sonnet-4-6");
 
         Assert.Equal("claude-opus-4-7", resolved);
     }
 
     [Fact]
-    public void ResolveAuditUsageModelId_CrossKind_FallsBackToRunnerDefault()
+    public void ResolveAuditModelId_CrossKind_UsesAuditorMemberModel()
     {
-        // Cross-review (audit runner kind != work runner kind): ExecAuditorAsync
-        // drops the vendor-specific work model (ModelId = null), so usage must
-        // bucket on the audit runner's DefaultModelId — never the work item's
-        // model, which the audit runner never dispatched on.
+        // Cross-review (audit runner kind != work runner kind): the vendor-specific
+        // work model is invalid for the audit runner, so it resolves the AUDITOR's
+        // own configured class-member model — NOT a hardcoded default and NOT the
+        // work model. This is the gpt-5.5 mis-route regression: the incident
+        // resolved to the CLI built-in instead of the codex member's configured id.
         var auditRunner = new CodexAgentRunner(new AgentDefaultsSnapshot(
             new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase) { ["codex"] = "gpt-5.5" }));
-        var resolved = PipelineRunner.ResolveAuditUsageModelId(
-            auditRunner, workRunnerKind: AgentKind.Claude, ctxModelId: "claude-opus-4-7");
+        var resolved = PipelineRunner.ResolveAuditModelId(
+            auditRunner, workRunnerKind: AgentKind.Claude, ctxModelId: "claude-opus-4-7",
+            auditorMemberModelId: "gpt-5.6-sol");
+
+        Assert.Equal("gpt-5.6-sol", resolved);
+    }
+
+    [Fact]
+    public void ResolveAuditModelId_CrossKind_NoMemberModel_FallsBackToRunnerDefault()
+    {
+        // Cross-kind with no configured auditor member model: fall back to the
+        // audit runner's config-driven DefaultModelId (never null, never a hardcoded
+        // literal), so spend still lands in a concrete bucket and dispatch has a model.
+        var auditRunner = new CodexAgentRunner(new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase) { ["codex"] = "gpt-5.5" }));
+        var resolved = PipelineRunner.ResolveAuditModelId(
+            auditRunner, workRunnerKind: AgentKind.Claude, ctxModelId: "claude-opus-4-7",
+            auditorMemberModelId: null);
 
         Assert.Equal("gpt-5.5", resolved);
     }
 
     [Fact]
-    public void ResolveAuditUsageModelId_SameKind_NullContextModel_FallsBackToRunnerDefault()
+    public void ResolveAuditModelId_SameKind_NullContextModel_FallsBackToRunnerDefault()
     {
         // Same-kind with no explicit work model: ResolveObservedModelId falls
         // through to the runner default rather than null, so spend still lands in
         // a concrete bucket instead of the NULL/default bucket by accident.
         var auditRunner = new ClaudeAgentRunner(new AgentDefaultsSnapshot(
             new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase) { ["claude"] = "claude-opus-4-8" }));
-        var resolved = PipelineRunner.ResolveAuditUsageModelId(
-            auditRunner, workRunnerKind: AgentKind.Claude, ctxModelId: null);
+        var resolved = PipelineRunner.ResolveAuditModelId(
+            auditRunner, workRunnerKind: AgentKind.Claude, ctxModelId: null, auditorMemberModelId: null);
 
         Assert.Equal("claude-opus-4-8", resolved);
+    }
+
+    [Fact]
+    public void ResolveAuditModelId_CrossKind_ChangingMemberModel_ChangesResolvedModel()
+    {
+        // Single-source proof: the cross-kind audit model derives from the auditor's
+        // class-member ModelId, so changing that member id changes the resolved audit
+        // model with no other edit — the same value that drives the work dispatch.
+        var auditRunner = new CodexAgentRunner(new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase) { ["codex"] = "gpt-5.5" }));
+
+        Assert.Equal("gpt-5.6-sol", PipelineRunner.ResolveAuditModelId(
+            auditRunner, AgentKind.Claude, ctxModelId: null, auditorMemberModelId: "gpt-5.6-sol"));
+        Assert.Equal("gpt-5.7-next", PipelineRunner.ResolveAuditModelId(
+            auditRunner, AgentKind.Claude, ctxModelId: null, auditorMemberModelId: "gpt-5.7-next"));
     }
 
     private static WorkItem NewItem(string branch) => new()
@@ -898,8 +929,9 @@ public sealed class PipelineRunnerCostCaptureTests : IDisposable
 
         // Explicit work model so the audit usage row's dispatch bucket is a concrete,
         // assertable value: a same-kind auditor keeps ctx.ModelId per
-        // ResolveAuditUsageModelId, so the audit usage event must key on it — not the
-        // parsed snapshot model ("fake-model"), not null.
+        // ResolveAuditModelId (pinned on AuditorRunRecord.ResolvedModelId), so the
+        // audit usage event must key on it — not the parsed snapshot model
+        // ("fake-model"), not null.
         var item = NewItem("feature/llm-audit-usage") with { ModelId = "claude-opus-4-7" };
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);

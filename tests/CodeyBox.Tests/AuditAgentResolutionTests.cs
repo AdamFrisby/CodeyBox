@@ -70,6 +70,53 @@ public sealed class AuditAgentResolutionTests : IDisposable
         Assert.Equal(AgentKind.Gemini, llmAuditor.ObservedRunnerKind);
     }
 
+    // ── Cross-kind audit model resolution (gpt-5.5 mis-route regression) ─────
+
+    [Fact]
+    public async Task CrossKindAudit_ResolvesAuditRunnerModel_NotNull()
+    {
+        // Regression for the mis-route incident: a cross-kind auditor (work=Claude,
+        // audit=Gemini) previously received ModelId=null and the CLI fell back to
+        // its stale built-in model. The audit runner's configured default model
+        // (here the Gemini runner's DefaultModelId) must now reach the auditor
+        // context instead — never null.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ContextCapturingAuditor(
+            "security:llm-review", AuditCapabilities.AgentCredentials | AuditCapabilities.Network);
+
+        using var tp = BuildCrossReviewPipeline(seed, [auditor],
+            workAgent: AgentKind.Claude,
+            auditAgent: AgentKind.Gemini,
+            credentialsForGemini: true,
+            geminiDefaultModelId: "gemini-3-pro-preview");
+
+        await RunItemAsync(tp);
+
+        Assert.Equal(AgentKind.Gemini, auditor.ObservedRunnerKind);
+        Assert.True(auditor.ObservedModelIdWasSet, "auditor must have run");
+        Assert.Equal("gemini-3-pro-preview", auditor.ObservedModelId);
+    }
+
+    [Fact]
+    public async Task SameKindAudit_KeepsWorkModel()
+    {
+        // Control for the cross-kind case: a same-kind auditor keeps the work
+        // item's model rather than falling back to the runner default.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new ContextCapturingAuditor(
+            "security:llm-review", AuditCapabilities.AgentCredentials | AuditCapabilities.Network);
+
+        using var tp = BuildCrossReviewPipeline(seed, [auditor],
+            workAgent: AgentKind.Claude,
+            auditAgent: null,                 // no override → work agent audits itself
+            credentialsForGemini: false);
+
+        await RunItemAsync(tp, workModelId: "claude-opus-4-8");
+
+        Assert.Equal(AgentKind.Claude, auditor.ObservedRunnerKind);
+        Assert.Equal("claude-opus-4-8", auditor.ObservedModelId);
+    }
+
     // ── PerAuditorAgent takes precedence over AuditAgent ────────────────────
 
     [Fact]
@@ -225,7 +272,8 @@ public sealed class AuditAgentResolutionTests : IDisposable
         bool registerCodex = false,
         IReadOnlyDictionary<string, AgentKind>? perAuditorAgent = null,
         AgentAvailabilityRegistry? availability = null,
-        IInVmSmokeGate? inVmSmokeGate = null)
+        IInVmSmokeGate? inVmSmokeGate = null,
+        string? geminiDefaultModelId = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -236,7 +284,7 @@ public sealed class AuditAgentResolutionTests : IDisposable
 
         var claudeAgent = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = workAgent };
         var runners = new List<IAgentRunner> { claudeAgent };
-        if (registerGemini) runners.Add(new PassthroughRunner(AgentKind.Gemini));
+        if (registerGemini) runners.Add(new PassthroughRunner(AgentKind.Gemini, geminiDefaultModelId));
         if (registerCodex) runners.Add(new PassthroughRunner(AgentKind.Codex));
         var registry = new AgentRegistry(runners);
 
@@ -283,7 +331,7 @@ public sealed class AuditAgentResolutionTests : IDisposable
         return new TestPipelineWithCapture(pipeline, store, claudeAgent, webhooks);
     }
 
-    private static async Task RunItemAsync(TestPipelineWithCapture tp)
+    private static async Task RunItemAsync(TestPipelineWithCapture tp, string? workModelId = null)
     {
         tp.Agent.WorkPlan.Enqueue(new FileWrite("a.txt", "v1"));
         var item = new WorkItem
@@ -295,6 +343,7 @@ public sealed class AuditAgentResolutionTests : IDisposable
             BaseBranch = "main",
             WorkBranch = "feature/x",
             PushUpstream = false,
+            ModelId = workModelId,
         };
         await tp.Store.CreateAsync(item);
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
@@ -314,6 +363,15 @@ internal sealed class ContextCapturingAuditor : IAuditor
     public AuditCapabilities Required { get; }
     public AgentKind? ObservedRunnerKind { get; private set; }
 
+    /// <summary>
+    /// The model id the pipeline resolved for this auditor's dispatch
+    /// (<see cref="AuditContext.ModelId"/>). Lets a cross-kind test assert the
+    /// audit runner never receives a null model that would silently route to the
+    /// CLI's stale built-in default.
+    /// </summary>
+    public string? ObservedModelId { get; private set; }
+    public bool ObservedModelIdWasSet { get; private set; }
+
     public ContextCapturingAuditor(string name, AuditCapabilities required)
     {
         Name = name;
@@ -323,6 +381,8 @@ internal sealed class ContextCapturingAuditor : IAuditor
     public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
     {
         ObservedRunnerKind = context.AuditRunner?.Kind;
+        ObservedModelId = context.ModelId;
+        ObservedModelIdWasSet = true;
         return Task.FromResult(new AuditResult(true, []));
     }
 }
@@ -333,10 +393,23 @@ internal sealed class ContextCapturingAuditor : IAuditor
 /// be registered but is never actually invoked (the auditor captures the kind
 /// from context instead).
 /// </summary>
-internal sealed class PassthroughRunner : IAgentRunner
+internal sealed class PassthroughRunner : IAgentRunner, IAgentDefaultModelProvider
 {
     public AgentKind Kind { get; }
-    public PassthroughRunner(AgentKind kind) => Kind = kind;
+
+    /// <summary>
+    /// Optional config-sourced default model. Mirrors a real runner backed by
+    /// <c>AgentDefaultsSnapshot</c>; lets a cross-kind audit test assert the
+    /// resolved audit model falls back to this configured default rather than the
+    /// old null (which routed to the CLI's stale built-in model).
+    /// </summary>
+    public string? DefaultModelId { get; }
+
+    public PassthroughRunner(AgentKind kind, string? defaultModelId = null)
+    {
+        Kind = kind;
+        DefaultModelId = defaultModelId;
+    }
 
     public Task<AgentResult> RunAsync(ISandbox sandbox, string workingDirectory, string prompt,
         AgentCredential? credential, string? modelId = null, string? reasoningMode = null, CancellationToken ct = default, Action<string>? stdoutChunkCallback = null, bool captureStructuredStream = false)

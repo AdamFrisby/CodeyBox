@@ -504,10 +504,12 @@ public sealed class CursorQuotaProbeTests
           }
         }
         """);
-        // max(total=50, auto=20) = 50 -> 50% available.
+        // max(total=50, auto=20) = 50 -> 50% available. When the response omits
+        // its own autoBucketModels, the deferred known-model fallback list seeds
+        // the auto bucket (composer-2.5 among them).
         Assert.Equal(50, snap.AvailablePct, precision: 5);
-        Assert.True(snap.PerModel.ContainsKey(CursorQuotaProbe.DefaultRoutedModelId));
-        Assert.Equal(50, snap.PerModel[CursorQuotaProbe.DefaultRoutedModelId].AvailablePct, precision: 5);
+        Assert.True(snap.PerModel.ContainsKey("composer-2.5"));
+        Assert.Equal(50, snap.PerModel["composer-2.5"].AvailablePct, precision: 5);
     }
 
     [Fact]

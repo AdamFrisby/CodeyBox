@@ -12653,6 +12653,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                     workRunner,
                                     credential,
                                     member?.RouteKey,
+                                    member?.ModelId,
                                     project,
                                     ctx,
                                     ct);
@@ -12684,6 +12685,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                 workRunner,
                                 credential,
                                 member?.RouteKey,
+                                member?.ModelId,
                                 project,
                                 ctx,
                                 ct);
@@ -12844,6 +12846,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         workRunner,
                         candidateCredential,
                         trialItem.AgentInstanceId,
+                        // The quota-fallback wrapper rewrites trialItem.ModelId to
+                        // the effective audit member's configured ModelId (initial
+                        // override or a spilled fallback member), so this is the
+                        // auditor's own class-member model — robust to mid-audit
+                        // spill, not just pair.Member's initial value.
+                        trialItem.ModelId,
                         project,
                         candidateCtx,
                         attemptCt);
@@ -13237,6 +13245,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         IAgentRunner workRunner,
         AgentCredential? credential,
         string? agentInstanceId,
+        string? auditorMemberModelId,
         Project project,
         AuditContext ctx,
         CancellationToken ct)
@@ -13270,14 +13279,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // when the runner's session-resume contract requires it (see work-phase
         // comment).
         var auditNeedsStreamForResume = auditor.Kind == "llm" && !isPlanReview && NeedsStructuredStreamForSessionResume(runner);
-        // The work item's ModelId came from the AgentMembership picked for the
-        // work agent kind. If audit cross-review picked a different kind, that
-        // model id is vendor-specific and won't be valid for the audit runner —
-        // drop it and let the runner fall back to its DefaultModelId.
-        // ReasoningMode uses the universal low/medium/high vocabulary and is
-        // safe to forward across kinds.
-        var crossKind = runner.Kind != workRunner.Kind;
-        var auditModelId = crossKind ? null : ctx.ModelId;
+        // Resolve the model the auditor dispatches on. A same-kind auditor keeps
+        // the work item's model (ctx.ModelId, itself the work member's configured
+        // ModelId). A cross-kind auditor cannot use the work model (it is
+        // vendor-specific to the work kind), so it resolves the AUDITOR's own
+        // configured class-member model (auditorMemberModelId) — the single source
+        // of truth for that agent's model — falling back to the runner's
+        // config-driven DefaultModelId only when no member model is configured.
+        // The prior `crossKind ? null` rule dropped the resolved auditor model and
+        // let the CLI pick its stale built-in model (the gpt-5.5 mis-route
+        // incident). ReasoningMode uses the universal low/medium/high vocabulary
+        // and is safe to forward across kinds.
+        var auditModelId = ResolveAuditModelId(runner, workRunner.Kind, ctx.ModelId, auditorMemberModelId);
         await using var supervision = auditor.Kind == "llm" && !isPlanReview
             ? await StartAgentSupervisionSessionAsync(
                 ctx.WorkItemId,
@@ -13379,6 +13392,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             auditor,
             runner,
             agentInstanceId,
+            auditModelId,
             result,
             startedAt,
             sw.Elapsed,
@@ -13869,18 +13883,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         if (needsCreds)
         {
-            // Record usage under the model the auditor actually dispatched on, so
+            // Record usage under the exact model the auditor dispatched on, so
             // spend lands in the same bucket EvaluateAuditCandidateQuotaAsync gates
-            // on (see BuildUsageEvent). ExecAuditorAsync dispatches with
-            // ModelId = crossKind ? null : ctx.ModelId, so mirror that here:
-            // same-kind keeps the work item's model, cross-kind falls back to the
-            // runner default. Passing modelId:null unconditionally would bucket
-            // same-kind audit spend under the runner default instead of ctx.ModelId,
-            // understating the gated window and fail-opening the spend cap.
+            // on (see BuildUsageEvent). ExecAuditorAsync resolved and pinned that
+            // model on the run record (ResolvedModelId): same-kind keeps the work
+            // model, cross-kind uses the auditor's configured class-member model.
+            // Reading it back here keeps recording and dispatch on a single value
+            // instead of re-deriving and risking drift.
             await TryRecordCostAsync(run.Result.RawOutput, null,
                 run.Runner.Kind, run.AgentInstanceId, ctx.WorkItemId, "audit", ctx.Iteration,
                 run.StartedAt, run.StartedAt + run.Elapsed,
-                ResolveAuditUsageModelId(run.Runner, workRunner.Kind, ctx.ModelId));
+                run.ResolvedModelId);
         }
         await _auditorTelemetry.EmitAuditorSubStepsAsync(run.Auditor.Name, run.Result.RawOutput,
             ctx.WorkItemId, ctx.Iteration, run.StartedAt);
@@ -14108,6 +14121,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         IAuditor Auditor,
         IAgentRunner Runner,
         string? AgentInstanceId,
+        string? ResolvedModelId,
         AuditResult Result,
         DateTimeOffset StartedAt,
         TimeSpan Elapsed,
@@ -16334,21 +16348,23 @@ public sealed partial class PipelineRunner : IPipelineRunner
     }
 
     /// <summary>
-    /// Resolves the model id under which a completed auditor's spend is recorded
-    /// so audit usage lands in the same budget bucket the gate queries. Mirrors
-    /// the dispatch rule in <see cref="ExecAuditorAsync"/>: a same-kind auditor
-    /// keeps the work item's model (<paramref name="ctxModelId"/>); a cross-kind
-    /// auditor drops the (vendor-specific) work model and falls back to the audit
-    /// runner's DefaultModelId. Recording the work model unconditionally would
-    /// bucket cross-kind spend under a model the audit runner never dispatched on;
-    /// recording null unconditionally would understate the gated same-kind window
-    /// and fail-open its spend cap.
+    /// Resolves the model id an auditor dispatches on (and records spend under, so
+    /// dispatch and usage accounting stay on a single value). A same-kind auditor
+    /// keeps the work item's model (<paramref name="ctxModelId"/>, itself the work
+    /// member's configured ModelId). A cross-kind auditor cannot use the work model
+    /// (it is vendor-specific to the work kind), so it resolves the AUDITOR's own
+    /// configured class-member model (<paramref name="auditorMemberModelId"/>) —
+    /// the single source of truth for that agent's model. In either branch, an
+    /// empty resolved model falls back to the runner's config-driven
+    /// <see cref="IAgentDefaultModelProvider.DefaultModelId"/> (never a hardcoded
+    /// literal), so spend still lands in a concrete bucket and the CLI never
+    /// silently drops to its stale built-in model (the gpt-5.5 mis-route incident).
     /// </summary>
-    internal static string? ResolveAuditUsageModelId(
-        IAgentRunner auditRunner, AgentKind workRunnerKind, string? ctxModelId)
+    internal static string? ResolveAuditModelId(
+        IAgentRunner auditRunner, AgentKind workRunnerKind, string? ctxModelId, string? auditorMemberModelId)
     {
         var crossKind = auditRunner.Kind != workRunnerKind;
-        return ResolveObservedModelId(auditRunner, crossKind ? null : ctxModelId);
+        return ResolveObservedModelId(auditRunner, crossKind ? auditorMemberModelId : ctxModelId);
     }
 
     /// <summary>

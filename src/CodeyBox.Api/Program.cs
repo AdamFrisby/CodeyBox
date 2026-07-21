@@ -1049,7 +1049,8 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new CodexAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>(),
     sp.GetRequiredService<CodeyBox.Core.AgentNetworkToleranceSnapshot>(),
     sp.GetRequiredService<IQuotaFailureClassifier>()));
-builder.Services.AddSingleton<IAgentRunner, GeminiAgentRunner>();
+builder.Services.AddSingleton<IAgentRunner>(sp => new GeminiAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>()));
 builder.Services.AddSingleton<IAgentRunner, CursorAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, OpencodeAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner>(_ => new AntigravityAgentRunner
@@ -1665,7 +1666,10 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
                 codexAuth.AccountId ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_ACCOUNT_ID"));
         }) ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
-        loggerFactory.CreateLogger<CodexQuotaProbe>());
+        loggerFactory.CreateLogger<CodexQuotaProbe>(),
+        // Config-sourced routed-default model: lets the subscription-bucket alias
+        // target follow CodeyBox:AgentDefaults[codex] instead of a source literal.
+        sp.GetRequiredService<AgentDefaultsSnapshot>());
     var wrapped = WrapLastKnownGood(probe, sp);
     source.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
     return wrapped;
