@@ -56,6 +56,7 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `audit.started` | An audit iteration started; carries the scheduled auditor list |
 | `audit.findings.emitted` | Audit iteration produced findings; carries the full finding list so trackers can render comments without polling |
 | `audit.completed` | Audit iteration finished with a `pass` or `fail` verdict |
+| `audit.auditor_timed_out` | An auditor timed out during execution or sandbox launch (see [Details](#auditauditor_timed_out-details)) |
 | `merge.started` | Merge phase started |
 | `merge.completed` | Merge phase succeeded; carries the merge commit SHA |
 | `upstream.pr_stale_base` | A CodeyBox-authored PR has been left unmergeable by motion on the base branch; needs operator rebase (see [Details](#upstream_pr_stale_base-details)) |
@@ -70,7 +71,7 @@ Every event is a JSON object POSTed as the request body.
 
 ```json
 {
-  "eventSchemaVersion": "1.0",
+  "eventSchemaVersion": "1.5",
   "event": "work_item.audit_passed",
   "occurredAt": "2026-04-29T12:34:56.789+00:00",
   "workItem": {
@@ -797,6 +798,28 @@ As with `iteration.completed`, `audit.completed` is only emitted when the
 audit phase completes — if the audit phase throws (timeout, agent crash,
 host shutdown) the matching `audit.started` will have no partner event;
 trackers should rely on the terminal failure event to close the iteration.
+
+### `audit.auditor_timed_out` details
+
+```json
+{
+  "details": {
+    "workItemId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "auditor": "security:llm-review",
+    "agent": "claude",
+    "iteration": 1,
+    "sandboxId": "cb-sandbox-xyz"
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `workItemId` | string | UUID of the work item |
+| `auditor` | string | Name of the auditor that timed out |
+| `agent` | string | Kind of the agent running the auditor |
+| `iteration` | int | Audit iteration number |
+| `sandboxId` | string | ID of the sandbox, or `"(launch-timeout)"` if the timeout occurred during sandbox launch |
 
 ### `merge.started` details
 

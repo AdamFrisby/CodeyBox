@@ -513,6 +513,22 @@ public static class AuditLog
             .Information("Auditor {AuditorName} completed: worstSeverity={WorstSeverity} duration={DurationMs}ms agentKind={AgentKind}",
                 auditorName, worstSeverity, (long)duration.TotalMilliseconds, agentKind.Value);
 
+    public static void AuditorTimedOut(
+        WorkItemId workItemId,
+        string auditor,
+        AgentKind agent,
+        int iteration,
+        string sandboxId) =>
+        Audit("audit.auditor_timed_out")
+            .ForContext("WorkItemId", workItemId.ToString())
+            .ForContext("Auditor", auditor)
+            .ForContext("Agent", agent.Value)
+            .ForContext("Iteration", iteration)
+            .ForContext("SandboxId", sandboxId)
+            .Warning(
+                "Auditor {Auditor} (agent: {Agent}) timed out during iteration {Iteration} in sandbox {SandboxId}",
+                auditor, agent.Value, iteration, sandboxId);
+
     /// <summary>
     /// Emitted once per audit iteration when at least one LLM auditor actually
     /// ran with a different agent than the work agent. Tells operators this

@@ -165,8 +165,6 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
 
         foreach (var item in occupants)
             await _store.CreateAsync(item);
-        foreach (var item in readyBacklog)
-            await _store.CreateAsync(item);
 
         // One kick is enough: the refill loop fills all four slots from the
         // store-backed pickup query without a per-item enqueue.
@@ -179,6 +177,9 @@ public sealed class WorkerPoolSlotReleaseWakeTests : IDisposable
         // Pool is now full (four entered occupants == four slots), so the ready
         // backlog is genuinely blocked. This is a real invariant, not a timing
         // snapshot.
+        foreach (var item in readyBacklog)
+            await _store.CreateAsync(item);
+
         foreach (var item in readyBacklog)
             Assert.False(pipeline.HasEntered(item.Id));
 

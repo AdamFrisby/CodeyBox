@@ -169,7 +169,8 @@ internal static class TestSupport
         IEnumerable<IAgentQuotaProbe>? auditQuotaProbes = null,
         IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? toolCallCounters = null,
         IMergeScopeResolver? mergeScopeResolver = null,
-        IReadOnlyDictionary<string, string>? projectKnobs = null)
+        IReadOnlyDictionary<string, string>? projectKnobs = null,
+        Microsoft.Extensions.Logging.ILogger<PipelineRunner>? logger = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -285,7 +286,7 @@ internal static class TestSupport
             pipelineStore,
             terminalWebhookDispatcher,
             resolvedOptions,
-            NullLogger<PipelineRunner>.Instance,
+            logger ?? NullLogger<PipelineRunner>.Instance,
             timingStore: timingStore,
             auditQuotaProbes: auditQuotaProbes,
             auditReports: auditReportStore,
