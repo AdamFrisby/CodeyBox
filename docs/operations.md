@@ -8,7 +8,13 @@ short — the framework is small.
 1. Linux host with KVM available (`/dev/kvm`).
 2. .NET 10 SDK if building from source; otherwise just the runtime.
 3. A sandbox provider — pick from `docs/sandbox-providers.md`. Quick start:
-   - **Recommended (real VM, integration-tested)**: install Multipass with
+   - **Recommended for persistent/high-throughput headless operation**:
+     install Incus 6.3+ and configure an existing ZFS or Btrfs pool, then set
+     `CodeyBox.SandboxProvider=incus`. Its baseline clones are copy-on-write,
+     avoiding a full multi-gigabyte image copy for every pass. Confirm the
+     service identity, storage pool, and host compatibility described in
+     [`sandbox-providers.md`](sandbox-providers.md) before installing.
+   - **Simplest setup or graphical workloads**: install Multipass with
      `sudo snap install multipass`, then run
      `sudo scripts/setup-host-networks.sh` to create the network profile
      bridges + nftables rules. Set `CodeyBox.SandboxProvider=multipass`.
@@ -20,8 +26,8 @@ short — the framework is small.
    upstream).
 5. Service user with:
    * Write access to `GitRootDirectory` and `StateDatabasePath` parents.
-   * Access to `/dev/kvm` (Multipass).
-   * Permission to run `multipass` (the snap installs a group automatically).
+   * Access to `/dev/kvm` (Multipass or Incus).
+   * Membership in `incus-admin` for Incus, or permission to run `multipass`.
    * **No** SSH or other host privileges beyond the above.
 
 The repository ships gitignored helper scripts under `local/` for
