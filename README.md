@@ -102,18 +102,8 @@ matters.
 
 ## Quickstart
 
-The fastest way to watch it work end-to-end, on your own machine:
-
-> Run it on **Multipass** from the start — it's a one-line install
-> (`snap install multipass`) and gives you real KVM isolation. A `process`
-> provider exists for constrained CI, but it runs the agent **directly on your
-> host with no isolation** — never point it at anything untrusted.
-
-**1. Requirements:** the [.NET 10 SDK](https://dotnet.microsoft.com/download),
-git, [Multipass](https://multipass.run) (`snap install multipass`), and at
-least one agent CLI installed and logged in (e.g. `claude`).
-
-**2. Build:**
+Install the [.NET 10 SDK](https://dotnet.microsoft.com/download), Git, a
+supported sandbox provider, and at least one authenticated agent CLI. Then:
 
 ```bash
 git clone https://github.com/AdamFrisby/CodeyBox.git
@@ -121,213 +111,39 @@ cd CodeyBox
 dotnet build CodeyBox.slnx
 ```
 
-> The repository supplies its package sources through `Directory.Build.props` for
-> direct project builds and `Directory.Solution.props` for solution builds. Both
-> resolve `NuGet.Config` relative to the repository, so package-source selection is
-> independent of the caller's working directory. NuGet still inspects — and creates,
-> when absent — user-level configuration under `$HOME/.nuget/NuGet/`, so it needs a
-> **writable** location for that directory. In locked-down environments where the
-> inherited path is not writable (for example a home baked read-only or owned by
-> another user), NuGet otherwise aborts restore with an unauthorized-access error
-> (`Failed to read NuGet.Config due to unauthorized access`) for every project — a
-> checked-in `NuGet.Config` or `--configfile` does not help, because NuGet still
-> probes the user settings directory regardless.
->
-> The repository heals this automatically for **any** `dotnet` invocation, including
-> the bare `dotnet build`/`dotnet test` the CI and audit gates run directly.
-> `Directory.Build.props` and `Directory.Solution.props` carry an MSBuild
-> `InitialTargets` hook (defined once in `Directory.NuGetHomeHeal.targets`) that runs
-> at the very start of every MSBuild invocation — before NuGet's user-config read, at
-> both the solution and project level. When it finds the inherited `.nuget/NuGet`
-> unusable it quarantines it aside and recreates a writable one, preserving the baked
-> package cache via symlink so restore stays offline-safe; when the home is already
-> usable it is a no-op. So `dotnet build CodeyBox.slnx`, `dotnet build
-> --no-incremental /warnaserror`, and `dotnet test --no-build` all self-heal with no
-> wrapper or environment override. (The hook is POSIX-shell based and conditioned to
-> Unix; on Windows keep the home writable.)
->
-> `./build.sh` applies the same recovery for non-MSBuild callers: it probes the
-> inherited `.nuget/NuGet` directory and, when it is not writable, quarantines it
-> aside and recreates a writable one (falling back to a scratch `DOTNET_CLI_HOME` only
-> when `$HOME` itself is unwritable), then forwards any arguments straight to `dotnet`
-> — for example `./build.sh build --no-incremental -warnaserror` or `./build.sh test
-> --no-build CodeyBox.slnx`; with no arguments it builds the whole solution. The heal
-> logic in both paths is the single source of truth in `scripts/nuget-home-heal.sh`.
->
-> If you would rather fix the condition at its source — a baseline image that bakes
-> `$HOME/.nuget` owned by another account, so every COW clone inherits it — heal it
-> once at environment/baseline provisioning time instead (fixing ownership with
-> `chown -R "$(id -u):$(id -g)" ~/.nuget`, pointing `DOTNET_CLI_HOME` at a writable
-> directory, or applying the following probe-then-quarantine recipe):
->
-> ```sh
-> # Probe first and only heal when the home is genuinely unusable, exactly like the
-> # in-tree recovery, so the recipe is safe to re-run (a second pass on an
-> # already-healed home is a no-op instead of quarantining the good tree). $HOME
-> # is writable even when $HOME/.nuget is not, so rename the broken tree aside
-> # (no root needed) into a unique, PID-suffixed name — never a fixed one that a
-> # re-run would move the recovered tree into — recreate a writable one, and
-> # preserve the populated package cache via symlink so restore stays
-> # offline-safe. Seed a readable user config too: the fatal gate error is a
-> # *read* failure, so pre-writing the file guarantees the read succeeds without
-> # relying on NuGet creating it later.
-> if ! ( mkdir -p "$HOME/.nuget/NuGet" \
->          && [ ! -e "$HOME/.nuget/NuGet/NuGet.Config" -o -r "$HOME/.nuget/NuGet/NuGet.Config" ] \
->          && touch "$HOME/.nuget/NuGet/.probe" ) 2>/dev/null; then
->   quarantine="$HOME/.nuget.unwritable.$$" \
->     && mv "$HOME/.nuget" "$quarantine" \
->     && mkdir -p "$HOME/.nuget/NuGet" \
->     && ln -s "$quarantine/packages" "$HOME/.nuget/packages" \
->     && printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<configuration />' \
->          > "$HOME/.nuget/NuGet/NuGet.Config"
-> fi
-> rm -f "$HOME/.nuget/NuGet/.probe" 2>/dev/null || true
-> ```
->
-> Verified both ways: with the home healed (in-tree or at the baseline)
-> `dotnet build CodeyBox.slnx` is 0 warnings / 0 errors and the solution-level
-> `dotnet test --no-build` runs clean.
+Create a hot-reloaded project configuration, set `CODEYBOX_API_KEY` and
+`CODEYBOX_EXTRA_CONFIG`, and run `src/CodeyBox.Api`. A minimal configuration
+and the full production preflight are in [`SKILL.md`](SKILL.md). The complete
+schemas live in [`docs/projects.md`](docs/projects.md) and
+[`docs/configuration.md`](docs/configuration.md).
 
-**3. Configure a project.** Drop a JSON file somewhere and point
-`CODEYBOX_EXTRA_CONFIG` at it (it hot-reloads on change):
-
-```json
-{
-  "CodeyBox": {
-    "SandboxProvider": "multipass",
-    "Projects": [
-      {
-        "Id": "my-app",
-        "RepositoryUrl": "https://github.com/you/my-app.git",
-        "BaseBranch": "main",
-        "Agent": "claude"
-      }
-    ]
-  }
-}
-```
-
-**4. Run:**
+Queue a first task with the CLI:
 
 ```bash
-export CODEYBOX_API_KEY=pick-any-bearer-token      # auth for the REST API
-export CODEYBOX_CLAUDE_API_KEY=...                 # the agent's own credential
-export CODEYBOX_EXTRA_CONFIG=/path/to/your.json
-dotnet run --project src/CodeyBox.Api              # http://localhost:5036
+dotnet run --project tools/CodeyBox.Cli -- queue add \
+  --project my-app \
+  --title "Add a hello file" \
+  --prompt "Add hello.txt containing the word hello."
+dotnet run --project tools/CodeyBox.Cli -- queue watch WORK_ITEM_ID
 ```
 
-**5. Queue a task:**
-
-```bash
-curl -X POST http://localhost:5036/workitems \
-  -H "authorization: Bearer $CODEYBOX_API_KEY" \
-  -H 'content-type: application/json' \
-  -d '{
-    "projectId": "my-app",
-    "title": "Add a hello file",
-    "prompt": "Add a hello.txt file containing the word hello.",
-    "agent": "claude"
-  }'
-```
-
-Watch it move through the pipeline with the CLI:
-
-```bash
-dotnet run --project tools/CodeyBox.Cli -- queue watch <work-item-id>
-```
-
-See [`docs/projects.md`](docs/projects.md) for the full project schema
-(auditors, per-phase network profiles, upstream config) and
-[`docs/configuration.md`](docs/configuration.md) for everything tunable.
+Choose the sandbox provider, storage, network policy, Admin deployment,
+baseline strategy, and upstream policy deliberately before production. Start
+with [`docs/sandbox-providers.md`](docs/sandbox-providers.md),
+[`docs/security.md`](docs/security.md), and
+[`docs/operations.md`](docs/operations.md).
 
 ## Running it well
 
-CodeyBox trades wall-clock for review depth. A feel for what that means in
-practice — with real numbers from running it on its own codebase:
+CodeyBox trades wall-clock time and tokens for review depth. Throughput is
+bounded by host CPU and agent quota because each concurrent phase runs a VM.
+Small, dependent tasks generally converge faster than monolithic prompts.
 
-**What to expect.**
-
-- **Features take 2–10 audit rounds to merge (median 5, mean ~7), and in 100+
-  merges not one has passed on the first audit** — a worker *could* nail it
-  first try; we've just never seen it happen. A long tail reaches 30–40 rounds
-  on hard changes. The auditors don't return a complete issue list each pass;
-  the multi-round grind *is* the thoroughness. Budget for iteration, not
-  one-shot.
-- **Throughput is bounded by the lesser of host CPU and agent quota — not raw
-  speed.** Each agent is a full VM, so concurrent capacity is first a CPU
-  decision. With a single quota-limited subscription workhorse expect a handful
-  of merges a day; it climbs as you add parallelism and more agents. Deep in a
-  provider's quota tail it can drop to 1–2/day and items park — that's the
-  system draining quota, not a fault.
-- **Every round costs tokens.** Watch per-item cost early to build a feel for
-  the economics before scaling up.
-
-Audit rounds to merge, across 114 merged changes to this codebase — most land
-in 2–4 rounds, with a long tail beyond:
-
-```mermaid
-xychart-beta
-    title "Audit rounds to merge (114 merged · median 5 · 0 first-pass so far)"
-    x-axis [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    y-axis "Merged changes" 0 --> 22
-    bar [0, 20, 18, 16, 7, 8, 7, 10, 4, 4]
-```
-
-_Equal-width, one bar per round; a further **20** changes took **11–41** rounds — the long tail, off-chart._
-
-**Getting good results.**
-
-- **Anchor the fleet with a workhorse** — a strong coding subscription is
-  cost-effective for the bulk of the work — but **run in parallel and add
-  smaller agents too.** CodeyBox pools them into a class and routes across
-  them, so throughput scales with members, not just with one agent's quota.
-- **Concurrency is limited by host CPU first, then agent quota.** Because each
-  agent runs a real VM, vCPUs are the hard ceiling: **3 concurrent works well
-  on modest hardware.** Beefier hosts scale higher — especially on
-  **API / pay-per-use pricing**, where you aren't capped by a subscription's
-  short rolling-window and can push concurrency up to whatever the host allows.
-- **Small, dependent tasks** converge faster and cleaner than monoliths. Chain
-  them with `--depends-on`.
-- Set your auditor set and iteration cap **deliberately**: hard gates compound
-  quality but cost rounds. Config hot-reloads — tune without restart.
-
-**Where it can fail, and how to recover.**
-
-- **Quota exhaustion** → items go `WaitingForQuotaReset` and drain (expected).
-  Recover by waiting for the reset or adding capacity.
-- **Silent agent failures** (a flaky provider returns "no changes", or a hidden
-  429) → the no-changes circuit breaker excludes that agent; retry the affected
-  items once it clears.
-- **Post-redeploy provisioning regressions** (a bad cloud-init / base-image
-  change can fail *every* VM) → after any redeploy, watch the queue for a
-  failure flood.
-- **Clean shutdowns don't auto-restart** under `Restart=on-failure` — if the
-  daemon is down with a clean exit, start it again and check the run log for
-  the real reason.
-- **Suspend can wedge VMs** on some hosts → use `SandboxTeardownMode=Stop`.
-- **Audit non-convergence** → items that hit the iteration cap flag
-  `AuditFailed` and are *not* merged; triage or re-queue with
-  `codeybox queue retry`.
-
-**Run an LLM monitor over the top.** The orchestrator runs no LLMs itself — but
-you can point a capable one (Claude in a terminal, or Claude Code) at the
-**`codeybox` CLI** and have it babysit the fleet unattended: periodic health
-check-ins that read the queue, retry transient/infrastructure failures,
-re-queue starved items, and escalate to you only for genuine decisions.
-
-```mermaid
-flowchart LR
-    M["LLM monitor<br/>Claude via codeybox CLI"] -->|"queue ls / show · /quota · /agents/availability"| C["CodeyBox API"]
-    C -->|"stuck? failed? starved?"| M
-    M -->|"retry / re-queue transient failures"| C
-    M -->|"only genuine decisions"| H["You"]
-```
-
-Give it read access plus scoped `queue retry` / `queue add`, a cadence (e.g.
-every few hours), and clear rules on what's routine versus what needs you.
-Judge health by **state transitions and `updatedAt` advancing**, not by the
-Done count — a quota-throttled queue is slow but healthy; a *wedged* one has
-frozen timestamps.
+Tune concurrency, agent classes, auditors, iteration limits, and budgets for
+your workload. Watch state transitions and updated timestamps—not only
+completed-item count—to distinguish a quota-limited queue from a stuck one.
+Recovery procedures are in [`docs/operations.md`](docs/operations.md) and
+[`docs/recovery.md`](docs/recovery.md).
 
 ## Features
 
@@ -544,7 +360,8 @@ transport robustness) and decomposing the pipeline internals.
 
 ## Status
 
-CodeyBox is under active development and builds clean against .NET 10. Multipass
-is the recommended, integration-tested, isolation-providing configuration; the
-`process` sandbox is for constrained testing only and gives no isolation. Issues
-and contributions are welcome.
+CodeyBox is under active development and builds clean against .NET 10. Incus is
+recommended for persistent, high-throughput headless deployments; Multipass is
+the simpler option and supports graphical sandboxes. The `process` provider is
+for constrained testing only and gives no isolation. Issues and contributions
+are welcome.
