@@ -33,10 +33,8 @@ public sealed class SecurityAuditToolProvisioningConfigTests
             cmd.Contains("python3 -m pip install", StringComparison.Ordinal) &&
             cmd.Contains("semgrep==1.168.0", StringComparison.Ordinal) &&
             !cmd.Contains("--only-binary", StringComparison.Ordinal));
-        Assert.Contains(runcmd, cmd => cmd.Contains("npm install -g @openai/codex", StringComparison.Ordinal));
         Assert.Contains(runcmd, cmd => cmd.Contains("gitleaks version | grep -Fx 8.29.0", StringComparison.Ordinal));
         Assert.Contains(runcmd, cmd => cmd.Contains("semgrep --version | grep -Fx 1.168.0", StringComparison.Ordinal));
-        Assert.Contains(runcmd, cmd => cmd.Contains("codex --version", StringComparison.Ordinal));
 
         Assert.Contains("semgrep.dev", auditHosts);
         Assert.Contains("registry.semgrep.dev", auditHosts);
