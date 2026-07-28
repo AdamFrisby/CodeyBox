@@ -7,6 +7,17 @@ namespace CodeyBox.Tests;
 
 public sealed class PresetCatalogTests
 {
+    [Fact]
+    public void TestsReviewFocus_ExemptsNonExecutableOnlyChangesFromMissingTestFindings()
+    {
+        var reviewFocus = new PresetCatalog().GetAuditTypeReviewFocus("tests");
+
+        Assert.Contains("NON-EXECUTABLE CHANGE EXEMPTION", reviewFocus, StringComparison.Ordinal);
+        Assert.Contains("static marker/content files", reviewFocus, StringComparison.Ordinal);
+        Assert.Contains("do NOT require a new test", reviewFocus, StringComparison.Ordinal);
+        Assert.Contains("Still apply Steps 1 and 3 normally", reviewFocus, StringComparison.Ordinal);
+    }
+
     private sealed class FakeAgent : IAgentRunner
     {
         public AgentKind Kind => AgentKind.Claude;
