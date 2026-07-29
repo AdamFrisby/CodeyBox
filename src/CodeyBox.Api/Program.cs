@@ -4916,6 +4916,7 @@ namespace CodeyBox.Api
     /// </summary>
     public sealed class CodeyBoxOptions
     {
+        public string? PublicBaseUrl { get; set; }
         public string GitRootDirectory { get; set; } = "/var/lib/codeybox/repos";
         public int GitCommandMaxOutputBytes { get; set; } = LocalGitHostOptions.DefaultGitCommandMaxOutputBytes;
         public bool EnableSharedUpstreamMirror { get; set; } = false;
