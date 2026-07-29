@@ -272,7 +272,6 @@ public sealed record ProjectJobTrackExport
     /// stored; the token value is read at export time and never persisted.
     /// </summary>
     public string? TokenEnvVar { get; init; }
-
     /// <summary>
     /// External-id namespace (on the work item's <see cref="WorkItem.ExternalIds"/>)
     /// whose value is the owning JobTrack task id used as the case's
@@ -372,6 +371,12 @@ public sealed record ProjectUpstream
     public string? GitHubRepository { get; init; }
     public string? GenericUrl { get; init; }
     public string? TokenEnvVar { get; init; }
+    /// <summary>Environment variable containing the numeric GitHub App ID.</summary>
+    public string? GitHubAppIdEnvVar { get; init; }
+    /// <summary>Environment variable containing the numeric installation ID.</summary>
+    public string? GitHubAppInstallationIdEnvVar { get; init; }
+    /// <summary>Environment variable containing the absolute 0600 PEM key path.</summary>
+    public string? GitHubAppPrivateKeyPathEnvVar { get; init; }
 
     // GitHub-specific completion options
     /// <summary>How GitHub merges the PR. One of "merge" | "squash" | "rebase". Default "merge".</summary>

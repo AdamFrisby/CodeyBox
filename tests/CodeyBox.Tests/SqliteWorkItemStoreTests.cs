@@ -40,6 +40,21 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
             PushUpstream = false,
             UpstreamPushAttempts = 2,
             AuditorProfile = "uat",
+            Initiator = new WorkInitiator
+            {
+                Issuer = "jobtrack",
+                Subject = "user-1",
+                DisplayName = "Test User",
+                ProviderIdentities =
+                [
+                    new WorkInitiatorProviderIdentity
+                    {
+                        Provider = "github",
+                        AccountId = "42",
+                        Login = "test-user",
+                    },
+                ],
+            },
         };
         await _store.CreateAsync(item);
         var read = await _store.GetAsync(item.Id);
@@ -51,6 +66,11 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         Assert.Equal(item.UpstreamPushAttempts, read.UpstreamPushAttempts);
         Assert.Equal(item.Agent, read.Agent);
         Assert.Equal("uat", read.AuditorProfile);
+        Assert.NotNull(read.Initiator);
+        Assert.Equal(item.Initiator.Issuer, read.Initiator!.Issuer);
+        Assert.Equal(item.Initiator.Subject, read.Initiator.Subject);
+        Assert.Equal(item.Initiator.DisplayName, read.Initiator.DisplayName);
+        Assert.Equal(item.Initiator.ProviderIdentities, read.Initiator.ProviderIdentities);
     }
 
     [Fact]

@@ -38,6 +38,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<GitHubUpstreamRemote> _log;
     private readonly GitHubUpstreamOptions _opts;
+    private readonly IGitHubTokenProvider _tokenProvider;
     private readonly ITimingStore? _timings;
     private readonly IPullRequestDescriptionGenerator? _descriptionGenerator;
 
@@ -53,10 +54,12 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         _httpClientFactory = httpClientFactory;
         _log = log;
         _opts = opts;
+        _tokenProvider = opts.TokenProvider
+            ?? (!string.IsNullOrEmpty(opts.Token)
+                ? new FixedGitHubTokenProvider(opts.Token)
+                : throw new ArgumentException("A GitHub token or token provider must be provided", nameof(opts)));
         _timings = timings;
         _descriptionGenerator = descriptionGenerator;
-        if (string.IsNullOrEmpty(_opts.Token))
-            throw new ArgumentException("GitHub PAT must be provided", nameof(opts));
         if (!IsValidRemoteName(_opts.Owner))
             throw new ArgumentException($"GitHub Owner contains invalid characters: '{_opts.Owner}'", nameof(opts));
         if (!IsValidRemoteName(_opts.Repository))
@@ -81,7 +84,8 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     public async Task<UpstreamPushResult> PushAsync(string repositoryId, string branch, CancellationToken ct = default)
     {
         var url = RepoUrl();
-        using var askpass = GitCredentialHelper.CreateAskPassFor(_opts.Token, "x-access-token");
+        var token = await _tokenProvider.GetTokenAsync(ct);
+        using var askpass = GitCredentialHelper.CreateAskPassFor(token, "x-access-token");
         try
         {
             await _gitHost.PushToUpstreamAsync(
@@ -95,7 +99,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         }
         catch (Exception ex)
         {
-            var scrubbed = Scrub(ex.Message);
+            var scrubbed = Scrub(ex.Message, token);
             return new UpstreamPushResult(false, scrubbed);
         }
     }
@@ -130,7 +134,8 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
 
         // Step 1: push work branch
         var repoUrl = RepoUrl();
-        using var askpass = GitCredentialHelper.CreateAskPassFor(_opts.Token, "x-access-token");
+        var token = await _tokenProvider.GetTokenAsync(ct);
+        using var askpass = GitCredentialHelper.CreateAskPassFor(token, "x-access-token");
         await using (var pushScope = await TimingScope.BeginAsync(
             _timings, request.WorkItemId, "upstream_push", "upstream.push_branch",
             log: _log))
@@ -149,7 +154,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             {
                 // Log only the scrubbed message at Debug; the raw exception object is
                 // withheld because git can echo credential material on auth failures.
-                var scrubbed = Scrub(ex.Message);
+                var scrubbed = Scrub(ex.Message, token);
                 _log.LogDebug("Work-branch push to upstream threw: {Message} (full exception withheld; may contain credentials)", scrubbed);
                 throw new InvalidOperationException($"Failed to push work branch '{SanitizeForLog(request.WorkBranch)}': {scrubbed}");
             }
@@ -286,7 +291,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         {
             var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls" +
                 $"?state=open&per_page={perPage}&page={page}";
-            using var listReq = BuildRequest(HttpMethod.Get, url);
+            using var listReq = await BuildRequestAsync(HttpMethod.Get, url, ct);
             using var listResp = await SendAsync(listReq, ct);
             if (!listResp.IsSuccessStatusCode)
             {
@@ -336,7 +341,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     private async Task<GitHubPrDetailMergeable?> FetchPullRequestDetailAsync(int number, CancellationToken ct)
     {
         var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls/{number}";
-        using var req = BuildRequest(HttpMethod.Get, url);
+        using var req = await BuildRequestAsync(HttpMethod.Get, url, ct);
         using var resp = await SendAsync(req, ct);
         if (!resp.IsSuccessStatusCode)
         {
@@ -367,7 +372,8 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
                 nameof(baseBranch));
 
         var repoUrl = RepoUrl();
-        using var askpass = GitCredentialHelper.CreateAskPassFor(_opts.Token, "x-access-token");
+        var token = await _tokenProvider.GetTokenAsync(ct);
+        using var askpass = GitCredentialHelper.CreateAskPassFor(token, "x-access-token");
         return await _gitHost.FetchUpstreamBranchAsync(repositoryId, repoUrl, baseBranch, askpass.Environment, ct);
     }
 
@@ -382,7 +388,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         var body = new GitHubMergesRequest(targetBranch, sourceBranch,
             $"chore: sync {sourceBranch} into {targetBranch}");
 
-        using var req = BuildRequest(HttpMethod.Post, url);
+        using var req = await BuildRequestAsync(HttpMethod.Post, url, ct);
         req.Content = JsonContent.Create(body);
 
         using var response = await SendAsync(req, ct);
@@ -405,7 +411,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/releases";
         var body = new GitHubCreateReleaseRequest(tagName, sha, tagName, releaseNotes ?? string.Empty);
 
-        using var req = BuildRequest(HttpMethod.Post, url);
+        using var req = await BuildRequestAsync(HttpMethod.Post, url, ct);
         req.Content = JsonContent.Create(body);
 
         using var response = await SendAsync(req, ct);
@@ -437,7 +443,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         var staticBody = request.Description ?? string.Empty;
 
         if (_descriptionGenerator is null || !_opts.PrDescription.Enabled)
-            return new PrDescriptionResult(staticBody + PrFooter, Generated: false);
+            return new PrDescriptionResult(staticBody + BuildFooter(request), Generated: false);
 
         try
         {
@@ -471,7 +477,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             // Redact the generated body — the LLM may echo secrets from the diff.
             generated = RawOutputRedactor.Redact(generated);
             _log.LogInformation("LLM-generated PR description produced ({Chars} chars)", generated.Length);
-            return new PrDescriptionResult(generated + PrFooter, Generated: true);
+            return new PrDescriptionResult(generated + BuildFooter(request), Generated: true);
         }
         catch (TimeoutException)
         {
@@ -492,7 +498,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             _log.LogWarning("PR description generation failed ({Message}); using static template", ex.Message);
         }
 
-        return new PrDescriptionResult(staticBody + PrFooter, Generated: false);
+        return new PrDescriptionResult(staticBody + BuildFooter(request), Generated: false);
     }
 
     private sealed record PrDescriptionResult(string Body, bool Generated);
@@ -544,6 +550,25 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     // The Co-Authored-By trailer identifies CodeyBox as a co-author on the
     // forge side; the 🤖 line links back to the platform for operators.
     private const string PrFooter = "\n\n---\n*Co-Authored-By: CodeyBox <noreply@codeybox.invalid>*  \n🤖 Generated with [CodeyBox](https://codeybox.invalid)";
+
+    private static string BuildFooter(UpstreamCompletionRequest request)
+    {
+        if (request.Initiator is null)
+            return PrFooter;
+        var github = request.Initiator.FindProvider("github");
+        var attribution = github is not null && GitHubIdentity.IsValidLogin(github.Login)
+            ? $"@{github.Login}"
+            : EscapeMarkdown(request.Initiator.DisplayName);
+        return $"\n\nInitiated by {attribution}{PrFooter}";
+    }
+
+    private static string EscapeMarkdown(string value) =>
+        value.Replace("\\", "\\\\", StringComparison.Ordinal)
+            .Replace("@", "\\@", StringComparison.Ordinal)
+            .Replace("*", "\\*", StringComparison.Ordinal)
+            .Replace("_", "\\_", StringComparison.Ordinal)
+            .Replace("[", "\\[", StringComparison.Ordinal)
+            .Replace("]", "\\]", StringComparison.Ordinal);
 
     private static readonly Regex CollapseWhitespace = new(@"\s+", RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly Regex PullRequestNumberOnly = new(@"^\(#\d+\)$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
@@ -619,7 +644,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls";
         var body = new GitHubCreatePrRequest(prTitle, description, request.WorkBranch, request.BaseBranch);
 
-        using var req = BuildRequest(HttpMethod.Post, url);
+        using var req = await BuildRequestAsync(HttpMethod.Post, url, ct);
         req.Content = JsonContent.Create(body);
 
         var postPrSw = Stopwatch.StartNew();
@@ -652,7 +677,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         try
         {
             var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls/{prNumber}";
-            using var req = BuildRequest(HttpMethod.Get, url);
+            using var req = await BuildRequestAsync(HttpMethod.Get, url, ct);
 
             var getPrSw = Stopwatch.StartNew();
             using var response = await SendAsync(req, ct);
@@ -695,7 +720,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls/{prNumber}/merge";
         var body = await BuildMergeRequestAsync(prNumber, prTitle, prDescription, completionRequest, ct);
 
-        using var req = BuildRequest(HttpMethod.Put, url);
+        using var req = await BuildRequestAsync(HttpMethod.Put, url, ct);
         req.Content = JsonContent.Create(body);
 
         var putMergeSw = Stopwatch.StartNew();
@@ -778,7 +803,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         {
             var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls/{prNumber}/commits" +
                 $"?per_page={perPage}&page={page}";
-            using var req = BuildRequest(HttpMethod.Get, url);
+            using var req = await BuildRequestAsync(HttpMethod.Get, url, ct);
             using var response = await SendAsync(req, ct);
             if (!response.IsSuccessStatusCode)
             {
@@ -1206,10 +1231,14 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     private static bool IsSquashMerge(string mergeMethod)
         => mergeMethod.Equals("squash", StringComparison.OrdinalIgnoreCase);
 
-    private HttpRequestMessage BuildRequest(HttpMethod method, string url)
+    private async Task<HttpRequestMessage> BuildRequestAsync(
+        HttpMethod method,
+        string url,
+        CancellationToken cancellationToken)
     {
         var req = new HttpRequestMessage(method, url);
-        req.Headers.Authorization = new AuthenticationHeaderValue("token", _opts.Token);
+        var token = await _tokenProvider.GetTokenAsync(cancellationToken);
+        req.Headers.Authorization = new AuthenticationHeaderValue("token", token);
         return req;
     }
 
@@ -1218,8 +1247,8 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
 
     private string RepoUrl() => $"https://github.com/{_opts.Owner}/{_opts.Repository}.git";
 
-    private string Scrub(string message) =>
-        message.Replace(_opts.Token, "***", StringComparison.Ordinal);
+    private static string Scrub(string message, string token) =>
+        message.Replace(token, "***", StringComparison.Ordinal);
 
     private static string SanitizeForLog(string? value) =>
         value?.Replace("\n", "\\n", StringComparison.Ordinal)
@@ -1247,7 +1276,8 @@ public sealed record GitHubUpstreamOptions
     public required string Owner { get; init; }
     public required string Repository { get; init; }
     /// <summary>GitHub PAT or fine-grained token. Never logged, never on argv.</summary>
-    public required string Token { get; init; }
+    public string? Token { get; init; }
+    public IGitHubTokenProvider? TokenProvider { get; init; }
     public string MergeMethod { get; init; } = "merge";
     public bool AutoMerge { get; init; }
     public string? PullRequestTitleTemplate { get; init; }
@@ -1259,6 +1289,12 @@ public sealed record GitHubUpstreamOptions
     // (e.g. when the instance is passed to a structured logger via {Opts}).
     public override string ToString() =>
         $"GitHubUpstreamOptions {{ Owner = {Owner}, Repository = {Repository}, Token = ***, MergeMethod = {MergeMethod}, AutoMerge = {AutoMerge} }}";
+}
+
+internal sealed class FixedGitHubTokenProvider(string token) : IGitHubTokenProvider
+{
+    public ValueTask<string> GetTokenAsync(CancellationToken cancellationToken = default) =>
+        ValueTask.FromResult(token);
 }
 
 // Internal DTOs — only used for GitHub REST serialisation, never exposed.

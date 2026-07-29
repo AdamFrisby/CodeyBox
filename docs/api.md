@@ -13,6 +13,64 @@ service refuses to start without it. Send it on every request:
 Authorization: Bearer <CODEYBOX_API_KEY>
 ```
 
+`CODEYBOX_API_KEY` remains the legacy operator credential. Integrations that
+need caller attribution should use a named client whose token is kept in its
+own environment variable:
+
+```json
+{
+  "CodeyBox": {
+    "ApiClients": [
+      {
+        "Name": "jobtrack",
+        "TokenEnvVar": "CODEYBOX_JOBTRACK_API_KEY",
+        "CanDelegateInitiator": true,
+        "Principal": {
+          "Issuer": "jobtrack",
+          "Subject": "service",
+          "DisplayName": "JobTrack"
+        }
+      }
+    ]
+  }
+}
+```
+
+Only a client with `CanDelegateInitiator` may send the optional `initiator`
+object on `POST /workitems`. A normal named client is always attributed to its
+configured fixed principal, and the legacy operator key cannot delegate.
+Delegated identities are authenticated claims from the integration—not
+credentials—and are persisted with the work item for API, commit, and pull
+request attribution.
+
+### GitHub App delivery credentials
+
+For team installations, configure the GitHub upstream with a GitHub App
+installation rather than a developer PAT. The App must have repository
+permissions `Contents: read and write` and `Pull requests: read and write`;
+CodeyBox does not require a user token. Keep the downloaded private key in a
+service-owned, non-symlink file with mode `0600`.
+
+```json
+{
+  "Upstream": {
+    "Kind": "github",
+    "GitHubOwner": "example",
+    "GitHubRepository": "repository",
+    "GitHubAppIdEnvVar": "CODEYBOX_GITHUB_APP_ID",
+    "GitHubAppInstallationIdEnvVar": "CODEYBOX_GITHUB_INSTALLATION_ID",
+    "GitHubAppPrivateKeyPathEnvVar": "CODEYBOX_GITHUB_PRIVATE_KEY_PATH"
+  }
+}
+```
+
+The three named environment variables contain the numeric App ID, numeric
+installation ID, and absolute PEM path respectively. CodeyBox creates a
+short-lived App JWT just in time, exchanges it for an installation token, and
+caches that token only until one minute before GitHub's expiry. `TokenEnvVar`
+remains available as the single-developer/PAT fallback; do not configure both
+credential modes on one project.
+
 Tokens are compared in constant time. `WWW-Authenticate: Bearer` is
 returned on 401.
 

@@ -526,6 +526,12 @@ public sealed record WorkItem
         = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
+    /// Authenticated caller that caused this work item to be created. Preserved
+    /// across retry and rework; an explicit replay records the replay caller.
+    /// </summary>
+    public WorkInitiator? Initiator { get; init; }
+
+    /// <summary>
     /// Legacy single-value form, preserved for the deprecation window. Returns
     /// the value at namespace <c>legacy</c> if present; otherwise the first
     /// value in <see cref="ExternalIds"/> ordered ordinal-ignore-case by key

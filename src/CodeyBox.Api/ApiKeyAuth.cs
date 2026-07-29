@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using CodeyBox.Core;
 
 namespace CodeyBox.Api;
 
@@ -33,7 +34,7 @@ internal static class ApiKeyAuth
             var disabled = configuration.GetValue<bool>(DisableConfigKey);
 
             if (disabled)
-                return new ApiKeyState(Token: null, Disabled: true);
+                return new ApiKeyState(Token: null, Disabled: true, Clients: []);
 
             var key = Environment.GetEnvironmentVariable(EnvVarName);
             if (string.IsNullOrWhiteSpace(key))
@@ -43,7 +44,26 @@ internal static class ApiKeyAuth
                 throw new InvalidOperationException(
                     $"{EnvVarName} must be at least 32 characters of high-entropy random data.");
 
-            return new ApiKeyState(Token: key, Disabled: false);
+            var clients = configuration.GetSection("CodeyBox:ApiClients")
+                .Get<List<ApiClientOptions>>() ?? [];
+            var resolved = new List<ResolvedApiClient>(clients.Count);
+            foreach (var client in clients)
+            {
+                if (string.IsNullOrWhiteSpace(client.Name)
+                    || string.IsNullOrWhiteSpace(client.TokenEnvVar)
+                    || client.Principal is null)
+                    throw new InvalidOperationException(
+                        "Each CodeyBox:ApiClients entry requires Name, TokenEnvVar, and Principal.");
+                var token = Environment.GetEnvironmentVariable(client.TokenEnvVar);
+                if (string.IsNullOrWhiteSpace(token) || token.Length < 32)
+                    throw new InvalidOperationException(
+                        $"{client.TokenEnvVar} must contain at least 32 characters of high-entropy random data.");
+                ValidateInitiator(client.Principal);
+                resolved.Add(new ResolvedApiClient(
+                    client.Name, token, client.Principal, client.CanDelegateInitiator));
+            }
+
+            return new ApiKeyState(Token: key, Disabled: false, Clients: resolved);
         });
         builder.Services.AddHostedService<ApiKeyAuthValidator>();
     }
@@ -61,6 +81,8 @@ internal static class ApiKeyAuth
             var state = ctx.RequestServices.GetRequiredService<ApiKeyState>();
             if (state.Disabled)
             {
+                ctx.Items[PrincipalItemKey] = new ApiClientPrincipal(
+                    "authentication-disabled", OperatorInitiator, CanDelegateInitiator: false);
                 await next();
                 return;
             }
@@ -90,7 +112,7 @@ internal static class ApiKeyAuth
                 }
             }
 
-            if (!IsAuthorized(ctx, state))
+            if (!TryAuthenticate(ctx, state, out var principal))
             {
                 ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
                 ctx.Response.Headers["WWW-Authenticate"] = "Bearer";
@@ -98,6 +120,7 @@ internal static class ApiKeyAuth
                 return;
             }
 
+            ctx.Items[PrincipalItemKey] = principal;
             await next();
         });
     }
@@ -107,9 +130,87 @@ internal static class ApiKeyAuth
         ArgumentNullException.ThrowIfNull(ctx);
         ArgumentNullException.ThrowIfNull(state);
 
-        return state.Disabled
-            || (TryExtractBearer(ctx, out var presented) && ConstantTimeEquals(presented, state.Token!));
+        return state.Disabled || TryAuthenticate(ctx, state, out _);
     }
+
+    internal static InitiatorResolution ResolveInitiator(
+        HttpContext context,
+        WorkInitiator? delegated)
+    {
+        if (!context.Items.TryGetValue(PrincipalItemKey, out var value)
+            || value is not ApiClientPrincipal principal)
+            return new(null, Results.Unauthorized());
+
+        if (delegated is null)
+            return new(principal.FixedInitiator, null);
+        if (!principal.CanDelegateInitiator)
+            return new(null, Results.Json(
+                new { error = "this API client may not delegate an initiator" },
+                statusCode: StatusCodes.Status403Forbidden));
+
+        try { ValidateInitiator(delegated); }
+        catch (ArgumentException ex)
+        {
+            return new(null, Results.BadRequest(new { error = ex.Message }));
+        }
+        return new(delegated, null);
+    }
+
+    private static bool TryAuthenticate(
+        HttpContext context,
+        ApiKeyState state,
+        out ApiClientPrincipal principal)
+    {
+        principal = default!;
+        if (!TryExtractBearer(context, out var presented))
+            return false;
+        if (state.Token is not null && ConstantTimeEquals(presented, state.Token))
+        {
+            principal = new ApiClientPrincipal(
+                "legacy-operator", OperatorInitiator, CanDelegateInitiator: false);
+            return true;
+        }
+        foreach (var client in state.Clients)
+        {
+            if (!ConstantTimeEquals(presented, client.Token))
+                continue;
+            principal = new ApiClientPrincipal(
+                client.Name, client.FixedInitiator, client.CanDelegateInitiator);
+            return true;
+        }
+        return false;
+    }
+
+    private static void ValidateInitiator(WorkInitiator initiator)
+    {
+        ValidateIdentityPart(initiator.Issuer, nameof(initiator.Issuer), 200);
+        ValidateIdentityPart(initiator.Subject, nameof(initiator.Subject), 200);
+        ValidateIdentityPart(initiator.DisplayName, nameof(initiator.DisplayName), 200);
+        if (initiator.ProviderIdentities.Count > 16)
+            throw new ArgumentException("initiator.providerIdentities may contain at most 16 entries");
+        foreach (var identity in initiator.ProviderIdentities)
+        {
+            ValidateIdentityPart(identity.Provider, "initiator.provider", 50);
+            ValidateIdentityPart(identity.AccountId, "initiator.accountId", 200);
+            ValidateIdentityPart(identity.Login, "initiator.login", 200);
+        }
+    }
+
+    private static void ValidateIdentityPart(string value, string name, int maximumLength)
+    {
+        if (string.IsNullOrWhiteSpace(value) || value.Length > maximumLength)
+            throw new ArgumentException($"{name} must be between 1 and {maximumLength} characters");
+        if (value.Any(char.IsControl))
+            throw new ArgumentException($"{name} must not contain control characters");
+    }
+
+    internal const string PrincipalItemKey = "CodeyBox.ApiClientPrincipal";
+    private static readonly WorkInitiator OperatorInitiator = new()
+    {
+        Issuer = "codeybox",
+        Subject = "operator",
+        DisplayName = "CodeyBox operator",
+    };
 
     private static bool TryExtractBearer(HttpContext ctx, out string token)
     {
@@ -130,7 +231,31 @@ internal static class ApiKeyAuth
     }
 }
 
-internal sealed record ApiKeyState(string? Token, bool Disabled);
+internal sealed record ApiKeyState(
+    string? Token,
+    bool Disabled,
+    IReadOnlyList<ResolvedApiClient> Clients);
+
+internal sealed record ResolvedApiClient(
+    string Name,
+    string Token,
+    WorkInitiator FixedInitiator,
+    bool CanDelegateInitiator);
+
+internal sealed record ApiClientPrincipal(
+    string Name,
+    WorkInitiator FixedInitiator,
+    bool CanDelegateInitiator);
+
+internal sealed record InitiatorResolution(WorkInitiator? Value, IResult? Error);
+
+internal sealed class ApiClientOptions
+{
+    public string Name { get; set; } = string.Empty;
+    public string TokenEnvVar { get; set; } = string.Empty;
+    public WorkInitiator? Principal { get; set; }
+    public bool CanDelegateInitiator { get; set; }
+}
 
 /// <summary>
 /// Forces fail-fast at host start by resolving <see cref="ApiKeyState"/> in

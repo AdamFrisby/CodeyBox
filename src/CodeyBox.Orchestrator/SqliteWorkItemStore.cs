@@ -376,6 +376,9 @@ public sealed class SqliteWorkItemStore :
             RunMigration("ALTER TABLE work_items ADD COLUMN plan_reviewed_at TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN plan_review_summary TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN plan_review_attempts INTEGER NOT NULL DEFAULT 0;");
+            // Authenticated work initiator snapshot. Null is the explicit
+            // backfill for work created before initiator attribution existed.
+            RunMigration("ALTER TABLE work_items ADD COLUMN initiator_json TEXT;");
 
             // Per-iteration dispatch record. One row per (work_item_id, iteration);
             // most-recent-dispatch-wins — a re-dispatch (e.g. orchestrator
@@ -1339,7 +1342,8 @@ public sealed class SqliteWorkItemStore :
                         re_check_verdicts_json, template_name, template_entry_index,
                         preserve_work_branch_on_queued_pickup,
                         terminal_retry_attempts, next_terminal_retry_at,
-                        knobs_json, plan_artifact, plan_generated_at, plan_reviewed_at, plan_review_summary, plan_review_attempts)
+                        knobs_json, plan_artifact, plan_generated_at, plan_reviewed_at, plan_review_summary, plan_review_attempts,
+                        initiator_json)
                     VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $agent_instance_id, $wt, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
                         $local_squash_sha, $merged_pr_number, $merged_pr_url,
@@ -1357,7 +1361,8 @@ public sealed class SqliteWorkItemStore :
                         $re_check_verdicts, $template_name, $template_entry_index,
                         $preserve_work_branch_on_queued_pickup,
                         $terminal_retry_attempts, $next_terminal_retry_at,
-                        $knobs, $plan_artifact, $plan_generated_at, $plan_reviewed_at, $plan_review_summary, $plan_review_attempts);
+                        $knobs, $plan_artifact, $plan_generated_at, $plan_reviewed_at, $plan_review_summary, $plan_review_attempts,
+                        $initiator);
                     """;
                 Bind(cmd, item);
                 await cmd.ExecuteNonQueryAsync(ct);
@@ -4138,6 +4143,8 @@ public sealed class SqliteWorkItemStore :
         cmd.Parameters.AddWithValue("$plan_reviewed_at", (object?)item.PlanReviewedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$plan_review_summary", (object?)item.PlanReviewSummary ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$plan_review_attempts", item.PlanReviewAttempts);
+        cmd.Parameters.AddWithValue("$initiator",
+            item.Initiator is null ? (object)DBNull.Value : JsonSerializer.Serialize(item.Initiator, JsonOpts));
     }
 
     private static string SerialiseKnobs(IReadOnlyDictionary<string, string>? knobs)
@@ -4261,7 +4268,24 @@ public sealed class SqliteWorkItemStore :
         PlanReviewedAt = ReadNullableDateTimeOffset(r, "plan_reviewed_at"),
         PlanReviewSummary = ReadNullableString(r, "plan_review_summary"),
         PlanReviewAttempts = ReadInt32OrDefault(r, "plan_review_attempts", defaultValue: 0),
+        Initiator = ReadInitiator(r),
     };
+
+    private static WorkInitiator? ReadInitiator(SqliteDataReader reader)
+    {
+        var ordinal = reader.GetOrdinal("initiator_json");
+        if (reader.IsDBNull(ordinal))
+            return null;
+        try
+        {
+            return JsonSerializer.Deserialize<WorkInitiator>(reader.GetString(ordinal), JsonOpts)
+                ?? throw new InvalidDataException("work item initiator_json must be an object");
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidDataException("work item initiator_json is invalid JSON", ex);
+        }
+    }
 
     private static AgentTurnResumeCheckpoint? ReadAgentTurnResumeCheckpoint(SqliteDataReader reader)
     {
