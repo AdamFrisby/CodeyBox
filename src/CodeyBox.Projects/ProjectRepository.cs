@@ -596,6 +596,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             GitHubAppIdEnvVar = c.GitHubAppIdEnvVar,
             GitHubAppInstallationIdEnvVar = c.GitHubAppInstallationIdEnvVar,
             GitHubAppPrivateKeyPathEnvVar = c.GitHubAppPrivateKeyPathEnvVar,
+            GitHubAppSlug = c.GitHubAppSlug,
             MergeMethod = mergeMethod,
             AutoMerge = c.AutoMerge ?? false,
             PullRequestTitleTemplate = c.PullRequestTitleTemplate,

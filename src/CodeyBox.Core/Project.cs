@@ -377,6 +377,8 @@ public sealed record ProjectUpstream
     public string? GitHubAppInstallationIdEnvVar { get; init; }
     /// <summary>Environment variable containing the absolute 0600 PEM key path.</summary>
     public string? GitHubAppPrivateKeyPathEnvVar { get; init; }
+    /// <summary>Slug of an App created through the on-demand connect flow.</summary>
+    public string? GitHubAppSlug { get; init; }
 
     // GitHub-specific completion options
     /// <summary>How GitHub merges the PR. One of "merge" | "squash" | "rebase". Default "merge".</summary>

@@ -34,6 +34,7 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
     private readonly ILogger<LlmPullRequestDescriptionGenerator> _generatorLog;
     private readonly IReadOnlyList<IUpstreamRemote> _pluginRemotes;
     private readonly ILogger<UpstreamRemoteFactory>? _factoryLog;
+    private readonly GitHubAppStore? _githubApps;
 
     public UpstreamRemoteFactory(
         IGitHost gitHost,
@@ -45,7 +46,8 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
         ILogger<LlmPullRequestDescriptionGenerator> generatorLog,
         IEnumerable<IUpstreamRemote>? pluginRemotes = null,
         ILogger<UpstreamRemoteFactory>? factoryLog = null,
-        ITimingStore? timings = null)
+        ITimingStore? timings = null,
+        GitHubAppStore? githubApps = null)
     {
         _gitHost = gitHost;
         _httpClientFactory = httpClientFactory;
@@ -56,6 +58,7 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
         _generatorLog = generatorLog;
         _timings = timings;
         _factoryLog = factoryLog;
+        _githubApps = githubApps;
 
         var remotes = new List<IUpstreamRemote>();
         foreach (var remote in pluginRemotes ?? [])
@@ -93,7 +96,9 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
                         $"Project {project.Id}: Upstream.Kind=github requires GitHubOwner"),
                     Repository = u.GitHubRepository ?? throw new InvalidOperationException(
                         $"Project {project.Id}: Upstream.Kind=github requires GitHubRepository"),
-                    Token = HasGitHubAppConfiguration(u) ? null : ReadToken(project, u),
+                    Token = HasGitHubAppConfiguration(u) || !string.IsNullOrWhiteSpace(u.GitHubAppSlug)
+                        ? null
+                        : ReadToken(project, u),
                     TokenProvider = BuildGitHubAppTokenProvider(project, u),
                     MergeMethod = ValidateMergeMethod(project.Id, u.MergeMethod),
                     AutoMerge = u.AutoMerge,
@@ -125,6 +130,21 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
 
     private IGitHubTokenProvider? BuildGitHubAppTokenProvider(Project project, ProjectUpstream upstream)
     {
+        if (!string.IsNullOrWhiteSpace(upstream.GitHubAppSlug))
+        {
+            if (HasGitHubAppConfiguration(upstream) || !string.IsNullOrWhiteSpace(upstream.TokenEnvVar))
+                throw new InvalidOperationException(
+                    $"Project {project.Id}: GitHubAppSlug cannot be combined with other credential settings.");
+            var app = _githubApps?.Get(upstream.GitHubAppSlug)
+                ?? throw new InvalidOperationException(
+                    $"Project {project.Id}: linked GitHub App '{upstream.GitHubAppSlug}' was not found.");
+            if (app.InstallationId <= 0)
+                throw new InvalidOperationException(
+                    $"Project {project.Id}: linked GitHub App '{upstream.GitHubAppSlug}' is not installed.");
+            return new GitHubAppTokenProvider(
+                _httpClientFactory,
+                new GitHubAppTokenOptions(app.AppId, app.InstallationId, app.PrivateKeyPath));
+        }
         if (!HasGitHubAppConfiguration(upstream))
             return null;
         if (!string.IsNullOrWhiteSpace(upstream.TokenEnvVar))

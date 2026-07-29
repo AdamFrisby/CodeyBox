@@ -35,6 +35,7 @@ using CodeyBox.Sandbox.Process;
 using CodeyBox.Sandbox.Sprites;
 using CodeyBox.HostProcess;
 using CodeyBox.Webhooks;
+using CodeyBox.Upstream.GitHub;
 using CodeyBox.Notifications;
 using Serilog;
 using Serilog.Events;
@@ -2240,6 +2241,13 @@ builder.Services.AddSingleton<IProjectRepository>(sp => new ProjectRepository(
     sp.GetRequiredService<IKnobRegistry>(),
     sp.GetService<IDeploymentDriverRegistry>()));
 builder.Services.AddSingleton<IUpstreamRemoteFactory, UpstreamRemoteFactory>();
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddSingleton<GitHubAppConnectState>();
+builder.Services.AddSingleton(new GitHubAppStore(
+    Environment.GetEnvironmentVariable("CODEYBOX_GITHUB_APP_STORE")
+        ?? (builder.Environment.IsProduction()
+            ? "/var/lib/codeybox/github-apps"
+            : Path.Combine(Path.GetTempPath(), $"codeybox-github-apps-{Environment.ProcessId}"))));
 builder.Services.AddSingleton(_ =>
 {
     var options = builder.Configuration.GetSection("CodeyBox:Presets").Get<PresetCatalogOptions>()
@@ -3815,10 +3823,13 @@ var prometheusOpts = builder.Configuration
 var prometheusAnonymousPaths = (prometheusOpts.Enabled && !prometheusOpts.RequireApiKey)
     ? new[] { prometheusOpts.Path }
     : Array.Empty<string>();
+var anonymousExactPaths = prometheusAnonymousPaths
+    .Concat(["/github-app/start", "/github-app/callback"])
+    .ToArray();
 
 app.UseApiKeyAuth(
     anonymousPrefixes: ["/healthz", "/webhooks/"],
-    anonymousExactPaths: prometheusAnonymousPaths);
+    anonymousExactPaths: anonymousExactPaths);
 
 // Idempotency-Key support for mutating endpoints — see IdempotencyMiddleware
 // for behaviour. Ordered after auth so unauthenticated requests can't poison
@@ -3837,6 +3848,7 @@ AgentPricingEndpoints.Map(app);
 ProjectBudgetEndpoints.Map(app);
 WorkItemDiffEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
+GitHubAppConnectEndpoints.Map(app);
 AuditReportEndpoints.Map(app);
 AgentStreamEndpoints.Map(app);
 SseEndpoints.Map(app);

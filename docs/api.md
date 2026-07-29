@@ -51,6 +51,35 @@ permissions `Contents: read and write` and `Pull requests: read and write`;
 CodeyBox does not require a user token. Keep the downloaded private key in a
 service-owned, non-symlink file with mode `0600`.
 
+CodeyBox can create and install a private App on demand, so an operator does
+not normally need to pre-register one. Set `CodeyBox:PublicBaseUrl` to the
+external HTTPS origin, then make an authenticated `POST /github-app/connect`
+request and open the returned `url` in a browser. GitHub asks where to install
+the App and returns to CodeyBox; `GET /github-app/status` lists the resulting
+slug. CodeyBox stores the generated key under
+`CODEYBOX_GITHUB_APP_STORE` (default `/var/lib/codeybox/github-apps`) with
+owner-only permissions.
+
+Use that slug in the project:
+
+```json
+{
+  "Upstream": {
+    "Kind": "github",
+    "GitHubOwner": "example",
+    "GitHubRepository": "repository",
+    "GitHubAppSlug": "codeybox-hostname"
+  }
+}
+```
+
+The connect and status endpoints require normal CodeyBox API authentication;
+only their single-use browser callbacks are anonymous. Pending setup links
+expire after ten minutes.
+
+For a centrally managed, pre-registered App, configure the three environment
+variable references instead:
+
 ```json
 {
   "Upstream": {
