@@ -2740,6 +2740,10 @@ builder.Services.AddSingleton<IAuditReportStore>(sp =>
 });
 builder.Services.AddSingleton<ITimingStore>(sp =>
 {
+    // Timing rows have a foreign key to work_items. Ensure the primary store
+    // has initialized that shared schema even when a sandbox provider resolves
+    // ITimingStore before any endpoint resolves IWorkItemStore.
+    _ = sp.GetRequiredService<SqliteWorkItemStore>();
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteTimingStore(
         opts.StateDatabasePath,
