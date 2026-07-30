@@ -3840,7 +3840,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
             ValidatePickupRebaseWorkBranch(item, baseBranch, workBranch);
 
-            var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
+            var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity, item.Initiator);
             await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", workBranch, $"origin/{workBranch}");
@@ -4864,10 +4864,17 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
     /// <summary>
     /// Resolves the git author identity to use for sandbox commits.
-    /// Precedence: project override → host global git identity → synthetic fallback.
+    /// Precedence: linked initiator GitHub identity → project override → host
+    /// global git identity → synthetic fallback.
     /// </summary>
-    internal static (string Name, string Email) ResolveGitIdentity(Project project, HostGitIdentity? host)
+    internal static (string Name, string Email) ResolveGitIdentity(
+        Project project,
+        HostGitIdentity? host,
+        WorkInitiator? initiator = null)
     {
+        var github = initiator?.FindProvider("github");
+        if (github is not null && GitHubIdentity.TryNoreplyEmail(github, out var email))
+            return (initiator!.DisplayName, email);
         if (!string.IsNullOrWhiteSpace(project.GitAuthorName) && !string.IsNullOrWhiteSpace(project.GitAuthorEmail))
             return (project.GitAuthorName, project.GitAuthorEmail);
         if (host is not null)
@@ -5221,7 +5228,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{branch}");
                 checkedOutExistingBranch = true;
             }
-            var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
+            var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity, item.Initiator);
             await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
 
@@ -8308,6 +8315,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             OriginCheckWorkItemId = checkItem.Id,
             JobType = JobType.Normal,
             Knobs = onYes.Knobs,
+            Initiator = checkItem.Initiator,
         };
 
         try
@@ -8327,7 +8335,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             return;
         }
 
-        AuditLog.WorkItemCreated(followup.Id, followup.ProjectId, followup.Title);
+        AuditLog.WorkItemCreated(followup.Id, followup.ProjectId, followup.Title, followup.Initiator);
 
         // Enqueue iff all (zero-or-more) dependencies are already satisfied.
         // Same posture as POST /workitems: unsatisfied deps mean we persist
@@ -16813,7 +16821,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 activitySource: CodeyBoxActivities.Pipeline);
             await using (cleanMergeScope)
             {
-                var (cleanGitName, cleanGitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
+                var (cleanGitName, cleanGitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity, item.Initiator);
                 var cleanTrailerBlock = await ComposeCommitTrailerBlockAsync(
                     item.Id, runner.Kind, ResolveObservedModelId(runner, item.ModelId), ct);
                 var cleanMessage = $"codeybox: merge {workBranch}\n\n{cleanTrailerBlock}\n";
@@ -16883,7 +16891,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
             }
             CodeyBoxMeters.SandboxLifecycle.Record(mergeCloneScope.ElapsedMs, new KeyValuePair<string, object?>("step", "clone"));
-            var (mergeGitName, mergeGitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
+            var (mergeGitName, mergeGitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity, item.Initiator);
             await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", mergeGitEmail);
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", mergeGitName);
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", baseBranch);
@@ -17864,6 +17872,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 AddressedFindings = addressedFindings,
                 AgentStdout = agentStdout,
                 PromptRevision = item.PromptRevision,
+                Initiator = item.Initiator,
                 TokenEnvVar = project.Upstream.TokenEnvVar,
                 AutoMerge = project.Upstream.AutoMerge,
                 MergeMethod = project.Upstream.MergeMethod,
@@ -18745,7 +18754,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 await MaterialiseCredentialFilesAsync(sandbox, credential, ct);
 
             await Run(sandbox, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
-            var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
+            var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity, item.Initiator);
             await RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
             await Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
 

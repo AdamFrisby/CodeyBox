@@ -435,6 +435,7 @@ internal sealed class WorkItemCreationService
             AuditMaxIterations = auditMaxIterations,
             AuditComplexity = auditComplexity,
             ExternalIds = canonicalExternalIds,
+            Initiator = req.Initiator,
             ReleaseId = releaseId,
             RequiredCapabilities = requiredCapabilities,
             Knobs = knobs,
@@ -475,7 +476,7 @@ internal sealed class WorkItemCreationService
             }
             return Error("an external id already exists in this project (concurrent duplicate)");
         }
-        AuditLog.WorkItemCreated(item.Id, item.ProjectId, item.Title);
+        AuditLog.WorkItemCreated(item.Id, item.ProjectId, item.Title, item.Initiator);
 
         var freshDepStates = new Dictionary<WorkItemId, WorkItemState>();
         var freshDepExternalIds = new Dictionary<WorkItemId, string?>();

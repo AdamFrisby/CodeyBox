@@ -13,6 +13,93 @@ service refuses to start without it. Send it on every request:
 Authorization: Bearer <CODEYBOX_API_KEY>
 ```
 
+`CODEYBOX_API_KEY` remains the legacy operator credential. Integrations that
+need caller attribution should use a named client whose token is kept in its
+own environment variable:
+
+```json
+{
+  "CodeyBox": {
+    "ApiClients": [
+      {
+        "Name": "jobtrack",
+        "TokenEnvVar": "CODEYBOX_JOBTRACK_API_KEY",
+        "CanDelegateInitiator": true,
+        "Principal": {
+          "Issuer": "jobtrack",
+          "Subject": "service",
+          "DisplayName": "JobTrack"
+        }
+      }
+    ]
+  }
+}
+```
+
+Only a client with `CanDelegateInitiator` may send the optional `initiator`
+object on `POST /workitems`. A normal named client is always attributed to its
+configured fixed principal, and the legacy operator key cannot delegate.
+Delegated identities are authenticated claims from the integration—not
+credentials—and are persisted with the work item for API, commit, and pull
+request attribution.
+
+### GitHub App delivery credentials
+
+For team installations, configure the GitHub upstream with a GitHub App
+installation rather than a developer PAT. The App must have repository
+permissions `Contents: read and write` and `Pull requests: read and write`;
+CodeyBox does not require a user token. Keep the downloaded private key in a
+service-owned, non-symlink file with mode `0600`.
+
+CodeyBox can create and install a private App on demand, so an operator does
+not normally need to pre-register one. Set `CodeyBox:PublicBaseUrl` to the
+external HTTPS origin, then make an authenticated `POST /github-app/connect`
+request and open the returned `url` in a browser. GitHub asks where to install
+the App and returns to CodeyBox; `GET /github-app/status` lists the resulting
+slug. CodeyBox stores the generated key under
+`CODEYBOX_GITHUB_APP_STORE` (default `/var/lib/codeybox/github-apps`) with
+owner-only permissions.
+
+Use that slug in the project:
+
+```json
+{
+  "Upstream": {
+    "Kind": "github",
+    "GitHubOwner": "example",
+    "GitHubRepository": "repository",
+    "GitHubAppSlug": "codeybox-hostname"
+  }
+}
+```
+
+The connect and status endpoints require normal CodeyBox API authentication;
+only their single-use browser callbacks are anonymous. Pending setup links
+expire after ten minutes.
+
+For a centrally managed, pre-registered App, configure the three environment
+variable references instead:
+
+```json
+{
+  "Upstream": {
+    "Kind": "github",
+    "GitHubOwner": "example",
+    "GitHubRepository": "repository",
+    "GitHubAppIdEnvVar": "CODEYBOX_GITHUB_APP_ID",
+    "GitHubAppInstallationIdEnvVar": "CODEYBOX_GITHUB_INSTALLATION_ID",
+    "GitHubAppPrivateKeyPathEnvVar": "CODEYBOX_GITHUB_PRIVATE_KEY_PATH"
+  }
+}
+```
+
+The three named environment variables contain the numeric App ID, numeric
+installation ID, and absolute PEM path respectively. CodeyBox creates a
+short-lived App JWT just in time, exchanges it for an installation token, and
+caches that token only until one minute before GitHub's expiry. `TokenEnvVar`
+remains available as the single-developer/PAT fallback; do not configure both
+credential modes on one project.
+
 Tokens are compared in constant time. `WWW-Authenticate: Bearer` is
 returned on 401.
 
