@@ -135,6 +135,8 @@ public sealed record UpstreamCompletionRequest
     /// cannot be read from the forge.
     /// </summary>
     public int? PromptRevision { get; init; }
+    /// <summary>Authenticated originator used for human attribution in delivery metadata.</summary>
+    public WorkInitiator? Initiator { get; init; }
     /// <summary>
     /// Name of the environment variable holding the upstream credential (from
     /// <c>Upstream.TokenEnvVar</c> in the project config). Null when not configured.

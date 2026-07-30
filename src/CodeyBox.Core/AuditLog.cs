@@ -30,10 +30,20 @@ public static class AuditLog
 
     // ── Work item lifecycle ──────────────────────────────────────────────────
 
-    public static void WorkItemCreated(WorkItemId id, ProjectId projectId, string title) =>
+    public static void WorkItemCreated(
+        WorkItemId id,
+        ProjectId projectId,
+        string title,
+        WorkInitiator? initiator = null) =>
         Audit("work_item.created")
-            .Information("Work item {WorkItemId} created for project {ProjectId}: {Title}",
-                id.ToString(), projectId.Value, title);
+            .Information(
+                "Work item {WorkItemId} created for project {ProjectId}: {Title}; initiator {InitiatorIssuer}/{InitiatorSubject} ({InitiatorDisplayName})",
+                id.ToString(),
+                projectId.Value,
+                title,
+                initiator?.Issuer,
+                initiator?.Subject,
+                initiator?.DisplayName);
 
     public static void WorkItemTransitioned(WorkItemId id, string toState) =>
         Audit("work_item.transitioned")

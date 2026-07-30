@@ -70,7 +70,7 @@ public sealed partial class PipelineRunner
                 workBranch,
                 $"origin/{workBranch}");
 
-            var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity);
+            var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity, item.Initiator);
             await RunWithCancellation(sandbox, phaseCt, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
             await RunMasked(sandbox, phaseCt, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
 

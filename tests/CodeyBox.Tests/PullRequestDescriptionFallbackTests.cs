@@ -100,6 +100,36 @@ public sealed class PullRequestDescriptionFallbackTests
         Assert.Single(handler.RequestBodies);
         Assert.Contains("Co-Authored-By: CodeyBox", handler.RequestBodies[0]);
     }
+
+    [Fact]
+    public async Task CompleteAsync_AttributesLinkedGitHubInitiator()
+    {
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(4, "https://github.com/myorg/myrepo/pull/4"));
+        var request = SampleRequest with
+        {
+            Initiator = new WorkInitiator
+            {
+                Issuer = "jobtrack",
+                Subject = "user-1",
+                DisplayName = "Ada Lovelace",
+                ProviderIdentities =
+                [
+                    new WorkInitiatorProviderIdentity
+                    {
+                        Provider = "github",
+                        AccountId = "42",
+                        Login = "ada",
+                    },
+                ],
+            },
+        };
+
+        await BuildRemote(handler, new ThrowingDescriptionGenerator())
+            .CompleteAsync(request, CancellationToken.None);
+
+        Assert.Contains("Initiated by @ada", handler.RequestBodies.Single());
+    }
 }
 
 internal sealed class ThrowingDescriptionGenerator : IPullRequestDescriptionGenerator

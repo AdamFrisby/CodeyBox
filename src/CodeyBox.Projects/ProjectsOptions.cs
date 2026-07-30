@@ -174,6 +174,10 @@ public sealed class ProjectUpstreamConfig
     public string? GitHubRepository { get; set; }
     public string? GenericUrl { get; set; }
     public string? TokenEnvVar { get; set; }
+    public string? GitHubAppIdEnvVar { get; set; }
+    public string? GitHubAppInstallationIdEnvVar { get; set; }
+    public string? GitHubAppPrivateKeyPathEnvVar { get; set; }
+    public string? GitHubAppSlug { get; set; }
     public string? MergeMethod { get; set; }
     public bool? AutoMerge { get; set; }
     public string? PullRequestTitleTemplate { get; set; }

@@ -34,6 +34,7 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
     private readonly ILogger<LlmPullRequestDescriptionGenerator> _generatorLog;
     private readonly IReadOnlyList<IUpstreamRemote> _pluginRemotes;
     private readonly ILogger<UpstreamRemoteFactory>? _factoryLog;
+    private readonly GitHubAppStore? _githubApps;
 
     public UpstreamRemoteFactory(
         IGitHost gitHost,
@@ -45,7 +46,8 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
         ILogger<LlmPullRequestDescriptionGenerator> generatorLog,
         IEnumerable<IUpstreamRemote>? pluginRemotes = null,
         ILogger<UpstreamRemoteFactory>? factoryLog = null,
-        ITimingStore? timings = null)
+        ITimingStore? timings = null,
+        GitHubAppStore? githubApps = null)
     {
         _gitHost = gitHost;
         _httpClientFactory = httpClientFactory;
@@ -56,6 +58,7 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
         _generatorLog = generatorLog;
         _timings = timings;
         _factoryLog = factoryLog;
+        _githubApps = githubApps;
 
         var remotes = new List<IUpstreamRemote>();
         foreach (var remote in pluginRemotes ?? [])
@@ -93,7 +96,10 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
                         $"Project {project.Id}: Upstream.Kind=github requires GitHubOwner"),
                     Repository = u.GitHubRepository ?? throw new InvalidOperationException(
                         $"Project {project.Id}: Upstream.Kind=github requires GitHubRepository"),
-                    Token = ReadToken(project, u),
+                    Token = HasGitHubAppConfiguration(u) || !string.IsNullOrWhiteSpace(u.GitHubAppSlug)
+                        ? null
+                        : ReadToken(project, u),
+                    TokenProvider = BuildGitHubAppTokenProvider(project, u),
                     MergeMethod = ValidateMergeMethod(project.Id, u.MergeMethod),
                     AutoMerge = u.AutoMerge,
                     PullRequestTitleTemplate = u.PullRequestTitleTemplate,
@@ -120,6 +126,65 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
         throw new InvalidOperationException(
             $"Project {project.Id}: unknown upstream kind '{u.Kind}'. " +
             $"Available kinds: {string.Join(", ", allKinds)}");
+    }
+
+    private IGitHubTokenProvider? BuildGitHubAppTokenProvider(Project project, ProjectUpstream upstream)
+    {
+        if (!string.IsNullOrWhiteSpace(upstream.GitHubAppSlug))
+        {
+            if (HasGitHubAppConfiguration(upstream) || !string.IsNullOrWhiteSpace(upstream.TokenEnvVar))
+                throw new InvalidOperationException(
+                    $"Project {project.Id}: GitHubAppSlug cannot be combined with other credential settings.");
+            var app = _githubApps?.Get(upstream.GitHubAppSlug)
+                ?? throw new InvalidOperationException(
+                    $"Project {project.Id}: linked GitHub App '{upstream.GitHubAppSlug}' was not found.");
+            if (app.InstallationId <= 0)
+                throw new InvalidOperationException(
+                    $"Project {project.Id}: linked GitHub App '{upstream.GitHubAppSlug}' is not installed.");
+            return new GitHubAppTokenProvider(
+                _httpClientFactory,
+                new GitHubAppTokenOptions(app.AppId, app.InstallationId, app.PrivateKeyPath));
+        }
+        if (!HasGitHubAppConfiguration(upstream))
+            return null;
+        if (!string.IsNullOrWhiteSpace(upstream.TokenEnvVar))
+            throw new InvalidOperationException(
+                $"Project {project.Id}: configure either TokenEnvVar or GitHub App credentials, not both.");
+        if (string.IsNullOrWhiteSpace(upstream.GitHubAppIdEnvVar)
+            || string.IsNullOrWhiteSpace(upstream.GitHubAppInstallationIdEnvVar)
+            || string.IsNullOrWhiteSpace(upstream.GitHubAppPrivateKeyPathEnvVar))
+            throw new InvalidOperationException(
+                $"Project {project.Id}: GitHub App delivery requires all three GitHubApp*EnvVar settings.");
+
+        var appId = ReadPositiveInt64EnvironmentVariable(project, upstream.GitHubAppIdEnvVar);
+        var installationId = ReadPositiveInt64EnvironmentVariable(
+            project, upstream.GitHubAppInstallationIdEnvVar);
+        var keyPath = Environment.GetEnvironmentVariable(upstream.GitHubAppPrivateKeyPathEnvVar);
+        if (string.IsNullOrWhiteSpace(keyPath))
+            throw new InvalidOperationException(
+                $"Project {project.Id}: env var '{upstream.GitHubAppPrivateKeyPathEnvVar}' is empty.");
+        return new GitHubAppTokenProvider(
+            _httpClientFactory,
+            new GitHubAppTokenOptions(appId, installationId, keyPath));
+    }
+
+    private static bool HasGitHubAppConfiguration(ProjectUpstream upstream) =>
+        !string.IsNullOrWhiteSpace(upstream.GitHubAppIdEnvVar)
+        || !string.IsNullOrWhiteSpace(upstream.GitHubAppInstallationIdEnvVar)
+        || !string.IsNullOrWhiteSpace(upstream.GitHubAppPrivateKeyPathEnvVar);
+
+    private static long ReadPositiveInt64EnvironmentVariable(Project project, string name)
+    {
+        var value = Environment.GetEnvironmentVariable(name);
+        if (!long.TryParse(
+                value,
+                System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var parsed)
+            || parsed <= 0)
+            throw new InvalidOperationException(
+                $"Project {project.Id}: env var '{name}' must contain a positive integer.");
+        return parsed;
     }
 
     private static string ValidateMergeMethod(ProjectId projectId, string mergeMethod)
