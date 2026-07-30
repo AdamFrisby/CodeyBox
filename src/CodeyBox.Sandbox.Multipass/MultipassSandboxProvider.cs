@@ -2548,7 +2548,16 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         SandboxSpec spec,
         string cloudInitPath)
     {
-        var argv = new List<string> { opts.MultipassBinary, "launch", "--name", name };
+        var launchTimeoutSeconds = (int)Math.Ceiling(opts.VmStartTimeout.TotalSeconds);
+        var argv = new List<string>
+        {
+            opts.MultipassBinary,
+            "launch",
+            "--name",
+            name,
+            "--timeout",
+            launchTimeoutSeconds.ToString(CultureInfo.InvariantCulture),
+        };
         if (spec.Limits.CpuCount is { } cpus) argv.AddRange(["--cpus", cpus.ToString()]);
         if (spec.Limits.MemoryBytes is { } mem) argv.AddRange(["--memory", $"{mem / (1024 * 1024)}M"]);
         if (spec.Limits.DiskBytes is { } disk) argv.AddRange(["--disk", $"{disk / (1024 * 1024)}M"]);
