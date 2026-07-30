@@ -270,12 +270,16 @@ Pick with `CodeyBox.SandboxProvider`:
 
 | Provider           | Setup                              | Isolation                                             |
 |--------------------|------------------------------------|-------------------------------------------------------|
-| `multipass`        | `snap install multipass`           | **KVM kernel isolation — the recommended default**    |
+| `incus`            | Incus 6.3+ and existing ZFS/Btrfs pool | KVM isolation; fast, space-efficient COW baseline clones |
+| `multipass`        | `snap install multipass`           | KVM isolation; simplest setup and graphical support   |
 | `multipass-remote` | Multipass on a remote host + SSH   | KVM isolation, VMs offloaded to another machine over SSH — orchestrator stays local |
 | `bubblewrap`       | `apt install bubblewrap`           | namespaces, shared kernel; integration-tested         |
 | `process`          | none                               | **none — testing only, never with untrusted prompts** |
 
-`multipass` is the isolation-providing configuration you want for anything real.
+Choose explicitly: prefer `incus` for persistent or high-throughput headless
+installations, and `multipass` for the simplest setup or graphical workloads.
+Multipass baseline clones copy full VM images; Incus ZFS/Btrfs clones are
+copy-on-write, reducing launch time, disk use, and repeated SSD writes.
 `multipass-remote` runs the same VMs on a separate host over SSH while the
 orchestrator — state, git, merge, auditors — stays local, so you can offload VM
 CPU without splitting the brain.
@@ -288,8 +292,11 @@ See [`docs/sandbox-providers.md`](docs/sandbox-providers.md).
 
 ## Going to production
 
-1. **Use Multipass** (`"SandboxProvider": "multipass"`) — the quickstart already
-   does; nothing to change.
+1. **Choose the provider deliberately.** Prefer Incus for persistent,
+   high-throughput headless operation; use Multipass when simpler setup or
+   graphical sandboxes matter more. Follow
+   [`docs/sandbox-providers.md`](docs/sandbox-providers.md), including Incus
+   storage-pool and service-identity prerequisites.
 2. **Set up host egress** once, with sudo: `scripts/setup-host-networks.sh`
    creates a Linux bridge per network profile and writes nftables rules that
    drop anything not on the profile's allowlist. A compromised agent with

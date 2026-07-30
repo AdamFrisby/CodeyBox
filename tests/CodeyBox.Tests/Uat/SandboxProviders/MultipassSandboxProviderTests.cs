@@ -4033,10 +4033,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
     [Fact]
     public void LaunchArgv_MapsConfiguredProfileToHostBridgeAndRejectsUnknownProfiles()
     {
-        var provider = NewProvider(networkProfiles: new Dictionary<string, string>
-        {
-            ["claude"] = "cb-claude",
-        });
+        var provider = NewProvider(
+            networkProfiles: new Dictionary<string, string>
+            {
+                ["claude"] = "cb-claude",
+            },
+            vmStartTimeout: TimeSpan.FromMinutes(10));
         var spec = new SandboxSpec
         {
             ImageReference = "24.04",
@@ -4052,6 +4054,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         var argv = provider.BuildLaunchArgv("codeybox-test", spec, "/staging/cloud-init.yaml");
 
         Assert.Equal("multipass", argv[0]);
+        var timeoutIndex = argv.ToList().IndexOf("--timeout");
+        Assert.True(timeoutIndex > 0, string.Join(' ', argv));
+        Assert.Equal("600", argv[timeoutIndex + 1]);
         Assert.Contains("--cpus", argv);
         Assert.Contains("4", argv);
         var argvList = argv.ToList();
