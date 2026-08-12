@@ -913,7 +913,7 @@ public static class AuditLog
 
     public static void QueuePaused(string reason) =>
         Audit("queue.paused")
-            .Information("Queue paused: {Reason}", reason);
+            .Information("Queue paused: {Reason}", reason.Replace("\r", "").Replace("\n", ""));
 
     public static void QueueResumed() =>
         Audit("queue.resumed")
@@ -933,7 +933,8 @@ public static class AuditLog
         Audit("agent.paused")
             .Information(
                 "Agent {Agent} paused by {PausedBy}: {Reason} expiresAt={ExpiresAt}",
-                agent.Value, pausedBy, reason, expiresAt);
+                agent.Value, pausedBy.Replace("\r", "").Replace("\n", ""),
+                reason.Replace("\r", "").Replace("\n", ""), expiresAt);
 
     public static void AgentResumed(
         AgentKind agent,
@@ -942,19 +943,20 @@ public static class AuditLog
         Audit("agent.resumed")
             .Information(
                 "Agent {Agent} resumed by {ResumedBy}: {Reason}",
-                agent.Value, resumedBy, reason ?? "");
+                agent.Value, resumedBy.Replace("\r", "").Replace("\n", ""),
+                (reason ?? "").Replace("\r", "").Replace("\n", ""));
 
     public static void AgentPauseExpired(AgentKind agent, string? reason) =>
         Audit("agent.pause_expired")
             .Information(
                 "Agent {Agent} pause expired: {Reason}",
-                agent.Value, reason ?? "");
+                agent.Value, (reason ?? "").Replace("\r", "").Replace("\n", ""));
 
     public static void AgentStartedWhilePaused(AgentKind agent, string? reason) =>
         Audit("agent.started_while_paused")
             .Warning(
                 "Orchestrator started with agent {Agent} paused; no new work will dispatch to it until resumed: {Reason}",
-                agent.Value, reason ?? "");
+                agent.Value, (reason ?? "").Replace("\r", "").Replace("\n", ""));
 
     public static void AgentPauseDispatchDeferred(
         WorkItemId id,
@@ -963,7 +965,8 @@ public static class AuditLog
         Audit("agent.pause_dispatch_deferred")
             .Information(
                 "Work item {WorkItemId} waiting for paused agent resume from={RetryFrom}: {Reason}",
-                id.ToString(), retryFrom, reason);
+                id.ToString(), retryFrom.Replace("\r", "").Replace("\n", ""),
+                reason.Replace("\r", "").Replace("\n", ""));
 
     public static void AgentPauseWaitingItemResumed(
         WorkItemId id,
@@ -1222,7 +1225,7 @@ public static class AuditLog
         Audit(logger, "store.disk_full")
             .Fatal(
                 "SQLite reported SQLITE_FULL during '{Operation}'; host disk is exhausted and no further state transitions can be persisted",
-                operation);
+                operation.Replace("\r", "").Replace("\n", ""));
 
     public static void ProjectQueuePaused(ProjectId projectId, string reason) =>
         Audit("project_queue.paused")

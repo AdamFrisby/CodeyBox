@@ -253,7 +253,9 @@ var moveEndpoint = app.MapPost("/admin/move/{id}/{direction}",
         }
         catch (Exception ex)
         {
-            moveLogger.LogWarning(ex, "No-JS reorder for item {ItemId} direction={Direction} failed", id, direction);
+            moveLogger.LogWarning(ex, "No-JS reorder for item {ItemId} direction={Direction} failed",
+                id.Replace("\r", "").Replace("\n", ""),
+                direction.Replace("\r", "").Replace("\n", ""));
         }
         return Results.Redirect("/");
     });
