@@ -11,7 +11,7 @@ namespace CodeyBox.Admin.Tests;
 /// the work item table shows links and states, and that action buttons match
 /// the release state.
 /// </summary>
-public sealed class ReleaseDetailPageTests : TestContext
+public sealed class ReleaseDetailPageTests : BunitContext
 {
     private const string ReleaseId = "aaaaaaaa-0000-0000-0000-000000000001";
 
@@ -50,7 +50,7 @@ public sealed class ReleaseDetailPageTests : TestContext
         fake.ReleaseOverride = MakeRelease(name: "v2.3.0");
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
+        var cut = Render<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
 
         Assert.Contains("v2.3.0", cut.Markup);
     }
@@ -62,7 +62,7 @@ public sealed class ReleaseDetailPageTests : TestContext
         fake.ReleaseOverride = MakeRelease(state: "Open");
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
+        var cut = Render<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
 
         Assert.Contains("state-open", cut.Markup);
     }
@@ -74,7 +74,7 @@ public sealed class ReleaseDetailPageTests : TestContext
         fake.ReleaseOverride = MakeRelease(branchName: "release/feature-y");
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
+        var cut = Render<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
 
         Assert.Contains("release/feature-y", cut.Markup);
     }
@@ -86,7 +86,7 @@ public sealed class ReleaseDetailPageTests : TestContext
         fake.ReleaseOverride = null;
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
+        var cut = Render<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
 
         Assert.Contains("not found", cut.Markup, StringComparison.OrdinalIgnoreCase);
     }
@@ -104,7 +104,7 @@ public sealed class ReleaseDetailPageTests : TestContext
         ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
+        var cut = Render<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
 
         Assert.Contains("queue-table", cut.Markup);
         Assert.Contains("Add tests", cut.Markup);
@@ -121,7 +121,7 @@ public sealed class ReleaseDetailPageTests : TestContext
         ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
+        var cut = Render<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
 
         // Short ID is first 8 chars
         Assert.Contains("bbbbbbbb", cut.Markup);
@@ -139,7 +139,7 @@ public sealed class ReleaseDetailPageTests : TestContext
         ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
+        var cut = Render<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
 
         Assert.Contains("state-done", cut.Markup);
         Assert.Contains("state-failed", cut.Markup);
@@ -154,7 +154,7 @@ public sealed class ReleaseDetailPageTests : TestContext
         fake.ReleaseWorkItemsOverride = [MakeWorkItemObj(wiId, "My Task", "Done")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
+        var cut = Render<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
 
         Assert.Contains($"/work-items/{wiId}", cut.Markup);
     }
@@ -167,7 +167,7 @@ public sealed class ReleaseDetailPageTests : TestContext
         fake.ReleaseWorkItemsOverride = [];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
+        var cut = Render<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
 
         Assert.Contains("No work items in this release", cut.Markup);
     }
@@ -185,7 +185,7 @@ public sealed class ReleaseDetailPageTests : TestContext
         ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
+        var cut = Render<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
 
         Assert.Contains("Auth refactor", cut.Markup);
         Assert.Contains("DB migration", cut.Markup);
@@ -201,7 +201,7 @@ public sealed class ReleaseDetailPageTests : TestContext
         fake.ReleaseOverride = MakeRelease(state: "Open");
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
+        var cut = Render<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
 
         Assert.Contains("Close", cut.Markup);
         Assert.Contains("Abandon", cut.Markup);
@@ -214,7 +214,7 @@ public sealed class ReleaseDetailPageTests : TestContext
         fake.ReleaseOverride = MakeRelease(state: "Closed");
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
+        var cut = Render<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
 
         Assert.Contains("Trigger Review", cut.Markup);
         Assert.Contains("Reopen", cut.Markup);
@@ -227,7 +227,7 @@ public sealed class ReleaseDetailPageTests : TestContext
         fake.ReleaseOverride = MakeRelease(state: "Failed", failedReason: "audit did not converge");
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
+        var cut = Render<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
 
         Assert.Contains("Reopen", cut.Markup);
     }
@@ -239,7 +239,7 @@ public sealed class ReleaseDetailPageTests : TestContext
         fake.ReleaseOverride = MakeRelease(state: "Failed", failedReason: "audit did not converge");
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
+        var cut = Render<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
 
         Assert.Contains("audit did not converge", cut.Markup);
     }
@@ -251,7 +251,7 @@ public sealed class ReleaseDetailPageTests : TestContext
         fake.ReleaseOverride = MakeRelease(state: "Released");
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
+        var cut = Render<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
 
         Assert.DoesNotContain("Close", cut.Markup);
         Assert.DoesNotContain("Abandon", cut.Markup);
@@ -266,7 +266,7 @@ public sealed class ReleaseDetailPageTests : TestContext
         fake.ReleaseOverride = MakeRelease(state: "InReview");
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
+        var cut = Render<ReleaseDetailPage>(p => p.Add(x => x.Id, ReleaseId));
 
         Assert.DoesNotContain("Close", cut.Markup);
         Assert.DoesNotContain("Trigger Review", cut.Markup);

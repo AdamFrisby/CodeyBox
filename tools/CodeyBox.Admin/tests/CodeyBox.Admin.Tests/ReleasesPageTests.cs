@@ -10,7 +10,7 @@ namespace CodeyBox.Admin.Tests;
 /// Renders the Releases list component with canned release data and verifies
 /// that state badges and action buttons are appropriate to each release state.
 /// </summary>
-public sealed class ReleasesPageTests : TestContext
+public sealed class ReleasesPageTests : BunitContext
 {
     private static ReleaseDto MakeRelease(
         string id = "aaaaaaaa-0000-0000-0000-000000000001",
@@ -39,7 +39,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         Assert.Contains("No releases found", cut.Markup);
     }
@@ -51,7 +51,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         Assert.DoesNotContain("queue-table", cut.Markup);
     }
@@ -63,7 +63,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [MakeRelease()];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         Assert.Contains("queue-table", cut.Markup);
     }
@@ -75,7 +75,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [MakeRelease(name: "v2.5.1")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         Assert.Contains("v2.5.1", cut.Markup);
     }
@@ -88,7 +88,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [MakeRelease(id: id, name: "v1.0.0")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         Assert.Contains($"/releases/{id}", cut.Markup);
     }
@@ -100,7 +100,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [MakeRelease(state: "Open")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         Assert.Contains("state-open", cut.Markup);
     }
@@ -112,7 +112,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [MakeRelease(state: "Closed")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         Assert.Contains("state-closed", cut.Markup);
     }
@@ -124,7 +124,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [MakeRelease(state: "InReview")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         Assert.Contains("state-inreview", cut.Markup);
     }
@@ -136,7 +136,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [MakeRelease(state: "Released")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         Assert.Contains("state-released", cut.Markup);
     }
@@ -148,7 +148,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [MakeRelease(state: "Failed")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         Assert.Contains("state-failed", cut.Markup);
     }
@@ -160,7 +160,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [MakeRelease(state: "Open")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         Assert.Contains("close", cut.Markup);
         Assert.Contains("abandon", cut.Markup);
@@ -173,7 +173,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [MakeRelease(state: "Open")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         Assert.DoesNotContain("trigger review", cut.Markup);
     }
@@ -185,7 +185,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [MakeRelease(state: "Closed")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         Assert.Contains("trigger review", cut.Markup);
         Assert.Contains("reopen", cut.Markup);
@@ -198,7 +198,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [MakeRelease(state: "Closed")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         // "close" button only shown for open releases
         Assert.DoesNotContain(">close<", cut.Markup);
@@ -212,7 +212,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [MakeRelease(state: "Failed")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         Assert.Contains("reopen", cut.Markup);
     }
@@ -224,7 +224,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [MakeRelease(state: "Released")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         // Released state has no action buttons (only view link).
         Assert.DoesNotContain(">close<", cut.Markup);
@@ -240,7 +240,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [MakeRelease(branchName: "release/feature-x")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         Assert.Contains("release/feature-x", cut.Markup);
     }
@@ -252,7 +252,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [MakeRelease(branchName: null)];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         Assert.Contains("—", cut.Markup);
     }
@@ -269,7 +269,7 @@ public sealed class ReleasesPageTests : TestContext
         ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         Assert.Contains("v1.0.0", cut.Markup);
         Assert.Contains("v1.1.0", cut.Markup);
@@ -283,7 +283,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         Assert.Contains("New Release", cut.Markup);
     }
@@ -295,7 +295,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
         cut.Find(".btn-primary").Click();
 
         Assert.Contains("modal-overlay", cut.Markup);
@@ -309,7 +309,7 @@ public sealed class ReleasesPageTests : TestContext
         fake.ReleasesOverride = [MakeRelease(state: "Abandoned")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ReleasesPage>();
+        var cut = Render<ReleasesPage>();
 
         Assert.DoesNotContain(">close<", cut.Markup);
         Assert.DoesNotContain(">abandon<", cut.Markup);

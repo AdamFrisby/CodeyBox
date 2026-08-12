@@ -242,6 +242,15 @@ public sealed class ProjectAuditorComposer
                 ". Ensure the corresponding audit preset is enabled and its auditor is available.");
         }
 
+        for (var i = 0; i < auditors.Count; i++)
+        {
+            if (auditors[i] is ShellCommandAuditor shellAuditor &&
+                _requiredAuditors.Contains(shellAuditor.Name))
+            {
+                auditors[i] = shellAuditor.WithRequiredToolAvailability();
+            }
+        }
+
         return auditors;
     }
 

@@ -6,7 +6,7 @@ using WorkItemTimingsPage = CodeyBox.Admin.Web.Components.Pages.WorkItemTimings;
 
 namespace CodeyBox.Admin.Tests;
 
-public sealed class AgentActivitySectionTests : TestContext
+public sealed class AgentActivitySectionTests : BunitContext
 {
     private const string ItemId = "aabbccdd-0000-0000-0000-000000000001";
 
@@ -59,7 +59,7 @@ public sealed class AgentActivitySectionTests : TestContext
         };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemTimingsPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemTimingsPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("Agent activity", cut.Markup);
         Assert.Contains("agent-activity-table", cut.Markup);
@@ -83,7 +83,7 @@ public sealed class AgentActivitySectionTests : TestContext
         };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemTimingsPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemTimingsPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("Agent activity", cut.Markup);
         Assert.Contains("stream-json not supported by this agent", cut.Markup);
@@ -114,7 +114,7 @@ public sealed class AgentActivitySectionTests : TestContext
         };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemTimingsPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemTimingsPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("Agent activity", cut.Markup);
         Assert.Contains("stream-json not supported by this agent", cut.Markup);

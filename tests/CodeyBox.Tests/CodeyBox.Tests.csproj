@@ -11,10 +11,6 @@
   <!-- Suppress vulnerability advisories for OTel transitive dependencies that have no patched
        version in the local NuGet cache. Mirrored from CodeyBox.Api.csproj. -->
   <ItemGroup>
-    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-g94r-2vxg-569j" />
-    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-4625-4j76-fww9" />
-    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-9j88-vvj5-vhgr" />
-    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-g7hc-96xr-gvvx" />
   </ItemGroup>
 
   <ItemGroup>

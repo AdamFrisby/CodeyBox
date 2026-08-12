@@ -29,6 +29,15 @@ var googleEnabled = !string.IsNullOrWhiteSpace(googleClientId)
 var allowedEmailDomains = builder.Configuration
     .GetSection("CodeyBoxAdmin:Authentication:AllowedEmailDomains")
     .Get<string[]>() ?? [];
+if (!builder.Environment.IsDevelopment() && requireAuth)
+{
+    if (!cloudflareEnabled && !googleEnabled)
+        throw new InvalidOperationException(
+            "Production authentication requires Cloudflare Access or Google OAuth.");
+    if (allowedEmailDomains.Length == 0)
+        throw new InvalidOperationException(
+            "Production authentication requires at least one allowed email domain.");
+}
 var dataProtectionKeysPath = builder.Configuration["CodeyBoxAdmin:DataProtectionKeysPath"];
 if (!string.IsNullOrWhiteSpace(dataProtectionKeysPath))
 {
@@ -57,7 +66,9 @@ var authentication = builder.Services.AddAuthentication(options =>
         // Strict prevents the auth cookie from being sent on any cross-site request.
         opts.Cookie.SameSite = SameSiteMode.Strict;
         opts.Cookie.HttpOnly = true;
-        opts.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
+        opts.Cookie.SecurePolicy = builder.Environment.IsDevelopment()
+            ? CookieSecurePolicy.SameAsRequest
+            : CookieSecurePolicy.Always;
     });
 
 if (cloudflareEnabled)
@@ -100,9 +111,7 @@ if (requireAuth)
             {
                 // A configured domain list is an origin-side backstop to Cloudflare/Google policy.
                 // Local emergency credentials remain usable when explicitly configured.
-                if (allowedEmailDomains.Length == 0
-                    || context.User.Identity?.AuthenticationType == CookieAuthenticationDefaults.AuthenticationScheme
-                       && context.User.FindFirstValue(ClaimTypes.Email) is null)
+                if (allowedEmailDomains.Length == 0)
                     return true;
                 var email = context.User.FindFirstValue(ClaimTypes.Email)
                     ?? context.User.FindFirstValue("email");
@@ -162,38 +171,41 @@ app.Use(async (ctx, next) =>
 // Cookie-based login — credentials read exclusively from env vars (CODEYBOX_ADMIN_USERNAME /
 // CODEYBOX_ADMIN_PASSWORD), never from config files or code.
 // Login.razor includes <AntiforgeryToken />, so antiforgery is enforced without DisableAntiforgery().
-app.MapPost("/account/login", async (HttpContext ctx) =>
+if (app.Environment.IsDevelopment())
 {
-    var form = await ctx.Request.ReadFormAsync();
-    var username = form["username"].ToString().Trim();
-    var password = form["password"].ToString();
-    var returnUrl = form["returnUrl"].ToString();
+    app.MapPost("/account/login", async (HttpContext ctx) =>
+    {
+        var form = await ctx.Request.ReadFormAsync();
+        var username = form["username"].ToString().Trim();
+        var password = form["password"].ToString();
+        var returnUrl = form["returnUrl"].ToString();
 
-    var expectedUsername = Environment.GetEnvironmentVariable("CODEYBOX_ADMIN_USERNAME") ?? "admin";
-    var expectedPassword = Environment.GetEnvironmentVariable("CODEYBOX_ADMIN_PASSWORD") ?? "";
+        var expectedUsername = Environment.GetEnvironmentVariable("CODEYBOX_ADMIN_USERNAME") ?? "admin";
+        var expectedPassword = Environment.GetEnvironmentVariable("CODEYBOX_ADMIN_PASSWORD") ?? "";
 
     // Timing-safe comparison prevents oracle attacks on credential length/prefix.
-    var usernameOk = CryptographicOperations.FixedTimeEquals(
-        Encoding.UTF8.GetBytes(username), Encoding.UTF8.GetBytes(expectedUsername));
-    var passwordOk = !string.IsNullOrEmpty(expectedPassword) &&
-        CryptographicOperations.FixedTimeEquals(
-            Encoding.UTF8.GetBytes(password), Encoding.UTF8.GetBytes(expectedPassword));
+        var usernameOk = CryptographicOperations.FixedTimeEquals(
+            Encoding.UTF8.GetBytes(username), Encoding.UTF8.GetBytes(expectedUsername));
+        var passwordOk = !string.IsNullOrEmpty(expectedPassword) &&
+            CryptographicOperations.FixedTimeEquals(
+                Encoding.UTF8.GetBytes(password), Encoding.UTF8.GetBytes(expectedPassword));
 
-    if (!usernameOk || !passwordOk)
-        return Results.Redirect("/login?error=1");
+        if (!usernameOk || !passwordOk)
+            return Results.Redirect("/login?error=1");
 
-    var claims = new[] { new Claim(ClaimTypes.Name, username) };
-    var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
-    await ctx.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, new ClaimsPrincipal(identity));
+        var claims = new[] { new Claim(ClaimTypes.Name, username) };
+        var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
+        await ctx.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, new ClaimsPrincipal(identity));
 
-    var redirect = !string.IsNullOrEmpty(returnUrl) &&
-        returnUrl.StartsWith('/') &&
-        !returnUrl.StartsWith("//") &&
-        Uri.TryCreate(returnUrl, UriKind.Relative, out _)
-        ? returnUrl
-        : "/";
-    return Results.Redirect(redirect);
-}).AllowAnonymous();
+        var redirect = !string.IsNullOrEmpty(returnUrl) &&
+            returnUrl.StartsWith('/') &&
+            !returnUrl.StartsWith("//") &&
+            Uri.TryCreate(returnUrl, UriKind.Relative, out _)
+            ? returnUrl
+            : "/";
+        return Results.Redirect(redirect);
+    }).AllowAnonymous();
+}
 
 app.MapGet("/account/google-login", (string? returnUrl) =>
 {

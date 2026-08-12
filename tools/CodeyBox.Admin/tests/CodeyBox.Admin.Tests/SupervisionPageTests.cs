@@ -7,7 +7,7 @@ using SupervisionPage = CodeyBox.Admin.Web.Components.Pages.Supervision;
 
 namespace CodeyBox.Admin.Tests;
 
-public sealed class SupervisionPageTests : TestContext
+public sealed class SupervisionPageTests : BunitContext
 {
     public SupervisionPageTests()
     {
@@ -52,7 +52,7 @@ public sealed class SupervisionPageTests : TestContext
         };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<SupervisionPage>();
+        var cut = Render<SupervisionPage>();
 
         Assert.Contains("[codeybox:autonomous]", cut.Markup);
         Assert.Contains("CodeyBox prompt sent before dashboard opened", cut.Markup);

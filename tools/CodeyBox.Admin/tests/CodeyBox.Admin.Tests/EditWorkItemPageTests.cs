@@ -6,7 +6,7 @@ using EditWorkItemPage = CodeyBox.Admin.Web.Components.Pages.EditWorkItem;
 
 namespace CodeyBox.Admin.Tests;
 
-public sealed class EditWorkItemPageTests : TestContext
+public sealed class EditWorkItemPageTests : BunitContext
 {
     private static WorkItemDto MakeItem(string id, string title, string state = "Queued",
         string prompt = "Original prompt") => new()
@@ -29,7 +29,7 @@ public sealed class EditWorkItemPageTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<EditWorkItemPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<EditWorkItemPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.Contains("Save", cut.Markup);
         Assert.Contains("My Task", cut.Markup);
@@ -42,7 +42,7 @@ public sealed class EditWorkItemPageTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<EditWorkItemPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<EditWorkItemPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.Contains("Prepopulated Title", cut.Markup);
     }
@@ -54,7 +54,7 @@ public sealed class EditWorkItemPageTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<EditWorkItemPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<EditWorkItemPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.Contains("My detailed prompt", cut.Markup);
     }
@@ -66,7 +66,7 @@ public sealed class EditWorkItemPageTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<EditWorkItemPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<EditWorkItemPage>(p => p.Add(x => x.Id, item.Id));
 
         // Should show state message, not the edit form.
         Assert.Contains("Working", cut.Markup);
@@ -79,7 +79,7 @@ public sealed class EditWorkItemPageTests : TestContext
         var fake = new FakeApiClient([]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<EditWorkItemPage>(p =>
+        var cut = Render<EditWorkItemPage>(p =>
             p.Add(x => x.Id, "aabbccdd-0000-0000-0000-000000000099"));
 
         Assert.Contains("not found", cut.Markup, StringComparison.OrdinalIgnoreCase);
@@ -92,9 +92,9 @@ public sealed class EditWorkItemPageTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<EditWorkItemPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<EditWorkItemPage>(p => p.Add(x => x.Id, item.Id));
         // Re-render with same Id — LoadAsync should not fire again.
-        cut.SetParametersAndRender(p => p.Add(x => x.Id, item.Id));
+        cut.Render(p => p.Add(x => x.Id, item.Id));
 
         Assert.Equal(1, fake.GetWorkItemCallCount);
     }
@@ -106,7 +106,7 @@ public sealed class EditWorkItemPageTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<EditWorkItemPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<EditWorkItemPage>(p => p.Add(x => x.Id, item.Id));
 
         // Form is suppressed for non-Queued items.
         Assert.DoesNotContain("Save", cut.Markup);

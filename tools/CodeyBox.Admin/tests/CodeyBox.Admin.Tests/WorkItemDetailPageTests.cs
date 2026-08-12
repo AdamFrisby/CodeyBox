@@ -7,7 +7,7 @@ using WorkItemDetailPage = CodeyBox.Admin.Web.Components.Pages.WorkItemDetail;
 
 namespace CodeyBox.Admin.Tests;
 
-public sealed class WorkItemDetailPageTests : TestContext
+public sealed class WorkItemDetailPageTests : BunitContext
 {
     public WorkItemDetailPageTests()
     {
@@ -35,7 +35,7 @@ public sealed class WorkItemDetailPageTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.Contains("My Work Item", cut.Markup);
     }
@@ -47,7 +47,7 @@ public sealed class WorkItemDetailPageTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.Contains("Some prompt text", cut.Markup);
     }
@@ -65,7 +65,7 @@ public sealed class WorkItemDetailPageTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.Contains("Plan", cut.Markup);
         Assert.Contains("PLAN:", cut.Markup);
@@ -82,7 +82,7 @@ public sealed class WorkItemDetailPageTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.Contains("edit", cut.Markup, StringComparison.OrdinalIgnoreCase);
     }
@@ -94,7 +94,7 @@ public sealed class WorkItemDetailPageTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.DoesNotContain("/edit", cut.Markup);
     }
@@ -106,7 +106,7 @@ public sealed class WorkItemDetailPageTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.Contains("Retry", cut.Markup);
     }
@@ -117,7 +117,7 @@ public sealed class WorkItemDetailPageTests : TestContext
         var fake = new FakeApiClient([]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p =>
+        var cut = Render<WorkItemDetailPage>(p =>
             p.Add(x => x.Id, "aabbccdd-0000-0000-0000-000000000099"));
 
         Assert.Contains("not found", cut.Markup, StringComparison.OrdinalIgnoreCase);
@@ -130,9 +130,9 @@ public sealed class WorkItemDetailPageTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
         // Re-render with the same Id — LoadAsync should not fire again.
-        cut.SetParametersAndRender(p => p.Add(x => x.Id, item.Id));
+        cut.Render(p => p.Add(x => x.Id, item.Id));
 
         // GetWorkItemAsync was called exactly once, not twice.
         Assert.Equal(1, fake.GetWorkItemCallCount);
@@ -145,7 +145,7 @@ public sealed class WorkItemDetailPageTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.Contains("Timeline", cut.Markup);
         Assert.Contains("/timeline", cut.Markup);
@@ -169,7 +169,7 @@ public sealed class WorkItemDetailPageTests : TestContext
         fake.QuestionsOverride[item.Id] = [MakeOpenQuestion(item.Id, "q-001", "Which approach to use?")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.Contains("Questions", cut.Markup);
         Assert.Contains("q-001", cut.Markup);
@@ -184,7 +184,7 @@ public sealed class WorkItemDetailPageTests : TestContext
         fake.QuestionsOverride[item.Id] = [MakeOpenQuestion(item.Id, "q-001", "Which approach?")];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.Contains("textarea", cut.Markup);
         Assert.Contains("Submit", cut.Markup);
@@ -212,7 +212,7 @@ public sealed class WorkItemDetailPageTests : TestContext
         ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.Contains("Answered", cut.Markup, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("Use approach B.", cut.Markup);
@@ -240,7 +240,7 @@ public sealed class WorkItemDetailPageTests : TestContext
         ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.Contains("Dismissed", cut.Markup, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("Out of scope for this PR.", cut.Markup);
@@ -254,7 +254,7 @@ public sealed class WorkItemDetailPageTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.DoesNotContain("question-block", cut.Markup);
         Assert.Contains("Replay", cut.Markup);

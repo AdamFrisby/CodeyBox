@@ -74,6 +74,10 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
     /// </summary>
     public IReadOnlyList<string> Argv => _opts.Argv;
 
+    /// <summary>Marks this auditor's executable as mandatory infrastructure.</summary>
+    public ShellCommandAuditor WithRequiredToolAvailability()
+        => new(_opts with { MissingToolBehavior = MissingToolBehavior.Unavailable });
+
     public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
     {
         var toolName = _opts.ToolName ?? _opts.Argv[0];
@@ -283,6 +287,13 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         // propagate exit 127 from repository-controlled scripts; those remain
         // blocking command failures.
         var missingTool = IsConfirmedMissingTopLevelTool(result);
+        if (missingTool && _opts.MissingToolBehavior == MissingToolBehavior.Unavailable)
+        {
+            throw new AuditUnavailableException(
+                $"Required audit tool '{toolName}' is not installed in the sandbox.",
+                result.ExitCode,
+                CombinedOutput(result));
+        }
         var severity = missingTool
             ? MissingToolSeverity()
             : AuditSeverity.Error;
@@ -336,6 +347,12 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
 
     private AuditResult MissingToolResult(string toolName, string rawOutput)
     {
+        if (_opts.MissingToolBehavior == MissingToolBehavior.Unavailable)
+        {
+            throw new AuditUnavailableException(
+                $"Required audit tool '{toolName}' is not installed in the sandbox.");
+        }
+
         var finding = new AuditFinding(
             AuditorName: Name,
             Severity: MissingToolSeverity(),
@@ -350,6 +367,12 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
             : _opts.MissingToolSeverity ?? AuditSeverity.Info;
 }
 
+public enum MissingToolBehavior
+{
+    Finding,
+    Unavailable,
+}
+
 public sealed record ShellCommandAuditorOptions
 {
     public required string Name { get; init; }
@@ -360,6 +383,7 @@ public sealed record ShellCommandAuditorOptions
     public IAuditResultClassifier? ResultClassifier { get; init; }
     public AuditCapabilities Required { get; init; } = AuditCapabilities.None;
     public AuditSeverity? MissingToolSeverity { get; init; }
+    public MissingToolBehavior MissingToolBehavior { get; init; } = MissingToolBehavior.Finding;
     /// <summary>
     /// Review targets for this command. Empty configuration is materialised as
     /// Code-only by composers. Plan commands read their artifact through

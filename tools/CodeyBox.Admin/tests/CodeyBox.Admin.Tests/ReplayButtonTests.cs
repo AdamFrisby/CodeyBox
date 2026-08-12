@@ -13,7 +13,7 @@ namespace CodeyBox.Admin.Tests;
 /// non-terminal states. Also verifies that the comparison page link appears
 /// alongside the replay button.
 /// </summary>
-public sealed class ReplayButtonTests : TestContext
+public sealed class ReplayButtonTests : BunitContext
 {
     public ReplayButtonTests()
     {
@@ -43,7 +43,7 @@ public sealed class ReplayButtonTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.Contains("Replay", cut.Markup);
     }
@@ -60,7 +60,7 @@ public sealed class ReplayButtonTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         // "Retry" may appear, but the "Replay" agent-comparison button should not.
         // The Timeline link also contains no "Replay" text now that we renamed it.
@@ -76,7 +76,7 @@ public sealed class ReplayButtonTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.Contains("/comparison", cut.Markup);
     }
@@ -88,7 +88,7 @@ public sealed class ReplayButtonTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.DoesNotContain("/comparison", cut.Markup);
     }
@@ -100,7 +100,7 @@ public sealed class ReplayButtonTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.Contains("Timeline", cut.Markup);
         Assert.Contains("/timeline", cut.Markup);
@@ -114,7 +114,7 @@ public sealed class ReplayButtonTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.Contains("Replay of", cut.Markup);
         Assert.Contains("aabbccdd", cut.Markup);
@@ -127,7 +127,7 @@ public sealed class ReplayButtonTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         // Find and click the Replay button (it's a <button>, not a link)
         var replayBtn = cut.FindAll("button").FirstOrDefault(b => b.TextContent.Contains("Replay"));

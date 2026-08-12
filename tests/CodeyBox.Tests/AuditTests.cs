@@ -679,6 +679,23 @@ public sealed class AuditTests
     }
 
     [Fact]
+    public async Task ShellCommandAuditor_RequiredMissingTool_IsInfrastructureUnavailable()
+    {
+        var auditor = new ShellCommandAuditor(new ShellCommandAuditorOptions
+        {
+            Name = "security:gitleaks",
+            Argv = ["gitleaks", "detect"],
+            MissingToolBehavior = MissingToolBehavior.Unavailable,
+        });
+        var sandbox = new FakeSandbox(_ => new SandboxExecResult(1, "", ""));
+
+        var exception = await Assert.ThrowsAsync<AuditUnavailableException>(() =>
+            auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("gitleaks", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task CSharpTestPass_IgnoresFastFailuresWithoutStackTraceAndReportsRealFailures()
     {
         var auditor = CSharpTestPassAuditor();

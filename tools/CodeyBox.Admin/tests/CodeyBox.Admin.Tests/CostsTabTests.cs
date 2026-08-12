@@ -7,7 +7,7 @@ using WorkItemCostsPage = CodeyBox.Admin.Web.Components.Pages.WorkItemCosts;
 
 namespace CodeyBox.Admin.Tests;
 
-public sealed class CostsTabTests : TestContext
+public sealed class CostsTabTests : BunitContext
 {
     private const string ItemId = "aabbccdd-0000-0000-0000-000000000001";
 
@@ -71,7 +71,7 @@ public sealed class CostsTabTests : TestContext
         fake.CostsOverride[ItemId] = MakeCosts(estimatedUsd: 0.168525, elapsedMs: 0);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemCostsPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemCostsPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("$", cut.Markup);
         Assert.Contains("12.3K input", cut.Markup);
@@ -84,7 +84,7 @@ public sealed class CostsTabTests : TestContext
         fake.CostsOverride[ItemId] = MakeCosts(phases: ["work", "audit"]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemCostsPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemCostsPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("costs-phase-table", cut.Markup);
         Assert.Contains("work", cut.Markup);
@@ -97,7 +97,7 @@ public sealed class CostsTabTests : TestContext
         var fake = new FakeApiClient([]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemCostsPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemCostsPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("not found", cut.Markup, StringComparison.OrdinalIgnoreCase);
     }
@@ -113,7 +113,7 @@ public sealed class CostsTabTests : TestContext
         };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemCostsPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemCostsPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("No cost data", cut.Markup);
     }
@@ -131,7 +131,7 @@ public sealed class CostsTabTests : TestContext
             agentKinds: ["cursor"]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemCostsPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemCostsPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("Token counts unavailable", cut.Markup);
         Assert.Contains("15s", cut.Markup);
@@ -145,7 +145,7 @@ public sealed class CostsTabTests : TestContext
         fake.CostsOverride[ItemId] = MakeCosts(agentKinds: ["claude"]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemCostsPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemCostsPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("claude", cut.Markup);
         Assert.Contains("costs-agent-table", cut.Markup);
@@ -160,7 +160,7 @@ public sealed class CostsTabTests : TestContext
         fake.CostsOverride[ItemId] = costs;
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemCostsPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemCostsPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("claude/acct-a", cut.Markup);
         Assert.Contains("costs-agent-table", cut.Markup);

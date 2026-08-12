@@ -7,7 +7,7 @@ using WorkItemTimingsPage = CodeyBox.Admin.Web.Components.Pages.WorkItemTimings;
 
 namespace CodeyBox.Admin.Tests;
 
-public sealed class TimingsTabTests : TestContext
+public sealed class TimingsTabTests : BunitContext
 {
     private const string ItemId = "aabbccdd-0000-0000-0000-000000000001";
 
@@ -45,7 +45,7 @@ public sealed class TimingsTabTests : TestContext
         fake.TimingsOverride[ItemId] = MakeTimings(12_000);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemTimingsPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemTimingsPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("12.0s", cut.Markup);
     }
@@ -57,7 +57,7 @@ public sealed class TimingsTabTests : TestContext
         fake.TimingsOverride[ItemId] = MakeTimings(12_000, ["agent.exec"]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemTimingsPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemTimingsPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("agent.exec", cut.Markup);
         Assert.Contains("timings-top", cut.Markup);
@@ -70,7 +70,7 @@ public sealed class TimingsTabTests : TestContext
         fake.TimingsOverride[ItemId] = MakeTimings();
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemTimingsPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemTimingsPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("timings-phase", cut.Markup);
         Assert.Contains("work", cut.Markup);
@@ -82,7 +82,7 @@ public sealed class TimingsTabTests : TestContext
         var fake = new FakeApiClient([]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemTimingsPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemTimingsPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("not found", cut.Markup, StringComparison.OrdinalIgnoreCase);
     }
@@ -94,7 +94,7 @@ public sealed class TimingsTabTests : TestContext
         fake.TimingsOverride[ItemId] = MakeTimings();
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemTimingsPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemTimingsPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains($"/work-items/{ItemId}", cut.Markup);
     }

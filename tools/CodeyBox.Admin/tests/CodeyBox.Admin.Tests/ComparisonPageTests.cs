@@ -11,7 +11,7 @@ namespace CodeyBox.Admin.Tests;
 /// comparison grid is populated correctly. Also verifies that cost and timing
 /// cells appear when data is available.
 /// </summary>
-public sealed class ComparisonPageTests : TestContext
+public sealed class ComparisonPageTests : BunitContext
 {
     private static WorkItemDto MakeItem(string id, string agent, string state = "Done") => new()
     {
@@ -43,7 +43,7 @@ public sealed class ComparisonPageTests : TestContext
         fake.ReplaysOverride = MakeReplays(source);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ComparisonPage>(p => p.Add(x => x.Id, source.Id));
+        var cut = Render<ComparisonPage>(p => p.Add(x => x.Id, source.Id));
 
         Assert.Contains("claude", cut.Markup);
         Assert.Contains("Done", cut.Markup);
@@ -58,7 +58,7 @@ public sealed class ComparisonPageTests : TestContext
         fake.ReplaysOverride = MakeReplays(source, replay);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ComparisonPage>(p => p.Add(x => x.Id, source.Id));
+        var cut = Render<ComparisonPage>(p => p.Add(x => x.Id, source.Id));
 
         Assert.Contains("claude", cut.Markup);
         Assert.Contains("gemini", cut.Markup);
@@ -73,7 +73,7 @@ public sealed class ComparisonPageTests : TestContext
         fake.ReplaysOverride = null;
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ComparisonPage>(p =>
+        var cut = Render<ComparisonPage>(p =>
             p.Add(x => x.Id, "aabbccdd-0000-0000-0000-000000000099"));
 
         Assert.Contains("not found", cut.Markup, StringComparison.OrdinalIgnoreCase);
@@ -92,7 +92,7 @@ public sealed class ComparisonPageTests : TestContext
         };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ComparisonPage>(p => p.Add(x => x.Id, source.Id));
+        var cut = Render<ComparisonPage>(p => p.Add(x => x.Id, source.Id));
 
         Assert.Contains("Wall-clock", cut.Markup);
         Assert.Contains("45.0s", cut.Markup);
@@ -111,7 +111,7 @@ public sealed class ComparisonPageTests : TestContext
         };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ComparisonPage>(p => p.Add(x => x.Id, source.Id));
+        var cut = Render<ComparisonPage>(p => p.Add(x => x.Id, source.Id));
 
         Assert.Contains("Token cost", cut.Markup);
         Assert.Contains("$0.1234", cut.Markup);
@@ -125,7 +125,7 @@ public sealed class ComparisonPageTests : TestContext
         fake.ReplaysOverride = MakeReplays(source);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ComparisonPage>(p => p.Add(x => x.Id, source.Id));
+        var cut = Render<ComparisonPage>(p => p.Add(x => x.Id, source.Id));
 
         Assert.DoesNotContain("Wall-clock", cut.Markup);
         Assert.DoesNotContain("Token cost", cut.Markup);
@@ -139,7 +139,7 @@ public sealed class ComparisonPageTests : TestContext
         fake.ReplaysOverride = MakeReplays(source);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ComparisonPage>(p => p.Add(x => x.Id, source.Id));
+        var cut = Render<ComparisonPage>(p => p.Add(x => x.Id, source.Id));
 
         Assert.Contains($"/work-items/{source.Id}", cut.Markup);
     }
@@ -152,7 +152,7 @@ public sealed class ComparisonPageTests : TestContext
         fake.ReplaysOverride = MakeReplays(source);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<ComparisonPage>(p => p.Add(x => x.Id, source.Id));
+        var cut = Render<ComparisonPage>(p => p.Add(x => x.Id, source.Id));
 
         // Short ID (first 8 chars) should appear in the column header
         Assert.Contains("aabbccdd", cut.Markup);

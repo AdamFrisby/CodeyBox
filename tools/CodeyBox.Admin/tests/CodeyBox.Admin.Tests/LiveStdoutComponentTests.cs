@@ -12,7 +12,7 @@ namespace CodeyBox.Admin.Tests;
 /// Hub connection is skipped (HubUrl = "") so tests run without a real SignalR server.
 /// The tail is delivered via <see cref="FakeApiClient.GetStdoutTailAsync"/>.
 /// </summary>
-public sealed class LiveStdoutComponentTests : TestContext
+public sealed class LiveStdoutComponentTests : BunitContext
 {
     public LiveStdoutComponentTests()
     {
@@ -42,7 +42,7 @@ public sealed class LiveStdoutComponentTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.Contains("live-stdout", cut.Markup);
         Assert.Contains("Live Output", cut.Markup);
@@ -55,7 +55,7 @@ public sealed class LiveStdoutComponentTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.DoesNotContain("live-stdout", cut.Markup);
     }
@@ -68,7 +68,7 @@ public sealed class LiveStdoutComponentTests : TestContext
         fake.StdoutTailOverride[item.Id] = "some cached output";
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
         cut.WaitForState(() => cut.Markup.Contains("some cached output"), TimeSpan.FromSeconds(2));
 
         Assert.Contains("live-stdout", cut.Markup);
@@ -85,7 +85,7 @@ public sealed class LiveStdoutComponentTests : TestContext
         fake.StdoutTailOverride[item.Id] = "agent is working...\nsome progress here\n";
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
         cut.WaitForState(() => cut.Markup.Contains("agent is working"), TimeSpan.FromSeconds(2));
 
         Assert.Contains("agent is working", cut.Markup);
@@ -100,7 +100,7 @@ public sealed class LiveStdoutComponentTests : TestContext
         // GetStdoutTailAsync returns null (no entry in override dict)
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         // Panel is visible (non-terminal), but the pre element is empty
         Assert.Contains("live-stdout", cut.Markup);
@@ -116,7 +116,7 @@ public sealed class LiveStdoutComponentTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
 
         Assert.Contains("Live Output", cut.Markup);
         Assert.DoesNotContain("Output Tail", cut.Markup);
@@ -130,7 +130,7 @@ public sealed class LiveStdoutComponentTests : TestContext
         fake.StdoutTailOverride[item.Id] = "last known output";
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
+        var cut = Render<WorkItemDetailPage>(p => p.Add(x => x.Id, item.Id));
         cut.WaitForState(() => cut.Markup.Contains("last known output"), TimeSpan.FromSeconds(2));
 
         Assert.Contains("Output Tail", cut.Markup);

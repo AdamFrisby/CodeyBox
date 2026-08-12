@@ -10,7 +10,7 @@ namespace CodeyBox.Admin.Tests;
 /// Renders the Suggestions list component with a fake API client and asserts
 /// that the table and filters reflect the returned suggestions.
 /// </summary>
-public sealed class SuggestionListPageTests : TestContext
+public sealed class SuggestionListPageTests : BunitContext
 {
     private static SuggestionDto MakeSuggestion(
         string id = "aaaaaaaa-0000-0000-0000-000000000001",
@@ -35,7 +35,7 @@ public sealed class SuggestionListPageTests : TestContext
     public void Suggestions_EmptyList_ShowsNoOpenMessage()
     {
         Services.AddSingleton<ICodeyBoxApiClient>(new SuggestionFakeClient([]));
-        var cut = RenderComponent<SuggestionsPage>();
+        var cut = Render<SuggestionsPage>();
         Assert.Contains("No open suggestions", cut.Markup);
     }
 
@@ -43,7 +43,7 @@ public sealed class SuggestionListPageTests : TestContext
     public void Suggestions_EmptyList_DoesNotRenderTable()
     {
         Services.AddSingleton<ICodeyBoxApiClient>(new SuggestionFakeClient([]));
-        var cut = RenderComponent<SuggestionsPage>();
+        var cut = Render<SuggestionsPage>();
         Assert.DoesNotContain("queue-table", cut.Markup);
     }
 
@@ -51,7 +51,7 @@ public sealed class SuggestionListPageTests : TestContext
     public void Suggestions_WithItems_RendersTable()
     {
         Services.AddSingleton<ICodeyBoxApiClient>(new SuggestionFakeClient([MakeSuggestion()]));
-        var cut = RenderComponent<SuggestionsPage>();
+        var cut = Render<SuggestionsPage>();
         Assert.Contains("queue-table", cut.Markup);
     }
 
@@ -59,7 +59,7 @@ public sealed class SuggestionListPageTests : TestContext
     public void Suggestions_TitleAppearsInRow()
     {
         Services.AddSingleton<ICodeyBoxApiClient>(new SuggestionFakeClient([MakeSuggestion(title: "Fix the bug")]));
-        var cut = RenderComponent<SuggestionsPage>();
+        var cut = Render<SuggestionsPage>();
         Assert.Contains("Fix the bug", cut.Markup);
     }
 
@@ -68,7 +68,7 @@ public sealed class SuggestionListPageTests : TestContext
     {
         var id = "aaaaaaaa-0000-0000-0000-000000000001";
         Services.AddSingleton<ICodeyBoxApiClient>(new SuggestionFakeClient([MakeSuggestion(id: id, title: "Fix bug")]));
-        var cut = RenderComponent<SuggestionsPage>();
+        var cut = Render<SuggestionsPage>();
         Assert.Contains($"/suggestions/{id}", cut.Markup);
     }
 
@@ -76,7 +76,7 @@ public sealed class SuggestionListPageTests : TestContext
     public void Suggestions_ShowsCategoryBadge()
     {
         Services.AddSingleton<ICodeyBoxApiClient>(new SuggestionFakeClient([MakeSuggestion(category: "security")]));
-        var cut = RenderComponent<SuggestionsPage>();
+        var cut = Render<SuggestionsPage>();
         Assert.Contains("category-badge", cut.Markup);
         Assert.Contains("security", cut.Markup);
     }
@@ -85,7 +85,7 @@ public sealed class SuggestionListPageTests : TestContext
     public void Suggestions_ShowsSeverityCssClass()
     {
         Services.AddSingleton<ICodeyBoxApiClient>(new SuggestionFakeClient([MakeSuggestion(severity: "important")]));
-        var cut = RenderComponent<SuggestionsPage>();
+        var cut = Render<SuggestionsPage>();
         Assert.Contains("severity-important", cut.Markup);
     }
 
@@ -93,7 +93,7 @@ public sealed class SuggestionListPageTests : TestContext
     public void Suggestions_MinorSeverity_ShowsMinorCss()
     {
         Services.AddSingleton<ICodeyBoxApiClient>(new SuggestionFakeClient([MakeSuggestion(severity: "minor")]));
-        var cut = RenderComponent<SuggestionsPage>();
+        var cut = Render<SuggestionsPage>();
         Assert.Contains("severity-minor", cut.Markup);
     }
 
@@ -107,7 +107,7 @@ public sealed class SuggestionListPageTests : TestContext
             MakeSuggestion(id: "id-0003", title: "Gamma"),
         };
         Services.AddSingleton<ICodeyBoxApiClient>(new SuggestionFakeClient(items));
-        var cut = RenderComponent<SuggestionsPage>();
+        var cut = Render<SuggestionsPage>();
         Assert.Contains("Alpha", cut.Markup);
         Assert.Contains("Beta", cut.Markup);
         Assert.Contains("Gamma", cut.Markup);
@@ -117,7 +117,7 @@ public sealed class SuggestionListPageTests : TestContext
     public void Suggestions_ShowsDismissButton()
     {
         Services.AddSingleton<ICodeyBoxApiClient>(new SuggestionFakeClient([MakeSuggestion()]));
-        var cut = RenderComponent<SuggestionsPage>();
+        var cut = Render<SuggestionsPage>();
         Assert.Contains("dismiss", cut.Markup);
     }
 
@@ -126,7 +126,7 @@ public sealed class SuggestionListPageTests : TestContext
     {
         var wiId = "bbbbbbbb-0000-0000-0000-000000000001";
         Services.AddSingleton<ICodeyBoxApiClient>(new SuggestionFakeClient([MakeSuggestion(sourceWorkItemId: wiId)]));
-        var cut = RenderComponent<SuggestionsPage>();
+        var cut = Render<SuggestionsPage>();
         // Short work item ID (first 8 chars) appears as link text
         Assert.Contains("bbbbbbbb", cut.Markup);
     }
@@ -135,7 +135,7 @@ public sealed class SuggestionListPageTests : TestContext
     public void Suggestions_PageTitle_ContainsSuggestions()
     {
         Services.AddSingleton<ICodeyBoxApiClient>(new SuggestionFakeClient([]));
-        var cut = RenderComponent<SuggestionsPage>();
+        var cut = Render<SuggestionsPage>();
         Assert.Contains("Suggestions", cut.Markup);
     }
 
@@ -147,7 +147,7 @@ public sealed class SuggestionListPageTests : TestContext
             MakeSuggestion(category: "docs"),
         ]);
         Services.AddSingleton<ICodeyBoxApiClient>(client);
-        var cut = RenderComponent<SuggestionsPage>();
+        var cut = Render<SuggestionsPage>();
 
         var selects = cut.FindAll("select");
         selects[0].Change("security");  // first select is Category
@@ -163,7 +163,7 @@ public sealed class SuggestionListPageTests : TestContext
             MakeSuggestion(severity: "minor"),
         ]);
         Services.AddSingleton<ICodeyBoxApiClient>(client);
-        var cut = RenderComponent<SuggestionsPage>();
+        var cut = Render<SuggestionsPage>();
 
         var selects = cut.FindAll("select");
         selects[1].Change("important");  // second select is Severity
@@ -178,7 +178,7 @@ public sealed class SuggestionListPageTests : TestContext
         var s2 = MakeSuggestion(id: "id-bb02", title: "Beta");
         var client = new SuggestionCapturingClient([s1, s2]);
         Services.AddSingleton<ICodeyBoxApiClient>(client);
-        var cut = RenderComponent<SuggestionsPage>();
+        var cut = Render<SuggestionsPage>();
 
         // Use InvokeAsync to wrap Find+Change atomically on the renderer's sync context,
         // preventing re-renders from invalidating the event handler ID mid-operation.
