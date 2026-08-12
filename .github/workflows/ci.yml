@@ -5,6 +5,8 @@ on:
     branches: [main]
   push:
     branches: [main]
+  schedule:
+    - cron: '23 4 * * 1'
   workflow_dispatch: {}
 
 permissions: {}
@@ -68,3 +70,38 @@ jobs:
       - uses: actions/dependency-review-action@e7aeea1772ec01da74cafda11c5caa463520ca59 # v3
         with:
           fail-on-severity: moderate
+
+  security-scans:
+    name: secrets, workflow, and filesystem security
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan committed history for secrets
+        uses: gitleaks/gitleaks-action@e0c47f4e5d619bb0c9f2117567b7f10696f901dd # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Audit GitHub Actions workflows
+        uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
+        with:
+          inputs: .github/workflows
+          collect: workflows
+          online-audits: false
+          persona: regular
+          min-severity: low
+          min-confidence: medium
+          version: v1.29.0
+          advanced-security: false
+          annotations: true
+      - name: Scan filesystem dependencies, misconfiguration, and secrets
+        run: >-
+          docker run --rm
+          --mount type=bind,source="$GITHUB_WORKSPACE",target=/src,readonly
+          --workdir /src
+          aquasec/trivy@sha256:16f1ee8462d0ba07dd69239150d60ba7b591c55e02dfc33a3fc19710b861d180
+          fs --scanners vuln,misconfig,secret --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 .
