@@ -143,6 +143,7 @@ internal static class WorkItemEndpoints
         IWorkItemStore store,
         IProjectRepository projects,
         IWorkItemCostStore? costs,
+        IUpstreamRemoteFactory upstreams,
         ILoggerFactory loggerFactory,
         IAgentFallbackHistoryStore? fallbackHistory,
         // [FromServices] + nullable makes this a genuinely OPTIONAL dependency:
@@ -175,6 +176,33 @@ internal static class WorkItemEndpoints
         var iterations = await store.GetIterationsAsync(item.Id, ct);
         var dto = ToDto(item, project, statesById, depExternalIds, usage,
             iterations: iterations.Count > 0 ? iterations : null);
+        if (project is not null && item.MergedPrNumber is > 0)
+        {
+            try
+            {
+                var pullRequest = await upstreams.Create(project).GetPullRequestAsync(item.MergedPrNumber.Value, ct);
+                if (pullRequest is not null)
+                {
+                    dto = dto with
+                    {
+                        PullRequestState = pullRequest.Status.ToString().ToLowerInvariant(),
+                        PullRequestMergeSha = pullRequest.MergeCommitSha,
+                    };
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                loggerFactory.CreateLogger("CodeyBox.Api.WorkItemEndpoints").LogWarning(
+                    ex,
+                    "Failed to read upstream PR {PullRequestNumber} for work item {WorkItemId}",
+                    item.MergedPrNumber,
+                    item.Id);
+            }
+        }
         if (fallbackHistory is not null)
         {
             // Always emit a list (possibly empty) when the store is wired, so
@@ -2555,6 +2583,8 @@ public sealed record WorkItemDto(
     string? LocalSquashSha = null,
     int? MergedPrNumber = null,
     string? MergedPrUrl = null,
+    string? PullRequestState = null,
+    string? PullRequestMergeSha = null,
     int MinModelScore = 0,
     string? ReleaseId = null,
     string? FailureKind = null,

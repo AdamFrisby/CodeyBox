@@ -35,6 +35,32 @@ public sealed class GitHubListOpenPullRequestsTests
     private static HttpResponseMessage JsonResponse(HttpStatusCode status, string json) =>
         new(status) { Content = new StringContent(json, Encoding.UTF8, "application/json") };
 
+    [Theory]
+    [InlineData("open", false, PullRequestStatus.Open, "github-test-sha", null)]
+    [InlineData("closed", false, PullRequestStatus.Closed, "github-test-sha", null)]
+    [InlineData("closed", true, PullRequestStatus.Merged, "merge-sha", "merge-sha")]
+    public async Task GetPullRequestAsync_MapsForgeLifecycle(
+        string state,
+        bool merged,
+        PullRequestStatus expected,
+        string? githubMergeSha,
+        string? expectedMergeSha)
+    {
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(JsonResponse(HttpStatusCode.OK, $$"""
+        {"number":41,"html_url":"https://github.com/myorg/myrepo/pull/41",
+         "state":"{{state}}","merged":{{merged.ToString().ToLowerInvariant()}},
+         "merge_commit_sha":{{(githubMergeSha is null ? "null" : $"\"{githubMergeSha}\"")}}}
+        """));
+
+        var result = await BuildRemote(handler).GetPullRequestAsync(41);
+
+        Assert.NotNull(result);
+        Assert.Equal(expected, result.Status);
+        Assert.Equal(expectedMergeSha, result.MergeCommitSha);
+        Assert.Equal("https://github.com/myorg/myrepo/pull/41", result.Url);
+    }
+
     [Fact]
     public async Task ListOpenPullRequestsAsync_FiltersByBranchPrefix_AndReadsMergeability()
     {
