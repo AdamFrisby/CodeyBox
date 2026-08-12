@@ -83,7 +83,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Scan committed history for secrets
-        uses: gitleaks/gitleaks-action@e0c47f4e5d619bb0c9f2117567b7f10696f901dd # v3.0.0
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Audit GitHub Actions workflows
