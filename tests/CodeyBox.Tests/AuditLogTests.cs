@@ -68,6 +68,29 @@ public sealed class AuditLogTests : IDisposable
         Assert.Equal(30_000L, GetScalar<long>(evt, "DurationMs"));
     }
 
+    [Fact]
+    public void OperatorControlledAuditFields_remove_line_breaks()
+    {
+        AuditLog.AgentPaused(
+            new AgentKind("codex\r\nforged"),
+            "operator reason\r\nforged",
+            "operator\r\nforged",
+            expiresAt: null);
+        AuditLog.ProjectQueuePaused(
+            new ProjectId("project-safe"),
+            "queue reason\r\nforged");
+
+        Assert.All(_sink.Events, evt =>
+        {
+            foreach (var value in evt.Properties.Values.OfType<ScalarValue>()
+                         .Select(value => value.Value).OfType<string>())
+            {
+                Assert.DoesNotContain('\r', value);
+                Assert.DoesNotContain('\n', value);
+            }
+        });
+    }
+
     // ── Scope propagation ────────────────────────────────────────────────────
 
     [Fact]
