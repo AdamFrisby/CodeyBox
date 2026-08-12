@@ -668,6 +668,8 @@ internal sealed class E2ePoolWiringFactory(
                 ["CodeyBox:DangerouslyDisableAuth"] = "true",
                 ["CodeyBox:DangerouslyAllowProcessSandbox"] = "true",
                 ["CodeyBox:SandboxProvider"] = "process",
+                ["CodeyBox:WorkloadTrust"] = "Trusted",
+                ["CodeyBox:AcknowledgeSharedKernelRisk"] = "true",
                 ["CodeyBox:E2eExecution:PoolKind"] = poolKind,
                 ["CodeyBox:E2eExecution:Enabled"] = e2eEnabled.ToString(),
                 ["CodeyBox:E2eExecution:BaselineImageRef"] = baselineImageRef,

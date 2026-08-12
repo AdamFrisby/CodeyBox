@@ -237,6 +237,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     }
 
     public string Name => ProviderId;
+    public SandboxIsolationLevel IsolationLevel => SandboxIsolationLevel.DedicatedKernel;
     // HTTP ingest and detached launch are spec-dependent: the concrete sandbox
     // advertises them only when its network profile resolves to a host bridge.
     public SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.ExecPipe;

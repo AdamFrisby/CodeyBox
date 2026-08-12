@@ -124,6 +124,7 @@ public sealed class MultipassRemoteSandboxProvider : ISandboxProvider, IActiveSa
     }
 
     public string Name => "multipass-remote";
+    public SandboxIsolationLevel IsolationLevel => SandboxIsolationLevel.DedicatedKernel;
 
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {

@@ -3,7 +3,10 @@ using System.Security.Cryptography;
 using System.Text;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Authentication.Google;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.DataProtection;
 using CodeyBox.Admin.Web.Services;
 using CodeyBox.Admin.Web;
 
@@ -15,9 +18,38 @@ builder.Services.AddRazorComponents()
 var apiBaseUrl = builder.Configuration.GetValue<string>("CodeyBoxAdmin:ApiBaseUrl")
     ?? "http://localhost:5050";
 var requireAuth = builder.Configuration.GetValue<bool>("CodeyBoxAdmin:RequireAuth", false);
+var cloudflareTeamDomain = builder.Configuration["CodeyBoxAdmin:Authentication:CloudflareAccess:TeamDomain"]?.TrimEnd('/');
+var cloudflareAudience = builder.Configuration["CodeyBoxAdmin:Authentication:CloudflareAccess:Audience"];
+var cloudflareEnabled = !string.IsNullOrWhiteSpace(cloudflareTeamDomain)
+    && !string.IsNullOrWhiteSpace(cloudflareAudience);
+var googleClientId = builder.Configuration["CodeyBoxAdmin:Authentication:Google:ClientId"];
+var googleClientSecret = builder.Configuration["CodeyBoxAdmin:Authentication:Google:ClientSecret"];
+var googleEnabled = !string.IsNullOrWhiteSpace(googleClientId)
+    && !string.IsNullOrWhiteSpace(googleClientSecret);
+var allowedEmailDomains = builder.Configuration
+    .GetSection("CodeyBoxAdmin:Authentication:AllowedEmailDomains")
+    .Get<string[]>() ?? [];
+var dataProtectionKeysPath = builder.Configuration["CodeyBoxAdmin:DataProtectionKeysPath"];
+if (!string.IsNullOrWhiteSpace(dataProtectionKeysPath))
+{
+    builder.Services.AddDataProtection()
+        .SetApplicationName("CodeyBox.Admin")
+        .PersistKeysToFileSystem(new DirectoryInfo(dataProtectionKeysPath));
+}
 
 // Always register auth so AuthorizeRouteView works regardless of RequireAuth setting.
-builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
+var authentication = builder.Services.AddAuthentication(options =>
+    {
+        options.DefaultScheme = "CodeyBoxAdmin";
+        options.DefaultChallengeScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+    })
+    .AddPolicyScheme("CodeyBoxAdmin", "CodeyBox admin authentication", options =>
+    {
+        options.ForwardDefaultSelector = context =>
+            cloudflareEnabled && context.Request.Headers.ContainsKey("Cf-Access-Jwt-Assertion")
+                ? "CloudflareAccess"
+                : CookieAuthenticationDefaults.AuthenticationScheme;
+    })
     .AddCookie(opts =>
     {
         opts.LoginPath = "/login";
@@ -28,12 +60,55 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
         opts.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
     });
 
+if (cloudflareEnabled)
+{
+    authentication.AddJwtBearer("CloudflareAccess", options =>
+    {
+        options.Authority = $"https://{cloudflareTeamDomain}";
+        options.Audience = cloudflareAudience;
+        options.RequireHttpsMetadata = true;
+        options.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                context.Token = context.Request.Headers["Cf-Access-Jwt-Assertion"].FirstOrDefault();
+                return Task.CompletedTask;
+            }
+        };
+    });
+}
+
+if (googleEnabled)
+{
+    authentication.AddGoogle(GoogleDefaults.AuthenticationScheme, options =>
+    {
+        options.ClientId = googleClientId!;
+        options.ClientSecret = googleClientSecret!;
+        options.SignInScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+        options.SaveTokens = false;
+        options.CorrelationCookie.SameSite = SameSiteMode.Lax;
+    });
+}
+
 if (requireAuth)
 {
     // Fallback policy forces authentication on every page that doesn't opt out with [AllowAnonymous].
     builder.Services.AddAuthorizationBuilder()
         .SetFallbackPolicy(new AuthorizationPolicyBuilder()
             .RequireAuthenticatedUser()
+            .RequireAssertion(context =>
+            {
+                // A configured domain list is an origin-side backstop to Cloudflare/Google policy.
+                // Local emergency credentials remain usable when explicitly configured.
+                if (allowedEmailDomains.Length == 0
+                    || context.User.Identity?.AuthenticationType == CookieAuthenticationDefaults.AuthenticationScheme
+                       && context.User.FindFirstValue(ClaimTypes.Email) is null)
+                    return true;
+                var email = context.User.FindFirstValue(ClaimTypes.Email)
+                    ?? context.User.FindFirstValue("email");
+                return email is not null && allowedEmailDomains.Any(domain =>
+                    email.EndsWith($"@{domain.TrimStart('@')}", StringComparison.OrdinalIgnoreCase));
+            })
             .Build());
 }
 else
@@ -118,6 +193,19 @@ app.MapPost("/account/login", async (HttpContext ctx) =>
         ? returnUrl
         : "/";
     return Results.Redirect(redirect);
+}).AllowAnonymous();
+
+app.MapGet("/account/google-login", (string? returnUrl) =>
+{
+    if (!googleEnabled)
+        return Results.NotFound();
+    var redirect = !string.IsNullOrEmpty(returnUrl)
+        && returnUrl.StartsWith('/') && !returnUrl.StartsWith("//")
+        ? returnUrl
+        : "/";
+    return Results.Challenge(
+        new AuthenticationProperties { RedirectUri = redirect },
+        [GoogleDefaults.AuthenticationScheme]);
 }).AllowAnonymous();
 
 // Logout — clears the session cookie and returns to login page.

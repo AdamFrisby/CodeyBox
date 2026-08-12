@@ -1,9 +1,15 @@
 @page "/login"
 @attribute [AllowAnonymous]
+@inject IConfiguration Configuration
 
 <PageTitle>Login — CodeyBox Admin</PageTitle>
 
 <h1>CodeyBox Admin Login</h1>
+
+@if (_googleEnabled)
+{
+    <p><a class="btn btn-primary" href="@($"/account/google-login?returnUrl={Uri.EscapeDataString(_returnUrl)}")">Continue with Google</a></p>
+}
 
 @if (_loginError)
 {
@@ -41,11 +47,14 @@
     [SupplyParameterFromQuery(Name = "error")] public string? ErrorParam { get; set; }
 
     private bool _loginError;
+    private bool _googleEnabled;
     private string _returnUrl = "/";
 
     protected override void OnInitialized()
     {
         _loginError = ErrorParam is not null;
+        _googleEnabled = !string.IsNullOrWhiteSpace(Configuration["CodeyBoxAdmin:Authentication:Google:ClientId"])
+            && !string.IsNullOrWhiteSpace(Configuration["CodeyBoxAdmin:Authentication:Google:ClientSecret"]);
         _returnUrl = !string.IsNullOrEmpty(ReturnUrl) && ReturnUrl.StartsWith('/')
             ? ReturnUrl
             : "/";

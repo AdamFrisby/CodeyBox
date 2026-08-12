@@ -34,6 +34,7 @@ public sealed class ProjectAuditorComposer
     private readonly IReadOnlyDictionary<string, IAuditor> _pluginAuditors;
     private readonly TestFailureAttributionOptionsSnapshot? _testFailureAttributionOptions;
     private readonly ILogger<ProjectAuditorComposer> _logger;
+    private readonly IReadOnlySet<string> _requiredAuditors;
 
     /// <summary>
     /// DI constructor. Receives all <see cref="IAuditor"/> singletons registered
@@ -64,7 +65,8 @@ public sealed class ProjectAuditorComposer
         PresetCatalogOptions? catalogOptions = null,
         Func<TestRunOptions>? testRunOptions = null,
         Func<PlanAdherenceAuditorOptions>? planAdherenceOptions = null,
-        TestFailureAttributionOptionsSnapshot? testFailureAttributionOptions = null)
+        TestFailureAttributionOptionsSnapshot? testFailureAttributionOptions = null,
+        RequiredAuditorPolicy? requiredAuditorPolicy = null)
     {
         _catalog = catalog;
         _catalogOptions = catalogOptions?.Clone() ?? new PresetCatalogOptions();
@@ -72,6 +74,8 @@ public sealed class ProjectAuditorComposer
         _planAdherenceOptions = planAdherenceOptions;
         _testFailureAttributionOptions = testFailureAttributionOptions;
         _logger = logger;
+        _requiredAuditors = new HashSet<string>(
+            requiredAuditorPolicy?.Names ?? [], StringComparer.OrdinalIgnoreCase);
 
         var byName = new Dictionary<string, IAuditor>(StringComparer.OrdinalIgnoreCase);
         var index = new Dictionary<string, IAuditor>(StringComparer.OrdinalIgnoreCase);
@@ -223,8 +227,19 @@ public sealed class ProjectAuditorComposer
             var excluded = new HashSet<string>(project.Audit.ExcludedAuditors, StringComparer.OrdinalIgnoreCase);
             auditors.RemoveAll(a =>
                 excluded.Contains(a.Name) &&
+                !_requiredAuditors.Contains(a.Name) &&
                 !(project.Audit.BuildScriptRequired &&
                   a.Name.Equals(WellKnownAuditorNames.BuildScript, StringComparison.OrdinalIgnoreCase)));
+        }
+
+        var missingRequired = _requiredAuditors
+            .Where(name => !auditors.Any(a => a.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+            .ToArray();
+        if (missingRequired.Length > 0)
+        {
+            throw new InvalidOperationException(
+                "Required auditors were not composed: " + string.Join(", ", missingRequired) +
+                ". Ensure the corresponding audit preset is enabled and its auditor is available.");
         }
 
         return auditors;
@@ -431,3 +446,6 @@ public sealed class ProjectAuditorComposer
         };
     }
 }
+
+/// <summary>Host policy naming auditors that projects may neither omit nor exclude.</summary>
+public sealed record RequiredAuditorPolicy(IReadOnlyList<string> Names);

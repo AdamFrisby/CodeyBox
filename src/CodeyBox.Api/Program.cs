@@ -479,6 +479,26 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
     var inner = SandboxProviderKinds.SupportsHotReload(kind)
         ? BuildReloadableSandboxProvider(sp, opts, loggerFactory, startupLog)
         : BuildSandboxProviderInner(sp, opts, environment, startupLog, loggerFactory, kind);
+    var workloadTrust = Enum.TryParse<WorkloadTrust>(opts.WorkloadTrust, true, out var configuredTrust)
+        ? configuredTrust
+        : environment.IsDevelopment() ? WorkloadTrust.Trusted : WorkloadTrust.Untrusted;
+    if (!environment.IsDevelopment()
+        && workloadTrust == WorkloadTrust.Untrusted
+        && inner.IsolationLevel != SandboxIsolationLevel.DedicatedKernel)
+    {
+        throw new InvalidOperationException(
+            $"Untrusted workloads require a dedicated-kernel sandbox; provider '{inner.Name}' " +
+            $"advertises {inner.IsolationLevel} isolation.");
+    }
+    if (!environment.IsDevelopment()
+        && workloadTrust == WorkloadTrust.Trusted
+        && inner.IsolationLevel != SandboxIsolationLevel.DedicatedKernel
+        && !opts.AcknowledgeSharedKernelRisk)
+    {
+        throw new InvalidOperationException(
+            $"Trusted workloads using provider '{inner.Name}' ({inner.IsolationLevel}) require " +
+            "CodeyBox:AcknowledgeSharedKernelRisk=true.");
+    }
     var orchestratorOptions = sp.GetRequiredService<OrchestratorOptions>();
     startupLog.LogInformation(
         "Sandbox admission control: provider={Provider}, MaxConcurrentSandboxes={MaxConcurrentSandboxes}",
@@ -2404,6 +2424,8 @@ builder.Services.AddSingleton<Func<PlanAdherenceAuditorOptions>>(sp =>
     return () => monitor.CurrentValue;
 });
 
+builder.Services.AddSingleton(new RequiredAuditorPolicy(
+    builder.Configuration.GetSection("CodeyBox:RequiredAuditors").Get<string[]>() ?? []));
 builder.Services.AddSingleton<ProjectAuditorComposer>();
 builder.Services.AddSingleton<ProjectMechanicalFixerComposer>();
 
@@ -4297,7 +4319,16 @@ app.MapGet("/healthz", (ISandboxProvider sandboxes) =>
             belowThreshold = s.FreeBytes is long b && b < s.ThresholdBytes,
         }).ToArray()
         : [];
-    return Results.Ok(new { status = "ok", disk });
+    return Results.Ok(new
+    {
+        status = "ok",
+        sandbox = new
+        {
+            provider = sandboxes.Name,
+            isolation = sandboxes.IsolationLevel.ToString()
+        },
+        disk
+    });
 });
 
 try
@@ -5125,6 +5156,18 @@ namespace CodeyBox.Api
         /// a restart and are rejected during reload.
         /// </summary>
         public string? SandboxProvider { get; set; }
+
+        /// <summary>
+        /// Trust classification for repository and agent-controlled input. Defaults to Untrusted outside
+        /// Development, where only a provider advertising dedicated-kernel isolation is admitted.
+        /// </summary>
+        public string? WorkloadTrust { get; set; }
+
+        /// <summary>Explicit acknowledgement for trusted workloads using shared-kernel isolation.</summary>
+        public bool AcknowledgeSharedKernelRisk { get; set; }
+
+        /// <summary>Auditors that every project must compose and cannot exclude.</summary>
+        public IReadOnlyList<string> RequiredAuditors { get; set; } = [];
 
         /// <summary>
         /// Provider-neutral lifecycle inventory retained during a hot-reload

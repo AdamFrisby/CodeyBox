@@ -53,6 +53,8 @@ public sealed class ProcessSandboxStartupGuardTests
             {
                 ["CodeyBox:SandboxProvider"] = "process",
                 ["CodeyBox:DangerouslyAllowProcessSandbox"] = "true",
+                ["CodeyBox:WorkloadTrust"] = "Trusted",
+                ["CodeyBox:AcknowledgeSharedKernelRisk"] = "true",
             });
 
         var provider = factory.Services.GetRequiredService<ISandboxProvider>();

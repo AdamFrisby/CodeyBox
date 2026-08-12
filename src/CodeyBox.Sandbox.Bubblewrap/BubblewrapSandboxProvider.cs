@@ -50,6 +50,7 @@ public sealed class BubblewrapSandboxProvider : ISandboxProvider
     }
 
     public string Name => "bubblewrap";
+    public SandboxIsolationLevel IsolationLevel => SandboxIsolationLevel.SharedKernel;
 
     /// <inheritdoc/>
     /// <remarks>

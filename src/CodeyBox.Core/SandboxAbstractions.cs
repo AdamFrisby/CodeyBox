@@ -99,6 +99,13 @@ public interface IManagedSandboxLifecycle
 public interface ISandboxProvider : IManagedSandboxLifecycle
 {
     /// <summary>
+    /// Strongest isolation boundary this provider guarantees. New providers deliberately default to
+    /// <see cref="SandboxIsolationLevel.None"/> so an unknown implementation cannot silently satisfy a
+    /// production trust policy.
+    /// </summary>
+    SandboxIsolationLevel IsolationLevel => SandboxIsolationLevel.None;
+
+    /// <summary>
     /// Agent-output data plane this provider can offer for long-running CLI
     /// invocations. Providers that do not override this keep stdout/stderr on
     /// the normal <see cref="ISandbox.ExecAsync"/> pipe.
@@ -118,6 +125,19 @@ public interface ISandboxProvider : IManagedSandboxLifecycle
     /// regardless of state.
     /// </summary>
     Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default);
+}
+
+public enum SandboxIsolationLevel
+{
+    None,
+    SharedKernel,
+    DedicatedKernel
+}
+
+public enum WorkloadTrust
+{
+    Trusted,
+    Untrusted
 }
 
 /// <summary>

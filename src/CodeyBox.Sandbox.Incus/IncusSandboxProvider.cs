@@ -150,6 +150,7 @@ public sealed class IncusSandboxProvider :
     }
 
     public string Name => ProviderId;
+    public SandboxIsolationLevel IsolationLevel => SandboxIsolationLevel.DedicatedKernel;
     public bool CapturesResourceMetrics => ReadOptions().CaptureResourceMetrics;
 
     public IReadOnlyList<DiskGuardSample> SampleDiskGuardState()
