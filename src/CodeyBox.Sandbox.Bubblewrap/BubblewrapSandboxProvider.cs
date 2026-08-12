@@ -86,6 +86,11 @@ public sealed class BubblewrapSandboxProvider : ISandboxProvider
         // are ordered so the longest sandbox path comes first (tmpfs
         // entries are deeper paths typical for /run/codeybox/creds).
         var binds = new List<BindEntry>();
+        var homePath = Path.Combine(root, "home");
+        Directory.CreateDirectory(homePath);
+        if (!OperatingSystem.IsWindows())
+            File.SetUnixFileMode(homePath, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        binds.Add(new BindEntry("/home/codeybox", homePath, ReadOnly: false));
         foreach (var m in spec.Mounts)
         {
             if (m.Tmpfs)
@@ -124,7 +129,7 @@ public sealed record BubblewrapSandboxOptions
     /// only if you have an unusual layout.
     /// </summary>
     public IReadOnlyList<string> ReadOnlyHostBinds { get; init; } =
-        ["/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin"];
+        ["/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin", "/run/systemd/resolve"];
 }
 
 internal sealed record BindEntry(string SandboxPath, string HostPath, bool ReadOnly);
@@ -184,7 +189,7 @@ internal sealed class BubblewrapSandbox : ISandbox
         // and bwrap inherits them by default (no --clearenv).
         psi.EnvironmentVariables.Clear();
         psi.EnvironmentVariables["PATH"] = "/usr/local/bin:/usr/bin:/bin";
-        psi.EnvironmentVariables["HOME"] = exec.WorkingDirectory ?? _spec.WorkingDirectory;
+        psi.EnvironmentVariables["HOME"] = "/home/codeybox";
         foreach (var (k, v) in _spec.Environment) psi.EnvironmentVariables[k] = v;
         if (exec.ExtraEnvironment is not null)
             foreach (var (k, v) in exec.ExtraEnvironment) psi.EnvironmentVariables[k] = v;

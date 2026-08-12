@@ -171,7 +171,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         while IFS= read -r target; do
           [ -n "$target" ] || continue
           echo "CodeyBox required build: dotnet build $target"
-          dotnet build "$target"
+          dotnet build "$target" --disable-build-servers --maxcpucount:1
         done < "$targets_file"
         """;
 
@@ -253,6 +253,28 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                     baseBranchHasMarkers: true,
                     baseBranch: baseBranch,
                     missingRequiredMarkers: missingRequired);
+            }
+
+            // Documentation-only changes cannot affect compilation. Avoid a
+            // full solution restore/build for these branches while retaining
+            // the non-skippable marker-deletion checks above.
+            try
+            {
+                var changedPaths = await _gitHost.GetChangedPathsAsync(
+                    request.RepositoryId,
+                    baseBranch,
+                    request.WorkBranch,
+                    ct);
+                if (changedPaths.Count > 0
+                    && changedPaths.All(static change => IsDocumentationPath(change.Path)
+                        && (change.OldPath is null || IsDocumentationPath(change.OldPath))))
+                {
+                    return DotnetBuildMarkerInspection.NotApplicable();
+                }
+            }
+            catch (NotSupportedException)
+            {
+                // Hosts without diff inspection retain the conservative build.
             }
 
             if (workHasMarkers)
@@ -464,7 +486,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         // headless for required-build verification.
         var net = new SandboxNetworkPolicy
         {
-            AllowedHosts = [],
+            AllowedHosts = _pipelineOptions.AuditToolAllowedHosts,
             HostGitEndpoint = access.Network.HostGitEndpoint,
             ProfileName = request.SandboxPolicy.NetworkProfile,
         };
@@ -555,6 +577,14 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         return fileName.EndsWith(".sln", StringComparison.OrdinalIgnoreCase)
             || fileName.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase)
             || fileName.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsDocumentationPath(string path)
+    {
+        var extension = Path.GetExtension(path);
+        return extension.Equals(".md", StringComparison.OrdinalIgnoreCase)
+            || extension.Equals(".mdx", StringComparison.OrdinalIgnoreCase)
+            || extension.Equals(".rst", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>

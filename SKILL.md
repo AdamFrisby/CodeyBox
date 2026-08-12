@@ -14,6 +14,10 @@ Before changing a production installation, inspect the host and ask about
 unresolved policy choices. Do not silently omit optional components or choose
 production defaults on the user's behalf.
 
+Ask explicitly: **"Do you want the CodeyBox Admin UI installed?"** Do not infer
+the answer from an API-only deployment. If yes, confirm its hostname and
+authentication before selecting the ingress topology.
+
 Confirm:
 
 - sandbox provider and storage pool;

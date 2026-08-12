@@ -764,8 +764,8 @@ public sealed class RequiredBuildGateTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
         var dotnetInvocations = await File.ReadAllLinesAsync(fakeDotnet.LogPath);
-        Assert.Contains("build ./CodeyBox.slnx", dotnetInvocations);
-        Assert.Contains("build ./tests/CodeyBox.Tests.csproj", dotnetInvocations);
+        Assert.Contains("build ./CodeyBox.slnx --disable-build-servers --maxcpucount:1", dotnetInvocations);
+        Assert.Contains("build ./tests/CodeyBox.Tests.csproj --disable-build-servers --maxcpucount:1", dotnetInvocations);
     }
 
     [Fact]
@@ -936,8 +936,8 @@ public sealed class RequiredBuildGateTests : IDisposable
         Assert.Equal(WorkItemState.AuditFailed, final!.State);
         Assert.Contains("required build failed", final.LastError);
         var dotnetInvocations = await File.ReadAllLinesAsync(fakeDotnet.LogPath);
-        Assert.Contains("build ./CodeyBox.slnx", dotnetInvocations);
-        Assert.Contains("build ./tests/CodeyBox.Tests.csproj", dotnetInvocations);
+        Assert.Contains("build ./CodeyBox.slnx --disable-build-servers --maxcpucount:1", dotnetInvocations);
+        Assert.Contains("build ./tests/CodeyBox.Tests.csproj --disable-build-servers --maxcpucount:1", dotnetInvocations);
     }
 
     [Fact]
