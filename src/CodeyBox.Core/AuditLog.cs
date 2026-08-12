@@ -933,7 +933,8 @@ public static class AuditLog
         Audit("agent.paused")
             .Information(
                 "Agent {Agent} paused by {PausedBy}: {Reason} expiresAt={ExpiresAt}",
-                agent.Value, pausedBy.Replace("\r", "").Replace("\n", ""),
+                agent.Value.Replace("\r", "").Replace("\n", ""),
+                pausedBy.Replace("\r", "").Replace("\n", ""),
                 reason.Replace("\r", "").Replace("\n", ""), expiresAt);
 
     public static void AgentResumed(
@@ -943,7 +944,8 @@ public static class AuditLog
         Audit("agent.resumed")
             .Information(
                 "Agent {Agent} resumed by {ResumedBy}: {Reason}",
-                agent.Value, resumedBy.Replace("\r", "").Replace("\n", ""),
+                agent.Value.Replace("\r", "").Replace("\n", ""),
+                resumedBy.Replace("\r", "").Replace("\n", ""),
                 (reason ?? "").Replace("\r", "").Replace("\n", ""));
 
     public static void AgentPauseExpired(AgentKind agent, string? reason) =>
@@ -1229,7 +1231,9 @@ public static class AuditLog
 
     public static void ProjectQueuePaused(ProjectId projectId, string reason) =>
         Audit("project_queue.paused")
-            .Information("Project {ProjectId} queue paused: {Reason}", projectId.Value, reason);
+            .Information("Project {ProjectId} queue paused: {Reason}",
+                projectId.Value.Replace("\r", "").Replace("\n", ""),
+                reason.Replace("\r", "").Replace("\n", ""));
 
     public static void ProjectQueueResumed(ProjectId projectId) =>
         Audit("project_queue.resumed")
