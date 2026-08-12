@@ -653,6 +653,8 @@ internal sealed class E2ePoolWiringFactory(
 {
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-e2epool-{Guid.NewGuid():N}.db");
+    private readonly string _githubAppStorePath = Path.Combine(
+        Path.GetTempPath(), $"codeybox-github-apps-e2e-{Guid.NewGuid():N}");
     private readonly IReadOnlyList<string>? _e2eRemoteTargets = e2eRemoteTargets;
     private readonly IReadOnlyList<string>? _globalRemoteExtraSshOptions = globalRemoteExtraSshOptions;
     private readonly IReadOnlyList<string>? _e2eRemoteExtraSshOptions = e2eRemoteExtraSshOptions;
@@ -681,6 +683,7 @@ internal sealed class E2ePoolWiringFactory(
                 ["CodeyBox:GitRootDirectory"] = Path.Combine(tmp, $"test-git-{Guid.NewGuid():N}"),
                 ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
                 ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
+                ["CodeyBox:GitHubAppStorePath"] = _githubAppStorePath,
             };
             if (_globalRemoteExtraSshOptions is { Count: > 0 })
             {
@@ -729,6 +732,7 @@ internal sealed class E2ePoolWiringFactory(
         if (disposing)
         {
             try { File.Delete(_dbPath); } catch { /* best-effort */ }
+            try { Directory.Delete(_githubAppStorePath, recursive: true); } catch { /* best-effort */ }
         }
         base.Dispose(disposing);
     }

@@ -56,9 +56,9 @@ not normally need to pre-register one. Set `CodeyBox:PublicBaseUrl` to the
 external HTTPS origin, then make an authenticated `POST /github-app/connect`
 request and open the returned `url` in a browser. GitHub asks where to install
 the App and returns to CodeyBox; `GET /github-app/status` lists the resulting
-slug. CodeyBox stores the generated key under
-`CODEYBOX_GITHUB_APP_STORE` (default `/var/lib/codeybox/github-apps`) with
-owner-only permissions.
+slug. CodeyBox stores the generated key under `CodeyBox:GitHubAppStorePath`
+(or the legacy `CODEYBOX_GITHUB_APP_STORE` environment variable; default
+`/var/lib/codeybox/github-apps`) with owner-only permissions.
 
 Use that slug in the project:
 

@@ -2264,7 +2264,8 @@ builder.Services.AddSingleton<IUpstreamRemoteFactory, UpstreamRemoteFactory>();
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<GitHubAppConnectState>();
 builder.Services.AddSingleton(new GitHubAppStore(
-    Environment.GetEnvironmentVariable("CODEYBOX_GITHUB_APP_STORE")
+    builder.Configuration["CodeyBox:GitHubAppStorePath"]
+        ?? Environment.GetEnvironmentVariable("CODEYBOX_GITHUB_APP_STORE")
         ?? (builder.Environment.IsProduction()
             ? "/var/lib/codeybox/github-apps"
             : Path.Combine(Path.GetTempPath(), $"codeybox-github-apps-{Environment.ProcessId}"))));
