@@ -8,7 +8,7 @@
 
 @if (_googleEnabled)
 {
-    <p><a class="btn btn-primary" href="@($"/account/google-login?returnUrl={Uri.EscapeDataString(_returnUrl)}")">Continue with Google</a></p>
+    <p><a class="btn btn-primary" data-enhance-nav="false" href="@($"/account/google-login?returnUrl={Uri.EscapeDataString(_returnUrl)}")">Continue with Google</a></p>
 }
 
 @if (_loginError)
