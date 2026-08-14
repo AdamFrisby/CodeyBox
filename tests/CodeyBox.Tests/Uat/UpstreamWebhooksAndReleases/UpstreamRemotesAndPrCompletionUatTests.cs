@@ -161,6 +161,6 @@ public sealed class UpstreamRemotesAndPrCompletionUatTests : IDisposable
                 new SequenceHttpMessageHandler(),
                 UpstreamWebhooksAndReleasesHelpers.GitHubOptions() with { Token = "" }));
 
-        Assert.Contains("PAT", ex.Message);
+        Assert.Contains("token provider", ex.Message);
     }
 }

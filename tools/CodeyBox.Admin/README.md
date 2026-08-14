@@ -23,7 +23,13 @@ All settings live in `appsettings.json` (or environment variable overrides using
 | Key | Default | Description |
 |-----|---------|-------------|
 | `CodeyBoxAdmin:ApiBaseUrl` | `http://localhost:5050` | Base URL of the CodeyBox orchestrator API |
-| `CodeyBoxAdmin:RequireAuth` | `false` | Enable cookie-based login gate |
+| `CodeyBoxAdmin:RequireAuth` | `false` | Require authenticated operators for every dashboard route |
+| `CodeyBoxAdmin:Authentication:CloudflareAccess:Enabled` | `false` | Accept a validated Cloudflare Access assertion forwarded by the edge |
+| `CodeyBoxAdmin:Authentication:CloudflareAccess:TeamDomain` | — | Cloudflare Access team domain, required when the assertion flow is enabled |
+| `CodeyBoxAdmin:Authentication:CloudflareAccess:Audience` | — | Exact Cloudflare Access application audience tag, required when enabled |
+| `CodeyBoxAdmin:Authentication:Google:ClientId` | — | Native Google OAuth client ID (both Google values required) |
+| `CodeyBoxAdmin:Authentication:Google:ClientSecret` | — | Native Google OAuth client secret; environment/secret store only |
+| `CodeyBoxAdmin:Authentication:AllowedEmailDomains` | — | Required production allowlist for Cloudflare and Google identities |
 
 ### API bearer token
 
@@ -33,9 +39,25 @@ The dashboard authenticates to the orchestrator with the same bearer token the C
 CODEYBOX_API_KEY=your-32-char-secret dotnet run --project tools/CodeyBox.Admin/src/CodeyBox.Admin.Web
 ```
 
-### Auth gate
+### Operator authentication
 
-When `RequireAuth=true`, all dashboard pages require a cookie login. The placeholder login page is at `/login`. For v1 this is suitable for trusted internal networks only — configure a TLS-terminating reverse proxy (nginx, Caddy) in front before exposing externally.
+When `RequireAuth=true`, every dashboard route requires an authenticated operator.
+Production startup fails closed unless at least one of these fully configured mechanisms
+and an email-domain allowlist are present:
+
+- **Cloudflare Access** — enable the `CloudflareAccess` block above. The dashboard
+  validates the signed `Cf-Access-Jwt-Assertion` against the configured team's OIDC
+  metadata and exact application audience. It never trusts the convenience email header.
+  A valid Access session signs the operator in on each request, so no second prompt is shown.
+- **Native Google OAuth** — set `CodeyBoxAdmin__Authentication__Google__ClientId` and
+  `CodeyBoxAdmin__Authentication__Google__ClientSecret` in protected environment
+  configuration, then register `https://<admin-host>/signin-google` as an authorized
+  redirect URI in the Google OAuth client. The login page presents **Continue with Google**
+  and uses a secure, HttpOnly local session cookie.
+
+Both methods may be enabled. A direct/internal request with no Cloudflare assertion can then
+use Google; an invalid assertion is rejected rather than silently falling back. Local
+username/password login remains Development-only.
 
 ## Pages
 

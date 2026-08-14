@@ -59,7 +59,10 @@ jobs:
 
   dependency-review:
     name: dependency review
-    if: github.event_name == 'pull_request'
+    # Enable only after GitHub's dependency graph is available for this
+    # repository. The build job always runs a .NET vulnerability audit; this
+    # supplemental PR-diff review is enabled with ENABLE_GITHUB_DEPENDENCY_REVIEW.
+    if: github.event_name == 'pull_request' && vars.ENABLE_GITHUB_DEPENDENCY_REVIEW == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read

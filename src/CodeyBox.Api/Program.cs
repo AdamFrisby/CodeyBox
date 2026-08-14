@@ -2263,12 +2263,19 @@ builder.Services.AddSingleton<IProjectRepository>(sp => new ProjectRepository(
 builder.Services.AddSingleton<IUpstreamRemoteFactory, UpstreamRemoteFactory>();
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<GitHubAppConnectState>();
-builder.Services.AddSingleton(new GitHubAppStore(
-    builder.Configuration["CodeyBox:GitHubAppStorePath"]
-        ?? Environment.GetEnvironmentVariable("CODEYBOX_GITHUB_APP_STORE")
-        ?? (builder.Environment.IsProduction()
-            ? "/var/lib/codeybox/github-apps"
-            : Path.Combine(Path.GetTempPath(), $"codeybox-github-apps-{Environment.ProcessId}"))));
+// Read the store path from the final service-provider configuration. Test hosts
+// add their configuration sources after this registration code has run; reading
+// builder.Configuration here would ignore their isolated writable store path.
+builder.Services.AddSingleton(sp =>
+{
+    var configuration = sp.GetRequiredService<IConfiguration>();
+    return new GitHubAppStore(
+        configuration["CodeyBox:GitHubAppStorePath"]
+            ?? Environment.GetEnvironmentVariable("CODEYBOX_GITHUB_APP_STORE")
+            ?? (builder.Environment.IsProduction()
+                ? "/var/lib/codeybox/github-apps"
+                : Path.Combine(Path.GetTempPath(), $"codeybox-github-apps-{Environment.ProcessId}")));
+});
 builder.Services.AddSingleton(_ =>
 {
     var options = builder.Configuration.GetSection("CodeyBox:Presets").Get<PresetCatalogOptions>()
