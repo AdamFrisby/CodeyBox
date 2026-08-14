@@ -4410,6 +4410,9 @@ namespace CodeyBox.Api
         /// <summary>Use lazily baked baselines and COW <c>incus copy</c> clones for sandbox creation.</summary>
         public bool UseBaselineImages { get; set; } = Defaults.UseBaselineImages;
 
+        /// <summary>Enable UEFI Secure Boot for newly initialized Incus VMs.</summary>
+        public bool SecureBoot { get; set; } = Defaults.SecureBoot;
+
         /// <summary>
         /// Shell commands run once while baking a baseline or during a full
         /// launch.
@@ -4959,6 +4962,7 @@ namespace CodeyBox.Api
     /// </summary>
     public sealed class CodeyBoxOptions
     {
+        public List<ApiClientOptions> ApiClients { get; set; } = [];
         public string? PublicBaseUrl { get; set; }
         public string GitRootDirectory { get; set; } = "/var/lib/codeybox/repos";
         public int GitCommandMaxOutputBytes { get; set; } = LocalGitHostOptions.DefaultGitCommandMaxOutputBytes;

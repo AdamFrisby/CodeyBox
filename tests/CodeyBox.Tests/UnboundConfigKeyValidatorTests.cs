@@ -55,6 +55,24 @@ public sealed class UnboundConfigKeyValidatorTests
     }
 
     [Fact]
+    public void Inspect_AllowsDocumentedNamedApiClientConfiguration()
+    {
+        var config = BuildConfig(new()
+        {
+            ["CodeyBox:ApiClients:0:Name"] = "jobtrack",
+            ["CodeyBox:ApiClients:0:TokenEnvVar"] = "CODEYBOX_JOBTRACK_API_KEY",
+            ["CodeyBox:ApiClients:0:CanDelegateInitiator"] = "true",
+            ["CodeyBox:ApiClients:0:Principal:Issuer"] = "jobtrack",
+            ["CodeyBox:ApiClients:0:Principal:Subject"] = "service",
+            ["CodeyBox:ApiClients:0:Principal:DisplayName"] = "JobTrack",
+        });
+
+        var reports = UnboundConfigKeyHostedValidator.Inspect(config);
+
+        Assert.Empty(reports);
+    }
+
+    [Fact]
     public void Inspect_DescendsIntoNestedObjects_AndReportsPathInFull()
     {
         var config = BuildConfig(new()

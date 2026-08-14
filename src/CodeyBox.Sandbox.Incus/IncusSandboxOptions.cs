@@ -89,6 +89,12 @@ public sealed record IncusSandboxOptions
     public string BaselineNamePrefix { get; init; } = "cb-incus-baseline-";
     public bool UseBaselineImages { get; init; } = true;
 
+    /// <summary>
+    /// Enables UEFI Secure Boot for newly initialized VMs. Disable only on hosts
+    /// whose firmware cannot boot otherwise-valid signed guest images.
+    /// </summary>
+    public bool SecureBoot { get; init; } = true;
+
     /// <summary>Maps CodeyBox policy names to pre-existing, host-firewalled Linux bridges.</summary>
     public IReadOnlyDictionary<string, string> NetworkProfiles { get; init; }
         = new Dictionary<string, string>();

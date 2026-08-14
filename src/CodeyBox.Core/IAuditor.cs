@@ -241,7 +241,14 @@ public sealed record AuditContext(
     /// for code audits; a plan reviewer treats a null/blank value as "no plan
     /// to review".
     /// </summary>
-    string? PlanArtifact = null)
+    string? PlanArtifact = null,
+    /// <summary>
+    /// Blocking findings from the immediately preceding audit iteration. During
+    /// rework, changes directly required to resolve these findings are part of
+    /// the effective task scope even when the original prompt otherwise limits
+    /// the files that may change. Null/empty on the first audit iteration.
+    /// </summary>
+    IReadOnlyList<AuditFinding>? PriorBlockingFindings = null)
 {
     /// <summary>
     /// The effective review target: <see cref="Target"/> when set, otherwise

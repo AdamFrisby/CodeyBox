@@ -1537,14 +1537,14 @@ public sealed class IncusSandboxProvider :
             _timeProvider,
             token => VerifyDeviceTopologyAsync(options, name, bridge, mounts, token),
             ct).ConfigureAwait(false);
+        if (runCloudInit)
+            await WaitForCloudInitAsync(options, name, ct).ConfigureAwait(false);
         await IncusGuestLifecycle.PrepareRuntimeDirectoryAsync(
             _cli,
             options,
             name,
             ct).ConfigureAwait(false);
         await PrepareDotnetCliHomeAsync(options, name, ct).ConfigureAwait(false);
-        if (runCloudInit)
-            await WaitForCloudInitAsync(options, name, ct).ConfigureAwait(false);
         await IncusGuestLifecycle.VerifyExecWrapperAsync(
             _cli,
             options,

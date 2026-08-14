@@ -41,6 +41,7 @@ internal static class IncusSandboxConfigMapper
             InstanceNamePrefix = incus.InstanceNamePrefix,
             BaselineNamePrefix = incus.BaselineNamePrefix,
             UseBaselineImages = incus.UseBaselineImages,
+            SecureBoot = incus.SecureBoot,
             NetworkProfiles = SnapshotNetworkProfiles(options.SandboxNetworkProfiles),
             AllowedHostMountRoots = SnapshotAllowedHostMountRoots(options),
             // Provider provisioning is independent: an empty Incus value
