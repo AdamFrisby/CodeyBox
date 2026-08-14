@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.Authentication.Google;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.IdentityModel.Tokens;
 using CodeyBox.Admin.Web.Services;
 using CodeyBox.Admin.Web;
 
@@ -14,14 +15,22 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddRazorComponents()
     .AddInteractiveServerComponents();
+builder.Services.AddCascadingAuthenticationState();
 
 var apiBaseUrl = builder.Configuration.GetValue<string>("CodeyBoxAdmin:ApiBaseUrl")
     ?? "http://localhost:5050";
 var requireAuth = builder.Configuration.GetValue<bool>("CodeyBoxAdmin:RequireAuth", false);
+var cloudflareAccessRequested = builder.Configuration.GetValue<bool>("CodeyBoxAdmin:Authentication:CloudflareAccess:Enabled");
 var cloudflareTeamDomain = builder.Configuration["CodeyBoxAdmin:Authentication:CloudflareAccess:TeamDomain"]?.TrimEnd('/');
 var cloudflareAudience = builder.Configuration["CodeyBoxAdmin:Authentication:CloudflareAccess:Audience"];
-var cloudflareEnabled = !string.IsNullOrWhiteSpace(cloudflareTeamDomain)
+var cloudflareConfigured = !string.IsNullOrWhiteSpace(cloudflareTeamDomain)
     && !string.IsNullOrWhiteSpace(cloudflareAudience);
+if (cloudflareAccessRequested && !cloudflareConfigured)
+{
+    throw new InvalidOperationException(
+        "Cloudflare Access requires both TeamDomain and Audience when enabled.");
+}
+var cloudflareEnabled = cloudflareAccessRequested && cloudflareConfigured;
 var googleClientId = builder.Configuration["CodeyBoxAdmin:Authentication:Google:ClientId"];
 var googleClientSecret = builder.Configuration["CodeyBoxAdmin:Authentication:Google:ClientSecret"];
 var googleEnabled = !string.IsNullOrWhiteSpace(googleClientId)
@@ -78,6 +87,11 @@ if (cloudflareEnabled)
         options.Authority = $"https://{cloudflareTeamDomain}";
         options.Audience = cloudflareAudience;
         options.RequireHttpsMetadata = true;
+        options.MapInboundClaims = false;
+        options.TokenValidationParameters.RequireSignedTokens = true;
+        options.TokenValidationParameters.RequireExpirationTime = true;
+        options.TokenValidationParameters.ClockSkew = TimeSpan.FromSeconds(30);
+        options.TokenValidationParameters.ValidAlgorithms = [SecurityAlgorithms.RsaSha256];
         options.Events = new JwtBearerEvents
         {
             OnMessageReceived = context =>
