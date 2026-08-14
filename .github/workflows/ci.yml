@@ -59,10 +59,10 @@ jobs:
 
   dependency-review:
     name: dependency review
-    # GitHub only supports this action on public repositories unless Advanced
-    # Security is enabled. Keep it active when this repository is open source,
-    # or when an operator explicitly enables it for a private repository.
-    if: github.event_name == 'pull_request' && (github.event.repository.private == false || vars.ENABLE_DEPENDENCY_REVIEW == 'true')
+    # Enable only after GitHub's dependency graph is available for this
+    # repository. The build job always runs a .NET vulnerability audit; this
+    # supplemental PR-diff review is enabled with ENABLE_GITHUB_DEPENDENCY_REVIEW.
+    if: github.event_name == 'pull_request' && vars.ENABLE_GITHUB_DEPENDENCY_REVIEW == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
