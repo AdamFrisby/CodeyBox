@@ -59,7 +59,10 @@ jobs:
 
   dependency-review:
     name: dependency review
-    if: github.event_name == 'pull_request'
+    # GitHub only supports this action on public repositories unless Advanced
+    # Security is enabled. Keep it active when this repository is open source,
+    # or when an operator explicitly enables it for a private repository.
+    if: github.event_name == 'pull_request' && (github.event.repository.private == false || vars.ENABLE_DEPENDENCY_REVIEW == 'true')
     runs-on: ubuntu-latest
     permissions:
       contents: read
