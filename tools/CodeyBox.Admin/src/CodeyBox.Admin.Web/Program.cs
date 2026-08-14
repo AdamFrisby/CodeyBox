@@ -163,7 +163,9 @@ var app = builder.Build();
 if (!app.Environment.IsDevelopment())
     app.UseExceptionHandler("/error");
 
-app.MapStaticAssets();
+// Static framework, stylesheet, and script assets are required to render the
+// anonymous login page. Protect the interactive dashboard route instead.
+app.MapStaticAssets().AllowAnonymous();
 app.UseAntiforgery();
 
 // Auth middleware must run before Blazor components so the user principal is available.
