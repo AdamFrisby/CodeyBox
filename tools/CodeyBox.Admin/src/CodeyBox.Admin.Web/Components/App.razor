@@ -1,3 +1,9 @@
+@inject IHttpContextAccessor HttpContextAccessor
+
+@{
+    var isAuthenticated = HttpContextAccessor.HttpContext?.User.Identity?.IsAuthenticated == true;
+}
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -9,8 +15,17 @@
     <HeadOutlet />
 </head>
 <body>
-    <Routes @rendermode="@InteractiveServer" />
-    <script src="_framework/blazor.web.js"></script>
-    <script src="js/live-stdout.js"></script>
+    @* The login page must not start a protected Blazor circuit: the negotiate
+       request would be redirected to HTML and the client expects JSON. *@
+    @if (isAuthenticated)
+    {
+        <Routes @rendermode="@InteractiveServer" />
+        <script src="_framework/blazor.web.js"></script>
+        <script src="js/live-stdout.js"></script>
+    }
+    else
+    {
+        <Routes />
+    }
 </body>
 </html>
