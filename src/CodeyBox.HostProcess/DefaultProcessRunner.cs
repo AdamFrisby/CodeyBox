@@ -185,7 +185,7 @@ public sealed class DefaultProcessRunner : IProcessRunner
                 p.StandardInput.Close();
             }
 
-            await p.WaitForExitAsync(ct).ConfigureAwait(false);
+            await WaitForRootExitAsync(p, isolatedLinuxProcessGroup, ct).ConfigureAwait(false);
 
             if (Volatile.Read(ref outputLimitTerminationRequested) != 0)
             {
@@ -237,6 +237,30 @@ public sealed class DefaultProcessRunner : IProcessRunner
             throw new AggregateException(
                 "Host process failed and its teardown could not be fully verified.",
                 [initiatingError, .. cleanupErrors]);
+        }
+    }
+
+    private async Task WaitForRootExitAsync(
+        DiagProcess process,
+        bool isolatedLinuxProcessGroup,
+        CancellationToken ct)
+    {
+        if (!isolatedLinuxProcessGroup)
+        {
+            await process.WaitForExitAsync(ct).ConfigureAwait(false);
+            return;
+        }
+
+        // Very short-lived `setsid -- <command>` roots can exit between
+        // Process.WaitForExitAsync enabling exit notifications and registering
+        // its continuation. Polling HasExited also reaps the child and avoids
+        // leaving an Incus operation suspended until its outer deadline.
+        while (!process.HasExited)
+        {
+            await Task.Delay(
+                _options.ProcessGroupExitPollInterval,
+                _timeProvider,
+                ct).ConfigureAwait(false);
         }
     }
 

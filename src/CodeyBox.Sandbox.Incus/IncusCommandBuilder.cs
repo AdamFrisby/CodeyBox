@@ -150,7 +150,7 @@ internal static class IncusBaselineNaming
         }
         var canonical = new
         {
-            version = 3,
+            version = 4,
             profile = profileName,
             flavor = flavor.ToString(),
             image = options.DefaultImage,
@@ -158,6 +158,7 @@ internal static class IncusBaselineNaming
             cpus = options.BaselineCpus,
             memory = options.BaselineMemoryBytes,
             disk = options.BaselineDiskBytes,
+            secureBoot = options.SecureBoot,
             bridge = options.NetworkProfiles.TryGetValue(profileName, out var bridge) ? bridge : null,
             runcmd = options.ExtraRuncmd.ToArray(),
             generatedCloudInit = IncusCloudInit.Build(options, flavor),
@@ -254,6 +255,11 @@ internal static class IncusCommandBuilder
         result.Add("--storage");
         result.Add(options.StoragePoolName);
         result.Add("--no-profiles");
+        if (!options.SecureBoot)
+        {
+            result.Add("--config");
+            result.Add("security.secureboot=false");
+        }
         if (limits.CpuCount is { } cpus)
         {
             result.Add("--config");
