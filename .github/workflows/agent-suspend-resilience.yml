@@ -42,7 +42,7 @@ jobs:
       CODEYBOX_OPENCODE_AUTH_FILE: ${{ secrets.CODEYBOX_OPENCODE_AUTH_FILE }}
       CODEYBOX_ACP_BRIDGE_VERIFY_SOURCE_VM: ${{ vars.CODEYBOX_ACP_BRIDGE_VERIFY_VM }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: multipass version
         run: multipass version
