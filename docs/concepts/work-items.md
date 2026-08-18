@@ -1,12 +1,8 @@
-# Work Items and Dependencies
-
-## Overview
+# Work items
 
 A *work item* is the unit of work CodeyBox submits to an agent. Each item belongs to a project, carries a natural-language prompt, and progresses through a defined [state machine](architecture.md).
 
 Work items can declare that they depend on other work items. The orchestrator will not start a dependent until every item it depends on has reached `Done` — successful completion. Failed / AuditFailed / Cancelled prerequisites block dependents until an operator retries-and-resolves them.
-
----
 
 ## Declaring dependencies
 
@@ -44,8 +40,6 @@ POST /workitems
 }
 ```
 
----
-
 ## The dependency gate
 
 A dependency is **satisfied** when it has reached `Done` — successful end-to-end completion. The gate is recomputed from the live store on every dispatch tick, so a dep that lands after a kick is honored on the very next pickup; no cached `dependsOnSatisfied` flag is consulted.
@@ -60,11 +54,9 @@ A dependency is **satisfied** when it has reached `Done` — successful end-to-e
 | `AbandonedAfterRecoveryAttempts` | ❌ No | Investigate the stuck root cause, then `POST /workitems/{depId}/retry` |
 | Any non-terminal state | ❌ No | None — wait for completion |
 
-Rationale: a dependent built on a failed prerequisite cannot be validated end-to-end. Running it anyway burns agent quota on speculative work the operator will likely discard once the parent is retried. The conservative posture matches the CB-12 quota-conservation policy.
+Rationale: a dependent built on a failed prerequisite cannot be validated end-to-end. Running it anyway burns agent quota on speculative work the operator will likely discard once the parent is retried.
 
 If the operator wants to keep a dependent alive after deciding the parent is no longer needed, they can edit the dependent's `dependsOn` (PATCH endpoint) to drop the entry — the gate then re-evaluates without the parent.
-
----
 
 ## Create-time validation
 
@@ -78,16 +70,12 @@ If the operator wants to keep a dependent alive after deciding the parent is no 
 
 Cycle detection runs DFS over the full dependency graph (O(V + E) where V is the number of work items in the store and E is the total number of dependency edges).
 
----
-
 ## Enqueueing behaviour
 
 * **At create time**: if all dependencies are already `Done` (or there are none), the item is enqueued immediately. Otherwise it is persisted in `Queued` state but not placed in the worker queue.
 * **When a dependency reaches `Done`**: the orchestrator scans for `Queued` items whose full dependency set is now satisfied and enqueues them automatically. Reaching a non-`Done` terminal state (`Failed`, `AuditFailed`, `Cancelled`, …) does NOT enqueue dependents — they wait until an operator retries-and-resolves the parent.
 * **At startup (recovery)**: `Queued` items with unsatisfied dependencies are not re-enqueued; they will be picked up when their in-progress dependencies reach `Done`.
 * **At every dispatch tick**: the dispatcher refuses to pick up a Queued item with unsatisfied `dependsOn`, even when a kick exists for the item and a worker slot is free. The gate is the single source of truth for ordering — no path bypasses it.
-
----
 
 ## Cancellation vs interruption
 
@@ -150,7 +138,7 @@ manual close.
 Use `POST /workitems/{id}/uncancel` to reset a `Cancelled` item back to `Queued` when:
 
 - `cancellationReason=ParentCascaded` — the parent has since been retried.
-- `cancellationReason=null` — legacy item whose reason is ambiguous (likely a pre-fix host-shutdown victim; see Operations Guide).
+- `cancellationReason=null` — an older row with no recorded reason, most likely a host-shutdown casualty.
 
 Returns 409 when `cancellationReason=OperatorRequested` — use `POST /workitems/{id}/resume` instead (see below).
 
@@ -184,7 +172,7 @@ When the recovery loop has retried an item more than `CodeyBox:DeadWorker:MaxRec
 
 ### Cancellation source attribution
 
-When a pipeline phase is interrupted by `OperationCanceledException`, the orchestrator now attributes the cancellation to a stable source label, persisted as `cancellationSource` on the work item and surfaced in `lastError` / webhook events. This replaces the previously-conflated `failureKind=timeout` / `lastError='A task was canceled.'` shape that made it impossible to tell apart a real configured timeout from a transient host-side cancellation.
+When a pipeline phase is interrupted by `OperationCanceledException`, the orchestrator attributes the cancellation to a stable source label, persisted as `cancellationSource` and surfaced in `lastError` and webhook events. Without it, a configured timeout and a transient host-side cancellation are indistinguishable.
 
 | `cancellationSource` | Meaning | `failureKind` on Failed | Auto-retry? |
 |----------------------|---------|-------------------------|-------------|
@@ -212,8 +200,6 @@ The resume-state mapping mirrors the dead-worker reaper / startup replay:
 
 Auto-retry events emit `work_item.transient_cancel_retried` (audit-log level Warning) with phase, source, attempt, and max so dashboards can isolate host-hiccup churn from quota or operator-driven retries.
 
----
-
 ## Inspecting blast radius
 
 Before cancelling an item, check what depends on it:
@@ -223,8 +209,6 @@ GET /workitems/{id}/dependents
 ```
 
 Returns the list of work items that have this item in their `dependsOn`. Useful for understanding the downstream impact before taking action.
-
----
 
 ## API additions
 
@@ -284,7 +268,7 @@ The single `agent` field reflects only the **current** phase's agent and is over
 
 A new `agentHistory` row is appended on every phase transition — once per agent attempt for the Work, Rework, and Merge phases, and once per LLM auditor for each Audit iteration. Quota/timeout fallbacks append an additional row for the agent that took over, so every agent that touched the item is recorded.
 
-Because each audit iteration re-runs the **full** auditor list (a rework can regress a dimension a previously-passing auditor would catch), a `Work → Audit → Rework → Audit → Merge` progression with `N` LLM auditors produces `1 + N + 1 + N + 1 = 2N + 3` rows. So the canonical seven-row trail corresponds to two auditors (`N = 2`); three auditors honestly produce nine rows, not seven. Entries are an immutable audit trail: `endedAt` / `outcome` are `null` while the phase is in progress and stamped exactly once on completion (`outcome` is `"success"` or `"failure:<reason>"`). `agentHistory` is `[]` (not omitted) when the store is wired but nothing has run yet; history starts empty for items created before the feature existed.
+Because each audit iteration re-runs the **full** auditor list (a rework can regress a dimension a previously-passing auditor would catch), a `Work → Audit → Rework → Audit → Merge` progression with `N` LLM auditors produces `1 + N + 1 + N + 1 = 2N + 3` rows. So the canonical seven-row trail corresponds to two auditors (`N = 2`); three auditors honestly produce nine rows, not seven. Entries are an immutable audit trail: `endedAt` / `outcome` are `null` while the phase is in progress and stamped exactly once on completion (`outcome` is `"success"` or `"failure:<reason>"`). `agentHistory` is `[]` (not omitted) when the store is wired but nothing has run yet.
 
 `workAgent` is the original implementer — the `work`-phase entry that completed with `outcome: "success"`, falling back to the first `work` attempt while none has succeeded yet. After a work-phase quota/timeout fallback (e.g. codex `failure:quota` then claude `success`), this reports the agent that actually produced the implementation, not the exhausted first attempt. It is distinct from "who's currently auditing it".
 
@@ -296,12 +280,10 @@ Returns just the involvement trail — cheaper than the full work-item read for 
 { "workItemId": "<id>", "workAgent": "cursor", "agentHistory": [ … ] }
 ```
 
----
-
 ## Model quality routing
 
 Work items carry two fields that control which agent member is selected by the
-quota router. See [docs/agent-classes.md](agent-classes.md) for the full
+quota router. See [`agent-classes.md`](agent-classes.md) for the full
 routing algorithm.
 
 ### `agentClassId`
@@ -318,7 +300,7 @@ set, the router picks the highest-scoring available member of that class.
 }
 ```
 
-When null, falls back to `Project.DefaultAgentClass`, then to the legacy
+When null, falls back to `Project.DefaultAgentClass`, then to the item's
 direct `Agent` field. Per-item `agentClassId` always overrides the project
 default.
 
@@ -343,10 +325,10 @@ If no class member meets the floor the item **fails immediately** with error
 `ROUTING_NO_ELIGIBLE: no member of class '...' meets MinModelScore=N` — it is
 not retried. Lower `minModelScore` or add a capable member to the class.
 
-> **Deprecated as the eligibility gate.** `minModelScore` is being replaced by
-> the explicit `requiredCapabilities` mechanism below. Both are honoured during
-> the transition window (a member must pass both gates) so existing items keep
-> working unchanged.
+> **Prefer `requiredCapabilities` below.** A score floor is a blunt proxy for
+> trust; explicit capability tags say what you actually mean. Both gates are
+> enforced — a member must pass each — so items setting only `minModelScore`
+> keep working.
 
 ### `requiredCapabilities`
 
@@ -372,7 +354,7 @@ Trust vs. preference:
 - `QualityScore` continues to drive **preference** ("of the eligible models,
   pick the strongest") — never the gate.
 
-See [Capability gate in `docs/agent-classes.md`](agent-classes.md#capability-gate)
+See [the capability gate](agent-classes.md#capability-gate)
 for the recommended tag vocabulary, member declaration syntax, and migration
 notes from `minModelScore`.
 
@@ -380,8 +362,6 @@ Tag values are compared case-insensitively; duplicates are de-duped and
 whitespace trimmed at create / patch time. The list is editable via
 `PATCH /workitems/{id}` while the item is still `Queued` and is preserved
 across `/replay`.
-
----
 
 ## Check-and-act work items
 
@@ -527,8 +507,6 @@ invocation. Orphaned follow-ups (whose originating check has been
 deleted) skip the gate and proceed normally — losing the check item
 must not strand the follow-up.
 
----
-
 ## Refactor work items
 
 A *refactor* work item is a `JobType` flag that runs the same
@@ -596,8 +574,6 @@ Operators can see active gates on `GET /queue/status` in the `refactorGates`
 array. Each entry reports the `projectId`, `state` (`draining` or `locked`),
 the refactor work-item ID, current in-flight counts, and the defer reason.
 
----
-
 ## Editing dependencies post-hoc
 
 `dependsOn` is editable via `PATCH /workitems/{id}` with replace-set
@@ -618,3 +594,172 @@ The change is persisted via a partial UPDATE that touches only
 `depends_on_json` and `updated_at`, so a concurrent worker mid-pipeline
 is not stomped. An audit-log entry (`work_item.dependencies_changed`)
 records the pre- and post-edit ID sets.
+
+## Replaying an item on another agent
+
+A **replay** is a new, independent work item cloned from an existing terminal
+work item with a different agent or model. Source and replay share the same
+prompt and base branch but get separate IDs, work branches, audit iterations,
+merge commits, and PRs.
+
+Replays exist so operators can answer: *"is the new agent actually better?"*
+Without comparison data, agent selection is gut-feel. With replay, the same
+prompt runs under Claude, Codex, Gemini — side by side, objectively comparable
+on cost, wall-clock, and finding counts.
+
+### Semantics
+
+#### Must be terminal
+
+A replay can only be created from a source in a **terminal state** (Done,
+Failed, AuditFailed, Cancelled). Non-terminal sources are rejected with `400`.
+
+Rationale: the source's full history (audit findings, timings, cost) is only
+meaningful once it has finished. Replaying a still-running item would produce
+an incomplete comparison.
+
+#### A replay is a new work item
+
+The replay gets its own:
+
+- Internal UUID
+- Work branch (auto-generated or caller-supplied)
+- Queue position
+- Audit iterations
+- Cost record
+- Timing record
+- PR / merge commit
+
+The source is left completely unchanged — it is never restarted or modified.
+
+#### DependsOn inheritance
+
+The replay inherits the source's `dependsOn` list exactly. If the source
+depended on items A and B, the replay also depends on A and B. This preserves
+the dependency graph for replays that are part of a larger pipeline.
+
+#### Immutability
+
+`replay_of_work_item_id` is set at creation and never updated via the API
+(`PATCH` has no effect on it). Cycles are impossible by construction because a
+replay's source must be terminal, and a terminal item cannot gain a new
+replay-of link.
+
+#### Replays of replays
+
+Allowed. The chain `source → replayA → replayB` is valid. The comparison
+endpoint treats the *requested* item as the source and follows `replay_of`
+recursively — `GET /workitems/source/replays` returns both replayA and replayB.
+
+#### Orphan-on-cancel
+
+When the source work item is **cancelled**, all replays that point to it have
+their `replay_of_work_item_id` cleared (set to null). The replays continue
+running; they are simply no longer linked to the (now-cancelled) source.
+
+Replay items that were started before the source was cancelled are not
+interrupted. This is intentional — replays are research artifacts and should
+run to completion even when the source is abandoned.
+
+### API
+
+#### `POST /workitems/{id}/replay`
+
+Creates a replay of work item `{id}`.
+
+**Request body** (all fields optional):
+
+```json
+{
+  "agent": "gemini",
+  "agentClassId": "frontier-coding",
+  "workBranch": "feat/foo-replay-gemini"
+}
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `agent` | source's agent | Override the agent. Must be a known agent kind. Clears `agentClassId` if set. |
+| `modelId` | — | **Not accepted.** Always returns `400 Bad Request`. Model is resolved at pickup from `AgentMembership`. Use `agentClassId` to route via a class that specifies the target model. |
+| `agentClassId` | source's agentClassId | Route via a named agent class instead of a direct agent. Clears `agent` if set. |
+| `workBranch` | `<source-branch>-replay-<short-id>` | Override the auto-generated work branch. Standard branch-name rules apply. Must differ from baseBranch. |
+
+**Responses:**
+
+- `201 Created` — the new work item record (same shape as `GET /workitems/{id}`).
+- `400 Bad Request` — source is not in a terminal state; unknown agent; invalid work branch; or `modelId` is set.
+- `404 Not Found` — source item does not exist.
+
+The new item starts in `Queued` state and enters the normal pipeline.
+
+#### `GET /workitems/{id}/replays`
+
+Returns the source work item and all its replay descendants, recursively. For
+a chain `source → replayA → replayB`, this returns both replayA and replayB.
+
+**Response:**
+
+```json
+{
+  "source": { ...workItemDto },
+  "replays": [
+    { ...workItemDto, "replayOfWorkItemId": "<source-id>" },
+    ...
+  ]
+}
+```
+
+Replays are ordered by `created_at` ascending (oldest first). The `source`
+field is the item identified by `{id}` — if you pass a replay's ID, it becomes
+the source in the response and its own replays are returned.
+
+**Responses:**
+
+- `200 OK` — source + replays list (replays may be empty).
+- `404 Not Found` — the item does not exist.
+
+### The `replayOfWorkItemId` field
+
+Both `GET /workitems/{id}` and `GET /workitems` include:
+
+```json
+"replayOfWorkItemId": "<uuid or null>"
+```
+
+This field is `null` for items not created via the replay API, and non-null
+(pointing to the source) for replays. It is cleared to `null` if the source
+is cancelled (see orphan-on-cancel above).
+
+### Admin dashboard
+
+The **Replay** button appears on the work-item-detail page for any item in a
+terminal state. Clicking it opens a modal with an **Agent** dropdown (defaulting to the current agent), an **Agent class**
+field, and an optional **Work branch**. There is no model field — the model is
+resolved at pickup from the agent membership, so route through a class to pin
+one.
+
+After creation, the dashboard navigates to the new replay's detail page.
+
+#### Comparison page
+
+`/work-items/{id}/comparison` shows a side-by-side grid of the source and all
+its replays. Columns include:
+
+| Row | Source | Replay 1 | Replay 2 |
+|---|---|---|---|
+| Agent | claude | gemini | codex |
+| Status | Done | Queued | Failed |
+| Work branch | feat/source | feat/source-replay-abc12345 | feat/source-replay-def67890 |
+| Created | … | … | … |
+| Wall-clock | 45.0s | — | — |
+| Token cost | $0.34 | — | — |
+
+Wall-clock and token-cost rows appear only when timing or cost data has been
+recorded for at least one column.
+
+### One replay at a time
+
+The endpoint creates a single replay per call. For a four-way bake-off, call
+the endpoint four times with different `agent` values. There is no
+"replay-across-all-agents" shortcut by design — the operator chooses which
+agents to compare.
