@@ -422,7 +422,7 @@ When `event` is `work_item.recovered`, the `details` field is populated:
 | `projectId` | string | Project the work item belongs to |
 | `questionId` | string | The question ID that was answered |
 | `answer` | string | The operator's answer (redacted of secrets) |
-| `answeredBy` | string\|null | Identity of the operator who answered; currently always `null` (auth layer does not yet populate caller identity) |
+| `answeredBy` | string\|null | Always `null` — the answer endpoint does not record the authenticated caller |
 
 ### `auto_retry` details
 

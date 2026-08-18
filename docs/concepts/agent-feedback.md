@@ -170,9 +170,10 @@ orchestrator's replay pass deliberately skips `NeedsOperatorInput` items.
 - Question text is capped at 4 000 characters per question.
 - There is a hard cap of 10 questions per work item regardless of how many
   `<codeybox-question>` blocks the agent emits.
-- The `answeredBy` field is present in the `work_item.question_answered` webhook
-  payload and in `GET /workitems/{id}/questions` responses, but is currently always
-  `null` — the API-key authentication layer does not yet provide caller identity.
+- `answeredBy` appears in the `work_item.question_answered` payload and in
+  `GET /workitems/{id}/questions`, but is always `null`: the answer endpoint
+  passes `answeredBy: null`, so the named-client principal that authenticated
+  the call is not recorded against the answer.
 
 ## Suggestions
 
