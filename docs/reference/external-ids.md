@@ -2,8 +2,6 @@
 
 Work items can carry a caller-supplied **external ID** — an opaque string that lets API consumers reference a work item by a familiar identifier from another system (JIRA, GitHub Issues, an internal tracker, etc.) without storing a separate UUID mapping.
 
----
-
 ## Why
 
 Two problems external IDs solve:
@@ -13,8 +11,6 @@ Two problems external IDs solve:
 2. **Dependency batching.** The standard workflow to express "B depends on A" is: POST A → wait for 201 response → capture A's UUID → POST B with `dependsOn=[uuid]`. Every round-trip is a ~100 ms RTT. Queuing 50 dependent items takes 50 serialised RTTs.
 
    With external IDs, the caller generates identifiers locally (sequential numbers, ULIDs, anything) and POSTs all 50 in parallel. The `dependsOn` array accepts external IDs alongside UUIDs; the orchestrator resolves the cross-references at create time — no round-trips needed.
-
----
 
 ## Format and validation
 
@@ -29,8 +25,6 @@ The safe shape is: lowercase letters, digits, and the separators `_-:.` — for 
 
 Violating any rule returns `400 Bad Request`.
 
----
-
 ## Uniqueness
 
 `externalId` is **unique per project**, not globally. Two different projects may legitimately use the same scheme (`JIRA-1234` in project `my-app` and `JIRA-1234` in project `other-app` are independent).
@@ -44,8 +38,6 @@ Attempting to create a second work item in the same project with a duplicate `ex
   "error": "externalId 'JIRA-1234' already exists in project 'my-app' for work item <uuid> (state: Queued)"
 }
 ```
-
----
 
 ## Usage
 
@@ -118,8 +110,6 @@ All three can be POSTed in parallel (in any order that keeps the dep chain intac
 - Deleting and re-creating a dependency under the same `externalId` does **not** re-link existing dependents — they remain pointed at the old UUID. Operators who care should re-create dependent items too.
 - If any `dependsOn` entry (UUID or externalId) cannot be resolved, the request returns `400 Bad Request` with the unresolved ID enumerated.
 
----
-
 ## Webhook payloads
 
 Every webhook event that carries a work item payload gains `externalId` alongside the existing `id`:
@@ -136,8 +126,6 @@ Every webhook event that carries a work item payload gains `externalId` alongsid
 ```
 
 When the work item has no external ID, `externalId` is `null` (or omitted if the receiver uses `JsonIgnoreCondition.WhenWritingNull`).
-
----
 
 ## Integration patterns
 

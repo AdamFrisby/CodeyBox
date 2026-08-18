@@ -5,8 +5,6 @@ for HashiCorp Vault, AWS SSM, Azure KeyVault, Doppler, 1Password CLI, Pulumi ESC
 internal corporate vaults, and any other secret-management backend. Plugins compose
 with the existing plugin foundation; write a class, drop a DLL, restart the host.
 
----
-
 ## Contents
 
 1. [Why credential plugins](#why-credential-plugins)
@@ -18,8 +16,6 @@ with the existing plugin foundation; write a class, drop a DLL, restart the host
 7. [Credential redaction](#credential-redaction)
 8. [Sample: JSON-file mock vault](#sample-json-file-mock-vault)
 
----
-
 ## Why credential plugins
 
 Today, every secret must be an environment variable (`CODEYBOX_CLAUDE_API_KEY`,
@@ -28,8 +24,6 @@ rotate. Real-world ops shops keep secrets in proper vaults that issue short-live
 credentials on demand. A credential plugin is the clean answer: it implements
 `ICredentialProvider`, reads from your vault, and returns a fresh `AgentCredential`
 on every pickup.
-
----
 
 ## Chain order rationale
 
@@ -56,8 +50,6 @@ BUILT-IN-OAUTH → PLUGINS → BUILT-IN-ENV
 
 **Operators with no credential plugins see zero behaviour change.** The chain
 collapses to the pre-plugin OAuth-file → env-var behaviour.
-
----
 
 ## Writing a credential plugin
 
@@ -154,8 +146,6 @@ Add the DLL path and allow the plugin ID in `appsettings.json`:
 }
 ```
 
----
-
 ## Time-bound credentials and ExpiresAt
 
 Short-lived vault credentials should set `AgentCredential.ExpiresAt`:
@@ -185,8 +175,6 @@ providers), the chain calls through every time — no caching — so live rotati
 - Do not log raw credential values. Serilog's `SensitiveDataRedactionEnricher`
   provides a last line of defence but should not be relied upon as the primary
   protection.
-
----
 
 ## Per-project priority
 
@@ -220,8 +208,6 @@ Priority filtering is applied automatically by the orchestrator when it calls
 `IProjectAwareCredentialProvider.GetAsync(agent, priority, ct)`. Plugin authors
 implementing `ICredentialProvider` do not need to perform any ordering themselves.
 
----
-
 ## Plugin configuration via `IPluginHost.ScopedConfig`
 
 Each plugin receives an `IPluginHost` that exposes a configuration section scoped
@@ -238,8 +224,6 @@ var timeout = int.Parse(_host.ScopedConfig["TimeoutSeconds"] ?? "30");
 Plugins do **not** get access to other plugins' configuration sections or to the
 host's built-in credential provider settings. Isolation is enforced by the scoped
 key prefix.
-
----
 
 ## Security hardening: allowlist for credential plugins
 
@@ -265,8 +249,6 @@ other plugin types.
 Use the wildcard only in isolated local development environments where you
 control the plugin directory exclusively.
 
----
-
 ## Credential redaction
 
 The `SensitiveDataRedactionEnricher` intercepts structured Serilog log-event
@@ -286,8 +268,6 @@ When catching exceptions from deserialization (e.g. `JsonException`), log only
 safe fields — the error type and the file path — never the `Exception.Message`,
 which may contain a snippet of the offending text and inadvertently expose a
 credential value.
-
----
 
 ## Sample: JSON-file mock vault
 

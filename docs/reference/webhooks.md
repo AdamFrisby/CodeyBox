@@ -525,9 +525,9 @@ populated:
 | `reason` | string\|null | Free-form note (≤500 chars) provided by the operator, or `null` if omitted |
 | `resolutionSha` | string\|null | 7–40 character hex SHA of the resolution commit, or `null` if omitted |
 
-`details` is `null` for the in-flight / queued cancel path when neither
-`reason` nor `resolutionSha` is supplied — preserves the legacy payload shape
-for receivers that have not opted into the close-out metadata.
+`details` is `null` on the in-flight or queued cancel path when neither `reason`
+nor `resolutionSha` was supplied, so a receiver that ignores close-out metadata
+sees the payload unchanged.
 
 ### `question_dismissed` details
 
@@ -551,7 +551,14 @@ When `event` is `work_item.question_dismissed`, the `details` field carries the 
 | `questionId` | string | The question ID that was dismissed |
 | `reason` | string | The operator's reason for dismissal (redacted of secrets) |
 
----
+### `project.budget_warning` details
+
+`project.budget_warning`, `project.budget_exceeded`, and
+`project.budget_recovered` all carry the same `ProjectBudgetEventDetails`
+payload:
+
+| Field | Type | Description |
+|---|---|---|
 | `projectId` | string | Project whose budget triggered the event |
 | `currentSpendUsd` | decimal | 30-day rolling spend at time of event |
 | `budgetUsd` | decimal | Configured `MonthlyCostBudgetUsd` |
@@ -560,14 +567,21 @@ When `event` is `work_item.question_dismissed`, the `details` field carries the 
 
 On restart, the first sweep tick re-fires any events that apply (idempotency requirement). Receivers should de-duplicate by `(projectId, thresholdState)` — the `pct` value lets you derive which band you're in.
 
-See [`budget-alerts.md`](../operating/budgets.md) for configuration and edge-trigger semantics.
+See [`budgets.md`](../operating/budgets.md) for configuration and edge-trigger semantics.
 
----
+### `recovered` details
+
+`work_item.recovered` fires when the dead-worker reaper, the worker-progress
+watchdog, or the item-stale watchdog hands an interrupted item back to the
+queue:
+
+| Field | Type | Description |
+|---|---|---|
 | `workItemId` | string | UUID of the recovered work item |
 | `projectId` | string | Project the item belongs to |
 | `fromState` | string | State the item was in when the worker was declared dead |
 | `toState` | string | State the item was transitioned to; `"AbandonedAfterRecoveryAttempts"` if `MaxRecoveryAttempts` was exceeded |
-| `reason` | string | Always `"dead worker detected"` |
+| `reason` | string | Why recovery ran — `"dead worker detected"`, `"orchestrator restart with stranded item"`, or `"item-stale updatedAt"` |
 | `recoveryAttempt` | int | Which recovery attempt this is (1-based) |
 | `maxRecoveryAttempts` | int | The configured cap before the item is abandoned for operator triage |
 

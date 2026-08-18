@@ -10,8 +10,6 @@ The schema mirrors what is wired up in `src/CodeyBox.Webhooks/EventSchema.cs`.
 The two are kept in lockstep by `EventSchemaDocSyncTests` — if you edit one
 without the other, CI fails.
 
----
-
 ## Current version
 
 ```
@@ -27,8 +25,6 @@ The single canonical source in code is `WebhookEvent.CurrentSchemaVersion`
 compile-time value — payload defaults, tests, validators — should reference
 that const rather than declare its own. The dispatcher does not own the
 schema version; the event type does.
-
----
 
 ## Envelope
 
@@ -74,8 +70,6 @@ legacy names will remain for the lifetime of the `1.x` series.
 
 See [`webhooks.md`](webhooks.md) for the shape of `workItem`, `project`,
 `release`, `usage`, `usageTotal`, and per-event `details` payloads.
-
----
 
 ## Event types
 
@@ -159,8 +153,6 @@ escalation. Schema 1.3 adds per-agent pause/resume and agent-pause waiting
 events. Schema 1.4 adds transient transport retry waiting events. Schema 1.5 adds planning-phase transition events and auditor-timeout
 attribution events.
 
----
-
 ## Evolution rules (additive-only)
 
 CodeyBox follows additive-only schema evolution so trackers can opt in to
@@ -177,8 +169,6 @@ strict version-major checking without fear of silent breaks.
 
 Major bumps must be telegraphed to operators with at least one release of
 deprecation notice. The default posture is to never do them.
-
----
 
 ## Opting in to strict-major handling (tracker side)
 
@@ -212,8 +202,6 @@ def handle(headers, body_bytes):
     ...
 ```
 
----
-
 ## Validating during development
 
 `EventSchema.ValidateEnvelope(WebhookEvent)` (in `CodeyBox.Webhooks`) is the
@@ -234,8 +222,6 @@ If you add a new event type, follow this checklist:
 4. If the change is a rename/removal/type-change, that is a major bump:
    coordinate with operators first, then update `CurrentSchemaVersion` and
    set `introducedIn` on the affected entries.
-
----
 
 ## Out of scope (for now)
 

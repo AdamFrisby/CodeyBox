@@ -9,8 +9,6 @@ Structured agent event streams are stored separately from OTel under
 carry phase and duration metadata, while agent streams preserve the raw
 per-event stdout JSONL for later analysis.
 
----
-
 ## Configuration
 
 All options live under the `CodeyBox:Otel` section.
@@ -58,16 +56,12 @@ If `Enabled=true` and the configuration is invalid, the process refuses to start
 - `OtlpEndpoint` must be set (in appsettings **or** via `OTEL_EXPORTER_OTLP_ENDPOINT`); the appsettings value, when present, must parse as an absolute http/https URL.
 - `ExportProtocol` must be exactly `"grpc"` or `"httpprotobuf"`.
 
----
-
 ## Supported protocols
 
 | Protocol | Typical port | Notes |
 |---|---|---|
 | `grpc` (default) | 4317 | gRPC / HTTP/2, binary Protobuf. Best for local collectors (Jaeger, Tempo, OpenTelemetry Collector). |
 | `httpprotobuf` | 4318 | HTTP/1.1, binary Protobuf. Use when your network blocks gRPC or when sending directly to Honeycomb, Datadog, etc. |
-
----
 
 ## Trace model
 
@@ -105,8 +99,6 @@ CodeyBox-produced spans carry these attributes (where applicable):
 ### W3C trace context propagation
 
 Outbound HTTP calls (GitHub API, agent quota probes, webhooks) automatically receive W3C `traceparent` / `tracestate` headers via `AddHttpClientInstrumentation`. This allows distributed tracing across services that support W3C trace context.
-
----
 
 ## Metric model
 
@@ -168,8 +160,6 @@ Polled at collection time; registered only when OTel is enabled.
 
 In addition, `.NET` runtime metrics (GC, thread pool, memory) are emitted automatically via `AddRuntimeInstrumentation`.
 
----
-
 ## Sandbox Resource Usage
 
 When `CodeyBox:MultipassSandbox:CaptureResourceMetrics=true` or
@@ -194,8 +184,6 @@ maximum. Incus's interval is configured with
 cost on the Ubuntu baseline is a single `/proc/meminfo` read plus one shell loop
 wakeup per tick; steady-state storage is one integer file and no per-process
 history.
-
----
 
 ## Prometheus scrape exporter
 
@@ -314,15 +302,11 @@ scrape_configs:
       - targets: ['codeybox.internal:5000']
 ```
 
----
-
 ## Log model
 
 When OTel is enabled, the existing `ILogger` output is **also** routed through the OpenTelemetry logging provider — the Serilog console/file sinks are unchanged. Serilog forwards each event to the OTel provider (`writeToProviders`), which exports `LogRecord`s over OTLP stamped with the active span's `TraceId`/`SpanId` for log↔trace correlation. Scopes, formatted messages, and structured state values are all included. No logging call sites change; the OTel provider is purely additive and is not registered when OTel is disabled.
 
 The same credential/PII redaction enricher that protects the file logs runs before events reach the OTel provider.
-
----
 
 ## Example configurations
 
@@ -401,8 +385,6 @@ Open `http://localhost:16686` and search for service `codeybox`.
 ```
 
 Point the Datadog Agent's OTLP ingest at port 4317 (`DD_OTLP_CONFIG_RECEIVER_PROTOCOLS_GRPC_ENDPOINT=0.0.0.0:4317`).
-
----
 
 ## Relationship to the timings database
 

@@ -15,8 +15,6 @@ This solves two real problems:
    equivalent and could finish the same task — but without agent classes
    there is no way to express that relationship.
 
----
-
 ## Agent class config
 
 Classes are configured under `CodeyBox:AgentClasses` in `appsettings.json`:
@@ -236,8 +234,6 @@ AgentClass 'frontier-coding' resolved members: [claude/claude-opus-4-7(Subscript
 | `ReasoningMode` | no* | Agent CLI reasoning knob, e.g. `"high"`. *Required for Gemini members with `QualityScore` ≥ 90. |
 | `Capabilities` | no | List of clearance/trust tags this member is allowed to handle (e.g. `["sensitive", "architectural"]`). Default empty — a member with no tags can only run work items that require no tags. See [Capability gate](#capability-gate) below. |
 
----
-
 ## Quality scores
 
 `QualityScore` is an operator-controlled integer (0–200) that encodes how
@@ -286,8 +282,6 @@ If no member is eligible, the work item **fails immediately** with error
 `ROUTING_NO_ELIGIBLE: no member of class '...' meets MinModelScore=N /
 RequiredCapabilities=[...]`. The item is not retried; the operator must relax
 the work item's clearance/floor or add a capable member to the class.
-
----
 
 ## Capability gate
 
@@ -399,8 +393,6 @@ on an item and it must pass both gates. To move existing restricted items:
 A follow-up item will deprecate and remove `MinModelScore` once existing items
 have migrated.
 
----
-
 ## Time-of-day score modifiers
 
 Small score deltas that fire during defined UTC time windows act as tiebreakers
@@ -412,8 +404,6 @@ models with equal base score (e.g. Opus 100 → effective 99 vs Codex 100 →
 effective 100). It never demotes a genuinely superior model below an inferior
 one (Opus eff 99 still beats Gemini eff 95). Modifiers are bounded to ±5 at
 startup to prevent accidental gating.
-
----
 
 ## Billing modes
 
@@ -441,8 +431,6 @@ so items are never blocked indefinitely:
 ```
 
 A startup warning is emitted when a class has only Subscription members.
-
----
 
 ## Routing algorithm
 
@@ -475,8 +463,6 @@ On every pickup attempt for a work item with an `AgentClassId`:
 
 When `AgentClassId` is null and the project has no `DefaultAgentClass`, the
 router is skipped entirely — no probe call, no wait.
-
----
 
 ## Quota probes
 
@@ -511,8 +497,6 @@ Both probes return `AvailablePct = -1` on:
 
 `AvailablePct = -1` follows `UnknownPolicy`. The default is
 `UseObservedFailures`, not blind fail-open.
-
----
 
 ## Quota router tuning
 
@@ -581,8 +565,6 @@ entry such as `codex: { StartFloorPct: 1, EndFloorPct: 0, MinQuotaPct: 1 }`
 lets codex burn close to empty, while an omitted claude entry keeps the global
 protective ramp.
 
----
-
 ## Work item and project fields
 
 ### `WorkItem.AgentClassId`
@@ -633,8 +615,6 @@ Set once per project so all work items inherit quota routing without specifying
 
 A per-item `AgentClassId` overrides the project default.
 
----
-
 ## Audit agent vs. agent class
 
 The agent-class router described above applies to the **work phase** (and
@@ -667,8 +647,6 @@ All routing decisions are emitted as `Audit=true` events:
 | `quota_router.waiting` | When all Subscription members are exhausted. |
 | `quota_router.deferred` | When the orchestrator schedules a deferred re-enqueue. |
 | `quota_router.audit_fallthrough` | When the audit agent's quota was low and the pipeline fell through to the work agent. |
-
----
 
 ## Startup validation
 

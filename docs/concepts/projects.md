@@ -705,8 +705,6 @@ Returns current consumption against the configured limits:
 
 The admin dashboard shows this as colour-coded usage bars per project.
 
----
-
 ## Monthly cost budget
 
 Set `Budget.MonthlyCostBudgetUsd > 0` to enable spend tracking and automatic alerts over a rolling 30-day window. See [budget-alerts.md](../operating/budgets.md) for the full description.
@@ -835,8 +833,6 @@ the built-in env-var provider.
 See [`docs/extending/credential-plugins.md`](../extending/credential-plugins.md) for the full plugin
 author guide, chain-order rationale, and sample implementation.
 
----
-
 ## Plugging in a different project source
 
 `IProjectRepository` is the single read surface. The default impl is
@@ -854,8 +850,6 @@ live in `CodeyBox.Audit.Presets/Defaults` as embedded resources. Selected preset
 
 For one-off auditors that don't need a preset (project-specific build
 checks, etc.), use a `Custom` entry in the project config — no code change.
-
----
 
 ## Release management
 

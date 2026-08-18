@@ -15,8 +15,6 @@ the *availability* side (the data the `/quota` endpoint exposes, sampled
 on a cadence) so operators can correlate tokens-consumed against
 quota-burned.
 
----
-
 ## Contents
 
 1. [How it works](#how-it-works)
@@ -28,8 +26,6 @@ quota-burned.
 7. [REST: `GET /quota/reset-advice`](#rest-get-quotareset-advice)
 8. [Adding further metric streams](#adding-further-metric-streams)
 9. [Migrating off the standalone poller](#migrating-off-the-standalone-poller)
-
----
 
 ## How it works
 
@@ -60,8 +56,6 @@ DI dependencies and invokes them directly — the snapshot data is
 authoritative (probe → snapshot → row) and the plugin remains usable when
 the API is degraded.
 
----
-
 ## Enabling the plugin
 
 The plugin ships as a separate assembly (`CodeyBox.StatisticsPlugin.dll`).
@@ -82,8 +76,6 @@ it. In `appsettings.json`:
 After enabling, restart the orchestrator. The plugin's quota sampler starts
 on its first interval and writes both normalised and raw rows on every
 tick.
-
----
 
 ## Configuration reference
 
@@ -150,8 +142,6 @@ next prune cycle / advice query.
 | `ResetOptimality:AnchorRefineToleranceHours` | `double` | `6` | Phase-drift tolerance for logger-based cadence refinement. Drift at or below this keeps the configured `CadenceAnchor`; larger drift shifts it. |
 | `ResetOptimality:RefineAnchorFromLogger` | `bool` | `true` | Phase-refine `CadenceAnchor` from observed reset-target-window refills in the logged series (self-calibration). When false the configured anchor is used verbatim. |
 
----
-
 ## Storage layout
 
 The plugin owns its own SQLite file — independent of `state.db` so the
@@ -177,8 +167,6 @@ stats workload never competes for the orchestrator's hot-path write gate.
 **`quota_raw`** — one row per probe call, keyed by the same `snapshot_id`,
 carrying the full `AgentQuotaSnapshot` serialised as JSON. Useful for
 back-fill, debugging, or fields the normalised schema does not yet expose.
-
----
 
 ## REST: `GET /quota/history`
 
@@ -234,8 +222,6 @@ curl 'http://orchestrator/quota/history?agent=claude&raw=true&limit=10'
 
 Each row carries the same `AgentQuotaSnapshot` JSON the `/quota` endpoint
 produces, anchored to its sample time.
-
----
 
 ## REST: `GET /stats/capacity`
 
@@ -323,8 +309,6 @@ curl 'http://orchestrator/stats/capacity?agent=claude&window=seven_day'
   own % remaining, but provider counters can lag actual ingestion by
   seconds-to-minutes. A short measurement window can show a misalignment
   that washes out over longer horizons.
-
----
 
 ## REST: `GET /quota/reset-credits`
 
@@ -420,8 +404,6 @@ curl 'http://orchestrator/quota/reset-credits?agent=codex'
 `credits.length` the seed list does not exactly cover the pre-observation
 baseline — a signal to adjust `Seeds`.
 
----
-
 ## REST: `GET /quota/reset-advice`
 
 Composes the live quota snapshot (from the probe) and the derived banked-credit
@@ -492,8 +474,6 @@ curl 'http://orchestrator/quota/reset-advice?agent=codex'
 estimate (not an observed grant) and must not be rendered as a precise provider
 deadline.
 
----
-
 ## Adding further metric streams
 
 Implement `IMetricSampler` and decorate the class with `[CodeyBoxPlugin]`
@@ -529,8 +509,6 @@ Best practice — mirror the quota plugin's shape:
   when the plugin is not loaded.
 - Read all knobs from `CodeyBox:Plugins:<your-plugin-id>` and re-bind on
   the scoped config's reload token so hot-reload works.
-
----
 
 ## Migrating off the standalone poller
 

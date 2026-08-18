@@ -1565,8 +1565,6 @@ Per-project config (upstream, audit policy, per-phase network profiles)
 lives under `Projects[]` — see [`projects.md`](../concepts/projects.md). Host-side
 network profile setup lives in [`host-firewall.md`](../operating/host-firewall.md).
 
----
-
 ## Release endpoints
 
 See [`releases.md`](../operating/releases.md) for a full introduction to the release
@@ -1641,8 +1639,6 @@ Secrets come from environment variables (never `appsettings.json`):
 * `CODEYBOX_CODEX_API_KEY`
 * The env var named in each project's `Upstream.TokenEnvVar` (per-project
   upstream credentials — never shared across projects).
-
----
 
 ### `GET /fleet/summary`
 

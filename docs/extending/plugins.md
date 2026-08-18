@@ -5,8 +5,6 @@ interfaces as built-in components. Plugins load at host startup from paths you
 configure; the orchestrator discovers them by reflection and registers them into
 the DI container automatically. No forking required.
 
----
-
 ## Contents
 
 1. [How it works](#how-it-works)
@@ -16,9 +14,6 @@ the DI container automatically. No forking required.
 5. [Plugin lifecycle](#plugin-lifecycle)
 6. [Threat model](#threat-model)
 7. [Publishing to NuGet](#publishing-to-nuget)
-8. [Future work](#future-work)
-
----
 
 ## How it works
 
@@ -42,8 +37,6 @@ Each plugin assembly is loaded into a dedicated named
 `AssemblyLoadContext` (`Plugin:<assembly-name>`) for isolation. The host's
 `CodeyBox.Core` and `CodeyBox.PluginSdk` assemblies are always resolved from
 the host's own context so that type-identity checks succeed.
-
----
 
 ## Writing a plugin
 
@@ -181,8 +174,6 @@ the host's `appsettings.json`:
 Access these during `InitializeAsync` via `context.ScopedConfig`, or inject
 `IConfiguration` and call `.GetSection("CodeyBox:Plugins:myorg.my-auditor:")`.
 
----
-
 ## Configuration reference
 
 Bind from `CodeyBox:Plugins` in `appsettings.json`:
@@ -215,8 +206,6 @@ Bind from `CodeyBox:Plugins` in `appsettings.json`:
 **Important:** an empty `Allowlist` is the safe default — no plugins load unless
 the operator explicitly opts in. This is intentional.
 
----
-
 ## API-version contract
 
 Every plugin declares the minimum host API version it requires via
@@ -235,8 +224,6 @@ require a version newer than `CodeyBoxApiVersion.Current` (currently `"1.1"`).
 
 A plugin built against host `1.0` will keep working on any `1.x` host
 (same major, any minor ≥ 0). It will NOT load on `2.0` (different major).
-
----
 
 ## Plugin lifecycle
 
@@ -259,8 +246,6 @@ Host startup
 ```
 
 **No hot-reload in v1.** Plugin changes require a host restart.
-
----
 
 ## Threat model
 
@@ -298,14 +283,12 @@ Before adding a plugin to your allowlist:
 4. **Monitor `plugin.loaded` audit events.** Alert on unexpected plugin IDs.
 5. **Prefer plugins from vendors you have a support agreement with.**
 
-### Future mitigations (out of scope for v1)
+### Not mitigated
 
-- Code-signing verification (check Authenticode / sigstore signature before
-  loading).
-- Assembly-level sandboxing (separate process, gVisor, WebAssembly).
-- Capability declarations (plugins declare required permissions at install time).
-
----
+A loaded plugin runs in-process with full host trust. There is no signature
+check before loading, no per-plugin process or assembly sandbox, and no
+capability declaration a plugin can be held to. The allowlist is the control:
+only load plugins you would run as your own code.
 
 ## Publishing to NuGet
 
@@ -320,11 +303,3 @@ When you're ready to share your plugin:
 
 The `CodeyBox.PluginSdk` package itself follows this same pattern.
 
----
-
-## Future work
-
-- Code-signing / sigstore integration.
-- Per-plugin process isolation.
-- Hot-reload support (requires collectible ALCs throughout).
-- Plugin marketplace / registry.

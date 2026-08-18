@@ -186,8 +186,6 @@ A field that is *neither* hot-reloadable nor explicitly guarded continues
 to require a restart in practice (the consumer captured the value at
 startup); we add explicit guards as we tighten the contract.
 
----
-
 ## Top-level keys
 
 | Key | Type | Default | Description |
@@ -214,8 +212,6 @@ startup); we add explicit guards as we tighten the contract.
 | `Shutdown.SandboxTeardownMode` | enum | `Stop` | Graceful-shutdown sandbox teardown mode: `Stop` cleanly stops and preserves the VM without a RAM snapshot; `Suspend` preserves RAM state via `multipass suspend` and is opt-in; `Dispose` purges the VM. |
 | `PhaseAbsoluteTimeoutMultiplier` | number | `3.0` | Multiplier applied to a phase's per-attempt timeout to bound fallback chains. Work/rework attempts each get the full `WorkTimeout`; merge attempts each get the full `MergeTimeout`; the whole fallback chain is capped at this multiplier times that per-attempt timeout. |
 
----
-
 ## `SandboxProviderCutover`
 
 Provider-neutral lifecycle retention for a hot-reload sandbox-provider
@@ -232,8 +228,6 @@ preserved sandboxes or baselines still need inventory and cleanup:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `RetainedInventoryProviders` | string[] | `[]` | Provider IDs retained for lifecycle and baseline inventory after restart. Values must be unique members of the registered hot-reload provider set; currently `multipass` and `incus`. Remove an ID after that provider's resources are gone. Maximum 8 entries. |
-
----
 
 ## `Incus`
 
@@ -360,8 +354,6 @@ commands pass. Disabling Incus baselines leaves this bake-only list empty.
 | `CodeyBox:DiskGuard:RecheckIn` | `00:05:00` | Delay reported for deferred work. |
 | `CodeyBox:DiskGuard:AdditionalPaths` | `[]` | Up to 64 extra host paths to probe; the state-database directory and effective Incus staging directory are included automatically, for at most 66 effective Incus host paths. |
 
----
-
 ## `WorkerPool`
 
 Controls worker concurrency and spawn pacing.
@@ -387,8 +379,6 @@ host-capacity ceiling underneath those per-phase policies, so a burst of LLM
 auditors from several items queues at sandbox creation instead of multiplying
 into unbounded VMs. The value is captured at startup; restart CodeyBox to resize
 the live admission gate.
-
----
 
 ## `PipelineTuning`
 
@@ -426,8 +416,6 @@ checkpoint. A retained lease is provider-bound internal metadata, not an
 additional retry attempt. Cancellation or any lifecycle transition that clears
 the lease makes the VM eligible for the normal sandbox leak reaper.
 
----
-
 ## `WorkerPoolHealthWatchdog`
 
 Detects a dispatcher/pool stall where worker slots are free, dependency-ready
@@ -449,8 +437,6 @@ the configured window. Settings are read on each sweep, so edits hot-reload.
 | `MaxRecoveryAttempts` | `2` | Bounded self-recovery attempts before `worker_pool.restart_required`. |
 | `MaxRecoveryEnqueueBatchSize` | `32` | Max runnable work IDs re-kicked per recovery attempt. |
 | `RecoveryVerificationDelay` | `00:00:05` | Delay before checking whether recovery cleared the stall. |
-
----
 
 ## `WorkerProgressWatchdog`
 
@@ -488,8 +474,6 @@ CPU signal, and active sandbox ownership signal are all stale for
 | `ItemStaleCheckInterval` | `00:05:00` | Item-centric stale sweep cadence. Sampled at startup; restart to change. |
 | `ItemStaleMaxRecoveryAttempts` | `3` | Bounded item-stale recoveries before parking at `NeedsOperatorInput`; `0` means unlimited. |
 
----
-
 ## `Shutdown`
 
 Controls graceful shutdown drains and the startup resume path for sandboxes
@@ -512,8 +496,6 @@ that were suspended by the previous process.
 | `SandboxResumeTimeout` | `00:10:00` | Caller-side cap for each persisted VM resume call. On timeout, suspend bookkeeping is cleared and normal recovery/leak handling proceeds. |
 | `SandboxAdoptionDeadlineSeconds` | `1800` | Max wait for an adopted in-VM agent to finish after its VM resumes. |
 | `SandboxTeardownMode` | `Stop` | `Stop`, `Suspend`, or `Dispose` for in-flight worker sandboxes during graceful shutdown. `Suspend` is opt-in because it writes a RAM snapshot. |
-
----
 
 ## `AgentClasses`
 
@@ -546,8 +528,6 @@ builder de-dupes case-insensitively and trims whitespace.
 member. For class-routed Claude work items, this class/member opt-in composes
 with the global `CodeyBox:ClaudeSession:Enabled` switch and the per-project
 `ClaudeSession.Enabled` flag; member settings override the class setting.
-
----
 
 ## `AgentScoreModifiers`
 
@@ -592,8 +572,6 @@ for the design rationale.
 Modifiers are bounded to ±5 at startup; values outside that range are rejected
 with a startup error. See [agent-classes.md](../concepts/agent-classes.md) for how effective
 scores interact with the `MinModelScore` floor.
-
----
 
 ## `QuotaRouter`
 
@@ -660,8 +638,6 @@ dispatch at about 1% quota, while claude remains on the global 25% to 3% ramp
 if omitted. When an agent override sets `MinQuotaPct`, that value also replaces
 the global per-window fallback floor for that agent.
 
----
-
 ## `AutoRetryOnQuotaFailure`
 
 Opt-in automatic re-queue of Failed work items whose failure was caused by
@@ -691,8 +667,6 @@ pause queues for a reason. Each scheduler evaluation emits a
 `quota_retry_attempted` audit-log event with `Source` and `Outcome`, including
 no-op skips. Each successful auto-retry emits a `work_item.auto_retry` webhook
 (see [docs/reference/webhooks.md](webhooks.md#auto_retry-details)).
-
----
 
 ## `AutoRetryOnTransientFailure`
 
@@ -739,8 +713,6 @@ genuine build/test timeouts are not misclassified as retryable transport
 incidents. A parsed stream-json `turn.failed` event whose `error.message` is
 exactly `timeout` is the exception because that is provider transport metadata,
 not free-form build output.
-
----
 
 ## `ConfigValidation`
 
@@ -890,8 +862,6 @@ failure surfaces before any pipeline component reads its options. Switch
 to `"warn"` mode temporarily if you need to ship a config edit before the
 matching code rename lands; flip back to `"strict"` once both are in.
 
----
-
 ## `AuditLog`
 
 Rolling file log configuration.
@@ -911,8 +881,6 @@ Rolling file log configuration.
 | `AuditPath` | `logs/audit-.json` | Audit-only log (`Audit=true` events). |
 | `RetainedDays` | `30` | Number of rolled files to keep. Must be ≥ 1. |
 | `MaxFileSizeBytes` | `104857600` | Per-file cap before rolling (100 MiB). |
-
----
 
 ## `Attachments`
 
@@ -960,8 +928,6 @@ current `CodeyBox:Attachments` options at use time.
 | `OrphanSweepInterval` | `06:00:00` | Period between orphan-blob sweeps. |
 | `OrphanGracePeriod` | `00:10:00` | Grace window before unreferenced blobs/temp files are removed. |
 
----
-
 ## `PromptPreprocessing`
 
 Agent prompt preprocessing configuration. CodeyBox ships built-in
@@ -999,8 +965,6 @@ preprocessors that run in order before every agent invocation:
 |-----|---------|-------------|
 | `ProjectRulesPath` | `AGENTS.md` | Repo-relative rules file to prepend when present. Re-read before each agent invocation. Missing files leave the prompt unchanged. |
 
----
-
 ## `AgentStreams`
 
 Structured stdout stream capture for agent invocations. See
@@ -1022,8 +986,6 @@ and API endpoints.
 | `Path` | `logs/agents` | Root directory for per-work-item stream files. Must be writable at startup. |
 | `MaxFileSizeMb` | `32` | Per-file cap. Must be ≥ 1. |
 | `RetainedDays` | `14` | Daily sweep deletes older files. `0` keeps forever. |
-
----
 
 ## `AgentSupervision`
 
@@ -1053,8 +1015,6 @@ SignalR protocol and injection semantics.
 | `CompletedSessionRetentionSeconds` | `300` | How long completed session snapshots remain listable. `0` prunes immediately. |
 | `MaxSessions` | `512` | Maximum active/recent sessions tracked in memory. |
 
----
-
 ## `AgentStreamAnalysis`
 
 Read-only parser settings for agent stream analytics.
@@ -1073,19 +1033,13 @@ Read-only parser settings for agent stream analytics.
 | `MaxLineBytes` | `67108864` | Maximum JSONL event size accepted by the parser. Defaults to 64 MiB so large tool-result events fit under the default stream file cap. |
 | `MaxJsonDepth` | `64` | Maximum JSON nesting depth accepted by the parser. |
 
----
-
 ## `Projects`
 
 See [docs/concepts/projects.md](../concepts/projects.md).
 
----
-
 ## `Webhooks`
 
 See [docs/reference/webhooks.md](webhooks.md).
-
----
 
 ## Environment variables used by CodeyBox
 
