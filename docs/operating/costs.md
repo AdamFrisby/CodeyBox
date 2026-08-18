@@ -1,236 +1,225 @@
-# Cost Reporting
+# Cost tracking
 
-Per-invocation LLM token and estimated cost tracking for the CodeyBox
-orchestrator, designed to answer "what did this work item actually cost
-to run?" with per-phase and per-agent breakdowns.
+Every agent invocation writes a row to the `work_item_costs` table with token
+counts, elapsed time, and an estimated USD figure, so you can answer "what did
+this work item actually cost to run?" broken down by phase and by agent.
 
-## Overview
+Read the numbers back with:
 
-Every agent invocation (work, rework, check, post-act re-check, audit LLM
-auditors, merge) attempts to extract token usage from the agent CLI's output
-and store a cost row in the `work_item_costs` SQLite table. When no extractor
-is registered, an extractor cannot find tokens, or an extractor throws, the
-pipeline still writes a zero-token, $0 row with the invocation timestamps so
-elapsed agent time and run count remain visible. Costs are surfaced via two
-REST endpoints and an admin dashboard "Costs" tab.
+```bash
+curl -H "authorization: Bearer $CODEYBOX_API_KEY" \
+  http://localhost:5036/workitems/<id>/costs      # one item, per phase and iteration
+curl -H "authorization: Bearer $CODEYBOX_API_KEY" \
+  http://localhost:5036/projects/my-app/costs     # project rollup
+```
 
-Cost writes are **best-effort**: any failure during extraction or storage
-is logged at Warning level and does not abort the pipeline phase.
+The admin dashboard's Costs tab (`/work-items/{id}/costs`) charts the same data:
+cost by phase, a per-phase token table with per-iteration sub-rows, and a
+by-agent breakdown.
 
-## Instrumented phases
+Cost writes are best-effort. A failure to extract or store a cost is logged at
+Warning and never aborts the phase.
 
-| Phase | Description |
+## What gets a row
+
+| Phase | Invocation |
 |---|---|
-| `work` | Initial work agent run |
-| `rework` | Subsequent work agent runs after an audit failure |
-| `check` | Initial CheckAndAct read-only agent run |
+| `work` | initial work agent run |
+| `rework` | work agent runs after a failed audit |
+| `check` | the read-only run of a CheckAndAct item |
 | `post-act-recheck` | CheckAndAct follow-up validation after remediation |
-| `audit` | LLM-backed auditors (`needsCredentials == true`); one row per auditor invocation |
-| `merge` | Merge agent run |
+| `audit` | each LLM-backed auditor invocation (one row per auditor) |
+| `merge` | merge agent run |
 
-Tool-only auditors (those that do not call an LLM) are not instrumented
-because they do not incur API costs.
+Tool-only auditors — formatters, gitleaks, semgrep, the test suite — call no
+LLM and are not instrumented.
 
-## Estimated USD
+When no extractor is registered for the agent, the extractor finds no tokens,
+or it throws, the pipeline still writes a zero-token row carrying the start and
+end timestamps and `raw_metadata_json.source = "elapsed_fallback"`. Elapsed
+agent time and invocation counts therefore stay accurate even where token
+counts are unavailable.
 
-All cost figures are computed as **subscription-equivalent pay-per-API
-costs** — i.e., what the same token counts would cost on a pay-per-API
-plan — even when the agent is run under a subscription plan.  This makes
-costs comparable across agents and over time, and ensures that a "free"
-cached token still shows as a fraction of its list-price value.
+## How the dollar figure is computed
 
-Extractors normalize provider usage before storage: `input_tokens` is the
-non-cached input bucket billed at the normal input rate, and
-`cached_input_tokens` is billed separately at the cached input rate. The
-formula is:
+Costs are **subscription-equivalent pay-per-API prices**: what those token
+counts would have cost on a pay-per-token plan, even when the run was covered
+by a subscription. That keeps agents comparable to each other and to their own
+past runs, and stops a cached token from looking free.
 
 ```
-estimated_usd   = (input_tokens / 1_000_000) × input_rate_per_m
-                + (cached_input_tokens / 1_000_000) × cached_rate_per_m
-                + (output_tokens / 1_000_000) × output_rate_per_m
+estimated_usd = (input_tokens        / 1e6) × input_rate_per_m
+              + (cached_input_tokens / 1e6) × cached_rate_per_m
+              + (output_tokens       / 1e6) × output_rate_per_m
 ```
 
-## Database schema
+Extractors normalise provider usage before storage: `input_tokens` is the
+non-cached bucket billed at the normal input rate, `cached_input_tokens` the
+bucket billed at the cached rate.
 
-```sql
-CREATE TABLE IF NOT EXISTS work_item_costs (
-    id                TEXT PRIMARY KEY,
-    work_item_id      TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
-    phase             TEXT NOT NULL,          -- work | rework | audit | merge
-    iteration         INTEGER,                -- audit iteration number, NULL for work/merge
-    agent_kind        TEXT NOT NULL,          -- claude | codex | gemini | copilot
-    model_id          TEXT,                   -- model string from agent output, if available
-    input_tokens      INTEGER NOT NULL,
-    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
-    output_tokens     INTEGER NOT NULL,
-    estimated_usd     REAL NOT NULL DEFAULT 0,
-    started_at        TEXT NOT NULL,          -- ISO-8601 with offset
-    ended_at          TEXT NOT NULL,          -- ISO-8601 with offset
-    raw_metadata_json TEXT NOT NULL DEFAULT '{}'
-);
-CREATE INDEX IF NOT EXISTS idx_costs_work_item
-    ON work_item_costs(work_item_id, phase, iteration);
-CREATE INDEX IF NOT EXISTS idx_costs_project_time
-    ON work_item_costs (work_item_id, started_at);
-```
+## Pricing table
 
-The table lives in the same SQLite file as `work_items` and uses WAL mode
-(`journal_mode=WAL`, `busy_timeout=30000`) for safe concurrent access.  Rows
-are deleted automatically when the parent work item is deleted (CASCADE).
+CodeyBox ships a per-(agent, model) rate table at
+`src/CodeyBox.Api/agent-pricing-defaults.json`, copied next to the API binary
+and loaded at startup from `IHostEnvironment.ContentRootPath`, so a new
+install reports useful costs without any operator research.
 
-## Pricing configuration
-
-Rates live in `appsettings.json` under `CodeyBox.AgentPricing`:
-
-```json
-"AgentPricing": {
-  "Rates": {
-    "claude": {
-      "claude-opus-4-7":  { "inputPerMillion": 15.0, "cachedInputPerMillion": 1.50, "outputPerMillion": 75.0 },
-      "claude-sonnet-4-6": { "inputPerMillion": 3.0,  "cachedInputPerMillion": 0.30, "outputPerMillion": 15.0 }
-    },
-    "codex": {
-      "gpt-5.5":   { "inputPerMillion": 5.0, "cachedInputPerMillion": 0.50, "outputPerMillion": 30.0 },
-      "codex-5.5": { "inputPerMillion": 5.0, "cachedInputPerMillion": 0.50, "outputPerMillion": 30.0 }
-    },
-    "gemini": {
-      "gemini-3.0-pro": { "inputPerMillion": 7.0, "cachedInputPerMillion": 0.70, "outputPerMillion": 21.0 }
-    }
+```jsonc
+{
+  "_meta": {
+    "lastUpdated": "YYYY-MM-DD",
+    "sources": { "<agentKey>": "<doc URL>" },
+    "notes":   { "<agentKey>": "<caveat>" }
   },
-  "DefaultRates": {
-    "claude": { "inputPerMillion": 3.0, "cachedInputPerMillion": 0.30, "outputPerMillion": 15.0 }
+  "Rates": {
+    "<agentKey>": {
+      "<modelId>": {
+        "inputPerMillion":       0.0,
+        "cachedInputPerMillion": 0.0,
+        "outputPerMillion":      0.0
+      }
+    }
   }
 }
 ```
 
-Rate lookup is four-level: **model-specific** → **operator DefaultRates** →
-**AgentDefaults model rate** → **provider built-in fallback**.
+`<agentKey>` is `AgentKind.Value` (`claude`, `codex`, `gemini`, …).
+`<modelId>` is the model identifier the provider's CLI reports in its usage
+events.
 
-Rules:
-- Negative rates cause a startup error (`InvalidOperationException`);
-  the API will not start.
-- A completely missing agent entry logs a Warning at startup but does not
-  prevent the API from starting.  Any invocations for that agent will use
-  the built-in fallback constants.
+| Agent | Bundled rates | Why |
+|---|---|---|
+| `claude`, `codex`, `gemini` | yes | the provider publishes per-token list prices |
+| `opencode` | yes, estimated | OpenCode Go is subscription-priced. Bundled rates are a single subscription-equivalent USD/M per model (same value for input, cached, and output), derived from the $12/5h budget, each model's requests-per-5h limit, and the token mix documented at [opencode.ai/docs/go](https://opencode.ai/docs/go). Keys are `opencode-go/<model-id>`. |
+| `cursor`, `copilot` | no | flat-rate subscriptions with no published per-token price |
 
-## Parser behaviour
+`_meta.notes` carries those caveats in the file, and `GET /agent-pricing`
+echoes them, so the reasoning is visible at runtime rather than only here.
 
-Each supported agent kind has a dedicated `IAgentCostExtractor`
-implementation that parses the agent CLI's stdout and stderr.
+### Overrides and lookup order
 
-If an extractor is missing, returns `null`, or throws, the pipeline records an
-elapsed-time fallback row: `input_tokens = 0`, `cached_input_tokens = 0`,
-`output_tokens = 0`, `estimated_usd = 0`, and
-`raw_metadata_json.source = "elapsed_fallback"`. The row's `started_at` /
-`ended_at` still feed `usageTotal.elapsedMs`, the cost API's `elapsedMs`, and
-invocation counts.
+Operators set the same shape under `CodeyBox:AgentPricing` in
+`codeybox-extra.json` — useful to price a subscription-only agent, or to
+correct a rate before the next release:
 
-### Claude (`ClaudeCostExtractor`)
+```jsonc
+{
+  "CodeyBox": {
+    "AgentPricing": {
+      "Rates": {
+        "opencode": {
+          "opencode-go/deepseek-v4-pro": {
+            "inputPerMillion":       0.0419,
+            "cachedInputPerMillion": 0.0419,
+            "outputPerMillion":      0.0419
+          }
+        }
+      }
+    }
+  }
+}
+```
 
-Primary: scans the agent's NDJSON stdout for a `result` event with a
-`usage` field:
+A rate is resolved in this order, first hit wins:
+
+1. operator entry for that exact (agent, model);
+2. bundled entry for that (agent, model);
+3. operator `DefaultRates[agent]` — operator-only, the bundled file has none;
+4. the rate of `AgentDefaults[agent]`'s model, used when an invocation
+   reported tokens but no model id;
+5. the provider's `IAgentCostExtractor.DefaultPricing` constants.
+
+The merge re-runs on hot-reload and logs
+`AgentPricing loaded: bundled=N, operator-overrides=M, total=… (bundled lastUpdated=…)`
+at Information. Negative rates fail startup; a missing agent entry logs a
+Warning and falls through to the built-in constants.
+
+`GET /agent-pricing` returns the merged table with `_meta`, the resolved
+`sourcePath`, and counts. Its `lastUpdated` is the staleness signal — if it is
+months old, so are the rates.
+
+### Refreshing the bundled rates
+
+Edit `agent-pricing-defaults.json`, bump `_meta.lastUpdated` to today's UTC
+date, fix `_meta.sources` if a price page moved, and say in the PR which page
+you cross-checked. Refresh when a discrepancy actually surfaces — a mismatched
+cost report, a new model with no attributed cost — not on a schedule. Provider
+price pages are HTML with no machine-readable feed, and mapping model ids to
+prices needs a human, so this file is deliberately not auto-updated.
+
+## Per-agent extractors
+
+Each agent kind has an `IAgentCostExtractor` that parses the CLI's stdout and
+stderr. Every extractor has a structured primary path and a human-readable
+fallback.
+
+**Claude.** Reads the `result` event from the NDJSON stream:
 
 ```json
-{"type":"result","subtype":"success","usage":{"input_tokens":1234,"output_tokens":567,"cache_read_input_tokens":890,"cache_creation_input_tokens":250},"model":"claude-sonnet-4-6"}
+{"type":"result","usage":{"input_tokens":1234,"output_tokens":567,"cache_read_input_tokens":890,"cache_creation_input_tokens":250},"model":"claude-sonnet-4-6"}
 ```
 
-Anthropic splits prompt input into three buckets: `input_tokens` (truly
-novel content), `cache_creation_input_tokens` (tokens written to cache
-this turn — priced higher than fresh on the API), and
-`cache_read_input_tokens` (read from cache — cheap). The extractor stores
-`input_tokens + cache_creation_input_tokens` in the `input_tokens` column so
-both the fresh portion and `cache_creation` are billed at the configured
-normal input rate. `cached_input_tokens` is `cache_read_input_tokens` only.
+Anthropic splits prompt input three ways: `input_tokens` (novel content),
+`cache_creation_input_tokens` (written to cache this turn, priced above fresh
+input), and `cache_read_input_tokens` (cheap). The extractor stores
+`input_tokens + cache_creation_input_tokens` in `input_tokens` so both are
+billed at the normal rate, and only `cache_read_input_tokens` as
+`cached_input_tokens`. Fallback: the `Input: 1,234 tokens, Output: 567 tokens`
+footer emitted without `--output-format stream-json`, including its
+`N cached tokens` clause when present.
 
-Fallback: scans stderr/stdout for the human-readable footer line emitted
-when `--output-format stream-json` is not used:
-
-```
-Input: 1,234 tokens, Output: 567 tokens
-```
-
-The fallback captures cached token counts when the output includes the "N cached tokens" pattern.
-
-### Codex (`CodexCostExtractor`)
-
-Primary: scans stdout/stderr for a JSON object with a `usage` key. Current
-`codex exec --json` emits a terminal event like:
+**Codex.** Reads the terminal event from `codex exec --json`:
 
 ```json
 {"type":"turn.completed","usage":{"input_tokens":10546,"cached_input_tokens":2432,"output_tokens":5}}
 ```
 
-The extractor also accepts the OpenAI usage shape:
+It also accepts the OpenAI usage shape (`prompt_tokens`,
+`completion_tokens`, `prompt_tokens_details.cached_tokens`). In both shapes
+the prompt total includes cached tokens, so stored `input_tokens` is
+`prompt total − cached`. Fallback: `Prompt tokens: … / Cached input tokens: … /
+Completion tokens: …`.
 
-```json
-{"usage":{"prompt_tokens":82750,"completion_tokens":290,"prompt_tokens_details":{"cached_tokens":82000}}}
+**Gemini.** Reads `{"promptTokenCount":1234,"candidatesTokenCount":567}`;
+falls back to `Total tokens: input=1234 output=567`.
+
+**Copilot** emits no token counts, so `CopilotCostExtractor` returns `null` and
+Copilot-backed phases get elapsed-time rows only. Any agent without a
+registered extractor behaves the same way, and startup logs a Warning naming
+those agent kinds.
+
+Two limits worth knowing: counts are per agent run, never per tool call; and
+actual subscription billing will not match `estimated_usd`, by design. Rates
+are always applied at *current* prices — there is no back-attribution of old
+invocations against the rates in force at the time.
+
+## Table shape
+
+```sql
+CREATE TABLE IF NOT EXISTS work_item_costs (
+    id                  TEXT PRIMARY KEY,
+    work_item_id        TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    phase               TEXT NOT NULL,          -- work | rework | check | post-act-recheck | audit | merge
+    iteration           INTEGER,                -- audit iteration, NULL for work/merge
+    agent_kind          TEXT NOT NULL,
+    model_id            TEXT,                   -- from agent output when reported
+    input_tokens        INTEGER NOT NULL,
+    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens       INTEGER NOT NULL,
+    estimated_usd       REAL NOT NULL DEFAULT 0,
+    started_at          TEXT NOT NULL,          -- ISO-8601 with offset
+    ended_at            TEXT NOT NULL,
+    raw_metadata_json   TEXT NOT NULL DEFAULT '{}'
+);
 ```
 
-For both shapes, the prompt/input total includes cached tokens, so the
-stored `input_tokens` value is `prompt/input total - cached tokens`.
+It shares the SQLite file and WAL settings (`journal_mode=WAL`,
+`busy_timeout=30000`) with `work_items`, and rows cascade-delete with their
+work item.
 
-Fallback: scans stdout/stderr for human-readable token lines like:
+To turn collection off entirely, drop the `IWorkItemCostStore`,
+`AgentCostCalculator`, and `IAgentCostExtractor` registrations from
+`Program.cs`; every cost path null-checks the store and skips.
 
-```
-Prompt tokens: 12,345 / Cached input tokens: 2,000 / Completion tokens: 678
-```
-
-### Gemini (`GeminiCostExtractor`)
-
-Primary: scans stdout for a JSON object with `promptTokenCount` and
-`candidatesTokenCount`:
-
-```json
-{"promptTokenCount":1234,"candidatesTokenCount":567}
-```
-
-Fallback: scans stdout for a human-readable line like:
-
-```
-Total tokens: input=1234 output=567
-```
-
-### Parser limitations
-
-- **No per-tool-call granularity**: token counts are aggregated for the
-  full agent run.  There is no breakdown by individual tool call.
-- **Subscription plan variance**: actual billing under a subscription plan
-  may differ from the computed `estimated_usd` figure.
-- **Missing model in fallback mode**: the fallback regex paths do not emit
-  a model string. Cost capture fills `model_id` from the dispatched/default
-  model when known; otherwise rate lookup falls back through
-  `DefaultRates`, the agent's `AgentDefaults` model rate, and finally the
-  provider built-in fallback.
-- **Copilot**: GitHub Copilot does not emit token counts in its CLI output.
-  `CopilotCostExtractor` returns `null`, so completed Copilot-backed phases
-  write the standard elapsed-time fallback rows.
-- **Unknown agents**: any agent kind without a registered extractor still
-  writes elapsed-time fallback rows for completed invocations. A Warning is
-  logged at startup listing agent kinds without extractors.
-
-## REST API
-
-See [`api.md`](api.md) for `GET /workitems/{id}/costs` and
-`GET /projects/{id}/costs`.
-
-## Admin dashboard
-
-The admin UI exposes a per-work-item costs page at
-`/work-items/{id}/costs` (linked from the work item detail page as the
-"Costs" button).
-
-The page shows:
-- Total estimated cost and token summary (with cache-hit percentage when
-  applicable)
-- Stacked horizontal bar chart of cost by phase (work/rework/audit/merge)
-- Token breakdown table by phase, with per-iteration sub-rows for rework
-  and audit phases
-- By-agent breakdown table
-
-## Disabling cost collection
-
-Cost collection is enabled by default when the API starts.  To disable it,
-remove or comment out the `IWorkItemCostStore`, `AgentCostCalculator`, and
-`IReadOnlyDictionary<AgentKind, IAgentCostExtractor>` registrations in
-`Program.cs`.  All cost code paths check for null stores and silently skip
-collection.
+Endpoint payloads are in [`../reference/api.md`](../reference/api.md).
+Spend caps and alerting build on this data — see [`budgets.md`](budgets.md).
