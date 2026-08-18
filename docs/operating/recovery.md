@@ -1,20 +1,16 @@
-# Dead-Worker Recovery
+# Crash and restart recovery
 
 CodeyBox detects worker crashes via a heartbeat registry and automatically re-queues any work items that were in-flight when the crash occurred.
 
----
-
-## Problem
+## What can be orphaned
 
 If the orchestrator process is killed mid-flight (OOM, host shutdown, `SIGKILL`), any work items in a non-terminal worker-owned state (`Planning`, `PlanReview`, `Working`, `Auditing`, `Reworking`, `Merging`, `UpstreamPushing`) or a durable phase-boundary state (`PlanApproved`, `WorkComplete`, `AuditPassed`, `Merged`) may be left orphaned. On restart, recovery re-queues them at the correct resume point.
 
 The dead-worker reaper fixes this: workers prove they are alive every N seconds; items whose worker hasn't heartbeated in M seconds are presumed dead and transitioned back to a safe pick-up point.
 
----
-
 ## How it works
 
-### 1. Worker registry
+### The worker registry
 
 Each worker slot writes a row to `worker_registry` on startup:
 
@@ -29,11 +25,11 @@ Each worker slot writes a row to `worker_registry` on startup:
 
 On **clean shutdown** the row is deleted. On **crash** (OOM, SIGKILL, panic) the row stays stale; the reaper cleans it up.
 
-### 2. Heartbeat
+### Heartbeats
 
 Each active worker fires an `UPDATE worker_registry SET last_heartbeat_at = $now ...` every `HeartbeatInterval` (default **15 s**). Heartbeat failures are **fail-soft**: a transient SQLite write failure is logged at Warning level and retried on the next interval — it never crashes the worker.
 
-### 3. Reaper sweeps
+### Reaper sweeps
 
 `DeadWorkerReaper` (`IHostedService`) runs a periodic sweep every `CheckInterval` (default **60 s**):
 
@@ -58,140 +54,19 @@ Each active worker fires an `UPDATE worker_registry SET last_heartbeat_at = $now
 
 The reaper also runs **once synchronously at orchestrator startup** (before the worker pool begins pulling from the queue), ensuring that items orphaned by the _previous_ process crash are recovered before any new work starts.
 
-### Durable agent-turn recovery boundaries
+### Durable agent-turn checkpoints
 
-A work or rework agent can fail after making useful edits but before the
-orchestrator creates the normal phase commit. When the remaining failure is a
-recognised quota failure, transient-network failure, infrastructure failure
-carrying the sandbox provider's explicit `ExecutionUnavailable` signal, or
-process exit `137` (SIGKILL/OOM), CodeyBox attempts a durable checkpoint.
-Exhausting a live CLI resume budget does not by itself make another generic
-failure eligible for durable re-dispatch.
+A work or rework agent can die after making useful edits but before the
+orchestrator creates the phase commit. For a bounded set of failures — a
+recognised quota failure, a transient network failure, an infrastructure
+failure carrying the provider's explicit `ExecutionUnavailable` signal, or exit
+`137` (SIGKILL/OOM) — CodeyBox captures the dirty tree and the agent's private
+CLI state so the *exact* turn can resume rather than restart.
 
-The dirty source tree and private CLI state have separate persistence
-boundaries. Git receives only the source commit at
-`refs/heads/codeybox/preempt/<work-item-id>/<source-commit>-<archive-sha256>`.
-The bounded archive and its restore manifest are captured under the private
-`/run/codeybox/agent-turn` tmpfs, removed before source staging, and saved as an
-immutable host-private SQLite BLOB capped at 32 MiB and keyed by the exact ref.
-The ref binds the work item, source commit, and archive SHA-256; restore verifies
-all three before exposing the archive to the exact route. Clearing checkpoint
-metadata deletes its private archives through a SQLite trigger. Startup
-reconciliation removes orphaned or no-longer-referenced BLOB rows, and a
-successfully committed replacement checkpoint removes older generations.
+The mechanics, the retained-VM fallback for Incus, and the attempt caps are in
+[`agent-turn-checkpoints.md`](agent-turn-checkpoints.md).
 
-The immutable checkpoint is preferred because it is safe to replay in a fresh
-sandbox. There is one provider-specific fallback: if an Incus
-`ExecutionUnavailable` incident also prevents the capture commands from
-running, CodeyBox can retain the exact stopped VM that contains the dirty
-`/work` tree. The provider prepares an opaque recovery token and immutable
-private manifest while the VM is healthy; only their hashes are bound into the
-Incus instance configuration. On failure, Incus durably records the exact
-interrupted exec and returns the pre-created token without depending on the
-unavailable daemon.
-
-The work-item store publishes the retained lease and its typed turn metadata in
-one lifecycle compare-and-set. That same SQL statement enforces the global
-`CodeyBox:PipelineTuning:MaxRetainedAgentTurnSandboxes` cap (16 by default,
-valid range 1–256), including across concurrent orchestrator processes. If the
-cap or lifecycle comparison rejects publication, sandbox preservation is
-disarmed and the original agent failure remains authoritative. A lease is
-internal capability data and is never exposed in public work-item JSON or log
-formatting.
-
-### Retained Incus adoption and conversion
-
-A retry of a retained boundary must use the exact recorded agent route and
-lease provider. Before any VM mutation, the pipeline atomically records a
-`Preparation` claim. Unlike a `Dispatched` claim, it does not increment the
-agent-turn attempt count because no agent CLI is allowed to run in mutable
-recovery evidence. The provider-cutover router sends the request to the
-lease-named provider even if the selected backend changed after the outage.
-
-Incus additionally takes an exclusive lock in the sandbox's private staging
-tree. It validates the exact project, instance and token/manifest hashes, then
-checks the creation-time sandbox specification, storage and guest identities,
-network and effective device topology, inode-pinned host mount sources, and
-recorded guest links. VM start is authorized again at each lifecycle sink.
-Recovery uses an isolated boot with host devices detached, validates guest
-paths, restores the exact devices, non-persistent tmpfs mounts and links, waits
-for mount readiness, and removes the recorded exec control files. Any
-uncertainty refuses recovery, keeps the lease preserved, and makes a
-best-effort authoritative force-stop when a start may have occurred.
-
-After adoption, the pipeline validates the work branch and isolated Git origin,
-captures the CLI scratchpad, commits and pushes the dirty tree, and publishes
-the content-bound private archive. SQLite atomically replaces the lease with
-that immutable checkpoint. Only after publication does CodeyBox disarm
-preservation and delete the retained VM. The item is then enqueued
-automatically; its next pickup performs the ordinary immutable resumed-agent
-dispatch. A failed adoption or conversion keeps the lease, releases the
-preparation claim, and remains retryable after infrastructure is repaired. If
-the post-conversion queue write fails, the immutable checkpoint remains paired
-with an infrastructure-shaped `Failed` item for a later retry; the lease and VM
-are not falsely restored.
-
-The typed Git or retained-lease boundary stays paired with the item while it is
-`Working`, `Reworking`, `WaitingForQuotaReset`, `WaitingForTransientRetry`,
-`WaitingForAgentResume`, `NeedsOperatorInput`,
-`AbandonedAfterRecoveryAttempts`, or an infrastructure-shaped `Failed`. The
-last two states deliberately keep typed evidence available for an operator;
-legacy Git-only preempt records do not gain that broader persistence. Once
-quota/network/provider conditions recover, the corresponding automatic
-scheduler—or a manual retry with no explicit phase—restores the original
-`Working`/`Reworking` boundary. The first agent dispatch is pinned to the saved
-route. That route receives the private archive through `RunResumedAsync`, and
-Claude/Codex resume the exact saved session when an id was captured. A later
-agent-class fallback receives only the source tree; because the archive was
-never committed to Git, another route cannot recover it from the checkout,
-history, or bare origin.
-
-If a resumed invocation exits cleanly without creating a new diff, CodeyBox
-accepts it only when the checkpoint already contains meaningful source changes
-relative to the pre-turn work-branch tip. An allow-empty checkpoint followed by
-a no-op resume uses the normal initial-work/rework no-diff failure path.
-
-Durable re-dispatches are bounded by
-`CodeyBox:PipelineTuning:AgentSessionResumeMaxAttempts`. The attempt is claimed
-atomically immediately before the resume hook rather than at enqueue time, so
-manual, scheduler, startup, and dead-worker paths share the same cap. If typed
-resume preparation fails while restoring private state or prerequisites before
-the agent CLI starts, the exact claim is released and that attempt is refunded;
-an outage after CLI dispatch remains consumed. A value of `0` refuses an
-agent-turn redispatch. This is independent of `DeadWorker.MaxRecoveryAttempts`
-and of legacy suspend/preempt recovery. A retained-VM `Preparation` claim is
-also independent: it consumes no agent attempt and is released when conversion
-does not publish. Changing the prompt or explicitly choosing a different retry
-phase discards an immutable checkpoint; a retained lease cannot be discarded by
-selecting another phase because provider cleanup must remain authoritative. If
-private archive capture/storage, source commit/push, or content verification
-fails outside the bounded retained-Incus path, the original error remains
-authoritative and normal phase recovery applies.
-
-The item-stale watchdog does not release a live dispatch claim merely because
-`UpdatedAt` is old. It must recovery-cancel a pipeline registered in this
-process and observe that registration become inactive within
-`WorkerProgressWatchdog.PostAgentTransitionTimeout`; the row is then re-read
-and changed through its state/`UpdatedAt` compare-and-set. A claim owned by
-another process on the same host remains untouched for confirmed
-process-death/startup recovery. A claim owned by another host fails closed
-until that host is externally fenced; heartbeat expiry alone cannot prove the
-remote agent has stopped writing.
-
-Once a resumed agent's resulting tree is pushed and synced to the work branch,
-CodeyBox clears the older turn checkpoint before required-build and other
-post-agent verification. A later verification outage therefore retries from
-the published branch phase boundary instead of restoring stale pre-turn source
-or provider session state.
-
-`SandboxLeakReaper` treats every provider-scoped lease still referenced by a
-work item as protected, including leases in operator and abandoned-recovery
-states. When cancellation or another lifecycle transition clears the lease,
-the VM is no longer protected and normal provider inventory cleanup can remove
-it. This couples database authority and resource cleanup without relying on a
-process-local handle.
-
-### 4. State-mapping rules
+### Where each state resumes
 
 | State when worker died | Recovered to | Why |
 |---|---|---|
@@ -208,8 +83,6 @@ process-local handle.
 | `UpstreamPushing` | `Merged` | Re-attempt the upstream push |
 | Any terminal state | — (no action) | Already finished |
 | `Queued` | — (no action) | Not worker-owned; safe without intervention |
-
----
 
 ## Configuration
 
@@ -239,8 +112,6 @@ All options live under `CodeyBox:DeadWorker`:
 }
 ```
 
----
-
 ## Observability
 
 ### Audit log events
@@ -254,13 +125,11 @@ All options live under `CodeyBox:DeadWorker`:
 
 ### Webhook events
 
-See [`webhooks.md`](webhooks.md#recovered-details) for the `work_item.recovered` payload.
+See [`../reference/webhooks.md`](../reference/webhooks.md#recovered-details) for the `work_item.recovered` payload.
 
 ### API
 
-`GET /workers` lists currently-registered workers (heartbeating and stale). See [`api.md`](api.md#get-workers) for the response shape.
-
----
+`GET /workers` lists currently-registered workers (heartbeating and stale). See [`../reference/api.md`](../reference/api.md#get-workers) for the response shape.
 
 ## Idempotency
 
@@ -277,8 +146,62 @@ Running the reaper twice in quick succession (e.g., startup-sync + the first per
   work-item update, the item remains mid-flight. The startup stranded-item sweep
   sees that no worker owns it and replays the same bounded recovery policy.
 
----
-
-## Multi-host future
+## Multi-host
 
 Today CodeyBox is single-host. The same registry and reaper design works unchanged in a future multi-host configuration: each host's workers write to the same shared SQLite (or a future shared store), and the reaper on any host can claim and recover orphans from dead workers on other hosts. The `worker_id` GUID and `host_name`/`process_id` fields provide full attribution for cross-host debugging.
+
+## Restarting the process
+
+CodeyBox is a single ASP.NET process owning one port — in production
+`http://127.0.0.1:5000` by default (`UseUrls` in `src/CodeyBox.Api/Program.cs`,
+used when `ASPNETCORE_URLS`, `urls`, and `Kestrel:Endpoints:Default` are all
+unset); the `dotnet run` profile uses `5036`. A binary swap or operator restart
+therefore refuses TCP connections for a short window. There is **no blue/green
+port handover, by choice**: the design accepts the gap and expects callers to
+retry.
+
+| Phase | Typical duration | What a caller sees |
+|---|---|---|
+| Old process draining | up to `CodeyBox:Shutdown:GraceSeconds` (default 60 s) | still bound and serving until the listener stops |
+| Port unbound → new process listening | 5–30 s | `connection refused` |
+| Warm-up | < 1 s | first request takes a cold path |
+
+The drain figure is a worker-drain ceiling, not a fixed wait — a shutdown with
+nothing to tear down returns in seconds. With a suspend-capable provider the
+ceiling rises to the RAM-scaled suspend budget (about 30 minutes for the default
+12 GiB VM), because `Shutdown:SandboxTeardownMode` can be hot-reloaded to
+`Suspend` immediately before shutdown. The HTTP listener stops accepting almost
+immediately on SIGTERM, so plan for **up to 30 seconds of refused connections**.
+
+What that means for each caller:
+
+- **Pollers** (anything on a timer reading `/workitems`, `/quota`, …) recover on
+  their next tick, since the queries are read-only and recompute from live
+  state. Keep the interval under 5 minutes and send an `Idempotency-Key` header
+  on mutating calls — `IdempotencyMiddleware` caches the response for
+  `(method, path, body)` for 24 hours, so a retry after the server already
+  applied the change returns the cached `2xx` instead of applying it twice.
+- **Outbound webhooks** are unaffected by a CodeyBox restart, and tolerate a
+  receiver restart: `HttpWebhookDispatcher` retries `MaxAttempts` times with a
+  backoff that doubles from `InitialBackoffSeconds`. The defaults (`3`, `1 s`)
+  put attempts at t+0, t+1, t+3. Because the tail grows geometrically —
+  `MaxAttempts` of 4, 5, 6, 7 ends at t+7, t+15, t+31, t+63 — set **≥ 6** if the
+  receiver itself may take 30 s to restart. Delivery runs on a background
+  channel, never blocking the pipeline, and drains for up to 30 s on shutdown.
+- **GitHub release webhooks** are retried by GitHub up to 8 times over ~3.5
+  days, so a 30-second window costs at most a delayed delivery.
+- **Nothing inside CodeyBox calls its own API.** The orchestrator, audit, merge
+  and push paths use in-process services.
+
+**Known gap.** The changelog webhook handler creates its work item with a fresh
+id and does not key on `X-GitHub-Delivery` or the release tag. A delivery that
+the server fully processed but could not acknowledge — a crash after
+`CreateAsync`, before the `202` reaches GitHub — produces a duplicate changelog
+work item when GitHub retries. A refused connection does not trigger this,
+since the handler never runs.
+
+To rehearse the window: `kill -SIGTERM` the API, wait for the port to free,
+leave it down for 30 s, start it again, and check that work-item count is
+unchanged, that your poller's next tick succeeds, and that GitHub's "Recent
+deliveries" panel shows a successful retry. The new process logs its recovery
+banner as the reaper resets in-flight items to their safe restart point.
