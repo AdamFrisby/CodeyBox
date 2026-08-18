@@ -16,11 +16,8 @@ operational trade-off matches your deployment.
 | `multipass-remote` | Real Ubuntu VM on remote executor hosts     | `ssh` from orchestrator + `snap install multipass` per executor  | Working — distributed executor pool |
 | `sprites`         | Hosted Firecracker microVM                   | sprites.dev account and token                                    | Working                         |
 
-CodeyBox previously shipped Kata, gVisor, and crun-vm provider scaffolds.
-Those were code-reviewed but never runtime-validated, so they were
-removed — running unverified isolation code is worse than acknowledging
-the gap. Multipass remains available throughout the Incus cutover; selecting
-Incus is explicit and does not inherit Multipass configuration or lifecycle.
+Multipass and Incus are configured independently: selecting Incus is explicit
+and inherits none of Multipass's configuration, baselines, or lifecycle state.
 
 ## `process` (dev only — refuses to load in production)
 
@@ -658,6 +655,56 @@ disk-guard preflight, or package-cache seeding. Baseline baking and cache
 population remain per-executor operator duties; the remote provider only
 consumes an already-present baseline on the selected host.
 
+## `sprites` — hosted Firecracker microVMs
+
+Sandboxes run as sprites.dev microVMs driven over an HTTP/WebSocket API rather
+than on your host, so there is no local KVM requirement and no host bridge. The
+provider stages host mounts *into* the sprite on create.
+
+```json
+"CodeyBox": {
+  "SandboxProvider": "sprites",
+  "Sprites": {
+    "ApiBaseUrl": "https://…",
+    "TokenEnvironmentVariable": "SPRITES_TOKEN",
+    "NamePrefix": "codeybox-",
+    "Region": null,
+    "DefaultCpuCount": null,
+    "DefaultMemoryBytes": null,
+    "AllowPersistentTmpfsDowngrade": false
+  }
+}
+```
+
+Startup rejects a non-absolute `ApiBaseUrl`, a plain-`http://` one (unless
+`AllowUnsafeHttp` is set, which is for local tests only), a missing
+`TokenEnvironmentVariable`, and a `NamePrefix` outside lowercase letters,
+digits, and hyphens.
+
+Three behaviours differ from the local VM providers, and all three matter
+operationally:
+
+- **Writable host mounts sync back once, at teardown.** `ExecAsync` never
+  syncs, so anything reading a writable host mount between execs sees
+  pre-run content until the sandbox is disposed.
+- **There is no tmpfs.** A credential mount backed by a host path is refused
+  outright rather than silently landing on the sprite's ext4 filesystem — use
+  credential environment variables instead. A non-secret scratch tmpfs (the
+  audit phase's `/audit`, for example) is transparently downgraded to a
+  persistent directory, with a warning per mount until
+  `AllowPersistentTmpfsDowngrade` is set. Downgraded contents live on the
+  sprite filesystem and are captured by checkpoints.
+- **Egress is the provider's, not your host's.** `NetworkProfiles` maps a
+  profile name to allowed hosts through the Sprites API; the host-side
+  nftables enforcement described in
+  [`../operating/host-firewall.md`](../operating/host-firewall.md) does not
+  apply, because the VM is not on your machine.
+
+Transfer sizes are bounded by `MaxSyncArchiveBytes`,
+`MaxSyncArchiveExpandedBytes`, `MaxSyncArchiveEntries`, `MaxFileSyncBytes`, and
+their base64 counterparts, so a hostile sprite cannot force an unbounded
+download during sync-back.
+
 ## Choosing
 
 | Use case                                                    | Pick                |
@@ -666,6 +713,8 @@ consumes an already-present baseline on the selected host.
 | Pre-prod / trusted prompts / "just give me a sandbox"       | `bubblewrap`        |
 | **Production on Ubuntu / kernel isolation**                 | **`multipass`**     |
 | Production where VM throughput needs a separate host        | `multipass-remote`  |
+| Persistent, high-throughput headless host with a ZFS/Btrfs pool | `incus`          |
+| No local KVM available, hosted VMs acceptable               | `sprites`           |
 
 ## Adding a new provider
 
@@ -691,6 +740,8 @@ varies by provider:**
 | bubblewrap   | Binary on/off (`--unshare-net` or `--share-net`); no per-host filtering                |
 | multipass    | Host-side nftables on per-profile Linux bridges; agent inside the VM cannot bypass it  |
 | incus        | Host-side nftables on the same per-profile bridges; one filtered NIC and no NAT NIC    |
+| multipass-remote | Bridges named per profile on the **executor** host; the profile→bridge map is CodeyBox config, but the bridges and their nftables rules must be created on that host |
+| sprites      | Allowed hosts declared per profile through the Sprites API; enforced by the provider, not by you |
 
 The Multipass and Incus paths provide real per-host enforcement, configured
 once via `scripts/setup-host-networks.sh` and described in
