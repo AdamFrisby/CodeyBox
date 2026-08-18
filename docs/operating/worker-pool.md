@@ -1,8 +1,9 @@
-# Orchestrator
+# Worker pool and queue control
 
 The orchestrator is a .NET `BackgroundService` that drives work items through
-the pipeline. It maintains a **worker pool** — a set of concurrent pipeline
-executions bounded by configurable limits.
+the pipeline, running several at once under a set of admission limits. This
+page covers sizing those limits, detecting a hung agent, and pausing dispatch —
+globally, per project, or per agent.
 
 ## Worker pool sizing
 
@@ -32,8 +33,8 @@ Controls the total number of live sandboxes admitted by the process. The API
 wraps the selected `ISandboxProvider` with a single admission gate, so every
 `CreateAsync` call path shares this budget. A token is acquired before provider
 provisioning starts and released on the first disposal of the returned sandbox
-handle. Multipass therefore never has more than this many concurrently-live VMs
-from this orchestrator process, even when several worker items enter audit or
+handle. The provider therefore never has more than this many concurrently-live
+sandboxes from this orchestrator process, even when several worker items enter audit or
 merge at the same time.
 
 When unset, the default is `ceil(MaxConcurrentWorkers * 1.5)`: enough headroom
@@ -57,7 +58,7 @@ not:
 MaxConcurrentWorkers * MaxLlmAuditorParallelism
 ```
 
-#### Deadlock Safety
+#### Deadlock safety
 
 Worker, audit, merge, smoke, and verification phases use `await using` sandbox
 handles, so a phase releases its token when that sandbox is disposed before the
@@ -135,18 +136,15 @@ This gives each agent a head-start before the next one calls the API,
 reducing the chance of hitting the subscription rate limit on the first
 request of every session.
 
-## Legacy config key
-
-Prior to the worker pool overhaul, concurrency was set via:
+## The older `Concurrency` key
 
 ```json
 "CodeyBox": { "Concurrency": 4 }
 ```
 
-This key is still recognised for backward compatibility. At startup the
-orchestrator logs a deprecation warning and copies the value into
-`MaxConcurrentWorkers`. No config file edits are required to keep an
-existing deployment working, but migrating to `WorkerPool` is encouraged.
+is still read. Resolution order is `WorkerPool:MaxConcurrentWorkers`, then
+`Concurrency`, then `1`, so an existing deployment keeps working untouched —
+but every other pool knob lives under `WorkerPool`, so set it there.
 
 ## Stuck-agent detection
 
@@ -295,7 +293,7 @@ The queue index page shows a coloured banner at the top:
 - **Running (green)**: subtle dot + **Pause queue** button (opens a modal
   asking for a reason).
 
-## Per-Agent Pause
+## Per-agent pause
 
 Operators can pause and resume one agent kind without stopping the whole
 queue. The pause is a pickup gate only: in-flight runs are not killed, and all
@@ -303,7 +301,7 @@ other agents continue dispatching normally.
 When an agent class pools multiple subscriptions for one kind, pause the
 specific route key (`claude/acct-a`) to leave its siblings dispatching.
 
-### API And CLI
+### API and CLI
 
 ```
 GET  /agents/paused
@@ -322,7 +320,7 @@ The paused set is persisted in SQLite and survives orchestrator restart. A
 pause can be indefinite or have an expiry; expired pauses auto-resume on the
 next pause-state read.
 
-### Routing Behaviour
+### Routing behaviour
 
 | What | Behaviour |
 |---|---|
