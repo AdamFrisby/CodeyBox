@@ -13,9 +13,10 @@ service refuses to start without it. Send it on every request:
 Authorization: Bearer <CODEYBOX_API_KEY>
 ```
 
-`CODEYBOX_API_KEY` remains the legacy operator credential. Integrations that
-need caller attribution should use a named client whose token is kept in its
-own environment variable:
+`CODEYBOX_API_KEY` is the operator credential: one key, no caller identity, no
+delegation. An integration that needs attribution gets a named client with its
+own token environment variable instead. Every token, operator or named, must be
+at least 32 characters or the service refuses to start.
 
 ```json
 {
@@ -37,8 +38,8 @@ own environment variable:
 ```
 
 Only a client with `CanDelegateInitiator` may send the optional `initiator`
-object on `POST /workitems`. A normal named client is always attributed to its
-configured fixed principal, and the legacy operator key cannot delegate.
+object on `POST /workitems`. Any other named client is attributed to its
+configured fixed principal, and the operator key cannot delegate at all.
 Delegated identities are authenticated claims from the integration—not
 credentials—and are persisted with the work item for API, commit, and pull
 request attribution.
