@@ -47,7 +47,7 @@ at anything that matters.
 | [quota](operating/quota.md) | probes, floors, the burn gate, the observed-failure breaker |
 | [costs](operating/costs.md) | what each run cost, and where the rates come from |
 | [spend limits](operating/budgets.md) | per-agent budgets and per-project budget alerts |
-| [logging](operating/logging.md) | the structured audit log, every event name and property |
+| [logging](operating/logging.md) | the structured audit log: files, common properties, event names |
 | [observability](operating/observability.md) | OpenTelemetry traces, metrics, Prometheus scrape |
 | [pipeline metrics](operating/pipeline-metrics.md) | per-step timings and the transition-health score |
 | [agent streams](operating/agent-streams.md) | capturing agent stdout as NDJSON, and what the analyser derives |

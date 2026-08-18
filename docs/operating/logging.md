@@ -16,13 +16,9 @@ one JSON object per line. Every event carries the fields documented in
 [Common properties](#common-properties). The plain-text console mirror uses Serilog's default
 output template (timestamp, level, message, properties).
 
-The console mirror replaces the historical shell-redirect of stdout (e.g.
-`>> codeybox-orchestrator.run.log`). That redirect produced a single ever-growing file
-(22 M+ lines / multi-GB by 2026-06), which made tail / grep return weeks-old lines as if they
-were current, and paid the full multi-GB scan cost on every operator inspection. The in-process
-sink rolls by day and size so individual files stay readable and total retention is bounded.
-
----
+The console mirror exists so stdout survives without an external `>>` redirect:
+it rolls by day and by size, so no single file grows past the point where `tail`
+and `grep` return weeks-old lines at multi-gigabyte scan cost.
 
 ## Configuration
 
@@ -72,8 +68,6 @@ and should be removed. If you must keep an out-of-process capture for transport 
 reasons, set `ConsoleLog:Enabled=false` to avoid duplicating the writes — but in either case
 the unbounded single-file pattern is the thing that has to stop.
 
----
-
 ## Common properties
 
 Every event (main and audit) carries:
@@ -96,9 +90,11 @@ Audit-tier events additionally carry:
 | `WorkItemId` | string (GUID, N-format) | Present on all events emitted while a work item is being processed. |
 | `ProjectId` | string | Present on all events emitted after the project is resolved. |
 
----
-
 ## Audit event taxonomy
+
+The tables below carry the events operators alert on most, with their
+properties. They are not the complete set — every name is listed in
+[Every event name](#every-event-name).
 
 ### Work item lifecycle
 
@@ -126,7 +122,7 @@ Audit-tier events additionally carry:
 | `EventName` | Level | Emitted by | Properties |
 |-------------|-------|-----------|------------|
 | `sandbox.created` | Info | `MultipassSandboxProvider.CreateAsync` | `VmName`, `NetworkProfile` |
-| `sandbox.launch_transient_retry` | Info | `MultipassSandboxProvider.CreateAsync` | `WorkItemId`, `Attempt`, `ErrorClass` |
+| `sandbox.provisioning_transient_retry` | Info | `MultipassSandboxProvider` | `WorkItemId`, `Operation`, `Attempt`, `ErrorClass` |
 | `sandbox.agent_infra_failure` | Warning | `PipelineRunner` | `WorkItemId`, `Agent`, `Sandbox`, `Phase`, `Summary`, `Reason`. Missing agent binaries and runner prerequisite materialisation failures are sandbox/provisioning signals and do not increment the agent fast-fail breaker. |
 | `sandbox.disposed` | Info | `MultipassSandbox.DisposeAsync` | `VmName` |
 
@@ -168,8 +164,6 @@ Audit-tier events additionally carry:
 | `webhook.delivered` | Info | `HttpWebhookDispatcher.DispatchToEndpointAsync` | `Endpoint`, `WebhookEvent`, `StatusCode`, `Attempt` |
 | `webhook.delivery_failed` | Warning | Same | `Endpoint`, `WebhookEvent`, `Attempts`, `LastFailure` |
 
----
-
 ## Secret redaction
 
 All log events pass through `SensitiveDataRedactionEnricher` before writing.
@@ -185,15 +179,11 @@ This is defence-in-depth. Call sites are explicitly designed never to log raw
 secrets (PATs, HMAC secrets, agent API keys). The enricher catches accidental
 leakage; it is not a license to log credentials.
 
----
-
 ## Example audit event (CLEF)
 
 ```json
 {"@t":"2026-04-29T12:34:56.789Z","@mt":"Agent {Agent} started in sandbox {Sandbox} for phase {Phase}","Agent":"claude","Sandbox":"codeybox-a1b2c3d4e5f","Phase":"work","Audit":true,"EventName":"agent.started","WorkItemId":"3f7e2a1b4c5d6e7f8091a2b3c4d5e6f7","ProjectId":"acme-backend","Application":"CodeyBox","MachineName":"codeybox-host","ThreadId":14}
 ```
-
----
 
 ## Log query examples
 
@@ -215,4 +205,71 @@ jq 'select(.EventName == "upstream.api_call_failed")' logs/audit-*.json
 **All Warning-or-above audit events:**
 ```sh
 jq 'select(.Audit == true and (.["@l"] == "Warning" or .["@l"] == "Error" or .["@l"] == "Fatal"))' logs/codeybox-*.json
+```
+
+## Every event name
+
+`src/CodeyBox.Core/AuditLog.cs` is the authority: one method per event, each
+naming its `EventName` literal. The 140 events it emits today, grouped by
+prefix and shown without it:
+
+**`agent`** — `attempt_timeout_fallback`, `claude_acp_transport_degraded`, `claude_session_close_failed`, `claude_session_suspend_failed`, `claude_token_push_failed`, `claude_token_pushed_to_vm`, `claude_transcript_sanitizer_failed`, `claude_unauthorized`, `finished`, `killed_by_stuck_probe`, `log_capture_failed`, `pause_dispatch_deferred`, `pause_expired`, `pause_waiting_item_resumed`, `paused`, `restore_requeue_item`, `restore_requeue_swept`, `resume_exhausted_fallback`, `resumed`, `session_resume_liveness_probe_failed`, `smoke_failed`, `smoke_succeeded`, `started`, `started_while_paused`, `structured_stream_probe_failed`, `stuck_detected`, `supervision_injection_completed`, `supervision_injection_queued`, `supervision_injection_started`
+
+**`agentic_conflict_resolver`** — `attempt_failed`
+
+**`audit`** — `auditor_timed_out`, `cross_review_active`, `failed`, `iteration_complete`, `llm_auditor_parked_quota`, `llm_panel_skipped_build_test_gate`, `passed`, `profile_selected`
+
+**`auditor`** — `run`
+
+**`auth`** — `token_read`
+
+**`baseline`** — `migrated`
+
+**`budget`** — `deferred`
+
+**`budget_alert`** — `exceeded`, `recovered`, `startup_safe`, `warning`
+
+**`changelog`** — `generated`, `release_requested`, `webhook_received`, `webhook_rejected`, `work_item_created`
+
+**`concurrency`** — `gated_per_agent`, `gated_rate_aware`
+
+**`(ungrouped)`** — `config_reloaded`, `quota_retry_attempted`, `test_failure_attribution_partial`, `test_failure_attribution_skipped`, `transient_retry_attempted`
+
+**`disk`** — `deferred`
+
+**`plugin`** — `initialization_failed`, `loaded`, `skipped_api_version`, `skipped_not_allowlisted`
+
+**`project_queue`** — `paused`, `resumed`
+
+**`queue`** — `paused`, `resumed`, `started_while_paused`
+
+**`quota_router`** — `agent_fallback`, `all_exhausted`, `audit_agent_not_audit_capable`, `audit_fallthrough`, `deferred`, `probed`, `scored`, `waiting`
+
+**`rebase_resolver`** — `agent_selected`, `agent_unavailable`, `all_at_cap`, `cap_rerouted`, `rerouted`
+
+**`refactor`** — `exclusivity_deferred`
+
+**`sandbox`** — `agent_infra_failure`, `created`, `disposed`, `disposed_on_shutdown`, `leak_detected`, `leak_dispose_failed`, `leak_disposed`, `provisioning_deferred`, `provisioning_transient_retry`, `startup_reconcile_failed`, `startup_reconciled`, `stopped_on_shutdown`, `suspended_on_shutdown`
+
+**`store`** — `disk_full`
+
+**`suggestion`** — `created`, `dismissed`, `promoted`, `revert_failed`, `reverted`
+
+**`upstream`** — `api_call_failed`, `pr_merged`, `pr_opened`, `pr_stale_base`, `push`
+
+**`webhook`** — `delivered`, `delivery_failed`
+
+**`work_item`** — `abandoned_after_recovery`, `cancelled`, `created`, `dependencies_changed`, `dependencies_resolved`, `dependent_cancelled`, `dependent_restored`, `failed`, `item_stale_detected`, `item_stale_recovered`, `patched`, `picked_up`, `post_agent_timeout`, `priority_changed`, `recovered`, `reordered`, `resumed`, `retried`, `terminal_failure_classified`, `transient_cancel_retried`, `transitioned`, `watchdog_parked`, `watchdog_recovered`, `watchdog_stuck`, `worker_dead_failed_terminal`, `worker_dead_recovered`
+
+**`work_prompt`** — `self_review_checklist`
+
+**`worker`** — `deregistered`, `registered`
+
+**`worker_pool`** — `spawn_throttled`, `worker_finished`, `worker_started`
+
+Regenerate this list after adding an event:
+
+```bash
+grep -oE 'Audit\((logger, )?"[a-z_.]+"' src/CodeyBox.Core/AuditLog.cs \
+  | grep -oE '"[a-z_.]+"' | tr -d '"' | sort -u
 ```
