@@ -84,14 +84,20 @@ cycles tend to plateau quickly.
 | Host git server              | Host (or sidecar)  | Sandbox network    | No                    | No                    |
 | Upstream remote (e.g. GitHub)| External           | —                  | —                     | —                     |
 
-The merge phase is host-verified. Before accepting an agent-produced merge,
-the orchestrator runs host-side `git merge-tree --write-tree --no-messages`
-against the pre-merge main commit and the work tip.
+The merge phase is host-decided. It starts with host-side
+`git merge-tree --write-tree --no-messages` against the pre-merge base commit
+and the work tip, and what happens next depends on whether that conflicts.
 
-For clean merges, the agent commit tree must exactly match the host
-`merge-tree` result, and the accepted commit must keep both the pre-merge main
-commit and the work tip in its ancestry. For conflicted merges, the orchestrator
-runs the configured agent's normal CLI shape inside the work-item sandbox
+A **clean merge needs no agent and no sandbox**: `merge-tree` already produced
+the exact tree, so the host creates the merge commit directly with
+`git commit-tree`, then re-checks that both parents are reachable and the
+committed tree still matches. (This path once dispatched an in-VM agent to run
+`git merge --no-ff`; a VM boot per deterministic git operation is wasteful, and
+an agent given the project's rules alongside the merge instruction sometimes
+started a build instead and timed out with the branch unmerged.)
+
+For **conflicted** merges the orchestrator runs the configured agent's normal
+CLI shape inside the work-item sandbox
 through `IAgentRunner.RunAsync` with a conflict-resolution prompt. The agent
 reads conflicted files directly off the sandbox working tree, writes resolutions,
 and `git add`'s them; the orchestrator then verifies (no unmerged paths, no
