@@ -340,7 +340,7 @@ Recommended tag vocabulary (start small, extend as needs emerge):
 | `sensitive` | Anything you would not want a weaker or unverified model to touch — auth flows, secrets handling, billing logic. |
 | `architectural` | Cross-cutting refactors and design-doc-shaped work. |
 | `security` | Threat-modelling, dependency vulns, anything in a security review. |
-| `audit` | **Framework-recognised.** Marks a member as eligible to run the [audit phase](audit.md). See [Audit-capability pool](#audit-capability-pool) below. |
+| `audit` | **Framework-recognised.** Marks a member as eligible to run the [audit phase](../quality/audit.md). See [Audit-capability pool](#audit-capability-pool) below. |
 
 Tag comparison is case-insensitive; values are otherwise free-form so you can
 extend the vocabulary without code changes. The builder de-dupes and trims, so
@@ -488,7 +488,7 @@ Calls `https://api.anthropic.com/api/oauth/usage` with
 `Authorization: Bearer <Claude OAuth access token>`.
 
 Parses overall `rate_limit` plus per-model `additional_rate_limits`; see
-[`quota-endpoints.md`](quota-endpoints.md).
+[`quota-endpoints.md`](../operating/quota.md).
 
 ### `CodexQuotaProbe`
 

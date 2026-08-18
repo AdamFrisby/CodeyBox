@@ -256,7 +256,7 @@ A graphical request fails explicitly; it is never rerouted to Multipass.
   operator warning because ZFS has stronger VM-volume isolation and is the
   recommended production choice.
 - The `cb-*` Linux bridges and nftables policy described in
-  [`host-firewall.md`](host-firewall.md). Incus's default NAT bridge is not a
+  [`host-firewall.md`](../operating/host-firewall.md). Incus's default NAT bridge is not a
   substitute for CodeyBox's host-enforced profile policy.
 
 Follow the official [Incus installation guide](https://linuxcontainers.org/incus/docs/main/installing/)
@@ -324,7 +324,7 @@ failure is propagated and never retried through the other provider. A durable
 recovery lease is the explicit exception: it is routed to the exact registered
 provider named by the lease even if selection changed after the outage.
 Selecting any other provider still requires a restart. See
-[`configuration.md`](configuration.md#incus) for every key and bound.
+[`configuration.md`](../reference/configuration.md#incus) for every key and bound.
 
 Queued Incus baseline pins survive both prefix edits and restarts: the cutover
 router recognizes their stable flavor-plus-12-hex structural suffix, while the
@@ -396,7 +396,7 @@ group dance (multipass handles its own KVM access). Confirm with
   too (e.g. `~/snap/multipass/common/codeybox-repos`), otherwise the
   per-work-item bare repo can't be bind-mounted into the VM.
 * **Egress enforcement is host-side via nftables on per-profile bridges**
-  (see [`host-firewall.md`](host-firewall.md)). Operator runs
+  (see [`host-firewall.md`](../operating/host-firewall.md)). Operator runs
   `scripts/setup-host-networks.sh` once, defining one bridge per
   profile (e.g. `claude`, `multi-llm`, `isolated`). The orchestrator's
   `SandboxNetworkProfiles` config maps profile names to bridges; the
@@ -649,7 +649,7 @@ takes effect on the next sandbox launch without an orchestrator restart.
 capacity; placement counters show reservations, created VMs, deferrals,
 and runtime health transitions. Coordinator pinch-points are also timed:
 SQLite write-gate wait, host-side git commands, and agent-stream capture
-I/O. See [`observability.md`](observability.md).
+I/O. See [`observability.md`](../operating/observability.md).
 
 **Scope.** This provider supports cloning from an operator-baked remote
 Multipass baseline when `SandboxSpec.BaselineImageRef` is set. It deliberately
@@ -694,6 +694,6 @@ varies by provider:**
 
 The Multipass and Incus paths provide real per-host enforcement, configured
 once via `scripts/setup-host-networks.sh` and described in
-[`host-firewall.md`](host-firewall.md). Incus instances are created with
+[`host-firewall.md`](../operating/host-firewall.md). Incus instances are created with
 `--no-profiles` and receive only the selected `cb-*` bridge NIC, so they cannot
 route around that host policy through an Incus NAT network.

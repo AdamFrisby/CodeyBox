@@ -130,7 +130,7 @@ Hot-reloadable today:
 - `TransitionHealth.{Enabled,WindowHours,MaxTransitions}` — hot-reloaded through
   `TransitionHealthOptionsSnapshot`; controls the `/fleet/transition-health`
   endpoint's rolling window and "last N transitions" cap.
-  See [`transition-health.md`](transition-health.md).
+  See [`transition-health.md`](../operating/pipeline-metrics.md).
 - `PromptPreprocessing.ProjectRulesPath` — re-read before every agent
   invocation; changes affect the next work/rework/audit/merge/check-and-act
   prompt.
@@ -327,7 +327,7 @@ snapshot before using a pin.
 | `MaxTmpfsDeviceBytes` | long | `17179869184` | Maximum logical size of one memory-backed guest tmpfs mount (16 GiB). Incus maps the conventional `/work` request to its bounded VM root disk instead, so this setting still governs credentials and other real tmpfs mounts but not `/work`. |
 | `MaxAggregateTmpfsBytes` | long | `34359738368` | Maximum aggregate logical size of all memory-backed guest tmpfs mounts in one sandbox (32 GiB), excluding Incus's root-disk-backed `/work`. |
 
-See [Sandbox providers](sandbox-providers.md#incus--cow-vms-with-virtiofs) for
+See [Sandbox providers](../concepts/sandboxes.md#incus--cow-vms-with-virtiofs) for
 Incus installation, project, ZFS/Btrfs pool, and security prerequisites. Incus
 also derives its pool and host-volume preflight from the shared
 `CodeyBox:DiskGuard:Enabled`, `MinFreeBytes`, `RecheckIn`, and `AdditionalPaths`
@@ -343,7 +343,7 @@ must match the creation-time project, pool, guest identity, sandbox
 specification, network/topology, inode-pinned host sources, and guest links.
 The retry first converts the VM to the ordinary Git/private-state checkpoint
 under an exclusive preparation claim, then deletes it and automatically queues
-the immutable resumed dispatch. See [Recovery](recovery.md#retained-incus-adoption-and-conversion)
+the immutable resumed dispatch. See [Recovery](../operating/recovery.md#retained-incus-adoption-and-conversion)
 for the lifecycle and failure behavior.
 
 When `UseBaselineImages=true`, the API derives Incus post-bake verification
@@ -518,7 +518,7 @@ that were suspended by the previous process.
 ## `AgentClasses`
 
 Defines named groups of interchangeable agents for quota-aware routing.
-See [docs/agent-classes.md](agent-classes.md) for the full model including
+See [docs/agent-classes.md](../concepts/agent-classes.md) for the full model including
 `QualityScore` semantics, the floor filter, and TOD modifiers.
 
 ```json
@@ -552,7 +552,7 @@ with the global `CodeyBox:ClaudeSession:Enabled` switch and the per-project
 ## `AgentScoreModifiers`
 
 Small time-of-day score deltas that act as tiebreakers between near-equivalent
-members. All times are UTC. See [docs/agent-classes.md](agent-classes.md#time-of-day-score-modifiers)
+members. All times are UTC. See [docs/agent-classes.md](../concepts/agent-classes.md#time-of-day-score-modifiers)
 for the design rationale.
 
 ```json
@@ -590,7 +590,7 @@ for the design rationale.
 | `EndUtc` | yes | Window end in `HH:mm` format (UTC). If `EndUtc < StartUtc` the window wraps midnight. |
 
 Modifiers are bounded to ±5 at startup; values outside that range are rejected
-with a startup error. See [agent-classes.md](agent-classes.md) for how effective
+with a startup error. See [agent-classes.md](../concepts/agent-classes.md) for how effective
 scores interact with the `MinModelScore` floor.
 
 ---
@@ -857,11 +857,11 @@ The inspector also understands the two operator-keyed map shapes that
 `ProjectsOptionsBinder.ApplyCustomMaps` reads:
 
 - `Audit:Languages:Overrides:<lang-id>:…` — the per-language override map
-  documented in [`docs/languages.md`](languages.md). Operator-defined
+  documented in [`docs/languages.md`](../quality/presets.md). Operator-defined
   language ids are accepted as dictionary keys; typos *inside* the
   override value (e.g. `Replce` instead of `Replace`) are still flagged.
 - `Audit:AuditTypes:<id>:…` — the per-audit-type override map documented
-  in [`docs/audit-types.md`](audit-types.md). The inspector detects the
+  in [`docs/audit-types.md`](../quality/presets.md). The inspector detects the
   shape automatically (all-numeric keys → list form, any non-numeric key
   → map form) and walks the override POCO under each id so unknown
   sub-fields still surface.
@@ -1004,7 +1004,7 @@ preprocessors that run in order before every agent invocation:
 ## `AgentStreams`
 
 Structured stdout stream capture for agent invocations. See
-[docs/agent-streams.md](agent-streams.md) for file layout, CLI flags, retention,
+[docs/agent-streams.md](../operating/agent-streams.md) for file layout, CLI flags, retention,
 and API endpoints.
 
 ```json
@@ -1028,7 +1028,7 @@ and API endpoints.
 ## `AgentSupervision`
 
 Config-gated live human supervision and injection for all active agent
-invocations. See [docs/agent-supervision.md](agent-supervision.md) for the
+invocations. See [docs/agent-supervision.md](../operating/supervision.md) for the
 SignalR protocol and injection semantics.
 
 ```json
@@ -1077,7 +1077,7 @@ Read-only parser settings for agent stream analytics.
 
 ## `Projects`
 
-See [docs/projects.md](projects.md).
+See [docs/projects.md](../concepts/projects.md).
 
 ---
 

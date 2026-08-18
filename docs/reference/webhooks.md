@@ -351,7 +351,7 @@ One event fires **per suggestion entry**, not per file. A suggestions.json with
 three entries produces three separate `work_item.suggestion` events. All three
 carry the same `workItem` and `project` context.
 
-See [`suggestions.md`](suggestions.md) for the full agent contract and operator
+See [`suggestions.md`](../concepts/agent-feedback.md) for the full agent contract and operator
 workflow.
 
 ### `question_asked` details
@@ -554,7 +554,7 @@ When `event` is `work_item.question_dismissed`, the `details` field carries the 
 
 On restart, the first sweep tick re-fires any events that apply (idempotency requirement). Receivers should de-duplicate by `(projectId, thresholdState)` — the `pct` value lets you derive which band you're in.
 
-See [`budget-alerts.md`](budget-alerts.md) for configuration and edge-trigger semantics.
+See [`budget-alerts.md`](../operating/budgets.md) for configuration and edge-trigger semantics.
 
 ---
 | `workItemId` | string | UUID of the recovered work item |
@@ -565,7 +565,7 @@ See [`budget-alerts.md`](budget-alerts.md) for configuration and edge-trigger se
 | `recoveryAttempt` | int | Which recovery attempt this is (1-based) |
 | `maxRecoveryAttempts` | int | The configured cap before the item is abandoned for operator triage |
 
-`work_item.recovered` fires even when `toState` is `"AbandonedAfterRecoveryAttempts"` (i.e. the cap was exceeded). Phase-boundary re-dispatches such as `AuditPassed` → `AuditPassed` also emit this webhook and consume a recovery attempt. Subscribe to this event to monitor crash recovery and alert when an item keeps crashing. See [`recovery.md`](recovery.md) for the full state-mapping rules and configuration.
+`work_item.recovered` fires even when `toState` is `"AbandonedAfterRecoveryAttempts"` (i.e. the cap was exceeded). Phase-boundary re-dispatches such as `AuditPassed` → `AuditPassed` also emit this webhook and consume a recovery attempt. Subscribe to this event to monitor crash recovery and alert when an item keeps crashing. See [`recovery.md`](../operating/recovery.md) for the full state-mapping rules and configuration.
 
 ### `agent_smoke_failed` details
 
@@ -904,7 +904,7 @@ idempotent on `(projectId, prNumber, headSha)`.
 | `Content-Type` | `application/json; charset=utf-8` |
 | `X-CodeyBox-Event` | Event name, e.g. `work_item.done` |
 | `X-CodeyBox-Delivery` | Random UUID, unique per delivery attempt batch |
-| `X-CodeyBox-Schema-Version` | Event-payload schema version (semver), e.g. `1.1`. See [`EVENT_SCHEMA.md`](EVENT_SCHEMA.md) for evolution rules. |
+| `X-CodeyBox-Schema-Version` | Event-payload schema version (semver), e.g. `1.1`. See [`EVENT_SCHEMA.md`](events.md) for evolution rules. |
 | `X-CodeyBox-Signature` | `sha256=<hex>` — only present when `SecretEnvVar` is configured |
 
 ---
@@ -1007,7 +1007,7 @@ The HMAC secret itself must **never** appear in config files. Put it in an envir
 ## Release events
 
 These events fire during the release management lifecycle (opt-in per project;
-see [`releases.md`](releases.md)).
+see [`releases.md`](../operating/releases.md)).
 
 | Event | Fired when |
 |---|---|

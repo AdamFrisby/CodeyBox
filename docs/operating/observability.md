@@ -402,7 +402,7 @@ Point the Datadog Agent's OTLP ingest at port 4317 (`DD_OTLP_CONFIG_RECEIVER_PRO
 
 ## Relationship to the timings database
 
-The SQLite timings database (see [`timings.md`](timings.md)) and OTel are complementary:
+The SQLite timings database (see [`timings.md`](pipeline-metrics.md)) and OTel are complementary:
 
 | Capability | Timings DB | OTel |
 |---|---|---|

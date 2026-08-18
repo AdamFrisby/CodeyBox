@@ -106,7 +106,7 @@ The retention window is controlled by `CodeyBox:AuditLog:RetainedDays`
 Returns all stored reports grouped by target and iteration, with findings inline.
 `rawOutputAvailable` indicates whether a `/raw` fetch will succeed.
 
-See [`api.md`](api.md) for the full response shape.
+See [`api.md`](../reference/api.md) for the full response shape.
 
 ### `GET /workitems/{id}/audit-reports/{target}/{iteration}/{auditor}/raw`
 

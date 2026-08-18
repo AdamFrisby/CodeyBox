@@ -8,7 +8,7 @@ work-prompt and audit-prompt fragment seams).
 
 Knobs are designed for *fan-out*: this surface is expected to grow to dozens of
 small dials over time. Adding a new knob is a **localised** change — implement
-[`IKnob`](../src/CodeyBox.Core/IKnob.cs), register it as a DI singleton, and
+[`IKnob`](../../src/CodeyBox.Core/IKnob.cs), register it as a DI singleton, and
 the knob is immediately visible to the API for set/validate, persisted on every
 new work item, and consulted at prompt-assembly time (work and audit). No
 edits to the API endpoints, the orchestrator, the SQLite store, or the
@@ -85,7 +85,7 @@ clears an inherited `Defaults.Knobs` entry for that known key.
 ## Resolution and prompt injection
 
 At every WORK and AUDIT agent invocation, the
-[`KnobWorkPromptPreprocessor`](../src/CodeyBox.Orchestrator/Knobs/KnobWorkPromptPreprocessor.cs)
+[`KnobWorkPromptPreprocessor`](../../src/CodeyBox.Orchestrator/Knobs/KnobWorkPromptPreprocessor.cs)
 loads the work item when one exists, resolves each registered knob's effective
 value (item → project default → knob default), asks every knob for its
 phase-specific prompt fragment, and appends the non-empty fragments to the
@@ -196,7 +196,7 @@ requested change.
   dimension on the meter — the lever is on the merge surface today.
   Scheduling biases for refactor-vs-normal items remain provided by
   `JobType.Refactor`'s project-exclusive dispatcher gate (see
-  [`OrchestratorService`](../src/CodeyBox.Orchestrator/OrchestratorService.cs)
+  [`OrchestratorService`](../../src/CodeyBox.Orchestrator/OrchestratorService.cs)
   — `RefactorCandidateBlockedReason` and the surrounding refactor drain
   logic); operators that want a `changeScope=refactor` item to skip
   pile-ups in hot files should mark the item `JobType.Refactor` as well.

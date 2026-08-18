@@ -331,7 +331,7 @@ Set `Audit.BuildScriptRequired=true` for projects that must provide the script:
 cannot execute, exits `126`/`127`, or times out, the item fails/defer-surfaces as
 `could-not-verify` infrastructure rather than a source-code audit finding.
 
-See [`docs/audit.md`](audit.md) for the full cross-review documentation
+See [`docs/audit.md`](../quality/audit.md) for the full cross-review documentation
 including trade-offs, observability events, and quota fallthrough behaviour.
 
 ### Stuck-agent detection
@@ -405,7 +405,7 @@ networkProfiles:
 ```
 
 The host-side `networks.conf` accepts three profile modes (full
-discussion in [`host-firewall.md`](host-firewall.md)):
+discussion in [`host-firewall.md`](../operating/host-firewall.md)):
 
 | Mode             | Egress                                                                | Use case                                                          |
 |------------------|-----------------------------------------------------------------------|-------------------------------------------------------------------|
@@ -482,7 +482,7 @@ attribute. If the plugin is not loaded, the composer logs a warning and skips
 the entry — other auditors continue normally. No `Name` field is required; the
 plugin's own `IAuditor.Name` is used in findings and logs.
 
-See [`docs/auditor-plugins.md`](auditor-plugins.md) for the full authoring guide,
+See [`docs/auditor-plugins.md`](../extending/auditor-plugins.md) for the full authoring guide,
 project skeleton, and sample plugin.
 
 ## Per-project upstream
@@ -571,7 +571,7 @@ other per-project state injection mechanism.
 `TokenEnvVar` to name the environment variable holding the token; the plugin reads it
 with `Environment.GetEnvironmentVariable(...)`.
 
-See [`docs/upstream-plugins.md`](upstream-plugins.md) for how to author an upstream
+See [`docs/upstream-plugins.md`](../extending/upstream-plugins.md) for how to author an upstream
 remote plugin.
 
 ### GitHub upstream: pull request flow
@@ -709,7 +709,7 @@ The admin dashboard shows this as colour-coded usage bars per project.
 
 ## Monthly cost budget
 
-Set `Budget.MonthlyCostBudgetUsd > 0` to enable spend tracking and automatic alerts over a rolling 30-day window. See [budget-alerts.md](budget-alerts.md) for the full description.
+Set `Budget.MonthlyCostBudgetUsd > 0` to enable spend tracking and automatic alerts over a rolling 30-day window. See [budget-alerts.md](../operating/budgets.md) for the full description.
 
 ```json
 {
@@ -761,7 +761,7 @@ POST /workitems            — body now requires "projectId" instead of "reposit
 
 ## Credential provider priority
 
-When multiple [credential plugins](credential-plugins.md) are installed, a project
+When multiple [credential plugins](../extending/credential-plugins.md) are installed, a project
 can declare which plugins it prefers and in what order:
 
 ```json
@@ -832,7 +832,7 @@ the built-in env-var provider.
 > configuration option that excludes all installed plugins while keeping the
 > built-in providers.
 
-See [`docs/credential-plugins.md`](credential-plugins.md) for the full plugin
+See [`docs/credential-plugins.md`](../extending/credential-plugins.md) for the full plugin
 author guide, chain-order rationale, and sample implementation.
 
 ---
@@ -850,7 +850,7 @@ the orchestrator only reads through the interface.
 Use repository-owned YAML under `codeybox/languages` or
 `codeybox/audit-types`, or per-project appsettings overrides, for project-specific preset data. Built-in defaults
 live in `CodeyBox.Audit.Presets/Defaults` as embedded resources. Selected preset ids are validated against the composed catalog at startup with did-you-mean diagnostics for typos. See
-[`languages.md`](languages.md) and [`audit-types.md`](audit-types.md).
+[`languages.md`](../quality/presets.md) and [`audit-types.md`](../quality/presets.md).
 
 For one-off auditors that don't need a preset (project-specific build
 checks, etc.), use a `Custom` entry in the project config — no code change.
@@ -861,7 +861,7 @@ checks, etc.), use a `Custom` entry in the project config — no code change.
 
 Releases group work items that target a shared release branch instead of
 `main`. The feature is **opt-in** via `release.enabled = true`. See
-[`releases.md`](releases.md) for a complete description.
+[`releases.md`](../operating/releases.md) for a complete description.
 
 ```yaml
 projects:

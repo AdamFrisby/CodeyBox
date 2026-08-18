@@ -72,7 +72,7 @@ options validator (see `CodeyBoxOptions.MaximumMaxBulkItems`).
 ## Emission from an approved plan
 
 When the optional planning phase is on (the `plan` knob — see
-[the planning docs](../AGENTS.md)) and a plan is **approved**, CodeyBox turns
+[the planning docs](../../AGENTS.md)) and a plan is **approved**, CodeyBox turns
 the plan's declared test intentions into real, queryable test cases so the
 downstream coverage / execution gates consume structured cases instead of
 prose. The plan artifact's `testStrategy` array is the source: each entry is

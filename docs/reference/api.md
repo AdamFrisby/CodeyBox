@@ -115,7 +115,7 @@ front it with a TLS-terminating reverse proxy (nginx, Caddy, …) and set
 
 ## Observability
 
-When OpenTelemetry is enabled (see [`observability.md`](observability.md)), all incoming HTTP requests are automatically traced as spans via `AspNetCore` instrumentation. The `traceparent` response header is set on every request so callers can correlate client-side traces with server-side spans.
+When OpenTelemetry is enabled (see [`observability.md`](../operating/observability.md)), all incoming HTTP requests are automatically traced as spans via `AspNetCore` instrumentation. The `traceparent` response header is set on every request so callers can correlate client-side traces with server-side spans.
 
 ## Endpoints
 
@@ -138,7 +138,7 @@ Queue a new work item.
 ```
 
 * `projectId` — required. Must match a configured project (see
-  [`projects.md`](projects.md)). Unknown ids are rejected.
+  [`projects.md`](../concepts/projects.md)). Unknown ids are rejected.
 * `externalId` — optional caller-supplied identifier (e.g. `"JIRA-1234"`,
   `"GH-456"`, `"sprint-7:ticket-99"`). Must be 1–256 ASCII printable
   characters (no whitespace, no `/`, no `?`, no `;` `<` `=` `>`), must not start with `wi-`,
@@ -165,12 +165,12 @@ Queue a new work item.
   allows batching dependent items without waiting for UUID responses — see
   [`external-ids.md`](external-ids.md#dependency-batching-without-round-trips).
   Unknown IDs, self references, and cycles are rejected with `400`. See
-  [`work-items.md`](work-items.md) for details.
+  [`work-items.md`](../concepts/work-items.md) for details.
 * `requiredCapabilities` — optional array of clearance/trust tags every
   routed agent member must declare (e.g. `["sensitive"]`). Defaults to empty
   (any member of the resolved agent class is eligible). Tags are trimmed and
   de-duplicated case-insensitively; max 16 entries, each ≤64 chars. See
-  [`agent-classes.md`](agent-classes.md#capability-gate) for the recommended
+  [`agent-classes.md`](../concepts/agent-classes.md#capability-gate) for the recommended
   tag vocabulary.
 * `agentControl` — optional control-plane work item. When provided, the item
   does not launch an agent; it performs a queued agent pause/resume action:
@@ -184,7 +184,7 @@ Queue a new work item.
   exclusive: it only starts when the project has zero other in-flight
   items, and while it runs no other item for the project may start. Mutually
   exclusive with `check` and `agentControl`. See
-  [`work-items.md`](work-items.md#refactor-work-items) for full dispatch
+  [`work-items.md`](../concepts/work-items.md#refactor-work-items) for full dispatch
   semantics.
 
 Response: `201 Created` with the work item record.
@@ -304,7 +304,7 @@ Returns `404 Not Found` when the project exists but has no item with that extern
 ### `POST /workitems/{id}/replay`
 
 Clone a terminal work item and run it with a different agent or model. See
-[`replay.md`](replay.md) for full semantics.
+[`replay.md`](../concepts/work-items.md) for full semantics.
 
 **Request body** (all optional):
 
@@ -415,7 +415,7 @@ first request. In-flight items are re-read from disk on every call.
 ### `GET /workitems/{id}/audit-reports`
 
 Returns all stored per-auditor reports for a work item, grouped by
-review target and iteration. See [`audit-reports.md`](audit-reports.md) for the full
+review target and iteration. See [`audit-reports.md`](../quality/audit-reports.md) for the full
 schema and semantics.
 
 ```json
@@ -479,7 +479,7 @@ such as `plan` or `code`.
 
 Structured agent stdout streams are captured when
 `CodeyBox:AgentStreams:Enabled=true`. See
-[`agent-streams.md`](agent-streams.md) for capture semantics and CLI flag
+[`agent-streams.md`](../operating/agent-streams.md) for capture semantics and CLI flag
 support.
 
 #### `GET /workitems/{id}/agent-streams`
@@ -617,7 +617,7 @@ leaderboard.
 Live human supervision is disabled unless
 `CodeyBox:AgentSupervision:Enabled=true`. The primary realtime protocol is
 SignalR on `/hubs/agent-stdout`; see
-[`agent-supervision.md`](agent-supervision.md).
+[`agent-supervision.md`](../operating/supervision.md).
 
 #### `GET /agent-supervision/sessions`
 
@@ -660,7 +660,7 @@ injections, and `429` when that session's injection queue is full.
 ### `GET /workitems/{id}/costs`
 
 Returns token usage and estimated cost data for a single work item, aggregated
-by phase and by agent.  See [`cost-reporting.md`](cost-reporting.md) for the
+by phase and by agent.  See [`cost-reporting.md`](../operating/costs.md) for the
 cost model and pricing configuration.
 
 **Response (200 OK):**
@@ -855,7 +855,7 @@ SignalR hub below.
 ### `GET /workitems/{id}/timings`
 
 Returns per-step wall-clock timing data for a single work item as a structured
-tree grouped by phase and step.  See [`timings.md`](timings.md) for the full
+tree grouped by phase and step.  See [`timings.md`](../operating/pipeline-metrics.md) for the full
 response shape and field descriptions.
 
 * Returns `200 OK` with the timing tree.
@@ -874,7 +874,7 @@ SQLite cursor rather than loading all rows into memory.
 |-------|-------------|
 | `n` | Number of completed work items to include (default 50, max 500). |
 
-**Response (200 OK):** step-stat array.  See [`timings.md`](timings.md) for
+**Response (200 OK):** step-stat array.  See [`timings.md`](../operating/pipeline-metrics.md) for
 the full schema.
 
 ### `GET /workitems/{id}/questions`
@@ -985,7 +985,7 @@ Cancel a work item or close out a terminal-failure item.
   item is transitioned to `Cancelled` for bookkeeping — used after an
   operator resolves the work out-of-band (e.g. manually merging the
   branch). No cascade, no replay; the pipeline never re-dispatches the
-  row. See [docs/work-items.md](work-items.md#closing-terminal-failure-items-operator-bookkeeping).
+  row. See [docs/work-items.md](../concepts/work-items.md#closing-terminal-failure-items-operator-bookkeeping).
 * Already-`Cancelled` items return `202 Accepted` as a no-op (idempotent).
 * `Done` items return `409 Conflict` — a successful merge cannot be cancelled.
 
@@ -1022,7 +1022,7 @@ provided (non-null) in the body are updated.
 * Returns `409 Conflict` for non-`dependsOn` fields when the item is not in `Queued` state (in-flight items are read-only). `dependsOn` is allowed on any **non-terminal** state and returns `409` only on terminal items.
 * Validation rules for `title`, `prompt`, and `agent` are identical to `POST /workitems`.
 * `workTimeoutMinutes` is clamped to `[1, 480]`, `mergeTimeoutMinutes` to `[1, 240]`, `minModelScore` to `[0, 200]` — out-of-range values pin to the boundary rather than 400, matching the creation surface. This lets an operator bulk-PATCH the queue after a defaults bump without special-casing stray inputs.
-* `requiredCapabilities` is the explicit clearance/trust gate (see [agent-classes.md](agent-classes.md#capability-gate)). Tags are trimmed, de-duplicated case-insensitively, and validated for length (≤64 chars) and count (≤16 entries). Sending the field replaces the existing list; omit it to leave the list unchanged.
+* `requiredCapabilities` is the explicit clearance/trust gate (see [agent-classes.md](../concepts/agent-classes.md#capability-gate)). Tags are trimmed, de-duplicated case-insensitively, and validated for length (≤64 chars) and count (≤16 entries). Sending the field replaces the existing list; omit it to leave the list unchanged.
 * `dependsOn` is replace-set semantics: the array overwrites the item's full dependency list. Each entry is a GUID, a namespaced `ns:value` externalId, or a bare externalId (must be unambiguous within the project). Capped at 100 entries; the create-time validation (existence, self-loop, cycle) re-runs against the proposed graph and `400`s on rejection. Pass `[]` to clear all deps. Persisted via a partial UPDATE that does not stomp `state` / `startedAt`, and a `work_item.dependencies_changed` audit-log entry records the pre/post sets.
 * Priority is not editable here — use `PATCH /workitems/{id}/priority` (works on any non-terminal state, uses a TOCTOU-safe partial UPDATE).
 
@@ -1216,7 +1216,7 @@ Response: `200 OK` with a JSON array:
 | `lastHeartbeatAt` | When the heartbeat last fired (updated every `HeartbeatInterval`, default 15 s) |
 | `currentWorkItemId` | UUID of the work item being processed, or `null` if none |
 
-An empty array means no workers are currently registered. A row with a stale `lastHeartbeatAt` means the worker process has crashed and the dead-worker reaper will recover it on the next sweep (or has already done so and the row wasn't cleaned up). See [`recovery.md`](recovery.md) for the full reaper design.
+An empty array means no workers are currently registered. A row with a stale `lastHeartbeatAt` means the worker process has crashed and the dead-worker reaper will recover it on the next sweep (or has already done so and the row wasn't cleaned up). See [`recovery.md`](../operating/recovery.md) for the full reaper design.
 
 ### `GET /sandboxes/leaked`
 
@@ -1240,7 +1240,7 @@ snapshot and disambiguates equal names during a provider cutover.
 ]
 ```
 
-See [`sandbox-leaks.md`](sandbox-leaks.md) for full leak detection semantics.
+See [`sandbox-leaks.md`](../operating/sandbox-reliability.md) for full leak detection semantics.
 
 ### `GET /admin/sandbox-leaks`
 
@@ -1379,7 +1379,7 @@ the last 60 minutes, `wouldAllow` decisions, and paused-agent annotations
 (`agentInstanceId`, `paused`, `pausedReason`, `pausedAt`, `pausedBy`,
 `pauseExpiresAt`, `dispatchStatus`). Configured pooled instances are returned
 as separate rows, with `kindAggregates` summarising the broader kind. See
-[`quota-gate.md`](quota-gate.md).
+[`quota-gate.md`](../operating/quota.md).
 
 ### `POST /projects/{id}/release`
 
@@ -1417,7 +1417,7 @@ oldest were omitted.
   disabled for the project.
 * Returns `404 Not Found` when the project does not exist.
 
-See [`changelog-automation.md`](changelog-automation.md) for configuration
+See [`changelog-automation.md`](../operating/releases.md) for configuration
 and the webhook flow.
 
 ### `POST /webhooks/github/release`
@@ -1436,7 +1436,7 @@ GitHub HMAC instead.
 * Non-`published`/`released` actions (e.g. `deleted`) return `202 Accepted` silently.
 * Repositories not matching any configured project return `202 Accepted` silently.
 
-See [`changelog-automation.md`](changelog-automation.md) for setup instructions.
+See [`changelog-automation.md`](../operating/releases.md) for setup instructions.
 
 ## SignalR hub — live agent stdout
 
@@ -1523,15 +1523,15 @@ for displaying human-readable dependency labels.
 `AuditPassed`, `Reworking`, `AuditFailed`, `Merging`, `Merged`,
 `UpstreamPushing`, `Done`, `NeedsOperatorInput`, `Failed`, `Cancelled`.
 `NeedsOperatorInput` means the agent asked one or more questions and is
-waiting for operator input — see [`agent-questions.md`](agent-questions.md).
+waiting for operator input — see [`agent-questions.md`](../concepts/agent-feedback.md).
 Audit states only appear when the deployment has registered auditors (see
-[`audit.md`](audit.md)).
+[`audit.md`](../quality/audit.md)).
 
 `dependsOn` lists the IDs of work items this item depends on.
 `dependsOnSatisfied` is `true` when every dependency has reached `Done`
 (or when there are no dependencies). Failed / AuditFailed / Cancelled
 deps leave it `false` — the operator must retry-and-resolve the parent
-before the dependent can run. See [`work-items.md`](work-items.md).
+before the dependent can run. See [`work-items.md`](../concepts/work-items.md).
 
 ## Configuration
 
@@ -1562,14 +1562,14 @@ before the dependent can run. See [`work-items.md`](work-items.md).
 ```
 
 Per-project config (upstream, audit policy, per-phase network profiles)
-lives under `Projects[]` — see [`projects.md`](projects.md). Host-side
-network profile setup lives in [`host-firewall.md`](host-firewall.md).
+lives under `Projects[]` — see [`projects.md`](../concepts/projects.md). Host-side
+network profile setup lives in [`host-firewall.md`](../operating/host-firewall.md).
 
 ---
 
 ## Release endpoints
 
-See [`releases.md`](releases.md) for a full introduction to the release
+See [`releases.md`](../operating/releases.md) for a full introduction to the release
 management feature.
 
 ### `POST /releases`
@@ -1697,7 +1697,7 @@ Returns an infrastructure-health score that classifies recent pipeline stage
 transitions as legitimate forward progress vs. infra failures. Done-rate is
 intentionally excluded — the score does not move when more items complete.
 
-See [`transition-health.md`](transition-health.md) for the full taxonomy
+See [`transition-health.md`](../operating/pipeline-metrics.md) for the full taxonomy
 (LEGITIMATE vs. INFRA_FAILURE vs. SKIPPED), the per-stage breakdown, and the
 configuration knobs (`CodeyBox:TransitionHealth:{Enabled,WindowHours,MaxTransitions}`,
 all hot-reloadable).

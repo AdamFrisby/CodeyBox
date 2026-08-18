@@ -169,7 +169,7 @@ mapping is used by Multipass and Incus; changing the example provider to
 `multipass` does not change the map.
 
 **2. Per-project, per-phase profile selection** in each project's config
-(see [`projects.md`](projects.md)):
+(see [`projects.md`](../concepts/projects.md)):
 
 ```yaml
 networkProfiles:

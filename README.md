@@ -60,7 +60,7 @@ useful for larger or higher-risk changes. Phases 1–3 are atomic — the change
 are done host-side (no agent); only genuine conflicts are handed to an in-VM
 agent, then verified by a deterministic host-side scope fence. Push is a
 separate retryable tier, so a flaky remote never corrupts your local result.
-The full state machine is in [`docs/architecture.md`](docs/architecture.md).
+The full state machine is in [`docs/architecture.md`](docs/concepts/architecture.md).
 
 ## Security: defense in depth
 
@@ -97,7 +97,7 @@ adversary — especially one targeting a weaker coding agent you've installed �
 may still find a path, and a misconfigured egress profile or an over-broad
 project setup weakens the model. The goal is to be meaningfully harder to
 abuse than comparable tools, not unbreakable. Read
-[`docs/security.md`](docs/security.md) before you trust it with anything that
+[`docs/security.md`](docs/concepts/security.md) before you trust it with anything that
 matters.
 
 ## Quickstart
@@ -114,8 +114,8 @@ dotnet build CodeyBox.slnx
 Create a hot-reloaded project configuration, set `CODEYBOX_API_KEY` and
 `CODEYBOX_EXTRA_CONFIG`, and run `src/CodeyBox.Api`. A minimal configuration
 and the full production preflight are in [`SKILL.md`](SKILL.md). The complete
-schemas live in [`docs/projects.md`](docs/projects.md) and
-[`docs/configuration.md`](docs/configuration.md).
+schemas live in [`docs/projects.md`](docs/concepts/projects.md) and
+[`docs/configuration.md`](docs/reference/configuration.md).
 
 Queue a first task with the CLI:
 
@@ -129,9 +129,9 @@ dotnet run --project tools/CodeyBox.Cli -- queue watch WORK_ITEM_ID
 
 Choose the sandbox provider, storage, network policy, Admin deployment,
 baseline strategy, and upstream policy deliberately before production. Start
-with [`docs/sandbox-providers.md`](docs/sandbox-providers.md),
-[`docs/security.md`](docs/security.md), and
-[`docs/operations.md`](docs/operations.md).
+with [`docs/sandbox-providers.md`](docs/concepts/sandboxes.md),
+[`docs/security.md`](docs/concepts/security.md), and
+[`docs/operations.md`](docs/operating/running.md).
 
 ## Running it well
 
@@ -142,8 +142,8 @@ Small, dependent tasks generally converge faster than monolithic prompts.
 Tune concurrency, agent classes, auditors, iteration limits, and budgets for
 your workload. Watch state transitions and updated timestamps—not only
 completed-item count—to distinguish a quota-limited queue from a stuck one.
-Recovery procedures are in [`docs/operations.md`](docs/operations.md) and
-[`docs/recovery.md`](docs/recovery.md).
+Recovery procedures are in [`docs/operations.md`](docs/operating/running.md) and
+[`docs/recovery.md`](docs/operating/recovery.md).
 
 ## Features
 
@@ -151,11 +151,11 @@ Recovery procedures are in [`docs/operations.md`](docs/operations.md) and
   quality scores and concurrency caps; CodeyBox routes each task to the best
   available member and **falls back mid-task** when one hits a quota wall, so
   a single provider's 5-hour limit never stalls the queue.
-  → [`docs/agent-classes.md`](docs/agent-classes.md)
+  → [`docs/agent-classes.md`](docs/concepts/agent-classes.md)
 - **VM isolation with host-enforced egress.** Each agent runs in a fresh
   microVM with least-privilege credentials; network policy lives on the host
   as nftables profiles a guest can't flush.
-  → [`docs/host-firewall.md`](docs/host-firewall.md)
+  → [`docs/host-firewall.md`](docs/operating/host-firewall.md)
 - **Quality gates you stack.** Compose exactly which auditors must pass before
   a merge — tool checks (format/build/test, gitleaks, semgrep) and LLM reviews
   (security, architecture, quality, completeness, anti-cheating) — and nothing
@@ -168,16 +168,16 @@ Recovery procedures are in [`docs/operations.md`](docs/operations.md) and
   fence verifies the result before the push is accepted.
 - **Quota governance.** Per-agent/per-model pricing, budgets, alerts, and a
   burn-rate-aware quota gate that routes around exhausted providers.
-  → [`docs/quota-gate.md`](docs/quota-gate.md)
+  → [`docs/quota-gate.md`](docs/operating/quota.md)
 - **Durable and restartable.** SQLite-backed state, crash/restart tolerance,
   sandbox suspend-resilience, and deterministic replay.
-  → [`docs/restart-tolerance.md`](docs/restart-tolerance.md)
+  → [`docs/restart-tolerance.md`](docs/operating/recovery.md)
 - **Three ways to drive it.** A REST API, a typed CLI, and a Blazor admin
   dashboard — plus HMAC-signed outbound webhooks.
-  → [`docs/api.md`](docs/api.md), [`docs/webhooks.md`](docs/webhooks.md)
+  → [`docs/api.md`](docs/reference/api.md), [`docs/webhooks.md`](docs/reference/webhooks.md)
 - **Pluggable everything.** Ship custom auditors, upstream remotes, credential
   providers, or sandbox backends as NuGet plugins — no fork.
-  → [`docs/plugins.md`](docs/plugins.md)
+  → [`docs/plugins.md`](docs/extending/plugins.md)
 
 ## Quality gates you control
 
@@ -192,7 +192,7 @@ the agent, which reworks and resubmits — the loop repeats until **every** gate
 passes or it hits the iteration cap (at which point the item is flagged
 `AuditFailed` and is *not* merged). Nothing lands until it clears the bar you
 set. The auditor set, the failing-severity threshold, and the iteration cap
-are all per-project config. → [`docs/audit.md`](docs/audit.md)
+are all per-project config. → [`docs/audit.md`](docs/quality/audit.md)
 
 ## Know what every change costs
 
@@ -214,7 +214,7 @@ curl -H "authorization: Bearer $CODEYBOX_API_KEY" \
 ```
 
 The admin dashboard's Costs tab charts the same data.
-→ [`docs/cost-reporting.md`](docs/cost-reporting.md)
+→ [`docs/cost-reporting.md`](docs/operating/costs.md)
 
 ## Drive it from the CLI
 
@@ -243,7 +243,7 @@ codeybox queue cancel <id>
 
 `queue add` also takes `--agent`, `--work-branch`, `--push-upstream`, and
 `--depends-on` (to chain dependent items); `--json` / `--quiet` make every
-command pipe-friendly. → [`docs/cli.md`](docs/cli.md)
+command pipe-friendly. → [`docs/cli.md`](docs/reference/cli.md)
 
 ## The agent fleet
 
@@ -288,21 +288,21 @@ A **graphical** flavor (a desktop + VNC/X display, plus a computer-use bridge
 exposing screenshots and input synthesis through the sandbox API) layers on top
 of Multipass for projects that need a display. It's enabled **per project** with
 `"GraphicalSandbox": true`, not selected via `SandboxProvider`.
-See [`docs/sandbox-providers.md`](docs/sandbox-providers.md).
+See [`docs/sandbox-providers.md`](docs/concepts/sandboxes.md).
 
 ## Going to production
 
 1. **Choose the provider deliberately.** Prefer Incus for persistent,
    high-throughput headless operation; use Multipass when simpler setup or
    graphical sandboxes matter more. Follow
-   [`docs/sandbox-providers.md`](docs/sandbox-providers.md), including Incus
+   [`docs/sandbox-providers.md`](docs/concepts/sandboxes.md), including Incus
    storage-pool and service-identity prerequisites.
 2. **Set up host egress** once, with sudo: `scripts/setup-host-networks.sh`
    creates a Linux bridge per network profile and writes nftables rules that
    drop anything not on the profile's allowlist. A compromised agent with
    `sudo` can't disable this because it lives on the host, not in the guest.
-   → [`docs/host-firewall.md`](docs/host-firewall.md)
-3. **Read [`docs/security.md`](docs/security.md)** — the threat model, the
+   → [`docs/host-firewall.md`](docs/operating/host-firewall.md)
+3. **Read [`docs/security.md`](docs/concepts/security.md)** — the threat model, the
    trust boundaries, and the sharp edges. This is not optional.
 
 Credentials are tiered: tool-only audit sandboxes hold **no** agent secrets,
@@ -327,12 +327,12 @@ Co-Authored-By: CodeyBox <noreply@codeybox.invalid>
 
 The [`docs/`](docs/README.md) tree is the full reference. Good entry points:
 
-- [`architecture.md`](docs/architecture.md) — the system, plugin points, state machine
-- [`security.md`](docs/security.md) — threat model (**read before deploying**)
-- [`projects.md`](docs/projects.md) — project, auditor, and upstream config
-- [`agent-classes.md`](docs/agent-classes.md) — routing, quotas, and fallback
-- [`plugins.md`](docs/plugins.md) — the Plugin SDK
-- [`api.md`](docs/api.md) — the full REST reference
+- [`architecture.md`](docs/concepts/architecture.md) — the system, plugin points, state machine
+- [`security.md`](docs/concepts/security.md) — threat model (**read before deploying**)
+- [`projects.md`](docs/concepts/projects.md) — project, auditor, and upstream config
+- [`agent-classes.md`](docs/concepts/agent-classes.md) — routing, quotas, and fallback
+- [`plugins.md`](docs/extending/plugins.md) — the Plugin SDK
+- [`api.md`](docs/reference/api.md) — the full REST reference
 
 ## Roadmap
 

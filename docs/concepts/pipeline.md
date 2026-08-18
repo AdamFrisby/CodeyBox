@@ -147,7 +147,7 @@ it would be a real PR on a self-hosted forge.
 
 ## Phase 2: Audit + rework loop
 
-Skipped if no auditors are registered. See [`audit.md`](audit.md) for
+Skipped if no auditors are registered. See [`audit.md`](../quality/audit.md) for
 the full breakdown. Tool auditors run in a credential-free sandbox; LLM
 auditors run in a sandbox with agent credentials. On failure the agent
 reworks (pushing further commits onto the same `codeybox/<id>` branch)

@@ -36,7 +36,7 @@ No arguments are required. The wizard is fully interactive.
 
 `security` · `architecture` · `quality` · `completeness` · `cheating` · `tests`
 
-See [projects.md](projects.md) for what each preset runs.
+See [projects.md](../concepts/projects.md) for what each preset runs.
 
 ### Network profile names
 

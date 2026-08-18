@@ -174,9 +174,9 @@ The agent is classified **stuck** when both dimensions show zero activity for
    the agent process.
 3. Audit event `agent.killed_by_stuck_probe` is logged.
 4. Webhook event `work_item.agent_stuck` is fired (see
-   [webhooks.md](webhooks.md)).
+   [webhooks.md](../reference/webhooks.md)).
 5. The work item transitions to **Failed** (or is re-queued if
-   `AutoRetryOnStuck` is enabled — see [projects.md](projects.md)).
+   `AutoRetryOnStuck` is enabled — see [projects.md](../concepts/projects.md)).
 
 ### Platform support
 

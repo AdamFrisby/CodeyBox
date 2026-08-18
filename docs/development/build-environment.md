@@ -1,10 +1,9 @@
 # Build environment prerequisites
 
 The solution builds warnings-clean and its test suite passes on any correctly
-provisioned .NET 10 host. This note records one **provisioning** prerequisite
-that is external to the source tree, because it has recurred as a build-gate
-failure when the build container is misconfigured — and the in-repo mitigations
-that make raw `dotnet build` survive that misconfiguration.
+provisioned .NET 10 host. Two things outside the source tree can still break it: a non-writable NuGet
+home, and missing host tools. Both have repeatedly been mistaken for code
+regressions, so both are recorded here with their remedies.
 
 ## Writable per-user NuGet configuration directory
 
@@ -72,7 +71,7 @@ another user.
 ### Baseline seeding must guest-own `$HOME/.nuget`
 
 When a package-cache seed lands under `$HOME/.nuget/packages`, Incus and
-Multipass provisioning now also `chown` the `$HOME/.nuget` parent directory
+Multipass provisioning also `chown` the `$HOME/.nuget` parent directory
 (not only the `packages` leaf). Root-created parents from ExtraRuncmd
 `mkdir -p` otherwise leave NuGet unable to create its settings directory on
 fresh clones. Prefer baking images this way; the in-repo self-heal remains the
@@ -82,11 +81,9 @@ backstop for already-baked baselines.
 
 A handful of `CodeyBox.Tests` cases depend on host tooling or on a
 correctly-executing self-contained native binary rather than on repository
-source. They **fail identically on `main` (verified against base commit
-`925943c2`, which predates every change on this branch)** when those external
-prerequisites are missing, so they are provisioning gaps, not regressions of any
-source change. They are recorded here so a misprovisioned container is diagnosed
-against this list instead of a work branch's diff.
+source. They fail identically on `main` when those prerequisites are missing, so a
+failure here is a provisioning gap, not a regression in the diff under review.
+Check this list before blaming a work branch.
 
 - **`file(1)` on `PATH`.**
   `AcpBridgeUnitTests.AcpBridge_PublishScript_RequiresMultipassWhenVmVerificationIsNotSkipped`
@@ -121,3 +118,26 @@ against this list instead of a work branch's diff.
   assert on wall-clock-bounded process teardown / retry counts; they pass in
   isolation but can flake when the host is saturated under the parallel audit
   suite. Run the affected classes with spare CPU headroom.
+
+## In-sandbox remediation when you cannot re-provision
+
+When `chown` is unavailable — no root, `no_new_privs` set — but the build user
+owns `$HOME`, rename the foreign-owned tree aside and re-expose the cache:
+
+```bash
+mv ~/.nuget ~/.nuget.foreign-owned
+mkdir -p ~/.nuget/NuGet
+ln -s ~/.nuget.foreign-owned/packages ~/.nuget/packages
+```
+
+A directory entry under `$HOME` can be renamed by the owner of `$HOME` even
+when the entry itself belongs to another uid, so this needs no privilege. The
+cache stays readable through the symlink, so restore still works offline.
+
+This only helps a harness that reuses the *same* `$HOME` for the agent session
+and the later build. An audit harness that mounts a fresh root-owned home each
+iteration discards the rename and fails identically next time — that case needs
+the image fixed at provisioning time, or the gate run with `DOTNET_CLI_HOME`
+redirected. No repository-committed file can substitute: NuGet resolves and
+reads the per-user settings path from `$HOME` before any target the repository
+could hook has executed.
