@@ -218,9 +218,10 @@ any error message). The named `HttpClient "github-upstream"` carries the
 
 #### LLM-generated PR descriptions
 
-When an `IPullRequestDescriptionGenerator` is wired up (default in production)
-and `Upstream.PrDescription.Enabled = true`, step 2 generates a narrative PR
-body from:
+Step 2 generates a narrative PR body when `Upstream.PrDescription.Enabled` is
+true **and** `SandboxImageReference` names an image with the generator agent's
+CLI installed. An empty image reference disables the generator regardless of
+`Enabled`, and the static template is used. Inputs:
 
 - `git diff --stat` (compact change summary)
 - Full `git diff` between base and work branches, capped at `MaxDiffBytes`
@@ -241,7 +242,7 @@ diff or echoed back by the LLM are replaced with `***`.
 
 | Condition | Behaviour |
 |---|---|
-| `Enabled = false` | Static template used immediately; no LLM call |
+| `Enabled = false`, or `SandboxImageReference` empty | Static template used immediately; no LLM call |
 | Generator succeeds | LLM body used as PR description prefix |
 | Generator times out (`Timeout`, default 30 s) | Warning logged; static template used |
 | Generator throws | Warning logged; static template used |
