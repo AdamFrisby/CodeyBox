@@ -100,7 +100,7 @@ public interface IKnob
 
     /// <summary>
     /// Operator-facing description. Keep this short; details belong in
-    /// <c>docs/knobs.md</c>.
+    /// <c>docs/reference/knobs.md</c>.
     /// </summary>
     string Description { get; }
 

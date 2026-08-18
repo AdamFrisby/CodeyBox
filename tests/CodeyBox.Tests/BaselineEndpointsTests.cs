@@ -22,7 +22,7 @@ namespace CodeyBox.Tests;
 /// </list>
 /// The factory installs a deterministic <see cref="FakeResolver"/> so the
 /// reaper's most-recent-sweep state is predictable; the tests assert the
-/// exact JSON shape documented in <c>docs/api.md</c> and verify that the
+/// exact JSON shape documented in <c>docs/reference/api.md</c> and verify that the
 /// per-baseline <c>workItems</c> array is wired through
 /// <see cref="IWorkItemStore.ListWorkItemsForBaselineAsync"/>.
 /// </summary>

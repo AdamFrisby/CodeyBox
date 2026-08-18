@@ -1,66 +1,110 @@
 # CodeyBox documentation
 
-Start here if you're new:
+CodeyBox runs coding agents in throwaway VMs, reviews what they produce, and
+merges it. These pages describe how that works and how to run it.
 
-1. [`architecture.md`](architecture.md) — the system at a glance, plugin
-   points, state machine.
-2. [`security.md`](security.md) — threat model, mitigations, sharp edges.
-   **Read before deploying.**
-3. [`security-audit.md`](security-audit.md) — initial-pass audit, all
-   findings with severities and status.
-4. [`projects.md`](projects.md) — multi-project config, per-project
-   upstream/auditors, defaults inheritance, language + audit-type presets.
-5. [`sandbox-providers.md`](sandbox-providers.md) — Multipass,
-   Bubblewrap, and Process trade-offs and host setup.
-6. [`host-firewall.md`](host-firewall.md) — host-side egress enforcement
-   for the Multipass provider (operator setup, profile model, what it
-   protects against).
-7. [`AGENTS.md`](../AGENTS.md) — built-in agents and how to add new ones.
-8. [`audit.md`](audit.md) — opt-in audit phase between work and merge,
-   capability-grouped sandboxes, rework loop.
-9. [`git-workflow.md`](git-workflow.md) — what the work, audit, rework,
-   and merge phases actually do at the git level.
-10. [`api.md`](api.md) — REST endpoints, configuration, and authentication.
-11. [`operations.md`](operations.md) — running, logs, restarts, failure modes.
-12. [`webhooks.md`](webhooks.md) — outbound webhook events, payload shape, HMAC signing, and configuration.
-13. [`audit-logging.md`](audit-logging.md) — structured audit log: location, format, all event names and
-    properties. Start here when writing SIEM rules or log-query dashboards.
-14. [`agent-supervision.md`](agent-supervision.md) — config-gated human live
-    supervision, streaming, and injection across concurrent agent sessions.
-15. [`test-cases.md`](test-cases.md) — first-class TestCase artifact attached
-    to work items: lean schema, SQLite persistence, REST surface, and the
-    JobTrack mapping (`SourceWorkItemId` ↔ `SourceTaskId`).
-16. [`e2e-execution.md`](e2e-execution.md) — runtime + pool that deterministically
-    replays committed `E2eReplay` artifacts on cheap CPU-only cloud VMs,
-    in parallel, off the coding-worker fleet.
+**New here?** [`getting-started.md`](getting-started.md) takes you from a clean
+host to a merged change. Then read
+[`concepts/architecture.md`](concepts/architecture.md) for the shape of the
+system, and [`concepts/security.md`](concepts/security.md) before you point it
+at anything that matters.
 
-## Plugin SDK
+## Concepts — how it works
 
-15. [`plugins.md`](plugins.md) — plugin author guide. Covers project setup,
-    `[CodeyBoxPlugin]` attribute, allowlist configuration, configuration
-    scoping, the API-version contract, threat model, and NuGet publishing
-    pattern. Start here if you want to ship a custom auditor, upstream remote,
-    or credential provider without forking CodeyBox.
+| Page | What it covers |
+|---|---|
+| [architecture](concepts/architecture.md) | components, trust boundaries, the state machine, plugin points |
+| [pipeline](concepts/pipeline.md) | what work, audit, rework, merge and push do at the git level |
+| [work items](concepts/work-items.md) | dependencies, cancellation, check-and-act, refactor items, replay |
+| [projects](concepts/projects.md) | per-project repository, auditors, upstream, budgets, credentials |
+| [agents](concepts/agents.md) | the agent CLI contract, the built-in eight, adding a ninth |
+| [agent classes](concepts/agent-classes.md) | routing across agents, quality scores, quota-aware fallback |
+| [sandboxes](concepts/sandboxes.md) | Incus, Multipass, remote Multipass, Sprites, Bubblewrap, Process |
+| [security](concepts/security.md) | threat model, mitigations, sharp edges, known gaps |
+| [questions and suggestions](concepts/agent-feedback.md) | how an agent asks you something, or flags adjacent work |
 
-## Admin dashboard
+## Quality — the gate before merge
 
-A Blazor Server web UI lives at [`tools/CodeyBox.Admin/`](../tools/CodeyBox.Admin/README.md).
-Run with `dotnet run --project tools/CodeyBox.Admin/src/CodeyBox.Admin.Web`.
-It speaks to the orchestrator over REST only — no shared code with the orchestrator.
+| Page | What it covers |
+|---|---|
+| [audit](quality/audit.md) | the audit phase, capability-grouped sandboxes, the rework loop |
+| [audit reports](quality/audit-reports.md) | how findings are stored, queried, and de-duplicated |
+| [presets](quality/presets.md) | language detection and audit-type prompts, and who may override them |
+| [mutation rigor](quality/mutation-rigor.md) | the per-item gate that checks tests actually catch bugs |
+| [test cases](quality/test-cases.md) | test cases as a first-class artifact on a work item |
+| [E2E execution](quality/e2e-execution.md) | replaying committed E2E artifacts on cheap CPU-only VMs |
 
-## CLI (operator tools)
+## Operating — running it
 
-A typed command-line client lives at [`tools/CodeyBox.Cli/`](../tools/CodeyBox.Cli/README.md).
-Run with `dotnet run --project tools/CodeyBox.Cli -- <command>`, or publish as a self-contained AOT binary.
+| Page | What it covers |
+|---|---|
+| [running](operating/running.md) | host setup, starting the service, the failure modes you will meet |
+| [host firewall](operating/host-firewall.md) | host-side nftables egress enforcement, profiles, troubleshooting |
+| [worker pool](operating/worker-pool.md) | concurrency sizing, stuck-agent detection, queue and per-agent pause |
+| [recovery](operating/recovery.md) | crash recovery, where each state resumes, the restart window |
+| [agent-turn checkpoints](operating/agent-turn-checkpoints.md) | resuming a *partial* agent turn — the deep end of recovery |
+| [sandbox reliability](operating/sandbox-reliability.md) | leaked VMs, smoke probes, surviving suspend/resume |
+| [quota](operating/quota.md) | probes, floors, the burn gate, the observed-failure breaker |
+| [costs](operating/costs.md) | what each run cost, and where the rates come from |
+| [spend limits](operating/budgets.md) | per-agent budgets and per-project budget alerts |
+| [logging](operating/logging.md) | the structured audit log: files, common properties, event names |
+| [observability](operating/observability.md) | OpenTelemetry traces, metrics, Prometheus scrape |
+| [pipeline metrics](operating/pipeline-metrics.md) | per-step timings and the transition-health score |
+| [agent streams](operating/agent-streams.md) | capturing agent stdout as NDJSON, and what the analyser derives |
+| [supervision](operating/supervision.md) | watching and injecting into a live agent session |
+| [releases](operating/releases.md) | release branches with a deep audit, and changelog automation |
 
-For sandbox tool installation examples across C#, Python, Node, Go, and Rust,
-see [`baseline-bake-examples.md`](baseline-bake-examples.md).
+## Reference — look it up
+
+| Page | What it covers |
+|---|---|
+| [configuration](reference/configuration.md) | every `CodeyBox:*` key, defaults, hot-reload behaviour |
+| [API](reference/api.md) | REST endpoints, auth, the work-item record, SignalR |
+| [webhooks](reference/webhooks.md) | outbound events, payloads, HMAC signing, delivery semantics |
+| [events](reference/events.md) | the versioned event envelope and its evolution rules |
+| [CLI](reference/cli.md) | the `codeybox` client and the project-config wizard |
+| [knobs](reference/knobs.md) | per-item directives and how to add one |
+| [external IDs](reference/external-ids.md) | addressing work items by your tracker's identifier |
+| [agent quirks](reference/agent-quirks.md) | per-CLI binary names, auth layouts, flags, traps |
+| [agent sessions](reference/agent-sessions.md) | the opt-in session contract and the Claude session worker |
+| [sandbox baselines](reference/sandbox-baselines.md) | bake recipes for C#, Python, Node, Go, Rust, agent CLIs, security tools |
+
+## Extending — plugins
+
+| Page | What it covers |
+|---|---|
+| [plugin SDK](extending/plugins.md) | the plugin contract, allowlist, API-version rules, threat model |
+| [auditor plugins](extending/auditor-plugins.md) | shipping a custom auditor |
+| [upstream plugins](extending/upstream-plugins.md) | shipping a forge integration |
+| [credential plugins](extending/credential-plugins.md) | shipping a credential provider |
+| [statistics plugin](extending/statistics-plugin.md) | the bundled quota-history and capacity plugin |
+| [file-size-limits auditor](extending/file-size-limits-auditor.md) | a small worked example of a deterministic auditor |
+
+## Developing CodeyBox itself
+
+| Page | What it covers |
+|---|---|
+| [build environment](development/build-environment.md) | provisioning prerequisites that break the build when missing |
+| [manual UAT](development/manual-uat/) | operator checklists for what automated tests cannot cover |
+| [`AGENTS.md`](../AGENTS.md) | the engineering contract every change is graded against |
+
+## The other clients
+
+The **admin dashboard** ([`tools/CodeyBox.Admin/`](../tools/CodeyBox.Admin/README.md))
+is a Blazor Server UI — queue, diffs, findings, cost and timing charts:
 
 ```bash
-codeybox configure                          # set API URL + token
+dotnet run --project tools/CodeyBox.Admin/src/CodeyBox.Admin.Web
+```
+
+The **CLI** ([`tools/CodeyBox.Cli/`](../tools/CodeyBox.Cli/README.md)) is a typed
+client for the same API:
+
+```bash
+codeybox configure
 codeybox queue add --project myapp --title "healthz" --prompt-file ./prompt.md
 codeybox queue ls --state Queued,Working
 codeybox queue watch <id>
 ```
 
-Speaks to the orchestrator over REST only — no shared code with the orchestrator.
+Both talk to the orchestrator over REST only, and share no code with it.

@@ -11,7 +11,7 @@ public sealed record WebhookEvent
 {
     /// <summary>
     /// Semver string identifying the event-payload schema this event was emitted
-    /// under. Bumped by additive-only rules in <c>docs/EVENT_SCHEMA.md</c>: new
+    /// under. Bumped by additive-only rules in <c>docs/reference/events.md</c>: new
     /// fields or event types are minor bumps; renames or removals are major.
     /// Trackers opting into strict mode reject majors they don't recognise.
     /// </summary>

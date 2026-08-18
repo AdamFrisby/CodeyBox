@@ -13,7 +13,7 @@ namespace CodeyBox.StatisticsPlugin;
 /// a normalised row-set and the raw <see cref="AgentQuotaSnapshot"/> JSON.
 ///
 /// <para>The plugin replaces the standalone external poller historically used
-/// to track subscription quota burn-down — see <c>docs/statistics-plugin.md</c>
+/// to track subscription quota burn-down — see <c>docs/extending/statistics-plugin.md</c>
 /// for migration notes. Operators query the resulting time-series through
 /// <c>GET /quota/history</c> on the orchestrator's API; the endpoint resolves
 /// the plugin's <see cref="IQuotaTimeSeriesStore"/> registration through DI
