@@ -2,8 +2,6 @@
 
 CodeyBox can POST JSON events to one or more HTTPS endpoints as a work item moves through the pipeline. Use this to integrate with Slack, audit-log services, custom dashboards, or any HTTP receiver.
 
----
-
 ## Event taxonomy
 
 One event is fired per state transition. Events follow the naming convention `work_item.<state>`:
@@ -48,7 +46,7 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `work_item.question_asked` | Agent emitted a `<codeybox-question>` block; item parked at `NeedsOperatorInput` (see [Details](#question_asked-details)) |
 | `work_item.question_answered` | Operator answered a question via `POST /workitems/{id}/answer` (see [Details](#question_answered-details)) |
 | `work_item.question_dismissed` | Operator dismissed a question via `POST /workitems/{id}/dismiss-question` (see [Details](#question_dismissed-details)) |
-| `sandbox.leak_detected` | A leaked `codeybox-*` Multipass VM was detected (see [Details](#sandbox_leak-details)) |
+| `sandbox.leak_detected` | A leaked `codeybox-*` sandbox was detected on any lifecycle-tracked provider (see [Details](#sandbox_leak-details)) |
 | `sandbox.leak_disposed` | A leaked sandbox was successfully auto-disposed |
 | `sandbox.leak_dispose_failed` | Auto-disposal of a leaked sandbox failed |
 | `iteration.started` | A work or rework iteration was dispatched to the agent (see [Intermediate events](#intermediate-progress-events)) |
@@ -60,10 +58,18 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `merge.started` | Merge phase started |
 | `merge.completed` | Merge phase succeeded; carries the merge commit SHA |
 | `upstream.pr_stale_base` | A CodeyBox-authored PR has been left unmergeable by motion on the base branch; needs operator rebase (see [Details](#upstream_pr_stale_base-details)) |
+| `work_item.merge_conflict_resolution_failed` | Merge conflict resolution was rejected by host verification or the scope fence; the item is terminal |
+| `work_item.waiting_for_quota_reset` | Every eligible class member hit quota in one pickup; the item is parked, not failed. Details use the agent-fallback shape |
+| `work_item.resumed` | An operator-cancelled item re-entered the pipeline via `POST /workitems/{id}/resume`. Details: `id`, `externalId`, resumed-from phase |
+| `work_item.check_followup_enqueued` | A check-and-act verdict matched and its follow-up item was queued. Details: `originCheckWorkItemId`, `followupWorkItemId` |
+| `work_item.post_act_recheck_completed` | A post-act re-check finished. Details: iteration, `answer`, `actionableAnswer`, originating check id |
+| `agent.fallback` | Routing moved a phase to another class member mid-item. Details: phase, iteration, from/to agent and model, reason |
+| `agent.smoke_recovered` | A previously benched agent passed a later smoke probe and rejoined routing |
+| `agent.claude_session_suspend_failed` | A Claude session worker could not suspend its VM. Details: `workItemId`, `sessionId`, error |
+| `agent.claude_session_close_failed` | A Claude session worker could not close its session. Details: `workItemId`, `sessionId`, error |
+| `sandbox.provisioning_deferred` | A sandbox launch was deferred by a provider-side condition. Details: `provider`, `operation`, `errorClass`, `resumeState`, `suggestedRetryAt` |
 
 `work_item.audit_iteration` fires **after every audit iteration**, regardless of pass or fail, and carries per-iteration counts in the `details` field.
-
----
 
 ## Payload shape
 
@@ -600,8 +606,6 @@ fires and carries the same work-item context. Subscribe to `agent.smoke_failed`
 to alert on credential problems independently of whether any work items were
 affected.
 
----
-
 ### `sandbox_leak` details
 
 When `event` is `sandbox.leak_detected`, `sandbox.leak_disposed`, or
@@ -628,8 +632,6 @@ sandboxes are not associated with a specific work item.
 | `reason` | string | all | Stable classification reason code (added in event schema `1.1`), e.g. `untracked_sandbox_age_threshold_exceeded` or `untracked_sandbox_missing_creation_metadata` |
 | `disposedAt` | ISO-8601 | `sandbox.leak_disposed` | Timestamp when the sandbox was successfully disposed |
 | `error` | string | `sandbox.leak_dispose_failed` | Human-readable failure reason (e.g. `"timeout"` or multipass error) |
-
----
 
 ## Intermediate progress events
 
@@ -857,8 +859,6 @@ If the merge phase throws (agent failure, host shutdown), the matching
 `merge.started` will have no partner event; trackers should rely on the
 terminal failure event in the same way as for the iteration/audit phases.
 
----
-
 ### `upstream.pr_stale_base` details
 
 ```json
@@ -895,8 +895,6 @@ attempt did not resolve the conflict. On orchestrator restart the dedup
 state resets and a still-stale PR re-fires once, so trackers should be
 idempotent on `(projectId, prNumber, headSha)`.
 
----
-
 ## Request headers
 
 | Header | Value |
@@ -906,8 +904,6 @@ idempotent on `(projectId, prNumber, headSha)`.
 | `X-CodeyBox-Delivery` | Random UUID, unique per delivery attempt batch |
 | `X-CodeyBox-Schema-Version` | Event-payload schema version (semver), e.g. `1.1`. See [`EVENT_SCHEMA.md`](events.md) for evolution rules. |
 | `X-CodeyBox-Signature` | `sha256=<hex>` — only present when `SecretEnvVar` is configured |
-
----
 
 ## Signing (HMAC-SHA256)
 
@@ -945,8 +941,6 @@ function verify(secret, bodyBuffer, signatureHeader) {
 ```
 
 Always use a constant-time comparison (`hmac.compare_digest` / `timingSafeEqual`) to avoid timing attacks.
-
----
 
 ## Configuration
 
@@ -992,8 +986,6 @@ Add a `Webhooks` array inside the `CodeyBox` config section. Each entry configur
 
 The HMAC secret itself must **never** appear in config files. Put it in an environment variable and reference it by name via `SecretEnvVar`.
 
----
-
 ## Delivery semantics
 
 - Delivery is **fire-and-forget** from the pipeline's perspective. Webhook failures never affect work-item state.
@@ -1001,8 +993,6 @@ The HMAC secret itself must **never** appear in config files. Put it in an envir
 - Failed deliveries are retried up to `MaxAttempts` times with exponential back-off. After that, a warning is logged and the delivery is abandoned.
 - On graceful shutdown the dispatcher drains in-flight deliveries (up to 30 s timeout).
 - When no endpoints are configured, a no-op dispatcher is used — zero overhead.
-
----
 
 ## Release events
 
