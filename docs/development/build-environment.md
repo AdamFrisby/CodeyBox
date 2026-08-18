@@ -26,20 +26,32 @@ error : Failed to read NuGet.Config due to unauthorized access.
 and, because no assemblies are produced, `dotnet test --no-build` then reports
 each test DLL path as an "invalid argument".
 
-### In-repo self-heal: `Directory.Build.targets`
+### In-repo self-heal: MSBuild `InitialTargets`
 
-`Directory.Build.targets` runs `scripts/ensure-writable-nuget-home.sh` as an
-`InitialTargets` step before any project targets. When `$HOME/.nuget` exists
-but is not writable, the script renames it aside (the build user owns `$HOME`,
-so the rename does not need root), recreates a writable `$HOME/.nuget`, and
-preserves any pre-baked `packages` cache via symlink. Concurrent MSBuild nodes
-share a lock so solution builds do not race.
+MSBuild aggregates `InitialTargets` from the imported
+`Directory.Build.props`/`.targets` and runs them at the very start of every
+project evaluation — before restore resolves the NuGet user-settings directory.
+That is the only committed-file hook early enough to matter, and CodeyBox uses
+it twice: `Directory.Build.props` runs `scripts/reclaim-nuget-home.sh`
+(fast-path no-op when the home is already usable, non-destructive, race-safe
+across parallel evaluations via an atomic `mkdir` lock, and never fails the
+build), and `Directory.Build.targets` runs
+`scripts/ensure-writable-nuget-home.sh`. When `$HOME/.nuget` exists but is
+not writable, the scripts rename it aside — the build user owns `$HOME`, so the
+rename needs no root — recreate a writable `$HOME/.nuget`, and preserve any
+pre-baked `packages` cache by symlink.
+
+A `BeforeTargets="Restore"` target is *not* early enough: solution restore
+aborts during graph construction, before any project's `Restore` chain runs. Nor
+can a props file re-point the home in process — MSBuild rejects
+`[System.Environment]::SetEnvironmentVariable` with `MSB4185`, since env
+mutation is not on the property-function allowlist.
 
 This is the operative remediation for auditors that invoke `dotnet` **raw**
 (`process:required-build`, `csharp:build-WaE`) against a misprovisioned image:
-those auditors do not go through `build.sh`, and a host orchestrator binary
-that predates the gate's `DOTNET_CLI_HOME` redirect still runs the work
-branch's MSBuild imports. A repository `nuget.config` / `-p:RestoreConfigFile`
+those auditors do not go through `build.sh`, and the work branch's MSBuild
+imports run even when the orchestrator binary driving them is older than the
+gate's `DOTNET_CLI_HOME` redirect. A repository `nuget.config` / `-p:RestoreConfigFile`
 cannot substitute — NuGet touches the per-user settings directory before
 honouring them.
 
@@ -54,10 +66,9 @@ cache (`NUGET_PACKAGES`) so offline images keep restoring. A root-owned
 `$HOME/.nuget` no longer fails the gate. (These are set inside the script rather
 than via tracked config files because NuGet touches the per-user settings
 directory before honouring a repository `nuget.config`,
-`-p:RestoreConfigFile`, or `Directory.Build.props` — each was verified not to
-avoid the failure on its own. The `Directory.Build.targets` InitialTargets
-repair above is the complementary, branch-controlled path that helps when the
-running orchestrator still embeds an older build script.)
+`-p:RestoreConfigFile`, or `Directory.Build.props` — none of which avoids the
+failure. The `Directory.Build.targets` InitialTargets repair above is the
+complementary, branch-controlled path.)
 
 ### The `build.sh` entry point handles this itself
 
@@ -76,6 +87,29 @@ Multipass provisioning also `chown` the `$HOME/.nuget` parent directory
 `mkdir -p` otherwise leave NuGet unable to create its settings directory on
 fresh clones. Prefer baking images this way; the in-repo self-heal remains the
 backstop for already-baked baselines.
+
+## In-sandbox remediation when you cannot re-provision
+
+When `chown` is unavailable — no root, `no_new_privs` set — but the build user
+owns `$HOME`, rename the foreign-owned tree aside and re-expose the cache:
+
+```bash
+mv ~/.nuget ~/.nuget.foreign-owned
+mkdir -p ~/.nuget/NuGet
+ln -s ~/.nuget.foreign-owned/packages ~/.nuget/packages
+```
+
+A directory entry under `$HOME` can be renamed by the owner of `$HOME` even
+when the entry itself belongs to another uid, so this needs no privilege. The
+cache stays readable through the symlink, so restore still works offline.
+
+This only helps a harness that reuses the *same* `$HOME` for the agent session
+and the later build. An audit harness that mounts a fresh root-owned home each
+iteration discards the rename and fails identically next time — that case needs
+the image fixed at provisioning time, or the gate run with `DOTNET_CLI_HOME`
+redirected. No repository-committed file can substitute: NuGet resolves and
+reads the per-user settings path from `$HOME` before any target the repository
+could hook has executed.
 
 ## Host-tool / native-runtime prerequisites for the full test suite
 
@@ -118,26 +152,3 @@ Check this list before blaming a work branch.
   assert on wall-clock-bounded process teardown / retry counts; they pass in
   isolation but can flake when the host is saturated under the parallel audit
   suite. Run the affected classes with spare CPU headroom.
-
-## In-sandbox remediation when you cannot re-provision
-
-When `chown` is unavailable — no root, `no_new_privs` set — but the build user
-owns `$HOME`, rename the foreign-owned tree aside and re-expose the cache:
-
-```bash
-mv ~/.nuget ~/.nuget.foreign-owned
-mkdir -p ~/.nuget/NuGet
-ln -s ~/.nuget.foreign-owned/packages ~/.nuget/packages
-```
-
-A directory entry under `$HOME` can be renamed by the owner of `$HOME` even
-when the entry itself belongs to another uid, so this needs no privilege. The
-cache stays readable through the symlink, so restore still works offline.
-
-This only helps a harness that reuses the *same* `$HOME` for the agent session
-and the later build. An audit harness that mounts a fresh root-owned home each
-iteration discards the rename and fails identically next time — that case needs
-the image fixed at provisioning time, or the gate run with `DOTNET_CLI_HOME`
-redirected. No repository-committed file can substitute: NuGet resolves and
-reads the per-user settings path from `$HOME` before any target the repository
-could hook has executed.
