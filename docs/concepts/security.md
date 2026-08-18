@@ -16,6 +16,12 @@ We assume the LLM agent's output is **adversarial-by-default**:
 * A compromise of the agent process must not become a compromise of the host
   or any other sandbox.
 
+Everything crossing the API boundary is hostile too: work-item titles and
+prompts, repository URLs, branch and ref names, attachments, and the output
+of plugins and auditors. The API bearer token is a service credential for
+one trusted caller — it is not an authorization system, and it confers no
+per-user or per-tenant separation.
+
 We do **not** defend against:
 
 * A compromised host kernel running the orchestrator.
@@ -35,10 +41,11 @@ year) becomes a host compromise. With Multipass (KVM-backed), each
 sandbox runs its own kernel inside a real VM. A guest kernel exploit
 doesn't get the attacker out of the VM.
 
-The recommended provider is Multipass — single-package install, no root
-config edits, and the kernel-isolated path that has been
-integration-tested end-to-end. Bubblewrap reduces attack surface but
-remains shared-kernel; choose it only when KVM isn't available.
+Two providers give you that kernel isolation: Incus (COW clones, best for
+persistent headless hosts) and Multipass (simplest install, supports
+graphical sandboxes). Bubblewrap reduces attack surface but shares the
+host kernel; choose it only when KVM isn't available, and only for
+prompts and repositories you already trust.
 
 The dev-only `Sandbox.Process` provider has **none** of these properties.
 It is for local pipeline development only. Do not run it against
@@ -72,8 +79,8 @@ the sandbox boundary.
 Every sandbox sits on a host-managed Linux bridge whose nftables rules
 drop everything not on the bridge's allowlist. The bridges are created
 once by `scripts/setup-host-networks.sh`; the orchestrator only chooses
-which bridge a given sandbox attaches to (via `multipass launch
---network <bridge>`).
+which bridge a given sandbox attaches to (via the provider's
+launch flags).
 
 Three egress modes per profile:
 
@@ -86,11 +93,12 @@ Three egress modes per profile:
 
 Per-project, per-phase profile selection lives in project config. The
 orchestrator passes a default-route override via cloud-init so the VM
-can't accidentally egress through Multipass's default (blocked) bridge.
+can't accidentally egress through the provider's own default (blocked)
+bridge.
 
 A compromised agent with sudo cannot bypass this: the drops happen in
 the host kernel, on bridges the agent has no view into. `iptables -F`
-inside the VM affects nothing. See [`host-firewall.md`](host-firewall.md)
+inside the VM affects nothing. See [`../operating/host-firewall.md`](../operating/host-firewall.md)
 for the threat model and setup. The Process and Bubblewrap providers do
 **not** enforce egress (they are dev-only / shared-kernel).
 
@@ -103,7 +111,7 @@ secret never lands on a persistent disk inside the VM.
 ### 5. Resource bounds
 
 `SandboxResourceLimits` caps CPU, memory, disk, and wall-clock.
-Multipass enforces memory and CPU limits at VM-launch time. The
+Incus and Multipass enforce memory and CPU limits at VM-launch time. The
 orchestrator additionally enforces per-attempt `WorkTimeout` and
 `MergeTimeout` budgets, plus an absolute fallback-chain cap, via
 `CancellationTokenSource` timers.
@@ -123,22 +131,32 @@ to the orchestrator. The orchestrator log lines never contain credential
 material. *Do not* extend the orchestrator to log the contents of
 `AgentCredential` or `GitHubUpstreamOptions`.
 
-## Audit status
+## Known gaps
 
-An initial security audit has been performed (see
-[`security-audit.md`](security-audit.md)). Highlights:
+Tracked weaknesses in the current posture, most recently reviewed
+2026-08-12 against OWASP ASVS 5.0 Level 2:
 
-* Cross-work-item bare-repo exposure — **fixed** (per-item mount).
-* `workBranch == baseBranch` bypass of merge containment — **fixed**.
-* GitHub PAT visible on argv via token-in-URL — **fixed** (askpass).
-* Git option-injection via `RepositoryUrl` / branch names — **fixed**
-  (validation + `--` separator).
-* Agent secrets on per-exec argv — **fixed** (env-file at boot).
-* Default network bind tightened to loopback.
-* Bearer-token auth required (or explicit `DangerouslyDisableAuth`).
+* **Default-branch protection is not enforced** on the CodeyBox
+  repository itself — reviewed pull requests, required checks, and
+  force-push/deletion blocks are not yet mandatory.
+* **Adversarial testing is incomplete.** The following have been reasoned
+  about and unit-tested but not attacked on a live host: sandbox escape
+  and egress bypass, cloud-metadata SSRF and DNS rebinding, hostile git
+  refs/hooks/submodules/LFS and attachment inputs, credential leakage
+  through argv, environment, prompts, plugin output and crash dumps, and
+  plugin supply-chain integrity.
+* **Destructive sandbox testing needs KVM.** Verifying escape claims
+  requires a host with nested virtualization; a second container on the
+  same kernel is not adequate containment.
 
-See the audit doc for the complete list, severities, and accepted-risk
-items.
+Fixed in earlier passes, listed so you don't re-report them:
+cross-work-item bare-repo exposure (now a per-item mount), the
+`workBranch == baseBranch` merge-containment bypass, GitHub PAT exposure
+on argv via token-in-URL (now askpass), git option injection through
+`RepositoryUrl` and branch names (validation plus a `--` separator),
+agent secrets on per-exec argv (now an env-file written at boot), a
+default network bind wider than loopback, and log entries that accepted
+un-sanitized operator-controlled values.
 
 ## Sharp edges (read these before deploying)
 
@@ -147,22 +165,23 @@ items.
 `Sandbox.Process` runs commands as the host's normal user, with read-only
 copies for read-only mounts and *symlinks* for writable mounts. It does
 not enforce the network policy. It exists so the orchestrator pipeline
-can be developed and tested without a Multipass setup. Do not ship this
+can be developed and tested without a VM provider installed. Do not ship this
 provider to production. Configuration that selects it fails loudly when
 `ASPNETCORE_ENVIRONMENT != Development` unless
 `DangerouslyAllowProcessSandbox=true` is explicitly set.
 
 ### B. Sandbox image trust
 
-The orchestrator pulls and runs images by reference
-(`SandboxImageReference`). You are trusting:
+Sandboxes boot an Ubuntu cloud image (Incus defaults to
+`images:ubuntu/24.04/cloud`) and then run whatever `ExtraRuncmd` bakes
+into the baseline — typically language toolchains and agent CLI
+installers fetched over the network at bake time. You are trusting those
+installers and the distro mirrors they come from.
 
-1. The contents of that image (including the agent CLI binary inside it).
-2. The image registry's TLS and signing configuration.
-
-Use a digest pin (`codeybox/agent@sha256:…`) in production, not a tag.
-Build the image yourself; do not pull `claude` or `gh` binaries from
-arbitrary upstream sources without verification.
+Bake a baseline once and clone it, rather than re-running installers per
+sandbox: it is faster and it narrows the window in which a compromised
+upstream installer can reach your fleet. Pin toolchain versions in the
+bake script. See [`../reference/sandbox-baselines.md`](../reference/sandbox-baselines.md).
 
 ### C. Prompt injection through repository content
 
@@ -208,7 +227,8 @@ multiple users, you must:
 * Partition `ICredentialProvider` per-tenant (do not let tenant A's work
   items use tenant B's API key).
 * Partition the SQLite store or move to per-tenant DBs.
-* Gate the REST API behind authentication (out of scope today).
+* Add per-tenant authorization. The bearer token authenticates a caller;
+  it does not distinguish one tenant's work items from another's.
 
 ## Operational hygiene
 
