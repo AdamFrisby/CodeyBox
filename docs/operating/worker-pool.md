@@ -176,21 +176,24 @@ The agent is classified **stuck** when both dimensions show zero activity for
 5. The work item transitions to **Failed** (or is re-queued if
    `AutoRetryOnStuck` is enabled — see [projects.md](../concepts/projects.md)).
 
-### Platform support
+### Where the probe works
 
-| Provider | CPU probe | Network probe |
-|---|---|---|
-| **ProcessSandbox** (dev) | ✓ | ✓ (host processes, host netns) |
-| **Bubblewrap** (production) | ✓ | ✓ (host-visible PIDs, per-process netns) |
-| **Multipass** (production KVM) | ✗ — agent runs inside VM | ✗ |
+It reads `/proc` on the host, so it only sees an agent that is a host process
+in the orchestrator's own process tree:
 
-On Multipass the agent process is not visible from the host `/proc` filesystem.
-The probe's `TryRead()` returns `null` every sample, so no stuck classification
-occurs. The existing coarse phase timeout remains the only protection in that
-configuration.
+| Provider | CPU + socket probe |
+|---|---|
+| `process` | yes — the agent is a direct child |
+| `bubblewrap` | yes — host-visible PIDs, per-process netns, and the orchestrator owns the process |
+| `multipass`, `incus`, `multipass-remote`, `sprites` | no — the agent runs inside a VM, invisible to host `/proc` |
 
-On non-Linux hosts (macOS, Windows) the probe is also silently disabled (null
-source).
+Inside a VM `TryRead()` returns `null` every sample, no stuck classification
+happens, and the phase timeout is the only protection. The same is true on
+macOS and Windows, where the source is null.
+
+The ancestor filter matters on a workstation: only processes whose parent chain
+reaches the orchestrator PID count, so an operator's own interactive `claude` or
+`codex` session sitting idle cannot be mistaken for a stuck agent.
 
 ### Threshold tuning
 
