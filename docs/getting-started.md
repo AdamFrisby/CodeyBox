@@ -130,8 +130,13 @@ For a UI, run the Blazor dashboard — queue, diffs, findings, cost and timing
 charts:
 
 ```bash
-dotnet run --project tools/CodeyBox.Admin/src/CodeyBox.Admin.Web
+CodeyBoxAdmin__ApiBaseUrl=http://localhost:5036 \
+  dotnet run --project tools/CodeyBox.Admin/src/CodeyBox.Admin.Web
 ```
+
+The dashboard's default `ApiBaseUrl` is `http://localhost:5050`, which matches
+neither the `dotnet run` port (5036) nor the production default (5000) — set it
+explicitly or the dashboard will show nothing.
 
 ## When it does not work
 
