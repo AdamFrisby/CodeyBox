@@ -122,6 +122,8 @@ Outbound HTTP calls (GitHub API, agent quota probes, webhooks) automatically rec
 | `codeybox.agent.cost_usd` | `USD` | `agent.kind`, `model` | Estimated agent cost, summed as cost rows are recorded (aligned with the per-work-item cost rows — no double counting). |
 | `codeybox.audit.iterations` | `{iteration}` | `outcome` (`passed` \| `reworking` \| `failed` \| `needs_operator_input`), `iteration`, `self_review_checklist` (`on` \| `off`), `planned` (`on` \| `off`) | Incremented once per completed code-audit iteration. The `planned` tag slices code-stage iteration count for planned vs unplanned items. |
 | `codeybox.audit.first_audit.outcome` | `{audit}` | `outcome` (`passed` \| `failed`), `planned` (`on` \| `off`) | One per work item at its first code-audit iteration. Slices first-audit pass-rate by the planned cohort (proves whether planning reduces cycles). |
+| `codeybox.session.first_audit.outcome` | `{audit}` | `self_review` (`on` \| `off`), `outcome` (`passed` \| `failed`) | Same, for session-mode items: first-audit pass-rate with and without the pre-emptive self-review turn. |
+| `codeybox.session.preemptive_self_review.turns` | `{turn}` | outcome (`committed` \| `no_changes` \| `failed` \| `skipped_empty_guidance`) | One per pre-emptive self-review turn, showing how often it produced commits before the formal audit. |
 | `codeybox.audit.rework_empty.events` | `{event}` | `outcome` (`detected` \| `escalation_succeeded` \| `parked` \| `failed`) | Empty audit-rework handling sub-events. |
 | `codeybox.webhook.deliveries` | `{delivery}` | `endpoint`, `event`, `outcome` (`delivered` \| `failed`) | One per terminal webhook delivery outcome. |
 | `codeybox.sandbox.remote_placement.count` | `{placement}` | `host_id`, `outcome` (`reserved` \| `created`) | Remote multipass host-pool placement reservations and successful VM creations. |
@@ -146,6 +148,8 @@ Outbound HTTP calls (GitHub API, agent quota probes, webhooks) automatically rec
 | `codeybox.coordinator.sqlite.write_gate.wait_ms` | `ms` | `outcome` (`acquired` \| `canceled`) | Time spent waiting for the shared SQLite single-writer gate. |
 | `codeybox.coordinator.git.command.duration_ms` | `ms` | `operation`, `outcome` (`success` \| `exit_nonzero` \| `canceled` \| `error`) | Host-side git command duration inside the orchestrator process. |
 | `codeybox.coordinator.agent_stream.capture.duration_ms` | `ms` | `phase`, `outcome` (`completed` \| `truncated` \| `error`) | Agent stream capture writer duration on the orchestrator host. |
+| `codeybox.coordinator.agent_stream.backpressure.wait_ms` | `ms` | `phase` | Time an agent-stream writer spent blocked on capture backpressure. |
+| `codeybox.session.audit_iterations` | `{iteration}` | `self_review` (`on` \| `off`), `outcome` (`passed` \| `failed` \| `needs_operator_input`) | Iterations consumed before a session-mode item's audit verdict. |
 
 ### Observable gauges
 
