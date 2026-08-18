@@ -92,7 +92,7 @@ git rm --cached -- .codeybox/suggestions.json
 git diff --cached --quiet && exit 1      # fail if no changes
 git commit -m "codeybox: <title>
 
-Co-Authored-By: CodeyBox <noreply@codeybox.invalid>"
+<trailer block — see Provenance in the README>"
 git push origin codeybox/<id>:codeybox/<id>
 ```
 
@@ -105,12 +105,10 @@ git rebase origin/<workBranch>
 git push origin <workBranch>:<workBranch>
 ```
 
-This is Approach B from the retry design: preserve the prior attempt's
-reachable commits and replay the new sandbox commits on top. The rejected
-pre-clean alternative would delete or rename the stale bare-repo ref before
-the retry; that is simpler, but it makes attempt history handling a separate
-observability concern and does not match the host-side upstream-push recovery.
-Rebase conflicts fail the work item with a clear manual-resolution error.
+Rebasing rather than deleting the stale ref keeps the previous attempt's
+commits reachable, which matches how host-side upstream-push recovery behaves
+and keeps attempt history in one place. A rebase conflict fails the work item
+with a manual-resolution error.
 
 ### Git identity propagation
 
@@ -129,17 +127,17 @@ Resolution order (first match wins):
    config is found (fresh containers, CI runners without a configured identity).
    A warning is logged at startup.
 
-### Co-Authored-By trailer
+### Commit trailers
 
-Every commit produced by the orchestrator or instructed to the agent includes:
+Every orchestrator-produced commit ends with a trailer block —
+`CodeyBox-WorkItem`, `CodeyBox-Agent`, `CodeyBox-Prompt-Revision` when known,
+`CodeyBox-Fallbacks` when a fallback happened, and finally
+`Co-Authored-By: CodeyBox <noreply@codeybox.invalid>`. Mechanical-fixer commits
+carry `CodeyBox-Mechanical-Fixer` in place of `CodeyBox-Agent`.
 
-```
-Co-Authored-By: CodeyBox <noreply@codeybox.invalid>
-```
-
-The `.invalid` TLD (per RFC 2606) signals "not a real email" while GitHub still
+The `.invalid` TLD (RFC 2606) signals "not a real email" while GitHub still
 renders the trailer in the PR conversation view. The operator's email never
-appears in this trailer — only `noreply@codeybox.invalid`.
+appears there — only `noreply@codeybox.invalid`.
 
 The orchestrator then opens a PR record via `IPullRequestService`. With the
 default in-memory impl this is just metadata; with a Gitea/Forgejo backend
@@ -154,26 +152,37 @@ reworks (pushing further commits onto the same `codeybox/<id>` branch)
 and the loop reruns. On `MaxIterations` without convergence the work
 item flips to `AuditFailed`.
 
-## Phase 3: Merge (agent-driven)
+## Phase 3: Merge
 
-The merge sandbox is a **fresh** sandbox under the project's `merge`
-network profile. The agent is invoked to perform the merge — it can
-resolve `git merge` conflicts and run the project's test suite if the
-profile allows the necessary egress. The orchestrator then verifies
-merge state before pushing:
+The host computes the merge first:
 
 ```bash
-# The orchestrator verifies that, post-agent:
-#   1. The current branch is <baseBranch>
-#   2. HEAD's parents include the workBranch's tip
-#   3. Working tree is clean
-# Failures here flip the item to Failed; the agent cannot push something
-# other than the merge.
+git merge-tree --write-tree --no-messages <preMergeBaseSha> <workTipSha>
+```
 
+**No conflicts — no sandbox at all.** The host writes the merge commit
+directly from that tree, then re-verifies before moving the base ref:
+
+```bash
+git commit-tree <mergedTree> -p <preMergeBaseSha> -p <workTipSha> -m "codeybox: merge <workBranch>…"
+# then: both parents reachable, committed tree == merge-tree result
 git push origin <baseBranch>:<baseBranch>
 ```
 
-The merge is `--no-ff` so the work-branch is preserved in the history.
+Two parents means the work branch stays visible in history, exactly as
+`git merge --no-ff` would leave it.
+
+**Conflicts — the agent resolves them in its own sandbox.** The merge sandbox
+runs under the project's `merge` network profile. The agent reads the
+conflicted files from the working tree, writes resolutions, and stages them
+through its normal CLI. The orchestrator then checks there are no unmerged
+paths and no conflict markers left in any originally-conflicted file, commits,
+and applies the scope fence described in
+[`architecture.md`](architecture.md#process--trust-boundaries): every changed
+line must fall inside a conflict span plus `Audit.MergeScopeBufferLines` of
+context. Anything outside — a new file, a rename, an edit to a file that never
+conflicted — rejects the resolution and the item lands in
+`MergeConflictResolutionFailed`.
 
 ## Phase 4: Upstream push (host)
 
@@ -292,8 +301,7 @@ upstream URL — `IGitHost` is the abstraction to evolve.
 
 ## Conflict handling
 
-The agent-driven merge phase resolves conflicts directly: the agent is
-invoked with the merge state and can edit files, run tests, and commit.
-The orchestrator's post-merge verification catches the case where the
-agent didn't actually produce a valid merge and flips the item to
-`Failed` rather than letting it push.
+Conflicts are resolved by the agent inside the merge sandbox, and accepted only
+by the deterministic host-side checks above. A resolution that edits outside the
+conflict spans is rejected rather than pushed — the model cannot use "resolving
+a conflict" as cover for other edits.
