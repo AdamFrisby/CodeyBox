@@ -1,18 +1,19 @@
-# Releases
+# Releases and changelogs
 
-A **release** is a named grouping of work items whose PRs all target a shared
-release branch rather than `main` directly. When all work items in a closed
-release reach a terminal state, CodeyBox automatically runs a codebase-wide
-**deep audit** (OWASP ASVS checks, architecture coherence, CVE scans) before
-merging the release branch into `main` and optionally creating a GitHub
-release tag.
+Two related features, both opt-in per project: **releases** group work items
+onto a shared branch and gate it behind a codebase-wide deep audit, and
+**changelog automation** turns a published GitHub release into a `CHANGELOG.md`
+entry.
 
-Releases are **opt-in per project**. Projects with `release.enabled = false`
-(the default) see zero behavior change.
+## Releases
 
----
+A release is a named group of work items whose branches target
+`release/{name}` instead of `main`. When every item in a closed release reaches
+a terminal state, CodeyBox runs a deep audit — OWASP ASVS review, architecture
+coherence, dependency CVE scan — over the whole codebase before merging the
+release branch to `main` and optionally tagging it on GitHub.
 
-## State machine
+Projects with `release.enabled = false` (the default) behave exactly as before.
 
 ```
 open ─── close ──▶ closed ─── all items terminal ──▶ in_review
@@ -25,113 +26,190 @@ open ─── close ──▶ closed ─── all items terminal ──▶ in_
 
 | State | Meaning |
 |---|---|
-| `open` | Accepting new work items. Release branch created on first work item pickup. |
-| `closed` | No new work items; waiting for in-flight items to finish. |
+| `open` | Accepting new work items. The release branch is created on first work-item pickup. |
+| `closed` | No new items; waiting for in-flight ones to finish. |
 | `in_review` | Deep audit running. Remediation work items may be created automatically. |
-| `released` | Branch merged to main; GitHub release tag created (if configured). |
-| `failed` | Deep audit exceeded `maxIterations`. Human review required. Reopen to add remediation items. |
+| `released` | Branch merged to main, GitHub tag created if configured. |
+| `failed` | Deep audit exceeded `deepAuditMaxIterations`. Reopen to add remediation items. |
 | `abandoned` | Manually discarded from any non-`released` state. |
 
----
-
-## Configuration
-
-Enable releases in `codeybox.yaml` (or `codeybox.jsonc`):
+### Configuration
 
 ```yaml
 projects:
   - id: my-app
     repositoryUrl: https://github.com/example/my-app
     release:
-      enabled: true                 # required; false by default
-      branchNameTemplate: "release/{name}"  # default
-      autoSyncMainIntervalMinutes: 720      # 12 h; 0 = disable
+      enabled: true                         # false by default
+      branchNameTemplate: "release/{name}"
+      autoSyncMainIntervalMinutes: 720      # 12h; 0 disables
       deepAuditors:
         - owasp-asvs
         - arch-coherence
         - deps-cve-scan
-      deepAuditMaxIterations: 5            # default
-      targetTag: ""                        # optional; set to create a GitHub tag
+      deepAuditMaxIterations: 5
+      targetTag: ""                         # set to create a GitHub tag
 ```
 
-### `autoSyncMainIntervalMinutes`
+`ReleaseMainSyncService` merges `main` into every open release branch every
+`autoSyncMainIntervalMinutes`, so the branch does not drift far enough to make
+the final merge painful. It never auto-resolves: a conflict emits a
+`release.sync_conflict` webhook, logs a warning, and waits for a human to fix
+and push.
 
-The `ReleaseMainSyncService` background service merges `main` into every open
-release branch at this interval. This keeps the release branch from diverging
-too far from `main`, reducing the final-merge conflict surface. Set to `0` to
-disable; defaults to `720` (12 hours).
+An empty `deepAuditors` list skips the deep audit and goes straight to
+`released` once all items are terminal. The built-ins:
 
-On merge conflict the service emits a `release.sync_conflict` webhook and logs
-a warning. It does **not** auto-resolve conflicts — a human must fix the
-conflict and push to the release branch.
-
-### `deepAuditors`
-
-Names of the built-in deep auditors to run during `in_review`. Available
-built-in auditors:
-
-| Name | Kind | Description |
+| Name | Kind | What it does |
 |---|---|---|
-| `owasp-asvs` | llm | OWASP ASVS L1/L2 security review (V2, V3, V5, V7, V8, V9, V13) |
-| `arch-coherence` | llm | Architecture coherence: layer violations, circular deps, god objects, hardcoded config |
-| `deps-cve-scan` | shell | Dispatches by `Project.Audit.Languages`: C# `dotnet list package --vulnerable --include-transitive` with NuGet pinned to `https://api.nuget.org/v3/index.json`, Python `pip-audit`/`safety`, Node `npm audit --json` pinned to `https://registry.npmjs.org/` with repository npm proxy settings blocked, Go `govulncheck -json ./...`, Rust `cargo audit`. Critical/High = Error, Moderate/Medium = Warning |
+| `owasp-asvs` | LLM | OWASP ASVS L1/L2 review (V2, V3, V5, V7, V8, V9, V13) |
+| `arch-coherence` | LLM | layer violations, circular dependencies, god objects, hardcoded config |
+| `deps-cve-scan` | shell | per-language dependency scan; Critical/High are errors, Moderate/Medium warnings |
 
-LLM auditors require agent credentials. The shell auditor (`deps-cve-scan`)
-requires the matching language scanner to be installed in the sandbox image;
-if a declared language's scanner is absent it emits an Info finding and passes
-rather than failing. Languages without marker files in the repository are
-skipped. For backward compatibility, if `Project.Audit.Languages` is omitted,
-`deps-cve-scan` uses the legacy C# default. Set `Project.Audit.Languages` to
-an explicit empty list (`[]`) to run no language-specific dependency scanners.
+`deps-cve-scan` dispatches on `Project.Audit.Languages`: C# runs
+`dotnet list package --vulnerable --include-transitive` against
+`https://api.nuget.org/v3/index.json`, Python `pip-audit`/`safety`, Node
+`npm audit --json` pinned to `https://registry.npmjs.org/` with repository npm
+proxy settings blocked, Go `govulncheck -json ./...`, Rust `cargo audit`.
+Languages with no marker file in the repository are skipped, and a declared
+language whose scanner is missing from the sandbox emits an Info finding rather
+than failing the audit. Omitting `Project.Audit.Languages` scans C# only; set it
+to `[]` to run no language scanners at all.
 
-Tool-only network deep auditors such as `deps-cve-scan` require a sandbox
-provider that can enforce `AuditToolAllowedHosts`. Multipass supports this via
-the audit-tool network profile. Bubblewrap cannot enforce per-host allowlists,
-so CodeyBox blocks these auditors on bubblewrap instead of granting unrestricted
-host network access.
+Network-using tool auditors like `deps-cve-scan` need a provider that can
+enforce `AuditToolAllowedHosts`. Multipass and Incus can, through the audit-tool
+network profile. Bubblewrap cannot enforce a per-host allowlist, so CodeyBox
+blocks these auditors there rather than handing them unrestricted host network
+access. Custom deep auditors register through the plugin system — see
+[`../extending/plugins.md`](../extending/plugins.md).
 
-Custom auditors can be registered via the plugin system (see `plugins.md`).
-
-An empty `deepAuditors` list skips the deep audit entirely and transitions
-directly to `released` once all work items are terminal.
-
----
-
-## Work items in a release
-
-Set `releaseId` when creating a work item to associate it with a release:
+### Putting work items in a release
 
 ```
 POST /workitems
+{ "projectId": "my-app", "title": "Add JSON config support", "prompt": "...", "releaseId": "a1b2c3d4..." }
+```
+
+The release must exist, belong to the same project, and be `open`, with release
+management enabled for the project. The orchestrator then overrides
+`baseBranch` to the release branch — such items never target `main` — and
+creates the branch atomically on first pickup.
+
+Endpoints are grouped under `/releases` in
+[`../reference/api.md`](../reference/api.md); events are prefixed `release.`
+in [`../reference/webhooks.md`](../reference/webhooks.md).
+
+## Changelog automation
+
+When a GitHub release is published, CodeyBox walks the merged PRs between the
+previous tag and the new one, asks an LLM to summarise and categorise them, and
+either returns the markdown (manual call) or opens a work item that writes it
+into `CHANGELOG.md` (webhook flow).
+
+```
+GitHub release published
+        │
+        ▼  POST /webhooks/github/release — HMAC-SHA256 validated,
+        │  project resolved by repository URL, previous tag from the Releases API
+        ▼
+IPullRequestEnumerator — commits between fromTag→toTag via the Compare API,
+        │  PR numbers from merge-commit messages, title+body per PR (cap 200)
+        ▼
+IChangelogGenerator — redact secrets, batch if >100 KB, call the Messages API,
+        │  parse into markdown + category map
+        ▼
+WorkItem "apply this changelog entry to CHANGELOG.md" → the normal pipeline
+```
+
+Unlike coding work, this LLM call is made by the orchestrator process itself,
+not inside a sandbox.
+
+### Configuration
+
+```json
 {
-  "projectId": "my-app",
-  "title": "Add JSON config support",
-  "prompt": "...",
-  "releaseId": "a1b2c3d4..."
+  "CodeyBox": {
+    "Changelog": {
+      "Enabled": true,
+      "GeneratorAgent": "claude",
+      "GeneratorModelId": "claude-opus-4-7",
+      "ChangelogPath": "CHANGELOG.md",
+      "SectionHeaderFormat": "## [{tag}] - {date:yyyy-MM-dd}",
+      "GitHubWebhookSecretEnvVar": "CODEYBOX_GH_RELEASE_WEBHOOK_SECRET"
+    }
+  }
 }
 ```
 
-Constraints:
-- The release must exist, belong to the same project, and be in `Open` state.
-- Release management must be enabled for the project (`release.enabled = true`).
+| Field | Default | Meaning |
+|---|---|---|
+| `Enabled` | `true` | Global switch. |
+| `GeneratorAgent` | `"claude"` | The only supported generator today. |
+| `GeneratorModelId` | `"claude-opus-4-7"` | Model passed to the Anthropic API. |
+| `ChangelogPath` | `"CHANGELOG.md"` | Path inside the repository. |
+| `SectionHeaderFormat` | `"## [{tag}] - {date:yyyy-MM-dd}"` | Supports `{tag}` and `{date:yyyy-MM-dd}`. |
+| `GitHubWebhookSecretEnvVar` | `null` | Env var holding the HMAC secret. With no secret configured, signatures are not verified — do not run that way in production. |
 
-The orchestrator overrides `baseBranch` to the release branch for any work
-item with a `releaseId`. The release branch is created atomically on the first
-work item pickup (SETIFNULL).
+Per-project overrides go in the project's entry:
 
-Work items added to a release **do not** target `main` — their PRs and work
-branches are opened against `release/{name}` instead.
+```json
+{
+  "id": "my-app",
+  "changelog": {
+    "enabled": true,
+    "changelogPath": "docs/CHANGELOG.md",
+    "sectionHeaderFormat": "## {tag} ({date:yyyy-MM-dd})"
+  }
+}
+```
 
----
+### Wiring the webhook
 
-## API
+1. Generate a secret and export it under the name in
+   `GitHubWebhookSecretEnvVar`:
+   `export CODEYBOX_GH_RELEASE_WEBHOOK_SECRET="$(openssl rand -hex 32)"`.
+2. On GitHub: repo → Settings → Webhooks → Add webhook. Payload URL
+   `https://your-host/webhooks/github/release`, content type
+   `application/json`, the same secret, and **Releases** as the only event.
+3. Publish a release.
 
-See [`api.md`](api.md) for the full endpoint reference. Release endpoints are
-grouped under `/releases`.
+The endpoint validates `X-Hub-Signature-256` (HMAC-SHA256), returns `202` right
+away, and does the edit through the normal work-item pipeline. An absent or
+wrong signature gets a `401` with no body. The secret is never logged, and no
+payload data is logged.
 
----
+### Generating one by hand
 
-## Webhooks
+```http
+POST /projects/{id}/release
+Authorization: Bearer <CODEYBOX_API_KEY>
+Content-Type: application/json
 
-See [`webhooks.md`](webhooks.md) for the full webhook event reference. Release
-events are prefixed `release.`.
+{ "fromTag": "v1.2.0", "toTag": "v1.3.0" }
+```
+
+returns the markdown synchronously:
+
+```json
+{
+  "markdown": "## [v1.3.0] - 2026-05-15\n\n### Added\n- ...\n",
+  "categoryToPrNumbers": { "Added": [16, 18], "Fixed": [17] },
+  "wasCapped": false
+}
+```
+
+`400` means a missing tag, no GitHub upstream on the project, or changelog
+generation disabled for it; `404` is an unknown project.
+
+`wasCapped: true` means the range held more than 200 PRs and the oldest were
+dropped — re-run over a narrower tag range for full coverage. Above 100 KB of
+combined PR titles and bodies the generator summarises in batches and merges the
+partial summaries in a final pass, keeping each call inside the model's context
+window.
+
+If the repository has no `CHANGELOG.md`, the work-item prompt tells the agent to
+create it. For a first run, point `fromTag` at the earliest tag you care about.
+
+PR bodies pass through `RawOutputRedactor` before reaching the model, replacing
+GitHub PATs, Anthropic keys, and Google API keys with `***`. GitHub PATs
+themselves are read from the environment at call time and never stored.
