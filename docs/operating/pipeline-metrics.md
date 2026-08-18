@@ -1,4 +1,170 @@
-# Transition-health metric
+# Pipeline health and timings
+
+Two operator questions, two endpoints. *Where is the time going?* —
+`/workitems/{id}/timings`, per step, per phase. *Is the pipeline itself
+breaking?* — `/fleet/transition-health`, which separates plumbing failures from
+work that is simply hard.
+
+## Where the time goes
+
+Every significant step of a work item is measured into the `work_item_timings`
+SQLite table, so "why did this take 40 minutes?" is answerable from data. Timing
+writes are best-effort: a failed write is logged at Warning and never affects
+the work item.
+
+### Instrumented steps
+
+| Phase | Step | Description |
+|---|---|---|
+| `work` | `vm.clone` | Cloning the baseline VM (Multipass or Incus) |
+| `work` | `vm.launch` | Launching a fresh VM (no-baseline path) |
+| `work` | `vm.mount` | Mounting project directories into the VM |
+| `work` | `vm.start` | Starting the VM |
+| `work` | `vm.exec_first` | First sandbox `ExecAsync` call (cloud-init catch-up) |
+| `work` | `vm.dispose` | Deleting and purging the VM |
+| `work` | `bwrap.exec_setup` | Setting up the bubblewrap sandbox root |
+| `work` | `bwrap.exec_first` | First bubblewrap `ExecAsync` call |
+| `work` | `bwrap.teardown` | Removing the bubblewrap sandbox root |
+| `work` | `git.clone_into_sandbox` | Cloning the bare repo into the sandbox |
+| `work` | `agent.exec` | Full agent execution (from spawn to exit) |
+| `work` | `git.commit` | Staging + committing the agent's changes |
+| `work` | `git.push_back_to_bare_repo` | Pushing the work branch to the bare repo |
+| `rework` | same as `work` | Second (or later) work attempt after audit failure |
+| `audit` | `auditor.<name>` | Each auditor's full build + analysis run |
+| `audit` | `<language>.build` | Language build phase parsed from auditor stdout, for example `csharp.build` |
+| `audit` | `<language>.test_run` | Language test execution phase parsed from auditor stdout, for example `csharp.test_run` |
+| `audit` | `gitleaks.scan` | gitleaks scan phase parsed from auditor stdout |
+| `audit` | `semgrep.scan` | semgrep scan phase parsed from auditor stdout |
+| `merge` | `git.clone_into_sandbox` | Cloning the bare repo for the merge agent |
+| `merge` | `agent.exec` | Merge agent execution |
+| `upstream_push` | `upstream.complete` | Full upstream push wrapper (PipelineRunner) |
+| `upstream_push` | `upstream.push_branch` | Git push of the work branch to the upstream remote |
+| `upstream_push` | `upstream.api_create_pr` | GitHub API call to create the pull request |
+| `upstream_push` | `upstream.api_merge_pr` | GitHub API call to merge the pull request |
+
+The `metadata_json` column on each row carries extra context:
+
+- `agent.exec` rows include `{"agent":"<kind>"}` (e.g., `"claude"`).
+- `auditor.<name>` rows include `{"agent":"<kind>"}` — the auditor runner kind.
+  The auditor name is already in the `step` column; the iteration is in the
+  `iteration` column, not in `metadata_json`.
+- `upstream.complete` rows include `{"attempt":<n>}`.
+
+#### Agent-internal timing
+
+Timings stop at `agent.exec` — what the agent did *inside* that span is not
+broken out here. Tool-call and thinking/executing splits come from the captured
+NDJSON streams instead, summarised into `agent_stream_summaries` once an item
+reaches a terminal state; see [`agent-streams.md`](agent-streams.md). No
+`agent.tool_call.*` rows are written to `work_item_timings`.
+
+### Database schema
+
+```sql
+CREATE TABLE IF NOT EXISTS work_item_timings (
+    id          TEXT    PRIMARY KEY,
+    work_item_id TEXT   NOT NULL,
+    phase       TEXT    NOT NULL,
+    iteration   INTEGER,
+    step        TEXT    NOT NULL,
+    started_at  TEXT    NOT NULL,   -- ISO-8601 with offset
+    ended_at    TEXT,               -- NULL while in-flight
+    duration_ms INTEGER,            -- NULL while in-flight
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_timings_work_item_phase
+    ON work_item_timings (work_item_id, phase, iteration, started_at);
+```
+
+The table lives in the same SQLite file as `work_items` and uses WAL mode
+(`journal_mode=WAL`, `busy_timeout=30000`) for safe concurrent access.
+
+### REST API
+
+#### `GET /workitems/{id}/timings`
+
+Returns timing data for a single work item.
+
+**Response (200 OK):**
+
+```json
+{
+  "workItemId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "totalDurationMs": 62000,
+  "topSteps": [
+    { "step": "agent.exec", "totalMs": 45000, "count": 2 },
+    { "step": "git.clone_into_sandbox", "totalMs": 10000, "count": 2 }
+  ],
+  "byPhase": {
+    "work": {
+      "durationMs": 55000,
+      "steps": [
+        { "step": "git.clone_into_sandbox", "startedAt": "...", "endedAt": "...", "durationMs": 5000 },
+        { "step": "agent.exec", "startedAt": "...", "endedAt": "...", "durationMs": 45000, "metadataJson": "{\"agent\":\"claude\"}" },
+        { "step": "git.commit", "startedAt": "...", "endedAt": "...", "durationMs": 300 },
+        { "step": "git.push_back_to_bare_repo", "startedAt": "...", "endedAt": "...", "durationMs": 200 }
+      ]
+    }
+  }
+}
+```
+
+Rows with `durationMs: null` are in-flight (the work item is currently running
+that step).
+
+**404** if the work item does not exist.
+**400** if `{id}` is not a valid GUID.
+
+#### `GET /workitems/timings/aggregate?n=50`
+
+Returns aggregate statistics across the last *n* completed work items
+(default: 50, max: 500).  The query streams the SQLite cursor rather than
+loading all rows into memory.
+
+**Response (200 OK):**
+
+```json
+{
+  "workItemCount": 12,
+  "stepStats": [
+    {
+      "phase": "work",
+      "step": "agent.exec",
+      "count": 14,
+      "medianMs": 42000,
+      "p95Ms": 110000
+    },
+    {
+      "phase": "work",
+      "step": "git.clone_into_sandbox",
+      "count": 14,
+      "medianMs": 3200,
+      "p95Ms": 8000
+    }
+  ]
+}
+```
+
+Percentiles are computed via sorted-array indexing (not approximate streaming
+algorithms) which is acceptable because N is bounded at 500.
+
+### Admin dashboard
+
+Two pages are available in the admin UI:
+
+- **Work item → Timings button** (`/work-items/{id}/timings`): per-item
+  breakdown by phase and step, with in-flight rows shown.
+- **Aggregate Timings** (`/timings/aggregate`): system-wide median and p95
+  per step across the last N completed work items, with a configurable N
+  picker and Refresh button.
+
+### Disabling timing collection
+
+Timing collection is enabled by default when the API starts.  To disable it,
+remove or comment out the `ITimingStore` registration in `Program.cs`.  All
+timing code paths check for a null store and silently skip collection.
+
+## Is the plumbing healthy?
 
 The transition-health metric reports infrastructure health of the pipeline
 independently of work throughput. Done-rate conflates plumbing health with
@@ -7,10 +173,9 @@ system can have zero completions for hours (hard work + low concurrency) and
 a degrading system can keep completing while its infra-failure rate climbs.
 This metric isolates plumbing.
 
-It is computed from data the orchestrator already persists; no new
-instrumentation was added.
+It is computed entirely from data the orchestrator already persists.
 
-## What it measures
+### What it measures
 
 Over a configurable rolling window (default 24 h), the score is
 
@@ -26,7 +191,7 @@ wrong, so plumbing health is unknown but not bad"); this is the
 conventional health-check choice. The companion `total_transitions` field
 lets a dashboard surface "low-confidence" when the sample is small.
 
-## Legitimate vs. infra-failure taxonomy
+### Legitimate vs. infra-failure taxonomy
 
 A stage transition is **LEGITIMATE** when it represents forward progress or
 the audit loop working as designed:
@@ -79,7 +244,7 @@ when it neither represents healthy progress nor an infra failure:
   yet classified a failure; counting it as infra would over-pessimise the
   score, counting it as legitimate would under-pessimise.
 
-## Source data
+### Source data
 
 Transitions come from three persisted signals (no new tables):
 
@@ -97,7 +262,7 @@ Transitions come from three persisted signals (no new tables):
    (a work-quality outcome, not an infra failure), and the preceding
    audit_report rows are already counted by signal #2.
 
-## Endpoint
+### Endpoint
 
 ```
 GET /fleet/transition-health
@@ -157,7 +322,7 @@ without parsing the full breakdown.
 When the endpoint is disabled, a `404` is returned with
 `{ "error": "transition-health is disabled" }`.
 
-## Configuration
+### Configuration
 
 ```jsonc
 {
@@ -183,7 +348,7 @@ Clamps applied at binding time:
   "default 24 h".
 - `MaxTransitions` is clamped to `[50, 100_000]` when set.
 
-## Architectural notes for contributors
+### For contributors
 
 - The classifier (`TransitionHealthClassifier`) is a pure function over
   hand-authored snapshots: it takes a `TransitionDataSnapshot` and an
