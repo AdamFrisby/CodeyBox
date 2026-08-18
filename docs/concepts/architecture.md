@@ -4,9 +4,14 @@ CodeyBox is a C#/.NET orchestration framework that runs LLM coding agents
 (Claude Code, GitHub Copilot CLI, OpenAI Codex CLI, ...) inside VM-isolated
 sandboxes and merges their output through a controlled git workflow. Managed
 projects are language-agnostic; Python, Node, Go, Rust, C#, and custom stacks
-all enter through the same project and auditor configuration. The parent
-orchestrator runs **no LLMs** - its only job is to schedule sandboxes and
-shepherd state.
+all enter through the same project and auditor configuration.
+
+No coding agent ever runs on the host: every model call that touches a
+repository happens through an agent CLI inside a sandbox. The orchestrator's job
+is to schedule those sandboxes and shepherd state. It does make a small, fixed
+set of its own HTTP calls — quota and smoke probes, model listing, changelog
+summarisation, and the deliberately tool-free text-only calls used for plan
+review — none of which hand a repository to a model.
 
 ## High-level flow
 
@@ -41,18 +46,17 @@ shepherd state.
    └─────────────────────────────────────────────────────────┘
 ```
 
-See [`audit.md`](../quality/audit.md) for the audit phase in detail. Built-in language
-presets are config-driven YAML resources; see [`languages.md`](../quality/presets.md)
-for the schema and override rules. LLM audit focus prompts and the review frame
-are also config-driven; see [`audit-types.md`](../quality/presets.md).
+The audit phase is covered in [`../quality/audit.md`](../quality/audit.md).
+Language detection, audit-type prompts, and the LLM review frame all come from
+config-driven presets — schema and override rules in
+[`../quality/presets.md`](../quality/presets.md).
 
-## Auditor Profiles
+## Auditor profiles
 
-Projects can define named auditor profiles under `Audit.Profiles`. The
-top-level `Audit` object remains the backwards-compatible `default` profile;
-configs without `Profiles` behave as before. `Audit.Profile` selects the
-project-default profile for all work items in that project. Per-work-item
-profile overrides are intentionally out of scope today.
+Projects can define named auditor profiles under `Audit.Profiles`. The top-level
+`Audit` object *is* the `default` profile, so a config with no `Profiles` block
+needs no changes. `Audit.Profile` picks the project's default profile; there is
+no per-work-item override.
 
 A profile is a complete audit bundle: languages, audit types, custom auditors,
 iteration limits, agent routing, and excluded auditor names. The composer
@@ -87,15 +91,15 @@ against the pre-merge main commit and the work tip.
 For clean merges, the agent commit tree must exactly match the host
 `merge-tree` result, and the accepted commit must keep both the pre-merge main
 commit and the work tip in its ancestry. For conflicted merges, the orchestrator
-runs the configured agent's normal CLI shape inside the work-item sandbox via
-<see cref="IAgentRunner.RunAsync"/> with a conflict-resolution prompt. The agent
+runs the configured agent's normal CLI shape inside the work-item sandbox
+through `IAgentRunner.RunAsync` with a conflict-resolution prompt. The agent
 reads conflicted files directly off the sandbox working tree, writes resolutions,
 and `git add`'s them; the orchestrator then verifies (no unmerged paths, no
 conflict markers in any of the originally-conflicted files) and commits. This
 is the same CLI shape the agent uses for any normal pickup, so subscription
 credentials (Claude OAuth, Cursor session) are exercised through the supported
-client surface and there is no raw-HTTP-to-the-provider path on the orchestrator
-host. The resolver iterates through a candidate chain (the work item's primary
+client surface rather than a hand-rolled host-side request. The resolver iterates
+through a candidate chain (the work item's primary
 runner plus its class fallback chain, with at-cap agents deprioritised) until
 one candidate produces a clean working tree.
 
@@ -111,10 +115,8 @@ and whitespace-only edits outside the allowed ranges are rejected and the work
 item enters `MergeConflictResolutionFailed`.
 
 Because the agent reads files directly off the working tree inside the sandbox,
-there is no per-file or per-hunk payload cap — large conflicted files (hundreds
-of KiB or more) are handled the same way as small ones. The previous text-only
-resolver had a 128 KiB resolver-payload cap and a hunk-scoped fallback for files
-exceeding it; both have been removed.
+there is no per-file or per-hunk payload cap: a conflicted file of several
+hundred KiB is handled exactly like a small one.
 
 This deterministic scope fence is the security boundary. The optional merge
 security review is an LLM text review over the resolved conflict diff in a
@@ -234,8 +236,8 @@ intent is that you can swap any of these without touching the orchestrator:
 
 ## Why this shape
 
-* **Loose coupling.** Adam wants every subsystem swappable. Concrete types
-  never appear in cross-component method signatures; everything is the Core
+* **Loose coupling.** Every subsystem is swappable. Concrete types never
+  appear in cross-component method signatures; everything is the Core
   interface.
 * **Atomic Work+Merge.** Mirrors how a human reviewer reasons: either the
   feature lands cleanly on the integration branch or it doesn't. Half-applied
@@ -273,10 +275,8 @@ intent is that you can swap any of these without touching the orchestrator:
   Upstream creds live only in the orchestrator process and never cross
   the sandbox boundary.
 
-## What's not built yet
+## Known limits
 
-* The Gitea / GitHub-PR upstream variant currently pushes the merged
-  branch directly; opening a real upstream PR is a future enhancement.
 * `scripts/setup-host-networks.sh` resolves hostnames at setup time and
   writes IP rules. CDN rotation past resolved IPs fails closed (correct
   direction); for high-stakes use, swap the per-profile chain for an
