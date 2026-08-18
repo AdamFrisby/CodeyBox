@@ -69,12 +69,13 @@ All options are under `CodeyBox:SandboxLeak` in `appsettings.json`.
 }
 ```
 
-| Key | Default | Description |
-|---|---|---|
-| `Enabled` | `true` | Enable or disable the sweep entirely |
-| `CheckInterval` | `00:15:00` (15 min) | How often to run the leak scan |
-| `LeakAgeThreshold` | `00:30:00` (30 min) | Minimum age before a non-active sandbox is declared leaked |
-| `AutoDispose` | `true` | When true, automatically purge each detected leak |
+| Key | Default | Reload | Description |
+|---|---|---|---|
+| `Enabled` | `true` | startup only | Enable or disable the sweep entirely. |
+| `CheckInterval` | `00:15:00` | startup only | How often the scan runs; sampled when the timer is constructed. |
+| `LeakAgeThreshold` | `00:30:00` | hot | Minimum age before an untracked sandbox is declared leaked. |
+| `AutoDispose` | `true` | hot | Purge each detected leak automatically. |
+| `MaxConcurrentAutoDispose` | `4` | hot | Parallel disposals, capped to limit pressure on the provider during restart cleanup. |
 
 #### AutoDispose
 
