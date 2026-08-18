@@ -148,7 +148,7 @@ Outbound HTTP calls (GitHub API, agent quota probes, webhooks) automatically rec
 | `codeybox.coordinator.sqlite.write_gate.wait_ms` | `ms` | `outcome` (`acquired` \| `canceled`) | Time spent waiting for the shared SQLite single-writer gate. |
 | `codeybox.coordinator.git.command.duration_ms` | `ms` | `operation`, `outcome` (`success` \| `exit_nonzero` \| `canceled` \| `error`) | Host-side git command duration inside the orchestrator process. |
 | `codeybox.coordinator.agent_stream.capture.duration_ms` | `ms` | `phase`, `outcome` (`completed` \| `truncated` \| `error`) | Agent stream capture writer duration on the orchestrator host. |
-| `codeybox.coordinator.agent_stream.backpressure.wait_ms` | `ms` | `phase` | Time an agent-stream writer spent blocked on capture backpressure. |
+| `codeybox.coordinator.agent_stream.backpressure.wait_ms` | `ms` | `phase`, `outcome` | Time an agent-stream writer spent blocked enqueueing under capture backpressure. |
 | `codeybox.session.audit_iterations` | `{iteration}` | `self_review` (`on` \| `off`), `outcome` (`passed` \| `failed` \| `needs_operator_input`) | Iterations consumed before a session-mode item's audit verdict. |
 
 ### Observable gauges
