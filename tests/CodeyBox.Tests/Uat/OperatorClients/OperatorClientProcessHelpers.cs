@@ -35,7 +35,7 @@ internal static class OperatorClientPaths
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
         while (dir is not null)
         {
-            if (File.Exists(Path.Combine(dir.FullName, "docs", "uat", "00-plan.md")))
+            if (File.Exists(Path.Combine(dir.FullName, "CodeyBox.slnx")))
                 return dir.FullName;
             dir = dir.Parent;
         }

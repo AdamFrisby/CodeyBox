@@ -14,7 +14,7 @@ namespace CodeyBox.Orchestrator;
 /// cached snapshot. A cache would let either path report a stale "healthy"
 /// percent for the cache lifetime after an accounting outage begins, masking the
 /// store failure and contradicting the fail-closed contract in
-/// <c>docs/agent-budgets.md</c> (degraded accounting must read as exhausted on
+/// <c>docs/operating/budgets.md</c> (degraded accounting must read as exhausted on
 /// /quota). Recomputing is cheap — one indexed SUM per window — and neither path
 /// is a tight loop (dispatch and dashboard polling).
 /// </para>
@@ -260,7 +260,7 @@ public sealed class AgentBudgetCalculator : IAgentBudgetProvider, IAgentBudgetCo
     /// substituting a narrower span (e.g. a 1-hour Rolling window or a zero-width
     /// default), so a future caller that skips the guards fails loudly instead of
     /// undercounting usage and loosening the gate — consistent with the
-    /// fail-closed contract in <c>docs/agent-budgets.md</c>.
+    /// fail-closed contract in <c>docs/operating/budgets.md</c>.
     /// </summary>
     private static (DateTimeOffset From, DateTimeOffset To, DateTimeOffset? Reset) WindowBounds(
         AgentBudgetWindowOptions w, DateTimeOffset now)

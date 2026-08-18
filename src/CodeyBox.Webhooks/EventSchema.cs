@@ -6,10 +6,10 @@ namespace CodeyBox.Webhooks;
 /// <summary>
 /// Single source of truth for the webhook + SSE event schema. Exposed verbatim
 /// by <c>GET /events/schema</c> so downstream trackers can validate at startup
-/// and enable schema-version-strict mode without scraping <c>docs/EVENT_SCHEMA.md</c>.
+/// and enable schema-version-strict mode without scraping <c>docs/reference/events.md</c>.
 ///
 /// <para>Evolution is additive-only — see <see cref="EvolutionRules"/>. The
-/// in-repo doc <c>docs/EVENT_SCHEMA.md</c> must mirror this object; the
+/// in-repo doc <c>docs/reference/events.md</c> must mirror this object; the
 /// <c>EventSchemaDocSyncTests</c> guard against drift.</para>
 /// </summary>
 public static class EventSchema
@@ -179,7 +179,7 @@ public static class EventSchema
         if (evt.EmittedAt == default)
             return $"event '{evt.Event}': emittedAt is required";
         if (!KnownEventTypesSet.Contains(evt.Event))
-            return $"event '{evt.Event}': eventType is not in EventSchema.KnownEventTypes — add it to the list (and docs/EVENT_SCHEMA.md) or fix the emit-site spelling";
+            return $"event '{evt.Event}': eventType is not in EventSchema.KnownEventTypes — add it to the list (and docs/reference/events.md) or fix the emit-site spelling";
         return null;
     }
 

@@ -108,7 +108,7 @@ public sealed class OpencodeAgentRunner : CliAgentRunnerBase, IAgentDefaultModel
         // need it can set the OPENCODE_REASONING_FLAG env var on the host
         // to the correct flag name (e.g. "--reasoning-effort"); when set we
         // append it followed by the requested mode. Without verification we
-        // do NOT speculate on the flag name. See docs/agents.md.
+        // do NOT speculate on the flag name. See docs/concepts/agents.md.
         if (!string.IsNullOrEmpty(reasoningMode))
         {
             var flag = Environment.GetEnvironmentVariable("OPENCODE_REASONING_FLAG");

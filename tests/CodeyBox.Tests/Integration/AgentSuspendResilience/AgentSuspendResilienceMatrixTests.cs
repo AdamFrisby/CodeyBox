@@ -38,14 +38,14 @@ public sealed class AgentSuspendResilienceMatrixTests
         var outcome = await AgentSuspendSmokeHarness.RunScenarioAsync(agent, suspendSeconds);
 
         // ≤60s: must complete or surface a recoverable failure (orchestrator retry).
-        // Longer windows: same bar — document failures in docs/agent-suspend-resilience.md.
+        // Longer windows: same bar — document failures in docs/operating/sandbox-reliability.md.
         if (suspendSeconds <= 60)
         {
             Assert.True(
                 outcome is AgentSuspendSmokeOutcome.Completed or AgentSuspendSmokeOutcome.RecoverableFailure,
                 $"agent={agentName} suspend={suspendSeconds}s expected survival, got {outcome}");
         }
-        // >60s: record outcome in scenario logs for docs/agent-suspend-resilience.md;
+        // >60s: record outcome in scenario logs for docs/operating/sandbox-reliability.md;
         // do not fail CI on long windows until the matrix is populated.
     }
 }

@@ -16,7 +16,7 @@ public enum BudgetWindowKind
 /// <summary>
 /// Operator-configurable multi-window spend budget per (agent, model). Bound
 /// under <c>CodeyBox:AgentBudgets</c> and hot-reloadable. See
-/// <c>docs/agent-budgets.md</c> for the accounting caveats (this orchestrator
+/// <c>docs/operating/budgets.md</c> for the accounting caveats (this orchestrator
 /// only counts what it dispatched; size budgets below the provider's real cap).
 /// <para>
 /// Lives in Core alongside <see cref="IAgentBudgetProvider"/> so host

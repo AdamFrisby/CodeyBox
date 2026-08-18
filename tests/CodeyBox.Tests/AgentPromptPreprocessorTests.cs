@@ -60,7 +60,7 @@ public sealed class AgentPromptPreprocessorTests
         var sandbox = new FileBackedSandbox(new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["AGENTS.md"] = "rule one\n",
-            ["docs/agents.md"] = "rule two\n",
+            ["docs/concepts/agents.md"] = "rule two\n",
         });
         var preprocessor = new ProjectRulesPromptPreprocessor(
             monitor,
@@ -73,11 +73,11 @@ public sealed class AgentPromptPreprocessorTests
         Assert.Contains("rule one", first);
         Assert.Contains("original prompt", first);
 
-        monitor.CurrentValue = new AgentPromptPreprocessingOptions { ProjectRulesPath = "docs/agents.md" };
+        monitor.CurrentValue = new AgentPromptPreprocessingOptions { ProjectRulesPath = "docs/concepts/agents.md" };
 
         var second = await preprocessor.ProcessAsync(NewContext(sandbox), "next prompt");
 
-        Assert.Contains("Loaded from `docs/agents.md`.", second);
+        Assert.Contains("Loaded from `docs/concepts/agents.md`.", second);
         Assert.Contains("rule two", second);
         Assert.Contains("next prompt", second);
     }
@@ -557,10 +557,10 @@ public sealed class AgentPromptPreprocessorTests
     public async Task ProjectRulesPreprocessor_NormalizesBackslashesToForwardSlashes()
     {
         var monitor = new MutableOptionsMonitor<AgentPromptPreprocessingOptions>(
-            new() { ProjectRulesPath = "docs\\agents.md" });
+            new() { ProjectRulesPath = "docs\\concepts\\agents.md" });
         var sandbox = new FileBackedSandbox(new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            ["docs/agents.md"] = "win-style path resolves\n",
+            ["docs/concepts/agents.md"] = "win-style path resolves\n",
         });
         var preprocessor = new ProjectRulesPromptPreprocessor(
             monitor,
@@ -568,7 +568,7 @@ public sealed class AgentPromptPreprocessorTests
 
         var result = await preprocessor.ProcessAsync(NewContext(sandbox), "prompt");
 
-        Assert.Contains("Loaded from `docs/agents.md`.", result);
+        Assert.Contains("Loaded from `docs/concepts/agents.md`.", result);
         Assert.Contains("win-style path resolves", result);
     }
 
