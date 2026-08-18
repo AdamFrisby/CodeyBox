@@ -223,8 +223,7 @@ If you add a new event type, follow this checklist:
    coordinate with operators first, then update `CurrentSchemaVersion` and
    set `introducedIn` on the affected entries.
 
-## Out of scope (for now)
+## Deliberately not built
 
-- Auto-generated client SDKs from the schema — tracked as a follow-up if a
-  consumer asks for it. The current shape is small enough that hand-rolled
-  validators work fine.
+- Auto-generated client SDKs from the schema. The envelope is small enough
+  that a hand-rolled validator is less work than a generator.

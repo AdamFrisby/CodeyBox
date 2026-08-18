@@ -167,10 +167,9 @@ hot-reloadable; a project with no `JobTrackExport` block exports nothing):
 | `MaxAttempts` | `3` | Upsert attempts per case before it counts as failed (≥ 1). |
 | `RetryBaseDelayMs` | `250` | Base back-off; the nth retry waits `n × RetryBaseDelayMs`. `0` disables the delay. |
 
-## Out of scope
+## What lives elsewhere
 
-This data model is the foundation only. The following land as separate items:
-
-- **Executing** test cases on cheap cloud VMs (E2E infra).
-- The mutation / regression gates that use `ConformanceJson` to score
-  coverage.
+This page is the data model. Running the cases is
+[`e2e-execution.md`](e2e-execution.md); the per-item testing-rigor gate is
+[`mutation-rigor.md`](mutation-rigor.md). Scoring coverage from
+`ConformanceJson` is not implemented.

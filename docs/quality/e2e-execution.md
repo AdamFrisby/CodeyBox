@@ -150,10 +150,10 @@ recorded actions/selectors/assertions into deterministic browser/app
 interaction. The brief calls out a cheap-model selector-repair fallback as a
 future addition; this runtime records failure detail but does not repair.
 
-## Out of scope (deliberate)
+## Deliberately not built
 
-- **Cheap-model selector-repair on failure.** The seam exists
-  (`E2eRunResult.FailedStepIndex`); the hook is intentionally not built.
-- **Conformance gates / coverage scoring.** Lives in
-  [`test-cases.md`](test-cases.md) and on a separate item that consumes
-  `ConformanceJson` against the run history this runtime produces.
+- **Selector repair on failure.** `E2eRunResult.FailedStepIndex` gives a
+  cheap-model repair hook somewhere to attach; nothing attaches to it.
+- **Conformance gates and coverage scoring.** The `ConformanceJson` field
+  exists on the test case ([`test-cases.md`](test-cases.md)); nothing scores
+  run history against it.
