@@ -1,4 +1,4 @@
-# Test Cases
+# Test cases
 
 CodeyBox treats **test cases** as a first-class artifact attached to a work
 item. They are the data model that E2E execution, the mutation / regression

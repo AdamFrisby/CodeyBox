@@ -57,7 +57,7 @@ One event is fired per state transition. Events follow the naming convention `wo
 | `audit.auditor_timed_out` | An auditor timed out during execution or sandbox launch (see [Details](#auditauditor_timed_out-details)) |
 | `merge.started` | Merge phase started |
 | `merge.completed` | Merge phase succeeded; carries the merge commit SHA |
-| `upstream.pr_stale_base` | A CodeyBox-authored PR has been left unmergeable by motion on the base branch; needs operator rebase (see [Details](#upstream_pr_stale_base-details)) |
+| `upstream.pr_stale_base` | A CodeyBox-authored PR has been left unmergeable by motion on the base branch; needs operator rebase (see [Details](#upstreampr_stale_base-details)) |
 | `work_item.merge_conflict_resolution_failed` | Merge conflict resolution was rejected by host verification or the scope fence; the item is terminal |
 | `work_item.waiting_for_quota_reset` | Every eligible class member hit quota in one pickup; the item is parked, not failed. Details use the agent-fallback shape |
 | `work_item.resumed` | An operator-cancelled item re-entered the pipeline via `POST /workitems/{id}/resume`. Details: `id`, `externalId`, resumed-from phase |

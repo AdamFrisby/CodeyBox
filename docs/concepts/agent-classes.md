@@ -1,4 +1,4 @@
-# Agent Classes
+# Agent classes
 
 An **agent class** is a named group of interchangeable agents. Instead of
 binding a work item directly to `claude` or `codex`, you bind it to a class

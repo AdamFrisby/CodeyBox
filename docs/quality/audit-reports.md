@@ -1,4 +1,4 @@
-# Audit Reports
+# Audit reports
 
 Per-auditor findings are persisted to the SQLite database after every
 auditor invocation, providing a durable record of which defects were

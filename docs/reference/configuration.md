@@ -343,7 +343,7 @@ must match the creation-time project, pool, guest identity, sandbox
 specification, network/topology, inode-pinned host sources, and guest links.
 The retry first converts the VM to the ordinary Git/private-state checkpoint
 under an exclusive preparation claim, then deletes it and automatically queues
-the immutable resumed dispatch. See [Recovery](../operating/recovery.md#retained-incus-adoption-and-conversion)
+the immutable resumed dispatch. See [Agent-turn checkpoints](../operating/agent-turn-checkpoints.md#retained-incus-adoption-and-conversion)
 for the lifecycle and failure behavior.
 
 When `UseBaselineImages=true`, the API derives Incus post-bake verification

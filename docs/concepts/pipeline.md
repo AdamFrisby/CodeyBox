@@ -1,4 +1,4 @@
-# Git workflow
+# The pipeline in git terms
 
 How a work item flows through the git topology, and why each step looks the
 way it does.

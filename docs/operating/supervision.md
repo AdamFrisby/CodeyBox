@@ -1,4 +1,4 @@
-# Agent Supervision
+# Agent supervision
 
 Agent supervision is a config-gated human-in-the-loop channel for live agent
 invocations. It is off by default.
