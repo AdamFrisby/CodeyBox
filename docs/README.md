@@ -19,7 +19,7 @@ at anything that matters.
 | [projects](concepts/projects.md) | per-project repository, auditors, upstream, budgets, credentials |
 | [agents](concepts/agents.md) | the agent CLI contract, the built-in eight, adding a ninth |
 | [agent classes](concepts/agent-classes.md) | routing across agents, quality scores, quota-aware fallback |
-| [sandboxes](concepts/sandboxes.md) | Incus, Multipass, remote Multipass, Bubblewrap, Process |
+| [sandboxes](concepts/sandboxes.md) | Incus, Multipass, remote Multipass, Sprites, Bubblewrap, Process |
 | [security](concepts/security.md) | threat model, mitigations, sharp edges, known gaps |
 | [questions and suggestions](concepts/agent-feedback.md) | how an agent asks you something, or flags adjacent work |
 
