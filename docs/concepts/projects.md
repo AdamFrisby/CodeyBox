@@ -94,7 +94,7 @@ after a restart. No other config change is needed.
 Set `DefaultAgentClass` to a class ID from `CodeyBox:AgentClasses` to enable
 quota-aware routing for all work items in this project without requiring
 per-item `agentClassId` in the API payload. See
-[docs/agent-classes.md](agent-classes.md) for the full routing model.
+[docs/concepts/agent-classes.md](agent-classes.md) for the full routing model.
 
 A per-item `agentClassId` overrides the project default. Set it to `null`
 (omit it in the JSON payload) to fall back to legacy direct `Agent` pick.
@@ -132,7 +132,7 @@ or an object form where keys select audit types and values tune their prompts:
 }
 ```
 
-See `docs/audit-types.md` for prompt schemas and precedence.
+See `docs/quality/presets.md` for prompt schemas and precedence.
 
 ### Project ID rules
 
@@ -331,7 +331,7 @@ Set `Audit.BuildScriptRequired=true` for projects that must provide the script:
 cannot execute, exits `126`/`127`, or times out, the item fails/defer-surfaces as
 `could-not-verify` infrastructure rather than a source-code audit finding.
 
-See [`docs/audit.md`](../quality/audit.md) for the full cross-review documentation
+See [`docs/quality/audit.md`](../quality/audit.md) for the full cross-review documentation
 including trade-offs, observability events, and quota fallthrough behaviour.
 
 ### Stuck-agent detection
@@ -482,7 +482,7 @@ attribute. If the plugin is not loaded, the composer logs a warning and skips
 the entry — other auditors continue normally. No `Name` field is required; the
 plugin's own `IAuditor.Name` is used in findings and logs.
 
-See [`docs/auditor-plugins.md`](../extending/auditor-plugins.md) for the full authoring guide,
+See [`docs/extending/auditor-plugins.md`](../extending/auditor-plugins.md) for the full authoring guide,
 project skeleton, and sample plugin.
 
 ## Per-project upstream
@@ -571,7 +571,7 @@ other per-project state injection mechanism.
 `TokenEnvVar` to name the environment variable holding the token; the plugin reads it
 with `Environment.GetEnvironmentVariable(...)`.
 
-See [`docs/upstream-plugins.md`](../extending/upstream-plugins.md) for how to author an upstream
+See [`docs/extending/upstream-plugins.md`](../extending/upstream-plugins.md) for how to author an upstream
 remote plugin.
 
 ### GitHub upstream: pull request flow
@@ -832,7 +832,7 @@ the built-in env-var provider.
 > configuration option that excludes all installed plugins while keeping the
 > built-in providers.
 
-See [`docs/credential-plugins.md`](../extending/credential-plugins.md) for the full plugin
+See [`docs/extending/credential-plugins.md`](../extending/credential-plugins.md) for the full plugin
 author guide, chain-order rationale, and sample implementation.
 
 ---

@@ -1,7 +1,6 @@
 # Sandbox Providers Manual UAT
 
-These procedures cover the manual/spec-only checks from `docs/uat/00-plan.md`
-for the Sandbox Providers section. Run them on a disposable host or disposable
+These procedures cover the Sandbox Providers section. Run them on a disposable host or disposable
 project; several steps intentionally create and destroy sandboxes.
 
 ## Multipass Real VM Launch And Baseline Clone

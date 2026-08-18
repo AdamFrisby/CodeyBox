@@ -178,4 +178,4 @@ Then configure the orchestrator:
 3. Set `Upstream.Kind` in your project config to match `IUpstreamRemote.Name`.
 4. Add `Upstream.PluginConfig` entries for any plugin-specific settings.
 
-See `docs/plugins.md` for full plugin registration and allowlisting guidance.
+See `docs/extending/plugins.md` for full plugin registration and allowlisting guidance.

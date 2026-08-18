@@ -1,7 +1,6 @@
 # Persistence And Recovery Manual UAT
 
-These procedures cover the spec-only checks from `docs/uat/00-plan.md` for the
-Persistence And Recovery section. Run them against disposable state databases and
+These procedures cover the Persistence And Recovery section. Run them against disposable state databases and
 repositories only.
 
 ## Real State Database Upgrade

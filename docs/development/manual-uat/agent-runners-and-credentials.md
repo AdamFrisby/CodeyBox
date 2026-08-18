@@ -1,7 +1,5 @@
 # Agent Runners And Credentials Manual UAT
 
-Scope: `docs/uat/00-plan.md#agent-runners-and-credentials`.
-
 Use this checklist for the scenarios that require real vendor CLIs, real OAuth/API credentials, or a VM sandbox. Do not commit real credentials or captured auth files.
 
 ## Prerequisites

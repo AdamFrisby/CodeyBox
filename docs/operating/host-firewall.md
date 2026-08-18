@@ -98,7 +98,7 @@ reach LAN hosts via the host's other interfaces.
 Once per host:
 
 ```bash
-# 1. Install the selected VM provider first. See docs/sandbox-providers.md;
+# 1. Install the selected VM provider first. See docs/concepts/sandboxes.md;
 #    Incus also requires its pre-created ZFS/Btrfs pool.
 
 # 2. Create the network profile config.

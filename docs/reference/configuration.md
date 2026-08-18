@@ -518,7 +518,7 @@ that were suspended by the previous process.
 ## `AgentClasses`
 
 Defines named groups of interchangeable agents for quota-aware routing.
-See [docs/agent-classes.md](../concepts/agent-classes.md) for the full model including
+See [docs/concepts/agent-classes.md](../concepts/agent-classes.md) for the full model including
 `QualityScore` semantics, the floor filter, and TOD modifiers.
 
 ```json
@@ -552,7 +552,7 @@ with the global `CodeyBox:ClaudeSession:Enabled` switch and the per-project
 ## `AgentScoreModifiers`
 
 Small time-of-day score deltas that act as tiebreakers between near-equivalent
-members. All times are UTC. See [docs/agent-classes.md](../concepts/agent-classes.md#time-of-day-score-modifiers)
+members. All times are UTC. See [docs/concepts/agent-classes.md](../concepts/agent-classes.md#time-of-day-score-modifiers)
 for the design rationale.
 
 ```json
@@ -690,7 +690,7 @@ Items paused at the project or global queue level are skipped — operators
 pause queues for a reason. Each scheduler evaluation emits a
 `quota_retry_attempted` audit-log event with `Source` and `Outcome`, including
 no-op skips. Each successful auto-retry emits a `work_item.auto_retry` webhook
-(see [docs/webhooks.md](webhooks.md#auto_retry-details)).
+(see [docs/reference/webhooks.md](webhooks.md#auto_retry-details)).
 
 ---
 
@@ -857,11 +857,11 @@ The inspector also understands the two operator-keyed map shapes that
 `ProjectsOptionsBinder.ApplyCustomMaps` reads:
 
 - `Audit:Languages:Overrides:<lang-id>:…` — the per-language override map
-  documented in [`docs/languages.md`](../quality/presets.md). Operator-defined
+  documented in [`docs/quality/presets.md`](../quality/presets.md). Operator-defined
   language ids are accepted as dictionary keys; typos *inside* the
   override value (e.g. `Replce` instead of `Replace`) are still flagged.
 - `Audit:AuditTypes:<id>:…` — the per-audit-type override map documented
-  in [`docs/audit-types.md`](../quality/presets.md). The inspector detects the
+  in [`docs/quality/presets.md`](../quality/presets.md). The inspector detects the
   shape automatically (all-numeric keys → list form, any non-numeric key
   → map form) and walks the override POCO under each id so unknown
   sub-fields still surface.
@@ -1004,7 +1004,7 @@ preprocessors that run in order before every agent invocation:
 ## `AgentStreams`
 
 Structured stdout stream capture for agent invocations. See
-[docs/agent-streams.md](../operating/agent-streams.md) for file layout, CLI flags, retention,
+[docs/operating/agent-streams.md](../operating/agent-streams.md) for file layout, CLI flags, retention,
 and API endpoints.
 
 ```json
@@ -1028,7 +1028,7 @@ and API endpoints.
 ## `AgentSupervision`
 
 Config-gated live human supervision and injection for all active agent
-invocations. See [docs/agent-supervision.md](../operating/supervision.md) for the
+invocations. See [docs/operating/supervision.md](../operating/supervision.md) for the
 SignalR protocol and injection semantics.
 
 ```json
@@ -1077,13 +1077,13 @@ Read-only parser settings for agent stream analytics.
 
 ## `Projects`
 
-See [docs/projects.md](../concepts/projects.md).
+See [docs/concepts/projects.md](../concepts/projects.md).
 
 ---
 
 ## `Webhooks`
 
-See [docs/webhooks.md](webhooks.md).
+See [docs/reference/webhooks.md](webhooks.md).
 
 ---
 

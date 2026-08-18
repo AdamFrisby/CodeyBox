@@ -1,7 +1,6 @@
 # Upstream, Webhooks, And Releases Manual UAT
 
-These procedures cover the spec-only checks from `docs/uat/00-plan.md` for the
-Upstream, Webhooks, And Releases section. Run them against disposable projects,
+These procedures cover the Upstream, Webhooks, And Releases section. Run them against disposable projects,
 repositories, webhook receivers, and tokens.
 
 ## Live GitHub PR Open And Auto-Merge

@@ -256,7 +256,7 @@ Capability: `None`.
 
 ### Built-in audit-type presets
 
-CodeyBox ships these audit-type presets as YAML resources (see `docs/audit-types.md`):
+CodeyBox ships these audit-type presets as YAML resources (see `docs/quality/presets.md`):
 
 | Preset         | Components                                                              |
 |----------------|-------------------------------------------------------------------------|
@@ -268,7 +268,7 @@ CodeyBox ships these audit-type presets as YAML resources (see `docs/audit-types
 | `tests`        | Deterministic diff-patterns for no-op assertions + LLM review focus for test meaningfulness. |
 
 A project enables a preset by listing its name in
-`Audit.AuditTypes` (see `docs/projects.md`).
+`Audit.AuditTypes` (see `docs/concepts/projects.md`).
 
 ### Built-in auditor profiles
 
@@ -286,7 +286,7 @@ CodeyBox includes `uat`, a preset for UAT/test-generation work:
 ### Built-in language presets
 
 Language presets are selected with `Project.Audit.Languages`. They are
-tool-only YAML resources; see `docs/languages.md`.
+tool-only YAML resources; see `docs/quality/presets.md`.
 
 | Language | Marker files | auditors |
 |---|---|---|
@@ -637,7 +637,7 @@ The pipeline falls back to the work agent (with a warning log) when:
   minimum threshold AND there is no work-item agent class to walk.
 
 When the work item DOES have an agent class configured (see
-`docs/agent-classes.md`) and the configured audit agent's quota is below
+`docs/concepts/agent-classes.md`) and the configured audit agent's quota is below
 threshold, the audit router walks the work-item's class chain — preferring
 class members that pass the same observed-failure + probe checks the
 work-phase router uses — and routes the LLM auditor to the first viable
@@ -666,7 +666,7 @@ quota-exhausted.
 | `quota_router.audit_fallthrough` | Once per auditor when quota triggered fallthrough. |
 | `audit.llm_auditor_parked_quota` | Once per auditor when every candidate agent was quota-exhausted; the work item parks in `WaitingForQuotaReset` and the `QuotaRetryScheduler` resumes the same iteration when quota returns. |
 
-The `work_item.audit_iteration` webhook event (see `docs/webhooks.md`)
+The `work_item.audit_iteration` webhook event (see `docs/reference/webhooks.md`)
 gains an optional `auditAgentKind` field in its `details` object:
 - Set to the audit agent kind string (e.g. `"gemini"`) when cross-review
   is active for that iteration.

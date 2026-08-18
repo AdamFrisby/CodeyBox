@@ -678,7 +678,7 @@ consumes an already-present baseline on the selected host.
    - `SandboxConventions.WorkDir` and `CredentialsDir` paths inside the sandbox.
 3. Document the new provider in this file.
 4. Register it in the switch in `Program.cs`.
-5. Update `docs/security.md` with any provider-specific caveats.
+5. Update `docs/concepts/security.md` with any provider-specific caveats.
 
 ## Network allowlist enforcement
 

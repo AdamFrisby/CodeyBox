@@ -1,7 +1,6 @@
 # Projects And Configuration Manual UAT
 
-These procedures cover the manual/spec-only checks from `docs/uat/00-plan.md`
-for the Projects And Configuration section. Run them against a disposable
+These procedures cover the Projects And Configuration section. Run them against a disposable
 CodeyBox deployment and preserve the effective config file, startup logs, API
 responses, and relevant screenshots with the UAT run record.
 

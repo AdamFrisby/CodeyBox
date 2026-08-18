@@ -1,18 +1,22 @@
-# CodeyBox CLI — Project Configuration Wizard
+# Command-line tools
 
-`CodeyBox.Cli` is a standalone interactive wizard that walks an operator
-through configuring a new project entry and outputs the JSON snippet
-to paste into `appsettings.json`.
+Two separate binaries, easy to confuse:
 
-## Running the wizard
+| Tool | Project | What it does |
+|---|---|---|
+| `codeybox` | `tools/CodeyBox.Cli` | typed client for the REST API — queue, inspect, watch, pause. Full command reference in [`../../tools/CodeyBox.Cli/README.md`](../../tools/CodeyBox.Cli/README.md). |
+| the wizard | `src/CodeyBox.Cli` (`CodeyBox.Wizard`) | interactive project-configuration generator; prints a JSON snippet for your config file. Documented below. |
+
+## The project-configuration wizard
+
+It asks a fixed sequence of questions and writes nothing — you paste the
+result. No arguments:
 
 ```bash
 dotnet run --project src/CodeyBox.Cli
 ```
 
-No arguments are required. The wizard is fully interactive.
-
-## What it asks
+### What it asks
 
 | Step | Prompt | Notes |
 |------|--------|-------|
@@ -56,7 +60,7 @@ CODEYBOX_NETWORK_PROFILES=claude,restricted,outbound \
 The names must match keys you have configured in `SandboxNetworkProfiles`
 in `appsettings.json`.
 
-## Output
+### Output
 
 After all prompts the wizard prints the generated JSON. In an interactive
 terminal it renders inside a styled panel. When stdout is redirected the
@@ -107,18 +111,9 @@ override file):
 }
 ```
 
-## Building
+## Pausing an agent
 
-The project is included in the solution and builds with the rest of
-the codebase:
-
-```bash
-dotnet build CodeyBox.slnx
-```
-
-## Agent Pause Commands
-
-The operator CLI also exposes per-agent runtime pause controls:
+The `codeybox` client exposes per-agent runtime pause controls:
 
 ```bash
 codeybox agents pause claude --reason "reserve quota for oversight" --for 6h

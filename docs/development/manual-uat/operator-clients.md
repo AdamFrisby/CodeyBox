@@ -1,7 +1,6 @@
 # Operator Clients Manual UAT
 
-These procedures cover the manual/spec-only flows from `docs/uat/00-plan.md` for
-the Operator Clients section.
+These procedures cover the Operator Clients section.
 
 ## Installed CLI
 

@@ -1,7 +1,6 @@
 # Pipeline And Worker Lifecycle Manual UAT
 
-These procedures cover the spec-only checks from `docs/uat/00-plan.md` for the
-Pipeline And Worker Lifecycle section. Run them against a disposable project and
+These procedures cover the Pipeline And Worker Lifecycle section. Run them against a disposable project and
 repository; do not use a production queue or upstream.
 
 ## Full Sandboxed Real-Agent Pipeline

@@ -1,7 +1,5 @@
 # Plugins Manual UAT
 
-Source plan: `docs/uat/00-plan.md#Plugins`
-
 Use a non-production CodeyBox deployment. Preserve plugin DLL checksums, effective configuration, `/plugins` payloads, audit report payloads, work item IDs, relevant log excerpts, and screenshots with the UAT run record.
 
 ## External Plugin Installation And Discovery

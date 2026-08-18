@@ -307,4 +307,4 @@ To adapt for a real vault:
 2. Parse the vault's lease duration into `ExpiresAt`.
 3. Add authentication (AppRole, Kubernetes SA, etc.) via `IPluginHost.ScopedConfig`.
 
-See [`docs/plugins.md`](plugins.md) for the general plugin authoring guide.
+See [`docs/extending/plugins.md`](plugins.md) for the general plugin authoring guide.

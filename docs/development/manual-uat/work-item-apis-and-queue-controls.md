@@ -1,7 +1,5 @@
 # Work Item APIs And Queue Controls Manual UAT
 
-Source plan: `docs/uat/00-plan.md#work-item-apis-and-queue-controls`
-
 Run these procedures against a disposable CodeyBox deployment with authentication enabled and a non-production repository. Preserve request/response payloads, dashboard screenshots, audit log excerpts, and affected work item IDs with the UAT run record.
 
 ## API Smoke And Admin UI

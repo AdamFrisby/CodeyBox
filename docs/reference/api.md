@@ -985,7 +985,7 @@ Cancel a work item or close out a terminal-failure item.
   item is transitioned to `Cancelled` for bookkeeping — used after an
   operator resolves the work out-of-band (e.g. manually merging the
   branch). No cascade, no replay; the pipeline never re-dispatches the
-  row. See [docs/work-items.md](../concepts/work-items.md#closing-terminal-failure-items-operator-bookkeeping).
+  row. See [docs/concepts/work-items.md](../concepts/work-items.md#closing-terminal-failure-items-operator-bookkeeping).
 * Already-`Cancelled` items return `202 Accepted` as a no-op (idempotent).
 * `Done` items return `409 Conflict` — a successful merge cannot be cancelled.
 

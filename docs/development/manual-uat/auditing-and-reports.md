@@ -1,7 +1,5 @@
 # Auditing And Reports Manual UAT
 
-Source plan: `docs/uat/00-plan.md#Auditing-And-Reports`
-
 Use a non-production CodeyBox deployment with authentication enabled unless a step explicitly says otherwise. Preserve the work item IDs, audit report API payloads, dashboard screenshots, and relevant log excerpts with the UAT run record.
 
 ## Operator Config Review For Presets

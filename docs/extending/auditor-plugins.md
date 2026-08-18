@@ -251,7 +251,7 @@ dotnet build samples/CodeyBox.SampleAuditorPlugin/
 
 ## Security model
 
-Plugin security is documented in full in [`docs/plugins.md`](plugins.md). Key points:
+Plugin security is documented in full in [`docs/extending/plugins.md`](plugins.md). Key points:
 
 - Only IDs in `CodeyBox:Plugins:Allowlist` load. An empty allowlist blocks everything.
 - Plugins cannot shadow `ICredentialProvider` or `IAgentRunner` — the loader blocks

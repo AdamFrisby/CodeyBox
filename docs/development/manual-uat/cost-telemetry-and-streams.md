@@ -1,7 +1,6 @@
 # Cost, Telemetry, And Streams Manual UAT
 
-These procedures cover the manual/spec-only checks from
-`docs/uat/00-plan.md#cost-telemetry-and-streams`. Run them against disposable
+Run these procedures against disposable
 projects, credentials, collectors, and webhook receivers. Do not preserve real
 secrets in the UAT record.
 

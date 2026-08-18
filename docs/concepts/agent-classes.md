@@ -404,7 +404,7 @@ have migrated.
 ## Time-of-day score modifiers
 
 Small score deltas that fire during defined UTC time windows act as tiebreakers
-between near-equivalent models. See `docs/configuration.md` for the full
+between near-equivalent models. See `docs/reference/configuration.md` for the full
 `CodeyBox:AgentScoreModifiers` schema.
 
 **Design intent:** a modifier of −1 is *only* enough to break a tie between two
@@ -640,7 +640,7 @@ A per-item `AgentClassId` overrides the project default.
 The agent-class router described above applies to the **work phase** (and
 rework) of a work item. The **audit phase** uses a separate resolution path
 via `Project.Audit.AuditAgent` / `Project.Audit.PerAuditorAgent` — see
-`docs/audit.md` for the full cross-review documentation.
+`docs/quality/audit.md` for the full cross-review documentation.
 
 Key differences:
 
@@ -679,7 +679,7 @@ At startup the orchestrator validates the `AgentClasses` config:
 - Each member `Agent` is non-empty.
 - Each member `Billing` is `Subscription` or `PayPerApi`.
 - Each member has a `QualityScore` in 0–200. Missing scores are **rejected**
-  with a migration message: add `QualityScore=N; see docs/agent-classes.md`.
+  with a migration message: add `QualityScore=N; see docs/concepts/agent-classes.md`.
 - Duplicate `(route key, ModelId)` members are rejected. To pool multiple
   same-kind subscriptions, give them distinct `InstanceId` values.
 - Full route-key instance ids such as `claude/acct-a` must have a prefix that
