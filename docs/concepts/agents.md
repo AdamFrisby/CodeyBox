@@ -10,18 +10,22 @@ tooling, not in the agent runner contract.
 
 | Kind        | Binary in sandbox | Auth env (sandbox-side) | Host env (orchestrator) |
 |-------------|-------------------|-------------------------|-------------------------|
-| `claude`    | `claude`          | `ANTHROPIC_API_KEY`     | `CODEYBOX_CLAUDE_API_KEY` |
+| `claude`    | `claude`          | `ANTHROPIC_API_KEY`, or `CLAUDE_CODE_OAUTH_TOKEN` for a subscription | `CODEYBOX_CLAUDE_API_KEY`, or `CODEYBOX_CLAUDE_OAUTH_JSON` for a subscription bundle |
 | `copilot`   | `copilot`         | `GH_TOKEN`              | `CODEYBOX_COPILOT_TOKEN`  |
 | `codex`     | `codex`           | `OPENAI_API_KEY`        | `CODEYBOX_CODEX_API_KEY`  |
 | `gemini`    | `gemini`          | `GEMINI_API_KEY`        | `CODEYBOX_GEMINI_API_KEY` |
 | `cursor`    | `agent`           | `CODEYBOX_CURSOR_AUTH_JSON` (subscription credentials JSON) | `CODEYBOX_CURSOR_AUTH_FILE` (file path on host) |
-| `opencode`  | `opencode`        | `OPENCODE_AUTH_JSON` (file-materialised) | `CODEYBOX_OPENCODE_AUTH_FILE` |
-| `antigravity` | `agy`           | `CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON` (OAuth credentials JSON, file-materialised to `~/.agy/oauth_creds.json`) | `CODEYBOX_ANTIGRAVITY_OAUTH_TOKEN` (raw access token fallback) |
+| `opencode`  | `opencode`        | `OPENCODE_AUTH_JSON`, written to `~/.local/share/opencode/auth.json` | `CODEYBOX_OPENCODE_AUTH_FILE` |
+| `antigravity` | `agy`           | `CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON` (OAuth bundle, written to `~/.gemini/antigravity-cli/antigravity-oauth-token`) | `CODEYBOX_ANTIGRAVITY_OAUTH_CREDS_JSON` |
 | `crock`     | `crock`           | `CROCK_CONFIG_JSON` (file-materialised to `~/.crockcode/config.json`) | `CODEYBOX_CROCK_CONFIG_JSON` |
 
-The sandbox-side env name is what the agent CLI reads. The host-side env
-name is what the orchestrator's `EnvironmentCredentialProvider` looks up
-when building the credential bundle. They are intentionally namespaced
+The sandbox-side env name is what the agent CLI reads. The host-side name is
+what the orchestrator looks up when building the credential bundle — for most
+agents through `EnvironmentCredentialProvider`, and for Claude, Cursor,
+Antigravity, opencode, and Crock through a dedicated provider that materialises
+a credential *file* inside the sandbox. Quota probes resolve their own tokens
+separately: Antigravity's, for instance, falls back to the Gemini OAuth file and
+then `CODEYBOX_ANTIGRAVITY_OAUTH_TOKEN`. They are intentionally namespaced
 differently so the host environment can hold multiple agents'
 credentials at once without collision.
 
