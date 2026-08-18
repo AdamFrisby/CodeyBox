@@ -81,7 +81,7 @@ public sealed class CrockAgentRunner : CliAgentRunnerBase
     /// from <c>CODEYBOX_CROCK_CONFIG_JSON</c> on the host (or the per-instance
     /// member <c>CredentialReference</c>) and ships it inside the credential
     /// bundle under this name; the runner materialises it to
-    /// <c>~/.crockcode/config.json</c>. See <c>docs/concepts/agents.md</c> (CrockCode
+    /// <c>~/.crockcode/config.json</c>. See <c>docs/agents.md</c> (CrockCode
     /// section) for the operator setup.
     /// </summary>
     public const string ConfigEnvVar = "CROCK_CONFIG_JSON";

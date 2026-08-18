@@ -36,7 +36,7 @@ namespace CodeyBox.Agents.Claude;
 /// <param name="UsedResume">True when this turn passed a continuation id (CLI <c>--resume</c> for print, ACP <c>session/load</c> for acp).</param>
 /// <param name="Transport">Transport tag — <c>"print"</c>, <c>"acp"</c>, or empty for legacy callers.</param>
 /// <remarks>
-/// <para>ACP cache-warmth verification (see docs/concepts/agents.md "Verifying ACP cache
+/// <para>ACP cache-warmth verification (see docs/agents.md "Verifying ACP cache
 /// warmth"). The print transport keeps one long-lived <c>claude --print --resume</c>
 /// per turn; the ACP transport currently tears down and respawns
 /// <c>claude --ide</c> each turn, with continuity supplied by <c>session/load</c>.

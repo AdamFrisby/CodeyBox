@@ -114,7 +114,7 @@ public sealed class CursorAgentRunnerFastModeRegressionTests
                 Assert.False(FastTokenPattern.IsMatch(token),
                     $"Cursor runner emitted a fast-mode-shaped token '{token}' in argv. " +
                     $"NO fast mode under any flag combination, env var, or config option. " +
-                    $"See docs/concepts/agents.md and CursorAgentRunner.cs class summary.");
+                    $"See docs/agents.md and CursorAgentRunner.cs class summary.");
             }
         }
     }

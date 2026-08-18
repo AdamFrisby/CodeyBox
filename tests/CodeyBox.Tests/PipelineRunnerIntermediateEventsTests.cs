@@ -324,7 +324,7 @@ public sealed class PipelineRunnerIntermediateEventsTests : IDisposable
         var startedDetails = Assert.IsType<IterationStartedDetails>(reworkStarted!.Details);
         Assert.Equal(item.Id.ToString(), startedDetails.WorkItemId);
         Assert.Equal(IterationPhase.Rework, startedDetails.Phase);
-        // Resume re-bases the rework numbering to 1 — see docs/reference/webhooks.md
+        // Resume re-bases the rework numbering to 1 — see docs/webhooks.md
         // "Resumed-after-preempt caveat".
         Assert.Equal(1, startedDetails.Iteration);
 

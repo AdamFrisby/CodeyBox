@@ -20,7 +20,7 @@ public enum AutomationKind
 /// (no SurfaceArea, no parent/path/level hierarchy). <see cref="ExecutableArtifactJson"/>
 /// and <see cref="ConformanceJson"/> are persisted as opaque JSON strings; the schema for
 /// those payloads is owned by their consumers (the E2E executor, the mutation gate), which
-/// land as separate items. See <c>docs/quality/test-cases.md</c> for the schema and the JobTrack mapping.
+/// land as separate items. See <c>docs/test-cases.md</c> for the schema and the JobTrack mapping.
 /// </summary>
 public sealed record TestCase
 {

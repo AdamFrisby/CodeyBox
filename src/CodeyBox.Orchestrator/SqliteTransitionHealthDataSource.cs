@@ -160,7 +160,7 @@ public sealed class SqliteTransitionHealthDataSource : ITransitionHealthDataSour
         // throughput (not a health signal), Cancelled is operator intent, and
         // AuditFailed (rework-cap hit) is a work-quality outcome whose
         // preceding audit_report rows already contribute to the audit-stage
-        // score. See docs/operating/pipeline-metrics.md.
+        // score. See docs/transition-health.md.
         var failedState = (int)WorkItemState.Failed;
         var abandonedState = (int)WorkItemState.AbandonedAfterRecoveryAttempts;
         var mcrfState = (int)WorkItemState.MergeConflictResolutionFailed;

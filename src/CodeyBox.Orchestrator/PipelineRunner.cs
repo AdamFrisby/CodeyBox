@@ -4805,7 +4805,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         string? approvedPlan = null)
     {
         var sb = new System.Text.StringBuilder();
-        sb.Append($"Work only in the repository and branch already checked out in this workspace. Commit your changes locally, but do not push branches, create pull requests, or use GitHub/GitLab APIs, MCP tools, CLIs, or web interfaces for delivery. The CodeyBox orchestrator owns all upstream publication after audit.\n\nEvery commit message MUST end with the following trailers, separated from the subject by a blank line:\n\n    {CodeyBoxTrailers.PromptRevisionTrailerKey}: ${CodeyBoxTrailers.PromptRevisionEnvVar}\n    {CodeyBoxTrailers.CoAuthoredBy}\n\nThe `{CodeyBoxTrailers.PromptRevisionTrailerKey}` value MUST be the literal integer from the `{CodeyBoxTrailers.PromptRevisionEnvVar}` environment variable — the orchestrator uses it to detect when an agent finished work against an older prompt. Copy the number verbatim; do not include the variable syntax in the commit.\n\nIf during your work you notice adjacent issues that are out of scope for the current task — bugs you saw, gaps in tests, missing validation, dead code — write them to `.codeybox/suggestions.json` as structured entries (schema in `docs/concepts/agent-feedback.md`). Do **not** fix them in this work item; the operator will triage. If you have nothing to suggest, do not create the file.");
+        sb.Append($"Work only in the repository and branch already checked out in this workspace. Commit your changes locally, but do not push branches, create pull requests, or use GitHub/GitLab APIs, MCP tools, CLIs, or web interfaces for delivery. The CodeyBox orchestrator owns all upstream publication after audit.\n\nEvery commit message MUST end with the following trailers, separated from the subject by a blank line:\n\n    {CodeyBoxTrailers.PromptRevisionTrailerKey}: ${CodeyBoxTrailers.PromptRevisionEnvVar}\n    {CodeyBoxTrailers.CoAuthoredBy}\n\nThe `{CodeyBoxTrailers.PromptRevisionTrailerKey}` value MUST be the literal integer from the `{CodeyBoxTrailers.PromptRevisionEnvVar}` environment variable — the orchestrator uses it to detect when an agent finished work against an older prompt. Copy the number verbatim; do not include the variable syntax in the commit.\n\nIf during your work you notice adjacent issues that are out of scope for the current task — bugs you saw, gaps in tests, missing validation, dead code — write them to `.codeybox/suggestions.json` as structured entries (schema in `docs/suggestions.md`). Do **not** fix them in this work item; the operator will triage. If you have nothing to suggest, do not create the file.");
 
         // Pre-flight self-check: surface the project's mechanical (shell-kind)
         // auditors so the agent runs them before declaring done. Language-agnostic
@@ -19282,7 +19282,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
     /// <summary>
     /// Builds the focused conflict-rework prompt. Mirrors the template in
-    /// <c>docs/concepts/work-items.md</c> guidance for this feature: explains the
+    /// <c>docs/work-items.md</c> guidance for this feature: explains the
     /// in-progress rebase state, prohibits destructive actions, and documents
     /// the <c>SEMANTIC_INCOMPATIBLE:</c> escape hatch.
     /// </summary>

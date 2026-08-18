@@ -70,12 +70,12 @@ public sealed class PluginLoader : IPluginLoader
 
     // Plugins must not shadow the agent runner: doing so would let an allowlisted
     // plugin intercept all agent execution for the host, contradicting the threat
-    // model in docs/extending/plugins.md.
+    // model in docs/plugins.md.
     //
     // ICredentialProvider is intentionally NOT blocked. Plugins that implement it
     // are registered as normal DI singletons and inserted into the credential chain
     // between the built-in OAuth-file and env-var providers. The chain order is
-    // BUILT-IN-OAUTH → PLUGINS → BUILT-IN-ENV. See docs/extending/credential-plugins.md for
+    // BUILT-IN-OAUTH → PLUGINS → BUILT-IN-ENV. See docs/credential-plugins.md for
     // the full rationale and per-project priority override semantics.
     private static readonly HashSet<Type> _blockedInterfaces =
     [

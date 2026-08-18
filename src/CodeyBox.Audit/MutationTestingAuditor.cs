@@ -11,7 +11,7 @@ namespace CodeyBox.Audit;
 ///   base...HEAD</c>, filtered by configured extensions and exclude prefixes.</item>
 ///   <item>Hands the scoped file list to an injected <see cref="IMutationRunner"/>,
 ///   which mutates that code and re-runs the project's test suite per mutant
-///   (the runner is expected to parallelise — see docs/quality/mutation-rigor.md
+///   (the runner is expected to parallelise — see docs/mutation-testing.md
 ///   for the runtime budget).</item>
 ///   <item>Reports one Error finding per surviving mutant in changed code
 ///   (un-gameable conformance: a no-assert / impl-mirroring test kills no

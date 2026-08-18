@@ -8,7 +8,7 @@
     - Never reference CodeyBox.Orchestrator or CodeyBox.Api.
     - Additional NuGet packages are allowed for HTTP client functionality.
 
-    See docs/extending/upstream-plugins.md for authoring guidance.
+    See docs/upstream-plugins.md for authoring guidance.
   -->
 
   <PropertyGroup>

@@ -12,7 +12,7 @@ namespace CodeyBox.Tests;
 /// correlate the worker exit with the phase + source the pipeline saw:
 /// a typo in the template, swallowing the wrong exception type, or omitting
 /// the phase/source placeholders would silently regress the operator dashboard
-/// contract advertised in docs/operating/logging.md and docs/concepts/work-items.md.
+/// contract advertised in docs/audit-logging.md and docs/work-items.md.
 ///
 /// <para>Pinned to the "Background service timing" collection because both
 /// tests wait up to 15s for the OrchestratorService worker loop to pick the

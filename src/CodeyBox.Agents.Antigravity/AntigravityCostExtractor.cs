@@ -31,7 +31,7 @@ public sealed class AntigravityCostExtractor : IAgentCostExtractor
     /// 7-day lockout) means token-precision billing is operator-config
     /// territory anyway — this default keeps cost reporting non-zero until
     /// the operator wires <c>CodeyBox:AgentPricing</c> for the gateway model
-    /// ids they actually use. See docs/operating/costs.md.
+    /// ids they actually use. See docs/agent-pricing.md.
     /// </summary>
     public ModelRateConfig? DefaultPricing { get; } = new()
     {

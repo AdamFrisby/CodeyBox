@@ -14,7 +14,7 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// Verifies that the framework configuration stack supports the hot-reload
-/// guarantees from <c>docs/reference/configuration.md</c> — operators editing
+/// guarantees from <c>docs/configuration.md</c> — operators editing
 /// <c>appsettings.json</c> see the change in flight without restarting
 /// CodeyBox, except for fields that are open-handle-bound or otherwise
 /// unsafe to swap, which are rejected by an <see cref="IValidateOptions{T}"/>.

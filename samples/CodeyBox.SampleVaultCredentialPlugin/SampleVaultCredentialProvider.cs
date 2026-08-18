@@ -11,7 +11,7 @@
 // 4. Configure the vault path under CodeyBox:Plugins:sample.vault-creds.
 // 5. Restart the orchestrator — the chain picks up the plugin automatically.
 //
-// See docs/extending/credential-plugins.md for the full author guide.
+// See docs/credential-plugins.md for the full author guide.
 
 using System.Text.Json;
 using CodeyBox.Core;

@@ -16,7 +16,7 @@
 //   The orchestrator forwards it via UpstreamCompletionRequest.TokenEnvVar;
 //   this plugin reads the token with Environment.GetEnvironmentVariable(request.TokenEnvVar).
 //
-// See docs/extending/upstream-plugins.md for full authoring guidance.
+// See docs/upstream-plugins.md for full authoring guidance.
 
 using System.Net;
 using System.Net.Http.Headers;

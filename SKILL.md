@@ -63,7 +63,7 @@ authenticated Admin, API, and caller access through the canonical origin.
 
 Provider baselines are independent. Ask which network-profile baselines to
 prewarm; do not assume Incus inherits Multipass provisioning. Read
-`docs/concepts/sandboxes.md` and `docs/operating/host-firewall.md`.
+`docs/sandbox-providers.md` and `docs/host-firewall.md`.
 
 ## Define installation completeness
 
@@ -81,7 +81,7 @@ The normal public layout is `https://codeybox.example/` for Admin and
 Admin hostname is an explicit exception, not the default.
 
 An operator must be able to tell what is running, what needs attention, why it
-failed, and how to recover it. Read `docs/concepts/security.md`, `docs/operating/running.md`,
+failed, and how to recover it. Read `docs/security.md`, `docs/operations.md`,
 and the Admin documentation before finalizing the inventory.
 
 ## Build and configure
@@ -117,7 +117,7 @@ Put project configuration in JSON and point `CODEYBOX_EXTRA_CONFIG` at it:
 ```
 
 Use credential-free repository URLs and protected environment variables for
-secrets. See `docs/concepts/projects.md` and `docs/reference/configuration.md`.
+secrets. See `docs/projects.md` and `docs/configuration.md`.
 
 For development:
 
@@ -219,4 +219,4 @@ reconciliation, dashboard visibility, and failure recovery separately.
   policy, and retry the bounded upstream phase.
 
 Judge health by advancing state and timestamps, not only completed-item count.
-See `docs/operating/running.md` and `docs/operating/recovery.md`.
+See `docs/operations.md` and `docs/recovery.md`.

@@ -5,7 +5,7 @@ using CodeyBox.Webhooks;
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Guards against drift between <c>docs/reference/events.md</c> and the
+/// Guards against drift between <c>docs/EVENT_SCHEMA.md</c> and the
 /// programmatic <see cref="EventSchema"/>. Drift is checked in both directions:
 /// every entry in <see cref="EventSchema.KnownEventTypes"/> must appear in the
 /// doc, and every row in the doc's event-type table must exist in code. That
@@ -28,7 +28,7 @@ public sealed class EventSchemaDocSyncTests
     }
 
     private static string ReadDoc() =>
-        File.ReadAllText(Path.Combine(FindRepoRoot(), "docs", "reference", "events.md"));
+        File.ReadAllText(Path.Combine(FindRepoRoot(), "docs", "EVENT_SCHEMA.md"));
 
     [Fact]
     public void Doc_MentionsEveryKnownEventType()
@@ -38,7 +38,7 @@ public sealed class EventSchemaDocSyncTests
         {
             Assert.True(
                 doc.Contains($"`{name}`"),
-                $"docs/reference/events.md must include a row for event type `{name}` (was added to EventSchema.KnownEventTypes but the doc was not updated)");
+                $"docs/EVENT_SCHEMA.md must include a row for event type `{name}` (was added to EventSchema.KnownEventTypes but the doc was not updated)");
         }
     }
 
@@ -61,7 +61,7 @@ public sealed class EventSchemaDocSyncTests
         var stale = docTypes.Except(known).ToList();
         Assert.True(
             stale.Count == 0,
-            $"docs/reference/events.md still lists event types that are no longer in EventSchema.KnownEventTypes: {string.Join(", ", stale)}");
+            $"docs/EVENT_SCHEMA.md still lists event types that are no longer in EventSchema.KnownEventTypes: {string.Join(", ", stale)}");
     }
 
     [Fact]
@@ -75,7 +75,7 @@ public sealed class EventSchemaDocSyncTests
         {
             Assert.True(
                 schema.EventTypes.TryGetValue(name, out var eventType),
-                $"docs/reference/events.md lists event type `{name}` but EventSchema does not");
+                $"docs/EVENT_SCHEMA.md lists event type `{name}` but EventSchema does not");
             Assert.Equal(introducedIn, eventType.IntroducedIn);
         }
     }
@@ -87,7 +87,7 @@ public sealed class EventSchemaDocSyncTests
         Assert.Equal(ExpectedCurrentSchemaVersion, EventSchema.CurrentVersion);
 
         var declaration = Regex.Match(doc, @"^eventSchemaVersion\s*=\s*""(?<version>\d+\.\d+)""\s*$", RegexOptions.Multiline);
-        Assert.True(declaration.Success, "docs/reference/events.md must declare the current eventSchemaVersion");
+        Assert.True(declaration.Success, "docs/EVENT_SCHEMA.md must declare the current eventSchemaVersion");
         Assert.Equal(ExpectedCurrentSchemaVersion, declaration.Groups["version"].Value);
     }
 

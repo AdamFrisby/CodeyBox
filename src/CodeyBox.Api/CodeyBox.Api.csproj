@@ -37,7 +37,7 @@
   <!--
     Bundled per-(agent, model) pricing defaults. Copied next to the binary so
     AgentPricingDefaults can resolve it via IHostEnvironment.ContentRootPath
-    in both `dotnet run` and published deployments. See docs/operating/costs.md.
+    in both `dotnet run` and published deployments. See docs/agent-pricing.md.
     Uses Update (not Include) because the .NET Web SDK auto-discovers
     Content items at the project root.
   -->

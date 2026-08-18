@@ -16,7 +16,7 @@
 //   <PackageReference Include="CodeyBox.Core"      Version="..." />
 //   <PackageReference Include="CodeyBox.PluginSdk" Version="..." />
 //
-// See docs/extending/auditor-plugins.md for full author guidance.
+// See docs/auditor-plugins.md for full author guidance.
 
 using System.Text.RegularExpressions;
 using CodeyBox.Core;

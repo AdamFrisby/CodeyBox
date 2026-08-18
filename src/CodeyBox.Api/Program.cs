@@ -395,7 +395,7 @@ ApiKeyAuth.Configure(builder);
 
 // --- Sandbox provider --------------------------------------------------------
 // Selected by CodeyBox:SandboxProvider in config. Each option has a different
-// security/setup trade-off — see docs/concepts/sandboxes.md.
+// security/setup trade-off — see docs/sandbox-providers.md.
 //
 //   process     — UNSAFE. No isolation. Dev only; refuses to load outside
 //                 Development env unless DangerouslyAllowProcessSandbox=true.
@@ -472,7 +472,7 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
             throw new InvalidOperationException(
                 "CodeyBox:SandboxProvider must be set in non-Development environments. " +
                 "Choose one of: incus, multipass, multipass-remote, sprites, bubblewrap, process " +
-                "(see docs/concepts/sandboxes.md for trade-offs).");
+                "(see docs/sandbox-providers.md for trade-offs).");
         }
     }
 
@@ -1086,7 +1086,7 @@ builder.Services.AddSingleton<IAgentRunner>(_ => new AntigravityAgentRunner
 // Crock: registered, but DISABLED in shipped agent-class config. Operators opt
 // in by adding `crock` to an AgentClass member list AND setting
 // CodeyBox:Crock:HostDaemonSocketPath to the on-host `crock daemon` Unix
-// socket. See the CrockCode section of docs/concepts/agents.md and CrockSandboxOptions
+// socket. See the CrockCode section of docs/agents.md and CrockSandboxOptions
 // for the tunnel-model rationale and operator setup.
 builder.Services.AddSingleton<IAgentRunner>(sp => new CrockAgentRunner
 {
@@ -1227,7 +1227,7 @@ IReadOnlyList<LoadedPlugin>? preDiscoveredPlugins = null;
 // 2. Plugin ICredentialProvider implementations — inserted in discovery order
 //    (between OAuth-file and env-var). Vault-issued short-lived credentials
 //    are preferred over env-var fallbacks. Per-project ordering is expressed
-//    via Project.CredentialProviderPriority; see docs/extending/credential-plugins.md.
+//    via Project.CredentialProviderPriority; see docs/credential-plugins.md.
 // 3. CodexOAuthFileCredentialProvider and EnvironmentCredentialProvider —
 //    fallback providers. Codex host auth is deliberately after plugins so a
 //    project-selected credential plugin can isolate Codex credentials from the
@@ -1460,7 +1460,7 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // Note: no OPENCODE_API_KEY mapping. The opencode subscription IS the
         // credential path; auth flows exclusively through the auth.json file
         // materialised by OpencodeOAuthFileCredentialProvider. See the brief
-        // for the relevant 'Don't do' rule and docs/concepts/agents.md for setup.
+        // for the relevant 'Don't do' rule and docs/agents.md for setup.
         // Note: Antigravity is NOT in this verbatim mapping. The agy CLI's
         // OAuth token bundle is shipped to the sandbox by the dedicated
         // AntigravityEnvironmentCredentialProvider registered separately below.
@@ -2616,7 +2616,7 @@ builder.Services.AddSingleton<IChangelogGenerator>(sp =>
             throw new InvalidOperationException(
                 "CodeyBox:Changelog:GitHubWebhookSecretEnvVar must be configured in non-Development environments. " +
                 "Set it to the name of the environment variable holding the HMAC-SHA256 webhook secret " +
-                "(see docs/operating/releases.md).");
+                "(see docs/changelog-automation.md).");
         }
     }
 }
@@ -2998,7 +2998,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
 // Bundled per-(agent, model) pricing defaults shipped with CodeyBox so new
 // installs get cost reporting without the operator hand-populating every
 // entry from provider docs. Operator config under CodeyBox:AgentPricing
-// always wins per (agentKind, modelId). See docs/operating/costs.md.
+// always wins per (agentKind, modelId). See docs/agent-pricing.md.
 builder.Services.AddSingleton<AgentPricingDefaultsSnapshot>(sp =>
 {
     var env = sp.GetRequiredService<IHostEnvironment>();
@@ -3647,7 +3647,7 @@ builder.Services.AddSingleton<IHostSmokeProbeRunner>(sp => sp.GetRequiredService
 // against this extension point is the statistics plugin's quota sampler — but
 // the host is sampler-agnostic; further plugins (throughput, audit pass rate,
 // cost-over-time) can register additional IMetricSampler implementations.
-// See docs/extending/plugins.md (IMetricSampler) and docs/extending/statistics-plugin.md.
+// See docs/plugins.md (IMetricSampler) and docs/statistics-plugin.md.
 builder.Services.AddHostedService<MetricSamplerHost>();
 builder.Services.AddHostedService(sp => new AuditAgentStartupValidationService(
     sp.GetRequiredService<IProjectRepository>(),
@@ -3807,7 +3807,7 @@ builder.Services.AddHostedService(sp =>
 // Discovers assemblies from CodeyBox:Plugins, registers plugin types under
 // their Core interfaces before the container is frozen, then runs
 // IPluginInitializer.InitializeAsync at startup via PluginInitializationService.
-// See docs/extending/plugins.md for author guidance, allowlist config, and threat model.
+// See docs/plugins.md for author guidance, allowlist config, and threat model.
 preDiscoveredPlugins = builder.Services.AddCodeyBoxPlugins(builder.Configuration);
 
 var app = builder.Build();
@@ -4382,7 +4382,7 @@ namespace CodeyBox.Api
     ///
     /// The configured storage pool must already exist and use the ZFS or Btrfs
     /// driver; ZFS is strongly recommended for VM workloads.
-    /// See <c>docs/concepts/sandboxes.md</c> for the host setup and security
+    /// See <c>docs/sandbox-providers.md</c> for the host setup and security
     /// requirements.
     /// </summary>
     public sealed class IncusSandboxConfig
@@ -4917,7 +4917,7 @@ namespace CodeyBox.Api
 
     /// <summary>
     /// Top-level options bag bound from the <c>CodeyBox</c> configuration
-    /// section. See <c>docs/reference/configuration.md</c> for the full hot-reload
+    /// section. See <c>docs/configuration.md</c> for the full hot-reload
     /// contract per field. Summary of the rule of thumb consumers should
     /// follow when adding new fields:
     /// <list type="bullet">
@@ -5356,7 +5356,7 @@ namespace CodeyBox.Api
 
         /// <summary>
         /// Agent class definitions for quota-aware routing. Each class lists one or
-        /// more agent members in preference order. See docs/concepts/agent-classes.md.
+        /// more agent members in preference order. See docs/agent-classes.md.
         /// </summary>
         public List<AgentClassOptions> AgentClasses { get; set; } = [];
 
@@ -5374,7 +5374,7 @@ namespace CodeyBox.Api
         /// Operator-extensible per-agent quota stderr patterns. Keys are agent
         /// kind values (e.g. <c>cursor</c>); each entry adds a substring + kind
         /// to the per-provider detector's built-in defaults. See
-        /// docs/operating/quota.md for the schema and supported agent kinds.
+        /// docs/quota-gate.md for the schema and supported agent kinds.
         /// </summary>
         public Dictionary<string, List<QuotaFailurePatternOptions>> QuotaFailurePatterns { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
@@ -5390,7 +5390,7 @@ namespace CodeyBox.Api
         /// <summary>
         /// Time-of-day score modifiers. Applied as small effective-score adjustments
         /// to act as tiebreakers between near-equivalent models during peak cost windows.
-        /// See docs/reference/configuration.md for the schedule schema.
+        /// See docs/configuration.md for the schedule schema.
         /// </summary>
         public AgentScoreModifiersOptions AgentScoreModifiers { get; set; } = new();
 
@@ -5404,10 +5404,10 @@ namespace CodeyBox.Api
         /// </summary>
         public TransitionHealthConfig TransitionHealth { get; set; } = new();
 
-        /// <summary>Agent token pricing for cost estimation. See docs/operating/costs.md.</summary>
+        /// <summary>Agent token pricing for cost estimation. See docs/cost-reporting.md.</summary>
         public AgentPricingOptions AgentPricing { get; set; } = new();
 
-        /// <summary>Monthly cost-budget alert sweep configuration. See docs/operating/budgets.md.</summary>
+        /// <summary>Monthly cost-budget alert sweep configuration. See docs/budget-alerts.md.</summary>
         public BudgetAlertOptions BudgetAlerts { get; set; } = new();
 
         /// <summary>Automatic retry for quota-failed items.</summary>
@@ -5439,10 +5439,10 @@ namespace CodeyBox.Api
         /// </summary>
         public AutoRequeueOnAgentRestoreConfig AutoRequeueOnAgentRestore { get; set; } = new();
 
-        /// <summary>OpenTelemetry export configuration. See docs/operating/observability.md.</summary>
+        /// <summary>OpenTelemetry export configuration. See docs/observability.md.</summary>
         public OtelOptions Otel { get; set; } = new();
 
-        /// <summary>Changelog automation configuration. See docs/operating/releases.md.</summary>
+        /// <summary>Changelog automation configuration. See docs/changelog-automation.md.</summary>
         public ChangelogOptions Changelog { get; set; } = new();
 
         /// <summary>
@@ -5456,7 +5456,7 @@ namespace CodeyBox.Api
         /// <summary>
         /// Sandbox leak reaper configuration. The reaper periodically scans for
         /// <c>codeybox-*</c> Multipass VMs that outlived their work item and logs
-        /// (or optionally auto-disposes) them. See docs/operating/sandbox-reliability.md.
+        /// (or optionally auto-disposes) them. See docs/sandbox-leaks.md.
         /// </summary>
         public SandboxLeakOptions SandboxLeak { get; set; } = new();
 
@@ -6355,7 +6355,7 @@ namespace CodeyBox.Api
         public string? SandboxEnvironmentVariable { get; set; }
         /// <summary>
         /// Operator-curated capability score (0–200). Required; no silent default.
-        /// See docs/concepts/agent-classes.md for recommended seed values.
+        /// See docs/agent-classes.md for recommended seed values.
         /// </summary>
         public int? QualityScore { get; set; }
         /// <summary>
@@ -6367,7 +6367,7 @@ namespace CodeyBox.Api
         /// Clearance/capability tags this member is trusted to handle, e.g.
         /// <c>["sensitive", "architectural"]</c>. Default empty — members with
         /// no tags can only run work items that require no tags. See
-        /// docs/concepts/agent-classes.md for the recommended tag vocabulary.
+        /// docs/agent-classes.md for the recommended tag vocabulary.
         /// </summary>
         public List<string> Capabilities { get; set; } = [];
         /// <summary>
@@ -6697,7 +6697,7 @@ namespace CodeyBox.Api
     /// <summary>
     /// Rolling file log configuration. Paths are resolved relative to the
     /// API process's working directory when they are not absolute.
-    /// See <c>docs/operating/logging.md</c> for details.
+    /// See <c>docs/audit-logging.md</c> for details.
     /// </summary>
     public sealed class AuditLogOptions
     {

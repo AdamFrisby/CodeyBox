@@ -253,7 +253,7 @@ public sealed record JobTrackExportSummary
 /// <summary>
 /// Exports a work item's CodeyBox test cases to JobTrack. Config-gated and
 /// opt-in per project; propagation is best-effort and idempotent, and never
-/// fails the owning work item. See <c>docs/quality/test-cases.md</c>.
+/// fails the owning work item. See <c>docs/test-cases.md</c>.
 /// </summary>
 public interface IJobTrackTestCaseExporter
 {

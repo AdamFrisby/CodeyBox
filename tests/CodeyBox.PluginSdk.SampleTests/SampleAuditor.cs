@@ -13,7 +13,7 @@
 // under its Core interface(s) as a DI singleton. Existing orchestrator code
 // that resolves IEnumerable<IAuditor> will pick it up automatically.
 //
-// See docs/extending/plugins.md for full authoring guidance.
+// See docs/plugins.md for full authoring guidance.
 
 using CodeyBox.Core;
 using CodeyBox.PluginSdk;

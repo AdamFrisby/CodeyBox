@@ -9,7 +9,7 @@ namespace CodeyBox.Tests;
 /// Verifies the schema-version envelope (added in event schema 1.0) is
 /// present on every webhook/SSE payload and on every outbound HTTP request.
 /// These checks anchor the additive-only contract described in
-/// <c>docs/reference/events.md</c> — if a future refactor drops one of the three
+/// <c>docs/EVENT_SCHEMA.md</c> — if a future refactor drops one of the three
 /// required envelope fields, this suite fails fast.
 /// </summary>
 public sealed class EventSchemaEnvelopeTests

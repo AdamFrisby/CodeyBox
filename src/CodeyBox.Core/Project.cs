@@ -162,7 +162,7 @@ public sealed record Project
     /// tries Vault first, then AWS SSM, and falls back to env vars. A plugin
     /// installed but not listed (e.g. "myorg.1password") is not tried.</para>
     ///
-    /// <para>See <c>docs/extending/credential-plugins.md</c> for the full chain-order
+    /// <para>See <c>docs/credential-plugins.md</c> for the full chain-order
     /// rationale and per-project override semantics.</para>
     /// </summary>
     public IReadOnlyList<string> CredentialProviderPriority { get; init; } = [];
@@ -223,7 +223,7 @@ public sealed record Project
     /// Per-project JobTrack test-case export configuration. Disabled by default:
     /// only projects that explicitly opt in propagate their CodeyBox test cases
     /// to JobTrack. See <see cref="ProjectJobTrackExport"/> and
-    /// <c>docs/quality/test-cases.md</c>.
+    /// <c>docs/test-cases.md</c>.
     /// </summary>
     public ProjectJobTrackExport JobTrackExport { get; init; } = ProjectJobTrackExport.Disabled;
 }
@@ -316,7 +316,7 @@ public sealed record ProjectClaudeSessionConfig
 
 /// <summary>
 /// Per-project changelog automation overrides. Unset fields fall back to the
-/// global <c>ChangelogOptions</c>. See <c>docs/operating/releases.md</c>.
+/// global <c>ChangelogOptions</c>. See <c>docs/changelog-automation.md</c>.
 /// </summary>
 public sealed record ProjectChangelog
 {
@@ -430,7 +430,7 @@ public sealed record ProjectUpstream
     /// way to compose results, producing throwaway rewrites instead of
     /// iterative progress. Setting this flag to <c>true</c> bypasses the
     /// validator for projects that genuinely want that behaviour (short-lived
-    /// experiments, snapshot replay, etc.). See <c>docs/concepts/projects.md</c>.
+    /// experiments, snapshot replay, etc.). See <c>docs/projects.md</c>.
     /// </summary>
     public bool AcknowledgeSandboxIsolation { get; init; }
 
@@ -439,7 +439,7 @@ public sealed record ProjectUpstream
 
 /// <summary>
 /// Per-project LLM-generated PR description configuration.
-/// See <c>docs/concepts/pipeline.md</c> for configuration guidance.
+/// See <c>docs/git-workflow.md</c> for configuration guidance.
 /// </summary>
 public sealed record ProjectPrDescription
 {
