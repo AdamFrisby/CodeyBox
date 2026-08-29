@@ -28,6 +28,10 @@
     <ProjectReference Include="..\CodeyBox.Notifications\CodeyBox.Notifications.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="CodeyBox.Tests" />
+  </ItemGroup>
+
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>

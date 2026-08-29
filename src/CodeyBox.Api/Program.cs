@@ -291,6 +291,7 @@ builder.Services.AddOptions<TestSelectionOptions>()
         static opts => TestSelectionModeParser.TryParse(opts.Mode, out _),
         $"{TestSelectionOptions.SectionName}:Mode must be one of: all");
 builder.Services.Configure<NotificationsOptions>(builder.Configuration.GetSection("CodeyBox:Notifications"));
+builder.Services.Configure<AuditProgressApiOptions>(builder.Configuration.GetSection("CodeyBox:AuditProgressApi"));
 // E2eExecutionOptions binds as a standalone section so the pool / dispatcher can
 // take IOptionsMonitor<E2eExecutionOptions> directly without dragging the whole
 // CodeyBoxOptions graph. The same section is also a property on CodeyBoxOptions
@@ -3884,6 +3885,7 @@ WorkItemDiffEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
 GitHubAppConnectEndpoints.Map(app);
 AuditReportEndpoints.Map(app);
+AuditProgressEndpoints.Map(app);
 AgentStreamEndpoints.Map(app);
 SseEndpoints.Map(app);
 ChangelogEndpoints.Map(app);

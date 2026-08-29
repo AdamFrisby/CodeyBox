@@ -191,6 +191,88 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task GetAllAuditProgressForWorkItem_ReturnsRowsWithDeterministicSurrogateId()
+    {
+        var item = Sample();
+        await _store.CreateAsync(item);
+        var attempt = DateTimeOffset.UtcNow.AddMinutes(-5);
+        var recordedAt = DateTimeOffset.UtcNow;
+
+        await _store.RecordAuditProgressAsync(
+            item.Id,
+            attempt,
+            new AuditProgressRecord(
+                Iteration: 3,
+                MaxIterations: 5,
+                BlockingFindings: 1,
+                NonBlockingFindings: 0,
+                BlockingFindingIds: ["b1"],
+                BlockingFindingsDetails:
+                [
+                    new AuditProgressFinding("sec", AuditSeverity.Error, "blocker", "why", "src/A.cs:1"),
+                ],
+                Findings:
+                [
+                    new AuditProgressFinding("sec", AuditSeverity.Error, "blocker", "why", "src/A.cs:1"),
+                ],
+                WorkBranchTip: "tip"),
+            recordedAt);
+
+        var rows = await _store.GetAllAuditProgressForWorkItemAsync(item.Id);
+        var row = Assert.Single(rows);
+
+        // The surrogate id is the deterministic hash of the natural composite key.
+        var expectedId = SqliteWorkItemStore.ComputeAuditProgressId(
+            item.Id.ToString(), attempt.ToString("O"), 3);
+        Assert.Equal(expectedId, row.Id);
+        Assert.Equal(item.Id, row.WorkItemId);
+        Assert.Equal(attempt.ToString("O"), row.WorkAttemptKey);
+        Assert.Equal(recordedAt, row.RecordedAt);
+        Assert.Equal(3, row.Progress.Iteration);
+        Assert.Equal("blocker", Assert.Single(row.Progress.Findings).Title);
+    }
+
+    [Fact]
+    public async Task GetAuditProgressById_EnforcesOwnership_AndReturnsFullRow()
+    {
+        var item = Sample();
+        var other = Sample();
+        await _store.CreateAsync(item);
+        await _store.CreateAsync(other);
+        var attempt = DateTimeOffset.UtcNow.AddMinutes(-2);
+
+        await _store.RecordAuditProgressAsync(
+            item.Id,
+            attempt,
+            new AuditProgressRecord(
+                Iteration: 1,
+                MaxIterations: 3,
+                BlockingFindings: 0,
+                NonBlockingFindings: 1,
+                BlockingFindingIds: [],
+                BlockingFindingsDetails: [],
+                Findings:
+                [
+                    new AuditProgressFinding("quality", AuditSeverity.Warning, "nit", "detail", null),
+                ],
+                WorkBranchTip: null),
+            DateTimeOffset.UtcNow);
+
+        var id = SqliteWorkItemStore.ComputeAuditProgressId(item.Id.ToString(), attempt.ToString("O"), 1);
+
+        // Correct owner → full row.
+        var found = await _store.GetAuditProgressByIdAsync(item.Id, id);
+        Assert.NotNull(found);
+        Assert.Equal(id, found!.Id);
+        Assert.Equal("nit", Assert.Single(found.Progress.Findings).Title);
+
+        // Same id but a different work item → not returned (ownership enforced at the query).
+        Assert.Null(await _store.GetAuditProgressByIdAsync(other.Id, id));
+        // Unknown id under the correct work item → not found.
+        Assert.Null(await _store.GetAuditProgressByIdAsync(item.Id, "deadbeef"));
+    }
+
+    [Fact]
     public async Task ListByStateAsync_FiltersCorrectly()
     {
         var working = Sample();

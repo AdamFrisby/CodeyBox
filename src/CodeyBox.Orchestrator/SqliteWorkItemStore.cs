@@ -150,6 +150,20 @@ public sealed class SqliteWorkItemStore :
             RunMigration("ALTER TABLE work_item_audit_progress ADD COLUMN scheduled_auditors_json TEXT NOT NULL DEFAULT '[]';");
             RunMigration("ALTER TABLE work_item_audit_progress ADD COLUMN completed_auditors_json TEXT NOT NULL DEFAULT '[]';");
 
+            // Additive migration: single-column surrogate key so the HTTP/UI layer can address
+            // one audit-progress row by a stable id. The natural key is the 3-column composite
+            // (work_item_id, work_attempt_started_at, iteration), which is awkward as a REST path.
+            // The id is deterministic — sha256(work_item_id | attempt | iteration) — so it is stable
+            // across re-derivation and backfills identically for rows written before this migration.
+            RunMigration("ALTER TABLE work_item_audit_progress ADD COLUMN id TEXT;");
+            BackfillAuditProgressIds();
+            using (var progressIdIdxCmd = _conn.CreateCommand())
+            {
+                progressIdIdxCmd.CommandText =
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_work_item_audit_progress_id ON work_item_audit_progress(id);";
+                progressIdIdxCmd.ExecuteNonQuery();
+            }
+
             // Additive migration: add agent_class_id column for quota-aware routing.
             RunMigration("ALTER TABLE work_items ADD COLUMN agent_class_id TEXT;");
             // Additive migration: selected agent instance route key for per-account credentials.
@@ -3803,15 +3817,16 @@ public sealed class SqliteWorkItemStore :
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = """
                 INSERT INTO work_item_audit_progress (
-                    work_item_id, work_attempt_started_at, iteration, max_iterations,
+                    id, work_item_id, work_attempt_started_at, iteration, max_iterations,
                     blocking_findings, non_blocking_findings, blocking_finding_ids_json,
                     blocking_findings_json, findings_json, work_branch_tip, status,
                     scheduled_auditors_json, completed_auditors_json, recorded_at)
                 VALUES (
-                    $wi, $attempt, $iter, $max, $blocking, $non_blocking, $blocking_ids,
+                    $id, $wi, $attempt, $iter, $max, $blocking, $non_blocking, $blocking_ids,
                     $blocking_findings, $findings, $tip, $status, $scheduled_auditors,
                     $completed_auditors, $recorded_at)
                 ON CONFLICT(work_item_id, work_attempt_started_at, iteration) DO UPDATE SET
+                    id = excluded.id,
                     max_iterations = excluded.max_iterations,
                     blocking_findings = excluded.blocking_findings,
                     non_blocking_findings = excluded.non_blocking_findings,
@@ -3824,6 +3839,8 @@ public sealed class SqliteWorkItemStore :
                     completed_auditors_json = excluded.completed_auditors_json,
                     recorded_at = excluded.recorded_at;
                 """;
+            cmd.Parameters.AddWithValue("$id", ComputeAuditProgressId(
+                workItemId.ToString(), AuditProgressAttemptKey(workAttemptStartedAt), progress.Iteration));
             cmd.Parameters.AddWithValue("$wi", workItemId.ToString());
             cmd.Parameters.AddWithValue("$attempt", AuditProgressAttemptKey(workAttemptStartedAt));
             cmd.Parameters.AddWithValue("$iter", progress.Iteration);
@@ -3895,6 +3912,90 @@ public sealed class SqliteWorkItemStore :
         }
     }
 
+    private const string SelectStoredAuditProgressColumns =
+        """
+        SELECT id, work_item_id, work_attempt_started_at, recorded_at, iteration, max_iterations,
+               blocking_findings, non_blocking_findings, blocking_finding_ids_json,
+               blocking_findings_json, findings_json, work_branch_tip, status,
+               scheduled_auditors_json, completed_auditors_json
+        FROM work_item_audit_progress
+        """;
+
+    private static StoredAuditProgress ReadStoredAuditProgress(System.Data.Common.DbDataReader reader)
+        => new(
+            Id: reader.GetString(0),
+            WorkItemId: new WorkItemId(Guid.Parse(reader.GetString(1))),
+            WorkAttemptKey: reader.GetString(2),
+            RecordedAt: DateTimeOffset.Parse(reader.GetString(3), System.Globalization.CultureInfo.InvariantCulture),
+            Progress: new AuditProgressRecord(
+                Iteration: reader.GetInt32(4),
+                MaxIterations: reader.GetInt32(5),
+                BlockingFindings: reader.GetInt32(6),
+                NonBlockingFindings: reader.GetInt32(7),
+                BlockingFindingIds: DeserializeStringList(reader.GetString(8)),
+                BlockingFindingsDetails: DeserializeAuditProgressFindings(reader.GetString(9)),
+                Findings: DeserializeAuditProgressFindings(reader.GetString(10)),
+                WorkBranchTip: reader.IsDBNull(11) ? null : reader.GetString(11),
+                Status: reader.GetString(12),
+                ScheduledAuditors: DeserializeStringList(reader.GetString(13)),
+                CompletedAuditors: DeserializeStringList(reader.GetString(14))));
+
+    /// <summary>
+    /// All audit-progress rows for a work item across every work-attempt partition,
+    /// newest attempt/iteration first. Read path for the audit-progress API/UI.
+    /// </summary>
+    public async Task<IReadOnlyList<StoredAuditProgress>> GetAllAuditProgressForWorkItemAsync(
+        WorkItemId workItemId,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = SelectStoredAuditProgressColumns +
+                "\nWHERE work_item_id = $wi\nORDER BY work_attempt_started_at DESC, iteration DESC;";
+            cmd.Parameters.AddWithValue("$wi", workItemId.ToString());
+
+            var results = new List<StoredAuditProgress>();
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+                results.Add(ReadStoredAuditProgress(reader));
+            return results;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// One audit-progress row addressed by its surrogate id. The <paramref name="workItemId"/>
+    /// is part of the lookup, so a row is only returned when it genuinely belongs to that work
+    /// item (ownership re-verified at the query, not trusted from the caller). Null if not found.
+    /// </summary>
+    public async Task<StoredAuditProgress?> GetAuditProgressByIdAsync(
+        WorkItemId workItemId,
+        string id,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = SelectStoredAuditProgressColumns +
+                "\nWHERE work_item_id = $wi AND id = $id\nLIMIT 1;";
+            cmd.Parameters.AddWithValue("$wi", workItemId.ToString());
+            cmd.Parameters.AddWithValue("$id", id);
+
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            return await reader.ReadAsync(ct) ? ReadStoredAuditProgress(reader) : null;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async Task<int> PurgeAuditProgressAsync(
         WorkItemId workItemId,
         DateTimeOffset? workAttemptStartedAt,
@@ -3939,6 +4040,63 @@ public sealed class SqliteWorkItemStore :
 
     private static string AuditProgressAttemptKey(DateTimeOffset? workAttemptStartedAt)
         => workAttemptStartedAt?.ToString("O") ?? "";
+
+    /// <summary>
+    /// Deterministic single-column surrogate key for an audit-progress row, derived from its
+    /// natural composite key. Stable across re-derivation (same composite → same id) so it can
+    /// be computed identically on write and when backfilling pre-existing rows. The unit
+    /// separator (U+001F) delimits fields so distinct composites cannot alias
+    /// (e.g. ("a","b") vs ("ab","")).
+    /// </summary>
+    internal static string ComputeAuditProgressId(string workItemId, string attemptKey, long iteration)
+    {
+        var input = string.Concat(
+            workItemId, "\u001f", attemptKey, "\u001f",
+            iteration.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        return Convert.ToHexStringLower(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(input)));
+    }
+
+    /// <summary>
+    /// One-time migration step: populate <c>id</c> for audit-progress rows written before the
+    /// surrogate-key column existed. Idempotent — once every row has an id this is a no-op, so
+    /// it is safe to run on every startup. Runs before the unique index on <c>id</c> is created.
+    /// </summary>
+    private void BackfillAuditProgressIds()
+    {
+        var pending = new List<(string WorkItemId, string Attempt, long Iteration)>();
+        using (var sel = _conn.CreateCommand())
+        {
+            sel.CommandText =
+                "SELECT work_item_id, work_attempt_started_at, iteration FROM work_item_audit_progress WHERE id IS NULL;";
+            using var reader = sel.ExecuteReader();
+            while (reader.Read())
+                pending.Add((reader.GetString(0), reader.GetString(1), reader.GetInt64(2)));
+        }
+        if (pending.Count == 0)
+            return;
+
+        using var tx = _conn.BeginTransaction();
+        using (var upd = _conn.CreateCommand())
+        {
+            upd.Transaction = tx;
+            upd.CommandText =
+                "UPDATE work_item_audit_progress SET id = $id " +
+                "WHERE work_item_id = $wi AND work_attempt_started_at = $attempt AND iteration = $iter;";
+            var pId = upd.Parameters.Add("$id", SqliteType.Text);
+            var pWi = upd.Parameters.Add("$wi", SqliteType.Text);
+            var pAttempt = upd.Parameters.Add("$attempt", SqliteType.Text);
+            var pIter = upd.Parameters.Add("$iter", SqliteType.Integer);
+            foreach (var (wi, attempt, iter) in pending)
+            {
+                pId.Value = ComputeAuditProgressId(wi, attempt, iter);
+                pWi.Value = wi;
+                pAttempt.Value = attempt;
+                pIter.Value = iter;
+                upd.ExecuteNonQuery();
+            }
+        }
+        tx.Commit();
+    }
 
     private static IReadOnlyList<string> DeserializeStringList(string json)
     {
