@@ -29,6 +29,63 @@ a fine-grained token scoped to the minimum the agent needs, ideally one
 that cannot push to your real repos. Sandbox network policy must
 **not** include `github.com` for this token to be safe.
 
+Install with `npm install -g @github/copilot`. Everything below was verified against **v1.0.82**.
+
+**`--allow-all-tools` is required for non-interactive mode** — the CLI's own words. Without it a
+`-p` run blocks on a permission prompt nothing will answer. The runner also passes
+`--allow-all-paths` (every CodeyBox run is sandboxed, where Copilot's own path check guards nothing
+the VM does not while still interrupting constantly), but deliberately **not** `--allow-all-urls` or
+`--allow-all`: network egress is a different boundary, governed by the sandbox network profile.
+
+**`--model <id>` exists** (an earlier comment in this runner claimed it did not) and is the only
+thing that selects the wire model in `-p` mode. `COPILOT_MODEL`, `COPILOT_PROVIDER_MODEL_ID` and
+`COPILOT_PROVIDER_WIRE_MODEL` do **not** change it — captured at an instrumented endpoint, all three
+left the wire model at Copilot's session default.
+
+**No stdin prompt mode.** The prompt is an argv element (`-p <text>`); both `-p -` and a bare
+invocation ignore stdin. Unlike the agy/codex/gemini runners this one cannot dodge the 128 KiB
+`MAX_ARG_STRLEN`, so a very large rework prompt can still surface as exit 126.
+
+#### BYOK (bring your own key)
+
+Setting a base URL points inference at any OpenAI-compatible endpoint, with no GitHub account
+involved in inference. Copilot exposes this axis **only** through the environment — there are no
+argv flags — so CodeyBox renders it from `CodeyBox:Copilot`:
+
+| Variable | Meaning |
+| --- | --- |
+| `COPILOT_PROVIDER_BASE_URL` | **Activates BYOK**; every other variable is inert without it. Copilot appends `/chat/completions`, so include the version segment (`http://model-host:11434/v1`). |
+| `COPILOT_PROVIDER_TYPE` | `openai` (covers Ollama, vLLM, llama.cpp), `azure`, `anthropic` |
+| `COPILOT_PROVIDER_API_KEY` / `..._BEARER_TOKEN` | Bearer wins inside Copilot — set one |
+| `COPILOT_PROVIDER_WIRE_API` | `completions` or `responses` |
+| `COPILOT_PROVIDER_TRANSPORT` | `http` or `websockets` (websockets only with `responses`) |
+| `COPILOT_PROVIDER_HEADERS` | newline-separated `Name: Value` |
+| `COPILOT_OFFLINE` | no GitHub auth/telemetry/web tools/GitHub MCP/auto-update. **Requires a provider**, so CodeyBox emits it only alongside one. |
+
+The credential is **not** a config value: it arrives through the credential chain as
+`CODEYBOX_COPILOT_PROVIDER_API_KEY` → `COPILOT_PROVIDER_API_KEY`, so the secret never sits in a
+config file.
+
+**`apply_patch` breaks strict servers.** Copilot offers it as an OpenAI *custom* tool with a Lark
+grammar (`"type":"custom"` rather than `"type":"function"`), and a server implementing only function
+tools rejects the **whole** tools array — an llama.cpp-backed endpoint answers
+`Failed to parse tools: Unsupported tool type` with HTTP 500 and no turn can start. So
+`ExcludedTools` defaults to `["apply_patch"]` whenever a provider is configured; set it to `[]` to
+opt out.
+
+Whether the custom tool is sent at all depends on the `--model` id, which also selects
+`reasoning_effort`:
+
+| `--model` | `reasoning_effort` sent | tool types sent |
+| --- | --- | --- |
+| a local model's own name (unrecognised) | omitted | `function` only |
+| a well-known id (`gpt-5.6-*`) | e.g. `medium` | `custom` + `function` |
+
+So naming the local model directly is the safe choice, and the `apply_patch` exclusion is harmless
+there and necessary with a well-known id — which is why it defaults on rather than being conditioned
+on the id. Note this differs from older guidance written against v1.0.81, which advised substituting
+a well-known id; on 1.0.82 that *introduces* the custom-tool breakage instead of avoiding it.
+
 ### OpenAI Codex CLI
 Reads `OPENAI_API_KEY`. The `--full-auto` flag skips Codex's per-edit
 confirmations — appropriate inside a sandbox.
@@ -324,6 +381,56 @@ pay-per-api surface is undocumented at the time of writing; treat
 `PayPerApi` as a forward hook.
 
 ### Google Antigravity CLI (`agy`)
+
+#### Invocation: `--print` is unusable; use stream-json (verified agy 1.1.24 and 1.1.26)
+
+`--print` is a **string** flag, so a bare `--print` swallows the next argv element as its prompt.
+The shape this runner used until 2026-09-05 — `[agy, --print, --dangerously-skip-permissions]` with
+the prompt on stdin — therefore ran with the literal prompt `--dangerously-skip-permissions`,
+discarded the real prompt, and left permissions un-skipped. The CLI says so:
+
+```
+Error: --print took "--dangerously-skip-permissions" as its prompt, so the intended prompt was
+left as an argument and ignored.
+```
+
+…and then **exits 0**. A totally failed run was therefore indistinguishable from a successful one and
+surfaced downstream as "produced no changes". Moving `--print` last does not help either
+(`flag needs an argument: -print`, also exit 0).
+
+Attaching the prompt to the flag (`--print='…'`) is not an option here: rework prompts carrying audit
+findings exceed Linux's 128 KiB `MAX_ARG_STRLEN`, which is why the prompt is on stdin.
+`--input-format stream-json` selects non-interactive mode on its own, keeps the prompt on stdin, and
+is the only shape that does both. It requires `--output-format stream-json`, so **structured output
+is mandatory, not optional**. One NDJSON frame per turn on stdin:
+
+```json
+{"event":"user","message":{"role":"user","content":[{"type":"text","text":"…"}]}}
+```
+
+The envelope key is `event`, **not** `type` — agy's stream-json resembles Claude Code's and is not it;
+a Claude-shaped line is rejected with `stream input message is missing the "event" field`. Output
+frames are `init` (carries `conversation_id`, `cwd`, the tool list and `permission_mode`),
+`step_update`, and one `result` per turn.
+
+#### `--add-dir` must be absolute
+
+Without a workspace, a clean guest can silently drop file writes: agy reports `SUCCESS` while the
+working tree is untouched. Pass `--add-dir <absolute working directory>`. The path **must** be
+absolute — verified against 1.1.26, `--add-dir .` also reported `SUCCESS` and wrote the file
+*nowhere at all*: not the working directory, not `~/.gemini/antigravity-cli/scratch/`. The runner
+therefore omits the flag entirely rather than ever passing a relative path.
+
+#### Model ids are not display names
+
+`agy models` prints `id<TAB>Display Name`. `--model` takes the **id** (`gemini-3.8-flash-high`), not
+the display name (`Gemini 3.8 Flash (High)`). Reasoning effort is encoded in the id (`-high`,
+`-medium`, `-low`) rather than passed separately. The gateway's catalogue moves independently of the
+CLI version, so `AntigravityKnownModels` goes stale silently — it named `gemini-3.5-flash-*` long
+after the gateway had delisted it for 3.6/3.7/3.8, and after Sonnet's id dropped its `-thinking`
+suffix. `agy models` is the authority.
+
+---
 
 Antigravity is Google's successor to `gemini-cli`. Gemini Code Assist (the
 subscription `gemini-cli` rides) is being sunset 2026-06-18; the `agy`

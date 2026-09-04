@@ -292,6 +292,7 @@ builder.Services.AddOptions<TestSelectionOptions>()
         $"{TestSelectionOptions.SectionName}:Mode must be one of: all");
 builder.Services.Configure<NotificationsOptions>(builder.Configuration.GetSection("CodeyBox:Notifications"));
 builder.Services.Configure<AuditProgressApiOptions>(builder.Configuration.GetSection("CodeyBox:AuditProgressApi"));
+builder.Services.Configure<CopilotOptions>(builder.Configuration.GetSection("CodeyBox:Copilot"));
 // E2eExecutionOptions binds as a standalone section so the pool / dispatcher can
 // take IOptionsMonitor<E2eExecutionOptions> directly without dragging the whole
 // CodeyBoxOptions graph. The same section is also a property on CodeyBoxOptions
@@ -1066,7 +1067,13 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new ClaudeAgentRunner(
     sp.GetRequiredService<ClaudeThinkingBlockSanitizerConfig>(),
     sp.GetRequiredService<CodeyBox.Core.AgentNetworkToleranceSnapshot>(),
     sp.GetRequiredService<IQuotaFailureClassifier>()));
-builder.Services.AddSingleton<IAgentRunner, CopilotAgentRunner>();
+// Copilot: subscription mode by default; setting CodeyBox:Copilot:Provider:BaseUrl switches inference
+// to an OpenAI-compatible endpoint (BYOK). The credential for that endpoint arrives through the
+// credential chain as COPILOT_PROVIDER_API_KEY, never from this configuration section.
+builder.Services.AddSingleton<IAgentRunner>(sp => new CopilotAgentRunner
+{
+    Options = sp.GetRequiredService<IOptionsMonitor<CopilotOptions>>().CurrentValue,
+});
 builder.Services.AddSingleton<IAgentRunner>(sp => new CodexAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>(),
     sp.GetRequiredService<CodeyBox.Core.AgentNetworkToleranceSnapshot>(),
@@ -1445,6 +1452,17 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
     builtInLast.Add(new EnvironmentCredentialProvider(new[]
     {
         new AgentCredentialMapping(AgentKind.Copilot, "CODEYBOX_COPILOT_TOKEN", "GH_TOKEN"),
+        // BYOK: the key for the operator-configured OpenAI-compatible endpoint. Kept in the credential
+        // chain rather than CodeyBox:Copilot so the secret never lands in a config file. Absent in
+        // subscription mode, and absent for local servers that need no key.
+        new AgentCredentialMapping(
+            AgentKind.Copilot,
+            "CODEYBOX_COPILOT_PROVIDER_API_KEY",
+            CopilotAgentRunner.ProviderApiKeyEnvironmentVariable),
+        new AgentCredentialMapping(
+            AgentKind.Copilot,
+            "CODEYBOX_COPILOT_PROVIDER_BEARER_TOKEN",
+            CopilotAgentRunner.ProviderBearerTokenEnvironmentVariable),
         new AgentCredentialMapping(AgentKind.Codex, "CODEYBOX_CODEX_API_KEY", "OPENAI_API_KEY"),
         new AgentCredentialMapping(AgentKind.Gemini, "CODEYBOX_GEMINI_API_KEY", "GEMINI_API_KEY"),
         // Cursor: the CLI uses subscription auth via ~/.cursor/credentials.json

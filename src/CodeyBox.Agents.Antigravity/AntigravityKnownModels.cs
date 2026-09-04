@@ -15,8 +15,13 @@ namespace CodeyBox.Agents.Antigravity;
 ///
 /// <para>This list is a seed — operators can configure unknown ids and the
 /// validator only warns (matching <c>CodeyBox.Agents.Gemini.GeminiKnownModels</c>).
-/// The canonical strings shipped here were captured against agy v1.0.6 on
-/// 2026-06-09; refresh as Google ships new gateway models. Per the work-item
+/// The canonical strings shipped here were captured from <c>agy models</c> against agy v1.1.24
+/// on 2026-09-05; refresh as Google ships new gateway models.
+/// <b>The gateway list moves independently of the CLI version</b>, so this seed goes stale
+/// silently: the previous capture (v1.0.6) still named <c>gemini-3.5-flash-*</c> long after the
+/// gateway had delisted it in favour of 3.6/3.7/3.8, and after Sonnet's id had dropped its
+/// <c>-thinking</c> suffix. <c>agy models</c> is the authority; this list only drives the
+/// warn-only config validator. Per the work-item
 /// note we deliberately keep numbers (quota sizes / pricing) config-driven —
 /// the model identifiers themselves are needed for argv though.</para>
 /// </summary>
@@ -29,15 +34,24 @@ public static class AntigravityKnownModels
     /// </summary>
     public static readonly IReadOnlyList<string> All = new[]
     {
-        // Gemini 3.5 Flash — three thinking levels share the gateway model id.
-        "gemini-3.5-flash-low",
-        "gemini-3.5-flash-medium",
-        "gemini-3.5-flash-high",
+        // Gemini 3.8 Flash — current top of the gateway. Thinking level is encoded in the id.
+        "gemini-3.8-flash-high",
+        "gemini-3.8-flash-medium",
+        "gemini-3.8-flash-low",
+        // Gemini 3.7 Flash.
+        "gemini-3.7-flash-high",
+        "gemini-3.7-flash-medium",
+        "gemini-3.7-flash-low",
+        // Gemini 3.6 Flash.
+        "gemini-3.6-flash-high",
+        "gemini-3.6-flash-medium",
+        "gemini-3.6-flash-low",
         // Gemini 3.1 Pro — low and high thinking.
-        "gemini-3.1-pro-low",
         "gemini-3.1-pro-high",
-        // Anthropic via the same gateway.
-        "claude-sonnet-4-6-thinking",
+        "gemini-3.1-pro-low",
+        // Anthropic via the same gateway. Note the Sonnet id no longer carries the
+        // "-thinking" suffix that Opus still does.
+        "claude-sonnet-4-6",
         "claude-opus-4-6-thinking",
         // OpenAI GPT-OSS via the same gateway.
         "gpt-oss-120b-medium",

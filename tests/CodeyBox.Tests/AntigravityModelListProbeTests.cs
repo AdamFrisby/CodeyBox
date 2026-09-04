@@ -29,7 +29,7 @@ public sealed class AntigravityModelListProbeTests
         Assert.Equal(AntigravityKnownModels.All, result.ModelIds);
         // The real gateway ids that previously logged "NOT in provider model
         // list" against the Code Assist catalog must now validate.
-        Assert.Contains("gemini-3.5-flash-high", result.ModelIds);
+        Assert.Contains("gemini-3.8-flash-high", result.ModelIds);
         Assert.Contains("claude-opus-4-6-thinking", result.ModelIds);
     }
 }

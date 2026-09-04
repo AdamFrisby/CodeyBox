@@ -938,7 +938,9 @@ internal sealed class CapturingSandbox : ISandbox
         }
         if (StructuredProbeOutput is not null
             && exec.Argv.Contains("--output-format")
-            && string.Equals(exec.Stdin, AntigravityAgentRunner.StructuredStreamProbePrompt, StringComparison.Ordinal))
+            // agy's probe prompt now travels inside an NDJSON frame, so match on containment.
+            && exec.Stdin is { } probeStdin
+            && probeStdin.Contains(AntigravityAgentRunner.StructuredStreamProbePrompt, StringComparison.Ordinal))
         {
             return Task.FromResult(new SandboxExecResult(
                 StructuredProbeExitCode,
