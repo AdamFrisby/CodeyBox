@@ -162,4 +162,49 @@ public sealed class CredentialFileTokenExtractorTests
         Assert.False(ok);
         Assert.Equal(string.Empty, bundle);
     }
+
+    // --- ExtractAntigravityAccessToken -------------------------------------------------
+
+    [Fact]
+    public void ExtractAntigravityAccessToken_ReadsNativeNestedShape()
+    {
+        // This is the shape agy actually writes, and the one the gemini extractor cannot read.
+        var raw = """{"auth_method":"consumer","token":{"access_token":"ya29.nested","refresh_token":"r","token_type":"Bearer"}}""";
+
+        Assert.Equal("ya29.nested", CredentialFileTokenExtractor.ExtractAntigravityAccessToken(raw));
+    }
+
+    [Fact]
+    public void ExtractAntigravityAccessToken_ReadsLegacyFlatShape()
+    {
+        Assert.Equal(
+            "ya29.flat",
+            CredentialFileTokenExtractor.ExtractAntigravityAccessToken("""{"access_token":"ya29.flat"}"""));
+    }
+
+    [Fact]
+    public void ExtractAntigravityAccessToken_RegressionGuard_GeminiExtractorCannotReadTheNestedShape()
+    {
+        // Pins the reason this method exists: the quota probe used ExtractGeminiAccessToken on the agy
+        // bundle, always got null, and reported "no token configured" — which the router treats as an
+        // UNKNOWN quota reading, so agy dispatched with no quota gate at all.
+        var raw = """{"auth_method":"consumer","token":{"access_token":"ya29.nested"}}""";
+
+        Assert.Null(CredentialFileTokenExtractor.ExtractGeminiAccessToken(raw));
+        Assert.NotNull(CredentialFileTokenExtractor.ExtractAntigravityAccessToken(raw));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("not json")]
+    [InlineData("[]")]
+    [InlineData("""{"token":{}}""")]
+    [InlineData("""{"token":{"access_token":""}}""")]
+    [InlineData("""{"access_token":123}""")]
+    public void ExtractAntigravityAccessToken_ReturnsNullForUnusableInput(string? raw)
+    {
+        Assert.Null(CredentialFileTokenExtractor.ExtractAntigravityAccessToken(raw));
+    }
 }

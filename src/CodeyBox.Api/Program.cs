@@ -1804,7 +1804,11 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
             member,
             () => new AgentQuotaCredentials(
                 CredentialFileTokenExtractor.ExtractGeminiAccessToken(source.GetRaw())
-                    ?? CredentialFileTokenExtractor.ExtractGeminiAccessToken(
+                    // The agy bundle nests its token ({"token":{"access_token":…}}), so the gemini
+                    // extractor — which only reads a flat top-level access_token — always returned
+                    // null here. The probe then reported "no token configured", the router treated
+                    // that as UNKNOWN, and agy dispatched with no quota gate at all.
+                    ?? CredentialFileTokenExtractor.ExtractAntigravityAccessToken(
                         Environment.GetEnvironmentVariable(AntigravityConstants.OAuthCredsEnvVar))
                     ?? Environment.GetEnvironmentVariable("CODEYBOX_ANTIGRAVITY_OAUTH_TOKEN")
                     ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_TOKEN")))
