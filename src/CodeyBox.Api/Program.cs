@@ -292,7 +292,6 @@ builder.Services.AddOptions<TestSelectionOptions>()
         $"{TestSelectionOptions.SectionName}:Mode must be one of: all");
 builder.Services.Configure<NotificationsOptions>(builder.Configuration.GetSection("CodeyBox:Notifications"));
 builder.Services.Configure<AuditProgressApiOptions>(builder.Configuration.GetSection("CodeyBox:AuditProgressApi"));
-builder.Services.Configure<CopilotOptions>(builder.Configuration.GetSection("CodeyBox:Copilot"));
 // E2eExecutionOptions binds as a standalone section so the pool / dispatcher can
 // take IOptionsMonitor<E2eExecutionOptions> directly without dragging the whole
 // CodeyBoxOptions graph. The same section is also a property on CodeyBoxOptions
@@ -1072,7 +1071,7 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new ClaudeAgentRunner(
 // credential chain as COPILOT_PROVIDER_API_KEY, never from this configuration section.
 builder.Services.AddSingleton<IAgentRunner>(sp => new CopilotAgentRunner
 {
-    Options = sp.GetRequiredService<IOptionsMonitor<CopilotOptions>>().CurrentValue,
+    Options = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Copilot,
 });
 builder.Services.AddSingleton<IAgentRunner>(sp => new CodexAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>(),
@@ -5115,6 +5114,14 @@ namespace CodeyBox.Api
         /// Hot-reloadable through <c>IOptionsMonitor</c>.
         /// </summary>
         public CrockSandboxOptions Crock { get; set; } = new();
+
+        /// <summary>
+        /// GitHub Copilot CLI runner configuration. Subscription mode by default; setting
+        /// <c>Provider.BaseUrl</c> switches inference to an OpenAI-compatible endpoint (BYOK).
+        /// The BYOK credential is deliberately not here — it arrives through the credential chain
+        /// as <c>CODEYBOX_COPILOT_PROVIDER_API_KEY</c> so the secret never sits in config.
+        /// </summary>
+        public CopilotOptions Copilot { get; set; } = new();
 
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
