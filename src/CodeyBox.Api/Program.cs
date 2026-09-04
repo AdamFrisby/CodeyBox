@@ -1081,14 +1081,14 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new GeminiAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>()));
 builder.Services.AddSingleton<IAgentRunner, CursorAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, OpencodeAgentRunner>();
-builder.Services.AddSingleton<IAgentRunner>(_ => new AntigravityAgentRunner
+builder.Services.AddSingleton<IAgentRunner>(sp => new AntigravityAgentRunner
 {
     // agy's built-in --print-timeout default (5m) aborts a one-shot session with
     // "timed out waiting for response" and zero changes the first time a single
     // gemini turn on a large work item exceeds it. Override with a generous,
     // operator-tunable budget. CodeyBox:Antigravity:PrintTimeoutMinutes (default 20).
     PrintTimeout = TimeSpan.FromMinutes(
-        builder.Configuration.GetValue<int?>("CodeyBox:Antigravity:PrintTimeoutMinutes") ?? 20),
+        sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Antigravity.PrintTimeoutMinutes),
 });
 // Crock: registered, but DISABLED in shipped agent-class config. Operators opt
 // in by adding `crock` to an AgentClass member list AND setting
@@ -1803,7 +1803,14 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
         member => AgentInstanceCredentialResolver.ResolveQuotaCredentials(
             member,
             () => new AgentQuotaCredentials(
-                CredentialFileTokenExtractor.ExtractGeminiAccessToken(source.GetRaw())
+                // Read the token FILE first and on every probe. agy's access token lives ~1h and is
+                    // refreshed into the keyring by the CLI; an env var captured at process start
+                    // expires mid-run, after which every read is a 401 that the router treats as
+                    // UNKNOWN and fails open. The file is kept live by an external refresher.
+                    ReadAntigravityTokenFile(
+                        sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>()
+                            .CurrentValue.Antigravity.OAuthTokenFile)
+                    ?? CredentialFileTokenExtractor.ExtractGeminiAccessToken(source.GetRaw())
                     // The agy bundle nests its token ({"token":{"access_token":…}}), so the gemini
                     // extractor — which only reads a flat top-level access_token — always returned
                     // null here. The probe then reported "no token configured", the router treated
@@ -1814,11 +1821,37 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
                     ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_TOKEN")))
             ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
-        loggerFactory.CreateLogger<AntigravityQuotaProbe>());
+        loggerFactory.CreateLogger<AntigravityQuotaProbe>(),
+        timeProvider: null,
+        quotaUserAgent: sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>()
+            .CurrentValue.Antigravity.QuotaUserAgent);
     var wrapped = WrapLastKnownGood(probe, sp);
     source.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
     return wrapped;
 });
+
+// Reads the agy OAuth bundle from disk for the quota probe. Bounded and failure-tolerant: an
+// absent, unreadable, oversized or malformed file simply yields null so the caller falls through to
+// its other credential sources rather than throwing inside a probe.
+static string? ReadAntigravityTokenFile(string? path)
+{
+    const int MaxTokenFileBytes = 64 * 1024;
+    if (string.IsNullOrWhiteSpace(path))
+        return null;
+
+    try
+    {
+        var info = new FileInfo(path);
+        if (!info.Exists || info.Length > MaxTokenFileBytes)
+            return null;
+
+        return CredentialFileTokenExtractor.ExtractAntigravityAccessToken(File.ReadAllText(path));
+    }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
+    {
+        return null;
+    }
+}
 
 // --- Agent class router ------------------------------------------------------
 builder.Services.AddSingleton<AgentClassRouter>(sp =>
@@ -5126,6 +5159,12 @@ namespace CodeyBox.Api
         /// as <c>CODEYBOX_COPILOT_PROVIDER_API_KEY</c> so the secret never sits in config.
         /// </summary>
         public CopilotOptions Copilot { get; set; } = new();
+
+        /// <summary>
+        /// Google Antigravity (<c>agy</c>) runner and quota-probe settings. Bound from
+        /// <c>CodeyBox:Antigravity</c>.
+        /// </summary>
+        public AntigravitySectionOptions Antigravity { get; set; } = new();
 
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;

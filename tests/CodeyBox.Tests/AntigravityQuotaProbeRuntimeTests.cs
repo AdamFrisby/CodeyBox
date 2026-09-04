@@ -47,6 +47,67 @@ public sealed class AntigravityQuotaProbeRuntimeTests
     // ── loadCodeAssist: 200 / 429 / 403 / 5xx / transport ────────────────────
 
     [Fact]
+    public async Task QuotaSummary_200_PreferredOverAuthorizationRead_AndReportsRealWindows()
+    {
+        // The meter is the real reading: per-window remaining fractions with resets. When it answers,
+        // the probe must use it and must NOT fall back to the liveness read (which can only say 100%).
+        const string summary = """
+        {"groups":[{"displayName":"Gemini Models","buckets":[
+          {"bucketId":"gemini-weekly","remainingFraction":0.42,"resetTime":"2026-09-11T20:54:22Z","window":"weekly"},
+          {"bucketId":"gemini-5h","remainingFraction":0.10,"resetTime":"2026-09-05T01:54:22Z","window":"5h"}]}]}
+        """;
+        var handler = new LoadCodeAssistRouter(
+            HttpStatusCode.OK, TierBody,
+            quotaSummaryStatus: HttpStatusCode.OK, quotaSummaryBody: summary);
+
+        var probe = BuildProbe(handler);
+        var snapshot = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
+
+        // Aggregates to the scarcest window, and parks against THAT window's reset.
+        Assert.Equal(10.0, snapshot.AvailablePct, precision: 6);
+        Assert.Equal(new DateTimeOffset(2026, 9, 5, 1, 54, 22, TimeSpan.Zero), snapshot.ResetAt);
+        Assert.Equal(2, snapshot.Windows.Count);
+        Assert.Contains(snapshot.Windows, w => w.Name == "seven_day" && Math.Abs(w.AvailablePct - 42.0) < 1e-6);
+        Assert.Contains(snapshot.Windows, w => w.Name == "five_hour" && Math.Abs(w.AvailablePct - 10.0) < 1e-6);
+
+        // The meter was consulted and the fallback was not needed.
+        Assert.Single(handler.QuotaSummaryRequests);
+        Assert.Empty(handler.LoadCodeAssistRequests);
+        Assert.Contains("aicode-consumers", handler.QuotaSummaryRequests[0].Body);
+    }
+
+    [Fact]
+    public async Task QuotaSummary_403_FallsBackToAuthorizationRead()
+    {
+        // An unentitled client identity gets 403 from the meter. That must degrade to the liveness
+        // read rather than reporting unknown, which the router would treat as fail-open.
+        var handler = new LoadCodeAssistRouter(
+            HttpStatusCode.OK, TierBody, quotaSummaryStatus: HttpStatusCode.Forbidden);
+
+        var probe = BuildProbe(handler);
+        var snapshot = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
+
+        Assert.True(snapshot.IsKnown);
+        Assert.Contains("authorized", snapshot.Notes!);
+        Assert.Single(handler.QuotaSummaryRequests);
+        Assert.Single(handler.LoadCodeAssistRequests);
+    }
+
+    [Fact]
+    public async Task QuotaSummary_MalformedBody_FallsBackRatherThanInventingAReading()
+    {
+        var handler = new LoadCodeAssistRouter(
+            HttpStatusCode.OK, TierBody,
+            quotaSummaryStatus: HttpStatusCode.OK, quotaSummaryBody: "not json");
+
+        var probe = BuildProbe(handler);
+        var snapshot = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
+
+        Assert.Contains("authorized", snapshot.Notes!);
+        Assert.Single(handler.LoadCodeAssistRequests);
+    }
+
+    [Fact]
     public async Task LoadCodeAssist_200_Reports100PctAvailableWithTier()
     {
         // A 200 from :loadCodeAssist means the credential is valid and the
@@ -63,9 +124,9 @@ public sealed class AntigravityQuotaProbeRuntimeTests
         Assert.Equal(100.0, snapshot.PerModel["gemini-3.5-flash-high"].AvailablePct);
         // The request hit loadCodeAssist with the GEMINI plugin type (ANTIGRAVITY
         // is rejected by the proto on this host).
-        Assert.Single(handler.Requests);
-        Assert.Equal(AntigravityQuotaProbe.LoadCodeAssistEndpoint, handler.Requests[0].Uri);
-        Assert.Contains("GEMINI", handler.Requests[0].Body);
+        Assert.Single(handler.LoadCodeAssistRequests);
+        Assert.Equal(AntigravityQuotaProbe.LoadCodeAssistEndpoint, handler.LoadCodeAssistRequests[0].Uri);
+        Assert.Contains("GEMINI", handler.LoadCodeAssistRequests[0].Body);
     }
 
     [Fact]
@@ -179,7 +240,7 @@ public sealed class AntigravityQuotaProbeRuntimeTests
 
         Assert.Equal(-1.0, snapshot.AvailablePct);
         Assert.Contains("no token", snapshot.Notes!);
-        Assert.Empty(handler.Requests);
+        Assert.Empty(handler.LoadCodeAssistRequests);
     }
 
     // ── MarkExhaustedAsync + GetAvailabilityAsync gating ─────────────────────
@@ -201,7 +262,7 @@ public sealed class AntigravityQuotaProbeRuntimeTests
         Assert.Equal(resetAt, snapshot.ResetAt);
         Assert.Contains("exhausted", snapshot.Notes!);
         // No HTTP must have flowed — the override short-circuits the probe.
-        Assert.Empty(handler.Requests);
+        Assert.Empty(handler.LoadCodeAssistRequests);
     }
 
     [Fact]
@@ -258,7 +319,7 @@ public sealed class AntigravityQuotaProbeRuntimeTests
 
         Assert.Equal(0.0, snapshot.AvailablePct);
         Assert.Equal(now.AddMinutes(10), snapshot.ResetAt);
-        Assert.Empty(handler.Requests);
+        Assert.Empty(handler.LoadCodeAssistRequests);
     }
 
     [Fact]
@@ -273,7 +334,7 @@ public sealed class AntigravityQuotaProbeRuntimeTests
         var snapshot = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
 
         Assert.Equal(100.0, snapshot.AvailablePct);
-        Assert.Single(handler.Requests);
+        Assert.Single(handler.LoadCodeAssistRequests);
     }
 
     [Fact]
@@ -318,7 +379,7 @@ public sealed class AntigravityQuotaProbeRuntimeTests
         var snapshot = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
 
         Assert.Equal(100.0, snapshot.AvailablePct);
-        Assert.Single(handler.Requests);
+        Assert.Single(handler.LoadCodeAssistRequests);
     }
 
     [Fact]
@@ -364,7 +425,7 @@ public sealed class AntigravityQuotaProbeRuntimeTests
         time.Advance(TimeSpan.FromMinutes(10));
         var fresh = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
         Assert.Equal(100.0, fresh.AvailablePct);
-        Assert.NotEmpty(handler.Requests);
+        Assert.NotEmpty(handler.LoadCodeAssistRequests);
     }
 
     // ── TTL cache ────────────────────────────────────────────────────────────
@@ -385,14 +446,14 @@ public sealed class AntigravityQuotaProbeRuntimeTests
 
         Assert.Equal(100.0, first.AvailablePct);
         Assert.Equal(100.0, second.AvailablePct);
-        Assert.Single(handler.Requests);
+        Assert.Single(handler.LoadCodeAssistRequests);
 
         // After TTL elapses the cache entry is dropped; the next call must
         // re-issue the probe rather than hand back a stale snapshot forever.
         time.Advance(TimeSpan.FromMinutes(6));
         var refreshed = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
         Assert.Equal(100.0, refreshed.AvailablePct);
-        Assert.Equal(2, handler.Requests.Count);
+        Assert.Equal(2, handler.LoadCodeAssistRequests.Count);
     }
 
     [Fact]
@@ -405,12 +466,12 @@ public sealed class AntigravityQuotaProbeRuntimeTests
         var probe = BuildProbe(handler, cacheTtl: TimeSpan.FromMinutes(5));
 
         _ = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
-        Assert.Single(handler.Requests);
+        Assert.Single(handler.LoadCodeAssistRequests);
 
         probe.InvalidateCache();
 
         _ = await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
-        Assert.Equal(2, handler.Requests.Count);
+        Assert.Equal(2, handler.LoadCodeAssistRequests.Count);
     }
 
     [Fact]
@@ -435,7 +496,7 @@ public sealed class AntigravityQuotaProbeRuntimeTests
 
         Assert.Equal(0.0, snapshot.AvailablePct);
         Assert.Equal(now.AddMinutes(10), snapshot.ResetAt);
-        Assert.Empty(handler.Requests);
+        Assert.Empty(handler.LoadCodeAssistRequests);
     }
 
     [Fact]
@@ -450,20 +511,20 @@ public sealed class AntigravityQuotaProbeRuntimeTests
         await probe.MarkExhaustedAsync(member, TimeSpan.FromHours(6), now.AddHours(6));
         var gated = await probe.GetAvailabilityAsync(member, CancellationToken.None);
         Assert.Equal(0.0, gated.AvailablePct);
-        Assert.Empty(handler.Requests);
+        Assert.Empty(handler.LoadCodeAssistRequests);
 
         ((IAgentQuotaRecoveryStateInvalidator)probe).InvalidateRecoveryState(member);
         var stillGated = await probe.GetAvailabilityAsync(member, CancellationToken.None);
 
         Assert.Equal(0.0, stillGated.AvailablePct);
         Assert.Equal(now.AddHours(6), stillGated.ResetAt);
-        Assert.Empty(handler.Requests);
+        Assert.Empty(handler.LoadCodeAssistRequests);
 
         time.Advance(TimeSpan.FromHours(7));
         var recovered = await probe.GetAvailabilityAsync(member, CancellationToken.None);
 
         Assert.Equal(100.0, recovered.AvailablePct);
-        Assert.Single(handler.Requests);
+        Assert.Single(handler.LoadCodeAssistRequests);
     }
 
     // ── Test helpers ─────────────────────────────────────────────────────────
@@ -489,19 +550,33 @@ public sealed class AntigravityQuotaProbeRuntimeTests
         private readonly string _body;
         private readonly TimeSpan? _retryAfter;
         private readonly Exception? _throwOnSend;
+        private readonly HttpStatusCode _quotaSummaryStatus;
+        private readonly string _quotaSummaryBody;
 
         public List<(string Uri, string Body)> Requests { get; } = new();
+
+        /// <summary>Only the authorization-read calls — the assertions about re-issuing HTTP are about
+        /// that endpoint, and the probe now also attempts the quota meter first.</summary>
+        public List<(string Uri, string Body)> LoadCodeAssistRequests =>
+            Requests.Where(r => r.Uri == AntigravityQuotaProbe.LoadCodeAssistEndpoint).ToList();
+
+        public List<(string Uri, string Body)> QuotaSummaryRequests =>
+            Requests.Where(r => r.Uri == AntigravityQuotaProbe.QuotaSummaryEndpoint).ToList();
 
         public LoadCodeAssistRouter(
             HttpStatusCode status = HttpStatusCode.OK,
             string body = "{}",
             TimeSpan? retryAfter = null,
-            Exception? throwOnSend = null)
+            Exception? throwOnSend = null,
+            HttpStatusCode quotaSummaryStatus = HttpStatusCode.Forbidden,
+            string quotaSummaryBody = "{}")
         {
             _status = status;
             _body = body;
             _retryAfter = retryAfter;
             _throwOnSend = throwOnSend;
+            _quotaSummaryStatus = quotaSummaryStatus;
+            _quotaSummaryBody = quotaSummaryBody;
         }
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
@@ -511,6 +586,18 @@ public sealed class AntigravityQuotaProbeRuntimeTests
             Requests.Add((uri, body));
 
             if (_throwOnSend is not null) throw _throwOnSend;
+
+            // The gateway gates the meter on client identity; an unentitled caller gets 403 and the
+            // probe degrades to the authorization read. Default here mirrors that so the fallback is
+            // covered rather than bypassed.
+            if (uri == AntigravityQuotaProbe.QuotaSummaryEndpoint)
+            {
+                return new HttpResponseMessage(_quotaSummaryStatus)
+                {
+                    Content = new StringContent(_quotaSummaryBody),
+                };
+            }
+
             if (uri != AntigravityQuotaProbe.LoadCodeAssistEndpoint)
                 throw new InvalidOperationException($"Unexpected endpoint {uri}");
 
