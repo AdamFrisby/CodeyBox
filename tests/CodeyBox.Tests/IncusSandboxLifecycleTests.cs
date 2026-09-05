@@ -775,6 +775,77 @@ public sealed class IncusSandboxLifecycleTests
     }
 
     [Fact]
+    public async Task ListBaselineImagesAsync_SkipsSiblingWithoutConfigAndReturnsValidOwnedEntry()
+    {
+        const string baselineName = "cb-baseline-complete";
+        var stagingRoot = Path.Combine(Path.GetTempPath(), $"codeybox-incus-inventory-{Guid.NewGuid():N}");
+        var runner = new ScriptedLifecycleRunner((argv, _, _) =>
+        {
+            if (argv.SequenceEqual(["incus", "project", "list", "--format=json"]))
+                return Task.FromResult(Success("[{\"name\":\"codeybox\"}]"));
+            if (argv.SequenceEqual(["incus", "query", "/1.0/projects/codeybox"]))
+                return Task.FromResult(Success(ManagedProjectQuery(stagingRoot)));
+            if (argv.Contains("list", StringComparer.Ordinal))
+            {
+                return Task.FromResult(Success(
+                    $"[{{\"name\":\"{baselineName}\",\"type\":\"virtual-machine\",\"status\":\"STOPPED\"," +
+                    $"\"config\":{{\"{IncusSandboxProvider.ManagedKey}\":\"true\"," +
+                    $"\"{IncusSandboxProvider.KindKey}\":\"{IncusSandboxProvider.BaselineKind}\"}}}}," +
+                    "{\"name\":\"incomplete-sibling\",\"type\":\"virtual-machine\",\"status\":\"STOPPED\"}]"));
+            }
+            throw new InvalidOperationException($"Unexpected Incus command: {string.Join(' ', argv)}");
+        });
+        var provider = new IncusSandboxProvider(
+            () => new IncusSandboxOptions
+            {
+                StagingDirectory = stagingRoot,
+                DiskGuard = null,
+            },
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner);
+
+        var baseline = Assert.Single(await provider.ListBaselineImagesAsync(CancellationToken.None));
+
+        Assert.Equal(baselineName, baseline.Name);
+    }
+
+    [Fact]
+    public async Task DisposeBaselineImageAsync_MissingConfigOnExactEntryRemainsStrict()
+    {
+        const string baselineName = "cb-baseline-incomplete";
+        var stagingRoot = Path.Combine(Path.GetTempPath(), $"codeybox-incus-inventory-{Guid.NewGuid():N}");
+        var runner = new ScriptedLifecycleRunner((argv, _, _) =>
+        {
+            if (argv.SequenceEqual(["incus", "project", "list", "--format=json"]))
+                return Task.FromResult(Success("[{\"name\":\"codeybox\"}]"));
+            if (argv.SequenceEqual(["incus", "query", "/1.0/projects/codeybox"]))
+                return Task.FromResult(Success(ManagedProjectQuery(stagingRoot)));
+            if (argv.Contains("list", StringComparer.Ordinal))
+            {
+                return Task.FromResult(Success(
+                    $"[{{\"name\":\"{baselineName}\",\"type\":\"virtual-machine\",\"status\":\"STOPPED\"}}," +
+                    $"{{\"name\":\"complete-sibling\",\"type\":\"virtual-machine\",\"config\":{{" +
+                    $"\"{IncusSandboxProvider.ManagedKey}\":\"true\"," +
+                    $"\"{IncusSandboxProvider.KindKey}\":\"{IncusSandboxProvider.BaselineKind}\"}}}}]"));
+            }
+            throw new InvalidOperationException($"Unexpected Incus command: {string.Join(' ', argv)}");
+        });
+        var provider = new IncusSandboxProvider(
+            () => new IncusSandboxOptions
+            {
+                StagingDirectory = stagingRoot,
+                DiskGuard = null,
+            },
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner);
+
+        await Assert.ThrowsAsync<JsonException>(() =>
+            provider.DisposeBaselineImageAsync(baselineName, CancellationToken.None));
+    }
+
+    [Fact]
     public async Task Create_WhenDaemonCompletionIsUncertain_RetainsNamedStagingForReaper()
     {
         var stateHome = Path.Combine(Path.GetTempPath(), $"codeybox-incus-state-{Guid.NewGuid():N}");
