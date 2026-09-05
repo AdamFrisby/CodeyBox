@@ -2191,14 +2191,34 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         };
         await fix.Store.CreateAsync(item);
 
-        var reworkStarted = WaitForReworkStart(fix.Codex, fix.Claude, fix.Gemini);
+        var reworkStarted = WaitForAgentPhaseStart(AgentKind.Codex, "rework", fix.Codex, fix.Claude, fix.Gemini);
+        var claudeReworkStarted = WaitForAgentPhaseStart(AgentKind.Claude, "rework", fix.Codex, fix.Claude, fix.Gemini);
+        var geminiReworkStarted = WaitForAgentPhaseStart(AgentKind.Gemini, "rework", fix.Codex, fix.Claude, fix.Gemini);
         var pipelineTask = fix.Pipeline.RunAsync(item, CancellationToken.None);
         await WaitForReworkStartAsync(reworkStarted, pipelineTask);
-        await RunWithAdvancingTimeAsync(
+
+        await RunWithAdvancingTimeUntilAsync(
+            claudeReworkStarted,
             pipelineTask,
             time,
             step: TimeSpan.FromMilliseconds(100),
-            maxSteps: 500);
+            maxSteps: 200);
+
+        await RunWithAdvancingTimeUntilAsync(
+            geminiReworkStarted,
+            pipelineTask,
+            time,
+            step: TimeSpan.FromMilliseconds(100),
+            maxSteps: 200);
+
+        var geminiStartedAt = time.GetUtcNow() - DateTimeOffset.UnixEpoch;
+        await AdvanceManualTimeToElapsedAsync(
+            time,
+            geminiStartedAt + TimeSpan.FromSeconds(10.1),
+            pipelineTask,
+            step: TimeSpan.FromMilliseconds(100));
+
+        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(10));
 
         var elapsed = time.GetUtcNow() - DateTimeOffset.UnixEpoch;
         Assert.InRange(elapsed, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(32));
