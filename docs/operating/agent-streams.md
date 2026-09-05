@@ -14,7 +14,8 @@ each stdout line as it arrives.
       "Enabled": true,
       "Path": "logs/agents",
       "MaxFileSizeMb": 32,
-      "RetainedDays": 14
+      "RetainedDays": 14,
+      "MaxTotalSizeMb": 2048
     }
   }
 }
@@ -25,10 +26,21 @@ each stdout line as it arrives.
 | `Enabled` | `true` | When `false`, no stream flags are added and no files are opened. |
 | `Path` | `logs/agents` | Root directory for captured streams. Must be writable at startup. |
 | `MaxFileSizeMb` | `32` | Per-file cap. After the cap is reached, later stdout lines are dropped and a final `[...truncated by N bytes]` marker is appended. |
-| `RetainedDays` | `14` | Daily sweep deletes older stream files. `0` keeps files forever. |
+| `RetainedDays` | `14` | Daily sweep deletes stream files whose **last-write** time is older than this. `0` disables age-based eviction (keeps files forever). |
+| `MaxTotalSizeMb` | `2048` | Size backstop: total bytes across all stream files. When exceeded, the sweep evicts the oldest-by-last-write files first until back under the cap. Runs independently of `RetainedDays`, so a zero/misconfigured retention window can't grow the directory unbounded. `0` disables the backstop. |
 
-Startup validation rejects an empty path, `MaxFileSizeMb < 1`, or
-`RetainedDays < 0`.
+All three numeric knobs (`MaxFileSizeMb`, `RetainedDays`, `MaxTotalSizeMb`) are
+hot-reloadable; `Path` is pinned at startup by the hot-reload guard.
+
+The sweep runs on startup and then daily (`AgentStreamRetentionService`), so it
+executes even when few new streams are being written. Age is measured from the
+file's last-write time rather than its creation time, because Linux birth-time
+is frequently unavailable and the runtime falls back to the inode change time,
+which metadata touches reset — making creation-time cutoffs silently fail to age
+files out.
+
+Startup validation rejects an empty path, `MaxFileSizeMb < 1`,
+`RetainedDays < 0`, or `MaxTotalSizeMb < 0`.
 
 ## File layout
 
@@ -201,7 +213,9 @@ See [`../reference/api.md`](../reference/api.md#agent-streams) for response shap
 Typical streams are a few KB to about 1 MB per invocation. A five-iteration item
 with three LLM auditors per iteration can produce around 20 stream files. At
 roughly 10-30 MB per work item and 100 work items per week, the default 14-day
-retention is about 30 GB of stream data.
+retention is about 30 GB of stream data. The `MaxTotalSizeMb` backstop (default
+2 GB) caps the on-disk footprint regardless of the age window, evicting oldest
+files first once the aggregate size is exceeded.
 
 `logs/` is gitignored, which covers the default `logs/agents/` path.
 

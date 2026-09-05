@@ -1026,7 +1026,9 @@ public sealed class AgentStreamRetentionSweepTests : IDisposable
 
         var file = Assert.Single(await store.ListAsync(itemId));
         var path = Path.Combine(_root, itemId.ToString(), file.FileName);
-        File.SetCreationTimeUtc(path, DateTime.UtcNow.AddDays(-20));
+        // Age by last-write time: the sweep uses GetLastWriteTimeUtc because
+        // Linux creation/birth time is unreliable.
+        File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddDays(-20));
 
         var deleted = await store.SweepAsync(DateTimeOffset.UtcNow);
 

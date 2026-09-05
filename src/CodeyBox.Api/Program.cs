@@ -3095,9 +3095,18 @@ builder.Services.AddSingleton<AgentStreamsOptions>(sp =>
     return opts;
 });
 builder.Services.AddSingleton<IAgentStreamStore>(sp =>
-    new AgentStreamStore(
-        sp.GetRequiredService<AgentStreamsOptions>(),
-        sp.GetRequiredService<ILogger<AgentStreamStore>>()));
+{
+    // Resolve the AgentStreamsOptions singleton once to run ValidateAtStartup
+    // (directory writability probe + startup log), then read numeric knobs
+    // (RetainedDays, MaxTotalSizeMb, MaxFileSizeMb) live from IOptionsMonitor so
+    // retention/size caps hot-reload without a restart. Path is pinned by the
+    // hot-reload guard, so reading it live is equivalent to the snapshot.
+    _ = sp.GetRequiredService<AgentStreamsOptions>();
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    return new AgentStreamStore(
+        () => monitor.CurrentValue.AgentStreams,
+        sp.GetRequiredService<ILogger<AgentStreamStore>>());
+});
 builder.Services.AddSingleton(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AgentStreamAnalysis;
