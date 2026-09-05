@@ -359,10 +359,15 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
         // operators can see (via /quota) which window is the actual gate.
         var windows = new List<WindowQuota>(windowSources.Length);
         ModelQuota? mostConstrained = null;
-        foreach (var (windowName, window) in windowSources)
+        foreach (var (positionalName, window) in windowSources)
         {
             if (window is null)
                 continue;
+
+            // Name the window by the length it declares, not by the slot it arrived in.
+            var windowName = positionalName == "overall"
+                ? positionalName
+                : ResolveWindowName(window.Value, positionalName);
 
             var quota = TryParseWindow(window.Value, windowName);
             if (quota is null)
@@ -388,6 +393,37 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
         return mostConstrained is null
             ? null
             : mostConstrained with { Windows = windows };
+    }
+
+    /// <summary>
+    /// Two days. Any window at least this long is a weekly allowance; anything shorter is the
+    /// short rolling one. Sits far from both real values (5h = 18,000s, weekly = 604,800s) so a
+    /// provider tweak to either does not flip the classification.
+    /// </summary>
+    private const double WeeklyWindowThresholdSeconds = 2 * 24 * 60 * 60;
+
+    /// <summary>
+    /// The window's real name, taken from the length the payload declares rather than from which
+    /// JSON slot it arrived in.
+    /// </summary>
+    /// <remarks>
+    /// The slot is not the window: this account's <c>primary_window</c> carries
+    /// <c>limit_window_seconds: 604800</c> — a WEEKLY allowance — while the positional convention
+    /// would call it <c>5h-rolling</c>. Mislabelling it is not cosmetic: <c>/quota</c> then shows a
+    /// weekly exhaustion as a five-hourly one (implying it recovers in hours when it recovers in
+    /// days), and the per-window floor in <c>QuotaRouter.MinQuotaPctByWindow</c> is looked up under
+    /// the wrong key. Falls back to the positional default when the length is absent.
+    /// </remarks>
+    private static string ResolveWindowName(JsonElement window, string positionalDefault)
+    {
+        if ((TryGetDoubleProperty(window, "limit_window_seconds", out var seconds)
+             || TryGetDoubleProperty(window, "limitWindowSeconds", out seconds))
+            && seconds > 0)
+        {
+            return seconds >= WeeklyWindowThresholdSeconds ? "weekly" : "5h-rolling";
+        }
+
+        return positionalDefault;
     }
 
     private static ModelQuota? TryParseWindow(JsonElement el, string window)
