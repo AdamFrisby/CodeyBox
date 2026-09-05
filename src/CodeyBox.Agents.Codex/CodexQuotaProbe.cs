@@ -407,9 +407,11 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
     /// JSON slot it arrived in.
     /// </summary>
     /// <remarks>
-    /// The slot is not the window: this account's <c>primary_window</c> carries
-    /// <c>limit_window_seconds: 604800</c> — a WEEKLY allowance — while the positional convention
-    /// would call it <c>5h-rolling</c>. Mislabelling it is not cosmetic: <c>/quota</c> then shows a
+    /// The slot is not the window. OpenAI disabled the 5-hour limit for <b>Pro</b> accounts (it now
+    /// applies to basic accounts only), so on Pro the WEEKLY allowance arrives in
+    /// <c>primary_window</c> (<c>limit_window_seconds: 604800</c>) and <c>secondary_window</c> is
+    /// null — while the positional convention would call that weekly window <c>5h-rolling</c>.
+    /// Naming by declared length covers both account shapes without branching on plan type. Mislabelling it is not cosmetic: <c>/quota</c> then shows a
     /// weekly exhaustion as a five-hourly one (implying it recovers in hours when it recovers in
     /// days), and the per-window floor in <c>QuotaRouter.MinQuotaPctByWindow</c> is looked up under
     /// the wrong key. Falls back to the positional default when the length is absent.
