@@ -628,11 +628,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             // as an independent AND-gate (dispatchable only if breaker AND quota
             // both allow). Peek is non-mutating so spilling past a benched member
             // and readiness checks never consume a half-open trial; the trial is
-            // consumed at the dispatch-commit point below. A quota-retry admission
-            // for this exact member bypasses the breaker so an operator-scheduled
-            // retry can probe recovery, mirroring the recent-failure precheck.
+            // consumed at the dispatch-commit point below.
             if (_circuitBreaker is not null
-                && !quotaRetryAdmissionMatches
                 && !_circuitBreaker.IsDispatchAllowed(member, nowUtc))
             {
                 var breakerReason = "circuit breaker open (repeated dispatch failures)";
@@ -1026,10 +1023,20 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             budgetRecheck = _opts.CapRetryRecheckInterval;
         var allFallbackSmokeExcluded = ordered.Count > 0
             && ordered.All(x => smokeExcluded.Contains((x.Member.Agent, x.Member.ModelId)));
+        var allFallbackBreakerExcluded = ordered.Count > 0
+            && ordered.All(x => breakerExcluded.Contains(x.Member));
+        if (allFallbackBreakerExcluded)
+            budgetRecheck = TightenToBreakerRetry(budgetRecheck, earliestBreakerRetry, nowUtc);
         string parkReason;
         if (allFallbackSmokeExcluded)
             parkReason = $"all PayPerApi members of class '{classId}' are benched by the smoke gate / fast-fail breaker — "
                          + "waiting for the in-VM smoke sweep or an operator reset to clear them";
+        else if (allFallbackBreakerExcluded)
+        {
+            var retry = earliestBreakerRetry is { } r ? $" earliest breaker recheck {r:O};" : "";
+            parkReason = $"all PayPerApi members of class '{classId}' are benched by the failure circuit breaker;{retry} "
+                         + "waiting for the breaker cooldown to admit a half-open trial";
+        }
         else if (budgetExhaustedMembers.Count > 0 && fallbackCapBlocked)
             parkReason = $"all PayPerApi members of class '{classId}' are budget-exhausted or at their per-agent concurrency cap";
         else if (fallbackCapBlocked)
