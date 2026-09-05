@@ -1025,12 +1025,6 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
             cliRunner: _ => Task.FromResult(true),
             keyringReader: _ => Task.FromResult<string?>(keyringBundle));
 
-        // Verify parse on keyring bundle
-        var parsedKeyring = refresher.ExposeParseCreds(keyringBundle);
-        Assert.Equal("ya29.refreshed-access", parsedKeyring.AccessToken);
-        Assert.Equal("rt-refreshed", parsedKeyring.RefreshToken);
-        Assert.NotNull(parsedKeyring.ExpiresAt);
-
         // Perform refresh and verify returned token
         var token = await refresher.GetAccessTokenAsync();
         Assert.Equal("ya29.refreshed-access", token);
@@ -1050,11 +1044,19 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
         Assert.Equal("keep-this-claim", tokenObj.GetProperty("custom_claim").GetString());
         Assert.True(DateTimeOffset.TryParse(tokenObj.GetProperty("expiry").GetString(), out _));
 
-        // Round-trip persisted text back through ParseCreds
-        var parsedPersisted = refresher.ExposeParseCreds(persistedText);
-        Assert.Equal("ya29.refreshed-access", parsedPersisted.AccessToken);
-        Assert.Equal("rt-refreshed", parsedPersisted.RefreshToken);
-        Assert.NotNull(parsedPersisted.ExpiresAt);
+        // Verify that the persisted file can be read and parsed directly
+        Assert.Equal("ya29.refreshed-access", CredentialFileTokenExtractor.ExtractAntigravityAccessToken(persistedText));
+
+        // And verify that a fresh refresher instance consuming the persisted file recognizes it as unexpired without refreshing
+        using var source2 = new AntigravityCredentialFileSource(path, watch: false);
+        using var refresher2 = new AntigravityOauthCredentialFileRefresher(
+            source2,
+            new RefresherFakeHttpClientFactory("agent-quota", new RefresherCapturingHandler(HttpStatusCode.OK, "")),
+            NullLogger<AntigravityOauthCredentialFileRefresher>.Instance,
+            cliRunner: _ => throw new InvalidOperationException("CLI should not be called for unexpired token"),
+            keyringReader: _ => throw new InvalidOperationException("Keyring should not be called for unexpired token"));
+        var token2 = await refresher2.GetAccessTokenAsync();
+        Assert.Equal("ya29.refreshed-access", token2);
     }
 
     [Fact]
@@ -1070,6 +1072,8 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
 
         var cliCount = 0;
         var keyringCount = 0;
+        var gateReached = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseCli = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         using var refresher = new AntigravityOauthCredentialFileRefresher(
             source,
@@ -1078,7 +1082,8 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
             cliRunner: async _ =>
             {
                 Interlocked.Increment(ref cliCount);
-                await Task.Delay(100);
+                gateReached.TrySetResult(true);
+                await releaseCli.Task;
                 return true;
             },
             keyringReader: _ =>
@@ -1088,6 +1093,8 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
             });
 
         var calls = Enumerable.Range(0, 10).Select(_ => refresher.GetAccessTokenAsync()).ToArray();
+        await gateReached.Task;
+        releaseCli.TrySetResult(true);
         await Task.WhenAll(calls);
 
         Assert.All(calls, t => Assert.Equal("concurrent-new", t.Result));
@@ -1255,10 +1262,78 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
     }
 
     [Fact]
-    public void Antigravity_RemoveInterimExternalRefresher_DoesNotThrow()
+    public async Task SecretServiceClient_ReadSecretAsync_WhenSessionBusUnreachable_ReturnsNullWithoutThrowing()
     {
-        var ex = Record.Exception(AntigravityOauthCredentialFileRefresher.RemoveInterimExternalRefresher);
-        Assert.Null(ex);
+        var nullLog = NullLogger<AntigravityOauthCredentialFileRefresher>.Instance;
+        var result = await SecretServiceClient.ReadSecretAsync(
+            "gemini",
+            "antigravity",
+            busAddress: "unix:path=/tmp/nonexistent-dbus-socket-" + Guid.NewGuid().ToString("N"),
+            timeout: TimeSpan.FromMilliseconds(500),
+            log: nullLog);
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public async Task SecretServiceClient_ReadSecretAsync_WhenCancelled_PropagatesCancellation()
+    {
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            await SecretServiceClient.ReadSecretAsync(
+                "gemini",
+                "antigravity",
+                busAddress: "unix:path=/tmp/nonexistent-dbus-socket",
+                ct: cts.Token);
+        });
+    }
+
+    [Fact]
+    public async Task Antigravity_Refresh_DefaultKeyringReader_WhenKeyringUnreachable_GracefullyDegradesToStaleToken()
+    {
+        var expiredIso = DateTimeOffset.UtcNow.AddMinutes(-30).ToString("o");
+        var path = WriteCreds("antigravity-oauth-token",
+            AntigravityCreds("stale-fallback-token", "rt-1", expiredIso));
+        using var source = new AntigravityCredentialFileSource(path, watch: false);
+
+        // Omit keyringReader to exercise production SecretServiceClient fallback path
+        using var refresher = new AntigravityOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", new RefresherCapturingHandler(HttpStatusCode.OK, "")),
+            NullLogger<AntigravityOauthCredentialFileRefresher>.Instance,
+            cliRunner: _ => Task.FromResult(true));
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        // System keyring is unreachable in test sandbox, so refresher gracefully degrades to stale token without throwing
+        Assert.Equal("stale-fallback-token", token);
+    }
+
+    [Fact]
+    public async Task Antigravity_Refresh_WhenKeyringReturnsExpiredToken_FailsRefreshAndReturnsStaleToken()
+    {
+        var expiredIso = DateTimeOffset.UtcNow.AddMinutes(-30).ToString("o");
+        var path = WriteCreds("antigravity-oauth-token",
+            AntigravityCreds("stale-token", "rt-1", expiredIso));
+        using var source = new AntigravityCredentialFileSource(path, watch: false);
+
+        // Keyring yields a credential whose expiration timestamp is already in the past
+        var expiredKeyringBundle = AntigravityCreds("expired-from-keyring", "rt-expired", expiredIso);
+
+        using var refresher = new AntigravityOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", new RefresherCapturingHandler(HttpStatusCode.OK, "")),
+            NullLogger<AntigravityOauthCredentialFileRefresher>.Instance,
+            cliRunner: _ => Task.FromResult(true),
+            keyringReader: _ => Task.FromResult<string?>(expiredKeyringBundle));
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        // Must treat refresh as failed and return stale token rather than caching expired-from-keyring
+        Assert.Equal("stale-token", token);
     }
 
     // ── BuildPersistedJson field preservation ────────────────────────────────

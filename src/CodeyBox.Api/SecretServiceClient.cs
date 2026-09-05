@@ -1,4 +1,5 @@
 using System.Text;
+using Microsoft.Extensions.Logging;
 using Tmds.DBus;
 
 namespace CodeyBox.Api;
@@ -51,8 +52,11 @@ public static class SecretServiceClient
         string username,
         string? busAddress = null,
         TimeSpan? timeout = null,
+        ILogger? log = null,
         CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
+
         var address = busAddress ?? ResolveSessionBusAddress();
         if (string.IsNullOrEmpty(address))
             return null;
@@ -117,8 +121,16 @@ public static class SecretServiceClient
                 }
             }
         }
-        catch (Exception)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            if (ct.IsCancellationRequested)
+                throw new OperationCanceledException("Operation was cancelled", ex, ct);
+
+            log?.LogWarning(ex, "Failed to read secret from SecretService for {Service}/{Username}", service, username);
             return null;
         }
     }

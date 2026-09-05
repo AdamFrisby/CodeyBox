@@ -334,7 +334,123 @@ public abstract class OauthCredentialFileRefresher : IDisposable
         GC.SuppressFinalize(this);
     }
 
-    protected internal sealed record ParsedCreds(
+    internal static readonly TimeSpan WhichTimeout = TimeSpan.FromSeconds(5);
+
+    /// <summary>Resolves an executable path using the platform-specific resolver command.</summary>
+    internal static string? ResolveExecutablePath(string resolverCommand, string targetBinary)
+    {
+        try
+        {
+            using var proc = Process.Start(new ProcessStartInfo
+            {
+                FileName = resolverCommand,
+                ArgumentList = { targetBinary },
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            });
+            if (proc is null) return null;
+            if (!proc.WaitForExit(WhichTimeout))
+            {
+                try { proc.Kill(entireProcessTree: true); } catch (Exception ex2) when (ex2 is InvalidOperationException or IOException or System.ComponentModel.Win32Exception) { }
+                return null;
+            }
+            if (proc.ExitCode == 0)
+            {
+                var path = proc.StandardOutput.ReadLine()?.Trim();
+                if (!string.IsNullOrEmpty(path)) return path;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException
+            or System.ComponentModel.Win32Exception)
+        { }
+        return null;
+    }
+
+    internal static string ResolveCliRefreshPathValue(string? inheritedPath)
+    {
+        if (!string.IsNullOrWhiteSpace(inheritedPath))
+            return inheritedPath;
+
+        return OperatingSystem.IsWindows()
+            ? @"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem"
+            : "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    }
+
+    internal static string ResolveCliRefreshWorkingDirectory()
+    {
+        var home = Environment.GetEnvironmentVariable("HOME");
+        if (!string.IsNullOrWhiteSpace(home) && Directory.Exists(home))
+            return home;
+
+        var temp = Path.GetTempPath();
+        return Directory.Exists(temp) ? temp : Path.DirectorySeparatorChar.ToString();
+    }
+
+    internal static void PopulateCliRefreshEnvironment(ProcessStartInfo psi)
+    {
+        psi.Environment.Clear();
+        foreach (var key in new[]
+                 {
+                     "HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME", "SHELL",
+                     "SystemRoot", "WINDIR", "ComSpec", "PATHEXT", "TEMP", "TMP",
+                     "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+                 })
+        {
+            var val = Environment.GetEnvironmentVariable(key);
+            if (val is not null) psi.Environment[key] = val;
+        }
+
+        psi.Environment["PATH"] = ResolveCliRefreshPathValue(
+            psi.Environment.TryGetValue("PATH", out var path) ? path : null);
+    }
+
+    internal static async Task<bool> ExecuteCliProcessAsync(
+        string cliPath,
+        IReadOnlyList<string> arguments,
+        TimeSpan timeout,
+        CancellationToken ct)
+    {
+        Process? proc = null;
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(timeout);
+            var psi = new ProcessStartInfo
+            {
+                FileName = cliPath,
+                WorkingDirectory = ResolveCliRefreshWorkingDirectory(),
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            foreach (var arg in arguments)
+            {
+                psi.ArgumentList.Add(arg);
+            }
+            PopulateCliRefreshEnvironment(psi);
+            proc = Process.Start(psi);
+            if (proc is null) return false;
+            var stdoutTask = proc.StandardOutput.ReadToEndAsync(cts.Token);
+            var stderrTask = proc.StandardError.ReadToEndAsync(cts.Token);
+            await proc.WaitForExitAsync(cts.Token).ConfigureAwait(false);
+            await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false);
+            return proc.ExitCode == 0;
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or IOException
+            or InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            try { proc?.Kill(entireProcessTree: true); } catch (Exception ex2) when (ex2 is InvalidOperationException or IOException or System.ComponentModel.Win32Exception) { }
+            return false;
+        }
+        finally
+        {
+            proc?.Dispose();
+        }
+    }
+
+    protected sealed record ParsedCreds(
         string? AccessToken,
         string? RefreshToken,
         DateTimeOffset? ExpiresAt,
@@ -342,7 +458,7 @@ public abstract class OauthCredentialFileRefresher : IDisposable
         string? ClientSecret,
         string? AccountId);
 
-    protected internal sealed record RefreshResult(
+    protected sealed record RefreshResult(
         string? AccessToken,
         string? RefreshToken,
         TimeSpan ExpiresIn);
@@ -502,87 +618,12 @@ public sealed class GeminiOauthCredentialFileRefresher
         return BuildCliRefreshDelegate(cliPath);
     }
 
+    private static readonly string[] GeminiCliRefreshArgs = ["-p", "."];
+
     private static Func<CancellationToken, Task<bool>> BuildCliRefreshDelegate(string cliPath)
     {
-        return async ct =>
-        {
-            Process? proc = null;
-            try
-            {
-                using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                cts.CancelAfter(GeminiCliRefreshTimeout);
-                var psi = new ProcessStartInfo
-                {
-                    FileName = cliPath,
-                    WorkingDirectory = ResolveCliRefreshWorkingDirectory(),
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                };
-                psi.ArgumentList.Add("-p");
-                psi.ArgumentList.Add(".");
-                PopulateCliRefreshEnvironment(psi);
-                proc = Process.Start(psi);
-                if (proc is null) return false;
-                var stdoutTask = proc.StandardOutput.ReadToEndAsync(cts.Token);
-                var stderrTask = proc.StandardError.ReadToEndAsync(cts.Token);
-                await proc.WaitForExitAsync(cts.Token).ConfigureAwait(false);
-                await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false);
-                return proc.ExitCode == 0;
-            }
-            catch (Exception ex) when (ex is OperationCanceledException or IOException
-                or InvalidOperationException or System.ComponentModel.Win32Exception)
-            {
-                try { proc?.Kill(entireProcessTree: true); } catch (Exception ex2) when (ex2 is InvalidOperationException or IOException or System.ComponentModel.Win32Exception) { }
-                return false;
-            }
-            finally
-            {
-                proc?.Dispose();
-            }
-        };
+        return ct => ExecuteCliProcessAsync(cliPath, GeminiCliRefreshArgs, GeminiCliRefreshTimeout, ct);
     }
-
-    internal static string ResolveCliRefreshPathValue(string? inheritedPath)
-    {
-        if (!string.IsNullOrWhiteSpace(inheritedPath))
-            return inheritedPath;
-
-        return OperatingSystem.IsWindows()
-            ? @"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem"
-            : "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-    }
-
-    internal static string ResolveCliRefreshWorkingDirectory()
-    {
-        var home = Environment.GetEnvironmentVariable("HOME");
-        if (!string.IsNullOrWhiteSpace(home) && Directory.Exists(home))
-            return home;
-
-        var temp = Path.GetTempPath();
-        return Directory.Exists(temp) ? temp : Path.DirectorySeparatorChar.ToString();
-    }
-
-    internal static void PopulateCliRefreshEnvironment(ProcessStartInfo psi)
-    {
-        psi.Environment.Clear();
-        foreach (var key in new[]
-                 {
-                     "HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME", "SHELL",
-                     "SystemRoot", "WINDIR", "ComSpec", "PATHEXT", "TEMP", "TMP",
-                     "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
-                 })
-        {
-            var val = Environment.GetEnvironmentVariable(key);
-            if (val is not null) psi.Environment[key] = val;
-        }
-
-        psi.Environment["PATH"] = ResolveCliRefreshPathValue(
-            psi.Environment.TryGetValue("PATH", out var path) ? path : null);
-    }
-
-    internal static readonly TimeSpan WhichTimeout = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// Resolves the absolute path to the host <c>gemini</c> binary using
@@ -592,37 +633,6 @@ public sealed class GeminiOauthCredentialFileRefresher
     internal static string? ResolveGeminiCliPath()
     {
         return ResolveExecutablePath(OperatingSystem.IsWindows() ? "where" : "which", "gemini");
-    }
-
-    /// <summary>Resolves an executable path using the platform-specific resolver command.</summary>
-    internal static string? ResolveExecutablePath(string resolverCommand, string targetBinary)
-    {
-        try
-        {
-            using var proc = Process.Start(new ProcessStartInfo
-            {
-                FileName = resolverCommand,
-                ArgumentList = { targetBinary },
-                RedirectStandardOutput = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            });
-            if (proc is null) return null;
-            if (!proc.WaitForExit(WhichTimeout))
-            {
-                try { proc.Kill(entireProcessTree: true); } catch (Exception ex2) when (ex2 is InvalidOperationException or IOException or System.ComponentModel.Win32Exception) { }
-                return null;
-            }
-            if (proc.ExitCode == 0)
-            {
-                var path = proc.StandardOutput.ReadLine()?.Trim();
-                if (!string.IsNullOrEmpty(path)) return path;
-            }
-        }
-        catch (Exception ex) when (ex is IOException or InvalidOperationException
-            or System.ComponentModel.Win32Exception)
-        { }
-        return null;
     }
 
     protected override string BuildPersistedJson(string existingRaw, RefreshResult result, DateTimeOffset newExpiresAt)
@@ -1043,7 +1053,7 @@ public sealed class AntigravityOauthCredentialFileRefresher
         : base(source, httpClientFactory, timeProvider ?? TimeProvider.System, log)
     {
         _cliRunner = cliRunner;
-        _keyringReader = keyringReader ?? (ct => SecretServiceClient.ReadSecretAsync("gemini", "antigravity", ct: ct));
+        _keyringReader = keyringReader ?? (c => SecretServiceClient.ReadSecretAsync("gemini", "antigravity", log: log, ct: c));
     }
 
     public async Task<string?> GetAccessTokenAsync(CancellationToken ct = default)
@@ -1094,6 +1104,13 @@ public sealed class AntigravityOauthCredentialFileRefresher
         }
     }
 
+    /// <summary>
+    /// Threshold to distinguish between Unix timestamps in seconds vs milliseconds.
+    /// Timestamps below 100 billion correspond to dates before Nov 5138 in seconds,
+    /// whereas in milliseconds they correspond to dates before Mar 1973.
+    /// </summary>
+    private const long UnixSecondsThreshold = 100_000_000_000L;
+
     private static DateTimeOffset? ExtractExpiry(JsonElement element)
     {
         if (element.TryGetProperty("expiry", out var exp))
@@ -1106,7 +1123,7 @@ public sealed class AntigravityOauthCredentialFileRefresher
             }
             else if (exp.ValueKind == JsonValueKind.Number && exp.TryGetInt64(out var n))
             {
-                return n < 100_000_000_000L
+                return n < UnixSecondsThreshold
                     ? DateTimeOffset.FromUnixTimeSeconds(n)
                     : DateTimeOffset.FromUnixTimeMilliseconds(n);
             }
@@ -1114,7 +1131,7 @@ public sealed class AntigravityOauthCredentialFileRefresher
 
         if (element.TryGetProperty("expiry_date", out var expDate) && expDate.ValueKind == JsonValueKind.Number && expDate.TryGetInt64(out var ms))
         {
-            return ms < 100_000_000_000L
+            return ms < UnixSecondsThreshold
                 ? DateTimeOffset.FromUnixTimeSeconds(ms)
                 : DateTimeOffset.FromUnixTimeMilliseconds(ms);
         }
@@ -1159,7 +1176,8 @@ public sealed class AntigravityOauthCredentialFileRefresher
 
         var expiresAt = refreshed.ExpiresAt ?? (TimeProvider.GetUtcNow() + FallbackTokenLifetime);
         var expiresIn = expiresAt - TimeProvider.GetUtcNow();
-        if (expiresIn <= TimeSpan.Zero) expiresIn = FallbackTokenLifetime;
+        if (expiresIn <= TimeSpan.Zero)
+            return new RefreshResult(null, null, TimeSpan.Zero);
 
         return new RefreshResult(refreshed.AccessToken, refreshed.RefreshToken, expiresIn);
     }
@@ -1261,79 +1279,16 @@ public sealed class AntigravityOauthCredentialFileRefresher
 
     internal static string? ResolveAntigravityCliPath()
     {
-        return GeminiOauthCredentialFileRefresher.ResolveExecutablePath(OperatingSystem.IsWindows() ? "where" : "which", "agy");
+        return ResolveExecutablePath(OperatingSystem.IsWindows() ? "where" : "which", "agy");
     }
+
+    private static readonly string[] AntigravityCliRefreshArgs = ["--print", "/usage"];
 
     internal static Func<CancellationToken, Task<bool>> BuildCliRefreshDelegate(string cliPath)
     {
-        return async ct =>
-        {
-            Process? proc = null;
-            try
-            {
-                using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                cts.CancelAfter(AntigravityCliRefreshTimeout);
-                var psi = new ProcessStartInfo
-                {
-                    FileName = cliPath,
-                    WorkingDirectory = GeminiOauthCredentialFileRefresher.ResolveCliRefreshWorkingDirectory(),
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                };
-                psi.ArgumentList.Add("--print");
-                psi.ArgumentList.Add("/usage");
-                GeminiOauthCredentialFileRefresher.PopulateCliRefreshEnvironment(psi);
-                proc = Process.Start(psi);
-                if (proc is null) return false;
-                var stdoutTask = proc.StandardOutput.ReadToEndAsync(cts.Token);
-                var stderrTask = proc.StandardError.ReadToEndAsync(cts.Token);
-                await proc.WaitForExitAsync(cts.Token).ConfigureAwait(false);
-                await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false);
-                return proc.ExitCode == 0;
-            }
-            catch (Exception ex) when (ex is OperationCanceledException or IOException
-                or InvalidOperationException or System.ComponentModel.Win32Exception)
-            {
-                try { proc?.Kill(entireProcessTree: true); } catch (Exception ex2) when (ex2 is InvalidOperationException or IOException or System.ComponentModel.Win32Exception) { }
-                return false;
-            }
-            finally
-            {
-                proc?.Dispose();
-            }
-        };
-    }
-
-    internal static void RemoveInterimExternalRefresher()
-    {
-        try
-        {
-            const string scriptPath = "/home/adam/codey-agy-token-refresh.sh";
-            if (File.Exists(scriptPath))
-                File.Delete(scriptPath);
-        }
-        catch { }
-
-        try
-        {
-            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            var userSystemdDir = Path.Combine(home, ".config", "systemd", "user");
-            var timer = Path.Combine(userSystemdDir, "codeybox-agy-token-refresh.timer");
-            var service = Path.Combine(userSystemdDir, "codeybox-agy-token-refresh.service");
-            if (File.Exists(timer)) File.Delete(timer);
-            if (File.Exists(service)) File.Delete(service);
-        }
-        catch { }
+        return ct => ExecuteCliProcessAsync(cliPath, AntigravityCliRefreshArgs, AntigravityCliRefreshTimeout, ct);
     }
 
     private static string? TryString(JsonElement obj, string name)
         => obj.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
-
-    internal ParsedCreds ExposeParseCreds(string raw) => ParseCreds(raw);
-    internal string ExposeBuildPersistedJson(string existingRaw, RefreshResult result, DateTimeOffset newExpiresAt)
-        => BuildPersistedJson(existingRaw, result, newExpiresAt);
-    internal static RefreshResult CreateRefreshResult(string? access, string? refresh, TimeSpan expiresIn)
-        => new(access, refresh, expiresIn);
 }

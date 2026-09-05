@@ -1342,9 +1342,6 @@ if (antigravityOAuthFilePath.StartsWith("~/", StringComparison.Ordinal))
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         antigravityOAuthFilePath[2..]);
 
-// Clean up interim external refresher if present on the host.
-AntigravityOauthCredentialFileRefresher.RemoveInterimExternalRefresher();
-
 // Optional override for where the sandbox-side credential file gets written.
 // Operators who confirm a different `opencode auth login` destination set
 // CODEYBOX_OPENCODE_AUTH_DEST on the host; the runner uses this value as the
