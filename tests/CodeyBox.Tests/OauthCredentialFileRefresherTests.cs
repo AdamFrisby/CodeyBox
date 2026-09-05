@@ -1,5 +1,8 @@
 using System.Net;
+using System.Text;
+using CodeyBox.Agents.Antigravity;
 using CodeyBox.Api;
+using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -876,6 +879,388 @@ public sealed class OauthCredentialFileRefresherTests : IDisposable
         Assert.Equal(1, log.WarningCount);
     }
 
+    // ── Antigravity ──────────────────────────────────────────────────────────
+
+    private static string AntigravityCreds(
+        string access,
+        string refresh,
+        string expiryIso,
+        string authMethod = "consumer",
+        string? tokenType = "Bearer")
+        => $$"""
+        {
+          "auth_method": "{{authMethod}}",
+          "token": {
+            "access_token": "{{access}}",
+            "refresh_token": "{{refresh}}",
+            "token_type": "{{tokenType}}",
+            "expiry": "{{expiryIso}}"
+          }
+        }
+        """;
+
+    [Fact]
+    public async Task Antigravity_Refresh_WhenExpired_InvokesCliAndKeyringAndReturnsNewToken()
+    {
+        var expiredIso = DateTimeOffset.UtcNow.AddMinutes(-10).ToString("o");
+        var path = WriteCreds("antigravity-oauth-token",
+            AntigravityCreds("old-access", "rt-1", expiredIso));
+        using var source = new AntigravityCredentialFileSource(path, watch: false);
+
+        var refreshedExpiry = DateTimeOffset.UtcNow.AddHours(1).ToString("o");
+        var refreshedBundle = AntigravityCreds("new-access", "rt-2", refreshedExpiry);
+
+        var cliCalled = 0;
+        var keyringCalled = 0;
+
+        using var refresher = new AntigravityOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", new RefresherCapturingHandler(HttpStatusCode.OK, "")),
+            NullLogger<AntigravityOauthCredentialFileRefresher>.Instance,
+            cliRunner: _ => { cliCalled++; return Task.FromResult(true); },
+            keyringReader: _ => { keyringCalled++; return Task.FromResult<string?>(refreshedBundle); });
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        Assert.Equal("new-access", token);
+        Assert.Equal(1, cliCalled);
+        Assert.Equal(1, keyringCalled);
+
+        // Verify disk file updated
+        var updated = File.ReadAllText(path);
+        Assert.Contains("\"new-access\"", updated);
+        Assert.Contains("\"rt-2\"", updated);
+    }
+
+    [Fact]
+    public async Task Antigravity_Refresh_WhenFresh_DoesNotCallCliOrKeyring()
+    {
+        var freshExpiry = DateTimeOffset.UtcNow.AddHours(2).ToString("o");
+        var path = WriteCreds("antigravity-oauth-token",
+            AntigravityCreds("good-token", "rt-fresh", freshExpiry));
+        using var source = new AntigravityCredentialFileSource(path, watch: false);
+
+        var cliCalled = 0;
+        var keyringCalled = 0;
+
+        using var refresher = new AntigravityOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", new RefresherCapturingHandler(HttpStatusCode.OK, "")),
+            NullLogger<AntigravityOauthCredentialFileRefresher>.Instance,
+            cliRunner: _ => { cliCalled++; return Task.FromResult(true); },
+            keyringReader: _ => { keyringCalled++; return Task.FromResult<string?>("{}"); });
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        Assert.Equal("good-token", token);
+        Assert.Equal(0, cliCalled);
+        Assert.Equal(0, keyringCalled);
+    }
+
+    [Fact]
+    public async Task Antigravity_Refresh_WhenExpired_TriggerExactlyOneRefreshAttempt_AndFailedRefreshReturnsStaleTokenWithoutThrowing()
+    {
+        var expiredIso = DateTimeOffset.UtcNow.AddMinutes(-10).ToString("o");
+        var path = WriteCreds("antigravity-oauth-token",
+            AntigravityCreds("stale-access-token", "rt-stale", expiredIso));
+        using var source = new AntigravityCredentialFileSource(path, watch: false);
+
+        var cliAttempts = 0;
+        var log = new CountingLogger<AntigravityOauthCredentialFileRefresher>();
+
+        using var refresher = new AntigravityOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", new RefresherCapturingHandler(HttpStatusCode.OK, "")),
+            log,
+            cliRunner: _ =>
+            {
+                cliAttempts++;
+                return Task.FromResult(false);
+            },
+            keyringReader: _ => Task.FromResult<string?>(null));
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        Assert.Equal("stale-access-token", token);
+        Assert.Equal(1, cliAttempts);
+        Assert.Equal(1, log.WarningCount);
+    }
+
+    [Fact]
+    public async Task Antigravity_NestedKeyringJson_RoundTripsThroughParseAndPersist()
+    {
+        var initialJson = """
+        {
+          "auth_method": "consumer",
+          "account_hint": "user@example.com",
+          "token": {
+            "access_token": "ya29.initial-access",
+            "refresh_token": "rt-initial",
+            "token_type": "Bearer",
+            "expiry": "2026-01-01T00:00:00.0000000Z",
+            "custom_claim": "keep-this-claim"
+          }
+        }
+        """;
+        var path = WriteCreds("antigravity-oauth-token", initialJson);
+        using var source = new AntigravityCredentialFileSource(path, watch: false);
+
+        var refreshedExpiry = DateTimeOffset.UtcNow.AddHours(2);
+        var keyringBundle = $$"""
+        {
+          "auth_method": "consumer",
+          "token": {
+            "access_token": "ya29.refreshed-access",
+            "refresh_token": "rt-refreshed",
+            "token_type": "Bearer",
+            "expiry": "{{refreshedExpiry:o}}"
+          }
+        }
+        """;
+
+        using var refresher = new AntigravityOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", new RefresherCapturingHandler(HttpStatusCode.OK, "")),
+            NullLogger<AntigravityOauthCredentialFileRefresher>.Instance,
+            cliRunner: _ => Task.FromResult(true),
+            keyringReader: _ => Task.FromResult<string?>(keyringBundle));
+
+        // Verify parse on keyring bundle
+        var parsedKeyring = refresher.ExposeParseCreds(keyringBundle);
+        Assert.Equal("ya29.refreshed-access", parsedKeyring.AccessToken);
+        Assert.Equal("rt-refreshed", parsedKeyring.RefreshToken);
+        Assert.NotNull(parsedKeyring.ExpiresAt);
+
+        // Perform refresh and verify returned token
+        var token = await refresher.GetAccessTokenAsync();
+        Assert.Equal("ya29.refreshed-access", token);
+
+        // Inspect persisted file: rotated fields updated, unrotated fields preserved
+        var persistedText = File.ReadAllText(path);
+        using var doc = System.Text.Json.JsonDocument.Parse(persistedText);
+        var root = doc.RootElement;
+
+        Assert.Equal("consumer", root.GetProperty("auth_method").GetString());
+        Assert.Equal("user@example.com", root.GetProperty("account_hint").GetString());
+
+        var tokenObj = root.GetProperty("token");
+        Assert.Equal("ya29.refreshed-access", tokenObj.GetProperty("access_token").GetString());
+        Assert.Equal("rt-refreshed", tokenObj.GetProperty("refresh_token").GetString());
+        Assert.Equal("Bearer", tokenObj.GetProperty("token_type").GetString());
+        Assert.Equal("keep-this-claim", tokenObj.GetProperty("custom_claim").GetString());
+        Assert.True(DateTimeOffset.TryParse(tokenObj.GetProperty("expiry").GetString(), out _));
+
+        // Round-trip persisted text back through ParseCreds
+        var parsedPersisted = refresher.ExposeParseCreds(persistedText);
+        Assert.Equal("ya29.refreshed-access", parsedPersisted.AccessToken);
+        Assert.Equal("rt-refreshed", parsedPersisted.RefreshToken);
+        Assert.NotNull(parsedPersisted.ExpiresAt);
+    }
+
+    [Fact]
+    public async Task Antigravity_Refresh_ConcurrentCalls_PerformSingleRoundTrip()
+    {
+        var expiredIso = DateTimeOffset.UtcNow.AddMinutes(-10).ToString("o");
+        var path = WriteCreds("antigravity-oauth-token",
+            AntigravityCreds("old-token", "rt-1", expiredIso));
+        using var source = new AntigravityCredentialFileSource(path, watch: false);
+
+        var refreshedExpiry = DateTimeOffset.UtcNow.AddHours(1).ToString("o");
+        var refreshedBundle = AntigravityCreds("concurrent-new", "rt-2", refreshedExpiry);
+
+        var cliCount = 0;
+        var keyringCount = 0;
+
+        using var refresher = new AntigravityOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", new RefresherCapturingHandler(HttpStatusCode.OK, "")),
+            NullLogger<AntigravityOauthCredentialFileRefresher>.Instance,
+            cliRunner: async _ =>
+            {
+                Interlocked.Increment(ref cliCount);
+                await Task.Delay(100);
+                return true;
+            },
+            keyringReader: _ =>
+            {
+                Interlocked.Increment(ref keyringCount);
+                return Task.FromResult<string?>(refreshedBundle);
+            });
+
+        var calls = Enumerable.Range(0, 10).Select(_ => refresher.GetAccessTokenAsync()).ToArray();
+        await Task.WhenAll(calls);
+
+        Assert.All(calls, t => Assert.Equal("concurrent-new", t.Result));
+        Assert.Equal(1, cliCount);
+        Assert.Equal(1, keyringCount);
+    }
+
+    [Fact]
+    public async Task Antigravity_QuotaProbe_ContinuesReportingNumericQuotaPastTokenExpirationWithout401()
+    {
+        var startTime = new DateTimeOffset(2026, 6, 1, 12, 0, 0, TimeSpan.Zero);
+        var time = new RefresherTestClock(startTime);
+
+        var path = WriteCreds("antigravity-oauth-token",
+            AntigravityCreds("expired-initial", "rt-0", startTime.AddMinutes(-10).ToString("o")));
+        using var source = new AntigravityCredentialFileSource(path, watch: false);
+
+        var currentToken = "token-gen-1";
+        var currentExpires = startTime.AddHours(1);
+
+        var cliCalled = 0;
+        var keyringCalled = 0;
+
+        using var refresher = new AntigravityOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", new RefresherCapturingHandler(HttpStatusCode.OK, "")),
+            NullLogger<AntigravityOauthCredentialFileRefresher>.Instance,
+            timeProvider: time,
+            cliRunner: _ => { cliCalled++; return Task.FromResult(true); },
+            keyringReader: _ =>
+            {
+                keyringCalled++;
+                return Task.FromResult<string?>(AntigravityCreds(currentToken, "rt-" + keyringCalled, currentExpires.ToString("o")));
+            });
+
+        const string summaryJson = """
+        {"groups":[{"displayName":"Gemini Models","buckets":[
+          {"bucketId":"gemini-weekly","remainingFraction":0.68,"resetTime":"2026-06-08T12:00:00Z","window":"weekly"}]}]}
+        """;
+
+        var probeHandler = new AntigravityCapturingProbeHandler(
+            expectedTokens: new[] { "token-gen-1", "token-gen-2" },
+            summaryJson: summaryJson);
+
+        var probe = new AntigravityQuotaProbe(
+            new QuotaFakeHttpClientFactory("agent-quota", probeHandler),
+            member =>
+            {
+                var tok = refresher.GetAccessTokenAsync().GetAwaiter().GetResult();
+                return new AgentQuotaCredentials(tok);
+            },
+            cacheTtl: TimeSpan.FromSeconds(30),
+            NullLogger<AntigravityQuotaProbe>.Instance,
+            timeProvider: time);
+
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Antigravity,
+            Billing = AgentBilling.Subscription,
+            ModelId = "gemini-3.5-flash-high",
+            QualityScore = 80,
+        };
+
+        // Initial probe read with expired token on disk:
+        // Refresher detects expiry, calls CLI & keyring, updates file and yields token-gen-1.
+        // Probe sends token-gen-1, receives 200 with 68% available.
+        var snap1 = await probe.GetAvailabilityAsync(member, CancellationToken.None);
+        Assert.True(snap1.IsKnown);
+        Assert.Equal(68.0, snap1.AvailablePct);
+        Assert.DoesNotContain("401", snap1.Notes ?? "");
+        Assert.Equal(1, cliCalled);
+        Assert.Equal(1, keyringCalled);
+
+        // Advance 70 minutes past token-gen-1 expiry.
+        time.Advance(TimeSpan.FromMinutes(70));
+        currentToken = "token-gen-2";
+        currentExpires = time.GetUtcNow().AddHours(1);
+
+        // Second probe read:
+        // Token has expired; refresher self-refreshes to token-gen-2.
+        // Probe continues reporting numeric quota summaries without 401.
+        var snap2 = await probe.GetAvailabilityAsync(member, CancellationToken.None);
+        Assert.True(snap2.IsKnown);
+        Assert.Equal(68.0, snap2.AvailablePct);
+        Assert.DoesNotContain("401", snap2.Notes ?? "");
+        Assert.Equal(2, cliCalled);
+        Assert.Equal(2, keyringCalled);
+    }
+
+    [Fact]
+    public async Task Antigravity_Refresh_WhenFileMissing_BootstrapsAndCreatesFile()
+    {
+        var missingPath = Path.Combine(_dir, "missing-token-" + Guid.NewGuid().ToString("N"));
+        Assert.False(File.Exists(missingPath));
+
+        using var source = new AntigravityCredentialFileSource(missingPath, watch: false);
+        var refreshedBundle = AntigravityCreds("bootstrap-token", "rt-boot", DateTimeOffset.UtcNow.AddHours(1).ToString("o"));
+
+        using var refresher = new AntigravityOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", new RefresherCapturingHandler(HttpStatusCode.OK, "")),
+            NullLogger<AntigravityOauthCredentialFileRefresher>.Instance,
+            cliRunner: _ => Task.FromResult(true),
+            keyringReader: _ => Task.FromResult<string?>(refreshedBundle));
+
+        var token = await refresher.GetAccessTokenAsync();
+
+        Assert.Equal("bootstrap-token", token);
+        Assert.True(File.Exists(missingPath));
+        var content = File.ReadAllText(missingPath);
+        Assert.Contains("bootstrap-token", content);
+    }
+
+    [Fact]
+    public async Task Antigravity_Refresh_PersistedFileIs0600OnPosix()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var path = WriteCreds("antigravity-oauth-token",
+            AntigravityCreds("old-token", "rt-1", DateTimeOffset.UtcNow.AddMinutes(-5).ToString("o")));
+        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite
+            | UnixFileMode.GroupRead | UnixFileMode.OtherRead);
+        using var source = new AntigravityCredentialFileSource(path, watch: false);
+
+        var refreshedBundle = AntigravityCreds("mode-new", "rt-2", DateTimeOffset.UtcNow.AddHours(1).ToString("o"));
+        using var refresher = new AntigravityOauthCredentialFileRefresher(
+            source,
+            new RefresherFakeHttpClientFactory("agent-quota", new RefresherCapturingHandler(HttpStatusCode.OK, "")),
+            NullLogger<AntigravityOauthCredentialFileRefresher>.Instance,
+            cliRunner: _ => Task.FromResult(true),
+            keyringReader: _ => Task.FromResult<string?>(refreshedBundle));
+
+        Assert.Equal("mode-new", await refresher.GetAccessTokenAsync());
+        var mode = File.GetUnixFileMode(path);
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, mode);
+    }
+
+    [Fact]
+    public async Task Antigravity_TryCreateCliRefreshHandler_WhenScriptExitsZero_ReturnsTrue()
+    {
+        var scriptPath = WriteExecutableScript("echo ok", exitCode: 0);
+        var handler = AntigravityOauthCredentialFileRefresher.TryCreateCliRefreshHandler(
+            resolvePath: () => scriptPath);
+        Assert.NotNull(handler);
+        Assert.True(await handler(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Antigravity_TryCreateCliRefreshHandler_WhenScriptExitsNonZero_ReturnsFalse()
+    {
+        var scriptPath = WriteExecutableScript("echo fail", exitCode: 1);
+        var handler = AntigravityOauthCredentialFileRefresher.TryCreateCliRefreshHandler(
+            resolvePath: () => scriptPath);
+        Assert.NotNull(handler);
+        Assert.False(await handler(CancellationToken.None));
+    }
+
+    [Fact]
+    public void Antigravity_TryCreateCliRefreshHandler_WhenPathIsNull_ReturnsNull()
+    {
+        var handler = AntigravityOauthCredentialFileRefresher.TryCreateCliRefreshHandler(
+            resolvePath: () => null);
+        Assert.Null(handler);
+    }
+
+    [Fact]
+    public void Antigravity_RemoveInterimExternalRefresher_DoesNotThrow()
+    {
+        var ex = Record.Exception(AntigravityOauthCredentialFileRefresher.RemoveInterimExternalRefresher);
+        Assert.Null(ex);
+    }
+
     // ── BuildPersistedJson field preservation ────────────────────────────────
     //
     // Each refresher's BuildPersistedJson is deliberately structured to copy
@@ -1133,4 +1518,55 @@ internal sealed class CountingLogger<T> : ILogger<T>
         public static readonly NullScope Instance = new();
         public void Dispose() { }
     }
+}
+
+internal sealed class AntigravityCapturingProbeHandler : HttpMessageHandler
+{
+    private readonly HashSet<string> _validTokens;
+    private readonly string _summaryJson;
+
+    public AntigravityCapturingProbeHandler(IEnumerable<string> expectedTokens, string summaryJson)
+    {
+        _validTokens = new HashSet<string>(expectedTokens, StringComparer.Ordinal);
+        _summaryJson = summaryJson;
+    }
+
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+    {
+        var auth = request.Headers.Authorization?.Parameter;
+        if (string.IsNullOrEmpty(auth) || !_validTokens.Contains(auth))
+        {
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Unauthorized)
+            {
+                Content = new StringContent("""{"error":{"code":401,"message":"Request had invalid authentication credentials."}}""")
+            });
+        }
+
+        if (request.RequestUri?.ToString() == AntigravityQuotaProbe.QuotaSummaryEndpoint)
+        {
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(_summaryJson, Encoding.UTF8, "application/json")
+            });
+        }
+
+        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("""{"currentTier":{"id":"g1-pro-tier"}}""", Encoding.UTF8, "application/json")
+            });
+    }
+}
+
+internal sealed class RefresherTestClock : TimeProvider
+{
+    private DateTimeOffset _now;
+
+    public RefresherTestClock(DateTimeOffset start)
+    {
+        _now = start;
+    }
+
+    public void Advance(TimeSpan by) => _now = _now.Add(by);
+
+    public override DateTimeOffset GetUtcNow() => _now;
 }
