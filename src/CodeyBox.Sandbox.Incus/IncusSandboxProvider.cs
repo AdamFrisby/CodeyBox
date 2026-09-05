@@ -2903,7 +2903,7 @@ public sealed class IncusSandboxProvider :
         return null;
     }
 
-    private static IReadOnlyList<IncusInstanceInfo> ParseInstances(string json)
+    internal static IReadOnlyList<IncusInstanceInfo> ParseInstances(string json)
     {
         using var document = JsonDocument.Parse(json);
         if (document.RootElement.ValueKind != JsonValueKind.Array)
@@ -2938,11 +2938,25 @@ public sealed class IncusSandboxProvider :
         return result;
     }
 
+    /// <summary>
+    /// Reads an inventory entry's config map. A missing or non-object <c>config</c> yields an EMPTY
+    /// map rather than throwing.
+    /// </summary>
+    /// <remarks>
+    /// Incus lists instances that are mid-create or mid-delete without a materialised config. Throwing
+    /// on those aborted the ENTIRE inventory parse, which is disproportionate in both directions:
+    /// ownership is positive-only (<see cref="IsOwned"/> requires <c>managed=true</c> plus a matching
+    /// kind), so a config-less entry could never have been ours anyway — while the exception failed
+    /// whatever work item happened to trigger the listing, including mid-audit, and broke the reaper
+    /// sweeps. An empty map preserves the safety property exactly (we still act only on entries we
+    /// positively identify as ours) and a transient entry that is genuinely ours is picked up by the
+    /// next sweep once its config materialises.
+    /// </remarks>
     private static Dictionary<string, string> ParseConfig(JsonElement element)
     {
         var result = new Dictionary<string, string>(StringComparer.Ordinal);
         if (!element.TryGetProperty("config", out var config) || config.ValueKind != JsonValueKind.Object)
-            throw new JsonException("Incus inventory entries must contain a JSON object property named 'config'.");
+            return result;
         foreach (var property in config.EnumerateObject())
         {
             if (property.Value.ValueKind != JsonValueKind.String)
@@ -2966,7 +2980,7 @@ public sealed class IncusSandboxProvider :
             ? value
             : null;
 
-    private sealed record IncusInstanceInfo(
+    internal sealed record IncusInstanceInfo(
         string Name,
         string Status,
         string Type,
