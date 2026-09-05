@@ -291,6 +291,16 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalid
     /// </summary>
     private async Task<AgentQuotaSnapshot> FetchWithResilienceAsync(string token, CancellationToken ct)
     {
+        // Honour an outstanding rate-limit cooldown without touching the network at all. Without this
+        // the cache TTL alone governs frequency, and every expiry sends another request into a window
+        // the provider has already closed.
+        if (RemainingRateLimitCooldown() is { } remaining)
+        {
+            return Unknown(
+                QuotaUnknownReason.Transient,
+                $"rate-limited; suppressing probes for another {remaining.TotalSeconds:F0}s");
+        }
+
         var opts = _resilienceProvider();
         var totalAttempts = Math.Max(1, opts.MaxRetries + 1);
         ProbeAttemptResult last = default;
@@ -305,7 +315,8 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalid
             }
 
             last = await ProbeOnceAsync(token, ct);
-            if (last.Outcome is ProbeOutcome.Success or ProbeOutcome.PermanentFailure)
+            if (last.Outcome is ProbeOutcome.Success or ProbeOutcome.PermanentFailure
+                or ProbeOutcome.RateLimited)
             {
                 // Success returns the parsed snapshot (a real reading, or a
                 // Permanent unknown for an unparseable 200); PermanentFailure
@@ -337,6 +348,22 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalid
                 _log.LogDebug("Claude quota endpoint returned {StatusCode}; treating quota as unknown",
                     status);
                 var reason = $"HTTP {status}";
+
+                // A 429 is the endpoint telling us to stop asking. Retrying it — which the transient
+                // path does, with exponential backoff, up to MaxRetries — spends further requests on
+                // an endpoint that is already refusing, deepening the rate limit we are trying to
+                // escape. Record a cooldown instead and stop this call's retry loop.
+                if (response.StatusCode == HttpStatusCode.TooManyRequests)
+                {
+                    var until = ResolveRateLimitCooldownUntil(response);
+                    SetRateLimitedUntil(until);
+                    _log.LogInformation(
+                        "Claude quota endpoint rate-limited; suppressing probes until {Until:O}", until);
+                    return ProbeAttemptResult.RateLimited(
+                        Unknown(QuotaUnknownReason.Transient, $"{reason} (rate-limited; retry after {until:O})"),
+                        reason);
+                }
+
                 return IsTransientStatus(response.StatusCode)
                     ? ProbeAttemptResult.Transient(reason)
                     : ProbeAttemptResult.Permanent(Unknown(QuotaUnknownReason.Permanent, reason), reason);
@@ -367,7 +394,66 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalid
             || status == HttpStatusCode.TooManyRequests;
     }
 
-    private enum ProbeOutcome { Success, TransientFailure, PermanentFailure }
+    /// <summary>
+    /// Fallback cooldown when a 429 carries no usable <c>Retry-After</c>. Long enough to actually
+    /// relieve the endpoint, short enough that a transient limit does not blind the router for long.
+    /// </summary>
+    internal static readonly TimeSpan DefaultRateLimitCooldown = TimeSpan.FromMinutes(15);
+
+    /// <summary>Upper bound on a provider-supplied <c>Retry-After</c>, so a hostile or mistaken value
+    /// cannot suppress quota reads indefinitely.</summary>
+    internal static readonly TimeSpan MaxRateLimitCooldown = TimeSpan.FromHours(1);
+
+    private readonly object _rateLimitLock = new();
+    private DateTimeOffset? _rateLimitedUntil;
+
+    /// <summary>How long the current cooldown still has to run, or null when probing is allowed.</summary>
+    private TimeSpan? RemainingRateLimitCooldown()
+    {
+        lock (_rateLimitLock)
+        {
+            if (_rateLimitedUntil is not { } until) return null;
+            var remaining = until - _timeProvider.GetUtcNow();
+            if (remaining <= TimeSpan.Zero)
+            {
+                _rateLimitedUntil = null;
+                return null;
+            }
+
+            return remaining;
+        }
+    }
+
+    private void SetRateLimitedUntil(DateTimeOffset until)
+    {
+        lock (_rateLimitLock)
+        {
+            // Never shorten an existing cooldown: a later 429 with a smaller hint must not let us
+            // resume earlier than an earlier, stricter one asked.
+            if (_rateLimitedUntil is not { } existing || until > existing)
+                _rateLimitedUntil = until;
+        }
+    }
+
+    /// <summary>
+    /// When to resume probing after a 429: the provider's <c>Retry-After</c> when it supplies a usable
+    /// one (delta-seconds or HTTP-date), else <see cref="DefaultRateLimitCooldown"/>. Clamped to
+    /// <see cref="MaxRateLimitCooldown"/>.
+    /// </summary>
+    private DateTimeOffset ResolveRateLimitCooldownUntil(HttpResponseMessage response)
+    {
+        var now = _timeProvider.GetUtcNow();
+        var retryAfter = response.Headers.RetryAfter;
+        TimeSpan? hinted = retryAfter?.Delta;
+        if (hinted is null && retryAfter?.Date is { } date)
+            hinted = date - now;
+
+        var cooldown = hinted is { } h && h > TimeSpan.Zero ? h : DefaultRateLimitCooldown;
+        if (cooldown > MaxRateLimitCooldown) cooldown = MaxRateLimitCooldown;
+        return now + cooldown;
+    }
+
+    private enum ProbeOutcome { Success, TransientFailure, PermanentFailure, RateLimited }
 
     private readonly record struct ProbeAttemptResult(
         ProbeOutcome Outcome,
@@ -382,6 +468,11 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalid
 
         public static ProbeAttemptResult Permanent(AgentQuotaSnapshot snapshot, string reason)
             => new(ProbeOutcome.PermanentFailure, snapshot, reason);
+
+        /// <summary>The endpoint refused with 429. Ends this call's retry loop and carries a transient
+        /// unknown, so the last-known-good decorator can still substitute a recent reading.</summary>
+        public static ProbeAttemptResult RateLimited(AgentQuotaSnapshot snapshot, string reason)
+            => new(ProbeOutcome.RateLimited, snapshot, reason);
     }
 
     private static async Task<string?> ReadCappedAsync(HttpContent content, CancellationToken ct)
