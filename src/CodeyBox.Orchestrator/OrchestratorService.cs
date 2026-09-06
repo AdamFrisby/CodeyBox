@@ -83,6 +83,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private readonly IWorkerRegistry? _workerRegistry;
     private readonly DeadWorkerOptions? _deadWorkerOpts;
     private readonly DeadWorkerReaper? _reaper;
+    private readonly WorkItemRepoReaper? _repoReaper;
     private readonly IStartupRecoveryInputBarrier? _startupRecoveryBarrier;
     private readonly IStartupInitialRecoverySink? _startupRecoveryCompletion;
     private readonly ReleaseService? _releaseService;
@@ -273,7 +274,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         IQuotaRetryDispatchPromoter? quotaRetryDispatchPromoter = null,
         IQuotaRetryAdmissionRouter? quotaRetryAdmissionRouter = null,
         TimeProvider? timeProvider = null,
-        BackgroundServiceFailureTracker? failureTracker = null)
+        BackgroundServiceFailureTracker? failureTracker = null,
+        WorkItemRepoReaper? repoReaper = null)
     {
         _queue = queue;
         _store = store;
@@ -301,6 +303,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _quotaRouterOptions = quotaRouterOptions;
         _budgetDeferralRecheck = budgetDeferralRecheck;
         _time = timeProvider ?? TimeProvider.System;
+        _repoReaper = repoReaper;
+        _repoReaper?.RegisterActiveItemCheck(id => _activeItems.ContainsKey(id));
         // Prefer the shared snapshot when DI provides one (production path —
         // PipelineRunner reads from the same instance, so hot-reload swaps
         // here are visible there). Test fixtures that pass only the legacy
@@ -2266,6 +2270,17 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             _log.LogInformation("Worker {WorkerId} skipping {Id} in terminal state {State}", workerIndex, id, item.State);
             ClearPreStartRefactorDrainClaim(item);
             _activeItems.TryRemove(id, out _);
+            if (_repoReaper is not null)
+            {
+                try
+                {
+                    await _repoReaper.ReapWorkItemAsync(id, ct: CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Failed to reap repo for work item {Id}", id);
+                }
+            }
             return;
         }
 
@@ -2805,6 +2820,18 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 catch (Exception ex)
                 {
                     _log.LogWarning(ex, "Failed to deregister worker {WorkerId}; row will be reaped by DeadWorkerReaper", registeredWorkerId);
+                }
+            }
+
+            if (_repoReaper is not null)
+            {
+                try
+                {
+                    await _repoReaper.ReapWorkItemAsync(id, ct: CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Failed to reap repo for work item {Id}", id);
                 }
             }
         }

@@ -646,6 +646,7 @@ internal static class WorkItemEndpoints
         IWebhookDispatcher webhooks,
         IProjectRepository projects,
         ITimingStore? timings,
+        [FromServices] WorkItemRepoReaper? repoReaper,
         string? reason,
         string? resolutionSha,
         CancellationToken ct)
@@ -684,6 +685,11 @@ internal static class WorkItemEndpoints
                 WorkItemCancellationReason.OperatorRequested);
             await store.UpdateAsync(closed, ct);
             AuditLog.WorkItemCancelled(workItemId);
+            if (repoReaper is not null)
+            {
+                try { await repoReaper.ReapWorkItemAsync(workItemId, ct: CancellationToken.None); }
+                catch { }
+            }
             var project = await projects.GetAsync(item.ProjectId, ct);
             if (project is not null)
                 await webhooks.PublishAsync(new WebhookEvent
@@ -718,6 +724,11 @@ internal static class WorkItemEndpoints
                 WorkItemCancellationReason.OperatorRequested);
             await store.UpdateAsync(cancelled, ct);
             AuditLog.WorkItemCancelled(workItemId);
+            if (repoReaper is not null)
+            {
+                try { await repoReaper.ReapWorkItemAsync(workItemId, ct: CancellationToken.None); }
+                catch { }
+            }
             var project = await projects.GetAsync(item.ProjectId, ct);
             if (project is not null)
                 await webhooks.PublishAsync(new WebhookEvent

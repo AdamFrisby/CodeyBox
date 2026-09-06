@@ -87,6 +87,11 @@ Hot-reloadable today:
   `WorkerProgressWatchdog.ActiveSandboxProgressSignalEnabled` — re-read on
   every watchdog sweep. `WorkerProgressWatchdog.CheckInterval` and
   `WorkerProgressWatchdog.ItemStaleCheckInterval` are sampled once at startup.
+- `RepoRetention` (`RepoRetention.Enabled`, `RepoRetention.GracePeriod` / `GraceWindow`,
+  `RepoRetention.CheckInterval`) — re-read on every reap attempt and sweep cycle.
+  Reaps bare git repository clones for completed/terminal work items and sweeps
+  already-terminal clones left behind across host restarts. `GracePeriod` sets how
+  long completed clones are retained before reaping (default 0 for immediate reaping).
 - `Shutdown.SandboxResumeMode`, `Shutdown.SandboxResumeTimeout`, and
   `Shutdown.SandboxAdoptionDeadlineSeconds` — re-read by the startup resume
   service. In the default background mode, the API listener is not held offline
@@ -874,6 +879,28 @@ The validator runs as a hosted service at host start, so a strict-mode
 failure surfaces before any pipeline component reads its options. Switch
 to `"warn"` mode temporarily if you need to ship a config edit before the
 matching code rename lands; flip back to `"strict"` once both are in.
+
+## `RepoRetention`
+
+Work-item bare git repository clone retention and reaping configuration.
+Reaps the bare clone for a work item when it enters a terminal state, and
+periodically sweeps already-terminal clones left behind across host restarts.
+All values are hot-reloadable. Also acceptably keyed as `RepoReaper`.
+
+```json
+"RepoRetention": {
+  "Enabled": true,
+  "GracePeriod": "00:00:00",
+  "CheckInterval": "00:15:00"
+}
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `Enabled` | bool | `true` | When true, enables periodic sweep and terminal work-item repository reaping. Set false to disable clone cleanup. |
+| `GracePeriod` | TimeSpan | `00:00:00` | How long a terminal work item's bare git repository clone is retained before being reaped. Default `00:00:00` (immediate reaping upon terminal state). Aliased as `GraceWindow`. |
+| `GraceWindow` | TimeSpan | `00:00:00` | Alias for `GracePeriod`. |
+| `CheckInterval` | TimeSpan | `00:15:00` | Cadence for the periodic background sweep of stale/terminal clones. |
 
 ## `AuditLog`
 

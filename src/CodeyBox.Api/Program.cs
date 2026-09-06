@@ -2976,6 +2976,17 @@ builder.Services.AddSingleton<DeadWorkerReaper>(sp =>
         startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>(),
         cancellationRegistry: sp.GetRequiredService<CancellationRegistry>());
 });
+builder.Services.AddSingleton<WorkItemRepoReaper>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    return new WorkItemRepoReaper(
+        sp.GetRequiredService<IGitHost>(),
+        sp.GetRequiredService<IWorkItemStore>(),
+        () => monitor.CurrentValue.RepoRetention,
+        sp.GetRequiredService<ILogger<WorkItemRepoReaper>>(),
+        time: sp.GetService<TimeProvider>() ?? TimeProvider.System,
+        workerRegistry: sp.GetService<IWorkerRegistry>());
+});
 
 // --- Worker progress watchdog -----------------------------------------------
 // Lifecycle-wide progress enforcer that complements the dead-worker reaper
@@ -3587,7 +3598,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     knobRegistry: sp.GetRequiredService<IKnobRegistry>(),
     quotaRetryDispatchPromoter: sp.GetRequiredService<IQuotaRetryDispatchPromoter>(),
     quotaRetryAdmissionRouter: sp.GetRequiredService<IQuotaRetryAdmissionRouter>(),
-    failureTracker: sp.GetRequiredService<BackgroundServiceFailureTracker>()));
+    failureTracker: sp.GetRequiredService<BackgroundServiceFailureTracker>(),
+    repoReaper: sp.GetRequiredService<WorkItemRepoReaper>()));
 builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<IRefactorProjectGateStatusProvider>(
@@ -3616,6 +3628,7 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorServic
 builder.Services.AddSingleton<IShutdownDispatchGate>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<DeadWorkerReaper>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<WorkItemRepoReaper>());
 // Run the watchdog as a hosted service. AttachWorkerPoolSlotReleaser is called
 // after OrchestratorService is fully constructed so the watchdog can release
 // a wedged worker's pool slot synchronously.
@@ -5598,6 +5611,22 @@ namespace CodeyBox.Api
         /// its own concern.
         /// </summary>
         public DeploymentLeakOptions DeploymentLeak { get; set; } = new();
+
+        /// <summary>
+        /// Work-item bare git repository clone retention and reaping configuration.
+        /// Reaps clones for terminal work items (Done, Failed, Cancelled, etc.) and
+        /// sweeps already-terminal clones left behind across restarts.
+        /// </summary>
+        public RepoRetentionOptions RepoRetention { get; set; } = new();
+
+        /// <summary>
+        /// Alias for <see cref="RepoRetention"/>.
+        /// </summary>
+        public RepoRetentionOptions RepoReaper
+        {
+            get => RepoRetention;
+            set => RepoRetention = value;
+        }
 
         /// <summary>
         /// B1 baseline-image reaper configuration. Reference-counted GC for
