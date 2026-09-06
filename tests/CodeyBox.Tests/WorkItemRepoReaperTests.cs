@@ -347,6 +347,78 @@ public sealed class WorkItemRepoReaperTests : IDisposable
     }
 
     [Fact]
+    public async Task Sweep_DoesNotRaceActiveWorker_InRegistry_DashedGuidFormat()
+    {
+        var item = CreateItem(WorkItemState.Done);
+        await _store.CreateAsync(item);
+        var repoPath = CreateRepoClone(item.Id);
+
+        // Worker registry may persist CurrentWorkItemId in D-format (dashed)
+        // while clone directories use WorkItemId.ToString() N-format.
+        var workerRegistration = new WorkerRegistration
+        {
+            WorkerId = Guid.NewGuid().ToString(),
+            HostName = "worker-host-1",
+            ProcessId = 1234,
+            StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            LastHeartbeatAt = DateTimeOffset.UtcNow,
+            CurrentWorkItemId = item.Id.Value.ToString("D"),
+        };
+        await _registry.RegisterAsync(workerRegistration);
+
+        var options = new RepoRetentionOptions { Enabled = true, GracePeriod = TimeSpan.Zero };
+        var reaper = new WorkItemRepoReaper(
+            _gitHost,
+            _store,
+            options,
+            NullLogger<WorkItemRepoReaper>.Instance,
+            workerRegistry: _registry);
+
+        var reaped = await reaper.ReapWorkItemAsync(item.Id);
+        Assert.False(reaped);
+        Assert.True(Directory.Exists(repoPath));
+
+        var summary = await reaper.RunSweepAsync();
+        Assert.Equal(0, summary.Reaped);
+        Assert.Equal(1, summary.SkippedActive);
+        Assert.True(Directory.Exists(repoPath));
+    }
+
+    [Fact]
+    public async Task Sweep_RefusesReparsePointClone_AndContinues()
+    {
+        var item = CreateItem(WorkItemState.Done);
+        await _store.CreateAsync(item);
+        var outside = Path.Combine(_testDir, "outside-target");
+        Directory.CreateDirectory(outside);
+        var keepFile = Path.Combine(outside, "keep.txt");
+        File.WriteAllText(keepFile, "keep");
+
+        var linkPath = Path.Combine(_gitRoot, item.Id + ".git");
+        Directory.CreateSymbolicLink(linkPath, outside);
+
+        var validItem = CreateItem(WorkItemState.Done);
+        await _store.CreateAsync(validItem);
+        var validRepo = CreateRepoClone(validItem.Id);
+
+        var options = new RepoRetentionOptions { Enabled = true, GracePeriod = TimeSpan.Zero };
+        var reaper = new WorkItemRepoReaper(
+            _gitHost,
+            _store,
+            options,
+            NullLogger<WorkItemRepoReaper>.Instance);
+
+        var summary = await reaper.RunSweepAsync();
+
+        Assert.Equal(1, summary.Reaped);
+        Assert.True(summary.Errors >= 1);
+        Assert.False(Directory.Exists(validRepo));
+        Assert.True(Directory.Exists(outside));
+        Assert.True(File.Exists(keepFile));
+        Assert.Equal("keep", File.ReadAllText(keepFile));
+    }
+
+    [Fact]
     public async Task Enabled_False_SkipsReapAndSweep()
     {
         var item = CreateItem(WorkItemState.Done);
@@ -397,17 +469,9 @@ public sealed class WorkItemRepoReaperTests : IDisposable
             options,
             NullLogger<WorkItemRepoReaper>.Instance);
 
-        using var cts = new CancellationTokenSource();
-        // StartAsync invokes ExecuteAsync which executes the initial startup sweep
-        await reaper.StartAsync(cts.Token);
-
-        // Give the background task a moment to run the startup sweep
-        for (var i = 0; i < 20 && (Directory.Exists(repo1) || Directory.Exists(repo2)); i++)
-        {
-            await Task.Delay(50);
-        }
-
-        await reaper.StopAsync(CancellationToken.None);
+        var summary = await reaper.RunSweepAsync();
+        Assert.Equal(2, summary.Reaped);
+        Assert.Equal(1, summary.SkippedNonTerminal);
 
         Assert.False(Directory.Exists(repo1));
         Assert.False(Directory.Exists(repo2));
@@ -441,6 +505,25 @@ public sealed class WorkItemRepoReaperTests : IDisposable
         Assert.Equal(1, summary.Reaped);
         Assert.True(Directory.Exists(errorRepo));
         Assert.False(Directory.Exists(validRepo));
+    }
+
+    [Fact]
+    public async Task TryReapWorkItemAsync_DisposeFailure_DoesNotThrow()
+    {
+        var item = CreateItem(WorkItemState.Done);
+        await _store.CreateAsync(item);
+        var repoPath = CreateRepoClone(item.Id);
+
+        var faultInjectingGitHost = new FaultInjectingGitHost(_gitHost, item.Id.ToString());
+        var options = new RepoRetentionOptions { Enabled = true, GracePeriod = TimeSpan.Zero };
+        var reaper = new WorkItemRepoReaper(
+            faultInjectingGitHost,
+            _store,
+            options,
+            NullLogger<WorkItemRepoReaper>.Instance);
+
+        await reaper.TryReapWorkItemAsync(item.Id);
+        Assert.True(Directory.Exists(repoPath));
     }
 
     [Fact]

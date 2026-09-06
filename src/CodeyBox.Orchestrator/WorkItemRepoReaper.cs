@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using CodeyBox.Core;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -160,7 +159,7 @@ public sealed class WorkItemRepoReaper : BackgroundService
         if (_workerRegistry is not null)
         {
             var activeWorkers = await _workerRegistry.ListAsync(ct).ConfigureAwait(false);
-            if (activeWorkers.Any(w => string.Equals(w.CurrentWorkItemId, id.ToString(), StringComparison.OrdinalIgnoreCase)))
+            if (IsOwnedByRegisteredWorker(activeWorkers, id))
                 return false;
         }
 
@@ -180,11 +179,38 @@ public sealed class WorkItemRepoReaper : BackgroundService
         if (IsItemActive(id))
             return false;
 
+        if (_workerRegistry is not null)
+        {
+            var activeWorkers = await _workerRegistry.ListAsync(ct).ConfigureAwait(false);
+            if (IsOwnedByRegisteredWorker(activeWorkers, id))
+                return false;
+        }
+
         await _gitHost.DisposeRepositoryAsync(id.ToString(), ct).ConfigureAwait(false);
         _log.LogInformation(
             "WorkItemRepoReaper: reaped clone for terminal work item {WorkItemId} (state={State}, age={Age}, grace={Grace})",
             id, item.State, age, grace);
         return true;
+    }
+
+    /// <summary>
+    /// Best-effort reap used by worker completion and API close-out paths.
+    /// Failures are logged and do not propagate to the caller.
+    /// </summary>
+    public async Task TryReapWorkItemAsync(WorkItemId id, CancellationToken ct = default)
+    {
+        try
+        {
+            await ReapWorkItemAsync(id, force: false, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "WorkItemRepoReaper: failed to reap clone for work item {WorkItemId}", id);
+        }
     }
 
     /// <summary>
@@ -238,11 +264,7 @@ public sealed class WorkItemRepoReaper : BackgroundService
         var activeWorkers = _workerRegistry is not null
             ? await _workerRegistry.ListAsync(ct).ConfigureAwait(false)
             : [];
-        var activeWorkItemIds = new HashSet<string>(
-            activeWorkers
-                .Where(w => !string.IsNullOrEmpty(w.CurrentWorkItemId))
-                .Select(w => w.CurrentWorkItemId!),
-            StringComparer.OrdinalIgnoreCase);
+        var activeWorkItemIds = CollectRegisteredWorkItemIds(activeWorkers);
 
         var now = _time.GetUtcNow();
         var grace = opts.GracePeriod < TimeSpan.Zero ? TimeSpan.Zero : opts.GracePeriod;
@@ -250,35 +272,30 @@ public sealed class WorkItemRepoReaper : BackgroundService
         foreach (var dir in candidateDirs)
         {
             ct.ThrowIfCancellationRequested();
+            WorkItemId? parsedId = null;
             try
             {
                 summary.Scanned++;
                 var dirName = Path.GetFileName(dir);
-                string rawId;
-                if (dirName.EndsWith(".git", StringComparison.OrdinalIgnoreCase))
+                if (!TryParseWorkItemCloneDirectory(dirName, out var workItemId, out var repositoryId))
                 {
-                    rawId = dirName[..^4];
-                }
-                else if (Guid.TryParse(dirName, out _))
-                {
-                    rawId = dirName;
-                }
-                else
-                {
-                    // Non-repo directory (e.g. _upstream-mirror, .codeybox-disabled-hooks)
+                    // Non-work-item directory (e.g. _upstream-mirror, merge staging, disabled hooks)
                     continue;
                 }
 
-                if (!Guid.TryParse(rawId, out var guid))
+                parsedId = workItemId;
+
+                if (IsReparsePoint(dir))
                 {
-                    // Unknown or non-work-item naming scheme (e.g. merge staging clones)
+                    summary.Errors++;
+                    _log.LogWarning(
+                        "WorkItemRepoReaper: refusing to reap work item {WorkItemId} because its clone path is a reparse point",
+                        workItemId);
                     continue;
                 }
 
-                var workItemId = new WorkItemId(guid);
-
-                // Check worker ownership (must not race the worker owning a clone)
-                if (IsItemActive(workItemId) || activeWorkItemIds.Contains(rawId))
+                // Compare parsed work-item ids so D-format / N-format GUID strings match.
+                if (IsItemActive(workItemId) || activeWorkItemIds.Contains(workItemId))
                 {
                     summary.SkippedActive++;
                     _log.LogDebug("WorkItemRepoReaper: work item {WorkItemId} clone is owned by an active worker; skipping", workItemId);
@@ -301,7 +318,7 @@ public sealed class WorkItemRepoReaper : BackgroundService
                 {
                     // Tolerates an entry whose work item no longer exists in DB without aborting the sweep
                     summary.SkippedUnknown++;
-                    _log.LogWarning("WorkItemRepoReaper: work item {WorkItemId} for repository {Dir} was not found in database; skipping", workItemId, dir);
+                    _log.LogWarning("WorkItemRepoReaper: work item {WorkItemId} was not found in database; skipping", workItemId);
                     continue;
                 }
 
@@ -325,7 +342,7 @@ public sealed class WorkItemRepoReaper : BackgroundService
                 }
 
                 // TOCTOU guard: re-verify not active and still terminal
-                if (IsItemActive(workItemId))
+                if (IsItemActive(workItemId) || activeWorkItemIds.Contains(workItemId))
                 {
                     summary.SkippedActive++;
                     continue;
@@ -338,7 +355,7 @@ public sealed class WorkItemRepoReaper : BackgroundService
                     continue;
                 }
 
-                await _gitHost.DisposeRepositoryAsync(rawId, ct).ConfigureAwait(false);
+                await _gitHost.DisposeRepositoryAsync(repositoryId, ct).ConfigureAwait(false);
                 summary.Reaped++;
                 _log.LogInformation(
                     "WorkItemRepoReaper: reaped clone for terminal work item {WorkItemId} (state={State}, age={Age}, grace={Grace})",
@@ -351,7 +368,14 @@ public sealed class WorkItemRepoReaper : BackgroundService
             catch (Exception ex)
             {
                 summary.Errors++;
-                _log.LogWarning(ex, "WorkItemRepoReaper: failed to inspect/reap entry {Dir}; continuing sweep", dir);
+                if (parsedId is { } workItemId)
+                {
+                    _log.LogWarning(ex, "WorkItemRepoReaper: failed to inspect/reap work item {WorkItemId}; continuing sweep", workItemId);
+                }
+                else
+                {
+                    _log.LogWarning(ex, "WorkItemRepoReaper: failed to inspect/reap a repository entry; continuing sweep");
+                }
             }
         }
 
@@ -363,6 +387,61 @@ public sealed class WorkItemRepoReaper : BackgroundService
         }
 
         return summary;
+    }
+
+    private static bool IsOwnedByRegisteredWorker(IReadOnlyList<WorkerRegistration> workers, WorkItemId id)
+    {
+        for (var i = 0; i < workers.Count; i++)
+        {
+            if (TryParseWorkItemId(workers[i].CurrentWorkItemId, out var owned) && owned == id)
+                return true;
+        }
+        return false;
+    }
+
+    private static HashSet<WorkItemId> CollectRegisteredWorkItemIds(IReadOnlyList<WorkerRegistration> workers)
+    {
+        var ids = new HashSet<WorkItemId>();
+        for (var i = 0; i < workers.Count; i++)
+        {
+            if (TryParseWorkItemId(workers[i].CurrentWorkItemId, out var owned))
+                ids.Add(owned);
+        }
+        return ids;
+    }
+
+    private static bool TryParseWorkItemCloneDirectory(string dirName, out WorkItemId id, out string repositoryId)
+    {
+        id = default;
+        repositoryId = string.Empty;
+        if (!dirName.EndsWith(".git", StringComparison.OrdinalIgnoreCase) || dirName.Length <= 4)
+            return false;
+
+        repositoryId = dirName[..^4];
+        return TryParseWorkItemId(repositoryId, out id);
+    }
+
+    private static bool TryParseWorkItemId(string? value, out WorkItemId id)
+    {
+        id = default;
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+        if (!Guid.TryParse(value.AsSpan(), out var guid))
+            return false;
+        id = new WorkItemId(guid);
+        return true;
+    }
+
+    private static bool IsReparsePoint(string path)
+    {
+        try
+        {
+            return (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
     }
 }
 

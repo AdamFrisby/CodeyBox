@@ -686,10 +686,7 @@ internal static class WorkItemEndpoints
             await store.UpdateAsync(closed, ct);
             AuditLog.WorkItemCancelled(workItemId);
             if (repoReaper is not null)
-            {
-                try { await repoReaper.ReapWorkItemAsync(workItemId, ct: CancellationToken.None); }
-                catch { }
-            }
+                await repoReaper.TryReapWorkItemAsync(workItemId, CancellationToken.None);
             var project = await projects.GetAsync(item.ProjectId, ct);
             if (project is not null)
                 await webhooks.PublishAsync(new WebhookEvent
@@ -725,10 +722,7 @@ internal static class WorkItemEndpoints
             await store.UpdateAsync(cancelled, ct);
             AuditLog.WorkItemCancelled(workItemId);
             if (repoReaper is not null)
-            {
-                try { await repoReaper.ReapWorkItemAsync(workItemId, ct: CancellationToken.None); }
-                catch { }
-            }
+                await repoReaper.TryReapWorkItemAsync(workItemId, CancellationToken.None);
             var project = await projects.GetAsync(item.ProjectId, ct);
             if (project is not null)
                 await webhooks.PublishAsync(new WebhookEvent
@@ -854,6 +848,7 @@ internal static class WorkItemEndpoints
         string id,
         IWorkItemStore store,
         IAgentStreamSummaryStore? streamSummaries,
+        [FromServices] WorkItemRepoReaper? repoReaper,
         CancellationToken ct)
     {
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
@@ -898,6 +893,8 @@ internal static class WorkItemEndpoints
         if (streamSummaries is not null)
             await streamSummaries.DeleteByWorkItemAsync(abandoned.Id, ct);
         AuditLog.WorkItemTransitioned(abandoned.Id, abandoned.State.ToString());
+        if (repoReaper is not null)
+            await repoReaper.TryReapWorkItemAsync(abandoned.Id, CancellationToken.None);
 
         return Results.Ok(new { id = abandoned.Id.ToString(), state = abandoned.State.ToString() });
     }

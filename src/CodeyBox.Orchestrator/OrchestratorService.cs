@@ -2271,16 +2271,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             ClearPreStartRefactorDrainClaim(item);
             _activeItems.TryRemove(id, out _);
             if (_repoReaper is not null)
-            {
-                try
-                {
-                    await _repoReaper.ReapWorkItemAsync(id, ct: CancellationToken.None);
-                }
-                catch (Exception ex)
-                {
-                    _log.LogWarning(ex, "Failed to reap repo for work item {Id}", id);
-                }
-            }
+                await _repoReaper.TryReapWorkItemAsync(id, CancellationToken.None);
             return;
         }
 
@@ -2824,16 +2815,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             }
 
             if (_repoReaper is not null)
-            {
-                try
-                {
-                    await _repoReaper.ReapWorkItemAsync(id, ct: CancellationToken.None);
-                }
-                catch (Exception ex)
-                {
-                    _log.LogWarning(ex, "Failed to reap repo for work item {Id}", id);
-                }
-            }
+                await _repoReaper.TryReapWorkItemAsync(id, CancellationToken.None);
         }
 
         // No-progress re-dispatch backoff (incident 2026-06-04). Reached only on

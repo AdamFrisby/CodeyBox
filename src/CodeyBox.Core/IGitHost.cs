@@ -39,22 +39,10 @@ public interface IGitHost
 
     /// <summary>
     /// Returns the root directory where managed bare repositories are stored.
+    /// Hosts that do not keep repositories on the local filesystem leave this
+    /// empty so clone-retention sweeps no-op rather than probing <see cref="GetRepoPath"/>.
     /// </summary>
-    string RepositoriesRootDirectory
-    {
-        get
-        {
-            try
-            {
-                var sample = GetRepoPath("probe");
-                return Path.GetDirectoryName(sample) ?? string.Empty;
-            }
-            catch
-            {
-                return string.Empty;
-            }
-        }
-    }
+    string RepositoriesRootDirectory => string.Empty;
 
     /// <summary>
     /// Gives hosts that expose agent-writable repositories a chance to clean
