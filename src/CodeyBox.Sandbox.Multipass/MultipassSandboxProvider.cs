@@ -5472,7 +5472,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             codeybox_process_group_alive() {
                 codeybox_probe_pgid=$1
                 if [ -d /proc ]; then
-                    awk -v pgid="$codeybox_probe_pgid" '
+                    cat /proc/[0-9]*/stat 2>/dev/null | awk -v pgid="$codeybox_probe_pgid" '
                         {
                             line = $0
                             sub(/^[^)]*\) /, "", line)
@@ -5480,7 +5480,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                             if (fields[3] == pgid && fields[1] != "Z") found = 1
                         }
                         END { exit found ? 0 : 1 }
-                    ' /proc/[0-9]*/stat 2>/dev/null
+                    '
                     return $?
                 fi
                 kill -0 "-$codeybox_probe_pgid" 2>/dev/null
@@ -7521,7 +7521,7 @@ while True:
             codeybox_process_group_alive() {
                 codeybox_probe_pgid=$1
                 if [ -d /proc ]; then
-                    awk -v pgid="$codeybox_probe_pgid" '
+                    cat /proc/[0-9]*/stat 2>/dev/null | awk -v pgid="$codeybox_probe_pgid" '
                         {
                             line = $0
                             sub(/^[^)]*\) /, "", line)
@@ -7529,7 +7529,7 @@ while True:
                             if (fields[3] == pgid && fields[1] != "Z") found = 1
                         }
                         END { exit found ? 0 : 1 }
-                    ' /proc/[0-9]*/stat 2>/dev/null
+                    '
                     return $?
                 fi
                 kill -0 "-$codeybox_probe_pgid" 2>/dev/null
