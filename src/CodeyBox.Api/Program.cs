@@ -1333,6 +1333,15 @@ if (opencodeAuthFilePath.StartsWith("~/", StringComparison.Ordinal))
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         opencodeAuthFilePath[2..]);
 
+var antigravityOAuthFilePath =
+    Environment.GetEnvironmentVariable("CODEYBOX_ANTIGRAVITY_OAUTH_FILE")
+    ?? builder.Configuration["CodeyBox:Antigravity:OAuthTokenFile"]
+    ?? Path.Combine(geminiHome, "antigravity-cli", "antigravity-oauth-token");
+if (antigravityOAuthFilePath.StartsWith("~/", StringComparison.Ordinal))
+    antigravityOAuthFilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        antigravityOAuthFilePath[2..]);
+
 // Optional override for where the sandbox-side credential file gets written.
 // Operators who confirm a different `opencode auth login` destination set
 // CODEYBOX_OPENCODE_AUTH_DEST on the host; the runner uses this value as the
@@ -1364,6 +1373,10 @@ builder.Services.AddSingleton(sp => new CursorCredentialFileSource(
     watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
 builder.Services.AddSingleton(sp => new OpencodeCredentialFileSource(
     opencodeAuthFilePath,
+    sp.GetService<ILogger<CredentialFileSource>>(),
+    watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
+builder.Services.AddSingleton(sp => new AntigravityCredentialFileSource(
+    antigravityOAuthFilePath,
     sp.GetService<ILogger<CredentialFileSource>>(),
     watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
 
@@ -1629,6 +1642,11 @@ builder.Services.AddSingleton<IGeminiQuotaTokenSource>(sp =>
             ?? config["CodeyBox:GeminiOauthClientSecret"],
         cliTokenRefresher: GeminiOauthCredentialFileRefresher.TryCreateCliRefreshHandler());
 });
+builder.Services.AddSingleton<IAntigravityQuotaTokenSource>(sp => new AntigravityOauthCredentialFileRefresher(
+    sp.GetRequiredService<AntigravityCredentialFileSource>(),
+    sp.GetRequiredService<IHttpClientFactory>(),
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<AntigravityOauthCredentialFileRefresher>(),
+    cliRunner: AntigravityOauthCredentialFileRefresher.TryCreateCliRefreshHandler()));
 
 // Every quota probe is wrapped so a transient blip serves the most recent real
 // reading (bounded by ProbeMaxStalenessSeconds + the reading's own reset) rather
@@ -1798,16 +1816,16 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     var source = sp.GetRequiredService<GeminiOAuthCredentialFileSource>();
+    var antigravitySource = sp.GetRequiredService<AntigravityCredentialFileSource>();
+    var tokenSource = sp.GetRequiredService<IAntigravityQuotaTokenSource>();
     var probe = new AntigravityQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         member => AgentInstanceCredentialResolver.ResolveQuotaCredentials(
             member,
             () => new AgentQuotaCredentials(
-                // Read the token FILE first and on every probe. agy's access token lives ~1h and is
-                    // refreshed into the keyring by the CLI; an env var captured at process start
-                    // expires mid-run, after which every read is a 401 that the router treats as
-                    // UNKNOWN and fails open. The file is kept live by an external refresher.
-                    ReadAntigravityTokenFile(
+                tokenSource.GetAccessTokenAsync(CancellationToken.None).ConfigureAwait(false).GetAwaiter().GetResult()
+                    ?? ReadAntigravityTokenFile(antigravitySource.FilePath)
+                    ?? ReadAntigravityTokenFile(
                         sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>()
                             .CurrentValue.Antigravity.OAuthTokenFile)
                     ?? CredentialFileTokenExtractor.ExtractGeminiAccessToken(source.GetRaw())
@@ -1827,6 +1845,7 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
             .CurrentValue.Antigravity.QuotaUserAgent);
     var wrapped = WrapLastKnownGood(probe, sp);
     source.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
+    antigravitySource.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
     return wrapped;
 });
 

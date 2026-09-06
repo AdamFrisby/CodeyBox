@@ -228,10 +228,9 @@ public static class AgentInstanceCredentialResolver
 
         if (agent == AgentKind.Antigravity)
         {
-            // The agy CLI ships a Google OAuth creds JSON of the same shape as
-            // gemini-cli; reuse the Gemini extractor so a single per-instance
-            // file works for either CLI.
-            var token = CredentialFileTokenExtractor.ExtractGeminiAccessToken(raw);
+            // Accept both native nested agy shape (token.access_token) and legacy flat shape.
+            var token = CredentialFileTokenExtractor.ExtractAntigravityAccessToken(raw)
+                ?? CredentialFileTokenExtractor.ExtractGeminiAccessToken(raw);
             if (string.IsNullOrWhiteSpace(token)) return false;
             credentials = new AgentQuotaCredentials(token);
             return true;

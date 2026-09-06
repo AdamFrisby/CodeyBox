@@ -34,9 +34,8 @@ public sealed class AntigravitySectionOptions
     /// refreshed into the system keyring by the CLI itself. An environment variable is captured once at
     /// process start, so the probe's copy expires mid-run and every subsequent read returns
     /// <c>401</c> — which the router treats as UNKNOWN and fails open, dispatching with no quota gate.
-    /// Reading a file per probe lets an external refresher (see <c>codey-dump-antigravity-token.sh</c>,
-    /// scheduled by the <c>codeybox-agy-token-refresh</c> timer) keep the credential live without
-    /// restarting the orchestrator.</para>
+    /// Reading a file per probe lets the orchestrator's <c>AntigravityOauthCredentialFileRefresher</c>
+    /// keep the credential live without restarting the orchestrator.</para>
     /// </summary>
     public string? OAuthTokenFile { get; set; }
 }
