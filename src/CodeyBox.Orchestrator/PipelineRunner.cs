@@ -5717,24 +5717,35 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     runner.Kind, agentResult.Stderr, agentResult.Stdout, agentPhase, sandbox.Id);
                 if (detection is not null)
                 {
-                    await _quotaClassifier.RecordIfQuotaFailureAsync(
-                        _quotaFailures,
-                        runner.Kind,
-                        observedModelId,
-                        agentResult.Summary,
-                        agentResult.Stderr,
-                        agentEndedAt,
-                        _auditQuotaOptions.ObservedFailureRetention,
-                        ct,
-                        projectId: item.ProjectId,
-                        stdout: agentResult.Stdout);
+                    var quotaContradicted = await IsQuotaFailureContradictedByProbeAsync(
+                        item, project, runner.Kind, observedModelId, ct);
+                    if (!quotaContradicted)
+                    {
+                        await _quotaClassifier.RecordIfQuotaFailureAsync(
+                            _quotaFailures,
+                            runner.Kind,
+                            observedModelId,
+                            agentResult.Summary,
+                            agentResult.Stderr,
+                            agentEndedAt,
+                            _auditQuotaOptions.ObservedFailureRetention,
+                            ct,
+                            projectId: item.ProjectId,
+                            stdout: agentResult.Stdout);
 
-                    var quotaKind = detection?.Kind ?? QuotaFailureKind.RateLimitExceeded;
-                    throw new TerminalQuotaError(quotaKind,
-                        QuotaFailureMessage(
-                            quotaKind,
-                            $"Agent {runner.Kind} reported quota failure: {agentResult.Summary}"),
-                        detection?.ResetAt);
+                        var quotaKind = detection?.Kind ?? QuotaFailureKind.RateLimitExceeded;
+                        throw new TerminalQuotaError(quotaKind,
+                            QuotaFailureMessage(
+                                quotaKind,
+                                $"Agent {runner.Kind} reported quota failure: {agentResult.Summary}"),
+                            detection?.ResetAt);
+                    }
+
+                    throw new TerminalTransientNetworkError(
+                        runner.Kind,
+                        agentPhase,
+                        new AgentFailureClassification(AgentFailureKind.TransientNetwork, Reason: "Agent reported failure while quota probe reports healthy capacity"),
+                        $"Agent {runner.Kind} reported failure during {agentPhase} with healthy quota: {agentResult.Summary}");
                 }
 
                 ThrowIfTransientAgentFailure(runner, agentResult, agentPhase);
@@ -10010,13 +10021,19 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
     }
 
-    private AgentMembership BuildNoDiffQuotaProbeMember(
+    private AgentMembership BuildQuotaProbeMember(
         WorkItem item,
-        Project project,
+        Project? project,
         AgentKind agent,
         string? observedModelId)
     {
-        var selected = TryResolveSelectedMember(agent, project, item);
+        var effectiveProject = project ?? new Project
+        {
+            Id = item.ProjectId,
+            DisplayName = item.ProjectId.Value,
+            RepositoryUrl = string.Empty,
+        };
+        var selected = TryResolveSelectedMember(agent, effectiveProject, item);
         if (selected is not null)
         {
             return observedModelId is null
@@ -10033,6 +10050,179 @@ public sealed partial class PipelineRunner : IPipelineRunner
             Billing = AgentBilling.Subscription,
             QualityScore = SyntheticQuotaProbeQualityScore,
         };
+    }
+
+    private AgentMembership BuildNoDiffQuotaProbeMember(
+        WorkItem item,
+        Project project,
+        AgentKind agent,
+        string? observedModelId) =>
+        BuildQuotaProbeMember(item, project, agent, observedModelId);
+
+    private async Task<bool> IsQuotaFailureContradictedByProbeAsync(
+        WorkItem item,
+        Project? project,
+        AgentKind agent,
+        string? observedModelId,
+        CancellationToken ct)
+    {
+        if (_quotaProbesByKind is null
+            || !_quotaProbesByKind.TryGetValue(agent, out var probe))
+        {
+            return false;
+        }
+
+        var member = BuildQuotaProbeMember(item, project, agent, observedModelId);
+        try
+        {
+            var snapshot = await probe.GetAvailabilityAsync(member, ct).ConfigureAwait(false);
+            var quota = QuotaGatePolicy.ResolveMemberQuota(snapshot, member);
+            if (!quota.IsKnown)
+                return false;
+
+            var nowUtc = _opts.TimeProvider.GetUtcNow();
+            var gate = _auditQuotaGatePolicy.Evaluate(member, quota, nowUtc);
+            if (gate.Allow)
+            {
+                _log.LogWarning(
+                    "Agent {Agent}/{Model} reported quota-like failure, but probe reports healthy quota ({AvailablePct:F1}%, floor={Floor:F1}%); treating as transient retryable failure instead of quota exhaustion",
+                    agent.Value, member.ModelId ?? "(default)", quota.AvailablePct, _auditQuotaGatePolicy.ComputeEffectiveFloorPct(agent, quota, nowUtc));
+                return true;
+            }
+
+            return false;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "Quota probe corroboration failed for agent {Agent}; proceeding with detected failure",
+                agent.Value);
+            return false;
+        }
+    }
+
+    private async Task<bool> HasAnyQuotaCandidateHealthyProbeAsync(
+        WorkItem item,
+        Project? project,
+        string classId,
+        CancellationToken ct,
+        AgentMembership? preferredMember = null)
+    {
+        if (_quotaProbesByKind is null || _classRouter is null)
+            return false;
+
+        var effectiveProject = project ?? new Project
+        {
+            Id = item.ProjectId,
+            DisplayName = item.ProjectId.Value,
+            RepositoryUrl = string.Empty,
+        };
+        var nowUtc = _opts.TimeProvider.GetUtcNow();
+
+        if (preferredMember is not null
+            && _quotaProbesByKind.TryGetValue(preferredMember.Agent, out var preferredProbe))
+        {
+            try
+            {
+                var snapshot = await preferredProbe.GetAvailabilityAsync(preferredMember, ct).ConfigureAwait(false);
+                var quota = QuotaGatePolicy.ResolveMemberQuota(snapshot, preferredMember);
+                if (quota.IsKnown)
+                {
+                    var gate = _auditQuotaGatePolicy.Evaluate(preferredMember, quota, nowUtc);
+                    if (gate.Allow)
+                        return true;
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _log.LogDebug(ex, "Probe check failed for preferred member {Agent} in class '{ClassId}'", preferredMember.Agent.Value, classId);
+            }
+        }
+
+        IReadOnlyList<AgentMembership> candidates;
+        try
+        {
+            candidates = await _classRouter.OrderedFallbackCandidatesAsync(
+                item, effectiveProject, ct, smokeTarget: null, requireQuota: false).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogDebug(ex, "Failed to resolve fallback candidates for class '{ClassId}' during probe corroboration", classId);
+            return false;
+        }
+
+        foreach (var candidate in candidates)
+        {
+            if (!_quotaProbesByKind.TryGetValue(candidate.Agent, out var probe))
+                continue;
+
+            try
+            {
+                var snapshot = await probe.GetAvailabilityAsync(candidate, ct).ConfigureAwait(false);
+                var quota = QuotaGatePolicy.ResolveMemberQuota(snapshot, candidate);
+                if (!quota.IsKnown)
+                    continue;
+
+                var gate = _auditQuotaGatePolicy.Evaluate(candidate, quota, nowUtc);
+                if (gate.Allow)
+                {
+                    return true;
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _log.LogDebug(ex, "Probe check failed for candidate {Agent} in class '{ClassId}'", candidate.Agent.Value, classId);
+            }
+        }
+
+        return false;
+    }
+
+    private async Task<bool> IsQuotaContradictedByProbeForWorkItemAsync(
+        WorkItem item,
+        Project? project,
+        string phase,
+        CancellationToken ct)
+    {
+        if (_quotaProbesByKind is null)
+            return false;
+
+        var agent = item.Agent;
+        if (agent is { } agentKind && _quotaProbesByKind.TryGetValue(agentKind, out var probe))
+        {
+            var member = BuildQuotaProbeMember(item, project, agentKind, item.ModelId);
+            try
+            {
+                var snapshot = await probe.GetAvailabilityAsync(member, ct).ConfigureAwait(false);
+                var quota = QuotaGatePolicy.ResolveMemberQuota(snapshot, member);
+                if (quota.IsKnown)
+                {
+                    var nowUtc = _opts.TimeProvider.GetUtcNow();
+                    var gate = _auditQuotaGatePolicy.Evaluate(member, quota, nowUtc);
+                    if (gate.Allow)
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _log.LogDebug(ex, "Probe check in TransitionWaitingForQuotaResetAsync failed for agent {Agent}", agentKind.Value);
+            }
+        }
+
+        var classId = item.AgentClassId ?? project?.DefaultAgentClass;
+        if (_classRouter is not null && classId is not null)
+        {
+            return await HasAnyQuotaCandidateHealthyProbeAsync(item, project, classId, ct).ConfigureAwait(false);
+        }
+
+        return false;
     }
 
     private async Task ThrowIfNoDiffReworkCapturedAuthErrorAsync(
@@ -12998,7 +13188,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     if (IsLlmAgentExecutionFailure(run.Result))
                     {
                         await ThrowIfAuditorRunAuthRequiredAsync(run, needsCreds, item, project, attemptCt);
-                        await ThrowIfAuditorRunQuotaAsync(run, needsCreds, project.Id, attemptCt);
+                        await ThrowIfAuditorRunQuotaAsync(run, needsCreds, item, project, attemptCt);
                         ThrowIfTransientAgentFailure(
                             run.Runner,
                             ToAgentResultForAuditFailureClassification(run.Result),
@@ -13010,7 +13200,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     }
 
                     await ThrowIfAuditorRunAuthRequiredAsync(run, needsCreds, item, project, attemptCt);
-                    await ThrowIfAuditorRunQuotaAsync(run, needsCreds, project.Id, attemptCt);
+                    await ThrowIfAuditorRunQuotaAsync(run, needsCreds, item, project, attemptCt);
 
                     // HARD INVARIANT: an auditor that could not RUN must surface as
                     // a transient execution failure, never as a code-quality finding
@@ -14105,7 +14295,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         // 401 diagnostics that are also quota-detector inputs; the operator
         // action is to re-authenticate, not to park the item for quota reset.
         await ThrowIfAuditorRunAuthRequiredAsync(run, needsCreds, item, project, ct);
-        await ThrowIfAuditorRunQuotaAsync(run, needsCreds, project.Id, ct);
+        await ThrowIfAuditorRunQuotaAsync(run, needsCreds, item, project, ct);
 
         if (needsCreds)
         {
@@ -14212,7 +14402,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private async Task ThrowIfAuditorRunQuotaAsync(
         AuditorRunRecord run,
         bool needsCreds,
-        ProjectId projectId,
+        WorkItem item,
+        Project project,
         CancellationToken ct)
     {
         if (!needsCreds)
@@ -14238,26 +14429,38 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 run.Runner.Kind, run.Result.AgentStderr, run.Result.AgentStdout, "audit", sandboxName: null);
             var quotaDetection = _quotaClassifier.Detect(
                 run.Runner.Kind, run.Result.AgentStderr, run.Result.AgentStdout);
-            await _quotaClassifier.RecordIfQuotaFailureAsync(
-                _quotaFailures,
-                run.Runner.Kind,
-                ResolveObservedModelId(run.Runner, modelId: null),
-                run.Result.AgentSummary,
-                run.Result.AgentStderr,
-                DateTimeOffset.UtcNow,
-                _auditQuotaOptions.ObservedFailureRetention,
-                ct,
-                projectId: projectId,
-                stdout: run.Result.AgentStdout);
 
             if (quotaDetection is not null)
             {
-                throw new TerminalQuotaError(
-                    quotaDetection.Kind,
-                    QuotaFailureMessage(
+                var quotaContradicted = await IsQuotaFailureContradictedByProbeAsync(
+                    item, project, run.Runner.Kind, ResolveObservedModelId(run.Runner, modelId: null), ct);
+                if (!quotaContradicted)
+                {
+                    await _quotaClassifier.RecordIfQuotaFailureAsync(
+                        _quotaFailures,
+                        run.Runner.Kind,
+                        ResolveObservedModelId(run.Runner, modelId: null),
+                        run.Result.AgentSummary,
+                        run.Result.AgentStderr,
+                        DateTimeOffset.UtcNow,
+                        _auditQuotaOptions.ObservedFailureRetention,
+                        ct,
+                        projectId: project.Id,
+                        stdout: run.Result.AgentStdout);
+
+                    throw new TerminalQuotaError(
                         quotaDetection.Kind,
-                        $"Audit agent {run.Runner.Kind} reported quota failure while running {run.Auditor.Name}: {run.Result.AgentSummary ?? "agent failed"}"),
-                    quotaDetection.ResetAt);
+                        QuotaFailureMessage(
+                            quotaDetection.Kind,
+                            $"Audit agent {run.Runner.Kind} reported quota failure while running {run.Auditor.Name}: {run.Result.AgentSummary ?? "agent failed"}"),
+                        quotaDetection.ResetAt);
+                }
+
+                throw new TerminalTransientNetworkError(
+                    run.Runner.Kind,
+                    "audit",
+                    new AgentFailureClassification(AgentFailureKind.TransientNetwork, Reason: "Audit agent reported failure while quota probe reports healthy capacity"),
+                    $"Audit agent {run.Runner.Kind} reported failure while running {run.Auditor.Name} with healthy quota: {run.Result.AgentSummary ?? "agent failed"}");
             }
         }
 
@@ -14282,24 +14485,35 @@ public sealed partial class PipelineRunner : IPipelineRunner
             {
                 _quotaAuditEmitter.EmitAdvisoryAuditEvents(
                     run.Runner.Kind, run.Result.AgentTerminalDiagnostic, run.Result.AgentStdout, "audit", sandboxName: null);
-                await _quotaClassifier.RecordIfQuotaFailureAsync(
-                    _quotaFailures,
+                var quotaContradicted = await IsQuotaFailureContradictedByProbeAsync(
+                    item, project, run.Runner.Kind, ResolveObservedModelId(run.Runner, modelId: null), ct);
+                if (!quotaContradicted)
+                {
+                    await _quotaClassifier.RecordIfQuotaFailureAsync(
+                        _quotaFailures,
+                        run.Runner.Kind,
+                        ResolveObservedModelId(run.Runner, modelId: null),
+                        run.Result.AgentSummary,
+                        run.Result.AgentTerminalDiagnostic,
+                        DateTimeOffset.UtcNow,
+                        _auditQuotaOptions.ObservedFailureRetention,
+                        ct,
+                        projectId: project.Id,
+                        stdout: run.Result.AgentStdout,
+                        bypassExitedSummaryGuard: true);
+                    throw new TerminalQuotaError(
+                        terminalQuota!.Kind,
+                        QuotaFailureMessage(
+                            terminalQuota.Kind,
+                            $"Audit agent {run.Runner.Kind} reported quota failure on clean exit while running {run.Auditor.Name}: {RedactAndTruncateAgentDetail(run.Result.AgentTerminalDiagnostic)}"),
+                        terminalQuota.ResetAt);
+                }
+
+                throw new TerminalTransientNetworkError(
                     run.Runner.Kind,
-                    ResolveObservedModelId(run.Runner, modelId: null),
-                    run.Result.AgentSummary,
-                    run.Result.AgentTerminalDiagnostic,
-                    DateTimeOffset.UtcNow,
-                    _auditQuotaOptions.ObservedFailureRetention,
-                    ct,
-                    projectId: projectId,
-                    stdout: run.Result.AgentStdout,
-                    bypassExitedSummaryGuard: true);
-                throw new TerminalQuotaError(
-                    terminalQuota!.Kind,
-                    QuotaFailureMessage(
-                        terminalQuota.Kind,
-                        $"Audit agent {run.Runner.Kind} reported quota failure on clean exit while running {run.Auditor.Name}: {RedactAndTruncateAgentDetail(run.Result.AgentTerminalDiagnostic)}"),
-                    terminalQuota.ResetAt);
+                    "audit",
+                    new AgentFailureClassification(AgentFailureKind.TransientNetwork, Reason: "Audit agent clean-exit diagnostic reported failure while quota probe reports healthy capacity"),
+                    $"Audit agent {run.Runner.Kind} reported failure on clean exit while running {run.Auditor.Name} with healthy quota: {RedactAndTruncateAgentDetail(run.Result.AgentTerminalDiagnostic)}");
             }
         }
 
@@ -14846,6 +15060,20 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         if (totalQuotaRejected > 0)
         {
+            var hasHealthyCandidate = await HasAnyQuotaCandidateHealthyProbeAsync(
+                item, project, classId, ct, preferredProbeMember);
+            if (hasHealthyCandidate)
+            {
+                _log.LogWarning(
+                    "LLM auditor '{Auditor}' candidate(s) of class '{ClassId}' were flagged as quota-rejected, but probe reports healthy quota; treating as transient retry instead of WaitingForQuotaReset",
+                    auditorName, classId);
+                throw new TerminalTransientNetworkError(
+                    preferredKind ?? item.Agent ?? workRunner.Kind,
+                    "audit",
+                    new AgentFailureClassification(AgentFailureKind.TransientNetwork, Reason: "LLM auditor candidate flagged exhausted but probe is healthy"),
+                    $"LLM auditor '{auditorName}' cannot run: candidate agent(s) flagged exhausted but probe is healthy");
+            }
+
             var parkMessage =
                 $"LLM auditor '{auditorName}' cannot run: all {totalQuotaRejected} candidate agent(s) of class '{classId}' quota-exhausted";
             AuditLog.LlmAuditorParkedQuota(item.Id, auditorName, totalQuotaRejected);
@@ -20888,6 +21116,15 @@ Original merge-phase failure (JSON string, for context only):
     {
         var ct = CancellationToken.None;
         var current = await _store.GetAsync(item.Id, ct) ?? item;
+        if (await IsQuotaContradictedByProbeForWorkItemAsync(current, project, phase, ct))
+        {
+            _log.LogWarning(
+                "Work item {Id} was targeted for WaitingForQuotaReset ({Reason}), but probe reports healthy quota; redirecting to WaitingForTransientRetry",
+                item.Id, error);
+            await TransitionWaitingForTransientRetryAsync(current, error, project, phase, current.Agent);
+            return;
+        }
+
         var effectiveResetAt = await ResolveQuotaResetAtForFailedTransitionAsync(current, project, quotaResetAt, phase, ct, quotaKind);
         var agentTurnRetryFrom = RetryFromForAgentTurnCheckpoint(current);
         var next = WorkItemRecoveryPolicy.ReleaseAgentTurnDispatchClaim(
