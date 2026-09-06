@@ -275,4 +275,35 @@ public sealed class AntigravityQuotaFailureDetectorTests
         Assert.Null(AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(null));
         Assert.Null(AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(""));
     }
+
+    [Fact]
+    public void IndividualQuotaReached_IsDetected_AndCarriesItsOwnReset()
+    {
+        // Verbatim from a live agy result frame. It says "quota reached", not "quota exceeded", so it
+        // matched none of the original patterns and the run hard-FAILED instead of parking — despite
+        // the message stating exactly when it recovers.
+        const string message =
+            "Individual quota reached. Please upgrade your subscription to increase your limits. "
+            + "Resets in 1h8m20s.";
+
+        var detection = new AntigravityQuotaFailureDetector().Detect(message, null);
+
+        Assert.NotNull(detection);
+        // A short rolling window, not a weekly lockout.
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.NotNull(detection.ResetAt);
+    }
+
+    [Fact]
+    public void IndividualQuotaReached_IsDetectedFromAStreamJsonResultFrame()
+    {
+        // This is how it actually reaches us: inside agy's NDJSON result frame, not on stderr.
+        const string stdout =
+            """{"event":"result","result":{"status":"ERROR","error":"Individual quota reached. Resets in 1h8m20s."}}""";
+
+        var detection = new AntigravityQuotaFailureDetector().Detect(null, stdout);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+    }
 }
