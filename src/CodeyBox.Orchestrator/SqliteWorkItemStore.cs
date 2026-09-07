@@ -234,6 +234,7 @@ public sealed class SqliteWorkItemStore :
             RunMigration("ALTER TABLE work_items ADD COLUMN quota_retry_attempts INTEGER NOT NULL DEFAULT 0;");
             RunMigration("ALTER TABLE work_items ADD COLUMN quota_retry_from TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN quota_retry_phase TEXT;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN quota_retry_scope TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN next_transient_retry_at TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN transient_retry_attempts INTEGER NOT NULL DEFAULT 0;");
             RunMigration("ALTER TABLE work_items ADD COLUMN transient_retry_first_failed_at TEXT;");
@@ -1360,6 +1361,7 @@ public sealed class SqliteWorkItemStore :
                         suspended_vm_name, suspended_at, agent_log_path,
                         failure_kind, auth_failure_scope, quota_reset_at, next_quota_retry_at, quota_retry_attempts, quota_retry_from,
                         quota_retry_phase,
+                        quota_retry_scope,
                         next_transient_retry_at, transient_retry_attempts, transient_retry_first_failed_at, transient_retry_from,
                         agent_pause_target, agent_pause_retry_from, auditor_profile, priority,
                         audit_max_iterations, audit_complexity,
@@ -1379,6 +1381,7 @@ public sealed class SqliteWorkItemStore :
                         $suspended_vm_name, $suspended_at, $agent_log_path,
                         $failure_kind, $auth_failure_scope, $quota_reset_at, $next_quota_retry_at, $quota_retry_attempts, $quota_retry_from,
                         $quota_retry_phase,
+                        $quota_retry_scope,
                         $next_transient_retry_at, $transient_retry_attempts, $transient_retry_first_failed_at, $transient_retry_from,
                         $agent_pause_target, $agent_pause_retry_from, $auditor_profile, $priority,
                         $audit_max_iterations, $audit_complexity,
@@ -1647,6 +1650,7 @@ public sealed class SqliteWorkItemStore :
                     quota_retry_attempts = $quota_retry_attempts,
                     quota_retry_from = $quota_retry_from,
                     quota_retry_phase = $quota_retry_phase,
+                    quota_retry_scope = $quota_retry_scope,
                     next_transient_retry_at = $next_transient_retry_at,
                     transient_retry_attempts = $transient_retry_attempts,
                     transient_retry_first_failed_at = $transient_retry_first_failed_at,
@@ -1741,6 +1745,7 @@ public sealed class SqliteWorkItemStore :
                     quota_retry_attempts = $quota_retry_attempts,
                     quota_retry_from = $quota_retry_from,
                     quota_retry_phase = $quota_retry_phase,
+                    quota_retry_scope = $quota_retry_scope,
                     next_transient_retry_at = $next_transient_retry_at,
                     transient_retry_attempts = $transient_retry_attempts,
                     transient_retry_first_failed_at = $transient_retry_first_failed_at,
@@ -1837,6 +1842,7 @@ public sealed class SqliteWorkItemStore :
                     quota_retry_attempts = $quota_retry_attempts,
                     quota_retry_from = $quota_retry_from,
                     quota_retry_phase = $quota_retry_phase,
+                    quota_retry_scope = $quota_retry_scope,
                     next_transient_retry_at = $next_transient_retry_at,
                     transient_retry_attempts = $transient_retry_attempts,
                     transient_retry_first_failed_at = $transient_retry_first_failed_at,
@@ -2250,6 +2256,7 @@ public sealed class SqliteWorkItemStore :
                     quota_retry_attempts = $quota_retry_attempts,
                     quota_retry_from = $quota_retry_from,
                     quota_retry_phase = $quota_retry_phase,
+                    quota_retry_scope = $quota_retry_scope,
                     next_transient_retry_at = $next_transient_retry_at,
                     transient_retry_attempts = $transient_retry_attempts,
                     transient_retry_first_failed_at = $transient_retry_first_failed_at,
@@ -2682,6 +2689,7 @@ public sealed class SqliteWorkItemStore :
                         quota_retry_attempts = $quota_retry_attempts,
                         quota_retry_from = $quota_retry_from,
                         quota_retry_phase = $quota_retry_phase,
+                        quota_retry_scope = $quota_retry_scope,
                         next_transient_retry_at = $next_transient_retry_at,
                         transient_retry_attempts = $transient_retry_attempts,
                         transient_retry_first_failed_at = $transient_retry_first_failed_at,
@@ -4169,6 +4177,7 @@ public sealed class SqliteWorkItemStore :
         cmd.Parameters.AddWithValue("$quota_retry_attempts", item.QuotaRetryAttempts);
         cmd.Parameters.AddWithValue("$quota_retry_from", (object?)item.QuotaRetryFrom ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$quota_retry_phase", (object?)item.QuotaRetryPhase ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$quota_retry_scope", (object?)item.QuotaRetryScope ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$next_transient_retry_at", (object?)item.NextTransientRetryAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$transient_retry_attempts", item.TransientRetryAttempts);
         cmd.Parameters.AddWithValue("$transient_retry_first_failed_at", (object?)item.TransientRetryFirstFailedAt?.ToString("O") ?? DBNull.Value);
@@ -4300,6 +4309,7 @@ public sealed class SqliteWorkItemStore :
         QuotaRetryAttempts = ReadInt32OrDefault(r, "quota_retry_attempts", defaultValue: 0),
         QuotaRetryFrom = ReadNullableString(r, "quota_retry_from"),
         QuotaRetryPhase = ReadNullableString(r, "quota_retry_phase"),
+        QuotaRetryScope = ReadNullableString(r, "quota_retry_scope"),
         NextTransientRetryAt = ReadNullableDateTimeOffset(r, "next_transient_retry_at"),
         TransientRetryAttempts = ReadInt32OrDefault(r, "transient_retry_attempts", defaultValue: 0),
         TransientRetryFirstFailedAt = ReadNullableDateTimeOffset(r, "transient_retry_first_failed_at"),

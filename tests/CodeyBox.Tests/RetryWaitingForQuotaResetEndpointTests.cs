@@ -73,21 +73,29 @@ public sealed class RetryWaitingForQuotaResetEndpointTests : IDisposable
     }
 
     [Fact]
-    public async Task Retry_WaitingForQuotaReset_PreservesQuotaRetryAttempts()
+    public async Task Retry_WaitingForQuotaReset_ResetsQuotaRetryBudget()
     {
-        // Operator-triggered retries (trigger="manual" inside RetryAsync) must
-        // NOT increment QuotaRetryAttempts — that counter is reserved for the
-        // auto-retry scheduler so it can stop after MaxAutoRetriesPerWorkItem.
-        // A regression that always increments would let one operator click
-        // exhaust the auto-retry budget the scheduler may later need.
-        var item = WaitingItem() with { QuotaRetryAttempts = 1 };
+        // An operator retry must restore a usable budget: POST /retry resets
+        // QuotaRetryAttempts to zero and clears QuotaRetryScope so the
+        // retried item cannot immediately re-fail on an inherited cap. (This
+        // supersedes the earlier preserve-the-counter contract: a retried
+        // item that kept attempts=cap would die on its next quota event
+        // without ever running.)
+        var item = WaitingItem() with
+        {
+            QuotaRetryAttempts = 3,
+            QuotaRetryScope = "quota-bucket:v1:agent=claude;route=claude;model=",
+        };
         await _factory.Store.CreateAsync(item);
 
         var resp = await _client.PostAsJsonAsync($"/workitems/{item.Id}/retry", new { from = "work" });
         Assert.Equal(HttpStatusCode.Accepted, resp.StatusCode);
 
         var readBack = await _factory.Store.GetAsync(item.Id);
-        Assert.Equal(1, readBack!.QuotaRetryAttempts);
+        Assert.NotNull(readBack);
+        Assert.Equal(WorkItemState.Queued, readBack!.State);
+        Assert.Equal(0, readBack.QuotaRetryAttempts);
+        Assert.Null(readBack.QuotaRetryScope);
     }
 
     [Fact]
