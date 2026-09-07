@@ -32,9 +32,20 @@ public sealed class CompositeQuotaFailureClassifier : IQuotaFailureClassifier, I
 
         var scopedStdout = detector.ScopeStdoutForQuotaDetection(stdout);
         var detection = detector.Detect(stderr, scopedStdout);
-        return detection is null
-            ? QuotaFailureClassification.None
-            : QuotaFailureClassification.Quota(detection);
+        if (detection is null)
+            return QuotaFailureClassification.None;
+
+        // Evidence-trust split: a marker on process stderr is provider-emitted
+        // (the agent cannot plant it in its own prose), so it keeps the legacy
+        // quota path unconditionally. A stdout/stream-only match is
+        // agent-quotable — the agent may be discussing, committing, or forging
+        // provider errors — so callers must corroborate it against the live
+        // quota probe before parking. Re-running Detect on stderr alone (rather
+        // than threading match sources through every detector) keeps this in
+        // one place; the primary detection above is unchanged.
+        var providerSurfaceMatch = !string.IsNullOrEmpty(stderr)
+            && detector.Detect(stderr, null) is not null;
+        return QuotaFailureClassification.Quota(detection, providerSurfaceMatch);
     }
 
     public QuotaDetection? Detect(AgentKind agent, string? stderr, string? stdout)
