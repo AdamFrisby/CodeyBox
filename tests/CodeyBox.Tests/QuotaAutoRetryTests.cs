@@ -2957,23 +2957,42 @@ public sealed class QuotaAutoRetryTests : IDisposable
     }
 
     [Fact]
-    public void QuotaRecoveryProbeMonitor_DuplicateProbeRegistrationFailsFast()
+    public async Task QuotaRecoveryProbeMonitor_DuplicateKindProbesFailClosedAtResolution()
     {
+        // Two probes serving the same kind is legal: probes resolve by member
+        // key, so same-kind probes coexist (e.g. two meters for one agent).
+        // Two equally broad claims for one member conflict — resolution logs at
+        // Error and fails closed, so NEITHER probe is consulted and the member
+        // stays tracked instead of recovering through an arbitrary winner.
         var quotaSignal = new AgentQuotaAvailabilityBroadcaster(
             NullLogger<AgentQuotaAvailabilityBroadcaster>.Instance);
         var options = new QuotaRouterOptions { MinQuotaPct = 10 };
+        var first = new MutableProbe(AgentKind.Codex, availablePct: 0);
+        var second = new MutableProbe(AgentKind.Codex, availablePct: 100);
 
-        Assert.Throws<ArgumentException>(() => new AgentQuotaRecoveryProbeMonitor(
+        using var monitor = new AgentQuotaRecoveryProbeMonitor(
             quotaSignal,
             quotaSignal,
             [
-                new MutableProbe(AgentKind.Codex, availablePct: 0),
-                new MutableProbe(AgentKind.Codex, availablePct: 100),
+                first,
+                second,
             ],
             new QuotaGateAvailability(new QuotaGatePolicy(options)),
             options,
             NullLogger<AgentQuotaRecoveryProbeMonitor>.Instance,
-            _time));
+            _time);
+
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Codex,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+        quotaSignal.RecordQuotaUsability(member, isUsable: false);
+
+        Assert.Equal(0, await monitor.ProbeTrackedMembersOnceAsync(CancellationToken.None));
+        Assert.Equal(0, first.CallCount);
+        Assert.Equal(0, second.CallCount);
     }
 
     [Fact]
