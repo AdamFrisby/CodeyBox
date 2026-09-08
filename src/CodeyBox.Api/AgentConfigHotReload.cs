@@ -619,7 +619,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         var prev = _lastRouter;
         try
         {
-            var catalog = AgentClassesConfigBuilder.Build(opts.AgentClasses, opts.AgentInstances, _log);
+            var catalog = AgentClassesConfigBuilder.Build(opts.AgentClasses, opts.AgentInstances, _log, opts.Copilot.Providers);
             var todModifiers = AgentClassesConfigBuilder.BuildTodModifiers(opts.AgentScoreModifiers, _log);
             _router.ApplyConfigReload(catalog, todModifiers);
             _lastRouter = next;

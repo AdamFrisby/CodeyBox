@@ -15,6 +15,16 @@ public sealed class CopilotOptions
     public CopilotProviderOptions Provider { get; set; } = new();
 
     /// <summary>
+    /// Named BYOK providers a class member can select through its
+    /// <c>Provider</c> reference (bound from
+    /// <c>CodeyBox:Copilot:Providers:{name}</c>). Names match
+    /// case-insensitively. A member with no provider reference keeps using
+    /// <see cref="Provider"/>, so existing deployments without this section
+    /// behave exactly as before.
+    /// </summary>
+    public Dictionary<string, CopilotProviderOptions> Providers { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
     /// Runs Copilot with no GitHub access beyond the model provider (<c>COPILOT_OFFLINE</c>): no GitHub
     /// authentication, telemetry, web tools, GitHub MCP server or auto-update.
     ///

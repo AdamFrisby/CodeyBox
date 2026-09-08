@@ -51,6 +51,14 @@ public sealed record AgentMembership
     public AgentCredentialReference? CredentialReference { get; init; }
 
     /// <summary>
+    /// Per-instance provider source. When null, the agent-global provider
+    /// configuration is used. Only agents with a named provider catalog
+    /// honour this (today: Copilot via <c>CodeyBox:Copilot:Providers</c>);
+    /// any other agent naming a provider fails configuration validation.
+    /// </summary>
+    public AgentProviderReference? ProviderReference { get; init; }
+
+    /// <summary>
     /// Stable routing/accounting key for this member. Default legacy members
     /// return the bare agent kind (for example <c>claude</c>); named members
     /// return <c>claude/acct-a</c>.
@@ -192,6 +200,22 @@ public sealed record AgentCredentialReference
         || !string.IsNullOrWhiteSpace(SettingsFilePath)
         || !string.IsNullOrWhiteSpace(DestinationPath)
         || !string.IsNullOrWhiteSpace(SandboxEnvironmentVariable);
+}
+
+/// <summary>
+/// A named provider entry for one routable agent instance. The name resolves
+/// against the agent's provider catalog (for Copilot:
+/// <c>CodeyBox:Copilot:Providers</c>); exactly how the resolved entry is
+/// materialized is agent-specific. A name that resolves to no catalog entry
+/// fails configuration validation — the member must never silently fall back
+/// to a different backend than the operator named.
+/// </summary>
+public sealed record AgentProviderReference
+{
+    /// <summary>Provider catalog entry name, e.g. <c>byok</c>.</summary>
+    public string? Name { get; init; }
+
+    public bool HasAnyReference => !string.IsNullOrWhiteSpace(Name);
 }
 
 /// <summary>Helpers for stable agent instance route keys.</summary>

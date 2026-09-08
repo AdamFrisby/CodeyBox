@@ -66,6 +66,15 @@ The credential is **not** a config value: it arrives through the credential chai
 `CODEYBOX_COPILOT_PROVIDER_API_KEY` → `COPILOT_PROVIDER_API_KEY`, so the secret never sits in a
 config file.
 
+**Per-member providers.** `CodeyBox:Copilot:Providers:{name}` holds named BYOK
+entries a class member selects with its `Provider` reference; a member with no
+reference keeps using the agent-global `CodeyBox:Copilot:Provider`. The runner
+renders each invocation from the member's effective provider, so a BYOK
+harness member and a native-subscription member (distinct `InstanceId`s) can
+coexist on one CLI. A member naming an entry that does not exist fails
+configuration validation at startup — it never silently falls back to another
+backend.
+
 **`apply_patch` breaks strict servers.** Copilot offers it as an OpenAI *custom* tool with a Lark
 grammar (`"type":"custom"` rather than `"type":"function"`), and a server implementing only function
 tools rejects the **whole** tools array — an llama.cpp-backed endpoint answers

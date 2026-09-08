@@ -102,6 +102,42 @@ For simple single-credential deployments, omit `InstanceId` and
 `AgentInstances`; the route key remains the bare kind (`claude`, `codex`, …)
 and behavior is unchanged.
 
+### Per-member Copilot providers
+
+A copilot member can name a `Provider` entry from `CodeyBox:Copilot:Providers`
+instead of using the agent-global `CodeyBox:Copilot:Provider`. This lets one
+CLI serve as two independently-routed members — a BYOK execution harness and
+a native GitHub Copilot subscription — distinguished by `InstanceId` so their
+route keys, quota buckets, pauses, and cost rows stay separate:
+
+```json
+{
+  "CodeyBox": {
+    "Copilot": {
+      "Providers": {
+        "byok": { "BaseUrl": "https://opencode.ai/zen/go/v1", "Type": "openai", "WireApi": "responses" }
+      }
+    },
+    "AgentClasses": [
+      {
+        "Id": "frontier-coding",
+        "Members": [
+          { "Agent": "copilot", "InstanceId": "harness", "Provider": "byok", "Billing": "Subscription", "QualityScore": 100 },
+          { "Agent": "copilot", "InstanceId": "sub", "Billing": "Subscription", "QualityScore": 99 }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`copilot/harness` infers against the `byok` endpoint; `copilot/sub` inherits
+the agent-global provider (native subscription auth when it configures no
+base URL). Members without a `Provider` behave exactly as before. A member
+naming a provider with no catalog entry — or any non-copilot member naming
+one — fails configuration validation at startup instead of silently running
+against another backend.
+
 ### Claude session opt-in
 
 Class-routed Claude work items use the resumable session worker only when the
@@ -230,6 +266,7 @@ AgentClass 'frontier-coding' resolved members: [claude/claude-opus-4-7(Subscript
 | `SettingsFilePath` | no | Optional companion settings file, currently used by Gemini OAuth. |
 | `DestinationPath` | no | Optional sandbox destination path for file-materializing runners. |
 | `SandboxEnvironmentVariable` | no | Optional override for the sandbox environment variable used for token injection. |
+| `Provider` | no | Named provider entry for this member instance (today: a `CodeyBox:Copilot:Providers` entry for copilot members). Null means the agent-global provider configuration. |
 | `QualityScore` | **yes** | Operator-curated capability score on a 0–200 scale. No silent default; startup rejects missing scores with a migration message. |
 | `ReasoningMode` | no* | Agent CLI reasoning knob, e.g. `"high"`. *Required for Gemini members with `QualityScore` ≥ 90. |
 | `Capabilities` | no | List of clearance/trust tags this member is allowed to handle (e.g. `["sensitive", "architectural"]`). Default empty — a member with no tags can only run work items that require no tags. See [Capability gate](#capability-gate) below. |

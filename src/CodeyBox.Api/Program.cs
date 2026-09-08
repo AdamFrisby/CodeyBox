@@ -1969,7 +1969,7 @@ builder.Services.AddSingleton<AgentClassRouter>(sp =>
 
     // Build and validate the catalog. Shared with AgentConfigHotReload so a
     // reload of CodeyBox:AgentClasses runs the same validation rules.
-    var catalog = AgentClassesConfigBuilder.Build(cbOpts.AgentClasses, cbOpts.AgentInstances, startupLog);
+    var catalog = AgentClassesConfigBuilder.Build(cbOpts.AgentClasses, cbOpts.AgentInstances, startupLog, cbOpts.Copilot.Providers);
     var subscriptionMembers = catalog.Sum(c => c.Members.Count(m => m.Billing == AgentBilling.Subscription));
     startupLog.LogInformation("Quota gate enabled for {Count} subscription members", subscriptionMembers);
 
@@ -6605,6 +6605,13 @@ namespace CodeyBox.Api
 
         /// <summary>Optional override for the sandbox env var used for token injection.</summary>
         public string? SandboxEnvironmentVariable { get; set; }
+
+        /// <summary>
+        /// Optional named provider entry for this instance (today: a
+        /// <c>CodeyBox:Copilot:Providers</c> entry for copilot instances).
+        /// Null means the agent-global provider configuration.
+        /// </summary>
+        public string? Provider { get; set; }
     }
 
     /// <summary>Config binding for one member of an agent class.</summary>
@@ -6630,6 +6637,12 @@ namespace CodeyBox.Api
         public string? DestinationPath { get; set; }
         /// <summary>Inline override for the sandbox env var used for token injection.</summary>
         public string? SandboxEnvironmentVariable { get; set; }
+        /// <summary>
+        /// Inline named provider entry for this member instance (today: a
+        /// <c>CodeyBox:Copilot:Providers</c> entry for copilot members).
+        /// Null means the agent-global provider configuration.
+        /// </summary>
+        public string? Provider { get; set; }
         /// <summary>
         /// Operator-curated capability score (0–200). Required; no silent default.
         /// See docs/concepts/agent-classes.md for recommended seed values.

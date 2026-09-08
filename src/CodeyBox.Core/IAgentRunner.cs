@@ -65,6 +65,34 @@ public interface IAgentCredentialEnvironmentPolicy
 }
 
 /// <summary>
+/// Optional runner capability for CLIs whose per-invocation configuration
+/// varies by class member (today: Copilot's per-member BYOK provider
+/// override). The orchestrator calls <see cref="ForMember"/> with the
+/// selected member and invokes the returned runner through the plain
+/// <see cref="IAgentRunner"/> contract, so wrappers, supervision turns and
+/// resume paths need no member-aware overloads of their own.
+/// </summary>
+/// <remarks>
+/// The returned runner must carry only immutable state (typically a copy of
+/// the runner's options with the member's override applied) so concurrently
+/// dispatched members never observe each other's configuration. When the
+/// member carries no override for this runner, the implementation returns
+/// itself.
+/// </remarks>
+public interface IMemberScopedAgentRunner : IAgentRunner
+{
+    /// <summary>
+    /// Returns a runner bound to <paramref name="member"/>'s configuration:
+    /// the member's override when it names one this runner honours, else the
+    /// runner's agent-global configuration. Never returns null. Throws
+    /// <see cref="InvalidOperationException"/> when the member names a
+    /// provider that does not resolve — silently running an unintended
+    /// backend is worse than refusing the invocation.
+    /// </summary>
+    IAgentRunner ForMember(AgentMembership member);
+}
+
+/// <summary>
 /// Runner-declared HOME credential destination for a payload carried in an
 /// environment variable. <paramref name="HomeRelativePath"/> must be a
 /// non-empty path relative to HOME with no traversal segments. When

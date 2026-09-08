@@ -21,7 +21,7 @@ namespace CodeyBox.Agents.Copilot;
 /// exceed it and surface as exit 126 from the sandbox wrapper's exec. There is no CLI affordance to work
 /// around this today.</para>
 /// </summary>
-public sealed class CopilotAgentRunner : CliAgentRunnerBase
+public sealed class CopilotAgentRunner : CliAgentRunnerBase, IMemberScopedAgentRunner
 {
     public override AgentKind Kind => AgentKind.Copilot;
 
@@ -86,12 +86,43 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase
         => CredentialEnvironmentVariables;
 
     /// <summary>
+    /// Returns a runner bound to <paramref name="member"/>'s effective
+    /// provider (its named override, else <see cref="Options"/>'s global
+    /// provider). Members without an override get this instance back, so
+    /// existing single-provider deployments allocate nothing and behave
+    /// identically. The bound runner is a fresh immutable instance, so two
+    /// members — e.g. a BYOK harness and a native subscription — dispatch
+    /// concurrently without observing each other's configuration.
+    /// </summary>
+    public IAgentRunner ForMember(AgentMembership member)
+    {
+        ArgumentNullException.ThrowIfNull(member);
+        var effective = CopilotProviderResolver.ResolveEffectiveProvider(member, Options);
+        if (ReferenceEquals(effective, Options.Provider))
+            return this;
+
+        return new CopilotAgentRunner
+        {
+            Binary = Binary,
+            Options = new CopilotOptions
+            {
+                Provider = effective,
+                Providers = Options.Providers,
+                Offline = Options.Offline,
+                ExcludedTools = Options.ExcludedTools,
+            },
+        };
+    }
+
+    /// <summary>
     /// Renders BYOK settings to the environment variables Copilot reads. Empty when no base URL is
     /// configured: BYOK is inactive until <c>COPILOT_PROVIDER_BASE_URL</c> is set, and emitting the rest
     /// without it would be noise the CLI ignores. Pure, so the mapping is unit-testable without
     /// launching anything. Header values containing
     /// <see cref="ProviderSessionIdPlaceholder"/> are resolved with a freshly generated identifier;
-    /// pass an explicit generator to the overload for deterministic tests.
+    /// pass an explicit generator to the overload for deterministic tests. To render a member's
+    /// effective provider, resolve it first with <see cref="CopilotProviderResolver"/> and call
+    /// <see cref="BuildProviderEnvironment(CopilotProviderOptions, bool)"/>.
     /// </summary>
     /// <remarks>
     /// The credential (API key / bearer token) is deliberately absent: it reaches the CLI through the
@@ -121,8 +152,33 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase
         CopilotOptions options,
         Func<string>? sessionIdGenerator)
     {
+        ArgumentNullException.ThrowIfNull(options);
+        return BuildProviderEnvironment(options.Provider, options.Offline, sessionIdGenerator);
+    }
+
+    /// <summary>
+    /// Renders one (already resolved) provider to the environment variables
+    /// Copilot reads, honouring <paramref name="offline"/> only alongside a
+    /// configured provider. An unconfigured <paramref name="provider"/>
+    /// yields an empty map: the native-subscription path. Configured header values containing
+    /// <see cref="ProviderSessionIdPlaceholder"/> are resolved with a freshly generated identifier.
+    /// </summary>
+    public static IReadOnlyDictionary<string, string> BuildProviderEnvironment(CopilotProviderOptions provider, bool offline)
+        => BuildProviderEnvironment(provider, offline, null);
+
+    /// <summary>
+    /// Renders one (already resolved) provider to the environment variables
+    /// Copilot reads, honouring <paramref name="offline"/> only alongside a
+    /// configured provider. An unconfigured <paramref name="provider"/>
+    /// yields an empty map: the native-subscription path.
+    /// </summary>
+    public static IReadOnlyDictionary<string, string> BuildProviderEnvironment(
+        CopilotProviderOptions provider,
+        bool offline,
+        Func<string>? sessionIdGenerator)
+    {
+        ArgumentNullException.ThrowIfNull(provider);
         var env = new Dictionary<string, string>(StringComparer.Ordinal);
-        var provider = options.Provider;
         if (!provider.IsConfigured || provider.BaseUrl is not { } baseUrl)
             return env;
 
@@ -158,7 +214,7 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase
         }
 
         // Copilot requires a provider for offline mode, so the flag is honoured only alongside one.
-        if (options.Offline)
+        if (offline)
             env["COPILOT_OFFLINE"] = "true";
 
         return env;
