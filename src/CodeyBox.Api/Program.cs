@@ -113,19 +113,40 @@ if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASPNETCORE_URLS"))
     // Rolling plain-text mirror of the console stream. Replaces the
     // historical `>>` shell-redirect of stdout to codeybox-orchestrator.run.log,
     // which grew without bound (22 M+ lines / multi-GB by 2026-06) and made
-    // operator tail/grep return weeks-old lines. Bound by both date and size,
-    // capped by RetainedFileCountLimit. Disable via
+    // operator tail/grep return weeks-old lines. RunLogSink bounds it by size
+    // (RetainedFileCountLimit x MaxFileSizeBytes peak) and stamps every line
+    // with a full-date UTC timestamp. Both rotation knobs are re-read live
+    // (see ReadRunLogOptions), so they hot-reload without a restart; only the
+    // path stays pinned to its startup value. Disable via
     // CodeyBox:AuditLog:ConsoleLog:Enabled=false if the operator manages
     // run-log capture out of process.
+    // builder.Configuration reloads appsettings / CODEYBOX_EXTRA_CONFIG in
+    // place, so re-binding just the small ConsoleLog section here (at most
+    // once per second) is what makes the knobs hot-reloadable this early in
+    // bootstrap, before the DI container (and IOptionsMonitor) exists.
+    var runLogGate = new object();
+    var runLogCached = auditOpts.ConsoleLog;
+    var runLogCachedAt = DateTimeOffset.UtcNow;
+    ConsoleLogOptions ReadRunLogOptions()
+    {
+        lock (runLogGate)
+        {
+            if (DateTimeOffset.UtcNow - runLogCachedAt > TimeSpan.FromSeconds(1))
+            {
+                runLogCached = builder.Configuration
+                    .GetSection("CodeyBox:AuditLog:ConsoleLog")
+                    .Get<ConsoleLogOptions>() ?? new ConsoleLogOptions();
+                runLogCachedAt = DateTimeOffset.UtcNow;
+            }
+
+            return runLogCached;
+        }
+    }
+
     if (auditOpts.ConsoleLog.Enabled)
     {
-        serilogConfig = serilogConfig.WriteTo.File(
-            path: auditOpts.ConsoleLog.Path,
-            rollingInterval: RollingInterval.Day,
-            retainedFileCountLimit: auditOpts.ConsoleLog.RetainedFileCountLimit,
-            fileSizeLimitBytes: auditOpts.ConsoleLog.MaxFileSizeBytes,
-            rollOnFileSizeLimit: true,
-            shared: false);
+        serilogConfig = serilogConfig.WriteTo.Sink(
+            new RunLogSink(auditOpts.ConsoleLog.Path, ReadRunLogOptions));
     }
 
     serilogConfig = serilogConfig
@@ -6953,7 +6974,10 @@ namespace CodeyBox.Api
     /// settings keep ~14 rolled files of up to 100 MiB each (≈ 1.4 GiB peak
     /// disk) and roll on both calendar day and size; disable by setting
     /// <c>Enabled=false</c> if the operator manages run-log capture out of
-    /// process.
+    /// process. <see cref="RetainedFileCountLimit"/> and
+    /// <see cref="MaxFileSizeBytes"/> are re-read on every write, so edits
+    /// hot-reload without a restart; only <see cref="Path"/> is pinned at
+    /// startup.
     /// </summary>
     public sealed class ConsoleLogOptions
     {
@@ -6965,17 +6989,20 @@ namespace CodeyBox.Api
         public bool Enabled { get; set; } = true;
 
         /// <summary>
-        /// Path template for the rolling run log. Serilog inserts the date
+        /// Path template for the rolling run log. The sink inserts the UTC date
         /// before the trailing dot (e.g. <c>codeybox-console-20260618.log</c>).
-        /// Relative paths resolve from the process working directory.
+        /// Relative paths resolve from the process working directory. Pinned
+        /// at startup (not hot-reloadable).
         /// </summary>
         public string Path { get; set; } = "logs/codeybox-console-.log";
 
         /// <summary>
         /// Total number of rolled files to retain across all dates / size
         /// segments. Counted-by-file (not by day) so the cap holds even when
-        /// size rolling produces several segments in a single day. Must be
-        /// >= 1. Default: 14.
+        /// size rolling produces several segments in a single day, and so the
+        /// total footprint stays bounded at
+        /// <c>RetainedFileCountLimit x MaxFileSizeBytes</c> regardless of write
+        /// rate. Must be >= 1. Default: 14. Hot-reloadable.
         /// </summary>
         public int RetainedFileCountLimit { get; set; } = 14;
 
@@ -6983,6 +7010,7 @@ namespace CodeyBox.Api
         /// Per-file size cap before rolling to a new segment. Combined with
         /// the day boundary, this is what actually keeps individual files
         /// readable with tail / less. Must be >= 1 MiB. Default: 100 MiB.
+        /// Hot-reloadable.
         /// </summary>
         public long MaxFileSizeBytes { get; set; } = 100 * 1024 * 1024;
     }

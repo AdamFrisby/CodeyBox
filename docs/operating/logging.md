@@ -13,12 +13,20 @@ you launch the binary from). Override via `appsettings.json` — see [Configurat
 
 The structured file format is [Compact Log Event Format (CLEF / NDJSON)](https://clef-json.org/):
 one JSON object per line. Every event carries the fields documented in
-[Common properties](#common-properties). The plain-text console mirror uses Serilog's default
-output template (timestamp, level, message, properties).
+[Common properties](#common-properties). The plain-text console mirror writes one line per
+event as `[2026-09-08T16:15:29.123Z INF] message` (multi-line for exceptions):
+a full-date UTC timestamp, a 3-letter level, and the rendered message. The full date
+is deliberate — a bare `HH:mm:ss` stamp made time-based greps match lines from earlier
+days, manufacturing incidents that never occurred.
 
 The console mirror exists so stdout survives without an external `>>` redirect:
-it rolls by day and by size, so no single file grows past the point where `tail`
-and `grep` return weeks-old lines at multi-gigabyte scan cost.
+it rolls by day and by size under a retained-file cap, so no single file grows past
+the point where `tail` and `grep` return weeks-old lines at multi-gigabyte scan cost,
+and the total footprint stays bounded at
+`RetainedFileCountLimit × MaxFileSizeBytes` regardless of write rate. Size segments
+for a day are named `codeybox-console-YYYYMMDD_001.log`, `_002`, and so on; rotation
+happens while the process holds the active file open for append, so no lines are lost
+and no restart is needed.
 
 ## Configuration
 
@@ -47,8 +55,8 @@ and `grep` return weeks-old lines at multi-gigabyte scan cost.
 | `MaxFileSizeBytes` | 104857600 (100 MiB) | Per-JSON-file size cap before rolling to a new file. |
 | `ConsoleLog:Enabled` | `true` | Master switch for the rolling plain-text console mirror. Set `false` if your supervisor already captures stdout out of process — disabling this only stops writing the mirror file; stdout is unaffected. |
 | `ConsoleLog:Path` | `logs/codeybox-console-.log` | Path template for the plain-text console mirror. Same date-insertion convention. |
-| `ConsoleLog:RetainedFileCountLimit` | 14 | Total rolled console files kept across all dates and size segments. Counted-by-file (not by day) so the cap holds when size rolling produces multiple segments per day. Must be ≥ 1. |
-| `ConsoleLog:MaxFileSizeBytes` | 104857600 (100 MiB) | Per-file size cap before rolling the console mirror. Must be ≥ 1 MiB. Combined with the daily boundary, this is what keeps individual files readable with `tail` / `less`. |
+| `ConsoleLog:RetainedFileCountLimit` | 14 | Total rolled console files kept across all dates and size segments. Counted-by-file (not by day) so the cap holds when size rolling produces multiple segments per day, and so the total footprint stays bounded even under sustained high-rate writes. Must be ≥ 1. Hot-reloadable. |
+| `ConsoleLog:MaxFileSizeBytes` | 104857600 (100 MiB) | Per-file size cap before rolling the console mirror. Must be ≥ 1 MiB. Combined with the daily boundary, this is what keeps individual files readable with `tail` / `less`. Hot-reloadable. |
 
 Startup fails fast if any enabled path's directory cannot be created or written to.
 
@@ -56,7 +64,9 @@ Startup fails fast if any enabled path's directory cannot be created or written 
 
 Peak disk for the console mirror is `RetainedFileCountLimit × MaxFileSizeBytes`. The shipped
 defaults (14 × 100 MiB) give ≈ 1.4 GiB peak retention — enough to cover a typical week of
-verbose operator activity while staying bounded. Operators running a long inspection window
+verbose operator activity while staying bounded. Both knobs hot-reload: editing them in
+`appsettings.json` (or the extra-config file) takes effect within about a second, no
+restart needed. Operators running a long inspection window
 should raise `RetainedFileCountLimit` rather than `MaxFileSizeBytes` so individual files stay
 quick to grep / tail.
 
