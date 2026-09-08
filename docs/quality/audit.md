@@ -166,7 +166,9 @@ that hands the build user a root-owned `~/.nuget` therefore aborts
 `csharp:build-WaE`, `csharp:test-pass`, and the non-skippable
 `process:required-build` with `Failed to read NuGet.Config due to unauthorized
 access`. The `csharp:test-pass` "argument …dll is invalid" message is the same
-failure downstream: nothing built, so there is no test assembly.
+failure downstream: nothing built, so there is no test assembly. It surfaces
+as infrastructure (`could-not-verify`), not as a code finding — see
+`DotnetTestAuditor` below.
 
 No committed repository file can redirect that read — NuGet resolves the path
 from process environment. CodeyBox works around it in three places instead: the
@@ -230,6 +232,17 @@ DI-registered as `ITestRunnerAuditor` so the test-selector seam can enumerate
 its `TestSuiteDescriptor`. Run options
 (`CSharpTestPassAuditorIdleTimeout` / `CSharpTestPassBlameHangTimeout`) are
 sourced through the type from `CodeyBox:PipelineTuning` and hot-reload.
+
+Result classification distinguishes "the code failed" from "the runner never
+ran". A non-zero exit with parsed `Failed <test> [...]` headers,
+compiler/SDK errors (`CS`/`NETSDK`/`NU`), or `Build FAILED.` stays a blocking
+code finding. A non-zero exit with zero parsed failures plus a
+runner-invocation refusal — VSTest's `The argument … is invalid.` /
+`The test source file … was not found.` for an absent test assembly, or
+MSBuild `MSB1001`/`MSB1003`/`MSB1009` — raises `AuditUnavailableException`,
+failing the item as infrastructure (`could-not-verify`) without consuming a
+rework iteration. When both shapes appear in one transcript, the genuine
+failure signals win and the outcome stays a code finding.
 
 Capability: `None`.
 
