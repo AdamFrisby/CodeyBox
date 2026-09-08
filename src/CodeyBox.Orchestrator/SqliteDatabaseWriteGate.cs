@@ -557,3 +557,29 @@ internal sealed class SqliteWriteGateReentrancyException : InvalidOperationExcep
     public string WaitingHolder { get; }
     public string CurrentHolder { get; }
 }
+
+/// <summary>
+/// Escalation signal raised when the dispatch loop cannot acquire the SQLite
+/// write gate for <c>MaxConsecutiveDispatchGateTimeoutsBeforeEscalation</c>
+/// consecutive pickup attempts. A single acquisition timeout is transient and
+/// handled with a backoff; a sustained run means the gate holder is stuck or
+/// the database is wedged, which must surface (and stop the host with a
+/// non-zero exit) rather than retry silently forever.
+/// </summary>
+public sealed class SqliteWriteGatePersistentlyUnavailableException : TimeoutException
+{
+    public SqliteWriteGatePersistentlyUnavailableException(
+        int consecutiveTimeouts,
+        string? lastWaitingHolder,
+        string? lastCurrentHolder)
+        : base($"SQLite write gate acquisition failed {consecutiveTimeouts} consecutive times (last waiter: '{lastWaitingHolder ?? "unknown"}', last holder: '{lastCurrentHolder ?? "unknown"}'); the gate holder may be stuck.")
+    {
+        ConsecutiveTimeouts = consecutiveTimeouts;
+        LastWaitingHolder = lastWaitingHolder;
+        LastCurrentHolder = lastCurrentHolder;
+    }
+
+    public int ConsecutiveTimeouts { get; }
+    public string? LastWaitingHolder { get; }
+    public string? LastCurrentHolder { get; }
+}

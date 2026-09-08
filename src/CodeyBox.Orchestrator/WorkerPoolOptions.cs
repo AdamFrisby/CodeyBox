@@ -28,4 +28,21 @@ public sealed class WorkerPoolOptions
     /// Spreads out quota usage and sandbox-launch load. Default 0 (no pacing).
     /// </summary>
     public TimeSpan MinSpawnInterval { get; set; } = TimeSpan.Zero;
+
+    /// <summary>
+    /// Backoff between dispatch-pickup attempts after a SQLite write-gate
+    /// acquisition timeout. A single timeout is transient (holder momentarily
+    /// slow), so the loop logs at Warning and retries after this delay
+    /// instead of faulting the host. Must be non-negative and under 1 hour.
+    /// Default 1 second.
+    /// </summary>
+    public TimeSpan DispatchGateAcquisitionBackoff { get; set; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// Consecutive pickup gate-acquisition timeouts before the dispatch loop
+    /// escalates with <c>SqliteWriteGatePersistentlyUnavailableException</c>
+    /// (fatal: stops the host with a non-zero exit so a supervisor restarts).
+    /// Must be at least 1. Default 10.
+    /// </summary>
+    public int MaxConsecutiveDispatchGateTimeoutsBeforeEscalation { get; set; } = 10;
 }

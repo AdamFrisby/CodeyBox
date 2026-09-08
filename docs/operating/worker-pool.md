@@ -14,6 +14,21 @@ Three independent knobs control worker admission and sandbox pressure:
 | `CodeyBox:WorkerPool:MaxConcurrentWorkers` | `int` | `1` | Hard cap on simultaneous in-flight work items |
 | `CodeyBox:WorkerPool:MaxConcurrentSandboxes` | `int` | `ceil(MaxConcurrentWorkers * 1.5)` | Global cap on live sandboxes/VMs across every phase |
 | `CodeyBox:WorkerPool:MinSpawnInterval` | `string` (TimeSpan) | `"00:00:00"` (none) | Minimum wall-clock gap between consecutive spawns |
+| `CodeyBox:WorkerPool:DispatchGateAcquisitionBackoff` | `string` (TimeSpan) | `"00:00:01"` | Backoff between dispatch pickups after a SQLite write-gate acquisition timeout |
+| `CodeyBox:WorkerPool:MaxConsecutiveDispatchGateTimeoutsBeforeEscalation` | `int` | `10` | Consecutive pickup gate timeouts before fatal escalation (host stops, non-zero exit) |
+
+### Dispatch write-gate outage resilience
+
+Dispatch pickup reads run on dedicated SQLite connections and never contend
+for the write gate, so a slow writer only delays pickup when pickup itself
+needs to write. When a pickup attempt cannot acquire the gate, the loop logs
+a Warning naming the current holder, waits
+`DispatchGateAcquisitionBackoff`, and retries on the next dispatch turn —
+the timeout never faults the host by itself. If timeouts persist for
+`MaxConsecutiveDispatchGateTimeoutsBeforeEscalation` consecutive attempts,
+the loop escalates fatally: the host stops with a non-zero exit code so a
+supervisor (`Restart=on-failure`) restarts the process instead of sitting
+idle. An intentional shutdown still exits 0.
 
 ### MaxConcurrentWorkers
 
