@@ -58,6 +58,13 @@ internal static class WorkItemEndpoints
             currentlyRunning = status.CurrentlyRunning,
             queuedCount = status.QueuedCount,
             lastSpawnAt = status.LastSpawnAt,
+            occupiedSlots = (status.OccupiedSlots ?? []).Select(s => new
+            {
+                workerIndex = s.WorkerIndex,
+                workItemId = s.WorkItemId,
+                registryWorkerId = s.RegistryWorkerId,
+                acquiredAt = s.AcquiredAt,
+            }).ToArray(),
         });
     }
 

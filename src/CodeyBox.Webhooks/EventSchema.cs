@@ -87,6 +87,7 @@ public static class EventSchema
         // Worker pool / dispatcher health
         "worker_pool.stalled",
         "worker_pool.restart_required",
+        "worker_pool.slot_reclaimed",
         // Agent-level (smoke probe, fallback)
         "agent.smoke_failed",
         "agent.smoke_recovered",

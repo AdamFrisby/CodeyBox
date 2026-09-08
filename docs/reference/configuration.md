@@ -444,7 +444,8 @@ the configured window. Settings are read on each sweep, so edits hot-reload.
 "WorkerPoolHealthWatchdog": {
   "StallTimeout": "00:10:00",
   "CheckInterval": "00:01:00",
-  "MaxRecoveryAttempts": 2
+  "MaxRecoveryAttempts": 2,
+  "OrphanedSlotMaxAge": "00:30:00"
 }
 ```
 
@@ -455,6 +456,7 @@ the configured window. Settings are read on each sweep, so edits hot-reload.
 | `MaxRecoveryAttempts` | `2` | Bounded self-recovery attempts before `worker_pool.restart_required`. |
 | `MaxRecoveryEnqueueBatchSize` | `32` | Max runnable work IDs re-kicked per recovery attempt. |
 | `RecoveryVerificationDelay` | `00:00:05` | Delay before checking whether recovery cleared the stall. |
+| `OrphanedSlotMaxAge` | `00:30:00` | Max age of a still-running worker's slot before orphan reconciliation reclaims it. Slots whose worker already exited are reclaimed immediately regardless of age. |
 
 ## `WorkerProgressWatchdog`
 
