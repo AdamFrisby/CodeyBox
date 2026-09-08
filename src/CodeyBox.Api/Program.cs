@@ -279,6 +279,22 @@ builder.Services.AddSingleton(sp => new SqliteDatabaseWriteGateFactory(
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SqliteWriteGate,
     sp.GetRequiredService<ILoggerFactory>(),
     TimeProvider.System));
+// A BackgroundService fault stops the host via StopHost, which the host
+// reports as a graceful shutdown (exit code 0) — indistinguishable from an
+// intentional stop, so Restart=on-failure supervisors never restart after an
+// orchestrator crash (e.g. a sustained SQLite write-gate outage escalated by
+// the dispatch loop). Stated explicitly here (rather than relying on the
+// framework default) because the exit-code contract below depends on it:
+// faults are recorded on the tracker and mapped to a non-zero exit.
+builder.Services.Configure<HostOptions>(static o =>
+    o.BackgroundServiceExceptionBehavior = BackgroundServiceExceptionBehavior.StopHost);
+builder.Services.AddSingleton<BackgroundServiceFailureTracker>();
+builder.Services.AddHostedService(sp => new SqliteDatabaseMaintenanceService(
+    sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.StateDatabasePath,
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SqliteMaintenance,
+    sp.GetRequiredService<SqliteDatabaseWriteGateFactory>(),
+    sp.GetRequiredService<ILogger<SqliteDatabaseMaintenanceService>>(),
+    TimeProvider.System));
 builder.Services.Configure<BuildScriptAuditorOptions>(builder.Configuration.GetSection("CodeyBox:BuildScriptAudit"));
 // Regression-test-selection mode (Audit:TestSelection:Mode). Bound through
 // AddOptions so IOptionsMonitor<TestSelectionOptions> hot-reloads the mode
@@ -3569,7 +3585,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     dispatchAvailability: sp.GetRequiredService<IAgentDispatchAvailability>(),
     knobRegistry: sp.GetRequiredService<IKnobRegistry>(),
     quotaRetryDispatchPromoter: sp.GetRequiredService<IQuotaRetryDispatchPromoter>(),
-    quotaRetryAdmissionRouter: sp.GetRequiredService<IQuotaRetryAdmissionRouter>()));
+    quotaRetryAdmissionRouter: sp.GetRequiredService<IQuotaRetryAdmissionRouter>(),
+    failureTracker: sp.GetRequiredService<BackgroundServiceFailureTracker>()));
 builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<IRefactorProjectGateStatusProvider>(
@@ -4426,6 +4443,19 @@ app.MapGet("/healthz", (ISandboxProvider sandboxes) =>
 try
 {
     app.Run();
+
+    // StopHost maps a BackgroundService fault to a graceful host shutdown,
+    // which would otherwise exit 0 exactly like an intentional stop. A
+    // recorded fault means the orchestrator died (e.g. sustained SQLite
+    // write-gate outage); exit non-zero so supervisors detect and restart.
+    var failureTracker = app.Services.GetService<BackgroundServiceFailureTracker>();
+    if (failureTracker?.Fault is not null)
+    {
+        Log.Error(
+            failureTracker.Fault,
+            "Host stopped after a background service fault; exiting non-zero");
+        Environment.ExitCode = BackgroundServiceFailureTracker.ResolveExitCode(backgroundServiceFaulted: true);
+    }
 }
 catch (Exception ex)
 {
@@ -5054,6 +5084,7 @@ namespace CodeyBox.Api
         public string SharedUpstreamMirrorDirectory { get; set; } = "_upstream-mirror";
         public string StateDatabasePath { get; set; } = "/var/lib/codeybox/state.db";
         public SqliteWriteGateOptions SqliteWriteGate { get; set; } = new();
+        public SqliteMaintenanceOptions SqliteMaintenance { get; set; } = new();
         public string TemplateDirectory { get; set; } = "templates";
         public const int DefaultMaxTemplateChecks = 256;
         public const int MaximumMaxTemplateChecks = 1000;

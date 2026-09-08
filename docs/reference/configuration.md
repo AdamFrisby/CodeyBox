@@ -73,6 +73,10 @@ Hot-reloadable today:
   alter a holder already inside the gate. Values have defensive upper bounds:
   acquisition timeout <= 30 seconds, hold diagnostic threshold <= 5 minutes,
   queued waiters <= 4096, and concurrent read connections <= 128.
+- `SqliteMaintenance.{Enabled,CheckInterval,FreelistPageThreshold,VacuumTimeout}`
+  — sampled on every maintenance iteration (default every 6 hours). A VACUUM
+  runs only when freelist pages reach `FreelistPageThreshold` (default 100,000),
+  bounding state-database file growth from deleted/updated rows.
 - `WorkerProgressWatchdog.ProgressTimeout`,
   `WorkerProgressWatchdog.AutoRecover`,
   `WorkerProgressWatchdog.MaxRecoveryAttempts`,
@@ -365,7 +369,9 @@ Controls worker concurrency and spawn pacing.
 "WorkerPool": {
   "MaxConcurrentWorkers": 2,
   "MaxConcurrentSandboxes": 3,
-  "MinSpawnIntervalMs": 0
+  "MinSpawnIntervalMs": 0,
+  "DispatchGateAcquisitionBackoff": "00:00:01",
+  "MaxConsecutiveDispatchGateTimeoutsBeforeEscalation": 10
 }
 ```
 
@@ -374,6 +380,8 @@ Controls worker concurrency and spawn pacing.
 | `MaxConcurrentWorkers` | `1` | Hard cap on simultaneously active pipelines. |
 | `MaxConcurrentSandboxes` | `ceil(MaxConcurrentWorkers * 1.5)` | Global cap on concurrently live sandboxes/VMs across work, audit, merge, smoke, and verifier phases. Every `ISandboxProvider.CreateAsync` path shares this budget. |
 | `MinSpawnIntervalMs` | `0` | Minimum milliseconds between successive worker spawns. |
+| `DispatchGateAcquisitionBackoff` | `"00:00:01"` | Backoff between dispatch pickups after a SQLite write-gate acquisition timeout. |
+| `MaxConsecutiveDispatchGateTimeoutsBeforeEscalation` | `10` | Consecutive pickup gate timeouts before fatal escalation (host stops, non-zero exit). |
 
 `MaxConcurrentWorkers` limits concurrent work items. It does not include
 additional sandboxes created inside an item for audit, merge/rebase, security

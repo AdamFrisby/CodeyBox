@@ -382,7 +382,7 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
     }
 
     [Fact]
-    public async Task ReadMethods_WaitBehindSharedConnectionGate()
+    public async Task ReadMethods_DoNotWaitBehindWriteGate()
     {
         var queued = Sample();
         var now = DateTimeOffset.UtcNow;
@@ -432,35 +432,64 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         await RunWithoutHeldGateContext(() => DrainAsync(_store.ListByReplaySourceAsync(source.Id))).WaitAsync(TimeSpan.FromSeconds(5));
         await RunWithoutHeldGateContext(() => DrainAsync(_store.ListByReleaseAsync(releaseId))).WaitAsync(TimeSpan.FromSeconds(5));
 
-        var reads = new Dictionary<string, Task>(StringComparer.Ordinal)
+        // Reads run on dedicated WAL reader connections, so none of them contend
+        // with the held write gate: every read below completes before release.
+        var readTimeout = TimeSpan.FromSeconds(5);
+        Assert.Equal(
+            2,
+            await RunWithoutHeldGateContext(() => _store.CountByStateAsync(WorkItemState.Queued))
+                .WaitAsync(readTimeout));
+        var eligible = await RunWithoutHeldGateContext(async () =>
         {
-            ["CountByStateAsync"] = RunWithoutHeldGateContext(() => _store.CountByStateAsync(WorkItemState.Queued)),
-            ["ListDispatchEligibleByPriorityAsync"] = RunWithoutHeldGateContext(() => DrainAsync(
-                _store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId>()))),
-            ["CountStartedInWindowAsync"] = RunWithoutHeldGateContext(() => _store.CountStartedInWindowAsync(working.ProjectId, now.AddHours(-1))),
-            ["CountInFlightAsync"] = RunWithoutHeldGateContext(() => _store.CountInFlightAsync(working.ProjectId)),
-            ["CountInFlightSplitByRefactorAsync"] = RunWithoutHeldGateContext(() => _store.CountInFlightSplitByRefactorAsync(working.ProjectId)),
-            ["GetByExternalIdAsync"] = RunWithoutHeldGateContext(() => _store.GetByExternalIdAsync(working.ProjectId, "EXT-123")),
-            ["GetByNamespacedExternalIdAsync"] = RunWithoutHeldGateContext(() => _store.GetByNamespacedExternalIdAsync(working.ProjectId, "jobtrack", "EXT-123")),
-            ["GetFleetStateCountsAsync"] = RunWithoutHeldGateContext(() => _store.GetFleetStateCountsAsync()),
-            ["GetFleetRecentOutcomesAsync"] = RunWithoutHeldGateContext(() => _store.GetFleetRecentOutcomesAsync()),
-            ["GetFleetPauseStatesAsync"] = RunWithoutHeldGateContext(() => _store.GetFleetPauseStatesAsync()),
-            ["GetActiveBaselineImageRefsAsync"] = RunWithoutHeldGateContext(() => _store.GetActiveBaselineImageRefsAsync()),
-            ["ListWorkItemsForBaselineAsync"] = RunWithoutHeldGateContext(() => _store.ListWorkItemsForBaselineAsync("cb-baseline-gated-read")),
-            ["GetIterationsAsync"] = RunWithoutHeldGateContext(() => _store.GetIterationsAsync(working.Id)),
-            ["GetAuditProgressAsync"] = RunWithoutHeldGateContext(() => _store.GetAuditProgressAsync(working.Id, attemptStartedAt)),
-        };
-
-        await Task.Delay(100);
-
-        var completedBeforeRelease = reads
-            .Where(kv => kv.Value.IsCompleted)
-            .Select(kv => kv.Key)
-            .ToArray();
-        Assert.Empty(completedBeforeRelease);
-
-        gate.Dispose();
-        await Task.WhenAll(reads.Values).WaitAsync(TimeSpan.FromSeconds(5));
+            var collected = new List<WorkItem>();
+            await foreach (var item in _store.ListDispatchEligibleByPriorityAsync(new HashSet<WorkItemId>()))
+                collected.Add(item);
+            return collected;
+        }).WaitAsync(readTimeout);
+        Assert.Contains(eligible, item => item.Id == queued.Id);
+        Assert.Equal(
+            1,
+            await RunWithoutHeldGateContext(() => _store.CountStartedInWindowAsync(working.ProjectId, now.AddHours(-1)))
+                .WaitAsync(readTimeout));
+        Assert.Equal(
+            1,
+            await RunWithoutHeldGateContext(() => _store.CountInFlightAsync(working.ProjectId))
+                .WaitAsync(readTimeout));
+        var (refactorInFlight, otherInFlight) = await RunWithoutHeldGateContext(
+            () => _store.CountInFlightSplitByRefactorAsync(working.ProjectId))
+            .WaitAsync(readTimeout);
+        Assert.Equal(1, refactorInFlight + otherInFlight);
+        var byExternalId = await RunWithoutHeldGateContext(
+            () => _store.GetByExternalIdAsync(working.ProjectId, "EXT-123"))
+            .WaitAsync(readTimeout);
+        Assert.Equal(working.Id, byExternalId!.Id);
+        var byNamespacedExternalId = await RunWithoutHeldGateContext(
+            () => _store.GetByNamespacedExternalIdAsync(working.ProjectId, "jobtrack", "EXT-123"))
+            .WaitAsync(readTimeout);
+        Assert.Equal(working.Id, byNamespacedExternalId!.Id);
+        var fleetStateCounts = await RunWithoutHeldGateContext(() => _store.GetFleetStateCountsAsync())
+            .WaitAsync(readTimeout);
+        Assert.Equal(3, fleetStateCounts.Sum(entry => entry.Count));
+        var fleetRecentOutcomes = await RunWithoutHeldGateContext(() => _store.GetFleetRecentOutcomesAsync())
+            .WaitAsync(readTimeout);
+        Assert.NotNull(fleetRecentOutcomes);
+        var fleetPauseStates = await RunWithoutHeldGateContext(() => _store.GetFleetPauseStatesAsync())
+            .WaitAsync(readTimeout);
+        Assert.NotNull(fleetPauseStates);
+        var baselineRefs = await RunWithoutHeldGateContext(() => _store.GetActiveBaselineImageRefsAsync())
+            .WaitAsync(readTimeout);
+        Assert.Contains("cb-baseline-gated-read", baselineRefs);
+        var baselineItems = await RunWithoutHeldGateContext(
+            () => _store.ListWorkItemsForBaselineAsync("cb-baseline-gated-read"))
+            .WaitAsync(readTimeout);
+        Assert.Contains(baselineItems, entry => entry.Id == working.Id);
+        var iterations = await RunWithoutHeldGateContext(() => _store.GetIterationsAsync(working.Id))
+            .WaitAsync(readTimeout);
+        Assert.Single(iterations);
+        var auditProgress = await RunWithoutHeldGateContext(
+            () => _store.GetAuditProgressAsync(working.Id, attemptStartedAt))
+            .WaitAsync(readTimeout);
+        Assert.Single(auditProgress);
     }
 
     [Fact]
