@@ -169,6 +169,16 @@ Recognized patterns are intentionally conservative:
 - `exceeded the rate limit`
 - `quota exceeded`
 - `exhausted your capacity` (Gemini per-model wall)
+- `429 Error from provider` / `HTTP 429` / `status 429` / `API Error: 429` /
+  `429 Too Many Requests` (Copilot and opencode CLIs relaying a provider
+  throughput refusal, e.g. a BYOK Console endpoint answering 429)
+
+A provider 429 is a transient rate condition, not an exhausted account cap:
+it parks the item with a `rate-limited by provider` reason (visibly distinct
+from the `reported quota failure` recorded for spent caps) and resumes on
+the rate-limit backoff. Bare `429` mentions without one of the anchored
+shapes above are ignored so code under review that cites the number is not
+misclassified.
 
 `API Error: 401` from the Claude CLI is deliberately **not** a quota pattern.
 Anthropic's single-use OAuth refresh tokens, combined with concurrent host and
@@ -188,7 +198,12 @@ error envelopes recognised:
 
 The reset interval (e.g. `reset after 21h41m24s`, `try again after 5m17s`)
 is parsed and persisted as `WorkItem.QuotaResetAt` so the targeted retry
-timer fires once the wall expires.
+timer fires once the wall expires. An echoed `Retry-After: <seconds>` header
+is honoured the same way. When a rate-limited failure carries no parseable
+reset, the item resumes after `CodeyBox:PipelineTuning:DefaultRateLimitPause`
+(default 5 minutes, hot-reloadable) — deliberately and meaningfully longer
+than the in-CLI retry budget that precedes the park, and separately tunable
+from the `DefaultQuotaFailurePause` applied to spent account caps.
 
 Routing-log rejections distinguish three cases so audit-log readers can tell
 breaker hits apart from probe-derived rejections:

@@ -401,7 +401,8 @@ Hot-reloadable retry and recovery bounds used by pipeline execution.
   "AgentSessionResumeMaxAttempts": 2,
   "MaxRetainedAgentTurnSandboxes": 16,
   "EmptyReworkEscalationRetries": 1,
-  "BlockRedundantDotnetBuildTestInAuditSandbox": true
+  "BlockRedundantDotnetBuildTestInAuditSandbox": true,
+  "DefaultRateLimitPause": "00:05:00"
 }
 ```
 
@@ -414,6 +415,7 @@ Hot-reloadable retry and recovery bounds used by pipeline execution.
 | `BlockRedundantDotnetBuildTestInAuditSandbox` | `true` | Prepends an audit-sandbox-only `dotnet` shim that immediately succeeds `dotnet build` and `dotnet test` with a notice because the deterministic build/test gate already ran. Other `dotnet` subcommands pass through unchanged; work, merge, and conflict-resolution sandboxes are unaffected. |
 | `CSharpTestPassAuditorIdleTimeout` | unset | Test-runner-specific idle guard for the `csharp:test-pass` (dotnet test) auditor, applied in place of `AuditorIdleTimeout`. Sourced through `DotnetTestAuditor` (an `ITestRunnerAuditor`). Unset means the generic `AuditorIdleTimeout` applies. |
 | `CSharpTestPassBlameHangTimeout` | unset | Per-test hang-dump timeout injected into the `csharp:test-pass` command as `--blame-hang --blame-hang-timeout`. Unset omits blame-hang, keeping the command byte-identical to the legacy path. |
+| `DefaultRateLimitPause` | `00:05:00` (5 min) | Last-resort pause for transient provider rate limits (429) with no parseable reset window and no `Retry-After` echo. Hot-reloadable. Separate from the pause applied to spent account caps, because a throughput limit clears far sooner than a billing window. |
 
 Durable agent-turn scratchpad archives have a non-configurable 32 MiB safety
 cap. They are stored as content-verified, host-private SQLite BLOBs and are

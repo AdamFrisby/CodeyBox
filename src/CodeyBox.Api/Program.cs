@@ -3202,6 +3202,7 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, OpencodeQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();
+builder.Services.AddSingleton<IAgentQuotaFailureDetector, CopilotQuotaFailureDetector>();
 builder.Services.AddSingleton<IQuotaFailureClassifier>(sp =>
     new CompositeQuotaFailureClassifier(sp.GetServices<IAgentQuotaFailureDetector>()));
 builder.Services.AddSingleton<IAgentAuthFailureClassifier>(sp =>

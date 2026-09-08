@@ -308,6 +308,10 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         {
             failures.Add("CodeyBox:PipelineTuning:EmptyReworkEscalationRetries must be non-negative");
         }
+        if (options.PipelineTuning.DefaultRateLimitPause <= TimeSpan.Zero)
+        {
+            failures.Add("CodeyBox:PipelineTuning:DefaultRateLimitPause must be a positive TimeSpan");
+        }
 
         if (options.PipelineTuning.CSharpTestPassAuditorIdleTimeout is { } cSharpTestIdle && cSharpTestIdle < TimeSpan.Zero)
         {
