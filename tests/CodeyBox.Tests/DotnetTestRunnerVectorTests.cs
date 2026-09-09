@@ -59,14 +59,22 @@ public sealed class DotnetTestRunnerVectorTests : IDisposable
         // through the real runner, nested inside the outer suite.
         if (!await IsDotnetAvailableAsync())
             return;
-        if (!TryLocateOwnTestProject(out var csproj, out _))
+        if (!TryLocateOwnTestProject(out var csproj, out var testDll))
+            return;
+
+        // The outer suite can be built in either Debug or Release. Match its
+        // output configuration: --no-build otherwise makes the nested runner
+        // look for Debug binaries during CI's Release-only test gate.
+        var configuration = Directory.GetParent(Path.GetDirectoryName(testDll)!)?.Name;
+        if (string.IsNullOrWhiteSpace(configuration))
             return;
 
         const string fastTest = "CodeyBox.Tests.AuditTests.DotnetTestAuditor_AllTestsDefaultOptions_EmitsByteIdenticalLegacyCommand";
         var (exit, combined) = await RunDotnetAsync(
             Path.GetDirectoryName(csproj)!,
             TimeSpan.FromMinutes(4),
-            "test", csproj, "--no-build", "--filter", $"FullyQualifiedName={fastTest}");
+            "test", csproj, "--configuration", configuration, "--no-build",
+            "--filter", $"FullyQualifiedName={fastTest}");
 
         Assert.Equal(0, exit);
         Assert.Contains("Passed!", combined, StringComparison.Ordinal);
