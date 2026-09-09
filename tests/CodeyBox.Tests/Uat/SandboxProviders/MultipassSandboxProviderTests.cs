@@ -1510,12 +1510,19 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             [launchScript],
             environmentOverrides: MergeEnvironment(poisonedEnvironment, FakeSudoPathEnvironment()));
         await WaitForProcessGroupGoneAsync(processGroupMarker, DetachedLaunchWatchdog);
+        // The launcher exits as soon as the supervisor publishes its marker and
+        // process-group absence is only an indirect liveness signal, so observe
+        // the detached child's own completion sentinel (written after its other
+        // outputs) before reading them. Without this the reads below race a
+        // still-starting child under parallel load and flake with FileNotFound.
+        await WaitForFileAsync(doneFile, DetachedLaunchWatchdog);
 
         Assert.Equal(0, exit);
         Assert.Equal("", stdout);
         Assert.Equal("", stderr);
         Assert.Equal("", await File.ReadAllTextAsync(visibleEnvironmentFile));
         Assert.Equal("poison-agent-run-id", await File.ReadAllTextAsync(visibleRunIdFile));
+        Assert.Equal("done", await File.ReadAllTextAsync(doneFile));
     }
 
     [Fact]

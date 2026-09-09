@@ -53,6 +53,18 @@ public interface IQuotaRetryAdmissionRouter
         Project? project,
         CancellationToken ct,
         string? requiredCapability = null);
+
+    /// <summary>
+    /// Peeks at the routing bucket recorded by the most recent
+    /// <see cref="IQuotaRetryRouter.ResolveQuotaRetryAsync"/> admission for
+    /// <paramref name="itemId"/>, without probing. Returns <c>null</c> when no
+    /// unexpired admission is on record (e.g. direct routes, which never
+    /// record). Prefer this over
+    /// <see cref="ResolveCurrentQuotaRetryAdmissionAsync"/> when the caller
+    /// just admitted the item and only needs to know which bucket won — it
+    /// costs no probe round-trip.
+    /// </summary>
+    QuotaRetryAdmissionPoolKey? PeekQuotaRetryAdmission(WorkItemId itemId);
 }
 
 public sealed record QuotaRetryRoutingDecision(

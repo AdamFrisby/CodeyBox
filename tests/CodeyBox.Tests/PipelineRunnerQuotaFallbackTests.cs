@@ -2037,9 +2037,30 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         await fix.Store.CreateAsync(item);
 
         var reworkStarted = WaitForReworkStart(fix.Codex, fix.Claude, fix.Gemini);
+        var geminiReworkStarted = WaitForAgentPhaseStart(AgentKind.Gemini, "rework", fix.Codex, fix.Claude, fix.Gemini);
         var pipelineTask = fix.Pipeline.RunAsync(item, CancellationToken.None);
         await WaitForReworkStartAsync(reworkStarted, pipelineTask);
-        await RunWithAdvancingTimeAsync(pipelineTask, time, step: TimeSpan.FromMilliseconds(100), maxSteps: 250);
+        // Pump manual time only until the last fallback attempt is in flight,
+        // then advance to the absolute cap and stop the clock: post-cap
+        // teardown (store transitions, history, webhooks) is real-time work,
+        // and every extra pump step after the cap fires inflates the measured
+        // elapsed by 100ms while the pipeline drains. Under full-suite
+        // parallel load that drain stalls ~1-2s real, which a keep-pumping
+        // loop converts into ~7s of phantom manual time (observed 21.7s
+        // against the 15s cap). Stopping the clock at the cap measures the
+        // timeout itself rather than teardown scheduling lag.
+        await RunWithAdvancingTimeUntilAsync(
+            geminiReworkStarted,
+            pipelineTask,
+            time,
+            step: TimeSpan.FromMilliseconds(100),
+            maxSteps: 250);
+        await AdvanceManualTimeToElapsedAsync(
+            time,
+            TimeSpan.FromSeconds(15),
+            pipelineTask,
+            step: TimeSpan.FromMilliseconds(100));
+        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(30));
 
         var elapsed = time.GetUtcNow() - DateTimeOffset.UnixEpoch;
         Assert.InRange(elapsed, TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(17));

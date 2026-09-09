@@ -671,7 +671,7 @@ auto-retried.
 | `Enabled` | `false` | Master switch. When false, the hosted service is registered but exits at startup; the manual `POST /workitems/{id}/retry` path is unaffected. |
 | `PeriodicCheckInterval` | `00:05:00` (5 min) | Safety-net sweep cadence: every interval the scheduler re-checks every Failed quota item against the quota gate. Catches items whose probe didn't expose a reset timestamp, and re-arms after restarts where a targeted timer was lost. The sweep ignores `NextQuotaRetryAt` and asks the router directly — the targeted timer is just an optimisation. On startup, overdue `NextQuotaRetryAt` rows are retried immediately as well as being re-armed with a zero-delay targeted timer. |
 | `ClockDriftSafetyMargin` | `00:02:00` (2 min) | Padding added to the parsed `QuotaResetAt` before firing the targeted retry, to absorb clock drift between this orchestrator and the upstream provider. |
-| `MaxAutoRetriesPerWorkItem` | `3` | Per-item lifetime cap on auto-retries. Prevents ping-pong if the failure was misclassified as quota. Manual retries do not count against this cap. |
+| `MaxAutoRetriesPerWorkItem` | `3` | Per-agent retry budget, tracked against the quota bucket (agent/route/model) the attempts were accrued on. Re-routing to a different agent with quota resets the counter to a full budget. A manual `POST /workitems/{id}/retry` resets the counter (and its bucket) so the retried item cannot immediately re-fail on an inherited cap. |
 
 Items paused at the project or global queue level are skipped — operators
 pause queues for a reason. Each scheduler evaluation emits a
