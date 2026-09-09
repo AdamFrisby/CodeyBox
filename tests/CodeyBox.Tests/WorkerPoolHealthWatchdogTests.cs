@@ -1191,6 +1191,17 @@ public sealed class WorkerPoolHealthWatchdogTests : IDisposable
             return Task.FromResult(ids.Count);
         }
 
+        public Task<WorkerSlotReclaimResult> TryReclaimOrphanedWorkerSlotsAsync(
+            TimeSpan maxSlotAge,
+            CancellationToken ct) =>
+            Task.FromResult(
+                new WorkerSlotReclaimResult(
+                    PoolAtCapacity: false,
+                    MaxConcurrent: Status.MaxConcurrent,
+                    RunningItemCount: 0,
+                    ActiveSandboxCount: 0,
+                    ReclaimedSlots: []));
+
     }
 
     private sealed class FixedRoutingReadiness : IAgentRoutingReadiness

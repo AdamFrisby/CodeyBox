@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Collections.Frozen;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -146,6 +147,25 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     // _currentlyRunning or over-releasing the semaphore.
     private readonly ConcurrentDictionary<string, WorkerSlotLease> _workerSlotsByRegistryId = new(StringComparer.Ordinal);
 
+    // Every unreleased lease, keyed by reference, regardless of whether the
+    // worker registered a registry row. Powers GetWorkerSlotOccupancy (slot
+    // identities for diagnosis) and the orphaned-slot reconciliation, which
+    // reclaims leases whose worker exited without releasing. Entries are added
+    // before Task.Run and removed exactly once by the single-shot release, so
+    // the set always mirrors the permits the pool believes are occupied.
+    private readonly ConcurrentDictionary<WorkerSlotLease, byte> _liveWorkerSlots = new();
+
+    // Worker task per unreleased lease. A lease whose task reached a terminal
+    // state but was never released is proof the worker exited without
+    // releasing — the primary orphan signal (incident 2026-09-07).
+    private readonly ConcurrentDictionary<WorkerSlotLease, Task> _workerTasks = new();
+
+    // Reports how many sandboxes currently exist (created but not disposed).
+    // Consulted by the orphaned-slot reconciliation so a slot backing live
+    // provisioning work is never mistaken for an orphan. Defaults to the
+    // process-wide live-sandbox counter; tests inject a fixed value.
+    private readonly Func<long> _activeSandboxCountProvider;
+
     // Tracks work item IDs that are currently sleeping in a deferred-requeue
     // delay (budget / quota / project-pause defer). They remain Queued in the
     // store; the pickup query skips them until the delay fires and removes them.
@@ -276,6 +296,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         IQuotaRetryDispatchPromoter? quotaRetryDispatchPromoter = null,
         IQuotaRetryAdmissionRouter? quotaRetryAdmissionRouter = null,
         TimeProvider? timeProvider = null,
+        Func<long>? activeSandboxCountProvider = null,
         BackgroundServiceFailureTracker? failureTracker = null,
         WorkItemRepoReaper? repoReaper = null)
     {
@@ -305,6 +326,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         _quotaRouterOptions = quotaRouterOptions;
         _budgetDeferralRecheck = budgetDeferralRecheck;
         _time = timeProvider ?? TimeProvider.System;
+        _activeSandboxCountProvider = activeSandboxCountProvider ?? (static () => SandboxLiveCounter.Active);
         _repoReaper = repoReaper;
         _repoReaper?.RegisterActiveItemCheck(id => _activeItems.ContainsKey(id));
         // Prefer the shared snapshot when DI provides one (production path —
@@ -644,7 +666,25 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             _concurrencyGate.CurrentTarget,
             Volatile.Read(ref _currentlyRunning),
             queuedCount,
-            ticks == 0 ? null : new DateTimeOffset(ticks, TimeSpan.Zero));
+            ticks == 0 ? null : new DateTimeOffset(ticks, TimeSpan.Zero),
+            GetWorkerSlotOccupancy());
+    }
+
+    /// <summary>
+    /// Snapshot of every worker slot the pool currently believes is occupied,
+    /// with the owning worker index and work item. Used for diagnosis (so an
+    /// occupancy leak is confirmable without inferring it from unmatched log
+    /// lines) and by the orphaned-slot reconciliation.
+    /// </summary>
+    public IReadOnlyList<WorkerSlotOccupancy> GetWorkerSlotOccupancy()
+    {
+        var snapshot = new List<WorkerSlotOccupancy>(_liveWorkerSlots.Count);
+        foreach (var lease in _liveWorkerSlots.Keys)
+        {
+            snapshot.Add(ToOccupancy(lease));
+        }
+        snapshot.Sort(static (a, b) => a.WorkerIndex.CompareTo(b.WorkerIndex));
+        return snapshot;
     }
 
     public async Task<IReadOnlyList<RefactorProjectGateStatus>> GetRefactorProjectGateStatusAsync(
@@ -877,6 +917,27 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         return !IsStillWorkerOwnedAfterRecoveryRelease(item);
     }
 
+    /// <summary>
+    /// Work-item states that prove a worker is genuinely executing: the item
+    /// left the pickup states and entered a phase the pipeline owns. A pool
+    /// that reports itself at capacity while no item is in one of these states
+    /// and no sandbox exists holds phantom slots (incident 2026-09-07).
+    /// The worker holds its slot lease across the whole pipeline run
+    /// (released only in the worker-task finally), so this must cover every
+    /// mid-run phase including upstream push and conflict rework.
+    /// Single source of truth for the worker-owned policy; shared by the
+    /// recovery-release check and orphan reconciliation below.
+    /// </summary>
+    internal static readonly FrozenSet<WorkItemState> WorkerOwnedRunningStates =
+        FrozenSet.ToFrozenSet([
+            WorkItemState.Working,
+            WorkItemState.Merging,
+            WorkItemState.Auditing,
+            WorkItemState.Reworking,
+            WorkItemState.UpstreamPushing,
+            WorkItemState.ReworkingForConflict,
+        ]);
+
     private static bool IsStillWorkerOwnedAfterRecoveryRelease(WorkItem item)
     {
         if (item.State is WorkItemState.Working or WorkItemState.Reworking
@@ -884,12 +945,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             && item.StartedAt is null)
             return false;
 
-        return item.State is WorkItemState.Working
-            or WorkItemState.Auditing
-            or WorkItemState.Reworking
-            or WorkItemState.Merging
-            or WorkItemState.UpstreamPushing
-            or WorkItemState.ReworkingForConflict;
+        return WorkerOwnedRunningStates.Contains(item.State);
     }
 
     private void AttachRegistryWorkerId(WorkerSlotLease lease, string workerId)
@@ -902,18 +958,135 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             _workerSlotsByRegistryId.TryRemove(workerId, out _);
     }
 
+    private static WorkerSlotOccupancy ToOccupancy(WorkerSlotLease lease) =>
+        new(lease.WorkerIndex, lease.WorkItemId.ToString(), lease.RegistryWorkerId, lease.AcquiredAt);
+
+    /// <summary>
+    /// Reconciles worker-pool slots against durable reality. When the pool
+    /// reports itself at capacity while no work item is in a running state and
+    /// no sandbox exists, every held slot whose item is not running is
+    /// orphaned and is reclaimed: the gate permit and counter are released,
+    /// the pickup reservation is cleared so the item becomes dispatchable
+    /// again, and a dispatch wake refills the freed slot.
+    ///
+    /// <para>A lease is reclaimed only when its worker provably cannot still
+    /// need it: the worker task already reached a terminal state (exited
+    /// without releasing — the incident shape), or the lease is older than
+    /// <paramref name="maxSlotAge"/> (a hung worker invisible to every
+    /// item-state watchdog). Live young workers are never touched, so slow
+    /// provisioning cannot trigger a double-dispatch. The single-shot lease
+    /// claim makes a race with a concurrently exiting worker safe: exactly one
+    /// side releases.</para>
+    /// </summary>
+    internal async Task<WorkerSlotReclaimResult> TryReclaimOrphanedWorkerSlotsAsync(
+        TimeSpan maxSlotAge,
+        CancellationToken ct)
+    {
+        if (maxSlotAge <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(maxSlotAge), "Orphaned-slot max age must be positive.");
+
+        var target = _concurrencyGate.CurrentTarget;
+        var atCapacity = _concurrencyGate.CurrentInFlight >= target
+            || Volatile.Read(ref _currentlyRunning) >= target;
+        if (!atCapacity || _liveWorkerSlots.IsEmpty)
+            return new WorkerSlotReclaimResult(false, target, 0, 0, []);
+
+        var runningItemCount = 0;
+        await foreach (var item in _store.ListAsync(ct))
+        {
+            if (WorkerOwnedRunningStates.Contains(item.State))
+                runningItemCount++;
+        }
+
+        var activeSandboxes = _activeSandboxCountProvider();
+        if (runningItemCount > 0 || activeSandboxes > 0)
+            return new WorkerSlotReclaimResult(true, target, runningItemCount, activeSandboxes, []);
+
+        var now = _time.GetUtcNow();
+        var reclaimed = new List<WorkerSlotOccupancy>();
+        foreach (var lease in _liveWorkerSlots.Keys)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var item = await _store.GetAsync(lease.WorkItemId, ct);
+            if (item is not null && WorkerOwnedRunningStates.Contains(item.State))
+                continue;
+
+            var taskCompleted = _workerTasks.TryGetValue(lease, out var workerTask)
+                && workerTask.IsCompleted;
+            var age = now - lease.AcquiredAt;
+            if (!taskCompleted && age < maxSlotAge)
+                continue;
+
+            if (!ReleaseWorkerSlotLease(lease))
+                continue;
+
+            reclaimed.Add(ToOccupancy(lease));
+            _log.LogWarning(
+                "Worker pool: reclaimed orphaned slot of worker {WorkerIndex} for work item {WorkItemId} ({Reason}; slot age {SlotAge}) with no running item and no live sandbox while pool reported at capacity",
+                lease.WorkerIndex,
+                lease.WorkItemId,
+                taskCompleted ? "worker task exited without releasing" : "worker task still running past max slot age",
+                age);
+
+            // Refill the freed slot like a normal worker exit. Release already
+            // happened above; this only clears deferrals and fans out wakes.
+            await EnqueueSlotReleasedDispatchWakeAsync(lease, ct);
+        }
+
+        reclaimed.Sort(static (a, b) => a.WorkerIndex.CompareTo(b.WorkerIndex));
+        return new WorkerSlotReclaimResult(true, target, 0, activeSandboxes, reclaimed);
+    }
+
     private bool ReleaseWorkerSlotLease(WorkerSlotLease lease)
+    {
+        if (!TryClaimWorkerSlotRelease(lease))
+            return false;
+
+        AuditLog.WorkerPoolWorkerFinished(lease.WorkerIndex, lease.WorkItemId);
+        TryReleaseConcurrencyGate();
+        return true;
+    }
+
+    /// <summary>
+    /// Single-shot claim shared by every slot-release route (worker exit, the
+    /// dead-worker reaper, the unlaunched-spawn path, orphan reconciliation).
+    /// Marks the lease released and unwinds every resource the spawn acquired:
+    /// the live-slot tracking entries, the pickup reservation, the registry
+    /// linkage, and the running counter. Returns false when another route
+    /// already released the lease, so concurrent releasers never
+    /// double-decrement the counter or over-release the gate.
+    /// </summary>
+    private bool TryClaimWorkerSlotRelease(WorkerSlotLease lease)
     {
         if (!lease.TryMarkReleased())
             return false;
 
+        _liveWorkerSlots.TryRemove(lease, out _);
+        _workerTasks.TryRemove(lease, out _);
         _activeItems.TryRemove(lease.WorkItemId, out _);
         if (lease.RegistryWorkerId is { } workerId)
             _workerSlotsByRegistryId.TryRemove(workerId, out _);
         Interlocked.Decrement(ref _currentlyRunning);
-        AuditLog.WorkerPoolWorkerFinished(lease.WorkerIndex, lease.WorkItemId);
-        TryReleaseConcurrencyGate();
         return true;
+    }
+
+    /// <summary>
+    /// Releases a slot whose worker delegate was rejected before it could run
+    /// (Task.Run threw). No 'started' event was emitted, so no 'finished'
+    /// event is emitted either — a Warning records the release instead.
+    /// </summary>
+    private void ReleaseUnlaunchedWorkerSlot(WorkerSlotLease lease, Exception ex)
+    {
+        if (!TryClaimWorkerSlotRelease(lease))
+            return;
+
+        TryReleaseConcurrencyGate();
+        _log.LogWarning(
+            ex,
+            "Worker pool: worker {WorkerIndex} slot for work item {WorkItemId} released without starting",
+            lease.WorkerIndex,
+            lease.WorkItemId);
     }
 
     private async ValueTask ReleaseCompletedWorkerSlotLeaseAsync(WorkerSlotLease lease, CancellationToken ct)
@@ -1176,6 +1349,16 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     break;
                 }
 
+                // The gate permit acquired above is owned by this scope until a
+                // worker task takes it over. Every exit below — break, continue,
+                // or an unexpected throw (store failure during pickup, a
+                // faulting hook, Task.Run rejection) — releases the permit
+                // exactly once via Dispose, so a spawn-path failure can neither
+                // leak a slot nor leave the pool believing it is at capacity
+                // (incident 2026-09-07: two unreleased slots stalled dispatch
+                // for hours while every health signal reported healthy).
+                using var slotScope = new PendingWorkerSlot(this);
+
                 // Late dispatch-pause check: PauseDispatch may have fired while we
                 // were blocked on the concurrency gate. Without this check, one
                 // final worker could be spawned after dispatch was paused (the
@@ -1184,7 +1367,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 // uncleanly when the BackgroundService cancellation token fires).
                 if (IsDispatchPaused)
                 {
-                    TryReleaseConcurrencyGate();
                     stopDispatchLoop = true;
                     break;
                 }
@@ -1194,7 +1376,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 // while the operator-visible queue state is Paused.
                 if (IsQueuePaused)
                 {
-                    TryReleaseConcurrencyGate();
                     await RequeueDispatchWakeAsync(CancellationToken.None);
                     break;
                 }
@@ -1206,10 +1387,31 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 // spurious — release the slot and loop back for the next kick.
                 // Gate-acquisition timeouts are absorbed inside (backoff + retry
                 // on the next turn); only a sustained outage escalates fatally.
-                WorkItemId? id = await PickNextEligibleResilientAsync(stoppingToken);
+                // Any other pickup failure (e.g. a transient store outage, or
+                // host shutdown racing the query) must not take the slot with
+                // it and must not kill the dispatch loop: the scope releases
+                // the slot and the loop parks until the next dispatch signal.
+                // The fatal gate-outage escalation is rethrown so it reaches
+                // ExecuteAsync's failure tracker and stops the host.
+                WorkItemId? id;
+                try
+                {
+                    id = await PickNextEligibleResilientAsync(stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    stopDispatchLoop = true;
+                    break;
+                }
+                catch (Exception ex) when (ex is not SqliteWriteGatePersistentlyUnavailableException)
+                {
+                    _log.LogError(
+                        ex,
+                        "Worker pool: pickup failed after acquiring concurrency slot; slot released, waiting for next dispatch signal");
+                    break;
+                }
                 if (id is null)
                 {
-                    TryReleaseConcurrencyGate();
                     break;
                 }
 
@@ -1218,10 +1420,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 // when the worker exits.
                 if (!_activeItems.TryAdd(id.Value, 0))
                 {
-                    TryReleaseConcurrencyGate();
                     blockForFirstSlot = false;
                     continue;
                 }
+                slotScope.TrackActiveItem(id.Value);
 
                 if (_opts.OnWorkerReservedForTest is { } onWorkerReservedForTest)
                 {
@@ -1231,10 +1433,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     }
                     catch (Exception ex)
                     {
-                        _log.LogError(ex, "OnWorkerReservedForTest callback threw; releasing concurrency slot and skipping item {Id}", id);
+                        _log.LogError(ex, "OnWorkerReservedForTest callback threw; skipping item {Id}", id);
                         await ClearPreStartRefactorDrainClaimAsync(id.Value, stoppingToken);
-                        _activeItems.TryRemove(id.Value, out _);
-                        TryReleaseConcurrencyGate();
                         blockForFirstSlot = false;
                         continue;
                     }
@@ -1264,24 +1464,18 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                             if (pacing == SpawnPacingWaitResult.Cancelled)
                             {
                                 await ClearPreStartRefactorDrainClaimAsync(id.Value, stoppingToken);
-                                _activeItems.TryRemove(id.Value, out _);
-                                TryReleaseConcurrencyGate();
                                 stopDispatchLoop = true;
                                 break;
                             }
                             if (pacing == SpawnPacingWaitResult.DispatchPaused)
                             {
                                 await ClearPreStartRefactorDrainClaimAsync(id.Value, stoppingToken);
-                                _activeItems.TryRemove(id.Value, out _);
-                                TryReleaseConcurrencyGate();
                                 stopDispatchLoop = true;
                                 break;
                             }
                             if (pacing == SpawnPacingWaitResult.QueuePaused)
                             {
                                 await ClearPreStartRefactorDrainClaimAsync(id.Value, stoppingToken);
-                                _activeItems.TryRemove(id.Value, out _);
-                                TryReleaseConcurrencyGate();
                                 await _queue.EnqueueDispatchWakeAsync(stoppingToken);
                                 break;
                             }
@@ -1292,8 +1486,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 if (IsDispatchPaused)
                 {
                     await ClearPreStartRefactorDrainClaimAsync(id.Value, stoppingToken);
-                    _activeItems.TryRemove(id.Value, out _);
-                    TryReleaseConcurrencyGate();
                     stopDispatchLoop = true;
                     break;
                 }
@@ -1301,8 +1493,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 if (IsQueuePaused)
                 {
                     await ClearPreStartRefactorDrainClaimAsync(id.Value, stoppingToken);
-                    _activeItems.TryRemove(id.Value, out _);
-                    TryReleaseConcurrencyGate();
                     await RequeueDispatchWakeAsync(CancellationToken.None);
                     break;
                 }
@@ -1312,10 +1502,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 try { _opts.OnWorkerSpawned?.Invoke(); }
                 catch (Exception ex)
                 {
-                    _log.LogError(ex, "OnWorkerSpawned callback threw; releasing concurrency slot and skipping item {Id}", id);
+                    _log.LogError(ex, "OnWorkerSpawned callback threw; skipping item {Id}", id);
                     await ClearPreStartRefactorDrainClaimAsync(id.Value, stoppingToken);
-                    _activeItems.TryRemove(id.Value, out _);
-                    TryReleaseConcurrencyGate();
                     blockForFirstSlot = false;
                     continue;
                 }
@@ -1326,28 +1514,50 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 // Increment before Task.Run so the counter is never transiently negative
                 // if the task's finally block executes before we reach the increment.
                 Interlocked.Increment(ref _currentlyRunning);
-                var slotLease = new WorkerSlotLease(workerIndex, capturedId);
-                var task = Task.Run(async () =>
+                var slotLease = new WorkerSlotLease(workerIndex, capturedId, _time.GetUtcNow());
+                _liveWorkerSlots.TryAdd(slotLease, 0);
+                // Ownership of the gate permit (and the _activeItems reservation
+                // tracked above) moves from the dispatch-loop scope to the worker
+                // lease. The worker task's finally releases it on every exit;
+                // if Task.Run rejects the delegate below, the unlaunched path
+                // releases it instead — either way it cannot leak.
+                slotScope.TransferToWorker();
+                Task task;
+                try
                 {
-                    AuditLog.WorkerPoolWorkerStarted(workerIndex, capturedId);
-                    try
+                    task = Task.Run(async () =>
                     {
-                        if (IsQueuePaused)
+                        try
                         {
-                            _log.LogInformation(
-                                "Worker {WorkerId} skipping {Id}: queue paused after spawn reservation but before pipeline start",
-                                workerIndex,
-                                capturedId);
-                            await ClearPreStartRefactorDrainClaimAsync(capturedId, stoppingToken);
-                            return;
+                            AuditLog.WorkerPoolWorkerStarted(workerIndex, capturedId);
+                            if (IsQueuePaused)
+                            {
+                                _log.LogInformation(
+                                    "Worker {WorkerId} skipping {Id}: queue paused after spawn reservation but before pipeline start",
+                                    workerIndex,
+                                    capturedId);
+                                await ClearPreStartRefactorDrainClaimAsync(capturedId, stoppingToken);
+                                return;
+                            }
+                            await RunItemAsync(workerIndex, capturedId, slotLease, stoppingToken);
                         }
-                        await RunItemAsync(workerIndex, capturedId, slotLease, stoppingToken);
-                    }
-                    finally
-                    {
-                        await ReleaseCompletedWorkerSlotLeaseAsync(slotLease, stoppingToken);
-                    }
-                });
+                        finally
+                        {
+                            await ReleaseCompletedWorkerSlotLeaseAsync(slotLease, stoppingToken);
+                        }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    // The delegate was rejected before it could run, so no
+                    // 'started' event was emitted. Release the slot without the
+                    // 'finished' event and park until the next dispatch signal.
+                    ReleaseUnlaunchedWorkerSlot(slotLease, ex);
+                    break;
+                }
+                _workerTasks[slotLease] = task;
+                if (slotLease.IsReleased)
+                    _workerTasks.TryRemove(slotLease, out _);
 
                 inFlight.Add(task);
                 // Prune completed tasks on every iteration to prevent unbounded growth.
@@ -1959,6 +2169,33 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     internal bool TryEnterGlobalConcurrencyGateForTest() => _concurrencyGate.TryEnter();
     internal void ReleaseGlobalConcurrencyGateForTest() => _concurrencyGate.Release();
     internal int GlobalConcurrencyGateInFlightForTest => _concurrencyGate.CurrentInFlight;
+
+    /// <summary>
+    /// Occupies one worker slot through the real acquisition primitives (gate
+    /// permit, running counter, live-slot tracking, pickup reservation) with a
+    /// synthetic worker task, reproducing the slot state the pool holds after
+    /// the 2026-09-07 leak: the pool believes a worker owns the slot. With
+    /// <paramref name="completedTask"/> the synthetic task has already exited
+    /// without releasing (the incident shape — reclaimed immediately);
+    /// otherwise it stays pending (a hung worker — reclaimed only past the max
+    /// age). Throws when the pool has no free slot.
+    /// </summary>
+    internal void SimulateOrphanedSlotForTest(WorkItemId id, bool completedTask)
+    {
+        if (!_concurrencyGate.TryEnter())
+            throw new InvalidOperationException("No free worker slot to simulate an orphaned slot.");
+
+        Interlocked.Increment(ref _currentlyRunning);
+        var lease = new WorkerSlotLease(
+            Interlocked.Increment(ref _nextWorkerId),
+            id,
+            _time.GetUtcNow());
+        _liveWorkerSlots.TryAdd(lease, 0);
+        _workerTasks[lease] = completedTask
+            ? Task.CompletedTask
+            : new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously).Task;
+        _activeItems.TryAdd(id, 0);
+    }
 
     // Fires the same slot-release dispatch-wake fan-out the worker-completion
     // path runs (EnqueueSlotReleasedDispatchWakeAsync), without requiring a
@@ -3056,14 +3293,18 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     {
         private int _released;
 
-        public WorkerSlotLease(int workerIndex, WorkItemId workItemId)
+        public WorkerSlotLease(int workerIndex, WorkItemId workItemId, DateTimeOffset acquiredAt)
         {
             WorkerIndex = workerIndex;
             WorkItemId = workItemId;
+            AcquiredAt = acquiredAt;
         }
 
         public int WorkerIndex { get; }
         public WorkItemId WorkItemId { get; }
+
+        /// <summary>When the dispatch loop acquired the slot (worker spawn time).</summary>
+        public DateTimeOffset AcquiredAt { get; }
         public string? RegistryWorkerId { get; private set; }
         public bool IsReleased => Volatile.Read(ref _released) != 0;
 
@@ -3077,6 +3318,38 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         public bool TryMarkReleased()
             => Interlocked.Exchange(ref _released, 1) == 0;
+    }
+
+    /// <summary>
+    /// Owns one concurrency-gate permit between acquisition in the dispatch
+    /// loop and worker spawn, plus the <c>_activeItems</c> reservation once the
+    /// item is picked. Dispose releases both unless <see cref="TransferToWorker"/>
+    /// moved ownership to the worker lease — so every dispatch-loop exit
+    /// (break, continue, or throw) releases exactly once, and a successful
+    /// spawn releases zero times here. Single-threaded: only the dispatch loop
+    /// touches an instance.
+    /// </summary>
+    private sealed class PendingWorkerSlot(OrchestratorService owner) : IDisposable
+    {
+        private WorkItemId? _activeItem;
+        private bool _transferred;
+        private bool _disposed;
+
+        public void TrackActiveItem(WorkItemId id) => _activeItem = id;
+
+        public void TransferToWorker() => _transferred = true;
+
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+            _disposed = true;
+            if (_transferred)
+                return;
+            if (_activeItem.HasValue)
+                owner._activeItems.TryRemove(_activeItem.Value, out _);
+            owner.TryReleaseConcurrencyGate();
+        }
     }
 
     private sealed record BudgetDeferral(string Reason, TimeSpan RecheckIn);
@@ -3763,7 +4036,32 @@ public sealed record WorkerPoolStatus(
     int MaxConcurrent,
     int CurrentlyRunning,
     int QueuedCount,
-    DateTimeOffset? LastSpawnAt);
+    DateTimeOffset? LastSpawnAt,
+    IReadOnlyList<WorkerSlotOccupancy>? OccupiedSlots = null);
+
+/// <summary>
+/// One occupied worker-pool slot: the worker index from the pool's spawn
+/// counter, the work item it was spawned for, the worker-registry id once the
+/// worker registers (null while the worker is still in pre-registration
+/// pickup), and when the slot was acquired.
+/// </summary>
+public sealed record WorkerSlotOccupancy(
+    int WorkerIndex,
+    string WorkItemId,
+    string? RegistryWorkerId,
+    DateTimeOffset AcquiredAt);
+
+/// <summary>
+/// Outcome of one orphaned-slot reconciliation pass. Counts describe the pool
+/// as observed during the pass; <see cref="ReclaimedSlots"/> carries the
+/// identities of the slots that were reclaimed.
+/// </summary>
+public sealed record WorkerSlotReclaimResult(
+    bool PoolAtCapacity,
+    int MaxConcurrent,
+    int RunningItemCount,
+    long ActiveSandboxCount,
+    IReadOnlyList<WorkerSlotOccupancy> ReclaimedSlots);
 
 public sealed record RefactorProjectGateStatus(
     ProjectId ProjectId,

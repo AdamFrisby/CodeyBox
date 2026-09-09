@@ -126,6 +126,7 @@ public sealed class EventSchemaDocSyncTests
             "upstream.pr_stale_base",
             "worker_pool.stalled",
             "worker_pool.restart_required",
+            "worker_pool.slot_reclaimed",
             "agent.paused",
             "agent.resumed",
             "agent.restore_requeue_swept",
@@ -145,6 +146,7 @@ public sealed class EventSchemaDocSyncTests
         Assert.Equal("1.1", schema.EventTypes["upstream.pr_stale_base"].IntroducedIn);
         Assert.Equal("1.2", schema.EventTypes["worker_pool.stalled"].IntroducedIn);
         Assert.Equal("1.2", schema.EventTypes["worker_pool.restart_required"].IntroducedIn);
+        Assert.Equal("1.2", schema.EventTypes["worker_pool.slot_reclaimed"].IntroducedIn);
         Assert.Equal("1.3", schema.EventTypes["agent.paused"].IntroducedIn);
         Assert.Equal("1.3", schema.EventTypes["agent.resumed"].IntroducedIn);
         Assert.Equal("1.3", schema.EventTypes["work_item.waiting_for_agent_resume"].IntroducedIn);

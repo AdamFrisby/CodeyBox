@@ -123,6 +123,11 @@ public sealed class WorkerPoolHealthCoordinator : IWorkerPoolHealthSource, IAgen
         return enqueued;
     }
 
+    public Task<WorkerSlotReclaimResult> TryReclaimOrphanedWorkerSlotsAsync(
+        TimeSpan maxSlotAge,
+        CancellationToken ct) =>
+        _dispatcher.TryReclaimOrphanedWorkerSlotsAsync(maxSlotAge, ct);
+
     private async Task<bool> IsRunnableCandidateAsync(
         WorkItem candidate,
         Func<WorkItem, Task<bool>> dependenciesSatisfied,

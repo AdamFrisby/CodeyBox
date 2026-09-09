@@ -42,6 +42,7 @@ public sealed class WorkerPoolHealthWatchdogOptionsValidationTests
     [InlineData("batch")]
     [InlineData("scan")]
     [InlineData("verify")]
+    [InlineData("orphan")]
     public void InvalidValues_Throw(string scenario)
     {
         var opts = new WorkerPoolHealthWatchdogOptions();
@@ -64,6 +65,9 @@ public sealed class WorkerPoolHealthWatchdogOptionsValidationTests
                 break;
             case "verify":
                 opts.RecoveryVerificationDelay = TimeSpan.FromSeconds(-1);
+                break;
+            case "orphan":
+                opts.OrphanedSlotMaxAge = TimeSpan.Zero;
                 break;
         }
 

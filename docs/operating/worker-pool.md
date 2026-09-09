@@ -161,6 +161,37 @@ is still read. Resolution order is `WorkerPool:MaxConcurrentWorkers`, then
 `Concurrency`, then `1`, so an existing deployment keeps working untouched —
 but every other pool knob lives under `WorkerPool`, so set it there.
 
+## Orphaned worker-slot detection
+
+A worker slot must be released whichever way the worker exits — success,
+exception, cancellation, or an early return before any phase begins. If a slot
+is ever left occupied with no worker behind it, the pool reports itself at
+capacity while nothing runs: no VM exists, no work item is in a running state
+(`Working`, `Merging`, `Auditing`, `Reworking`), and dispatch stalls with
+every failure counter reading zero. That exact shape stalled dispatch for
+hours in September 2026.
+
+Two mechanisms close it:
+
+- **Structural release.** The dispatch loop holds each acquired gate permit in
+  a scope that releases it on every exit (including a store failure during
+  pickup or a rejected worker task), and the worker task releases its lease in
+  a `finally` that the `started` audit event can no longer bypass.
+- **Reconciliation.** On every watchdog sweep where the pool reports itself at
+  capacity, the orchestrator checks for the orphan signature: no running-state
+  item and no live sandbox. When it holds, each held slot whose worker has
+  already exited is reclaimed immediately; a slot whose worker task is still
+  running is reclaimed only past
+  `CodeyBox:WorkerPoolHealthWatchdog:OrphanedSlotMaxAge` (default 30 minutes,
+  well above legitimate provisioning). Reclaimed slots are logged at Warning
+  with the worker/item identities, published as the `worker_pool.slot_reclaimed`
+  webhook, and refilled via the normal dispatch wake.
+
+`GET /workers/status` exposes the current occupancy (`occupiedSlots`: worker
+index, work item, registry id, acquisition time) so a suspected leak is
+confirmable directly instead of inferred from unmatched `started`/`finished`
+log lines.
+
 ## Stuck-agent detection
 
 The orchestrator monitors each running agent for liveness. If an agent stops
@@ -380,8 +411,17 @@ Returns a JSON snapshot of the pool:
   "maxConcurrent": 4,
   "currentlyRunning": 2,
   "queuedCount": 3,
-  "lastSpawnAt": "2026-04-30T12:34:56.789+00:00"
+  "lastSpawnAt": "2026-04-30T12:34:56.789+00:00",
+  "occupiedSlots": [
+    {
+      "workerIndex": 7,
+      "workItemId": "fdc4158c-...",
+      "registryWorkerId": null,
+      "acquiredAt": "2026-04-30T12:34:50.123+00:00"
+    }
+  ]
 }
 ```
 
 `lastSpawnAt` is `null` if no worker has been spawned since startup.
+`occupiedSlots` lists every slot the pool currently believes is occupied (worker index, work item id, registry worker id once registered, acquisition time); empty when no slots are held.

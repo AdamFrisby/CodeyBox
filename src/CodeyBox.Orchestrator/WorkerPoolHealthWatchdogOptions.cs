@@ -48,6 +48,17 @@ public sealed class WorkerPoolHealthWatchdogOptions
     public TimeSpan RecoveryVerificationDelay { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
+    /// Maximum age of a worker slot whose task has not exited before the
+    /// orphaned-slot reconciliation reclaims it. Slots whose worker task
+    /// already exited are reclaimed immediately regardless of age; this bound
+    /// only applies to slots whose task is still running while the pool
+    /// reports at capacity with no running item and no live sandbox. Default
+    /// 30 minutes — well above any legitimate pre-sandbox provisioning window,
+    /// so a slow start cannot trigger a double-dispatch. Hot-reloadable.
+    /// </summary>
+    public TimeSpan OrphanedSlotMaxAge { get; set; } = TimeSpan.FromMinutes(30);
+
+    /// <summary>
     /// Validates configured values. Throws <see cref="InvalidOperationException"/>
     /// on misconfiguration.
     /// </summary>
@@ -81,5 +92,9 @@ public sealed class WorkerPoolHealthWatchdogOptions
         if (RecoveryVerificationDelay < TimeSpan.Zero)
             throw new InvalidOperationException(
                 $"CodeyBox:WorkerPoolHealthWatchdog:RecoveryVerificationDelay ({RecoveryVerificationDelay}) must be >= 0.");
+
+        if (OrphanedSlotMaxAge <= TimeSpan.Zero)
+            throw new InvalidOperationException(
+                $"CodeyBox:WorkerPoolHealthWatchdog:OrphanedSlotMaxAge ({OrphanedSlotMaxAge}) must be > 0.");
     }
 }

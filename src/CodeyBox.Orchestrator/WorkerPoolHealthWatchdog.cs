@@ -151,8 +151,20 @@ public sealed class WorkerPoolHealthWatchdog : BackgroundService
             return null;
 
         var status = await _pool.GetStatusAsync(ct);
-        if (status.CurrentlyRunning >= status.MaxConcurrent)
+        // Either counter reports full, or the live-lease occupancy does: the
+        // two can disagree when a slot was half-released, and a leaked slot
+        // shows up in at least one of them.
+        var occupiedSlots = status.OccupiedSlots?.Count ?? 0;
+        if (status.CurrentlyRunning >= status.MaxConcurrent || occupiedSlots >= status.MaxConcurrent)
+        {
+            // At capacity is normally healthy (workers are busy) — but it is
+            // also exactly what a leaked slot looks like (incident 2026-09-07:
+            // phantom slots held the pool at capacity for hours with no running
+            // item and no sandbox while this watchdog stayed silent). Ask the
+            // pool to reconcile before concluding there is nothing to do.
+            await DetectAndReclaimOrphanedSlotsAsync(ct);
             return null;
+        }
 
         var runnable = await _pool.ListRunnableCandidatesAsync(
             opts.MaxHealthCheckCandidateScan, ct);
@@ -259,6 +271,53 @@ public sealed class WorkerPoolHealthWatchdog : BackgroundService
             return true;
 
         return after.CurrentlyRunning > before.CurrentlyRunning;
+    }
+
+    /// <summary>
+    /// Runs one orphaned-slot reconciliation pass when the pool reports itself
+    /// at capacity. A reclaimed slot is surfaced at Warning with the occupied
+    /// slot identities (the only signal the 2026-09-07 leak would have
+    /// produced) plus a webhook for alerting; a pool with no orphans is silent.
+    /// </summary>
+    private async Task DetectAndReclaimOrphanedSlotsAsync(CancellationToken ct)
+    {
+        WorkerSlotReclaimResult result;
+        try
+        {
+            result = await _pool.TryReclaimOrphanedWorkerSlotsAsync(_opts.OrphanedSlotMaxAge, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Worker-pool orphaned-slot reconciliation failed");
+            return;
+        }
+
+        if (result.ReclaimedSlots.Count == 0)
+            return;
+
+        var slots = string.Join(
+            ", ",
+            result.ReclaimedSlots.Select(s => $"worker {s.WorkerIndex}/item {s.WorkItemId}"));
+        _log.LogWarning(
+            "Worker pool: reclaimed {ReclaimedCount} orphaned worker slot(s) with no running work item and no live sandbox while pool reported at capacity ({Running}/{Max}): {Slots}",
+            result.ReclaimedSlots.Count,
+            result.RunningItemCount,
+            result.MaxConcurrent,
+            slots);
+
+        await PublishAsync("worker_pool.slot_reclaimed", new
+        {
+            severity = "warning",
+            reclaimedSlots = result.ReclaimedSlots
+                .Select(s => new { workerIndex = s.WorkerIndex, workItemId = s.WorkItemId })
+                .ToArray(),
+            runningItemCount = result.RunningItemCount,
+            activeSandboxCount = result.ActiveSandboxCount,
+        }, ct);
     }
 
     private async Task EscalateRestartRequiredAsync(

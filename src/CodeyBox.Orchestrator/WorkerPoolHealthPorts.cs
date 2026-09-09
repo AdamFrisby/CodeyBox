@@ -18,6 +18,17 @@ public interface IWorkerPoolHealthSource
         CancellationToken ct);
 
     Task<int> TriggerDispatchRecoveryAsync(IEnumerable<WorkItemId> candidateIds, CancellationToken ct);
+
+    /// <summary>
+    /// Reconciles worker-pool slots against durable reality: when the pool
+    /// reports itself at capacity while no work item is in a running state and
+    /// no sandbox exists, reclaims the orphaned slots so dispatch can resume.
+    /// Returns the identities of the reclaimed slots (empty when the pool is
+    /// not in the orphaned state or every held slot is provably live).
+    /// </summary>
+    Task<WorkerSlotReclaimResult> TryReclaimOrphanedWorkerSlotsAsync(
+        TimeSpan maxSlotAge,
+        CancellationToken ct);
 }
 
 /// <summary>Runnable work item identity surfaced to the pool-health watchdog.</summary>
