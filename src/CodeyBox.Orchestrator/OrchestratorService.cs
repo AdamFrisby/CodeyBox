@@ -2255,10 +2255,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     {
         // Zero-duration pickup detection (incident 2026-09-07): a worker that
         // picks up an item and exits immediately without logging a reason is
-        // invisible except by the climbing worker counter. Every early exit
-        // below records its reason here; the post-run block logs it at
-        // Warning when the pickup made no progress (and was not deferred),
-        // so a tight re-pickup loop always names its cause.
+        // invisible except by the climbing worker counter. Each early return
+        // below logs its own reason at its own site. The exitReason recorded
+        // here covers only pipeline fall-through exits (pipeline-ran,
+        // phase-cancelled, cancelled, pipeline-exception); early returns run
+        // the finally blocks then return to the caller, so they never reach
+        // the no-progress guard below. The guard therefore applies only to
+        // pickups that ran (or attempted) the pipeline.
         var pickupStartedAt = _time.GetUtcNow();
         var exitReason = "pipeline-ran";
         var item = await _store.GetAsync(id, ct);
@@ -2266,7 +2269,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         {
             _log.LogWarning("Worker {WorkerId} dequeued unknown work item {Id}", workerIndex, id);
             _activeItems.TryRemove(id, out _);
-            exitReason = "unknown-item";
             return;
         }
         if (item.State is WorkItemState.Cancelled or WorkItemState.Done
@@ -2277,7 +2279,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             _log.LogInformation("Worker {WorkerId} skipping {Id} in terminal state {State}", workerIndex, id, item.State);
             ClearPreStartRefactorDrainClaim(item);
             _activeItems.TryRemove(id, out _);
-            exitReason = $"terminal-state:{item.State}";
             return;
         }
 
@@ -2288,7 +2289,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             _log.LogWarning("Worker {WorkerId} skipping {Id}: still in NeedsOperatorInput state", workerIndex, id);
             ClearPreStartRefactorDrainClaim(item);
             _activeItems.TryRemove(id, out _);
-            exitReason = "needs-operator-input";
             return;
         }
 
@@ -2299,7 +2299,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             _log.LogInformation("Worker {WorkerId} skipping {Id}: parked state {State}", workerIndex, id, item.State);
             ClearPreStartRefactorDrainClaim(item);
             _activeItems.TryRemove(id, out _);
-            exitReason = $"parked-state:{item.State}";
             return;
         }
 
@@ -2355,7 +2354,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             if (current is null)
             {
                 _log.LogWarning("Worker {WorkerId} dequeued unknown work item {Id} after claiming active slot", workerIndex, id);
-                exitReason = "unknown-item-after-claim";
                 return;
             }
 
@@ -2366,7 +2364,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             {
                 _log.LogInformation("Worker {WorkerId} skipping {Id} after active claim: terminal state {State}", workerIndex, id, current.State);
                 ClearPreStartRefactorDrainClaim(current);
-                exitReason = $"terminal-state-after-claim:{current.State}";
                 return;
             }
 
@@ -2380,7 +2377,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     "Worker {WorkerId} skipping {Id} after active claim: parked state {State}",
                     workerIndex, id, item.State);
                 ClearPreStartRefactorDrainClaim(item);
-                exitReason = $"parked-state-after-claim:{item.State}";
                 return;
             }
 
@@ -2404,7 +2400,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     _log.LogInformation(
                         "Worker {WorkerId} skipping {Id}: dependsOn gate not satisfied", workerIndex, id);
                     ClearPreStartRefactorDrainClaim(item);
-                    exitReason = "deps-unsatisfied";
                     return;
                 }
             }
@@ -2420,7 +2415,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             {
                 if (await TryDeferForRefactorExclusivityAsync(item, ct))
                 {
-                    exitReason = "refactor-exclusivity-deferred";
                     return;
                 }
             }
@@ -2502,7 +2496,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                             decision.PausedAgents.Count == 1 ? decision.PausedAgents[0] : null,
                             ct,
                             AgentPauseRetryFromForPickup(item, project));
-                        exitReason = "agent-pause-parked";
                         return;
                     }
 
@@ -2534,7 +2527,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     AuditLog.QuotaRouterDeferred(item.Id, deferDelay);
                     ClearPreStartRefactorDrainClaim(item);
                     ScheduleDeferredRequeue(item.Id, deferDelay, ct);
-                    exitReason = "quota-deferred";
                     return;
                 }
                 if (decision.Chosen is { } chosen)
@@ -2560,7 +2552,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     AuditLog.WorkItemFailed(item.Id, decision.Reason);
                     ClearPreStartRefactorDrainClaim(item);
                     await _store.UpdateAsync(item.With(WorkItemState.Failed, decision.Reason), ct);
-                    exitReason = "no-eligible-agent-failed";
                     return;
                 }
             }
@@ -2599,7 +2590,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                         pausedCandidate,
                         ct,
                         AgentPauseRetryFromForPickup(item, project));
-                    exitReason = "agent-pause-parked";
                     return;
                 }
 
@@ -2616,7 +2606,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                         AuditLog.ConcurrencyGated(item.Id, routedAgent, running, cap);
                         ClearPreStartRefactorDrainClaim(item);
                         ScheduleDeferredRequeue(item.Id, _quotaRouterOptions?.CapRetryRecheckInterval ?? DefaultCapRetryRecheckInterval, ct);
-                        exitReason = "agent-cap-deferred";
                         return;
                     }
                     // Reservation successful — outer finally releases on exit.
@@ -2638,7 +2627,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                         workerIndex, id, item.ProjectId.Value, projState.PausedReason);
                     ClearPreStartRefactorDrainClaim(item);
                     ScheduleDeferredRequeue(item.Id, _budgetDeferralRecheck?.Current.PausedProjectRecheck ?? TimeSpan.FromMinutes(1), ct);
-                    exitReason = "project-paused-deferred";
                     return;
                 }
             }
@@ -2658,7 +2646,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 // depend on project metadata being available.
                 if (await TryDeferForRefactorExclusivityAsync(item, ct))
                 {
-                    exitReason = "refactor-exclusivity-deferred";
                     return;
                 }
 
@@ -2680,7 +2667,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                         }
                         ClearPreStartRefactorDrainClaim(item);
                         ScheduleDeferredRequeue(item.Id, deferReason.RecheckIn, ct);
-                        exitReason = "budget-deferred";
                         return;
                     }
                 }
@@ -2721,7 +2707,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     "Worker {WorkerId} item {Id} aborted by host shutdown: phase={Phase} source={CancellationSource}",
                     workerIndex, id, pex.Phase, pex.Source);
                 await RecoverHostShutdownAbortedItemAsync(id);
-                exitReason = "host-shutdown-recovered";
                 return;
             }
             catch (PhaseCancellationException pex)
@@ -2734,7 +2719,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
                 await RecoverHostShutdownAbortedItemAsync(id);
-                exitReason = "host-shutdown-recovered";
                 return;
             }
             catch (OperationCanceledException)
@@ -2768,7 +2752,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     }, CancellationToken.None);
                 }
                 ScheduleDeferredRequeue(item.Id, dskEx.RecheckIn, ct);
-                exitReason = "disk-deferred";
                 return;
             }
             catch (SandboxProvisioningDeferredException provEx)
@@ -2804,7 +2787,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     "Worker {WorkerId} deferring {Id}: sandbox provisioning transient ({Provider}/{Operation}, {ErrorClass}); resumeState={ResumeState}",
                     workerIndex, id, provEx.Provider, provEx.Operation, provEx.ErrorClass, deferredItem.State);
                 ScheduleDeferredRequeue(item.Id, provEx.RecheckIn, ct);
-                exitReason = "provisioning-deferred";
                 return;
             }
             catch (Exception ex)
@@ -2848,11 +2830,12 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         }
 
         // No-progress re-dispatch guard (incidents 2026-06-04, 2026-09-07).
-        // Reached on EVERY exit path above that neither advanced the item's
-        // state nor scheduled a deferral: early returns inside the try flow
-        // through the finally above and land here, as does the pipeline-ran
-        // fall-through. The quota/budget/cap/disk deferrals all return
-        // earlier and already set _deferredItems, so they are excluded.
+        // Reached only by pipeline fall-through exits (pipeline-ran,
+        // phase-cancelled, cancelled, pipeline-exception): a return inside
+        // the try runs the finally blocks then returns to the caller, so
+        // deferred/terminal early returns never reach this guard — they are
+        // excluded because they already scheduled a deferral (and set
+        // _deferredItems) or parked/failed the item at their own site.
         // If the worker ran but
         // the item is STILL in the same re-pickable state it was dispatched in
         // (item.State is the dispatched state; the pipeline transitions the store,
