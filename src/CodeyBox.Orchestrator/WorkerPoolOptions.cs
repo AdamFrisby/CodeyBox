@@ -45,4 +45,27 @@ public sealed class WorkerPoolOptions
     /// Must be at least 1. Default 10.
     /// </summary>
     public int MaxConsecutiveDispatchGateTimeoutsBeforeEscalation { get; set; } = 10;
+
+    /// <summary>
+    /// Base delay for the no-progress re-dispatch backoff. When a worker
+    /// picks up an item but the pipeline returns without advancing its
+    /// state (and without scheduling a deferral), the item is deferred with
+    /// an escalating delay starting here and doubling per consecutive
+    /// no-progress pickup, capped by
+    /// <see cref="NoProgressBackoffMax"/>. Default 500ms.
+    /// </summary>
+    public TimeSpan NoProgressBackoffBase { get; set; } = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>
+    /// Ceiling for the no-progress re-dispatch backoff delay. Default 15s.
+    /// </summary>
+    public TimeSpan NoProgressBackoffMax { get; set; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Consecutive no-progress pickups of the same item after which the
+    /// item is transitioned to Failed (a pickup that neither advances the
+    /// item nor produces work is a failure to make progress) instead of
+    /// being re-dispatched. Default 10.
+    /// </summary>
+    public int MaxNoProgressRedispatches { get; set; } = 10;
 }

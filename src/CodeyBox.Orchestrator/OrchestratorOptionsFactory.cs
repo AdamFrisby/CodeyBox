@@ -76,6 +76,18 @@ public static class OrchestratorOptionsFactory
         if (wp.MaxConsecutiveDispatchGateTimeoutsBeforeEscalation < 1)
             throw new InvalidOperationException(
                 "CodeyBox:WorkerPool:MaxConsecutiveDispatchGateTimeoutsBeforeEscalation must be >= 1");
+        if (wp.NoProgressBackoffBase < TimeSpan.Zero)
+            throw new InvalidOperationException(
+                "CodeyBox:WorkerPool:NoProgressBackoffBase must be >= 0");
+        if (wp.NoProgressBackoffMax < TimeSpan.Zero)
+            throw new InvalidOperationException(
+                "CodeyBox:WorkerPool:NoProgressBackoffMax must be >= 0");
+        if (wp.NoProgressBackoffMax < wp.NoProgressBackoffBase)
+            throw new InvalidOperationException(
+                "CodeyBox:WorkerPool:NoProgressBackoffMax must be >= CodeyBox:WorkerPool:NoProgressBackoffBase");
+        if (wp.MaxNoProgressRedispatches < 2)
+            throw new InvalidOperationException(
+                "CodeyBox:WorkerPool:MaxNoProgressRedispatches must be >= 2");
 
         return new OrchestratorOptions
         {
@@ -84,6 +96,9 @@ public static class OrchestratorOptionsFactory
             MinSpawnInterval = wp.MinSpawnInterval,
             DispatchGateAcquisitionBackoff = wp.DispatchGateAcquisitionBackoff,
             MaxConsecutiveDispatchGateTimeoutsBeforeEscalation = wp.MaxConsecutiveDispatchGateTimeoutsBeforeEscalation,
+            NoProgressBackoffBase = wp.NoProgressBackoffBase,
+            NoProgressBackoffMax = wp.NoProgressBackoffMax,
+            MaxNoProgressRedispatches = wp.MaxNoProgressRedispatches,
         };
     }
 

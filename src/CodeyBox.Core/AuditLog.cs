@@ -156,12 +156,12 @@ public static class AuditLog
 
     public static void WorkerPoolWorkerStarted(int workerIndex, WorkItemId id) =>
         Audit("worker_pool.worker_started")
-            .Information("Worker pool: worker {WorkerIndex} started for work item {WorkItemId}",
+            .Debug("Worker pool: worker {WorkerIndex} started for work item {WorkItemId}",
                 workerIndex, id.ToString());
 
     public static void WorkerPoolWorkerFinished(int workerIndex, WorkItemId id) =>
         Audit("worker_pool.worker_finished")
-            .Information("Worker pool: worker {WorkerIndex} finished for work item {WorkItemId}",
+            .Debug("Worker pool: worker {WorkerIndex} finished for work item {WorkItemId}",
                 workerIndex, id.ToString());
 
     public static void WorkItemDependenciesResolved(WorkItemId id) =>
@@ -1076,11 +1076,11 @@ public static class AuditLog
 
     public static void WorkerRegistered(string workerId, string hostName, int processId) =>
         Audit("worker.registered")
-            .Information("Worker {WorkerId} registered on {HostName} (pid={ProcessId})", workerId, hostName, processId);
+            .Debug("Worker {WorkerId} registered on {HostName} (pid={ProcessId})", workerId, hostName, processId);
 
     public static void WorkerDeregistered(string workerId) =>
         Audit("worker.deregistered")
-            .Information("Worker {WorkerId} deregistered (clean shutdown)", workerId);
+            .Debug("Worker {WorkerId} deregistered (clean shutdown)", workerId);
 
     public static void DeadWorkerRecovered(WorkItemId itemId, string workerId, WorkItemState fromState, WorkItemState toState, int attempt) =>
         Audit("work_item.worker_dead_recovered")

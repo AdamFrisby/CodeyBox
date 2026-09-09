@@ -181,18 +181,20 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private const int DeferralWarningThreshold = 100;
 
     // No-progress re-dispatch backoff (incident 2026-06-04). When a worker is
-    // dispatched but the pipeline returns without advancing the item's state
-    // (e.g. a poisoned work branch whose pickup phase no-ops), the slot-release
-    // dispatch wake would re-pick the still-dispatchable item instantly — a tight
-    // ~160/sec spawn loop. MinSpawnInterval stays 0 for normal operation; instead
+    // dispatched but the pickup returns without advancing the item's state
+    // (e.g. a poisoned work branch whose pickup phase no-ops, or a worker-owned
+    // state such as Working that the pipeline hands straight back), the
+    // slot-release dispatch wake would re-pick the still-dispatchable item
+    // instantly — a tight ~500/sec spawn loop that fills the disk (incident
+    // 2026-09-07). MinSpawnInterval stays 0 for normal operation; instead
     // we count consecutive no-progress re-dispatches per item and defer with an
-    // escalating backoff (0.5s → 15s cap), turning a loop into delayed/no work
-    // rather than a high-load event. After a cap the item is Failed so a genuinely
-    // stuck item is cleared instead of looping forever. Reset to 0 on any progress.
+    // escalating backoff (base → max cap, both configurable), turning a loop
+    // into delayed/no work rather than a high-load event. After a cap the item
+    // is Failed so a genuinely stuck item is cleared instead of looping forever.
+    // Reset to 0 on any progress. Backoff bounds are hot-configurable via
+    // CodeyBox:WorkerPool:NoProgressBackoffBase/Max and
+    // CodeyBox:WorkerPool:MaxNoProgressRedispatches (startup-bound).
     private readonly ConcurrentDictionary<WorkItemId, int> _noProgressRedispatch = new();
-    private static readonly TimeSpan NoProgressBackoffBase = TimeSpan.FromMilliseconds(500);
-    private static readonly TimeSpan NoProgressBackoffMax = TimeSpan.FromSeconds(15);
-    private const int MaxNoProgressRedispatches = 10;
 
     /// <summary>
     /// Fallback deferral interval when <c>QuotaRouterOptions</c> is not wired
@@ -2255,6 +2257,17 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
     private async Task RunItemAsync(int workerIndex, WorkItemId id, WorkerSlotLease slotLease, CancellationToken ct)
     {
+        // Zero-duration pickup detection (incident 2026-09-07): a worker that
+        // picks up an item and exits immediately without logging a reason is
+        // invisible except by the climbing worker counter. Each early return
+        // below logs its own reason at its own site. The exitReason recorded
+        // here covers only pipeline fall-through exits (pipeline-ran,
+        // phase-cancelled, cancelled, pipeline-exception); early returns run
+        // the finally blocks then return to the caller, so they never reach
+        // the no-progress guard below. The guard therefore applies only to
+        // pickups that ran (or attempted) the pipeline.
+        var pickupStartedAt = _time.GetUtcNow();
+        var exitReason = "pipeline-ran";
         var item = await _store.GetAsync(id, ct);
         if (item is null)
         {
@@ -2407,7 +2420,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             try
             {
                 if (await TryDeferForRefactorExclusivityAsync(item, ct))
+                {
                     return;
+                }
             }
             finally
             {
@@ -2636,7 +2651,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 // the split-read and the in-flight marker. This does not
                 // depend on project metadata being available.
                 if (await TryDeferForRefactorExclusivityAsync(item, ct))
+                {
                     return;
+                }
 
                 if (project is not null)
                 {
@@ -2703,6 +2720,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 _log.LogInformation(
                     "Worker {WorkerId} item {Id} cancelled in phase {Phase}: source={CancellationSource}",
                     workerIndex, id, pex.Phase, pex.Source);
+                exitReason = $"phase-cancelled:{pex.Phase}";
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -2712,6 +2730,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             catch (OperationCanceledException)
             {
                 _log.LogInformation("Worker {WorkerId} item {Id} cancelled", workerIndex, id);
+                exitReason = "cancelled";
             }
             catch (SandboxDiskDeferredException dskEx)
             {
@@ -2779,6 +2798,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             catch (Exception ex)
             {
                 _log.LogError(ex, "Worker {WorkerId} unexpected failure on {Id}", workerIndex, id);
+                exitReason = $"pipeline-exception:{ex.GetType().Name}";
             }
         }
         finally
@@ -2818,9 +2838,14 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 await _repoReaper.TryReapWorkItemAsync(id, CancellationToken.None);
         }
 
-        // No-progress re-dispatch backoff (incident 2026-06-04). Reached only on
-        // the pipeline-ran fall-through — the quota/budget/cap/disk deferrals all
-        // `return` earlier and already set _deferredItems. If the worker ran but
+        // No-progress re-dispatch guard (incidents 2026-06-04, 2026-09-07).
+        // Reached only by pipeline fall-through exits (pipeline-ran,
+        // phase-cancelled, cancelled, pipeline-exception): a return inside
+        // the try runs the finally blocks then returns to the caller, so
+        // deferred/terminal early returns never reach this guard — they are
+        // excluded because they already scheduled a deferral (and set
+        // _deferredItems) or parked/failed the item at their own site.
+        // If the worker ran but
         // the item is STILL in the same re-pickable state it was dispatched in
         // (item.State is the dispatched state; the pipeline transitions the store,
         // not this local), it made no progress and the slot-release dispatch wake
@@ -2832,36 +2857,44 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             var afterRun = await _store.GetAsync(id, CancellationToken.None);
             if (afterRun is not null
                 && afterRun.State == item.State
-                && afterRun.State is WorkItemState.Queued
-                    or WorkItemState.WorkComplete or WorkItemState.AuditPassed)
+                && IsDispatchRepickableState(afterRun.State))
             {
                 var attempt = _noProgressRedispatch.AddOrUpdate(id, 1, static (_, c) => c + 1);
-                if (attempt >= MaxNoProgressRedispatches)
+                var pickupDuration = _time.GetUtcNow() - pickupStartedAt;
+                var maxAttempts = _opts.MaxNoProgressRedispatches;
+                if (attempt >= maxAttempts)
                 {
                     _noProgressRedispatch.TryRemove(id, out _);
                     _log.LogWarning(
-                        "Worker {WorkerId} failing {Id}: no progress after {Attempts} consecutive re-dispatches in state {State}",
-                        workerIndex, id, attempt, afterRun.State);
+                        "Worker {WorkerId} failing {Id}: no progress after {Attempts} consecutive re-dispatches in state {State} (last exit: {ExitReason} after {DurationMs}ms)",
+                        workerIndex, id, attempt, afterRun.State, exitReason, (long)pickupDuration.TotalMilliseconds);
                     await _store.UpdateAsync(
                         afterRun.With(WorkItemState.Failed,
-                            $"no progress after {attempt} consecutive re-dispatches (dispatched but the pipeline made no progress; likely a poisoned work branch or a stuck pickup phase)"),
+                            $"no progress after {attempt} consecutive re-dispatches in state {afterRun.State} (last exit: {exitReason}; dispatched but the pipeline made no progress)"),
                         CancellationToken.None);
                 }
                 else
                 {
                     var backoff = TimeSpan.FromMilliseconds(Math.Min(
-                        NoProgressBackoffBase.TotalMilliseconds * Math.Pow(2, attempt - 1),
-                        NoProgressBackoffMax.TotalMilliseconds));
-                    _log.LogDebug(
-                        "Worker {WorkerId} backing off {Id} {Ms}ms: no-progress re-dispatch #{Attempt}",
-                        workerIndex, id, backoff.TotalMilliseconds, attempt);
+                        _opts.NoProgressBackoffBase.TotalMilliseconds * Math.Pow(2, attempt - 1),
+                        _opts.NoProgressBackoffMax.TotalMilliseconds));
+                    // Warning, not Debug: a pickup that neither advances the
+                    // item nor produces work is a failure to make progress.
+                    // Rate is bounded by the deferral below (at most one such
+                    // pickup per backoff interval per item), so this cannot
+                    // spam at spawn-loop speed.
+                    _log.LogWarning(
+                        "Worker {WorkerId} backing off {Id} {Ms}ms: no-progress re-dispatch #{Attempt}/{MaxAttempts} in state {State} (exit: {ExitReason} after {DurationMs}ms)",
+                        workerIndex, id, backoff.TotalMilliseconds, attempt, maxAttempts, afterRun.State, exitReason, (long)pickupDuration.TotalMilliseconds);
                     ScheduleDeferredRequeue(id, backoff, ct);
                 }
             }
             else
             {
-                // Progressed (or item gone) — clear the counter so a future
-                // unrelated re-pickup starts fresh.
+                // Progressed (or item gone, or landed in a state the picker
+                // will not return — terminal/parked) — clear the counter so a
+                // future unrelated re-pickup starts fresh and one-off pickup
+                // races do not leak counter entries.
                 _noProgressRedispatch.TryRemove(id, out _);
             }
         }
@@ -2888,6 +2921,26 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             });
         }
     }
+
+    /// <summary>
+    /// Mirrors the pickup query's eligibility predicate (<see
+    /// cref="SqliteWorkItemStore.ListDispatchEligibleByPriorityAsync"/>): the
+    /// states a dispatch wake can return. Terminal and parked states are
+    /// excluded from pickup, so a no-progress exit landing in one of them is
+    /// a one-off race that cannot re-pick — only a still-eligible state can
+    /// spin, and only those count toward the no-progress guard.
+    /// </summary>
+    private static bool IsDispatchRepickableState(WorkItemState state) =>
+        state is not WorkItemState.Done
+        and not WorkItemState.Failed
+        and not WorkItemState.Cancelled
+        and not WorkItemState.AuditFailed
+        and not WorkItemState.MergeConflictResolutionFailed
+        and not WorkItemState.AbandonedAfterRecoveryAttempts
+        and not WorkItemState.NeedsOperatorInput
+        and not WorkItemState.WaitingForQuotaReset
+        and not WorkItemState.WaitingForAgentResume
+        and not WorkItemState.WaitingForTransientRetry;
 
     private static bool ShouldResolveAgentClassAtPickup(WorkItem item)
         // A durable turn checkpoint is bound to the exact runner instance and
@@ -3571,6 +3624,25 @@ public sealed record OrchestratorOptions
     /// <c>CodeyBox:WorkerPool:MaxConsecutiveDispatchGateTimeoutsBeforeEscalation</c>.
     /// </summary>
     public int MaxConsecutiveDispatchGateTimeoutsBeforeEscalation { get; init; } = 10;
+
+    /// <summary>
+    /// Base delay for the no-progress re-dispatch backoff (see
+    /// <c>CodeyBox:WorkerPool:NoProgressBackoffBase</c>). Default 500ms.
+    /// </summary>
+    public TimeSpan NoProgressBackoffBase { get; init; } = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>
+    /// Ceiling for the no-progress re-dispatch backoff delay (see
+    /// <c>CodeyBox:WorkerPool:NoProgressBackoffMax</c>). Default 15s.
+    /// </summary>
+    public TimeSpan NoProgressBackoffMax { get; init; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Consecutive no-progress pickups of the same item after which the item
+    /// is transitioned to Failed instead of being re-dispatched (see
+    /// <c>CodeyBox:WorkerPool:MaxNoProgressRedispatches</c>). Default 10.
+    /// </summary>
+    public int MaxNoProgressRedispatches { get; init; } = 10;
 
     /// <summary>
     /// Maximum number of times the recovery loop will reset a mid-flight work
