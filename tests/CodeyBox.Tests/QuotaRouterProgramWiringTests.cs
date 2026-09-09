@@ -384,7 +384,7 @@ public sealed class QuotaRouterProgramWiringTests
     }
 
     [Fact]
-    public async Task ProgramClaudeQuotaProbe_RetryAfterCapReadsUpdatedQuotaRouterOptions()
+    public async Task ProgramClaudeQuotaProbe_RetryAfterIsNotCappedByQuotaRouterOptions()
     {
         var time = new CapturingDelayTimeProvider(DateTimeOffset.UtcNow);
         var handler = new RetryAfterSequenceHandler(
@@ -399,14 +399,14 @@ public sealed class QuotaRouterProgramWiringTests
 
         var first = await probe.GetAvailabilityAsync(ClaudeMember, CancellationToken.None);
         Assert.Equal(60, first.AvailablePct, precision: 5);
-        Assert.Equal(TimeSpan.FromSeconds(1), Assert.Single(time.Delays));
+        Assert.Equal(TimeSpan.FromSeconds(10), Assert.Single(time.Delays));
 
         monitor.Set(ClaudeRetryOptions(maxRetryDelaySeconds: 3));
 
         var second = await probe.GetAvailabilityAsync(ClaudeMember, CancellationToken.None);
         Assert.Equal(70, second.AvailablePct, precision: 5);
         Assert.Equal(2, time.Delays.Count);
-        Assert.Equal(TimeSpan.FromSeconds(3), time.Delays[1]);
+        Assert.Equal(TimeSpan.FromSeconds(10), time.Delays[1]);
         Assert.Equal(4, handler.CallCount);
     }
 

@@ -233,7 +233,7 @@ public sealed class ClaudeSmokeProbeTests
     }
 
     [Fact]
-    public async Task OAuthUsage429_WithLargeRetryAfter_CapsDelayFromOptions()
+    public async Task OAuthUsage429_WithLargeRetryAfter_NeverShortensServerDelay()
     {
         var time = new CapturingDelayTimeProvider(DateTimeOffset.UtcNow);
         var handler = new RetryAfterSequenceHandler(
@@ -248,7 +248,7 @@ public sealed class ClaudeSmokeProbeTests
 
         Assert.True(result.Ok);
         Assert.Equal(2, handler.CallCount);
-        Assert.Equal(TimeSpan.FromSeconds(30), Assert.Single(time.Delays));
+        Assert.Equal(TimeSpan.FromMinutes(10), Assert.Single(time.Delays));
     }
 
     // ── Network error ─────────────────────────────────────────────────────────

@@ -287,13 +287,13 @@ public sealed class ClaudeQuotaProbeResilienceTests
         };
         yield return new object?[]
         {
-            "server delay capped",
+            "server delay is honoured",
             HttpStatusCode.TooManyRequests,
             TimeSpan.FromMinutes(10),
             (DateTimeOffset?)null,
             TimeSpan.FromMilliseconds(250),
             TimeSpan.FromSeconds(30),
-            TimeSpan.FromSeconds(30),
+            TimeSpan.FromMinutes(10),
         };
     }
 

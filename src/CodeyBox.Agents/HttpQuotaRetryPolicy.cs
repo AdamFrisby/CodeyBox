@@ -38,25 +38,27 @@ public static class HttpQuotaRetryPolicy
 
     /// <summary>
     /// Returns the larger of the computed exponential backoff and the provider's
-    /// <c>Retry-After</c> delay. Positive results are capped by
-    /// <paramref name="maxDelay"/>; a zero or negative cap intentionally means
-    /// "uncapped".
+    /// <c>Retry-After</c> delay. <paramref name="maxDelay"/> caps only the
+    /// locally-computed exponential delay: a provider's Retry-After value is
+    /// never shortened, because retrying before it expires can prolong a rate
+    /// limit. A zero or negative cap intentionally means "uncapped".
     /// </summary>
     public static TimeSpan ComputeRetryDelay(
         TimeSpan exponentialDelay,
         TimeSpan? retryAfterDelay,
         TimeSpan maxDelay)
     {
+        var cappedExponential = maxDelay > TimeSpan.Zero && exponentialDelay > maxDelay
+            ? maxDelay
+            : exponentialDelay;
         var serverDelay = retryAfterDelay ?? TimeSpan.Zero;
-        var delay = exponentialDelay >= serverDelay
-            ? exponentialDelay
+        var delay = cappedExponential >= serverDelay
+            ? cappedExponential
             : serverDelay;
 
         if (delay <= TimeSpan.Zero)
             return TimeSpan.Zero;
 
-        return maxDelay > TimeSpan.Zero && delay > maxDelay
-            ? maxDelay
-            : delay;
+        return delay;
     }
 }
