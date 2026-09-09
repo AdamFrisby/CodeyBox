@@ -2,15 +2,17 @@ using CodeyBox.Agents;
 using CodeyBox.Agents.Antigravity;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
+using CodeyBox.Sandbox.Process;
+using Microsoft.Extensions.Logging.Abstractions;
 using Serilog;
 using Serilog.Events;
 
 namespace CodeyBox.Tests;
 
 /// <summary>
-/// Unit tests for <see cref="AntigravityAgentRunner"/>. Uses the shared
-/// <c>CapturingSandbox</c> fake from the Gemini suite to inspect the argv,
-/// stdin, and resume shape — same pattern as the Claude/Gemini runner tests.
+/// Unit tests for <see cref="AntigravityAgentRunner"/>. Uses local sandbox
+/// fakes to inspect the argv, stdin, resume shape, structured-stream probe,
+/// and the extra glog-capture execs around the agy invocation.
 /// </summary>
 public sealed class AntigravityAgentRunnerTests
 {
@@ -33,15 +35,74 @@ public sealed class AntigravityAgentRunnerTests
     }
 
     [Fact]
-    public async Task RunAsync_Argv_ContainsPrintAndSkipPermissions()
+    public async Task RunAsync_Argv_UsesStreamJsonAndSkipPermissions_NeverBarePrint()
     {
         var sandbox = new AntigravityCapturingSandbox();
         var runner = new AntigravityAgentRunner();
 
         await runner.RunAsync(sandbox, "/work", "go", credential: null);
 
-        Assert.Contains("--print", sandbox.CapturedExec!.Argv);
-        Assert.Contains("--dangerously-skip-permissions", sandbox.CapturedExec!.Argv);
+        var argv = sandbox.CapturedExec!.Argv;
+        Assert.Contains("--dangerously-skip-permissions", argv);
+        var inIdx = IndexOf(argv, "--input-format");
+        Assert.True(inIdx >= 0, "expected --input-format in argv");
+        Assert.Equal("stream-json", argv[inIdx + 1]);
+        var outIdx = IndexOf(argv, "--output-format");
+        Assert.True(outIdx >= 0, "expected --output-format in argv");
+        Assert.Equal("stream-json", argv[outIdx + 1]);
+
+        // Regression guard. `--print` is a STRING flag in agy 1.1.x, so a bare `--print` swallows the
+        // next argv element as its prompt: the old [agy, --print, --dangerously-skip-permissions] shape
+        // ran with the literal prompt "--dangerously-skip-permissions", ignored the real prompt on
+        // stdin, left permissions un-skipped — and exited 0, so it read downstream as a successful run
+        // that "produced no changes".
+        Assert.DoesNotContain("--print", argv);
+    }
+
+    [Fact]
+    public async Task RunAsync_Argv_PassesAbsoluteAddDirForWorkingDirectory()
+    {
+        var sandbox = new AntigravityCapturingSandbox();
+        var runner = new AntigravityAgentRunner();
+
+        await runner.RunAsync(sandbox, "/work/repo", "go", credential: null);
+
+        var argv = sandbox.CapturedExec!.Argv;
+        var idx = IndexOf(argv, "--add-dir");
+        Assert.True(idx >= 0, "expected --add-dir so agy treats the working tree as writable");
+        Assert.Equal("/work/repo", argv[idx + 1]);
+    }
+
+    [Fact]
+    public async Task RunAsync_Argv_OmitsAddDirWhenWorkingDirectoryIsRelative()
+    {
+        // A relative --add-dir is worse than none: verified against agy 1.1.24, `--add-dir .` reported
+        // SUCCESS and wrote the file nowhere at all — not the cwd, not the scratch dir.
+        var sandbox = new AntigravityCapturingSandbox();
+        var runner = new AntigravityAgentRunner();
+
+        await runner.RunAsync(sandbox, "relative/path", "go", credential: null);
+
+        Assert.DoesNotContain("--add-dir", sandbox.CapturedExec!.Argv);
+    }
+
+    [Fact]
+    public void BuildStreamJsonPromptFrame_UsesEventKey_AndEscapesPrompt()
+    {
+        // agy's stream-json resembles Claude Code's and is not it: the envelope key is `event`, and a
+        // Claude-shaped line is rejected with `stream input message is missing the "event" field`.
+        var frame = AntigravityAgentRunner.BuildStreamJsonPromptFrame("say \"hi\"\nand stop");
+
+        Assert.EndsWith("\n", frame, StringComparison.Ordinal);
+        using var doc = System.Text.Json.JsonDocument.Parse(frame);
+        var root = doc.RootElement;
+        Assert.Equal("user", root.GetProperty("event").GetString());
+        var message = root.GetProperty("message");
+        Assert.Equal("user", message.GetProperty("role").GetString());
+        var part = message.GetProperty("content")[0];
+        Assert.Equal("text", part.GetProperty("type").GetString());
+        // Round-trips quotes and newlines rather than breaking the frame.
+        Assert.Equal("say \"hi\"\nand stop", part.GetProperty("text").GetString());
     }
 
     [Fact]
@@ -70,7 +131,9 @@ public sealed class AntigravityAgentRunnerTests
 
         await runner.RunAsync(sandbox, "/work", prompt, credential: null);
 
-        Assert.Equal(prompt, sandbox.CapturedExec!.Stdin);
+        // stdin carries the prompt inside agy's one-frame-per-turn NDJSON envelope.
+        Assert.Contains(prompt, sandbox.CapturedExec!.Stdin!);
+        Assert.Contains("\"event\":\"user\"", sandbox.CapturedExec!.Stdin!);
         Assert.DoesNotContain(prompt, sandbox.CapturedExec!.Argv);
     }
 
@@ -131,7 +194,7 @@ public sealed class AntigravityAgentRunnerTests
     public async Task RunAsync_WithOAuthCredsBundle_WritesCredentialsFileToSandbox()
     {
         // PrepareSandboxAsync must materialise the agy token bundle into
-        // ~/.gemini/antigravity-cli/antigravity-oauth-token (chmod 600) — agy's
+        // ~/.gemini/antigravity-cli/antigravity-oauth-token (mode 0600) — agy's
         // fileTokenStorage path when no system keyring is present (every headless
         // sandbox). The bundle is shipped verbatim by upstream credential
         // providers (refresh_token retained so the in-VM agy can self-refresh —
@@ -156,9 +219,10 @@ public sealed class AntigravityAgentRunnerTests
         Assert.Equal("bash", prep.Argv[0]);
         Assert.Equal("-c", prep.Argv[1]);
         var script = prep.Argv[2];
-        Assert.Contains("$HOME/.gemini/antigravity-cli/antigravity-oauth-token", script);
-        Assert.Contains(AntigravityConstants.OAuthCredsEnvVar, script);
-        Assert.Contains("chmod 600", script);
+        Assert.Equal(".gemini/antigravity-cli/antigravity-oauth-token", prep.Argv[5]);
+        Assert.Equal(credential.EnvironmentVariables[AntigravityConstants.OAuthCredsEnvVar], prep.Stdin);
+        Assert.DoesNotContain(AntigravityConstants.OAuthCredsEnvVar, script);
+        Assert.Contains("0o600", script);
         // Second exec is the agy CLI invocation, not the prep hook.
         Assert.Equal("agy", prepAndAgyExecs[1].Argv[0]);
     }
@@ -213,15 +277,16 @@ public sealed class AntigravityAgentRunnerTests
     [Fact]
     public async Task RunAsync_WhenCaptureStructuredStreamTrue_AppendsOutputFormatStreamJson()
     {
-        // PipelineRunner only sets captureStructuredStream=true after
-        // SupportsStructuredStreamAsync confirmed `agy --help` advertises the
-        // flag. The runner must then ask for stream-json so the captured
-        // .jsonl is structured (and AntigravityStreamParser /
-        // AntigravityCostExtractor can decode it). A regression that dropped
-        // --output-format / stream-json would silently downgrade the run to
-        // plaintext-fallback capture — invisible to the new parser tests,
-        // which hand-write the NDJSON themselves.
-        var sandbox = new AntigravityCapturingSandbox();
+        // The runner enables structured capture only after a real print-mode
+        // probe emits NDJSON. Help text alone is not enough because agy 1.0.x
+        // can mention stream-json in unrelated help text while rejecting the
+        // flag for --print.
+        var sandbox = new AntigravityCapturingSandbox
+        {
+            VersionOutput = "agy version test-supported",
+            HelpOutput = "Usage: agy --input-format stream-json --output-format stream-json",
+            StructuredProbeOutput = "{\"type\":\"result\",\"result\":\"ok\"}\n",
+        };
         var runner = new AntigravityAgentRunner();
 
         await runner.RunAsync(
@@ -235,13 +300,403 @@ public sealed class AntigravityAgentRunnerTests
     }
 
     [Fact]
-    public async Task RunAsync_WhenCaptureStructuredStreamFalse_OmitsOutputFormatStreamJson()
+    public async Task RunAsync_WhenStructuredProbeEmitsUsage_KeepsStreamJsonAndWarns()
     {
-        // Plaintext-capture path: SupportsStructuredStreamAsync said no (older
-        // agy without the flag, or help-text probe failed), so the runner must
-        // NOT pass --output-format. Passing it on a CLI that doesn't recognise
-        // it bombs the run with "unknown option" — exactly the cascade the
-        // gated capability check was added to prevent.
+        var sandbox = new AntigravityCapturingSandbox(stdout: "plain output", stderr: "")
+        {
+            VersionOutput = "agy version test-broken-help",
+            HelpOutput = "Usage: agy --input-format stream-json --output-format stream-json",
+            StructuredProbeOutput = """
+                Available subcommands:
+                  install   Configure environment paths and shell settings
+                  models    List available models
+                """,
+        };
+        var runner = new AntigravityAgentRunner();
+
+        var result = await runner.RunAsync(
+            sandbox, "/work", "go", credential: null,
+            captureStructuredStream: true);
+
+        Assert.True(result.Success);
+        // No plaintext fallback exists any more — stream-json is the only non-interactive mode that
+        // keeps the prompt on stdin — so the flags stay and only the capture-disabled warning changes.
+        Assert.Contains("--output-format", sandbox.CapturedExec!.Argv);
+        Assert.DoesNotContain("--print", sandbox.CapturedExec!.Argv);
+        Assert.Contains("structured stream capture was disabled", result.Stderr);
+    }
+
+    [SkippableFact]
+    public async Task RunAsync_WithRealSandboxAndBrokenStructuredProbe_KeepsStreamJsonAndWarns()
+    {
+        Skip.If(OperatingSystem.IsWindows(), "ProcessSandbox shell-script probe test requires Unix executable permissions.");
+
+        using var temp = new TemporaryTestDirectory("codeybox-agy-probe-");
+        var binDir = Path.Combine(temp.Path, "bin");
+        var recordDir = Path.Combine(temp.Path, "records");
+        Directory.CreateDirectory(binDir);
+        Directory.CreateDirectory(recordDir);
+
+        // The fake agy below matches this marker literally (its script is a non-interpolated raw
+        // string), so pin the coupling rather than letting the two drift apart silently.
+        Assert.Contains(
+            "CODEYBOX_STRUCTURED_STREAM_PROBE",
+            AntigravityAgentRunner.StructuredStreamProbePrompt,
+            StringComparison.Ordinal);
+
+        var agyPath = Path.Combine(binDir, "agy");
+        File.WriteAllText(agyPath, """
+            #!/usr/bin/env bash
+            set -eu
+            record_dir="${AGY_RECORD_DIR:?}"
+            mkdir -p "$record_dir"
+            args="$*"
+
+            case " $args " in
+              *" --version "*)
+                printf '%s\n' 'agy version process-broken'
+                exit 0
+                ;;
+              *" --help "*)
+                printf '%s\n' 'Usage: agy --input-format stream-json --output-format stream-json'
+                exit 0
+                ;;
+            esac
+
+            stdin="$(cat)"
+            # Probe and work runs now share an argv shape (the format flags are unconditional), so the
+            # probe is identified by its prompt travelling in the stdin frame.
+            if [[ "$stdin" == *"CODEYBOX_STRUCTURED_STREAM_PROBE"* ]]; then
+              {
+                printf 'probe_argv=%s\n' "$args"
+                printf 'probe_stdin=%s\n' "$stdin"
+              } >> "$record_dir/events.txt"
+              printf '%s\n' 'Available subcommands:'
+              printf '%s\n' '  models    List available models'
+              exit 0
+            fi
+
+            {
+              printf 'work_argv=%s\n' "$args"
+              printf 'work_stdin=%s\n' "$stdin"
+            } >> "$record_dir/events.txt"
+            printf '%s\n' 'plain-work'
+            """);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                agyPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
+                | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+        }
+
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Mounts =
+            [
+                new SandboxMount { SandboxPath = "/tools", HostPath = binDir, ReadOnly = false },
+                new SandboxMount { SandboxPath = SandboxConventions.WorkDir, Tmpfs = true },
+            ],
+            Environment = new Dictionary<string, string>
+            {
+                ["PATH"] = "/tools:/usr/bin:/bin",
+                ["AGY_RECORD_DIR"] = recordDir,
+            },
+            WorkingDirectory = SandboxConventions.WorkDir,
+        });
+        var runner = new AntigravityAgentRunner { Binary = "/tools/agy" };
+
+        var result = await runner.RunAsync(
+            sandbox,
+            SandboxConventions.WorkDir,
+            "create /tmp/x containing BANANA",
+            credential: null,
+            captureStructuredStream: true);
+
+        Assert.True(result.Success, result.Stderr);
+        Assert.Contains("plain-work", result.Stdout);
+        Assert.Contains("structured stream capture was disabled", result.Stderr);
+
+        var events = File.ReadAllLines(Path.Combine(recordDir, "events.txt"));
+        Assert.Contains(events, line => line.StartsWith("probe_argv=", StringComparison.Ordinal));
+        var workArgv = Assert.Single(events, line => line.StartsWith("work_argv=", StringComparison.Ordinal));
+        // The invocation shape does not change when the probe fails: there is no plaintext mode that
+        // keeps the prompt on stdin, so stream-json stays and only the capture warning differs.
+        Assert.Contains("--output-format", workArgv);
+        Assert.DoesNotContain("--print ", workArgv);
+        Assert.Contains(events, line =>
+            line.StartsWith("work_stdin=", StringComparison.Ordinal)
+            && line.Contains("create /tmp/x containing BANANA", StringComparison.Ordinal));
+    }
+
+    [SkippableFact]
+    public async Task RunAsync_WithRealSandboxAndSupportedPrintProbe_UsesStructuredStreamInvocation()
+    {
+        Skip.If(OperatingSystem.IsWindows(), "ProcessSandbox shell-script probe test requires Unix executable permissions.");
+
+        using var temp = new TemporaryTestDirectory("codeybox-agy-probe-");
+        var binDir = Path.Combine(temp.Path, "bin");
+        var recordDir = Path.Combine(temp.Path, "records");
+        Directory.CreateDirectory(binDir);
+        Directory.CreateDirectory(recordDir);
+
+        var agyPath = Path.Combine(binDir, "agy");
+        File.WriteAllText(agyPath, $$"""
+            #!/usr/bin/env bash
+            set -eu
+            record_dir="${AGY_RECORD_DIR:?}"
+            mkdir -p "$record_dir"
+            args="$*"
+
+            case " $args " in
+              *" --version "*)
+                printf '%s\n' 'agy version process-supported'
+                exit 0
+                ;;
+              *" --help "*)
+                printf '%s\n' 'Usage: agy --input-format stream-json --output-format stream-json'
+                exit 0
+                ;;
+            esac
+
+            stdin="$(cat)"
+            if [[ "$stdin" == *"{{AntigravityAgentRunner.StructuredStreamProbePrompt}}"* ]]; then
+              {
+                printf 'probe_argv=%s\n' "$args"
+                printf 'probe_stdin=%s\n' "$stdin"
+                printf 'probe_cwd=%s\n' "$(pwd)"
+              } >> "$record_dir/events.txt"
+              printf '%s\n' '{"type":"result","result":"CODEYBOX_STRUCTURED_STREAM_PROBE"}'
+              exit 0
+            fi
+
+            {
+              printf 'work_argv=%s\n' "$args"
+              printf 'work_stdin=%s\n' "$stdin"
+              printf 'work_cwd=%s\n' "$(pwd)"
+            } >> "$record_dir/events.txt"
+            printf '%s\n' '{"type":"result","result":"work-ok"}'
+            """);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(
+                agyPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
+                | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+        }
+
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Mounts =
+            [
+                new SandboxMount { SandboxPath = "/tools", HostPath = binDir, ReadOnly = false },
+                new SandboxMount { SandboxPath = SandboxConventions.WorkDir, Tmpfs = true },
+            ],
+            Environment = new Dictionary<string, string>
+            {
+                ["PATH"] = "/tools:/usr/bin:/bin",
+                ["AGY_RECORD_DIR"] = recordDir,
+            },
+            WorkingDirectory = SandboxConventions.WorkDir,
+        });
+        var runner = new AntigravityAgentRunner { Binary = "/tools/agy" };
+
+        var result = await runner.RunAsync(
+            sandbox,
+            SandboxConventions.WorkDir,
+            "create /tmp/x containing BANANA",
+            credential: null,
+            captureStructuredStream: true);
+
+        Assert.True(result.Success, result.Stderr);
+        Assert.Contains("\"work-ok\"", result.Stdout);
+        Assert.DoesNotContain("structured stream capture was disabled", result.Stderr);
+
+        var events = File.ReadAllLines(Path.Combine(recordDir, "events.txt"));
+        Assert.Contains(events, line => line.StartsWith("probe_argv=", StringComparison.Ordinal));
+        Assert.Contains(events, line => line.StartsWith("probe_cwd=", StringComparison.Ordinal));
+        // stdin is an NDJSON frame wrapping the prompt, not the bare prompt.
+        Assert.Contains(events, line =>
+            line.StartsWith("probe_stdin=", StringComparison.Ordinal)
+            && line.Contains(AntigravityAgentRunner.StructuredStreamProbePrompt, StringComparison.Ordinal));
+        var workArgv = Assert.Single(events, line => line.StartsWith("work_argv=", StringComparison.Ordinal));
+        Assert.Contains("--input-format stream-json", workArgv);
+        Assert.Contains("--output-format stream-json", workArgv);
+        Assert.Contains(events, line =>
+            line.StartsWith("work_stdin=", StringComparison.Ordinal)
+            && line.Contains("\"event\":\"user\"", StringComparison.Ordinal)
+            && line.Contains("create /tmp/x containing BANANA", StringComparison.Ordinal));
+        Assert.Contains(events, line => line.StartsWith("work_cwd=", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task RunAsync_WhenHelpDoesNotAdvertiseStreamJson_StillUsesStreamJson_ButWarns()
+    {
+        // There is no plaintext fallback to degrade to: agy's only non-interactive mode that keeps the
+        // prompt on stdin is --input-format stream-json (bare --print consumes the next argv element as
+        // its prompt). So a CLI that does not advertise the format flags still gets the stream-json
+        // invocation — the run is expected to fail loudly rather than silently produce nothing — and the
+        // unverified-support warning is surfaced on stderr.
+        var sandbox = new AntigravityCapturingSandbox
+        {
+            VersionOutput = "agy version test-no-flag",
+            HelpOutput = "Usage: agy",
+        };
+        var runner = new AntigravityAgentRunner();
+
+        var result = await runner.RunAsync(
+            sandbox, "/work", "go", credential: null,
+            captureStructuredStream: true);
+
+        Assert.Contains("--input-format", sandbox.CapturedExec!.Argv);
+        Assert.Contains("--output-format", sandbox.CapturedExec!.Argv);
+        Assert.Contains("structured stream capture was disabled", result.Stderr);
+        // The malformed bare --print shape must never come back.
+        Assert.DoesNotContain("--print", sandbox.CapturedExec!.Argv);
+    }
+
+    [Fact]
+    public async Task SupportsStructuredStreamAsync_CachesSupportPerAgyVersion()
+    {
+        var sandbox = new AntigravityCapturingSandbox
+        {
+            VersionOutput = "agy version cache-a",
+            HelpOutput = "Usage: agy --input-format stream-json --output-format stream-json",
+            StructuredProbeOutput = "{\"type\":\"result\",\"result\":\"ok\"}\n",
+        };
+        var runner = new AntigravityAgentRunner();
+
+        Assert.True(await runner.SupportsStructuredStreamAsync(sandbox));
+
+        sandbox.VersionOutput = "agy version cache-b";
+        sandbox.StructuredProbeOutput = """
+            Available subcommands:
+              install   Configure environment paths and shell settings
+            """;
+
+        Assert.False(await runner.SupportsStructuredStreamAsync(sandbox));
+
+        Assert.Equal(2, sandbox.AllExecs.Count(e => e.Argv.Contains("--help")));
+        Assert.Equal(2, sandbox.AllExecs.Count(IsStructuredStreamProbe));
+    }
+
+    [Fact]
+    public async Task SupportsStructuredStreamAsync_WhenProbeEmitsGeminiToolCallShape_ReturnsTrue()
+    {
+        var sandbox = new AntigravityCapturingSandbox
+        {
+            VersionOutput = "agy version test-gemini-tool-call",
+            HelpOutput = "Usage: agy --input-format stream-json --output-format stream-json",
+            StructuredProbeOutput = "{\"toolCall\":{\"name\":\"read_file\"}}\n",
+        };
+        var runner = new AntigravityAgentRunner();
+
+        Assert.True(await runner.SupportsStructuredStreamAsync(sandbox));
+    }
+
+    [Fact]
+    public async Task RunAsync_WhenProbeEmitsNdjsonButExitsNonzero_KeepsStreamJsonAndWarns()
+    {
+        var sandbox = new AntigravityCapturingSandbox(stdout: "plain output", stderr: "")
+        {
+            VersionOutput = "agy version test-probe-nonzero",
+            HelpOutput = "Usage: agy --input-format stream-json --output-format stream-json",
+            StructuredProbeOutput = "{\"type\":\"result\",\"result\":\"ok\"}\n",
+            StructuredProbeExitCode = 1,
+        };
+        var runner = new AntigravityAgentRunner();
+
+        Assert.False(await runner.SupportsStructuredStreamAsync(sandbox));
+
+        var result = await runner.RunAsync(
+            sandbox, "/work", "go", credential: null,
+            captureStructuredStream: true);
+
+        Assert.True(result.Success);
+        // A failed probe no longer changes the invocation (there is no plaintext mode that keeps the
+        // prompt on stdin); it only disables structured folding and surfaces the warning.
+        Assert.Contains("--output-format", sandbox.CapturedExec!.Argv);
+        Assert.DoesNotContain("--print", sandbox.CapturedExec!.Argv);
+        Assert.Contains("structured stream capture was disabled", result.Stderr);
+    }
+
+    [Fact]
+    public async Task RunAsync_WhenStructuredProbeThrows_KeepsStreamJsonAndWarns()
+    {
+        var sandbox = new ThrowingStructuredProbeSandbox
+        {
+            VersionOutput = "agy version test-probe-throws",
+            HelpOutput = "Usage: agy --input-format stream-json --output-format stream-json",
+        };
+        var runner = new AntigravityAgentRunner();
+
+        var result = await runner.RunAsync(
+            sandbox, "/work", "go", credential: null,
+            captureStructuredStream: true);
+
+        Assert.True(result.Success);
+        // A failed probe no longer changes the invocation (there is no plaintext mode that keeps the
+        // prompt on stdin); it only disables structured folding and surfaces the warning.
+        Assert.Contains("--output-format", sandbox.CapturedExec!.Argv);
+        Assert.DoesNotContain("--print", sandbox.CapturedExec!.Argv);
+        Assert.Contains("structured stream capture was disabled", result.Stderr);
+    }
+
+    [Fact]
+    public async Task RunAsync_WithFileBackedCredentialRejectingSandbox_FailsBeforeStructuredProbe()
+    {
+        var sandbox = new RejectingFileBackedCredentialSandbox
+        {
+            VersionOutput = "agy version should-not-run",
+            HelpOutput = "Usage: agy --input-format stream-json --output-format stream-json",
+            StructuredProbeOutput = "{\"type\":\"result\",\"result\":\"ok\"}\n",
+        };
+        var runner = new AntigravityAgentRunner();
+        var credential = new AgentCredential(
+            AgentKind.Antigravity,
+            new Dictionary<string, string>
+            {
+                [AntigravityConstants.OAuthCredsEnvVar] = "{}",
+            },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunAsync(
+            sandbox, "/work", "go", credential,
+            captureStructuredStream: true);
+
+        Assert.False(result.Success);
+        Assert.Contains("file-backed credentials are not supported", result.Summary, StringComparison.Ordinal);
+        Assert.Empty(sandbox.AllExecs);
+    }
+
+    [Fact]
+    public async Task SupportsStructuredStreamAsync_WithFileBackedCredentialRejectingSandbox_FailsClosedBeforeProbe()
+    {
+        var sandbox = new RejectingFileBackedCredentialSandbox
+        {
+            VersionOutput = "agy version should-not-run",
+            HelpOutput = "Usage: agy --input-format stream-json --output-format stream-json",
+            StructuredProbeOutput = "{\"type\":\"result\",\"result\":\"ok\"}\n",
+        };
+        var runner = new AntigravityAgentRunner();
+
+        Assert.False(await runner.SupportsStructuredStreamAsync(sandbox));
+        Assert.Empty(sandbox.AllExecs);
+    }
+
+    [Fact]
+    public async Task RunAsync_WhenCaptureStructuredStreamFalse_StillUsesStreamJson()
+    {
+        // The format flags are no longer gated on captureStructuredStream. stream-json INPUT is the
+        // only non-interactive mode that keeps the prompt on stdin, and it requires stream-json output,
+        // so both are unconditional. captureStructuredStream now selects only how this runner folds
+        // agy's glog into the capture, not whether agy emits NDJSON.
         var sandbox = new AntigravityCapturingSandbox();
         var runner = new AntigravityAgentRunner();
 
@@ -249,18 +704,18 @@ public sealed class AntigravityAgentRunnerTests
             sandbox, "/work", "go", credential: null,
             captureStructuredStream: false);
 
-        Assert.DoesNotContain("--output-format", sandbox.CapturedExec!.Argv);
-        Assert.DoesNotContain("stream-json", sandbox.CapturedExec!.Argv);
+        Assert.Contains("--input-format", sandbox.CapturedExec!.Argv);
+        Assert.Contains("--output-format", sandbox.CapturedExec!.Argv);
+        Assert.DoesNotContain("--print", sandbox.CapturedExec!.Argv);
     }
 
     [Fact]
-    public async Task RunResumedAsync_DoesNotRequestStructuredStream()
+    public async Task RunResumedAsync_UsesStreamJsonLikeAFreshRun()
     {
-        // Resume turns deliberately drop captureStructuredStream — see
-        // CliAgentRunnerBase.RunResumedAsync wiring. Verify the resume argv
-        // never carries the flag even when SupportsStructuredStreamAsync would
-        // have said yes, so a resumed agy run doesn't introduce a
-        // capture-format change mid-conversation.
+        // Resume used to opt out of the structured stream, which was right while --output-format was
+        // optional. It no longer is: stream-json input requires stream-json output, so a resumed turn
+        // emits NDJSON whether or not anyone asked. The capture format therefore stays consistent
+        // across a preempt/resume boundary rather than changing mid-conversation.
         var sandbox = new AntigravityCapturingSandbox();
         var runner = new AntigravityAgentRunner();
 
@@ -270,8 +725,9 @@ public sealed class AntigravityAgentRunnerTests
 
         await runner.RunResumedAsync(sandbox, "/work", "next turn", credential: null, resume);
 
-        Assert.DoesNotContain("--output-format", sandbox.CapturedExec!.Argv);
-        Assert.DoesNotContain("stream-json", sandbox.CapturedExec!.Argv);
+        Assert.Contains("--input-format", sandbox.CapturedExec!.Argv);
+        Assert.Contains("--output-format", sandbox.CapturedExec!.Argv);
+        Assert.DoesNotContain("--print", sandbox.CapturedExec!.Argv);
     }
 
     [Fact]
@@ -355,6 +811,42 @@ public sealed class AntigravityAgentRunnerTests
         //    stream for observability / audit.
         Assert.Contains("Model resolved: gemini-3.5-flash\n", streamedChunks);
         Assert.Contains("RESOURCE_EXHAUSTED (code 429): Individual quota reached\n", streamedChunks);
+    }
+
+    [Fact]
+    public async Task RunAsync_FailedRun_RenderedGoogleApi429Message_FoldsTerminalErrorIntoStderr()
+    {
+        // REGRESSION guard for the glog->result.Stderr surfacing of a HIDDEN 429.
+        // agy frequently logs the cloudcode-pa 429 as the rendered Google-API
+        // MESSAGE — "Resource has been exhausted (e.g. check quota)." — not the
+        // raw JSON envelope, so neither the "RESOURCE_EXHAUSTED" token nor the
+        // phrase "quota exceeded" appears. If that message is not a recognised
+        // marker the terminal region is empty, NOTHING is folded into Stderr, and
+        // the pipeline terminal-fails the run as a generic "agent exited 1" with
+        // no quota record and no WaitingForQuotaReset park. This test fails if the
+        // marker/pattern set stops covering the rendered-message shape.
+        var sandbox = new AntigravityLogCapturingSandbox(
+            logFileContent: "Model resolved: gemini-3.5-flash\n"
+                + "applyAuthResult: authMethod=consumer\n"
+                + "Error: Resource has been exhausted (e.g. check quota).",
+            agyExitCode: 1);
+        var runner = new AntigravityAgentRunner();
+
+        var result = await runner.RunAsync(
+            sandbox, "/work", "do something", credential: null,
+            captureStructuredStream: false);
+
+        // The terminal 429 message IS folded into the classifier-facing Stderr so
+        // the quota detector sees it; agy's own process stderr is preserved ahead.
+        Assert.Contains("Resource has been exhausted", result.Stderr ?? string.Empty);
+        Assert.Contains("agy failed", result.Stderr ?? string.Empty);
+        Assert.DoesNotContain("Model resolved: gemini-3.5-flash", result.Stderr ?? string.Empty);
+
+        // And the folded Stderr is genuinely quota-classifiable end-to-end through
+        // the real detector the pipeline consults.
+        var detection = new AntigravityQuotaFailureDetector().Detect(result.Stderr, result.Stdout);
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
     }
 
     [Fact]
@@ -560,8 +1052,15 @@ public sealed class AntigravityAgentRunnerTests
         // resume too; the non-terminal "resumed conversation" line is excluded.
         Assert.Contains("RESOURCE_EXHAUSTED", result.Stderr ?? string.Empty);
         Assert.DoesNotContain("resumed conversation", result.Stderr ?? string.Empty);
-        Assert.Contains("resumed conversation\n", streamedChunks);
-        Assert.Contains("RESOURCE_EXHAUSTED (code 429): Individual quota reached\n", streamedChunks);
+        // Resume now folds the glog through the structured envelope, like a fresh run: agy emits
+        // NDJSON on every non-interactive invocation, so the capture format no longer flips at a
+        // preempt/resume boundary.
+        Assert.Contains(streamedChunks, c =>
+            c.Contains("codeybox.stderr", StringComparison.Ordinal)
+            && c.Contains("resumed conversation", StringComparison.Ordinal));
+        Assert.Contains(streamedChunks, c =>
+            c.Contains("codeybox.stderr", StringComparison.Ordinal)
+            && c.Contains("RESOURCE_EXHAUSTED (code 429): Individual quota reached", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -573,7 +1072,12 @@ public sealed class AntigravityAgentRunnerTests
         var sandbox = new AntigravityLogCapturingSandbox(
             logFileContent: "Line 1\nLine 2",
             agyExitCode: 1
-        );
+        )
+        {
+            VersionOutput = "agy version structured-log-failure",
+            HelpOutput = "Usage: agy --input-format stream-json --output-format stream-json",
+            StructuredProbeOutput = "{\"type\":\"result\",\"result\":\"ok\"}\n",
+        };
         var runner = new AntigravityAgentRunner();
 
         var streamedChunks = new List<string>();
@@ -603,7 +1107,12 @@ public sealed class AntigravityAgentRunnerTests
         var sandbox = new AntigravityLogCapturingSandbox(
             logFileContent: "applyAuthResult: authMethod=consumer\nModel resolved: gemini-3.5-flash",
             agyExitCode: 0
-        );
+        )
+        {
+            VersionOutput = "agy version structured-log-success",
+            HelpOutput = "Usage: agy --input-format stream-json --output-format stream-json",
+            StructuredProbeOutput = "{\"type\":\"result\",\"result\":\"ok\"}\n",
+        };
         var runner = new AntigravityAgentRunner();
 
         var streamedChunks = new List<string>();
@@ -745,7 +1254,57 @@ public sealed class AntigravityAgentRunnerTests
         Assert.DoesNotContain(string.Empty, streamedChunks);  // no empty chunk
     }
 
-    private sealed class AntigravityLogCapturingSandbox : ISandbox
+    private sealed class TemporaryTestDirectory : IDisposable
+    {
+        public TemporaryTestDirectory(string prefix)
+        {
+            Path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(Path);
+        }
+
+        public string Path { get; }
+
+        public void Dispose()
+        {
+            if (Directory.Exists(Path))
+                Directory.Delete(Path, recursive: true);
+        }
+    }
+
+    private abstract class AntigravityStructuredProbeSandbox : ISandbox
+    {
+        public abstract string Id { get; }
+        public string? HelpOutput { get; set; }
+        public string? VersionOutput { get; set; }
+        public string? StructuredProbeOutput { get; set; }
+        public string? StructuredProbeStderr { get; set; }
+        public int StructuredProbeExitCode { get; set; }
+
+        public abstract Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default);
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+        protected SandboxExecResult? TryHandleStructuredStreamSupportProbeExec(SandboxExec exec)
+        {
+            if (VersionOutput is not null && exec.Argv.Contains("--version"))
+                return new SandboxExecResult(0, VersionOutput, string.Empty);
+
+            if (HelpOutput is not null && exec.Argv.Contains("--help"))
+                return new SandboxExecResult(0, HelpOutput, string.Empty);
+
+            if (StructuredProbeOutput is not null && IsStructuredStreamProbe(exec))
+            {
+                return new SandboxExecResult(
+                    StructuredProbeExitCode,
+                    StructuredProbeOutput,
+                    StructuredProbeStderr ?? string.Empty);
+            }
+
+            return null;
+        }
+    }
+
+    private sealed class AntigravityLogCapturingSandbox : AntigravityStructuredProbeSandbox
     {
         private readonly string _logFileContent;
         private readonly int _agyExitCode;
@@ -758,28 +1317,29 @@ public sealed class AntigravityAgentRunnerTests
             _tailExitCode = tailExitCode;
         }
 
-        public string Id => "fake-antigravity-log-sandbox";
+        public override string Id => "fake-antigravity-log-sandbox";
         public List<SandboxExec> AllExecs { get; } = new();
-        public SandboxExec? CapturedAgyExec => AllExecs.FirstOrDefault(e => e.Argv.Count > 0 && e.Argv[0] == "agy");
+        public SandboxExec? CapturedAgyExec => AllExecs.LastOrDefault(IsAgyWorkInvocation);
 
-        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        public override Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             AllExecs.Add(exec);
+            if (TryHandleStructuredStreamSupportProbeExec(exec) is { } probeResult)
+                return Task.FromResult(probeResult);
+
             if (exec.Argv.Count > 0 && exec.Argv[0] == "tail")
             {
                 return Task.FromResult(new SandboxExecResult(_tailExitCode, _logFileContent, string.Empty));
             }
-            if (exec.Argv.Count > 0 && (exec.Argv[0] == "mkdir" || exec.Argv[0] == "bash"))
+            if (exec.Argv.Count > 0 && (exec.Argv[0] == "mkdir" || exec.Argv[0] == "bash" || exec.Argv[0] == "sh"))
             {
                 return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
             }
             return Task.FromResult(new SandboxExecResult(_agyExitCode, "stdout-response", _agyExitCode == 0 ? string.Empty : "agy failed"));
         }
-
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
-    private sealed class AntigravityCapturingSandbox : ISandbox
+    private sealed class AntigravityCapturingSandbox : AntigravityStructuredProbeSandbox
     {
         private readonly int _prepExitCode;
         private readonly string _prepStderr;
@@ -804,16 +1364,23 @@ public sealed class AntigravityAgentRunnerTests
             _logFileContent = logFileContent;
         }
 
-        public string Id => "fake-antigravity";
+        public override string Id => "fake-antigravity";
         public List<SandboxExec> AllExecs { get; } = new();
-        public SandboxExec? CapturedExec => AllExecs.FirstOrDefault(e => e.Argv.Count > 0 && e.Argv[0] == "agy");
+        public SandboxExec? CapturedExec => AllExecs.LastOrDefault(IsAgyWorkInvocation);
 
-        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        public override Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             AllExecs.Add(exec);
+            if (TryHandleStructuredStreamSupportProbeExec(exec) is { } probeResult)
+                return Task.FromResult(probeResult);
+
             if (exec.Argv.Count > 0 && exec.Argv[0] == "bash")
             {
                 return Task.FromResult(new SandboxExecResult(_prepExitCode, string.Empty, _prepStderr));
+            }
+            if (exec.Argv.Count > 0 && (exec.Argv[0] == "mkdir" || exec.Argv[0] == "sh"))
+            {
+                return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
             }
             if (exec.Argv.Count > 0 && exec.Argv[0] == "tail")
             {
@@ -821,9 +1388,55 @@ public sealed class AntigravityAgentRunnerTests
             }
             return Task.FromResult(new SandboxExecResult(_exitCode, _stdout, _stderr));
         }
-
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
+
+    private sealed class ThrowingStructuredProbeSandbox : AntigravityStructuredProbeSandbox
+    {
+        public override string Id => "fake-throwing-structured-probe";
+        public List<SandboxExec> AllExecs { get; } = new();
+        public SandboxExec? CapturedExec => AllExecs.LastOrDefault(IsAgyWorkInvocation);
+
+        public override Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            AllExecs.Add(exec);
+            if (IsStructuredStreamProbe(exec))
+                throw new IOException("structured probe crashed");
+            if (TryHandleStructuredStreamSupportProbeExec(exec) is { } probeResult)
+                return Task.FromResult(probeResult);
+            if (exec.Argv.Count > 0 && (exec.Argv[0] == "mkdir" || exec.Argv[0] == "bash" || exec.Argv[0] == "sh"))
+                return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
+            if (exec.Argv.Count > 0 && exec.Argv[0] == "tail")
+                return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
+            return Task.FromResult(new SandboxExecResult(0, "plain output", string.Empty));
+        }
+    }
+
+    private sealed class RejectingFileBackedCredentialSandbox : AntigravityStructuredProbeSandbox, IRejectsFileBackedAgentCredentials
+    {
+        public override string Id => "fake-rejecting-file-backed-creds";
+        public string FileBackedAgentCredentialsUnsupportedReason => "test sandbox has persistent home";
+        public List<SandboxExec> AllExecs { get; } = new();
+
+        public override Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            AllExecs.Add(exec);
+            if (TryHandleStructuredStreamSupportProbeExec(exec) is { } probeResult)
+                return Task.FromResult(probeResult);
+            return Task.FromResult(new SandboxExecResult(0, "plain output", string.Empty));
+        }
+    }
+
+    // --input-format (not --print) is what marks a non-interactive agy invocation now.
+    private static bool IsAgyWorkInvocation(SandboxExec exec) =>
+        exec.Argv.Count > 0
+        && exec.Argv[0] == "agy"
+        && exec.Argv.Contains("--input-format")
+        && !IsStructuredStreamProbe(exec);
+
+    // The probe prompt now travels inside an NDJSON frame, so match on containment rather than equality.
+    private static bool IsStructuredStreamProbe(SandboxExec exec) =>
+        exec.Stdin is { } stdin
+        && stdin.Contains(AntigravityAgentRunner.StructuredStreamProbePrompt, StringComparison.Ordinal);
 }
 
 /// <summary>

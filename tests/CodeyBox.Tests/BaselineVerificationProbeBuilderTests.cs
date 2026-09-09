@@ -9,6 +9,7 @@ using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
+using CodeyBox.Sandbox;
 
 namespace CodeyBox.Tests;
 
@@ -300,6 +301,298 @@ public sealed class BaselineVerificationProbeBuilderTests
         Assert.Contains("no credential-independent command", ex.Message);
     }
 
+    [Fact]
+    public void Build_PreservesDepthFirstAuditOrderAndIgnoresReferenceCycles()
+    {
+        var root = new ProjectAuditConfig { AuditAgent = AgentKind.Gemini.Value };
+        var first = new ProjectAuditConfig { AuditAgent = AgentKind.Cursor.Value };
+        var nested = new ProjectAuditConfig { AuditAgent = AgentKind.Opencode.Value };
+        var second = new ProjectAuditConfig { AuditAgent = AgentKind.Copilot.Value };
+        root.Profiles = new Dictionary<string, ProjectAuditConfig>
+        {
+            ["first"] = first,
+            ["second"] = second,
+        };
+        first.Profiles = new Dictionary<string, ProjectAuditConfig> { ["nested"] = nested };
+        nested.Profiles = new Dictionary<string, ProjectAuditConfig> { ["cycle"] = root };
+
+        var commands = BaselineVerificationProbeBuilder.Build(
+            new CodeyBoxOptions(),
+            new ProjectsOptions
+            {
+                Defaults = new ProjectDefaultsConfig { Audit = root },
+            },
+            AllProbes());
+
+        Assert.Equal(
+            [
+                AgentKind.Claude.Value,
+                AgentKind.Gemini.Value,
+                AgentKind.Cursor.Value,
+                AgentKind.Opencode.Value,
+                AgentKind.Copilot.Value,
+            ],
+            commands.Select(command => command.Label));
+    }
+
+    [Fact]
+    public void Build_HandlesDeepCyclicAuditGraphWithoutRecursion()
+    {
+        const int depth = 2000;
+        var root = new ProjectAuditConfig { AuditAgent = AgentKind.Codex.Value };
+        var current = root;
+        for (var i = 1; i < depth; i++)
+        {
+            var child = new ProjectAuditConfig { AuditAgent = AgentKind.Codex.Value };
+            current.Profiles = new Dictionary<string, ProjectAuditConfig> { [$"depth-{i}"] = child };
+            current = child;
+        }
+        current.Profiles = new Dictionary<string, ProjectAuditConfig> { ["cycle"] = root };
+
+        var commands = BaselineVerificationProbeBuilder.Build(
+            new CodeyBoxOptions(),
+            new ProjectsOptions
+            {
+                Defaults = new ProjectDefaultsConfig { Audit = root },
+            },
+            AllProbes());
+
+        Assert.Equal(
+            [AgentKind.Claude.Value, AgentKind.Codex.Value],
+            commands.Select(command => command.Label));
+    }
+
+    [Fact]
+    public void Build_RejectsDeceptiveProbeAndExemptionEnumerablesAtObservedLimit()
+    {
+        var excessiveProbes = new DeceptiveReadOnlyList<IInVmSmokeProbe>(
+            reportedCount: 0,
+            Enumerable.Range(0, BaselineProvisioningLimits.MaximumVerificationCommands + 1)
+                .Select(index => (IInVmSmokeProbe)new StaticProbe(
+                    $"probe-{index}",
+                    [new InVmSmokeStep(["true"])]))
+                .ToArray());
+
+        var probeFailure = Assert.Throws<InvalidOperationException>(() =>
+            BaselineVerificationProbeBuilder.Build(
+                new CodeyBoxOptions(),
+                new ProjectsOptions(),
+                excessiveProbes));
+
+        Assert.Contains("more than 64 in-VM probes", probeFailure.Message, StringComparison.Ordinal);
+        Assert.Equal(BaselineProvisioningLimits.MaximumVerificationCommands + 1, excessiveProbes.EnumeratedCount);
+
+        var excessiveExemptions = new DeceptiveReadOnlyList<string>(
+            reportedCount: 0,
+            Enumerable.Range(0, BaselineProvisioningLimits.MaximumVerificationCommands + 1)
+                .Select(index => $"exempt-{index}")
+                .ToArray());
+
+        var exemptionFailure = Assert.Throws<InvalidOperationException>(() =>
+            BaselineVerificationProbeBuilder.Build(
+                new CodeyBoxOptions(),
+                new ProjectsOptions(),
+                AllProbes(),
+                new InVmSmokeOptions { ExemptAgentsWithoutProbe = excessiveExemptions }));
+
+        Assert.Contains("more than 64 exempt agents", exemptionFailure.Message, StringComparison.Ordinal);
+        Assert.Equal(BaselineProvisioningLimits.MaximumVerificationCommands + 1, excessiveExemptions.EnumeratedCount);
+    }
+
+    [Fact]
+    public void Build_RejectsDuplicateProbeEnumerableWithoutUnboundedEnumeration()
+    {
+        var duplicateProbes = new DeceptiveReadOnlyList<IInVmSmokeProbe>(
+            reportedCount: 0,
+            Enumerable.Range(0, BaselineProvisioningLimits.MaximumVerificationCommands + 1)
+                .Select(_ => (IInVmSmokeProbe)new StaticProbe(
+                    "duplicate",
+                    [new InVmSmokeStep(["true"])]))
+                .ToArray());
+
+        var failure = Assert.Throws<InvalidOperationException>(() =>
+            BaselineVerificationProbeBuilder.Build(
+                new CodeyBoxOptions(),
+                new ProjectsOptions(),
+                duplicateProbes));
+
+        Assert.Contains("duplicate in-VM probes", failure.Message, StringComparison.Ordinal);
+        Assert.Equal(2, duplicateProbes.EnumeratedCount);
+    }
+
+    [Fact]
+    public void Build_BoundsInspectedProbeStepsWithoutTrustingCount()
+    {
+        var steps = new DeceptiveReadOnlyList<InVmSmokeStep>(
+            reportedCount: 0,
+            Enumerable.Range(0, BaselineProvisioningLimits.MaximumVerificationCommands + 1)
+                .Select(_ => new InVmSmokeStep(["custom", "status"], Stdin: "credential"))
+                .ToArray());
+        var options = new CodeyBoxOptions
+        {
+            AgentClasses =
+            [
+                new AgentClassOptions
+                {
+                    Id = "custom",
+                    Members = [new AgentMembershipOptions { Agent = "custom" }],
+                },
+            ],
+        };
+
+        var failure = Assert.Throws<InvalidOperationException>(() =>
+            BaselineVerificationProbeBuilder.Build(
+                options,
+                new ProjectsOptions(),
+                [new StaticProbe("custom", steps)]));
+
+        Assert.Contains("more than 64 steps", failure.Message, StringComparison.Ordinal);
+        Assert.Equal(BaselineProvisioningLimits.MaximumVerificationCommands + 1, steps.EnumeratedCount);
+    }
+
+    [Fact]
+    public void Build_CountsDuplicateConfiguredAgentsAgainstInspectionBudget()
+    {
+        var options = new CodeyBoxOptions
+        {
+            AgentClasses =
+            [
+                new AgentClassOptions
+                {
+                    Id = "oversized",
+                    Members = Enumerable
+                        .Repeat(
+                            new AgentMembershipOptions { Agent = AgentKind.Claude.Value },
+                            BaselineVerificationProbeBuilder.MaximumConfigurationEntriesInspected)
+                        .ToList(),
+                },
+            ],
+        };
+
+        var failure = Assert.Throws<InvalidOperationException>(() =>
+            BaselineVerificationProbeBuilder.Build(options, new ProjectsOptions(), AllProbes()));
+
+        Assert.Contains(
+            $"more than {BaselineVerificationProbeBuilder.MaximumConfigurationEntriesInspected} configured entries",
+            failure.Message,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Build_SnapshotsValidUnicodeArgvAndRejectsUtf8Overflow()
+    {
+        var unicode = new string('\u00e9', 2048);
+        var argv = new List<string> { "custom", unicode };
+        var options = OptionsForAgent("custom");
+
+        var commands = BaselineVerificationProbeBuilder.Build(
+            options,
+            new ProjectsOptions(),
+            [
+                new StaticProbe("custom", [new InVmSmokeStep(argv)]),
+                new ClaudeInVmSmokeProbe(),
+            ]);
+        argv[1] = "changed";
+
+        Assert.Equal(unicode, commands[0].Argv[1]);
+
+        var overflow = new string('\u00e9', 2049);
+        var failure = Assert.Throws<InvalidOperationException>(() =>
+            BaselineVerificationProbeBuilder.Build(
+                options,
+                new ProjectsOptions(),
+                [
+                    new StaticProbe("custom", [new InVmSmokeStep(["custom", overflow])]),
+                    new ClaudeInVmSmokeProbe(),
+                ]));
+        Assert.Contains("4096 UTF-8 bytes", failure.Message, StringComparison.Ordinal);
+
+        var invalidUnicode = Assert.Throws<InvalidOperationException>(() =>
+            BaselineVerificationProbeBuilder.Build(
+                options,
+                new ProjectsOptions(),
+                [
+                    new StaticProbe("custom", [new InVmSmokeStep(["custom", "\ud800"])]),
+                    new ClaudeInVmSmokeProbe(),
+                ]));
+        Assert.Contains("not valid Unicode", invalidUnicode.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Build_RejectsControlCharactersAndOversizedFailureHint()
+    {
+        var options = OptionsForAgent("custom");
+
+        var controlFailure = Assert.Throws<InvalidOperationException>(() =>
+            BaselineVerificationProbeBuilder.Build(
+                options,
+                new ProjectsOptions(),
+                [
+                    new StaticProbe("custom", [new InVmSmokeStep(["custom", "bad\nargument"])]),
+                    new ClaudeInVmSmokeProbe(),
+                ]));
+        Assert.Contains("control characters", controlFailure.Message, StringComparison.Ordinal);
+
+        var hintFailure = Assert.Throws<InvalidOperationException>(() =>
+            BaselineVerificationProbeBuilder.Build(
+                options,
+                new ProjectsOptions(),
+                [
+                    new StaticProbe(
+                        "custom",
+                        [new InVmSmokeStep(["custom", "--version"], FailureHint: new string('h', 4097))]),
+                    new ClaudeInVmSmokeProbe(),
+                ]));
+        Assert.Contains("failure hint", hintFailure.Message, StringComparison.Ordinal);
+        Assert.Contains("4096 UTF-8 bytes", hintFailure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Build_RejectsAggregateVerificationTextAboveSharedLimit()
+    {
+        var members = Enumerable
+            .Range(0, BaselineProvisioningLimits.MaximumVerificationCommands - 1)
+            .Select(index => new AgentMembershipOptions { Agent = $"custom-{index}" })
+            .ToList();
+        var options = new CodeyBoxOptions
+        {
+            AgentClasses = [new AgentClassOptions { Id = "aggregate", Members = members }],
+        };
+        var largeArgument = new string('a', BaselineProvisioningLimits.MaximumVerificationTextUtf8Bytes);
+        var probes = members
+            .Select(member => (IInVmSmokeProbe)new StaticProbe(
+                member.Agent,
+                [
+                    new InVmSmokeStep(
+                        [member.Agent, largeArgument],
+                        FailureHint: new string('h', 100)),
+                ]))
+            .Append(new ClaudeInVmSmokeProbe())
+            .ToArray();
+
+        var failure = Assert.Throws<InvalidOperationException>(() =>
+            BaselineVerificationProbeBuilder.Build(options, new ProjectsOptions(), probes));
+
+        Assert.Contains(
+            BaselineProvisioningLimits.MaximumAggregateVerificationTextUtf8Bytes.ToString(
+                System.Globalization.CultureInfo.InvariantCulture),
+            failure.Message,
+            StringComparison.Ordinal);
+        Assert.Contains("in aggregate", failure.Message, StringComparison.Ordinal);
+    }
+
+    private static CodeyBoxOptions OptionsForAgent(string agent) => new()
+    {
+        AgentClasses =
+        [
+            new AgentClassOptions
+            {
+                Id = "custom",
+                Members = [new AgentMembershipOptions { Agent = agent }],
+            },
+        ],
+    };
+
     private static IReadOnlyList<IInVmSmokeProbe> AllProbes() =>
     [
         new ClaudeInVmSmokeProbe(),
@@ -319,5 +612,34 @@ public sealed class BaselineVerificationProbeBuilderTests
         [
             new(["aider", "status"], Stdin: "{}"),
         ];
+    }
+
+    private sealed class StaticProbe(
+        string kind,
+        IReadOnlyList<InVmSmokeStep> steps) : IInVmSmokeProbe
+    {
+        public AgentKind Kind => new(kind);
+
+        public IReadOnlyList<InVmSmokeStep> BuildSteps(AgentCredential? credential) => steps;
+    }
+
+    private sealed class DeceptiveReadOnlyList<T>(
+        int reportedCount,
+        IReadOnlyList<T> values) : IReadOnlyList<T>
+    {
+        public int Count => reportedCount;
+        public T this[int index] => values[index];
+        internal int EnumeratedCount { get; private set; }
+
+        public IEnumerator<T> GetEnumerator()
+        {
+            foreach (var value in values)
+            {
+                EnumeratedCount++;
+                yield return value;
+            }
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
     }
 }

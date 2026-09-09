@@ -3,6 +3,7 @@ using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.HostProcess;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Multipass;
 using CodeyBox.Tests.Uat.SandboxProviders;
 
@@ -139,13 +140,13 @@ public sealed class MultipassBaselinePinningTests : IDisposable
         var noProbe = MakeOptions(["touch /opt/codeybox-hash"]);
         var withProbe = MakeOptions(
             ["touch /opt/codeybox-hash"],
-            [new MultipassBaselineVerificationCommand("antigravity", ["agy", "--version"], "agy missing")]);
+            [new BaselineVerificationCommand("antigravity", ["agy", "--version"], "agy missing")]);
         var withChangedArgv = MakeOptions(
             ["touch /opt/codeybox-hash"],
-            [new MultipassBaselineVerificationCommand("antigravity", ["agy", "version"], "agy missing")]);
+            [new BaselineVerificationCommand("antigravity", ["agy", "version"], "agy missing")]);
         var withChangedHint = MakeOptions(
             ["touch /opt/codeybox-hash"],
-            [new MultipassBaselineVerificationCommand("antigravity", ["agy", "--version"], "agy not runnable")]);
+            [new BaselineVerificationCommand("antigravity", ["agy", "--version"], "agy not runnable")]);
 
         var noProbeName = MultipassSandboxProvider.ComposeBaselineNameFromLiveConfig(
             noProbe, "claude", SandboxProfileFlavor.Headless);
@@ -333,7 +334,7 @@ public sealed class MultipassBaselinePinningTests : IDisposable
                 ["touch /opt/codeybox-antigravity"],
                 baselineVerificationCommands:
                 [
-                    new MultipassBaselineVerificationCommand(
+                    new BaselineVerificationCommand(
                         "antigravity",
                         ["agy", "--version"],
                         "agy binary not runnable on sandbox PATH"),
@@ -391,11 +392,11 @@ public sealed class MultipassBaselinePinningTests : IDisposable
                 ["touch /opt/codeybox-multiple-verification"],
                 baselineVerificationCommands:
                 [
-                    new MultipassBaselineVerificationCommand(
+                    new BaselineVerificationCommand(
                         "antigravity",
                         ["agy", "--version"],
                         "agy binary not runnable on sandbox PATH"),
-                    new MultipassBaselineVerificationCommand(
+                    new BaselineVerificationCommand(
                         "codex",
                         ["codex", "--version"],
                         "codex binary not runnable on sandbox PATH"),
@@ -451,7 +452,7 @@ public sealed class MultipassBaselinePinningTests : IDisposable
                 ["touch /opt/codeybox-antigravity-fail"],
                 baselineVerificationCommands:
                 [
-                    new MultipassBaselineVerificationCommand(
+                    new BaselineVerificationCommand(
                         "antigravity",
                         ["agy", "--version"],
                         "agy binary not runnable on sandbox PATH"),
@@ -503,7 +504,7 @@ public sealed class MultipassBaselinePinningTests : IDisposable
                 ["touch /opt/codeybox-antigravity-hintless"],
                 baselineVerificationCommands:
                 [
-                    new MultipassBaselineVerificationCommand(
+                    new BaselineVerificationCommand(
                         "antigravity",
                         ["agy", "--version"],
                         FailureHint: hint),
@@ -538,7 +539,7 @@ public sealed class MultipassBaselinePinningTests : IDisposable
         var provider = new MultipassSandboxProvider(
             MakeOptions(
                 ["touch /opt/codeybox-empty-probe"],
-                baselineVerificationCommands: [new MultipassBaselineVerificationCommand("broken", [])]),
+                baselineVerificationCommands: [new BaselineVerificationCommand("broken", [])]),
             NullLogger<MultipassSandboxProvider>.Instance,
             null,
             runner);
@@ -632,7 +633,7 @@ public sealed class MultipassBaselinePinningTests : IDisposable
 
     private MultipassSandboxOptions MakeOptions(
         IReadOnlyList<string> extraRuncmd,
-        IReadOnlyList<MultipassBaselineVerificationCommand>? baselineVerificationCommands = null) => new()
+        IReadOnlyList<BaselineVerificationCommand>? baselineVerificationCommands = null) => new()
         {
             MultipassBinary = "/bin/false",
             StagingDirectory = Path.Combine(_workspace, "staging-" + Guid.NewGuid().ToString("N")),

@@ -103,6 +103,16 @@ public static class CredentialFileTokenExtractor
         return null;
     }
 
+    /// <summary>
+    /// Extracts an Anthropic API key from a CrockCode <c>config.json</c>
+    /// payload of shape <c>{ "anthropic_api_key": "sk-…", "tunnel_provider": "…" }</c>.
+    /// Tolerant of leading/trailing whitespace and the camelCase /
+    /// SCREAMING_SNAKE_CASE variants operators sometimes hand-write. Returns
+    /// null on any parse failure or when the key is missing/blank.
+    /// </summary>
+    public static string? ExtractCrockAnthropicApiKey(string? rawContents)
+        => CodeyBox.Agents.CrockConfigParser.TryGetAnthropicApiKey(rawContents);
+
     public static string? ExtractGeminiAccessToken(string? rawContents)
     {
         if (string.IsNullOrWhiteSpace(rawContents))
@@ -175,6 +185,55 @@ public static class CredentialFileTokenExtractor
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// Reads the access token out of an Antigravity (<c>agy</c>) OAuth bundle, accepting both the
+    /// native nested shape (<c>{"token":{"access_token":…}}</c>) and the legacy flat shape
+    /// (<c>{"access_token":…}</c>). Returns null when absent or unparseable.
+    /// </summary>
+    /// <remarks>
+    /// This exists because <see cref="ExtractGeminiAccessToken"/> only understands the flat shape the
+    /// gemini CLI writes. Pointing it at an agy bundle silently returns null, which the quota probe
+    /// reports as "no token configured" and the router then treats as an UNKNOWN reading — so agy was
+    /// dispatched with no quota gate at all rather than failing visibly. The two CLIs share
+    /// Sign-in-with-Google but not this file layout.
+    /// </remarks>
+    public static string? ExtractAntigravityAccessToken(string? rawContents)
+    {
+        if (string.IsNullOrWhiteSpace(rawContents))
+            return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(rawContents);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+                return null;
+
+            // Native agy shape: token.access_token.
+            if (root.TryGetProperty("token", out var tok)
+                && tok.ValueKind == JsonValueKind.Object
+                && tok.TryGetProperty("access_token", out var nested)
+                && nested.ValueKind == JsonValueKind.String
+                && nested.GetString() is { Length: > 0 } nestedToken)
+            {
+                return nestedToken;
+            }
+
+            // Legacy flat shape: top-level access_token.
+            if (root.TryGetProperty("access_token", out var flat)
+                && flat.ValueKind == JsonValueKind.String
+                && flat.GetString() is { Length: > 0 } flatToken)
+            {
+                return flatToken;
+            }
+        }
+        catch (JsonException)
+        {
+        }
+
+        return null;
     }
 
     private static bool HasNonEmptyAntigravityAccessToken(JsonElement root)

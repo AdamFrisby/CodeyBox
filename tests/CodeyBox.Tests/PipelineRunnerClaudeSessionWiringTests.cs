@@ -2,6 +2,8 @@ using System.Collections.Concurrent;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Sandbox;
+using CodeyBox.Sandbox.Process;
 using Microsoft.Extensions.Logging.Abstractions;
 using Serilog;
 
@@ -454,6 +456,8 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
             new AuditOutcome(false, [new AuditFinding("Lint", AuditSeverity.Error, "needs fix", "x")]),
             new AuditOutcome(true, []),
         ]);
+        var sandboxProvider = new SpecRecordingSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
 
         using var tp = TestSupport.BuildPipeline(
             _workspace,
@@ -461,7 +465,8 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
             auditors: [auditor],
             projectRepository: new InMemoryProjectRepository(project),
             claudeSessionOptions: new ClaudeSessionWorkerOptions { Enabled = true },
-            sessionAgentRunnerOverride: sessionRunner);
+            sessionAgentRunnerOverride: sessionRunner,
+            sandboxProvider: sandboxProvider);
 
         var item = NewItem();
         await tp.Store.CreateAsync(item);
@@ -473,6 +478,14 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
         // Exactly ONE session was opened — the lifecycle is shared across
         // work + rework, not a fresh session per phase.
         Assert.Equal(1, sessionRunner.OpenedSessions);
+        var sessionSandboxSpec = Assert.Single(
+            sandboxProvider.Specs,
+            spec => spec.TimingPhase == "work");
+        Assert.Contains(
+            sessionSandboxSpec.Mounts,
+            mount => mount.Tmpfs
+                && mount.SandboxPath == SandboxConventions.AgentTurnScratchpadDir
+                && mount.SizeBytes == SandboxConventions.AgentTurnScratchpadTmpfsBytes);
 
         // Exactly TWO worker turns ran on it (work + one rework).
         Assert.Equal(2, sessionRunner.SendTurns);
@@ -764,7 +777,9 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
         await tp.Pipeline.RunAsync(item, CancellationToken.None);
 
         var final = await tp.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.True(
+            final!.State == WorkItemState.Done,
+            $"Expected same-kind fallback success; state={final.State}, failure={final.FailureKind}, error={final.LastError}");
         Assert.Equal(1, sessionRunner.SendTurns);
         Assert.Equal(1, sessionRunner.CloseCalls);
         Assert.Equal(0, sessionRunner.SuspendCalls);
@@ -874,6 +889,28 @@ public sealed class PipelineRunnerClaudeSessionWiringTests : IDisposable
     // ─── test doubles ─────────────────────────────────────────────────────
 
     private sealed record RecordingFileWrite(string FileName, string Contents);
+
+    private sealed class SpecRecordingSandboxProvider : ISandboxProvider
+    {
+        private readonly ISandboxProvider _inner;
+
+        public SpecRecordingSandboxProvider(ISandboxProvider inner) => _inner = inner;
+
+        public string Name => _inner.Name;
+        public List<SandboxSpec> Specs { get; } = [];
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            Specs.Add(spec);
+            return _inner.CreateAsync(spec, ct);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            _inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) =>
+            _inner.DisposeLeakedAsync(name, ct);
+    }
 
     /// <summary>
     /// In-memory <see cref="ISessionAgentRunner"/> that records every

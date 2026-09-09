@@ -15,6 +15,9 @@ namespace CodeyBox.Cli;
 [JsonSerializable(typeof(ReorderRequest))]
 [JsonSerializable(typeof(PutPromptRequest))]
 [JsonSerializable(typeof(PatchPriorityRequest))]
+[JsonSerializable(typeof(AnswerQuestionRequest))]
+[JsonSerializable(typeof(DismissQuestionRequest))]
+[JsonSerializable(typeof(StdoutTailDto))]
 [JsonSourceGenerationOptions(
     PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,

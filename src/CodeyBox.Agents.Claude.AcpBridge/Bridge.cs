@@ -4,7 +4,6 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
@@ -23,7 +22,9 @@ internal sealed class Bridge : IAsyncDisposable
     private const int SignalInterrupt = 2;
     private const int SignalKill = 9;
     private const int SignalTerm = 15;
-    private const int ClaudeSigtermGraceMilliseconds = 1500;
+    private const int AuthTokenBytes = 24;
+    private const string SystemRandomDevice = "/dev/urandom";
+    private const int ClaudeSigtermGraceMilliseconds = 5000;
     private const int ClaudeSigkillWaitMilliseconds = 500;
     // Starts after Shutdown has already run; this is only the final grace for
     // a signal-interrupted stdin read to unwind cooperatively.
@@ -166,7 +167,20 @@ internal sealed class Bridge : IAsyncDisposable
             try { line = await stdin.ReadLineAsync(ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { return; }
             catch (ObjectDisposedException) { return; }
-            catch (IOException) when (ShutdownStarted) { return; }
+            // Shutdown() (posix signal, ProcessExit, claude-exited, turn deadline,
+            // peer-closed) disposes _stdinStream (Bridge.cs Shutdown) to unblock
+            // this in-flight read. Tearing down a StreamReader/FileStream mid
+            // ReadLineAsync is not thread-safe: besides IOException it can surface
+            // other exception types from torn async-buffer state under load — e.g.
+            // NotSupportedException ("Stream does not support reading") from
+            // ConsoleStream.ValidateRead when a queued read observes the closed
+            // stream, or InvalidOperationException from a racing async-buffer
+            // swap. Once shutdown or cancellation is in progress the unread line
+            // is irrelevant, so treat ANY such fault as expected teardown and stop
+            // reading — never let it escape RunAsync -> Main -> CoreCLR abort()
+            // (SIGABRT / exit 134). Genuine read faults outside shutdown still
+            // propagate.
+            catch (Exception) when (ShutdownStarted || ct.IsCancellationRequested) { return; }
             if (line is null) return; // EOF
             if (line.Length == 0) continue;
             DispatchEnvelope(line);
@@ -218,7 +232,7 @@ internal sealed class Bridge : IAsyncDisposable
         // the WebSocket handshake guard can never observe an empty
         // _authToken (which would short-circuit the check). Cheap, eliminates
         // the local race window.
-        _authToken = Convert.ToHexString(RandomNumberGenerator.GetBytes(24)).ToLowerInvariant();
+        _authToken = CreateAuthToken();
 
         try
         {
@@ -253,6 +267,20 @@ internal sealed class Bridge : IAsyncDisposable
     }
 
     private static TcpListener CreateLoopbackListener() => new(IPAddress.Loopback, 0);
+
+    private static string CreateAuthToken()
+    {
+        Span<byte> bytes = stackalloc byte[AuthTokenBytes];
+        using var random = new FileStream(
+            SystemRandomDevice,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            bufferSize: 1,
+            FileOptions.None);
+        random.ReadExactly(bytes);
+        return Convert.ToHexString(bytes).ToLowerInvariant();
+    }
 
     private async Task AcceptLoopAsync(CancellationToken ct)
     {
@@ -511,6 +539,11 @@ internal sealed class Bridge : IAsyncDisposable
         // any peer so the WebSocket handshake guard cannot see an empty
         // value during a connect/auth race.
         _lockPath = Path.Combine(baseDir, _port + ".lock");
+        if (ShutdownStarted)
+        {
+            DeleteLockfile();
+            return;
+        }
 
         var bytes = BridgePayloads.BuildLockfileBytes(
             Environment.ProcessId, _config.WorkingDirectory, _authToken ?? string.Empty, _port);
@@ -523,6 +556,9 @@ internal sealed class Bridge : IAsyncDisposable
             Fatal("lockfile_write_failed", ex.Message);
             return;
         }
+
+        if (ShutdownStarted)
+            DeleteLockfile();
     }
 
     private void EmitReady()
@@ -764,22 +800,7 @@ internal sealed class Bridge : IAsyncDisposable
         try { _turnDeadline?.Dispose(); } catch { }
 
         // CRITICAL: Delete the lockfile first to prevent any leak if we get terminated early.
-        if (_lockPath is not null)
-        {
-            try
-            {
-                File.Delete(_lockPath);
-            }
-            catch (Exception ex)
-            {
-                Emitter.Emit("lockfile_delete_failed", w =>
-                {
-                    w.WriteString("path", _lockPath);
-                    w.WriteString("exception", ex.GetType().FullName);
-                    w.WriteString("message", ex.Message);
-                });
-            }
-        }
+        DeleteLockfile();
 
         // Clean up connections and streams to immediately unblock the main thread's stdin read
         WebSocketConnection? peerToClose;
@@ -803,6 +824,25 @@ internal sealed class Bridge : IAsyncDisposable
         catch { }
 
         try { _cts.Cancel(); } catch { }
+    }
+
+    private void DeleteLockfile()
+    {
+        var lockPath = Volatile.Read(ref _lockPath);
+        if (string.IsNullOrEmpty(lockPath)) return;
+        try
+        {
+            File.Delete(lockPath);
+        }
+        catch (Exception ex)
+        {
+            Emitter.Emit("lockfile_delete_failed", w =>
+            {
+                w.WriteString("path", lockPath);
+                w.WriteString("exception", ex.GetType().FullName);
+                w.WriteString("message", ex.Message);
+            });
+        }
     }
 
     private static bool HasProcessExited(Process proc)
@@ -856,10 +896,9 @@ internal sealed class Bridge : IAsyncDisposable
 
         if (politeSent)
         {
-            // Brief grace window so claude can flush ~/.claude/projects/<slug>/<session>.jsonl
-            // before exiting. 1.5s is well under any operator-visible
-            // teardown latency while comfortably covering the JSONL flush
-            // path; if claude is wedged we still SIGKILL below.
+            // Grace window so claude can flush ~/.claude/projects/<slug>/<session>.jsonl
+            // before exiting. Bounded so a wedged child can't pin shutdown — if
+            // the window elapses we still SIGKILL below.
             try { p.WaitForExit(milliseconds: ClaudeSigtermGraceMilliseconds); }
             catch { /* WaitForExit can throw if the handle is racing dispose */ }
         }

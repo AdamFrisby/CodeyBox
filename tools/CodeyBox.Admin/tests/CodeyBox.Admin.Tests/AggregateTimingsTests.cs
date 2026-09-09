@@ -5,7 +5,7 @@ using CodeyBox.Admin.Web.Services;
 
 namespace CodeyBox.Admin.Tests;
 
-public sealed class AggregateTimingsTests : TestContext
+public sealed class AggregateTimingsTests : BunitContext
 {
     [Fact]
     public void AggregateTimings_ShowsWorkItemCount()
@@ -18,7 +18,7 @@ public sealed class AggregateTimingsTests : TestContext
         };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<CodeyBox.Admin.Web.Components.Pages.AggregateTimings>();
+        var cut = Render<CodeyBox.Admin.Web.Components.Pages.AggregateTimings>();
 
         Assert.Contains("42", cut.Markup);
     }
@@ -30,7 +30,7 @@ public sealed class AggregateTimingsTests : TestContext
         fake.AggregateTimingsOverride = new AggregateTimingsDto { WorkItemCount = 0, StepStats = [] };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<CodeyBox.Admin.Web.Components.Pages.AggregateTimings>();
+        var cut = Render<CodeyBox.Admin.Web.Components.Pages.AggregateTimings>();
 
         Assert.Contains("No completed timing data", cut.Markup);
     }
@@ -50,7 +50,7 @@ public sealed class AggregateTimingsTests : TestContext
         };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<CodeyBox.Admin.Web.Components.Pages.AggregateTimings>();
+        var cut = Render<CodeyBox.Admin.Web.Components.Pages.AggregateTimings>();
 
         Assert.Contains("aggregate-timings-table", cut.Markup);
         Assert.Contains("agent.exec", cut.Markup);
@@ -65,7 +65,7 @@ public sealed class AggregateTimingsTests : TestContext
         fake.AggregateTimingsOverride = new AggregateTimingsDto { WorkItemCount = 0, StepStats = [] };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<CodeyBox.Admin.Web.Components.Pages.AggregateTimings>();
+        var cut = Render<CodeyBox.Admin.Web.Components.Pages.AggregateTimings>();
 
         Assert.Contains("Refresh", cut.Markup);
     }

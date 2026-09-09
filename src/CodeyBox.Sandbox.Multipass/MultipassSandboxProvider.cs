@@ -1,6 +1,9 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -38,7 +41,7 @@ namespace CodeyBox.Sandbox.Multipass;
 /// any in-guest enforcement is voluntary and a compromised agent with
 /// sudo could flush it, so we don't pretend it's a boundary.
 /// See <c>scripts/setup-host-networks.sh</c> and
-/// <c>docs/host-firewall.md</c>.</para>
+/// <c>docs/operating/host-firewall.md</c>.</para>
 ///
 /// <para><b>Image:</b> defaults to Multipass's current LTS Ubuntu image.
 /// The agent CLI binaries (claude, codex, etc.) need to be installed in
@@ -49,6 +52,10 @@ namespace CodeyBox.Sandbox.Multipass;
 /// </summary>
 public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxProvider, IActiveSandboxProgressProvider, IDiskGuardedSandboxProvider, ISuspendingSandboxProvider, IBaselineImageResolver, IBaselineImageProvisioner, IResourceMetricsCapturingProvider
 {
+    public const string ProviderId = "multipass";
+
+    private const string PurposeMarkerFile = ".codeybox-purpose";
+
     // Options are resolved through a delegate once per public operation so an
     // operator can edit ExtraRuncmd / ExtraCloudInit / NetworkProfiles /
     // UseBaselineImages in appsettings.json and have the change land on the next
@@ -64,6 +71,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     private readonly ITimingStore? _timings;
     private readonly ISandboxResourceUsageStore? _resourceUsageStore;
     private readonly IDiskSpaceProbe _diskProbe;
+    private readonly Func<string, Ipv4Subnet?> _bridgeSubnetResolver;
     // Per-baseline-name semaphore: serialises bake operations so two
     // concurrent CreateAsync calls for the same profile don't both try to
     // launch the same baseline VM. Lazily populated.
@@ -117,6 +125,29 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     private SemaphoreSlim? _bootGate;
     private int _bootGateCapacity;
 
+    internal readonly record struct Ipv4Subnet(IPAddress Address, IPAddress Mask)
+    {
+        public bool Contains(string candidate)
+            => IPAddress.TryParse(candidate, out var parsed)
+                && parsed.AddressFamily == AddressFamily.InterNetwork
+                && Contains(parsed);
+
+        public bool Contains(IPAddress candidate)
+        {
+            if (candidate.AddressFamily != AddressFamily.InterNetwork)
+                return false;
+            var candidateBytes = candidate.GetAddressBytes();
+            var addressBytes = Address.GetAddressBytes();
+            var maskBytes = Mask.GetAddressBytes();
+            if (candidateBytes.Length != 4 || addressBytes.Length != 4 || maskBytes.Length != 4)
+                return false;
+            for (var i = 0; i < 4; i++)
+                if ((candidateBytes[i] & maskBytes[i]) != (addressBytes[i] & maskBytes[i]))
+                    return false;
+            return true;
+        }
+    }
+
     public MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log,
         ITimingStore? timings = null, ISandboxResourceUsageStore? resourceUsageStore = null)
         : this(() => opts, log, timings, new DefaultProcessRunner(), resourceUsageStore: resourceUsageStore)
@@ -132,8 +163,10 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
 
     internal MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log,
         ITimingStore? timings, IProcessRunner runner, MultipassDaemonRetryPolicy? daemonRetryPolicy = null,
-        IDiskSpaceProbe? diskProbe = null, ISandboxResourceUsageStore? resourceUsageStore = null)
-        : this(() => opts, log, timings, runner, daemonRetryPolicy, diskProbe, resourceUsageStore)
+        IDiskSpaceProbe? diskProbe = null,
+        ISandboxResourceUsageStore? resourceUsageStore = null,
+        Func<string, Ipv4Subnet?>? bridgeSubnetResolver = null)
+        : this(() => opts, log, timings, runner, daemonRetryPolicy, diskProbe, resourceUsageStore, bridgeSubnetResolver)
     {
     }
 
@@ -141,7 +174,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         ILogger<MultipassSandboxProvider> log, ITimingStore? timings, IProcessRunner runner,
         MultipassDaemonRetryPolicy? daemonRetryPolicy = null,
         IDiskSpaceProbe? diskProbe = null,
-        ISandboxResourceUsageStore? resourceUsageStore = null)
+        ISandboxResourceUsageStore? resourceUsageStore = null,
+        Func<string, Ipv4Subnet?>? bridgeSubnetResolver = null)
     {
         _optsAccessor = optionsAccessor;
         _log = log;
@@ -150,6 +184,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         _timings = timings;
         _resourceUsageStore = resourceUsageStore;
         _diskProbe = diskProbe ?? new DefaultDiskSpaceProbe();
+        _bridgeSubnetResolver = bridgeSubnetResolver ?? TryResolveBridgeSubnet;
         // StagingDirectory is captured once: the provider keeps the directory open
         // for the lifetime of the process. Re-binding it at runtime would orphan
         // already-staged sandboxes.
@@ -201,7 +236,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         return Path.Combine(Path.GetTempPath(), "codeybox-mp-staging");
     }
 
-    public string Name => "multipass";
+    public string Name => ProviderId;
+    public SandboxIsolationLevel IsolationLevel => SandboxIsolationLevel.DedicatedKernel;
     // HTTP ingest and detached launch are spec-dependent: the concrete sandbox
     // advertises them only when its network profile resolves to a host bridge.
     public SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.ExecPipe;
@@ -317,6 +353,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
 
         try
         {
+            await WriteSandboxPurposeMarkerAsync(sandboxRoot, spec.Purpose, ct).ConfigureAwait(false);
+
             // Track ownership before the VM becomes host-visible. A slow launch,
             // clone, cloud-init wait, mount, or environment transfer can overlap a
             // leak-reaper sweep; once multipass lists this name, it must already be
@@ -415,6 +453,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
 
             await TransferEnvAsync(opts, name, spec.Environment, sandboxRoot, workItemId, ct);
             AuditLog.SandboxCreated(name, spec.Network.ProfileName);
+            var hostAddress = await ResolveSandboxHostAddressAsync(opts, name, spec.Network.ProfileName, workItemId, ct).ConfigureAwait(false);
             // The exec wrapper is installed by cloud-init at boot
             // (see BuildCloudInit's write_files); on the clone path it's
             // already baked into the source VM's filesystem, so the clone
@@ -433,7 +472,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                 // multipass daemon.
                 opGateAcquirer: (argv, ct) => EnterMultipassOpGateAsync(ReadOptions(), argv, ct),
                 resourceUsageStore: _resourceUsageStore,
-                baselineRef: clonedFromBaselineRef);
+                baselineRef: clonedFromBaselineRef,
+                hostAddress: hostAddress);
             // Register in the owner index ONLY when a work-item ID is present.
             // Sandboxes created without one (some tests) have no orchestrator-side
             // owner to suspend back into, so skip them.
@@ -758,17 +798,49 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
 
         // Single sh -c so a mid-script failure short-circuits via `set -e`
         // instead of (e.g.) pushing a stale HEAD when the commit failed. The
-        // scratchpad touch mirrors CheckpointPreemptAsync so the resumable
-        // agent runner always finds a non-empty .codeybox/preempt-scratchpad.md
-        // to restore from. `--allow-empty` lets the push succeed even when
-        // the agent had no dirty changes left after its in-VM exit.
-        var script = $@"set -e
-cd {ShellSingleQuote(workingDir)}
-mkdir -p .codeybox
-test -f .codeybox/preempt-scratchpad.md || printf '%s\n' 'No CLI scratchpad was captured before suspend-resume.' > .codeybox/preempt-scratchpad.md
-git add -A
-git commit --allow-empty -m {ShellSingleQuote(commitMessage)}
-git push origin HEAD:{refName}";
+        // Provider session state lives only in the dedicated private scratchpad
+        // mount. Strip and positively guard the legacy repository-local names
+        // before pushing this recovery ref. `--allow-empty` lets the push
+        // succeed even when the agent had no dirty changes left after its
+        // in-VM exit.
+        const string reservedTreeFilter = """
+            import sys
+            prefixes = tuple(value.encode("utf-8") for value in sys.argv[1:])
+            buffered = bytearray()
+            entries = 0
+            found = False
+            while True:
+                chunk = sys.stdin.buffer.read(65536)
+                if not chunk:
+                    break
+                buffered.extend(chunk)
+                while True:
+                    separator = buffered.find(0)
+                    if separator < 0:
+                        if len(buffered) > 4096:
+                            raise ValueError("Git tree path exceeds guard limit")
+                        break
+                    path = bytes(buffered[:separator])
+                    del buffered[:separator + 1]
+                    entries += 1
+                    if entries > 100000 or len(path) > 4096:
+                        raise ValueError("Git tree exceeds guard limits")
+                    found = found or path.startswith(prefixes)
+            if buffered:
+                raise ValueError("Git tree path stream was not NUL terminated")
+            if found:
+                raise SystemExit(1)
+            """;
+        var script = $$"""
+            set -euo pipefail
+            cd {{ShellSingleQuote(workingDir)}}
+            git add -A
+            git rm -r --cached --ignore-unmatch -- ':(glob){{AgentTurnScratchpadArchive.LegacyCapturePrefix}}*' ':(glob){{AgentTurnScratchpadArchive.LegacyCapturePrefix}}*/**' ':(glob){{AgentTurnScratchpadArchive.LegacyRestorePrefix}}*' ':(glob){{AgentTurnScratchpadArchive.LegacyRestorePrefix}}*/**'
+            test -z "$(git ls-files --cached -- ':(glob){{AgentTurnScratchpadArchive.LegacyCapturePrefix}}*' ':(glob){{AgentTurnScratchpadArchive.LegacyCapturePrefix}}*/**' ':(glob){{AgentTurnScratchpadArchive.LegacyRestorePrefix}}*' ':(glob){{AgentTurnScratchpadArchive.LegacyRestorePrefix}}*/**')"
+            git commit --allow-empty -m {{ShellSingleQuote(commitMessage)}}
+            git ls-tree -r -z --name-only HEAD -- '{{AgentTurnScratchpadArchive.LegacyRepositoryDirectory}}' | python3 -c {{ShellSingleQuote(reservedTreeFilter)}} '{{AgentTurnScratchpadArchive.LegacyCapturePrefix}}' '{{AgentTurnScratchpadArchive.LegacyRestorePrefix}}'
+            git push origin HEAD:{{refName}}
+            """;
 
         try
         {
@@ -1095,13 +1167,41 @@ git push origin HEAD:{refName}";
                 createdAt = details.CreatedAt;
             var isActive = _activeSandboxNames.ContainsKey(name);
             var hasPreemptMarker = File.Exists(Path.Combine(stagingDir, ".codeybox-preempt"));
+            var purpose = ReadSandboxPurposeMarker(stagingDir);
             var diskBytes = detailsByName.TryGetValue(name, out details) ? details.DiskBytes : null;
             var state = detailsByName.TryGetValue(name, out details) ? details.State : null;
             infos.Add(new ManagedSandboxInfo(
                 name, createdAt, diskBytes > 0 ? diskBytes : null, isActive, hasPreemptMarker,
-                IsSuspendLifecycleState(state)));
+                IsSuspendLifecycleState(state),
+                Purpose: purpose));
         }
         return infos;
+    }
+
+    private static async Task WriteSandboxPurposeMarkerAsync(string sandboxRoot, SandboxPurpose purpose, CancellationToken ct)
+    {
+        await File.WriteAllTextAsync(
+            Path.Combine(sandboxRoot, PurposeMarkerFile),
+            purpose.ToString(),
+            ct).ConfigureAwait(false);
+    }
+
+    private static SandboxPurpose ReadSandboxPurposeMarker(string stagingDir)
+    {
+        var path = Path.Combine(stagingDir, PurposeMarkerFile);
+        if (!File.Exists(path))
+            return SandboxPurpose.WorkItem;
+        try
+        {
+            var value = File.ReadAllText(path).Trim();
+            return Enum.TryParse<SandboxPurpose>(value, ignoreCase: true, out var purpose)
+                ? purpose
+                : SandboxPurpose.WorkItem;
+        }
+        catch
+        {
+            return SandboxPurpose.WorkItem;
+        }
     }
 
     /// <summary>
@@ -1124,12 +1224,13 @@ git push origin HEAD:{refName}";
     private async Task<Dictionary<string, MultipassSandboxDetails>> FetchSandboxDetailsAsync(
         MultipassSandboxOptions opts,
         List<string> names,
-        CancellationToken ct)
+        CancellationToken ct,
+        WorkItemId? workItemId = null)
     {
         var argv = new List<string> { opts.MultipassBinary, "info", "--format", "json" };
         argv.AddRange(names);
 
-        var run = await RunAsync(opts, argv, stdin: null, ct: ct);
+        var run = await RunAsync(opts, argv, stdin: null, ct: ct, workItemId: workItemId);
         if (run.ExitCode != 0)
         {
             _log.LogWarning("multipass info failed (exit {ExitCode}): {Stderr}", run.ExitCode, run.Stderr);
@@ -1168,7 +1269,8 @@ git push origin HEAD:{refName}";
                 result[vmEntry.Name] = new MultipassSandboxDetails(
                     diskBytes,
                     TryReadCreatedAt(vmEntry.Value),
-                    state);
+                    state,
+                    TryReadIpv4Addresses(vmEntry.Value));
             }
         }
         catch (JsonException ex)
@@ -1176,6 +1278,34 @@ git push origin HEAD:{refName}";
             _log.LogWarning(ex, "Failed to parse multipass info output; sandbox details will be omitted");
         }
         return result;
+    }
+
+    private async Task<string?> ResolveSandboxHostAddressAsync(
+        MultipassSandboxOptions opts,
+        string name,
+        string? networkProfile,
+        WorkItemId? workItemId,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(networkProfile))
+            return null;
+        if (!opts.NetworkProfiles.TryGetValue(networkProfile, out var bridge))
+            return null;
+
+        var detailsByName = await FetchSandboxDetailsAsync(opts, [name], ct, workItemId).ConfigureAwait(false);
+        if (!detailsByName.TryGetValue(name, out var details))
+            return null;
+
+        var subnet = _bridgeSubnetResolver(bridge);
+        if (subnet is null)
+        {
+            _log.LogWarning(
+                "Sandbox {Name}: cannot identify IPv4 subnet for network profile {Profile} bridge {Bridge}; endpoint publishing disabled",
+                name, networkProfile, bridge);
+            return null;
+        }
+
+        return details.Ipv4Addresses.FirstOrDefault(subnet.Value.Contains);
     }
 
     private static DateTimeOffset? TryReadCreatedAt(JsonElement vmInfo)
@@ -1190,6 +1320,71 @@ git push origin HEAD:{refName}";
                 DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
                 out var parsed))
                 return parsed;
+        }
+
+        return null;
+    }
+
+    private static IReadOnlyList<string> TryReadIpv4Addresses(JsonElement vmInfo)
+    {
+        if (!vmInfo.TryGetProperty("ipv4", out var ipv4El))
+            return [];
+
+        if (ipv4El.ValueKind == JsonValueKind.Array)
+        {
+            var result = new List<string>();
+            foreach (var value in ipv4El.EnumerateArray())
+            {
+                foreach (var parsed in ParseIpv4s(value.GetString()))
+                    result.Add(parsed);
+            }
+            return result;
+        }
+
+        return ipv4El.ValueKind == JsonValueKind.String
+            ? ParseIpv4s(ipv4El.GetString()).ToList()
+            : [];
+    }
+
+    private static IEnumerable<string> ParseIpv4s(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            yield break;
+        foreach (var token in value.Split([' ', ',', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (IPAddress.TryParse(token, out var address) && address.AddressFamily == AddressFamily.InterNetwork)
+                yield return address.ToString();
+        }
+    }
+
+    private static Ipv4Subnet? TryResolveBridgeSubnet(string bridgeName)
+    {
+        if (string.IsNullOrWhiteSpace(bridgeName))
+            return null;
+
+        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (!string.Equals(nic.Name, bridgeName, StringComparison.Ordinal))
+                continue;
+
+            foreach (var address in nic.GetIPProperties().UnicastAddresses)
+            {
+                if (address.Address.AddressFamily != AddressFamily.InterNetwork)
+                    continue;
+                try
+                {
+                    if (address.IPv4Mask is { AddressFamily: AddressFamily.InterNetwork } mask)
+                        return new Ipv4Subnet(address.Address, mask);
+                }
+                catch (PlatformNotSupportedException)
+                {
+                    return null;
+                }
+                catch (NetworkInformationException)
+                {
+                    return null;
+                }
+            }
         }
 
         return null;
@@ -1459,7 +1654,7 @@ git push origin HEAD:{refName}";
         return Convert.ToHexString(hash.AsSpan(0, 6)).ToLowerInvariant();
     }
 
-    private static string RenderExecutableProvisionForHash(ExecutableProvisionOptions exe)
+    private static string RenderExecutableProvisionForHash(BaselineExecutableProvision exe)
     {
         var hostPath = ResolvePath(exe.HostSourcePath);
         return string.Join("\u001f", new[]
@@ -1484,7 +1679,7 @@ git push origin HEAD:{refName}";
         return "sha256:" + Convert.ToHexString(sha.ComputeHash(stream)).ToLowerInvariant();
     }
 
-    private static string RenderBaselineVerificationCommandForHash(MultipassBaselineVerificationCommand cmd) =>
+    private static string RenderBaselineVerificationCommandForHash(BaselineVerificationCommand cmd) =>
         string.Join("\u001f", new[]
         {
             cmd.Label,
@@ -1502,6 +1697,25 @@ git push origin HEAD:{refName}";
         var baselineName = ComposeBaselineNameFromLiveConfig(opts, profileName, flavor);
         RememberBaselineTarget(baselineName, profileName, flavor);
         return baselineName;
+    }
+
+    public static bool IsOwnedBaselineRef(MultipassSandboxOptions options, string baselineRef)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        if (string.IsNullOrEmpty(baselineRef) || baselineRef.Length > 24)
+            return false;
+
+        var prefix = options.BaselineNamePrefix;
+        if (string.IsNullOrEmpty(prefix) || prefix.Length >= 24 || !IsValidSandboxName(prefix))
+            return false;
+        if (!baselineRef.StartsWith(prefix, StringComparison.Ordinal))
+            return false;
+
+        var expectedLength = Math.Min(prefix.Length + 12, 24);
+        if (baselineRef.Length != expectedLength)
+            return false;
+
+        return baselineRef.AsSpan(prefix.Length).IndexOfAnyExcept("0123456789abcdef") < 0;
     }
 
     /// <inheritdoc/>
@@ -1525,19 +1739,32 @@ git push origin HEAD:{refName}";
         var listRun = await RunAsync(opts, [opts.MultipassBinary, "list", "--format=json"], stdin: null, ct: ct);
         if (listRun.ExitCode != 0)
         {
-            _log.LogWarning("multipass list failed (exit {Exit}): {Stderr}", listRun.ExitCode, listRun.Stderr);
-            return [];
+            throw new InvalidOperationException(
+                $"Could not enumerate Multipass baseline images because 'multipass list --format=json' exited with code {listRun.ExitCode}.");
         }
         var results = new List<BaselineImageInfo>();
         try
         {
             using var doc = JsonDocument.Parse(listRun.Stdout);
-            if (!doc.RootElement.TryGetProperty("list", out var list)) return results;
+            if (doc.RootElement.ValueKind != JsonValueKind.Object
+                || !doc.RootElement.TryGetProperty("list", out var list)
+                || list.ValueKind != JsonValueKind.Array)
+            {
+                throw new JsonException(
+                    "Multipass baseline inventory must contain a JSON array property named 'list'.");
+            }
             foreach (var entry in list.EnumerateArray())
             {
-                if (!entry.TryGetProperty("name", out var nameProp)) continue;
+                if (entry.ValueKind != JsonValueKind.Object
+                    || !entry.TryGetProperty("name", out var nameProp)
+                    || nameProp.ValueKind != JsonValueKind.String)
+                {
+                    throw new JsonException(
+                        "Every Multipass inventory entry must contain a string property named 'name'.");
+                }
                 var name = nameProp.GetString();
-                if (string.IsNullOrEmpty(name)) continue;
+                if (string.IsNullOrEmpty(name))
+                    throw new JsonException("Multipass inventory entry names must be non-empty.");
                 if (!name.StartsWith(prefix, StringComparison.Ordinal)) continue;
                 // multipass list doesn't expose created-at in --format=json;
                 // mtime of the disk image is the next-best signal but is provider-
@@ -1548,8 +1775,9 @@ git push origin HEAD:{refName}";
         }
         catch (JsonException ex)
         {
-            _log.LogWarning(ex, "Failed to parse multipass list JSON output");
-            return [];
+            throw new InvalidOperationException(
+                "Could not enumerate Multipass baseline images because 'multipass list --format=json' returned an invalid inventory document.",
+                ex);
         }
         return results;
     }
@@ -2021,6 +2249,27 @@ git push origin HEAD:{refName}";
                     throw new InvalidOperationException($"Failed to change VM directory ownership: {chownResult.Stderr}");
                 }
 
+                // 5b. When the seed lands under $HOME/.nuget/..., also chown the
+                // .nuget parent. mkdir -p as root leaves that directory
+                // root-owned; NuGet then cannot create $HOME/.nuget/NuGet and
+                // every raw `dotnet build` fails restore. Chown the directory
+                // inode only — packages was already reassigned with -R above.
+                var nugetHome = NuGetPackageCacheGuestPaths.TryGetNuGetHomeDirectory(
+                    vmDestPath,
+                    "/home/ubuntu");
+                if (nugetHome is not null)
+                {
+                    var nugetHomeChown = await RunAsync(
+                        opts,
+                        [opts.MultipassBinary, "exec", baselineName, "--", "sudo", "chown", "ubuntu:ubuntu", nugetHome],
+                        stdin: null, ct: ct, workItemId: workItemId).ConfigureAwait(false);
+                    if (nugetHomeChown.ExitCode != 0)
+                    {
+                        throw new InvalidOperationException(
+                            $"Failed to change VM NuGet home ownership: {nugetHomeChown.Stderr}");
+                    }
+                }
+
                 // 6. Clean up the tarball inside the VM
                 var rmResult = await RunAsync(
                     opts,
@@ -2300,7 +2549,16 @@ git push origin HEAD:{refName}";
         SandboxSpec spec,
         string cloudInitPath)
     {
-        var argv = new List<string> { opts.MultipassBinary, "launch", "--name", name };
+        var launchTimeoutSeconds = (int)Math.Ceiling(opts.VmStartTimeout.TotalSeconds);
+        var argv = new List<string>
+        {
+            opts.MultipassBinary,
+            "launch",
+            "--name",
+            name,
+            "--timeout",
+            launchTimeoutSeconds.ToString(CultureInfo.InvariantCulture),
+        };
         if (spec.Limits.CpuCount is { } cpus) argv.AddRange(["--cpus", cpus.ToString()]);
         if (spec.Limits.MemoryBytes is { } mem) argv.AddRange(["--memory", $"{mem / (1024 * 1024)}M"]);
         if (spec.Limits.DiskBytes is { } disk) argv.AddRange(["--disk", $"{disk / (1024 * 1024)}M"]);
@@ -3325,23 +3583,7 @@ test "$work" = present && test "$exec_wrapper" = present
     }
 
     internal static string BuildEnvironmentFileContent(IReadOnlyDictionary<string, string> env)
-    {
-        var sb = new StringBuilder();
-        foreach (var (k, v) in env)
-        {
-            if (k.Contains('=') || k.Contains('\n') || k.Contains('\0'))
-                throw new ArgumentException($"Invalid env key: {k}");
-            // /bin/sh dot-source has undefined behaviour on NUL bytes —
-            // some implementations truncate the file at the NUL, others
-            // fail with "syntax error". Either way the wrapper would
-            // exit 126 with no useful diagnostic, so reject up front.
-            if (v.Contains('\0'))
-                throw new ArgumentException($"Env value for '{k}' contains NUL byte");
-            sb.Append(k).Append('=').Append(ShellSingleQuote(v)).Append('\n');
-        }
-
-        return sb.ToString();
-    }
+        => SandboxEnvironmentVariablePolicy.BuildShellEnvironmentFileContent(env);
 
     internal static string ShellSingleQuote(string value) =>
         "'" + value.Replace("'", "'\"'\"'", StringComparison.Ordinal) + "'";
@@ -4534,7 +4776,25 @@ test "$work" = present && test "$exec_wrapper" = present
     }
 }
 
-internal readonly record struct MultipassSandboxDetails(long? DiskBytes, DateTimeOffset? CreatedAt, string? State = null);
+internal readonly record struct MultipassSandboxDetails
+{
+    public MultipassSandboxDetails(
+        long? diskBytes,
+        DateTimeOffset? createdAt,
+        string? state = null,
+        IReadOnlyList<string>? ipv4Addresses = null)
+    {
+        DiskBytes = diskBytes;
+        CreatedAt = createdAt;
+        State = state;
+        Ipv4Addresses = ipv4Addresses ?? [];
+    }
+
+    public long? DiskBytes { get; }
+    public DateTimeOffset? CreatedAt { get; }
+    public string? State { get; }
+    public IReadOnlyList<string> Ipv4Addresses { get; }
+}
 
 internal sealed class MultipassDaemonRetryPolicy
 {
@@ -4547,6 +4807,14 @@ internal sealed class MultipassDaemonRetryPolicy
     public TimeSpan ExhaustedRequeueDelay { get; init; } = TimeSpan.FromSeconds(30);
     public Func<TimeSpan, CancellationToken, Task> Delay { get; init; } =
         static (delay, ct) => Task.Delay(delay, ct);
+
+    /// <summary>
+    /// Serilog sink for the transient-retry audit events. Captured by reference at
+    /// policy construction so emission is immune to a concurrent reassignment of the
+    /// global <see cref="Serilog.Log.Logger"/> (which parallel test collections do).
+    /// Null falls back to the process-global logger.
+    /// </summary>
+    public Serilog.ILogger? AuditLogger { get; init; }
 }
 
 internal readonly record struct MultipassDaemonHealthProbeResult(bool IsHealthy, string Error)
@@ -4583,7 +4851,8 @@ internal static class MultipassDaemonRetry
         ILogger log,
         WorkItemId? workItemId,
         CancellationToken ct,
-        MultipassDaemonRetryPolicy? policy = null)
+        MultipassDaemonRetryPolicy? policy = null,
+        Serilog.ILogger? auditLogger = null)
     {
         ArgumentNullException.ThrowIfNull(argv);
         ArgumentNullException.ThrowIfNull(action);
@@ -4591,6 +4860,7 @@ internal static class MultipassDaemonRetry
         ArgumentNullException.ThrowIfNull(log);
 
         policy ??= MultipassDaemonRetryPolicy.Default;
+        auditLogger ??= Serilog.Log.Logger;
         if (policy.MaxAttempts < 1) throw new ArgumentOutOfRangeException(nameof(policy.MaxAttempts));
         if (policy.Backoffs.Count < policy.MaxAttempts - 1)
             throw new ArgumentException("Backoffs must contain one delay per retry.", nameof(policy));
@@ -4614,7 +4884,7 @@ internal static class MultipassDaemonRetry
             var retryOrdinal = attempt;
             var probe = await healthProbe(ct).ConfigureAwait(false);
             var delay = policy.Backoffs[attempt - 1];
-            AuditTransientRetry(workItemId, operation, retryOrdinal, errorClass);
+            AuditTransientRetry(workItemId, operation, retryOrdinal, errorClass, policy.AuditLogger ?? auditLogger);
 
             if (retryOrdinal == 1)
             {
@@ -4739,10 +5009,10 @@ internal static class MultipassDaemonRetry
         }
     }
 
-    private static void AuditTransientRetry(WorkItemId? workItemId, string operation, int attempt, string errorClass)
+    private static void AuditTransientRetry(WorkItemId? workItemId, string operation, int attempt, string errorClass, Serilog.ILogger? auditLogger)
     {
         if (workItemId.HasValue)
-            AuditLog.SandboxProvisioningTransientRetry(workItemId.Value, operation, attempt, errorClass);
+            AuditLog.SandboxProvisioningTransientRetry(workItemId.Value, operation, attempt, errorClass, auditLogger);
     }
 
     private static string Describe(IReadOnlyList<string> argv)
@@ -4866,19 +5136,6 @@ internal static class MultipassRetry
     }
 }
 
-/// <summary>
-/// A provider-neutral baseline-bake validation command: a one-shot in-VM command the
-/// provider runs against a freshly-baked baseline before it is stopped and reused as a
-/// clone source. <see cref="Label"/> is a human-readable identifier used only in log lines
-/// and error messages; the provider does not interpret it. Mapping from agent (or any
-/// other producer) to validation command lives in the composition layer — this record
-/// keeps the sandbox infrastructure layer free of agent-catalog semantics.
-/// </summary>
-public sealed record MultipassBaselineVerificationCommand(
-    string Label,
-    IReadOnlyList<string> Argv,
-    string? FailureHint = null);
-
 public sealed record MultipassSandboxOptions
 {
     public const int DefaultCloudInitReadyRetryAttempts = 3;
@@ -4918,9 +5175,9 @@ public sealed record MultipassSandboxOptions
     /// derives this list from configured AgentClass members so enabling a CLI-backed
     /// agent fails the bake immediately if its binary is missing from PATH. The
     /// sandbox layer itself only executes the commands and surfaces failures by
-    /// <see cref="MultipassBaselineVerificationCommand.Label"/>.
+    /// <see cref="BaselineVerificationCommand.Label"/>.
     /// </summary>
-    public IReadOnlyList<MultipassBaselineVerificationCommand> BaselineVerificationCommands { get; init; } = [];
+    public IReadOnlyList<BaselineVerificationCommand> BaselineVerificationCommands { get; init; } = [];
 
     /// <summary>
     /// Extra cloud-init YAML appended after the orchestrator's own
@@ -5124,7 +5381,7 @@ public sealed record MultipassSandboxOptions
     /// <summary>
     /// Configurable list of package cache seeds to copy from the host to the baseline VM at bake time.
     /// </summary>
-    public IReadOnlyList<PackageCacheSeedOptions> PackageCacheSeeds { get; init; } = [];
+    public IReadOnlyList<BaselinePackageCacheSeed> PackageCacheSeeds { get; init; } = [];
 
     /// <summary>
     /// Host-staged executable binaries to ship into the baseline VM at bake time.
@@ -5138,57 +5395,7 @@ public sealed record MultipassSandboxOptions
     /// to fail loudly if the file is missing rather than silently proceed.
     /// </para>
     /// </summary>
-    public IReadOnlyList<ExecutableProvisionOptions> ExecutableProvisions { get; init; } = [];
-}
-
-/// <summary>
-/// Configuration for a package cache seed to be copied into the baseline VM.
-/// </summary>
-public sealed record PackageCacheSeedOptions
-{
-    public string HostSourcePath { get; init; } = string.Empty;
-    public string VmDestPath { get; init; } = string.Empty;
-    public double? MaxSizeMB { get; init; }
-}
-
-/// <summary>
-/// Configuration for a host-staged executable binary that the baseline bake
-/// must ship into the VM at a known absolute path with mode 0755.
-/// <para>
-/// Provisioning uses <c>multipass transfer</c> for the bytes followed by an
-/// in-VM <c>install -m 0755 -o root -g root</c>, so the executable bit and
-/// file ownership are set deterministically — neither <c>File.Copy</c> on the
-/// host staging side nor <c>multipass transfer</c> documents preservation of
-/// the executable bit, and depending on it has produced silent breakage.
-/// </para>
-/// </summary>
-public sealed record ExecutableProvisionOptions
-{
-    /// <summary>Host path to the executable file. Tilde-expansion is honoured.</summary>
-    public string HostSourcePath { get; init; } = string.Empty;
-
-    /// <summary>
-    /// Absolute VM path where the executable must land (e.g.
-    /// <c>/home/ubuntu/.local/bin/agy</c>). The parent directory is created if it
-    /// does not already exist; parents below <c>/home/ubuntu</c> are kept owned by
-    /// the unprivileged <c>ubuntu</c> user even though the executable file itself
-    /// is root-owned.
-    /// </summary>
-    public string VmDestPath { get; init; } = string.Empty;
-
-    /// <summary>
-    /// Optional absolute VM paths at which to create symlinks pointing to
-    /// <see cref="VmDestPath"/>. Use to put a binary installed under the
-    /// non-login user's home onto a system PATH (e.g.
-    /// <c>/usr/local/bin/agy</c>).
-    /// </summary>
-    public IReadOnlyList<string> VmSymlinks { get; init; } = [];
-
-    /// <summary>
-    /// Diagnostic label used in log lines and bake-failure messages. Defaults to
-    /// the destination filename when unset.
-    /// </summary>
-    public string? Label { get; init; }
+    public IReadOnlyList<BaselineExecutableProvision> ExecutableProvisions { get; init; } = [];
 }
 
 /// <summary>
@@ -5236,7 +5443,7 @@ public sealed record MultipassDiskGuardOptions
     public TimeSpan RecheckIn { get; init; } = TimeSpan.FromMinutes(5);
 }
 
-internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDisposeSandbox, ISuspendableSandbox, IShutdownTeardownSandbox
+internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDisposeSandbox, ISuspendableSandbox, IShutdownTeardownSandbox, IProviderOwnedSandbox, IPrivilegedGuestFileHardeningSandbox, IResourceMetricsCapturingSandbox, IRoutableSandbox, ISandboxPortPublisher, IActiveSandboxLease
 {
     internal const int ArgvBytesWarningThreshold = 64 * 1024;
     internal const int MaxScreenshotPngBytes = 64 * 1024 * 1024;
@@ -5250,8 +5457,67 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private const int DetachedProcessGroupMalformedExitCode = 73;
     private const int DetachedSupervisorSetupFailedExitCode = 88;
     private const int DetachedPollFailureLimit = 5;
+    // Once the process group is observed gone without a captured authenticated
+    // exit, re-check the ingest listener this many times before declaring the
+    // completion lost. The wrapper posts its authenticated exit as its final
+    // act (after stdout has already streamed), so a gone-PG almost always means
+    // the exit POST is in flight or the liveness probe raced the still-draining
+    // wrapper under host load — a bounded grace closes that window without
+    // masking a genuine crash.
+    private const int DetachedAuthenticatedExitGraceAttempts = 25;
     private static readonly TimeSpan DetachedAuthenticatedExitCleanupTimeout = TimeSpan.FromSeconds(5);
     private const string DetachedSupervisorDirectory = "/run/codeybox-exec";
+    internal const string DetachedProcessGroupPollCommand = """
+            codeybox_pgid_marker=$1
+            codeybox_process_group_alive() {
+                codeybox_probe_pgid=$1
+                if [ -d /proc ]; then
+                    awk -v pgid="$codeybox_probe_pgid" '
+                        {
+                            line = $0
+                            sub(/^[^)]*\) /, "", line)
+                            split(line, fields, " ")
+                            if (fields[3] == pgid && fields[1] != "Z") found = 1
+                        }
+                        END { exit found ? 0 : 1 }
+                    ' /proc/[0-9]*/stat 2>/dev/null
+                    return $?
+                fi
+                kill -0 "-$codeybox_probe_pgid" 2>/dev/null
+            }
+            if ! test -f "$codeybox_pgid_marker"; then
+                printf 'missing\n'
+                exit 0
+            fi
+            codeybox_pgid=$(cat -- "$codeybox_pgid_marker" 2>/dev/null || true)
+            case "$codeybox_pgid" in
+                ''|*[!0-9]*|0)
+                    printf 'detached exec process group marker %s was malformed: %s\n' "$codeybox_pgid_marker" "$codeybox_pgid" >&2
+                    exit 73
+                    ;;
+            esac
+            codeybox_alive=gone
+            if codeybox_process_group_alive "$codeybox_pgid"; then
+                codeybox_alive=alive
+            fi
+            codeybox_exit_file="${codeybox_pgid_marker}.exit"
+            if test -f "$codeybox_exit_file"; then
+                codeybox_exit_code=$(cat -- "$codeybox_exit_file" 2>/dev/null || true)
+                case "$codeybox_exit_code" in
+                    ''|*[!0-9-]*)
+                        printf 'exited %s\n' "$codeybox_pgid"
+                        ;;
+                    *)
+                        printf 'exited %s %s %s\n' "$codeybox_pgid" "$codeybox_exit_code" "$codeybox_alive"
+                        ;;
+                esac
+            elif [ "$codeybox_alive" = "alive" ]; then
+                printf 'alive %s\n' "$codeybox_pgid"
+            else
+                printf 'exited %s\n' "$codeybox_pgid"
+            fi
+            exit 0
+            """;
 
     // Test seam: override the WaitForDetachedCompletionAsync poll interval.
     // Production polls every 2s; tests set a small value so the loop is not
@@ -5296,6 +5562,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private readonly Action<string>? _onNoLongerTrackedActive;
     private readonly Func<IReadOnlyList<string>, CancellationToken, Task<IDisposable>>? _opGateAcquirer;
     private readonly AgentOutputHttpIngestSessionStarter _agentOutputIngestSessionStarter;
+    private readonly string? _hostAddress;
     private readonly int _maxScreenshotPngBytes;
     private readonly int _maxScreenshotBase64StdoutBytes;
     private readonly int _maxScreenshotStderrBytes;
@@ -5305,6 +5572,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     private bool _preserveOnDispose;
     private bool _isSuspended;
     private bool _ownedByShutdownHandler;
+    private int _activeTrackingReleased;
     private long _activeProgressVersion;
     private string _activeProgressStatus = "active";
 
@@ -5353,7 +5621,8 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         Func<IReadOnlyList<string>, CancellationToken, Task<IDisposable>>? opGateAcquirer = null,
         AgentOutputHttpIngestSessionStarter? agentOutputIngestSessionStarter = null,
         ISandboxResourceUsageStore? resourceUsageStore = null,
-        string? baselineRef = null)
+        string? baselineRef = null,
+        string? hostAddress = null)
     {
         _name = name;
         _sandboxRoot = sandboxRoot;
@@ -5377,6 +5646,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         _opGateAcquirer = opGateAcquirer;
         _agentOutputIngestSessionStarter = agentOutputIngestSessionStarter
             ?? MultipassAgentOutputHttpIngestSession.TryStartAsync;
+        _hostAddress = hostAddress;
         _maxScreenshotPngBytes = maxScreenshotPngBytes ?? MaxScreenshotPngBytes;
         _maxScreenshotStderrBytes = maxScreenshotStderrBytes ?? MaxScreenshotStderrBytes;
         if (_maxScreenshotPngBytes <= 0)
@@ -5388,6 +5658,42 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
     }
 
     public string Id { get; }
+    public string ProviderId => MultipassSandboxProvider.ProviderId;
+    public bool CapturesResourceMetrics => _opts.CaptureResourceMetrics;
+    public string? HostAddress => _hostAddress;
+
+    public bool CanPublishPort(int port)
+        => !string.IsNullOrWhiteSpace(_hostAddress)
+            && !string.IsNullOrWhiteSpace(_spec.Network.ProfileName)
+            && _opts.NetworkProfiles.ContainsKey(_spec.Network.ProfileName)
+            && port is >= 1 and <= 65535;
+
+    public SandboxPublishedPort PublishPort(int port)
+    {
+        if (!CanPublishPort(port))
+            throw new NotSupportedException($"Multipass sandbox '{Id}' cannot publish port {port}.");
+        return new SandboxPublishedPort(
+            _hostAddress!,
+            port,
+            new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["endpoint.scope"] = "host-routable",
+            });
+    }
+
+    public void ReleaseActiveTracking()
+    {
+        if (Interlocked.Exchange(ref _activeTrackingReleased, 1) != 0)
+            return;
+        try
+        {
+            _onNoLongerTrackedActive?.Invoke(_name);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Failed to release active tracking for multipass VM {Name}", _name);
+        }
+    }
 
     internal ActiveSandboxProgress SnapshotActiveProgress(WorkItemId workItemId)
     {
@@ -5439,13 +5745,14 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         MultipassAgentOutputHttpIngestSession? agentOutputIngest = null;
         var stdoutChunkCallback = exec.StdoutChunkCallback;
         var stderrChunkCallback = exec.StderrChunkCallback;
-        var forceEnvironmentFile = false;
+        var effectiveEnvironment = BuildEffectiveExecEnvironment(exec);
+        var forceEnvironmentFile = exec.EnvironmentVariablesToUnset.Count > 0
+            || (exec.EnvironmentContainsSecrets && effectiveEnvironment is { Count: > 0 });
         var detachedHttpIngest = false;
         string? detachedExitToken = null;
         string? detachedProcessGroupMarker = null;
         string? detachedStdinFile = null;
         string? multipassStdin = exec.Stdin;
-        var effectiveEnvironment = BuildEffectiveExecEnvironment(exec);
         var pipeEnvironment = effectiveEnvironment;
         var prefersDetachedHttpIngest = ShouldDetachAgentOutputHttpIngest(exec)
             && maxStdoutBytes is null
@@ -5472,9 +5779,11 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
                 if (agentOutputIngest is not null)
                 {
                     detachedHttpIngest = ShouldDetachAgentOutputHttpIngest(exec);
-                    effectiveEnvironment = MergeExecEnvironment(
-                        RemoveAgentOutputExitToken(effectiveEnvironment),
-                        agentOutputIngest.BuildEnvironment(includeExitToken: false));
+                    effectiveEnvironment = ApplyEnvironmentRemovals(
+                        exec,
+                        MergeExecEnvironment(
+                            RemoveAgentOutputExitToken(effectiveEnvironment),
+                            agentOutputIngest.BuildEnvironment(includeExitToken: false)));
                     if (detachedHttpIngest)
                     {
                         detachedExitToken = agentOutputIngest.ExitToken;
@@ -5502,11 +5811,14 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
         List<string> wrapped;
         IReadOnlyList<string> argv;
-        if (forceEnvironmentFile && effectiveEnvironment is { Count: > 0 })
+        if (forceEnvironmentFile)
         {
             try
             {
-                var envFile = await TransferExecEnvironmentAsync(effectiveEnvironment, ct);
+                var envFile = await TransferExecEnvironmentAsync(
+                    effectiveEnvironment ?? new Dictionary<string, string>(StringComparer.Ordinal),
+                    exec.EnvironmentVariablesToUnset,
+                    ct);
                 transferredVmPaths.Add(envFile);
                 if (detachedHttpIngest)
                 {
@@ -5528,6 +5840,12 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
+                if (exec.EnvironmentContainsSecrets || exec.EnvironmentVariablesToUnset.Count > 0)
+                {
+                    throw new InvalidOperationException(
+                        "Required sandbox environment delivery failed before process launch.",
+                        ex);
+                }
                 if (detachedHttpIngest)
                 {
                     _log.LogWarning(ex,
@@ -5577,7 +5895,10 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
             if (effectiveEnvironment is { Count: > 0 })
             {
-                var envFile = await TransferExecEnvironmentAsync(effectiveEnvironment, ct);
+                var envFile = await TransferExecEnvironmentAsync(
+                    effectiveEnvironment,
+                    exec.EnvironmentVariablesToUnset,
+                    ct);
                 transferredVmPaths.Add(envFile);
                 wrapped = BuildWrappedInvocation(exec, effectiveEnvironment, envFile, stdinFile: null);
                 argv = BuildMultipassExecArgv(wrapped);
@@ -6068,25 +6389,15 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
 
     private IReadOnlyDictionary<string, string>? BuildEffectiveExecEnvironment(SandboxExec exec)
     {
-        if (_spec.Flavor != SandboxProfileFlavor.Graphical)
-            return exec.ExtraEnvironment;
-
-        if (exec.ExtraEnvironment is null || exec.ExtraEnvironment.Count == 0)
+        Dictionary<string, string>? merged = exec.ExtraEnvironment is { Count: > 0 }
+            ? new Dictionary<string, string>(exec.ExtraEnvironment, StringComparer.Ordinal)
+            : null;
+        if (_spec.Flavor == SandboxProfileFlavor.Graphical)
         {
-            return new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["DISPLAY"] = SandboxConventions.GraphicalDisplay,
-            };
+            merged ??= new Dictionary<string, string>(StringComparer.Ordinal);
+            merged.TryAdd("DISPLAY", SandboxConventions.GraphicalDisplay);
         }
-
-        if (exec.ExtraEnvironment.ContainsKey("DISPLAY"))
-            return exec.ExtraEnvironment;
-
-        var merged = new Dictionary<string, string>(exec.ExtraEnvironment, StringComparer.Ordinal)
-        {
-            ["DISPLAY"] = SandboxConventions.GraphicalDisplay,
-        };
-        return merged;
+        return ApplyEnvironmentRemovals(exec, merged);
     }
 
     private bool ShouldUseAgentOutputHttpIngest(
@@ -6133,6 +6444,17 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         return merged;
     }
 
+    private static IReadOnlyDictionary<string, string>? ApplyEnvironmentRemovals(
+        SandboxExec exec,
+        IReadOnlyDictionary<string, string>? environment)
+    {
+        if (environment is null || exec.EnvironmentVariablesToUnset.Count == 0)
+            return environment;
+        var scrubbed = new Dictionary<string, string>(environment, StringComparer.Ordinal);
+        exec.ApplyEnvironmentRemovals(name => scrubbed.Remove(name));
+        return scrubbed.Count == 0 ? null : scrubbed;
+    }
+
     private static IReadOnlyDictionary<string, string>? RemoveAgentOutputExitToken(
         IReadOnlyDictionary<string, string>? environment)
     {
@@ -6176,7 +6498,7 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         {
             wrapped.AddRange(["--env-file", extraEnvFile]);
         }
-        else if (effectiveEnvironment is { Count: > 0 })
+        if (extraEnvFile is null && effectiveEnvironment is { Count: > 0 })
         {
             // env(1) takes KEY=VALUE pairs followed by the command. This
             // keeps the common case small and preserves historical ordering.
@@ -6199,23 +6521,51 @@ internal sealed class MultipassSandbox : IPreemptibleSandbox, IPreserveOnDispose
         return total;
     }
 
-    private async Task<string> TransferExecEnvironmentAsync(IReadOnlyDictionary<string, string> env, CancellationToken ct)
+    private async Task<string> TransferExecEnvironmentAsync(
+        IReadOnlyDictionary<string, string> env,
+        IReadOnlyList<string> environmentVariablesToUnset,
+        CancellationToken ct)
     {
         var fileName = $"env-{Guid.NewGuid():N}";
         var hostDir = Path.Combine(_sandboxRoot, "exec-env");
         Directory.CreateDirectory(hostDir);
         MultipassSandboxProvider.TryChmod0700(hostDir);
         var hostPath = Path.Combine(hostDir, fileName);
-        await File.WriteAllTextAsync(hostPath, MultipassSandboxProvider.BuildEnvironmentFileContent(env), ct);
-        if (!OperatingSystem.IsWindows())
-            File.SetUnixFileMode(hostPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        var content = new StringBuilder(MultipassSandboxProvider.BuildEnvironmentFileContent(env));
+        foreach (var name in environmentVariablesToUnset)
+        {
+            SandboxEnvironmentVariableName.Validate(name, nameof(environmentVariablesToUnset));
+            content.Append("unset -- ")
+                .Append(MultipassSandboxProvider.ShellSingleQuote(name))
+                .Append('\n');
+        }
+        await File.WriteAllTextAsync(hostPath, content.ToString(), ct);
+        try
+        {
+            if (!OperatingSystem.IsWindows())
+                File.SetUnixFileMode(hostPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
 
-        const string vmDir = "/home/ubuntu/.codeybox-exec-env";
-        await RunVmCommandAsync(["mkdir", "-p", vmDir], ct);
-        await TransferFileToVmAsync(hostPath, $".codeybox-exec-env/{fileName}", "multipass transfer exec env file", ct);
-        var vmPath = $"{vmDir}/{fileName}";
-        await RunVmCommandAsync(["chmod", "0600", vmPath], ct);
-        return vmPath;
+            const string vmDir = "/home/ubuntu/.codeybox-exec-env";
+            await RunVmCommandAsync(["mkdir", "-p", vmDir], ct);
+            await TransferFileToVmAsync(hostPath, $".codeybox-exec-env/{fileName}", "multipass transfer exec env file", ct);
+            var vmPath = $"{vmDir}/{fileName}";
+            await RunVmCommandAsync(["chmod", "0600", vmPath], ct);
+            return vmPath;
+        }
+        finally
+        {
+            try
+            {
+                File.Delete(hostPath);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                _log.LogWarning(
+                    ex,
+                    "Failed to delete host-side sandbox exec environment file {FileName} from protected sandbox directory",
+                    fileName);
+            }
+        }
     }
 
     private async Task<string> TransferExecScriptAsync(IReadOnlyList<string> wrapped, CancellationToken ct)
@@ -6473,15 +6823,19 @@ while True:
         // regardless of host load, so tests assert exit 86 off that internal
         // deadline, not a host-scheduling race.
         sb.AppendLine("codeybox_http_ready() {");
+        // The outer `timeout 4` is the hard backstop for a slow interpreter
+        // startup under parallel CI. The inner socket read timeout (2.5s, below)
+        // is what actually governs how long we wait for the ingest server's
+        // response: a 1s read timeout could miss a loopback accept/response
+        // continuation delayed by thread-pool contention, false-failing the
+        // preflight (exit 86). Both stay under the negative-path callers' 5s
+        // readiness-latency assertion.
+        sb.AppendLine("timeout 4 env \\");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_URL=\"$codeybox_output_url\" \\");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_TOKEN=\"$codeybox_output_token\" \\");
         sb.AppendLine("CODEYBOX_AGENT_OUTPUT_RUN_ID=\"$codeybox_output_run_id\" \\");
         sb.AppendLine("python3 - <<'PY'");
-        sb.AppendLine("import os, signal, sys, urllib.error, urllib.parse, urllib.request");
-        sb.AppendLine("def codeybox_timeout(_signum, _frame):");
-        sb.AppendLine("    raise TimeoutError('ready probe timed out')");
-        sb.AppendLine("signal.signal(signal.SIGALRM, codeybox_timeout)");
-        sb.AppendLine("signal.alarm(2)");
+        sb.AppendLine("import os, sys, urllib.error, urllib.parse, urllib.request");
         sb.AppendLine("base = os.environ.get('CODEYBOX_AGENT_OUTPUT_URL', '').rstrip('/')");
         sb.AppendLine("run_id = os.environ.get('CODEYBOX_AGENT_OUTPUT_RUN_ID', '')");
         sb.AppendLine("token = os.environ.get('CODEYBOX_AGENT_OUTPUT_TOKEN', '')");
@@ -6495,7 +6849,7 @@ while True:
         sb.AppendLine("    method='POST',");
         sb.AppendLine("    headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/octet-stream'})");
         sb.AppendLine("try:");
-        sb.AppendLine("    with opener.open(req, timeout=1.0) as resp:");
+        sb.AppendLine("    with opener.open(req, timeout=2.5) as resp:");
         sb.AppendLine("        code = resp.getcode()");
         sb.AppendLine("        sys.exit(0 if 200 <= code < 300 else 1)");
         sb.AppendLine("except urllib.error.HTTPError:");
@@ -6676,6 +7030,7 @@ while True:
         sb.AppendLine("fi");
         sb.AppendLine("codeybox_http_exit \"$codeybox_wrapper_rc\" || true");
         sb.AppendLine("rm -f \"$codeybox_stdout_file\" \"$codeybox_stderr_file\"");
+        sb.AppendLine("codeybox_http_exit \"$codeybox_wrapper_rc\" || true");
         sb.AppendLine("exit \"$codeybox_wrapper_rc\"");
         sb.AppendLine("CODEYBOX_DETACHED_CHILD");
         sb.AppendLine("chmod 0700 \"$codeybox_child_script\"");
@@ -6921,14 +7276,49 @@ while True:
                 if (state.ProcessGroupAlive)
                     continue;
 
-                // PG is gone but the wrapper never delivered the host-authenticated
-                // completion. The wrapper crashed, was killed, or could not reach
-                // the ingest listener — surface a diagnostic rather than guessing.
+                // PG reported gone but the authenticated exit is not yet visible.
+                // The wrapper posts that exit as its last act before the group
+                // dies, and stdout has already streamed over the same channel, so
+                // this is almost always an in-flight exit POST (or a liveness
+                // probe that raced the still-draining wrapper under host load).
+                // Give the authenticated completion a bounded grace to land
+                // before concluding the wrapper crashed without delivering it.
+                if (await WaitForAuthenticatedExitAfterProcessGroupGoneAsync(ingest, ct).ConfigureAwait(false)
+                    is { } gracedExitCode)
+                {
+                    var reapError = await EnsureDetachedProcessGroupReapedAfterAuthenticatedExitAsync(processGroupMarker).ConfigureAwait(false);
+                    return new DetachedExitResult(gracedExitCode, reapError);
+                }
+
+                // Grace elapsed with still no authenticated completion. The
+                // wrapper crashed, was killed, or could not reach the ingest
+                // listener — surface a diagnostic rather than guessing.
                 return new DetachedExitResult(
                     1,
+                    "agent output transport produced nothing / detached run reported no exit: " +
                     $"detached exec process group {state.ProcessGroupId} exited without authenticated exit completion\n");
             }
         }
+    }
+
+    // Re-check the ingest listener for the authenticated exit after the process
+    // group is observed gone, giving an in-flight exit POST (or a raced liveness
+    // probe) a bounded window to resolve. Returns the exit code once captured,
+    // or null if the grace elapses with no authenticated completion.
+    private async Task<int?> WaitForAuthenticatedExitAfterProcessGroupGoneAsync(
+        MultipassAgentOutputHttpIngestSession ingest,
+        CancellationToken ct)
+    {
+        var graceInterval = DetachedPollIntervalOverride ?? TimeSpan.FromMilliseconds(200);
+        for (var attempt = 0; attempt < DetachedAuthenticatedExitGraceAttempts; attempt++)
+        {
+            if (ingest.TryGetExitCode(out var exitCode))
+                return exitCode;
+            ct.ThrowIfCancellationRequested();
+            await Task.Delay(graceInterval, ct).ConfigureAwait(false);
+        }
+
+        return ingest.TryGetExitCode(out var finalExitCode) ? finalExitCode : null;
     }
 
     private async Task<string?> EnsureDetachedProcessGroupReapedAfterAuthenticatedExitAsync(string processGroupMarker)
@@ -7064,43 +7454,8 @@ while True:
         // single multipass exec yields both liveness and (when available)
         // the wrapper-written exit code — no separate `cat` round-trip and no
         // additional host-side multipass spin.
-        const string pollCommand = """
-            codeybox_pgid_marker=$1
-            if ! test -f "$codeybox_pgid_marker"; then
-                printf 'missing\n'
-                exit 0
-            fi
-            codeybox_pgid=$(cat -- "$codeybox_pgid_marker" 2>/dev/null || true)
-            case "$codeybox_pgid" in
-                ''|*[!0-9]*|0)
-                    printf 'detached exec process group marker %s was malformed: %s\n' "$codeybox_pgid_marker" "$codeybox_pgid" >&2
-                    exit 73
-                    ;;
-            esac
-            codeybox_alive=gone
-            if kill -0 "-$codeybox_pgid" 2>/dev/null; then
-                codeybox_alive=alive
-            fi
-            codeybox_exit_file="${codeybox_pgid_marker}.exit"
-            if test -f "$codeybox_exit_file"; then
-                codeybox_exit_code=$(cat -- "$codeybox_exit_file" 2>/dev/null || true)
-                case "$codeybox_exit_code" in
-                    ''|*[!0-9-]*)
-                        printf 'exited %s\n' "$codeybox_pgid"
-                        ;;
-                    *)
-                        printf 'exited %s %s %s\n' "$codeybox_pgid" "$codeybox_exit_code" "$codeybox_alive"
-                        ;;
-                esac
-            elif [ "$codeybox_alive" = "alive" ]; then
-                printf 'alive %s\n' "$codeybox_pgid"
-            else
-                printf 'exited %s\n' "$codeybox_pgid"
-            fi
-            exit 0
-            """;
         var result = await RunMultipassAsync(
-            [_opts.MultipassBinary, "exec", _name, "--", "sudo", "-n", "sh", "-c", pollCommand, "codeybox-detached-poll", processGroupMarker],
+            [_opts.MultipassBinary, "exec", _name, "--", "sudo", "-n", "sh", "-c", DetachedProcessGroupPollCommand, "codeybox-detached-poll", processGroupMarker],
             stdin: null,
             ct: ct,
             maxStdoutBytes: 128,
@@ -7164,6 +7519,22 @@ while True:
     {
         const string killCommand = """
             codeybox_pgid_marker=$1
+            codeybox_process_group_alive() {
+                codeybox_probe_pgid=$1
+                if [ -d /proc ]; then
+                    awk -v pgid="$codeybox_probe_pgid" '
+                        {
+                            line = $0
+                            sub(/^[^)]*\) /, "", line)
+                            split(line, fields, " ")
+                            if (fields[3] == pgid && fields[1] != "Z") found = 1
+                        }
+                        END { exit found ? 0 : 1 }
+                    ' /proc/[0-9]*/stat 2>/dev/null
+                    return $?
+                fi
+                kill -0 "-$codeybox_probe_pgid" 2>/dev/null
+            }
             codeybox_wait_i=0
             while ! test -f "$codeybox_pgid_marker"; do
                 if [ "$codeybox_wait_i" -ge 50 ]; then
@@ -7179,7 +7550,7 @@ while True:
             kill -TERM "-$codeybox_pgid" 2>/dev/null || true
             codeybox_i=0
             while [ "$codeybox_i" -lt 20 ]; do
-                if ! kill -0 "-$codeybox_pgid" 2>/dev/null; then
+                if ! codeybox_process_group_alive "$codeybox_pgid"; then
                     exit 0
                 fi
                 sleep 0.1
@@ -7347,15 +7718,6 @@ while True:
         if (_preserveOnDispose)
             return;
 
-        try
-        {
-            _onNoLongerTrackedActive?.Invoke(_name);
-        }
-        catch (Exception callbackEx)
-        {
-            _log.LogWarning(callbackEx, "Failed to release active tracking for multipass VM {Name}", _name);
-        }
-
         var metrics = await EnsureResourceMetricsCapturedAsync(CancellationToken.None).ConfigureAwait(false);
 
         await using var disposeScope = await TimingScope.BeginAsync(
@@ -7373,10 +7735,16 @@ while True:
         catch (Exception ex)
         {
             _log.LogWarning(ex, "Failed to delete multipass VM {Name}", _name);
-            if (_ownedByShutdownHandler)
-                throw;
-            return;
+            ReleaseActiveTracking();
+            // The purge did not prove the VM gone. Re-arm the dispose guards so a
+            // later DisposeAsync (explicit retry) or the leak reaper can re-attempt
+            // deletion instead of silently orphaning the VM, and surface the failure
+            // so the caller learns the sandbox is still retryable rather than gone.
+            Volatile.Write(ref _disposed, 0);
+            Volatile.Write(ref _disposeStarted, 0);
+            throw;
         }
+        ReleaseActiveTracking();
         _onDisposed?.Invoke(_name);
         AuditLog.SandboxDisposed(_name, metrics);
         try { Directory.Delete(_sandboxRoot, recursive: true); }
@@ -7402,7 +7770,7 @@ while True:
 
             _resourceMetrics = metrics;
             await TryPersistResourceMetricsAsync(metrics, timeout, ct).ConfigureAwait(false);
-            RecordResourceMetricInstruments(metrics);
+            SandboxResourceMetricsTelemetry.Record(metrics);
             return metrics;
         }
         catch (OperationCanceledException)
@@ -7570,20 +7938,6 @@ while True:
         }
     }
 
-    private static void RecordResourceMetricInstruments(SandboxResourceMetrics metrics)
-    {
-        var phaseTag = new KeyValuePair<string, object?>("phase", metrics.Phase);
-        var networkTag = new KeyValuePair<string, object?>("network_profile", metrics.NetworkProfile ?? "");
-        if (BytesToMb(metrics.PeakRamBytes) is { } peak)
-            CodeyBoxMeters.SandboxPeakRamMb.Record(peak, phaseTag, networkTag);
-        if (metrics.AvgCpuPercent is { } cpu)
-            CodeyBoxMeters.SandboxAvgCpuPercent.Record(cpu, phaseTag, networkTag);
-        if (BytesToMb(metrics.NetRxBytes) is { } rx)
-            CodeyBoxMeters.SandboxNetRxMb.Record(rx, phaseTag, networkTag);
-        if (BytesToMb(metrics.NetTxBytes) is { } tx)
-            CodeyBoxMeters.SandboxNetTxMb.Record(tx, phaseTag, networkTag);
-    }
-
     private static bool HasRequiredResourceMetrics(SandboxResourceMetrics metrics) =>
         metrics.PeakRamBytes.HasValue
         && metrics.AvgCpuPercent.HasValue
@@ -7611,13 +7965,7 @@ while True:
     {
         if (!values.TryGetValue(key, out var raw) || string.IsNullOrWhiteSpace(raw))
             return null;
-        if (!double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
-            return null;
-        if (double.IsNaN(value) || double.IsInfinity(value) || value < min)
-            return null;
-        if (max.HasValue && value > max.Value)
-            return null;
-        return value;
+        return SandboxResourceMetricValidation.ParseFiniteDouble(raw, min, max);
     }
 
     private static double? BytesToMb(long? bytes) =>

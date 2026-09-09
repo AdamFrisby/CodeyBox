@@ -26,13 +26,40 @@ public interface IAgentStreamStore
     Task<int> SweepAsync(DateTimeOffset now, CancellationToken ct = default);
 }
 
+/// <param name="CapturedAt">When the stream file was first created (its
+/// creation timestamp). Stable for the lifetime of the file — cost-window
+/// correlation and "most recently captured file" selection rely on this being
+/// the capture instant, not the last append.</param>
+/// <param name="LastActivityAt">Timestamp of the most recent append to the
+/// file (its last-write time), never earlier than <paramref name="CapturedAt"/>.
+/// This is the liveness signal the progress watchdog reads: a long-running
+/// batch agent (e.g. crock) appends a per-poll chunk while waiting, which
+/// advances this stamp without changing <paramref name="CapturedAt"/>.</param>
 public sealed record AgentStreamFile(
     string FileName,
     string Phase,
     int Iteration,
     long SizeBytes,
     long? LineCount,
-    DateTimeOffset CapturedAt);
+    DateTimeOffset CapturedAt,
+    DateTimeOffset LastActivityAt)
+{
+    /// <summary>
+    /// Convenience overload for callers that have a single timestamp (a file
+    /// with no separate append activity): <see cref="LastActivityAt"/> defaults
+    /// to <paramref name="CapturedAt"/>.
+    /// </summary>
+    public AgentStreamFile(
+        string FileName,
+        string Phase,
+        int Iteration,
+        long SizeBytes,
+        long? LineCount,
+        DateTimeOffset CapturedAt)
+        : this(FileName, Phase, Iteration, SizeBytes, LineCount, CapturedAt, CapturedAt)
+    {
+    }
+}
 
 public sealed class AgentStreamStore : IAgentStreamStore
 {
@@ -44,14 +71,30 @@ public sealed class AgentStreamStore : IAgentStreamStore
         .ToArray();
 
     private readonly ILogger<AgentStreamStore> _log;
+    private readonly Func<AgentStreamsOptions> _optionsAccessor;
 
+    /// <summary>
+    /// Snapshot constructor: options are fixed for the lifetime of the store.
+    /// Used by tests and any caller that does not need hot-reload.
+    /// </summary>
     public AgentStreamStore(AgentStreamsOptions options, ILogger<AgentStreamStore> log)
+        : this(() => options, log)
     {
-        Options = options;
+        ArgumentNullException.ThrowIfNull(options);
+    }
+
+    /// <summary>
+    /// Live constructor: <paramref name="optionsAccessor"/> is invoked on each
+    /// access so config edits (retention days, size cap, per-file cap) take
+    /// effect without a restart. The accessor must be safe to call concurrently.
+    /// </summary>
+    public AgentStreamStore(Func<AgentStreamsOptions> optionsAccessor, ILogger<AgentStreamStore> log)
+    {
+        _optionsAccessor = optionsAccessor ?? throw new ArgumentNullException(nameof(optionsAccessor));
         _log = log;
     }
 
-    public AgentStreamsOptions Options { get; }
+    public AgentStreamsOptions Options => _optionsAccessor();
 
     public Task<AgentStreamCapture?> BeginCaptureAsync(
         WorkItemId workItemId,
@@ -163,48 +206,27 @@ public sealed class AgentStreamStore : IAgentStreamStore
 
     public Task<int> SweepAsync(DateTimeOffset now, CancellationToken ct = default)
     {
-        if (!Options.Enabled || Options.RetainedDays == 0)
+        var opts = Options;
+        if (!opts.Enabled)
             return Task.FromResult(0);
 
         var deleted = 0;
         try
         {
-            var root = Options.Path;
+            var root = opts.Path;
             if (!Directory.Exists(root))
                 return Task.FromResult(0);
 
-            var cutoff = now.UtcDateTime.AddDays(-Options.RetainedDays);
-            foreach (var file in Directory.EnumerateFiles(root, "*.jsonl", SearchOption.AllDirectories))
-            {
-                ct.ThrowIfCancellationRequested();
-                try
-                {
-                    if (File.GetCreationTimeUtc(file) < cutoff)
-                    {
-                        File.Delete(file);
-                        deleted++;
-                    }
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
-                {
-                    _log.LogWarning(ex, "Failed to delete expired agent stream file {Path}", file);
-                }
-            }
+            // Age-based eviction (RetainedDays == 0 disables it). The size-based
+            // backstop below runs regardless, so a zero/misconfigured retention
+            // window can never let the directory grow unbounded.
+            if (opts.RetainedDays > 0)
+                deleted += EvictExpired(root, now, opts.RetainedDays, ct);
 
-            foreach (var dir in Directory.EnumerateDirectories(root, "*", SearchOption.AllDirectories)
-                         .OrderByDescending(d => d.Length))
-            {
-                ct.ThrowIfCancellationRequested();
-                try
-                {
-                    if (!Directory.EnumerateFileSystemEntries(dir).Any())
-                        Directory.Delete(dir);
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
-                {
-                    _log.LogWarning(ex, "Failed to delete empty agent stream directory {Path}", dir);
-                }
-            }
+            if (opts.MaxTotalSizeMb > 0)
+                deleted += EvictBySize(root, opts.MaxTotalSizeMb * 1024L * 1024L, ct);
+
+            RemoveEmptyDirectories(root, ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
         {
@@ -212,6 +234,107 @@ public sealed class AgentStreamStore : IAgentStreamStore
         }
 
         return Task.FromResult(deleted);
+    }
+
+    /// <summary>
+    /// Deletes files whose last-write time is older than the retention window.
+    /// Uses <see cref="File.GetLastWriteTimeUtc(string)"/> rather than creation
+    /// time: on Linux the birth time is frequently unavailable and the runtime
+    /// falls back to the inode change time (ctime), which any metadata touch
+    /// resets — so creation-time cutoffs silently fail to age files out. The
+    /// last-write time is the append instant we actually control.
+    /// </summary>
+    private int EvictExpired(string root, DateTimeOffset now, int retainedDays, CancellationToken ct)
+    {
+        var deleted = 0;
+        var cutoff = now.UtcDateTime.AddDays(-retainedDays);
+        foreach (var file in Directory.EnumerateFiles(root, "*.jsonl", SearchOption.AllDirectories))
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                if (File.GetLastWriteTimeUtc(file) < cutoff)
+                {
+                    File.Delete(file);
+                    deleted++;
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                _log.LogWarning(ex, "Failed to delete expired agent stream file {Path}", file);
+            }
+        }
+
+        return deleted;
+    }
+
+    /// <summary>
+    /// Size-based backstop: when the aggregate size of all stream files exceeds
+    /// <paramref name="maxTotalBytes"/>, deletes the oldest-by-last-write files
+    /// first until the total is back under the cap. This bounds the directory
+    /// even if age-based retention is disabled or misconfigured.
+    /// </summary>
+    private int EvictBySize(string root, long maxTotalBytes, CancellationToken ct)
+    {
+        var files = new List<(string Path, long Size, DateTime LastWriteUtc)>();
+        var total = 0L;
+        foreach (var file in Directory.EnumerateFiles(root, "*.jsonl", SearchOption.AllDirectories))
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                var info = new FileInfo(file);
+                if (!info.Exists)
+                    continue;
+                files.Add((file, info.Length, info.LastWriteTimeUtc));
+                total += info.Length;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                _log.LogWarning(ex, "Failed to stat agent stream file {Path} for size backstop", file);
+            }
+        }
+
+        if (total <= maxTotalBytes)
+            return 0;
+
+        var deleted = 0;
+        foreach (var (path, size, _) in files.OrderBy(f => f.LastWriteUtc))
+        {
+            if (total <= maxTotalBytes)
+                break;
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                File.Delete(path);
+                total -= size;
+                deleted++;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                _log.LogWarning(ex, "Failed to evict agent stream file {Path} under size backstop", path);
+            }
+        }
+
+        return deleted;
+    }
+
+    private void RemoveEmptyDirectories(string root, CancellationToken ct)
+    {
+        foreach (var dir in Directory.EnumerateDirectories(root, "*", SearchOption.AllDirectories)
+                     .OrderByDescending(d => d.Length))
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                if (!Directory.EnumerateFileSystemEntries(dir).Any())
+                    Directory.Delete(dir);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                _log.LogWarning(ex, "Failed to delete empty agent stream directory {Path}", dir);
+            }
+        }
     }
 
     private string GetWorkItemDirectory(WorkItemId workItemId) =>
@@ -289,13 +412,28 @@ public sealed class AgentStreamStore : IAgentStreamStore
         if (!TryParseFileName(info.Name, out var phase, out var iteration))
             return null;
 
+        // CapturedAt is the stable creation instant (used by cost-window
+        // correlation and most-recent-capture selection). LastActivityAt is
+        // Max(creation, lastWrite) so each per-poll append to the same .jsonl
+        // advances the liveness stamp the progress watchdog reads. Long-batch
+        // agents (notably crock) append a stream chunk per status poll while
+        // waiting on an Anthropic Message Batches API task; the watchdog reads
+        // LastActivityAt so those heartbeats count as progress, while the
+        // capture-time consumers keep an immutable timestamp. (Clamp so a
+        // filesystem whose lastWrite precedes creation can never move
+        // LastActivityAt before CapturedAt.)
+        var createdAt = info.CreationTimeUtc;
+        var lastActivity = info.LastWriteTimeUtc > createdAt
+            ? info.LastWriteTimeUtc
+            : createdAt;
         return new AgentStreamFile(
             info.Name,
             phase,
             iteration,
             info.Length,
             includeLineCount ? CountLines(info.FullName, ct) : null,
-            new DateTimeOffset(info.CreationTimeUtc, TimeSpan.Zero));
+            new DateTimeOffset(createdAt, TimeSpan.Zero),
+            new DateTimeOffset(lastActivity, TimeSpan.Zero));
     }
 
     private static long CountLines(string path, CancellationToken ct)

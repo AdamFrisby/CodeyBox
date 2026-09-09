@@ -48,5 +48,9 @@ public sealed class EventSchemaEndpointTests : IDisposable
         Assert.True(envelope.TryGetProperty("eventSchemaVersion", out _));
         Assert.True(envelope.TryGetProperty("eventType", out _));
         Assert.True(envelope.TryGetProperty("emittedAt", out _));
+
+        Assert.Equal(
+            "1.5",
+            eventTypes.GetProperty("audit.auditor_timed_out").GetProperty("introducedIn").GetString());
     }
 }

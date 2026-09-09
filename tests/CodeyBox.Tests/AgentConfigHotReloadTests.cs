@@ -15,11 +15,12 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// Verifies hot-reload of <c>CodeyBox:AgentConcurrency</c>,
-/// <c>CodeyBox:AgentClasses</c>, <c>CodeyBox:AgentBurnEstimator</c>, and
-/// <c>CodeyBox:AgentPricing</c>: edits to these blocks of the layered config
-/// land in the running router / orchestrator / burn estimator / cost
-/// calculator without a restart, and in-flight items already past the
-/// dispatch gate keep the snapshot they started on.
+/// <c>CodeyBox:AgentClasses</c>, <c>CodeyBox:AgentBurnEstimator</c>,
+/// <c>CodeyBox:AgentPricing</c>, and snapshot-backed runtime knobs: edits to
+/// these blocks of the layered config land in the running router /
+/// orchestrator / burn estimator / cost calculator without a restart, and
+/// in-flight items already past the dispatch gate keep the snapshot they
+/// started on.
 /// </summary>
 [Collection("GlobalSerilog")]
 public sealed class AgentConfigHotReloadTests
@@ -112,6 +113,50 @@ public sealed class AgentConfigHotReloadTests
         Assert.False(smoke.Enabled);
         Assert.Equal(15, smoke.Current.CacheTtlMinutes);
         Assert.Equal(3, smoke.Current.StartupTimeoutSeconds);
+
+        await coordinator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task TestFailureAttributionHotReload_SwapsLiveSnapshotOnChange()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            TestFailureAttribution = new TestFailureAttributionOptions
+            {
+                Enabled = false,
+            },
+        };
+        var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
+        var router = new AgentClassRouter(
+            Array.Empty<AgentClass>(),
+            Array.Empty<IAgentQuotaProbe>(),
+            new QuotaRouterOptions { MinQuotaPct = 5.0 },
+            NullLogger<AgentClassRouter>.Instance);
+        using var orchFixture = OrchestratorFixture.Build(new AgentConcurrencyOptions());
+        var burnEstimator = new AgentBurnEstimator(
+            new InertCostStore(), new AgentBurnEstimatorOptions(),
+            NullLogger<AgentBurnEstimator>.Instance);
+        var attribution = new TestFailureAttributionOptionsSnapshot(new TestFailureAttributionOptions
+        {
+            Enabled = false,
+        });
+
+        var coordinator = new AgentConfigHotReload(
+            monitor, orchFixture.Orchestrator, router, burnEstimator,
+            NullLogger<AgentConfigHotReload>.Instance,
+            testFailureAttribution: attribution);
+        await coordinator.StartAsync(CancellationToken.None);
+
+        monitor.Fire(new CodeyBoxOptions
+        {
+            TestFailureAttribution = new TestFailureAttributionOptions
+            {
+                Enabled = true,
+            },
+        });
+
+        Assert.True(attribution.Enabled);
 
         await coordinator.StopAsync(CancellationToken.None);
     }
@@ -1869,6 +1914,7 @@ public sealed class AgentConfigHotReloadTests
             PipelineTuning = new PipelineTuningOptions
             {
                 DefaultQuotaFailurePause = TimeSpan.FromMinutes(5),
+                DefaultRateLimitPause = TimeSpan.FromMinutes(5),
                 QuotaExhaustionFallbackTtl = TimeSpan.FromHours(1),
                 MaxParsedQuotaResetWindow = TimeSpan.FromHours(24),
                 MergeSandboxStagingRestoreAttempts = 2,
@@ -1880,6 +1926,7 @@ public sealed class AgentConfigHotReloadTests
             new PipelineTuningOptions
             {
                 DefaultQuotaFailurePause = initial.PipelineTuning.DefaultQuotaFailurePause,
+                DefaultRateLimitPause = initial.PipelineTuning.DefaultRateLimitPause,
                 QuotaExhaustionFallbackTtl = initial.PipelineTuning.QuotaExhaustionFallbackTtl,
                 MaxParsedQuotaResetWindow = initial.PipelineTuning.MaxParsedQuotaResetWindow,
                 MergeSandboxStagingRestoreAttempts = initial.PipelineTuning.MergeSandboxStagingRestoreAttempts,
@@ -1903,6 +1950,7 @@ public sealed class AgentConfigHotReloadTests
         await coordinator.StartAsync(CancellationToken.None);
 
         Assert.Equal(TimeSpan.FromMinutes(5), snapshot.Current.DefaultQuotaFailurePause);
+        Assert.Equal(TimeSpan.FromMinutes(5), snapshot.Current.DefaultRateLimitPause);
         Assert.Equal(2, snapshot.Current.MergeSandboxStagingRestoreAttempts);
         Assert.Equal(2, snapshot.Current.MaxPlanReviewIterations);
 
@@ -1912,11 +1960,13 @@ public sealed class AgentConfigHotReloadTests
             PipelineTuning = new PipelineTuningOptions
             {
                 DefaultQuotaFailurePause = TimeSpan.FromMinutes(1),
+                DefaultRateLimitPause = TimeSpan.FromMinutes(2),
                 MergeSandboxStagingRestoreAttempts = 3,
                 MaxPlanReviewIterations = 4,
             },
         });
         Assert.Equal(TimeSpan.FromMinutes(1), snapshot.Current.DefaultQuotaFailurePause);
+        Assert.Equal(TimeSpan.FromMinutes(2), snapshot.Current.DefaultRateLimitPause);
         Assert.Equal(3, snapshot.Current.MergeSandboxStagingRestoreAttempts);
         Assert.Equal(4, snapshot.Current.MaxPlanReviewIterations);
 
@@ -1926,6 +1976,7 @@ public sealed class AgentConfigHotReloadTests
             PipelineTuning = new PipelineTuningOptions
             {
                 DefaultQuotaFailurePause = TimeSpan.FromMinutes(1),
+                DefaultRateLimitPause = TimeSpan.FromMinutes(2),
                 MergeSandboxStagingRestoreAttempts = 3,
                 MaxPlanReviewIterations = 4,
             },
@@ -2605,6 +2656,7 @@ public sealed class AgentConfigHotReloadTests
                 MaxQuestionsPerWorkItem = 10,
                 AgentSuspendMaxRetries = 1,
                 AgentSessionResumeMaxAttempts = 4,
+                MaxRetainedAgentTurnSandboxes = 16,
                 AuditShortCircuitEnabled = true,
                 EmptyReworkEscalationRetries = 1,
                 AuditorIdleTimeout = TimeSpan.FromMinutes(5),
@@ -2618,6 +2670,7 @@ public sealed class AgentConfigHotReloadTests
             MaxQuestionsPerWorkItem = initial.PipelineTuning.MaxQuestionsPerWorkItem,
             AgentSuspendMaxRetries = initial.PipelineTuning.AgentSuspendMaxRetries,
             AgentSessionResumeMaxAttempts = initial.PipelineTuning.AgentSessionResumeMaxAttempts,
+            MaxRetainedAgentTurnSandboxes = initial.PipelineTuning.MaxRetainedAgentTurnSandboxes,
             AuditShortCircuitEnabled = initial.PipelineTuning.AuditShortCircuitEnabled,
             EmptyReworkEscalationRetries = initial.PipelineTuning.EmptyReworkEscalationRetries,
             AuditorIdleTimeout = initial.PipelineTuning.AuditorIdleTimeout,
@@ -2650,6 +2703,7 @@ public sealed class AgentConfigHotReloadTests
             Assert.Equal(10, snapshot.Current.MaxQuestionsPerWorkItem);
             Assert.Equal(1, snapshot.Current.AgentSuspendMaxRetries);
             Assert.Equal(4, snapshot.Current.AgentSessionResumeMaxAttempts);
+            Assert.Equal(16, snapshot.Current.MaxRetainedAgentTurnSandboxes);
             Assert.True(snapshot.Current.AuditShortCircuitEnabled);
             Assert.Equal(1, snapshot.Current.EmptyReworkEscalationRetries);
             Assert.Equal(TimeSpan.FromMinutes(5), snapshot.Current.AuditorIdleTimeout);
@@ -2668,6 +2722,7 @@ public sealed class AgentConfigHotReloadTests
                     MaxQuestionsPerWorkItem = 20,
                     AgentSuspendMaxRetries = 3,
                     AgentSessionResumeMaxAttempts = 6,
+                    MaxRetainedAgentTurnSandboxes = 7,
                     AuditShortCircuitEnabled = false,
                     EmptyReworkEscalationRetries = 3,
                     AuditorIdleTimeout = TimeSpan.Zero,
@@ -2677,6 +2732,7 @@ public sealed class AgentConfigHotReloadTests
             Assert.Equal(20, snapshot.Current.MaxQuestionsPerWorkItem);
             Assert.Equal(3, snapshot.Current.AgentSuspendMaxRetries);
             Assert.Equal(6, snapshot.Current.AgentSessionResumeMaxAttempts);
+            Assert.Equal(7, snapshot.Current.MaxRetainedAgentTurnSandboxes);
             Assert.False(snapshot.Current.AuditShortCircuitEnabled);
             Assert.Equal(3, snapshot.Current.EmptyReworkEscalationRetries);
             Assert.Equal(TimeSpan.Zero, snapshot.Current.AuditorIdleTimeout);

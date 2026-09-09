@@ -98,7 +98,8 @@ public sealed record RequiredBuildVerificationResult(
     RequiredBuildVerificationStatus Status,
     int ExitCode,
     string Output,
-    string? Reason = null)
+    string? Reason = null,
+    IReadOnlyList<TestFailureAttributionResult>? TestFailureAttributions = null)
 {
     public static RequiredBuildVerificationResult Skipped { get; } =
         new(RequiredBuildVerificationStatus.Skipped, 0, string.Empty);

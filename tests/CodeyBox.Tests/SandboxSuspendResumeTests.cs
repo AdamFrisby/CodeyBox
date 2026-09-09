@@ -1920,6 +1920,56 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task StartupResume_AdoptionExit0_ReplacesClaimedTypedCheckpointWithGitOnlyCheckpoint()
+    {
+        var item = MakeItem();
+        var archive = new AgentTurnScratchpadArchive([1, 2, 3]);
+        var typedRef = AgentTurnCheckpointRef.Create(item.Id, new string('a', 40), archive);
+        var dispatchClaim = Guid.Parse("5f0c849e-c5b8-4205-bb5f-82a38df736be");
+        var turnCheckpoint = new AgentTurnResumeCheckpoint(
+                AgentKind.Claude,
+                "claude/default",
+                modelId: "claude-test",
+                reasoningMode: "high",
+                nativeSessionId: null,
+                WorkItemState.Working,
+                AgentTurnResumePhase.Work,
+                iteration: null,
+                promptRevision: item.PromptRevision,
+                createdAt: DateTimeOffset.UtcNow.AddMinutes(-10))
+            .ClaimDispatch(dispatchClaim);
+        await _store.CreateAsync(item with
+        {
+            Agent = AgentKind.Claude,
+            AgentInstanceId = "claude/default",
+            WorkBranch = "codeybox/startup-typed-checkpoint",
+            PreemptCheckpoint = typedRef.Value,
+            PreemptedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            AgentTurnResumeCheckpoint = turnCheckpoint,
+            SuspendedVmName = "vm-promote-typed",
+            SuspendedAt = DateTimeOffset.UtcNow,
+            AgentLogPath = "/work/.codeybox/agent-logs/typed.log",
+        });
+        var scratchpads = (IAgentTurnScratchpadStore)_store;
+        await scratchpads.SaveAsync(item.Id, typedRef, archive);
+
+        var provider = new FakeSuspendingProvider { AdoptionExitCodeToReturn = 0 };
+        var svc = MakeResumeService(provider);
+
+        await svc.ResumeAllForTestAsync(CancellationToken.None);
+
+        var promotedRef = $"refs/heads/codeybox/preempt/{item.Id}";
+        var pushed = Assert.Single(provider.CheckpointPushCalls);
+        Assert.Equal(promotedRef, pushed.RefName);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(promotedRef, after.PreemptCheckpoint);
+        Assert.Null(after.AgentTurnResumeCheckpoint);
+        Assert.Null(await scratchpads.ReadAsync(item.Id, typedRef));
+    }
+
+    [Fact]
     public async Task StartupResume_AdoptionNonZeroExit_DoesNotPromoteCheckpoint()
     {
         // A non-zero exit from the adopted agent means the in-VM work failed
@@ -2448,6 +2498,70 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await reaper.RunSweepAsync(CancellationToken.None);
 
         Assert.Contains("vm-stale-suspended", provider.DisposedNames);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.Working, null, true)]
+    [InlineData(WorkItemState.Failed, WorkItemFailureKinds.Infrastructure, true)]
+    [InlineData(WorkItemState.Failed, "other", false)]
+    [InlineData(WorkItemState.NeedsOperatorInput, null, true)]
+    [InlineData(WorkItemState.AbandonedAfterRecoveryAttempts, null, true)]
+    [InlineData(WorkItemState.Done, null, false)]
+    [InlineData(WorkItemState.Cancelled, null, false)]
+    public async Task LeakReaper_ProtectsRetainedLeaseOnlyInAllowedRecoveryStates(
+        WorkItemState state,
+        string? failureKind,
+        bool expectedProtected)
+    {
+        var vmName = $"vm-retained-{state.ToString().ToLowerInvariant()}-{Guid.NewGuid():N}";
+        var item = MakeItem(state) with
+        {
+            FailureKind = failureKind,
+            Agent = AgentKind.Claude,
+            AgentInstanceId = "claude/default",
+            WorkBranch = "codeybox/retained-lease",
+            PreemptedAt = DateTimeOffset.UtcNow.AddHours(-1),
+            AgentTurnResumeCheckpoint = new AgentTurnResumeCheckpoint(
+                AgentKind.Claude,
+                "claude/default",
+                modelId: null,
+                reasoningMode: null,
+                nativeSessionId: null,
+                WorkItemState.Working,
+                AgentTurnResumePhase.Work,
+                iteration: null,
+                promptRevision: 1,
+                createdAt: DateTimeOffset.UtcNow.AddHours(-1)),
+            AgentTurnRecoveryLease = new SandboxRecoveryLease(
+                "fake-leak-provider",
+                vmName,
+                Guid.NewGuid().ToString("N")),
+        };
+        await _store.CreateAsync(item);
+
+        var provider = new FakeSandboxLeakProvider();
+        provider.SeedManaged(new ManagedSandboxInfo(
+            vmName,
+            DateTimeOffset.UtcNow.AddHours(-1),
+            1024L * 1024,
+            IsTrackedActive: false));
+        var reaper = new SandboxLeakReaper(
+            provider,
+            new NullWebhookDispatcher(),
+            () => new SandboxLeakOptions
+            {
+                LeakAgeThreshold = TimeSpan.FromMinutes(30),
+                AutoDispose = true,
+            },
+            NullLogger<SandboxLeakReaper>.Instance,
+            _store);
+
+        await reaper.RunSweepAsync(CancellationToken.None);
+
+        if (expectedProtected)
+            Assert.DoesNotContain(vmName, provider.DisposedNames);
+        else
+            Assert.Contains(vmName, provider.DisposedNames);
     }
 
     [Fact]

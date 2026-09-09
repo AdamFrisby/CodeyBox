@@ -13,15 +13,31 @@ namespace CodeyBox.Agents.Gemini;
 /// The agent is expected to be installed in the sandbox image; the host
 /// injects the API key via GEMINI_API_KEY.
 /// </summary>
-public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, ITextOnlyAgentRunner
+public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, ITextOnlyAgentRunner, IAgentDefaultModelProvider
 {
     private static readonly HttpClient SharedTextOnlyHttp = new();
-    private const string DefaultTextOnlyModel = "gemini-2.5-pro";
+    private static readonly EnvBackedCredentialFile OAuthCredentialFile = new(
+        CodeyBox.Core.GeminiConstants.OAuthCredsEnvVar,
+        ".gemini/oauth_creds.json",
+        "gemini auth");
+    private static readonly EnvBackedCredentialFile SettingsCredentialFile = new(
+        CodeyBox.Core.GeminiConstants.SettingsEnvVar,
+        ".gemini/settings.json",
+        "gemini settings");
     private const int TextOnlyMaxOutputTokens = 8192;
 
+    private readonly AgentDefaultsSnapshot? _defaults;
     private readonly HttpClient _textOnlyHttp;
 
-    public GeminiAgentRunner() : this(textOnlyHttp: null) { }
+    public GeminiAgentRunner() : this(defaults: null) { }
+
+    /// <param name="defaults">
+    /// Live snapshot of per-agent default model IDs (see <see cref="AgentDefaultsSnapshot"/>).
+    /// Supplies <see cref="DefaultModelId"/> when a caller does not pass an explicit
+    /// model, so the CLI/HTTP dispatch model is sourced from hot-reloadable config
+    /// rather than a hardcoded literal.
+    /// </param>
+    public GeminiAgentRunner(AgentDefaultsSnapshot? defaults) : this(defaults, textOnlyHttp: null) { }
 
     /// <summary>
     /// Internal test seam: lets unit tests inject an <see cref="HttpClient"/>
@@ -30,10 +46,24 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     /// public Gemini endpoints. Production wiring uses the process-wide
     /// shared HttpClient.
     /// </summary>
-    internal GeminiAgentRunner(HttpClient? textOnlyHttp)
+    internal GeminiAgentRunner(HttpClient? textOnlyHttp) : this(defaults: null, textOnlyHttp) { }
+
+    internal GeminiAgentRunner(AgentDefaultsSnapshot? defaults, HttpClient? textOnlyHttp)
     {
+        _defaults = defaults;
         _textOnlyHttp = textOnlyHttp ?? SharedTextOnlyHttp;
     }
+
+    /// <summary>
+    /// Default model used for <c>--model</c> (CLI) and the text-only HTTP
+    /// endpoints when no per-item override is provided. Sourced live from
+    /// <see cref="AgentDefaultsSnapshot"/> (config key <c>CodeyBox:AgentDefaults[gemini]</c>)
+    /// so a model rev is a config edit, not a code change. Null when no default
+    /// is configured — callers with no explicit model then get no <c>--model</c>
+    /// flag (CLI) or a clear missing-model failure (text-only), never a stale
+    /// hardcoded id.
+    /// </summary>
+    public string? DefaultModelId => _defaults?.GetDefault(Kind.Value);
 
     // @google/gemini-cli emits ANSI colour codes and progress spinners to
     // stderr (and occasionally stdout) even in non-TTY mode. Strip them so
@@ -64,56 +94,12 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".gemini/tmp", ".gemini/history"];
 
-    protected override IReadOnlyList<string> FileBackedCredentialEnvironmentVariables =>
-        [CodeyBox.Core.GeminiConstants.OAuthCredsEnvVar, "CODEYBOX_GEMINI_SETTINGS_JSON"];
+    protected override IReadOnlyList<EnvBackedCredentialFile> EnvBackedCredentialFiles =>
+        [OAuthCredentialFile, SettingsCredentialFile];
+
+    protected override IReadOnlyList<string> DirectCredentialEnvironmentVariables => ["GEMINI_API_KEY"];
 
     protected override string PreemptProcessPattern => Binary;
-
-    /// <summary>
-    /// Materialises the Gemini OAuth credentials and settings file into
-    /// <c>~/.gemini/</c> inside the sandbox if the env-var bundle is present
-    /// (set by <c>GeminiOAuthFileCredentialProvider</c>). The Gemini CLI
-    /// hard-reads these paths and offers no env-var alternative for OAuth, so
-    /// we shuttle them in via env vars and write them at sandbox-prepare time.
-    /// </summary>
-    protected override async Task<AgentResult?> PrepareSandboxAsync(
-        ISandbox sandbox,
-        string workingDirectory,
-        AgentCredential? credential,
-        AgentResumeContext? resume,
-        CancellationToken ct = default)
-    {
-        // Skip the bash hook entirely when no OAuth bundle is present (e.g.
-        // operators using GEMINI_API_KEY); the CLI will fall back to whichever
-        // env-var auth path the credential pipeline plugged in.
-        if (credential is null
-            || !credential.EnvironmentVariables.ContainsKey(CodeyBox.Core.GeminiConstants.OAuthCredsEnvVar))
-            return null;
-
-        var script =
-            "set -eu\n" +
-            "mkdir -p \"$HOME/.gemini\"\n" +
-            "umask 077\n" +
-            "if [ -n \"${CODEYBOX_GEMINI_OAUTH_CREDS_JSON:-}\" ]; then\n" +
-            "  printf '%s' \"$CODEYBOX_GEMINI_OAUTH_CREDS_JSON\" > \"$HOME/.gemini/oauth_creds.json\"\n" +
-            "fi\n" +
-            "if [ -n \"${CODEYBOX_GEMINI_SETTINGS_JSON:-}\" ]; then\n" +
-            "  printf '%s' \"$CODEYBOX_GEMINI_SETTINGS_JSON\" > \"$HOME/.gemini/settings.json\"\n" +
-            "fi\n";
-        var write = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["bash", "-c", script],
-        }, ct);
-        if (!write.Success)
-        {
-            return new AgentResult(
-                Success: false,
-                Summary: $"failed to materialise gemini auth: exit {write.ExitCode}",
-                Stdout: write.Stdout,
-                Stderr: write.Stderr);
-        }
-        return null;
-    }
 
     public async Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default)
     {
@@ -150,10 +136,16 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             argv.Add("--output-format");
             argv.Add("stream-json");
         }
-        if (!string.IsNullOrEmpty(modelId))
+        // Fall back to the config-sourced default (DefaultModelId) when the
+        // caller passes no explicit model, mirroring CodexAgentRunner /
+        // CursorAgentRunner. When neither is set we omit --model and let
+        // gemini-cli pick its own built-in default — we never inject a
+        // hardcoded id here.
+        var effectiveModel = !string.IsNullOrEmpty(modelId) ? modelId : DefaultModelId;
+        if (!string.IsNullOrEmpty(effectiveModel))
         {
             argv.Add("--model");
-            argv.Add(modelId);
+            argv.Add(effectiveModel);
         }
         // Gemini CLI 0.40+ has no --reasoning/--thinking/--effort flag.
         // Reasoning level is encoded in the model config: gemini-3-* preset
@@ -224,17 +216,29 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         _ = workingDirectory;
         _ = reasoningMode;
 
+        // Resolve the dispatch model once: explicit per-call model wins, else
+        // the config-sourced default. No hardcoded fallback — an unresolved
+        // model surfaces as a clear failure rather than silently routing to a
+        // stale literal.
+        var effectiveModel = !string.IsNullOrWhiteSpace(modelId) ? modelId! : DefaultModelId;
+
         // API-key first preference: pay-per-use callers explicitly configured
         // GEMINI_API_KEY and expect that quota to be spent, not the OAuth one.
         if (TryGetApiKey(credential, out var apiKey))
-            return await SendApiKeyAsync(_textOnlyHttp, systemPrompt, userPrompt, apiKey, modelId, ct).ConfigureAwait(false);
+        {
+            if (string.IsNullOrWhiteSpace(effectiveModel)) return MissingModelResult();
+            return await SendApiKeyAsync(_textOnlyHttp, systemPrompt, userPrompt, apiKey, effectiveModel!, ct).ConfigureAwait(false);
+        }
 
         // OAuth subscription fallback: authorized for Gemini specifically (the
         // operator note explicitly permits subscription-OAuth usage against
         // Gemini's API directly; this is the resolver-cascade workaround until
         // the agentic in-VM resolver lands).
         if (TryGetOAuthAccessToken(credential, out var oauthToken))
-            return await SendOAuthAsync(_textOnlyHttp, systemPrompt, userPrompt, oauthToken, modelId, ct).ConfigureAwait(false);
+        {
+            if (string.IsNullOrWhiteSpace(effectiveModel)) return MissingModelResult();
+            return await SendOAuthAsync(_textOnlyHttp, systemPrompt, userPrompt, oauthToken, effectiveModel!, ct).ConfigureAwait(false);
+        }
 
         return new TextOnlyAgentResult(
             false,
@@ -243,17 +247,23 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             "GEMINI_API_KEY or Gemini OAuth credentials are required");
     }
 
+    private static TextOnlyAgentResult MissingModelResult() =>
+        new(
+            false,
+            "missing model id for Gemini text-only call",
+            null,
+            "No model id available (no default configured); set a default in CodeyBox:AgentDefaults or supply an explicit modelId.");
+
     private static async Task<TextOnlyAgentResult> SendApiKeyAsync(
         HttpClient http,
         string? systemPrompt,
         string userPrompt,
         string apiKey,
-        string? modelId,
+        string effectiveModel,
         CancellationToken ct)
     {
         try
         {
-            var effectiveModel = string.IsNullOrWhiteSpace(modelId) ? DefaultTextOnlyModel : modelId;
             var requestBody = BuildGenerateContentRequest(systemPrompt, userPrompt);
             var body = JsonSerializer.Serialize(requestBody);
             var endpoint = $"https://generativelanguage.googleapis.com/v1beta/models/{Uri.EscapeDataString(effectiveModel)}:generateContent";
@@ -283,12 +293,11 @@ public sealed class GeminiAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         string? systemPrompt,
         string userPrompt,
         string accessToken,
-        string? modelId,
+        string effectiveModel,
         CancellationToken ct)
     {
         try
         {
-            var effectiveModel = string.IsNullOrWhiteSpace(modelId) ? DefaultTextOnlyModel : modelId;
             // Code Assist wraps the GenerateContent body in {model, request}
             // (see GeminiQuotaProbe.ProbeOneAsync for the canonical shape).
             var generateContentRequest = BuildGenerateContentRequest(systemPrompt, userPrompt);

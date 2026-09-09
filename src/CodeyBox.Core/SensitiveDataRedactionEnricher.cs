@@ -25,7 +25,7 @@ public sealed class SensitiveDataRedactionEnricher : ILogEventEnricher
     private static readonly HashSet<string> SensitiveKeyFragments = new(StringComparer.OrdinalIgnoreCase)
     {
         "Token", "Secret", "Password", "Authorization", "ApiKey", "AuthJson", "Credential",
-        "SessionId",
+        "SessionId", "ThreadId", "ConversationId", "NativeSessionId",
     };
 
     internal const string SecretValuePatternSource =
@@ -59,6 +59,10 @@ public sealed class SensitiveDataRedactionEnricher : ILogEventEnricher
     private static readonly Regex JsonStringPropertyPattern = new(
         "(?<prefix>\"(?<key>(?:\\\\.|[^\"\\\\])*)\"\\s*:\\s*)\"(?:\\\\.|[^\"\\\\])*\"",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static readonly Regex ResumeMetadataTypePattern = new(
+        "\\\"type\\\"\\s*:\\s*\\\"(?:session_meta|thread\\.(?:started|created))\\\"",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
 
     private static readonly Regex TextKeyValuePattern = new(
         @"(?<prefix>\b(?<key>[A-Za-z_][A-Za-z0-9_.-]*)\s*[:=]\s*)(?<value>[^\r\n]*)",
@@ -107,10 +111,18 @@ public sealed class SensitiveDataRedactionEnricher : ILogEventEnricher
         if (string.IsNullOrEmpty(value))
             return value;
 
+        // Older Codex JSONL envelopes put the resumable conversation id in a
+        // generic `id` property nested under a typed session/thread event. A
+        // bare `id` is not globally sensitive, so enable that broader scrub
+        // only when this text contains one of those exact envelope types.
+        var containsResumeMetadata = ResumeMetadataTypePattern.IsMatch(value);
         return JsonStringPropertyPattern.Replace(value, match =>
         {
             var key = UnescapeJsonString(match.Groups["key"].Value);
-            return IsSensitiveKey(key) ? match.Groups["prefix"].Value + "\"***\"" : match.Value;
+            return IsSensitiveKey(key)
+                || containsResumeMetadata && string.Equals(key, "id", StringComparison.OrdinalIgnoreCase)
+                ? match.Groups["prefix"].Value + "\"***\""
+                : match.Value;
         });
     }
 

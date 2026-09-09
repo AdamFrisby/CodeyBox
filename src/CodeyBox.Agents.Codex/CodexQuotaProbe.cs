@@ -19,19 +19,22 @@ namespace CodeyBox.Agents.Codex;
 public sealed class CodexQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalidator
 {
     internal const string UsageEndpoint = "https://chatgpt.com/backend-api/wham/usage";
-    internal const string DefaultRoutedModelId = "gpt-5.5";
+
+    /// <summary>
+    /// Provider-side WHAM display-bucket name under which a Codex subscription's
+    /// usage is reported. This is an identifier in the upstream response, NOT a
+    /// routing default: the model the CLI actually routes to is sourced from
+    /// config (<see cref="AgentDefaultsSnapshot"/> / the class member's ModelId),
+    /// and <see cref="ApplyMemberGate"/> aliases this bucket's reading onto that
+    /// configured model. (Deferred follow-up: fold this into a config-driven
+    /// known-bucket list alongside the other provider model lists.)
+    /// </summary>
+    internal const string SubscriptionUsageBucketName = "GPT-5.3-Codex-Spark";
 
     private const int MaxResponseChars = 64 * 1024; // 64 KiB
-    private static readonly IReadOnlyDictionary<string, string[]> RoutedModelAliases =
-        new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
-        {
-            // Captured WHAM usage names the Codex subscription bucket by its
-            // product/display limit, while the CLI route configured in the
-            // default frontier class is gpt-5.5.
-            ["GPT-5.3-Codex-Spark"] = [DefaultRoutedModelId],
-        };
 
     private readonly IHttpClientFactory _httpClientFactory;
+    private readonly AgentDefaultsSnapshot? _defaults;
     private readonly Func<AgentMembership, AgentQuotaCredentials> _credentialsProvider;
     private readonly TimeSpan _cacheTtl;
     private readonly ILogger<CodexQuotaProbe> _log;
@@ -70,12 +73,14 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
         IHttpClientFactory httpClientFactory,
         Func<AgentMembership, AgentQuotaCredentials> credentialsProvider,
         TimeSpan cacheTtl,
-        ILogger<CodexQuotaProbe> log)
+        ILogger<CodexQuotaProbe> log,
+        AgentDefaultsSnapshot? defaults = null)
     {
         _httpClientFactory = httpClientFactory;
         _credentialsProvider = credentialsProvider;
         _cacheTtl = cacheTtl;
         _log = log;
+        _defaults = defaults;
     }
 
     public async Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
@@ -137,6 +142,38 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
         if (snapshot.AvailablePct < 0) return snapshot;
         if (string.IsNullOrWhiteSpace(member.ModelId)) return snapshot;
         if (snapshot.PerModel.ContainsKey(member.ModelId)) return snapshot;
+
+        // Config-driven subscription-bucket alias (replaces the former hardcoded
+        // gpt-5.5 alias target). The WHAM response reports a Codex subscription's
+        // usage under a provider display-bucket name (SubscriptionUsageBucketName),
+        // not the model id the CLI routes to. When the member being gated IS the
+        // configured codex routed-default model (CodeyBox:AgentDefaults[codex]) and
+        // that display bucket is present, alias its already-overall-capped reading
+        // onto the member so the floor is enforced on the subscription's own bucket
+        // rather than the looser account-wide overall. Sourcing the routed-model
+        // identity from config (not a source literal) makes a model rev a config
+        // edit, not a code change. Any other configured model (e.g. a newly
+        // released id the backend has not minted a bucket for) falls through to the
+        // overall reading below, unchanged.
+        var routedDefault = _defaults?.GetDefault(Kind.Value);
+        if (!string.IsNullOrWhiteSpace(routedDefault)
+            && string.Equals(routedDefault, member.ModelId, StringComparison.OrdinalIgnoreCase)
+            && snapshot.PerModel.TryGetValue(SubscriptionUsageBucketName, out var subscriptionQuota))
+        {
+            var aliasedPerModel = new Dictionary<string, ModelQuota>(snapshot.PerModel, StringComparer.OrdinalIgnoreCase)
+            {
+                [member.ModelId] = subscriptionQuota,
+            };
+            return new AgentQuotaSnapshot
+            {
+                AvailablePct = snapshot.AvailablePct,
+                ResetAt = snapshot.ResetAt,
+                Notes = snapshot.Notes,
+                PerModel = aliasedPerModel,
+                Windows = snapshot.Windows,
+                ResetCreditsAvailable = snapshot.ResetCreditsAvailable,
+            };
+        }
 
         // The configured model is not individually enumerated, but the overall
         // reading is known (guarded above) and is the binding constraint for
@@ -303,11 +340,6 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
                 continue;
 
             perModel[modelId] = quota;
-            if (RoutedModelAliases.TryGetValue(modelId, out var aliases))
-            {
-                foreach (var alias in aliases)
-                    perModel.TryAdd(alias, quota);
-            }
         }
 
         return perModel;
@@ -327,10 +359,15 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
         // operators can see (via /quota) which window is the actual gate.
         var windows = new List<WindowQuota>(windowSources.Length);
         ModelQuota? mostConstrained = null;
-        foreach (var (windowName, window) in windowSources)
+        foreach (var (positionalName, window) in windowSources)
         {
             if (window is null)
                 continue;
+
+            // Name the window by the length it declares, not by the slot it arrived in.
+            var windowName = positionalName == "overall"
+                ? positionalName
+                : ResolveWindowName(window.Value, positionalName);
 
             var quota = TryParseWindow(window.Value, windowName);
             if (quota is null)
@@ -356,6 +393,39 @@ public sealed class CodexQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
         return mostConstrained is null
             ? null
             : mostConstrained with { Windows = windows };
+    }
+
+    /// <summary>
+    /// Two days. Any window at least this long is a weekly allowance; anything shorter is the
+    /// short rolling one. Sits far from both real values (5h = 18,000s, weekly = 604,800s) so a
+    /// provider tweak to either does not flip the classification.
+    /// </summary>
+    private const double WeeklyWindowThresholdSeconds = 2 * 24 * 60 * 60;
+
+    /// <summary>
+    /// The window's real name, taken from the length the payload declares rather than from which
+    /// JSON slot it arrived in.
+    /// </summary>
+    /// <remarks>
+    /// The slot is not the window. OpenAI disabled the 5-hour limit for <b>Pro</b> accounts (it now
+    /// applies to basic accounts only), so on Pro the WEEKLY allowance arrives in
+    /// <c>primary_window</c> (<c>limit_window_seconds: 604800</c>) and <c>secondary_window</c> is
+    /// null — while the positional convention would call that weekly window <c>5h-rolling</c>.
+    /// Naming by declared length covers both account shapes without branching on plan type. Mislabelling it is not cosmetic: <c>/quota</c> then shows a
+    /// weekly exhaustion as a five-hourly one (implying it recovers in hours when it recovers in
+    /// days), and the per-window floor in <c>QuotaRouter.MinQuotaPctByWindow</c> is looked up under
+    /// the wrong key. Falls back to the positional default when the length is absent.
+    /// </remarks>
+    private static string ResolveWindowName(JsonElement window, string positionalDefault)
+    {
+        if ((TryGetDoubleProperty(window, "limit_window_seconds", out var seconds)
+             || TryGetDoubleProperty(window, "limitWindowSeconds", out seconds))
+            && seconds > 0)
+        {
+            return seconds >= WeeklyWindowThresholdSeconds ? "weekly" : "5h-rolling";
+        }
+
+        return positionalDefault;
     }
 
     private static ModelQuota? TryParseWindow(JsonElement el, string window)

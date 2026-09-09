@@ -60,6 +60,8 @@ internal static class QueueShow
                 Console.WriteLine($"Project:     {item.ProjectId}");
                 Console.WriteLine($"Title:       {item.Title}");
                 Console.WriteLine($"Agent:       {item.Agent}");
+                if (item.Initiator is not null)
+                    Console.WriteLine($"Initiator:   {item.Initiator.DisplayName} ({item.Initiator.Issuer})");
                 if (item.WorkBranch is not null)
                     Console.WriteLine($"Work branch: {item.WorkBranch}");
                 if (item.BaseBranch is not null)

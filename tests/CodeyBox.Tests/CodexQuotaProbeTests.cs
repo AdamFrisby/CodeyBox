@@ -144,8 +144,12 @@ public sealed class CodexQuotaProbeTests
     }
 
     [Fact]
-    public void ParseResponse_AddsDefaultRoutedAliasForWhamCodexBucket()
+    public void ParseResponse_KeepsSubscriptionBucketWithoutSynthesizingRoutingAlias()
     {
+        // ParseResponse maps the raw WHAM shape only. It preserves the provider
+        // subscription display bucket but does NOT synthesize a routing-alias key
+        // for a hardcoded model id — aliasing onto the configured routed model is a
+        // member-gate concern (config-sourced), covered separately.
         var snap = CodexQuotaProbe.ParseResponse("""
         {
           "rate_limit": { "primary_window": { "used_percent": 40 } },
@@ -159,7 +163,7 @@ public sealed class CodexQuotaProbeTests
         """);
 
         Assert.Equal(0, snap.PerModel["GPT-5.3-Codex-Spark"].AvailablePct);
-        Assert.Equal(0, snap.PerModel[CodexQuotaProbe.DefaultRoutedModelId].AvailablePct);
+        Assert.False(snap.PerModel.ContainsKey("gpt-5.5"));
     }
 
     // ── HTTP error handling ───────────────────────────────────────────────────

@@ -67,12 +67,23 @@ public static class OrchestratorOptionsFactory
         if (wp.MinSpawnInterval >= TimeSpan.FromHours(1))
             throw new InvalidOperationException(
                 "CodeyBox:WorkerPool:MinSpawnInterval must be < 1 hour (values >= 1h are almost certainly a configuration error)");
+        if (wp.DispatchGateAcquisitionBackoff < TimeSpan.Zero)
+            throw new InvalidOperationException(
+                "CodeyBox:WorkerPool:DispatchGateAcquisitionBackoff must be >= 0");
+        if (wp.DispatchGateAcquisitionBackoff >= TimeSpan.FromHours(1))
+            throw new InvalidOperationException(
+                "CodeyBox:WorkerPool:DispatchGateAcquisitionBackoff must be < 1 hour (values >= 1h are almost certainly a configuration error)");
+        if (wp.MaxConsecutiveDispatchGateTimeoutsBeforeEscalation < 1)
+            throw new InvalidOperationException(
+                "CodeyBox:WorkerPool:MaxConsecutiveDispatchGateTimeoutsBeforeEscalation must be >= 1");
 
         return new OrchestratorOptions
         {
             MaxConcurrentWorkers = maxConcurrent,
             MaxConcurrentSandboxes = maxConcurrentSandboxes,
             MinSpawnInterval = wp.MinSpawnInterval,
+            DispatchGateAcquisitionBackoff = wp.DispatchGateAcquisitionBackoff,
+            MaxConsecutiveDispatchGateTimeoutsBeforeEscalation = wp.MaxConsecutiveDispatchGateTimeoutsBeforeEscalation,
         };
     }
 

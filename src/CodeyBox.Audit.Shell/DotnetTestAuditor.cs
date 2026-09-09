@@ -89,14 +89,21 @@ public sealed class DotnetTestAuditor : IAuditor, ITestRunnerAuditor, IShellAudi
         // Delegate the run to a ShellCommandAuditor built from the current
         // invocation so the tool-presence probe, missing-tool handling and
         // result classification stay identical to the generic shell path.
+        var invocation = BuildInvocation(TestSelection.All, CurrentRunOptions);
         var inner = new ShellCommandAuditor(new ShellCommandAuditorOptions
         {
             Name = _opts.Name,
-            Argv = BuildInvocation(TestSelection.All, CurrentRunOptions),
+            Argv = invocation,
             ResultClassifier = _classifier,
             CanShortCircuitOnBlockingFinding = _opts.CanShortCircuitOnBlockingFinding,
             Role = _opts.Role,
             BuildTestGateEvidence = _opts.BuildTestGateEvidence,
+            // dotnet test performs a NuGet restore (even with --no-build it reads
+            // the settings), so it self-heals an unusable $HOME/.nuget through the
+            // single SelfHealNuGetHome mechanism (NuGetHomeSelfHeal wrapper) — the
+            // one NuGet-home heal source every .NET gate shares.
+            SelfHealNuGetHome = _opts.SelfHealNuGetHome,
+            TestFailureAttributionOptions = _opts.TestFailureAttributionOptions,
         });
         return inner.RunAsync(sandbox, workingDirectory, context, ct);
     }
@@ -143,9 +150,23 @@ public sealed record DotnetTestAuditorOptions
     public BuildTestGateEvidence BuildTestGateEvidence { get; init; } = BuildTestGateEvidence.None;
 
     /// <summary>
+    /// Forwarded to the delegated <see cref="ShellCommandAuditor"/> so a
+    /// <c>dotnet test</c> run self-heals a root-owned <c>~/.nuget</c>. Off by
+    /// default; see <see cref="ShellCommandAuditorOptions.SelfHealNuGetHome"/>.
+    /// </summary>
+    public bool SelfHealNuGetHome { get; init; }
+
+    /// <summary>
     /// Live accessor for hot-reloadable run options (blame-hang / idle-timeout).
     /// Null defaults to <see cref="TestRunOptions.Default"/>, which keeps the
     /// emitted command byte-identical to the legacy path.
     /// </summary>
     public Func<TestRunOptions>? RunOptionsAccessor { get; init; }
+
+    /// <summary>
+    /// Optional hot-reloadable test-failure-attribution options. When set, a
+    /// classified test failure triggers a base-checkout rerun that attributes
+    /// each failing test to the diff or to pre-existing state.
+    /// </summary>
+    public TestFailureAttributionOptionsSnapshot? TestFailureAttributionOptions { get; init; }
 }

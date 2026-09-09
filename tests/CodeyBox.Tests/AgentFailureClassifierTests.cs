@@ -364,6 +364,9 @@ public sealed class AgentFailureClassifierTests
     [InlineData("timeout waiting for child process to exit")]
     [InlineData("Connection timed out")]
     [InlineData("i/o timeout")]
+    [InlineData("codeybox-exec: agent output HTTP ingest unavailable before launch")]
+    [InlineData("agent output transport produced nothing / detached run reported no exit")]
+    [InlineData("detached exec process group 12345 exited without authenticated exit completion")]
     public void NetworkPatterns_Classified_AsTransient(string snippet)
     {
         var c = AgentFailureClassifier.Classify(stderr: snippet);
@@ -379,6 +382,7 @@ public sealed class AgentFailureClassifierTests
     [InlineData("timeout waiting for child process to exit")]
     [InlineData("Connection timed out")]
     [InlineData("i/o timeout")]
+    [InlineData("agent output transport produced nothing / detached run reported no exit")]
     public void NetworkPatterns_InStdout_Classified_AsTransient(string snippet)
     {
         var c = AgentFailureClassifier.Classify(stderr: null, stdout: snippet);

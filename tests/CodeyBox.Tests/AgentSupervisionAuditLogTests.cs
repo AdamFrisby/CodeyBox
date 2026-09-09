@@ -5,27 +5,47 @@ using Serilog.Events;
 
 namespace CodeyBox.Tests;
 
-[Collection("GlobalSerilog")]
 public sealed class AgentSupervisionAuditLogTests : IDisposable
 {
     private readonly TestSink _sink = new();
+    private readonly IDisposable _auditScope;
+
+    // A dedicated, injected Serilog logger keeps this test's audit events off the
+    // process-global Serilog.Log.Logger, so a concurrent host bootstrap that
+    // reassigns the global static cannot reroute them away from _sink. This is
+    // why the class no longer needs the GlobalSerilog serialization collection.
+    private readonly Serilog.Core.Logger _auditLogger;
 
     public AgentSupervisionAuditLogTests()
     {
-        Log.Logger = new LoggerConfiguration()
+        _auditLogger = new LoggerConfiguration()
             .Enrich.FromLogContext()
             .Enrich.With<SensitiveDataRedactionEnricher>()
             .WriteTo.Sink(_sink)
             .CreateLogger();
+
+        // Pin this test's audit emission to our sink for the whole async flow
+        // rather than relying on the process-global Log.Logger staying put: the
+        // audit suite runs WebApplicationFactory<Program> host boots (which
+        // rebuild Log.Logger) concurrently in other collections, and one landing
+        // between an action here and its inline audit emission would otherwise
+        // steal the event — leaving the sink empty. The AsyncLocal override flows
+        // into every call below and is immune to those global swaps.
+        _auditScope = AuditLog.PushScopedLogger(Log.Logger);
     }
 
-    public void Dispose() => Log.CloseAndFlush();
+    public void Dispose()
+    {
+        _auditScope.Dispose();
+        _auditLogger.Dispose();
+    }
 
     [Fact]
     public async Task HumanInjection_EmitsQueuedStartedCompletedAuditEventsWithRedaction()
     {
         var service = new AgentSupervisionService(
-            () => new AgentSupervisionOptions { Enabled = true, InjectionQueueCapacity = 4 });
+            () => new AgentSupervisionOptions { Enabled = true, InjectionQueueCapacity = 4 },
+            auditLogger: _auditLogger);
         await using var scope = await service.TryStartSessionAsync(Start())
             ?? throw new InvalidOperationException("expected supervision scope");
 

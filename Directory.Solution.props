@@ -1,0 +1,17 @@
+<Project InitialTargets="CodeyBoxHealNuGetHome">
+
+  <!-- Heal an unwritable inherited per-user NuGet home before the solution-level
+       restore reads it. The solution restore reads the user config once at the top
+       before dispatching per-project restores, so the hook has to run here too;
+       InitialTargets runs it before that read. Same shared target as the
+       project-level hook in Directory.Build.props. -->
+  <Import Project="$(MSBuildThisFileDirectory)Directory.NuGetHomeHeal.targets" />
+
+  <PropertyGroup>
+    <!-- Solution restore evaluates this before dispatching project restores, so
+         the repository config is selected even when the solution is built from
+         outside its directory. NuGet can still inspect user-level configuration. -->
+    <RestoreConfigFile>$(MSBuildThisFileDirectory)NuGet.Config</RestoreConfigFile>
+  </PropertyGroup>
+
+</Project>

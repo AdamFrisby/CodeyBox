@@ -1,3 +1,4 @@
+using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 
 namespace CodeyBox.Tests;
@@ -207,5 +208,157 @@ public sealed class WorkerProgressWatchdogOptionsValidationTests
         Assert.Equal(TimeSpan.FromMinutes(5), opts.ItemStaleCheckInterval);
         Assert.Equal(3, opts.ItemStaleMaxRecoveryAttempts);
         opts.Validate();
+    }
+
+    // --- Per-agent overrides --------------------------------------------
+
+    [Fact]
+    public void PerAgent_EmptyMap_ValidatesAndResolvesGlobalDefaults()
+    {
+        var opts = new WorkerProgressWatchdogOptions();
+        opts.Validate();
+        // No override for crock → resolves to global default.
+        Assert.Equal(opts.ProgressTimeout, opts.ResolveProgressTimeout(AgentKind.Crock));
+        Assert.Equal(opts.ItemStaleTimeout, opts.ResolveItemStaleTimeout(AgentKind.Crock));
+        // Null agent → resolves to global default.
+        Assert.Equal(opts.ProgressTimeout, opts.ResolveProgressTimeout(agent: null));
+        Assert.Equal(opts.ItemStaleTimeout, opts.ResolveItemStaleTimeout(agent: null));
+    }
+
+    [Fact]
+    public void PerAgent_CrockOverride_TakesPrecedenceForMatchingItems()
+    {
+        // Spec: a batch-latency agent (crock — minutes-to-hours per task)
+        // must be able to opt out of the 60-min default without bumping the
+        // global value and losing protection for synchronous agents.
+        var opts = new WorkerProgressWatchdogOptions
+        {
+            ProgressTimeout = TimeSpan.FromMinutes(60),
+            ItemStaleTimeout = TimeSpan.FromMinutes(75),
+            PerAgent =
+            {
+                ["crock"] = new AgentWatchdogOverride
+                {
+                    ProgressTimeout = TimeSpan.FromHours(6),
+                    ItemStaleTimeout = TimeSpan.FromHours(8),
+                },
+            },
+        };
+        opts.Validate();
+
+        Assert.Equal(TimeSpan.FromHours(6), opts.ResolveProgressTimeout(AgentKind.Crock));
+        Assert.Equal(TimeSpan.FromHours(8), opts.ResolveItemStaleTimeout(AgentKind.Crock));
+        // Synchronous agents keep the tight global default.
+        Assert.Equal(TimeSpan.FromMinutes(60), opts.ResolveProgressTimeout(AgentKind.Claude));
+        Assert.Equal(TimeSpan.FromMinutes(75), opts.ResolveItemStaleTimeout(AgentKind.Claude));
+    }
+
+    [Fact]
+    public void PerAgent_KeyComparisonIsCaseInsensitive()
+    {
+        // Operators sometimes write keys in different casings; the lookup
+        // must be tolerant so a "Crock" config entry still matches.
+        var opts = new WorkerProgressWatchdogOptions
+        {
+            PerAgent =
+            {
+                ["CROCK"] = new AgentWatchdogOverride { ProgressTimeout = TimeSpan.FromHours(3) },
+            },
+        };
+        opts.Validate();
+        Assert.Equal(TimeSpan.FromHours(3), opts.ResolveProgressTimeout(AgentKind.Crock));
+    }
+
+    [Fact]
+    public void PerAgent_PartialOverride_OnlyAppliesSetFields()
+    {
+        // Setting only ProgressTimeout leaves ItemStaleTimeout falling back
+        // to the global default.
+        var opts = new WorkerProgressWatchdogOptions
+        {
+            ItemStaleTimeout = TimeSpan.FromMinutes(75),
+            PerAgent =
+            {
+                ["crock"] = new AgentWatchdogOverride
+                {
+                    ProgressTimeout = TimeSpan.FromHours(6),
+                    // ItemStaleTimeout unset.
+                },
+            },
+        };
+        opts.Validate();
+        Assert.Equal(TimeSpan.FromHours(6), opts.ResolveProgressTimeout(AgentKind.Crock));
+        Assert.Equal(TimeSpan.FromMinutes(75), opts.ResolveItemStaleTimeout(AgentKind.Crock));
+    }
+
+    [Fact]
+    public void PerAgent_ZeroOverride_DisablesForThatKind()
+    {
+        // Zero is a documented "disable" sentinel — operators can opt an
+        // agent out of either watchdog without affecting the global default.
+        var opts = new WorkerProgressWatchdogOptions
+        {
+            ProgressTimeout = TimeSpan.FromMinutes(60),
+            PerAgent =
+            {
+                ["crock"] = new AgentWatchdogOverride { ProgressTimeout = TimeSpan.Zero },
+            },
+        };
+        opts.Validate();
+        Assert.Equal(TimeSpan.Zero, opts.ResolveProgressTimeout(AgentKind.Crock));
+    }
+
+    [Fact]
+    public void PerAgent_NegativeProgressTimeout_Throws()
+    {
+        var opts = new WorkerProgressWatchdogOptions
+        {
+            PerAgent =
+            {
+                ["crock"] = new AgentWatchdogOverride
+                {
+                    ProgressTimeout = TimeSpan.FromSeconds(-1),
+                },
+            },
+        };
+        var ex = Assert.Throws<InvalidOperationException>(opts.Validate);
+        Assert.Contains("crock", ex.Message);
+        Assert.Contains("ProgressTimeout", ex.Message);
+    }
+
+    [Fact]
+    public void PerAgent_ProgressTimeoutBelowCheckInterval_Throws()
+    {
+        // The constraint that ProgressTimeout >= CheckInterval applies to
+        // per-agent overrides too — a 5s override against a 60s sweep would
+        // pretend to trip on every sweep.
+        var opts = new WorkerProgressWatchdogOptions
+        {
+            CheckInterval = TimeSpan.FromSeconds(60),
+            PerAgent =
+            {
+                ["crock"] = new AgentWatchdogOverride
+                {
+                    ProgressTimeout = TimeSpan.FromSeconds(5),
+                },
+            },
+        };
+        var ex = Assert.Throws<InvalidOperationException>(opts.Validate);
+        Assert.Contains("crock", ex.Message);
+        Assert.Contains("CheckInterval", ex.Message);
+    }
+
+    [Fact]
+    public void PerAgent_EmptyKey_Throws()
+    {
+        var opts = new WorkerProgressWatchdogOptions
+        {
+            PerAgent =
+            {
+                [" "] = new AgentWatchdogOverride { ProgressTimeout = TimeSpan.FromHours(1) },
+            },
+        };
+        var ex = Assert.Throws<InvalidOperationException>(opts.Validate);
+        Assert.Contains("PerAgent", ex.Message);
     }
 }

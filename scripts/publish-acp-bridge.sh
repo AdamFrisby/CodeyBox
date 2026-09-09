@@ -316,7 +316,12 @@ def run_turn(bridge_path, claude_path, session_method, session_id, prompt):
         expected_lock_dir = os.path.join(os.path.expanduser("~"), ".claude", "ide")
 
         proc = subprocess.Popen(
-            [bridge_path],
+            [
+                "/usr/bin/env",
+                "--default-signal=HUP,INT,TERM",
+                "CODEYBOX_ACPBRIDGE_SIGNAL_BOOTSTRAP_REEXECED=1",
+                bridge_path,
+            ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

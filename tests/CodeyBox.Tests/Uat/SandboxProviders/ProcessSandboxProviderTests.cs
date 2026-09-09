@@ -126,6 +126,27 @@ public sealed class ProcessSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task ExecAsync_EnvironmentRemovalWinsAndSpecVariableIsAbsent()
+    {
+        var provider = new ProcessSandboxProvider(new RecordingLogger<ProcessSandboxProvider>());
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Environment = new Dictionary<string, string> { ["REMOVE_ME"] = "spec-value" },
+        });
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "if [ \"${REMOVE_ME+x}\" = x ]; then printf present; else printf absent; fi"],
+            ExtraEnvironment = new Dictionary<string, string> { ["REMOVE_ME"] = "exec-value" },
+            EnvironmentVariablesToUnset = ["REMOVE_ME"],
+        });
+
+        Assert.True(result.Success, result.Stderr);
+        Assert.Equal("absent", result.Stdout.TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
     public async Task ExecAsync_TranslatesSandboxAbsolutePathEntriesInPathEnvironment()
     {
         var provider = new ProcessSandboxProvider(new RecordingLogger<ProcessSandboxProvider>());
@@ -153,6 +174,52 @@ public sealed class ProcessSandboxProviderTests : IDisposable
         Assert.True(install.Success, install.Stderr);
         Assert.True(run.Success, run.Stderr);
         Assert.Equal("translated-path-entry", run.Stdout.TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
+    public async Task ExecAsync_TranslatesSandboxAbsolutePathValuesInOtherEnvironmentVariables()
+    {
+        var provider = new ProcessSandboxProvider(new RecordingLogger<ProcessSandboxProvider>());
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            WorkingDirectory = "/work",
+        });
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c",
+                "mkdir -p \"$HOME\" \"$DOTNET_CLI_HOME\" && "
+                + "test -d \"$HOME\" && test -d \"$DOTNET_CLI_HOME\""],
+            ExtraEnvironment = new Dictionary<string, string>
+            {
+                ["HOME"] = "/work/home",
+                ["DOTNET_CLI_HOME"] = "/work/dotnet-home",
+            },
+        });
+
+        Assert.True(result.Success, result.Stderr);
+    }
+
+    [Fact]
+    public async Task ExecAsync_StdinBrokenPipe_ReturnsProcessExitResult()
+    {
+        const int stdinBytes = 1024 * 1024;
+        var provider = new ProcessSandboxProvider(new RecordingLogger<ProcessSandboxProvider>());
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            WorkingDirectory = "/work",
+        });
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "printf immediate-failure >&2; exit 23"],
+            Stdin = new string('x', stdinBytes),
+        });
+
+        Assert.Equal(23, result.ExitCode);
+        Assert.Equal("immediate-failure", result.Stderr.TrimEnd('\r', '\n'));
     }
 
     [Fact]

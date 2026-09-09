@@ -476,10 +476,20 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             }
             if (promotedCheckpointRef is not null)
             {
+                // Startup adoption publishes a legacy Git-only checkpoint: the
+                // provider process has exited cleanly, but this path does not
+                // capture a new content-bound private scratchpad archive. Any
+                // older typed metadata therefore belongs to the pre-suspend
+                // dispatch and cannot remain paired with the promoted legacy
+                // ref. Clearing it in the same work-item write also releases
+                // its dispatch claim; the SQLite store's metadata-clear trigger
+                // discards the now-unreferenced private archive atomically.
                 updatedItem = updatedItem with
                 {
                     PreemptCheckpoint = promotedCheckpointRef,
                     PreemptedAt = _time.GetUtcNow(),
+                    AgentTurnResumeCheckpoint = null,
+                    AgentTurnRecoveryLease = null,
                 };
             }
             await _store.UpdateAsync(updatedItem, ct);

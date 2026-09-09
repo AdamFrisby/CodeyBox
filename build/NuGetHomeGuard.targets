@@ -1,0 +1,63 @@
+<Project InitialTargets="_CodeyBoxEnsureReadableNuGetHome">
+
+  <PropertyGroup>
+    <_CodeyBoxRepositoryDotNetHome>$(MSBuildThisFileDirectory)../.build/dotnet-home</_CodeyBoxRepositoryDotNetHome>
+  </PropertyGroup>
+
+  <UsingTask
+    TaskName="CodeyBoxEnsureReadableNuGetHome"
+    TaskFactory="RoslynCodeTaskFactory"
+    AssemblyFile="$(MSBuildToolsPath)/Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <RepositoryDotNetHome ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System" />
+      <Using Namespace="System.IO" />
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        var dotNetHome = Environment.GetEnvironmentVariable("DOTNET_CLI_HOME");
+        var home = string.IsNullOrWhiteSpace(dotNetHome)
+            ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+            : dotNetHome;
+        var configPath = Path.Combine(home, ".nuget", "NuGet", "NuGet.Config");
+        var useRepositoryHome = !File.Exists(configPath);
+
+        if (!useRepositoryHome)
+        {
+            try
+            {
+                using var config = new FileStream(
+                    configPath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                useRepositoryHome = true;
+            }
+            catch (IOException)
+            {
+                useRepositoryHome = true;
+            }
+        }
+
+        if (useRepositoryHome)
+        {
+            Directory.CreateDirectory(RepositoryDotNetHome);
+            Environment.SetEnvironmentVariable("DOTNET_CLI_HOME", RepositoryDotNetHome);
+        }
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
+  <!-- NuGet 7.6 creates its HTTP proxy cache from the user-wide config even
+       when RestoreConfigFile names one specific repository config. Run as an
+       initial target so an unreadable config is redirected before NuGet
+       captures its environment-derived paths during restore graph creation. -->
+  <Target Name="_CodeyBoxEnsureReadableNuGetHome">
+    <CodeyBoxEnsureReadableNuGetHome
+      RepositoryDotNetHome="$(_CodeyBoxRepositoryDotNetHome)" />
+  </Target>
+
+</Project>

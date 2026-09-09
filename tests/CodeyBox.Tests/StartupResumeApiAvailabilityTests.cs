@@ -65,7 +65,7 @@ public sealed class StartupResumeApiAvailabilityTests
         HttpResponseMessage? response = null;
         try
         {
-            // Both modes get +30s wall-clock slack to absorb parallel-suite
+            // Both modes get +90s wall-clock slack to absorb parallel-suite
             // host-startup contention; the per-mode elapsed assertions below
             // are what prove the resume contract, not the WaitAsync deadline.
             // Background mode: factory.CreateClient() returns as soon as the
@@ -74,7 +74,14 @@ public sealed class StartupResumeApiAvailabilityTests
             // signal). Blocking mode: factory.CreateClient() blocks until
             // the resume timeout elapses, so the stopwatch must span
             // CreateClient to observe the block.
-            var availabilityDeadline = configuredTimeout + TimeSpan.FromSeconds(30);
+            // 90s (not 30s) of slack: under the full audit suite running every
+            // host-spinning test class in parallel, Kestrel host startup plus the
+            // dedicated-thread hop can sit on a starved thread-pool ready-queue for
+            // tens of seconds. This is only the outer "did the request ever
+            // complete" guard — the per-mode elapsed assertions below (Background
+            // < configuredTimeout, Blocking hang >= configuredTimeout) are what
+            // prove the resume contract, so widening it loosens no behavioural bound.
+            var availabilityDeadline = configuredTimeout + TimeSpan.FromSeconds(90);
             response = await RunOnDedicatedThreadAsync(() =>
             {
                 if (mode == SandboxResumeMode.Blocking)

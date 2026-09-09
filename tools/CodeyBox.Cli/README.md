@@ -168,6 +168,54 @@ codeybox queue watch aabbccdd-... --poll     # force HTTP polling
 Exits when the item reaches a terminal state (`Done`, `Failed`, `Cancelled`, `AuditFailed`, `MergeConflictResolutionFailed`, `AbandonedAfterRecoveryAttempts`). Intermediate states such as `Merged` are followed until the item finishes.
 Press `Ctrl+C` to stop early.
 
+### `codeybox queue timeline <id>`
+
+Show a work item's event timeline (`GET /workitems/{id}/timeline`) as a `TIME / KIND / SUMMARY` table:
+
+```bash
+codeybox queue timeline aabbccdd-...
+codeybox queue timeline aabbccdd-... --json
+```
+
+### `codeybox queue diff <id>`
+
+Show the diff of a work item's branch against its base (`GET /workitems/{id}/diff`). The human-readable form prints a summary header (branches, SHAs, files changed, line counts) followed by the diff body; large diffs print a hint instead of the body.
+
+```bash
+codeybox queue diff aabbccdd-...
+codeybox queue diff aabbccdd-... --json
+```
+
+Prints "No diff available" (and `{}` under `--json`) when the work branch has no changes yet.
+
+### `codeybox queue logs <id>`
+
+Show the tail of a work item's captured agent stdout (`GET /workitems/{id}/stdout-tail`). Terminal escape sequences in the captured output are stripped before display.
+
+```bash
+codeybox queue logs aabbccdd-...
+codeybox queue logs aabbccdd-... --json   # { "id": ..., "tail": ... }
+```
+
+### `codeybox queue deps <id>`
+
+List the work items that depend on this one (`GET /workitems/{id}/dependents`):
+
+```bash
+codeybox queue deps aabbccdd-...
+codeybox queue deps aabbccdd-... --quiet   # dependent IDs only
+codeybox queue deps aabbccdd-... --json
+```
+
+### `codeybox queue costs <id>`
+
+Show token usage and estimated cost for a work item (`GET /workitems/{id}/costs`), broken down by phase and by agent:
+
+```bash
+codeybox queue costs aabbccdd-...
+codeybox queue costs aabbccdd-... --json
+```
+
 ### `codeybox version`
 
 ```bash

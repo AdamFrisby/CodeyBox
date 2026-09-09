@@ -8,7 +8,7 @@ using WorkItemTimelinePage = CodeyBox.Admin.Web.Components.Pages.WorkItemTimelin
 
 namespace CodeyBox.Admin.Tests;
 
-public sealed class TimelinePageTests : TestContext
+public sealed class TimelinePageTests : BunitContext
 {
     private static TimelineEntryDto MakeEntry(string kind, string summary, object? details = null) => new()
     {
@@ -40,7 +40,7 @@ public sealed class TimelinePageTests : TestContext
         fake.TimelineOverride = timeline;
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
+        var cut = Render<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("Queued → Working", cut.Markup);
         Assert.Contains("claude (work) started", cut.Markup);
@@ -54,7 +54,7 @@ public sealed class TimelinePageTests : TestContext
         // TimelineOverride is null → GetWorkItemTimelineAsync returns null → _notFound = true
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
+        var cut = Render<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("not found", cut.Markup, StringComparison.OrdinalIgnoreCase);
     }
@@ -73,7 +73,7 @@ public sealed class TimelinePageTests : TestContext
         Services.GetRequiredService<NavigationManager>()
             .NavigateTo($"http://localhost/work-items/{id}/timeline?kind=webhook_delivered");
 
-        var cut = RenderComponent<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
+        var cut = Render<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("No timeline entries", cut.Markup, StringComparison.OrdinalIgnoreCase);
     }
@@ -92,7 +92,7 @@ public sealed class TimelinePageTests : TestContext
         fake.TimelineOverride = timeline;
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
+        var cut = Render<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("Live", cut.Markup);
     }
@@ -106,7 +106,7 @@ public sealed class TimelinePageTests : TestContext
         fake.TimelineOverride = timeline;
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
+        var cut = Render<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
 
         Assert.DoesNotContain("Live", cut.Markup);
     }
@@ -120,7 +120,7 @@ public sealed class TimelinePageTests : TestContext
         fake.TimelineOverride = timeline;
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
+        var cut = Render<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("Detail", cut.Markup);
         Assert.Contains($"/work-items/{id}", cut.Markup);

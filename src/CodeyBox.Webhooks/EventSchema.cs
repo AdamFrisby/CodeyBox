@@ -6,10 +6,10 @@ namespace CodeyBox.Webhooks;
 /// <summary>
 /// Single source of truth for the webhook + SSE event schema. Exposed verbatim
 /// by <c>GET /events/schema</c> so downstream trackers can validate at startup
-/// and enable schema-version-strict mode without scraping <c>docs/EVENT_SCHEMA.md</c>.
+/// and enable schema-version-strict mode without scraping <c>docs/reference/events.md</c>.
 ///
 /// <para>Evolution is additive-only — see <see cref="EvolutionRules"/>. The
-/// in-repo doc <c>docs/EVENT_SCHEMA.md</c> must mirror this object; the
+/// in-repo doc <c>docs/reference/events.md</c> must mirror this object; the
 /// <c>EventSchemaDocSyncTests</c> guard against drift.</para>
 /// </summary>
 public static class EventSchema
@@ -17,6 +17,7 @@ public static class EventSchema
     /// <summary>Current schema version. Bumped per the rules below.</summary>
     public const string CurrentVersion = WebhookEvent.CurrentSchemaVersion;
     private const string InitialVersion = "1.0";
+    private const string UpstreamPrStaleBaseVersion = "1.1";
     private const string WorkerPoolHealthVersion = "1.2";
     private const string AgentPauseVersion = "1.3";
     private const string TransientRetryVersion = "1.4";
@@ -60,13 +61,15 @@ public static class EventSchema
     private static string EventTypeIntroducedIn(string name)
         => name switch
         {
+            "upstream.pr_stale_base" => UpstreamPrStaleBaseVersion,
             "agent.paused" or "agent.resumed" or "work_item.waiting_for_agent_resume" => AgentPauseVersion,
             "work_item.waiting_for_transient_retry" => TransientRetryVersion,
             "agent.restore_requeue_swept"
                 or "work_item.agent_restore_requeued"
                 or "work_item.planning"
                 or "work_item.plan_review"
-                or "work_item.plan_approved" => PlanningVersion,
+                or "work_item.plan_approved"
+                or "audit.auditor_timed_out" => PlanningVersion,
             _ when name.StartsWith("worker_pool.", StringComparison.Ordinal) => WorkerPoolHealthVersion,
             _ => InitialVersion,
         };
@@ -150,6 +153,8 @@ public static class EventSchema
         "release.sync_conflict",
         // Upstream/forge state surfaced by background sweeps (not state transitions)
         "upstream.pr_stale_base",
+        // Audit-level
+        "audit.auditor_timed_out",
     ];
 
     /// <summary>
@@ -174,7 +179,7 @@ public static class EventSchema
         if (evt.EmittedAt == default)
             return $"event '{evt.Event}': emittedAt is required";
         if (!KnownEventTypesSet.Contains(evt.Event))
-            return $"event '{evt.Event}': eventType is not in EventSchema.KnownEventTypes — add it to the list (and docs/EVENT_SCHEMA.md) or fix the emit-site spelling";
+            return $"event '{evt.Event}': eventType is not in EventSchema.KnownEventTypes — add it to the list (and docs/reference/events.md) or fix the emit-site spelling";
         return null;
     }
 

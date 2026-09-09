@@ -27,6 +27,23 @@ namespace CodeyBox.Tests;
 /// </summary>
 internal static class TestSupport
 {
+    /// <summary>
+    /// Returns the logical command a sandbox exec represents, unwrapping the
+    /// <see cref="NuGetHomeSelfHeal"/> self-heal wrapper
+    /// (<c>["sh","-c",script,"sh", ...original]</c>) that dotnet gate auditors
+    /// apply. Non-wrapped execs are returned unchanged. Lets a fake sandbox match
+    /// on the real command regardless of whether self-heal is enabled.
+    /// </summary>
+    public static IReadOnlyList<string> EffectiveArgv(SandboxExec exec) => EffectiveArgv(exec.Argv);
+
+    /// <inheritdoc cref="EffectiveArgv(SandboxExec)"/>
+    public static IReadOnlyList<string> EffectiveArgv(IReadOnlyList<string> argv) =>
+        argv.Count >= 4
+        && argv[0] == "sh" && argv[1] == "-c" && argv[3] == "sh"
+        && argv[2].Contains("nuget_home_broken", StringComparison.Ordinal)
+            ? [.. argv.Skip(4)]
+            : argv;
+
     public static WorkItemTerminalTransition CreateTerminalTransition(
         IWorkItemStore store,
         IWebhookDispatcher? webhooks,
@@ -152,7 +169,8 @@ internal static class TestSupport
         IEnumerable<IAgentQuotaProbe>? auditQuotaProbes = null,
         IReadOnlyDictionary<AgentKind, IAgentToolCallCounter>? toolCallCounters = null,
         IMergeScopeResolver? mergeScopeResolver = null,
-        IReadOnlyDictionary<string, string>? projectKnobs = null)
+        IReadOnlyDictionary<string, string>? projectKnobs = null,
+        Microsoft.Extensions.Logging.ILogger<PipelineRunner>? logger = null)
     {
         var gitRoot = Path.Combine(workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = stateDbPathOverride ?? Path.Combine(workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -268,7 +286,7 @@ internal static class TestSupport
             pipelineStore,
             terminalWebhookDispatcher,
             resolvedOptions,
-            NullLogger<PipelineRunner>.Instance,
+            logger ?? NullLogger<PipelineRunner>.Instance,
             timingStore: timingStore,
             auditQuotaProbes: auditQuotaProbes,
             auditReports: auditReportStore,
@@ -481,7 +499,7 @@ internal enum MergeStrategy
 /// File-write contents are consumed in order; provide one entry per
 /// expected work-phase (or rework-phase) invocation.
 /// </summary>
-internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunner, ITextOnlyAgentRunner
+internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunner, ITextOnlyAgentRunner, IAgentCredentialEnvironmentPolicy
 {
     private readonly Queue<MergeStrategy> _mergeStrategies;
     public Queue<FileWrite> WorkPlan { get; } = new();
@@ -527,6 +545,25 @@ internal partial class ScriptedAgent : IAgentRunner, IStructuredStreamAgentRunne
     public int StructuredStreamSupportProbeCount { get; private set; }
     public string? ResultStdout { get; set; }
     public AgentKind Kind { get; init; } = AgentKind.Claude;
+    public IReadOnlySet<string> DirectCredentialEnvironmentVariables { get; } =
+        new HashSet<string>(StringComparer.Ordinal)
+        {
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "CURSOR_API_KEY",
+            "GH_TOKEN",
+            "CODEYBOX_TEST_MARKER",
+            "TEST_TOKEN",
+            "WORK_TOKEN",
+        };
+    public IReadOnlySet<string> FileBackedCredentialEnvironmentVariables { get; } =
+        new HashSet<string>(StringComparer.Ordinal)
+        {
+            "CODEYBOX_CURSOR_AUTH_JSON",
+        };
+    public IReadOnlyList<AgentCredentialFileDestination> CredentialFileDestinations { get; } = [];
     /// <summary>
     /// When non-null, <see cref="GetTextOnlyUnavailabilityReason"/> returns this
     /// value (simulating a missing text-only credential), and
@@ -1054,4 +1091,25 @@ internal sealed class CapturingWebhookDispatcher : IWebhookDispatcher
             ? Task.CompletedTask
             : OnPublishAsync(evt, ct);
     }
+}
+
+/// <summary>
+/// Test helper mirroring <c>ShellCommandAuditor</c>'s <c>SelfHealNuGetHome</c>
+/// wrapping. A guarded dotnet auditor command is dispatched as
+/// <c>sh -c "&lt;preamble&gt;\nexec \"$@\"" sh &lt;cmd...&gt;</c> so the NuGet-home
+/// relocation runs before the real command. Fakes that classify a sandbox exec
+/// by its real command unwrap it here to see the command as configured.
+/// </summary>
+internal static class DotnetGuardWrapper
+{
+    public static bool IsGuardWrapped(IReadOnlyList<string> argv)
+        => argv.Count >= 5
+           && argv[0] == "sh"
+           && argv[1] == "-c"
+           && argv[2].EndsWith("exec \"$@\"", StringComparison.Ordinal)
+           && argv[3] == "sh";
+
+    /// <summary>The real command argv, unwrapped from the guard if present.</summary>
+    public static IReadOnlyList<string> EffectiveArgv(SandboxExec exec)
+        => IsGuardWrapped(exec.Argv) ? [.. exec.Argv.Skip(4)] : exec.Argv;
 }

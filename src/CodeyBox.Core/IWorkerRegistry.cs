@@ -31,6 +31,17 @@ public interface IWorkerRegistry
     Task<IReadOnlyList<WorkerRegistration>> ClaimDeadWorkersAsync(DateTimeOffset cutoff, CancellationToken ct = default);
 
     /// <summary>
+    /// Atomically claims one worker only when its heartbeat still predates
+    /// <paramref name="cutoff"/>. This lets recovery inspect and fence a
+    /// claimed agent-turn owner before deleting its durable registry evidence,
+    /// without a heartbeat TOCTOU between inspection and the claim.
+    /// </summary>
+    Task<WorkerRegistration?> TryClaimDeadWorkerAsync(
+        string workerId,
+        DateTimeOffset cutoff,
+        CancellationToken ct = default);
+
+    /// <summary>
     /// Atomically claims (DELETEs) a single worker row by id and returns the
     /// deleted row, or <c>null</c> if no row matched. Used by the progress
     /// watchdog to force-claim a heartbeating-but-wedged worker without

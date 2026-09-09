@@ -47,16 +47,7 @@ public sealed class WorkSandboxContext : IAsyncDisposable
         var requestedTimingPhase = string.IsNullOrWhiteSpace(spec.TimingPhase)
             ? "work"
             : spec.TimingPhase!;
-
-        // Per-phase VM isolation exists ONLY to keep each phase's teardown
-        // resource record attributable to a single phase. It is gated on the
-        // provider's resource-metrics capture toggle so that with the feature
-        // off (the default) a warm VM is still reused across work<->rework,
-        // exactly as before — no hidden VM churn for operators who never opted
-        // into capture.
-        var isolatePhasesForMetrics =
-            _provider is IResourceMetricsCapturingProvider capturing
-            && capturing.CapturesResourceMetrics;
+        var selectedProviderId = _provider.Name;
 
         // Check pressure threshold
         if (_provider is ISandboxAdmissionSnapshot snapshot)
@@ -71,6 +62,20 @@ public sealed class WorkSandboxContext : IAsyncDisposable
         }
 
         // Check lifetime and reuse limit
+        if (_activeSandbox != null)
+        {
+            var activeOwner = SandboxCapability.Find<IProviderOwnedSandbox>(_activeSandbox);
+            if (activeOwner is not null
+                && !string.Equals(activeOwner.ProviderId, selectedProviderId, StringComparison.Ordinal))
+            {
+                _log.LogInformation(
+                    "Active sandbox provider changed ('{Active}' != '{Selected}'); recreating sandbox.",
+                    activeOwner.ProviderId,
+                    selectedProviderId);
+                await DisposeActiveSandboxAsync();
+            }
+        }
+
         if (_activeSandbox != null)
         {
             var age = DateTimeOffset.UtcNow - _createdAt;
@@ -90,7 +95,7 @@ public sealed class WorkSandboxContext : IAsyncDisposable
                 _log.LogInformation("Active sandbox baseline image mismatch ('{Active}' != '{Request}'); recreating sandbox.", _activeBaselineImageRef, spec.BaselineImageRef);
                 await DisposeActiveSandboxAsync();
             }
-            else if (isolatePhasesForMetrics
+            else if (SandboxCapability.Find<IResourceMetricsCapturingSandbox>(_activeSandbox)?.CapturesResourceMetrics == true
                 && !string.Equals(_activeTimingPhase, requestedTimingPhase, StringComparison.Ordinal))
             {
                 _log.LogInformation("Active sandbox timing phase changed ('{Active}' != '{Request}') and resource-metrics capture is on; recreating sandbox for an accurate per-phase record.", _activeTimingPhase, requestedTimingPhase);
@@ -273,6 +278,8 @@ public sealed class WorkSandboxContext : IAsyncDisposable
             _preemptible = preemptible;
         }
         public Task StopAndPreserveAsync(CancellationToken ct = default) => _preemptible.StopAndPreserveAsync(ct);
+        public Task<SandboxRecoveryLease?> RetainForInfrastructureRecoveryAsync(CancellationToken ct = default) =>
+            _preemptible.RetainForInfrastructureRecoveryAsync(ct);
     }
 
     private sealed class ReusableSuspendableSandbox : ReusableSandbox, ISuspendableSandbox
@@ -311,6 +318,8 @@ public sealed class WorkSandboxContext : IAsyncDisposable
             _suspendable = suspendable;
         }
         public Task StopAndPreserveAsync(CancellationToken ct = default) => _preemptible.StopAndPreserveAsync(ct);
+        public Task<SandboxRecoveryLease?> RetainForInfrastructureRecoveryAsync(CancellationToken ct = default) =>
+            _preemptible.RetainForInfrastructureRecoveryAsync(ct);
         public Task SuspendAsync(CancellationToken ct = default) => _suspendable.SuspendAsync(ct);
         public bool IsSuspended => _suspendable.IsSuspended;
         public long? MemoryBytes => _suspendable.MemoryBytes;
@@ -327,6 +336,8 @@ public sealed class WorkSandboxContext : IAsyncDisposable
             _shutdown = shutdown;
         }
         public Task StopAndPreserveAsync(CancellationToken ct = default) => _preemptible.StopAndPreserveAsync(ct);
+        public Task<SandboxRecoveryLease?> RetainForInfrastructureRecoveryAsync(CancellationToken ct = default) =>
+            _preemptible.RetainForInfrastructureRecoveryAsync(ct);
         public bool IsOwnedByShutdownHandler => _shutdown.IsOwnedByShutdownHandler;
         public void MarkOwnedByShutdownHandler() => _shutdown.MarkOwnedByShutdownHandler();
     }
@@ -361,6 +372,8 @@ public sealed class WorkSandboxContext : IAsyncDisposable
             _shutdown = shutdown;
         }
         public Task StopAndPreserveAsync(CancellationToken ct = default) => _preemptible.StopAndPreserveAsync(ct);
+        public Task<SandboxRecoveryLease?> RetainForInfrastructureRecoveryAsync(CancellationToken ct = default) =>
+            _preemptible.RetainForInfrastructureRecoveryAsync(ct);
         public Task SuspendAsync(CancellationToken ct = default) => _suspendable.SuspendAsync(ct);
         public bool IsSuspended => _suspendable.IsSuspended;
         public long? MemoryBytes => _suspendable.MemoryBytes;

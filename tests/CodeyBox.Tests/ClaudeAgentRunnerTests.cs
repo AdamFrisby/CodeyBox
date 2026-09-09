@@ -199,9 +199,10 @@ public sealed class ClaudeAgentRunnerTests
         Assert.Equal("bash", prep.Argv[0]);
         Assert.Equal("-c", prep.Argv[1]);
         var script = prep.Argv[2];
-        Assert.Contains("$HOME/.claude/.credentials.json", script);
-        Assert.Contains("CODEYBOX_CLAUDE_OAUTH_JSON", script);
-        Assert.Contains("chmod 600", script);
+        Assert.Equal(".claude/.credentials.json", prep.Argv[5]);
+        Assert.Equal(credential.EnvironmentVariables[ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar], prep.Stdin);
+        Assert.DoesNotContain("CODEYBOX_CLAUDE_OAUTH_JSON", script);
+        Assert.Contains("0o600", script);
     }
 
     [Fact]
@@ -258,6 +259,33 @@ public sealed class ClaudeAgentRunnerTests
         Assert.Contains("claude auth", result.Summary);
         Assert.Single(sandbox.AllExecs, IsBashInvocation);
         Assert.DoesNotContain(sandbox.AllExecs, IsClaudeAgentInvocation);
+    }
+
+    [Fact]
+    public async Task RunResumedAsync_UsesPreserveNonEmptyCredentialPolicy()
+    {
+        var sandbox = new MultiExecCapturingSandbox();
+        var runner = new ClaudeAgentRunner();
+        var credential = new AgentCredential(
+            AgentKind.Claude,
+            new Dictionary<string, string>
+            {
+                [ClaudeOAuthFileCredentialProvider.OAuthJsonEnvVar] =
+                    """{"claudeAiOauth":{"accessToken":"stale-host-token"}}""",
+            },
+            new Dictionary<string, string>());
+
+        await runner.RunResumedAsync(
+            sandbox,
+            "/work",
+            "resume",
+            credential,
+            new AgentResumeContext("refs/heads/codeybox/preempt/item"));
+
+        var materialisation = Assert.Single(sandbox.AllExecs, exec =>
+            CredentialMaterialisationTestHelper.IsStdinMaterialisation(
+                exec, ".claude/.credentials.json"));
+        Assert.Equal("preserve-nonempty", materialisation.Argv[7]);
     }
 
     // ── Rotation pusher registration ──────────────────────────────────────────

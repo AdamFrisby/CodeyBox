@@ -38,8 +38,53 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
     // execution exceeding the required-build budget.
     private const int BuildTimeoutExitCode = 124;
 
-    private static readonly string BuildScript = $$"""
+    // POSIX-sh prologue that guarantees the dotnet/NuGet home points at a
+    // directory we can actually create NuGet's user-config folder under, BEFORE
+    // any dotnet invocation runs. dotnet/NuGet materialise $DOTNET_CLI_HOME/.nuget
+    // (defaulting to $HOME when DOTNET_CLI_HOME is unset) on first restore. In
+    // agent sandboxes that parent is frequently root-owned and unwritable, so
+    // restore aborts with "Failed to read NuGet.Config due to unauthorized
+    // access ... ~/.nuget". We keep an inherited DOTNET_CLI_HOME only when a
+    // write probe succeeds; otherwise (unset, or a non-writable/root-owned
+    // value) we fall back to a repo-local home anchored to an absolute $(pwd)
+    // path (the checked-out work tree) so a nested build step's CWD change
+    // cannot relocate it outside the sandbox and let restore probe root-owned
+    // ~/.nuget again. We export the resolved path as BOTH DOTNET_CLI_HOME and
+    // HOME: different SDK/NuGet builds derive the user-config directory from one
+    // or the other (older/alternate NuGet resolves it from $HOME, ignoring
+    // DOTNET_CLI_HOME), so pinning only DOTNET_CLI_HOME still lets those builds
+    // probe a root-owned ~/.nuget. Overriding HOME is safe here because the
+    // prologue runs immediately before dotnet inside the build step — the git
+    // clone/checkout that need the caller's HOME run as separate execs before it.
+    // A writable user-config DIRECTORY is not sufficient: a provisioning step can
+    // leave "$cli_home/.nuget/NuGet" writable (so the mkdir/-w probe passes) while
+    // the NuGet.Config FILE inside it is root-owned and unreadable. NuGet reads
+    // that file unconditionally while loading default settings and aborts with the
+    // exact "Failed to read NuGet.Config ... denied" seen in the failing gate, so
+    // we additionally require any existing NuGet.Config to be readable (-r) before
+    // keeping the inherited home; otherwise we fall back to the repo-local home,
+    // where NuGet materialises a fresh, readable config. Exposed internally so a
+    // deterministic shell test can exercise the unset / writable / non-writable /
+    // unreadable-config branches directly.
+    internal static readonly string DotnetCliHomeSelectionScript = $$"""
+        cli_home="${DOTNET_CLI_HOME:-}"
+        if [ -n "$cli_home" ] \
+          && mkdir -p "$cli_home/.nuget/NuGet" 2>/dev/null \
+          && [ -w "$cli_home/.nuget/NuGet" ] \
+          && { [ ! -e "$cli_home/.nuget/NuGet/NuGet.Config" ] || [ -r "$cli_home/.nuget/NuGet/NuGet.Config" ]; }; then
+          :
+        else
+          cli_home="$(pwd)/{{DotnetCliHomeConventions.DirectoryName}}"
+        fi
+        export DOTNET_CLI_HOME="$cli_home"
+        export HOME="$cli_home"
+        """;
+
+    // Exposed to tests so the actual gate script — the exact artifact the
+    // sandbox executes via `sh -c` — can be run under a controlled shell.
+    internal static readonly string BuildScript = $$"""
         set -eu
+        {{NuGetHomeSelfHeal.Preamble}}
         dotnet_command_not_found_exit={{DotnetCommandNotFoundExitCode}}
         no_required_build_target_exit={{NoRequiredBuildTargetExitCode}}
 
@@ -48,9 +93,37 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
           exit "$dotnet_command_not_found_exit"
         fi
 
-        targets_file="${TMPDIR:-/tmp}/codeybox-required-build-targets-$$"
-        cleanup() { rm -f "$targets_file"; }
+        tmp_root="${TMPDIR:-/tmp}"
+        targets_file="$tmp_root/codeybox-required-build-targets-$$"
+
+        # The build gate must survive sandbox images whose per-user home is not
+        # writable by the build user. `dotnet build` reads — and, when absent,
+        # creates — the per-user NuGet settings directory ($HOME/.nuget/NuGet)
+        # before honouring any repo-, solution-, or RestoreConfigFile-level
+        # configuration, so an image whose $HOME (or $HOME/.nuget) is owned by
+        # another user (e.g. root) fails every restore with
+        # "Failed to read NuGet.Config ... Permission denied" and produces no
+        # assemblies. Redirect the CLI/NuGet per-user home to a directory this
+        # script owns so the gate no longer depends on $HOME being writable.
+        dotnet_home="$tmp_root/codeybox-dotnet-home-$$"
+
+        cleanup() { rm -rf "$targets_file" "$dotnet_home"; }
         trap cleanup EXIT INT TERM
+
+        mkdir -p "$dotnet_home"
+        export DOTNET_CLI_HOME="$dotnet_home"
+        export DOTNET_NOLOGO=1
+        export DOTNET_CLI_TELEMETRY_OPTOUT=1
+
+        # Relocating DOTNET_CLI_HOME also relocates the NuGet global-packages
+        # folder ($DOTNET_CLI_HOME/.nuget/packages). Images that pre-bake their
+        # package cache under the original per-user home would then restore
+        # against an empty folder and require network access. Preserve that
+        # cache (read access is sufficient — restore never writes to an
+        # already-extracted package) so offline/pinned images keep working.
+        if [ -z "${NUGET_PACKAGES:-}" ] && [ -n "${HOME:-}" ] && [ -d "$HOME/.nuget/packages" ]; then
+          export NUGET_PACKAGES="$HOME/.nuget/packages"
+        fi
 
         find . -maxdepth 1 -type f \( -name '*.slnx' -o -name '*.sln' \) | sort > "$targets_file"
 
@@ -83,10 +156,22 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
           exit "$no_required_build_target_exit"
         fi
 
+        # Heal an inherited, non-writable per-user NuGet home before restore so a
+        # COW-inherited root-owned $HOME/.nuget cannot abort the build with
+        # "Failed to read NuGet.Config due to unauthorized access". The recovery
+        # is repository-owned (scripts/nuget-home-heal.sh) and dot-sourced so its
+        # fallback DOTNET_CLI_HOME propagates to the dotnet invocations below; it
+        # is a no-op when the home is usable and is skipped when the repository
+        # does not ship it. This adds no capability the gate lacks — it already
+        # runs the branch's arbitrary build logic via `dotnet build`.
+        if [ -f scripts/nuget-home-heal.sh ]; then
+          . ./scripts/nuget-home-heal.sh
+        fi
+
         while IFS= read -r target; do
           [ -n "$target" ] || continue
           echo "CodeyBox required build: dotnet build $target"
-          dotnet build "$target"
+          dotnet build "$target" --disable-build-servers --maxcpucount:1
         done < "$targets_file"
         """;
 
@@ -168,6 +253,28 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                     baseBranchHasMarkers: true,
                     baseBranch: baseBranch,
                     missingRequiredMarkers: missingRequired);
+            }
+
+            // Documentation-only changes cannot affect compilation. Avoid a
+            // full solution restore/build for these branches while retaining
+            // the non-skippable marker-deletion checks above.
+            try
+            {
+                var changedPaths = await _gitHost.GetChangedPathsAsync(
+                    request.RepositoryId,
+                    baseBranch,
+                    request.WorkBranch,
+                    ct);
+                if (changedPaths.Count > 0
+                    && changedPaths.All(static change => IsDocumentationPath(change.Path)
+                        && (change.OldPath is null || IsDocumentationPath(change.OldPath))))
+                {
+                    return DotnetBuildMarkerInspection.NotApplicable();
+                }
+            }
+            catch (NotSupportedException)
+            {
+                // Hosts without diff inspection retain the conservative build.
             }
 
             if (workHasMarkers)
@@ -330,6 +437,16 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         {
             throw;
         }
+        catch (SandboxDiskDeferredException)
+        {
+            // Disk-guard preflight refused the verification sandbox. Re-throw
+            // so the orchestrator defers and re-queues instead of flattening
+            // this into Unavailable (which terminal-fails the item). Kept
+            // explicit even though the disk deferral derives from the
+            // provisioning deferral below, so this boundary documents the
+            // incident it guards against.
+            throw;
+        }
         catch (SandboxProvisioningDeferredException)
         {
             throw;
@@ -379,11 +496,13 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         // headless for required-build verification.
         var net = new SandboxNetworkPolicy
         {
-            AllowedHosts = [],
+            AllowedHosts = _pipelineOptions.AuditToolAllowedHosts,
             HostGitEndpoint = access.Network.HostGitEndpoint,
             ProfileName = request.SandboxPolicy.NetworkProfile,
         };
 
+        var environment = new Dictionary<string, string>();
+        DotnetCliHomeConventions.ApplyIfAbsent(environment, SandboxConventions.WorkDir);
         return SandboxConventions.WithTimingEnvironment(new SandboxSpec
         {
             ImageReference = _pipelineOptions.SandboxImageReference,
@@ -392,7 +511,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                 .. access.Mounts,
                 new SandboxMount { SandboxPath = SandboxConventions.WorkDir, Tmpfs = true },
             ],
-            Environment = new Dictionary<string, string>(),
+            Environment = environment,
             Network = net,
             Flavor = SandboxProfileFlavor.Headless,
             WorkingDirectory = SandboxConventions.WorkDir,
@@ -468,6 +587,14 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         return fileName.EndsWith(".sln", StringComparison.OrdinalIgnoreCase)
             || fileName.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase)
             || fileName.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsDocumentationPath(string path)
+    {
+        var extension = Path.GetExtension(path);
+        return extension.Equals(".md", StringComparison.OrdinalIgnoreCase)
+            || extension.Equals(".mdx", StringComparison.OrdinalIgnoreCase)
+            || extension.Equals(".rst", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>

@@ -8,25 +8,41 @@ using Serilog.Events;
 
 namespace CodeyBox.Tests;
 
-[Collection("GlobalSerilog")]
 public sealed class QuotaRetrySchedulerAuditTests : IDisposable
 {
     private static readonly ProjectId TestProjectId = new("test-project");
     private static readonly ProjectId BrokenProjectId = new("broken-project");
     private readonly string _workspace = Directory.CreateTempSubdirectory("codeybox-quota-audit-").FullName;
     private readonly TestSink _sink = new();
+    private readonly IDisposable _auditScope;
+
+    // A dedicated, injected Serilog logger keeps this test's audit events off the
+    // process-global Serilog.Log.Logger, so a concurrent host bootstrap that
+    // reassigns the global static cannot reroute them away from _sink. This is
+    // why the class no longer needs the GlobalSerilog serialization collection.
+    private readonly Serilog.Core.Logger _auditLogger;
 
     public QuotaRetrySchedulerAuditTests()
     {
-        Log.Logger = new LoggerConfiguration()
+        _auditLogger = new LoggerConfiguration()
             .Enrich.FromLogContext()
             .WriteTo.Sink(_sink)
             .CreateLogger();
+
+        // Route this test's audit events to our sink for the whole flow rather
+        // than relying on the process-global Log.Logger staying put: the audit
+        // suite runs WebApplicationFactory<Program> host boots (which rebuild
+        // Log.Logger) concurrently in other collections, and one landing between
+        // a scheduler call and its audit emission would otherwise steal the event
+        // — leaving the sink empty. The AsyncLocal override flows into every
+        // scheduler method invoked below and is immune to those global swaps.
+        _auditScope = AuditLog.PushScopedLogger(Log.Logger);
     }
 
     public void Dispose()
     {
-        Log.CloseAndFlush();
+        _auditScope.Dispose();
+        _auditLogger.Dispose();
         try { Directory.Delete(_workspace, recursive: true); } catch { }
     }
 
@@ -43,6 +59,22 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
 
         AssertQuotaAttempt(failed, "periodic", "skipped:quota-still-gated", "Failed");
         AssertQuotaAttempt(waiting, "periodic", "skipped:quota-still-gated", "WaitingForQuotaReset");
+    }
+
+    [Fact]
+    public async Task Retry_UsesInjectedAuditLogger()
+    {
+        using var fixture = BuildScheduler(BuildRouter(availablePct: 0), BuildProjects());
+        var item = CreateQuotaItem(WorkItemState.WaitingForQuotaReset);
+        await fixture.Store.CreateAsync(item);
+
+        await InvokeTryRetryAsync(fixture.Scheduler, item, "periodic", CancellationToken.None);
+
+        AssertQuotaAttempt(
+            item,
+            "periodic",
+            "skipped:quota-still-gated",
+            "WaitingForQuotaReset");
     }
 
     [Fact]
@@ -448,7 +480,12 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
         Assert.Equal(WorkItemState.Merged, retried!.State);
         Assert.Equal(workBranch, retried.WorkBranch);
         Assert.Equal(1, retried.QuotaRetryAttempts);
-        var evt = AssertQuotaAttempt(item, "startup", "retried", "WaitingForQuotaReset");
+        // Delivery to the in-memory sink can lag the awaited state transition
+        // under load — a single immediate read then sees an empty collection.
+        // Poll via WaitForQuotaAttemptAsync instead; its predicate is identical
+        // to AssertQuotaAttempt, so this weakens nothing.
+        var evt = await WaitForQuotaAttemptAsync(item, "startup", "retried");
+        Assert.Equal("WaitingForQuotaReset", GetScalar<string>(evt, "State"));
         Assert.Equal("from=upstream", GetScalar<string>(evt, "Reason"));
     }
 
@@ -769,7 +806,8 @@ public sealed class QuotaRetrySchedulerAuditTests : IDisposable
             projects,
             queueController,
             webhooks,
-            time);
+            time,
+            auditLogger: _auditLogger);
         return new SchedulerFixture(store, gitHost, scheduler);
     }
 

@@ -9,6 +9,11 @@ namespace CodeyBox.Orchestrator;
 /// pickup and keeps <c>last_heartbeat_at</c> fresh via periodic updates.
 /// The <see cref="ClaimDeadWorkersAsync"/> method atomically deletes stale
 /// rows under a write lock so only the first caller performs recovery.
+/// Reads (<see cref="ListAsync"/>) run on dedicated connections and never
+/// take the write gate: the database is in WAL mode, so readers proceed
+/// concurrently with the single serialized writer. Writes execute
+/// synchronously while holding the gate so a holder never retains it across
+/// an awaited continuation — the hold covers only the statement itself.
 /// </summary>
 public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
 {
@@ -18,8 +23,12 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
     private static readonly TimeSpan HeartbeatInitialRetryDelay = TimeSpan.FromMilliseconds(50);
 
     private readonly SqliteConnection _conn;
+    private readonly string _connectionString;
+    private readonly string _dbPath;
     private readonly SqliteDatabaseWriteGate _writeLock;
+    private readonly SqliteDatabaseWriteGateFactory _writeGateFactory;
     private readonly ILogger<SqliteWorkerRegistry>? _logger;
+    private readonly int _busyTimeoutMilliseconds;
     private readonly int _commandTimeoutSeconds;
     private int _disposed;
 
@@ -29,13 +38,28 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         int busyTimeoutMilliseconds = 30000,
         SqliteDatabaseWriteGateFactory? writeGateFactory = null)
     {
+        // busy_timeout is per-connection SQLite state with a default of 0
+        // (fail immediately on lock contention). Zero is not a valid choice
+        // here: under WAL concurrency a heartbeat racing a writer would
+        // surface routine contention as SQLITE_BUSY instead of waiting out
+        // the brief lock hold. Fail fast on misconfiguration rather than
+        // silently running with lock retries disabled.
+        if (busyTimeoutMilliseconds <= 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(busyTimeoutMilliseconds),
+                "SQLite busy_timeout must be positive; 0 disables lock-wait retries and turns routine WAL contention into immediate SQLITE_BUSY failures.");
+
         _logger = logger;
-        _commandTimeoutSeconds = Math.Max(1, (int)Math.Ceiling(Math.Max(1, busyTimeoutMilliseconds) / 1000.0));
+        _busyTimeoutMilliseconds = busyTimeoutMilliseconds;
+        _commandTimeoutSeconds = Math.Max(1, (int)Math.Ceiling(busyTimeoutMilliseconds / 1000.0));
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
-        _conn = new SqliteConnection($"Data Source={path}");
-        _writeLock = SqliteDatabaseWriteGateFactory.Resolve(writeGateFactory).ForPath(path);
+        _dbPath = Path.GetFullPath(path);
+        _connectionString = $"Data Source={path}";
+        _conn = new SqliteConnection(_connectionString);
+        _writeGateFactory = SqliteDatabaseWriteGateFactory.Resolve(writeGateFactory);
+        _writeLock = _writeGateFactory.ForPath(path);
         var initialized = false;
         _writeLock.Wait();
         try
@@ -44,7 +68,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
 
             using (var pragma = _conn.CreateCommand())
             {
-                pragma.CommandText = $"PRAGMA journal_mode=WAL; PRAGMA busy_timeout={Math.Max(0, busyTimeoutMilliseconds)};";
+                pragma.CommandText = $"PRAGMA journal_mode=WAL; PRAGMA busy_timeout={busyTimeoutMilliseconds};";
                 pragma.ExecuteNonQuery();
             }
 
@@ -76,7 +100,10 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
 
     public async Task RegisterAsync(WorkerRegistration reg, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
+        // Synchronous execution under the gate: the hold covers only the
+        // statement, never an awaited continuation whose scheduling delay
+        // would extend the global hold under load.
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             using var cmd = _conn.CreateCommand();
@@ -91,7 +118,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
                     current_work_item_id = excluded.current_work_item_id;
                 """;
             Bind(cmd, reg);
-            await cmd.ExecuteNonQueryAsync(ct);
+            cmd.ExecuteNonQuery();
         }
         finally
         {
@@ -111,7 +138,9 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         {
             try
             {
-                await _writeLock.WaitAsync(ct);
+                // Synchronous statement under the gate (see RegisterAsync):
+                // the retry backoff below runs after the gate is released.
+                await _writeLock.WaitAsync(ct).ConfigureAwait(false);
                 try
                 {
                     using var cmd = _conn.CreateCommand();
@@ -124,7 +153,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
                     cmd.Parameters.AddWithValue("$hb", DateTimeOffset.UtcNow.ToString("O"));
                     cmd.Parameters.AddWithValue("$item", (object?)currentWorkItemId ?? DBNull.Value);
                     cmd.Parameters.AddWithValue("$id", workerId);
-                    await cmd.ExecuteNonQueryAsync(ct);
+                    cmd.ExecuteNonQuery();
                     return;
                 }
                 finally
@@ -154,13 +183,13 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
 
     public async Task DeregisterAsync(string workerId, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = "DELETE FROM worker_registry WHERE worker_id = $id;";
             cmd.Parameters.AddWithValue("$id", workerId);
-            await cmd.ExecuteNonQueryAsync(ct);
+            cmd.ExecuteNonQuery();
         }
         finally
         {
@@ -170,27 +199,20 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
 
     public async Task<IReadOnlyList<WorkerRegistration>> ListAsync(CancellationToken ct = default)
     {
-        // Microsoft.Data.Sqlite serializes commands per-connection: if another
-        // caller (e.g. ClaimDeadWorkersAsync) is mid-BeginTransaction on _conn,
-        // an unscoped ExecuteReaderAsync here throws "pending local transaction".
-        // _writeLock is the single-writer guard that protects every mutation
-        // and the only transactional read path; taking it for reads too closes
-        // the race without forcing callers to coordinate externally.
-        await _writeLock.WaitAsync(ct);
-        try
-        {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT * FROM worker_registry ORDER BY started_at;";
-            using var reader = await cmd.ExecuteReaderAsync(ct);
-            var results = new List<WorkerRegistration>();
-            while (await reader.ReadAsync(ct))
-                results.Add(Read(reader));
-            return results;
-        }
-        finally
-        {
-            _writeLock.Release();
-        }
+        // Read-only: runs on a dedicated connection without the write gate.
+        // WAL mode lets this reader proceed concurrently with a writer, and a
+        // separate connection avoids the per-connection "pending local
+        // transaction" race that forced reads through the gate in the first
+        // place.
+        using var readSlot = await _writeGateFactory.AcquireReadConnectionSlotAsync(_dbPath, ct).ConfigureAwait(false);
+        using var readConn = await OpenReadConnectionAsync(ct).ConfigureAwait(false);
+        using var cmd = readConn.CreateCommand();
+        cmd.CommandText = "SELECT * FROM worker_registry ORDER BY started_at;";
+        using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        var results = new List<WorkerRegistration>();
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            results.Add(Read(reader));
+        return results;
     }
 
     /// <summary>
@@ -200,7 +222,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
     /// </summary>
     public async Task<IReadOnlyList<WorkerRegistration>> ClaimDeadWorkersAsync(DateTimeOffset cutoff, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             var dead = new List<WorkerRegistration>();
@@ -210,9 +232,9 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
             sel.Transaction = tx;
             sel.CommandText = "SELECT * FROM worker_registry WHERE last_heartbeat_at < $cutoff;";
             sel.Parameters.AddWithValue("$cutoff", cutoff.ToString("O"));
-            using (var reader = await sel.ExecuteReaderAsync(ct))
+            using (var reader = sel.ExecuteReader())
             {
-                while (await reader.ReadAsync(ct))
+                while (reader.Read())
                     dead.Add(Read(reader));
             }
 
@@ -222,11 +244,62 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
                 del.Transaction = tx;
                 del.CommandText = "DELETE FROM worker_registry WHERE last_heartbeat_at < $cutoff;";
                 del.Parameters.AddWithValue("$cutoff", cutoff.ToString("O"));
-                await del.ExecuteNonQueryAsync(ct);
+                del.ExecuteNonQuery();
             }
 
             tx.Commit();
             return dead;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<WorkerRegistration?> TryClaimDeadWorkerAsync(
+        string workerId,
+        DateTimeOffset cutoff,
+        CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var tx = _conn.BeginTransaction();
+            WorkerRegistration? claimed = null;
+            using (var select = _conn.CreateCommand())
+            {
+                select.Transaction = tx;
+                select.CommandText = """
+                    SELECT *
+                    FROM worker_registry
+                    WHERE worker_id = $id
+                      AND last_heartbeat_at < $cutoff;
+                    """;
+                select.Parameters.AddWithValue("$id", workerId);
+                select.Parameters.AddWithValue("$cutoff", cutoff.ToString("O"));
+                using var reader = select.ExecuteReader();
+                if (reader.Read())
+                    claimed = Read(reader);
+            }
+
+            if (claimed is null)
+            {
+                tx.Commit();
+                return null;
+            }
+
+            using var delete = _conn.CreateCommand();
+            delete.Transaction = tx;
+            delete.CommandText = """
+                DELETE FROM worker_registry
+                WHERE worker_id = $id
+                  AND last_heartbeat_at < $cutoff;
+                """;
+            delete.Parameters.AddWithValue("$id", workerId);
+            delete.Parameters.AddWithValue("$cutoff", cutoff.ToString("O"));
+            var deleted = delete.ExecuteNonQuery();
+            tx.Commit();
+            return deleted == 1 ? claimed : null;
         }
         finally
         {
@@ -241,7 +314,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
     /// </summary>
     public async Task<WorkerRegistration?> TryClaimWorkerAsync(string workerId, CancellationToken ct = default)
     {
-        await _writeLock.WaitAsync(ct);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             using var tx = _conn.BeginTransaction();
@@ -252,8 +325,8 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
                 sel.Transaction = tx;
                 sel.CommandText = "SELECT * FROM worker_registry WHERE worker_id = $id;";
                 sel.Parameters.AddWithValue("$id", workerId);
-                using var reader = await sel.ExecuteReaderAsync(ct);
-                if (await reader.ReadAsync(ct))
+                using var reader = sel.ExecuteReader();
+                if (reader.Read())
                     claimed = Read(reader);
             }
 
@@ -263,7 +336,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
                 del.Transaction = tx;
                 del.CommandText = "DELETE FROM worker_registry WHERE worker_id = $id;";
                 del.Parameters.AddWithValue("$id", workerId);
-                await del.ExecuteNonQueryAsync(ct);
+                del.ExecuteNonQuery();
             }
 
             tx.Commit();
@@ -273,6 +346,19 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         {
             _writeLock.Release();
         }
+    }
+
+    private async Task<SqliteConnection> OpenReadConnectionAsync(CancellationToken ct)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        var conn = new SqliteConnection(_connectionString);
+        await conn.OpenAsync(ct).ConfigureAwait(false);
+
+        using var pragma = conn.CreateCommand();
+        // nosemgrep: csharp.lang.security.sqli.csharp-sqli.csharp-sqli -- busy_timeout takes no parameters; the interpolated value is a validated positive ctor argument, not caller input
+        pragma.CommandText = $"PRAGMA busy_timeout={_busyTimeoutMilliseconds};";
+        await pragma.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        return conn;
     }
 
     public void Dispose()

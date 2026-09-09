@@ -11,10 +11,6 @@
   <!-- Suppress vulnerability advisories for OTel transitive dependencies that have no patched
        version in the local NuGet cache. Mirrored from CodeyBox.Api.csproj. -->
   <ItemGroup>
-    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-g94r-2vxg-569j" />
-    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-4625-4j76-fww9" />
-    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-9j88-vvj5-vhgr" />
-    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-g7hc-96xr-gvvx" />
   </ItemGroup>
 
   <ItemGroup>
@@ -35,6 +31,9 @@
     <Content Include="Fixtures\**\*.json" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="Fixtures\**\*.jsonl" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="Fixtures\**\*.txt" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Fixtures\**\*.html" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Fixtures\demo-login-app\healthz" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Fixtures\vendor\linkedom-bundle.cjs" CopyToOutputDirectory="PreserveNewest" />
     <Compile Remove="Fixtures\**\*.cs" />
   </ItemGroup>
 
@@ -46,6 +45,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\CodeyBox.Api\CodeyBox.Api.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Core\CodeyBox.Core.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Deployment\CodeyBox.Deployment.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.PluginSdk\CodeyBox.PluginSdk.csproj" />
     <ProjectReference Include="..\..\plugins\CodeyBox.FileSizeLimitsAuditorPlugin\CodeyBox.FileSizeLimitsAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\CodeyBox.StatisticsPlugin\CodeyBox.StatisticsPlugin.csproj" />
@@ -77,6 +77,7 @@
     <ProjectReference Include="..\..\src\CodeyBox.Audit.Llm\CodeyBox.Audit.Llm.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Bubblewrap\CodeyBox.Sandbox.Bubblewrap.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Graphical\CodeyBox.Sandbox.Graphical.csproj" />
+    <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Incus\CodeyBox.Sandbox.Incus.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Multipass\CodeyBox.Sandbox.Multipass.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.MultipassRemote\CodeyBox.Sandbox.MultipassRemote.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Sandbox.Sprites\CodeyBox.Sandbox.Sprites.csproj" />

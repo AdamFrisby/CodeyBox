@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -12,10 +13,11 @@ namespace CodeyBox.Orchestrator;
 /// <see cref="OrchestratorService"/> can invoke it synchronously at startup
 /// before the worker pool begins pulling from the queue.
 ///
-/// Idempotency guarantee: <see cref="IWorkerRegistry.ClaimDeadWorkersAsync"/>
-/// atomically DELETEs stale rows in one transaction; only the caller that
-/// successfully removed a row performs recovery for that worker. Concurrent
-/// or restarted reapers are safe.
+/// Idempotency guarantee: <see cref="IWorkerRegistry.TryClaimDeadWorkerAsync"/>
+/// atomically deletes each still-stale row after any durable dispatch owner is
+/// fenced. The guarded work-item write is the final recovery election when a
+/// locally cancelled owner deregisters while quiescing. Concurrent or
+/// restarted reapers are safe.
 /// </summary>
 public sealed class DeadWorkerReaper : BackgroundService
 {
@@ -26,6 +28,9 @@ public sealed class DeadWorkerReaper : BackgroundService
     private readonly Func<DeadWorkerOptions> _optsAccessor;
     private readonly ILogger<DeadWorkerReaper> _log;
     private readonly IStartupInitialRecoveryBarrier? _startupRecoveryBarrier;
+    private readonly CancellationRegistry? _cancellations;
+    private readonly Func<int, bool> _localProcessMayBeRunning;
+    private readonly DateTimeOffset? _currentProcessStartedAt;
     private readonly ConcurrentDictionary<WorkItemId, byte> _recoveredItemsThisProcess = new();
     private IWorkerPoolRecoverySlotReleaser? _slotReleaser;
 
@@ -46,8 +51,20 @@ public sealed class DeadWorkerReaper : BackgroundService
         ILogger<DeadWorkerReaper> log,
         IWebhookDispatcher? webhooks = null,
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
-        IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null)
-        : this(registry, store, queue, () => opts, log, webhooks, slotReleaser, startupRecoveryBarrier) { }
+        IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null,
+        CancellationRegistry? cancellationRegistry = null,
+        Func<int, bool>? localProcessMayBeRunning = null)
+        : this(
+            registry,
+            store,
+            queue,
+            () => opts,
+            log,
+            webhooks,
+            slotReleaser,
+            startupRecoveryBarrier,
+            cancellationRegistry,
+            localProcessMayBeRunning) { }
 
     public DeadWorkerReaper(
         IWorkerRegistry registry,
@@ -57,7 +74,9 @@ public sealed class DeadWorkerReaper : BackgroundService
         ILogger<DeadWorkerReaper> log,
         IWebhookDispatcher? webhooks = null,
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
-        IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null)
+        IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null,
+        CancellationRegistry? cancellationRegistry = null,
+        Func<int, bool>? localProcessMayBeRunning = null)
     {
         _registry = registry;
         _store = store;
@@ -67,6 +86,9 @@ public sealed class DeadWorkerReaper : BackgroundService
         _webhooks = webhooks;
         _slotReleaser = slotReleaser;
         _startupRecoveryBarrier = startupRecoveryBarrier;
+        _cancellations = cancellationRegistry;
+        _localProcessMayBeRunning = localProcessMayBeRunning ?? LocalProcessMayBeRunning;
+        _currentProcessStartedAt = TryReadCurrentProcessStartedAt();
     }
 
     internal void AttachWorkerPoolSlotReleaser(IWorkerPoolRecoverySlotReleaser slotReleaser)
@@ -77,16 +99,20 @@ public sealed class DeadWorkerReaper : BackgroundService
 
     /// <summary>
     /// Runs a single reaper sweep. Safe to call concurrently or repeatedly;
-    /// the registry's atomic DELETE ensures no double-recovery.
+    /// the registry claim and guarded work-item write prevent double-recovery.
     /// </summary>
     public async Task RunOnceAsync(CancellationToken ct)
     {
         try
         {
             var cutoff = DateTimeOffset.UtcNow - _opts.DeadWorkerThreshold;
-            var dead = await _registry.ClaimDeadWorkersAsync(cutoff, ct);
-            foreach (var worker in dead)
-                await RecoverWorkerAsync(worker, ct);
+            var candidates = await _registry.ListAsync(ct);
+            foreach (var worker in candidates)
+            {
+                if (worker.LastHeartbeatAt >= cutoff)
+                    continue;
+                await TryRecoverStaleWorkerAsync(worker, cutoff, ct);
+            }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
         catch (Exception ex)
@@ -129,19 +155,20 @@ public sealed class DeadWorkerReaper : BackgroundService
     /// </para>
     ///
     /// <para>
-    /// Callers should invoke <see cref="RunOnceAsync"/> first so any stale
-    /// registry rows are claimed and deleted; the remaining rows are then
-    /// trusted as live and any items they own are left alone here.
+    /// Callers should invoke <see cref="RunOnceAsync"/> first. Stale rows whose
+    /// owners are proven inactive are claimed; unfenceable claimed owners keep
+    /// their registry row, so this sweep cannot misclassify them as stranded.
+    /// Remaining rows are trusted as live and their items are left alone here.
     /// </para>
     /// </summary>
     public async Task SweepStrandedItemsAsync(CancellationToken ct)
     {
         try
         {
-            // Snapshot the live worker set after the periodic reaper has
-            // claimed and deleted any stale rows. Anything still in the
-            // registry is therefore treated as a live worker; we must not
-            // touch its in-flight item.
+            // Snapshot the worker set after the periodic reaper has claimed
+            // every safely recoverable stale row. Unfenceable claimed owners
+            // deliberately remain registered alongside live workers; neither
+            // category may be treated as a stranded item.
             var liveWorkers = await _registry.ListAsync(ct);
             var liveOwnedIds = new HashSet<WorkItemId>();
             foreach (var w in liveWorkers)
@@ -162,6 +189,14 @@ public sealed class DeadWorkerReaper : BackgroundService
                         continue;
                     if (liveOwnedIds.Contains(item.Id))
                         continue;
+                    if (item.AgentTurnResumeCheckpoint?.DispatchClaimId is not null
+                        && _cancellations?.IsActive(item.Id) == true)
+                    {
+                        _log.LogWarning(
+                            "Startup recovery: refusing to release dispatch claim for item {ItemId}; a local pipeline is still active",
+                            item.Id);
+                        continue;
+                    }
                     await RecoverWorkItemAsync(
                         item,
                         StartupSweepWorkerId,
@@ -189,7 +224,43 @@ public sealed class DeadWorkerReaper : BackgroundService
             await RunOnceAsync(stoppingToken);
     }
 
-    private async Task RecoverWorkerAsync(WorkerRegistration worker, CancellationToken ct)
+    private async Task TryRecoverStaleWorkerAsync(
+        WorkerRegistration candidate,
+        DateTimeOffset cutoff,
+        CancellationToken ct)
+    {
+        WorkItem? fencedItem = null;
+        if (candidate.CurrentWorkItemId is { } currentWorkItemId
+            && Guid.TryParse(currentWorkItemId, out var guid))
+        {
+            var item = await _store.GetAsync(new WorkItemId(guid), ct);
+            if (item?.AgentTurnResumeCheckpoint?.DispatchClaimId is not null)
+            {
+                // Keep the registry row durable until the owner is fenced. A
+                // remote or still-running process must remain visible to every
+                // concurrent/startup sweep; deleting first would let a peer
+                // mistake the claimed item for an orphan.
+                fencedItem = await TryFenceDispatchClaimOwnerAsync(candidate, item, ct);
+                if (fencedItem is null)
+                    return;
+            }
+        }
+
+        var claimed = await _registry.TryClaimDeadWorkerAsync(candidate.WorkerId, cutoff, ct);
+        if (claimed is null && fencedItem is null)
+            return;
+
+        // A locally cancelled owner can deregister while the reaper waits for
+        // quiescence, and a concurrent reaper can win the row claim. The work-
+        // item state/updatedAt CAS remains the recovery election for an owner
+        // already proven inactive.
+        await RecoverWorkerAsync(claimed ?? candidate, ct, fencedItem);
+    }
+
+    private async Task RecoverWorkerAsync(
+        WorkerRegistration worker,
+        CancellationToken ct,
+        WorkItem? fencedItem = null)
     {
         if (worker.CurrentWorkItemId is null)
         {
@@ -206,7 +277,7 @@ public sealed class DeadWorkerReaper : BackgroundService
         }
 
         var itemId = new WorkItemId(guid);
-        var item = await _store.GetAsync(itemId, ct);
+        var item = fencedItem ?? await _store.GetAsync(itemId, ct);
         if (item is null)
         {
             _log.LogWarning("Dead worker {WorkerId} referenced work item {ItemId} which no longer exists", worker.WorkerId, itemId);
@@ -221,6 +292,190 @@ public sealed class DeadWorkerReaper : BackgroundService
             webhookReason: "dead worker detected",
             preserveWorkBranchForOrphan: false,
             ct);
+    }
+
+    private async Task<WorkItem?> TryFenceDispatchClaimOwnerAsync(
+        WorkerRegistration worker,
+        WorkItem item,
+        CancellationToken ct)
+    {
+        var expectedClaimId = item.AgentTurnResumeCheckpoint?.DispatchClaimId;
+        if (expectedClaimId is null)
+            return item;
+
+        var isLocalHost = string.Equals(
+            worker.HostName,
+            Environment.MachineName,
+            StringComparison.OrdinalIgnoreCase);
+        if (!isLocalHost)
+        {
+            return RefuseUnfencedClaimRecovery(
+                worker,
+                item,
+                expectedClaimId.Value,
+                "worker belongs to a different host");
+        }
+
+        var isCurrentProcessOwner = worker.ProcessId == Environment.ProcessId
+            && _currentProcessStartedAt is { } currentProcessStartedAt
+            && worker.StartedAt >= currentProcessStartedAt;
+        if (isCurrentProcessOwner)
+        {
+            if (_cancellations is null || !_cancellations.CancelForRecovery(item.Id))
+            {
+                return RefuseUnfencedClaimRecovery(
+                    worker,
+                    item,
+                    expectedClaimId.Value,
+                    "current-process owner has no active cancellation registration");
+            }
+
+            var quiescenceTimeout = _opts.DeadWorkerThreshold;
+            if (quiescenceTimeout <= TimeSpan.Zero)
+            {
+                return RefuseUnfencedClaimRecovery(
+                    worker,
+                    item,
+                    expectedClaimId.Value,
+                    "no positive claim-owner quiescence bound is configured");
+            }
+
+            using var quiescenceCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            try
+            {
+                quiescenceCts.CancelAfter(quiescenceTimeout);
+                await _cancellations.WaitForInactiveAsync(item.Id, quiescenceCts.Token);
+            }
+            catch (OperationCanceledException) when (
+                !ct.IsCancellationRequested
+                && quiescenceCts.IsCancellationRequested)
+            {
+                return RefuseUnfencedClaimRecovery(
+                    worker,
+                    item,
+                    expectedClaimId.Value,
+                    $"local owner did not quiesce within {quiescenceTimeout}");
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                return RefuseUnfencedClaimRecovery(
+                    worker,
+                    item,
+                    expectedClaimId.Value,
+                    "configured claim-owner quiescence bound is outside the supported timer range");
+            }
+
+            if (_cancellations.IsActive(item.Id))
+            {
+                return RefuseUnfencedClaimRecovery(
+                    worker,
+                    item,
+                    expectedClaimId.Value,
+                    "a local owner became active after cancellation quiescence");
+            }
+        }
+        else if (worker.ProcessId == Environment.ProcessId)
+        {
+            if (_currentProcessStartedAt is null)
+            {
+                return RefuseUnfencedClaimRecovery(
+                    worker,
+                    item,
+                    expectedClaimId.Value,
+                    "current process start time is unavailable, so PID reuse cannot be excluded");
+            }
+
+            // The same numeric PID belongs to this process now, but the worker
+            // registration predates this process epoch. The prior owner cannot
+            // still be running, which preserves recovery across container/PID-1
+            // restarts without canceling an unrelated current registration.
+        }
+        else if (_localProcessMayBeRunning(worker.ProcessId))
+        {
+            return RefuseUnfencedClaimRecovery(
+                worker,
+                item,
+                expectedClaimId.Value,
+                "same-host owner process may still be running");
+        }
+
+        // Cancellation or process-exit observation is only evidence about the
+        // snapshot we inspected. The old owner may have completed a legitimate
+        // transition while winding down, so never recover a changed claim.
+        var current = await _store.GetAsync(item.Id, ct);
+        if (current is null
+            || current.State != item.State
+            || current.UpdatedAt != item.UpdatedAt
+            || current.AgentTurnResumeCheckpoint?.DispatchClaimId != expectedClaimId)
+        {
+            _log.LogDebug(
+                "Dead-worker recovery: item {ItemId} advanced while dispatch claim {ClaimId} was being fenced; skipping recovery",
+                item.Id,
+                expectedClaimId);
+            return null;
+        }
+
+        return current;
+    }
+
+    private WorkItem? RefuseUnfencedClaimRecovery(
+        WorkerRegistration worker,
+        WorkItem item,
+        Guid claimId,
+        string reason)
+    {
+        _log.LogWarning(
+            "Dead-worker recovery: retaining dispatch claim {ClaimId} for item {ItemId}; worker {WorkerId} cannot be fenced safely (host={Host}, pid={ProcessId}): {Reason}",
+            claimId,
+            item.Id,
+            worker.WorkerId,
+            worker.HostName,
+            worker.ProcessId,
+            reason);
+        return null;
+    }
+
+    private static bool LocalProcessMayBeRunning(int processId)
+    {
+        if (processId <= 0)
+            return true;
+
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            return !process.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        catch (Exception ex) when (ex is
+            InvalidOperationException
+            or System.ComponentModel.Win32Exception
+            or NotSupportedException
+            or System.Security.SecurityException)
+        {
+            // Permission, platform, and process-inspection failures are not
+            // proof of death. Fail closed so a live owner is never duplicated.
+            return true;
+        }
+    }
+
+    private static DateTimeOffset? TryReadCurrentProcessStartedAt()
+    {
+        try
+        {
+            using var process = Process.GetCurrentProcess();
+            return new DateTimeOffset(process.StartTime).ToUniversalTime();
+        }
+        catch (Exception ex) when (ex is
+            InvalidOperationException
+            or System.ComponentModel.Win32Exception
+            or NotSupportedException
+            or System.Security.SecurityException)
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -265,7 +520,7 @@ public sealed class DeadWorkerReaper : BackgroundService
             return;
         }
 
-        if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
+        if (item.HasAgentTurnRecoveryBoundary
             && item.State is WorkItemState.Working or WorkItemState.Reworking)
         {
             var preemptAttempt = WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
@@ -275,7 +530,19 @@ public sealed class DeadWorkerReaper : BackgroundService
                 _opts.MaxRecoveryAttempts,
                 DateTimeOffset.UtcNow,
                 "exceeded MaxRecoveryAttempts");
-            await _store.UpdateAsync(preempted, ct);
+            var recoveryWritten = await _store.TryUpdateIfStateAndUpdatedAtAsync(
+                preempted,
+                item.State,
+                item.UpdatedAt,
+                ct);
+            if (!recoveryWritten)
+            {
+                _log.LogInformation(
+                    "Recovery ({WorkerId}): checkpointed work item {ItemId} advanced before the guarded recovery write; skipping",
+                    workerIdContext,
+                    itemId);
+                return;
+            }
             MarkRecoveredItem(itemId);
 
             if (preempted.State == WorkItemState.AbandonedAfterRecoveryAttempts)
@@ -291,7 +558,11 @@ public sealed class DeadWorkerReaper : BackgroundService
                 await _queue.EnqueueAsync(itemId, ct);
                 _log.LogInformation(
                     "Recovery ({WorkerId}): work item {ItemId} has preempt checkpoint {Ref}; re-enqueued for clean resume (attempt {Attempt}/{Max})",
-                    workerIdContext, itemId, item.PreemptCheckpoint, preemptAttempt, _opts.MaxRecoveryAttempts);
+                    workerIdContext,
+                    itemId,
+                    item.PreemptCheckpoint ?? item.AgentTurnRecoveryLease!.SandboxId,
+                    preemptAttempt,
+                    _opts.MaxRecoveryAttempts);
             }
 
             if (_webhooks is not null)
@@ -361,6 +632,8 @@ public sealed class DeadWorkerReaper : BackgroundService
                     StartedAt = null,
                     PreemptedAt = null,
                     PreemptCheckpoint = null,
+                    AgentTurnResumeCheckpoint = null,
+                    AgentTurnRecoveryLease = null,
                     UpdatedAt = DateTimeOffset.UtcNow,
                 }, checkAttempt, item.State);
                 _log.LogWarning(
@@ -432,6 +705,8 @@ public sealed class DeadWorkerReaper : BackgroundService
                     StartedAt = null,
                     PreemptedAt = null,
                     PreemptCheckpoint = null,
+                    AgentTurnResumeCheckpoint = null,
+                    AgentTurnRecoveryLease = null,
                     UpdatedAt = DateTimeOffset.UtcNow,
                 }, controlAttempt, item.State);
                 _log.LogWarning(
@@ -492,7 +767,7 @@ public sealed class DeadWorkerReaper : BackgroundService
 
         if (preserveWorkBranchForOrphan
             && item.State is WorkItemState.Working or WorkItemState.Reworking
-            && string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
+            && !item.HasAgentTurnRecoveryBoundary
             && !WorkItemRecoveryPolicy.IsRerunnableCheckAndActWithoutPreempt(item)
             && !WorkItemRecoveryPolicy.IsRerunnableAgentControlWithoutPreempt(item))
         {
@@ -506,6 +781,8 @@ public sealed class DeadWorkerReaper : BackgroundService
                     StartedAt = null,
                     PreemptedAt = null,
                     PreemptCheckpoint = null,
+                    AgentTurnResumeCheckpoint = null,
+                    AgentTurnRecoveryLease = null,
                     UpdatedAt = orphanNow,
                 }, orphanAttempt, item.State)
                 : WorkItemRecoveryPolicy.BuildStaleItemRecovery(
@@ -616,6 +893,8 @@ public sealed class DeadWorkerReaper : BackgroundService
                 StartedAt = null,
                 PreemptedAt = null,
                 PreemptCheckpoint = null,
+                AgentTurnResumeCheckpoint = null,
+                AgentTurnRecoveryLease = null,
                 UpdatedAt = DateTimeOffset.UtcNow,
             }, attempt, item.State);
             _log.LogWarning(
@@ -629,6 +908,10 @@ public sealed class DeadWorkerReaper : BackgroundService
             {
                 State = recoveryTarget.Value,
                 LastError = null,
+                PreemptedAt = null,
+                PreemptCheckpoint = null,
+                AgentTurnResumeCheckpoint = null,
+                AgentTurnRecoveryLease = null,
                 UpdatedAt = DateTimeOffset.UtcNow,
                 // Re-dispatchable recovery targets must not appear in-flight to CountInFlightAsync.
                 StartedAt = WorkItemRecoveryPolicy.ShouldClearStartedAtForRecoveryTarget(recoveryTarget.Value)

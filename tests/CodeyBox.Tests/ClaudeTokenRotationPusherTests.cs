@@ -236,7 +236,7 @@ public sealed class ClaudeTokenRotationPusherTests : IDisposable
         var failed = Assert.Single(_sink.Events, e => GetEventName(e) == "agent.claude_token_push_failed");
         Assert.Equal(LogEventLevel.Warning, failed.Level);
         Assert.Equal("codeybox-vm", GetScalar<string>(failed, "SandboxName"));
-        Assert.Contains("permission denied", GetScalar<string>(failed, "Reason") ?? "");
+        Assert.Contains("exit code 1", GetScalar<string>(failed, "Reason") ?? "");
 
         Assert.DoesNotContain(_sink.Events, e => GetEventName(e) == "agent.claude_token_pushed_to_vm");
     }
@@ -314,10 +314,11 @@ public sealed class ClaudeTokenRotationPusherTests : IDisposable
 
     private static void AssertBundleWrittenViaStdin(SandboxExec exec)
     {
-        Assert.Equal(3, exec.Argv.Count);
+        Assert.True(exec.Argv.Count >= 9);
         Assert.Equal("bash", exec.Argv[0]);
         Assert.Equal("-c", exec.Argv[1]);
-        Assert.Contains("$HOME/.claude/.credentials.json", exec.Argv[2]);
+        Assert.Equal("$HOME", exec.Argv[4]);
+        Assert.Equal(".claude/.credentials.json", exec.Argv[5]);
         // Bundle must be piped in via stdin, not via env-var or argv.
         Assert.NotNull(exec.Stdin);
         using var doc = JsonDocument.Parse(exec.Stdin!);

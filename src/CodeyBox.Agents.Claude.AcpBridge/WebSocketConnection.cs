@@ -1,6 +1,6 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Net.Sockets;
-using System.Security.Cryptography;
 using System.Text;
 
 namespace CodeyBox.Agents.Claude.AcpBridge;
@@ -20,6 +20,11 @@ internal sealed class WebSocketConnection
 {
     private const string WebSocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     private const string AuthHeaderName = "x-claude-code-ide-authorization";
+    private const string Sha1SumPath = "/usr/bin/sha1sum";
+    private const int MaxWebSocketKeyCharacters = 256;
+    private const int Sha1HexCharacters = 40;
+    private const int MaxSha1StdoutCharacters = 128;
+    private const int MaxSha1StderrCharacters = 1024;
 
     // Hard cap on any single inbound WebSocket frame payload. RFC6455 §5.2 lets
     // the length-127 form carry a 63-bit value (up to ~9.2 EB); without a cap
@@ -75,7 +80,7 @@ internal sealed class WebSocketConnection
             }
         }
 
-        var accept = ComputeAcceptKey(wsKey);
+        var accept = await ComputeAcceptKeyAsync(wsKey, ct).ConfigureAwait(false);
         var reply =
             "HTTP/1.1 101 Switching Protocols\r\n" +
             "Upgrade: websocket\r\n" +
@@ -256,11 +261,118 @@ internal sealed class WebSocketConnection
         return true;
     }
 
-    private static string ComputeAcceptKey(string clientKey)
+    private static async Task<string> ComputeAcceptKeyAsync(string clientKey, CancellationToken ct)
     {
-        var bytes = Encoding.ASCII.GetBytes(clientKey + WebSocketGuid);
-        var hash = SHA1.HashData(bytes);
-        return Convert.ToBase64String(hash);
+        if (clientKey.Length > MaxWebSocketKeyCharacters || clientKey.Any(static c => c > 0x7f))
+            throw new InvalidDataException("The WebSocket key is invalid or exceeds its safety bound.");
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = Sha1SumPath,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        startInfo.Environment.Clear();
+        // `--` closes option parsing at the fixed executable sink. The
+        // untrusted client key is carried only on stdin and is bounded above.
+        startInfo.ArgumentList.Add("--");
+
+        using var process = Process.Start(startInfo)
+            ?? throw new IOException("Unable to start the WebSocket SHA-1 provider.");
+        Task<string>? stdoutTask = null;
+        Task<string>? stderrTask = null;
+        try
+        {
+            stdoutTask = ReadBoundedTextAsync(
+                process.StandardOutput,
+                MaxSha1StdoutCharacters,
+                ct);
+            stderrTask = ReadBoundedTextAsync(
+                process.StandardError,
+                MaxSha1StderrCharacters,
+                ct);
+            await process.StandardInput.WriteAsync(
+                (clientKey + WebSocketGuid).AsMemory(),
+                ct).ConfigureAwait(false);
+            process.StandardInput.Close();
+            await process.WaitForExitAsync(ct).ConfigureAwait(false);
+            var stdout = await stdoutTask.ConfigureAwait(false);
+            var stderr = await stderrTask.ConfigureAwait(false);
+            if (process.ExitCode != 0)
+            {
+                throw new IOException(
+                    $"The WebSocket SHA-1 provider exited with code {process.ExitCode}: {stderr.Trim()}");
+            }
+
+            if (stdout.Length < Sha1HexCharacters
+                || !stdout.AsSpan(0, Sha1HexCharacters).ToString().All(static c =>
+                    c is >= '0' and <= '9' or >= 'a' and <= 'f'))
+            {
+                throw new IOException("The WebSocket SHA-1 provider returned an invalid digest.");
+            }
+
+            var hash = Convert.FromHexString(stdout.AsSpan(0, Sha1HexCharacters));
+            return Convert.ToBase64String(hash);
+        }
+        catch (Exception primaryFailure)
+        {
+            var cleanupFailures = new List<Exception>();
+            try
+            {
+                if (!process.HasExited)
+                    process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception cleanupFailure)
+            {
+                cleanupFailures.Add(new IOException(
+                    "The WebSocket SHA-1 provider could not be terminated after failure.",
+                    cleanupFailure));
+            }
+
+            if (stdoutTask is not null && stderrTask is not null)
+            {
+                try
+                {
+                    await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    // The initiating cancellation already carries this failure;
+                    // awaiting here only observes both reader tasks.
+                }
+                catch (Exception readerFailure) when (!ReferenceEquals(readerFailure, primaryFailure))
+                {
+                    cleanupFailures.Add(new IOException(
+                        "The WebSocket SHA-1 provider output readers failed during cleanup.",
+                        readerFailure));
+                }
+            }
+
+            if (cleanupFailures.Count != 0)
+                throw new AggregateException([primaryFailure, .. cleanupFailures]);
+            throw;
+        }
+    }
+
+    private static async Task<string> ReadBoundedTextAsync(
+        StreamReader reader,
+        int maxCharacters,
+        CancellationToken ct)
+    {
+        var buffer = new char[maxCharacters + 1];
+        var count = 0;
+        while (count < buffer.Length)
+        {
+            var read = await reader.ReadAsync(buffer.AsMemory(count), ct).ConfigureAwait(false);
+            if (read == 0)
+                return new string(buffer, 0, count);
+            count += read;
+        }
+        throw new IOException("A WebSocket SHA-1 provider output exceeded its safety bound.");
     }
 
     private async Task<HttpRequest?> ReadHttpRequestAsync(CancellationToken ct)

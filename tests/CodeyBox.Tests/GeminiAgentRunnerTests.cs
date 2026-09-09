@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http;
 using System.Text.Json;
+using CodeyBox.Agents.Antigravity;
 using CodeyBox.Agents.Gemini;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
@@ -121,6 +122,96 @@ public sealed class GeminiAgentRunnerTests
         await runner.RunAsync(sandbox, "/work", "prompt", credential: null, modelId: "");
 
         Assert.DoesNotContain("--model", sandbox.CapturedExec!.Argv);
+    }
+
+    [Fact]
+    public async Task RunAsync_NullModelId_WithConfiguredDefault_InjectsDefaultModelFlag()
+    {
+        // The cross-kind audit path (and any null-model invocation) must dispatch
+        // on the config-sourced default rather than letting gemini-cli fall back
+        // to its stale built-in model. Mirrors CodexAgentRunner / CursorAgentRunner.
+        var sandbox = new CapturingSandbox();
+        var runner = new GeminiAgentRunner(new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase) { ["gemini"] = "gemini-3-pro-preview" }));
+
+        await runner.RunAsync(sandbox, "/work", "prompt", credential: null, modelId: null);
+
+        var argv = sandbox.CapturedExec!.Argv.ToList();
+        var modelIdx = argv.IndexOf("--model");
+        Assert.True(modelIdx >= 0, "argv must contain --model flag from the configured default");
+        Assert.Equal("gemini-3-pro-preview", argv[modelIdx + 1]);
+    }
+
+    [Fact]
+    public async Task RunAsync_ExplicitModelId_OverridesConfiguredDefault()
+    {
+        var sandbox = new CapturingSandbox();
+        var runner = new GeminiAgentRunner(new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase) { ["gemini"] = "gemini-3-pro-preview" }));
+
+        await runner.RunAsync(sandbox, "/work", "prompt", credential: null, modelId: "gemini-3-flash-preview");
+
+        var argv = sandbox.CapturedExec!.Argv.ToList();
+        var modelIdx = argv.IndexOf("--model");
+        Assert.Equal("gemini-3-flash-preview", argv[modelIdx + 1]);
+    }
+
+    [Fact]
+    public void DefaultModelId_ReflectsConfiguredSnapshot()
+    {
+        // Single source of truth: changing the config default changes the runner's
+        // resolved model with no code edit.
+        var runner = new GeminiAgentRunner(new AgentDefaultsSnapshot(
+            new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase) { ["gemini"] = "gemini-3-pro-preview" }));
+
+        Assert.Equal("gemini-3-pro-preview", runner.DefaultModelId);
+    }
+
+    [Fact]
+    public void DefaultModelId_NoConfiguredDefault_IsNull()
+    {
+        Assert.Null(new GeminiAgentRunner().DefaultModelId);
+    }
+
+    [Fact]
+    public async Task RunTextOnlyAsync_NoModelAndNoDefault_FailsWithMissingModel()
+    {
+        // Documented no-config fallback: with neither an explicit model nor a
+        // configured default, the text-only path fails clearly instead of routing
+        // to a stale hardcoded id.
+        var handler = new CapturingGeminiHandler(HttpStatusCode.OK, "{}");
+        var runner = new GeminiAgentRunner(new HttpClient(handler));
+        var cred = new AgentCredential(AgentKind.Gemini,
+            new Dictionary<string, string> { ["GEMINI_API_KEY"] = "AIzaSyTest" },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunTextOnlyAsync("hello", cred, modelId: null);
+
+        Assert.False(result.Success);
+        Assert.Contains("no default configured", result.Error);
+        // The guard fires before any HTTP dispatch.
+        Assert.Null(handler.LastRequest);
+    }
+
+    [Fact]
+    public async Task RunTextOnlyAsync_NoModel_UsesConfiguredDefaultInEndpoint()
+    {
+        // With no per-call model, the API-key endpoint URL must embed the
+        // config-sourced default model, proving the literal fallback is gone.
+        var handler = new CapturingGeminiHandler(HttpStatusCode.OK,
+            """{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}""");
+        var runner = new GeminiAgentRunner(
+            new AgentDefaultsSnapshot(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase) { ["gemini"] = "gemini-3-pro-preview" }),
+            new HttpClient(handler));
+        var cred = new AgentCredential(AgentKind.Gemini,
+            new Dictionary<string, string> { ["GEMINI_API_KEY"] = "AIzaSyTest" },
+            new Dictionary<string, string>());
+
+        var result = await runner.RunTextOnlyAsync("hello", cred, modelId: null);
+
+        Assert.True(result.Success);
+        Assert.NotNull(handler.LastRequest);
+        Assert.Contains("gemini-3-pro-preview", handler.LastRequest!.RequestUri!.ToString());
     }
 
     [Fact]
@@ -588,7 +679,9 @@ public sealed class GeminiAgentRunnerTests
             },
             new Dictionary<string, string>());
 
-        var result = await runner.RunTextOnlyAsync("hello", cred);
+        // An explicit model is supplied so the resolver reaches the HTTP path;
+        // this test asserts credential routing, not model resolution.
+        var result = await runner.RunTextOnlyAsync("hello", cred, modelId: "gemini-3-pro-preview");
 
         // The early-return guard would have produced this exact summary;
         // assert we got past it.
@@ -782,8 +875,9 @@ public sealed class GeminiAgentRunnerTests
 }
 
 /// <summary>
-/// Fake sandbox that records the most recent <see cref="SandboxExec"/> it
-/// received and returns configurable exit code, stdout, and stderr.
+/// Fake sandbox that records every <see cref="SandboxExec"/>, exposes the most
+/// recent one, and can return canned version/help/structured-probe responses
+/// before falling back to configurable exit code, stdout, stderr, and chunks.
 /// </summary>
 internal sealed class CapturingSandbox : ISandbox
 {
@@ -808,12 +902,53 @@ internal sealed class CapturingSandbox : ISandbox
     /// stream detection). When null, falls back to the regular stdout/stderr.
     /// </summary>
     public string? HelpOutput { get; init; }
+    public string? VersionOutput { get; init; }
+    public string? StructuredProbeOutput { get; init; }
+    public string? StructuredProbeStderr { get; init; }
+    public int StructuredProbeExitCode { get; init; }
+    public bool VersionStdoutLimitExceeded { get; init; }
+    public bool VersionStderrLimitExceeded { get; init; }
+    public bool HelpStdoutLimitExceeded { get; init; }
+    public bool HelpStderrLimitExceeded { get; init; }
+    public bool StructuredProbeStdoutLimitExceeded { get; init; }
+    public bool StructuredProbeStderrLimitExceeded { get; init; }
+    public List<SandboxExec> Execs { get; } = [];
 
     public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
+        Execs.Add(exec);
         CapturedExec = exec;
+        if (VersionOutput is not null && exec.Argv.Contains("--version"))
+        {
+            return Task.FromResult(new SandboxExecResult(
+                0,
+                VersionOutput,
+                string.Empty,
+                VersionStdoutLimitExceeded,
+                VersionStderrLimitExceeded));
+        }
         if (HelpOutput is not null && exec.Argv.Contains("--help"))
-            return Task.FromResult(new SandboxExecResult(0, HelpOutput, string.Empty));
+        {
+            return Task.FromResult(new SandboxExecResult(
+                0,
+                HelpOutput,
+                string.Empty,
+                HelpStdoutLimitExceeded,
+                HelpStderrLimitExceeded));
+        }
+        if (StructuredProbeOutput is not null
+            && exec.Argv.Contains("--output-format")
+            // agy's probe prompt now travels inside an NDJSON frame, so match on containment.
+            && exec.Stdin is { } probeStdin
+            && probeStdin.Contains(AntigravityAgentRunner.StructuredStreamProbePrompt, StringComparison.Ordinal))
+        {
+            return Task.FromResult(new SandboxExecResult(
+                StructuredProbeExitCode,
+                StructuredProbeOutput,
+                StructuredProbeStderr ?? string.Empty,
+                StructuredProbeStdoutLimitExceeded,
+                StructuredProbeStderrLimitExceeded));
+        }
         if (_stdoutChunk is not null)
             exec.StdoutChunkCallback?.Invoke(_stdoutChunk);
         return Task.FromResult(new SandboxExecResult(_exitCode, _stdout, _stderr));

@@ -119,7 +119,7 @@ public sealed class SandboxLeakDetectionTests
     }
 
     [Fact]
-    public async Task LeakedSandboxEndpoint_DisposesDuplicateNamesOneProviderSnapshotAtATime()
+    public async Task LeakedSandboxEndpoint_RequiresProviderIdForDuplicateNames()
     {
         var threshold = TimeSpan.FromMinutes(30);
         var first = new UatSandboxProvider();
@@ -148,9 +148,32 @@ public sealed class SandboxLeakDetectionTests
             webhooks: webhooks);
         using var client = factory.CreateClient();
 
-        var firstDispose = await client.PostAsync("/sandboxes/leaked/codeybox-duplicate/dispose", content: null);
-        var secondDispose = await client.PostAsync("/sandboxes/leaked/codeybox-duplicate/dispose", content: null);
-        var thirdDispose = await client.PostAsync("/sandboxes/leaked/codeybox-duplicate/dispose", content: null);
+        var listed = await client.GetAsync("/sandboxes/leaked");
+        listed.EnsureSuccessStatusCode();
+        var body = await listed.Content.ReadFromJsonAsync<JsonElement>();
+        var providerIds = body.EnumerateArray()
+            .Select(leak => leak.GetProperty("providerId").GetString())
+            .ToArray();
+        Assert.Equal(2, providerIds.Length);
+        Assert.All(providerIds, providerId => Assert.False(string.IsNullOrWhiteSpace(providerId)));
+        Assert.Equal(2, providerIds.Distinct(StringComparer.Ordinal).Count());
+        var firstProviderId = Assert.IsType<string>(providerIds[0]);
+        var secondProviderId = Assert.IsType<string>(providerIds[1]);
+
+        var ambiguousDispose = await client.PostAsync(
+            "/sandboxes/leaked/codeybox-duplicate/dispose",
+            content: null);
+        Assert.Equal(HttpStatusCode.Conflict, ambiguousDispose.StatusCode);
+
+        var firstDispose = await client.PostAsync(
+            $"/sandboxes/leaked/codeybox-duplicate/dispose?providerId={Uri.EscapeDataString(firstProviderId)}",
+            content: null);
+        var secondDispose = await client.PostAsync(
+            $"/sandboxes/leaked/codeybox-duplicate/dispose?providerId={Uri.EscapeDataString(secondProviderId)}",
+            content: null);
+        var thirdDispose = await client.PostAsync(
+            "/sandboxes/leaked/codeybox-duplicate/dispose",
+            content: null);
 
         firstDispose.EnsureSuccessStatusCode();
         secondDispose.EnsureSuccessStatusCode();
@@ -218,6 +241,28 @@ public sealed class SandboxLeakDetectionTests
     }
 
     [Fact]
+    public async Task LeakedSandboxEndpoint_AllowsProviderOwnedCustomPrefixFromLatestSnapshot()
+    {
+        var threshold = TimeSpan.FromMinutes(30);
+        var provider = new UatSandboxProvider();
+        provider.Add(new ManagedSandboxInfo("incus-custom-endpoint", OldEnough(threshold), null, false));
+        var reaper = BuildReaper(
+            provider,
+            new CapturingWebhookDispatcher(),
+            leakAgeThreshold: threshold);
+        await reaper.RunSweepAsync(CancellationToken.None);
+        using var factory = new SandboxProviderApiFactory(
+            sandboxProvider: provider,
+            reaper: reaper);
+        using var client = factory.CreateClient();
+
+        var response = await client.PostAsync("/sandboxes/leaked/incus-custom-endpoint/dispose", content: null);
+
+        response.EnsureSuccessStatusCode();
+        Assert.Equal(["incus-custom-endpoint"], provider.DisposedNames);
+    }
+
+    [Fact]
     public async Task LeakedSandboxEndpoint_ReturnsNotFoundWhenNameIsAbsentFromLeakSnapshot()
     {
         using var factory = new SandboxProviderApiFactory(
@@ -228,6 +273,21 @@ public sealed class SandboxLeakDetectionTests
         var response = await client.PostAsync("/sandboxes/leaked/primary/dispose", content: null);
 
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task LeakedSandboxEndpoint_RejectsWhitespaceProviderIdentity()
+    {
+        using var factory = new SandboxProviderApiFactory(
+            sandboxProvider: new UatSandboxProvider(),
+            reaper: BuildReaper(new UatSandboxProvider(), new CapturingWebhookDispatcher()));
+        using var client = factory.CreateClient();
+
+        var response = await client.PostAsync(
+            "/sandboxes/leaked/primary/dispose?providerId=%20%20",
+            content: null);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
 
     [Fact]

@@ -1,0 +1,28 @@
+<Project InitialTargets="EnsureWritableNuGetUserSettings">
+
+  <Import Project="$(MSBuildThisFileDirectory)build/NuGetHomeGuard.targets" />
+
+  <!--
+    NuGet unconditionally creates/reads $HOME/.nuget/NuGet before honouring any
+    project-, solution-, or RestoreConfigFile-level config. Sandbox images that
+    leave $HOME/.nuget root-owned (common when a package cache is seeded under
+    $HOME/.nuget/packages as root) make every raw `dotnet build` fail restore.
+    Repair that environmental fault before any project targets run so auditors
+    that invoke `dotnet` directly (process:required-build, csharp:build-WaE)
+    succeed without depending on DOTNET_CLI_HOME redirects in the host
+    orchestrator binary. See scripts/ensure-writable-nuget-home.sh and
+    docs/build-environment.md.
+
+    NuGetHomeGuard.targets (imported above) supplies an in-process backstop:
+    when the user config is present-but-unreadable, its initial target
+    redirects DOTNET_CLI_HOME to repository-local state so NuGet's proxy-cache
+    initialization survives before compilation.
+  -->
+  <Target Name="EnsureWritableNuGetUserSettings">
+    <Exec
+      Command="sh &quot;$(MSBuildThisFileDirectory)scripts/ensure-writable-nuget-home.sh&quot;"
+      Condition="'$(OS)' != 'Windows_NT'"
+      IgnoreStandardErrorWarningFormat="true" />
+  </Target>
+
+</Project>

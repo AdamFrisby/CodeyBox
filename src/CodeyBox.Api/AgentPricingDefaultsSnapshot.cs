@@ -29,7 +29,10 @@ internal sealed class AgentPricingDefaultsSnapshot
     /// <summary>Absolute path to the loaded defaults file.</summary>
     public string SourcePath { get; init; } = "";
 
-    /// <summary>Per-(agent, model) rates from the bundled file (no DefaultRates).</summary>
+    /// <summary>
+    /// Per-(agent, model) rates plus per-agent unknown-model <c>DefaultRates</c>
+    /// fallbacks, both from the bundled file.
+    /// </summary>
     public AgentPricingOptions Baseline { get; init; } = new();
 }
 
@@ -40,6 +43,13 @@ internal sealed class AgentPricingDefaultsFileDto
     public AgentPricingDefaultsMeta Meta { get; set; } = new();
 
     public Dictionary<string, Dictionary<string, ModelRateConfig>> Rates { get; set; } =
+        new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Per-agent unknown-model fallback rate, applied when a model id is absent
+    /// from that agent's <see cref="Rates"/> bucket. Key is agent kind.
+    /// </summary>
+    public Dictionary<string, ModelRateConfig> DefaultRates { get; set; } =
         new(StringComparer.Ordinal);
 }
 

@@ -571,28 +571,39 @@ public sealed class MultipassDaemonRetryTests
 /// <summary>
 /// Pins the AuditLog.SandboxProvisioningTransientRetry emission on retry to a real
 /// Serilog sink. The unit-only tests above use the Microsoft.Extensions.Logging
-/// ILogger which is independent of Serilog's static <c>Log.Logger</c>, so the
-/// surface contract — the audit pipeline ACTUALLY fires for each retry with
-/// the correct workItemId/attempt/errorClass — is only verified here.
-///
-/// Wired into the GlobalSerilog collection because it mutates the static
-/// Serilog logger that other tests also touch.
+/// ILogger, so the surface contract — the audit pipeline ACTUALLY fires for each
+/// retry with the correct workItemId/attempt/errorClass — is only verified here.
 /// </summary>
-[Collection("GlobalSerilog")]
 public sealed class MultipassDaemonRetryAuditTests : IDisposable
 {
     private readonly TestSink _sink = new();
+    private readonly IDisposable _auditScope;
+
+    private readonly Serilog.Core.Logger _auditLogger;
 
     public MultipassDaemonRetryAuditTests()
     {
-        Log.Logger = new LoggerConfiguration()
+        _auditLogger = new LoggerConfiguration()
             .Enrich.FromLogContext()
             .Enrich.With<SensitiveDataRedactionEnricher>()
             .WriteTo.Sink(_sink)
             .CreateLogger();
+
+        // Pin this test's audit emission to our sink for the whole async flow
+        // rather than relying on the process-global Log.Logger staying put: the
+        // audit suite runs WebApplicationFactory<Program> host boots (which
+        // rebuild Log.Logger) concurrently in other collections, and one landing
+        // between a retry here and its inline audit emission would otherwise
+        // steal the event — leaving the sink empty. The AsyncLocal override flows
+        // into every call below and is immune to those global swaps.
+        _auditScope = AuditLog.PushScopedLogger(Log.Logger);
     }
 
-    public void Dispose() => Log.CloseAndFlush();
+    public void Dispose()
+    {
+        _auditScope.Dispose();
+        _auditLogger.Dispose();
+    }
 
     private static IReadOnlyList<string> Argv(string command, params string[] rest) =>
         ["/usr/bin/multipass", command, .. rest];
@@ -600,9 +611,12 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
     private static Task<MultipassDaemonHealthProbeResult> Healthy(CancellationToken _) =>
         Task.FromResult(MultipassDaemonHealthProbeResult.Healthy());
 
-    private static MultipassDaemonRetryPolicy InstantPolicy() => new()
+    // Pass the sink logger by reference so the audit emission lands in _sink even if a
+    // parallel test collection reassigns the global Serilog.Log.Logger mid-run.
+    private MultipassDaemonRetryPolicy InstantPolicy() => new()
     {
         Delay = (_, _) => Task.CompletedTask,
+        AuditLogger = _auditLogger,
     };
 
     [Fact]
@@ -616,7 +630,8 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
             NullLogger.Instance,
             workItemId,
             CancellationToken.None,
-            InstantPolicy());
+            InstantPolicy(),
+            _auditLogger);
 
         var retryEvents = _sink.Events
             .Where(e => GetScalar<string>(e, "EventName") == "sandbox.provisioning_transient_retry")
@@ -650,7 +665,8 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
             NullLogger.Instance,
             WorkItemId.New(),
             CancellationToken.None,
-            InstantPolicy());
+            InstantPolicy(),
+            _auditLogger);
 
         Assert.DoesNotContain(_sink.Events, e =>
             GetScalar<string>(e, "EventName") == "sandbox.provisioning_transient_retry");
@@ -668,7 +684,8 @@ public sealed class MultipassDaemonRetryAuditTests : IDisposable
             NullLogger.Instance,
             workItemId: null,
             CancellationToken.None,
-            InstantPolicy());
+            InstantPolicy(),
+            _auditLogger);
 
         Assert.DoesNotContain(_sink.Events, e =>
             GetScalar<string>(e, "EventName") == "sandbox.provisioning_transient_retry");

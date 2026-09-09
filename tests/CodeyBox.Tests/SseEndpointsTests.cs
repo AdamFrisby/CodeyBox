@@ -174,7 +174,12 @@ public sealed class SseEndpointsTests : IDisposable
         };
         await _factory.Store.CreateAsync(item, CancellationToken.None);
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        // 60s (not 10s): under the full audit suite every host-spinning test class
+        // runs in parallel, so the streaming GET + subscriber wait + frame read can
+        // exceed 10s of wall-clock on a starved thread pool. The token only bounds
+        // the harness against a genuine hang; no assertion checks elapsed time, so
+        // widening it weakens nothing the test proves.
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
         using var resp = await _client.GetAsync(
             $"/workitems/proj:{externalId}/events",
             HttpCompletionOption.ResponseHeadersRead,

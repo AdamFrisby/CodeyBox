@@ -83,7 +83,7 @@ internal static class QueueList
         return cmd;
     }
 
-    private static void PrintTable(List<WorkItemDto> items)
+    internal static void PrintTable(List<WorkItemDto> items)
     {
         const int idW = 10;
         const int stateW = 12;

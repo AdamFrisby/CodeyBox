@@ -82,6 +82,7 @@ internal sealed class LanguagePresetAuditor : IAuditor, IShellAuditorArgvProvide
         CancellationToken ct)
     {
         var allFindings = new List<AuditFinding>();
+        var testFailureAttributions = new List<TestFailureAttributionResult>();
         var rawParts = new List<string>();
         var passed = true;
         var rawOutputChars = 0;
@@ -107,6 +108,7 @@ internal sealed class LanguagePresetAuditor : IAuditor, IShellAuditorArgvProvide
                 buildTestGateEvidenceVerified,
                 result.BuildTestGateEvidenceVerified);
             allFindings.AddRange(result.Findings);
+            testFailureAttributions.AddRange(result.TestFailureAttributions);
             if (!string.IsNullOrWhiteSpace(result.RawOutput))
                 AppendRawPart(rawParts, $"## {projectDirectory}\n{result.RawOutput}", ref rawOutputChars, ref rawOutputTruncated);
         }
@@ -131,7 +133,11 @@ internal sealed class LanguagePresetAuditor : IAuditor, IShellAuditorArgvProvide
         return new AuditResult(
             passed,
             allFindings,
-            RawOutput: string.Join("\n\n", rawParts))
+            RawOutput: string.Join("\n\n", rawParts),
+            AgentStderr: null,
+            AgentSummary: null,
+            AgentStdout: null,
+            TestFailureAttributions: testFailureAttributions)
         {
             BuildTestGateEvidenceVerified = buildTestGateEvidenceVerified,
         };

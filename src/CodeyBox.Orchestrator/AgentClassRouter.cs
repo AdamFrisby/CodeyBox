@@ -1426,6 +1426,26 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             .ToHashSet();
     }
 
+    /// <summary>
+    /// Peeks at the bucket recorded by the latest quota-retry admission for
+    /// this item (see <see cref="IQuotaRetryAdmissionRouter"/>). Never probes
+    /// and never consumes: dispatch-time consumption still owns the record.
+    /// </summary>
+    public QuotaRetryAdmissionPoolKey? PeekQuotaRetryAdmission(WorkItemId itemId)
+    {
+        var nowUtc = _time.GetUtcNow();
+        PruneExpiredQuotaRetryAdmissions(nowUtc);
+        if (!_quotaRetryAdmissions.TryGetValue(itemId, out var admission))
+            return null;
+        if (admission.ExpiresAt <= nowUtc)
+            return null;
+
+        return new QuotaRetryAdmissionPoolKey(
+            admission.RouteKey,
+            new AgentKind(AgentInstanceIds.KindFromRouteKey(admission.RouteKey)),
+            admission.ModelId);
+    }
+
     public async Task<QuotaRetryAdmissionPoolKey?> ResolveCurrentQuotaRetryAdmissionAsync(
         WorkItem item,
         Project? project,

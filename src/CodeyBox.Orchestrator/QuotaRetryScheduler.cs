@@ -30,6 +30,11 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
     private readonly TimeProvider _time;
     private readonly IBaselineImageResolver _baselineResolver;
     private readonly ILogger<QuotaRetryScheduler> _log;
+    // Audit events are emitted through this Serilog logger rather than the static
+    // global so a concurrent reassignment of Serilog.Log.Logger (e.g. another
+    // component's logging bootstrap) cannot silently reroute them. Captured at
+    // construction from the process-global logger when none is injected.
+    private readonly Serilog.ILogger _auditLogger;
     // A single wake-up task serves every signal that can make a parked item
     // routable again (quota refill, operator pause/resume, etc.). Generic
     // signals use the bounded global priority batch; member/agent recovery
@@ -81,9 +86,11 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         Func<AutoRetryOnQuotaFailureOptions>? autoRetryOptionsAccessor = null,
         IAgentQuotaAvailabilitySignal? quotaAvailabilitySignal = null,
         IAgentAvailabilityRecoverySignal? agentAvailabilityRecoverySignal = null,
-        IAgentPauseSignal? pauseSignal = null)
+        IAgentPauseSignal? pauseSignal = null,
+        Serilog.ILogger? auditLogger = null)
     {
         _store = store;
+        _auditLogger = auditLogger ?? Serilog.Log.Logger;
         _retrier = retrier;
         _opts = opts;
         _autoRetryOptionsAccessor = autoRetryOptionsAccessor ?? (() => _opts.AutoRetryOnQuotaFailure);
@@ -94,6 +101,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         _webhooks = webhooks;
         _time = timeProvider ?? TimeProvider.System;
         _baselineResolver = baselineResolver ?? NullBaselineImageResolver.Instance;
+        _auditLogger = auditLogger ?? Serilog.Log.Logger;
         _quotaAvailabilitySignal = quotaAvailabilitySignal;
         if (_quotaAvailabilitySignal is not null)
         {
@@ -322,7 +330,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
                 outcome = await PerformRetryAsync(item, "startup", ct);
             }
 
-            AuditLog.QuotaRetryAttempted(item.Id, "startup", outcome.Outcome, item.State.ToString(), outcome.Reason);
+            AuditLog.QuotaRetryAttempted(item.Id, "startup", outcome.Outcome, item.State.ToString(), outcome.Reason, _auditLogger);
             return outcome;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -331,7 +339,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         }
         catch (Exception ex)
         {
-            AuditLog.QuotaRetryAttempted(item.Id, "startup", "error", item.State.ToString(), ex.Message);
+            AuditLog.QuotaRetryAttempted(item.Id, "startup", "error", item.State.ToString(), ex.Message, _auditLogger);
             throw;
         }
     }
@@ -363,7 +371,11 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             decision.ShouldWait,
             decision.NoEligibleMembers,
             decision.Reason);
-        return item;
+        // Keep the persisted scope consistent across restarts: a config change
+        // while down can leave the recorded bucket stale, and the startup
+        // requeue bypasses the periodic cap check, so align here rather than
+        // letting the next sweep discover the drift.
+        return await AlignQuotaRetryScopeAsync(item, project, ct);
     }
 
     // The periodic sweep is the safety net: it walks every Failed/quota item
@@ -679,7 +691,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         try
         {
             var outcome = await TryRetryCoreAsync(item, source, ct, requireAutoRetryEnabled);
-            AuditLog.QuotaRetryAttempted(item.Id, source, outcome.Outcome, item.State.ToString(), outcome.Reason);
+            AuditLog.QuotaRetryAttempted(item.Id, source, outcome.Outcome, item.State.ToString(), outcome.Reason, _auditLogger);
             return outcome;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -688,7 +700,7 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         }
         catch (Exception ex)
         {
-            AuditLog.QuotaRetryAttempted(item.Id, source, "error", item.State.ToString(), ex.Message);
+            AuditLog.QuotaRetryAttempted(item.Id, source, "error", item.State.ToString(), ex.Message, _auditLogger);
             throw;
         }
     }
@@ -776,6 +788,14 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
             return new QuotaRetryAttemptResult("skipped:no-eligible-members", decision.Reason);
         }
 
+        // 3b. Scope the retry budget to the quota bucket the item is routable
+        // on right now. Attempts accrued against an exhausted agent must not
+        // gate a re-route to a healthy peer: when the current bucket differs
+        // from the recorded scope, reset to a full budget before the cap
+        // check below. Legacy rows (null scope) stamp the current bucket
+        // without resetting.
+        item = await AlignQuotaRetryScopeAsync(item, project, ct);
+
         // 4. Enforce the max retry cap only after quota re-evaluation. A
         // WaitingForQuotaReset row at the cap must not remain parked once an
         // eligible member is usable; move it to an operator-visible state.
@@ -793,6 +813,86 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
 
         // 5. Trigger retry.
         return await PerformRetryAsync(item, trigger, ct);
+    }
+
+    /// <summary>
+    /// Aligns the item's quota-retry budget with the quota bucket it is
+    /// routable on right now. Returns the item with <c>QuotaRetryScope</c>
+    /// stamped to the current bucket; when the bucket differs from the
+    /// recorded scope, <c>QuotaRetryAttempts</c> resets to zero so attempts
+    /// accrued against an exhausted agent do not gate a healthy peer. Rows
+    /// that predate scoping (null scope) keep their inherited count and only
+    /// gain the stamp. Returns the item unchanged when the current bucket
+    /// cannot be determined (no admission router and not a direct route),
+    /// preserving legacy behavior. In-memory only: persistence flows through
+    /// the conditional store write of the retry or terminal transition that
+    /// follows, so a concurrent state change cannot land a half-aligned row.
+    /// </summary>
+    private async Task<WorkItem> AlignQuotaRetryScopeAsync(
+        WorkItem item,
+        Project project,
+        CancellationToken ct)
+    {
+        string? currentScope = null;
+        if (_router is IQuotaRetryAdmissionRouter admissionRouter
+            && !DirectAgentMembership.IsDirectRoute(item, project))
+        {
+            // Prefer the bucket the gate evaluation just admitted: it names
+            // the exact member that won without another probe round-trip.
+            // Fall back to a fresh admission query only when nothing was
+            // recorded (custom router implementations are not required to
+            // record). Direct routes never record, so they skip straight to
+            // the direct key below.
+            var peeked = admissionRouter.PeekQuotaRetryAdmission(item.Id);
+            if (peeked is { } admitted)
+            {
+                currentScope = QuotaRetryScope.ForAdmission(admitted);
+            }
+            else
+            {
+                try
+                {
+                    var pool = await admissionRouter.ResolveCurrentQuotaRetryAdmissionAsync(
+                        item,
+                        project,
+                        ct,
+                        QuotaRetryPhasePolicy.RequiredCapabilityForQuotaRetryCandidate(item));
+                    if (pool is { } key)
+                        currentScope = QuotaRetryScope.ForAdmission(key);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _log.LogDebug(
+                        ex,
+                        "Failed to resolve the current quota bucket for work item {Id}; keeping the recorded retry scope",
+                        item.Id);
+                }
+            }
+        }
+
+        currentScope ??= QuotaRetryScope.ForDirectRoute(item, project);
+        if (currentScope is null)
+            return item;
+
+        if (item.QuotaRetryScope is null)
+            return item with { QuotaRetryScope = currentScope };
+
+        if (!string.Equals(item.QuotaRetryScope, currentScope, StringComparison.Ordinal))
+        {
+            _log.LogInformation(
+                "Work item {Id} re-routed from '{OldScope}' to '{NewScope}'; resetting quota auto-retry attempts ({Attempts} discarded)",
+                item.Id,
+                item.QuotaRetryScope,
+                currentScope,
+                item.QuotaRetryAttempts);
+            return item with { QuotaRetryAttempts = 0, QuotaRetryScope = currentScope };
+        }
+
+        return item;
     }
 
     private async Task<QuotaRetryAttemptResult> TransitionWaitingItemForAgentResumeAsync(
@@ -843,9 +943,14 @@ public sealed class QuotaRetryScheduler : BackgroundService, IDisposable, IWorke
         CancellationToken ct)
     {
         var reason = $"attempts={item.QuotaRetryAttempts}; max={retryOptions.MaxAutoRetriesPerWorkItem}";
+        // Name the agent whose quota exhaustion owns this budget, not the
+        // last-routed agent: after a fallback re-route the item's Agent can
+        // be a healthy peer with quota available, which would misattribute
+        // the failure and cost diagnosis time.
+        var exhaustedAgent = QuotaRetryScope.DescribeExhaustedAgent(item.QuotaRetryScope, item.Agent);
         var failed = item.With(
             WorkItemState.Failed,
-            $"quota auto-retry reached max attempts ({retryOptions.MaxAutoRetriesPerWorkItem}); operator retry required",
+            $"quota auto-retry reached max attempts ({retryOptions.MaxAutoRetriesPerWorkItem}) for agent '{exhaustedAgent}'; operator retry required",
             failureKind: "quota",
             quotaResetAt: item.QuotaResetAt) with
         {

@@ -55,6 +55,24 @@ public sealed class UnboundConfigKeyValidatorTests
     }
 
     [Fact]
+    public void Inspect_AllowsDocumentedNamedApiClientConfiguration()
+    {
+        var config = BuildConfig(new()
+        {
+            ["CodeyBox:ApiClients:0:Name"] = "jobtrack",
+            ["CodeyBox:ApiClients:0:TokenEnvVar"] = "CODEYBOX_JOBTRACK_API_KEY",
+            ["CodeyBox:ApiClients:0:CanDelegateInitiator"] = "true",
+            ["CodeyBox:ApiClients:0:Principal:Issuer"] = "jobtrack",
+            ["CodeyBox:ApiClients:0:Principal:Subject"] = "service",
+            ["CodeyBox:ApiClients:0:Principal:DisplayName"] = "JobTrack",
+        });
+
+        var reports = UnboundConfigKeyHostedValidator.Inspect(config);
+
+        Assert.Empty(reports);
+    }
+
+    [Fact]
     public void Inspect_DescendsIntoNestedObjects_AndReportsPathInFull()
     {
         var config = BuildConfig(new()
@@ -314,7 +332,7 @@ public sealed class UnboundConfigKeyValidatorTests
         // ProjectsOptionsBinder.ApplyLanguageMap reads Audit:Languages:Overrides
         // as a dict<lang-id, ProjectLanguagePresetOverrideConfig> even though
         // ProjectAuditConfig.Languages is typed List<string>?. Documented in
-        // docs/languages.md:65-90. Default-strict startup must NOT flag the
+        // docs/quality/presets.md:65-90. Default-strict startup must NOT flag the
         // documented map shape.
         var config = BuildConfig(new()
         {
@@ -358,7 +376,7 @@ public sealed class UnboundConfigKeyValidatorTests
         // ProjectsOptionsBinder.ApplyAuditTypeMap accepts Audit:AuditTypes as
         // a string-keyed dict of audit-type id to ProjectAuditTypeOverrideConfig
         // even though the typed property is List<string>?. Documented in
-        // docs/audit-types.md:43-65 and docs/projects.md:118-133.
+        // docs/quality/presets.md:43-65 and docs/concepts/projects.md:118-133.
         var config = BuildConfig(new()
         {
             ["CodeyBox:Defaults:Audit:AuditTypes:security:ReviewFocus"] = "- Project-specific auth checks",

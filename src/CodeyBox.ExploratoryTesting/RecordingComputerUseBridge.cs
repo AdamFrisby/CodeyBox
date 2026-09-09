@@ -20,6 +20,10 @@ public sealed record RecordingComputerUseBridgeOptions
     /// for the web pilot; CLI/API recorders should override.
     /// </summary>
     public string Modality { get; init; } = "web-graphical";
+
+    public int MaxTraceEntries { get; init; } = 256;
+
+    public int MaxTraceBytes { get; init; } = 32 * 1024 * 1024;
 }
 
 /// <summary>
@@ -51,7 +55,7 @@ public sealed record RecordingComputerUseMetadata
 /// without external synchronisation; concurrent reading during
 /// <see cref="ExecuteAsync"/> requires caller-supplied serialisation.</para>
 /// </summary>
-public sealed class RecordingComputerUseBridge
+public sealed class RecordingComputerUseBridge : IComputerUseExplorationTarget
 {
     private readonly ComputerUseBridge _inner;
     private readonly TimeProvider _timeProvider;
@@ -60,6 +64,7 @@ public sealed class RecordingComputerUseBridge
     private SessionTrace _trace;
     private TraceTargetDescriptor? _lastTargetDescriptor;
     private int _sequence;
+    private long _traceBytesUsed;
 
     public RecordingComputerUseBridge(
         ComputerUseBridge inner,
@@ -121,6 +126,36 @@ public sealed class RecordingComputerUseBridge
         }
     }
 
+    private void EnsureTraceCapacity(TraceEntry entry)
+    {
+        if (_entries.Count >= _options.MaxTraceEntries)
+        {
+            throw new InvalidOperationException(
+                $"Authoring trace entry cap of {_options.MaxTraceEntries} was exceeded.");
+        }
+
+        var projected = _traceBytesUsed + EstimateTraceEntryBytes(entry);
+        if (projected > _options.MaxTraceBytes)
+        {
+            throw new InvalidOperationException(
+                $"Authoring trace byte cap of {_options.MaxTraceBytes} was exceeded.");
+        }
+    }
+
+    private static long EstimateTraceEntryBytes(TraceEntry entry)
+    {
+        long bytes = 256;
+        if (entry.Action.TargetDescriptor.AccessibilitySnapshotJson is { } preJson)
+            bytes += System.Text.Encoding.UTF8.GetByteCount(preJson);
+        if (entry.Observation.AccessibilitySnapshotJson is { } postJson)
+            bytes += System.Text.Encoding.UTF8.GetByteCount(postJson);
+        if (entry.Observation.ScreenshotPng is { } screenshot)
+            bytes += screenshot.LongLength;
+        if (entry.Action.TargetDescriptor.Visual?.Region is { } region)
+            bytes += region.Width * region.Height * 4L;
+        return bytes;
+    }
+
     /// <summary>
     /// Executes <paramref name="request"/> through the inner bridge, capturing
     /// pre/post screenshots and journaling a <see cref="TraceEntry"/>.
@@ -162,9 +197,13 @@ public sealed class RecordingComputerUseBridge
         (int? cx, int? cy) = ResolveActionCentre(canonicalAction, events);
         TraceAccessibilityDescriptor? preAccessibility = null;
         string? preAccessibilityJson = null;
-        if (cx.HasValue && cy.HasValue)
+        if (canonicalAction is "click" or "type" or "double_click")
         {
             preAccessibilityJson = await CaptureAccessibilityTreeBestEffortAsync(sandbox, ct).ConfigureAwait(false);
+        }
+
+        if (cx.HasValue && cy.HasValue)
+        {
             preAccessibility = await CaptureAccessibilityBestEffortAsync(
                 sandbox,
                 cx.Value,
@@ -190,7 +229,7 @@ public sealed class RecordingComputerUseBridge
         var isGlobalInput = ShouldRecordGlobalInput(metadata, canonicalAction, events);
         var targetDescriptor = isGlobalInput
             ? BuildEmptyTargetDescriptor(preScreenshot)
-            : BuildTargetDescriptor(canonicalAction, events, preScreenshot, preAccessibility);
+            : BuildTargetDescriptor(canonicalAction, events, preScreenshot, preAccessibility, preAccessibilityJson);
         UpdateRememberedFocusTarget(canonicalAction, events, targetDescriptor, postAccessibilityJson, postScreenshot);
 
         var entry = new TraceEntry
@@ -214,7 +253,9 @@ public sealed class RecordingComputerUseBridge
 
         lock (_entries)
         {
+            EnsureTraceCapacity(entry);
             _entries.Add(entry);
+            _traceBytesUsed += EstimateTraceEntryBytes(entry);
         }
 
         return result;
@@ -307,7 +348,8 @@ public sealed class RecordingComputerUseBridge
         string action,
         SandboxInputEvent[] events,
         byte[]? preScreenshot,
-        TraceAccessibilityDescriptor? preAccessibility)
+        TraceAccessibilityDescriptor? preAccessibility,
+        string? preAccessibilityJson)
     {
         var (cx, cy) = ResolveActionCentre(action, events);
 
@@ -362,6 +404,7 @@ public sealed class RecordingComputerUseBridge
         return new TraceTargetDescriptor
         {
             Accessibility = preAccessibility,
+            AccessibilitySnapshotJson = preAccessibilityJson,
             Visual = new TraceVisualDescriptor
             {
                 Region = region,

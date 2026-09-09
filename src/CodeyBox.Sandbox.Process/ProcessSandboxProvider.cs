@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net.Sockets;
 using System.Text;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -189,6 +190,7 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox, IPreserveOnDisposeSa
         foreach (var (k, v) in _spec.Environment) psi.EnvironmentVariables[k] = TranslateEnvironmentValue(k, v);
         if (exec.ExtraEnvironment is not null)
             foreach (var (k, v) in exec.ExtraEnvironment) psi.EnvironmentVariables[k] = TranslateEnvironmentValue(k, v);
+        exec.ApplyEnvironmentRemovals(name => psi.EnvironmentVariables.Remove(name));
 
         using var proc = new System.Diagnostics.Process { StartInfo = psi };
         var stdout = new StringBuilder();
@@ -212,7 +214,11 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox, IPreserveOnDisposeSa
             };
         }
 
-        proc.Start();
+        await StartWithTransientRetryAsync(
+            proc.Start,
+            static (attempt, token) => Task.Delay(SpawnRetryBackoffs[attempt - 1], token),
+            SpawnMaxAttempts,
+            ct).ConfigureAwait(false);
         RegisterProcess(proc);
         Task<LimitedReadResult>? limitedStdoutTask = null;
         Task<LimitedReadResult>? limitedStderrTask = null;
@@ -245,8 +251,15 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox, IPreserveOnDisposeSa
             }
             if (exec.Stdin is not null)
             {
-                await proc.StandardInput.WriteAsync(exec.Stdin);
-                proc.StandardInput.Close();
+                try
+                {
+                    await WriteStandardInputAsync(proc, exec.Stdin, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    KillProcessTree(proc);
+                    throw;
+                }
             }
 
             try
@@ -277,6 +290,47 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox, IPreserveOnDisposeSa
         {
             UnregisterProcess(proc);
         }
+    }
+
+    private static async Task WriteStandardInputAsync(
+        System.Diagnostics.Process process,
+        string stdin,
+        CancellationToken ct)
+    {
+        var shouldClose = true;
+        try
+        {
+            await process.StandardInput.WriteAsync(stdin.AsMemory(), ct).ConfigureAwait(false);
+        }
+        catch (IOException ex) when (IsBrokenPipe(ex))
+        {
+            // The child closed stdin early; keep waiting so callers receive its exit code and stderr.
+            shouldClose = false;
+        }
+
+        if (!shouldClose)
+            return;
+
+        try
+        {
+            process.StandardInput.Close();
+        }
+        catch (IOException ex) when (IsBrokenPipe(ex))
+        {
+            // Close may flush buffered data after the child has already exited.
+        }
+    }
+
+    private static bool IsBrokenPipe(IOException ex)
+    {
+        const int hResultBrokenPipe = unchecked((int)0x8007006D);
+        const int hResultNoData = unchecked((int)0x800700E8);
+        const int nativeBrokenPipe = 32;
+
+        return ex.HResult is hResultBrokenPipe or hResultNoData
+            || ex.InnerException is SocketException socket
+            && (socket.NativeErrorCode == nativeBrokenPipe
+                || socket.SocketErrorCode is SocketError.Shutdown or SocketError.ConnectionReset);
     }
 
     private void RegisterProcess(System.Diagnostics.Process process)
@@ -314,6 +368,75 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox, IPreserveOnDisposeSa
             KillProcessTree(process);
         return Task.CompletedTask;
     }
+
+    /// <summary>
+    /// Total number of <c>posix_spawn</c> attempts (initial + retries) before a
+    /// transient spawn failure is allowed to propagate.
+    /// </summary>
+    internal const int SpawnMaxAttempts = 4;
+
+    /// <summary>
+    /// Backoff before each retry. One entry per retry (<see cref="SpawnMaxAttempts"/>
+    /// minus the initial attempt). Deliberately short: the failures we retry are
+    /// momentary kernel resource exhaustion (EAGAIN/EMFILE) that clears as the
+    /// full-suite fork/fd storm drains, not a sustained outage.
+    /// </summary>
+    private static readonly TimeSpan[] SpawnRetryBackoffs =
+    [
+        TimeSpan.FromMilliseconds(20),
+        TimeSpan.FromMilliseconds(50),
+        TimeSpan.FromMilliseconds(100),
+    ];
+
+    /// <summary>
+    /// Starts a process, retrying a bounded number of times on a TRANSIENT
+    /// spawn failure. Under heavy parallel load (the full test suite launches
+    /// thousands of short-lived subprocesses through redirected pipes)
+    /// <c>posix_spawn</c>/<c>fork</c> can momentarily return EAGAIN (thread/PID
+    /// pressure) or EMFILE/ENFILE (fd pressure); treating that blip as a hard
+    /// failure spuriously degrades the caller (e.g. silently disables agy
+    /// structured-stream capture for a whole run). The child never started on a
+    /// throwing attempt, so re-issuing the spawn is safe and idempotent.
+    /// A non-transient failure (e.g. ENOENT — binary missing) is rethrown
+    /// immediately rather than retried.
+    /// </summary>
+    /// <param name="start">Spawns the process once; returns its result (ignored).
+    /// Throws <see cref="System.ComponentModel.Win32Exception"/> on spawn failure.</param>
+    /// <param name="delay">Backoff before retry <paramref name="attempt"/> (1-based).</param>
+    /// <param name="maxAttempts">Total attempts including the first; must be &gt;= 1.</param>
+    internal static async Task StartWithTransientRetryAsync(
+        Func<bool> start,
+        Func<int, CancellationToken, Task> delay,
+        int maxAttempts,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(start);
+        ArgumentNullException.ThrowIfNull(delay);
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxAttempts, 1);
+
+        for (var attempt = 1; ; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                start();
+                return;
+            }
+            catch (System.ComponentModel.Win32Exception ex)
+                when (attempt < maxAttempts && IsTransientSpawnFailure(ex))
+            {
+                await delay(attempt, ct).ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <summary>
+    /// True for kernel error codes that indicate momentary resource exhaustion
+    /// during spawn — worth a bounded retry — rather than a deterministic
+    /// misconfiguration (bad path, permission) that a retry cannot fix.
+    /// </summary>
+    private static bool IsTransientSpawnFailure(System.ComponentModel.Win32Exception ex) =>
+        ex.NativeErrorCode is 11 /* EAGAIN */ or 12 /* ENOMEM */ or 23 /* ENFILE */ or 24 /* EMFILE */;
 
     private static async Task<LimitedReadResult> ReadLimitedAsync(
         StreamReader reader,
@@ -412,7 +535,7 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox, IPreserveOnDisposeSa
     private string TranslateEnvironmentValue(string key, string value)
     {
         if (!string.Equals(key, "PATH", StringComparison.Ordinal))
-            return value;
+            return TranslatePath(value);
 
         var entries = value.Split(':');
         for (var i = 0; i < entries.Length; i++)

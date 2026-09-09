@@ -62,9 +62,6 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalid
     internal const string UsageEndpoint =
         "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage";
 
-    /// <summary>Default routed Cursor model in agent-class configs.</summary>
-    internal const string DefaultRoutedModelId = "composer-2.5";
-
     private const int MaxResponseChars = 64 * 1024; // 64 KiB
     private const int UnexpectedShapeLogCapChars = 1024;
 
@@ -87,10 +84,17 @@ public sealed class CursorQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalid
         @"(""[A-Za-z0-9_\-]*(?:token|key|secret|password|auth|session|cookie|bearer)[A-Za-z0-9_\-]*"")\s*:\s*""(?:[^""\\]|\\.)*""",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
+    // Known Cursor models that ride the shared "auto" quota bucket, used ONLY as
+    // a fallback when a live response omits its own autoBucketModels list. This
+    // is a deferred known-model reference list (like GeminiKnownModels / the
+    // claude probe lists), NOT a routing default — the model a member actually
+    // routes to is sourced from config (the AgentClass member's ModelId /
+    // CursorAgentRunner.DefaultModelId). An unrecognised configured model still
+    // degrades gracefully to the overall reading via ApplyMemberGate.
     private static readonly string[] FallbackAutoBucketModels =
     [
         "default",
-        DefaultRoutedModelId,
+        "composer-2.5",
         "composer-1.5",
         "composer-2",
         "composer-2.5-fast",

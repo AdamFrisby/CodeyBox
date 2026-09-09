@@ -144,6 +144,14 @@ internal sealed class MultipassAgentOutputHttpIngestSession : IAsyncDisposable
             if (!string.Equals(nic.Name, bridgeName, StringComparison.Ordinal))
                 continue;
 
+            if (nic.OperationalStatus is OperationalStatus.Down
+                or OperationalStatus.LowerLayerDown
+                or OperationalStatus.Dormant
+                or OperationalStatus.NotPresent)
+            {
+                return null;
+            }
+
             foreach (var address in nic.GetIPProperties().UnicastAddresses)
             {
                 if (address.Address.AddressFamily == AddressFamily.InterNetwork)

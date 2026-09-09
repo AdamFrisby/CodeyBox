@@ -9,6 +9,7 @@ public sealed class WorkItemDto
     public string Id { get; set; } = "";
     public string? ExternalId { get; set; }
     public Dictionary<string, string> ExternalIds { get; set; } = [];
+    public WorkInitiatorDto? Initiator { get; set; }
     public string ProjectId { get; set; } = "";
     public string Title { get; set; } = "";
     public string Prompt { get; set; } = "";
@@ -69,4 +70,19 @@ public sealed class WorkItemDto
             return $"{(int)elapsed.TotalDays}d";
         }
     }
+}
+
+public sealed class WorkInitiatorDto
+{
+    public string Issuer { get; set; } = "";
+    public string Subject { get; set; } = "";
+    public string DisplayName { get; set; } = "";
+    public List<WorkInitiatorProviderIdentityDto> ProviderIdentities { get; set; } = [];
+}
+
+public sealed class WorkInitiatorProviderIdentityDto
+{
+    public string Provider { get; set; } = "";
+    public string AccountId { get; set; } = "";
+    public string Login { get; set; } = "";
 }

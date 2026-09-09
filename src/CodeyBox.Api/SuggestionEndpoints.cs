@@ -105,6 +105,7 @@ internal static class SuggestionEndpoints
         ITaskQueue queue,
         IProjectRepository projects,
         IAgentRegistry agents,
+        HttpContext context,
         CancellationToken ct)
     {
         var suggestion = await store.GetAsync(id, ct);
@@ -188,6 +189,8 @@ internal static class SuggestionEndpoints
             """;
         if (!string.IsNullOrWhiteSpace(body?.ExtraInstructions))
             prompt += "\n\n" + body.ExtraInstructions;
+        var initiator = ApiKeyAuth.ResolveInitiator(context, delegated: null);
+        if (initiator.Error is not null) return initiator.Error;
         var item = new WorkItem
         {
             Id = newId,
@@ -203,6 +206,7 @@ internal static class SuggestionEndpoints
             ExternalIds = externalId is null
                 ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
                 : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["legacy"] = externalId },
+            Initiator = initiator.Value,
         };
 
         // Atomically claim the suggestion BEFORE creating the work item.
@@ -215,7 +219,7 @@ internal static class SuggestionEndpoints
         {
             await workItemStore.CreateAsync(item, ct);
             AuditLog.SuggestionPromoted(id, newId.ToString());
-            AuditLog.WorkItemCreated(item.Id, item.ProjectId, item.Title);
+            AuditLog.WorkItemCreated(item.Id, item.ProjectId, item.Title, item.Initiator);
             await queue.EnqueueAsync(item.Id, ct);
         }
         catch (WorkItemExternalIdConflictException)

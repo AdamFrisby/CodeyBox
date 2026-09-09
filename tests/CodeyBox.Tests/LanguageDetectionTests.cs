@@ -564,12 +564,19 @@ public sealed class LanguageDetectionTests
 
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
-            var command = string.Join(' ', exec.Argv);
-            Commands.Add(command);
+            // dotnet gate auditors wrap the command in the NuGet-home self-heal
+            // (SelfHealNuGetHome); unwrap to the logical command for recording
+            // and matching. DotnetGuardWrapper handles the self-heal wrapping.
+            var argv = DotnetGuardWrapper.EffectiveArgv(exec);
+            Commands.Add(string.Join(' ', argv));
             if (exec.WorkingDirectory is not null)
                 WorkingDirectories.Add(exec.WorkingDirectory);
 
-            if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
+            // The audited build command (guard-wrapped) is not a marker probe.
+            if (DotnetGuardWrapper.IsGuardWrapped(exec.Argv))
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+
+            if (argv.Count >= 3 && argv[0] == "sh" && argv[1] == "-c")
             {
                 var directories = Enumerable.Range(0, 40).Select(i => $"./project-{i}");
                 if (_includeRootMarker)
@@ -595,17 +602,23 @@ public sealed class LanguageDetectionTests
             if (exec.WorkingDirectory is not null)
                 WorkingDirectories.Add(exec.WorkingDirectory);
 
-            if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
+            // dotnet gate auditors wrap the command in the NuGet-home self-heal
+            // (SelfHealNuGetHome); unwrap to the logical command so genuine
+            // sh -c probes (tool presence / marker discovery) can be matched.
+            // The wrapped dotnet test command is handled below.
+            var argv = DotnetGuardWrapper.EffectiveArgv(exec);
+            if (!DotnetGuardWrapper.IsGuardWrapped(exec.Argv)
+                && argv.Count >= 3 && argv[0] == "sh" && argv[1] == "-c")
             {
-                if (exec.Argv[2].Contains("command -v", StringComparison.Ordinal))
+                if (argv[2].Contains("command -v", StringComparison.Ordinal))
                     return Task.FromResult(new SandboxExecResult(0, "/usr/bin/dotnet\n", ""));
 
                 return Task.FromResult(new SandboxExecResult(0, "./project-ok\n./project-unverified\n", ""));
             }
 
-            if (exec.Argv.Count >= 2 &&
-                exec.Argv[0] == "dotnet" &&
-                exec.Argv[1] == "test" &&
+            if (argv.Count >= 2 &&
+                argv[0] == "dotnet" &&
+                argv[1] == "test" &&
                 exec.WorkingDirectory?.EndsWith("/project-unverified", StringComparison.Ordinal) == true)
             {
                 const string output = """
@@ -632,16 +645,23 @@ public sealed class LanguageDetectionTests
 
         public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
-            var command = string.Join(' ', exec.Argv);
             var workingDirectory = exec.WorkingDirectory ?? Environment.CurrentDirectory;
-            Invocations.Add((command, workingDirectory));
+            // Record the real command as configured; dotnet auditor commands
+            // arrive wrapped in the NuGet-home self-heal (SelfHealNuGetHome:
+            // sh -c "<preamble>" sh cmd...). DotnetGuardWrapper unwraps it to
+            // the logical command.
+            var argv = DotnetGuardWrapper.EffectiveArgv(exec);
+            Invocations.Add((string.Join(' ', argv), workingDirectory));
 
-            if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
+            if (DotnetGuardWrapper.IsGuardWrapped(exec.Argv))
+                return new SandboxExecResult(0, "", "");
+
+            if (argv.Count >= 3 && argv[0] == "sh" && argv[1] == "-c")
             {
-                if (exec.Argv[2].Contains("command -v", StringComparison.Ordinal))
-                    return new SandboxExecResult(0, "/usr/bin/" + exec.Argv[^1] + "\n", "");
+                if (argv[2].Contains("command -v", StringComparison.Ordinal))
+                    return new SandboxExecResult(0, "/usr/bin/" + argv[^1] + "\n", "");
 
-                return await RunShellAsync(exec.Argv[2], workingDirectory, ct);
+                return await RunShellAsync(argv[2], workingDirectory, ct);
             }
 
             return new SandboxExecResult(0, "", "");

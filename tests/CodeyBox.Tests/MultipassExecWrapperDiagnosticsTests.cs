@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Multipass;
 
 namespace CodeyBox.Tests;
@@ -31,6 +32,26 @@ public sealed class MultipassExecWrapperDiagnosticsTests
         var env = new Dictionary<string, string> { ["B\0AD"] = "value" };
         Assert.Throws<ArgumentException>(
             () => MultipassSandboxProvider.BuildEnvironmentFileContent(env));
+    }
+
+    [Theory]
+    [InlineData("1INVALID")]
+    [InlineData("X; touch /work/pwn #")]
+    public void BuildEnvironmentFileContent_RejectsInvalidKey(string key)
+    {
+        var env = new Dictionary<string, string> { [key] = "value" };
+        Assert.Throws<ArgumentException>(
+            () => MultipassSandboxProvider.BuildEnvironmentFileContent(env));
+    }
+
+    [Theory]
+    [InlineData("HOME")]
+    [InlineData("PATH")]
+    [InlineData("LD_PRELOAD")]
+    public void CredentialEnvironmentPolicy_RejectsReservedKey(string key)
+    {
+        Assert.Throws<ArgumentException>(
+            () => SandboxEnvironmentVariablePolicy.ValidateCredentialEnvironmentVariable(key, nameof(key)));
     }
 
     [Theory]
@@ -152,6 +173,47 @@ public sealed class MultipassExecWrapperDiagnosticsTests
             Assert.Equal(0, exit);
             Assert.Equal("", stderr);
             Assert.Equal("hello\nworld", stdout);
+            Assert.False(File.Exists(envPath));
+        }
+        finally
+        {
+            File.Delete(wrapperPath);
+            if (File.Exists(envPath))
+                File.Delete(envPath);
+            Directory.Delete(workDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExecWrapper_UnsetEnvironmentRunsAfterInheritedAndExecEnvironmentMerges()
+    {
+        if (OperatingSystem.IsWindows()) return;
+
+        var workDir = Path.Combine(Path.GetTempPath(), $"codeybox-wrap-work-{Guid.NewGuid():N}");
+        var wrapperPath = await CreateExecutableWrapperAsync();
+        var envPath = Path.Combine(Path.GetTempPath(), $"codeybox-env-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(workDir);
+        await File.WriteAllTextAsync(
+            envPath,
+            MultipassSandboxProvider.BuildEnvironmentFileContent(
+                new Dictionary<string, string> { ["REMOVE_ME"] = "exec-value" })
+            + "unset -- 'REMOVE_ME'\n");
+
+        try
+        {
+            var (exit, stdout, stderr) = await RunProcessAsync(
+                "/bin/bash",
+                [
+                    wrapperPath,
+                    workDir,
+                    "--env-file", envPath,
+                    "sh", "-c", "if [ \"${REMOVE_ME+x}\" = x ]; then printf present; else printf absent; fi",
+                ],
+                new Dictionary<string, string?> { ["REMOVE_ME"] = "spec-value" });
+
+            Assert.Equal(0, exit);
+            Assert.Equal("", stderr);
+            Assert.Equal("absent", stdout);
             Assert.False(File.Exists(envPath));
         }
         finally

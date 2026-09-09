@@ -38,9 +38,7 @@ internal static class MultipassRemoteOptionsMapper
             Cordoned = cfg.Cordoned,
             Healthy = cfg.Healthy,
             AllowedNetworkProfiles = cfg.AllowedNetworkProfiles?.ToArray() ?? [],
-            NetworkProfiles = networkProfiles is null
-                ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-                : new Dictionary<string, string>(networkProfiles, StringComparer.OrdinalIgnoreCase),
+            NetworkProfiles = ResolveNetworkProfiles(cfg.NetworkProfiles, networkProfiles),
             PlacementRecheckIn = cfg.PlacementRecheckIn ?? fromDefaults.PlacementRecheckIn,
             RuntimeUnhealthyBackoff = cfg.RuntimeUnhealthyBackoff ?? fromDefaults.RuntimeUnhealthyBackoff,
             ExecutorHosts = cfg.ExecutorHosts?.Select(h => new MultipassRemoteExecutorHostOptions
@@ -73,5 +71,20 @@ internal static class MultipassRemoteOptionsMapper
                 AllowedNetworkProfiles = h.AllowedNetworkProfiles?.ToArray(),
             }).ToArray() ?? [],
         };
+    }
+
+    // Per-config NetworkProfiles overrides the global map when supplied. Empty
+    // or null means "no override" — fall back to whatever the caller passed
+    // (typically <c>CodeyBoxOptions.SandboxNetworkProfiles</c>) so existing
+    // deployments with only a global map keep working.
+    private static Dictionary<string, string> ResolveNetworkProfiles(
+        Dictionary<string, string>? configProfiles,
+        IReadOnlyDictionary<string, string>? fallback)
+    {
+        if (configProfiles is { Count: > 0 })
+            return new Dictionary<string, string>(configProfiles, StringComparer.OrdinalIgnoreCase);
+        if (fallback is null)
+            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        return new Dictionary<string, string>(fallback, StringComparer.OrdinalIgnoreCase);
     }
 }

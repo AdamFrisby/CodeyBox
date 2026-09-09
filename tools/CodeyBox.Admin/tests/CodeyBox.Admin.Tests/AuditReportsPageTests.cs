@@ -11,7 +11,7 @@ namespace CodeyBox.Admin.Tests;
 /// Verifies the AuditReports page renders the findings-across-iterations matrix
 /// and per-auditor finding details correctly.
 /// </summary>
-public sealed class AuditReportsPageTests : TestContext
+public sealed class AuditReportsPageTests : BunitContext
 {
     private static AuditReportsDto MakeReports(string id, params AuditReportIterationDto[] iterations) =>
         new() { WorkItemId = id, Iterations = [.. iterations] };
@@ -62,7 +62,7 @@ public sealed class AuditReportsPageTests : TestContext
         fake.AuditReportsOverride = MakeReports(id);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<AuditReportsPage>(p => p.Add(x => x.Id, id));
+        var cut = Render<AuditReportsPage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("No audit reports", cut.Markup, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("audit-matrix", cut.Markup);
@@ -78,7 +78,7 @@ public sealed class AuditReportsPageTests : TestContext
                 findings: MakeFinding("f-aa", "Missing null check"))));
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<AuditReportsPage>(p => p.Add(x => x.Id, id));
+        var cut = Render<AuditReportsPage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("audit-matrix", cut.Markup);
         Assert.Contains("Findings across iterations", cut.Markup);
@@ -94,7 +94,7 @@ public sealed class AuditReportsPageTests : TestContext
                 findings: MakeFinding("f-aa", "Missing null check"))));
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<AuditReportsPage>(p => p.Add(x => x.Id, id));
+        var cut = Render<AuditReportsPage>(p => p.Add(x => x.Id, id));
 
         // The finding is present in iteration 1 — matrix should show ✓
         Assert.Contains("✓", cut.Markup);
@@ -113,7 +113,7 @@ public sealed class AuditReportsPageTests : TestContext
             MakeIteration(2, MakeAuditor("Lint"))); // no findings
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<AuditReportsPage>(p => p.Add(x => x.Id, id));
+        var cut = Render<AuditReportsPage>(p => p.Add(x => x.Id, id));
 
         // Should have ✓ for iter1 and · for iter2
         Assert.Contains("✓", cut.Markup);
@@ -130,7 +130,7 @@ public sealed class AuditReportsPageTests : TestContext
             MakeIteration(2, MakeAuditor("Lint", findings: MakeFinding("f-aa", "Issue"))));
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<AuditReportsPage>(p => p.Add(x => x.Id, id));
+        var cut = Render<AuditReportsPage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("audit-matrix-table", cut.Markup);
         // Both iteration columns should appear in the table header
@@ -149,7 +149,7 @@ public sealed class AuditReportsPageTests : TestContext
             MakeIteration(1, MakeAuditor("Lint")));
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<AuditReportsPage>(p => p.Add(x => x.Id, id));
+        var cut = Render<AuditReportsPage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("count-pass", cut.Markup);
         Assert.Contains("✓ pass", cut.Markup);
@@ -166,7 +166,7 @@ public sealed class AuditReportsPageTests : TestContext
                 MakeFinding("f-bb", "Error two"))));
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<AuditReportsPage>(p => p.Add(x => x.Id, id));
+        var cut = Render<AuditReportsPage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("count-blocking", cut.Markup);
         Assert.Contains("2 blocking", cut.Markup);
@@ -182,7 +182,7 @@ public sealed class AuditReportsPageTests : TestContext
                 findings: MakeFinding("f-aa", "Null pointer dereference", message: "The variable is never checked."))));
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<AuditReportsPage>(p => p.Add(x => x.Id, id));
+        var cut = Render<AuditReportsPage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("Null pointer dereference", cut.Markup);
         Assert.Contains("The variable is never checked.", cut.Markup);
@@ -197,7 +197,7 @@ public sealed class AuditReportsPageTests : TestContext
             MakeIteration(1, MakeAuditor("Lint", rawAvailable: true)));
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<AuditReportsPage>(p => p.Add(x => x.Id, id));
+        var cut = Render<AuditReportsPage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("audit-raw-btn", cut.Markup);
         Assert.Contains("raw", cut.Markup);
@@ -212,7 +212,7 @@ public sealed class AuditReportsPageTests : TestContext
             MakeIteration(1, MakeAuditor("Lint", rawAvailable: false)));
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<AuditReportsPage>(p => p.Add(x => x.Id, id));
+        var cut = Render<AuditReportsPage>(p => p.Add(x => x.Id, id));
 
         Assert.DoesNotContain("audit-raw-btn", cut.Markup);
     }
@@ -225,7 +225,7 @@ public sealed class AuditReportsPageTests : TestContext
         // AuditReportsOverride is null → GetAuditReportsAsync returns null → _notFound = true
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<AuditReportsPage>(p => p.Add(x => x.Id, id));
+        var cut = Render<AuditReportsPage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("not found", cut.Markup, StringComparison.OrdinalIgnoreCase);
     }
@@ -238,7 +238,7 @@ public sealed class AuditReportsPageTests : TestContext
         fake.AuditReportsOverride = MakeReports(id);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<AuditReportsPage>(p => p.Add(x => x.Id, id));
+        var cut = Render<AuditReportsPage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains($"/work-items/{id}", cut.Markup);
         Assert.Contains($"/work-items/{id}/timeline", cut.Markup);

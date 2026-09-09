@@ -24,21 +24,55 @@ namespace CodeyBox.Tests;
 /// emission, so asserting only on result.Summary does not cover the audit
 /// channel that operators actually rely on for retrospective triage.
 /// </summary>
-[Collection("GlobalSerilog")]
 public sealed class AgenticConflictResolverAuditLogTests : IDisposable
 {
     private readonly TestSink _sink = new();
+    private readonly IDisposable _auditScope;
+
+    // A dedicated Serilog logger wired to this class's own sink, threaded into
+    // every resolver under test so the audit emission lands in _sink even if a
+    // concurrent host bootstrap (e.g. a WebApplicationFactory test in a sibling
+    // collection) reassigns/flushes the process-global Serilog.Log.Logger
+    // mid-run — which previously rerouted these events off _sink and left the
+    // poll in AssertSingleAttemptFailedEvent empty. That injection is why this
+    // class no longer joins the GlobalSerilog serialization collection, matching
+    // the MultipassDaemonRetryPolicy.AuditLogger deflake pattern. Concrete
+    // Logger (not ILogger) so Dispose() can be called.
+    private readonly Serilog.Core.Logger _auditLogger;
 
     public AgenticConflictResolverAuditLogTests()
     {
-        Log.Logger = new LoggerConfiguration()
+        _auditLogger = new LoggerConfiguration()
             .Enrich.FromLogContext()
             .Enrich.With<SensitiveDataRedactionEnricher>()
             .WriteTo.Sink(_sink)
             .CreateLogger();
+
+        // Pin this test's audit emission to our sink for the whole async flow
+        // rather than relying on the process-global Log.Logger staying put: the
+        // audit suite runs WebApplicationFactory<Program> host boots (which
+        // rebuild Log.Logger) concurrently in other collections, and one landing
+        // between an action here and its inline audit emission would otherwise
+        // steal the event — leaving the sink empty. The AsyncLocal override flows
+        // into every call below and is immune to those global swaps.
+        _auditScope = AuditLog.PushScopedLogger(Log.Logger);
     }
 
-    public void Dispose() => Log.CloseAndFlush();
+    public void Dispose()
+    {
+        _auditScope.Dispose();
+        _auditLogger.Dispose();
+    }
+
+    // A logger wired to the same sink but WITHOUT the SensitiveDataRedactionEnricher,
+    // for the cases that prove redaction must have already happened inside the
+    // resolver BEFORE the audit is emitted — rather than leaning on the sink-side
+    // enricher to cover for it.
+    private Serilog.Core.Logger CreateUnredactedAuditLogger() =>
+        new LoggerConfiguration()
+            .Enrich.FromLogContext()
+            .WriteTo.Sink(_sink)
+            .CreateLogger();
 
     [Fact]
     public async Task ResolveAsync_AgentThrows_EmitsAttemptFailedAuditWithExceptionTrace()
@@ -50,7 +84,8 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
         var runner = new ThrowingAgentRunner(new InvalidOperationException("agent CLI exploded with diagnostics"));
         var resolver = new AgenticConflictResolver(
             new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 2 }),
-            NullLogger<AgenticConflictResolver>.Instance);
+            NullLogger<AgenticConflictResolver>.Instance,
+            auditLogger: _auditLogger);
 
         var workItemId = WorkItemId.New();
         var result = await resolver.ResolveAsync(
@@ -62,7 +97,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             CancellationToken.None);
 
         Assert.False(result.Success);
-        var evt = AssertSingleAttemptFailedEvent(workItemId);
+        var evt = await AssertSingleAttemptFailedEvent(workItemId);
         Assert.Contains("threw InvalidOperationException", GetScalar<string>(evt, "Reason") ?? "", StringComparison.Ordinal);
         Assert.Contains("agent CLI exploded with diagnostics",
             GetScalar<string>(evt, "Reason") ?? "", StringComparison.Ordinal);
@@ -92,7 +127,8 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             stderr: "missing ANTHROPIC_API_KEY; refusing to run");
         var resolver = new AgenticConflictResolver(
             new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1, MaxAttemptsPerAgent = 1 }),
-            NullLogger<AgenticConflictResolver>.Instance);
+            NullLogger<AgenticConflictResolver>.Instance,
+            auditLogger: _auditLogger);
 
         var workItemId = WorkItemId.New();
         var result = await resolver.ResolveAsync(
@@ -104,7 +140,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             CancellationToken.None);
 
         Assert.False(result.Success);
-        var evt = AssertSingleAttemptFailedEvent(workItemId);
+        var evt = await AssertSingleAttemptFailedEvent(workItemId);
         Assert.Equal("agent exited 1", GetScalar<string>(evt, "Reason"));
         Assert.Equal("agent printed a startup banner before exiting", GetScalar<string>(evt, "StdoutTail"));
         Assert.Equal("missing ANTHROPIC_API_KEY; refusing to run", GetScalar<string>(evt, "StderrTail"));
@@ -129,7 +165,8 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
         var logger = new CapturingLogger<AgenticConflictResolver>();
         var resolver = new AgenticConflictResolver(
             new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1, MaxAttemptsPerAgent = 1 }),
-            logger);
+            logger,
+            auditLogger: _auditLogger);
 
         var result = await resolver.ResolveAsync(
             sandbox,
@@ -155,10 +192,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
     [Fact]
     public async Task ResolveAsync_AgentReportsFailure_RedactsSecretLikeStdoutAndStderrBeforeAudit()
     {
-        Log.Logger = new LoggerConfiguration()
-            .Enrich.FromLogContext()
-            .WriteTo.Sink(_sink)
-            .CreateLogger();
+        using var unredacted = CreateUnredactedAuditLogger();
 
         var sandbox = new AgenticConflictResolverTests.ConflictSandbox();
         sandbox.AddConflictedFile("conflict.txt",
@@ -171,7 +205,8 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             stderr: $"agent stderr leaked {StderrToken}");
         var resolver = new AgenticConflictResolver(
             new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1, MaxAttemptsPerAgent = 1 }),
-            NullLogger<AgenticConflictResolver>.Instance);
+            NullLogger<AgenticConflictResolver>.Instance,
+            auditLogger: unredacted);
 
         var workItemId = WorkItemId.New();
         var result = await resolver.ResolveAsync(
@@ -183,7 +218,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             CancellationToken.None);
 
         Assert.False(result.Success);
-        var evt = AssertSingleAttemptFailedEvent(workItemId);
+        var evt = await AssertSingleAttemptFailedEvent(workItemId);
         var stdoutTail = GetScalar<string>(evt, "StdoutTail") ?? "";
         var stderrTail = GetScalar<string>(evt, "StderrTail") ?? "";
         Assert.DoesNotContain(StdoutToken, stdoutTail, StringComparison.Ordinal);
@@ -204,7 +239,8 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             stderr: string.Join('\n', Enumerable.Range(0, 700).Select(static i => $"stderr line {i:D4} value")));
         var resolver = new AgenticConflictResolver(
             new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1, MaxAttemptsPerAgent = 1 }),
-            NullLogger<AgenticConflictResolver>.Instance);
+            NullLogger<AgenticConflictResolver>.Instance,
+            auditLogger: _auditLogger);
 
         var workItemId = WorkItemId.New();
         var result = await resolver.ResolveAsync(
@@ -216,7 +252,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             CancellationToken.None);
 
         Assert.False(result.Success);
-        var evt = AssertSingleAttemptFailedEvent(workItemId);
+        var evt = await AssertSingleAttemptFailedEvent(workItemId);
         var stdoutTail = GetScalar<string>(evt, "StdoutTail") ?? "";
         var stderrTail = GetScalar<string>(evt, "StderrTail") ?? "";
         Assert.Equal(2049, stdoutTail.Length);
@@ -256,7 +292,8 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             stderr: "warning: incomplete model output");
         var resolver = new AgenticConflictResolver(
             new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1, MaxAttemptsPerAgent = 1 }),
-            NullLogger<AgenticConflictResolver>.Instance);
+            NullLogger<AgenticConflictResolver>.Instance,
+            auditLogger: _auditLogger);
 
         var workItemId = WorkItemId.New();
         var result = await resolver.ResolveAsync(
@@ -268,7 +305,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             CancellationToken.None);
 
         Assert.False(result.Success);
-        var evt = AssertSingleAttemptFailedEvent(workItemId);
+        var evt = await AssertSingleAttemptFailedEvent(workItemId);
         var reason = GetScalar<string>(evt, "Reason") ?? "";
         Assert.StartsWith("verification:", reason, StringComparison.Ordinal);
         Assert.Contains("conflict markers remain", reason, StringComparison.Ordinal);
@@ -279,10 +316,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
     [Fact]
     public async Task ResolveAsync_SessionResumeExhausted_RedactsAuditStdoutAndStderrWithoutLoggerEnricher()
     {
-        Log.Logger = new LoggerConfiguration()
-            .Enrich.FromLogContext()
-            .WriteTo.Sink(_sink)
-            .CreateLogger();
+        using var unredacted = CreateUnredactedAuditLogger();
 
         var sandbox = new AgenticConflictResolverTests.ConflictSandbox();
         sandbox.AddConflictedFile("conflict.txt",
@@ -300,7 +334,8 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
         { Kind = new AgentKind("resumable") };
         var resolver = new AgenticConflictResolver(
             new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }),
-            NullLogger<AgenticConflictResolver>.Instance);
+            NullLogger<AgenticConflictResolver>.Instance,
+            auditLogger: unredacted);
 
         var workItemId = WorkItemId.New();
         var result = await resolver.ResolveAsync(
@@ -312,7 +347,7 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
             CancellationToken.None);
 
         Assert.False(result.Success);
-        var evt = AssertSingleAttemptFailedEvent(workItemId);
+        var evt = await AssertSingleAttemptFailedEvent(workItemId);
         var stdoutTail = GetScalar<string>(evt, "StdoutTail") ?? "";
         var stderrTail = GetScalar<string>(evt, "StderrTail") ?? "";
         Assert.DoesNotContain("ghp_", stdoutTail, StringComparison.Ordinal);
@@ -321,11 +356,22 @@ public sealed class AgenticConflictResolverAuditLogTests : IDisposable
         Assert.Contains("***", stderrTail, StringComparison.Ordinal);
     }
 
-    private LogEvent AssertSingleAttemptFailedEvent(WorkItemId workItemId)
+    private async Task<LogEvent> AssertSingleAttemptFailedEvent(WorkItemId workItemId)
     {
-        var attemptFailed = _sink.Events
-            .Where(e => GetScalar<string>(e, "EventName") == "agentic_conflict_resolver.attempt_failed")
-            .ToList();
+        // The audit event reaches the in-memory sink through the global Serilog
+        // pipeline, whose delivery can lag the awaited ResolveAsync completion
+        // under load. Poll for it rather than reading the sink once.
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(3);
+        List<LogEvent> attemptFailed;
+        while (true)
+        {
+            attemptFailed = _sink.Events
+                .Where(e => GetScalar<string>(e, "EventName") == "agentic_conflict_resolver.attempt_failed")
+                .ToList();
+            if (attemptFailed.Count > 0 || DateTimeOffset.UtcNow >= deadline)
+                break;
+            await Task.Delay(25);
+        }
         var match = Assert.Single(attemptFailed);
         Assert.True(GetScalar<bool>(match, "Audit"));
         Assert.Equal(LogEventLevel.Warning, match.Level);

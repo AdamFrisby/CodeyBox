@@ -30,7 +30,7 @@ namespace CodeyBox.Agents;
 public static class SessionResumeOptions
 {
     public const int DefaultMaxResumeAttempts = 2;
-    public const int MaxAllowedResumeAttempts = 10;
+    public const int MaxAllowedResumeAttempts = AgentTurnResumeCheckpoint.MaximumAttemptCount;
 
     private static int _maxResumeAttempts = DefaultMaxResumeAttempts;
 

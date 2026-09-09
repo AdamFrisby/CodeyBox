@@ -1,0 +1,44 @@
+<Project>
+
+  <!--
+    Heal an inherited, non-writable per-user NuGet home BEFORE `dotnet` reads it.
+
+    A COW-inherited / baked sandbox can ship `$HOME/.nuget` owned by root (or
+    otherwise unwritable), so the build user cannot create `$HOME/.nuget/NuGet/`
+    and restore aborts with "Failed to read NuGet.Config due to unauthorized
+    access" / "Access to the path '.../.nuget/NuGet' is denied" before any
+    package is restored. NuGet performs that user-config read during restore, so
+    the home must be repaired on disk before restore runs.
+
+    This is wired through `InitialTargets` (see Directory.Build.props /
+    Directory.Solution.props), which MSBuild runs at the very start of every
+    invocation — verified to execute BEFORE NuGet's user-config read, at both the
+    solution and the individual-project level. It therefore heals a plain
+    `dotnet build` / `dotnet test` / `dotnet build <solution>` with no wrapper
+    script, environment override, or orchestrator change: the exact commands the
+    build/test gates invoke directly.
+
+    The repair itself is the single source of truth in scripts/nuget-home-heal.sh
+    (also dot-sourced by build.sh and the orchestrator's audit gates). It is a
+    strict no-op when the home is already usable, so re-running it on every
+    project evaluation is cheap and side-effect-free.
+  -->
+  <PropertyGroup>
+    <CodeyBoxNuGetHomeHealScript>$(MSBuildThisFileDirectory)scripts/nuget-home-heal.sh</CodeyBoxNuGetHomeHealScript>
+  </PropertyGroup>
+
+  <Target Name="CodeyBoxHealNuGetHome"
+          Condition=" '$(OS)' != 'Windows_NT'
+                      and '$(DesignTimeBuild)' != 'true'
+                      and Exists('$(CodeyBoxNuGetHomeHealScript)') ">
+    <!-- The script never fails a `set -e` caller and returns 0 in every path, so
+         the command always exits 0 and produces no warning under
+         TreatWarningsAsErrors; the trailing `|| true` is belt-and-suspenders in
+         case a future edit changes that. Output is suppressed so a clean build
+         stays quiet. -->
+    <Exec Command="sh -c '. &quot;$(CodeyBoxNuGetHomeHealScript)&quot; &gt;/dev/null 2&gt;&amp;1 || true'"
+          StandardOutputImportance="low"
+          StandardErrorImportance="low" />
+  </Target>
+
+</Project>

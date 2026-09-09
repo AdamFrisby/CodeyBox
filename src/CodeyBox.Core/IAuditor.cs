@@ -241,7 +241,14 @@ public sealed record AuditContext(
     /// for code audits; a plan reviewer treats a null/blank value as "no plan
     /// to review".
     /// </summary>
-    string? PlanArtifact = null)
+    string? PlanArtifact = null,
+    /// <summary>
+    /// Blocking findings from the immediately preceding audit iteration. During
+    /// rework, changes directly required to resolve these findings are part of
+    /// the effective task scope even when the original prompt otherwise limits
+    /// the files that may change. Null/empty on the first audit iteration.
+    /// </summary>
+    IReadOnlyList<AuditFinding>? PriorBlockingFindings = null)
 {
     /// <summary>
     /// The effective review target: <see cref="Target"/> when set, otherwise
@@ -264,6 +271,25 @@ public sealed record AuditResult
         string? AgentStderr = null,
         string? AgentSummary = null,
         string? AgentStdout = null)
+        : this(
+            Passed,
+            Findings,
+            RawOutput,
+            AgentStderr,
+            AgentSummary,
+            AgentStdout,
+            TestFailureAttributions: null)
+    {
+    }
+
+    public AuditResult(
+        bool Passed,
+        IReadOnlyList<AuditFinding> Findings,
+        string? RawOutput,
+        string? AgentStderr,
+        string? AgentSummary,
+        string? AgentStdout,
+        IReadOnlyList<TestFailureAttributionResult>? TestFailureAttributions = null)
     {
         this.Passed = Passed;
         this.Findings = Findings;
@@ -271,6 +297,7 @@ public sealed record AuditResult
         this.AgentStderr = AgentStderr;
         this.AgentSummary = AgentSummary;
         this.AgentStdout = AgentStdout;
+        this.TestFailureAttributions = TestFailureAttributions ?? [];
     }
 
     public bool Passed { get; init; }
@@ -279,6 +306,7 @@ public sealed record AuditResult
     public string? AgentStderr { get; init; }
     public string? AgentSummary { get; init; }
     public string? AgentStdout { get; init; }
+    public IReadOnlyList<TestFailureAttributionResult> TestFailureAttributions { get; init; }
 
     /// <summary>
     /// Mirrors <see cref="CodeyBox.Core.AgentResult.TerminalDiagnostic"/> for an

@@ -43,6 +43,8 @@ public sealed class ReleaseService
     private readonly AgentPromptPreprocessorChain _promptPreprocessors;
     private readonly IAgentAuthFailureClassifier _authFailureClassifier;
     private readonly IAgentAuthRequiredHandler _authRequiredHandler;
+    private readonly Func<DeepAuditFailurePersistenceOptions> _deepAuditFailurePersistenceOptions;
+    private readonly TimeProvider _timeProvider;
 
     // Hot-reloadable deep-audit concurrency gate — resolved from IOptionsMonitor on every
     // acquire/remediate call so config edits take effect without restart.
@@ -76,7 +78,9 @@ public sealed class ReleaseService
         // by the host's DI graph and not rebuilt here, removing the duplication
         // between this class and PipelineRunner. Legacy embedders / tests that
         // don't wire this still get the registry-built path below.
-        IAgentAuthRequiredHandler? authRequiredHandler = null)
+        IAgentAuthRequiredHandler? authRequiredHandler = null,
+        Func<DeepAuditFailurePersistenceOptions>? deepAuditFailurePersistenceOptions = null,
+        TimeProvider? timeProvider = null)
     {
         _releases = releases;
         _workItems = workItems;
@@ -103,6 +107,9 @@ public sealed class ReleaseService
                 authAvailability ?? MissingAgentAuthAvailabilityRegistry.Instance,
                 _webhooks,
                 _log);
+        _deepAuditFailurePersistenceOptions = deepAuditFailurePersistenceOptions
+            ?? (static () => new DeepAuditFailurePersistenceOptions());
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     private async Task AcquireDeepAuditSlotAsync(CancellationToken ct)
@@ -367,6 +374,9 @@ public sealed class ReleaseService
             catch (Exception ex)
             {
                 _log.LogError(ex, "Deep audit phase threw for release {Id}", inReview.Id);
+                await ReconcileInternalDeepAuditFailureAsync(
+                    inReview,
+                    "deep audit phase failed due to an internal credential or sandbox error");
             }
             finally
             {
@@ -555,7 +565,7 @@ public sealed class ReleaseService
                         AuditorName: auditor.Name,
                         Severity: AuditSeverity.Error,
                         Title: "Network-capable tool auditor requires an enforcing sandbox provider",
-                        Description: $"The {auditor.Name} deep auditor requests package-registry network access without agent credentials, but the configured sandbox provider '{_sandboxes.Name}' cannot enforce AuditToolAllowedHosts. Use the multipass provider with the audit-tool network profile, or disable this deep auditor for this deployment."));
+                        Description: $"The {auditor.Name} deep auditor requests package-registry network access without agent credentials, but the configured sandbox provider '{_sandboxes.Name}' cannot enforce AuditToolAllowedHosts. Use a sandbox provider with an enforcing audit-tool network profile, or disable this deep auditor for this deployment."));
                 continue;
             }
 
@@ -565,20 +575,62 @@ public sealed class ReleaseService
                 if (!_agents.TryGet(agentKind, out runner))
                     runner = null;
                 if (runner is not null)
+                {
                     credential = await _credentials.GetAsync(agentKind, ct);
+                    if (credential is not null && credential.Agent != agentKind)
+                    {
+                        throw new AgentCredentialScopeException(
+                            agentKind,
+                            $"credential belongs to agent '{credential.Agent.Value}'");
+                    }
+                }
             }
 
             var env = new Dictionary<string, string>();
             if (credential is not null)
-                foreach (var (k, v) in credential.EnvironmentVariables) env[k] = v;
+            {
+                if (runner is null)
+                {
+                    throw new InvalidOperationException(
+                        "A credentialed deep-audit sandbox requires a selected agent runner.");
+                }
+                var directEnvironment = SandboxEnvironmentVariablePolicy.SelectDirectCredentialEnvironment(
+                    credential,
+                    runner,
+                    nameof(credential.EnvironmentVariables));
+                foreach (var (k, v) in directEnvironment)
+                    env[k] = v;
+            }
 
             var sandboxTarget = SandboxTargetResolver.ResolveAudit(
                 needsCreds ? project.NetworkProfiles.AuditAgent : project.NetworkProfiles.AuditTool,
                 group.Key);
+            var mounts = new List<SandboxMount>(access.Mounts);
+            var mountDestinations = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var mount in mounts)
+            {
+                if (!mountDestinations.Add(mount.SandboxPath))
+                    throw new InvalidOperationException($"Sandbox mounts conflict at destination '{mount.SandboxPath}'.");
+            }
+            AddMount(new SandboxMount { SandboxPath = SandboxConventions.WorkDir, Tmpfs = true });
+            if (credential is not null)
+            {
+                foreach (var mount in credential.Mounts)
+                    AddMount(mount);
+                if (credential.Files.Count > 0)
+                {
+                    AddMount(new SandboxMount
+                    {
+                        SandboxPath = SandboxConventions.CredentialsDir,
+                        Tmpfs = true,
+                        SizeBytes = SandboxConventions.CredentialsTmpfsBytes,
+                    });
+                }
+            }
             var spec = new SandboxSpec
             {
                 ImageReference = _pipelineOpts.SandboxImageReference,
-                Mounts = [.. access.Mounts, new SandboxMount { SandboxPath = "/work", Tmpfs = true }],
+                Mounts = mounts,
                 Environment = env,
                 Network = new SandboxNetworkPolicy
                 {
@@ -593,6 +645,13 @@ public sealed class ReleaseService
                 Flavor = sandboxTarget.Flavor,
                 WorkingDirectory = "/work",
             };
+
+            void AddMount(SandboxMount mount)
+            {
+                if (!mountDestinations.Add(mount.SandboxPath))
+                    throw new InvalidOperationException($"Sandbox mounts conflict at destination '{mount.SandboxPath}'.");
+                mounts.Add(mount);
+            }
 
             await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
             if (credential is not null && credential.Files.Count > 0)
@@ -909,6 +968,77 @@ public sealed class ReleaseService
         _log.LogWarning("Release {Id} failed: {Reason}", release.Id, reason);
     }
 
+    private async Task ReconcileInternalDeepAuditFailureAsync(Release release, string reason)
+    {
+        DeepAuditFailurePersistenceSettings settings;
+        try
+        {
+            var options = _deepAuditFailurePersistenceOptions()
+                ?? throw new InvalidOperationException(
+                    "CodeyBox:DeepAuditFailurePersistence must not be null");
+            settings = options.CaptureValidated();
+        }
+        catch (InvalidOperationException ex)
+        {
+            _log.LogCritical(
+                ex,
+                "Release {Id} cannot persist its terminal deep-audit failure because the persistence retry configuration is invalid",
+                release.Id);
+            return;
+        }
+
+        Exception? lastPersistenceError = null;
+
+        for (var attempt = 1; attempt <= settings.MaxAttempts; attempt++)
+        {
+            try
+            {
+                var current = await _releases.GetAsync(release.Id, CancellationToken.None);
+                if (current is null)
+                    throw new InvalidOperationException($"Release '{release.Id}' disappeared while persisting its terminal deep-audit failure.");
+
+                if (current.State != ReleaseState.InReview)
+                {
+                    _log.LogInformation(
+                        "Release {Id}: terminal deep-audit failure reconciliation observed state {State}",
+                        release.Id,
+                        current.State);
+                    return;
+                }
+
+                await FailReleaseAsync(current, reason, CancellationToken.None);
+
+                var reconciled = await _releases.GetAsync(release.Id, CancellationToken.None);
+                if (reconciled?.State != ReleaseState.InReview)
+                    return;
+
+                lastPersistenceError = new InvalidOperationException(
+                    $"Release '{release.Id}' remained InReview after a terminal failure transition attempt.");
+            }
+            catch (Exception ex)
+            {
+                lastPersistenceError = ex;
+            }
+
+            if (attempt < settings.MaxAttempts)
+            {
+                _log.LogWarning(
+                    lastPersistenceError,
+                    "Release {Id}: terminal deep-audit failure persistence attempt {Attempt}/{MaxAttempts} failed; retrying",
+                    release.Id,
+                    attempt,
+                    settings.MaxAttempts);
+                await Task.Delay(settings.RetryDelay, _timeProvider, CancellationToken.None);
+            }
+        }
+
+        _log.LogCritical(
+            lastPersistenceError,
+            "Release {Id} remains unreconciled after {Attempts} terminal deep-audit failure persistence attempts",
+            release.Id,
+            settings.MaxAttempts);
+    }
+
     private async Task PublishAsync(
         string eventName,
         Release release,
@@ -1066,24 +1196,15 @@ public sealed class ReleaseService
 
     private static async Task MaterialiseCredentialFilesAsync(ISandbox sandbox, AgentCredential credential, CancellationToken ct)
     {
-        await sandbox.ExecAsync(new SandboxExec { Argv = ["mkdir", "-p", SandboxConventions.CredentialsDir] }, ct);
+        SandboxCredentialFileWriter.ValidateMaterializationPlan(credential, []);
         foreach (var (relativePath, contents) in credential.Files)
         {
-            var safePath = relativePath.Replace('\\', '/').TrimStart('/');
-            if (safePath.Contains("..", StringComparison.Ordinal))
-                throw new ArgumentException($"Credential file path must not contain '..': {relativePath}");
-            if (safePath.Length == 0)
-                throw new ArgumentException($"Credential file name resolves empty: {relativePath}");
-            var fullPath = $"{SandboxConventions.CredentialsDir}/{safePath}";
-            var dir = fullPath[..fullPath.LastIndexOf('/')];
-            await sandbox.ExecAsync(new SandboxExec { Argv = ["mkdir", "-p", dir] }, ct);
-            var write = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["sh", "-c", "umask 077 && cat > \"$0\"", fullPath],
-                Stdin = contents,
-            }, ct);
-            if (!write.Success)
-                throw new InvalidOperationException($"Failed to write credential file {safePath}: {write.Stderr}");
+            await SandboxCredentialFileWriter.WriteAsync(
+                sandbox,
+                new SandboxCredentialFileTarget(SandboxCredentialFileRoot.CredentialsDirectory, relativePath),
+                contents,
+                SandboxCredentialOverwritePolicy.Overwrite,
+                ct).ConfigureAwait(false);
         }
     }
 }

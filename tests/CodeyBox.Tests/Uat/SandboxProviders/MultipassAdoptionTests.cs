@@ -252,9 +252,11 @@ public sealed class MultipassAdoptionTests
         // promotes a stale HEAD.
         Assert.StartsWith("set -e", script, StringComparison.Ordinal);
         Assert.Contains("cd '/work'", script);
-        Assert.Contains("mkdir -p .codeybox", script);
-        Assert.Contains(".codeybox/preempt-scratchpad.md", script);
         Assert.Contains("git add -A", script);
+        Assert.Contains("git rm -r --cached --ignore-unmatch", script);
+        Assert.Contains(":(glob).codeybox/preempt-scratchpad*", script);
+        Assert.Contains("git ls-tree -r -z --name-only HEAD", script);
+        Assert.DoesNotContain("mkdir -p .codeybox", script);
         Assert.Contains("git commit --allow-empty -m 'CodeyBox preempt checkpoint for wi42'", script);
         // Ref is inlined unquoted (git rejects single-quoted refs on push as
         // ambiguous) — the validator is what makes this safe.

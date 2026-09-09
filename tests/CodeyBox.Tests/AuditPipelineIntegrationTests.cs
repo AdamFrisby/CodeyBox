@@ -429,7 +429,7 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task ReworkAgentTransientFailure_ParksWaitingForTransientRetryFromAudit()
+    public async Task ReworkAgentTransientFailure_ParksWaitingForExactReworkCheckpoint()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var time = new ManualTimeProvider();
@@ -469,7 +469,10 @@ public sealed class AuditPipelineIntegrationTests : IDisposable
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.WaitingForTransientRetry, final!.State);
         Assert.Equal("transient", final.FailureKind);
-        Assert.Equal("audit", final.TransientRetryFrom);
+        Assert.Equal("rework", final.TransientRetryFrom);
+        Assert.Equal(
+            AgentTurnResumePhase.Rework,
+            Assert.IsType<AgentTurnResumeCheckpoint>(final.AgentTurnResumeCheckpoint).Phase);
         Assert.Equal(time.GetUtcNow(), final.TransientRetryFirstFailedAt);
         Assert.Equal(time.GetUtcNow().AddSeconds(30), final.NextTransientRetryAt);
         Assert.Equal(0, final.TransientRetryAttempts);

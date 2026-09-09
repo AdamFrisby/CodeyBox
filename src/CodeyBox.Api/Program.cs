@@ -22,16 +22,20 @@ using CodeyBox.Audit.Llm.PlanAudit;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
+using CodeyBox.Deployment;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
+using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.Bubblewrap;
+using CodeyBox.Sandbox.Incus;
 using CodeyBox.Sandbox.Multipass;
 using CodeyBox.Sandbox.MultipassRemote;
 using CodeyBox.Sandbox.Process;
 using CodeyBox.Sandbox.Sprites;
 using CodeyBox.HostProcess;
 using CodeyBox.Webhooks;
+using CodeyBox.Upstream.GitHub;
 using CodeyBox.Notifications;
 using Serilog;
 using Serilog.Events;
@@ -275,8 +279,35 @@ builder.Services.AddSingleton(sp => new SqliteDatabaseWriteGateFactory(
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SqliteWriteGate,
     sp.GetRequiredService<ILoggerFactory>(),
     TimeProvider.System));
+// A BackgroundService fault stops the host via StopHost, which the host
+// reports as a graceful shutdown (exit code 0) — indistinguishable from an
+// intentional stop, so Restart=on-failure supervisors never restart after an
+// orchestrator crash (e.g. a sustained SQLite write-gate outage escalated by
+// the dispatch loop). Stated explicitly here (rather than relying on the
+// framework default) because the exit-code contract below depends on it:
+// faults are recorded on the tracker and mapped to a non-zero exit.
+builder.Services.Configure<HostOptions>(static o =>
+    o.BackgroundServiceExceptionBehavior = BackgroundServiceExceptionBehavior.StopHost);
+builder.Services.AddSingleton<BackgroundServiceFailureTracker>();
+builder.Services.AddHostedService(sp => new SqliteDatabaseMaintenanceService(
+    sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.StateDatabasePath,
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SqliteMaintenance,
+    sp.GetRequiredService<SqliteDatabaseWriteGateFactory>(),
+    sp.GetRequiredService<ILogger<SqliteDatabaseMaintenanceService>>(),
+    TimeProvider.System));
 builder.Services.Configure<BuildScriptAuditorOptions>(builder.Configuration.GetSection("CodeyBox:BuildScriptAudit"));
+// Regression-test-selection mode (Audit:TestSelection:Mode). Bound through
+// AddOptions so IOptionsMonitor<TestSelectionOptions> hot-reloads the mode
+// without a restart, with a fail-fast validator rejecting an unrecognised value
+// at load rather than silently narrowing at audit time. Default 'all' keeps the
+// emitted dotnet-test command byte-identical to today.
+builder.Services.AddOptions<TestSelectionOptions>()
+    .Bind(builder.Configuration.GetSection(TestSelectionOptions.SectionName))
+    .Validate(
+        static opts => TestSelectionModeParser.TryParse(opts.Mode, out _),
+        $"{TestSelectionOptions.SectionName}:Mode must be one of: all");
 builder.Services.Configure<NotificationsOptions>(builder.Configuration.GetSection("CodeyBox:Notifications"));
+builder.Services.Configure<AuditProgressApiOptions>(builder.Configuration.GetSection("CodeyBox:AuditProgressApi"));
 // E2eExecutionOptions binds as a standalone section so the pool / dispatcher can
 // take IOptionsMonitor<E2eExecutionOptions> directly without dragging the whole
 // CodeyBoxOptions graph. The same section is also a property on CodeyBoxOptions
@@ -286,6 +317,23 @@ builder.Services.AddOptions<E2eExecutionOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox:E2eExecution"))
     .Validate(static opts => IsValidE2eExecutionOptions(opts), "CodeyBox:E2eExecution is invalid")
     .Validate(opts => IsValidE2eExecutionOptionsForConfig(opts, builder.Configuration), "CodeyBox:E2eExecution remote pool prerequisites are invalid");
+// Post-implementation e2e-replay authoring/verification gate config. Bound
+// through AddOptions so IOptionsMonitor<E2eReplayAuthoringOptions> hot-reloads
+// the Enabled switch and thresholds without restart. Disabled by default; the
+// gate is a no-op until a deployment opts in AND wires a cheap-model authoring
+// driver (IE2eReplayAuthoringDriver).
+builder.Services.AddOptions<E2eReplayAuthoringOptions>()
+    .Bind(builder.Configuration.GetSection("CodeyBox:E2eReplayAuthoring"))
+    .Validate(
+        static opts => opts.MaxReauthorAttempts >= E2eReplayAuthoringOptions.MinReauthorAttempts
+            && opts.MaxReauthorAttempts <= E2eReplayAuthoringOptions.MaxAllowedReauthorAttempts,
+        "CodeyBox:E2eReplayAuthoring:MaxReauthorAttempts is out of range")
+    .Validate(
+        static opts => opts.VerificationTimeout > TimeSpan.Zero && opts.VerificationPollInterval > TimeSpan.Zero,
+        "CodeyBox:E2eReplayAuthoring verification timeout/poll interval must be positive")
+    .Validate(
+        static opts => !string.IsNullOrWhiteSpace(opts.AuthorModelId),
+        "CodeyBox:E2eReplayAuthoring:AuthorModelId is required");
 // Register ProjectsOptions through AddOptions so IOptionsMonitor<ProjectsOptions>
 // is wired into the framework's reload pipeline. PostConfigure layers our custom
 // map-shaped binding (audit-type / language overrides / profile inheritance) on
@@ -364,7 +412,7 @@ ApiKeyAuth.Configure(builder);
 
 // --- Sandbox provider --------------------------------------------------------
 // Selected by CodeyBox:SandboxProvider in config. Each option has a different
-// security/setup trade-off — see docs/sandbox-providers.md.
+// security/setup trade-off — see docs/concepts/sandboxes.md.
 //
 //   process     — UNSAFE. No isolation. Dev only; refuses to load outside
 //                 Development env unless DangerouslyAllowProcessSandbox=true.
@@ -373,16 +421,17 @@ ApiKeyAuth.Configure(builder);
 //   multipass   — Real Ubuntu VMs via Canonical's snap. Separate guest
 //                 kernel. Single 'snap install multipass' on Ubuntu, no
 //                 podman / OCI runtime / /etc edits. ~10-30s VM launch.
+//   incus       — Real VMs backed by a snapshot-capable Incus storage pool.
+//                 Baseline clones are copy-on-write and host directories are
+//                 shared through explicitly selected virtiofs devices.
 //   sprites     — Fly.io hosted Firecracker microVMs via sprites.dev. Requires
 //                 SPRITES_TOKEN (or configured token env var).
 builder.Services.AddSingleton<ISandboxProvider>(SelectSandboxProvider);
 
-// B1: register the baseline-image resolver capability as a derived view of
-// the registered sandbox provider. The factory returns null when the
-// provider does not implement IBaselineImageResolver (process / bubblewrap);
-// consumers must use GetService (not GetRequiredService) and handle null.
-// The factory is gated on the resolved provider — non-multipass setups get a
-// null factory hit, which the consumer treats as "no baseline pinning".
+// B1: register baseline-image capabilities as derived views of the selected
+// provider. Providers without baseline support (process / bubblewrap) receive
+// null-object implementations, so consumers can depend on the capability
+// without knowing which concrete provider is active.
 builder.Services.AddSingleton(sp =>
     sp.GetRequiredService<ISandboxProvider>() as IBaselineImageResolver
         ?? NullBaselineImageResolver.Instance);
@@ -423,7 +472,7 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     var startupLog = loggerFactory.CreateLogger("CodeyBox.Sandbox");
 
-    var kind = (opts.SandboxProvider ?? "").Trim().ToLowerInvariant();
+    var kind = ReloadableSandboxProvider.NormalizeConfiguredProviderId(opts.SandboxProvider);
     var environment = sp.GetRequiredService<IHostEnvironment>();
 
     if (string.IsNullOrEmpty(kind))
@@ -439,12 +488,34 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         {
             throw new InvalidOperationException(
                 "CodeyBox:SandboxProvider must be set in non-Development environments. " +
-                "Choose one of: multipass, multipass-remote, sprites, bubblewrap, process " +
-                "(see docs/sandbox-providers.md for trade-offs).");
+                "Choose one of: incus, multipass, multipass-remote, sprites, bubblewrap, process " +
+                "(see docs/concepts/sandboxes.md for trade-offs).");
         }
     }
 
-    var inner = BuildSandboxProviderInner(sp, opts, environment, startupLog, loggerFactory, kind);
+    var inner = SandboxProviderKinds.SupportsHotReload(kind)
+        ? BuildReloadableSandboxProvider(sp, opts, loggerFactory, startupLog)
+        : BuildSandboxProviderInner(sp, opts, environment, startupLog, loggerFactory, kind);
+    var workloadTrust = Enum.TryParse<WorkloadTrust>(opts.WorkloadTrust, true, out var configuredTrust)
+        ? configuredTrust
+        : environment.IsDevelopment() ? WorkloadTrust.Trusted : WorkloadTrust.Untrusted;
+    if (!environment.IsDevelopment()
+        && workloadTrust == WorkloadTrust.Untrusted
+        && inner.IsolationLevel != SandboxIsolationLevel.DedicatedKernel)
+    {
+        throw new InvalidOperationException(
+            $"Untrusted workloads require a dedicated-kernel sandbox; provider '{inner.Name}' " +
+            $"advertises {inner.IsolationLevel} isolation.");
+    }
+    if (!environment.IsDevelopment()
+        && workloadTrust == WorkloadTrust.Trusted
+        && inner.IsolationLevel != SandboxIsolationLevel.DedicatedKernel
+        && !opts.AcknowledgeSharedKernelRisk)
+    {
+        throw new InvalidOperationException(
+            $"Trusted workloads using provider '{inner.Name}' ({inner.IsolationLevel}) require " +
+            "CodeyBox:AcknowledgeSharedKernelRisk=true.");
+    }
     var orchestratorOptions = sp.GetRequiredService<OrchestratorOptions>();
     startupLog.LogInformation(
         "Sandbox admission control: provider={Provider}, MaxConcurrentSandboxes={MaxConcurrentSandboxes}",
@@ -456,6 +527,42 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
         inner,
         orchestratorOptions.MaxConcurrentSandboxes,
         loggerFactory.CreateLogger<SandboxAdmissionControlledProvider>());
+}
+
+static ReloadableSandboxProvider BuildReloadableSandboxProvider(
+    IServiceProvider sp,
+    CodeyBoxOptions startupOptions,
+    ILoggerFactory loggerFactory,
+    ILogger startupLog)
+{
+    var options = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    var multipassBaselineNamespace = new MultipassSandboxOptions();
+    return new ReloadableSandboxProvider(
+        () => options.CurrentValue.SandboxProvider ?? string.Empty,
+        () => options.CurrentValue.SandboxProviderCutover?.RetainedInventoryProviders ?? [],
+        [
+            new ReloadableSandboxProvider.ProviderRegistration(
+                SandboxProviderKinds.Multipass,
+                () => BuildMultipass(
+                    startupOptions,
+                    sp,
+                    loggerFactory,
+                    startupLog,
+                    sp.GetService<ITimingStore>(),
+                    sp.GetService<ISandboxResourceUsageStore>()),
+                baselineRef => MultipassSandboxProvider.IsOwnedBaselineRef(
+                    multipassBaselineNamespace,
+                    baselineRef)),
+            new ReloadableSandboxProvider.ProviderRegistration(
+                SandboxProviderKinds.Incus,
+                () => BuildIncus(
+                    sp,
+                    loggerFactory,
+                    sp.GetService<ITimingStore>(),
+                    sp.GetService<ISandboxResourceUsageStore>()),
+                IncusSandboxProvider.IsRoutableBaselineRef),
+        ],
+        loggerFactory.CreateLogger<ReloadableSandboxProvider>());
 }
 
 static ISandboxProvider BuildSandboxProviderInner(
@@ -473,17 +580,22 @@ static ISandboxProvider BuildSandboxProviderInner(
             new BubblewrapSandboxOptions(),
             loggerFactory.CreateLogger<BubblewrapSandboxProvider>(),
             sp.GetService<ITimingStore>()),
-        "multipass" => BuildMultipass(
+        SandboxProviderKinds.Multipass => BuildMultipass(
             opts,
             sp,
             loggerFactory,
             startupLog,
             sp.GetService<ITimingStore>(),
             sp.GetService<ISandboxResourceUsageStore>()),
+        SandboxProviderKinds.Incus => BuildIncus(
+            sp,
+            loggerFactory,
+            sp.GetService<ITimingStore>(),
+            sp.GetService<ISandboxResourceUsageStore>()),
         "multipass-remote" => BuildMultipassRemote(sp, loggerFactory),
         "sprites" => BuildSprites(sp, loggerFactory, startupLog),
         _ => throw new InvalidOperationException(
-            $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: multipass, multipass-remote, sprites, bubblewrap, process"),
+            $"Unknown CodeyBox:SandboxProvider '{kind}'. Valid: incus, multipass, multipass-remote, sprites, bubblewrap, process"),
     };
 }
 
@@ -650,7 +762,7 @@ static ISandboxProvider BuildE2eLocalSandboxProvider(IServiceProvider sp, ILogge
             "CodeyBox:E2eExecution:PoolKind=local is only available in Development.");
     }
 
-    var kind = (opts.SandboxProvider ?? "").Trim().ToLowerInvariant();
+    var kind = ReloadableSandboxProvider.NormalizeConfiguredProviderId(opts.SandboxProvider);
     if (string.IsNullOrEmpty(kind))
     {
         if (environment.IsDevelopment())
@@ -676,10 +788,48 @@ static ISandboxProvider BuildProcess(CodeyBoxOptions opts, IHostEnvironment env,
         throw new InvalidOperationException(
             "CodeyBox:SandboxProvider=process is UNSAFE outside Development. " +
             "Set CodeyBox:DangerouslyAllowProcessSandbox=true to override (NOT recommended), " +
-            "or pick multipass | bubblewrap.");
+            "or pick incus | multipass | bubblewrap.");
     }
     startupLog.LogWarning("Using Process sandbox provider — NO ISOLATION. Dev only.");
     return new ProcessSandboxProvider(loggerFactory.CreateLogger<ProcessSandboxProvider>());
+}
+
+static IncusSandboxProvider BuildIncus(
+    IServiceProvider sp,
+    ILoggerFactory loggerFactory,
+    ITimingStore? timings,
+    ISandboxResourceUsageStore? resourceUsageStore)
+{
+    var configLog = loggerFactory.CreateLogger("CodeyBox.Incus.Config");
+    var provider = new IncusSandboxProvider(
+        // The reloadable selector may route future work to another registered
+        // provider, while each Incus operation resolves the latest allowed
+        // settings. A live sandbox keeps the immutable IncusSandboxOptions
+        // snapshot captured when it was created, so a reload cannot change its
+        // project, pool, or device map halfway through teardown.
+        () =>
+        {
+            var live = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
+            var projects = sp.GetRequiredService<IOptionsMonitor<ProjectsOptions>>().CurrentValue;
+            var incus = live.Incus ?? new IncusSandboxConfig();
+            var baselineVerificationCommands = incus.UseBaselineImages
+                ? BaselineVerificationProbeBuilder.Build(
+                    live,
+                    projects,
+                    sp.GetServices<IInVmSmokeProbe>(),
+                    sp.GetService<InVmSmokeOptions>())
+                : Array.Empty<BaselineVerificationCommand>();
+            return IncusSandboxConfigMapper.Build(
+                live,
+                configLog,
+                baselineVerificationCommands);
+        },
+        loggerFactory.CreateLogger<IncusSandboxProvider>(),
+        timings,
+        resourceUsageStore);
+
+    LogDiskGuardBanner(provider, configLog);
+    return provider;
 }
 
 static MultipassSandboxProvider BuildMultipass(
@@ -724,7 +874,7 @@ static MultipassSandboxProvider BuildMultipass(
                     projects,
                     sp.GetServices<IInVmSmokeProbe>(),
                     sp.GetService<InVmSmokeOptions>())
-                : Array.Empty<MultipassBaselineVerificationCommand>();
+                : Array.Empty<BaselineVerificationCommand>();
             return new MultipassSandboxOptions
             {
                 ExtraCloudInit = live.MultipassExtraCloudInit,
@@ -743,19 +893,12 @@ static MultipassSandboxProvider BuildMultipass(
                     ? TimeSpan.FromSeconds(multipassSandbox.ResourceMetricsCaptureTimeoutSeconds)
                     : MultipassSandboxOptions.DefaultResourceMetricsCaptureTimeout,
                 DiskGuard = diskGuard,
-                PackageCacheSeeds = live.MultipassPackageCacheSeeds?.Select(s => new PackageCacheSeedOptions
-                {
-                    HostSourcePath = s.HostSourcePath,
-                    VmDestPath = s.VmDestPath,
-                    MaxSizeMB = s.MaxSizeMB
-                }).ToList() ?? [],
-                ExecutableProvisions = live.MultipassExecutableProvisions?.Select(e => new ExecutableProvisionOptions
-                {
-                    HostSourcePath = e.HostSourcePath,
-                    VmDestPath = e.VmDestPath,
-                    VmSymlinks = e.VmSymlinks?.ToList() ?? [],
-                    Label = e.Label,
-                }).ToList() ?? [],
+                PackageCacheSeeds = BaselineProvisioningConfigSnapshot.SnapshotPackageCacheSeeds(
+                    live.MultipassPackageCacheSeeds,
+                    "CodeyBox:MultipassPackageCacheSeeds"),
+                ExecutableProvisions = BaselineProvisioningConfigSnapshot.SnapshotExecutableProvisions(
+                    live.MultipassExecutableProvisions,
+                    "CodeyBox:MultipassExecutableProvisions"),
             };
         },
         loggerFactory.CreateLogger<MultipassSandboxProvider>(),
@@ -939,28 +1082,39 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new ClaudeAgentRunner(
     sp.GetRequiredService<ClaudeThinkingBlockSanitizerConfig>(),
     sp.GetRequiredService<CodeyBox.Core.AgentNetworkToleranceSnapshot>(),
     sp.GetRequiredService<IQuotaFailureClassifier>()));
-builder.Services.AddSingleton<IAgentRunner, CopilotAgentRunner>();
+// Copilot: subscription mode by default; setting CodeyBox:Copilot:Provider:BaseUrl switches inference
+// to an OpenAI-compatible endpoint (BYOK). The credential for that endpoint arrives through the
+// credential chain as COPILOT_PROVIDER_API_KEY, never from this configuration section.
+builder.Services.AddSingleton<IAgentRunner>(sp => new CopilotAgentRunner
+{
+    Options = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Copilot,
+});
 builder.Services.AddSingleton<IAgentRunner>(sp => new CodexAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>(),
     sp.GetRequiredService<CodeyBox.Core.AgentNetworkToleranceSnapshot>(),
     sp.GetRequiredService<IQuotaFailureClassifier>()));
-builder.Services.AddSingleton<IAgentRunner, GeminiAgentRunner>();
+builder.Services.AddSingleton<IAgentRunner>(sp => new GeminiAgentRunner(
+    sp.GetRequiredService<AgentDefaultsSnapshot>()));
 builder.Services.AddSingleton<IAgentRunner, CursorAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, OpencodeAgentRunner>();
-builder.Services.AddSingleton<IAgentRunner>(_ => new AntigravityAgentRunner
+builder.Services.AddSingleton<IAgentRunner>(sp => new AntigravityAgentRunner
 {
     // agy's built-in --print-timeout default (5m) aborts a one-shot session with
     // "timed out waiting for response" and zero changes the first time a single
     // gemini turn on a large work item exceeds it. Override with a generous,
     // operator-tunable budget. CodeyBox:Antigravity:PrintTimeoutMinutes (default 20).
     PrintTimeout = TimeSpan.FromMinutes(
-        builder.Configuration.GetValue<int?>("CodeyBox:Antigravity:PrintTimeoutMinutes") ?? 20),
+        sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Antigravity.PrintTimeoutMinutes),
 });
-// Crock: scaffolded and registered, but DISABLED in shipped agent-class config.
-// Operators opt in by adding `crock` to an AgentClass member list once the
-// dependent follow-up (cost/usage accounting, watchdog accommodation,
-// credential/tunnel provisioning) lands. See docs/agents.md (TBD section).
-builder.Services.AddSingleton<IAgentRunner, CrockAgentRunner>();
+// Crock: registered, but DISABLED in shipped agent-class config. Operators opt
+// in by adding `crock` to an AgentClass member list AND setting
+// CodeyBox:Crock:HostDaemonSocketPath to the on-host `crock daemon` Unix
+// socket. See the CrockCode section of docs/concepts/agents.md and CrockSandboxOptions
+// for the tunnel-model rationale and operator setup.
+builder.Services.AddSingleton<IAgentRunner>(sp => new CrockAgentRunner
+{
+    SandboxOptions = () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Crock,
+});
 builder.Services.AddSingleton<IAgentRegistry, AgentRegistry>();
 builder.Services.AddOptions<AgentPromptPreprocessingOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox:PromptPreprocessing"));
@@ -1042,24 +1196,28 @@ builder.Services.AddSingleton<CodeyBox.Agents.Claude.ClaudeSessionWorker>(sp =>
         .OfType<ClaudeAgentRunner>()
         .First();
 
-    // Resume hook: when the registered provider exposes the suspend/resume
-    // contract (multipass; not process / bubblewrap), bring the VM back up by
-    // delegating to its ResumeSandboxAsync. The AgentSessionSandboxRef.Id IS
-    // the multipass VM name (default sandboxRefFactory derives it from
-    // ISandbox.Id, which MultipassSandbox sets to the VM name). Non-suspending
-    // providers leave the hook unwired so a stop/resume cycle isn't attempted
-    // against them — ResumeSessionAsync then short-circuits the resume step.
+    // Provider identity is persisted with the sandbox reference so a live
+    // selector change cannot redirect an existing session to another backend.
     var provider = sp.GetService<ISandboxProvider>();
     Func<AgentSessionSandboxRef, CancellationToken, Task>? resumeHook = null;
     if (provider is ISuspendingSandboxProvider suspending)
-        resumeHook = (sandboxRef, ct) => suspending.ResumeSandboxAsync(sandboxRef.Id, ct);
+    {
+        resumeHook = (sandboxRef, ct) => AgentSessionSandboxRouting.ResumeAsync(
+            suspending,
+            // Provider-less durable references predate the Incus provider and
+            // were written when Multipass was the only resumable backend.
+            AgentSessionSandboxRouting.AddProviderScopeIfMissing(
+                sandboxRef,
+                SandboxProviderKinds.Multipass),
+            ct);
+    }
 
     return new CodeyBox.Agents.Claude.ClaudeSessionWorker(
         runner,
         sandboxReattacher: null,
         sandboxResumeHook: resumeHook,
         credentialProvider: sp.GetService<ICredentialProvider>(),
-        sandboxRefFactory: null,
+        sandboxRefFactory: AgentSessionSandboxRouting.CreateReference,
         metricsSink: sp.GetRequiredService<CodeyBox.Agents.Claude.IClaudeSessionMetricsSink>(),
         options: sp.GetRequiredService<CodeyBox.Agents.Claude.ClaudeSessionWorkerOptions>(),
         acpTransport: sp.GetRequiredService<CodeyBox.Agents.Claude.AcpClaudeTransport>(),
@@ -1092,7 +1250,7 @@ IReadOnlyList<LoadedPlugin>? preDiscoveredPlugins = null;
 // 2. Plugin ICredentialProvider implementations — inserted in discovery order
 //    (between OAuth-file and env-var). Vault-issued short-lived credentials
 //    are preferred over env-var fallbacks. Per-project ordering is expressed
-//    via Project.CredentialProviderPriority; see docs/credential-plugins.md.
+//    via Project.CredentialProviderPriority; see docs/extending/credential-plugins.md.
 // 3. CodexOAuthFileCredentialProvider and EnvironmentCredentialProvider —
 //    fallback providers. Codex host auth is deliberately after plugins so a
 //    project-selected credential plugin can isolate Codex credentials from the
@@ -1191,6 +1349,15 @@ if (opencodeAuthFilePath.StartsWith("~/", StringComparison.Ordinal))
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         opencodeAuthFilePath[2..]);
 
+var antigravityOAuthFilePath =
+    Environment.GetEnvironmentVariable("CODEYBOX_ANTIGRAVITY_OAUTH_FILE")
+    ?? builder.Configuration["CodeyBox:Antigravity:OAuthTokenFile"]
+    ?? Path.Combine(geminiHome, "antigravity-cli", "antigravity-oauth-token");
+if (antigravityOAuthFilePath.StartsWith("~/", StringComparison.Ordinal))
+    antigravityOAuthFilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        antigravityOAuthFilePath[2..]);
+
 // Optional override for where the sandbox-side credential file gets written.
 // Operators who confirm a different `opencode auth login` destination set
 // CODEYBOX_OPENCODE_AUTH_DEST on the host; the runner uses this value as the
@@ -1222,6 +1389,10 @@ builder.Services.AddSingleton(sp => new CursorCredentialFileSource(
     watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
 builder.Services.AddSingleton(sp => new OpencodeCredentialFileSource(
     opencodeAuthFilePath,
+    sp.GetService<ILogger<CredentialFileSource>>(),
+    watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
+builder.Services.AddSingleton(sp => new AntigravityCredentialFileSource(
+    antigravityOAuthFilePath,
     sp.GetService<ILogger<CredentialFileSource>>(),
     watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
 
@@ -1264,7 +1435,7 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
     // Gemini (Google AI Studio / Code Assist) OAuth files. The CLI hard-reads
     // ~/.gemini/{oauth_creds,settings}.json — there's no env-var alternative
     // for OAuth-personal — so the orchestrator ships their contents to the
-    // sandbox via env vars and GeminiAgentRunner.PrepareSandboxAsync writes
+        // sandbox via env vars and GeminiAgentRunner's shared credential lifecycle writes
     // them back to ~/.gemini/ inside the VM.
     builtInFirst.Add(new GeminiOAuthFileCredentialProvider(
         sp.GetRequiredService<GeminiOAuthCredentialFileSource>(),
@@ -1309,6 +1480,17 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
     builtInLast.Add(new EnvironmentCredentialProvider(new[]
     {
         new AgentCredentialMapping(AgentKind.Copilot, "CODEYBOX_COPILOT_TOKEN", "GH_TOKEN"),
+        // BYOK: the key for the operator-configured OpenAI-compatible endpoint. Kept in the credential
+        // chain rather than CodeyBox:Copilot so the secret never lands in a config file. Absent in
+        // subscription mode, and absent for local servers that need no key.
+        new AgentCredentialMapping(
+            AgentKind.Copilot,
+            "CODEYBOX_COPILOT_PROVIDER_API_KEY",
+            CopilotAgentRunner.ProviderApiKeyEnvironmentVariable),
+        new AgentCredentialMapping(
+            AgentKind.Copilot,
+            "CODEYBOX_COPILOT_PROVIDER_BEARER_TOKEN",
+            CopilotAgentRunner.ProviderBearerTokenEnvironmentVariable),
         new AgentCredentialMapping(AgentKind.Codex, "CODEYBOX_CODEX_API_KEY", "OPENAI_API_KEY"),
         new AgentCredentialMapping(AgentKind.Gemini, "CODEYBOX_GEMINI_API_KEY", "GEMINI_API_KEY"),
         // Cursor: the CLI uses subscription auth via ~/.cursor/credentials.json
@@ -1318,10 +1500,14 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // when an operator wants to inject the JSON directly via env var
         // without an on-host credential file.
         new AgentCredentialMapping(AgentKind.Cursor, "CODEYBOX_CURSOR_AUTH_JSON", "CODEYBOX_CURSOR_AUTH_JSON"),
+        // Note: Crock is NOT in this verbatim mapping. The crock provider needs to
+        // attach a bind-mount (the host crock daemon Unix socket) alongside the
+        // config env var, which only CrockEnvironmentCredentialProvider (registered
+        // separately) can do.
         // Note: no OPENCODE_API_KEY mapping. The opencode subscription IS the
         // credential path; auth flows exclusively through the auth.json file
         // materialised by OpencodeOAuthFileCredentialProvider. See the brief
-        // for the relevant 'Don't do' rule and docs/agents.md for setup.
+        // for the relevant 'Don't do' rule and docs/concepts/agents.md for setup.
         // Note: Antigravity is NOT in this verbatim mapping. The agy CLI's
         // OAuth token bundle is shipped to the sandbox by the dedicated
         // AntigravityEnvironmentCredentialProvider registered separately below.
@@ -1335,6 +1521,15 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
     // strip the refresh_token — agy has no other in-VM refresh path.)
     builtInLast.Add(new AntigravityEnvironmentCredentialProvider(
         sp.GetService<ILogger<AntigravityEnvironmentCredentialProvider>>()));
+    // Crock: pay-per-token Anthropic API key path. The dedicated provider ships
+    // the full CrockCode config JSON into the sandbox AND attaches a bind-mount
+    // for the host-side `crock daemon` Unix socket (in-VM tunnels are
+    // fundamentally incompatible with the sandbox network model — see
+    // CrockSandboxOptions for the full rationale). The accessor is resolved per
+    // pickup so hot-reloading CodeyBox:Crock takes effect without restarting.
+    builtInLast.Add(new CrockEnvironmentCredentialProvider(
+        sandboxOptions: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Crock,
+        sp.GetService<ILogger<CrockEnvironmentCredentialProvider>>()));
     builtInLast.Add(new EnvironmentCredentialProvider(new[]
     {
         // Also accept the conventional OpenAI SDK variable. This keeps Codex
@@ -1463,6 +1658,11 @@ builder.Services.AddSingleton<IGeminiQuotaTokenSource>(sp =>
             ?? config["CodeyBox:GeminiOauthClientSecret"],
         cliTokenRefresher: GeminiOauthCredentialFileRefresher.TryCreateCliRefreshHandler());
 });
+builder.Services.AddSingleton<IAntigravityQuotaTokenSource>(sp => new AntigravityOauthCredentialFileRefresher(
+    sp.GetRequiredService<AntigravityCredentialFileSource>(),
+    sp.GetRequiredService<IHttpClientFactory>(),
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<AntigravityOauthCredentialFileRefresher>(),
+    cliRunner: AntigravityOauthCredentialFileRefresher.TryCreateCliRefreshHandler()));
 
 // Every quota probe is wrapped so paused members use a longer polling cadence,
 // then transient blips serve the most recent real reading (bounded by the
@@ -1578,7 +1778,10 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
                 codexAuth.AccountId ?? Environment.GetEnvironmentVariable("CODEYBOX_CODEX_ACCOUNT_ID"));
         }) ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
-        loggerFactory.CreateLogger<CodexQuotaProbe>());
+        loggerFactory.CreateLogger<CodexQuotaProbe>(),
+        // Config-sourced routed-default model: lets the subscription-bucket alias
+        // target follow CodeyBox:AgentDefaults[codex] instead of a source literal.
+        sp.GetRequiredService<AgentDefaultsSnapshot>());
     return WireQuotaProbeTokenInvalidation(WrapQuotaProbe(probe, sp), source);
 });
 // Gemini OAuth-subscription path (Code Assist Individual / AI Pro / AI Ultra).
@@ -1625,11 +1828,31 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 // (UseObservedFailures) for opencode members. Replace with a real
 // HTTP-backed probe once an endpoint is confirmed.
 builder.Services.AddSingleton<IAgentQuotaProbe>(sp => WrapQuotaProbe(new OpencodeQuotaProbe(), sp));
-// Crock: ships as Unknown-only. Cost/usage accounting against Anthropic's
-// Message Batches API is part of the dependent follow-up; until then the
-// router falls onto its QuotaUnknownPolicy (UseObservedFailures) for any
-// crock member operators opt in.
-builder.Services.AddSingleton<IAgentQuotaProbe>(sp => WrapQuotaProbe(new CrockQuotaProbe(), sp));
+// Crock: pay-per-token Anthropic API key (with ~50% batch discount applied at
+// billing time). Anthropic exposes no per-key remaining-credit endpoint, so the
+// probe hits the token-free `GET /v1/models` to validate the key and surfaces
+// 100% / 0% / Unknown based on the HTTP shape. Spend gating lives in the
+// configured AgentBudgetProvider; the router takes MIN(probe, budget).
+//
+// IMPORTANT: this path uses the configured CrockCode API key only. There is no
+// fallback to a subscription OAuth token — calling api.anthropic.com with a
+// subscription token would (a) charge against the wrong account and (b)
+// surface a different quota meter than the one the dispatch actually rides.
+builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
+{
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var probe = new CrockQuotaProbe(
+        sp.GetRequiredService<IHttpClientFactory>(),
+        member => AgentInstanceCredentialResolver.ResolveQuotaCredentials(
+            member,
+            () => new AgentQuotaCredentials(
+                CrockQuotaProbe.TryExtractApiKey(
+                    Environment.GetEnvironmentVariable("CODEYBOX_CROCK_CONFIG_JSON"))))
+            ?? new AgentQuotaCredentials(null),
+        sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
+        loggerFactory.CreateLogger<CrockQuotaProbe>());
+    return WrapQuotaProbe(probe, sp);
+});
 // Antigravity: the agy gateway exposes NO readable per-model quota meter
 // (daily-cloudcode-pa :retrieveUserQuota* return 403), so the probe uses
 // :loadCodeAssist as a free authorization/tier liveness read (200 ⇒ available)
@@ -1642,21 +1865,61 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     var source = sp.GetRequiredService<GeminiOAuthCredentialFileSource>();
+    var antigravitySource = sp.GetRequiredService<AntigravityCredentialFileSource>();
+    var tokenSource = sp.GetRequiredService<IAntigravityQuotaTokenSource>();
     var probe = new AntigravityQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         member => AgentInstanceCredentialResolver.ResolveQuotaCredentials(
             member,
             () => new AgentQuotaCredentials(
-                CredentialFileTokenExtractor.ExtractGeminiAccessToken(source.GetRaw())
-                    ?? CredentialFileTokenExtractor.ExtractGeminiAccessToken(
+                tokenSource.GetAccessTokenAsync(CancellationToken.None).ConfigureAwait(false).GetAwaiter().GetResult()
+                    ?? ReadAntigravityTokenFile(antigravitySource.FilePath)
+                    ?? ReadAntigravityTokenFile(
+                        sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>()
+                            .CurrentValue.Antigravity.OAuthTokenFile)
+                    ?? CredentialFileTokenExtractor.ExtractGeminiAccessToken(source.GetRaw())
+                    // The agy bundle nests its token ({"token":{"access_token":…}}), so the gemini
+                    // extractor — which only reads a flat top-level access_token — always returned
+                    // null here. The probe then reported "no token configured", the router treated
+                    // that as UNKNOWN, and agy dispatched with no quota gate at all.
+                    ?? CredentialFileTokenExtractor.ExtractAntigravityAccessToken(
                         Environment.GetEnvironmentVariable(AntigravityConstants.OAuthCredsEnvVar))
                     ?? Environment.GetEnvironmentVariable("CODEYBOX_ANTIGRAVITY_OAUTH_TOKEN")
                     ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_TOKEN")))
             ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
-        loggerFactory.CreateLogger<AntigravityQuotaProbe>());
-    return WireQuotaProbeTokenInvalidation(WrapQuotaProbe(probe, sp), source);
+        loggerFactory.CreateLogger<AntigravityQuotaProbe>(),
+        timeProvider: null,
+        quotaUserAgent: sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>()
+            .CurrentValue.Antigravity.QuotaUserAgent);
+    var wrapped = WrapQuotaProbe(probe, sp);
+    source.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
+    antigravitySource.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
+    return wrapped;
 });
+
+// Reads the agy OAuth bundle from disk for the quota probe. Bounded and failure-tolerant: an
+// absent, unreadable, oversized or malformed file simply yields null so the caller falls through to
+// its other credential sources rather than throwing inside a probe.
+static string? ReadAntigravityTokenFile(string? path)
+{
+    const int MaxTokenFileBytes = 64 * 1024;
+    if (string.IsNullOrWhiteSpace(path))
+        return null;
+
+    try
+    {
+        var info = new FileInfo(path);
+        if (!info.Exists || info.Length > MaxTokenFileBytes)
+            return null;
+
+        return CredentialFileTokenExtractor.ExtractAntigravityAccessToken(File.ReadAllText(path));
+    }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
+    {
+        return null;
+    }
+}
 
 // --- Agent class router ------------------------------------------------------
 builder.Services.AddSingleton<AgentClassRouter>(sp =>
@@ -1950,6 +2213,12 @@ builder.Services.AddSingleton<IAgentModelListProbe, CursorModelListProbe>();
 // :retrieveUserQuota* and :fetchAvailableModels). The curated
 // AntigravityKnownModels list is authoritative, so the probe just returns it.
 builder.Services.AddSingleton<IAgentModelListProbe, AntigravityModelListProbe>();
+// Crock model-list probe: the crock CLI does not expose a `crock models`
+// command and Anthropic's /v1/models returns the on-demand catalog (not the
+// batch-eligible subset CrockCode supports), so the probe returns the curated
+// CrockKnownModels list. Operator-configured ids that are absent surface as
+// a startup warning, not a hard reject.
+builder.Services.AddSingleton<IAgentModelListProbe, CrockModelListProbe>();
 builder.Services.AddHostedService<AgentClassConfigValidator>();
 
 builder.Services.AddSingleton<SmokeOptions>(sp =>
@@ -2118,8 +2387,24 @@ builder.Services.AddSingleton<IProjectRepository>(sp => new ProjectRepository(
     sp.GetRequiredService<IOptionsMonitor<ProjectsOptions>>(),
     sp.GetRequiredService<ILogger<ProjectRepository>>(),
     sp.GetService<PresetCatalogOptions>(),
-    sp.GetRequiredService<IKnobRegistry>()));
+    sp.GetRequiredService<IKnobRegistry>(),
+    sp.GetService<IDeploymentDriverRegistry>()));
 builder.Services.AddSingleton<IUpstreamRemoteFactory, UpstreamRemoteFactory>();
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddSingleton<GitHubAppConnectState>();
+// Read the store path from the final service-provider configuration. Test hosts
+// add their configuration sources after this registration code has run; reading
+// builder.Configuration here would ignore their isolated writable store path.
+builder.Services.AddSingleton(sp =>
+{
+    var configuration = sp.GetRequiredService<IConfiguration>();
+    return new GitHubAppStore(
+        configuration["CodeyBox:GitHubAppStorePath"]
+            ?? Environment.GetEnvironmentVariable("CODEYBOX_GITHUB_APP_STORE")
+            ?? (builder.Environment.IsProduction()
+                ? "/var/lib/codeybox/github-apps"
+                : Path.Combine(Path.GetTempPath(), $"codeybox-github-apps-{Environment.ProcessId}")));
+});
 builder.Services.AddSingleton(_ =>
 {
     var options = builder.Configuration.GetSection("CodeyBox:Presets").Get<PresetCatalogOptions>()
@@ -2153,15 +2438,25 @@ static Func<TestRunOptions> DotnetTestRunOptionsAccessor(IServiceProvider sp)
 // same hot-reloadable PipelineTuningSnapshot.
 builder.Services.AddSingleton<Func<TestRunOptions>>(DotnetTestRunOptionsAccessor);
 
+// Hot-reloadable test-failure-attribution snapshot sourced from CodeyBoxOptions.
+// Rebuilt on IOptionsMonitor emissions by AgentConfigHotReload so a
+// configuration edit takes effect without a process restart.
+builder.Services.AddSingleton<TestFailureAttributionOptionsSnapshot>(sp =>
+{
+    var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new TestFailureAttributionOptionsSnapshot(cbOpts.TestFailureAttribution);
+});
+
 builder.Services.AddSingleton<IPresetCatalog>(sp => new PresetCatalog(
     sp.GetRequiredService<PresetCatalogOptions>(),
-    sp.GetRequiredService<Func<TestRunOptions>>()));
+    sp.GetRequiredService<Func<TestRunOptions>>(),
+    sp.GetRequiredService<TestFailureAttributionOptionsSnapshot>()));
 
 // The canonical dotnet-test runner, registered so the ITestSelector seam
 // (a separate work item) can resolve ITestRunnerAuditor from DI and enumerate
 // its TestSuiteDescriptor. The preset catalog builds its own instance for the
 // audit run from the csharp language YAML; this registration mirrors that
-// command with the same hot-reloadable run options.
+// command with the same hot-reloadable run options and attribution snapshot.
 builder.Services.AddSingleton<ITestRunnerAuditor>(sp => new DotnetTestAuditor(new DotnetTestAuditorOptions
 {
     Name = "csharp:test-pass",
@@ -2170,7 +2465,27 @@ builder.Services.AddSingleton<ITestRunnerAuditor>(sp => new DotnetTestAuditor(ne
     Role = AuditorRole.BuildTestGate,
     BuildTestGateEvidence = BuildTestGateEvidence.Test,
     RunOptionsAccessor = sp.GetRequiredService<Func<TestRunOptions>>(),
+    TestFailureAttributionOptions = sp.GetRequiredService<TestFailureAttributionOptionsSnapshot>(),
 }));
+
+// Test-selection seam. ConfiguredTestSelector reads Audit:TestSelection:Mode live
+// from IOptionsMonitor on every call (hot-reload) and dispatches to the selector
+// registered for that mode; the default 'all' maps to RunAllTestSelector, whose
+// TestSelection.All keeps the emitted dotnet-test command byte-identical to the
+// legacy path. The merge/release verification path (IRequiredBuildVerifier /
+// process:required-build) deliberately takes NO dependency on this seam: it always
+// verifies the full build/test surface regardless of Mode.
+builder.Services.AddSingleton<ITestSelector>(sp =>
+{
+    var modeMonitor = sp.GetRequiredService<IOptionsMonitor<TestSelectionOptions>>();
+    var selectorsByMode = new Dictionary<TestSelectionMode, ITestSelector>
+    {
+        [TestSelectionMode.All] = new RunAllTestSelector(),
+    };
+    return new ConfiguredTestSelector(
+        () => TestSelectionModeParser.Parse(modeMonitor.CurrentValue.Mode),
+        selectorsByMode);
+});
 builder.Services.AddSingleton<IAuditor, GraphicalSmokeAuditor>();
 builder.Services.AddSingleton<IAuditor>(sp => new BuildScriptAuditor(
     () => sp.GetRequiredService<IOptionsMonitor<BuildScriptAuditorOptions>>().CurrentValue));
@@ -2246,6 +2561,8 @@ builder.Services.AddSingleton<Func<PlanAdherenceAuditorOptions>>(sp =>
     return () => monitor.CurrentValue;
 });
 
+builder.Services.AddSingleton(new RequiredAuditorPolicy(
+    builder.Configuration.GetSection("CodeyBox:RequiredAuditors").Get<string[]>() ?? []));
 builder.Services.AddSingleton<ProjectAuditorComposer>();
 builder.Services.AddSingleton<ProjectMechanicalFixerComposer>();
 
@@ -2428,7 +2745,7 @@ builder.Services.AddSingleton<IChangelogGenerator>(sp =>
             throw new InvalidOperationException(
                 "CodeyBox:Changelog:GitHubWebhookSecretEnvVar must be configured in non-Development environments. " +
                 "Set it to the name of the environment variable holding the HMAC-SHA256 webhook secret " +
-                "(see docs/changelog-automation.md).");
+                "(see docs/operating/releases.md).");
         }
     }
 }
@@ -2447,7 +2764,8 @@ builder.Services.AddSingleton<IAgentSupervisionNotifier>(sp =>
 builder.Services.AddSingleton<IAgentSupervisionService>(sp => new AgentSupervisionService(
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.AgentSupervision,
     sp.GetRequiredService<IAgentSupervisionNotifier>(),
-    sp.GetRequiredService<ILogger<AgentSupervisionService>>()));
+    sp.GetRequiredService<ILogger<AgentSupervisionService>>(),
+    Log.Logger));
 
 // --- Audit timeline reader ---------------------------------------------------
 builder.Services.AddSingleton(sp =>
@@ -2472,7 +2790,10 @@ builder.Services.AddSingleton<SqliteWorkItemStore>(sp =>
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteWorkItemStore(
         opts.StateDatabasePath,
-        writeGateFactory: sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
+        writeGateFactory: sp.GetRequiredService<SqliteDatabaseWriteGateFactory>(),
+        // Lazy accessor: the failure-event store points at the same file and is
+        // resolved on demand so the two stores have no construction-order coupling.
+        failureEventStore: () => sp.GetService<IFailureEventStore>());
 });
 builder.Services.AddSingleton<IWorkItemStore>(sp => sp.GetRequiredService<SqliteWorkItemStore>());
 builder.Services.AddSingleton<IAuditProgressStore>(sp => sp.GetRequiredService<SqliteWorkItemStore>());
@@ -2546,6 +2867,37 @@ builder.Services.AddSingleton<E2eRunCancellationRegistry>();
 // for development only.
 builder.Services.AddSingleton<IE2eExecutionPool>(BuildE2eExecutionPool);
 builder.Services.AddHostedService<E2eRunDispatcher>();
+// Post-implementation e2e-replay gate. The verifier enqueues a replay run and
+// observes it via the same IE2eRunStore the dispatcher drains (cheap-CPU E2E
+// pool, never the coding fleet). The gate authors missing replays through the
+// optional IE2eReplayAuthoringDriver seam — resolved via GetService so the gate
+// degrades to fail-closed (a declared case with no working replay blocks) when
+// no deployment-specific driver is wired. Both are consumed by PipelineRunner
+// and self-gate on E2eReplayAuthoringOptions.Enabled (off by default).
+builder.Services.AddSingleton<IE2eReplayVerifier>(sp => new E2eRunReplayVerifier(
+    sp.GetRequiredService<IE2eRunStore>(),
+    sp.GetRequiredService<IOptionsMonitor<E2eReplayAuthoringOptions>>(),
+    logger: sp.GetRequiredService<ILogger<E2eRunReplayVerifier>>()));
+builder.Services.AddSingleton<WorkItemE2eReplayGate>(sp => new WorkItemE2eReplayGate(
+    sp.GetRequiredService<ITestCaseStore>(),
+    sp.GetRequiredService<IE2eReplayVerifier>(),
+    sp.GetRequiredService<IOptionsMonitor<E2eReplayAuthoringOptions>>(),
+    driver: sp.GetService<IE2eReplayAuthoringDriver>(),
+    logger: sp.GetRequiredService<ILogger<WorkItemE2eReplayGate>>()));
+// Best-effort JobTrack test-case export: an item's CodeyBox test cases are
+// pushed to JobTrack on the terminal Done transition, but only for projects that
+// opt in (Project.JobTrackExport.Enabled). The HTTP client is a named factory
+// client so its handler/timeout are shared and the bearer token stays per-request.
+builder.Services.AddHttpClient(HttpJobTrackTestCaseClient.HttpClientName, client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(30);
+});
+builder.Services.AddSingleton<IJobTrackTestCaseClient>(sp => new HttpJobTrackTestCaseClient(
+    sp.GetRequiredService<IHttpClientFactory>()));
+builder.Services.AddSingleton<IJobTrackTestCaseExporter>(sp => new JobTrackTestCaseExporter(
+    sp.GetRequiredService<ITestCaseStore>(),
+    sp.GetRequiredService<IJobTrackTestCaseClient>(),
+    sp.GetRequiredService<ILogger<JobTrackTestCaseExporter>>()));
 builder.Services.AddSingleton<IAuditReportStore>(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -2555,8 +2907,19 @@ builder.Services.AddSingleton<IAuditReportStore>(sp =>
 });
 builder.Services.AddSingleton<ITimingStore>(sp =>
 {
+    // Timing rows have a foreign key to work_items. Ensure the primary store
+    // has initialized that shared schema even when a sandbox provider resolves
+    // ITimingStore before any endpoint resolves IWorkItemStore.
+    _ = sp.GetRequiredService<SqliteWorkItemStore>();
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     return new SqliteTimingStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
+});
+builder.Services.AddSingleton<IFailureEventStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteFailureEventStore(
         opts.StateDatabasePath,
         sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
@@ -2649,7 +3012,8 @@ builder.Services.AddSingleton<DeadWorkerReaper>(sp =>
         () => monitor.CurrentValue.DeadWorker,
         sp.GetRequiredService<ILogger<DeadWorkerReaper>>(),
         sp.GetRequiredService<IWebhookDispatcher>(),
-        startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>());
+        startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>(),
+        cancellationRegistry: sp.GetRequiredService<CancellationRegistry>());
 });
 
 // --- Worker progress watchdog -----------------------------------------------
@@ -2683,7 +3047,8 @@ builder.Services.AddSingleton<WorkerProgressWatchdog>(sp =>
         sp.GetService<IAgentStreamStore>(),
         sp.GetService<IWebhookDispatcher>(),
         startupRecoveryBarrier: sp.GetRequiredService<IStartupInitialRecoveryBarrier>(),
-        activitySource: sp.GetRequiredService<IWorkerProgressActivitySource>());
+        activitySource: sp.GetRequiredService<IWorkerProgressActivitySource>(),
+        cancellationRegistry: sp.GetRequiredService<CancellationRegistry>());
 });
 
 // --- Per-item stale-updatedAt watchdog --------------------------------------
@@ -2748,6 +3113,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
         [AgentKind.Opencode] = new OpencodeCostExtractor(),
         [AgentKind.Copilot] = new CopilotCostExtractor(),
         [AgentKind.Antigravity] = new AntigravityCostExtractor(),
+        [AgentKind.Crock] = new CrockCostExtractor(),
     };
     // Warn once at startup for registered agents with no extractor.
     foreach (var kind in registry.Available)
@@ -2761,7 +3127,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
 // Bundled per-(agent, model) pricing defaults shipped with CodeyBox so new
 // installs get cost reporting without the operator hand-populating every
 // entry from provider docs. Operator config under CodeyBox:AgentPricing
-// always wins per (agentKind, modelId). See docs/agent-pricing.md.
+// always wins per (agentKind, modelId). See docs/operating/costs.md.
 builder.Services.AddSingleton<AgentPricingDefaultsSnapshot>(sp =>
 {
     var env = sp.GetRequiredService<IHostEnvironment>();
@@ -2803,9 +3169,18 @@ builder.Services.AddSingleton<AgentStreamsOptions>(sp =>
     return opts;
 });
 builder.Services.AddSingleton<IAgentStreamStore>(sp =>
-    new AgentStreamStore(
-        sp.GetRequiredService<AgentStreamsOptions>(),
-        sp.GetRequiredService<ILogger<AgentStreamStore>>()));
+{
+    // Resolve the AgentStreamsOptions singleton once to run ValidateAtStartup
+    // (directory writability probe + startup log), then read numeric knobs
+    // (RetainedDays, MaxTotalSizeMb, MaxFileSizeMb) live from IOptionsMonitor so
+    // retention/size caps hot-reload without a restart. Path is pinned by the
+    // hot-reload guard, so reading it live is equivalent to the snapshot.
+    _ = sp.GetRequiredService<AgentStreamsOptions>();
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    return new AgentStreamStore(
+        () => monitor.CurrentValue.AgentStreams,
+        sp.GetRequiredService<ILogger<AgentStreamStore>>());
+});
 builder.Services.AddSingleton(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AgentStreamAnalysis;
@@ -2866,6 +3241,7 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, OpencodeQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();
+builder.Services.AddSingleton<IAgentQuotaFailureDetector, CopilotQuotaFailureDetector>();
 builder.Services.AddSingleton<IQuotaFailureClassifier>(sp =>
     new CompositeQuotaFailureClassifier(sp.GetServices<IAgentQuotaFailureDetector>()));
 builder.Services.AddSingleton<IAgentAuthFailureClassifier>(sp =>
@@ -3014,7 +3390,9 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     authRequiredReader: sp.GetRequiredService<IAgentAuthRequiredAvailabilityReader>(),
     testCaseStore: sp.GetService<ITestCaseStore>(),
     mergeScopeResolver: sp.GetRequiredService<IMergeScopeResolver>(),
-    quotaAvailabilityPublisher: sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>()));
+    quotaAvailabilityPublisher: sp.GetRequiredService<IAgentQuotaAvailabilityPublisher>(),
+    e2eReplayGate: sp.GetService<WorkItemE2eReplayGate>(),
+    jobTrackExporter: sp.GetService<IJobTrackTestCaseExporter>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 
 builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler(
@@ -3040,7 +3418,8 @@ builder.Services.AddSingleton<QuotaRetryScheduler>(sp => new QuotaRetryScheduler
     },
     quotaAvailabilitySignal: sp.GetRequiredService<IAgentQuotaAvailabilitySignal>(),
     agentAvailabilityRecoverySignal: sp.GetRequiredService<IAgentAvailabilityRecoverySignal>(),
-    pauseSignal: sp.GetRequiredService<IAgentPauseSignal>()));
+    pauseSignal: sp.GetRequiredService<IAgentPauseSignal>(),
+    auditLogger: Log.Logger));
 builder.Services.AddSingleton<TransientRetryScheduler>(sp => new TransientRetryScheduler(
     sp.GetRequiredService<IWorkItemStore>(),
     sp.GetRequiredService<WorkItemRetrier>(),
@@ -3197,7 +3576,12 @@ builder.Services.AddSingleton<ReleaseService>(sp => new ReleaseService(
     promptPreprocessors: sp.GetRequiredService<AgentPromptPreprocessorChain>(),
     authFailureClassifier: sp.GetRequiredService<IAgentAuthFailureClassifier>(),
     authAvailability: sp.GetRequiredService<IAgentAuthAvailabilityRegistry>(),
-    authRequiredHandler: sp.GetRequiredService<IAgentAuthRequiredHandler>()));
+    authRequiredHandler: sp.GetRequiredService<IAgentAuthRequiredHandler>(),
+    deepAuditFailurePersistenceOptions: () => sp
+        .GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>()
+        .CurrentValue
+        .DeepAuditFailurePersistence,
+    timeProvider: sp.GetService<TimeProvider>() ?? TimeProvider.System));
 
 builder.Services.AddHostedService(sp => new ReleaseMainSyncService(
     sp.GetRequiredService<IReleaseStore>(),
@@ -3241,7 +3625,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     dispatchAvailability: sp.GetRequiredService<IAgentDispatchAvailability>(),
     knobRegistry: sp.GetRequiredService<IKnobRegistry>(),
     quotaRetryDispatchPromoter: sp.GetRequiredService<IQuotaRetryDispatchPromoter>(),
-    quotaRetryAdmissionRouter: sp.GetRequiredService<IQuotaRetryAdmissionRouter>()));
+    quotaRetryAdmissionRouter: sp.GetRequiredService<IQuotaRetryAdmissionRouter>(),
+    failureTracker: sp.GetRequiredService<BackgroundServiceFailureTracker>()));
 builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<IRefactorProjectGateStatusProvider>(
@@ -3368,6 +3753,7 @@ builder.Services.AddSingleton<AgentConfigHotReload>(sp =>
         quotaRouterOptions: sp.GetRequiredService<QuotaRouterOptions>(),
         coverage: sp.GetService<IInVmSmokeCoveragePolicy>(),
         smokeOptions: sp.GetRequiredService<SmokeOptionsSnapshot>(),
+        testFailureAttribution: sp.GetRequiredService<TestFailureAttributionOptionsSnapshot>(),
         pauses: sp.GetRequiredService<IAgentPauseController>(),
         agents: sp.GetRequiredService<IAgentRegistry>(),
         transitionHealth: sp.GetRequiredService<TransitionHealthOptionsSnapshot>(),
@@ -3401,7 +3787,7 @@ builder.Services.AddSingleton<IHostSmokeProbeRunner>(sp => sp.GetRequiredService
 // against this extension point is the statistics plugin's quota sampler — but
 // the host is sampler-agnostic; further plugins (throughput, audit pass rate,
 // cost-over-time) can register additional IMetricSampler implementations.
-// See docs/plugins.md (IMetricSampler) and docs/statistics-plugin.md.
+// See docs/extending/plugins.md (IMetricSampler) and docs/extending/statistics-plugin.md.
 builder.Services.AddHostedService<MetricSamplerHost>();
 builder.Services.AddHostedService(sp => new AuditAgentStartupValidationService(
     sp.GetRequiredService<IProjectRepository>(),
@@ -3454,6 +3840,58 @@ builder.Services.AddSingleton<SandboxLeakReaper>(sp =>
         leakSink: sp.GetRequiredService<LeakDetectionSink>());
 });
 builder.Services.AddHostedService(sp => sp.GetRequiredService<SandboxLeakReaper>());
+
+// --- Verification deployment drivers + manager -------------------------------
+// Built ONLY as the deployment abstraction (chain link 1) — no pipeline/audit
+// integration yet. Drivers are DI-resolved by their Kind via
+// DeploymentDriverRegistry, so a new kind is one new IDeploymentDriver
+// registration + recipe schema entry with zero core changes (per AGENTS.md
+// declared-capability pattern). The leak reaper sweeps managed sandboxes
+// whose deployment owner no longer exists in the manager's active set
+// (orchestrator restart, aborted deploy) — sibling to SandboxLeakReaper.
+builder.Services.AddSingleton<IDeploymentDriver, WebAppDeploymentDriver>();
+builder.Services.AddSingleton<IDeploymentDriver, DaemonDeploymentDriver>();
+builder.Services.AddSingleton<IDeploymentDriver, CliDeploymentDriver>();
+builder.Services.AddSingleton<IDeploymentDriver, LibraryDeploymentDriver>();
+builder.Services.AddSingleton<SandboxDeploymentSubstrateProvider>(sp =>
+    new SandboxDeploymentSubstrateProvider(sp.GetRequiredService<ISandboxProvider>()));
+builder.Services.AddSingleton<IDeploymentSubstrateProvider>(sp =>
+    sp.GetRequiredService<SandboxDeploymentSubstrateProvider>());
+builder.Services.AddSingleton<IDeploymentCleanupProvider>(sp =>
+    sp.GetRequiredService<SandboxDeploymentSubstrateProvider>());
+builder.Services.AddSingleton<IDeploymentDriverRegistry, DeploymentDriverRegistry>();
+builder.Services.AddSingleton<IDeploymentManager>(sp => new DeploymentManager(
+    sp.GetRequiredService<IDeploymentDriverRegistry>(),
+    sp.GetRequiredService<ILogger<DeploymentManager>>()));
+builder.Services.AddSingleton<DeploymentLeakReaper>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    // The work-item store holds the authoritative SuspendedVmName index — every
+    // VM the startup resume handler is going to multipass-start back to Running
+    // after an orchestrator restart. Without this filter, the deployment reaper
+    // would purge those VMs at LeakAgeThreshold even though SandboxLeakReaper
+    // explicitly preserves them via the same index.
+    var store = sp.GetRequiredService<IWorkItemStore>();
+    Func<CancellationToken, Task<IReadOnlySet<string>>> suspendedNames = async ct =>
+    {
+        var set = new HashSet<string>(StringComparer.Ordinal);
+        await foreach (var item in store.ListSuspendedAsync(ct).ConfigureAwait(false))
+        {
+            if (string.IsNullOrWhiteSpace(item.SuspendedVmName)) continue;
+            if (WorkItemDependencies.TerminalStates.Contains(item.State)) continue;
+            set.Add(item.SuspendedVmName!);
+        }
+        return set;
+    };
+    return new DeploymentLeakReaper(
+        sp.GetRequiredService<IDeploymentCleanupProvider>(),
+        sp.GetRequiredService<IDeploymentManager>(),
+        () => monitor.CurrentValue.DeploymentLeak,
+        sp.GetRequiredService<ILogger<DeploymentLeakReaper>>(),
+        clock: null,
+        suspendedNameProvider: suspendedNames);
+});
+builder.Services.AddHostedService(sp => sp.GetRequiredService<DeploymentLeakReaper>());
 
 // --- B1 baseline-image reaper ------------------------------------------------
 // Reference-counted GC for content-hashed Multipass baseline VMs. The reaper
@@ -3509,7 +3947,7 @@ builder.Services.AddHostedService(sp =>
 // Discovers assemblies from CodeyBox:Plugins, registers plugin types under
 // their Core interfaces before the container is frozen, then runs
 // IPluginInitializer.InitializeAsync at startup via PluginInitializationService.
-// See docs/plugins.md for author guidance, allowlist config, and threat model.
+// See docs/extending/plugins.md for author guidance, allowlist config, and threat model.
 preDiscoveredPlugins = builder.Services.AddCodeyBoxPlugins(builder.Configuration);
 
 var app = builder.Build();
@@ -3559,10 +3997,13 @@ var prometheusOpts = builder.Configuration
 var prometheusAnonymousPaths = (prometheusOpts.Enabled && !prometheusOpts.RequireApiKey)
     ? new[] { prometheusOpts.Path }
     : Array.Empty<string>();
+var anonymousExactPaths = prometheusAnonymousPaths
+    .Concat(["/github-app/start", "/github-app/callback"])
+    .ToArray();
 
 app.UseApiKeyAuth(
     anonymousPrefixes: ["/healthz", "/webhooks/"],
-    anonymousExactPaths: prometheusAnonymousPaths);
+    anonymousExactPaths: anonymousExactPaths);
 
 // Idempotency-Key support for mutating endpoints — see IdempotencyMiddleware
 // for behaviour. Ordered after auth so unauthenticated requests can't poison
@@ -3575,12 +4016,15 @@ E2eRunEndpoints.Map(app);
 WorkItemAttachmentEndpoints.Map(app);
 TaskTemplateEndpoints.Map(app);
 WorkItemTimingsEndpoints.Map(app);
+WorkItemFailureEventsEndpoints.Map(app);
 WorkItemCostsEndpoints.Map(app);
 AgentPricingEndpoints.Map(app);
 ProjectBudgetEndpoints.Map(app);
 WorkItemDiffEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
+GitHubAppConnectEndpoints.Map(app);
 AuditReportEndpoints.Map(app);
+AuditProgressEndpoints.Map(app);
 AgentStreamEndpoints.Map(app);
 SseEndpoints.Map(app);
 ChangelogEndpoints.Map(app);
@@ -4024,12 +4468,34 @@ app.MapGet("/healthz", (ISandboxProvider sandboxes) =>
             belowThreshold = s.FreeBytes is long b && b < s.ThresholdBytes,
         }).ToArray()
         : [];
-    return Results.Ok(new { status = "ok", disk });
+    return Results.Ok(new
+    {
+        status = "ok",
+        sandbox = new
+        {
+            provider = sandboxes.Name,
+            isolation = sandboxes.IsolationLevel.ToString()
+        },
+        disk
+    });
 });
 
 try
 {
     app.Run();
+
+    // StopHost maps a BackgroundService fault to a graceful host shutdown,
+    // which would otherwise exit 0 exactly like an intentional stop. A
+    // recorded fault means the orchestrator died (e.g. sustained SQLite
+    // write-gate outage); exit non-zero so supervisors detect and restart.
+    var failureTracker = app.Services.GetService<BackgroundServiceFailureTracker>();
+    if (failureTracker?.Fault is not null)
+    {
+        Log.Error(
+            failureTracker.Fault,
+            "Host stopped after a background service fault; exiting non-zero");
+        Environment.ExitCode = BackgroundServiceFailureTracker.ResolveExitCode(backgroundServiceFaulted: true);
+    }
 }
 catch (Exception ex)
 {
@@ -4043,6 +4509,222 @@ finally
 
 namespace CodeyBox.Api
 {
+    /// <summary>
+    /// Provider-neutral lifecycle inventory retained across a process restart
+    /// during a hot-reload provider cutover. IDs must name providers registered
+    /// in the API's reloadable provider set.
+    /// </summary>
+    public sealed class SandboxProviderCutoverConfig
+    {
+        public const int MaximumRetainedInventoryProviders =
+            ReloadableSandboxProvider.MaximumRetainedInventoryProviders;
+
+        /// <summary>
+        /// Provider IDs whose managed sandboxes and baselines must continue to
+        /// be inventoried and reaped even when another provider is selected.
+        /// </summary>
+        public List<string> RetainedInventoryProviders { get; set; } = [];
+    }
+
+    /// <summary>
+    /// Hot-reloadable settings for
+    /// <c>CodeyBox:SandboxProvider=incus</c>. Changes under
+    /// <c>CodeyBox:Incus</c> (except the restart-only project and staging
+    /// identities) are captured by the next provider operation. Existing
+    /// sandboxes retain their provisioning topology, while host-process
+    /// cleanup and transient exec retry policies are read live.
+    ///
+    /// The configured storage pool must already exist and use the ZFS or Btrfs
+    /// driver; ZFS is strongly recommended for VM workloads.
+    /// See <c>docs/concepts/sandboxes.md</c> for the host setup and security
+    /// requirements.
+    /// </summary>
+    public sealed class IncusSandboxConfig
+    {
+        private static readonly IncusSandboxOptions Defaults = new();
+
+        /// <summary>Incus CLI executable name or absolute path.</summary>
+        public string BinaryPath { get; set; } = Defaults.BinaryPath;
+
+        /// <summary>Restart-only dedicated non-default restricted Incus project that owns all CodeyBox instances; created and verified idempotently when absent.</summary>
+        public string ProjectName { get; set; } = Defaults.ProjectName;
+
+        /// <summary>Name of the pre-created ZFS or Btrfs storage pool used for VM roots and COW clones.</summary>
+        public string StoragePoolName { get; set; } = Defaults.StoragePoolName;
+
+        /// <summary>Incus VM image used when a sandbox spec has no explicit image reference.</summary>
+        public string DefaultImage { get; set; } = Defaults.DefaultImage;
+
+        /// <summary>Prefix for ordinary provider-owned VM instance names.</summary>
+        public string InstanceNamePrefix { get; set; } = Defaults.InstanceNamePrefix;
+
+        /// <summary>Prefix for content-addressed baked baseline VM names.</summary>
+        public string BaselineNamePrefix { get; set; } = Defaults.BaselineNamePrefix;
+
+        /// <summary>Use lazily baked baselines and COW <c>incus copy</c> clones for sandbox creation.</summary>
+        public bool UseBaselineImages { get; set; } = Defaults.UseBaselineImages;
+
+        /// <summary>Enable UEFI Secure Boot for newly initialized Incus VMs.</summary>
+        public bool SecureBoot { get; set; } = Defaults.SecureBoot;
+
+        /// <summary>
+        /// Shell commands run once while baking a baseline or during a full
+        /// launch.
+        /// </summary>
+        public List<string> ExtraRuncmd { get; set; } = [.. Defaults.ExtraRuncmd];
+
+        /// <summary>Host package-cache files or directories copied during Incus baseline or full-launch provisioning.</summary>
+        public List<PackageCacheSeedConfig> PackageCacheSeeds { get; set; } = [];
+
+        /// <summary>Host-staged executables copied during Incus baseline or full-launch provisioning.</summary>
+        public List<ExecutableProvisionConfig> ExecutableProvisions { get; set; } = [];
+
+        /// <summary>
+        /// Additional top-level cloud-init YAML merged into generated user
+        /// data. This is operator-visible configuration and must not contain
+        /// secrets.
+        /// </summary>
+        public string? ExtraCloudInit { get; set; } = Defaults.ExtraCloudInit;
+
+        /// <summary>Restart-only host directory for isolated mount snapshots and provider staging.</summary>
+        public string? StagingDirectory { get; set; } = Defaults.StagingDirectory;
+
+        /// <summary>
+        /// Additional canonical host-directory roots that Incus may expose
+        /// through virtiofs. <c>GitRootDirectory</c> and the enabled shared
+        /// upstream mirror directory are always included.
+        /// </summary>
+        public List<string> AllowedHostMountRoots { get; set; } = [.. Defaults.AllowedHostMountRoots];
+
+        /// <summary>Numeric non-root guest user ID; must match the effective host UID when attaching any host path.</summary>
+        public uint GuestUserId { get; set; } = Defaults.GuestUserId;
+
+        /// <summary>Numeric non-root guest group ID; must match the effective host GID when attaching any host path.</summary>
+        public uint GuestGroupId { get; set; } = Defaults.GuestGroupId;
+
+        /// <summary>Absolute home directory of the configured guest user.</summary>
+        public string GuestHome { get; set; } = Defaults.GuestHome;
+
+        /// <summary>Default deadline for a single Incus CLI lifecycle operation.</summary>
+        public TimeSpan OperationTimeout { get; set; } = Defaults.OperationTimeout;
+
+        /// <summary>Provider-side upper bound for one guest command; caller and sandbox wall-clock limits may be shorter.</summary>
+        public TimeSpan ExecTimeout { get; set; } = Defaults.ExecTimeout;
+
+        /// <summary>
+        /// Deadline applied to a cold Incus image/root initialization operation and,
+        /// separately, to executable staging/install, verification, and package-cache
+        /// seeding (including host input capture).
+        /// </summary>
+        public TimeSpan ImageProvisioningTimeout { get; set; } = Defaults.ImageProvisioningTimeout;
+
+        /// <summary>Deadline for VM boot and guest readiness.</summary>
+        public TimeSpan VmStartTimeout { get; set; } = Defaults.VmStartTimeout;
+
+        /// <summary>Deadline for a graceful VM stop.</summary>
+        public TimeSpan VmStopTimeout { get; set; } = Defaults.VmStopTimeout;
+
+        /// <summary>Deadline for cloud-init to finish inside a newly booted VM.</summary>
+        public TimeSpan CloudInitTimeout { get; set; } = Defaults.CloudInitTimeout;
+
+        /// <summary>Deadline for a virtiofs mount to become usable in the guest.</summary>
+        public TimeSpan MountReadyTimeout { get; set; } = Defaults.MountReadyTimeout;
+
+        /// <summary>Delay between VM/agent readiness probes.</summary>
+        public TimeSpan ReadinessPollInterval { get; set; } = Defaults.ReadinessPollInterval;
+
+        /// <summary>Upper bound for the guest-agent readiness poll interval; the poll backs off exponentially from <see cref="ReadinessPollInterval"/> to this cap so a boot storm does not hammer incusd.</summary>
+        public TimeSpan MaxReadinessPollInterval { get; set; } = Defaults.MaxReadinessPollInterval;
+
+        /// <summary>Delay before the recovery stack re-attempts a sandbox creation deferred because an Incus liveness deadline tripped under concurrent boot load.</summary>
+        public TimeSpan ProvisioningRetryRecheckIn { get; set; } = Defaults.ProvisioningRetryRecheckIn;
+
+        /// <summary>Independent deadline for terminating and draining one Incus CLI process tree.</summary>
+        public TimeSpan CliProcessCleanupTimeout { get; set; } = Defaults.CliProcessCleanupTimeout;
+
+        /// <summary>Delay between Linux Incus CLI process-group absence probes during cleanup.</summary>
+        public TimeSpan CliProcessGroupExitPollInterval { get; set; } = Defaults.CliProcessGroupExitPollInterval;
+
+        /// <summary>Attempts to read an active guest exec process-group ID before forced cleanup.</summary>
+        public int ExecPidPollAttempts { get; set; } = Defaults.ExecPidPollAttempts;
+
+        /// <summary>Attempts to delete and verify each transient guest exec control file.</summary>
+        public int ExecControlFileCleanupAttempts { get; set; } = Defaults.ExecControlFileCleanupAttempts;
+
+        /// <summary>Attempts to read and validate a guest exec completion sentinel.</summary>
+        public int ExecCompletionProbeAttempts { get; set; } = Defaults.ExecCompletionProbeAttempts;
+
+        /// <summary>Delayed recovery attempts after immediate interrupted-exec recovery fails; zero disables delayed recovery.</summary>
+        public int InterruptedExecRecoveryRetryAttempts { get; set; } = Defaults.InterruptedExecRecoveryRetryAttempts;
+
+        /// <summary>Delay before each delayed interrupted-exec recovery attempt.</summary>
+        public TimeSpan InterruptedExecRecoveryRetryDelay { get; set; } = Defaults.InterruptedExecRecoveryRetryDelay;
+
+        /// <summary>Maximum number of concurrent heavy Incus lifecycle/device operations.</summary>
+        public int MaxConcurrentOperations { get; set; } = Defaults.MaxConcurrentOperations;
+
+        /// <summary>Maximum VM boots (incus start + guest-agent readiness) in flight at once — staggers boots so a boot storm does not starve incusd and blow the readiness window. Hot-reloadable.</summary>
+        public int MaxConcurrentBoots { get; set; } = Defaults.MaxConcurrentBoots;
+
+        /// <summary>Inter-boot stagger in milliseconds applied after acquiring a boot slot. Zero disables the delay.</summary>
+        public int BootLaunchDelayMs { get; set; } =
+            (int)Defaults.BootLaunchDelay.TotalMilliseconds;
+
+        /// <summary>Maximum stdout bytes retained from one Incus CLI invocation.</summary>
+        public int MaxCliStdoutBytes { get; set; } = Defaults.MaxCliStdoutBytes;
+
+        /// <summary>Maximum stderr bytes retained from one Incus CLI invocation.</summary>
+        public int MaxCliStderrBytes { get; set; } = Defaults.MaxCliStderrBytes;
+
+        /// <summary>Capture best-effort guest resource metrics before sandbox teardown.</summary>
+        public bool CaptureResourceMetrics { get; set; } = Defaults.CaptureResourceMetrics;
+
+        /// <summary>Deadline for the best-effort resource metrics capture during teardown.</summary>
+        public TimeSpan ResourceMetricsCaptureTimeout { get; set; } = Defaults.ResourceMetricsCaptureTimeout;
+
+        /// <summary>Interval used by the guest peak-memory sampler.</summary>
+        public TimeSpan ResourceMetricsSampleInterval { get; set; } = Defaults.ResourceMetricsSampleInterval;
+
+        /// <summary>Default vCPU allocation baked into baseline VMs.</summary>
+        public int BaselineCpus { get; set; } = Defaults.BaselineCpus;
+
+        /// <summary>Default baseline VM memory allocation in bytes.</summary>
+        public long BaselineMemoryBytes { get; set; } = Defaults.BaselineMemoryBytes;
+
+        /// <summary>Default baseline root-disk size in bytes.</summary>
+        public long BaselineDiskBytes { get; set; } = Defaults.BaselineDiskBytes;
+
+        /// <summary>Maximum bytes accepted for one host-staged executable.</summary>
+        public long MaxExecutableProvisionBytes { get; set; } = Defaults.MaxExecutableProvisionBytes;
+
+        /// <summary>Maximum aggregate bytes accepted across host-staged executables.</summary>
+        public long MaxAggregateExecutableProvisionBytes { get; set; } = Defaults.MaxAggregateExecutableProvisionBytes;
+
+        /// <summary>Maximum bytes accepted for one package-cache seed.</summary>
+        public long MaxPackageCacheSeedBytes { get; set; } = Defaults.MaxPackageCacheSeedBytes;
+
+        /// <summary>Maximum aggregate bytes accepted across package-cache seeds.</summary>
+        public long MaxAggregatePackageCacheSeedBytes { get; set; } = Defaults.MaxAggregatePackageCacheSeedBytes;
+
+        /// <summary>Maximum filesystem entries inspected while copying one package-cache seed.</summary>
+        public int MaxPackageCacheSeedEntries { get; set; } = Defaults.MaxPackageCacheSeedEntries;
+
+        /// <summary>Maximum aggregate bytes copied into private host staging for one sandbox.</summary>
+        public long MaxSnapshotBytes { get; set; } = Defaults.MaxSnapshotBytes;
+
+        /// <summary>Maximum files, directories, and links copied into private host staging for one sandbox.</summary>
+        public int MaxSnapshotEntries { get; set; } = Defaults.MaxSnapshotEntries;
+
+        /// <summary>Maximum direct-mount entries inspected while choosing a host-to-guest identity probe.</summary>
+        public int MaxReadinessProbeEntries { get; set; } = Defaults.MaxReadinessProbeEntries;
+
+        /// <summary>Maximum logical size of one guest tmpfs device.</summary>
+        public long MaxTmpfsDeviceBytes { get; set; } = Defaults.MaxTmpfsDeviceBytes;
+
+        /// <summary>Maximum aggregate logical size of all guest tmpfs devices in one sandbox.</summary>
+        public long MaxAggregateTmpfsBytes { get; set; } = Defaults.MaxAggregateTmpfsBytes;
+    }
+
     public sealed class MultipassSandboxConfig
     {
         /// <summary>
@@ -4215,6 +4897,14 @@ namespace CodeyBox.Api
         /// treated as one legacy host named "default".
         /// </summary>
         public IList<MultipassRemoteExecutorHostConfig>? ExecutorHosts { get; set; }
+
+        /// <summary>
+        /// Maps logical network-profile names to bridge names on the remote
+        /// Multipass host(s). When omitted (null/empty), the remote provider
+        /// falls back to the global <c>SandboxNetworkProfiles</c> map for
+        /// backward compatibility.
+        /// </summary>
+        public Dictionary<string, string>? NetworkProfiles { get; set; }
     }
 
     public sealed class MultipassRemoteExecutorHostConfig
@@ -4381,7 +5071,7 @@ namespace CodeyBox.Api
 
     /// <summary>
     /// Top-level options bag bound from the <c>CodeyBox</c> configuration
-    /// section. See <c>docs/configuration.md</c> for the full hot-reload
+    /// section. See <c>docs/reference/configuration.md</c> for the full hot-reload
     /// contract per field. Summary of the rule of thumb consumers should
     /// follow when adding new fields:
     /// <list type="bullet">
@@ -4396,14 +5086,19 @@ namespace CodeyBox.Api
     ///   <c>Shutdown.SandboxAdoptionDeadlineSeconds</c>, <c>SandboxLeak</c>
     ///   (thresholds, per-sweep),
     ///   <c>AuditLog.RetainedDays</c> (DB retention, per-sweep), and the
-    ///   sandbox launch fields (<c>Multipass*</c>, <c>SandboxNetworkProfiles</c>,
+    ///   sandbox launch fields (<c>Multipass*</c>, <c>Incus.*</c> except
+    ///   <c>Incus.ProjectName</c> and effective <c>Incus.StagingDirectory</c>, the guarded
+    ///   <c>multipass</c>↔<c>incus</c> <c>SandboxProvider</c> switch,
+    ///   <c>SandboxNetworkProfiles</c>,
     ///   per-launch), and <c>Shutdown.SandboxTeardownMode</c> (next graceful
     ///   shutdown).</item>
     /// <item><b>Startup-only and rejected</b> on reload by
     ///   <see cref="ImmutableCodeyBoxOptionsValidator"/>:
-    ///   <c>SandboxProvider</c>, <c>StateDatabasePath</c>,
+    ///   <c>SandboxProvider</c> changes other than the guarded
+    ///   <c>multipass</c>↔<c>incus</c> switch, <c>StateDatabasePath</c>,
     ///   <c>GitRootDirectory</c>, <c>GitCommandMaxOutputBytes</c>,
-    ///   <c>AgentStreams.Path</c>,
+    ///   <c>Incus.ProjectName</c>, effective
+    ///   <c>Incus.StagingDirectory</c>, <c>AgentStreams.Path</c>,
     ///   <c>WorkerPool.MaxConcurrentSandboxes</c>,
     ///   <c>EnableSharedUpstreamMirror</c>, and
     ///   <c>SharedUpstreamMirrorDirectory</c>. The retaining
@@ -4421,12 +5116,15 @@ namespace CodeyBox.Api
     /// </summary>
     public sealed class CodeyBoxOptions
     {
+        public List<ApiClientOptions> ApiClients { get; set; } = [];
+        public string? PublicBaseUrl { get; set; }
         public string GitRootDirectory { get; set; } = "/var/lib/codeybox/repos";
         public int GitCommandMaxOutputBytes { get; set; } = LocalGitHostOptions.DefaultGitCommandMaxOutputBytes;
         public bool EnableSharedUpstreamMirror { get; set; } = false;
         public string SharedUpstreamMirrorDirectory { get; set; } = "_upstream-mirror";
         public string StateDatabasePath { get; set; } = "/var/lib/codeybox/state.db";
         public SqliteWriteGateOptions SqliteWriteGate { get; set; } = new();
+        public SqliteMaintenanceOptions SqliteMaintenance { get; set; } = new();
         public string TemplateDirectory { get; set; } = "templates";
         public const int DefaultMaxTemplateChecks = 256;
         public const int MaximumMaxTemplateChecks = 1000;
@@ -4543,6 +5241,30 @@ namespace CodeyBox.Api
         public const int DefaultMaxBulkItems = 1000;
         public const int MaximumMaxBulkItems = 10_000;
         public int MaxBulkItems { get; set; } = DefaultMaxBulkItems;
+
+        /// <summary>
+        /// Crock agent sandbox wiring — most importantly the host
+        /// <c>crock daemon</c> socket path. The runner refuses to dispatch
+        /// when <c>HostDaemonSocketPath</c> is unset because the public
+        /// tunnel-in-VM shape is incompatible with the sandbox network model.
+        /// Hot-reloadable through <c>IOptionsMonitor</c>.
+        /// </summary>
+        public CrockSandboxOptions Crock { get; set; } = new();
+
+        /// <summary>
+        /// GitHub Copilot CLI runner configuration. Subscription mode by default; setting
+        /// <c>Provider.BaseUrl</c> switches inference to an OpenAI-compatible endpoint (BYOK).
+        /// The BYOK credential is deliberately not here — it arrives through the credential chain
+        /// as <c>CODEYBOX_COPILOT_PROVIDER_API_KEY</c> so the secret never sits in config.
+        /// </summary>
+        public CopilotOptions Copilot { get; set; } = new();
+
+        /// <summary>
+        /// Google Antigravity (<c>agy</c>) runner and quota-probe settings. Bound from
+        /// <c>CodeyBox:Antigravity</c>.
+        /// </summary>
+        public AntigravitySectionOptions Antigravity { get; set; } = new();
+
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
         public double PhaseAbsoluteTimeoutMultiplier { get; set; } = 3.0;
@@ -4568,6 +5290,17 @@ namespace CodeyBox.Api
         public bool EmitPlanTestCases { get; set; } = true;
 
         /// <summary>
+        /// Optional runtime flake attribution for parsed dotnet test failures.
+        /// When enabled, the failing test names are rerun against the
+        /// merge-base/base checkout in the same sandbox and classified as
+        /// diff-attributable only when they pass on base and fail on the diff.
+        /// When disabled, or when the base rerun cannot be performed,
+        /// classification fails closed to diff-attributable.
+        /// Hot-reloadable via <see cref="AgentConfigHotReload"/>.
+        /// </summary>
+        public TestFailureAttributionOptions TestFailureAttribution { get; set; } = new();
+
+        /// <summary>
         /// Maximum concurrent release deep-audit phases across all releases.
         /// Bounds LLM/sandbox resource usage. Default 4.
         /// Hot-reloadable: read on each deep-audit start attempt.
@@ -4581,6 +5314,12 @@ namespace CodeyBox.Api
         /// </summary>
         public int DeepAuditRemediationItemTimeoutSeconds { get; set; } = 1800;
 
+        /// <summary>
+        /// Bounded retry policy for persisting an unexpected deep-audit failure.
+        /// Hot-reloadable: captured at the start of each failure reconciliation.
+        /// </summary>
+        public DeepAuditFailurePersistenceOptions DeepAuditFailurePersistence { get; set; } = new();
+
         /// <summary>Pipeline-runner quota-fallback and retry tuning. Hot-reloadable.</summary>
         public PipelineTuningOptions PipelineTuning { get; set; } = new();
 
@@ -4588,19 +5327,50 @@ namespace CodeyBox.Api
         public BudgetDeferralRecheckOptions BudgetDeferralRecheck { get; set; } = new();
 
         /// <summary>
-        /// Which sandbox provider to use. One of: <c>multipass</c>,
+        /// Which sandbox provider to use. One of: <c>incus</c>, <c>multipass</c>,
         /// <c>multipass-remote</c>, <c>sprites</c>, <c>bubblewrap</c>,
         /// <c>process</c>.
         /// Default is empty — startup defaults to 'process' in Development
         /// and refuses to start in other environments.
+        /// A process that starts with <c>multipass</c> or <c>incus</c> may
+        /// hot-switch between those two providers. All other changes require
+        /// a restart and are rejected during reload.
         /// </summary>
         public string? SandboxProvider { get; set; }
+
+        /// <summary>
+        /// Trust classification for repository and agent-controlled input. Defaults to Untrusted outside
+        /// Development, where only a provider advertising dedicated-kernel isolation is admitted.
+        /// </summary>
+        public string? WorkloadTrust { get; set; }
+
+        /// <summary>Explicit acknowledgement for trusted workloads using shared-kernel isolation.</summary>
+        public bool AcknowledgeSharedKernelRisk { get; set; }
+
+        /// <summary>Auditors that every project must compose and cannot exclude.</summary>
+        public IReadOnlyList<string> RequiredAuditors { get; set; } = [];
+
+        /// <summary>
+        /// Provider-neutral lifecycle inventory retained during a hot-reload
+        /// sandbox-provider cutover.
+        /// </summary>
+        public SandboxProviderCutoverConfig SandboxProviderCutover { get; set; } = new();
 
         /// <summary>
         /// Override that lets <c>process</c> sandbox load outside Development.
         /// Don't.
         /// </summary>
         public bool DangerouslyAllowProcessSandbox { get; set; }
+
+        /// <summary>
+        /// Incus VM, baseline, storage, and CLI settings. Full settings are
+        /// consumed when Incus is selected or retained for cutover inventory;
+        /// dormant-provider routing reads only the baseline namespace. Fields
+        /// other than <c>ProjectName</c> and the effective
+        /// <c>StagingDirectory</c> are hot-reloaded for the next Incus
+        /// operation.
+        /// </summary>
+        public IncusSandboxConfig Incus { get; set; } = new();
 
         /// <summary>
         /// Extra cloud-init YAML appended to the auto-generated network policy
@@ -4649,10 +5419,10 @@ namespace CodeyBox.Api
         /// the orchestrator then attaches each VM to the matching bridge,
         /// where host-side nftables rules enforce egress.
         ///
-        /// Empty → no host-enforced profile is selectable; sandboxes
-        /// fall back to Multipass's default bridge, which
-        /// setup-host-networks.sh blocks at the host. For functional
-        /// egress, populate this and run setup-host-networks.sh.
+        /// Empty → no host-enforced profile is selectable. Multipass then
+        /// has only its blocked default bridge; Incus instances are created
+        /// without a NIC. For functional egress, populate this and run
+        /// setup-host-networks.sh.
         ///
         /// Example:
         /// <code>
@@ -4663,8 +5433,12 @@ namespace CodeyBox.Api
         ///   "graphical": "cb-graphical"
         /// }
         /// </code>
-        /// Bridge names are limited to 15 characters by Linux IFNAMSIZ.
-        /// Profile names (the keys) have no such limit.
+        /// Bridge names are limited to 15 characters by Linux IFNAMSIZ. Incus
+        /// additionally requires profile names to be valid identifiers of at
+        /// most 63 ASCII letters, digits, hyphens, underscores, or dots;
+        /// Multipass does not impose that profile-name limit. Multipass
+        /// attaches the selected bridge as a second NIC; Incus uses it as the
+        /// VM's only NIC and does not inherit an Incus NAT profile.
         /// </summary>
         public Dictionary<string, string> SandboxNetworkProfiles { get; set; } = new(StringComparer.OrdinalIgnoreCase)
         {
@@ -4712,9 +5486,11 @@ namespace CodeyBox.Api
         /// Disk-guard preflight configuration. Enabled by default
         /// (<see cref="DiskGuardOptions.Enabled"/>=<c>true</c>,
         /// <see cref="DiskGuardOptions.MinFreeBytes"/>=10 GiB); every
-        /// <c>MultipassSandboxProvider.CreateAsync</c> call checks free space
-        /// on the configured mounts and defers the work item (same machinery
-        /// as the budget cap) when any mount is below the threshold. Set
+        /// sandbox creation checks the provider's backing storage and defers
+        /// the work item (same machinery as the budget cap) when it is below
+        /// the threshold. Multipass additionally checks its configured host
+        /// paths; Incus checks the selected storage pool, shared additional
+        /// paths, and its effective staging directory. Set
         /// <c>CodeyBox:DiskGuard:Enabled=false</c> to disable.
         /// </summary>
         public DiskGuardOptions DiskGuard { get; set; } = new();
@@ -4749,7 +5525,7 @@ namespace CodeyBox.Api
 
         /// <summary>
         /// Agent class definitions for quota-aware routing. Each class lists one or
-        /// more agent members in preference order. See docs/agent-classes.md.
+        /// more agent members in preference order. See docs/concepts/agent-classes.md.
         /// </summary>
         public List<AgentClassOptions> AgentClasses { get; set; } = [];
 
@@ -4767,7 +5543,7 @@ namespace CodeyBox.Api
         /// Operator-extensible per-agent quota stderr patterns. Keys are agent
         /// kind values (e.g. <c>cursor</c>); each entry adds a substring + kind
         /// to the per-provider detector's built-in defaults. See
-        /// docs/quota-gate.md for the schema and supported agent kinds.
+        /// docs/operating/quota.md for the schema and supported agent kinds.
         /// </summary>
         public Dictionary<string, List<QuotaFailurePatternOptions>> QuotaFailurePatterns { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
@@ -4783,7 +5559,7 @@ namespace CodeyBox.Api
         /// <summary>
         /// Time-of-day score modifiers. Applied as small effective-score adjustments
         /// to act as tiebreakers between near-equivalent models during peak cost windows.
-        /// See docs/configuration.md for the schedule schema.
+        /// See docs/reference/configuration.md for the schedule schema.
         /// </summary>
         public AgentScoreModifiersOptions AgentScoreModifiers { get; set; } = new();
 
@@ -4797,10 +5573,10 @@ namespace CodeyBox.Api
         /// </summary>
         public TransitionHealthConfig TransitionHealth { get; set; } = new();
 
-        /// <summary>Agent token pricing for cost estimation. See docs/cost-reporting.md.</summary>
+        /// <summary>Agent token pricing for cost estimation. See docs/operating/costs.md.</summary>
         public AgentPricingOptions AgentPricing { get; set; } = new();
 
-        /// <summary>Monthly cost-budget alert sweep configuration. See docs/budget-alerts.md.</summary>
+        /// <summary>Monthly cost-budget alert sweep configuration. See docs/operating/budgets.md.</summary>
         public BudgetAlertOptions BudgetAlerts { get; set; } = new();
 
         /// <summary>Automatic retry for quota-failed items.</summary>
@@ -4832,10 +5608,10 @@ namespace CodeyBox.Api
         /// </summary>
         public AutoRequeueOnAgentRestoreConfig AutoRequeueOnAgentRestore { get; set; } = new();
 
-        /// <summary>OpenTelemetry export configuration. See docs/observability.md.</summary>
+        /// <summary>OpenTelemetry export configuration. See docs/operating/observability.md.</summary>
         public OtelOptions Otel { get; set; } = new();
 
-        /// <summary>Changelog automation configuration. See docs/changelog-automation.md.</summary>
+        /// <summary>Changelog automation configuration. See docs/operating/releases.md.</summary>
         public ChangelogOptions Changelog { get; set; } = new();
 
         /// <summary>
@@ -4849,9 +5625,18 @@ namespace CodeyBox.Api
         /// <summary>
         /// Sandbox leak reaper configuration. The reaper periodically scans for
         /// <c>codeybox-*</c> Multipass VMs that outlived their work item and logs
-        /// (or optionally auto-disposes) them. See docs/sandbox-leaks.md.
+        /// (or optionally auto-disposes) them. See docs/operating/sandbox-reliability.md.
         /// </summary>
         public SandboxLeakOptions SandboxLeak { get; set; } = new();
+
+        /// <summary>
+        /// Verification-deployment leak reaper configuration. Sweeps managed
+        /// sandboxes that outlived an <see cref="IDeploymentManager"/>-tracked
+        /// deployment (orchestrator crash / aborted deploy). Same pattern as
+        /// <see cref="SandboxLeak"/>; running both is safe — each scopes to
+        /// its own concern.
+        /// </summary>
+        public DeploymentLeakOptions DeploymentLeak { get; set; } = new();
 
         /// <summary>
         /// B1 baseline-image reaper configuration. Reference-counted GC for
@@ -5031,7 +5816,7 @@ namespace CodeyBox.Api
     }
 
     /// <summary>
-    /// Configuration for a package cache seed to be copied into the baseline VM.
+    /// Configuration for a package-cache file or directory copied during VM provisioning.
     /// </summary>
     public sealed class PackageCacheSeedConfig
     {
@@ -5041,7 +5826,7 @@ namespace CodeyBox.Api
     }
 
     /// <summary>
-    /// Config-bound shape of <see cref="ExecutableProvisionOptions"/>.
+    /// Config-bound shape of <see cref="BaselineExecutableProvision"/>.
     /// </summary>
     public sealed class ExecutableProvisionConfig
     {
@@ -5219,6 +6004,8 @@ namespace CodeyBox.Api
     /// </summary>
     public sealed class DiskGuardOptions
     {
+        public const int MaximumAdditionalPaths = 64;
+
         /// <summary>
         /// Master switch. Default true so a stock deployment refuses to launch
         /// new sandboxes when the host is out of disk; set false to disable
@@ -5249,10 +6036,11 @@ namespace CodeyBox.Api
         public string RecheckIn { get; set; } = "00:05:00";
 
         /// <summary>
-        /// Extra paths to check in addition to <see cref="MultipassDataPath"/>.
-        /// The wiring code automatically adds the state-database directory so
-        /// SQLite writes won't be the first thing to ENOSPC on a host whose
-        /// /var/lib/codeybox lives on a different volume.
+        /// Extra host paths checked by VM providers in addition to their
+        /// provider-owned backing storage. The wiring automatically adds the
+        /// state-database directory, and Incus also adds its effective staging
+        /// directory, so those writes are not the first to hit ENOSPC. At most
+        /// <see cref="MaximumAdditionalPaths"/> paths may be configured.
         /// </summary>
         public List<string> AdditionalPaths { get; set; } = [];
     }
@@ -5736,7 +6524,7 @@ namespace CodeyBox.Api
         public string? SandboxEnvironmentVariable { get; set; }
         /// <summary>
         /// Operator-curated capability score (0–200). Required; no silent default.
-        /// See docs/agent-classes.md for recommended seed values.
+        /// See docs/concepts/agent-classes.md for recommended seed values.
         /// </summary>
         public int? QualityScore { get; set; }
         /// <summary>
@@ -5748,7 +6536,7 @@ namespace CodeyBox.Api
         /// Clearance/capability tags this member is trusted to handle, e.g.
         /// <c>["sensitive", "architectural"]</c>. Default empty — members with
         /// no tags can only run work items that require no tags. See
-        /// docs/agent-classes.md for the recommended tag vocabulary.
+        /// docs/concepts/agent-classes.md for the recommended tag vocabulary.
         /// </summary>
         public List<string> Capabilities { get; set; } = [];
         /// <summary>
@@ -6099,7 +6887,7 @@ namespace CodeyBox.Api
     /// <summary>
     /// Rolling file log configuration. Paths are resolved relative to the
     /// API process's working directory when they are not absolute.
-    /// See <c>docs/audit-logging.md</c> for details.
+    /// See <c>docs/operating/logging.md</c> for details.
     /// </summary>
     public sealed class AuditLogOptions
     {

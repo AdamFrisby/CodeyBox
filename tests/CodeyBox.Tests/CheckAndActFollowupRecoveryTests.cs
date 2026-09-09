@@ -25,6 +25,25 @@ public sealed class CheckAndActFollowupRecoveryTests : IDisposable
     public async Task PersistedNonActionableVerdict_CompletesWithoutFollowup()
     {
         var item = MakeCheckItem(answer: false, actionableAnswer: true);
+        item = item with
+        {
+            PreemptCheckpoint = null,
+            AgentTurnResumeCheckpoint = new AgentTurnResumeCheckpoint(
+                AgentKind.Claude,
+                "claude/default",
+                modelId: null,
+                reasoningMode: null,
+                nativeSessionId: null,
+                WorkItemState.Working,
+                AgentTurnResumePhase.Work,
+                iteration: null,
+                item.PromptRevision,
+                DateTimeOffset.UtcNow.AddMinutes(-2)),
+            AgentTurnRecoveryLease = new SandboxRecoveryLease(
+                "incus",
+                "retained-check-sandbox",
+                "retained-check-token"),
+        };
 
         var completed = await CheckAndActFollowupRecovery.TryBuildCompletedFromPersistedVerdictAsync(
             _store, item, CancellationToken.None);
@@ -35,6 +54,8 @@ public sealed class CheckAndActFollowupRecoveryTests : IDisposable
         Assert.Null(completed.StartedAt);
         Assert.Null(completed.PreemptedAt);
         Assert.Null(completed.PreemptCheckpoint);
+        Assert.Null(completed.AgentTurnResumeCheckpoint);
+        Assert.Null(completed.AgentTurnRecoveryLease);
     }
 
     [Fact]

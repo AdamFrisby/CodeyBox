@@ -1,6 +1,8 @@
 using CodeyBox.Agents.Opencode;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
+using CodeyBox.Sandbox.Process;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Tests;
 
@@ -147,12 +149,12 @@ public sealed class OpencodeAgentRunnerTests
         }
     }
 
-    // --- PrepareSandboxAsync credential-materialisation -------------------
-    // The runner's PrepareSandboxAsync writes the opencode auth.json inside
+    // --- Shared credential materialisation --------------------------------
+    // The non-overridable runner lifecycle writes opencode auth.json inside
     // the sandbox from the OPENCODE_AUTH_JSON credential env var. These
     // tests pin:
     //   - the materialisation script runs BEFORE the opencode CLI invocation;
-    //   - it references the correct env-var names and default destination;
+    //   - it references the correct default destination;
     //   - it honours OPENCODE_AUTH_DEST_PATH for non-XDG destinations;
     //   - it is skipped entirely when no credential is supplied;
     //   - a failed write fails the run with a meaningful summary and
@@ -182,11 +184,10 @@ public sealed class OpencodeAgentRunnerTests
     {
         for (var i = 0; i < execs.Count; i++)
         {
-            var argv = execs[i].Argv;
-            if (argv.Count >= 3
-                && argv[0] == "bash"
-                && argv[1] == "-c"
-                && argv[2].Contains("OPENCODE_AUTH_JSON", StringComparison.Ordinal))
+            if (CredentialMaterialisationTestHelper.IsStdinMaterialisation(
+                    execs[i], ".local/share/opencode/auth.json")
+                || CredentialMaterialisationTestHelper.IsEnvironmentMaterialisation(
+                    execs[i], "OPENCODE_AUTH_JSON", ".local/share/opencode/auth.json"))
                 return i;
         }
         return -1;
@@ -213,7 +214,7 @@ public sealed class OpencodeAgentRunnerTests
         // whose env dict does NOT contain OPENCODE_AUTH_JSON (e.g. a bundle
         // assembled from an unrelated env-var mapping) must also skip
         // materialisation rather than write empty content to the destination
-        // file. Pins the OR shape in PrepareSandboxAsync so a regression that
+        // file. Pins the lifecycle branch so a regression that
         // swapped it for AND, or renamed the OPENCODE_AUTH_JSON key, would
         // be caught here.
         var sandbox = new RecordingSandbox();
@@ -263,18 +264,35 @@ public sealed class OpencodeAgentRunnerTests
 
         var matIdx = FindMaterialisationScriptIndex(sandbox.Execs);
         Assert.True(matIdx >= 0);
-        var script = sandbox.Execs[matIdx].Argv[2];
-        Assert.Contains("$HOME/.local/share/opencode/auth.json", script);
-        Assert.Contains("OPENCODE_AUTH_DEST_PATH", script);
+        var exec = sandbox.Execs[matIdx];
+        Assert.Equal(".local/share/opencode/auth.json", exec.Argv[5]);
+        Assert.Equal("", exec.Argv[6]);
     }
 
     [Fact]
-    public async Task RunAsync_MaterialisationScript_HasUmask077_BeforeMkdirAndWrite()
+    public async Task RunAsync_MaterialisationScript_UsesCredentialDestinationOverride()
     {
-        // Auth file (and parent dir) must end up at 0700/0600. Order:
-        // umask 077 must precede BOTH mkdir -p (so the dir inherits 0700,
-        // not the typical 0755) AND the printf that writes the file (so
-        // newly created files inherit 0600, not 0644).
+        var sandbox = new RecordingSandbox();
+        var runner = new OpencodeAgentRunner();
+        var cred = OpencodeCred("""{"x":1}""", "$HOME/.config/opencode/auth.json");
+
+        await runner.RunAsync(sandbox, "/work", "x", credential: cred);
+
+        var matIdx = FindMaterialisationScriptIndex(sandbox.Execs);
+        Assert.True(matIdx >= 0);
+        var exec = sandbox.Execs[matIdx];
+        Assert.Equal(".local/share/opencode/auth.json", exec.Argv[5]);
+        Assert.Equal("$HOME/.config/opencode/auth.json", exec.Argv[6]);
+    }
+
+    [Fact]
+    public async Task RunAsync_MaterialisationScript_WritesThroughNoFollowDirectoryFds()
+    {
+        // Auth file (and parent dir) must end up at 0700/0600 without
+        // following a pre-created symlink. The shared writer opens parent
+        // directories with O_NOFOLLOW, writes stdin to a private file through
+        // the held directory fd, atomically replaces the destination, and then
+        // verifies the HOME-relative path still points to the file it wrote.
         var sandbox = new RecordingSandbox();
         var runner = new OpencodeAgentRunner();
         var cred = OpencodeCred("""{"x":1}""");
@@ -282,23 +300,21 @@ public sealed class OpencodeAgentRunnerTests
         await runner.RunAsync(sandbox, "/work", "x", credential: cred);
 
         var script = sandbox.Execs[FindMaterialisationScriptIndex(sandbox.Execs)].Argv[2];
-        var umaskIdx = script.IndexOf("umask 077", StringComparison.Ordinal);
-        var mkdirIdx = script.IndexOf("mkdir -p", StringComparison.Ordinal);
-        var printfIdx = script.IndexOf("printf", StringComparison.Ordinal);
-        Assert.True(umaskIdx >= 0, "script must set umask 077");
-        Assert.True(mkdirIdx >= 0, "script must mkdir the parent directory");
-        Assert.True(printfIdx >= 0, "script must write the auth file via printf");
-        Assert.True(umaskIdx < mkdirIdx, "umask 077 must come before mkdir so the parent dir is 0700");
-        Assert.True(umaskIdx < printfIdx, "umask 077 must come before the printf write");
+        Assert.Contains("O_NOFOLLOW", script, StringComparison.Ordinal);
+        Assert.Contains("DIRECTORY_MODE = 0o700", script, StringComparison.Ordinal);
+        Assert.Contains("os.mkdir(part, DIRECTORY_MODE", script, StringComparison.Ordinal);
+        Assert.Contains("os.replace(tmp_name, file_name", script, StringComparison.Ordinal);
+        Assert.Contains("open_existing_parent_directory", script, StringComparison.Ordinal);
+        Assert.Contains("credential destination parent path changed during write", script, StringComparison.Ordinal);
+        Assert.Contains("credential destination parent is a symlink", script, StringComparison.Ordinal);
     }
 
     [Fact]
     public async Task RunAsync_MaterialisationScript_ChmodsAuthFileTo600()
     {
-        // chmod 600 is a defense-in-depth backstop: umask only affects newly
-        // created files, so a pre-existing auth.json with looser modes
-        // would keep them after a truncate-rewrite. Explicit chmod pins the
-        // mode regardless of pre-existing state.
+        // fchmod(0600) is a defense-in-depth backstop after the temp-file write
+        // and before the atomic replace. It pins the final mode regardless of
+        // filesystem defaults or a pre-existing destination.
         var sandbox = new RecordingSandbox();
         var runner = new OpencodeAgentRunner();
         var cred = OpencodeCred("""{"x":1}""");
@@ -306,10 +322,15 @@ public sealed class OpencodeAgentRunnerTests
         await runner.RunAsync(sandbox, "/work", "x", credential: cred);
 
         var script = sandbox.Execs[FindMaterialisationScriptIndex(sandbox.Execs)].Argv[2];
-        var printfIdx = script.IndexOf("printf", StringComparison.Ordinal);
-        var chmodIdx = script.IndexOf("chmod 600", StringComparison.Ordinal);
-        Assert.True(chmodIdx >= 0, "script must chmod the auth file to 0600");
-        Assert.True(printfIdx < chmodIdx, "chmod must run after the printf write");
+        var writeIdx = script.IndexOf("handle.write(data)", StringComparison.Ordinal);
+        Assert.Contains("FILE_MODE = 0o600", script, StringComparison.Ordinal);
+        var chmodIdx = script.IndexOf("os.fchmod(handle.fileno(), FILE_MODE)", StringComparison.Ordinal);
+        var replaceIdx = script.IndexOf("os.replace(tmp_name, file_name", StringComparison.Ordinal);
+        Assert.True(chmodIdx >= 0, "script must set the auth file mode to 0600");
+        Assert.True(writeIdx >= 0, "script must write stdin into the private temp file");
+        Assert.True(replaceIdx >= 0, "script must atomically replace the destination");
+        Assert.True(writeIdx < chmodIdx, "mode hardening must run after the stdin write");
+        Assert.True(chmodIdx < replaceIdx, "mode hardening must run before the destination replace");
     }
 
     [Fact]
@@ -333,8 +354,8 @@ public sealed class OpencodeAgentRunnerTests
     [Fact]
     public async Task RunAsync_MaterialisationScript_DoesNotEmbedCredentialBytesInArgv()
     {
-        // The credential bytes must flow via the env-var, NOT be interpolated
-        // into the bash heredoc — otherwise the secret would appear in any
+        // The credential bytes must flow via stdin, NOT be interpolated into
+        // the bash heredoc or argv — otherwise the secret would appear in any
         // command-line audit log the orchestrator captures.
         var sandbox = new RecordingSandbox();
         var runner = new OpencodeAgentRunner();
@@ -345,8 +366,218 @@ public sealed class OpencodeAgentRunnerTests
 
         var script = sandbox.Execs[FindMaterialisationScriptIndex(sandbox.Execs)].Argv[2];
         Assert.DoesNotContain(secret, script);
-        // It should reference the env-var name instead.
-        Assert.Contains("OPENCODE_AUTH_JSON", script);
+        var authExec = sandbox.Execs[FindMaterialisationScriptIndex(sandbox.Execs)];
+        Assert.DoesNotContain(secret, authExec.Argv);
+        Assert.Equal(cred.EnvironmentVariables["OPENCODE_AUTH_JSON"], authExec.Stdin);
+        Assert.DoesNotContain("OPENCODE_AUTH_JSON", script);
+    }
+
+    [Fact]
+    public async Task RunAsync_ProcessSandbox_WritesCredentialToDestinationOverride()
+    {
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        var runner = new OpencodeAgentRunner { Binary = "/bin/true" };
+        const string authJson = """{"providers":{"deepseek":{"apiKey":"sk-test"}}}""";
+        var credential = OpencodeCred(authJson, "$HOME/.config/opencode/auth.json");
+
+        var result = await runner.RunAsync(sandbox, "/work", "x", credential);
+
+        Assert.True(result.Success, result.Stderr);
+        var readOverride = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat \"$HOME/.config/opencode/auth.json\""],
+        });
+        Assert.True(readOverride.Success, readOverride.Stderr);
+        Assert.Equal(authJson, readOverride.Stdout.TrimEnd('\r', '\n'));
+
+        var defaultPathMissing = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "test ! -e \"$HOME/.local/share/opencode/auth.json\""],
+        });
+        Assert.True(defaultPathMissing.Success, defaultPathMissing.Stderr);
+
+        var modes = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "printf '%s %s' \"$(stat -c %a \"$HOME/.config/opencode\")\" \"$(stat -c %a \"$HOME/.config/opencode/auth.json\")\""],
+        });
+        Assert.True(modes.Success, modes.Stderr);
+        Assert.Equal("700 600", modes.Stdout.Trim());
+    }
+
+    [Fact]
+    public async Task RunAsync_ProcessSandbox_RejectsEscapingDestinationOverrides()
+    {
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        var runner = new OpencodeAgentRunner { Binary = "/bin/true" };
+        var outside = Path.Combine(Path.GetTempPath(), "codeybox-opencode-outside-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(outside);
+        try
+        {
+            var absoluteOutside = Path.Combine(outside, "absolute-auth.json");
+            var absoluteResult = await runner.RunAsync(
+                sandbox,
+                "/work",
+                "x",
+                OpencodeCred("""{"x":1}""", absoluteOutside));
+            Assert.False(absoluteResult.Success);
+            Assert.Contains("failed to materialise opencode auth", absoluteResult.Summary, StringComparison.Ordinal);
+            Assert.False(File.Exists(absoluteOutside));
+
+            var traversalResult = await runner.RunAsync(
+                sandbox,
+                "/work",
+                "x",
+                OpencodeCred("""{"x":2}""", "../outside-auth.json"));
+            Assert.False(traversalResult.Success);
+            Assert.Contains("failed to materialise opencode auth", traversalResult.Summary, StringComparison.Ordinal);
+            var traversalMissing = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "test ! -e \"$HOME/../outside-auth.json\""],
+            });
+            Assert.True(traversalMissing.Success, traversalMissing.Stderr);
+
+            var symlinkTarget = Path.Combine(outside, "symlink-target");
+            Directory.CreateDirectory(symlinkTarget);
+            var setupSymlink = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "ln -s -- \"$1\" \"$HOME/link-parent\"", "setup", symlinkTarget],
+            });
+            Assert.True(setupSymlink.Success, setupSymlink.Stderr);
+
+            var symlinkResult = await runner.RunAsync(
+                sandbox,
+                "/work",
+                "x",
+                OpencodeCred("""{"x":3}""", "link-parent/auth.json"));
+            Assert.False(symlinkResult.Success);
+            Assert.Contains("failed to materialise opencode auth", symlinkResult.Summary, StringComparison.Ordinal);
+            Assert.False(File.Exists(Path.Combine(symlinkTarget, "auth.json")));
+        }
+        finally
+        {
+            try { Directory.Delete(outside, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task RunResumedAsync_ProcessSandbox_PreservesExistingRefreshedAuthFile()
+    {
+        // A resume may restore an auth file whose token was refreshed inside
+        // the prior sandbox. The shared lifecycle must preserve that newer
+        // non-empty file instead of replacing it with the stale host snapshot.
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        var runner = new OpencodeAgentRunner { Binary = "/bin/true" };
+        const string refreshedInVm = """{"providers":{"deepseek":{"apiKey":"refreshed-in-vm-token"}}}""";
+        const string staleSnapshot = """{"providers":{"deepseek":{"apiKey":"stale-snapshot-token"}}}""";
+
+        // Seed the scratchpad-restored file the resume path would normally
+        // produce by writing directly to the expected destination.
+        var seed = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c",
+                "mkdir -p \"$HOME/.local/share/opencode\" && umask 077 && printf '%s' \"$1\" > \"$HOME/.local/share/opencode/auth.json\"",
+                "seed-refreshed", refreshedInVm],
+        });
+        Assert.True(seed.Success, seed.Stderr);
+
+        var credential = OpencodeCred(staleSnapshot);
+        var result = await runner.RunResumedAsync(
+            sandbox,
+            "/work",
+            "resume prompt",
+            credential,
+            new AgentResumeContext("refs/heads/codeybox/preempt/wi"));
+
+        Assert.True(result.Success, result.Stderr);
+        var read = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat \"$HOME/.local/share/opencode/auth.json\""],
+        });
+        Assert.True(read.Success, read.Stderr);
+        Assert.Equal(refreshedInVm, read.Stdout.TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
+    public async Task RunAsync_ProcessSandbox_OverwritesExistingCredentialFileOnFreshRun()
+    {
+        // The non-resume path (RunAsync) must overwrite a pre-existing file so
+        // a resolver-fallback candidate replaces whatever an earlier candidate
+        // wrote. Complement of PreservesExistingRefreshedAuthFile: same file,
+        // same conditions, but RunAsync (no resume context) instead of
+        // RunResumedAsync.
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        var runner = new OpencodeAgentRunner { Binary = "/bin/true" };
+        const string earlierCandidate = """{"providers":{"deepseek":{"apiKey":"earlier-candidate"}}}""";
+        const string fallbackCandidate = """{"providers":{"deepseek":{"apiKey":"fallback-candidate"}}}""";
+
+        var seed = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c",
+                "mkdir -p \"$HOME/.local/share/opencode\" && chmod 0777 \"$HOME/.local/share/opencode\" && printf '%s' \"$1\" > \"$HOME/.local/share/opencode/auth.json\" && chmod 0666 \"$HOME/.local/share/opencode/auth.json\"",
+                "seed-earlier", earlierCandidate],
+        });
+        Assert.True(seed.Success, seed.Stderr);
+
+        var result = await runner.RunAsync(sandbox, "/work", "prompt", OpencodeCred(fallbackCandidate));
+
+        Assert.True(result.Success, result.Stderr);
+        var read = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "cat \"$HOME/.local/share/opencode/auth.json\""],
+        });
+        Assert.True(read.Success, read.Stderr);
+        Assert.Equal(fallbackCandidate, read.Stdout.TrimEnd('\r', '\n'));
+
+        var modes = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "printf '%s %s' \"$(stat -c %a \"$HOME/.local/share/opencode\")\" \"$(stat -c %a \"$HOME/.local/share/opencode/auth.json\")\""],
+        });
+        Assert.True(modes.Success, modes.Stderr);
+        Assert.Equal("700 600", modes.Stdout.Trim());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ProcessSandbox_LeafSymlinkNeverRedirectsCredentialBytes(bool resumed)
+    {
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        var runner = new OpencodeAgentRunner { Binary = "/bin/true" };
+        var outside = Path.Combine(Path.GetTempPath(), "codeybox-opencode-sentinel-" + Guid.NewGuid().ToString("N"));
+        await File.WriteAllTextAsync(outside, "outside-sentinel");
+        try
+        {
+            var setup = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "mkdir -p \"$HOME/.local/share/opencode\" && ln -s -- \"$1\" \"$HOME/.local/share/opencode/auth.json\"", "setup", outside],
+            });
+            Assert.True(setup.Success, setup.Stderr);
+
+            var credential = OpencodeCred("""{"token":"candidate-secret"}""");
+            var result = resumed
+                ? await runner.RunResumedAsync(
+                    sandbox,
+                    "/work",
+                    "resume",
+                    credential,
+                    new AgentResumeContext("refs/heads/codeybox/preempt/wi"))
+                : await runner.RunAsync(sandbox, "/work", "fresh", credential);
+
+            if (resumed)
+                Assert.False(result.Success);
+            else
+                Assert.True(result.Success, result.Stderr);
+            Assert.Equal("outside-sentinel", await File.ReadAllTextAsync(outside));
+        }
+        finally
+        {
+            File.Delete(outside);
+        }
     }
 
     [Fact]
@@ -471,10 +702,10 @@ public sealed class OpencodeAgentRunnerTests
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             Execs.Add(exec);
-            if (exec.Argv.Count >= 3
-                && exec.Argv[0] == "bash"
-                && exec.Argv[1] == "-c"
-                && exec.Argv[2].Contains("OPENCODE_AUTH_JSON", StringComparison.Ordinal))
+            if (CredentialMaterialisationTestHelper.IsStdinMaterialisation(
+                    exec, ".local/share/opencode/auth.json")
+                || CredentialMaterialisationTestHelper.IsEnvironmentMaterialisation(
+                    exec, "OPENCODE_AUTH_JSON", ".local/share/opencode/auth.json"))
             {
                 return Task.FromResult(new SandboxExecResult(_authWriteExitCode, "", "auth stderr"));
             }
@@ -498,10 +729,10 @@ public sealed class OpencodeAgentRunnerTests
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
             Execs.Add(exec);
-            if (exec.Argv.Count >= 3
-                && exec.Argv[0] == "bash"
-                && exec.Argv[1] == "-c"
-                && exec.Argv[2].Contains("OPENCODE_AUTH_JSON", StringComparison.Ordinal))
+            if (CredentialMaterialisationTestHelper.IsStdinMaterialisation(
+                    exec, ".local/share/opencode/auth.json")
+                || CredentialMaterialisationTestHelper.IsEnvironmentMaterialisation(
+                    exec, "OPENCODE_AUTH_JSON", ".local/share/opencode/auth.json"))
             {
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
             }

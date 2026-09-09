@@ -67,6 +67,27 @@ public static class PlanAuditTests
     /// <summary>Stable name of the TEST 03 auditor (referenced by DI + composition).</summary>
     public const string Test03AuditorName = "plan:architecture-boundary";
 
+    /// <summary>Stable name of the TEST 04 auditor (referenced by DI + composition).</summary>
+    public const string Test04AuditorName = "plan:invariants-contracts-migrations";
+
+    /// <summary>Stable name of the TEST 05 auditor (referenced by DI + composition).</summary>
+    public const string Test05AuditorName = "plan:security-privacy-supply-chain";
+
+    /// <summary>Stable name of the TEST 06 auditor (referenced by DI + composition).</summary>
+    public const string Test06AuditorName = "plan:reliability-failure-concurrency";
+
+    /// <summary>Stable name of the TEST 07 auditor (referenced by DI + composition).</summary>
+    public const string Test07AuditorName = "plan:test-strategy-evidence";
+
+    /// <summary>Stable name of the TEST 08 auditor (referenced by DI + composition).</summary>
+    public const string Test08AuditorName = "plan:observability-operations-repair";
+
+    /// <summary>Stable name of the TEST 09 auditor (referenced by DI + composition).</summary>
+    public const string Test09AuditorName = "plan:delivery-rollout-rollback";
+
+    /// <summary>Stable name of the TEST 10 auditor (referenced by DI + composition).</summary>
+    public const string Test10AuditorName = "plan:decision-quality-maintainability";
+
     /// <summary>
     /// TEST 01 — PLAN INTEGRITY AND EVIDENCE CLASSIFICATION. Determines whether
     /// the plan is grounded in the actual system rather than hallucinated
@@ -257,10 +278,680 @@ public static class PlanAuditTests
     };
 
     /// <summary>
+    /// TEST 04 — DOMAIN INVARIANTS, DATA OWNERSHIP, CONTRACTS, AND MIGRATIONS.
+    /// Verifies the plan protects the correctness of business rules, state,
+    /// schemas, APIs, events, and cross-version compatibility — every domain
+    /// invariant has a named enforcement point, each important fact has one source
+    /// of truth (with invalidation defined for any derived/cached/duplicated data),
+    /// schema/API/event changes are backward-compatible or justified, migrations
+    /// and backfills are idempotent/observable/reversible, and rolling-deploy mixed
+    /// versions (old-code/new-schema, new-code/old-data) and duplicate/out-of-order
+    /// events are handled rather than assumed away.
+    /// </summary>
+    public static PlanAuditTest Test04 { get; } = new()
+    {
+        Id = "04",
+        AuditorName = Test04AuditorName,
+        Title = "DOMAIN INVARIANTS, DATA OWNERSHIP, CONTRACTS, AND MIGRATIONS",
+        Objective =
+            "Verify the plan protects correctness of business rules, state, schemas, APIs, events, " +
+            "and cross-version compatibility.",
+        ReviewGuidance = """
+            - What domain invariants must hold, and where is each one enforced?
+            - What is the single source of truth for each important fact?
+            - What data is derived / cached / duplicated / denormalized, and how is invalidation handled?
+            - Are schema changes additive, backward-compatible, and safely deployable?
+            - Is an expand-contract (add → backfill → switch → remove) migration used where a breaking
+              change is otherwise required?
+            - Are migrations and backfills idempotent, resumable, observable, and safe for large datasets?
+            - Are public and internal interfaces, events, queues, SDKs, clients, and webhooks kept
+              backward-compatible (or is the break explicitly justified with a compatibility path)?
+            - What are the transactional boundaries and consistency expectations?
+            - Does the plan account for mixed-version operation during a rolling deploy — old code on a
+              new schema, and new code on old data — rather than assuming an atomic deploy?
+            - Are duplicate events, ordering, idempotency, and replay handled?
+            """,
+        PassCriteria =
+            "Invariants and their enforcement points are explicit; each important fact has one source " +
+            "of truth with invalidation defined for derived data; schema/API/event changes are " +
+            "backward-compatible or justified; migration/backfill is safe, observable, and reversible; " +
+            "and consistency and idempotency rules are clear.",
+        FailCriteria =
+            "The plan changes persistent data without migration details; duplicates state without an " +
+            "invalidation strategy; changes a contract without a compatibility analysis; assumes atomic " +
+            "deploys; or ignores old-code/new-schema and new-code/old-data operation.",
+        AutomaticBlocker = """
+            Treat as an automatic BLOCKER when the plan:
+            - risks data corruption, lost records, an irreversible destructive migration, or a broken
+              contract that it does not address; or
+            - modifies persistent state (on-disk format, DB schema, durable events/logs) without a
+              rollback, forward-fix, or compatibility strategy.
+            """,
+        RequiredFixes = """
+            - Name each domain invariant and the exact point at which it is enforced.
+            - Identify the source of truth for each important fact and mark what is derived / cached.
+            - Add a schema / API / event compatibility plan (additive or expand-contract, or a justified
+              break with a compatibility path).
+            - Add a migration / backfill / rollback plan that is idempotent, observable, and reversible.
+            - State the idempotency and consistency rules (transactional boundaries, duplicate/ordering/replay).
+            """,
+        Criteria =
+        [
+            "domain-invariants",           // each invariant named with its enforcement point
+            "source-of-truth",             // one authoritative source per important fact
+            "derived-data-invalidation",   // derived/cached/duplicated/denormalized data has invalidation
+            "schema-compatibility",        // schema changes additive/backward-compatible/safely-deployable
+            "expand-contract-migration",   // expand-contract used where a breaking change is otherwise needed
+            "migration-safety",            // migration/backfill idempotent, resumable, observable, large-data safe
+            "migration-reversibility",     // rollback / forward-fix path for the migration
+            "contract-compatibility",      // API/event/queue/SDK/client/webhook backward-compatible or justified
+            "transactional-consistency",   // transactional boundaries + consistency expectations explicit
+            "mixed-version-operation",     // old-code/new-schema + new-code/old-data during rolling deploys
+            "idempotency-ordering",        // duplicate events, ordering, idempotency, replay handled
+        ],
+    };
+
+    /// <summary>
+    /// TEST 05 — SECURITY, PRIVACY, ABUSE CASES, SUPPLY CHAIN, CONFIGURATION, AND
+    /// SECRETS. Determines whether the plan identifies the assets, trust
+    /// boundaries, and attacker-controlled inputs the change touches; enforces
+    /// authorization on the authoritative path (never in UI/client, prompts, or
+    /// comments); handles sensitive-data flow, retention, redaction, deletion, and
+    /// audit logging; and — for LLM/agent/RAG/tooling features — addresses prompt
+    /// injection, untrusted context, excessive agency, tool permissions, secret
+    /// exposure, repository exfiltration, poisoned files, and operator/human
+    /// approval gates. It also checks that new dependencies are justified
+    /// (purpose, maintenance, LICENSE, vulnerability, transitive and alternative
+    /// risk) and that config values and secrets are named, stored securely,
+    /// rotated, validated at startup, and handled safely when missing. This is a
+    /// GENERAL, project-agnostic gate: the full criteria set is kept for every
+    /// project (per-project relevance is the auditor on/off toggle); a specific
+    /// plan that genuinely does not touch an area self-skips just those criteria
+    /// as NOT_APPLICABLE.
+    /// </summary>
+    public static PlanAuditTest Test05 { get; } = new()
+    {
+        Id = "05",
+        AuditorName = Test05AuditorName,
+        Title = "SECURITY, PRIVACY, ABUSE CASES, SUPPLY CHAIN, CONFIGURATION, AND SECRETS",
+        Objective =
+            "Determine whether the plan identifies assets, trust boundaries, attacker-controlled " +
+            "inputs, permissions, dependency risks, and secret/config handling.",
+        ReviewGuidance = """
+            - What assets, trust boundaries, and new inputs does the change affect?
+            - What can a malicious, compromised, or confused actor control (network input, argv, env,
+              file/stream contents, IPC/RPC peers, another tenant's data, model/agent/tool output)?
+            - Is auth/authz enforced on the server-side / authoritative path and centralized to avoid
+              bypass — never only in the UI, client, prompt, or comment?
+            - Does every handler acting on a client-supplied id re-verify ownership/role at the moment
+              of action, comparing credentials by exact equality?
+            - How are sensitive-data flows handled: retention, minimization, logging, redaction, deletion?
+            - Are there audit logs for security-relevant actions (authz decisions, admin/privileged
+              operations, data access/exports)?
+            - FOR LLM / AGENT / RAG / TOOLING FEATURES: does the plan address prompt injection, untrusted
+              context, EXCESSIVE AGENCY, tool permissions/scoping, secret exposure, repository
+              exfiltration, poisoned files, and operator/human approval gates for high-impact actions?
+            - Are new dependencies justified by purpose, maintenance, LICENSE, known vulnerabilities,
+              transitive-risk, and alternatives considered?
+            - Are config values and secrets named, stored securely, rotated, validated at startup, and
+              handled safely when missing or malformed?
+            - Are input sizes, loop/recursion depth, buffers, queues, retries, concurrency, and
+              decompression ratios bounded before buffering?
+            """,
+        PassCriteria =
+            "A concrete threat model appropriate to the change (assets, trust boundaries, attacker " +
+            "inputs, abuse cases, mitigations); controls live in enforceable code paths, not " +
+            "conventions; privacy and audit logging are explicit where relevant; and dependencies, " +
+            "config, and secrets are justified and managed (stored securely, validated, safe when missing).",
+        FailCriteria =
+            "Generic security language ('add validation', 'handle securely') with no named boundary or " +
+            "control; authorization placed only in UI / client; abuse cases omitted for " +
+            "admin / integration / AI-agent / cross-trust flows; secrets hardcoded or vaguely handled; " +
+            "or a new dependency added without justification.",
+        AutomaticBlocker = """
+            Treat as an automatic BLOCKER when the plan:
+            - touches auth, permissions, user data, admin operations, files, external integrations, or
+              LLM tools WITHOUT a concrete threat model (assets, trust boundaries, attacker inputs,
+              abuse cases, mitigations); or
+            - relies on LLM behavior, prompt wording, code comments, developer/agent discipline, or
+              UI-hiding as a SECURITY boundary (a real boundary is an enforced check in an
+              authoritative code path); or
+            - risks leaking secrets or sensitive data (committing credentials, logging secrets or
+              unredacted sensitive data, exposing them to an untrusted model/tool, or exfiltrating the
+              repository).
+            """,
+        RequiredFixes = """
+            - Add a threat model: assets, trust boundaries, attacker-controlled inputs, abuse cases,
+              and the mitigation for each.
+            - Name the exact authorization checks and the authoritative enforcement point for each
+              (server-side / domain path, re-verified per action, exact-equality credential compares).
+            - Add negative security tests (rejected-unauthorized, injection-blocked, oversized-input-bounded).
+            - Add audit logging for security-relevant actions.
+            - Justify each new dependency (purpose, maintenance, LICENSE, vulnerabilities, transitive
+              risk, alternatives) and define config/secret handling (named, stored securely, rotated,
+              validated at startup, safe when missing).
+            - For LLM/agent features: scope tool permissions to least privilege, isolate untrusted
+              context from trusted instructions, bound agent authority, and add operator/human approval
+              gates for high-impact or irreversible actions.
+            """,
+        Criteria =
+        [
+            "assets-trust-boundaries",     // assets, trust boundaries, and new inputs are identified
+            "attacker-control",            // what a malicious/compromised/confused actor can control
+            "authz-enforcement",           // authz server-side/authoritative-path, centralized, per-action re-check
+            "sensitive-data-handling",     // data flow, retention, minimization, deletion of sensitive data
+            "logging-redaction",           // no secrets/unredacted sensitive data in logs
+            "audit-logging",               // audit logs for security-relevant actions
+            "input-bounding",              // input sizes/depth/buffers/retries/concurrency bounded before buffering
+            "prompt-injection",            // prompt injection + untrusted context isolated from instructions
+            "excessive-agency",            // tool permissions least-privilege, agent authority bounded
+            "repo-exfiltration",           // secret exposure, repository exfiltration, poisoned files
+            "human-approval-gates",        // operator/human approval gates for high-impact/irreversible actions
+            "dependency-justification",    // new deps justified: purpose/maintenance/LICENSE/vuln/transitive/alternatives
+            "config-secret-handling",      // config/secrets named, stored securely, rotated, validated, safe-when-missing
+            "negative-security-tests",     // negative security tests (unauthorized/injection/oversized)
+        ],
+    };
+
+    /// <summary>
+    /// TEST 06 — RELIABILITY, FAILURE MODES, CONCURRENCY, AND DEGRADATION.
+    /// Verifies the plan handles real-world failure rather than assuming the happy
+    /// path: primary failure modes are named with mitigations; every external call
+    /// is timeout-bounded and retries are capped and backed off; multi-step work is
+    /// idempotent (or has a recovery/state model) so it can be safely retried after
+    /// a partial success and tolerates duplicate delivery (duplicate message /
+    /// duplicate webhook / resubmission); concurrent and duplicate processing,
+    /// ordering, and locking / optimistic-concurrency are addressed rather than
+    /// assumed away; there is no hidden global or mutable shared state, and no
+    /// unsafe singleton lifecycle, without concurrency semantics; background jobs
+    /// are retryable, cancellable, observable, and poison-safe with a
+    /// dead-letter / repair path; resilience patterns (circuit breakers, rate
+    /// limits, bulkheads, queues, fallbacks) are used where needed; and degraded /
+    /// user-visible behavior under a dependency outage, slowdown, invalid response,
+    /// timeout, or rate-limit is defined. This is a GENERAL, project-agnostic gate:
+    /// the full criteria set is kept for every project (per-project relevance is
+    /// the auditor on/off toggle); a specific plan that genuinely does not touch an
+    /// area self-skips just those criteria as NOT_APPLICABLE with a one-line reason.
+    /// </summary>
+    public static PlanAuditTest Test06 { get; } = new()
+    {
+        Id = "06",
+        AuditorName = Test06AuditorName,
+        Title = "RELIABILITY, FAILURE MODES, CONCURRENCY, AND DEGRADATION",
+        Objective =
+            "Verify the plan handles real-world failure, partial completion, retries, concurrency, " +
+            "and dependency instability rather than assuming the happy path.",
+        ReviewGuidance = """
+            - What are the primary failure modes of this change, and what mitigates each?
+            - What happens if each step only partially succeeds — can the workflow resume, roll back,
+              or reconcile, or does it leave inconsistent state behind?
+            - Are all external / cross-process calls given explicit timeouts (never unbounded waits)?
+            - Are retries bounded, backed off, and jittered — never unbounded or tight-looping?
+            - Are operations idempotent under retry, duplicate message, duplicate webhook, and
+              resubmission (so a repeat does not double-apply an effect)?
+            - Are circuit breakers, rate limits, bulkheads, queues, or fallbacks needed anywhere,
+              and does the plan add them where they are?
+            - Is user-visible degraded behavior defined (what the caller sees when a dependency is
+              down, slow, or rate-limited)?
+            - Are background / async jobs retryable, cancellable, observable, and poison-safe, with a
+              dead-letter or manual-repair path for messages that never succeed?
+            - Are race conditions, locking, optimistic concurrency, duplicate processing, and ordering
+              addressed for anything that mutates shared or persistent state?
+            - Does the plan avoid hidden global state, unsafe singleton lifecycle, and mutable shared
+              state without concurrency semantics?
+            - What is the behavior under dependency outage, slowness, invalid response, timeout, or
+              rate-limit?
+            """,
+        PassCriteria =
+            "Failure modes and their mitigations are explicit; every external interaction is " +
+            "timeout-bounded and retry-safe (bounded, backed-off, idempotent); partial-failure " +
+            "recovery and concurrency control are addressed; and degraded / user-visible behavior " +
+            "under dependency instability is defined.",
+        FailCriteria =
+            "The plan assumes the happy path; uses unbounded retries or has no timeout on an external " +
+            "call; cannot safely retry after a partial failure; ignores duplicate delivery or " +
+            "concurrent updates; or lacks a fallback / user-facing failure behavior.",
+        AutomaticBlocker = """
+            Treat as an automatic BLOCKER when the plan:
+            - lets a security-sensitive, destructive, or persistent-mutation workflow be
+              repeated or partially applied unsafely (no idempotency key, no recovery/state
+              model, no atomicity); or
+            - lets an external dependency failure hang a critical request indefinitely (an
+              external / cross-process call with no timeout or bounded wait); or
+            - introduces unsafe concurrent mutation of shared or persistent state (no locking,
+              optimistic concurrency, or other concurrency control).
+            """,
+        RequiredFixes = """
+            - Add explicit timeout, bounded+backed-off retry, idempotency, and fallback semantics for
+              every external / cross-process interaction.
+            - Add a state machine or recovery model for multi-step workflows so a partial failure can
+              resume, roll back, or reconcile rather than leaving inconsistent state.
+            - Add a concurrency-control or locking strategy (lock, optimistic concurrency, or
+              single-writer ownership) for anything that mutates shared or persistent state.
+            - Add a dead-letter / poison-message / manual-repair path for background jobs, and define
+              the degraded, user-visible behavior under a dependency outage/slow/invalid/timeout/rate-limit.
+            """,
+        Criteria =
+        [
+            "failure-modes",           // primary failure modes named, each with a mitigation
+            "partial-failure",         // partial-success recovery/rollback/reconcile for multi-step work
+            "external-timeouts",       // every external/cross-process call is timeout-bounded
+            "bounded-retries",         // retries capped, backed off, jittered — never unbounded/tight-loop
+            "retry-idempotency",       // idempotent under retry/duplicate-message/duplicate-webhook/resubmission
+            "resilience-patterns",     // circuit breakers/rate limits/bulkheads/queues/fallbacks where needed
+            "degraded-behavior",       // user-visible degraded behavior under dependency failure defined
+            "background-jobs",         // background jobs retryable/cancellable/observable/poison-safe
+            "dead-letter-repair",      // dead-letter / poison-message / manual-repair path
+            "concurrency-control",     // races/locking/optimistic-concurrency/duplicate-processing/ordering
+            "shared-state-safety",     // no hidden global/mutable shared state or unsafe singleton lifecycle
+            "dependency-degradation",  // behavior under dependency outage/slow/invalid/timeout/rate-limit
+        ],
+    };
+
+    /// <summary>
+    /// TEST 07 — TEST STRATEGY AND EVIDENCE QUALITY. Determines whether the plan
+    /// provides risk-mapped evidence that the change is correct, secure,
+    /// compatible, and maintainable — tests are mapped to specific
+    /// risks / invariants / contracts / failure-modes rather than a bare "add
+    /// tests"; pure decision logic has unit tests; persistence / boundaries /
+    /// queues / jobs have integration tests; public and internal
+    /// APIs / events / SDKs / webhooks have contract tests; schema / data changes
+    /// have migration / backfill tests; the abuse surface (authz, validation,
+    /// duplicate processing, malformed input, expired tokens, unsafe LLM / tool
+    /// output) has negative + abuse tests; E2E is scoped to critical journeys
+    /// rather than substituting for lower-level coverage; scale-sensitive paths
+    /// have performance / load tests; test data is deterministic and not coupled
+    /// to implementation detail; the plan names which existing tests to update and
+    /// which regressions to prevent; and explicit, automated done-criteria connect
+    /// the deliverables to the tests that verify them before deployment. This
+    /// reviews only whether the plan DECLARES an adequate strategy — actual test
+    /// existence / execution is a code-stage concern. This is a GENERAL,
+    /// project-agnostic gate: the full criteria set is kept for every project
+    /// (per-project relevance is the auditor on/off toggle); a specific plan that
+    /// genuinely does not touch an area self-skips just those criteria as
+    /// NOT_APPLICABLE with a one-line reason.
+    /// </summary>
+    public static PlanAuditTest Test07 { get; } = new()
+    {
+        Id = "07",
+        AuditorName = Test07AuditorName,
+        Title = "TEST STRATEGY AND EVIDENCE QUALITY",
+        Objective =
+            "Determine whether the plan provides risk-mapped evidence that the change is correct, " +
+            "secure, compatible, and maintainable. Review only whether the plan DECLARES an adequate " +
+            "strategy — actual test execution/existence is code-stage.",
+        ReviewGuidance = """
+            - Are tests mapped to specific risks / invariants / contracts / failure-modes, or does the
+              plan just say "add tests" without naming what each test pins down?
+            - Are there unit tests for pure decision logic?
+            - Are there integration tests for persistence / boundaries / queues / jobs (through the real
+              component, not a mock asserting its own calls)?
+            - Are there contract tests for public and internal APIs / events / SDKs / webhooks?
+            - Are there migration / backfill tests for schema / data changes?
+            - Are there negative + abuse tests (authz rejection, input validation, duplicate processing,
+              malformed input, expired / invalid tokens, unsafe LLM / tool output) for the relevant risks?
+            - Is E2E testing limited to critical journeys rather than used as a substitute for
+              lower-level unit / integration / contract coverage?
+            - Are there performance / load tests where scale or throughput is a concern?
+            - Is the test data deterministic (injected clock, seeded randomness, isolated fixtures) and
+              free of brittle implementation-detail assertions?
+            - Does the plan name which existing tests to update and which regressions to prevent?
+            - Does the plan define explicit, objectively-checkable done-criteria that connect the
+              deliverables to the tests / checks / metrics that verify them before deployment?
+            """,
+        PassCriteria =
+            "Tests are specific and risk-based, covering positive, negative, compatibility, migration, " +
+            "and failure cases; the main invariants and contracts have direct test evidence (a named " +
+            "test that would fail if that behavior broke); and the plan defines how completion is " +
+            "verified through automated checks rather than a human sign-off.",
+        FailCriteria =
+            "The plan merely says 'add tests'; the tests only verify implementation details; " +
+            "negative / security / migration / failure tests are missing despite relevant risks; or " +
+            "there are no acceptance criteria connected to tests.",
+        AutomaticBlocker = """
+            Treat as an automatic BLOCKER when the plan:
+            - leaves a critical business, security, data-integrity, or contract risk with NO direct
+              test evidence (no named test that would fail if that specific behavior broke); or
+            - cannot say how correctness is verified before deployment (no acceptance / done criteria
+              connected to concrete tests, checks, or metrics).
+            """,
+        RequiredFixes = """
+            - Add a test matrix mapping each test to the specific risk / invariant / contract /
+              failure-mode it verifies.
+            - Add negative + abuse tests (authz rejection, validation, duplicate processing, malformed
+              input, expired tokens, unsafe LLM / tool output) for the relevant risks.
+            - Add the missing migration / contract / integration tests for the persistence, schema, and
+              boundary changes the plan makes.
+            - Add explicit, automated done-criteria that connect each deliverable to the test, check, or
+              metric that verifies it before deployment.
+            """,
+        Criteria =
+        [
+            "risk-mapped-tests",              // each test mapped to a specific risk/invariant/contract/failure-mode
+            "unit-tests-pure-logic",          // unit tests for pure decision logic
+            "integration-tests",              // integration tests for persistence/boundaries/queues/jobs
+            "contract-tests",                 // contract tests for public/internal APIs/events/SDKs/webhooks
+            "migration-tests",                // migration/backfill tests for schema/data changes
+            "negative-abuse-tests",           // negative+abuse tests (authz/validation/duplicate/malformed/expired/unsafe-LLM)
+            "e2e-scoping",                    // E2E limited to critical journeys, not a substitute for lower-level coverage
+            "performance-load-tests",         // performance/load tests where scale is a concern
+            "deterministic-test-data",        // deterministic data, no brittle implementation-detail assertions
+            "existing-tests-and-regressions", // which existing tests to update, which regressions to prevent
+            "done-criteria",                  // explicit automated done-criteria connecting deliverables to tests
+        ],
+    };
+
+    /// <summary>
+    /// TEST 08 — OBSERVABILITY, OPERATIONS, DEBUGGABILITY, AND REPAIRABILITY.
+    /// Verifies the plan makes production behavior observable, diagnosable,
+    /// supportable, and repairable without ad-hoc heroics: logs added / changed are
+    /// structured, tied to the changed behavior, and free of sensitive-data leakage;
+    /// success / failure / latency / throughput / retries / queue-depth / error-rate
+    /// have metrics where the change affects them; traces or correlation IDs follow a
+    /// request / job across services, jobs, and external calls; the critical failure
+    /// modes have alerts; support / operators can inspect stuck / failed / in-flight
+    /// state without manual database spelunking and can safely retry / cancel /
+    /// repair / reconcile a workflow that sticks or partially fails; security / admin /
+    /// data-sensitive actions emit audit events; migration / backfill progress and
+    /// correctness are verifiable; no critical failure path is silent; and the recovery
+    /// steps for common failures are discoverable and automated or operator-facing.
+    /// This reviews only whether the plan DECLARES adequate observability and
+    /// operability — actual log / metric emission is a code-stage concern. This is a
+    /// GENERAL, project-agnostic gate: the full criteria set is kept for every project
+    /// (per-project relevance is the auditor on/off toggle); a specific plan that
+    /// genuinely does not touch an area self-skips just those criteria as
+    /// NOT_APPLICABLE with a one-line reason. The human-process framing of a "runbook"
+    /// is reframed to the autonomous-factory equivalent: discoverable, self-documenting
+    /// recovery that is automated or operator-facing, never reliant on a human
+    /// remembering tribal knowledge.
+    /// </summary>
+    public static PlanAuditTest Test08 { get; } = new()
+    {
+        Id = "08",
+        AuditorName = Test08AuditorName,
+        Title = "OBSERVABILITY, OPERATIONS, DEBUGGABILITY, AND REPAIRABILITY",
+        Objective =
+            "Verify production behavior can be observed, diagnosed, supported, and repaired without " +
+            "ad hoc heroics.",
+        ReviewGuidance = """
+            - What logs are added or changed — are they structured (queryable, not free-text), tied to
+              the changed behavior, and safe from sensitive-data leakage?
+            - Are there metrics for success / failure / latency / throughput / retries / queue-depth /
+              error-rate where this change introduces or affects them?
+            - Are there traces or correlation IDs that follow a request / job across services, jobs, and
+              external calls?
+            - Are there alerts for the critical failure modes this change introduces?
+            - Can support / operators inspect stuck, failed, or in-flight state without manual database
+              spelunking?
+            - Can operators safely retry, cancel, repair, or reconcile a workflow that sticks or
+              partially fails?
+            - Are there audit events for security-relevant, admin, and data-sensitive actions?
+            - If the change includes a migration / backfill, how is its progress and correctness verified?
+            - What does failure look like in production — is every critical failure path observable rather
+              than silent?
+            - Are the recovery steps for common failures discoverable and automated or operator-facing,
+              rather than tribal knowledge a human must remember?
+            """,
+        PassCriteria =
+            "Observability signals (structured logs, metrics, traces / correlation IDs, alerts) are tied " +
+            "to the changed behavior and its failure modes; workflows that can stick or partially fail " +
+            "have an operator inspect + retry / cancel / repair / reconcile path; audit events cover " +
+            "security / admin / data-sensitive actions; and logs and diagnostics are useful and " +
+            "privacy-safe.",
+        FailCriteria =
+            "There is no way to know whether the change works in production; debugging a failure requires " +
+            "manual database spelunking; security- or billing-relevant actions lack auditability; there " +
+            "is no repair path for partial failure; or sensitive data would be logged or exposed through " +
+            "diagnostics.",
+        AutomaticBlocker = """
+            Treat as an automatic BLOCKER when the plan:
+            - lets a critical workflow fail silently (a failure path with no log, metric, alert, or other
+              signal that would reveal it in production); or
+            - leaves operators unable to detect or repair stuck / partially-applied / provisioning /
+              user-impacting state (no way to inspect it and no safe retry / cancel / reconcile / repair
+              path); or
+            - would log or expose sensitive data through diagnostics (secrets or unredacted sensitive data
+              in logs, traces, error responses, or debug endpoints).
+            """,
+        RequiredFixes = """
+            - Add structured logs, metrics, and traces / correlation IDs tied to the changed behavior and
+              its failure modes (success / failure / latency / throughput / retries / queue-depth /
+              error-rate), plus alerts for the critical failure modes.
+            - Add audit events for security-relevant, admin, and data-sensitive actions.
+            - Add an admin / operator repair path to inspect and safely retry / cancel / reconcile stuck
+              or partially-applied state.
+            - Define discoverable recovery steps for common failures — self-documenting and automated or
+              operator-facing detection + recovery, not reliant on a human remembering a runbook.
+            - Make migration / backfill progress and correctness verifiable, and ensure no failure path is
+              silent or leaks sensitive data through diagnostics.
+            """,
+        Criteria =
+        [
+            "structured-logs",            // logs added/changed are structured, queryable, tied to changed behavior
+            "diagnostic-privacy-safety",  // logs/traces/error-responses/debug endpoints never leak secrets/sensitive data
+            "metrics",                    // success/failure/latency/throughput/retries/queue-depth/error-rate metrics
+            "tracing-correlation",        // traces or correlation IDs across services/jobs/external calls
+            "alerting",                   // alerts for the critical failure modes the change introduces
+            "state-inspection",           // support/operators can inspect stuck/failed/in-flight state (no db spelunking)
+            "repair-reconcile",           // safe operator retry/cancel/repair/reconcile for stuck/partial state
+            "audit-events",               // audit events for security/admin/data-sensitive actions
+            "migration-observability",    // migration/backfill progress + correctness are verifiable
+            "silent-failure-visibility",  // no critical failure path is silent; failure is observable in production
+            "recovery-procedure",         // discoverable, automated-or-operator-facing recovery for common failures
+        ],
+    };
+
+    /// <summary>
+    /// TEST 09 — DELIVERY, DEPLOYMENT ORDER, ROLLOUT, FEATURE FLAGS, AND ROLLBACK.
+    /// Determines whether the plan can be safely delivered through a real deployment
+    /// with mixed versions, feature control, and recovery options: the implementation
+    /// is broken into reviewable, independently deployable steps that each compile and
+    /// pass tests; refactors are separated from behavior changes; deployment order is
+    /// explicit; the change is safe while old and new versions run together during the
+    /// rollout; DB / API / event / worker / client changes are sequenced so neither the
+    /// old nor the new version breaks mid-deploy; a production-impacting change has a
+    /// rollout path (staged / gated) rather than assuming an atomic deploy; any feature
+    /// flag has a defined lifecycle (default-state, an owning removal / expiry trigger,
+    /// a both-states test matrix, and a cleanup task); rollback is safe after new code
+    /// has written data, or a forward-fix is defined where rollback would corrupt or
+    /// orphan newly-written data; and old paths, deprecated fields, flags, and shims
+    /// have cleanup tasks. This reviews only whether the plan DECLARES a safe delivery /
+    /// rollout / rollback strategy — actual deployment execution is a code / ops-stage
+    /// concern. This is a GENERAL, project-agnostic gate: the full criteria set is kept
+    /// for every project (per-project relevance is the auditor on/off toggle); a
+    /// specific plan that genuinely does not touch an area — e.g. a single-process app
+    /// with no rolling deploy, no client versioning, and no feature flag — self-skips
+    /// just those criteria as NOT_APPLICABLE with a one-line reason. The human-process
+    /// framing of a feature-flag "owner" is reframed to the autonomous-factory
+    /// equivalent: an owning component or automated expiry / removal trigger, not a
+    /// human owner who must remember to remove the flag.
+    /// </summary>
+    public static PlanAuditTest Test09 { get; } = new()
+    {
+        Id = "09",
+        AuditorName = Test09AuditorName,
+        Title = "DELIVERY, DEPLOYMENT ORDER, ROLLOUT, FEATURE FLAGS, AND ROLLBACK",
+        Objective =
+            "Determine whether the plan can be safely delivered through a real deployment with mixed " +
+            "versions, feature control, and recovery options.",
+        ReviewGuidance = """
+            - Is the implementation broken into reviewable, independently deployable steps, and does each
+              step compile and pass tests on its own rather than only at the end?
+            - Are refactors separated from behavior changes, rather than combining a large refactor and a
+              behavior change in one step?
+            - Is the deployment order explicit (which parts deploy in which order)?
+            - Does the plan handle mixed-version operation — old and new code / data / clients running at
+              the same time during a rolling deploy — rather than assuming an atomic cut-over?
+            - Are DB / API / event / worker / client changes sequenced so that neither the old nor the new
+              version breaks at any point during the deployment?
+            - Is a feature flag needed, and if one is used are its default state, its owning removal /
+              expiry trigger, its cleanup task, and a test matrix covering BOTH flag states all defined?
+            - Is rollback safe after the new code has already written data, or does the plan define a
+              forward-fix where a rollback would corrupt or orphan newly-written data?
+            - Is the rollback-vs-forward-fix decision defined for each production-impacting change?
+            - Are there cleanup tasks for old paths, deprecated fields, feature flags, and compatibility
+              shims, so they are not left dangling?
+            """,
+        PassCriteria =
+            "Delivery is incremental, reviewable, and reversible where practical; deployment order and " +
+            "mixed-version behavior are explicit; a production-impacting change has a realistic rollback " +
+            "or forward-fix path; feature flags have lifecycle management (default state, an owning " +
+            "removal / expiry trigger, a both-states test matrix, and a cleanup task); and old paths / " +
+            "deprecated fields / flags / shims have cleanup tasks.",
+        FailCriteria =
+            "The plan assumes an atomic deployment; combines a large refactor and a behavior change in " +
+            "one step; lacks a rollback or cleanup path; or introduces a permanent feature flag with no " +
+            "owning removal / expiry trigger.",
+        AutomaticBlocker = """
+            Treat as an automatic BLOCKER when the plan:
+            - ships a production-impacting change with no rollout or rollback path (no way to gate,
+              stage, or reverse it); or
+            - makes a schema / API / event / client change that can break old or new versions during
+              deployment (the change is not sequenced for mixed-version operation); or
+            - would have a rollback corrupt or orphan newly-written data with no forward-fix defined.
+            """,
+        RequiredFixes = """
+            - Add an explicit deployment sequence — the order each part (DB / API / event / worker /
+              client) deploys in, split into reviewable, independently deployable steps that each build
+              and pass tests.
+            - Add mixed-version compatibility: sequence schema / API / event / client changes so neither
+              the old nor the new version breaks while both run during the rollout.
+            - Add a rollback or forward-fix path for each production-impacting change — and where a
+              rollback would corrupt or orphan newly-written data, define the forward-fix instead.
+            - Add feature-flag lifecycle management: a default state, a test matrix covering both states,
+              a cleanup task, and an owning removal / expiry trigger that is
+              an automated condition, not a human who must remember to remove the flag.
+            - Split refactors from behavior changes into separate steps, and add cleanup tasks for old
+              paths, deprecated fields, flags, and compatibility shims.
+            """,
+        Criteria =
+        [
+            "incremental-delivery",          // broken into reviewable, independently deployable steps
+            "step-buildability",             // each step compiles and passes tests on its own
+            "refactor-behavior-separation",  // refactors separated from behavior changes (not one bundled step)
+            "deployment-order",              // explicit order the parts deploy in
+            "change-sequencing",             // DB/API/event/worker/client changes sequenced so neither version breaks
+            "mixed-version-compatibility",   // safe while old+new code/data/clients run together during rollout
+            "rollout-strategy",              // production-impacting change has a rollout path, not an atomic-deploy assumption
+            "feature-flag-lifecycle",        // flag default-state / owning-removal-or-expiry-trigger / both-states test matrix / cleanup
+            "rollback-safety",               // rollback safe after new code writes data (no corrupt/orphan)
+            "rollback-vs-forward-fix",       // rollback-vs-forward-fix decision defined where rollback is unsafe
+            "cleanup-tasks",                 // cleanup for old paths / deprecated fields / flags / shims
+        ],
+    };
+
+    /// <summary>
+    /// TEST 10 — DECISION QUALITY, TRADE-OFFS, OWNERSHIP, AND MAINTAINABILITY.
+    /// Assesses whether the plan makes mature design decisions the next agent can
+    /// understand and maintain: significant architectural choices are recorded
+    /// ADR-style (context, decision, rationale); alternatives — including the
+    /// simplest viable option — are considered with their rejection reasons;
+    /// trade-offs, consequences, and reversibility (reversible vs one-way) are
+    /// explicit; the chosen design is justified against THIS codebase's own
+    /// conventions and constraints rather than fashion; new
+    /// modules / APIs / jobs / dependencies / flags / alerts / recovery procedures
+    /// carry a defined lifecycle and cleanup that is self-documenting and
+    /// discoverable for the next agent; existing naming / error-handling /
+    /// validation / dependency / folder conventions are preserved; the change adds
+    /// no second way to do something the codebase already does one way; the
+    /// documentation updates it requires are named; any temporary compatibility
+    /// code has a cleanup path and a removal trigger; and it avoids speculative
+    /// machinery not justified by a current requirement. This is a GENERAL,
+    /// project-agnostic gate: the full criteria set is kept for every project
+    /// (per-project relevance is the auditor on/off toggle); a specific plan that
+    /// genuinely does not touch an area self-skips just those criteria as
+    /// NOT_APPLICABLE with a one-line reason. The human-process framing of
+    /// "ownership" is reframed to the autonomous-factory equivalent: there is no
+    /// human to assign as an owner, so an "owned" module is one with a defined
+    /// lifecycle and cleanup whose state is discoverable by the next agent — not a
+    /// human owner who must remember to maintain or remove it.
+    /// </summary>
+    public static PlanAuditTest Test10 { get; } = new()
+    {
+        Id = "10",
+        AuditorName = Test10AuditorName,
+        Title = "DECISION QUALITY, TRADE-OFFS, OWNERSHIP, AND MAINTAINABILITY",
+        Objective =
+            "Assess whether the plan makes mature design decisions future maintainers can understand " +
+            "and own.",
+        ReviewGuidance = """
+            - Does the plan record its meaningful architectural decisions ADR-style — the context, the
+              decision, and the rationale — rather than jumping to an approach with no stated reasoning?
+            - Are alternatives considered, INCLUDING the simplest viable option, each with the reason it
+              was rejected?
+            - Are the trade-offs and consequences of the chosen design made explicit?
+            - Does the plan explain why the chosen design fits THIS codebase (its existing patterns,
+              constraints, and conventions) rather than being justified by fashion or generic best practice?
+            - Are the decisions reversible or one-way, and are the one-way / hard-to-reverse choices called
+              out as such?
+            - Do new modules / APIs / jobs / dependencies / flags / dashboards / alerts / recovery
+              procedures have a defined LIFECYCLE and cleanup — self-documenting and discoverable for the
+              next agent — rather than being left dangling with no owner and no removal path?
+            - Does the plan preserve the existing naming, error-handling, validation, dependency, and
+              folder / module conventions?
+            - Does it avoid introducing a SECOND way to do something the codebase already does one way (a
+              parallel / duplicate mechanism, config system, or abstraction)?
+            - Are the documentation updates the change requires named where they are needed?
+            - Does any temporary compatibility code (shim, adapter, dual-write, flag) have a defined
+              cleanup path and a concrete removal trigger?
+            - Does the plan avoid speculative machinery — abstraction, configurability, indirection, or
+              infrastructure not justified by a CURRENT requirement?
+            """,
+        PassCriteria =
+            "Important choices have rationale, alternatives (including the simplest viable option), " +
+            "trade-offs, consequences, and reversibility; the design is justified against this codebase's " +
+            "existing conventions and introduces no second way to do the same thing; new " +
+            "modules / dependencies / jobs / flags and any temporary compatibility code have a defined " +
+            "lifecycle and cleanup discoverable by the next agent; needed documentation updates are named; " +
+            "and a future maintainer can understand why the design exists.",
+        FailCriteria =
+            "The plan chooses a technology or pattern with no rationale; ignores existing conventions; " +
+            "adds an unowned module / dependency / job / flag with no defined lifecycle or cleanup; " +
+            "introduces a second way to do the same thing; adds speculative machinery no current " +
+            "requirement justifies; or leaves temporary compatibility code with no cleanup plan.",
+        AutomaticBlocker = """
+            Treat as an automatic BLOCKER when the plan:
+            - introduces major architectural complexity (a new module, service, dependency, framework, or
+              cross-cutting pattern) WITHOUT considering alternatives — including the simplest viable
+              option — or analyzing the trade-offs; or
+            - adds a new production-critical module, job, dependency, or process with NO defined lifecycle
+              or cleanup — nothing that states how it is maintained, superseded, or removed, and no
+              discoverable state for the next agent (there is no human owner to fall back on).
+            """,
+        RequiredFixes = """
+            - Add ADR-style decision notes for each significant choice: the context, the decision, and the
+              rationale for why it fits THIS codebase's conventions and constraints.
+            - Add the alternatives considered — including the simplest viable option — with the reason each
+              was rejected, plus the trade-offs, consequences, and whether the choice is reversible or one-way.
+            - Add a defined lifecycle and cleanup for every new module / API / job / dependency / flag /
+              alert / recovery procedure — self-documenting and discoverable for the next agent, not a
+              human owner assigned to remember it.
+            - Add the documentation updates the change requires, and a cleanup path plus a concrete removal
+              trigger for any temporary compatibility code.
+            - Remove speculative machinery no current requirement justifies, preserve the existing
+              conventions, and collapse any second way to do the same thing back into the existing one.
+            """,
+        Criteria =
+        [
+            "decision-record",          // significant decisions recorded ADR-style (context/decision/rationale)
+            "alternatives-considered",  // alternatives incl. the simplest viable option, each with a rejection reason
+            "tradeoffs-consequences",   // trade-offs and consequences of the chosen design are explicit
+            "codebase-fit",             // design justified against THIS codebase's conventions/constraints, not fashion
+            "reversibility",            // reversible vs one-way decisions identified; hard-to-reverse ones called out
+            "lifecycle-ownership",      // new module/api/job/dep/flag/alert has defined lifecycle+cleanup, discoverable
+            "convention-adherence",     // preserves naming/error-handling/validation/dependency/folder conventions
+            "no-duplicate-mechanism",   // no second way to do something the codebase already does one way
+            "documentation-updates",    // documentation updates named where the change needs them
+            "temporary-code-cleanup",   // temporary compatibility code has a cleanup path + removal trigger
+            "no-speculative-machinery", // no abstraction/config/indirection unjustified by a current requirement
+        ],
+    };
+
+    /// <summary>
     /// Every built-in plan-audit chain test, in chain order. The DI registration
     /// and <c>ProjectAuditorComposer</c> auto-inclusion both iterate this list,
     /// so adding a chain test here wires it everywhere without touching either
     /// call site (one source of truth for the chain membership).
     /// </summary>
-    public static IReadOnlyList<PlanAuditTest> All { get; } = [Test01, Test02, Test03];
+    public static IReadOnlyList<PlanAuditTest> All { get; } = [Test01, Test02, Test03, Test04, Test05, Test06, Test07, Test08, Test09, Test10];
 }

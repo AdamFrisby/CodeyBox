@@ -328,7 +328,7 @@ public sealed class LocalGitPreMergeVerifier : IPreMergeVerifier
                 catch (InvalidOperationException) { /* process already exited */ }
                 catch (System.ComponentModel.Win32Exception) { /* kill denied / process gone */ }
                 metricOutcome = "timeout";
-                return (124, await ReadOrEmpty(stdoutTask), $"verify command exceeded {timeout!.Value.TotalMinutes:0} min timeout");
+                return (124, await ReadWithGraceAsync(stdoutTask), $"verify command exceeded {timeout!.Value.TotalMinutes:0} min timeout");
             }
             catch (OperationCanceledException)
             {
@@ -370,13 +370,39 @@ public sealed class LocalGitPreMergeVerifier : IPreMergeVerifier
                 CoordinatorGitMetrics.Record(gitOperation!, stopwatch, metricOutcome);
         }
 
-        static async Task<string> ReadOrEmpty(Task<CapturedStream> t)
+        static async Task<string> ReadWithGraceAsync(Task<CapturedStream> t)
         {
-            // The read tasks are cancelled along with the timeout CTS, so
-            // an OCE here is expected. IOException can also surface when
-            // the process's stdio handles are closed by the kill above.
-            // Returning empty preserves the timeout-message tuple shape
-            // while suppressing the secondary noise.
+            // Bounded drain after a timeout-kill.
+            //
+            // Why: Process.Kill(entireProcessTree: true) on Linux walks
+            // /proc to enumerate descendants, which races against fork —
+            // a grandchild created between Start and the enumeration can
+            // be missed and survive as an orphan still holding our stdout
+            // pipe open. The cancellation token bound to ReadCappedAsync's
+            // inner ReadAsync does NOT interrupt a pipe ReadAsync
+            // mid-syscall on Linux (token checks happen between reads, but
+            // the read itself blocks in the kernel until data arrives or
+            // the pipe closes). So a naive `await t` here would block until
+            // the orphaned descendant naturally exits — turning a 500 ms
+            // timeout into a 30 s wall-clock hang on a `sleep 30` argv.
+            //
+            // Give the read a short grace in case stdout has already
+            // drained (every descendant actually exited), then abandon:
+            // the synthetic timeout message in Stderr (third tuple
+            // element) is the operator-visible signal, and stdout
+            // content here is best-effort diagnostic.
+            if (!t.IsCompleted)
+            {
+                var winner = await Task.WhenAny(t, Task.Delay(TimeSpan.FromSeconds(2)));
+                if (winner != t)
+                {
+                    // Observe the abandoned task's eventual exception so
+                    // it doesn't surface as an unobserved-task exception.
+                    _ = t.ContinueWith(static observed => observed.Exception,
+                        TaskScheduler.Default);
+                    return string.Empty;
+                }
+            }
             try { return (await t).Text; }
             catch (OperationCanceledException) { return string.Empty; }
             catch (IOException) { return string.Empty; }

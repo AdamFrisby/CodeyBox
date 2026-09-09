@@ -64,9 +64,12 @@ internal static class WorkItemEndpoints
     private static async Task<IResult> CreateAsync(
         CreateWorkItemRequest req,
         WorkItemCreationService creation,
+        HttpContext context,
         CancellationToken ct)
     {
-        var prepared = await creation.PrepareAsync(req, ct);
+        var initiator = ApiKeyAuth.ResolveInitiator(context, req.Initiator);
+        if (initiator.Error is not null) return initiator.Error;
+        var prepared = await creation.PrepareAsync(req with { Initiator = initiator.Value }, ct);
         if (prepared.Error is not null) return prepared.Error;
 
         var committed = await creation.CommitAsync(prepared.Prepared!, ct);
@@ -140,6 +143,7 @@ internal static class WorkItemEndpoints
         IWorkItemStore store,
         IProjectRepository projects,
         IWorkItemCostStore? costs,
+        IUpstreamRemoteFactory upstreams,
         ILoggerFactory loggerFactory,
         IAgentFallbackHistoryStore? fallbackHistory,
         // [FromServices] + nullable makes this a genuinely OPTIONAL dependency:
@@ -172,6 +176,33 @@ internal static class WorkItemEndpoints
         var iterations = await store.GetIterationsAsync(item.Id, ct);
         var dto = ToDto(item, project, statesById, depExternalIds, usage,
             iterations: iterations.Count > 0 ? iterations : null);
+        if (project is not null && item.MergedPrNumber is > 0)
+        {
+            try
+            {
+                var pullRequest = await upstreams.Create(project).GetPullRequestAsync(item.MergedPrNumber.Value, ct);
+                if (pullRequest is not null)
+                {
+                    dto = dto with
+                    {
+                        PullRequestState = pullRequest.Status.ToString().ToLowerInvariant(),
+                        PullRequestMergeSha = pullRequest.MergeCommitSha,
+                    };
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                loggerFactory.CreateLogger("CodeyBox.Api.WorkItemEndpoints").LogWarning(
+                    ex,
+                    "Failed to read upstream PR {PullRequestNumber} for work item {WorkItemId}",
+                    item.MergedPrNumber,
+                    item.Id);
+            }
+        }
         if (fallbackHistory is not null)
         {
             // Always emit a list (possibly empty) when the store is wired, so
@@ -424,6 +455,7 @@ internal static class WorkItemEndpoints
         ITaskQueue queue,
         IProjectRepository projects,
         IAgentRegistry agents,
+        HttpContext context,
         CancellationToken ct)
     {
         var (source, err) = await ResolveWorkItemAsync(id, store, ct);
@@ -491,6 +523,8 @@ internal static class WorkItemEndpoints
         }
 
         var project = await projects.GetAsync(source.ProjectId, ct);
+        var replayInitiator = ApiKeyAuth.ResolveInitiator(context, delegated: null);
+        if (replayInitiator.Error is not null) return replayInitiator.Error;
 
         var replay = new WorkItem
         {
@@ -512,10 +546,11 @@ internal static class WorkItemEndpoints
             MinModelScore = source.MinModelScore,
             RequiredCapabilities = source.RequiredCapabilities,
             Knobs = source.Knobs,
+            Initiator = replayInitiator.Value,
         };
 
         await store.CreateAsync(replay, ct);
-        AuditLog.WorkItemCreated(replay.Id, replay.ProjectId, replay.Title);
+        AuditLog.WorkItemCreated(replay.Id, replay.ProjectId, replay.Title, replay.Initiator);
 
         // Re-read dep states to decide whether to enqueue immediately.
         var depStates = new Dictionary<WorkItemId, WorkItemState>();
@@ -2101,6 +2136,7 @@ internal static class WorkItemEndpoints
             item.ExternalIds.Count == 0
                 ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
                 : item.ExternalIds.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase),
+            item.Initiator,
             item.ProjectId.Value,
             item.Title,
             item.Prompt,
@@ -2390,6 +2426,9 @@ public sealed record CreateWorkItemRequest(
     // accepted as a write-shortcut stored under namespace 'legacy'. Sending
     // both is allowed only when they agree; conflicting values 400.
     IReadOnlyDictionary<string, string>? ExternalIds = null,
+    // Accepted only from API clients configured with CanDelegateInitiator.
+    // All other callers receive their server-configured principal.
+    WorkInitiator? Initiator = null,
     // Clearance tags the agent member must declare. Empty (default) ⇒ any
     // member of the resolved AgentClass is eligible.
     IReadOnlyList<string>? RequiredCapabilities = null,
@@ -2518,6 +2557,7 @@ public sealed record WorkItemDto(
     string Id,
     string? ExternalId,
     IReadOnlyDictionary<string, string> ExternalIds,
+    WorkInitiator? Initiator,
     string ProjectId,
     string Title,
     string Prompt,
@@ -2543,6 +2583,8 @@ public sealed record WorkItemDto(
     string? LocalSquashSha = null,
     int? MergedPrNumber = null,
     string? MergedPrUrl = null,
+    string? PullRequestState = null,
+    string? PullRequestMergeSha = null,
     int MinModelScore = 0,
     string? ReleaseId = null,
     string? FailureKind = null,

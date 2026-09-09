@@ -34,6 +34,19 @@ public sealed class PipelineTuningOptions
     public TimeSpan DefaultQuotaFailurePause { get; set; } = TimeSpan.FromMinutes(5);
 
     /// <summary>
+    /// Last-resort pause applied when a <em>rate-limited</em> terminal failure
+    /// (transient provider 429 / throughput limit) carries no parseable reset
+    /// window — no <c>reset after …</c> tail and no <c>Retry-After</c> echo.
+    /// Kept separate from <see cref="DefaultQuotaFailurePause"/> because a
+    /// short-term throughput limit clears far sooner than a spent account
+    /// cap, so the two need different operator responses and different reset
+    /// expectations. Default 5 minutes — deliberately and meaningfully longer
+    /// than the sub-two-minute in-CLI retry budget that precedes the park, so
+    /// the provider has actually had time to drain before the item resumes.
+    /// </summary>
+    public TimeSpan DefaultRateLimitPause { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
     /// Per-process exhausted-member TTL when the chosen agent hits quota
     /// mid-flight. Subscription windows reset on the order of hours; one hour
     /// is a conservative upper bound that keeps the in-process cache useful
@@ -80,6 +93,13 @@ public sealed class PipelineTuningOptions
     /// re-invocation retry).
     /// </summary>
     public int AgentSessionResumeMaxAttempts { get; set; } = Agents.SessionResumeOptions.DefaultMaxResumeAttempts;
+
+    /// <summary>
+    /// Maximum provider-owned stopped sandboxes retained concurrently because
+    /// infrastructure prevented normal agent-turn checkpoint publication.
+    /// Enforced atomically in the work-item store. Default 16.
+    /// </summary>
+    public int MaxRetainedAgentTurnSandboxes { get; set; } = 16;
 
     /// <summary>
     /// Maximum number of sequential auto-merge race recoveries the upstream-push
@@ -240,6 +260,12 @@ public sealed class PipelineTuningOptions
     public void Validate()
     {
         _ = PlanReviewIterationLimit.Create(MaxPlanReviewIterations);
+        if (DefaultRateLimitPause <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(DefaultRateLimitPause),
+                "DefaultRateLimitPause must be a positive TimeSpan");
+        }
         if (PlannedItemAdvisoryAuditors is null)
         {
             throw new ArgumentNullException(
@@ -264,6 +290,12 @@ public sealed class PipelineTuningOptions
         if (MaxSandboxReuses < 1)
         {
             throw new ArgumentOutOfRangeException(nameof(MaxSandboxReuses), "MaxSandboxReuses must be >= 1");
+        }
+        if (MaxRetainedAgentTurnSandboxes is < 1 or > 256)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(MaxRetainedAgentTurnSandboxes),
+                "MaxRetainedAgentTurnSandboxes must be between 1 and 256");
         }
         if (MaxSandboxLifetime <= TimeSpan.Zero)
         {

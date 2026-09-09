@@ -28,6 +28,10 @@ namespace CodeyBox.Agents.Claude;
 public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAgentRunner, ICliSessionResumableAgentRunner, IAgentDefaultModelProvider, ITextOnlyAgentRunner, IPlanArtifactExtractor
 {
     private static readonly HttpClient SharedTextOnlyHttp = new();
+    private static readonly EnvBackedCredentialFile OAuthCredentialFile = new(
+        "CODEYBOX_CLAUDE_OAUTH_JSON",
+        ".claude/.credentials.json",
+        "claude auth");
 
     internal const string MessagesEndpoint = "https://api.anthropic.com/v1/messages";
     // /v1/models endpoint and anthropic-version pin live in ClaudeModelListProbe;
@@ -131,37 +135,22 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
 
     protected override IReadOnlyList<string> ScratchpadHomeDirectories => [".claude/projects", ".claude/todos"];
 
-    protected override IReadOnlyList<string> FileBackedCredentialEnvironmentVariables => ["CODEYBOX_CLAUDE_OAUTH_JSON"];
+    protected override IReadOnlyList<EnvBackedCredentialFile> EnvBackedCredentialFiles => [OAuthCredentialFile];
+
+    protected override IReadOnlyList<string> DirectCredentialEnvironmentVariables =>
+        ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"];
 
     protected override string PreemptProcessPattern => Binary;
 
     /// <summary>
-    /// Materialises the host's <c>~/.claude/.credentials.json</c> inside the
-    /// sandbox if the env-var bundle is present (set by
-    /// <c>ClaudeOAuthFileCredentialProvider</c>). The bundle is sanitised — it
-    /// carries the access_token (plus the expires_at hint when available) but
-    /// <em>omits</em> the refresh_token, so the in-VM <c>claude</c> CLI cannot
-    /// initiate its own refresh. This is deliberate: Anthropic's refresh tokens
-    /// are single-use, and the host CLI is the sole party allowed to refresh
-    /// (see <c>ClaudeOAuthFileCredentialProvider</c>'s class summary for the
-    /// race rationale). An in-VM iteration that outlives the access_token's
-    /// expiry surfaces as a 401, which is treated as transient/auth (not a
-    /// quota event) and audit-logged via
-    /// <c>AuditLog.ClaudeUnauthorizedObserved</c>; the next iteration picks up
-    /// the host's currently-fresh token. The legacy
-    /// <c>CLAUDE_CODE_OAUTH_TOKEN</c> env var remains the primary auth path;
-    /// this hook is purely additive.
-    ///
-    /// <para>
     /// When a <paramref name="resume"/> context is supplied (preempt-recovery
     /// path), this method also sanitises the restored session JSONL transcripts
     /// under <c>~/.claude/projects/**/*.jsonl</c> so a replayed conversation
     /// cannot 400 with "thinking blocks cannot be modified"
     /// (anthropics/claude-code #63335). Gated by
     /// <see cref="ClaudeThinkingBlockSanitizerConfig.Enabled"/>.
-    /// </para>
     /// </summary>
-    protected override async Task<AgentResult?> PrepareSandboxAsync(
+    protected override async Task<AgentResult?> PrepareAgentSandboxAsync(
         ISandbox sandbox,
         string workingDirectory,
         AgentCredential? credential,
@@ -182,36 +171,6 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             }
         }
 
-        // Skip the bash hook entirely when no OAuth bundle is present (e.g.
-        // ANTHROPIC_API_KEY flows); the CLI uses whichever env-var auth path
-        // the credential pipeline plugged in.
-        if (credential is null
-            || !credential.EnvironmentVariables.ContainsKey("CODEYBOX_CLAUDE_OAUTH_JSON"))
-            return null;
-
-        // umask 077 ensures the new file is 0600; the explicit chmod is belt-
-        // and-braces in case the sandbox image overrides umask elsewhere.
-        var script =
-            "set -eu\n" +
-            "umask 077\n" +
-            "mkdir -p \"$HOME/.claude\"\n" +
-            "if [ -n \"${CODEYBOX_CLAUDE_OAUTH_JSON:-}\" ]; then\n" +
-            "  printf '%s' \"$CODEYBOX_CLAUDE_OAUTH_JSON\" > \"$HOME/.claude/.credentials.json\"\n" +
-            "  chmod 600 \"$HOME/.claude/.credentials.json\"\n" +
-            "fi\n";
-        var write = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["bash", "-c", script],
-            ExtraEnvironment = credential.EnvironmentVariables,
-        }, ct).ConfigureAwait(false);
-        if (!write.Success)
-        {
-            return new AgentResult(
-                Success: false,
-                Summary: $"failed to materialise claude auth: exit {write.ExitCode}",
-                Stdout: write.Stdout,
-                Stderr: write.Stderr);
-        }
         return null;
     }
 
@@ -401,7 +360,19 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         string? modelId = null,
         string? reasoningMode = null,
         bool captureStructuredStream = false)
-        => BuildClaudeInvocation(prompt, modelId, reasoningMode, sessionIdForResume: null, captureStructuredStream);
+    {
+        _ = prompt;
+        var sessionId = resume.NativeSessionId is null
+            ? null
+            : ValidateClaudeSessionId(resume.NativeSessionId);
+        return BuildClaudeInvocation(
+            SessionResumePrompt,
+            modelId,
+            reasoningMode,
+            sessionIdForResume: sessionId,
+            captureStructuredStream,
+            resumeMostRecent: sessionId is null);
+    }
 
     /// <summary>
     /// Claude emits the resumable CLI session id only in its structured
@@ -440,24 +411,40 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
     /// CLI carries the original user prompt and in-progress context.
     /// </summary>
     protected override AgentInvocation BuildSessionResumeInvocation(
-        string sessionId,
+        AgentNativeSessionId sessionId,
         string prompt,
         AgentCredential? credential,
         string? modelId = null,
         string? reasoningMode = null,
         bool captureStructuredStream = false)
     {
-        if (string.IsNullOrWhiteSpace(sessionId))
-            throw new ArgumentException("sessionId must be non-empty", nameof(sessionId));
         _ = prompt;
-        return BuildClaudeInvocation(SessionResumePrompt, modelId, reasoningMode, sessionIdForResume: sessionId, captureStructuredStream);
+        return BuildClaudeInvocation(
+            SessionResumePrompt,
+            modelId,
+            reasoningMode,
+            sessionIdForResume: ValidateClaudeSessionId(sessionId),
+            captureStructuredStream,
+            resumeMostRecent: false);
     }
 
     internal const string SessionResumePrompt =
         "Continue from the restored session after the interrupted run. Do not restart completed work or repeat the original instructions.";
 
-    private AgentInvocation BuildClaudeInvocation(string prompt, string? modelId, string? reasoningMode, string? sessionIdForResume, bool captureStructuredStream)
-        => BuildClaudeSessionInvocation(prompt, modelId, reasoningMode, cliResumeSessionId: sessionIdForResume, captureStructuredStream);
+    private AgentInvocation BuildClaudeInvocation(
+        string prompt,
+        string? modelId,
+        string? reasoningMode,
+        string? sessionIdForResume,
+        bool captureStructuredStream,
+        bool resumeMostRecent = false)
+        => BuildClaudeSessionInvocation(
+            prompt,
+            modelId,
+            reasoningMode,
+            cliResumeSessionId: sessionIdForResume,
+            resumeMostRecent,
+            captureStructuredStream);
 
     /// <summary>
     /// Builds the claude CLI argv used by <see cref="ClaudeSessionWorker"/> for
@@ -470,13 +457,21 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         string? modelId,
         string? reasoningMode,
         string? cliResumeSessionId,
+        bool resumeMostRecent,
         bool captureStructuredStream)
     {
+        var validatedResumeSessionId = cliResumeSessionId is null
+            ? null
+            : ValidateClaudeSessionId(new AgentNativeSessionId(cliResumeSessionId));
         var argv = new List<string> { Binary, "--print", "--dangerously-skip-permissions" };
-        if (!string.IsNullOrWhiteSpace(cliResumeSessionId))
+        if (validatedResumeSessionId is not null)
         {
             argv.Add("--resume");
-            argv.Add(cliResumeSessionId);
+            argv.Add(validatedResumeSessionId);
+        }
+        else if (resumeMostRecent)
+        {
+            argv.Add("--continue");
         }
         if (captureStructuredStream)
         {
@@ -496,6 +491,15 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             argv.Add(reasoningMode);
         }
 
+        if (validatedResumeSessionId is not null || resumeMostRecent)
+        {
+            // End option parsing explicitly on continuation calls. A restored
+            // session id is validated above and passed as one argv element;
+            // this delimiter also keeps any future positional additions from
+            // reinterpreting restored data as CLI flags.
+            argv.Add("--");
+        }
+
         IReadOnlyDictionary<string, string>? extraEnv = null;
         var apiTimeout = BindApiTimeout();
         if (apiTimeout.HasValue)
@@ -507,6 +511,19 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         }
 
         return new AgentInvocation(argv, ExtraEnvironment: extraEnv, Stdin: prompt);
+    }
+
+    private static string ValidateClaudeSessionId(AgentNativeSessionId sessionId)
+    {
+        ArgumentNullException.ThrowIfNull(sessionId);
+        if (!ClaudeSessionWorker.IsValidCliSessionId(sessionId.Value))
+        {
+            throw new ArgumentException(
+                "Claude native session ids may contain only ASCII letters, digits, '-' and '_', up to 128 characters.",
+                nameof(sessionId));
+        }
+
+        return sessionId.Value;
     }
 
     /// <summary>
@@ -539,19 +556,25 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         var fakeResume = cliResumeSessionId is null
             ? null
             : new AgentResumeContext(CheckpointRef: $"claude-session:{cliResumeSessionId}");
-        var preparation = await PrepareSandboxAsync(sandbox, workingDirectory, credential, fakeResume, ct)
+        var preparation = await PrepareSandboxForRunAsync(
+                sandbox,
+                workingDirectory,
+                credential,
+                fakeResume,
+                ct,
+                preserveExistingCredentialFiles: false)
             .ConfigureAwait(false);
         if (preparation is not null)
             return preparation;
 
         var invocation = BuildClaudeSessionInvocation(
-            prompt, modelId, reasoningMode, cliResumeSessionId, captureStructuredStream);
-        invocation = invocation with
-        {
-            ExtraEnvironment = MergeCredentialEnvironment(invocation.ExtraEnvironment, credential),
-        };
-
-        var result = await ExecOnceAsync(sandbox, workingDirectory, invocation, stdoutChunkCallback, ct)
+            prompt,
+            modelId,
+            reasoningMode,
+            cliResumeSessionId,
+            resumeMostRecent: false,
+            captureStructuredStream);
+        var result = await ExecOnceAsync(sandbox, workingDirectory, invocation, credential, stdoutChunkCallback, ct)
             .ConfigureAwait(false);
 
         if (!result.Success
@@ -562,7 +585,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
                 .ConfigureAwait(false);
             if (sanitized is null)
             {
-                result = await ExecOnceAsync(sandbox, workingDirectory, invocation, stdoutChunkCallback, ct)
+                result = await ExecOnceAsync(sandbox, workingDirectory, invocation, credential, stdoutChunkCallback, ct)
                     .ConfigureAwait(false);
             }
             else
@@ -582,6 +605,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         ISandbox sandbox,
         string workingDirectory,
         AgentInvocation invocation,
+        AgentCredential? credential,
         Action<string>? stdoutChunkCallback,
         CancellationToken ct)
     {
@@ -589,7 +613,7 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
         {
             Argv = invocation.Argv,
             WorkingDirectory = workingDirectory,
-            ExtraEnvironment = invocation.ExtraEnvironment,
+            ExtraEnvironment = BuildExecEnvironment(invocation.ExtraEnvironment),
             Stdin = invocation.Stdin,
             StdoutChunkCallback = stdoutChunkCallback,
             AgentOutputTransport = SelectBatchAgentOutputTransport(sandbox),
@@ -600,7 +624,10 @@ public sealed class ClaudeAgentRunner : CliAgentRunnerBase, IStructuredStreamAge
             Success: execResult.Success,
             Summary: execResult.Success ? "ok" : $"agent exited {execResult.ExitCode}",
             Stdout: execResult.Stdout,
-            Stderr: execResult.Stderr);
+            Stderr: execResult.Stderr)
+        {
+            ExecutionUnavailable = execResult.ExecutionUnavailable,
+        };
     }
 
     private static bool ContainsUnsupportedFlagMessage(string output) =>

@@ -30,10 +30,20 @@ public static class AuditLog
 
     // ── Work item lifecycle ──────────────────────────────────────────────────
 
-    public static void WorkItemCreated(WorkItemId id, ProjectId projectId, string title) =>
+    public static void WorkItemCreated(
+        WorkItemId id,
+        ProjectId projectId,
+        string title,
+        WorkInitiator? initiator = null) =>
         Audit("work_item.created")
-            .Information("Work item {WorkItemId} created for project {ProjectId}: {Title}",
-                id.ToString(), projectId.Value, title);
+            .Information(
+                "Work item {WorkItemId} created for project {ProjectId}: {Title}; initiator {InitiatorIssuer}/{InitiatorSubject} ({InitiatorDisplayName})",
+                id.ToString(),
+                projectId.Value,
+                title,
+                initiator?.Issuer,
+                initiator?.Subject,
+                initiator?.DisplayName);
 
     public static void WorkItemTransitioned(WorkItemId id, string toState) =>
         Audit("work_item.transitioned")
@@ -261,12 +271,28 @@ public static class AuditLog
                 agent.Value, exceptionType, message);
 
     /// <summary>
+    /// The live structured-stream capability probe failed due to sandbox/provider
+    /// infrastructure rather than a clean unsupported result from the agent CLI.
+    /// The runner still fails closed to plaintext capture; this event preserves
+    /// enough context to distinguish those cases operationally.
+    /// </summary>
+    public static void AgentStructuredStreamProbeFailed(AgentKind agent, string exceptionType, string message) =>
+        Audit("agent.structured_stream_probe_failed")
+            .Warning("Agent {Agent} structured-stream probe failed ({ExceptionType}): {Message}",
+                agent.Value, exceptionType, message);
+
+    /// <summary>
     /// Per-attempt failure of the in-VM agentic conflict resolver. Carries the
     /// full stdout/stderr tail (truncated to <see cref="TruncateAuditTail"/>'s
     /// 2 KiB window) plus the runner kind, sandbox id, working directory, and
     /// attempt counter so operators can diagnose without trawling logs. Emitted
     /// at <c>Warning</c> because every emission represents an iteration that
     /// either burned a retry slot or ended a candidate.
+    ///
+    /// <paramref name="logger"/> defaults to the process-global Serilog logger
+    /// (production sets it once at startup). Callers holding their own audit
+    /// logger pass it explicitly so a concurrent reassignment of the global
+    /// static cannot reroute these events off their sink.
     /// </summary>
     public static void AgenticConflictResolverAttemptFailed(
         WorkItemId workItemId,
@@ -277,9 +303,10 @@ public static class AuditLog
         int maxAttempts,
         string reason,
         string? stdoutTail = null,
-        string? stderrTail = null)
+        string? stderrTail = null,
+        Serilog.ILogger? logger = null)
     {
-        var log = Audit("agentic_conflict_resolver.attempt_failed");
+        var log = Audit(logger, "agentic_conflict_resolver.attempt_failed");
         if (stdoutTail is not null) log = log.ForContext("StdoutTail", TruncateAuditTail(stdoutTail));
         if (stderrTail is not null) log = log.ForContext("StderrTail", TruncateAuditTail(stderrTail));
         log.Warning(
@@ -298,8 +325,9 @@ public static class AuditLog
         WorkItemId workItemId,
         string operation,
         int attempt,
-        string errorClass) =>
-        Audit("sandbox.provisioning_transient_retry")
+        string errorClass,
+        Serilog.ILogger? logger = null) =>
+        Audit(logger, "sandbox.provisioning_transient_retry")
             .Information(
                 "Sandbox provisioning transient failure for work item {WorkItemId}; operation={Operation}; retry {Attempt}; errorClass={ErrorClass}",
                 workItemId.ToString(), operation, attempt, errorClass);
@@ -494,6 +522,22 @@ public static class AuditLog
         Audit("auditor.run")
             .Information("Auditor {AuditorName} completed: worstSeverity={WorstSeverity} duration={DurationMs}ms agentKind={AgentKind}",
                 auditorName, worstSeverity, (long)duration.TotalMilliseconds, agentKind.Value);
+
+    public static void AuditorTimedOut(
+        WorkItemId workItemId,
+        string auditor,
+        AgentKind agent,
+        int iteration,
+        string sandboxId) =>
+        Audit("audit.auditor_timed_out")
+            .ForContext("WorkItemId", workItemId.ToString())
+            .ForContext("Auditor", auditor)
+            .ForContext("Agent", agent.Value)
+            .ForContext("Iteration", iteration)
+            .ForContext("SandboxId", sandboxId)
+            .Warning(
+                "Auditor {Auditor} (agent: {Agent}) timed out during iteration {Iteration} in sandbox {SandboxId}",
+                auditor, agent.Value, iteration, sandboxId);
 
     /// <summary>
     /// Emitted once per audit iteration when at least one LLM auditor actually
@@ -869,7 +913,7 @@ public static class AuditLog
 
     public static void QueuePaused(string reason) =>
         Audit("queue.paused")
-            .Information("Queue paused: {Reason}", reason);
+            .Information("Queue paused: {Reason}", reason.Replace("\r", "").Replace("\n", ""));
 
     public static void QueueResumed() =>
         Audit("queue.resumed")
@@ -889,7 +933,9 @@ public static class AuditLog
         Audit("agent.paused")
             .Information(
                 "Agent {Agent} paused by {PausedBy}: {Reason} expiresAt={ExpiresAt}",
-                agent.Value, pausedBy, reason, expiresAt);
+                agent.Value.Replace("\r", "").Replace("\n", ""),
+                pausedBy.Replace("\r", "").Replace("\n", ""),
+                reason.Replace("\r", "").Replace("\n", ""), expiresAt);
 
     public static void AgentResumed(
         AgentKind agent,
@@ -898,19 +944,21 @@ public static class AuditLog
         Audit("agent.resumed")
             .Information(
                 "Agent {Agent} resumed by {ResumedBy}: {Reason}",
-                agent.Value, resumedBy, reason ?? "");
+                agent.Value.Replace("\r", "").Replace("\n", ""),
+                resumedBy.Replace("\r", "").Replace("\n", ""),
+                (reason ?? "").Replace("\r", "").Replace("\n", ""));
 
     public static void AgentPauseExpired(AgentKind agent, string? reason) =>
         Audit("agent.pause_expired")
             .Information(
                 "Agent {Agent} pause expired: {Reason}",
-                agent.Value, reason ?? "");
+                agent.Value, (reason ?? "").Replace("\r", "").Replace("\n", ""));
 
     public static void AgentStartedWhilePaused(AgentKind agent, string? reason) =>
         Audit("agent.started_while_paused")
             .Warning(
                 "Orchestrator started with agent {Agent} paused; no new work will dispatch to it until resumed: {Reason}",
-                agent.Value, reason ?? "");
+                agent.Value, (reason ?? "").Replace("\r", "").Replace("\n", ""));
 
     public static void AgentPauseDispatchDeferred(
         WorkItemId id,
@@ -919,7 +967,8 @@ public static class AuditLog
         Audit("agent.pause_dispatch_deferred")
             .Information(
                 "Work item {WorkItemId} waiting for paused agent resume from={RetryFrom}: {Reason}",
-                id.ToString(), retryFrom, reason);
+                id.ToString(), retryFrom.Replace("\r", "").Replace("\n", ""),
+                reason.Replace("\r", "").Replace("\n", ""));
 
     public static void AgentPauseWaitingItemResumed(
         WorkItemId id,
@@ -1178,11 +1227,13 @@ public static class AuditLog
         Audit(logger, "store.disk_full")
             .Fatal(
                 "SQLite reported SQLITE_FULL during '{Operation}'; host disk is exhausted and no further state transitions can be persisted",
-                operation);
+                operation.Replace("\r", "").Replace("\n", ""));
 
     public static void ProjectQueuePaused(ProjectId projectId, string reason) =>
         Audit("project_queue.paused")
-            .Information("Project {ProjectId} queue paused: {Reason}", projectId.Value, reason);
+            .Information("Project {ProjectId} queue paused: {Reason}",
+                projectId.Value.Replace("\r", "").Replace("\n", ""),
+                reason.Replace("\r", "").Replace("\n", ""));
 
     public static void ProjectQueueResumed(ProjectId projectId) =>
         Audit("project_queue.resumed")
@@ -1240,8 +1291,9 @@ public static class AuditLog
         string source,
         string outcome,
         string state,
-        string? reason = null) =>
-        Audit("quota_retry_attempted")
+        string? reason = null,
+        Serilog.ILogger? logger = null) =>
+        Audit(logger, "quota_retry_attempted")
             .ForContext("Reason", reason ?? "")
             .Information(
                 "Quota retry attempted for work item {WorkItemId}: source={Source} outcome={Outcome} state={State} reason={Reason}",
@@ -1376,11 +1428,37 @@ public static class AuditLog
             .Information("Configuration reloaded: block={Block} oldValue={OldValue} newValue={NewValue}",
                 block, oldValue, newValue);
 
+    // ── Test failure attribution ────────────────────────────────────────────
+
+    public static void TestFailureAttributionSkipped(
+        WorkItemId workItemId,
+        string auditorName,
+        string reason,
+        int testCount) =>
+        Audit("test_failure_attribution_skipped")
+            .Warning(
+                "Test failure attribution skipped for work item {WorkItemId} auditor={AuditorName} tests={TestCount}: {Reason}",
+                workItemId.ToString(),
+                auditorName,
+                testCount,
+                reason);
+
+    public static void TestFailureAttributionPartial(
+        WorkItemId workItemId,
+        string auditorName,
+        string reason) =>
+        Audit("test_failure_attribution_partial")
+            .Warning(
+                "Test failure attribution partially completed for work item {WorkItemId} auditor={AuditorName}: {Reason}",
+                workItemId.ToString(),
+                auditorName,
+                reason);
+
     // ── Transcript sanitisation ──────────────────────────────────────────────
 
     /// <summary>
     /// Emitted when the preventive Claude thinking-block transcript sanitizer
-    /// fails inside <c>PrepareSandboxAsync</c>. The run continues — the
+    /// fails inside the runner's sandbox-preparation lifecycle. The run continues — the
     /// failure detail surfaces later via the reactive retry path if the CLI
     /// call subsequently 400s. This event gives operators an early signal
     /// that the primary prevention mechanism is unhealthy.
@@ -1453,9 +1531,10 @@ public static class AuditLog
         AgentKind agent,
         string actor,
         string injectionId,
-        string message)
+        string message,
+        Serilog.ILogger? logger = null)
     {
-        Audit("agent.supervision_injection_queued")
+        Audit(logger, "agent.supervision_injection_queued")
             .ForContext("InjectionText", TruncateAuditTail(RawChunkRedactor.Redact(message)))
             .Information(
                 "Live supervision injection {InjectionId} queued by {Actor} for work item {WorkItemId} session {SessionId} phase={Phase} agent={Agent}",
@@ -1473,8 +1552,9 @@ public static class AuditLog
         string phase,
         AgentKind agent,
         string actor,
-        string injectionId) =>
-        Audit("agent.supervision_injection_started")
+        string injectionId,
+        Serilog.ILogger? logger = null) =>
+        Audit(logger, "agent.supervision_injection_started")
             .Information(
                 "Live supervision injection {InjectionId} started for work item {WorkItemId} session {SessionId} phase={Phase} agent={Agent} actor={Actor}",
                 injectionId,
@@ -1492,9 +1572,10 @@ public static class AuditLog
         string actor,
         string injectionId,
         bool success,
-        string summary)
+        string summary,
+        Serilog.ILogger? logger = null)
     {
-        Audit("agent.supervision_injection_completed")
+        Audit(logger, "agent.supervision_injection_completed")
             .ForContext("Summary", TruncateAuditTail(RawChunkRedactor.Redact(summary)))
             .Information(
                 "Live supervision injection {InjectionId} completed for work item {WorkItemId} session {SessionId} phase={Phase} agent={Agent} actor={Actor} success={Success}",
@@ -1523,13 +1604,64 @@ public static class AuditLog
                 "Operator baseline migration: scanned={Scanned} migrated={Migrated} truncated={Truncated} projectFilter={ProjectFilter} baselineFilter={BaselineFilter}",
                 scanned, migrated, truncated, projectFilter ?? "", baselineFilter ?? "");
 
+    // ── Scoped sink override ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// Optional per-async-flow override of the audit sink. When set, audit
+    /// events emitted on the current control flow (and flows it spawns, since
+    /// the value rides <see cref="ExecutionContext"/>) route here instead of the
+    /// process-global <see cref="Log.Logger"/>.
+    /// </summary>
+    private static readonly AsyncLocal<Serilog.ILogger?> ScopedLogger = new();
+
+    /// <summary>
+    /// Routes audit events emitted on the current async control flow to
+    /// <paramref name="logger"/> until the returned scope is disposed, restoring
+    /// whatever override was previously in effect. Because the override is
+    /// carried by <see cref="AsyncLocal{T}"/> it flows across <c>await</c>
+    /// boundaries and <c>Task.Run</c> continuations but never leaks to other
+    /// concurrent flows.
+    ///
+    /// This exists so a consumer that must observe its own audit events
+    /// deterministically (notably tests that assert on emitted events) is not
+    /// disturbed by other flows rebuilding the process-global
+    /// <see cref="Log.Logger"/> — for example a <c>WebApplicationFactory</c>
+    /// host boot running concurrently. Not a substitute for global
+    /// configuration: production still logs through <see cref="Log.Logger"/>
+    /// whenever no scope is active.
+    /// </summary>
+    /// <exception cref="ArgumentNullException"><paramref name="logger"/> is null.</exception>
+    public static IDisposable PushScopedLogger(Serilog.ILogger logger)
+    {
+        ArgumentNullException.ThrowIfNull(logger);
+        var previous = ScopedLogger.Value;
+        ScopedLogger.Value = logger;
+        return new ScopedLoggerReset(previous);
+    }
+
+    private sealed class ScopedLoggerReset(Serilog.ILogger? previous) : IDisposable
+    {
+        private bool _disposed;
+
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+            _disposed = true;
+            ScopedLogger.Value = previous;
+        }
+    }
+
     // ── Internal helper ──────────────────────────────────────────────────────
 
     private static Serilog.ILogger Audit(string eventName) =>
-        Audit(Log.Logger, eventName);
+        Audit(ScopedLogger.Value ?? Log.Logger, eventName);
 
-    private static Serilog.ILogger Audit(Serilog.ILogger logger, string eventName) =>
-        logger
+    // A null logger falls back to the process-global Serilog logger. Callers that
+    // hold their own audit logger (so their events are immune to a concurrent
+    // reassignment of the global static) pass it explicitly.
+    private static Serilog.ILogger Audit(Serilog.ILogger? logger, string eventName) =>
+        (logger ?? Log.Logger)
             .ForContext("Audit", true)
             .ForContext("EventName", eventName);
 }

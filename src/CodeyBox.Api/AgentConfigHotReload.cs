@@ -78,6 +78,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly QuotaRouterOptions? _quotaRouterOptions;
     private readonly IInVmSmokeCoveragePolicy? _coverage;
     private readonly SmokeOptionsSnapshot? _smokeOptions;
+    private readonly TestFailureAttributionOptionsSnapshot? _testFailureAttribution;
     private readonly TransitionHealthOptionsSnapshot? _transitionHealth;
     private readonly IAgentPauseController? _pauses;
     private readonly IAgentRegistry? _agents;
@@ -101,6 +102,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private string _lastPipelineTuning = "";
     private string _lastBudgetDeferralRecheck = "";
     private string _lastSmoke = "";
+    private string _lastTestFailureAttribution = "";
     private string _lastTransitionHealth = "";
     private string _lastAgentPauses = "";
     private string _lastNetworkTolerance = "";
@@ -126,6 +128,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         QuotaRouterOptions? quotaRouterOptions = null,
         IInVmSmokeCoveragePolicy? coverage = null,
         SmokeOptionsSnapshot? smokeOptions = null,
+        TestFailureAttributionOptionsSnapshot? testFailureAttribution = null,
         IAgentPauseController? pauses = null,
         IAgentRegistry? agents = null,
         TransitionHealthOptionsSnapshot? transitionHealth = null,
@@ -154,6 +157,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _quotaRouterOptions = quotaRouterOptions;
         _coverage = coverage;
         _smokeOptions = smokeOptions;
+        _testFailureAttribution = testFailureAttribution;
         _transitionHealth = transitionHealth;
         _pauses = pauses;
         _agents = agents;
@@ -181,6 +185,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _lastPipelineTuning = SerializePipelineTuning(initial.PipelineTuning);
         _lastBudgetDeferralRecheck = SerializeBudgetDeferralRecheck(initial.BudgetDeferralRecheck);
         _lastSmoke = SerializeSmoke(initial.Smoke);
+        _lastTestFailureAttribution = SerializeTestFailureAttribution(initial.TestFailureAttribution);
         _lastTransitionHealth = SerializeTransitionHealth(initial.TransitionHealth);
         _lastAgentPauses = SerializeAgentPauses(initial.AgentPauses);
         _lastHostPoolCapacity = SerializeHostPoolCapacity(initial);
@@ -215,6 +220,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             LogRemoteHostCapacityIfChanged(opts);
             ApplyConcurrencyIfChanged(opts);
             ApplySmokeIfChanged(opts);
+            ApplyTestFailureAttributionIfChanged(opts);
             ApplyTransitionHealthIfChanged(opts);
             ApplyRouterIfChanged(opts);
             ApplyBurnIfChanged(opts);
@@ -1107,6 +1113,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.MaxPlanReviewIterations,
                 opts.PlanTaskBindingCoverageRatio,
                 DefaultQuotaFailurePauseSeconds = opts.DefaultQuotaFailurePause.TotalSeconds,
+                DefaultRateLimitPauseSeconds = opts.DefaultRateLimitPause.TotalSeconds,
                 QuotaExhaustionFallbackTtlSeconds = opts.QuotaExhaustionFallbackTtl.TotalSeconds,
                 MaxParsedQuotaResetWindowSeconds = opts.MaxParsedQuotaResetWindow.TotalSeconds,
                 opts.MergeSandboxStagingRestoreAttempts,
@@ -1133,6 +1140,31 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         CacheTtlMinutes = cacheTtlMinutes,
         StartupTimeoutSeconds = opts.StartupTimeoutSeconds,
     };
+
+    private void ApplyTestFailureAttributionIfChanged(CodeyBoxOptions opts)
+    {
+        if (_testFailureAttribution is null) return;
+
+        var next = SerializeTestFailureAttribution(opts.TestFailureAttribution);
+        if (string.Equals(_lastTestFailureAttribution, next, StringComparison.Ordinal))
+            return;
+
+        var prev = _lastTestFailureAttribution;
+        try
+        {
+            _testFailureAttribution.Replace(opts.TestFailureAttribution);
+            _lastTestFailureAttribution = next;
+            AuditLog.ConfigReloaded("TestFailureAttribution", prev, next);
+            _log.LogInformation("Hot-reloaded TestFailureAttribution: {OldValue} → {NewValue}", prev, next);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "Hot-reload of TestFailureAttribution rejected; keeping prior view ({Prev}). " +
+                "Fix the configuration error and re-save to retry.",
+                prev);
+        }
+    }
 
     private void ApplyTransitionHealthIfChanged(CodeyBoxOptions opts)
     {
@@ -1170,6 +1202,14 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.Enabled,
                 opts.WindowHours,
                 opts.MaxTransitions,
+            },
+            JsonOpts);
+
+    private static string SerializeTestFailureAttribution(TestFailureAttributionOptions opts) =>
+        JsonSerializer.Serialize(
+            new
+            {
+                opts.Enabled,
             },
             JsonOpts);
 

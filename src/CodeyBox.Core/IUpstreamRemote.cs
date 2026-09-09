@@ -80,7 +80,21 @@ public interface IUpstreamRemote
     Task<IReadOnlyList<UpstreamPullRequest>> ListOpenPullRequestsAsync(
         string branchPrefix, CancellationToken ct = default)
         => Task.FromResult<IReadOnlyList<UpstreamPullRequest>>([]);
+
+    /// <summary>
+    /// Reads a pull request by forge-assigned number. Returns <c>null</c> when
+    /// this upstream kind does not model pull requests or the PR is unavailable.
+    /// </summary>
+    Task<UpstreamPullRequestState?> GetPullRequestAsync(
+        int number, CancellationToken ct = default)
+        => Task.FromResult<UpstreamPullRequestState?>(null);
 }
+
+public sealed record UpstreamPullRequestState(
+    int Number,
+    string Url,
+    PullRequestStatus Status,
+    string? MergeCommitSha);
 
 /// <summary>
 /// Snapshot of an open pull request as seen by an <see cref="IUpstreamRemote"/>
@@ -135,6 +149,8 @@ public sealed record UpstreamCompletionRequest
     /// cannot be read from the forge.
     /// </summary>
     public int? PromptRevision { get; init; }
+    /// <summary>Authenticated originator used for human attribution in delivery metadata.</summary>
+    public WorkInitiator? Initiator { get; init; }
     /// <summary>
     /// Name of the environment variable holding the upstream credential (from
     /// <c>Upstream.TokenEnvVar</c> in the project config). Null when not configured.

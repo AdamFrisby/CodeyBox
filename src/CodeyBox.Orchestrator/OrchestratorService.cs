@@ -239,6 +239,11 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     // avoid a mixed-clock trap the spawn-pacing UtcNow reads that feed that
     // loop also stay on the system clock.
     private readonly TimeProvider _time;
+    private readonly BackgroundServiceFailureTracker? _failureTracker;
+    // Consecutive dispatch-pickup attempts that failed to acquire the SQLite
+    // write gate. Reset on every successful pickup scan; reaching
+    // MaxConsecutiveDispatchGateTimeoutsBeforeEscalation escalates fatally.
+    private int _consecutiveDispatchGateTimeouts;
 
     public OrchestratorService(
         ITaskQueue queue,
@@ -267,7 +272,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         IKnobRegistry? knobRegistry = null,
         IQuotaRetryDispatchPromoter? quotaRetryDispatchPromoter = null,
         IQuotaRetryAdmissionRouter? quotaRetryAdmissionRouter = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        BackgroundServiceFailureTracker? failureTracker = null)
     {
         _queue = queue;
         _store = store;
@@ -305,6 +311,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         // on every hot-reload via ApplyAgentConcurrencyReload — keeping the
         // semantics identical between cold-start and config-edit paths.
         AgentConcurrencyOptions.ValidateAndThrow(_concurrencySnapshot.Current);
+        _failureTracker = failureTracker;
         _concurrencyGate = new ResizableConcurrencyGate(opts.MaxConcurrentWorkers);
         LogResolvedAgentCaps(_concurrencySnapshot.Current, reason: "startup");
     }
@@ -867,7 +874,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private static bool IsStillWorkerOwnedAfterRecoveryRelease(WorkItem item)
     {
         if (item.State is WorkItemState.Working or WorkItemState.Reworking
-            && !string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
+            && item.HasAgentTurnRecoveryBoundary
             && item.StartedAt is null)
             return false;
 
@@ -1034,6 +1041,30 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        try
+        {
+            await ExecuteCoreAsync(stoppingToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            // Host shutdown: not a fault, the tracker stays clean so the
+            // process exits 0 and supervisors treat it as intentional.
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // BackgroundService faults stop the host with exit code 0 by
+            // default, which supervisors cannot distinguish from an
+            // intentional stop. Record the fault so the composition root can
+            // exit non-zero, then rethrow to preserve the StopHost behavior.
+            _failureTracker?.ReportFailure(ex);
+            _log.LogCritical(ex, "OrchestratorService terminated unexpectedly and will stop the host");
+            throw;
+        }
+    }
+
+    private async Task ExecuteCoreAsync(CancellationToken stoppingToken)
+    {
         // R8-core suspend/resume: SandboxResumeOnStartupService now runs in the
         // background by default so Kestrel can bind first. Keep startup recovery
         // ordered by waiting here before the dead-worker startup sweep touches
@@ -1167,7 +1198,9 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 // (_activeItems) and items currently sleeping in a defer-requeue delay
                 // (_deferredItems). When nothing eligible is found, this kick was
                 // spurious — release the slot and loop back for the next kick.
-                WorkItemId? id = await PickNextEligibleAsync(stoppingToken);
+                // Gate-acquisition timeouts are absorbed inside (backoff + retry
+                // on the next turn); only a sustained outage escalates fatally.
+                WorkItemId? id = await PickNextEligibleResilientAsync(stoppingToken);
                 if (id is null)
                 {
                     TryReleaseConcurrencyGate();
@@ -1427,6 +1460,59 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             _time.GetUtcNow(),
             _opts.MaxRecoveryAttempts,
             recoveryReason);
+
+    /// <summary>
+    /// Pickup with SQLite write-gate resilience. A gate-acquisition failure is
+    /// transient: log at Warning with the holder identity, back off, and
+    /// return null so this dispatch turn ends and the loop waits for the next
+    /// kick. A sustained run of consecutive failures escalates with
+    /// <see cref="SqliteWriteGatePersistentlyUnavailableException"/>, which is
+    /// fatal and stops the host (non-zero exit) rather than looping silently.
+    /// </summary>
+    internal async Task<WorkItemId?> PickNextEligibleResilientAsync(CancellationToken ct)
+    {
+        try
+        {
+            var id = await PickNextEligibleAsync(ct).ConfigureAwait(false);
+            Volatile.Write(ref _consecutiveDispatchGateTimeouts, 0);
+            return id;
+        }
+        catch (Exception ex) when (ex is SqliteWriteGateAcquisitionTimeoutException
+            or SqliteWriteGateWaitQueueFullException
+            or SqliteReadConcurrencyLimitExceededException)
+        {
+            var consecutive = Interlocked.Increment(ref _consecutiveDispatchGateTimeouts);
+            var (waitingHolder, currentHolder) = DescribeGateWaiter(ex);
+            _log.LogWarning(
+                ex,
+                "Dispatch pickup could not acquire the SQLite write gate ({Consecutive}/{Max} consecutive); waiting holder: {WaitingHolder}, current holder: {CurrentHolder}. Backing off {Backoff} and retrying on the next dispatch turn.",
+                consecutive,
+                _opts.MaxConsecutiveDispatchGateTimeoutsBeforeEscalation,
+                waitingHolder,
+                currentHolder,
+                _opts.DispatchGateAcquisitionBackoff);
+
+            if (consecutive >= _opts.MaxConsecutiveDispatchGateTimeoutsBeforeEscalation)
+            {
+                _log.LogCritical(
+                    "Dispatch pickup failed to acquire the SQLite write gate {Consecutive} consecutive times (last waiter: {WaitingHolder}, last holder: {CurrentHolder}); escalating to a fatal host stop",
+                    consecutive,
+                    waitingHolder,
+                    currentHolder);
+                throw new SqliteWriteGatePersistentlyUnavailableException(consecutive, waitingHolder, currentHolder);
+            }
+
+            await Task.Delay(_opts.DispatchGateAcquisitionBackoff, _time, ct).ConfigureAwait(false);
+            return null;
+        }
+    }
+
+    private static (string? WaitingHolder, string? CurrentHolder) DescribeGateWaiter(Exception ex) => ex switch
+    {
+        SqliteWriteGateAcquisitionTimeoutException timeout => (timeout.WaitingHolder, timeout.CurrentHolder),
+        SqliteWriteGateWaitQueueFullException full => (full.WaitingHolder, null),
+        _ => (ex.GetType().Name, null),
+    };
 
     /// <summary>
     /// Walks dispatch-eligible non-terminal items by priority order and returns
@@ -2047,7 +2133,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             return null;
         }
 
-        if (!string.IsNullOrWhiteSpace(item.PreemptCheckpoint)
+        if (item.HasAgentTurnRecoveryBoundary
             && item.State is WorkItemState.Working or WorkItemState.Reworking)
         {
             return WorkItemRecoveryPolicy.BuildPreemptCheckpointRecovery(
@@ -2070,6 +2156,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     StartedAt = null,
                     PreemptedAt = null,
                     PreemptCheckpoint = null,
+                    AgentTurnResumeCheckpoint = null,
+                    AgentTurnRecoveryLease = null,
                     UpdatedAt = _time.GetUtcNow(),
                 }, checkAttempts, item.State);
             }
@@ -2089,6 +2177,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     StartedAt = null,
                     PreemptedAt = null,
                     PreemptCheckpoint = null,
+                    AgentTurnResumeCheckpoint = null,
+                    AgentTurnRecoveryLease = null,
                     UpdatedAt = _time.GetUtcNow(),
                 }, controlAttempts, item.State);
             }
@@ -2105,6 +2195,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 StartedAt = null,
                 PreemptedAt = null,
                 PreemptCheckpoint = null,
+                AgentTurnResumeCheckpoint = null,
+                AgentTurnRecoveryLease = null,
                 UpdatedAt = _time.GetUtcNow(),
             }, WorkItemRecoveryPolicy.NextRecoveryAttempt(item), item.State);
         }
@@ -2139,6 +2231,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 StartedAt = null,
                 PreemptedAt = null,
                 PreemptCheckpoint = null,
+                AgentTurnResumeCheckpoint = null,
+                AgentTurnRecoveryLease = null,
                 UpdatedAt = _time.GetUtcNow(),
             }, newAttempts, item.State);
         }
@@ -2787,14 +2881,21 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     }
 
     private static bool ShouldResolveAgentClassAtPickup(WorkItem item)
-        => item.State is WorkItemState.Queued
+        // A durable turn checkpoint is bound to the exact runner instance and
+        // model that emitted its native session id. Re-routing a resumed
+        // Reworking item here would reserve one class member while the pipeline
+        // restores another member's transcript, defeating both quota accounting
+        // and same-session continuation. The direct-slot path below still
+        // applies the original member's concurrency/pause gates.
+        => !item.HasAgentTurnRecoveryBoundary
+        && item.State is (WorkItemState.Queued
             or WorkItemState.Planning
             or WorkItemState.PlanReview
             or WorkItemState.PlanApproved
             or WorkItemState.WorkComplete
             or WorkItemState.AuditPassed
             or WorkItemState.Reworking
-            or WorkItemState.ReworkingForConflict;
+            or WorkItemState.ReworkingForConflict);
 
     // Paused-agent parking is only relevant for states that actually invoke the
     // work agent at pickup (Queued/Reworking + planning-lifecycle). Continuation
@@ -3447,6 +3548,20 @@ public sealed record OrchestratorOptions
     public int MaxConcurrentSandboxes { get; init; } = 2;
     public TimeSpan MinSpawnInterval { get; init; } = TimeSpan.Zero;
     public TimeSpan ShutdownDrainTimeout { get; init; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// Backoff between dispatch-pickup attempts after a SQLite write-gate
+    /// acquisition timeout. Sourced from
+    /// <c>CodeyBox:WorkerPool:DispatchGateAcquisitionBackoff</c>.
+    /// </summary>
+    public TimeSpan DispatchGateAcquisitionBackoff { get; init; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// Consecutive pickup gate-acquisition timeouts before escalation to
+    /// <see cref="SqliteWriteGatePersistentlyUnavailableException"/>. Sourced from
+    /// <c>CodeyBox:WorkerPool:MaxConsecutiveDispatchGateTimeoutsBeforeEscalation</c>.
+    /// </summary>
+    public int MaxConsecutiveDispatchGateTimeoutsBeforeEscalation { get; init; } = 10;
 
     /// <summary>
     /// Maximum number of times the recovery loop will reset a mid-flight work

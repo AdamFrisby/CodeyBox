@@ -10,7 +10,7 @@ namespace CodeyBox.Admin.Tests;
 /// <summary>
 /// Tests for the SuggestionDetail page: loading, 404 handling, promote, and dismiss flows.
 /// </summary>
-public sealed class SuggestionDetailPageTests : TestContext
+public sealed class SuggestionDetailPageTests : BunitContext
 {
     private static SuggestionDto MakeSuggestion(string id = "aaaa-0001", string state = "open") => new()
     {
@@ -31,7 +31,7 @@ public sealed class SuggestionDetailPageTests : TestContext
     {
         var s = MakeSuggestion();
         Services.AddSingleton<ICodeyBoxApiClient>(new DetailFakeClient(s));
-        var cut = RenderComponent<SuggestionDetailPage>(p => p.Add(x => x.Id, s.Id));
+        var cut = Render<SuggestionDetailPage>(p => p.Add(x => x.Id, s.Id));
         Assert.Contains("Add tests for edge case", cut.Markup);
     }
 
@@ -40,7 +40,7 @@ public sealed class SuggestionDetailPageTests : TestContext
     {
         var s = MakeSuggestion();
         Services.AddSingleton<ICodeyBoxApiClient>(new DetailFakeClient(s));
-        var cut = RenderComponent<SuggestionDetailPage>(p => p.Add(x => x.Id, s.Id));
+        var cut = Render<SuggestionDetailPage>(p => p.Add(x => x.Id, s.Id));
         Assert.Contains("This is why we need it", cut.Markup);
     }
 
@@ -48,7 +48,7 @@ public sealed class SuggestionDetailPageTests : TestContext
     public void SuggestionDetail_NotFound_ShowsErrorBanner()
     {
         Services.AddSingleton<ICodeyBoxApiClient>(new DetailFakeClient(null));
-        var cut = RenderComponent<SuggestionDetailPage>(p => p.Add(x => x.Id, "no-such-id"));
+        var cut = Render<SuggestionDetailPage>(p => p.Add(x => x.Id, "no-such-id"));
         Assert.Contains("not found", cut.Markup, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -57,7 +57,7 @@ public sealed class SuggestionDetailPageTests : TestContext
     {
         var s = MakeSuggestion();
         Services.AddSingleton<ICodeyBoxApiClient>(new DetailFakeClient(s));
-        var cut = RenderComponent<SuggestionDetailPage>(p => p.Add(x => x.Id, s.Id));
+        var cut = Render<SuggestionDetailPage>(p => p.Add(x => x.Id, s.Id));
         Assert.Contains("Promote", cut.Markup);
     }
 
@@ -66,7 +66,7 @@ public sealed class SuggestionDetailPageTests : TestContext
     {
         var s = MakeSuggestion();
         Services.AddSingleton<ICodeyBoxApiClient>(new DetailFakeClient(s));
-        var cut = RenderComponent<SuggestionDetailPage>(p => p.Add(x => x.Id, s.Id));
+        var cut = Render<SuggestionDetailPage>(p => p.Add(x => x.Id, s.Id));
         Assert.Contains("Dismiss", cut.Markup);
     }
 
@@ -76,7 +76,7 @@ public sealed class SuggestionDetailPageTests : TestContext
         var s = MakeSuggestion();
         Services.AddSingleton<ICodeyBoxApiClient>(new DetailFakeClient(s));
         var nav = Services.GetRequiredService<NavigationManager>();
-        var cut = RenderComponent<SuggestionDetailPage>(p => p.Add(x => x.Id, s.Id));
+        var cut = Render<SuggestionDetailPage>(p => p.Add(x => x.Id, s.Id));
 
         await cut.InvokeAsync(() => cut.Find("button.btn-primary").Click());
 
@@ -90,7 +90,7 @@ public sealed class SuggestionDetailPageTests : TestContext
     {
         var s = MakeSuggestion();
         Services.AddSingleton<ICodeyBoxApiClient>(new DetailFakeClient(s));
-        var cut = RenderComponent<SuggestionDetailPage>(p => p.Add(x => x.Id, s.Id));
+        var cut = Render<SuggestionDetailPage>(p => p.Add(x => x.Id, s.Id));
 
         await cut.InvokeAsync(() => cut.Find("button.btn-danger").Click());
 
@@ -103,7 +103,7 @@ public sealed class SuggestionDetailPageTests : TestContext
         var s = MakeSuggestion();
         var client = new DetailCapturingClient(s);
         Services.AddSingleton<ICodeyBoxApiClient>(client);
-        var cut = RenderComponent<SuggestionDetailPage>(p => p.Add(x => x.Id, s.Id));
+        var cut = Render<SuggestionDetailPage>(p => p.Add(x => x.Id, s.Id));
 
         // Open the dismiss modal by clicking the main Dismiss button
         await cut.InvokeAsync(() => cut.Find("button.btn-danger").Click());

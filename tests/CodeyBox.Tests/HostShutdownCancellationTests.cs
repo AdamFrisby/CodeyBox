@@ -48,6 +48,16 @@ public sealed class HostShutdownCancellationTests : IDisposable
         State = WorkItemState.Queued,
     };
 
+    private static AgentTurnCheckpointRef AssertDurableCheckpointRef(
+        WorkItemId workItemId,
+        string? value)
+    {
+        Assert.False(string.IsNullOrWhiteSpace(value));
+        var checkpointRef = AgentTurnCheckpointRef.Parse(value!);
+        Assert.Equal(workItemId, checkpointRef.WorkItemId);
+        return checkpointRef;
+    }
+
     private ShutdownTestHarness BuildBlockingPipeline(string seedRepoUrl)
         => BuildPipeline(seedRepoUrl, new BlockingAgentRunner());
 
@@ -56,7 +66,10 @@ public sealed class HostShutdownCancellationTests : IDisposable
         IAgentRunner agent,
         PipelineOptions? options = null,
         ILogger<PipelineRunner>? logger = null,
-        ISandboxProvider? sandboxProvider = null)
+        ISandboxProvider? sandboxProvider = null,
+        IQuotaFailureClassifier? quotaClassifier = null,
+        IRequiredBuildVerifier? requiredBuildVerifier = null,
+        IReadOnlyList<IAuditor>? auditors = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var stateDb = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -70,6 +83,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
         var prs = new InMemoryPullRequestService();
         var registry = new AgentRegistry([agent]);
 
+        var configuredAuditors = auditors ?? [];
         var projects = new InMemoryProjectRepository(new Project
         {
             Id = new ProjectId("test-project"),
@@ -77,10 +91,14 @@ public sealed class HostShutdownCancellationTests : IDisposable
             RepositoryUrl = seedRepoUrl,
             DefaultBaseBranch = "main",
             DefaultAgent = AgentKind.Claude,
-            Audit = new ProjectAudit { MaxIterations = 3, AuditTypes = [] },
+            Audit = new ProjectAudit
+            {
+                MaxIterations = 3,
+                AuditTypes = configuredAuditors.Count == 0 ? [] : ["scripted"],
+            },
         });
 
-        var presetCatalog = new ScriptedAuditorCatalog([]);
+        var presetCatalog = new ScriptedAuditorCatalog(configuredAuditors);
         var composer = new ProjectAuditorComposer(presetCatalog);
         var upstreamFactory = new TestUpstreamFactory();
         var webhooks = new NullWebhookDispatcher();
@@ -92,7 +110,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
             webhooks,
             options ?? new PipelineOptions { SandboxImageReference = "ignored", AgentAllowedHosts = [] },
             logger ?? NullLogger<PipelineRunner>.Instance,
-            requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
+            quotaClassifier: quotaClassifier,
+            requiredBuildVerifier: requiredBuildVerifier ?? TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,
             terminalRevisionBuilder: terminalTransitions);
 
@@ -139,7 +158,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
         Assert.Equal(WorkItemState.Working, final!.State);
         Assert.Null(final.CancellationReason);
         Assert.NotNull(final.PreemptedAt);
-        Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", final.PreemptCheckpoint);
+        AssertDurableCheckpointRef(item.Id, final.PreemptCheckpoint);
         // (c) auto-retry is NOT triggered for host-shutdown attribution; the
         // recovery loop owns the item, and bumping TransientCancelRetries here
         // would race the host going away.
@@ -161,6 +180,529 @@ public sealed class HostShutdownCancellationTests : IDisposable
                 && s == "RunAsync.host-shutdown");
         Assert.Equal(CancellationSources.HostShutdown, boundary.Properties["CancellationSource"]);
         Assert.Equal(true, boundary.Properties["HostShutdown"]);
+    }
+
+    [Fact]
+    public async Task InfrastructureFailure_CheckpointsDirtyTurn_AndRetryResumesExactNativeSession()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new DurableFailureResumeAgent();
+        using var harness = BuildPipeline(seed, agent);
+
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+
+        await harness.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var failed = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(failed);
+        Assert.Equal(WorkItemState.Failed, failed.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, failed.FailureKind);
+        var durableRef = AssertDurableCheckpointRef(item.Id, failed.PreemptCheckpoint);
+        var checkpoint = Assert.IsType<AgentTurnResumeCheckpoint>(failed.AgentTurnResumeCheckpoint);
+        Assert.Equal(AgentTurnResumePhase.Work, checkpoint.Phase);
+        Assert.Equal(DurableFailureResumeAgent.SessionId, checkpoint.NativeSessionId?.Value);
+        Assert.Equal(0, checkpoint.AttemptCount);
+
+        var checkpointTree = await TestSupport.RunGit(
+            harness.GitHost.GetRepoPath(item.Id.ToString()),
+            "ls-tree",
+            "-r",
+            "--name-only",
+            failed.PreemptCheckpoint!);
+        Assert.Equal(0, checkpointTree.code);
+        Assert.Contains("partial-before-infrastructure-failure.txt", checkpointTree.stdout);
+        Assert.DoesNotContain(".codeybox/preempt-scratchpad", checkpointTree.stdout, StringComparison.Ordinal);
+        var privateScratchpad = await harness.Store.ReadAsync(item.Id, durableRef);
+        Assert.NotNull(privateScratchpad);
+
+        var queue = new InMemoryTaskQueue();
+        var retrier = new WorkItemRetrier(
+            harness.Store,
+            queue,
+            harness.GitHost,
+            NullLogger<WorkItemRetrier>.Instance);
+        var retry = await retrier.RetryAsync(failed, trigger: "manual");
+        Assert.True(retry.Success, retry.Error);
+        Assert.Equal(WorkItemState.Working, retry.ResumeState);
+
+        var resumed = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(resumed);
+        Assert.Equal(WorkItemState.Working, resumed.State);
+        Assert.Equal(0, resumed.AgentTurnResumeCheckpoint?.AttemptCount);
+
+        await harness.Pipeline.RunAsync(resumed, CancellationToken.None);
+
+        var completed = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(completed);
+        Assert.True(
+            completed.State == WorkItemState.Done,
+            $"Expected Done, got {completed.State}: {completed.LastError}");
+        Assert.Null(completed.PreemptedAt);
+        Assert.Null(completed.PreemptCheckpoint);
+        Assert.Null(completed.AgentTurnResumeCheckpoint);
+        Assert.Null(await harness.Store.ReadAsync(item.Id, durableRef));
+        Assert.Equal(1, agent.InitialWorkCalls);
+        Assert.Equal(1, agent.ResumeCalls);
+        Assert.Equal(DurableFailureResumeAgent.SessionId, agent.ResumedNativeSessionId?.Value);
+        Assert.True(agent.SawCheckpointedPartialWork);
+        Assert.True(agent.SawCheckpointScratchpad);
+    }
+
+    [Fact]
+    public async Task DurableResume_RestoreTransportUnavailable_RetainsCheckpointAndPrivateArchive()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new DurableFailureResumeAgent(throwResumePreparationUnavailable: true);
+        using var harness = BuildPipeline(seed, agent);
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+        await harness.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var interrupted = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(interrupted);
+        var checkpointRef = AssertDurableCheckpointRef(item.Id, interrupted!.PreemptCheckpoint);
+        Assert.NotNull(await harness.Store.ReadAsync(item.Id, checkpointRef));
+
+        var retrier = new WorkItemRetrier(
+            harness.Store,
+            new InMemoryTaskQueue(),
+            harness.GitHost,
+            NullLogger<WorkItemRetrier>.Instance);
+        var retry = await retrier.RetryAsync(interrupted, trigger: "test-restore-outage");
+        Assert.True(retry.Success, retry.Error);
+        var resumed = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(resumed);
+
+        await harness.Pipeline.RunAsync(resumed!, CancellationToken.None);
+
+        var failedRestore = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(failedRestore);
+        Assert.Equal(WorkItemState.Failed, failedRestore!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, failedRestore.FailureKind);
+        Assert.Equal(checkpointRef.Value, failedRestore.PreemptCheckpoint);
+        var checkpoint = Assert.IsType<AgentTurnResumeCheckpoint>(failedRestore.AgentTurnResumeCheckpoint);
+        Assert.Equal(0, checkpoint.AttemptCount);
+        Assert.Null(checkpoint.DispatchClaimId);
+        Assert.NotNull(await harness.Store.ReadAsync(item.Id, checkpointRef));
+        Assert.Equal(1, agent.ResumeCalls);
+    }
+
+    [Fact]
+    public async Task DurableResume_PromptEditedAfterRetryRefusesStaleCheckpointBeforeDispatch()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new DurableFailureResumeAgent();
+        using var harness = BuildPipeline(seed, agent);
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+        await harness.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var interrupted = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(interrupted);
+        var checkpointRef = AssertDurableCheckpointRef(item.Id, interrupted!.PreemptCheckpoint);
+        var retrier = new WorkItemRetrier(
+            harness.Store,
+            new InMemoryTaskQueue(),
+            harness.GitHost,
+            NullLogger<WorkItemRetrier>.Instance);
+        var retry = await retrier.RetryAsync(interrupted, trigger: "test-prompt-race");
+        Assert.True(retry.Success, retry.Error);
+        var stalePickup = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(stalePickup);
+
+        const string editedPrompt = "edited after the retry was queued";
+        var promptUpdate = await harness.Store.TryReplacePromptAsync(
+            item.Id,
+            editedPrompt,
+            DateTimeOffset.UtcNow);
+        Assert.Equal(PromptReplaceOutcome.Updated, promptUpdate.Outcome);
+
+        await harness.Pipeline.RunAsync(stalePickup, CancellationToken.None);
+
+        var final = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(editedPrompt, final.Prompt);
+        Assert.Equal(promptUpdate.NewRevision, final.PromptRevision);
+        Assert.Equal("restore", final.FailureKind);
+        Assert.Null(final.PreemptCheckpoint);
+        Assert.Null(final.AgentTurnResumeCheckpoint);
+        Assert.Null(await harness.Store.ReadAsync(item.Id, checkpointRef));
+        Assert.Equal(0, agent.ResumeCalls);
+    }
+
+    [Fact]
+    public async Task DurableResume_ConcurrentPickups_InvokeResumedCliExactlyOnce()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new DurableFailureResumeAgent(blockResume: true);
+        using var harness = BuildPipeline(seed, agent);
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+        await harness.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var interrupted = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(interrupted);
+        var retrier = new WorkItemRetrier(
+            harness.Store,
+            new InMemoryTaskQueue(),
+            harness.GitHost,
+            NullLogger<WorkItemRetrier>.Instance);
+        var retry = await retrier.RetryAsync(interrupted!, trigger: "test-concurrent-pickup");
+        Assert.True(retry.Success, retry.Error);
+        var resumed = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(resumed);
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        var firstPickup = harness.Pipeline.RunAsync(resumed!, timeout.Token);
+        await agent.ResumeEntered.WaitAsync(TimeSpan.FromSeconds(30));
+        var claimed = await harness.Store.GetAsync(item.Id);
+        var firstClaimId = claimed?.AgentTurnResumeCheckpoint?.DispatchClaimId;
+        Assert.NotNull(firstClaimId);
+
+        var duplicatePickup = harness.Pipeline.RunAsync(resumed!, timeout.Token);
+        await duplicatePickup.WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(1, agent.ResumeCalls);
+        var stillClaimed = await harness.Store.GetAsync(item.Id);
+        Assert.Equal(firstClaimId, stillClaimed?.AgentTurnResumeCheckpoint?.DispatchClaimId);
+
+        agent.ReleaseResume();
+        await firstPickup.WaitAsync(TimeSpan.FromSeconds(30));
+
+        var final = await harness.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final?.State);
+        Assert.Null(final?.AgentTurnResumeCheckpoint);
+        Assert.Equal(1, agent.ResumeCalls);
+    }
+
+    [Fact]
+    public async Task QuotaFailure_CheckpointsDirtyTurn_AndParksAtExactResumeBoundary()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new DurableFailureResumeAgent(quotaFailure: true);
+        using var harness = BuildPipeline(
+            seed,
+            agent,
+            quotaClassifier: new DurableFailureResumeAgent.QuotaFailureClassifier());
+
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+
+        await harness.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var parked = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked.State);
+        Assert.Equal("quota", parked.FailureKind);
+        Assert.Equal(RetryFromPolicy.Work, parked.QuotaRetryFrom);
+        Assert.Equal(RetryFromPolicy.Work, parked.QuotaRetryPhase);
+        AssertDurableCheckpointRef(item.Id, parked.PreemptCheckpoint);
+        var checkpoint = Assert.IsType<AgentTurnResumeCheckpoint>(parked.AgentTurnResumeCheckpoint);
+        Assert.Equal(AgentTurnResumePhase.Work, checkpoint.Phase);
+        Assert.Equal(DurableFailureResumeAgent.SessionId, checkpoint.NativeSessionId?.Value);
+    }
+
+    [Fact]
+    public async Task InfrastructureFailure_WithoutNativeId_ResumesFromScratchpadAndDirtyTree()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new DurableFailureResumeAgent(emitNativeSessionId: false);
+        using var harness = BuildPipeline(seed, agent);
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+
+        await harness.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var failed = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(failed);
+        Assert.Equal(WorkItemState.Failed, failed.State);
+        var checkpoint = Assert.IsType<AgentTurnResumeCheckpoint>(failed.AgentTurnResumeCheckpoint);
+        Assert.Null(checkpoint.NativeSessionId);
+
+        var retrier = new WorkItemRetrier(
+            harness.Store,
+            new InMemoryTaskQueue(),
+            harness.GitHost,
+            NullLogger<WorkItemRetrier>.Instance);
+        var retry = await retrier.RetryAsync(failed, trigger: "manual");
+        Assert.True(retry.Success, retry.Error);
+        var resumed = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(resumed);
+
+        await harness.Pipeline.RunAsync(resumed, CancellationToken.None);
+
+        var completed = await harness.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, completed?.State);
+        Assert.Equal(1, agent.ResumeCalls);
+        Assert.Null(agent.ResumedNativeSessionId);
+        Assert.True(agent.SawCheckpointedPartialWork);
+        Assert.True(agent.SawCheckpointScratchpad);
+    }
+
+    [Fact]
+    public async Task DurableResume_EmptyInitialCheckpointAndNoopResume_FollowsNormalNoDiffFailure()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new DurableFailureResumeAgent(
+            writePartialBeforeFailure: false,
+            writeOnResume: false);
+        using var harness = BuildPipeline(seed, agent);
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+
+        await harness.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var interrupted = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(interrupted);
+        Assert.Equal(WorkItemState.Failed, interrupted!.State);
+        Assert.False(string.IsNullOrWhiteSpace(interrupted.PreemptCheckpoint), interrupted.LastError);
+        var checkpointRef = AssertDurableCheckpointRef(item.Id, interrupted.PreemptCheckpoint);
+        Assert.NotNull(await harness.Store.ReadAsync(item.Id, checkpointRef));
+
+        var retrier = new WorkItemRetrier(
+            harness.Store,
+            new InMemoryTaskQueue(),
+            harness.GitHost,
+            NullLogger<WorkItemRetrier>.Instance);
+        var retry = await retrier.RetryAsync(interrupted, trigger: "test-resume");
+        Assert.True(retry.Success, retry.Error);
+        var resumed = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(resumed);
+
+        await harness.Pipeline.RunAsync(resumed!, CancellationToken.None);
+
+        var final = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("Agent produced no changes", final.LastError, StringComparison.Ordinal);
+        Assert.Null(final.PreemptCheckpoint);
+        Assert.Null(final.AgentTurnResumeCheckpoint);
+        Assert.Null(await harness.Store.ReadAsync(item.Id, checkpointRef));
+        Assert.Equal(1, agent.InitialWorkCalls);
+        Assert.Equal(1, agent.ResumeCalls);
+        Assert.False(agent.SawCheckpointedPartialWork);
+        Assert.True(agent.SawCheckpointScratchpad);
+    }
+
+    [Fact]
+    public async Task DurableResume_EmptyReworkCheckpointAndNoopResume_FollowsNormalNoDiffFailure()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new EmptyReworkDurableResumeAgent();
+        using var harness = BuildPipeline(
+            seed,
+            agent,
+            auditors: [new OnceFailingAuditor()]);
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+
+        await harness.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var interrupted = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(interrupted);
+        Assert.Equal(WorkItemState.Failed, interrupted!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, interrupted.FailureKind);
+        Assert.False(string.IsNullOrWhiteSpace(interrupted.PreemptCheckpoint), interrupted.LastError);
+        Assert.Equal(
+            AgentTurnResumePhase.Rework,
+            Assert.IsType<AgentTurnResumeCheckpoint>(interrupted.AgentTurnResumeCheckpoint).Phase);
+        var checkpointRef = AssertDurableCheckpointRef(item.Id, interrupted.PreemptCheckpoint);
+        Assert.NotNull(await harness.Store.ReadAsync(item.Id, checkpointRef));
+
+        var retrier = new WorkItemRetrier(
+            harness.Store,
+            new InMemoryTaskQueue(),
+            harness.GitHost,
+            NullLogger<WorkItemRetrier>.Instance,
+            auditProgress: harness.Store);
+        var retry = await retrier.RetryAsync(interrupted, trigger: "test-rework-resume");
+        Assert.True(retry.Success, retry.Error);
+        Assert.Equal(WorkItemState.Reworking, retry.ResumeState);
+        var resumed = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(resumed);
+
+        await harness.Pipeline.RunAsync(resumed!, CancellationToken.None);
+
+        var final = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Contains("Rework agent produced no changes", final.LastError, StringComparison.Ordinal);
+        Assert.Null(final.PreemptCheckpoint);
+        Assert.Null(final.AgentTurnResumeCheckpoint);
+        Assert.Null(await harness.Store.ReadAsync(item.Id, checkpointRef));
+        Assert.Equal(1, agent.InitialWorkCalls);
+        Assert.Equal(1, agent.InterruptedReworkCalls);
+        Assert.Equal(1, agent.ResumeCalls);
+        Assert.True(agent.SawCheckpointScratchpad);
+    }
+
+    [Fact]
+    public async Task DirectRecoveryRequeue_WhenDurableResumeDisabled_DoesNotInvokeCheckpointedTurn()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new DurableFailureResumeAgent();
+        using var harness = BuildPipeline(seed, agent);
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+        await harness.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var failed = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(failed);
+        var checkpointRef = AssertDurableCheckpointRef(item.Id, failed!.PreemptCheckpoint);
+        var bypassedRetrier = failed with
+        {
+            State = WorkItemState.Working,
+            FailureKind = null,
+            LastError = null,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        await harness.Store.UpdateAsync(bypassedRetrier);
+
+        var previousLimit = SessionResumeOptions.MaxResumeAttempts;
+        try
+        {
+            SessionResumeOptions.SetMaxResumeAttempts(0);
+            await harness.Pipeline.RunAsync(bypassedRetrier, CancellationToken.None);
+        }
+        finally
+        {
+            SessionResumeOptions.SetMaxResumeAttempts(previousLimit);
+        }
+
+        var after = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Null(after.PreemptCheckpoint);
+        Assert.Null(after.AgentTurnResumeCheckpoint);
+        Assert.Null(await harness.Store.ReadAsync(item.Id, checkpointRef));
+        Assert.Equal(0, agent.ResumeCalls);
+    }
+
+    [Fact]
+    public async Task PostAgentExecutionUnavailable_CheckpointsCompletedDirtyTreeBeforeFailing()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var sandboxProvider = new PostAgentGitUnavailableSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        using var harness = BuildPipeline(
+            seed,
+            new SuccessfulDirtyAgentRunner(),
+            sandboxProvider: sandboxProvider);
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+
+        await harness.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var failed = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(failed);
+        Assert.Equal(WorkItemState.Failed, failed!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, failed.FailureKind);
+        var checkpointRef = AssertDurableCheckpointRef(item.Id, failed.PreemptCheckpoint);
+        Assert.NotNull(failed.AgentTurnResumeCheckpoint);
+        Assert.Null(failed.AgentTurnResumeCheckpoint!.NativeSessionId);
+        Assert.NotNull(await harness.Store.ReadAsync(item.Id, checkpointRef));
+        var tree = await TestSupport.RunGit(
+            harness.GitHost.GetRepoPath(item.Id.ToString()),
+            "ls-tree",
+            "-r",
+            "--name-only",
+            checkpointRef.Value);
+        Assert.Equal(0, tree.code);
+        Assert.Contains("completed-before-git-infrastructure-failure.txt", tree.stdout);
+        Assert.DoesNotContain("preempt-scratchpad", tree.stdout, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ResumedAgent_PublishedChangesThenBuildInfrastructureFailure_DiscardsStaleTurnCheckpoint()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new DurableFailureResumeAgent();
+        var buildVerifier = new TestRequiredBuildVerifier(
+            RequiredBuildProbeResult.Applies,
+            RequiredBuildVerificationResult.Unavailable("injected build sandbox outage"));
+        using var harness = BuildPipeline(
+            seed,
+            agent,
+            requiredBuildVerifier: buildVerifier);
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+
+        await harness.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var interrupted = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(interrupted);
+        Assert.False(string.IsNullOrWhiteSpace(interrupted!.PreemptCheckpoint), interrupted.LastError);
+        var staleCheckpointRef = AssertDurableCheckpointRef(item.Id, interrupted.PreemptCheckpoint);
+        Assert.NotNull(await harness.Store.ReadAsync(item.Id, staleCheckpointRef));
+
+        var retrier = new WorkItemRetrier(
+            harness.Store,
+            new InMemoryTaskQueue(),
+            harness.GitHost,
+            NullLogger<WorkItemRetrier>.Instance);
+        var retry = await retrier.RetryAsync(interrupted, trigger: "test-resume");
+        Assert.True(retry.Success, retry.Error);
+        var resumed = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(resumed);
+
+        await harness.Pipeline.RunAsync(resumed!, CancellationToken.None);
+
+        var failedBuildVerification = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(failedBuildVerification);
+        Assert.Equal(WorkItemState.Failed, failedBuildVerification!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, failedBuildVerification.FailureKind);
+        Assert.Null(failedBuildVerification.PreemptCheckpoint);
+        Assert.Null(failedBuildVerification.AgentTurnResumeCheckpoint);
+        Assert.Null(await harness.Store.ReadAsync(item.Id, staleCheckpointRef));
+        Assert.Equal(1, agent.InitialWorkCalls);
+        Assert.Equal(1, agent.ResumeCalls);
+        Assert.Equal(1, buildVerifier.VerifyCalls);
+
+        var branchTree = await TestSupport.RunGit(
+            harness.GitHost.GetRepoPath(item.Id.ToString()),
+            "ls-tree",
+            "-r",
+            "--name-only",
+            failedBuildVerification.WorkBranch!);
+        Assert.Equal(0, branchTree.code);
+        Assert.Contains("partial-before-infrastructure-failure.txt", branchTree.stdout);
+        Assert.Contains("resumed-after-infrastructure-failure.txt", branchTree.stdout);
+
+        var boundaryRetry = await retrier.RetryAsync(
+            failedBuildVerification,
+            trigger: "test-build-recovery");
+        Assert.True(boundaryRetry.Success, boundaryRetry.Error);
+        Assert.Equal(WorkItemState.WorkComplete, boundaryRetry.ResumeState);
+        Assert.Equal(1, agent.ResumeCalls);
+    }
+
+    [Fact]
+    public async Task DirectExit137WithoutNativeId_RetainsDirtyTreeAsInfrastructureCheckpoint()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var harness = BuildPipeline(seed, new Exit137DirtyAgentRunner());
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+
+        await harness.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var failed = await harness.Store.GetAsync(item.Id);
+        Assert.NotNull(failed);
+        Assert.Equal(WorkItemState.Failed, failed!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, failed.FailureKind);
+        var checkpointRef = AssertDurableCheckpointRef(item.Id, failed.PreemptCheckpoint);
+        Assert.Null(failed.AgentTurnResumeCheckpoint?.NativeSessionId);
+        Assert.NotNull(await harness.Store.ReadAsync(item.Id, checkpointRef));
+        var tree = await TestSupport.RunGit(
+            harness.GitHost.GetRepoPath(item.Id.ToString()),
+            "ls-tree",
+            "-r",
+            "--name-only",
+            checkpointRef.Value);
+        Assert.Equal(0, tree.code);
+        Assert.Contains("partial-before-exit-137.txt", tree.stdout);
     }
 
     [Fact]
@@ -195,7 +737,7 @@ public sealed class HostShutdownCancellationTests : IDisposable
         var final = await harness.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Working, final!.State);
         Assert.Null(final.FailureKind);
-        Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", final.PreemptCheckpoint);
+        AssertDurableCheckpointRef(item.Id, final.PreemptCheckpoint);
         Assert.Contains(logger.Entries, e =>
             e.Message.Contains("Failed preserving sandbox", StringComparison.Ordinal));
     }
@@ -230,15 +772,18 @@ public sealed class HostShutdownCancellationTests : IDisposable
         var final = await harness.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Working, final!.State);
         Assert.Null(final.FailureKind);
-        Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", final.PreemptCheckpoint);
+        AssertDurableCheckpointRef(item.Id, final.PreemptCheckpoint);
         Assert.Contains(logger.Entries, e =>
             e.Message.Contains("Timed out preserving sandbox", StringComparison.Ordinal));
     }
 
     [Fact]
-    public async Task HostShutdown_PreemptHookTimeout_StillCreatesCheckpoint()
+    public async Task HostShutdown_PreemptHookIgnoresCancellation_RefusesCheckpointAndPreservesSandbox()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var logger = new CapturingLogger<PipelineRunner>();
+        var sandboxProvider = new SuspendableSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
         using var harness = BuildPipeline(
             seed,
             new HangingPreemptAgentRunner(),
@@ -247,7 +792,9 @@ public sealed class HostShutdownCancellationTests : IDisposable
                 SandboxImageReference = "ignored",
                 AgentAllowedHosts = [],
                 ShutdownGrace = TimeSpan.FromSeconds(8),
-            });
+            },
+            logger,
+            sandboxProvider);
 
         var item = NewItem();
         await harness.Store.CreateAsync(item);
@@ -261,15 +808,117 @@ public sealed class HostShutdownCancellationTests : IDisposable
         await WaitForStateAsync(harness.Store, item.Id, WorkItemState.Working, TimeSpan.FromSeconds(30));
         await hostShutdownCts.CancelAsync();
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pipelineTask.WaitAsync(TimeSpan.FromSeconds(10)));
+        var thrown = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => pipelineTask.WaitAsync(TimeSpan.FromSeconds(15)));
+        Assert.Contains("preempt checkpoint could not be created", thrown.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("did not terminate after cancellation", thrown.ToString(), StringComparison.OrdinalIgnoreCase);
 
         var final = await harness.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Working, final!.State);
-        Assert.Equal($"refs/heads/codeybox/preempt/{item.Id}", final.PreemptCheckpoint);
+        Assert.Null(final.PreemptCheckpoint);
+        Assert.Null(final.AgentTurnResumeCheckpoint);
+        Assert.Equal(1, Assert.Single(sandboxProvider.Wrappers).StopAndPreserveCalls);
+        Assert.Contains(logger.Entries, entry =>
+            entry.Message.Contains("checkpoint publication will be refused", StringComparison.Ordinal));
+        Assert.Contains(logger.Entries, entry =>
+            entry.Message.Contains("preserving sandbox without publishing a checkpoint", StringComparison.Ordinal));
 
-        var showRef = await TestSupport.RunGit(harness.GitHost.GetRepoPath(item.Id.ToString()),
-            "show-ref", "--verify", final.PreemptCheckpoint!);
-        Assert.Equal(0, showRef.code);
+        var refs = await TestSupport.RunGit(
+            harness.GitHost.GetRepoPath(item.Id.ToString()),
+            "for-each-ref",
+            "--format=%(refname)",
+            $"refs/heads/codeybox/preempt/{item.Id}/");
+        Assert.Equal(string.Empty, refs.stdout.Trim());
+    }
+
+    [Fact]
+    public async Task HostShutdown_SlowPreemptHookObservesCancellation_QuiescesThenCheckpoints()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new CancellationObservingSlowPreemptAgentRunner();
+        var logger = new CapturingLogger<PipelineRunner>();
+        using var harness = BuildPipeline(
+            seed,
+            agent,
+            new PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                AgentAllowedHosts = [],
+                ShutdownGrace = TimeSpan.FromSeconds(8),
+            },
+            logger);
+
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+        using var hostShutdownCts = new CancellationTokenSource();
+        var pipelineTask = Task.Run(() =>
+            harness.Pipeline.RunAsync(item, CancellationToken.None, hostShutdownCts.Token));
+
+        await WaitForStateAsync(harness.Store, item.Id, WorkItemState.Working, TimeSpan.FromSeconds(30));
+        await hostShutdownCts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => pipelineTask.WaitAsync(TimeSpan.FromSeconds(15)));
+
+        var final = await harness.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, final!.State);
+        var checkpointRef = AssertDurableCheckpointRef(item.Id, final.PreemptCheckpoint);
+        Assert.NotNull(final.AgentTurnResumeCheckpoint);
+        Assert.NotNull(await harness.Store.ReadAsync(item.Id, checkpointRef));
+        Assert.True(agent.CancellationObserved);
+        Assert.Contains(logger.Entries, entry =>
+            entry.Message.Contains("preempt signal exceeded timeout", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(logger.Entries, entry =>
+            entry.Message.Contains("checkpoint publication will be refused", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task HostShutdown_LateRepositoryScratchWriteAfterTimeout_CannotRaceCheckpointPublication()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new LateRepositoryWritingPreemptAgentRunner(TimeSpan.FromMilliseconds(750));
+        var logger = new CapturingLogger<PipelineRunner>();
+        var sandboxProvider = new SuspendableSandboxProvider(
+            new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance));
+        using var harness = BuildPipeline(
+            seed,
+            agent,
+            new PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                AgentAllowedHosts = [],
+                ShutdownGrace = TimeSpan.FromMilliseconds(500),
+            },
+            logger,
+            sandboxProvider);
+
+        var item = NewItem();
+        await harness.Store.CreateAsync(item);
+        using var hostShutdownCts = new CancellationTokenSource();
+        var pipelineTask = Task.Run(() =>
+            harness.Pipeline.RunAsync(item, CancellationToken.None, hostShutdownCts.Token));
+
+        await WaitForStateAsync(harness.Store, item.Id, WorkItemState.Working, TimeSpan.FromSeconds(30));
+        await hostShutdownCts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => pipelineTask.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.True(await agent.LateWriteCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+
+        var final = await harness.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, final!.State);
+        Assert.Null(final.PreemptCheckpoint);
+        Assert.Null(final.AgentTurnResumeCheckpoint);
+        Assert.Equal(1, Assert.Single(sandboxProvider.Wrappers).StopAndPreserveCalls);
+        Assert.Contains(logger.Entries, entry =>
+            entry.Message.Contains("checkpoint publication will be refused", StringComparison.Ordinal));
+
+        var refs = await TestSupport.RunGit(
+            harness.GitHost.GetRepoPath(item.Id.ToString()),
+            "for-each-ref",
+            "--format=%(refname)",
+            $"refs/heads/codeybox/preempt/{item.Id}/");
+        Assert.Equal(string.Empty, refs.stdout.Trim());
     }
 
     // ── Operator cancel: item must be Cancelled with OperatorRequested reason ──
@@ -459,6 +1108,8 @@ public sealed class HostShutdownCancellationTests : IDisposable
         await orchestrator.StopAsync(CancellationToken.None);
 
         Assert.Equal(1, agent.ResumeCalls);
+        Assert.True(agent.LegacyScratchpadFilesAbsentBeforeResume);
+        Assert.True(agent.PrivateScratchpadPresentBeforeResume);
         Assert.True(agent.RestoredScratchpad);
         Assert.Null(final.PreemptedAt);
         Assert.Null(final.PreemptCheckpoint);
@@ -984,6 +1635,417 @@ internal sealed class BlockingAgentRunner : IAgentRunner
     }
 }
 
+internal sealed class SuccessfulDirtyAgentRunner : IAgentRunner
+{
+    public AgentKind Kind => AgentKind.Claude;
+
+    public async Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
+    {
+        _ = prompt;
+        _ = credential;
+        _ = modelId;
+        _ = reasoningMode;
+        _ = stdoutChunkCallback;
+        _ = captureStructuredStream;
+        var write = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-c",
+                "printf '%s\\n' complete > completed-before-git-infrastructure-failure.txt",
+            ],
+            WorkingDirectory = workingDirectory,
+        }, ct);
+        return new AgentResult(
+            write.Success,
+            write.Success ? "completed work" : "failed to write completed work",
+            write.Stdout,
+            write.Stderr)
+        {
+            ExecutionUnavailable = write.ExecutionUnavailable,
+        };
+    }
+}
+
+internal sealed class Exit137DirtyAgentRunner : IAgentRunner
+{
+    public AgentKind Kind => AgentKind.Claude;
+
+    public async Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
+    {
+        _ = prompt;
+        _ = credential;
+        _ = modelId;
+        _ = reasoningMode;
+        _ = stdoutChunkCallback;
+        _ = captureStructuredStream;
+        var write = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "printf '%s\\n' partial > partial-before-exit-137.txt"],
+            WorkingDirectory = workingDirectory,
+        }, ct);
+        if (!write.Success)
+            return new AgentResult(false, "failed to create partial exit-137 work", write.Stdout, write.Stderr);
+        return new AgentResult(false, "agent exited 137", "", "process killed");
+    }
+}
+
+internal static class TestAgentTurnScratchpadCapture
+{
+    public static async Task CaptureAsync(ISandbox sandbox, CancellationToken ct)
+    {
+        var capture = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "bash", "-c",
+                "set -euo pipefail; root=$1; tmp=$(mktemp -d \"$root/capture.XXXXXX\"); cleanup() { rm -rf -- \"$tmp\"; }; trap cleanup EXIT; : > \"$tmp/manifest.tsv\"; archive=$(mktemp \"$root/scratchpad.tgz.tmp.XXXXXX\"); tar -czf \"$archive\" -C \"$tmp\" manifest.tsv; mv -f -- \"$archive\" \"$root/scratchpad.tgz\"",
+                "codeybox-test-capture",
+                SandboxConventions.AgentTurnScratchpadDir,
+            ],
+            WorkingDirectory = "/",
+        }, ct);
+        if (!capture.Success)
+            throw new InvalidOperationException("test scratchpad capture failed");
+    }
+}
+
+internal sealed class EmptyReworkDurableResumeAgent :
+    IAgentRunner,
+    IResumableAgentRunner,
+    IPreemptibleAgentRunner
+{
+    public AgentKind Kind => AgentKind.Claude;
+    public int InitialWorkCalls { get; private set; }
+    public int InterruptedReworkCalls { get; private set; }
+    public int ResumeCalls { get; private set; }
+    public bool SawCheckpointScratchpad { get; private set; }
+
+    public async Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
+    {
+        _ = credential;
+        _ = modelId;
+        _ = reasoningMode;
+        _ = stdoutChunkCallback;
+        _ = captureStructuredStream;
+        if (prompt.StartsWith("# Merge task", StringComparison.Ordinal))
+            return new AgentResult(false, "unexpected merge invocation", null, null);
+
+        if (InitialWorkCalls == 0)
+        {
+            InitialWorkCalls++;
+            var write = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "printf '%s\\n' initial > initial-before-rework.txt"],
+                WorkingDirectory = workingDirectory,
+            }, ct);
+            return new AgentResult(
+                write.Success,
+                write.Success ? "initial work complete" : "initial write failed",
+                write.Stdout,
+                write.Stderr);
+        }
+
+        InterruptedReworkCalls++;
+        return new AgentResult(
+            Success: false,
+            Summary: "rework execution became unavailable before making changes",
+            Stdout: null,
+            Stderr: "sandbox execution unavailable")
+        {
+            ExecutionUnavailable = true,
+        };
+    }
+
+    public async Task<AgentResult> RunResumedAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        AgentResumeContext resume,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null)
+    {
+        _ = prompt;
+        _ = credential;
+        _ = resume;
+        _ = modelId;
+        _ = reasoningMode;
+        _ = stdoutChunkCallback;
+        ResumeCalls++;
+        var scratchpad = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["test", "-f", SandboxConventions.AgentTurnScratchpadArchivePath],
+            WorkingDirectory = workingDirectory,
+        }, ct);
+        SawCheckpointScratchpad = scratchpad.Success;
+        return scratchpad.Success
+            ? new AgentResult(true, "rework resumed without source changes", null, null)
+            : new AgentResult(false, "rework scratchpad was not restored", scratchpad.Stdout, scratchpad.Stderr);
+    }
+
+    public Task RequestPreemptAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        CancellationToken ct = default)
+        => TestAgentTurnScratchpadCapture.CaptureAsync(sandbox, ct);
+}
+
+internal sealed class DurableFailureResumeAgent :
+    IAgentRunner,
+    IResumableAgentRunner,
+    IPreemptibleAgentRunner,
+    ICliSessionResumableAgentRunner
+{
+    public const string SessionId = "durable-session-7d858a41";
+    private readonly bool _quotaFailure;
+    private readonly bool _emitNativeSessionId;
+    private readonly bool _writePartialBeforeFailure;
+    private readonly bool _writeOnResume;
+    private readonly bool _blockResume;
+    private readonly bool _throwResumePreparationUnavailable;
+    private readonly TaskCompletionSource _resumeEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _resumeRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _resumeCalls;
+
+    public AgentKind Kind => AgentKind.Claude;
+    public bool RequiresStructuredStreamForSessionId => false;
+    public IQuotaFailureClassifier SessionResumeQuotaClassifier { get; } = new NoQuotaFailureClassifier();
+    public int InitialWorkCalls { get; private set; }
+    public int ResumeCalls => Volatile.Read(ref _resumeCalls);
+    public Task ResumeEntered => _resumeEntered.Task;
+    public AgentNativeSessionId? ResumedNativeSessionId { get; private set; }
+    public bool SawCheckpointedPartialWork { get; private set; }
+    public bool SawCheckpointScratchpad { get; private set; }
+
+    public DurableFailureResumeAgent(
+        bool quotaFailure = false,
+        bool emitNativeSessionId = true,
+        bool writePartialBeforeFailure = true,
+        bool writeOnResume = true,
+        bool blockResume = false,
+        bool throwResumePreparationUnavailable = false)
+    {
+        _quotaFailure = quotaFailure;
+        _emitNativeSessionId = emitNativeSessionId;
+        _writePartialBeforeFailure = writePartialBeforeFailure;
+        _writeOnResume = writeOnResume;
+        _blockResume = blockResume;
+        _throwResumePreparationUnavailable = throwResumePreparationUnavailable;
+    }
+
+    public void ReleaseResume() => _resumeRelease.TrySetResult();
+
+    public string? TryExtractSessionId(string? stdout) => null;
+
+    public async Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
+    {
+        _ = credential;
+        _ = modelId;
+        _ = reasoningMode;
+        _ = stdoutChunkCallback;
+        _ = captureStructuredStream;
+        if (prompt.StartsWith("# Merge task", StringComparison.Ordinal))
+            return await MergeAsync(sandbox, workingDirectory, prompt, ct);
+
+        InitialWorkCalls++;
+        if (_writePartialBeforeFailure)
+        {
+            var write = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["sh", "-c", "printf '%s\\n' partial > partial-before-infrastructure-failure.txt"],
+                WorkingDirectory = workingDirectory,
+            }, ct);
+            if (!write.Success)
+                return new AgentResult(false, "failed to create partial work", write.Stdout, write.Stderr);
+        }
+
+        return new AgentResult(
+            Success: false,
+            Summary: _quotaFailure
+                ? "agent reported quota exhaustion"
+                : "agent execution became unavailable",
+            Stdout: "native session initialized before interruption",
+            Stderr: _quotaFailure
+                ? QuotaFailureClassifier.Marker
+                : "sandbox execution unavailable")
+        {
+            ExecutionUnavailable = !_quotaFailure,
+            NativeSessionId = _emitNativeSessionId
+                ? new AgentNativeSessionId(SessionId)
+                : null,
+        };
+    }
+
+    public async Task<AgentResult> RunResumedAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        AgentResumeContext resume,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null)
+    {
+        _ = prompt;
+        _ = credential;
+        _ = modelId;
+        _ = reasoningMode;
+        _ = stdoutChunkCallback;
+        Interlocked.Increment(ref _resumeCalls);
+        _resumeEntered.TrySetResult();
+        if (_blockResume)
+            await _resumeRelease.Task.WaitAsync(ct);
+        if (_throwResumePreparationUnavailable)
+            throw new AgentResumePreparationUnavailableException(255);
+        ResumedNativeSessionId = resume.NativeSessionId;
+
+        var partial = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["test", "-f", "partial-before-infrastructure-failure.txt"],
+            WorkingDirectory = workingDirectory,
+        }, ct);
+        SawCheckpointedPartialWork = partial.Success;
+        var scratchpad = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["test", "-f", SandboxConventions.AgentTurnScratchpadArchivePath],
+            WorkingDirectory = workingDirectory,
+        }, ct);
+        SawCheckpointScratchpad = scratchpad.Success;
+        if ((_writePartialBeforeFailure && !partial.Success) || !scratchpad.Success)
+        {
+            return new AgentResult(
+                false,
+                "durable checkpoint restore was incomplete",
+                string.Concat(partial.Stdout, scratchpad.Stdout),
+                string.Concat(partial.Stderr, scratchpad.Stderr));
+        }
+
+        if (!_writeOnResume)
+            return new AgentResult(true, "resumed without source changes", null, null);
+
+        var write = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c", "printf '%s\\n' resumed > resumed-after-infrastructure-failure.txt"],
+            WorkingDirectory = workingDirectory,
+        }, ct);
+        return new AgentResult(
+            write.Success,
+            write.Success ? "resumed" : "resume write failed",
+            write.Stdout,
+            write.Stderr);
+    }
+
+    public Task RequestPreemptAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        CancellationToken ct = default)
+        => TestAgentTurnScratchpadCapture.CaptureAsync(sandbox, ct);
+
+    private static async Task<AgentResult> MergeAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        CancellationToken ct)
+    {
+        var workBranch = ExtractBetween(prompt, "merge branch `", "` into branch `");
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "git", "-C", workingDirectory, "merge", "--no-ff",
+                "-m", "codeybox: merge durable resume test",
+                $"origin/{workBranch}",
+            ],
+        }, ct);
+        return new AgentResult(
+            result.Success,
+            result.Success ? "merged" : "merge failed",
+            result.Stdout,
+            result.Stderr);
+    }
+
+    private static string ExtractBetween(string text, string left, string right)
+    {
+        var start = text.IndexOf(left, StringComparison.Ordinal);
+        if (start < 0)
+            return "main";
+        start += left.Length;
+        var end = text.IndexOf(right, start, StringComparison.Ordinal);
+        return end < 0 ? text[start..].Trim() : text[start..end];
+    }
+
+    private sealed class NoQuotaFailureClassifier : IQuotaFailureClassifier
+    {
+        public QuotaFailureClassification Classify(
+            AgentKind agent,
+            string? stderr,
+            string? stdout) => QuotaFailureClassification.None;
+
+        public QuotaDetection? Detect(AgentKind agent, string? stderr, string? stdout) => null;
+    }
+
+    public sealed class QuotaFailureClassifier : IQuotaFailureClassifier
+    {
+        public const string Marker = "test provider quota exhausted";
+
+        public QuotaFailureClassification Classify(
+            AgentKind agent,
+            string? stderr,
+            string? stdout)
+        {
+            var detection = Detect(agent, stderr, stdout);
+            return detection is null
+                ? QuotaFailureClassification.None
+                : QuotaFailureClassification.Quota(detection);
+        }
+
+        public QuotaDetection? Detect(AgentKind agent, string? stderr, string? stdout)
+            => string.Equals(stderr, Marker, StringComparison.Ordinal)
+                ? new QuotaDetection(QuotaFailureKind.LimitReached)
+                : null;
+    }
+}
+
 internal sealed class HangingPreemptAgentRunner : IAgentRunner, IPreemptibleAgentRunner
 {
     public AgentKind Kind => AgentKind.Claude;
@@ -1007,10 +2069,96 @@ internal sealed class HangingPreemptAgentRunner : IAgentRunner, IPreemptibleAgen
         => Task.Delay(Timeout.InfiniteTimeSpan);
 }
 
+internal sealed class LateRepositoryWritingPreemptAgentRunner : IAgentRunner, IPreemptibleAgentRunner
+{
+    private readonly TimeSpan _writeDelay;
+
+    public LateRepositoryWritingPreemptAgentRunner(TimeSpan writeDelay) => _writeDelay = writeDelay;
+
+    public AgentKind Kind => AgentKind.Claude;
+    public TaskCompletionSource<bool> LateWriteCompleted { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public async Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
+    {
+        await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+        return new AgentResult(false, "unreachable", null, null);
+    }
+
+    public async Task RequestPreemptAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        CancellationToken ct = default)
+    {
+        await Task.Delay(_writeDelay, CancellationToken.None);
+        var write = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-c",
+                "set -e; mkdir -p .codeybox/preempt-scratchpad.late; printf '%s\n' private-provider-state > .codeybox/preempt-scratchpad.late/session.txt; printf '%s\n' late > .codeybox/preempt-scratchpad.tgz",
+            ],
+            WorkingDirectory = workingDirectory,
+        }, CancellationToken.None);
+        LateWriteCompleted.TrySetResult(write.Success);
+        await Task.Delay(Timeout.InfiniteTimeSpan, CancellationToken.None);
+    }
+}
+
+internal sealed class CancellationObservingSlowPreemptAgentRunner : IAgentRunner, IPreemptibleAgentRunner
+{
+    public AgentKind Kind => AgentKind.Claude;
+    public bool CancellationObserved { get; private set; }
+
+    public async Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
+    {
+        await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+        return new AgentResult(false, "unreachable", null, null);
+    }
+
+    public async Task RequestPreemptAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        CancellationToken ct = default)
+    {
+        await TestAgentTurnScratchpadCapture.CaptureAsync(sandbox, ct);
+
+        try
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            CancellationObserved = true;
+            throw;
+        }
+    }
+}
+
 internal sealed class StartupResumeRecordingAgent : IAgentRunner, IResumableAgentRunner
 {
     public AgentKind Kind => AgentKind.Claude;
     public int ResumeCalls { get; private set; }
+    public bool LegacyScratchpadFilesAbsentBeforeResume { get; private set; }
+    public bool PrivateScratchpadPresentBeforeResume { get; private set; }
     public bool RestoredScratchpad { get; private set; }
 
     public Task<AgentResult> RunAsync(
@@ -1042,12 +2190,41 @@ internal sealed class StartupResumeRecordingAgent : IAgentRunner, IResumableAgen
         Action<string>? stdoutChunkCallback = null)
     {
         ResumeCalls++;
+        var legacyFilesAbsent = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-c",
+                "test ! -e \"$1\" && test ! -L \"$1\" && test ! -e \"$2\" && test ! -L \"$2\"",
+                "legacy-scratchpad-check",
+                ".codeybox/preempt-scratchpad.tgz",
+                ".codeybox/preempt-scratchpad.md",
+            ],
+            WorkingDirectory = workingDirectory,
+        }, ct);
+        LegacyScratchpadFilesAbsentBeforeResume = legacyFilesAbsent.Success;
+
+        var privateScratchpad = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["test", "-f", resume.ScratchpadArchivePath],
+            WorkingDirectory = workingDirectory,
+        }, ct);
+        PrivateScratchpadPresentBeforeResume = privateScratchpad.Success;
+        if (!legacyFilesAbsent.Success || !privateScratchpad.Success)
+        {
+            return new AgentResult(
+                false,
+                "legacy scratchpad migration was incomplete",
+                string.Concat(legacyFilesAbsent.Stdout, privateScratchpad.Stdout),
+                string.Concat(legacyFilesAbsent.Stderr, privateScratchpad.Stderr));
+        }
+
         var restore = await sandbox.ExecAsync(new SandboxExec
         {
             Argv =
             [
                 "sh", "-c",
-                "set -e; tmp=$(mktemp -d); tar -xzf \"$1\" -C \"$tmp\"; test -f \"$tmp/home/.testagent/session.txt\"; cp -a \"$tmp/home/.\" \"$HOME/\"; test -f \"$HOME/.testagent/session.txt\"; printf '%s\n' resumed > resumed-startup.txt",
+                "set -e; tmp=$(mktemp -d); trap 'rm -rf -- \"$tmp\"' EXIT; tar -xzf \"$1\" -C \"$tmp\"; test -f \"$tmp/home/.testagent/session.txt\"; cp -a \"$tmp/home/.\" \"$HOME/\"; test -f \"$HOME/.testagent/session.txt\"; printf '%s\n' resumed > resumed-startup.txt",
                 "startup-resume",
                 resume.ScratchpadArchivePath,
             ],
@@ -1123,7 +2300,7 @@ internal sealed class ReworkResumeRecordingAgent : IAgentRunner, IResumableAgent
         LastResumePrompt = prompt;
         var scratchpad = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["test", "-f", ".codeybox/preempt-scratchpad.md"],
+            Argv = ["test", "-f", resume.ScratchpadArchivePath],
             WorkingDirectory = workingDirectory,
         }, ct);
         SawScratchpad = scratchpad.Success;
@@ -1307,6 +2484,75 @@ internal sealed class PreemptPushSyncObservingSandboxProvider : ISandboxProvider
             => argv.Contains("push", StringComparer.Ordinal)
                 && argv.Any(arg => arg.StartsWith("HEAD:", StringComparison.Ordinal)
                     && !arg.StartsWith("HEAD:refs/heads/codeybox/preempt/", StringComparison.Ordinal));
+    }
+}
+
+internal sealed class PostAgentGitUnavailableSandboxProvider : ISandboxProvider
+{
+    private readonly ISandboxProvider _inner;
+
+    public PostAgentGitUnavailableSandboxProvider(ISandboxProvider inner)
+    {
+        _inner = inner;
+    }
+
+    public string Name => _inner.Name;
+
+    public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        => new PostAgentGitUnavailableSandbox(await _inner.CreateAsync(spec, ct));
+
+    public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct)
+        => _inner.ListAllManagedAsync(ct);
+
+    public Task DisposeLeakedAsync(string name, CancellationToken ct)
+        => _inner.DisposeLeakedAsync(name, ct);
+
+    private sealed class PostAgentGitUnavailableSandbox : ISandbox
+    {
+        private readonly ISandbox _inner;
+        private int _injected;
+        private int _agentCompleted;
+
+        public PostAgentGitUnavailableSandbox(ISandbox inner)
+        {
+            _inner = inner;
+        }
+
+        public string Id => _inner.Id;
+        public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
+        public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
+
+        public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            if (Volatile.Read(ref _agentCompleted) != 0
+                && exec.Argv.Count >= 5
+                && exec.Argv[0] == "git"
+                && exec.Argv.Contains("add", StringComparer.Ordinal)
+                && exec.Argv.Contains("-A", StringComparer.Ordinal)
+                && Interlocked.CompareExchange(ref _injected, 1, 0) == 0)
+            {
+                return new SandboxExecResult(
+                    1,
+                    Stdout: "",
+                    Stderr: "injected unavailable exec",
+                    ExecutionUnavailable: true);
+            }
+
+            var result = await _inner.ExecAsync(exec, ct);
+            if (result.Success
+                && exec.Argv.Any(argument => argument.Contains(
+                    "completed-before-git-infrastructure-failure.txt",
+                    StringComparison.Ordinal)))
+            {
+                Interlocked.Exchange(ref _agentCompleted, 1);
+            }
+            return result;
+        }
+
+        public Task SyncStateToHostAsync(CancellationToken ct = default)
+            => _inner.SyncStateToHostAsync(ct);
+
+        public ValueTask DisposeAsync() => _inner.DisposeAsync();
     }
 }
 

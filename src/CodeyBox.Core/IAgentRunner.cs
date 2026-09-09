@@ -36,6 +36,12 @@ public interface IAgentRunner
     /// </summary>
     AgentFailureClassification ClassifyFailure(AgentResult result)
     {
+        if (result.ExecutionUnavailable)
+        {
+            return new AgentFailureClassification(
+                AgentFailureKind.Infrastructure,
+                Reason: "sandbox execution was unavailable");
+        }
         if (AgentFailureClassifier.DetectAuthRequired(Kind, result.Stderr, result.Stdout) is { } authRequired)
             return authRequired.Classification;
         if (result.Success)
@@ -45,8 +51,40 @@ public interface IAgentRunner
 }
 
 /// <summary>
+/// Declares the exact credential environment names a runner supports. Direct
+/// variables are read by the CLI from its launched process environment and may
+/// be scoped to a single candidate exec; file-backed variables are payload or
+/// destination metadata consumed by the runner's stdin-based credential staging
+/// and must not be exposed through per-exec process environment.
+/// </summary>
+public interface IAgentCredentialEnvironmentPolicy
+{
+    IReadOnlySet<string> DirectCredentialEnvironmentVariables { get; }
+    IReadOnlySet<string> FileBackedCredentialEnvironmentVariables { get; }
+    IReadOnlyList<AgentCredentialFileDestination> CredentialFileDestinations { get; }
+}
+
+/// <summary>
+/// Runner-declared HOME credential destination for a payload carried in an
+/// environment variable. <paramref name="HomeRelativePath"/> must be a
+/// non-empty path relative to HOME with no traversal segments. When
+/// <paramref name="DestinationEnvironmentVariable"/> is present, its value may
+/// override the destination with an absolute path, relative path, <c>~/...</c>,
+/// or <c>$HOME/...</c>; materialisation must normalize and reject overrides
+/// that escape HOME. Existing non-empty files are preserved only when the
+/// caller explicitly selects preserve-nonempty staging.
+/// </summary>
+public sealed record AgentCredentialFileDestination(
+    string PayloadEnvironmentVariable,
+    string HomeRelativePath,
+    string? DestinationEnvironmentVariable = null);
+
+/// <summary>
 /// Optional runner capability for CLIs that can emit structured stdout
-/// streams suitable for persistent capture.
+/// streams suitable for persistent capture. Implementations may verify this by
+/// executing provider CLI probes inside the supplied sandbox, and those probes
+/// can create provider-specific auth/session state; callers must treat this as
+/// a command with sandbox side effects rather than a pure metadata query.
 /// </summary>
 public interface IStructuredStreamAgentRunner : IAgentRunner
 {
@@ -203,7 +241,8 @@ public interface IResumableAgentRunner : IAgentRunner
 
 public sealed record AgentResumeContext(
     string CheckpointRef,
-    string ScratchpadArchivePath = ".codeybox/preempt-scratchpad.tgz");
+    string ScratchpadArchivePath = AgentTurnScratchpadArchive.GuestArchivePath,
+    AgentNativeSessionId? NativeSessionId = null);
 
 /// <summary>
 /// Optional capability for runners that drive a CLI with a native in-process
@@ -260,6 +299,22 @@ public sealed record AgentResult(bool Success, string Summary, string? Stdout, s
     /// <c>WaitingForQuotaReset</c> instead of dead-lettering it.</para>
     /// </summary>
     public string? TerminalDiagnostic { get; init; }
+
+    /// <summary>
+    /// True only when the sandbox provider explicitly reported that execution
+    /// was unavailable. This typed signal distinguishes a dead/unreachable
+    /// sandbox from agent-produced text that merely resembles an infrastructure
+    /// failure.
+    /// </summary>
+    public bool ExecutionUnavailable { get; init; }
+
+    /// <summary>
+    /// Validated native CLI session identifier captured before a failed run.
+    /// Orchestration may persist it and supply it through
+    /// <see cref="AgentResumeContext.NativeSessionId"/> after the sandbox has
+    /// been restored or recreated.
+    /// </summary>
+    public AgentNativeSessionId? NativeSessionId { get; init; }
 }
 
 /// <summary>Maps agent kinds to runners. Loose coupling: register new runners without recompiling consumers.</summary>

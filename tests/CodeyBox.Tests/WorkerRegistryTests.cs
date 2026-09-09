@@ -5,7 +5,7 @@ namespace CodeyBox.Tests;
 
 /// <summary>
 /// Unit tests for <see cref="SqliteWorkerRegistry"/>: register, heartbeat,
-/// deregister, list, and ClaimDeadWorkers.
+/// deregister, list, and dead-worker claims.
 /// </summary>
 public sealed class WorkerRegistryTests : IDisposable
 {
@@ -210,6 +210,23 @@ public sealed class WorkerRegistryTests : IDisposable
 
         var claimed = await _registry.ClaimDeadWorkersAsync(DateTimeOffset.UtcNow.AddMinutes(-99999));
         Assert.Empty(claimed);
+    }
+
+    [Fact]
+    public async Task TryClaimDeadWorker_FreshHeartbeatWinsAndRowRemains()
+    {
+        var stale = MakeReg() with
+        {
+            LastHeartbeatAt = DateTimeOffset.UtcNow.AddMinutes(-10),
+        };
+        await _registry.RegisterAsync(stale);
+        var cutoff = DateTimeOffset.UtcNow.AddMinutes(-5);
+
+        await _registry.HeartbeatAsync(stale.WorkerId, stale.CurrentWorkItemId);
+        var claimed = await _registry.TryClaimDeadWorkerAsync(stale.WorkerId, cutoff);
+
+        Assert.Null(claimed);
+        Assert.Equal(stale.WorkerId, Assert.Single(await _registry.ListAsync()).WorkerId);
     }
 
 }

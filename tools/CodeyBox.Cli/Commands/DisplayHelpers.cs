@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using System.Text.Json;
 
 namespace CodeyBox.Cli.Commands;
@@ -130,6 +131,28 @@ internal static class DisplayHelpers
             return double.TryParse(property.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out value);
 
         return false;
+    }
+
+    /// <summary>
+    /// Strips terminal control characters from multi-line untrusted text while preserving
+    /// layout whitespace (newline, carriage return, tab). Use for rendering server-supplied
+    /// diffs and captured agent stdout to the terminal, where a bare <see cref="Sanitize"/>
+    /// would also swallow the newlines/tabs that make the output readable. Prevents ANSI /
+    /// escape-sequence injection from untrusted repo file content or agent output.
+    /// </summary>
+    internal static string SanitizeMultiline(string? s)
+    {
+        if (string.IsNullOrEmpty(s))
+            return s ?? "";
+
+        var sb = new StringBuilder(s.Length);
+        foreach (var c in s)
+        {
+            if (c is '\n' or '\r' or '\t' || !char.IsControl(c))
+                sb.Append(c);
+        }
+
+        return sb.ToString();
     }
 
     internal static string Sanitize(string? s)

@@ -54,8 +54,11 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
                 loggerFactory.Messages,
                 message => message.Contains("exceeded the configured maximum hold duration", StringComparison.Ordinal)
                     && message.Contains(nameof(HoldGateAcrossBlockedAwaitAsync), StringComparison.Ordinal));
-            Assert.Contains(
-                loggerFactory.Messages,
+            // The acquisition-timeout diagnostic is logged fire-and-forget on the thread
+            // pool (deduped to avoid flooding the timed-out caller's path under a boot
+            // storm), so poll for it rather than racing the queued work item.
+            await AssertLogMessageEventuallyAsync(
+                loggerFactory,
                 message => message.Contains("Timed out", StringComparison.Ordinal)
                     && message.Contains(nameof(WaitAndReleaseAsync), StringComparison.Ordinal));
         }
@@ -441,6 +444,23 @@ public sealed class SqliteWriteGateConcurrencyTests : IDisposable
         {
             gate.Release();
         }
+    }
+
+    private static async Task AssertLogMessageEventuallyAsync(
+        RecordingLoggerFactory loggerFactory,
+        Func<string, bool> predicate)
+    {
+        var deadline = TimeSpan.FromSeconds(5);
+        var pollInterval = TimeSpan.FromMilliseconds(10);
+        for (var waited = TimeSpan.Zero; waited < deadline; waited += pollInterval)
+        {
+            if (loggerFactory.Messages.Any(predicate))
+                return;
+            await Task.Delay(pollInterval);
+        }
+
+        // Final assertion surfaces the recorded messages if the log never arrived.
+        Assert.Contains(loggerFactory.Messages, message => predicate(message));
     }
 
     private static async Task WaitForReleasedWritersAsync(

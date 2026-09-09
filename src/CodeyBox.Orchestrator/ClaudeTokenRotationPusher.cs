@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Orchestrator;
@@ -42,20 +43,9 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 public sealed class ClaudeTokenRotationPusher : IClaudeTokenRotationPusher, IDisposable
 {
-    // The same bash hook the Claude runner's prepare path uses to
-    // materialise the credentials file on sandbox launch — but reads the
-    // bundle from stdin rather than from an env var, so the token never lands
-    // on the multipass exec argv during a runtime push.
-    private const string PushScript =
-        "set -eu\n" +
-        "umask 077\n" +
-        "mkdir -p \"$HOME/.claude\"\n" +
-        "cat > \"$HOME/.claude/.credentials.json\"\n" +
-        "chmod 600 \"$HOME/.claude/.credentials.json\"\n";
-
     private readonly ClaudeCredentialFileSource _source;
     private readonly ILogger<ClaudeTokenRotationPusher>? _log;
-    private readonly ConcurrentDictionary<string, ISandbox> _active = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, ActiveSandboxRegistration> _active = new(StringComparer.Ordinal);
     private bool _disposed;
 
     public ClaudeTokenRotationPusher(
@@ -74,15 +64,17 @@ public sealed class ClaudeTokenRotationPusher : IClaudeTokenRotationPusher, IDis
         // registrations of the same sandbox (e.g. reentrant agent calls in
         // tests) each own a distinct key and dispose independently.
         var key = $"{sandbox.Id}:{Guid.NewGuid():N}";
-        _active[key] = sandbox;
-        return new Registration(this, key);
+        var registration = new ActiveSandboxRegistration(sandbox);
+        _active[key] = registration;
+        return new Registration(this, key, registration);
     }
 
     /// <summary>
     /// Snapshot of currently-registered sandboxes. Exposed for tests; the
     /// production code path uses <see cref="OnTokenUpdated"/> directly.
     /// </summary>
-    internal IReadOnlyCollection<ISandbox> ActiveSandboxes => _active.Values.ToArray();
+    internal IReadOnlyCollection<ISandbox> ActiveSandboxes =>
+        _active.Values.Select(static registration => registration.Sandbox).ToArray();
 
     /// <summary>
     /// Synchronous entry point used by the rotation handler and by tests
@@ -104,8 +96,11 @@ public sealed class ClaudeTokenRotationPusher : IClaudeTokenRotationPusher, IDis
             return;
 
         var pushes = new List<Task>(snapshot.Length);
-        foreach (var (_, sandbox) in snapshot)
-            pushes.Add(PushToSandboxAsync(sandbox, bundle, ct));
+        foreach (var (_, registration) in snapshot)
+        {
+            if (registration.TryBeginPush())
+                pushes.Add(PushToSandboxAsync(registration, bundle, ct));
+        }
         await Task.WhenAll(pushes).ConfigureAwait(false);
     }
 
@@ -117,35 +112,37 @@ public sealed class ClaudeTokenRotationPusher : IClaudeTokenRotationPusher, IDis
         _ = Task.Run(() => PushToAllAsync(CancellationToken.None));
     }
 
-    private async Task PushToSandboxAsync(ISandbox sandbox, string bundle, CancellationToken ct)
+    private async Task PushToSandboxAsync(ActiveSandboxRegistration registration, string bundle, CancellationToken ct)
     {
+        var sandbox = registration.Sandbox;
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, registration.Cancellation.Token);
         try
         {
-            var result = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["bash", "-c", PushScript],
-                Stdin = bundle,
-            }, ct).ConfigureAwait(false);
-
-            if (result.Success)
-            {
-                AuditLog.ClaudeTokenPushedToVm(sandbox.Id);
-            }
-            else
-            {
-                var reason = string.IsNullOrEmpty(result.Stderr)
-                    ? $"exit {result.ExitCode}"
-                    : $"exit {result.ExitCode}: {result.Stderr.Trim()}";
-                AuditLog.ClaudeTokenPushFailed(sandbox.Id, reason);
-                _log?.LogWarning(
-                    "Failed to push rotated Claude token into sandbox {Sandbox}: {Reason}",
-                    sandbox.Id, reason);
-            }
+            await SandboxCredentialFileWriter.WriteAsync(
+                sandbox,
+                new SandboxCredentialFileTarget(
+                    SandboxCredentialFileRoot.Home,
+                ".claude/.credentials.json"),
+                bundle,
+                SandboxCredentialOverwritePolicy.Overwrite,
+                linkedCts.Token).ConfigureAwait(false);
+            AuditLog.ClaudeTokenPushedToVm(sandbox.Id);
         }
         catch (OperationCanceledException)
         {
             // Don't audit-log a cancellation — the sandbox is presumably
             // tearing down and the rotation push race-loses against disposal.
+        }
+        catch (SandboxCredentialFileWriteException ex)
+        {
+            var detail = string.IsNullOrWhiteSpace(ex.Stderr)
+                ? ex.Message
+                : $"{ex.Message}: {RedactDetail(ex.Stderr)}";
+            AuditLog.ClaudeTokenPushFailed(sandbox.Id, detail);
+            _log?.LogWarning(ex,
+                "Failed to push rotated Claude token into sandbox {Sandbox}: {Detail}",
+                sandbox.Id,
+                detail);
         }
         catch (Exception ex)
         {
@@ -154,6 +151,17 @@ public sealed class ClaudeTokenRotationPusher : IClaudeTokenRotationPusher, IDis
                 "Failed to push rotated Claude token into sandbox {Sandbox}",
                 sandbox.Id);
         }
+        finally
+        {
+            registration.EndPush();
+        }
+    }
+
+    private static string RedactDetail(string text)
+    {
+        var redacted = RawOutputRedactor.Redact(text).Replace('\r', ' ').Replace('\n', ' ');
+        const int max = 300;
+        return redacted.Length <= max ? redacted : redacted[..max];
     }
 
     public void Dispose()
@@ -167,18 +175,67 @@ public sealed class ClaudeTokenRotationPusher : IClaudeTokenRotationPusher, IDis
     {
         private readonly ClaudeTokenRotationPusher _owner;
         private readonly string _key;
+        private readonly ActiveSandboxRegistration _registration;
         private int _disposed;
 
-        public Registration(ClaudeTokenRotationPusher owner, string key)
+        public Registration(
+            ClaudeTokenRotationPusher owner,
+            string key,
+            ActiveSandboxRegistration registration)
         {
             _owner = owner;
             _key = key;
+            _registration = registration;
         }
 
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
             _owner._active.TryRemove(_key, out _);
+            _registration.Dispose();
+        }
+    }
+
+    private sealed class ActiveSandboxRegistration : IDisposable
+    {
+        private int _disposed;
+        private int _inFlight;
+        private readonly ManualResetEventSlim _drained = new(initialState: true);
+
+        public ActiveSandboxRegistration(ISandbox sandbox)
+        {
+            Sandbox = sandbox;
+        }
+
+        public ISandbox Sandbox { get; }
+        public CancellationTokenSource Cancellation { get; } = new();
+
+        public bool TryBeginPush()
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+                return false;
+            _drained.Reset();
+            Interlocked.Increment(ref _inFlight);
+            if (Volatile.Read(ref _disposed) == 0)
+                return true;
+            EndPush();
+            return false;
+        }
+
+        public void EndPush()
+        {
+            if (Interlocked.Decrement(ref _inFlight) == 0)
+                _drained.Set();
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 1)
+                return;
+            try { Cancellation.Cancel(); } catch { }
+            _drained.Wait();
+            Cancellation.Dispose();
+            _drained.Dispose();
         }
     }
 }

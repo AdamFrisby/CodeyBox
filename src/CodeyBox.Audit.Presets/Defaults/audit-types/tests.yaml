@@ -57,6 +57,13 @@ reviewFocus: |-
   piece. Also out: production code style, architecture, and task completeness — except per
   [CROSS-LANE-SECURITY].
 
+  NON-EXECUTABLE CHANGE EXEMPTION (applies before Step 2): when the diff changes only
+  documentation, prose, comments, static marker/content files, or declarative metadata that
+  cannot affect runtime/build/deploy behavior, do NOT require a new test and do NOT file a
+  missing-test finding. Existing build/validation commands or direct artifact inspection are
+  sufficient for this lane. Still apply Steps 1 and 3 normally if the diff adds, modifies,
+  disables, or removes tests.
+
   DEFINITIONS (closed — do not extend them):
   - CRITICAL functionality = ANY of:
     (i)   a deliverable explicitly listed in the task text; if the task is prose with no

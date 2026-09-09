@@ -272,6 +272,154 @@ public sealed class AgenticConflictResolverTests
         Assert.Equal("second", result.ChosenRunner?.Kind.Value);
         Assert.Equal(1, first.InvocationCount);
         Assert.Equal(1, second.InvocationCount);
+        Assert.Equal(1, sandbox.KillActiveExecsCallCount);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_CredentialFileMaterialiserFailure_DoesNotInvokeCandidate()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+
+        var runner = new FakeAgentResolverRunner(sb =>
+        {
+            sb.WriteFile("src/a.txt", "m + w\n");
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "should not run", null, null);
+        })
+        { Kind = new AgentKind("file-agent") };
+        var credential = new AgentCredential(
+            runner.Kind,
+            new Dictionary<string, string>(),
+            new Dictionary<string, string> { ["agent/auth.json"] = "{}" });
+        var resolver = new AgenticConflictResolver(
+            credentialFileMaterialiser: (_, _, _) =>
+                throw new InvalidOperationException("credential tmpfs is read-only"));
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [new AgenticConflictResolverCandidate(runner, credential)],
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal(0, runner.InvocationCount);
+        Assert.Same(runner, result.FailureRunner);
+        Assert.Same(credential, result.FailureCredential);
+        var classificationResult = Assert.IsType<AgentResult>(result.FailureClassificationResult);
+        Assert.Contains("credential file materialisation failed", classificationResult.Summary, StringComparison.Ordinal);
+        Assert.Contains("credential file materialisation failed", result.Summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_MaterialisationRollbackFailurePoisonsSandboxBeforeFallbackRuns()
+    {
+        var sandbox = new ConflictSandbox { FailCredentialCleanupWrites = true };
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+        var first = new FakeAgentResolverRunner(_ =>
+            new AgentResult(false, "must not run", null, null))
+        { Kind = new AgentKind("first-file-agent") };
+        var fallback = new FakeAgentResolverRunner(sb =>
+        {
+            sb.WriteFile("src/a.txt", "m + w\n");
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "must not run", null, null);
+        })
+        { Kind = new AgentKind("fallback-agent") };
+        var credential = new AgentCredential(
+            first.Kind,
+            new Dictionary<string, string>(),
+            new Dictionary<string, string> { ["agent/auth.json"] = "residual-secret" });
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions
+            {
+                MaxIterations = 2,
+                MaxAttemptsPerAgent = 1,
+            }),
+            credentialFileMaterialiser: async (candidateSandbox, candidateCredential, ct) =>
+            {
+                var file = Assert.Single(candidateCredential.Files);
+                await SandboxCredentialFileWriter.WriteAsync(
+                    candidateSandbox,
+                    new SandboxCredentialFileTarget(
+                        SandboxCredentialFileRoot.CredentialsDirectory,
+                        file.Key),
+                    file.Value,
+                    SandboxCredentialOverwritePolicy.Overwrite,
+                    ct);
+                throw new InvalidOperationException("second credential write failed");
+            });
+
+        var error = await Assert.ThrowsAsync<AgentCredentialSandboxPoisonedException>(() =>
+            resolver.ResolveAsync(
+                sandbox,
+                "/work",
+                WorkItemId.New(),
+                new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+                [
+                    new AgenticConflictResolverCandidate(first, credential),
+                    new AgenticConflictResolverCandidate(fallback, Credential: null),
+                ],
+                CancellationToken.None));
+
+        Assert.Equal(first.Kind, error.Candidate);
+        Assert.Equal(0, first.InvocationCount);
+        Assert.Equal(0, fallback.InvocationCount);
+        Assert.True(sandbox.TryGetCredentialFile("agent/auth.json", out var residual));
+        Assert.Equal("residual-secret", residual);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_ClearsPreviousCandidateCredentialFilesBeforeNextCandidate()
+    {
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+
+        var first = new FakeAgentResolverRunner(_ =>
+            new AgentResult(false, "first failed", null, "first stderr"))
+        { Kind = new AgentKind("first-agent") };
+        var second = new FakeAgentResolverRunner(sb =>
+        {
+            Assert.False(
+                sb.TryGetCredentialFile("agent/auth.json", out _),
+                "second candidate must not observe first candidate credential file");
+            sb.WriteFile("src/a.txt", "m + w\n");
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "ok", null, null);
+        })
+        { Kind = new AgentKind("second-agent") };
+        var firstCredential = new AgentCredential(
+            first.Kind,
+            new Dictionary<string, string>(),
+            new Dictionary<string, string> { ["agent/auth.json"] = "first-secret" });
+        var secondCredential = new AgentCredential(
+            second.Kind,
+            new Dictionary<string, string>(),
+            new Dictionary<string, string>());
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions
+            {
+                MaxIterations = 2,
+                MaxAttemptsPerAgent = 1,
+            }),
+            credentialFileMaterialiser: MaterialiseCredentialFilesForTestAsync);
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Rebase),
+            [
+                new AgenticConflictResolverCandidate(first, firstCredential),
+                new AgenticConflictResolverCandidate(second, secondCredential),
+            ],
+            CancellationToken.None);
+
+        Assert.True(result.Success, result.Summary);
+        Assert.Equal(1, sandbox.KillActiveExecsCallCount);
+        Assert.False(sandbox.TryGetCredentialFile("agent/auth.json", out _));
     }
 
     [Fact]
@@ -1423,6 +1571,24 @@ public sealed class AgenticConflictResolverTests
         Assert.True(result.Success, $"write failed for {path}: {result.Stderr}");
     }
 
+    private static async Task MaterialiseCredentialFilesForTestAsync(
+        ISandbox sandbox,
+        AgentCredential credential,
+        CancellationToken ct)
+    {
+        foreach (var (path, contents) in credential.Files)
+        {
+            await SandboxCredentialFileWriter.WriteAsync(
+                sandbox,
+                new SandboxCredentialFileTarget(
+                    SandboxCredentialFileRoot.CredentialsDirectory,
+                    path),
+                contents,
+                SandboxCredentialOverwritePolicy.Overwrite,
+                ct);
+        }
+    }
+
     private static string BuildLargeResolved(string conflictedContent)
     {
         // Replace just the conflict block with a merged line. Everything else
@@ -1459,6 +1625,7 @@ public sealed class AgenticConflictResolverTests
     internal sealed class ConflictSandbox : ISandbox
     {
         private readonly Dictionary<string, string> _files = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, string> _credentialFiles = new(StringComparer.Ordinal);
         private readonly HashSet<string> _unmerged = new(StringComparer.Ordinal);
         private readonly Dictionary<string, SandboxExecResult> _commands = new(StringComparer.Ordinal);
 
@@ -1474,6 +1641,8 @@ public sealed class AgenticConflictResolverTests
         public int DiffCallCount { get; private set; }
         public int GrepCallCount { get; private set; }
         public int LsFilesCallCount { get; private set; }
+        public int KillActiveExecsCallCount { get; private set; }
+        public bool FailCredentialCleanupWrites { get; init; }
 
         public void AddConflictedFile(string relativePath, string content)
         {
@@ -1485,6 +1654,9 @@ public sealed class AgenticConflictResolverTests
 
         public string GetFileContent(string relativePath) =>
             _files.TryGetValue(relativePath, out var content) ? content : throw new KeyNotFoundException(relativePath);
+
+        public bool TryGetCredentialFile(string relativePath, out string contents) =>
+            _credentialFiles.TryGetValue(relativePath, out contents!);
 
         public void GitAdd(string relativePath)
         {
@@ -1523,6 +1695,24 @@ public sealed class AgenticConflictResolverTests
 
                 var listed = BuildLsFilesUnmergedOutput(_unmerged.Order(StringComparer.Ordinal));
                 return Task.FromResult(new SandboxExecResult(0, listed, ""));
+            }
+
+            if (argv.Count >= 9
+                && argv[0] == "bash"
+                && argv[1] == "-c"
+                && argv[3] == "codeybox-credential-materialise")
+            {
+                var root = argv[4];
+                var relativePath = argv[5];
+                if (root != SandboxConventions.CredentialsDir)
+                    return Task.FromResult(new SandboxExecResult(2, "", "unexpected credential root"));
+                if (string.IsNullOrEmpty(exec.Stdin) && FailCredentialCleanupWrites)
+                    return Task.FromResult(new SandboxExecResult(5, "", "credential cleanup rejected"));
+                if (string.IsNullOrEmpty(exec.Stdin))
+                    _credentialFiles.Remove(relativePath);
+                else
+                    _credentialFiles[relativePath] = exec.Stdin;
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
             }
 
             if (argv.Count >= 5
@@ -1576,6 +1766,12 @@ public sealed class AgenticConflictResolverTests
                 return Task.FromResult(canned);
 
             return Task.FromResult(new SandboxExecResult(0, "", ""));
+        }
+
+        public Task KillActiveExecsAsync(CancellationToken ct = default)
+        {
+            KillActiveExecsCallCount++;
+            return Task.CompletedTask;
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;

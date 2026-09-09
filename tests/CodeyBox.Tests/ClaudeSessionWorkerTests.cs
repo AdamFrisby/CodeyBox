@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using CodeyBox.Agents.Claude;
+using CodeyBox.Api;
 using CodeyBox.Core;
 
 namespace CodeyBox.Tests;
@@ -45,9 +46,10 @@ public sealed class ClaudeSessionWorkerTests
         var worker = new ClaudeSessionWorker(BuildRunner());
 
         var handle = await worker.OpenSessionAsync(sandbox, "/work", credential: null);
-        await worker.SendTurnAsync(handle, "first prompt");
+        var result = await worker.SendTurnAsync(handle, "first prompt");
 
         var argv = sandbox.AgentExec!.Argv.ToList();
+        Assert.Equal("cli-sess-1", result.NativeSessionId?.Value);
         Assert.DoesNotContain("--resume", argv);
         Assert.Contains("--output-format", argv);
         Assert.Contains("stream-json", argv);
@@ -118,7 +120,7 @@ public sealed class ClaudeSessionWorkerTests
     [Fact]
     public async Task SuspendThenResume_StopsAndResumesVmBetweenTurns()
     {
-        var sandbox = new PreemptibleScriptedSandbox(
+        var sandbox = new SuspendablePreemptibleScriptedSandbox(
             StreamJsonFirstTurn("cli-sess-stop"),
             StreamJsonSecondTurn("cli-sess-stop"));
         var resumeHookCalled = 0;
@@ -148,9 +150,45 @@ public sealed class ClaudeSessionWorkerTests
     }
 
     [Fact]
+    public async Task NonSuspendableSandbox_ResumeUnsupported_FailsBeforeStopOrResumeHook()
+    {
+        var sandbox = new PreemptibleScriptedSandbox(
+            StreamJsonFirstTurn("cli-incus-running"),
+            StreamJsonSecondTurn("cli-incus-running"));
+        var resumeCalls = 0;
+        var worker = new ClaudeSessionWorker(
+            BuildRunner(),
+            sandboxResumeHook: (_, _) =>
+            {
+                Interlocked.Increment(ref resumeCalls);
+                return Task.CompletedTask;
+            });
+
+        var handle = await worker.OpenSessionAsync(sandbox, "/work", credential: null);
+        await worker.SendTurnAsync(handle, "first");
+
+        var suspendFailure = await Assert.ThrowsAsync<NotSupportedException>(
+            () => worker.SuspendSessionAsync(handle));
+        Assert.Contains("stopped-session resume", suspendFailure.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, sandbox.StopCallCount);
+
+        await Assert.ThrowsAsync<NotSupportedException>(
+            () => worker.ResumeSessionAsync(handle));
+        Assert.Equal(0, resumeCalls);
+
+        // The failed suspension made no transport or sandbox state transition;
+        // the still-running session remains usable until the caller chooses a
+        // fresh-sandbox fallback policy.
+        var second = await worker.SendTurnAsync(handle, "second");
+        Assert.True(second.Success);
+        Assert.Equal(2, sandbox.AllAgentExecs.Count);
+        await worker.CloseSessionAsync(handle);
+    }
+
+    [Fact]
     public async Task TurnWhileSuspended_ThrowsClearError()
     {
-        var sandbox = new PreemptibleScriptedSandbox(StreamJsonFirstTurn("cli-sess-blocked"));
+        var sandbox = new SuspendablePreemptibleScriptedSandbox(StreamJsonFirstTurn("cli-sess-blocked"));
         var worker = new ClaudeSessionWorker(BuildRunner());
 
         var handle = await worker.OpenSessionAsync(sandbox, "/work", credential: null);
@@ -251,8 +289,12 @@ public sealed class ClaudeSessionWorkerTests
         await worker.RefreshSessionCredentialAsync(handle, refreshed);
         await worker.SendTurnAsync(handle, "second");
 
-        Assert.Equal("old-token", sandbox.AllAgentExecs[0].ExtraEnvironment!["ANTHROPIC_API_KEY"]);
-        Assert.Equal("new-token", sandbox.AllAgentExecs[1].ExtraEnvironment!["ANTHROPIC_API_KEY"]);
+        var materialisedCredentials = sandbox.AllExecs
+            .Where(exec => string.Equals(exec.Stdin, "old-token", StringComparison.Ordinal)
+                || string.Equals(exec.Stdin, "new-token", StringComparison.Ordinal))
+            .Select(exec => exec.Stdin!)
+            .ToArray();
+        Assert.Equal(["old-token", "new-token"], materialisedCredentials);
     }
 
     // ── Sanitiser & 400 thinking-block recovery ───────────────────────────────
@@ -560,7 +602,7 @@ public sealed class ClaudeSessionWorkerTests
             AgentKind.Claude,
             new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["ANTHROPIC_API_KEY"] = token,
+                ["CODEYBOX_CLAUDE_OAUTH_JSON"] = token,
             },
             new Dictionary<string, string>(StringComparer.Ordinal));
 
@@ -612,7 +654,7 @@ public sealed class ClaudeSessionWorkerTests
         }
     }
 
-    private sealed class PreemptibleScriptedSandbox : ScriptedSandbox, IPreemptibleSandbox
+    private class PreemptibleScriptedSandbox : ScriptedSandbox, IPreemptibleSandbox
     {
         public int StopCallCount { get; private set; }
         public PreemptibleScriptedSandbox(params string[] agentStdouts) : base(agentStdouts) { }
@@ -623,10 +665,23 @@ public sealed class ClaudeSessionWorkerTests
         }
     }
 
+    private sealed class SuspendablePreemptibleScriptedSandbox :
+        PreemptibleScriptedSandbox,
+        ISuspendableSandbox
+    {
+        public SuspendablePreemptibleScriptedSandbox(params string[] agentStdouts)
+            : base(agentStdouts)
+        {
+        }
+
+        public Task SuspendAsync(CancellationToken ct = default) => Task.CompletedTask;
+    }
+
     private sealed class PreserveOnDisposeScriptedSandbox :
         ScriptedSandbox,
         IPreemptibleSandbox,
-        IPreserveOnDisposeSandbox
+        IPreserveOnDisposeSandbox,
+        ISuspendableSandbox
     {
         private bool _preserveOnDispose;
         public int StopCallCount { get; private set; }
@@ -641,6 +696,8 @@ public sealed class ClaudeSessionWorkerTests
             _preserveOnDispose = true;
             return Task.CompletedTask;
         }
+
+        public Task SuspendAsync(CancellationToken ct = default) => Task.CompletedTask;
 
         public void DisablePreserveOnDispose()
         {

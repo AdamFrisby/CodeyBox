@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -25,7 +27,13 @@ namespace CodeyBox.Sandbox.MultipassRemote;
 /// snapshot is correctly typed and a future suspend implementation slots in
 /// without changing the provider surface.</para>
 /// </summary>
-internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQualifiedSandbox, IReleaseAdmissionOnHostLossSandbox
+internal sealed class MultipassRemoteSandbox :
+    IShutdownTeardownSandbox,
+    IPrivilegedGuestFileHardeningSandbox,
+    IHostQualifiedSandbox,
+    IReleaseAdmissionOnHostLossSandbox,
+    ISandboxPortPublisher,
+    IActiveSandboxLease
 {
     private readonly SandboxSpec _spec;
     private readonly IReadOnlyList<StagedBindMount> _stagedMounts;
@@ -38,7 +46,9 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
     private readonly RemoteMultipassCleanup _cleanup;
     private readonly Action<string, string> _onDispose;
     private readonly ConcurrentDictionary<CancellationTokenSource, byte> _activeExecCts = new();
+    private readonly ConcurrentDictionary<int, IRemotePortForward> _endpointTunnels = new();
     private readonly SemaphoreSlim _disposeLock = new(1, 1);
+    private string? _vmAddress;
     private int _disposed; // 0/1 via Interlocked
     private int _activeTrackingReleased;
     private int _executionTransportLost;
@@ -76,6 +86,19 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
             log);
     }
 
+    /// <summary>
+    /// Records the remote VM's IPv4 address so <see cref="PublishPort"/> can
+    /// open an SSH local-forward to a port inside the guest. The provider calls
+    /// this after the VM reaches Running and the address is discoverable via
+    /// <c>multipass info</c>. A null or whitespace value leaves the sandbox
+    /// non-publishing (<see cref="CanPublishPort"/> returns false).
+    /// </summary>
+    internal void RegisterVmAddress(string? address)
+    {
+        var normalized = string.IsNullOrWhiteSpace(address) ? null : address;
+        Volatile.Write(ref _vmAddress, normalized);
+    }
+
     public string Id { get; }
     public string HostId { get; }
 
@@ -91,6 +114,44 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
 
     public WorkItemId? OwningWorkItemId => _spec.TimingWorkItemId;
 
+    public bool CanPublishPort(int port)
+        => !string.IsNullOrWhiteSpace(Volatile.Read(ref _vmAddress))
+            && _transport is IRemotePortForwardTransport
+            && port is >= 1 and <= 65535;
+
+    public SandboxPublishedPort PublishPort(int port)
+    {
+        if (!CanPublishPort(port))
+            throw new NotSupportedException($"Remote multipass sandbox '{Id}' cannot publish port {port}.");
+
+        var vmAddress = Volatile.Read(ref _vmAddress);
+        var localPort = ReserveLoopbackPort();
+        var tunnel = ((IRemotePortForwardTransport)_transport).StartLocalForward(
+            IPAddress.Loopback.ToString(),
+            localPort,
+            vmAddress!,
+            port);
+        if (!_endpointTunnels.TryAdd(localPort, tunnel))
+        {
+            tunnel.Dispose();
+            throw new InvalidOperationException($"Failed to track SSH endpoint tunnel for local port {localPort}.");
+        }
+
+        _log.LogInformation(
+            "Remote VM {Vm}: published sandbox port via local forward 127.0.0.1:{LocalPort} -> {RemoteHost}:{RemotePort}",
+            Id, localPort, vmAddress, port);
+
+        return new SandboxPublishedPort(
+            "127.0.0.1",
+            localPort,
+            new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["endpoint.scope"] = "ssh-local-forward",
+            ["endpoint.remote-vm-host"] = vmAddress!,
+            ["endpoint.remote-vm-port"] = port.ToString(CultureInfo.InvariantCulture),
+        });
+    }
+
     public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
         if (Volatile.Read(ref _disposed) != 0)
@@ -100,29 +161,71 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
 
         var opts = _opts;
         var workdir = exec.WorkingDirectory ?? _spec.WorkingDirectory ?? SandboxConventions.WorkDir;
+        var effectiveEnvironment = exec.ExtraEnvironment is { Count: > 0 }
+            ? new Dictionary<string, string>(exec.ExtraEnvironment, StringComparer.Ordinal)
+            : new Dictionary<string, string>(StringComparer.Ordinal);
+        exec.ApplyEnvironmentRemovals(name => effectiveEnvironment.Remove(name));
 
-        // Build the in-VM command: `cd <wd> && <argv...>` so subsequent execs
-        // honour the requested working directory without depending on a
-        // multipass --working-directory flag (versions differ).
-        var quotedArgv = QuoteArgvForShell(exec.Argv);
-        var inVmScript = new StringBuilder();
-        inVmScript.Append("cd ").Append(QuoteShellWord(workdir)).Append(" && ");
-
-        if (exec.ExtraEnvironment is not null && exec.ExtraEnvironment.Count > 0)
+        IReadOnlyList<string> remoteArgv;
+        string? transportStdin;
+        if (exec.EnvironmentContainsSecrets && effectiveEnvironment.Count > 0)
         {
-            foreach (var (k, v) in exec.ExtraEnvironment)
-            {
-                ValidateEnvKey(k);
-                inVmScript.Append(k).Append('=').Append(QuoteShellWord(v)).Append(' ');
-            }
+            var environmentFile = SandboxEnvironmentVariablePolicy.BuildShellEnvironmentFileContent(effectiveEnvironment);
+            var commandStdin = exec.Stdin ?? string.Empty;
+            remoteArgv =
+            [
+                opts.RemoteMultipassPath,
+                "exec",
+                Id,
+                "--",
+                "bash",
+                "-c",
+                SecretEnvironmentBootstrapScript,
+                "codeybox-secret-environment",
+                Encoding.UTF8.GetByteCount(environmentFile).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                Encoding.UTF8.GetByteCount(commandStdin).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                workdir,
+                exec.EnvironmentVariablesToUnset.Count.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                .. exec.EnvironmentVariablesToUnset,
+                .. exec.Argv,
+            ];
+            transportStdin = environmentFile + commandStdin;
         }
-        inVmScript.Append(quotedArgv);
-
-        // multipass exec <vm> -- bash -lc 'cd ... && ...'
-        var remoteArgv = new List<string>(8)
+        else
         {
-            opts.RemoteMultipassPath, "exec", Id, "--", "bash", "-lc", inVmScript.ToString(),
-        };
+            // Build the in-VM command: `cd <wd> && <argv...>` so subsequent execs
+            // honour the requested working directory without depending on a
+            // multipass --working-directory flag (versions differ).
+            var quotedArgv = QuoteArgvForShell(exec.Argv);
+            var inVmScript = new StringBuilder();
+            inVmScript.Append("cd ").Append(QuoteShellWord(workdir)).Append(" && ");
+
+            foreach (var name in exec.EnvironmentVariablesToUnset)
+                inVmScript.Append("unset -- ").Append(QuoteShellWord(name)).Append(" && ");
+
+            if (effectiveEnvironment.Count > 0)
+            {
+                foreach (var (k, v) in effectiveEnvironment)
+                {
+                    ValidateEnvKey(k);
+                    inVmScript.Append(k).Append('=').Append(QuoteShellWord(v)).Append(' ');
+                }
+            }
+            inVmScript.Append(quotedArgv);
+
+            // multipass exec <vm> -- bash -lc 'cd ... && ...'
+            remoteArgv =
+            [
+                opts.RemoteMultipassPath,
+                "exec",
+                Id,
+                "--",
+                "bash",
+                "-lc",
+                inVmScript.ToString(),
+            ];
+            transportStdin = exec.Stdin;
+        }
 
         // Chunk callbacks are pure live-update side channels; the transport's
         // ProcessRunResult.Stdout / Stderr remain authoritative for the final
@@ -173,7 +276,7 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
             {
                 var run = await _transport.RunAsync(
                     remoteArgv,
-                    stdin: exec.Stdin,
+                    stdin: transportStdin,
                     linkedCts.Token,
                     stdoutChunkCallback: OnStdout,
                     stderrChunkCallback: OnStderr,
@@ -224,17 +327,102 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
         }
     }
 
+    private const string SecretEnvironmentBootstrapScript =
+        """
+        set -eu
+        umask 077
+        codeybox_env_file=$(mktemp)
+        codeybox_stdin_file=$(mktemp)
+        trap 'rm -f "$codeybox_env_file" "$codeybox_stdin_file"' EXIT
+        dd if=/dev/stdin of="$codeybox_env_file" bs=1 count="$1" status=none
+        dd if=/dev/stdin of="$codeybox_stdin_file" bs=1 count="$2" status=none
+        codeybox_workdir=$3
+        codeybox_unset_count=$4
+        shift 4
+        set -a
+        . "$codeybox_env_file"
+        set +a
+        while [ "$codeybox_unset_count" -gt 0 ]; do
+            unset -- "$1"
+            shift
+            codeybox_unset_count=$((codeybox_unset_count - 1))
+        done
+        cd "$codeybox_workdir"
+        "$@" < "$codeybox_stdin_file"
+        """;
+
     public async Task KillActiveExecsAsync(CancellationToken ct = default)
     {
-        // Best-effort: cancel every in-flight exec's linked token. The
-        // OpenSSH child observing cancellation will tear down the SSH
-        // session, which kills the remote command.
+        // Best-effort: cancel every in-flight exec's linked token. The SSH
+        // child observing cancellation tears down the current remote command.
         foreach (var (cts, _) in _activeExecCts)
         {
             try { cts.Cancel(); } catch { }
         }
-        _ = ct;
-        await Task.CompletedTask.ConfigureAwait(false);
+
+        var opts = _opts;
+        var kill = await _runRemoteMaybeGated(
+            [
+                opts.RemoteMultipassPath,
+                "exec",
+                Id,
+                "--",
+                "bash",
+                "-lc",
+                KillSameUserProcessesScript,
+            ],
+            ct).ConfigureAwait(false);
+        if (kill.ExitCode != 0)
+        {
+            _log.LogWarning(
+                "Best-effort process cleanup for remote multipass sandbox {Name} returned exit {ExitCode}: {Stderr}",
+                Id,
+                kill.ExitCode,
+                kill.Stderr);
+        }
+    }
+
+    private const string KillSameUserProcessesScript =
+        """
+        set -eu
+        self=$$
+        parent=$PPID
+        uid=$(id -u)
+        list_pids() {
+          ps -eo pid=,ppid=,uid= |
+            awk -v uid="$uid" -v self="$self" -v parent="$parent" \
+              '$3 == uid && $1 != self && $1 != parent { print $1 }'
+        }
+        pids=$(list_pids || true)
+        if [ -n "$pids" ]; then
+          kill -TERM $pids 2>/dev/null || true
+          sleep 1
+          pids=$(list_pids || true)
+          if [ -n "$pids" ]; then
+            kill -KILL $pids 2>/dev/null || true
+          fi
+        fi
+        """;
+
+    /// <summary>
+    /// IActiveSandboxLease implementation. Idempotent — subsequent calls are
+    /// a no-op. Deployment cleanup uses this after a failed VM delete so the
+    /// leak reaper can reclaim state on a later sweep without the sandbox
+    /// remaining tracked as active.
+    /// </summary>
+    public void ReleaseActiveTracking()
+    {
+        if (Interlocked.CompareExchange(ref _activeTrackingReleased, 1, 0) != 0)
+            return;
+        SandboxLiveCounter.Decrement();
+        try
+        {
+            _onDispose(HostId, Id);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Failed to release active tracking for remote VM {Vm}", Id);
+        }
     }
 
     public bool IsOwnedByShutdownHandler { get; private set; }
@@ -261,7 +449,10 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
     public async ValueTask DisposeAsync()
     {
         if (Volatile.Read(ref _activeTrackingReleased) != 0)
+        {
+            StopEndpointTunnels();
             return;
+        }
 
         await _disposeLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
         try
@@ -273,6 +464,11 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
 
             var opts = _opts;
             var vmName = Id;
+
+            // Kill any SSH local-forward tunnels for published deployment
+            // endpoints before we teardown the VM so lingering ssh clients
+            // don't hold onto the transport during stop/delete.
+            StopEndpointTunnels();
 
             // 1) Try to cleanly stop the VM so background processes flush.
             try
@@ -421,11 +617,44 @@ internal sealed class MultipassRemoteSandbox : IShutdownTeardownSandbox, IHostQu
         Volatile.Read(ref _executionTransportLost) != 0
         && ex.InnerException is RemoteSshTransportException { IsHostTransportFailure: true };
 
+    // Thin overload retained so existing sync-back/leak-cleanup callers keep
+    // the vmName-labelled call sites; the parameterless public overload is
+    // what IActiveSandboxLease exposes and both funnel through the same
+    // idempotent state transition.
     private void ReleaseActiveTracking(string vmName)
     {
-        SandboxLiveCounter.Decrement();
-        Volatile.Write(ref _activeTrackingReleased, 1);
-        _onDispose(HostId, vmName);
+        _ = vmName;
+        ReleaseActiveTracking();
+    }
+
+    private static int ReserveLoopbackPort()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        return ((IPEndPoint)listener.LocalEndpoint).Port;
+    }
+
+    private void StopEndpointTunnels()
+    {
+        List<Exception>? failures = null;
+        foreach (var (port, tunnel) in _endpointTunnels.ToArray())
+        {
+            try
+            {
+                tunnel.Dispose();
+                _endpointTunnels.TryRemove(port, out _);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Remote VM {Vm}: failed to stop endpoint tunnel on local port {Port}", Id, port);
+                (failures ??= new()).Add(ex);
+            }
+        }
+
+        if (failures is { Count: 1 })
+            throw new InvalidOperationException("Failed to stop one remote endpoint tunnel.", failures[0]);
+        if (failures is { Count: > 1 })
+            throw new AggregateException("Failed to stop remote endpoint tunnels.", failures);
     }
 
     private static string QuoteArgvForShell(IReadOnlyList<string> argv)

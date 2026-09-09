@@ -7,6 +7,17 @@ namespace CodeyBox.Tests;
 
 public sealed class PresetCatalogTests
 {
+    [Fact]
+    public void TestsReviewFocus_ExemptsNonExecutableOnlyChangesFromMissingTestFindings()
+    {
+        var reviewFocus = new PresetCatalog().GetAuditTypeReviewFocus("tests");
+
+        Assert.Contains("NON-EXECUTABLE CHANGE EXEMPTION", reviewFocus, StringComparison.Ordinal);
+        Assert.Contains("static marker/content files", reviewFocus, StringComparison.Ordinal);
+        Assert.Contains("do NOT require a new test", reviewFocus, StringComparison.Ordinal);
+        Assert.Contains("Still apply Steps 1 and 3 normally", reviewFocus, StringComparison.Ordinal);
+    }
+
     private sealed class FakeAgent : IAgentRunner
     {
         public AgentKind Kind => AgentKind.Claude;
@@ -435,7 +446,11 @@ public sealed class PresetCatalogTests
                 return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
             }
 
-            if (exec.Argv.Count >= 2 && exec.Argv[0] == "dotnet" && exec.Argv[1] == "test")
+            // The test-pass gate wraps the exec in the NuGet-home self-heal
+            // (SelfHealNuGetHome); match on the effective (unwrapped) dotnet
+            // command. DotnetGuardWrapper unwraps the self-heal wrapper.
+            var effective = DotnetGuardWrapper.EffectiveArgv(exec);
+            if (effective.Count >= 2 && effective[0] == "dotnet" && effective[1] == "test")
                 return new SandboxExecResult(1, output, "");
 
             return new SandboxExecResult(0, ".\n", "");

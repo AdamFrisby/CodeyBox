@@ -356,32 +356,57 @@ public sealed class ReplayEngineTests
             new byte[] { 9, 9 },
             new byte[] { 9, 9 },
         });
+        // Hand each screenshot to the wait loop through a gate so the test drives
+        // the injected clock in lockstep with the loop's poll cycle. The loop's
+        // Task.Delay(clock) continuations run on the thread pool; a fixed-count
+        // Advance/Yield pump can exhaust its budget before those continuations get
+        // scheduled under load, so instead we advance only when the loop is parked
+        // on a poll and stop the moment it requests the next frame — deterministic
+        // regardless of thread-pool scheduling.
+        var readRequested = new SemaphoreSlim(0);
+        var releaseRead = new SemaphoreSlim(0);
         var sandbox = new ScriptedSandbox(StableScreenshotA)
         {
             AccessibilityAtPoint = (_, _) => Accessible("list", "tasks"),
         };
-        sandbox.GetScreenshot = _ => frames.Count > 0
-            ? Task.FromResult(frames.Dequeue())
-            : Task.FromResult<byte[]>(new byte[] { 9, 9 });
+        sandbox.GetScreenshot = async _ =>
+        {
+            readRequested.Release();
+            await releaseRead.WaitAsync();
+            return frames.Count > 0 ? frames.Dequeue() : new byte[] { 9, 9 };
+        };
 
         var clock = new ControllableTimeProvider(FrozenNow);
         var wait = new ScreenshotStabilityWait(clock);
         var options = new ReplayOptions
         {
+            // Timeout comfortably larger than the poll cadence so the settle is
+            // observed via stability, never a deadline the pump could overshoot.
             VisualWaitPollInterval = TimeSpan.FromMilliseconds(1),
-            VisualWaitTimeout = TimeSpan.FromSeconds(1),
+            VisualWaitTimeout = TimeSpan.FromMinutes(5),
             StableFrameCount = 2,
         };
 
         var task = wait.WaitAsync(sandbox, predicate: null, options, CancellationToken.None);
-        var maxPollsThroughTimeout = (int)(options.VisualWaitTimeout.Ticks / options.VisualWaitPollInterval.Ticks) + 2;
-        for (var i = 0; i < maxPollsThroughTimeout && !task.IsCompleted; i++)
+
+        // Five reads settle the screen (3 jitter frames + 2 identical). Between
+        // reads the loop parks on Task.Delay(clock); advance the fake clock until
+        // it requests the next frame so the poll fires without any wall-clock wait.
+        const int reads = 5;
+        for (var read = 0; read < reads; read++)
         {
-            clock.Advance(options.VisualWaitPollInterval);
-            await Task.Yield();
+            await readRequested.WaitAsync();
+            releaseRead.Release();
+            if (read < reads - 1)
+            {
+                while (!task.IsCompleted && readRequested.CurrentCount == 0)
+                {
+                    clock.Advance(options.VisualWaitPollInterval);
+                    await Task.Yield();
+                }
+            }
         }
-        if (!task.IsCompleted)
-            Assert.Fail("visual wait did not complete after advancing the injected clock through its timeout");
+
         var settled = await task;
 
         Assert.NotNull(settled);

@@ -142,6 +142,20 @@ public sealed class RawOutputRedactionTests
         Assert.Equal(input, result);
     }
 
+    [Theory]
+    [InlineData("{\"type\":\"thread.started\",\"thread_id\":\"019e8a0f-4c27-7b61-940f-e344bafa43d5\"}")]
+    [InlineData("{\"type\":\"thread.created\",\"conversation_id\":\"conversation-private\"}")]
+    [InlineData("{\"type\":\"session_meta\",\"payload\":{\"id\":\"session-private\"}}")]
+    public void Redact_CodexResumeMetadata_RemovesNativeConversationId(string input)
+    {
+        var result = RawOutputRedactor.Redact(input);
+
+        Assert.DoesNotContain("019e8a0f", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("conversation-private", result, StringComparison.Ordinal);
+        Assert.DoesNotContain("session-private", result, StringComparison.Ordinal);
+        Assert.Contains("***", result, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void Redact_StripsUnsafeControlCharacters_ButKeepsReadableWhitespace()
     {

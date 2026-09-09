@@ -74,6 +74,10 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
     /// </summary>
     public IReadOnlyList<string> Argv => _opts.Argv;
 
+    /// <summary>Marks this auditor's executable as mandatory infrastructure.</summary>
+    public ShellCommandAuditor WithRequiredToolAvailability()
+        => new(_opts with { MissingToolBehavior = MissingToolBehavior.Unavailable });
+
     public async Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
     {
         var toolName = _opts.ToolName ?? _opts.Argv[0];
@@ -85,12 +89,13 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
             ["CODEYBOX_AUDIT_TARGET"] = context.EffectiveTarget.Value,
             ["CODEYBOX_WORK_ITEM_ID"] = context.WorkItemId.ToString(),
         };
+        DotnetCliHomeConventions.ApplyIfDotnetInvocation(_opts.Argv, workingDirectory, environment);
 
         // Dispatch on the explicit review strategy; an unhandled future target is
         // rejected in Classify rather than silently run as a code audit.
         return AuditTargetSemantics.Classify(context.EffectiveTarget) == AuditReviewStrategy.PlanReview
             ? await RunPlanTargetAsync(sandbox, workingDirectory, context, environment, toolName, ct)
-            : await ExecAndClassifyAsync(sandbox, workingDirectory, environment, toolName, ct);
+            : await ExecAndClassifyAsync(sandbox, workingDirectory, context, environment, toolName, ct);
     }
 
     private async Task<AuditResult> RunPlanTargetAsync(
@@ -134,7 +139,7 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
             }
 
             environment["CODEYBOX_PLAN_ARTIFACT_PATH"] = planArtifactPath;
-            var result = await ExecAndClassifyAsync(sandbox, workingDirectory, environment, toolName, ct);
+            var result = await ExecAndClassifyAsync(sandbox, workingDirectory, context, environment, toolName, ct);
 
             // Explicit in-band cleanup so a removal failure on the happy path is
             // surfaced as a blocking finding (the snapshot must not outlive the run).
@@ -169,13 +174,14 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
     private async Task<AuditResult> ExecAndClassifyAsync(
         ISandbox sandbox,
         string workingDirectory,
+        AuditContext context,
         IReadOnlyDictionary<string, string> environment,
         string toolName,
         CancellationToken ct)
     {
         var result = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = _opts.Argv,
+            Argv = BuildExecArgv(),
             WorkingDirectory = workingDirectory,
             ExtraEnvironment = environment,
         }, ct);
@@ -195,11 +201,46 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
                 combinedOutput,
                 finding));
             if (classified is not null)
+            {
+                if (_opts.ResultClassifier is DotnetTestCommandResultClassifier
+                    && _opts.TestFailureAttributionOptions is not null)
+                {
+                    var parsed = DotnetTestOutputParser.Parse(Name, combinedOutput);
+                    var attributions = await DotnetTestFailureAttributionRunner.AttributeAsync(
+                        sandbox,
+                        workingDirectory,
+                        context,
+                        Name,
+                        _opts.Argv,
+                        parsed.FailedTestNames,
+                        parsed.HitFailureParseCap,
+                        _opts.TestFailureAttributionOptions,
+                        ct);
+                    return classified with { TestFailureAttributions = attributions };
+                }
+
                 return classified;
+            }
         }
 
         return new AuditResult(false, [finding], RawOutput: combinedOutput);
     }
+
+    /// <summary>
+    /// The argv actually dispatched to the sandbox. Without
+    /// <see cref="ShellCommandAuditorOptions.SelfHealNuGetHome"/> this is the
+    /// configured argv verbatim. When it is set (a dotnet-specific opt-in), the
+    /// argv is wrapped by <see cref="NuGetHomeSelfHeal.WrapDotnetInvocation"/> so
+    /// restore survives a root-owned <c>~/.nuget</c> -- a single <c>sh -c</c> that
+    /// runs the self-heal preamble then <c>exec "$@"</c>s the real command with
+    /// its arguments intact. The configured argv (not the wrapped form) is what
+    /// findings and the result classifier report, so wrapping is invisible to
+    /// callers.
+    /// </summary>
+    private IReadOnlyList<string> BuildExecArgv()
+        => _opts.SelfHealNuGetHome
+            ? NuGetHomeSelfHeal.WrapDotnetInvocation(_opts.Argv)
+            : _opts.Argv;
 
     private string BuildPlanArtifactPath(AuditContext context)
     {
@@ -246,6 +287,13 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
         // propagate exit 127 from repository-controlled scripts; those remain
         // blocking command failures.
         var missingTool = IsConfirmedMissingTopLevelTool(result);
+        if (missingTool && _opts.MissingToolBehavior == MissingToolBehavior.Unavailable)
+        {
+            throw new AuditUnavailableException(
+                $"Required audit tool '{toolName}' is not installed in the sandbox.",
+                result.ExitCode,
+                CombinedOutput(result));
+        }
         var severity = missingTool
             ? MissingToolSeverity()
             : AuditSeverity.Error;
@@ -299,6 +347,12 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
 
     private AuditResult MissingToolResult(string toolName, string rawOutput)
     {
+        if (_opts.MissingToolBehavior == MissingToolBehavior.Unavailable)
+        {
+            throw new AuditUnavailableException(
+                $"Required audit tool '{toolName}' is not installed in the sandbox.");
+        }
+
         var finding = new AuditFinding(
             AuditorName: Name,
             Severity: MissingToolSeverity(),
@@ -313,15 +367,23 @@ public sealed class ShellCommandAuditor : IAuditor, IShellAuditorArgvProvider
             : _opts.MissingToolSeverity ?? AuditSeverity.Info;
 }
 
+public enum MissingToolBehavior
+{
+    Finding,
+    Unavailable,
+}
+
 public sealed record ShellCommandAuditorOptions
 {
     public required string Name { get; init; }
     public required IReadOnlyList<string> Argv { get; init; }
+
     public string? ToolName { get; init; }
     public bool? TreatExit127AsMissingTool { get; init; }
     public IAuditResultClassifier? ResultClassifier { get; init; }
     public AuditCapabilities Required { get; init; } = AuditCapabilities.None;
     public AuditSeverity? MissingToolSeverity { get; init; }
+    public MissingToolBehavior MissingToolBehavior { get; init; } = MissingToolBehavior.Finding;
     /// <summary>
     /// Review targets for this command. Empty configuration is materialised as
     /// Code-only by composers. Plan commands read their artifact through
@@ -330,7 +392,16 @@ public sealed record ShellCommandAuditorOptions
     /// the command on every exit path, and is absent for Code runs.
     /// </summary>
     public IReadOnlySet<AuditTarget> Targets { get; init; } = AuditTargets.CodeOnly;
+    public TestFailureAttributionOptionsSnapshot? TestFailureAttributionOptions { get; init; }
     public bool CanShortCircuitOnBlockingFinding { get; init; }
     public AuditorRole Role { get; init; } = AuditorRole.None;
     public BuildTestGateEvidence BuildTestGateEvidence { get; init; } = BuildTestGateEvidence.None;
+
+    /// <summary>
+    /// When true and the command is a <c>dotnet</c> invocation, wrap it in the
+    /// shared <see cref="NuGetHomeSelfHeal"/> preamble so restore survives a
+    /// root-owned <c>~/.nuget</c> on unprivileged build hosts. Off by default; a
+    /// no-op on a healthy home and for non-dotnet commands.
+    /// </summary>
+    public bool SelfHealNuGetHome { get; init; }
 }

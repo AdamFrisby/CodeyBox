@@ -1427,7 +1427,6 @@ public sealed class E2eExecutionTests : IDisposable
         var runtime = new E2eReplayRuntime(NullLogger<E2eReplayRuntime>.Instance);
         var dispatcher = new E2eRunDispatcher(_runs, pool, runtime, _testCases, monitor, new E2eRunCancellationRegistry(), Admission(monitor), NullLogger<E2eRunDispatcher>.Instance);
 
-        var sw = Stopwatch.StartNew();
         for (var i = 0; i < total; i++)
         {
             // Drive the dispatcher one step at a time until everything is in-flight or terminal.
@@ -1452,7 +1451,6 @@ public sealed class E2eExecutionTests : IDisposable
             if (terminal == total) break;
             await Task.Delay(25);
         }
-        sw.Stop();
 
         var results = new List<E2eRun>();
         await foreach (var r in _runs.ListByBatchAsync(batch)) results.Add(r);
@@ -1460,12 +1458,14 @@ public sealed class E2eExecutionTests : IDisposable
         Assert.All(results, r => Assert.Equal(E2eRunStatus.Passed, r.Status));
         await WaitForDispatcherIdleAsync(dispatcher);
 
-        // Parallelism proof: sequential = total * perStepDelay (~800ms). With max=4 the
-        // ideal is two waves (~200ms); give it a generous ceiling so CI jitter doesn't
-        // flake — but well below the sequential bound.
-        var sequentialBound = total * perStepDelay.TotalMilliseconds;
-        Assert.True(sw.Elapsed.TotalMilliseconds < sequentialBound,
-            $"Dispatcher took {sw.Elapsed.TotalMilliseconds:F0}ms; sequential would be ~{sequentialBound:F0}ms — parallelism appears broken.");
+        // Parallelism proof: the provider records the peak number of sandboxes that were
+        // ever in-flight simultaneously. This is a direct, deterministic signal — unlike a
+        // wall-clock bound, it does not flake when a contended CI host stretches the run's
+        // real time toward the sequential total. If the pool serialised work (concurrency
+        // regressed to 1), the peak would be 1 and this fails; the cap check below fails if
+        // it ever exceeded the configured limit. Together they bracket the observed peak.
+        Assert.True(provider.MaxConcurrentSeen >= 2,
+            $"Peak observed concurrency was {provider.MaxConcurrentSeen}; expected >=2 — parallelism appears broken.");
 
         // Max observed in-flight on the provider must NOT exceed the configured cap.
         Assert.True(provider.MaxConcurrentSeen <= max,

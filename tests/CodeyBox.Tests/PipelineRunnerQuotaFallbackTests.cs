@@ -575,7 +575,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
         var fallback = Assert.Single(history, h => h.Phase == "rework" && h.ToAgent == AgentKind.Claude);
         Assert.Equal(AgentKind.Codex, fallback.FromAgent);
-        Assert.Contains("quota failure", fallback.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("rate-limited by provider", fallback.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("reported quota failure", fallback.Reason, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -612,7 +613,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
         var fallback = Assert.Single(history, h => h.Phase == "rework" && h.ToAgent == AgentKind.Claude);
         Assert.Equal(AgentKind.Codex, fallback.FromAgent);
-        Assert.Contains("quota failure", fallback.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("rate-limited by provider", fallback.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("reported quota failure", fallback.Reason, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -880,8 +882,11 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         Assert.NotNull(parked);
         Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
         Assert.Equal("quota", parked.FailureKind);
-        Assert.Equal("audit", parked.QuotaRetryFrom);
+        Assert.Equal("rework", parked.QuotaRetryFrom);
         Assert.Equal("rework", parked.QuotaRetryPhase);
+        Assert.Equal(
+            AgentTurnResumePhase.Rework,
+            Assert.IsType<AgentTurnResumeCheckpoint>(parked.AgentTurnResumeCheckpoint).Phase);
         Assert.NotNull(parked.NextQuotaRetryAt);
 
         var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
@@ -918,8 +923,11 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var parked = await fix.Store.GetAsync(item.Id, CancellationToken.None);
         Assert.NotNull(parked);
         Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
-        Assert.Equal("audit", parked.QuotaRetryFrom);
+        Assert.Equal("rework", parked.QuotaRetryFrom);
         Assert.Equal("rework", parked.QuotaRetryPhase);
+        Assert.Equal(
+            AgentTurnResumePhase.Rework,
+            Assert.IsType<AgentTurnResumeCheckpoint>(parked.AgentTurnResumeCheckpoint).Phase);
         Assert.Contains(await fix.Store.GetIterationsAsync(item.Id), i => i.Iteration == 2);
         Assert.DoesNotContain(
             await fix.Involvement.ListByWorkItemAsync(item.Id, CancellationToken.None),
@@ -931,7 +939,7 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
             fix.GitHost,
             NullLogger<WorkItemRetrier>.Instance,
             auditProgress: fix.Store);
-        var retry = await retrier.RetryAsync(parked, from: "audit", trigger: "test-quota-return");
+        var retry = await retrier.RetryAsync(parked, from: "rework", trigger: "test-quota-return");
         Assert.True(retry.Success, retry.Error);
 
         fix.Codex.WorkPlan.Enqueue(new FileWrite("a.txt", "reworked"));
@@ -1551,7 +1559,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var swap = history.Single(h => h.Phase == "work" && h.ToAgent == AgentKind.Claude);
         Assert.Equal(AgentKind.Codex, swap.FromAgent);
         Assert.Equal(AgentKind.Claude, swap.ToAgent);
-        Assert.Contains("quota", swap.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("rate-limited by provider", swap.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("reported quota failure", swap.Reason, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -2031,9 +2040,30 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         await fix.Store.CreateAsync(item);
 
         var reworkStarted = WaitForReworkStart(fix.Codex, fix.Claude, fix.Gemini);
+        var geminiReworkStarted = WaitForAgentPhaseStart(AgentKind.Gemini, "rework", fix.Codex, fix.Claude, fix.Gemini);
         var pipelineTask = fix.Pipeline.RunAsync(item, CancellationToken.None);
         await WaitForReworkStartAsync(reworkStarted, pipelineTask);
-        await RunWithAdvancingTimeAsync(pipelineTask, time, step: TimeSpan.FromMilliseconds(100), maxSteps: 250);
+        // Pump manual time only until the last fallback attempt is in flight,
+        // then advance to the absolute cap and stop the clock: post-cap
+        // teardown (store transitions, history, webhooks) is real-time work,
+        // and every extra pump step after the cap fires inflates the measured
+        // elapsed by 100ms while the pipeline drains. Under full-suite
+        // parallel load that drain stalls ~1-2s real, which a keep-pumping
+        // loop converts into ~7s of phantom manual time (observed 21.7s
+        // against the 15s cap). Stopping the clock at the cap measures the
+        // timeout itself rather than teardown scheduling lag.
+        await RunWithAdvancingTimeUntilAsync(
+            geminiReworkStarted,
+            pipelineTask,
+            time,
+            step: TimeSpan.FromMilliseconds(100),
+            maxSteps: 250);
+        await AdvanceManualTimeToElapsedAsync(
+            time,
+            TimeSpan.FromSeconds(15),
+            pipelineTask,
+            step: TimeSpan.FromMilliseconds(100));
+        await pipelineTask.WaitAsync(TimeSpan.FromSeconds(30));
 
         var elapsed = time.GetUtcNow() - DateTimeOffset.UnixEpoch;
         Assert.InRange(elapsed, TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(17));

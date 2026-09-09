@@ -45,6 +45,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
     private readonly ILogger<ProjectRepository> _logger;
     private readonly PresetCatalogOptions? _presetCatalogOptions;
     private readonly IKnobRegistry _knobRegistry;
+    private readonly IDeploymentDriverRegistry? _deploymentDrivers;
     private readonly IDisposable? _changeSubscription;
     private readonly Lock _reloadGate = new();
     private Snapshot _snapshot;
@@ -68,11 +69,13 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         IOptions<ProjectsOptions> options,
         ILogger<ProjectRepository> logger,
         PresetCatalogOptions? presetCatalogOptions,
-        IKnobRegistry? knobRegistry = null)
+        IKnobRegistry? knobRegistry = null,
+        IDeploymentDriverRegistry? deploymentDrivers = null)
     {
         _logger = logger;
         _presetCatalogOptions = presetCatalogOptions;
         _knobRegistry = knobRegistry ?? EmptyKnobRegistry;
+        _deploymentDrivers = deploymentDrivers;
         _snapshot = Build(options.Value, presetCatalogOptions);
         _lastObservedHash = ComputeContentHash(options.Value);
     }
@@ -81,12 +84,14 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         IOptionsMonitor<ProjectsOptions> monitor,
         ILogger<ProjectRepository> logger,
         PresetCatalogOptions? presetCatalogOptions = null,
-        IKnobRegistry? knobRegistry = null)
+        IKnobRegistry? knobRegistry = null,
+        IDeploymentDriverRegistry? deploymentDrivers = null)
     {
         ArgumentNullException.ThrowIfNull(monitor);
         _logger = logger;
         _presetCatalogOptions = presetCatalogOptions;
         _knobRegistry = knobRegistry ?? EmptyKnobRegistry;
+        _deploymentDrivers = deploymentDrivers;
         var initial = monitor.CurrentValue;
         _snapshot = Build(initial, presetCatalogOptions);
         _lastObservedHash = ComputeContentHash(initial);
@@ -337,7 +342,106 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
                 Enabled = pc.ClaudeSession?.Enabled ?? false,
             },
             Knobs = ResolveKnobs(pc.Id, pc.Knobs, defaults.Knobs),
+            Deployment = ResolveDeployment(pc.Id, pc.Deployment),
+            JobTrackExport = ResolveJobTrackExport(pc.Id, pc.JobTrackExport),
         };
+    }
+
+    /// <summary>
+    /// Binds and validates the per-project JobTrack export config. When the
+    /// project opts in (<c>Enabled=true</c>) the base URL must be an absolute
+    /// http(s) URL and the external-id namespace must be a valid namespace key;
+    /// invalid config fails config load/reload here rather than silently
+    /// producing a broken exporter at pipeline time. Disabled or absent config
+    /// resolves to the disabled sentinel with no validation.
+    /// </summary>
+    private static ProjectJobTrackExport ResolveJobTrackExport(string projectId, ProjectJobTrackExportConfig? c)
+    {
+        if (c is null)
+            return ProjectJobTrackExport.Disabled;
+
+        var enabled = c.Enabled ?? false;
+        var baseUrl = c.BaseUrl?.Trim() ?? string.Empty;
+        var importPath = string.IsNullOrWhiteSpace(c.ImportPath)
+            ? ProjectJobTrackExport.DefaultImportPath
+            : c.ImportPath.Trim();
+        var externalIdNamespace = string.IsNullOrWhiteSpace(c.ExternalIdNamespace)
+            ? ProjectJobTrackExport.DefaultExternalIdNamespace
+            : c.ExternalIdNamespace.Trim();
+        var maxAttempts = c.MaxAttempts ?? ProjectJobTrackExport.DefaultMaxAttempts;
+        var retryBaseDelayMs = c.RetryBaseDelayMs ?? 250;
+
+        if (maxAttempts < 1)
+            throw new InvalidOperationException(
+                $"Project '{projectId}' JobTrackExport.MaxAttempts must be >= 1 (got {maxAttempts})");
+        if (retryBaseDelayMs < 0)
+            throw new InvalidOperationException(
+                $"Project '{projectId}' JobTrackExport.RetryBaseDelayMs must be >= 0 (got {retryBaseDelayMs})");
+
+        if (enabled)
+        {
+            if (string.IsNullOrWhiteSpace(baseUrl))
+                throw new InvalidOperationException(
+                    $"Project '{projectId}' JobTrackExport.Enabled=true requires a BaseUrl");
+            if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri)
+                || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+                throw new InvalidOperationException(
+                    $"Project '{projectId}' JobTrackExport.BaseUrl '{baseUrl}' must be an absolute http(s) URL");
+            try
+            {
+                Validation.ValidateExternalIdNamespace(
+                    externalIdNamespace, $"projects[{projectId}].JobTrackExport.ExternalIdNamespace");
+            }
+            catch (ArgumentException ex)
+            {
+                // Surface as a config-load failure (like the other checks here),
+                // preserving the validator's precise message as the cause.
+                throw new InvalidOperationException(
+                    $"Project '{projectId}' JobTrackExport.ExternalIdNamespace is invalid: {ex.Message}", ex);
+            }
+        }
+
+        return new ProjectJobTrackExport
+        {
+            Enabled = enabled,
+            BaseUrl = baseUrl,
+            ImportPath = importPath,
+            TokenEnvVar = string.IsNullOrWhiteSpace(c.TokenEnvVar) ? null : c.TokenEnvVar.Trim(),
+            ExternalIdNamespace = externalIdNamespace,
+            DefaultSurfaceArea = string.IsNullOrWhiteSpace(c.DefaultSurfaceArea) ? null : c.DefaultSurfaceArea.Trim(),
+            MaxAttempts = maxAttempts,
+            RetryBaseDelay = TimeSpan.FromMilliseconds(retryBaseDelayMs),
+        };
+    }
+
+    /// <summary>
+    /// Binds the project's deployment recipe and, when a driver registry is
+    /// available, asks the matching driver to validate the per-driver fields
+    /// (RunCommand / Ports / HealthEndpoint / ArtifactPath / BuildCommand) at
+    /// config-load time. This surfaces misconfigurations during startup or
+    /// IOptionsMonitor reload rather than at first-dispatch time, matching the
+    /// contract on <see cref="CodeyBox.Core.IDeploymentDriver.ValidateRecipe"/>.
+    /// </summary>
+    private DeploymentRecipe? ResolveDeployment(string projectId, DeploymentRecipeConfig? cfg)
+    {
+        var recipe = DeploymentRecipeBinder.ToRecipe(cfg);
+        if (recipe is null) return null;
+        if (_deploymentDrivers is null) return recipe;
+
+        if (!_deploymentDrivers.TryGet(recipe.Kind, out var driver))
+            throw new InvalidOperationException(
+                $"Project '{projectId}' deployment recipe references unknown Kind '{recipe.Kind}'. " +
+                $"Registered: [{string.Join(", ", _deploymentDrivers.AvailableKinds)}]");
+        try
+        {
+            driver.ValidateRecipe(recipe);
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+        {
+            throw new InvalidOperationException(
+                $"Project '{projectId}' deployment recipe (kind '{recipe.Kind}') failed driver validation: {ex.Message}", ex);
+        }
+        return recipe;
     }
 
     /// <summary>
@@ -409,7 +513,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
     /// upstream to merge back into, every work item against a shared local seed
     /// forks from the same starting point and produces an independent rewrite
     /// — the operator has no way to compose results across work items. See
-    /// <c>docs/projects.md</c> for the full failure mode write-up.
+    /// <c>docs/concepts/projects.md</c> for the full failure mode write-up.
     ///
     /// Bypass: set <c>Upstream.AcknowledgeSandboxIsolation=true</c> for genuine
     /// sandbox/experiment projects, or configure a real upstream
@@ -429,7 +533,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             $"RepositoryUrl ('{repositoryUrl}'). This produces work items that all " +
             "fork from the same seed with no upstream to merge back into, so every " +
             "Done item is an independent rewrite rather than iterative progress " +
-            "(see docs/projects.md). Fix this by either: " +
+            "(see docs/concepts/projects.md). Fix this by either: " +
             "(1) configuring a real upstream (Upstream.Kind='github' or " +
             "'git-generic') so the orchestrator can push merged work back to a " +
             "shared remote, or " +
@@ -489,6 +593,10 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             GitHubRepository = c.GitHubRepository,
             GenericUrl = c.GenericUrl,
             TokenEnvVar = c.TokenEnvVar,
+            GitHubAppIdEnvVar = c.GitHubAppIdEnvVar,
+            GitHubAppInstallationIdEnvVar = c.GitHubAppInstallationIdEnvVar,
+            GitHubAppPrivateKeyPathEnvVar = c.GitHubAppPrivateKeyPathEnvVar,
+            GitHubAppSlug = c.GitHubAppSlug,
             MergeMethod = mergeMethod,
             AutoMerge = c.AutoMerge ?? false,
             PullRequestTitleTemplate = c.PullRequestTitleTemplate,

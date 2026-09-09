@@ -256,16 +256,23 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
     private readonly Func<AgentSupervisionOptions> _optionsAccessor;
     private readonly IAgentSupervisionNotifier _notifier;
     private readonly ILogger<AgentSupervisionService> _log;
+    // Audit events flow through this Serilog logger rather than the static global
+    // so a concurrent reassignment of Serilog.Log.Logger cannot silently reroute
+    // them. Captured at construction from the process-global logger when none is
+    // injected.
+    private readonly Serilog.ILogger _auditLogger;
     private readonly ConcurrentDictionary<string, AgentSupervisionSessionState> _sessions = new(StringComparer.Ordinal);
 
     public AgentSupervisionService(
         Func<AgentSupervisionOptions> optionsAccessor,
         IAgentSupervisionNotifier? notifier = null,
-        ILogger<AgentSupervisionService>? log = null)
+        ILogger<AgentSupervisionService>? log = null,
+        Serilog.ILogger? auditLogger = null)
     {
         _optionsAccessor = optionsAccessor ?? throw new ArgumentNullException(nameof(optionsAccessor));
         _notifier = notifier ?? NullAgentSupervisionNotifier.Instance;
         _log = log ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<AgentSupervisionService>.Instance;
+        _auditLogger = auditLogger ?? Serilog.Log.Logger;
     }
 
     public bool Enabled => CurrentOptions().Enabled;
@@ -384,7 +391,8 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
             state.Start.Agent,
             actor,
             injection.InjectionId,
-            message);
+            message,
+            _auditLogger);
 
         await SafeNotifyAsync(n => n.InjectionQueuedAsync(BuildInjectionEvent(state, injection, options), ct)).ConfigureAwait(false);
         await SafeNotifyAsync(n => n.SessionUpdatedAsync(BuildSnapshot(state, options), ct)).ConfigureAwait(false);
@@ -556,7 +564,8 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
             state.Start.Phase,
             state.Start.Agent,
             injection.Actor,
-            injection.InjectionId);
+            injection.InjectionId,
+            _auditLogger);
         var options = CurrentOptions();
         await SafeNotifyAsync(n => n.InjectionStartedAsync(BuildInjectionEvent(state, injection, options), ct))
             .ConfigureAwait(false);
@@ -579,7 +588,8 @@ public sealed class AgentSupervisionService : IAgentSupervisionService
             injection.Actor,
             injection.InjectionId,
             result.Success,
-            summary);
+            summary,
+            _auditLogger);
         var evt = new AgentSupervisionInjectionCompletedEvent(
             state.SessionId,
             injection.InjectionId,

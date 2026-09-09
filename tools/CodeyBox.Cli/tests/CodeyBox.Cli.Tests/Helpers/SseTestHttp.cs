@@ -38,29 +38,6 @@ internal static class SseTestHttp
         }
     }
 
-    internal sealed class DelayingEventsHandler : HttpMessageHandler
-    {
-        private readonly TimeSpan _delay;
-        private readonly Func<HttpRequestMessage, HttpResponseMessage> _inner;
-
-        internal DelayingEventsHandler(
-            TimeSpan delay,
-            Func<HttpRequestMessage, HttpResponseMessage> inner)
-        {
-            _delay = delay;
-            _inner = inner;
-        }
-
-        protected override async Task<HttpResponseMessage> SendAsync(
-            HttpRequestMessage request,
-            CancellationToken cancellationToken)
-        {
-            if (request.RequestUri?.AbsolutePath.EndsWith("/events", StringComparison.Ordinal) == true)
-                await Task.Delay(_delay, cancellationToken);
-            return _inner(request);
-        }
-    }
-
     /// <summary>Blocks on read until <paramref name="cancellationToken"/> is cancelled.</summary>
     internal sealed class BlockUntilCancelledStream : Stream
     {

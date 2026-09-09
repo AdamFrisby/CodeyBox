@@ -109,6 +109,40 @@ public sealed class BubblewrapSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task ExecAsync_EnvironmentRemovalWinsAndSpecVariableIsAbsent()
+    {
+        if (OperatingSystem.IsWindows()) return;
+
+        var fakeBwrap = Path.Combine(_workspace, "fake-env-removal-bwrap.sh");
+        WriteExecutableScript(
+            fakeBwrap,
+            "#!/bin/sh\n" +
+            "if [ \"${REMOVE_ME+x}\" = x ]; then printf present; else printf absent; fi\n");
+        var provider = new BubblewrapSandboxProvider(
+            new BubblewrapSandboxOptions
+            {
+                BwrapBinary = fakeBwrap,
+                ReadOnlyHostBinds = [],
+            },
+            new RecordingLogger<BubblewrapSandboxProvider>());
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            Environment = new Dictionary<string, string> { ["REMOVE_ME"] = "spec-value" },
+        });
+
+        var result = await ExecWithEtxtbsyRetryAsync(sandbox, new SandboxExec
+        {
+            Argv = ["ignored"],
+            ExtraEnvironment = new Dictionary<string, string> { ["REMOVE_ME"] = "exec-value" },
+            EnvironmentVariablesToUnset = ["REMOVE_ME"],
+        });
+
+        Assert.True(result.Success, result.Stderr);
+        Assert.Equal("absent", result.Stdout.TrimEnd('\r', '\n'));
+    }
+
+    [Fact]
     public async Task MissingDefaultReadOnlyHostBind_IsSkipped()
     {
         var missing = Path.Combine(_workspace, "does-not-exist");

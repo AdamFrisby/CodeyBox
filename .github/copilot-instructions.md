@@ -126,4 +126,4 @@ deserialize) must be safe to call with anything.
 - Config over hardcoding: operational values (model ids, thresholds, defaults, intervals) are
   hot-reloadable options, not literals in source. Add a config knob rather than a magic constant.
 - The coding-agent CLI/runner internals (how CodeyBox installs and invokes the agent CLIs) are
-  reference material in `docs/agents.md` — not rules for your change.
+  reference material in `docs/concepts/agents.md` — not rules for your change.

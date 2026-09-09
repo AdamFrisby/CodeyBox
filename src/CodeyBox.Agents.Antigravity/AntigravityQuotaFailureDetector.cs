@@ -22,8 +22,9 @@ namespace CodeyBox.Agents.Antigravity;
 ///
 /// Sources scanned:
 /// <list type="bullet">
-///   <item>stderr / stdout text (e.g. <c>RESOURCE_EXHAUSTED</c>,
-///         <c>quota exceeded</c>, <c>weekly limit reached</c>,
+///   <item>stderr / stdout text (e.g. <c>RESOURCE_EXHAUSTED</c>, the rendered
+///         Google-API 429 message <c>Resource has been exhausted (e.g. check
+///         quota).</c>, <c>quota exceeded</c>, <c>weekly limit reached</c>,
 ///         <c>account locked until</c>, <c>API Error: 401</c>).</item>
 ///   <item>NDJSON error envelopes: <c>{"type":"result","status":"error", ...}</c>
 ///         and <c>{"type":"error", ...}</c>, including the gateway's
@@ -45,8 +46,31 @@ public sealed class AntigravityQuotaFailureDetector : IAgentQuotaFailureDetector
         ("lockout in effect", QuotaFailureKind.LimitReached),
         ("exhausted your weekly", QuotaFailureKind.LimitReached),
         ("RESOURCE_EXHAUSTED", QuotaFailureKind.RateLimitExceeded),
+        // agy renders the underlying Generative Language / cloudcode-pa 429 as
+        // the canonical Google API error MESSAGE — "Resource has been exhausted
+        // (e.g. check quota)." — which the gateway ships alongside the
+        // "status":"RESOURCE_EXHAUSTED" enum. When agy logs the human-readable
+        // message form (not the raw JSON envelope), the screaming-snake token is
+        // absent and "check quota" is NOT "quota exceeded", so without these two
+        // rows a real hidden 429 was invisible to BOTH Detect and the
+        // terminal-region marker scan (ExtractTerminalErrorRegion) — the run
+        // fell through to a generic "agent exited 1" terminal failure with no
+        // quota_failures record and no WaitingForQuotaReset park. Match both the
+        // message text and the gRPC/camel-case status string some client
+        // renderings emit.
+        ("Resource has been exhausted", QuotaFailureKind.RateLimitExceeded),
+        ("ResourceExhausted", QuotaFailureKind.RateLimitExceeded),
         ("rate limit exceeded", QuotaFailureKind.RateLimitExceeded),
         ("quota exceeded", QuotaFailureKind.RateLimitExceeded),
+        // agy's PER-MODEL rolling limit, which is a third dimension the /usage meter does not
+        // surface: it refuses with this while the account's 5h reads 100% and the weekly is
+        // half-full. Observed verbatim: "Individual quota reached. Please upgrade your subscription
+        // to increase your limits. Resets in 1h8m20s." Note it says "quota reached", NOT "quota
+        // exceeded", so none of the rows above matched — the run fell through to a generic terminal
+        // failure and the item hard-FAILED instead of parking, even though the message carries its
+        // own reset which QuotaResetParser already knows how to read. RateLimitExceeded rather than
+        // LimitReached because this is a short rolling window (~1h), not a weekly lockout.
+        ("individual quota reached", QuotaFailureKind.RateLimitExceeded),
         ("too many requests", QuotaFailureKind.RateLimitExceeded),
         ("API Error: 401", QuotaFailureKind.Unauthorized),
         ("API Error: 403", QuotaFailureKind.Unauthorized),

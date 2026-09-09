@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using CodeyBox.Audit;
 using CodeyBox.Agents;
 using CodeyBox.Core;
@@ -23,6 +24,254 @@ public sealed class RequiredBuildGateTests : IDisposable
     {
         try { Directory.Delete(_workspace, recursive: true); }
         catch { }
+    }
+
+    // The required-build gate runs `dotnet build` directly (not via build.sh), so
+    // its script carries a NuGet-home self-heal for unprivileged hosts whose
+    // ~/.nuget is root-owned. These exercise the real production shell string.
+    [Fact]
+    public async Task NuGetHomeSelfHeal_RedirectsDotnetCliHome_WhenUserConfigUnreadable()
+    {
+        // The self-heal and this /bin/sh-driven check are POSIX-only (the gate
+        // runs on Linux build hosts); the Unix file-mode API is unavailable on
+        // Windows, so skip there rather than assert against it.
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var home = Path.Combine(_workspace, "broken-home");
+        var settingsDir = Path.Combine(home, ".nuget", "NuGet");
+        Directory.CreateDirectory(settingsDir);
+        var config = Path.Combine(settingsDir, "NuGet.Config");
+        File.WriteAllText(config, "<configuration/>");
+        // Simulate a NuGet.Config the current (unprivileged) user cannot read,
+        // the exact failure the audit build hit on a root-owned ~/.nuget.
+        File.SetUnixFileMode(config, UnixFileMode.None);
+        var tmp = Path.Combine(_workspace, "broken-tmp");
+        Directory.CreateDirectory(tmp);
+
+        try
+        {
+            var (exit, dotnetCliHome) = await RunSelfHealPreambleAsync(home, tmp);
+
+            Assert.Equal(0, exit);
+            // Redirected to a writable fallback derived from the leaf (the per-user
+            // "{leaf}-<uid>" dir, or a "{leaf}.XXXXXX" mktemp dir if that is
+            // unusable) under TMPDIR — never the broken home.
+            Assert.StartsWith(
+                Path.Combine(tmp, NuGetHomeSelfHeal.WritableHomeLeaf),
+                dotnetCliHome);
+            Assert.True(Directory.Exists(dotnetCliHome));
+        }
+        finally
+        {
+            File.SetUnixFileMode(config, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+    }
+
+    [Fact]
+    public async Task NuGetHomeSelfHeal_LeavesDotnetCliHomeUnset_OnHealthyHome()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var home = Path.Combine(_workspace, "healthy-home");
+        var settingsDir = Path.Combine(home, ".nuget", "NuGet");
+        Directory.CreateDirectory(settingsDir);
+        File.WriteAllText(Path.Combine(settingsDir, "NuGet.Config"), "<configuration/>");
+        var tmp = Path.Combine(_workspace, "healthy-tmp");
+        Directory.CreateDirectory(tmp);
+
+        var (exit, dotnetCliHome) = await RunSelfHealPreambleAsync(home, tmp);
+
+        Assert.Equal(0, exit);
+        Assert.Equal(string.Empty, dotnetCliHome);
+    }
+
+    // Runs the production self-heal preamble under `set -eu` (matching the gate's
+    // BuildScript) with an isolated HOME/TMPDIR and reports the resulting
+    // DOTNET_CLI_HOME, so the assertions reflect the real shell's behavior.
+    private static async Task<(int ExitCode, string DotnetCliHome)> RunSelfHealPreambleAsync(
+        string home,
+        string tmpDir)
+    {
+        var script =
+            "set -eu\n"
+            + NuGetHomeSelfHeal.Preamble
+            + "\nprintf '%s' \"${DOTNET_CLI_HOME:-}\"\n";
+
+        var psi = new System.Diagnostics.ProcessStartInfo("/bin/sh")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add(script);
+        // Force a deterministic, isolated NuGet home + temp root; strip any
+        // inherited DOTNET_CLI_HOME so the preamble decides from HOME alone.
+        psi.Environment["HOME"] = home;
+        psi.Environment["TMPDIR"] = tmpDir;
+        psi.Environment.Remove("DOTNET_CLI_HOME");
+        psi.Environment.Remove("NUGET_PACKAGES");
+
+        using var process = System.Diagnostics.Process.Start(psi)!;
+        var stdout = await process.StandardOutput.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        return (process.ExitCode, stdout.Trim());
+    }
+
+    [Fact]
+    public async Task BuildScript_RestoresGreen_WhenPerUserNuGetHomeIsNotWritable()
+    {
+        // Regression: sandbox images whose $HOME/.nuget is owned by another
+        // user (e.g. root) made every `dotnet build` fail restore with
+        // "Failed to read NuGet.Config ... Permission denied", producing no
+        // assemblies. The gate script must redirect the CLI/NuGet per-user
+        // home to a writable path so the build no longer depends on a writable
+        // $HOME, while still preserving any pre-baked global-packages cache.
+        if (OperatingSystem.IsWindows())
+            return; // BuildScript is a POSIX sh script executed inside a Linux sandbox.
+
+        var brokenHome = Path.Combine(_workspace, "broken-home-" + Guid.NewGuid().ToString("N")[..8]);
+        // A populated (root-owned in production) global-packages cache the gate must preserve.
+        Directory.CreateDirectory(Path.Combine(brokenHome, ".nuget", "packages", "newtonsoft.json"));
+        // The per-user NuGet settings directory exists but is not writable.
+        var brokenNuGetDir = Path.Combine(brokenHome, ".nuget", "NuGet");
+        Directory.CreateDirectory(brokenNuGetDir);
+        File.SetUnixFileMode(brokenNuGetDir, UnixFileMode.None);
+
+        try
+        {
+            var (exitCode, output) = await RunBuildScriptAsync(brokenHome);
+
+            Assert.Equal(0, exitCode);
+            Assert.Contains("Build succeeded.", output);
+        }
+        finally
+        {
+            // Restore permissions so the workspace can be deleted in Dispose.
+            File.SetUnixFileMode(brokenNuGetDir,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
+    [Fact]
+    public async Task BuildScript_FakeDotnet_IsADiscriminatingDetector()
+    {
+        // Guards the test above from decorativeness: proves the simulated
+        // `dotnet` genuinely fails against a non-writable per-user NuGet home
+        // when the redirect is absent, so BuildScript_RestoresGreen only
+        // passes because the gate script performs the redirect.
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var brokenHome = Path.Combine(_workspace, "broken-home-neg-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(Path.Combine(brokenHome, ".nuget", "packages", "newtonsoft.json"));
+        var brokenNuGetDir = Path.Combine(brokenHome, ".nuget", "NuGet");
+        Directory.CreateDirectory(brokenNuGetDir);
+        File.SetUnixFileMode(brokenNuGetDir, UnixFileMode.None);
+        var fakeDotnet = await WriteNuGetSensitiveFakeDotnetAsync();
+
+        try
+        {
+            // Invoke the fake dotnet directly with no DOTNET_CLI_HOME redirect,
+            // exactly the pre-fix condition, and confirm it reports the failure.
+            var psi = new ProcessStartInfo("/bin/sh")
+            {
+                ArgumentList = { "-c", $"exec '{fakeDotnet}' build ./App.slnx" },
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+            };
+            psi.Environment.Remove("DOTNET_CLI_HOME");
+            psi.Environment.Remove("NUGET_PACKAGES");
+            psi.Environment["HOME"] = brokenHome;
+
+            using var proc = Process.Start(psi)!;
+            var stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+
+            Assert.NotEqual(0, proc.ExitCode);
+            Assert.Contains("Failed to read NuGet.Config", stderr);
+        }
+        finally
+        {
+            File.SetUnixFileMode(brokenNuGetDir,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
+    /// <summary>
+    /// Runs the production <see cref="SandboxRequiredBuildVerifier.BuildScript"/>
+    /// under <c>/bin/sh</c> — the exact way the sandbox executes it — in a fresh
+    /// work directory containing a root solution marker, with a fake
+    /// NuGet-sensitive <c>dotnet</c> on PATH and the given non-writable HOME.
+    /// </summary>
+    private async Task<(int ExitCode, string Output)> RunBuildScriptAsync(string home)
+    {
+        var workDir = Path.Combine(_workspace, "buildscript-wd-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(workDir);
+        await File.WriteAllTextAsync(Path.Combine(workDir, "App.slnx"), "# solution marker\n");
+        var fakeDotnet = await WriteNuGetSensitiveFakeDotnetAsync();
+        var tmpDir = Path.Combine(_workspace, "buildscript-tmp-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tmpDir);
+
+        var psi = new ProcessStartInfo("/bin/sh")
+        {
+            ArgumentList = { "-c", SandboxRequiredBuildVerifier.BuildScript },
+            WorkingDirectory = workDir,
+            RedirectStandardError = true,
+            RedirectStandardOutput = true,
+            UseShellExecute = false,
+        };
+        // Simulate a clean sandbox: no inherited CLI-home / cache redirects.
+        psi.Environment.Remove("DOTNET_CLI_HOME");
+        psi.Environment.Remove("NUGET_PACKAGES");
+        psi.Environment["HOME"] = home;
+        psi.Environment["TMPDIR"] = tmpDir;
+        psi.Environment["PATH"] =
+            Path.GetDirectoryName(fakeDotnet) + Path.PathSeparator + "/usr/bin:/bin";
+
+        using var proc = Process.Start(psi)!;
+        var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+        var stderrTask = proc.StandardError.ReadToEndAsync();
+        await proc.WaitForExitAsync();
+        var output = (await stdoutTask) + (await stderrTask);
+        return (proc.ExitCode, output);
+    }
+
+    /// <summary>
+    /// Writes a fake <c>dotnet</c> that models NuGet restore's real
+    /// precondition: it reads/creates the per-user settings directory under the
+    /// CLI home ($DOTNET_CLI_HOME, else $HOME) and fails if that directory is
+    /// not writable, and it fails if a pre-baked $HOME/.nuget/packages cache
+    /// was not preserved via NUGET_PACKAGES.
+    /// </summary>
+    private async Task<string> WriteNuGetSensitiveFakeDotnetAsync()
+    {
+        var bin = Path.Combine(_workspace, "fake-dotnet-ng-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(bin);
+        var dotnet = Path.Combine(bin, "dotnet");
+        await File.WriteAllTextAsync(dotnet, """
+            #!/bin/sh
+            # Model NuGet's writable per-user settings-directory requirement.
+            cli_home="${DOTNET_CLI_HOME:-$HOME}"
+            ngdir="$cli_home/.nuget/NuGet"
+            mkdir -p "$ngdir" 2>/dev/null || true
+            if ! touch "$ngdir/NuGet.Config" 2>/dev/null; then
+              echo "error : Failed to read NuGet.Config due to unauthorized access. Path: '$ngdir/NuGet.Config'." >&2
+              exit 1
+            fi
+            if [ -n "${HOME:-}" ] && [ -d "$HOME/.nuget/packages" ] \
+               && [ "${NUGET_PACKAGES:-}" != "$HOME/.nuget/packages" ]; then
+              echo "error : pre-baked NuGet package cache not preserved (NUGET_PACKAGES=${NUGET_PACKAGES:-unset})" >&2
+              exit 1
+            fi
+            echo "Build succeeded."
+            exit 0
+            """);
+        MakeExecutable(dotnet);
+        return dotnet;
     }
 
     [Fact]
@@ -515,8 +764,8 @@ public sealed class RequiredBuildGateTests : IDisposable
         var final = await tp.Store.GetAsync(item.Id);
         Assert.Equal(WorkItemState.Done, final!.State);
         var dotnetInvocations = await File.ReadAllLinesAsync(fakeDotnet.LogPath);
-        Assert.Contains("build ./CodeyBox.slnx", dotnetInvocations);
-        Assert.Contains("build ./tests/CodeyBox.Tests.csproj", dotnetInvocations);
+        Assert.Contains("build ./CodeyBox.slnx --disable-build-servers --maxcpucount:1", dotnetInvocations);
+        Assert.Contains("build ./tests/CodeyBox.Tests.csproj --disable-build-servers --maxcpucount:1", dotnetInvocations);
     }
 
     [Fact]
@@ -687,8 +936,8 @@ public sealed class RequiredBuildGateTests : IDisposable
         Assert.Equal(WorkItemState.AuditFailed, final!.State);
         Assert.Contains("required build failed", final.LastError);
         var dotnetInvocations = await File.ReadAllLinesAsync(fakeDotnet.LogPath);
-        Assert.Contains("build ./CodeyBox.slnx", dotnetInvocations);
-        Assert.Contains("build ./tests/CodeyBox.Tests.csproj", dotnetInvocations);
+        Assert.Contains("build ./CodeyBox.slnx --disable-build-servers --maxcpucount:1", dotnetInvocations);
+        Assert.Contains("build ./tests/CodeyBox.Tests.csproj --disable-build-servers --maxcpucount:1", dotnetInvocations);
     }
 
     [Fact]
@@ -1018,6 +1267,121 @@ public sealed class RequiredBuildGateTests : IDisposable
             }, CancellationToken.None));
 
         Assert.Same(deferred, thrown);
+    }
+
+    [Fact]
+    public async Task SandboxRequiredBuildVerifier_SandboxCreateAsyncDiskDeferred_Rethrows()
+    {
+        // Regression test for the incident where a transient Incus-pool disk
+        // preflight during required-build verification was flattened into
+        // RequiredBuildVerificationResult.Unavailable (terminal
+        // failure_kind=infrastructure, recovery_attempts=0) instead of
+        // deferring. The verifier must re-throw the disk deferral so the
+        // orchestrator returns the item to a runnable state and re-picks it
+        // up after RecheckIn. Uses the Incus storage-pool mount from the
+        // incident — a distinct resource from the host-filesystem paths in
+        // DiskGuard.HostPaths that crosses the threshold independently.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var deferred = new SandboxDiskDeferredException(
+            mountPath: "incus-pool:codeybox-zfs",
+            freeBytes: 8_522_469_888,
+            thresholdBytes: 10_737_418_240,
+            recheckIn: TimeSpan.FromSeconds(42));
+        var verifier = new SandboxRequiredBuildVerifier(
+            new SandboxFactoryProvisioningDeferredProvider(deferred),
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" });
+
+        var item = NewItem("feature/sandbox-create-disk-deferred") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "ok.txt", "ok\n", "branch exists");
+
+        var thrown = await Assert.ThrowsAsync<SandboxDiskDeferredException>(() =>
+            verifier.VerifyAsync(new RequiredBuildVerificationRequest
+            {
+                WorkItemId = item.Id,
+                ProjectId = item.ProjectId,
+                SandboxPolicy = new RequiredBuildSandboxPolicy(),
+                RepositoryId = repoId,
+                BaseBranch = item.BaseBranch,
+                WorkBranch = item.WorkBranch!,
+                Phase = "audit",
+            }, CancellationToken.None));
+
+        Assert.Same(deferred, thrown);
+        Assert.Equal("incus-pool:codeybox-zfs", thrown.MountPath);
+        Assert.Equal(8_522_469_888, thrown.FreeBytes);
+        Assert.Equal(10_737_418_240, thrown.ThresholdBytes);
+        // The re-pickup interval must survive the verification boundary: the
+        // orchestrator schedules the deferred requeue from this value.
+        Assert.Equal(TimeSpan.FromSeconds(42), thrown.RecheckIn);
+        Assert.Equal(TimeSpan.FromSeconds(42), ((SandboxProvisioningDeferredException)thrown).RecheckIn);
+        // Type-level guarantee: existing provisioning-deferral filters catch
+        // the disk deferral, so no future call site can silently reacquire
+        // the flatten-to-Unavailable bug.
+        Assert.IsAssignableFrom<SandboxProvisioningDeferredException>(thrown);
+    }
+
+    [Fact]
+    public void SandboxDiskDeferredException_CarriesProvisioningDeferralContract()
+    {
+        var ex = new SandboxDiskDeferredException(
+            mountPath: "incus-pool:codeybox-zfs",
+            freeBytes: 512L * 1024 * 1024,
+            thresholdBytes: 10L * 1024 * 1024 * 1024,
+            recheckIn: TimeSpan.FromMinutes(5));
+
+        var asProvisioning = Assert.IsAssignableFrom<SandboxProvisioningDeferredException>(ex);
+        Assert.Equal(TimeSpan.FromMinutes(5), asProvisioning.RecheckIn);
+        Assert.StartsWith("disk preflight:", ex.Message, StringComparison.Ordinal);
+        Assert.Equal("disk-guard", asProvisioning.Provider);
+        Assert.Equal("create", asProvisioning.Operation);
+        Assert.Equal("disk-space", asProvisioning.ErrorClass);
+        Assert.Contains("incus-pool:codeybox-zfs", asProvisioning.Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task SandboxRequiredBuildVerifier_NonDeferrableCreateFailure_StillReturnsUnavailable()
+    {
+        // The new disk-deferral rethrow must not mask real faults: a
+        // non-deferrable sandbox-creation failure still surfaces as
+        // Unavailable (never a pass, never a rethrow), so the item keeps the
+        // historical terminal infrastructure-failure handling.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var verifier = new SandboxRequiredBuildVerifier(
+            new SandboxFactoryFailingSandboxProvider("sandbox provisioning denied by quota"),
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" });
+
+        var item = NewItem("feature/sandbox-create-genuine-failure") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "ok.txt", "ok\n", "branch exists");
+
+        var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            SandboxPolicy = new RequiredBuildSandboxPolicy(),
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+            Phase = "audit",
+        }, CancellationToken.None);
+
+        Assert.Equal(RequiredBuildVerificationStatus.Unavailable, result.Status);
+        Assert.Contains("sandbox provisioning denied by quota", result.Reason);
+        Assert.NotEqual(RequiredBuildVerificationStatus.Passed, result.Status);
+        Assert.NotEqual(RequiredBuildVerificationStatus.Failed, result.Status);
     }
 
     [Fact]
@@ -1932,6 +2296,9 @@ public sealed class RequiredBuildGateTests : IDisposable
         Assert.Equal("baseline-pin:abcdef0123", spec.BaselineImageRef);
         Assert.Equal(item.Id, spec.TimingWorkItemId);
         Assert.Equal(item.Id.ToString(), spec.Environment[SandboxConventions.WorkItemIdEnvironmentVariable]);
+        Assert.Equal(
+            DotnetCliHomeConventions.ResolvePath(SandboxConventions.WorkDir),
+            spec.Environment["DOTNET_CLI_HOME"]);
     }
 
     [Fact]

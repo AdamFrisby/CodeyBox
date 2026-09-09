@@ -140,13 +140,14 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
             }
             : current;
 
-        var failed = attributed.With(
-            WorkItemState.Failed,
-            error,
-            failureKind: command.FailureKind,
-            quotaResetAt: command.QuotaResetAt,
-            cancellationSource: command.CancellationSource,
-            authFailureScope: command.AuthFailureScope);
+        var failed = WorkItemRecoveryPolicy.ReleaseAgentTurnDispatchClaim(
+            attributed.With(
+                WorkItemState.Failed,
+                error,
+                failureKind: command.FailureKind,
+                quotaResetAt: command.QuotaResetAt,
+                cancellationSource: command.CancellationSource,
+                authFailureScope: command.AuthFailureScope));
 
         if (string.Equals(command.FailureKind, "quota", StringComparison.OrdinalIgnoreCase))
         {

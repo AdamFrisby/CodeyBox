@@ -92,8 +92,12 @@ public sealed class AgentQuotaProbesTests
     }
 
     [Fact]
-    public void CodexWhamUsageShape_MapsOverallAndDefaultRoutedModel()
+    public void CodexWhamUsageShape_MapsOverallAndSubscriptionBucket()
     {
+        // ParseResponse maps the raw WHAM shape only. The subscription display
+        // bucket ("GPT-5.3-Codex-Spark") is parsed and capped by overall; aliasing
+        // it onto a configured routed model is a member-gate concern (covered in
+        // QuotaProbeConfiguredModelMissingTests), not baked into ParseResponse.
         var snapshot = CodexQuotaProbe.ParseResponse("""
         {
           "rate_limit": { "primary_window": { "used_percent": 30 } },
@@ -108,7 +112,8 @@ public sealed class AgentQuotaProbesTests
 
         Assert.Equal(70, snapshot.AvailablePct);
         Assert.Equal(0, snapshot.PerModel["GPT-5.3-Codex-Spark"].AvailablePct);
-        Assert.Equal(0, snapshot.PerModel[CodexQuotaProbe.DefaultRoutedModelId].AvailablePct);
+        // No routing alias key is synthesised at parse time.
+        Assert.False(snapshot.PerModel.ContainsKey("gpt-5.5"));
     }
 
     [Fact]

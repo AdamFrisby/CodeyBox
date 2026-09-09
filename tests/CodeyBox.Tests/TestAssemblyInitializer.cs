@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using CodeyBox.Api;
+using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Webhooks;
 using Microsoft.Extensions.Configuration;
@@ -37,6 +38,7 @@ internal static class TestAssemblyInitializer
         SetIfMissing("ASPNETCORE_HOSTBUILDER__RELOADCONFIGONCHANGE", "false");
         SetIfMissing("DOTNET_USE_POLLING_FILE_WATCHER", "1");
         SetIfMissing(CredentialFileWatcherSettings.EnvironmentVariable, "false");
+        TrySetDotnetCliHomeFromRepoRoot();
 
         if (!UsePollingFileWatcher())
             WarnOnLowInotifyLimits(Console.Error);
@@ -53,6 +55,27 @@ internal static class TestAssemblyInitializer
     {
         if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable(name)))
             Environment.SetEnvironmentVariable(name, value);
+    }
+
+    private static void TrySetDotnetCliHomeFromRepoRoot()
+    {
+        if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DOTNET_CLI_HOME")))
+            return;
+
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null)
+        {
+            if (File.Exists(Path.Combine(dir.FullName, "CodeyBox.slnx"))
+                && File.Exists(Path.Combine(dir.FullName, "NuGet.Config")))
+            {
+                Environment.SetEnvironmentVariable(
+                    "DOTNET_CLI_HOME",
+                    DotnetCliHomeConventions.ResolvePath(dir.FullName));
+                return;
+            }
+
+            dir = dir.Parent;
+        }
     }
 
     private static bool UsePollingFileWatcher()

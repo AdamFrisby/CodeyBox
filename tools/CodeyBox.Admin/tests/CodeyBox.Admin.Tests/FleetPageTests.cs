@@ -10,7 +10,7 @@ namespace CodeyBox.Admin.Tests;
 /// Renders the Fleet component with canned summary data and asserts the correct
 /// rendering of rows, status dots, and recent-outcome glyphs.
 /// </summary>
-public sealed class FleetPageTests : TestContext
+public sealed class FleetPageTests : BunitContext
 {
     private static FleetSummaryDto MakeSummary(
         string projectId = "proj-alpha",
@@ -44,7 +44,7 @@ public sealed class FleetPageTests : TestContext
         ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
 
         Assert.Contains("Alpha", cut.Markup);
         Assert.Contains("Beta", cut.Markup);
@@ -57,7 +57,7 @@ public sealed class FleetPageTests : TestContext
         fake.FleetSummaryOverride = [MakeSummary(queued: 0, inFlight: 0)];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
 
         Assert.Contains("fleet-dot-grey", cut.Markup);
     }
@@ -69,7 +69,7 @@ public sealed class FleetPageTests : TestContext
         fake.FleetSummaryOverride = [MakeSummary(inFlight: 1)];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
 
         Assert.Contains("fleet-dot-blue", cut.Markup);
     }
@@ -81,7 +81,7 @@ public sealed class FleetPageTests : TestContext
         fake.FleetSummaryOverride = [MakeSummary(queued: 2)];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
 
         Assert.Contains("fleet-dot-yellow", cut.Markup);
     }
@@ -93,7 +93,7 @@ public sealed class FleetPageTests : TestContext
         fake.FleetSummaryOverride = [MakeSummary(isPaused: true)];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
 
         Assert.Contains("fleet-dot-red", cut.Markup);
     }
@@ -108,7 +108,7 @@ public sealed class FleetPageTests : TestContext
         ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
 
         // Done → ✓, Failed/AuditFailed → ✗, Cancelled → !
         Assert.Contains("fleet-outcome-ok", cut.Markup);
@@ -126,7 +126,7 @@ public sealed class FleetPageTests : TestContext
         ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
 
         // ✗ must appear before ✓✓ in the rendered output (newest first).
         var failIdx = cut.Markup.IndexOf("fleet-outcome-fail", StringComparison.Ordinal);
@@ -144,7 +144,7 @@ public sealed class FleetPageTests : TestContext
         ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
 
         Assert.Contains("Auditing", cut.Markup);
     }
@@ -156,7 +156,7 @@ public sealed class FleetPageTests : TestContext
         fake.FleetSummaryOverride = [MakeSummary()];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
 
         Assert.Contains("—", cut.Markup);
     }
@@ -168,7 +168,7 @@ public sealed class FleetPageTests : TestContext
         fake.FleetSummaryOverride = [MakeSummary(spendUsd: 18.42)];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
 
         Assert.Contains("$18.42", cut.Markup);
         Assert.Contains("budget-bar", cut.Markup);
@@ -181,7 +181,7 @@ public sealed class FleetPageTests : TestContext
         fake.FleetSummaryOverride = [MakeSummary(spendUsd: null)];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
 
         Assert.DoesNotContain("budget-bar-wrap", cut.Markup);
     }
@@ -193,7 +193,7 @@ public sealed class FleetPageTests : TestContext
         fake.FleetSummaryOverride = [MakeSummary()];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
 
         Assert.Contains("budget-alerts work item", cut.Markup);
     }
@@ -221,7 +221,7 @@ public sealed class FleetPageTests : TestContext
         };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
 
         Assert.Contains("fleet-tool-leaderboard-table", cut.Markup);
         Assert.Contains("Bash", cut.Markup);

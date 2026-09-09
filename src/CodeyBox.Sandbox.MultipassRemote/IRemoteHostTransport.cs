@@ -94,3 +94,16 @@ public interface IRemoteHostTransport
     /// </summary>
     Task StageOutAsync(string remotePath, string hostPath, CancellationToken ct);
 }
+
+public interface IRemotePortForwardTransport : IRemoteHostTransport
+{
+    IRemotePortForward StartLocalForward(
+        string localHost,
+        int localPort,
+        string remoteHost,
+        int remotePort);
+}
+
+public interface IRemotePortForward : IDisposable
+{
+}

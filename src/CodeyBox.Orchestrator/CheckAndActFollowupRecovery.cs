@@ -40,6 +40,8 @@ internal static class CheckAndActFollowupRecovery
             StartedAt = null,
             PreemptedAt = null,
             PreemptCheckpoint = null,
+            AgentTurnResumeCheckpoint = null,
+            AgentTurnRecoveryLease = null,
             UpdatedAt = DateTimeOffset.UtcNow,
         };
     }

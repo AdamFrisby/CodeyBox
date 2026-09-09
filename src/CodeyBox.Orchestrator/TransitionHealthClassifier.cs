@@ -226,7 +226,8 @@ public static class TransitionHealthClassifier
             WorkItemFailureKinds.AgentRoutingUnavailable => Infra(WorkItemFailureKinds.AgentRoutingUnavailable),
             "infrastructure" => Infra("infrastructure"),
             "configuration" => Infra("configuration"),
-            // "build", "cancelled", and "other" are intentionally not scored:
+            // "build", "e2e-replay", "cancelled", and "other" are intentionally
+            // not scored:
             //  - build is the RequiredBuildGate catching agent work-product
             //    that left the branch non-compiling — a work-quality failure,
             //    the gate working as designed. The infra-equivalent signal is
@@ -235,6 +236,10 @@ public static class TransitionHealthClassifier
             //    the audit-stage taxonomy, which maps "required build failed:"
             //    findings to LEGITIMATE and only "required build unavailable:"
             //    findings to InfraFailure.
+            //  - e2e-replay mirrors build: the WorkItemE2eReplayGate catching a
+            //    declared e2e capability whose committed replay could not be made
+            //    green (authoring/verification exhausted) — a work-quality
+            //    failure, not infra health.
             //  - cancelled is operator intent, not infra health.
             //  - other is the catch-all label PipelineRunner uses for failures
             //    we have not yet classified; counting it as infra would

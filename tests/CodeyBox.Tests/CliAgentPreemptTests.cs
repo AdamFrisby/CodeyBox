@@ -12,7 +12,7 @@ public sealed class CliAgentPreemptTests
     public async Task RequestPreempt_CapturesConfiguredScratchpadOnly()
     {
         var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
-        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        await using var sandbox = await provider.CreateAsync(SandboxSpecWithAgentTurnScratchpad());
         var runner = new TestCliRunner();
 
         var write = await sandbox.ExecAsync(new SandboxExec
@@ -29,7 +29,7 @@ public sealed class CliAgentPreemptTests
 
         var archive = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["sh", "-c", "tar -tzf .codeybox/preempt-scratchpad.tgz | sort"],
+            Argv = ["sh", "-c", "tar -tzf \"$1\" | sort", "archive-list", SandboxConventions.AgentTurnScratchpadArchivePath],
             WorkingDirectory = "/work",
         });
         Assert.True(archive.Success, archive.Stderr);
@@ -40,7 +40,7 @@ public sealed class CliAgentPreemptTests
 
         var captured = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["sh", "-c", "tmp=$(mktemp -d); tar -xzf .codeybox/preempt-scratchpad.tgz -C \"$tmp\"; cat \"$tmp/home/.testagent/scratch/todo.txt\""],
+            Argv = ["sh", "-c", "tmp=$(mktemp -d); tar -xzf \"$1\" -C \"$tmp\"; cat \"$tmp/home/.testagent/scratch/todo.txt\"", "archive-read", SandboxConventions.AgentTurnScratchpadArchivePath],
             WorkingDirectory = "/work",
         });
         Assert.True(captured.Success, captured.Stderr);
@@ -48,7 +48,7 @@ public sealed class CliAgentPreemptTests
 
         var manifest = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["cat", ".codeybox/preempt-scratchpad.md"],
+            Argv = ["sh", "-c", "tar -xOzf \"$1\" ./manifest.txt 2>/dev/null || tar -xOzf \"$1\" manifest.txt", "manifest-read", SandboxConventions.AgentTurnScratchpadArchivePath],
             WorkingDirectory = "/work",
         });
         Assert.True(manifest.Success, manifest.Stderr);
@@ -57,10 +57,44 @@ public sealed class CliAgentPreemptTests
     }
 
     [Fact]
+    public async Task RequestPreempt_DoesNotFollowRepositoryCodeyboxSymlink()
+    {
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(SandboxSpecWithAgentTurnScratchpad());
+        var runner = new TestCliRunner();
+
+        var arrange = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-c",
+                "set -e; mkdir -p legacy-target \"$HOME/.testagent/scratch\"; ln -s \"$PWD/legacy-target\" .codeybox; printf captured > \"$HOME/.testagent/scratch/todo.txt\"",
+            ],
+            WorkingDirectory = "/work",
+        });
+        Assert.True(arrange.Success, arrange.Stderr);
+
+        await runner.RequestPreemptAsync(sandbox, "/work");
+
+        var verify = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "sh", "-c",
+                "test -L .codeybox; test -z \"$(find -P legacy-target -mindepth 1 -print -quit)\"; test -f \"$1\"",
+                "verify-private-capture",
+                SandboxConventions.AgentTurnScratchpadArchivePath,
+            ],
+            WorkingDirectory = "/work",
+        });
+        Assert.True(verify.Success, verify.Stderr);
+    }
+
+    [Fact]
     public async Task RequestPreempt_CapturesScratchpadAfterTermSignal()
     {
         var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
-        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        await using var sandbox = await provider.CreateAsync(SandboxSpecWithAgentTurnScratchpad());
         var runner = new TermFlushRunner();
 
         var runTask = sandbox.ExecAsync(new SandboxExec
@@ -85,7 +119,7 @@ public sealed class CliAgentPreemptTests
 
         var captured = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["sh", "-c", "tmp=$(mktemp -d); tar -xzf .codeybox/preempt-scratchpad.tgz -C \"$tmp\"; cat \"$tmp/home/.testagent/scratch/flushed.txt\""],
+            Argv = ["sh", "-c", "tmp=$(mktemp -d); tar -xzf \"$1\" -C \"$tmp\"; cat \"$tmp/home/.testagent/scratch/flushed.txt\"", "archive-read", SandboxConventions.AgentTurnScratchpadArchivePath],
             WorkingDirectory = "/work",
         });
         Assert.True(captured.Success, captured.Stderr);
@@ -96,8 +130,8 @@ public sealed class CliAgentPreemptTests
     public async Task RequestPreempt_TargetsOnlyMatchingActiveRunnerExec()
     {
         var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
-        await using var sandbox1 = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
-        await using var sandbox2 = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        await using var sandbox1 = await provider.CreateAsync(SandboxSpecWithAgentTurnScratchpad());
+        await using var sandbox2 = await provider.CreateAsync(SandboxSpecWithAgentTurnScratchpad());
         var runner = new TermFlushRunner();
         using var keepSecondRunning = new CancellationTokenSource();
 
@@ -138,7 +172,7 @@ public sealed class CliAgentPreemptTests
     public async Task RunResumed_RestoresCapturedScratchpad()
     {
         var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
-        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        await using var sandbox = await provider.CreateAsync(SandboxSpecWithAgentTurnScratchpad());
         var runner = new TestCliRunner();
 
         var write = await sandbox.ExecAsync(new SandboxExec
@@ -166,10 +200,30 @@ public sealed class CliAgentPreemptTests
     }
 
     [Fact]
+    public async Task RunResumed_ExecutionUnavailableDuringScratchpadRestore_ThrowsTypedPreparationFailure()
+    {
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var inner = await provider.CreateAsync(SandboxSpecWithAgentTurnScratchpad());
+        await using var sandbox = new RestoreExecutionUnavailableSandbox(inner);
+        var runner = new TestCliRunner();
+
+        var failure = await Assert.ThrowsAsync<AgentResumePreparationUnavailableException>(() =>
+            runner.RunResumedAsync(
+                sandbox,
+                "/work",
+                "true",
+                credential: null,
+                new AgentResumeContext("refs/heads/codeybox/preempt/test")));
+
+        Assert.Equal(RestoreExecutionUnavailableSandbox.UnavailableExitCode, failure.ExitCode);
+        Assert.Equal(1, sandbox.RestoreAttempts);
+    }
+
+    [Fact]
     public async Task RunResumed_RejectsArchiveOutsideConfiguredScratchpadRoots()
     {
         var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
-        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        await using var sandbox = await provider.CreateAsync(SandboxSpecWithAgentTurnScratchpad());
         var runner = new TestCliRunner();
 
         var archive = await sandbox.ExecAsync(new SandboxExec
@@ -177,7 +231,9 @@ public sealed class CliAgentPreemptTests
             Argv =
             [
                 "bash", "-c",
-                "set -euo pipefail; mkdir -p .codeybox/tmp/home/.ssh; printf '%s\n' 'dir\thome\t.ssh' 'file\thome\t.ssh/config' > .codeybox/tmp/manifest.tsv; printf '%s\n' Host evil > .codeybox/tmp/home/.ssh/config; tar -czf .codeybox/preempt-scratchpad.tgz -C .codeybox/tmp ."
+                "set -euo pipefail; root=$1; tmp=$(mktemp -d \"$root/test-archive.XXXXXX\"); trap 'rm -rf -- \"$tmp\"' EXIT; mkdir -p \"$tmp/home/.ssh\"; printf '%s\n' 'dir\thome\t.ssh' 'file\thome\t.ssh/config' > \"$tmp/manifest.tsv\"; printf '%s\n' Host evil > \"$tmp/home/.ssh/config\"; tar -czf \"$root/scratchpad.tgz\" -C \"$tmp\" .",
+                "archive-create",
+                SandboxConventions.AgentTurnScratchpadDir,
             ],
             WorkingDirectory = "/work",
         });
@@ -195,7 +251,7 @@ public sealed class CliAgentPreemptTests
     public async Task RunResumed_RejectsSymlinkedDestinationPath()
     {
         var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
-        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        await using var sandbox = await provider.CreateAsync(SandboxSpecWithAgentTurnScratchpad());
         var runner = new TestCliRunner();
 
         var write = await sandbox.ExecAsync(new SandboxExec
@@ -232,7 +288,7 @@ public sealed class CliAgentPreemptTests
     public async Task RunResumed_RejectsArchiveOverUncompressedFileLimit()
     {
         var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
-        await using var sandbox = await provider.CreateAsync(new SandboxSpec { ImageReference = "ignored" });
+        await using var sandbox = await provider.CreateAsync(SandboxSpecWithAgentTurnScratchpad());
         var runner = new TestCliRunner();
 
         var archive = await sandbox.ExecAsync(new SandboxExec
@@ -240,7 +296,37 @@ public sealed class CliAgentPreemptTests
             Argv =
             [
                 "bash", "-c",
-                "set -euo pipefail; mkdir -p .codeybox/tmp/home/.testagent/scratch; printf '%s\n' 'dir\thome\t.testagent/scratch' 'file\thome\t.testagent/scratch/big.bin' > .codeybox/tmp/manifest.tsv; head -c 2097153 /dev/zero > .codeybox/tmp/home/.testagent/scratch/big.bin; tar -czf .codeybox/preempt-scratchpad.tgz -C .codeybox/tmp ."
+                $"set -euo pipefail; root=$1; tmp=$(mktemp -d \"$root/test-archive.XXXXXX\"); trap 'rm -rf -- \"$tmp\"' EXIT; mkdir -p \"$tmp/home/.testagent/scratch\"; printf '%s\\n' 'dir\\thome\\t.testagent/scratch' 'file\\thome\\t.testagent/scratch/big.bin' > \"$tmp/manifest.tsv\"; head -c {AgentTurnScratchpadArchive.MaximumFileBytes + 1} /dev/zero > \"$tmp/home/.testagent/scratch/big.bin\"; tar -czf \"$root/scratchpad.tgz\" -C \"$tmp\" .",
+                "archive-create",
+                SandboxConventions.AgentTurnScratchpadDir,
+            ],
+            WorkingDirectory = "/work",
+        });
+        Assert.True(archive.Success, archive.Stderr);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => runner.RunResumedAsync(
+            sandbox,
+            "/work",
+            "true",
+            credential: null,
+            new AgentResumeContext("refs/heads/codeybox/preempt/test")));
+    }
+
+    [Fact]
+    public async Task RunResumed_RejectsCompressedTarBombOverExpandedLimit()
+    {
+        var provider = new ProcessSandboxProvider(NullLogger<ProcessSandboxProvider>.Instance);
+        await using var sandbox = await provider.CreateAsync(SandboxSpecWithAgentTurnScratchpad());
+        var runner = new TestCliRunner();
+
+        var archive = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv =
+            [
+                "bash", "-c",
+                $"set -euo pipefail; root=$1; tmp=$(mktemp -d \"$root/tar-bomb.XXXXXX\"); trap 'rm -rf -- \"$tmp\"' EXIT; mkdir -p \"$tmp/home/.testagent/scratch\"; printf '%s\\n' 'dir\\thome\\t.testagent/scratch' 'file\\thome\\t.testagent/scratch/bomb.bin' > \"$tmp/manifest.tsv\"; head -c {AgentTurnScratchpadArchive.MaximumExpandedBytes + 1} /dev/zero > \"$tmp/home/.testagent/scratch/bomb.bin\"; tar -czf \"$root/scratchpad.tgz\" -C \"$tmp\" .; test \"$(wc -c < \"$root/scratchpad.tgz\")\" -lt {AgentTurnScratchpadArchive.MaximumBytes}",
+                "archive-create",
+                SandboxConventions.AgentTurnScratchpadDir,
             ],
             WorkingDirectory = "/work",
         });
@@ -269,9 +355,62 @@ public sealed class CliAgentPreemptTests
             => new(["sh", "-c", prompt]);
     }
 
+    private static SandboxSpec SandboxSpecWithAgentTurnScratchpad() => new()
+    {
+        ImageReference = "ignored",
+        Mounts =
+        [
+            new SandboxMount
+            {
+                SandboxPath = SandboxConventions.AgentTurnScratchpadDir,
+                Tmpfs = true,
+                SizeBytes = SandboxConventions.AgentTurnScratchpadTmpfsBytes,
+            },
+        ],
+    };
+
     private sealed class TermFlushRunner : TestCliRunner
     {
         protected override string PreemptProcessPattern => "codeybox-test-preempt-flush-marker";
+    }
+
+    private sealed class RestoreExecutionUnavailableSandbox : ISandbox
+    {
+        public const int UnavailableExitCode = 255;
+        private readonly ISandbox _inner;
+        private int _restoreAttempts;
+
+        public RestoreExecutionUnavailableSandbox(ISandbox inner)
+        {
+            _inner = inner;
+        }
+
+        public string Id => _inner.Id;
+        public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
+        public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
+        public int RestoreAttempts => Volatile.Read(ref _restoreAttempts);
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            if (exec.Argv.Count >= 4
+                && string.Equals(exec.Argv[0], "bash", StringComparison.Ordinal)
+                && string.Equals(exec.Argv[3], "codeybox-resume", StringComparison.Ordinal))
+            {
+                Interlocked.Increment(ref _restoreAttempts);
+                return Task.FromResult(new SandboxExecResult(
+                    UnavailableExitCode,
+                    Stdout: string.Empty,
+                    Stderr: "injected unavailable restore transport",
+                    ExecutionUnavailable: true));
+            }
+
+            return _inner.ExecAsync(exec, ct);
+        }
+
+        public Task SyncStateToHostAsync(CancellationToken ct = default)
+            => _inner.SyncStateToHostAsync(ct);
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private static async Task<SandboxExecResult> WaitForAsync(

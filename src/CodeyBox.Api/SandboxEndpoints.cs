@@ -44,11 +44,12 @@ internal static class SandboxEndpoints
     /// <summary>
     /// Operator-triggered dispose of a specific leaked sandbox by name. The sandbox
     /// must be present in the reaper's latest leaked list — this prevents accidental
-    /// deletion of an active codeybox-* VM mid-run. Use GET /sandboxes/leaked first
+    /// deletion of an active provider-managed sandbox mid-run. Use GET /sandboxes/leaked first
     /// to confirm the sandbox is detected as leaked.
     /// </summary>
     private static async Task<IResult> DisposeLeakedAsync(
         string name,
+        string? providerId,
         IManagedSandboxLifecycle provider,
         string? hostId,
         SandboxLeakReaper reaper,
@@ -58,25 +59,30 @@ internal static class SandboxEndpoints
     {
         if (string.IsNullOrWhiteSpace(name))
             return Results.BadRequest(new { error = "name is required" });
+        if (providerId is not null && !SandboxProviderIdPolicy.IsValidOpaque(providerId))
+            return Results.BadRequest(new { error = "providerId is invalid" });
 
         // Cross-check against the latest leak list so that active sandboxes (those
-        // tied to a running work item) cannot be purged via this endpoint.
-        var matchingLeaks = reaper.GetLatestLeaks()
-            .Where(l => l.Name == name)
+        // tied to a running work item) cannot be purged via this endpoint. The
+        // provider-scoped snapshot and concrete provider both re-verify ownership
+        // at their destructive sink. Host identity independently disambiguates
+        // duplicate names on remote executor pools.
+        var matches = reaper.GetLatestLeaks()
+            .Where(leak => string.Equals(leak.Name, name, StringComparison.Ordinal)
+                && (providerId is null
+                    || string.Equals(leak.LifecycleProviderId, providerId, StringComparison.Ordinal))
+                && (string.IsNullOrWhiteSpace(hostId)
+                    || string.Equals(leak.HostId, hostId, StringComparison.Ordinal)))
             .ToArray();
-        LeakedSandboxInfo? leak;
-        if (string.IsNullOrWhiteSpace(hostId))
-        {
-            if (matchingLeaks.Length > 1 && HasMultipleHostIds(matchingLeaks))
-                return Results.Conflict(new { error = "multiple leaked sandboxes share this name; specify hostId" });
-            leak = matchingLeaks.FirstOrDefault();
-        }
-        else
-        {
-            leak = matchingLeaks.FirstOrDefault(l => string.Equals(l.HostId, hostId, StringComparison.Ordinal));
-        }
-        if (leak is null)
+        if (matches.Length == 0)
             return Results.NotFound(new { error = "sandbox not found in latest leaked list; verify via GET /sandboxes/leaked" });
+        if (providerId is null && HasMultipleProviderIds(matches))
+            return Results.Conflict(new { error = "multiple providers report this sandbox name; specify providerId" });
+        if (string.IsNullOrWhiteSpace(hostId) && HasMultipleHostIds(matches))
+            return Results.Conflict(new { error = "multiple leaked sandboxes share this name; specify hostId" });
+        if (matches.Length != 1)
+            return Results.Conflict(new { error = "multiple leaked sandboxes share this identity; specify providerId and hostId from GET /sandboxes/leaked" });
+        var leak = matches[0];
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         cts.CancelAfter(TimeSpan.FromMinutes(5));
@@ -86,7 +92,7 @@ internal static class SandboxEndpoints
         {
             await provider.DisposeLeakedAsync(ToManagedSandboxInfo(leak), cts.Token);
             // Remove from the in-memory list immediately so a repeated call returns 404
-            // instead of attempting a redundant multipass delete and returning 500.
+            // instead of attempting a redundant provider delete and returning 500.
             reaper.RemoveFromLatestLeaks(leak);
             var disposedAt = DateTimeOffset.UtcNow;
             AuditLog.SandboxLeakDisposed(name,
@@ -149,7 +155,7 @@ internal static class SandboxEndpoints
                 },
             }, ct);
             log.LogWarning(ex, "SandboxEndpoints: failed to dispose leaked sandbox {Name}", name);
-            // Return a generic message; full details (including multipass stderr) are in the server log.
+            // Return a generic message; provider diagnostics remain in the server log.
             return Results.Problem("Dispose failed; see server logs for details", statusCode: 500);
         }
     }
@@ -161,6 +167,7 @@ internal static class SandboxEndpoints
         ageMinutes = Math.Round(l.Age.TotalMinutes, 1),
         diskMb = l.DiskBytes.HasValue ? l.DiskBytes.Value / (1024 * 1024) : (long?)null,
         reason = l.Reason,
+        providerId = l.LifecycleProviderId,
         lifecycleProviderId = l.LifecycleProviderId,
         hostId = l.HostId,
     };
@@ -173,6 +180,26 @@ internal static class SandboxEndpoints
             IsTrackedActive: false,
             LifecycleProviderId: leak.LifecycleProviderId,
             HostId: leak.HostId);
+
+    private static bool HasMultipleProviderIds(IEnumerable<LeakedSandboxInfo> leaks)
+    {
+        string? firstProviderId = null;
+        var sawProviderId = false;
+        foreach (var leak in leaks)
+        {
+            if (!sawProviderId)
+            {
+                firstProviderId = leak.LifecycleProviderId;
+                sawProviderId = true;
+                continue;
+            }
+
+            if (!string.Equals(firstProviderId, leak.LifecycleProviderId, StringComparison.Ordinal))
+                return true;
+        }
+
+        return false;
+    }
 
     private static bool HasMultipleHostIds(IEnumerable<LeakedSandboxInfo> leaks)
     {

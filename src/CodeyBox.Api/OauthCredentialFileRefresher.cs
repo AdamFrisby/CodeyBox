@@ -57,6 +57,12 @@ public interface IClaudeQuotaTokenSource : IOauthCredentialTokenSource
     Task<string?> GetAccessTokenAsync(CancellationToken ct = default);
 }
 
+/// <summary>Antigravity (Google Antigravity agy OAuth) quota-probe token source.</summary>
+public interface IAntigravityQuotaTokenSource : IOauthCredentialTokenSource
+{
+    Task<string?> GetAccessTokenAsync(CancellationToken ct = default);
+}
+
 /// <summary>
 /// Shared machinery for the three provider-specific refreshers: in-process
 /// cache, refresh serialisation, atomic file rewrite, and rate-limited warning
@@ -102,6 +108,9 @@ public abstract class OauthCredentialFileRefresher : IDisposable
         Log = log ?? throw new ArgumentNullException(nameof(log));
     }
 
+    protected virtual bool RequiresRefreshToken => true;
+    protected virtual bool CanRefreshWithoutFile => false;
+
     /// <summary>
     /// Reads the file, decides whether the in-file access_token is still fresh,
     /// and returns it; otherwise serialises through the refresh gate and posts
@@ -113,7 +122,11 @@ public abstract class OauthCredentialFileRefresher : IDisposable
 
         var raw = Source.GetRaw();
         if (string.IsNullOrEmpty(raw))
-            return null;
+        {
+            if (!CanRefreshWithoutFile)
+                return null;
+            raw = "{}";
+        }
 
         ParsedCreds parsed;
         try
@@ -126,7 +139,7 @@ public abstract class OauthCredentialFileRefresher : IDisposable
             return null;
         }
 
-        if (parsed.AccessToken is null)
+        if (!CanRefreshWithoutFile && parsed.AccessToken is null)
             return null;
 
         var now = TimeProvider.GetUtcNow();
@@ -142,7 +155,7 @@ public abstract class OauthCredentialFileRefresher : IDisposable
                 return CachedAccessToken;
         }
 
-        if (parsed.RefreshToken is null)
+        if (RequiresRefreshToken && parsed.RefreshToken is null)
         {
             MaybeWarn(null, "Credential file {Path} has expired access_token but no refresh_token; cannot refresh");
             return null;
@@ -163,7 +176,11 @@ public abstract class OauthCredentialFileRefresher : IDisposable
             // Re-parse from disk in case the file rotated while we waited.
             raw = Source.GetRaw();
             if (string.IsNullOrEmpty(raw))
-                return null;
+            {
+                if (!CanRefreshWithoutFile)
+                    return null;
+                raw = "{}";
+            }
             try
             {
                 parsed = ParseCreds(raw);
@@ -178,7 +195,7 @@ public abstract class OauthCredentialFileRefresher : IDisposable
             if (parsed.AccessToken is not null && parsed.ExpiresAt is { } expAgain && expAgain > now + DefaultExpirySkew)
                 return parsed.AccessToken;
 
-            if (parsed.RefreshToken is null)
+            if (RequiresRefreshToken && parsed.RefreshToken is null)
             {
                 MaybeWarn(null, "Credential file {Path} has expired access_token but no refresh_token; cannot refresh");
                 return null;
@@ -247,8 +264,8 @@ public abstract class OauthCredentialFileRefresher : IDisposable
     private void PersistRefreshedToken(ParsedCreds parsed, RefreshResult result, DateTimeOffset newExpiresAt)
     {
         var existingRaw = Source.GetRaw();
-        if (string.IsNullOrEmpty(existingRaw)) return;
-        var nextJson = BuildPersistedJson(existingRaw, result, newExpiresAt);
+        var baseJson = string.IsNullOrEmpty(existingRaw) ? "{}" : existingRaw;
+        var nextJson = BuildPersistedJson(baseJson, result, newExpiresAt);
         AtomicWriteCredsFile(Source.FilePath, nextJson);
     }
 
@@ -260,7 +277,7 @@ public abstract class OauthCredentialFileRefresher : IDisposable
     /// a separate post-create chmod would leave open. The tempfile lives in the
     /// same directory so the rename is atomic on the same filesystem.
     /// </summary>
-    private static void AtomicWriteCredsFile(string path, string contents)
+    protected static void AtomicWriteCredsFile(string path, string contents)
     {
         var dir = Path.GetDirectoryName(path) ?? ".";
         Directory.CreateDirectory(dir);
@@ -315,6 +332,122 @@ public abstract class OauthCredentialFileRefresher : IDisposable
         _disposed = true;
         _refreshGate.Dispose();
         GC.SuppressFinalize(this);
+    }
+
+    internal static readonly TimeSpan WhichTimeout = TimeSpan.FromSeconds(5);
+
+    /// <summary>Resolves an executable path using the platform-specific resolver command.</summary>
+    internal static string? ResolveExecutablePath(string resolverCommand, string targetBinary)
+    {
+        try
+        {
+            using var proc = Process.Start(new ProcessStartInfo
+            {
+                FileName = resolverCommand,
+                ArgumentList = { targetBinary },
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            });
+            if (proc is null) return null;
+            if (!proc.WaitForExit(WhichTimeout))
+            {
+                try { proc.Kill(entireProcessTree: true); } catch (Exception ex2) when (ex2 is InvalidOperationException or IOException or System.ComponentModel.Win32Exception) { }
+                return null;
+            }
+            if (proc.ExitCode == 0)
+            {
+                var path = proc.StandardOutput.ReadLine()?.Trim();
+                if (!string.IsNullOrEmpty(path)) return path;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException
+            or System.ComponentModel.Win32Exception)
+        { }
+        return null;
+    }
+
+    internal static string ResolveCliRefreshPathValue(string? inheritedPath)
+    {
+        if (!string.IsNullOrWhiteSpace(inheritedPath))
+            return inheritedPath;
+
+        return OperatingSystem.IsWindows()
+            ? @"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem"
+            : "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    }
+
+    internal static string ResolveCliRefreshWorkingDirectory()
+    {
+        var home = Environment.GetEnvironmentVariable("HOME");
+        if (!string.IsNullOrWhiteSpace(home) && Directory.Exists(home))
+            return home;
+
+        var temp = Path.GetTempPath();
+        return Directory.Exists(temp) ? temp : Path.DirectorySeparatorChar.ToString();
+    }
+
+    internal static void PopulateCliRefreshEnvironment(ProcessStartInfo psi)
+    {
+        psi.Environment.Clear();
+        foreach (var key in new[]
+                 {
+                     "HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME", "SHELL",
+                     "SystemRoot", "WINDIR", "ComSpec", "PATHEXT", "TEMP", "TMP",
+                     "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+                 })
+        {
+            var val = Environment.GetEnvironmentVariable(key);
+            if (val is not null) psi.Environment[key] = val;
+        }
+
+        psi.Environment["PATH"] = ResolveCliRefreshPathValue(
+            psi.Environment.TryGetValue("PATH", out var path) ? path : null);
+    }
+
+    internal static async Task<bool> ExecuteCliProcessAsync(
+        string cliPath,
+        IReadOnlyList<string> arguments,
+        TimeSpan timeout,
+        CancellationToken ct)
+    {
+        Process? proc = null;
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(timeout);
+            var psi = new ProcessStartInfo
+            {
+                FileName = cliPath,
+                WorkingDirectory = ResolveCliRefreshWorkingDirectory(),
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            foreach (var arg in arguments)
+            {
+                psi.ArgumentList.Add(arg);
+            }
+            PopulateCliRefreshEnvironment(psi);
+            proc = Process.Start(psi);
+            if (proc is null) return false;
+            var stdoutTask = proc.StandardOutput.ReadToEndAsync(cts.Token);
+            var stderrTask = proc.StandardError.ReadToEndAsync(cts.Token);
+            await proc.WaitForExitAsync(cts.Token).ConfigureAwait(false);
+            await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false);
+            return proc.ExitCode == 0;
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or IOException
+            or InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            try { proc?.Kill(entireProcessTree: true); } catch (Exception ex2) when (ex2 is InvalidOperationException or IOException or System.ComponentModel.Win32Exception) { }
+            return false;
+        }
+        finally
+        {
+            proc?.Dispose();
+        }
     }
 
     protected sealed record ParsedCreds(
@@ -485,86 +618,12 @@ public sealed class GeminiOauthCredentialFileRefresher
         return BuildCliRefreshDelegate(cliPath);
     }
 
+    private static readonly string[] GeminiCliRefreshArgs = ["-p", "."];
+
     private static Func<CancellationToken, Task<bool>> BuildCliRefreshDelegate(string cliPath)
     {
-        return async ct =>
-        {
-            Process? proc = null;
-            try
-            {
-                using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                cts.CancelAfter(GeminiCliRefreshTimeout);
-                var psi = new ProcessStartInfo
-                {
-                    FileName = cliPath,
-                    WorkingDirectory = ResolveCliRefreshWorkingDirectory(),
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                };
-                psi.ArgumentList.Add("-p");
-                psi.ArgumentList.Add(".");
-                PopulateCliRefreshEnvironment(psi);
-                proc = Process.Start(psi);
-                if (proc is null) return false;
-                var stdoutTask = proc.StandardOutput.ReadToEndAsync(cts.Token);
-                var stderrTask = proc.StandardError.ReadToEndAsync(cts.Token);
-                await proc.WaitForExitAsync(cts.Token).ConfigureAwait(false);
-                await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false);
-                return proc.ExitCode == 0;
-            }
-            catch (Exception ex) when (ex is OperationCanceledException or IOException
-                or InvalidOperationException or System.ComponentModel.Win32Exception)
-            {
-                try { proc?.Kill(entireProcessTree: true); } catch (Exception ex2) when (ex2 is InvalidOperationException or IOException or System.ComponentModel.Win32Exception) { }
-                return false;
-            }
-            finally
-            {
-                proc?.Dispose();
-            }
-        };
+        return ct => ExecuteCliProcessAsync(cliPath, GeminiCliRefreshArgs, GeminiCliRefreshTimeout, ct);
     }
-
-    internal static string ResolveCliRefreshPathValue(string? inheritedPath)
-    {
-        if (!string.IsNullOrWhiteSpace(inheritedPath))
-            return inheritedPath;
-
-        return OperatingSystem.IsWindows()
-            ? @"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem"
-            : "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-    }
-
-    private static string ResolveCliRefreshWorkingDirectory()
-    {
-        var home = Environment.GetEnvironmentVariable("HOME");
-        if (!string.IsNullOrWhiteSpace(home) && Directory.Exists(home))
-            return home;
-
-        var temp = Path.GetTempPath();
-        return Directory.Exists(temp) ? temp : Path.DirectorySeparatorChar.ToString();
-    }
-
-    private static void PopulateCliRefreshEnvironment(ProcessStartInfo psi)
-    {
-        psi.Environment.Clear();
-        foreach (var key in new[]
-                 {
-                     "HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME", "SHELL",
-                     "SystemRoot", "WINDIR", "ComSpec", "PATHEXT", "TEMP", "TMP",
-                 })
-        {
-            var val = Environment.GetEnvironmentVariable(key);
-            if (val is not null) psi.Environment[key] = val;
-        }
-
-        psi.Environment["PATH"] = ResolveCliRefreshPathValue(
-            psi.Environment.TryGetValue("PATH", out var path) ? path : null);
-    }
-
-    internal static readonly TimeSpan WhichTimeout = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// Resolves the absolute path to the host <c>gemini</c> binary using
@@ -574,37 +633,6 @@ public sealed class GeminiOauthCredentialFileRefresher
     internal static string? ResolveGeminiCliPath()
     {
         return ResolveExecutablePath(OperatingSystem.IsWindows() ? "where" : "which", "gemini");
-    }
-
-    /// <summary>Resolves an executable path using the platform-specific resolver command.</summary>
-    internal static string? ResolveExecutablePath(string resolverCommand, string targetBinary)
-    {
-        try
-        {
-            using var proc = Process.Start(new ProcessStartInfo
-            {
-                FileName = resolverCommand,
-                ArgumentList = { targetBinary },
-                RedirectStandardOutput = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            });
-            if (proc is null) return null;
-            if (!proc.WaitForExit(WhichTimeout))
-            {
-                try { proc.Kill(entireProcessTree: true); } catch (Exception ex2) when (ex2 is InvalidOperationException or IOException or System.ComponentModel.Win32Exception) { }
-                return null;
-            }
-            if (proc.ExitCode == 0)
-            {
-                var path = proc.StandardOutput.ReadLine()?.Trim();
-                if (!string.IsNullOrEmpty(path)) return path;
-            }
-        }
-        catch (Exception ex) when (ex is IOException or InvalidOperationException
-            or System.ComponentModel.Win32Exception)
-        { }
-        return null;
     }
 
     protected override string BuildPersistedJson(string existingRaw, RefreshResult result, DateTimeOffset newExpiresAt)
@@ -983,4 +1011,284 @@ public sealed class ClaudeOauthCredentialFileRefresher
         }
         return Encoding.UTF8.GetString(ms.ToArray());
     }
+}
+
+/// <summary>
+/// Refreshes Google Antigravity (<c>agy</c>) OAuth tokens.
+/// The host CLI (<c>agy</c>) refreshes its OAuth token using its embedded OAuth client
+/// and writes the resulting bundle to the system keyring (freedesktop Secret Service,
+/// item <c>service=gemini, username=antigravity</c>), but does NOT write back to disk.
+///
+/// <para>Refresh strategy:</para>
+/// <list type="number">
+///   <item>Invoke the host <c>agy</c> CLI via <c>agy --print '/usage'</c> so it self-refreshes.</item>
+///   <item>Read the refreshed token bundle from the Secret Service item <c>service=gemini, username=antigravity</c>.</item>
+///   <item>Persist it to disk at <c>Source.FilePath</c> (from <c>CodeyBox:Antigravity:OAuthTokenFile</c>) so the quota probe and in-VM dispatch pick it up.</item>
+/// </list>
+///
+/// <para>Degrades gracefully to returning the existing (stale) token rather than throwing if refresh fails.</para>
+/// </summary>
+public sealed class AntigravityOauthCredentialFileRefresher
+    : OauthCredentialFileRefresher, IAntigravityQuotaTokenSource
+{
+    /// <summary>Timeout for the agy CLI refresh sub-process.</summary>
+    internal static readonly TimeSpan AntigravityCliRefreshTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>Fallback token lifetime used when the keyring-refreshed bundle carries no expiry.</summary>
+    internal static readonly TimeSpan FallbackTokenLifetime = TimeSpan.FromHours(1);
+
+    private readonly Func<CancellationToken, Task<bool>>? _cliRunner;
+    private readonly Func<CancellationToken, Task<string?>> _keyringReader;
+
+    protected override bool RequiresRefreshToken => false;
+    protected override bool CanRefreshWithoutFile => true;
+
+    public AntigravityOauthCredentialFileRefresher(
+        AntigravityCredentialFileSource source,
+        IHttpClientFactory httpClientFactory,
+        ILogger<AntigravityOauthCredentialFileRefresher> log,
+        TimeProvider? timeProvider = null,
+        Func<CancellationToken, Task<bool>>? cliRunner = null,
+        Func<CancellationToken, Task<string?>>? keyringReader = null)
+        : base(source, httpClientFactory, timeProvider ?? TimeProvider.System, log)
+    {
+        _cliRunner = cliRunner;
+        _keyringReader = keyringReader ?? (c => SecretServiceClient.ReadSecretAsync("gemini", "antigravity", log: log, ct: c));
+    }
+
+    public async Task<string?> GetAccessTokenAsync(CancellationToken ct = default)
+    {
+        var token = await GetOrRefreshAsync(ct).ConfigureAwait(false);
+        if (!string.IsNullOrEmpty(token))
+            return token;
+
+        // Failure path: degrade to returning the existing (possibly expired) token rather than throwing.
+        var raw = Source.GetRaw();
+        if (!string.IsNullOrEmpty(raw))
+        {
+            try
+            {
+                var parsed = ParseCreds(raw);
+                if (!string.IsNullOrEmpty(parsed.AccessToken))
+                    return parsed.AccessToken;
+            }
+            catch (JsonException) { }
+        }
+
+        return null;
+    }
+
+    protected override ParsedCreds ParseCreds(string rawJson)
+    {
+        using var doc = JsonDocument.Parse(rawJson);
+        var root = doc.RootElement;
+        if (root.ValueKind != JsonValueKind.Object)
+            return new ParsedCreds(null, null, null, null, null, null);
+
+        // Native agy shape: {"auth_method":"consumer","token":{"access_token":...,"refresh_token":...,"token_type":"Bearer","expiry":"..."}}
+        if (root.TryGetProperty("token", out var tokenObj) && tokenObj.ValueKind == JsonValueKind.Object)
+        {
+            var access = TryString(tokenObj, "access_token");
+            var refresh = TryString(tokenObj, "refresh_token");
+            var expires = ExtractExpiry(tokenObj);
+            if (!string.IsNullOrEmpty(access))
+                return new ParsedCreds(access, refresh, expires, ClientId: null, ClientSecret: null, AccountId: null);
+        }
+
+        // Legacy flat shape: {"access_token":...,"refresh_token":...,"expiry_date":...}
+        {
+            var access = TryString(root, "access_token");
+            var refresh = TryString(root, "refresh_token");
+            var expires = ExtractExpiry(root);
+            return new ParsedCreds(access, refresh, expires, ClientId: null, ClientSecret: null, AccountId: null);
+        }
+    }
+
+    /// <summary>
+    /// Threshold to distinguish between Unix timestamps in seconds vs milliseconds.
+    /// Timestamps below 100 billion correspond to dates before Nov 5138 in seconds,
+    /// whereas in milliseconds they correspond to dates before Mar 1973.
+    /// </summary>
+    private const long UnixSecondsThreshold = 100_000_000_000L;
+
+    private static DateTimeOffset? ExtractExpiry(JsonElement element)
+    {
+        if (element.TryGetProperty("expiry", out var exp))
+        {
+            if (exp.ValueKind == JsonValueKind.String)
+            {
+                var str = exp.GetString();
+                if (!string.IsNullOrEmpty(str) && DateTimeOffset.TryParse(str, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.RoundtripKind, out var dto))
+                    return dto;
+            }
+            else if (exp.ValueKind == JsonValueKind.Number && exp.TryGetInt64(out var n))
+            {
+                return n < UnixSecondsThreshold
+                    ? DateTimeOffset.FromUnixTimeSeconds(n)
+                    : DateTimeOffset.FromUnixTimeMilliseconds(n);
+            }
+        }
+
+        if (element.TryGetProperty("expiry_date", out var expDate) && expDate.ValueKind == JsonValueKind.Number && expDate.TryGetInt64(out var ms))
+        {
+            return ms < UnixSecondsThreshold
+                ? DateTimeOffset.FromUnixTimeSeconds(ms)
+                : DateTimeOffset.FromUnixTimeMilliseconds(ms);
+        }
+
+        return null;
+    }
+
+    protected override async Task<RefreshResult> PerformRefreshAsync(ParsedCreds creds, CancellationToken ct)
+    {
+        if (_cliRunner is not null)
+        {
+            var cliOk = await _cliRunner(ct).ConfigureAwait(false);
+            if (!cliOk)
+                return new RefreshResult(null, null, TimeSpan.Zero);
+        }
+
+        string? secretJson;
+        try
+        {
+            secretJson = await _keyringReader(ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return new RefreshResult(null, null, TimeSpan.Zero);
+        }
+
+        if (string.IsNullOrEmpty(secretJson))
+            return new RefreshResult(null, null, TimeSpan.Zero);
+
+        ParsedCreds refreshed;
+        try
+        {
+            refreshed = ParseCreds(secretJson);
+        }
+        catch (JsonException)
+        {
+            return new RefreshResult(null, null, TimeSpan.Zero);
+        }
+
+        if (string.IsNullOrEmpty(refreshed.AccessToken))
+            return new RefreshResult(null, null, TimeSpan.Zero);
+
+        var expiresAt = refreshed.ExpiresAt ?? (TimeProvider.GetUtcNow() + FallbackTokenLifetime);
+        var expiresIn = expiresAt - TimeProvider.GetUtcNow();
+        if (expiresIn <= TimeSpan.Zero)
+            return new RefreshResult(null, null, TimeSpan.Zero);
+
+        return new RefreshResult(refreshed.AccessToken, refreshed.RefreshToken, expiresIn);
+    }
+
+    protected override string BuildPersistedJson(string existingRaw, RefreshResult result, DateTimeOffset newExpiresAt)
+    {
+        using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(existingRaw) ? "{}" : existingRaw);
+        using var ms = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(ms, new JsonWriterOptions { Indented = true }))
+        {
+            writer.WriteStartObject();
+            var sawToken = false;
+            var sawAuthMethod = false;
+
+            if (doc.RootElement.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var prop in doc.RootElement.EnumerateObject())
+                {
+                    if (prop.NameEquals("token") && prop.Value.ValueKind == JsonValueKind.Object)
+                    {
+                        sawToken = true;
+                        writer.WritePropertyName("token");
+                        writer.WriteStartObject();
+                        var sawAccess = false;
+                        var sawExpiry = false;
+                        var sawRefresh = false;
+
+                        foreach (var t in prop.Value.EnumerateObject())
+                        {
+                            if (t.NameEquals("access_token"))
+                            {
+                                writer.WriteString("access_token", result.AccessToken);
+                                sawAccess = true;
+                            }
+                            else if (t.NameEquals("refresh_token"))
+                            {
+                                sawRefresh = true;
+                                if (!string.IsNullOrEmpty(result.RefreshToken))
+                                    writer.WriteString("refresh_token", result.RefreshToken);
+                                else
+                                    t.WriteTo(writer);
+                            }
+                            else if (t.NameEquals("expiry"))
+                            {
+                                writer.WriteString("expiry", newExpiresAt.ToString("o"));
+                                sawExpiry = true;
+                            }
+                            else
+                            {
+                                t.WriteTo(writer);
+                            }
+                        }
+
+                        if (!sawAccess && result.AccessToken is not null)
+                            writer.WriteString("access_token", result.AccessToken);
+                        if (!sawRefresh && !string.IsNullOrEmpty(result.RefreshToken))
+                            writer.WriteString("refresh_token", result.RefreshToken);
+                        if (!sawExpiry)
+                            writer.WriteString("expiry", newExpiresAt.ToString("o"));
+
+                        writer.WriteEndObject();
+                    }
+                    else
+                    {
+                        if (prop.NameEquals("auth_method"))
+                            sawAuthMethod = true;
+                        prop.WriteTo(writer);
+                    }
+                }
+            }
+
+            if (!sawToken)
+            {
+                if (!sawAuthMethod)
+                    writer.WriteString("auth_method", "consumer");
+
+                writer.WritePropertyName("token");
+                writer.WriteStartObject();
+                writer.WriteString("access_token", result.AccessToken);
+                if (!string.IsNullOrEmpty(result.RefreshToken))
+                    writer.WriteString("refresh_token", result.RefreshToken);
+                writer.WriteString("token_type", "Bearer");
+                writer.WriteString("expiry", newExpiresAt.ToString("o"));
+                writer.WriteEndObject();
+            }
+
+            writer.WriteEndObject();
+        }
+        return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    internal static Func<CancellationToken, Task<bool>>? TryCreateCliRefreshHandler(
+        Func<string?>? resolvePath = null)
+    {
+        var cliPath = (resolvePath ?? ResolveAntigravityCliPath)();
+        if (cliPath is null) return null;
+        return BuildCliRefreshDelegate(cliPath);
+    }
+
+    internal static string? ResolveAntigravityCliPath()
+    {
+        return ResolveExecutablePath(OperatingSystem.IsWindows() ? "where" : "which", "agy");
+    }
+
+    private static readonly string[] AntigravityCliRefreshArgs = ["--print", "/usage"];
+
+    internal static Func<CancellationToken, Task<bool>> BuildCliRefreshDelegate(string cliPath)
+    {
+        return ct => ExecuteCliProcessAsync(cliPath, AntigravityCliRefreshArgs, AntigravityCliRefreshTimeout, ct);
+    }
+
+    private static string? TryString(JsonElement obj, string name)
+        => obj.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
 }

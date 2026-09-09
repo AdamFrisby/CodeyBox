@@ -92,6 +92,42 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
             UpdatedAt = updatedAt ?? _time.GetUtcNow().AddMinutes(-100),
         };
 
+    private WorkItem WithClaimedAgentTurnCheckpoint(WorkItem item)
+    {
+        var phase = item.State switch
+        {
+            WorkItemState.Working => AgentTurnResumePhase.Work,
+            WorkItemState.Reworking => AgentTurnResumePhase.Rework,
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(item),
+                item.State,
+                "Claimed agent-turn test checkpoints require Working or Reworking state."),
+        };
+        var checkpoint = new AgentTurnResumeCheckpoint(
+                AgentKind.Claude,
+                "claude/default",
+                modelId: null,
+                reasoningMode: null,
+                nativeSessionId: null,
+                item.State,
+                phase,
+                iteration: phase == AgentTurnResumePhase.Rework ? 1 : null,
+                item.PromptRevision,
+                _time.GetUtcNow().AddMinutes(-10))
+            .ClaimDispatch(Guid.Parse("77b7d18d-5969-4c03-9792-604c93a98ad2"));
+        var archive = new AgentTurnScratchpadArchive([0x1f, 0x8b, 0x08, 0x00]);
+        var checkpointRef = AgentTurnCheckpointRef.Create(
+            item.Id,
+            new string('a', 40),
+            archive);
+        return item with
+        {
+            PreemptedAt = _time.GetUtcNow().AddMinutes(-10),
+            PreemptCheckpoint = checkpointRef.Value,
+            AgentTurnResumeCheckpoint = checkpoint,
+        };
+    }
+
     // ── Acceptance (a): in-flight item with frozen updatedAt detected ────────
 
     [Fact]
@@ -290,6 +326,207 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
         Assert.Equal(advanced.UpdatedAt, after.UpdatedAt);
         Assert.Equal(0, after.RecoveryAttempts);
         Assert.Equal(0, _queue.Count);
+    }
+
+    [Fact]
+    public async Task RecoverItemAsync_ClaimedCheckpoint_WaitsForLocalPipelineToBecomeInactive()
+    {
+        var item = WithClaimedAgentTurnCheckpoint(MakeItem(
+            WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-100),
+            workBranch: "codeybox/claimed-local"));
+        await _store.CreateAsync(item);
+        await _registry.RegisterAsync(new WorkerRegistration
+        {
+            WorkerId = "claimed-local-worker",
+            HostName = "host",
+            ProcessId = 1001,
+            StartedAt = _time.GetUtcNow().AddMinutes(-100),
+            LastHeartbeatAt = _time.GetUtcNow(),
+            CurrentWorkItemId = item.Id.ToString(),
+        });
+
+        var registration = _cancellations.Register(item.Id);
+        var cancellationObserved = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cancellationObserver = registration.Token.Register(
+            () => cancellationObserved.TrySetResult());
+
+        var recoveryTask = _watchdog.RecoverItemAsync(
+            item,
+            "operator: fence claimed local pipeline",
+            CancellationToken.None);
+        await cancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var whilePipelineActive = await _store.GetAsync(item.Id);
+        Assert.Equal(
+            item.AgentTurnResumeCheckpoint?.DispatchClaimId,
+            whilePipelineActive?.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        Assert.Equal(0, whilePipelineActive?.RecoveryAttempts);
+        Assert.Equal(0, _queue.Count);
+        Assert.Empty(_slotReleaser.Releases);
+        Assert.Equal(CancellationRequestKind.Recovery, _cancellations.GetRequestKind(item.Id));
+
+        registration.Dispose();
+        var result = await recoveryTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(result.Recovered, result.Error);
+        var recovered = await _store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Working, recovered?.State);
+        Assert.Equal(item.PreemptCheckpoint, recovered?.PreemptCheckpoint);
+        Assert.NotNull(recovered?.AgentTurnResumeCheckpoint);
+        Assert.Null(recovered!.AgentTurnResumeCheckpoint!.DispatchClaimId);
+        Assert.Equal(1, recovered.AgentTurnResumeCheckpoint.AttemptCount);
+        Assert.Equal(1, recovered.RecoveryAttempts);
+        Assert.Equal(1, _queue.Count);
+        var release = Assert.Single(_slotReleaser.Releases);
+        Assert.Equal("claimed-local-worker", release.WorkerId);
+        Assert.Empty(await _registry.ListAsync());
+    }
+
+    [Fact]
+    public async Task RecoverItemAsync_ClaimedCheckpointWithoutLocalOwner_FailsClosed()
+    {
+        var item = WithClaimedAgentTurnCheckpoint(MakeItem(
+            WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-100),
+            workBranch: "codeybox/claimed-remote"));
+        await _store.CreateAsync(item);
+        await _registry.RegisterAsync(new WorkerRegistration
+        {
+            WorkerId = "claimed-remote-worker",
+            HostName = "remote-host",
+            ProcessId = 2002,
+            StartedAt = _time.GetUtcNow().AddMinutes(-100),
+            LastHeartbeatAt = _time.GetUtcNow(),
+            CurrentWorkItemId = item.Id.ToString(),
+        });
+
+        var result = await _watchdog.RecoverItemAsync(
+            item,
+            "operator: remote claimed checkpoint",
+            CancellationToken.None);
+
+        Assert.False(result.Recovered);
+        Assert.Contains("remote or unfenceable", result.Error, StringComparison.Ordinal);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(item.State, after?.State);
+        Assert.Equal(item.UpdatedAt, after?.UpdatedAt);
+        Assert.Equal(
+            item.AgentTurnResumeCheckpoint?.DispatchClaimId,
+            after?.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        Assert.Equal(0, after?.RecoveryAttempts);
+        Assert.Equal(0, _queue.Count);
+        Assert.Empty(_slotReleaser.Releases);
+        Assert.Single(await _registry.ListAsync());
+    }
+
+    [Fact]
+    public async Task RecoverItemAsync_ClaimedCheckpointWithoutCancellationRegistry_FailsClosed()
+    {
+        var item = WithClaimedAgentTurnCheckpoint(MakeItem(
+            WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-100),
+            workBranch: "codeybox/claimed-unfenceable"));
+        await _store.CreateAsync(item);
+        using var unfenceableWatchdog = new ItemStaleProgressWatchdog(
+            _store,
+            _queue,
+            _registry,
+            _opts,
+            NullLogger<ItemStaleProgressWatchdog>.Instance,
+            _webhooks,
+            _slotReleaser,
+            cancellations: null,
+            timeProvider: _time);
+
+        var result = await unfenceableWatchdog.RecoverItemAsync(
+            item,
+            "operator: no local fencing capability",
+            CancellationToken.None);
+
+        Assert.False(result.Recovered);
+        Assert.Contains("no local cancellation registry", result.Error, StringComparison.Ordinal);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(item.UpdatedAt, after?.UpdatedAt);
+        Assert.Equal(
+            item.AgentTurnResumeCheckpoint?.DispatchClaimId,
+            after?.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        Assert.Equal(0, _queue.Count);
+        Assert.Empty(_slotReleaser.Releases);
+    }
+
+    [Fact]
+    public async Task RecoverItemAsync_ClaimedCheckpointOwnerDoesNotQuiesce_FailsClosedAtBound()
+    {
+        _opts.PostAgentTransitionTimeout = TimeSpan.FromMilliseconds(50);
+        var item = WithClaimedAgentTurnCheckpoint(MakeItem(
+            WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-100),
+            workBranch: "codeybox/claimed-timeout"));
+        await _store.CreateAsync(item);
+        var registration = _cancellations.Register(item.Id);
+
+        var result = await _watchdog.RecoverItemAsync(
+                item,
+                "operator: claimed pipeline ignores cancellation",
+                CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.False(result.Recovered);
+        Assert.Contains("did not quiesce", result.Error, StringComparison.Ordinal);
+        Assert.True(registration.Token.IsCancellationRequested);
+        Assert.Equal(CancellationRequestKind.Recovery, _cancellations.GetRequestKind(item.Id));
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(item.UpdatedAt, after?.UpdatedAt);
+        Assert.Equal(
+            item.AgentTurnResumeCheckpoint?.DispatchClaimId,
+            after?.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        Assert.Equal(0, after?.RecoveryAttempts);
+        Assert.Equal(0, _queue.Count);
+        Assert.Empty(_slotReleaser.Releases);
+
+        registration.Dispose();
+    }
+
+    [Fact]
+    public async Task RecoverItemAsync_ClaimedCheckpointAdvancesWhileQuiescing_DoesNotOverwritePipeline()
+    {
+        var item = WithClaimedAgentTurnCheckpoint(MakeItem(
+            WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-100),
+            workBranch: "codeybox/claimed-advanced"));
+        await _store.CreateAsync(item);
+        var registration = _cancellations.Register(item.Id);
+        var cancellationObserved = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cancellationObserver = registration.Token.Register(
+            () => cancellationObserved.TrySetResult());
+
+        var recoveryTask = _watchdog.RecoverItemAsync(
+            item,
+            "operator: pipeline advances during quiescence",
+            CancellationToken.None);
+        await cancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var pipelineUpdate = item with
+        {
+            AgentTurnResumeCheckpoint = item.AgentTurnResumeCheckpoint!.ReleaseDispatchClaim(),
+            UpdatedAt = _time.GetUtcNow().AddSeconds(1),
+        };
+        await _store.UpdateAsync(pipelineUpdate);
+        registration.Dispose();
+
+        var result = await recoveryTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.False(result.Recovered);
+        Assert.Contains("advanced", result.Error, StringComparison.Ordinal);
+        var after = await _store.GetAsync(item.Id);
+        Assert.Equal(pipelineUpdate.UpdatedAt, after?.UpdatedAt);
+        Assert.Null(after?.AgentTurnResumeCheckpoint?.DispatchClaimId);
+        Assert.Equal(0, after?.RecoveryAttempts);
+        Assert.Equal(0, _queue.Count);
+        Assert.Empty(_slotReleaser.Releases);
     }
 
     [Fact]
@@ -606,6 +843,133 @@ public sealed class ItemStaleProgressWatchdogTests : IDisposable
 
         Assert.True(result.Recovered);
         Assert.Equal(WorkItemState.NeedsOperatorInput, result.NewState);
+    }
+
+    // ── Per-agent ItemStaleTimeout overrides (crock batch-latency liveness) ──
+
+    [Fact]
+    public async Task PerAgentItemStaleOverride_SavesCrockItemFromGlobalCutoff()
+    {
+        // Headline acceptance criterion for crock runtime-enablement on this
+        // watchdog: a crock work item legitimately parked waiting on an
+        // Anthropic Message Batches API task (minutes-to-hours) must NOT be
+        // recovered by the synchronous-agent default ItemStaleTimeout. The
+        // per-agent override under
+        // CodeyBox:WorkerProgressWatchdog:PerAgent:crock:ItemStaleTimeout
+        // extends the per-item stale window for crock items only.
+        _opts.ItemStaleTimeout = TimeSpan.FromMinutes(75);
+        _opts.PerAgent["crock"] = new AgentWatchdogOverride
+        {
+            ItemStaleTimeout = TimeSpan.FromHours(8),
+        };
+
+        // Stale 100 minutes — well past the 75-min global default but inside
+        // the 8h crock override. The watchdog must leave it alone.
+        var crockItem = MakeItem(WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-100)) with
+        { Agent = AgentKind.Crock };
+        await _store.CreateAsync(crockItem);
+
+        await _watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(crockItem.Id);
+        Assert.Equal(WorkItemState.Working, after!.State);
+        Assert.Equal(0, after.RecoveryAttempts);
+        Assert.Equal(0, _queue.Count);
+        Assert.Empty(_webhooks.Events);
+    }
+
+    [Fact]
+    public async Task PerAgentItemStaleOverride_StillRecoversCrockItemPastOverrideCeiling()
+    {
+        // Defence-in-depth: the per-agent override extends but does not
+        // disable the watchdog. A crock item stale past the override window
+        // still gets recovered — operators sized the override to the
+        // realistic batch latency, not to "never kill crock".
+        _opts.ItemStaleTimeout = TimeSpan.FromMinutes(75);
+        _opts.PerAgent["crock"] = new AgentWatchdogOverride
+        {
+            ItemStaleTimeout = TimeSpan.FromHours(2),
+        };
+
+        var crockItem = MakeItem(WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddHours(-3),
+            workBranch: "codeybox/auto/work-crock-stuck") with
+        { Agent = AgentKind.Crock };
+        await _store.CreateAsync(crockItem);
+
+        await _watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(crockItem.Id);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Equal(1, after.RecoveryAttempts);
+    }
+
+    [Fact]
+    public async Task PerAgentItemStaleOverride_DoesNotApplyToOtherAgents()
+    {
+        // The override is scoped to the configured kind. A Claude (or any
+        // non-crock) item stale past the global default still gets recovered
+        // even though a crock override is configured — defending against a
+        // bug where an override entry silently widens the window for every
+        // kind.
+        _opts.ItemStaleTimeout = TimeSpan.FromMinutes(75);
+        _opts.PerAgent["crock"] = new AgentWatchdogOverride
+        {
+            ItemStaleTimeout = TimeSpan.FromHours(8),
+        };
+
+        var claudeItem = MakeItem(WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-100),
+            workBranch: "codeybox/auto/work-claude-stuck") with
+        { Agent = AgentKind.Claude };
+        await _store.CreateAsync(claudeItem);
+
+        await _watchdog.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(claudeItem.Id);
+        Assert.Equal(WorkItemState.Queued, after!.State);
+        Assert.Equal(1, after.RecoveryAttempts);
+    }
+
+    [Fact]
+    public async Task GlobalItemStaleTimeoutZero_PerAgentOverrideStillFires()
+    {
+        // Off-by-default + per-agent opt-in: the global ItemStaleTimeout=0
+        // would normally short-circuit the sweep entirely (see
+        // Sweep_DisabledByZeroTimeout above). The per-agent override is the
+        // explicit opt-in for the kind, so the sweep must still execute when
+        // one is configured.
+        _opts.ItemStaleTimeout = TimeSpan.Zero;
+        _opts.PerAgent["crock"] = new AgentWatchdogOverride
+        {
+            ItemStaleTimeout = TimeSpan.FromHours(2),
+        };
+
+        // Crock item stale past the override → should be recovered.
+        var crockItem = MakeItem(WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddHours(-3),
+            workBranch: "codeybox/auto/work-crock-zero-global") with
+        { Agent = AgentKind.Crock };
+        await _store.CreateAsync(crockItem);
+
+        // A non-crock item past the (zero, ergo disabled) global timeout
+        // must NOT be touched — defending against the override accidentally
+        // re-enabling the sweep for every kind.
+        var claudeItem = MakeItem(WorkItemState.Working,
+            updatedAt: _time.GetUtcNow().AddMinutes(-200)) with
+        { Agent = AgentKind.Claude };
+        await _store.CreateAsync(claudeItem);
+
+        await _watchdog.RunOnceAsync(CancellationToken.None);
+
+        var afterCrock = await _store.GetAsync(crockItem.Id);
+        Assert.Equal(WorkItemState.Queued, afterCrock!.State);
+        Assert.Equal(1, afterCrock.RecoveryAttempts);
+
+        var afterClaude = await _store.GetAsync(claudeItem.Id);
+        Assert.Equal(WorkItemState.Working, afterClaude!.State);
+        Assert.Equal(0, afterClaude.RecoveryAttempts);
     }
 
     // ── Test doubles ────────────────────────────────────────────────────────
