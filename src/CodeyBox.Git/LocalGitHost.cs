@@ -691,6 +691,8 @@ public sealed class LocalGitHost : IGitHost
 
     public string GetRepoPath(string repositoryId) => Path.Combine(_opts.RootDirectory, repositoryId + ".git");
 
+    public string RepositoriesRootDirectory => _opts.RootDirectory;
+
     public void PrepareRepositoryForHostGitOperations(string repositoryId)
     {
         var path = GetRepoPath(repositoryId);

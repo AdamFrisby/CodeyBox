@@ -1509,6 +1509,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             "/bin/bash",
             [launchScript],
             environmentOverrides: MergeEnvironment(poisonedEnvironment, FakeSudoPathEnvironment()));
+        await WaitForFileAsync(doneFile, DetachedLaunchWatchdog);
         await WaitForProcessGroupGoneAsync(processGroupMarker, DetachedLaunchWatchdog);
         // The launcher exits as soon as the supervisor publishes its marker and
         // process-group absence is only an indirect liveness signal: the
@@ -1522,6 +1523,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal(0, exit);
         Assert.Equal("", stdout);
         Assert.Equal("", stderr);
+        Assert.True(File.Exists(doneFile));
         Assert.Equal("", await File.ReadAllTextAsync(visibleEnvironmentFile));
         Assert.Equal("poison-agent-run-id", await File.ReadAllTextAsync(visibleRunIdFile));
         Assert.Equal("done", await File.ReadAllTextAsync(doneFile));
@@ -6626,7 +6628,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                 ["-c", """
                     codeybox_pgid=$1
                     if [ -d /proc ]; then
-                        awk -v pgid="$codeybox_pgid" '
+                        cat /proc/[0-9]*/stat 2>/dev/null | awk -v pgid="$codeybox_pgid" '
                             {
                                 line = $0
                                 sub(/^[^)]*\) /, "", line)
@@ -6634,7 +6636,7 @@ public sealed class MultipassSandboxProviderTests : IDisposable
                                 if (fields[3] == pgid && fields[1] != "Z") found = 1
                             }
                             END { exit found ? 0 : 1 }
-                        ' /proc/[0-9]*/stat 2>/dev/null
+                        '
                         exit $?
                     fi
                     kill -0 "-$codeybox_pgid" 2>/dev/null
