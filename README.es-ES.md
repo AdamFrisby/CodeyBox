@@ -89,9 +89,9 @@ Ajusta la concurrencia, clases de agentes, auditores, límites de iteración y p
   → [`docs/agent-classes.md`](docs/agent-classes.md)
 - **Aislamiento en VM con egreso impuesto por el host.** Cada agente se ejecuta en una microVM nueva con credenciales de privilegio mínimo; la política de red reside en el host como perfiles nftables que un invitado no puede vaciar.
   → [`docs/host-firewall.md`](docs/host-firewall.md)
-- **Puertas de calidad que apilas.** Compón exactamente qué auditores deben pasar antes de una fusión: verificaciones de herramientas (formato/construcción/pruebas, gitleaks, semgrep) y revisiones LLM (seguridad, arquitectura, calidad, completitud, anti-engaño) y nada se aplica hasta que pase todas. → [Puertas de calidad bajo tu control](#quality-gates-you-control)
+- **Puertas de calidad que apilas.** Compón exactamente qué auditores deben pasar antes de una fusión: verificaciones de herramientas (formato/construcción/pruebas, gitleaks, semgrep) y revisiones LLM (seguridad, arquitectura, calidad, completitud, anti-engaño) y nada se aplica hasta que pase todas. → [Puertas de calidad bajo tu control](#puertas-de-calidad-bajo-tu-control)
 - **Rastreo de costos por elemento.** El gasto de tokens de cada elemento de trabajo se rastrea por fase y agente, para que sepas cuánto costó realmente ejecutar cada corrección de error o característica.
-  → [Conoce el costo de cada cambio](#know-what-every-change-costs)
+  → [Conoce el costo de cada cambio](#conoce-el-costo-de-cada-cambio)
 - **Resolución de conflictos por agentes.** El agente resuelve conflictos de fusión dentro de su propio entorno aislado a través de su CLI normal, y luego un control de ámbito determinista en el host verifica el resultado antes de aceptar el push.
 - **Gobernanza de cuotas.** Precios por agente/modelo, presupuestos, alertas y una puerta de cuota consciente del ritmo de consumo que enruta alrededor de los proveedores agotados.
   → [`docs/quota-gate.md`](docs/quota-gate.md)
@@ -218,7 +218,7 @@ El árbol [`docs/`](docs/README.md) es la referencia completa. Buenos puntos de 
 
 CodeyBox se construye a sí mismo, por lo que su hoja de ruta *es* su propia cola de trabajo. Los hilos más grandes que actualmente se mueven a través de la tubería: una lista viva, no una promesa:
 
-- **Fase de planificación** — un flujo opcional de plan primero (redactar un plan, revisarlo e implementarlo en su contra) se está implementando incrementalmente: la fase y el artefacto de plan almacenado están listos, con un panel de revisores de planes y verificación de adherencia al plan a continuación. → [Cómo funciona](#how-it-works)
+- **Fase de planificación** — un flujo opcional de plan primero (redactar un plan, revisarlo e implementarlo en su contra) se está implementando incrementalmente: la fase y el artefacto de plan almacenado están listos, con un panel de revisores de planes y verificación de adherencia al plan a continuación. → [Cómo funciona](#cómo-funciona)
 - **Ejecutar solo las pruebas que un cambio puede afectar** — selección sólida de pruebas de regresión (grafo de ensamblaje y luego basada en cobertura) que poda la suite para la auditoría por elemento mientras siempre ejecuta todo en la fusión, convirtiendo una ejecución completa de pruebas en segundos para cambios típicos.
 - **Puertas de calidad más fuertes y deterministas** — una puerta de cobertura con ámbito de diff, detección de fallos intermitentes que vuelve a ejecutar y *atribuye* fallos fuera del diff en lugar de culpar al cambio, y escaneo de secretos + SAST cableados en cada auditoría.
 - **Escalar entre máquinas** — pools de entornos aislados remotos y multi-host con colocación de VM consciente de capacidad, más backends de entornos aislados (p. ej., microVMs Firecracker).
