@@ -373,6 +373,25 @@ public sealed class AgentAvailabilityRegistry : IAgentAvailabilityRegistry, ISmo
     }
 
     /// <summary>
+    /// Removes a previously recorded no-changes outcome for
+    /// <paramref name="itemId"/> without touching exclusions or other items —
+    /// the pass was a correct no-op (zero blocking findings), not a silent
+    /// failure. Returns true when an outcome was removed.
+    /// </summary>
+    public bool RefundNoChangesOutcome(AgentKind kind, WorkItemId itemId)
+    {
+        if (!_entries.TryGetValue(kind, out var entry)) return false;
+        lock (entry.Sync)
+        {
+            if (!entry.NoChangesItems.Remove(itemId)) return false;
+            entry.ConsecutiveNoChanges = entry.NoChangesItems.Count;
+            if (entry.NoChangesItems.Count == 0)
+                entry.LastNoChangesAt = null;
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Benches <paramref name="kind"/> because it is named in an
     /// <c>AgentClass</c> but has no registered in-VM smoke probe, so its
     /// in-sandbox CLI can never be verified. Called once at startup by the
