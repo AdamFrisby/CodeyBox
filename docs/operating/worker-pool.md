@@ -411,8 +411,17 @@ Returns a JSON snapshot of the pool:
   "maxConcurrent": 4,
   "currentlyRunning": 2,
   "queuedCount": 3,
-  "lastSpawnAt": "2026-04-30T12:34:56.789+00:00"
+  "lastSpawnAt": "2026-04-30T12:34:56.789+00:00",
+  "occupiedSlots": [
+    {
+      "workerIndex": 7,
+      "workItemId": "fdc4158c-...",
+      "registryWorkerId": null,
+      "acquiredAt": "2026-04-30T12:34:50.123+00:00"
+    }
+  ]
 }
 ```
 
 `lastSpawnAt` is `null` if no worker has been spawned since startup.
+`occupiedSlots` lists every slot the pool currently believes is occupied (worker index, work item id, registry worker id once registered, acquisition time); empty when no slots are held.

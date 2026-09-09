@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Collections.Frozen;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -678,11 +679,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         var snapshot = new List<WorkerSlotOccupancy>(_liveWorkerSlots.Count);
         foreach (var lease in _liveWorkerSlots.Keys)
         {
-            snapshot.Add(new WorkerSlotOccupancy(
-                lease.WorkerIndex,
-                lease.WorkItemId.ToString(),
-                lease.RegistryWorkerId,
-                lease.AcquiredAt));
+            snapshot.Add(ToOccupancy(lease));
         }
         snapshot.Sort(static (a, b) => a.WorkerIndex.CompareTo(b.WorkerIndex));
         return snapshot;
@@ -918,6 +915,27 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         return !IsStillWorkerOwnedAfterRecoveryRelease(item);
     }
 
+    /// <summary>
+    /// Work-item states that prove a worker is genuinely executing: the item
+    /// left the pickup states and entered a phase the pipeline owns. A pool
+    /// that reports itself at capacity while no item is in one of these states
+    /// and no sandbox exists holds phantom slots (incident 2026-09-07).
+    /// The worker holds its slot lease across the whole pipeline run
+    /// (released only in the worker-task finally), so this must cover every
+    /// mid-run phase including upstream push and conflict rework.
+    /// Single source of truth for the worker-owned policy; shared by the
+    /// recovery-release check and orphan reconciliation below.
+    /// </summary>
+    internal static readonly FrozenSet<WorkItemState> WorkerOwnedRunningStates =
+        FrozenSet.ToFrozenSet([
+            WorkItemState.Working,
+            WorkItemState.Merging,
+            WorkItemState.Auditing,
+            WorkItemState.Reworking,
+            WorkItemState.UpstreamPushing,
+            WorkItemState.ReworkingForConflict,
+        ]);
+
     private static bool IsStillWorkerOwnedAfterRecoveryRelease(WorkItem item)
     {
         if (item.State is WorkItemState.Working or WorkItemState.Reworking
@@ -925,12 +943,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             && item.StartedAt is null)
             return false;
 
-        return item.State is WorkItemState.Working
-            or WorkItemState.Auditing
-            or WorkItemState.Reworking
-            or WorkItemState.Merging
-            or WorkItemState.UpstreamPushing
-            or WorkItemState.ReworkingForConflict;
+        return WorkerOwnedRunningStates.Contains(item.State);
     }
 
     private void AttachRegistryWorkerId(WorkerSlotLease lease, string workerId)
@@ -943,20 +956,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             _workerSlotsByRegistryId.TryRemove(workerId, out _);
     }
 
-    /// <summary>
-    /// Work-item states that prove a worker is genuinely executing: the item
-    /// left the pickup states and entered a phase the pipeline owns. A pool
-    /// that reports itself at capacity while no item is in one of these states
-    /// and no sandbox exists holds phantom slots (incident 2026-09-07).
-    /// </summary>
-    internal static readonly IReadOnlySet<WorkItemState> WorkerOwnedRunningStates =
-        new HashSet<WorkItemState>
-        {
-            WorkItemState.Working,
-            WorkItemState.Merging,
-            WorkItemState.Auditing,
-            WorkItemState.Reworking,
-        };
+    private static WorkerSlotOccupancy ToOccupancy(WorkerSlotLease lease) =>
+        new(lease.WorkerIndex, lease.WorkItemId.ToString(), lease.RegistryWorkerId, lease.AcquiredAt);
 
     /// <summary>
     /// Reconciles worker-pool slots against durable reality. When the pool
@@ -1018,11 +1019,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             if (!ReleaseWorkerSlotLease(lease))
                 continue;
 
-            reclaimed.Add(new WorkerSlotOccupancy(
-                lease.WorkerIndex,
-                lease.WorkItemId.ToString(),
-                lease.RegistryWorkerId,
-                lease.AcquiredAt));
+            reclaimed.Add(ToOccupancy(lease));
             _log.LogWarning(
                 "Worker pool: reclaimed orphaned slot of worker {WorkerIndex} for work item {WorkItemId} ({Reason}; slot age {SlotAge}) with no running item and no live sandbox while pool reported at capacity",
                 lease.WorkerIndex,
@@ -1557,6 +1554,8 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                     break;
                 }
                 _workerTasks[slotLease] = task;
+                if (slotLease.IsReleased)
+                    _workerTasks.TryRemove(slotLease, out _);
 
                 inFlight.Add(task);
                 // Prune completed tasks on every iteration to prevent unbounded growth.
