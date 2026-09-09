@@ -4930,7 +4930,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         int? iteration = null,
         IReadOnlyList<IAuditor>? auditorsForPreemptiveSelfReview = null,
         ReworkNoDiffHandling reworkNoDiffHandling = ReworkNoDiffHandling.TerminalError,
-        string? resumePreTurnCommitSha = null)
+        string? resumePreTurnCommitSha = null,
+        bool suppressNoChangesBreaker = false)
     {
         item = await RefreshAgentTurnResumeCheckpointAsync(item, isInitial, iteration, ct);
         var resumingGitCheckpoint = !string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
@@ -5967,8 +5968,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 // cannot see — auth collapse, capability collapse, or a failure
                 // mode whose signature isn't recognised yet. After N consecutive
                 // DISTINCT work items the agent is excluded; the same item
-                // retried doesn't advance the counter.
-                await RecordNoChangesOutcomeAsync(runner.Kind, item, project);
+                // retried doesn't advance the counter. Suppressed for rework
+                // passes that had zero blocking findings: with nothing to fix,
+                // an empty diff is the correct outcome, not a silent failure.
+                if (!suppressNoChangesBreaker)
+                    await RecordNoChangesOutcomeAsync(runner.Kind, item, project);
 
                 if (isInitial)
                 {
@@ -10960,7 +10964,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             var parked = await RunAuditReworkAsync(
                 item, project, runner, repoId, baseBranch, workBranch,
                 findings, iteration, reworkIterationNumber, maxIterations,
-                auditHistory, ct, hostShutdownToken);
+                auditHistory, ct, hostShutdownToken,
+                auditHasBlockingFindings: blocking.Count > 0);
             if (parked) return true;
         }
         return false;
@@ -11113,7 +11118,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         return await RunAuditReworkAsync(
             item, project, runner, repoId, baseBranch, workBranch,
             findings, last.Iteration, startIteration, maxIterations,
-            auditHistory, ct, hostShutdownToken);
+            auditHistory, ct, hostShutdownToken,
+            auditHasBlockingFindings: last.BlockingFindings > 0);
     }
 
     private async Task<bool> HasCompletedAuditReworkAsync(
@@ -11174,7 +11180,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
         int maxIterations,
         IReadOnlyList<AuditProgressSnapshot> auditHistory,
         CancellationToken ct,
-        CancellationToken hostShutdownToken)
+        CancellationToken hostShutdownToken,
+        bool auditHasBlockingFindings = true)
     {
         // Audit-driven rework is the primary rework path; open a phase.rework
         // span and record codeybox.phase.duration_ms{phase=rework} so rework
@@ -11223,7 +11230,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             // the loop's purpose of converging on a fix within the audit budget.
                             buildFailurePolicy: RequiredBuildPolicy.DeferToAuditLoop,
                             iteration: reworkIterationNumber,
-                            reworkNoDiffHandling: ReworkNoDiffHandling.AuditEmptyRework),
+                            reworkNoDiffHandling: ReworkNoDiffHandling.AuditEmptyRework,
+                            // With zero blocking findings there is nothing for
+                            // the agent to change, so an empty diff is the
+                            // correct outcome — not a silent-failure signal for
+                            // the no-changes circuit breaker.
+                            suppressNoChangesBreaker: !auditHasBlockingFindings),
                         workToken: attemptCt),
                 ct,
                 phaseCancellation: reworkPhase,
@@ -11334,6 +11346,13 @@ public sealed partial class PipelineRunner : IPipelineRunner
         if (auditHistory.Count == 0)
             throw new InvalidOperationException("Empty rework handling requires at least one audit progress snapshot.");
 
+        // With zero blocking findings there was nothing for the agent to
+        // change, so the empty pass is a correct no-op — not a silent-failure
+        // signal. Refund the no-changes outcome the dispatch recorded so this
+        // pass does not count toward the no-changes circuit breaker.
+        if (auditHistory[^1].BlockingFindings == 0)
+            _availability?.RefundNoChangesOutcome(emptyEx.Agent, item.Id);
+
         var converging = HasAuditConvergenceProgress(auditHistory);
         var configuredRetries = Math.Max(0, _pipelineTuning.Current.EmptyReworkEscalationRetries);
         var attempts = converging ? configuredRetries : 0;
@@ -11404,7 +11423,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             AuditLog.AuditFailed(last.Iteration, remaining.Count);
             throw new AuditFailedException(
                 $"Rework agent produced no changes after final audit iteration budget ({auditIteration}/{maxIterations}) with no convergence progress. " +
-                $"{remaining.Count} blocking finding(s): {remaining.Summary}");
+                $"{remaining.Count} blocking finding(s) ({last.NonBlockingFindings} non-blocking advisory finding(s) also recorded)" +
+                (remaining.Count == 0 ? "." : $": {remaining.Summary}"));
         }
 
         CodeyBoxMeters.ReworkEmptyEvents.Add(1,
@@ -11584,14 +11604,28 @@ public sealed partial class PipelineRunner : IPipelineRunner
     private static bool HasAuditConvergenceProgress(IReadOnlyList<AuditProgressSnapshot> history)
         => BuildAuditProgressSignals(history).Count > 0;
 
-    private static bool AuditProgressRequiresRework(AuditProgressSnapshot progress)
-        => progress.BlockingFindings > 0
-           || (!progress.IsComplete && progress.Findings.Count > 0);
+    internal static bool AuditProgressRequiresRework(AuditProgressSnapshot progress)
+        // A rework iteration only makes sense when something is blocking the
+        // merge. Zero-blocking snapshots (pass verdicts, or partial in-progress
+        // snapshots holding advisory findings only) must not dispatch rework:
+        // there are no changes for the agent to make, so the pass would come
+        // back empty and wedge the item in an empty-rework park loop. Final
+        // incomplete verdicts that need attention already promote their
+        // findings to blocking at record time, so they still carry
+        // BlockingFindings > 0 here.
+        => progress.BlockingFindings > 0;
 
-    private static IReadOnlyList<AuditProgressFinding> BlockingProgressFindingsForSummary(AuditProgressSnapshot progress)
+    internal static IReadOnlyList<AuditProgressFinding> BlockingProgressFindingsForSummary(AuditProgressSnapshot progress)
+        // BlockingFindingsDetails is the source of truth for what blocks the
+        // merge. Fall back to the full findings list only for legacy rows that
+        // recorded a positive blocking count without details — never when the
+        // blocking count is zero, otherwise advisory findings would be
+        // misreported as blocking.
         => progress.BlockingFindingsDetails.Count > 0
             ? progress.BlockingFindingsDetails
-            : progress.Findings;
+            : progress.BlockingFindings > 0
+                ? progress.Findings
+                : [];
 
     private async Task<IReadOnlyList<AuditProgressSnapshot>> LoadPersistedAuditProgressHistoryAsync(
         WorkItem item,
@@ -11977,7 +12011,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
             ? value
             : value[..AuditEscalationFindingDescriptionLimit] + "...";
 
-    private static string BuildAuditMaxIterationEscalationMessage(
+    internal static string BuildAuditMaxIterationEscalationMessage(
         IReadOnlyList<AuditProgressSnapshot> history)
     {
         var last = history[^1];
@@ -11985,10 +12019,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
         return
             $"Audit reached max iteration budget ({last.Iteration}/{last.MaxIterations}) with progress still visible; parked for operator review instead of hard-failing and discarding accumulated work. " +
-            $"{remaining.Count} blocking finding(s) remain: {remaining.Summary}";
+            $"{remaining.Count} blocking finding(s) remain ({last.NonBlockingFindings} non-blocking advisory finding(s) also recorded)" +
+            (remaining.Count == 0 ? "." : $": {remaining.Summary}");
     }
 
-    private static string BuildEmptyReworkEscalationMessage(
+    internal static string BuildEmptyReworkEscalationMessage(
         IReadOnlyList<AuditProgressSnapshot> history,
         AgentKind agent,
         int reworkIterationNumber,
@@ -12007,10 +12042,11 @@ public sealed partial class PipelineRunner : IPipelineRunner
         return
             $"Rework agent {agent.Value} produced no changes on rework iteration {reworkIterationNumber} {retrySummary}; " +
             $"{progressSummary}. Parked for operator review instead of hard-failing on a blank in-budget rework pass. " +
-            $"{remaining.Count} blocking finding(s) remain after audit iteration {last.Iteration}/{last.MaxIterations}: {remaining.Summary}";
+            $"{remaining.Count} blocking finding(s) remain after audit iteration {last.Iteration}/{last.MaxIterations} ({last.NonBlockingFindings} non-blocking advisory finding(s) also recorded)" +
+            (remaining.Count == 0 ? "." : $": {remaining.Summary}");
     }
 
-    private static (int Count, string Summary) BuildBlockingFindingSummary(
+    internal static (int Count, string Summary) BuildBlockingFindingSummary(
         AuditProgressSnapshot snapshot)
     {
         var remaining = BlockingProgressFindingsForSummary(snapshot);
