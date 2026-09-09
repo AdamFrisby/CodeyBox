@@ -87,26 +87,37 @@ public sealed record DiskGuardSample(string Path, long? FreeBytes, long Threshol
 /// monitored mounts dropped below the threshold. The orchestrator catches
 /// this, schedules a deferred re-pickup, and fires a <c>disk.deferred</c>
 /// webhook — same semantics as a budget cap.
+///
+/// <para>Derives from <see cref="SandboxProvisioningDeferredException"/> so
+/// every <c>catch</c> that honours a provisioning deferral honours a disk
+/// deferral too; a future call site cannot silently reacquire the bug where
+/// the disk deferral fell into a terminal-failure arm. The disk-specific
+/// <c>catch</c> in the orchestrator stays first so the <c>disk.deferred</c>
+/// webhook (not the provisioning one) still fires.</para>
 /// </summary>
-public sealed class SandboxDiskDeferredException : Exception
+public sealed class SandboxDiskDeferredException : SandboxProvisioningDeferredException
 {
     public SandboxDiskDeferredException(
         string mountPath,
         long freeBytes,
         long thresholdBytes,
         TimeSpan recheckIn)
-        : base(BuildMessage(mountPath, freeBytes, thresholdBytes))
+        : base(
+            BuildMessage(mountPath, freeBytes, thresholdBytes),
+            provider: "disk-guard",
+            operation: "create",
+            errorClass: "disk-space",
+            detail: $"only {freeBytes:N0} bytes free on '{mountPath}' (threshold {thresholdBytes:N0})",
+            recheckIn: recheckIn)
     {
         MountPath = mountPath;
         FreeBytes = freeBytes;
         ThresholdBytes = thresholdBytes;
-        RecheckIn = recheckIn;
     }
 
     public string MountPath { get; }
     public long FreeBytes { get; }
     public long ThresholdBytes { get; }
-    public TimeSpan RecheckIn { get; }
 
     private static string BuildMessage(string mount, long free, long threshold) =>
         $"disk preflight: only {free:N0} bytes free on '{mount}' (threshold {threshold:N0})";
