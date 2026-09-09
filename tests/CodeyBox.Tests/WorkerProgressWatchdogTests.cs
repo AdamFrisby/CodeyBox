@@ -719,6 +719,12 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         using var process = StartIdleProcess(itemId);
         try
         {
+            // A freshly forked `sleep` briefly runs (R state) before it parks in
+            // the nanosleep syscall. Observing during that window would report an
+            // active process, so wait for it to settle into a sleeping state
+            // before asserting the watchdog sees no CPU progress.
+            WaitUntilProcessSleeping(process);
+
             var source = new DefaultWorkerProgressActivitySource();
             var probe = new WorkerProgressActivityProbe(
                 ProcessCpuProgressSignalEnabled: true,
@@ -820,6 +826,12 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         using var process = StartIdleProcess(item.Id);
         try
         {
+            // See DefaultActivitySource_IdleWorkItemProcess_DoesNotReportCpuDelta:
+            // wait out the brief post-fork R state so the watchdog observes a
+            // genuinely idle process and recovers it rather than reading a
+            // transient active-process progress signal.
+            WaitUntilProcessSleeping(process);
+
             var idleOpts = new WorkerProgressWatchdogOptions
             {
                 ProgressTimeout = TimeSpan.FromMilliseconds(20),
@@ -2108,6 +2120,41 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         psi.Environment[SandboxConventions.WorkItemIdEnvironmentVariable] = itemId.ToString();
         return DiagProcess.Start(psi)
             ?? throw new InvalidOperationException("failed to start idle test process");
+    }
+
+    // Poll until the process leaves the running (R) state, i.e. it has parked in
+    // a blocking syscall. Bounded so a genuinely wedged process fails the caller's
+    // assertion instead of hanging the test; returns early once the process exits.
+    private static void WaitUntilProcessSleeping(DiagProcess process)
+    {
+        var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(2);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (process.HasExited)
+                return;
+            if (TryReadProcessState(process.Id, out var state) && state != 'R')
+                return;
+            Thread.Sleep(10);
+        }
+    }
+
+    private static bool TryReadProcessState(int pid, out char state)
+    {
+        state = '\0';
+        string stat;
+        try { stat = File.ReadAllText($"/proc/{pid}/stat"); }
+        catch { return false; }
+
+        // Skip past the (possibly parenthesised, space-containing) comm field; the
+        // process state is the first token after the closing ')'.
+        var close = stat.LastIndexOf(')');
+        if (close < 0)
+            return false;
+        var rest = stat[(close + 1)..].TrimStart();
+        if (rest.Length == 0)
+            return false;
+        state = rest[0];
+        return true;
     }
 
     private static void StopProcess(DiagProcess process)

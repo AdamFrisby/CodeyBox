@@ -41,6 +41,23 @@ public sealed class IncusCommandBuilderTests
     }
 
     [Fact]
+    public void BuildInit_CanDisableSecureBootForIncompatibleHostFirmware()
+    {
+        var argv = IncusCommandBuilder.BuildInit(
+            Options with { SecureBoot = false },
+            "images:ubuntu/24.04/cloud",
+            "codeybox-test",
+            new SandboxResourceLimits
+            {
+                CpuCount = 4,
+                MemoryBytes = 8L * 1024 * 1024 * 1024,
+                DiskBytes = 24L * 1024 * 1024 * 1024,
+            });
+
+        Assert.Contains("security.secureboot=false", argv);
+    }
+
+    [Fact]
     public void BuildCopy_ConstructsPoolLocalCowCopy()
     {
         var argv = IncusCommandBuilder.BuildCopy(

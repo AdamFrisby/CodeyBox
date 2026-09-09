@@ -11,7 +11,7 @@ namespace CodeyBox.Admin.Tests;
 /// Uses bunit for Blazor component rendering; relies on bunit's built-in
 /// NavigationManager and JSRuntime fakes.
 /// </summary>
-public sealed class NewWorkItemFormTests : TestContext
+public sealed class NewWorkItemFormTests : BunitContext
 {
     private static ProjectDto SampleProject() => new()
     {
@@ -40,7 +40,7 @@ public sealed class NewWorkItemFormTests : TestContext
         var fake = new FakeApiClient([], [SampleProject()]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<NewWorkItem>();
+        var cut = Render<NewWorkItem>();
 
         Assert.Contains("My Project", cut.Markup);
     }
@@ -51,7 +51,7 @@ public sealed class NewWorkItemFormTests : TestContext
         var fake = new FakeApiClient([], [SampleProject()]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<NewWorkItem>();
+        var cut = Render<NewWorkItem>();
 
         // Prompt textarea must be present with monospace class
         Assert.Contains("prompt-input", cut.Markup);
@@ -66,7 +66,7 @@ public sealed class NewWorkItemFormTests : TestContext
             [SampleProject()]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<NewWorkItem>();
+        var cut = Render<NewWorkItem>();
 
         // Queued items should appear in the depends-on multi-select area
         Assert.Contains("Dep Task", cut.Markup);
@@ -78,7 +78,7 @@ public sealed class NewWorkItemFormTests : TestContext
         var fake = new FakeApiClient([], [SampleProject()]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<NewWorkItem>();
+        var cut = Render<NewWorkItem>();
 
         // Submit the form without setting required fields
         cut.Find("form").Submit();
@@ -92,7 +92,7 @@ public sealed class NewWorkItemFormTests : TestContext
         var fake = new FakeApiClient([], [SampleProject()]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<NewWorkItem>();
+        var cut = Render<NewWorkItem>();
 
         cut.Find("form").Submit();
 
@@ -105,7 +105,7 @@ public sealed class NewWorkItemFormTests : TestContext
         var fake = new FakeApiClient([], [SampleProject()]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<NewWorkItem>();
+        var cut = Render<NewWorkItem>();
 
         cut.Find("form").Submit();
 
@@ -120,7 +120,7 @@ public sealed class NewWorkItemFormTests : TestContext
             [SampleProject()]);
         Services.AddSingleton<ICodeyBoxApiClient>(capturingClient);
 
-        var cut = RenderComponent<NewWorkItem>();
+        var cut = Render<NewWorkItem>();
 
         // Fill required fields
         cut.Find("select#project").Change("proj-1");
@@ -149,7 +149,7 @@ public sealed class NewWorkItemFormTests : TestContext
         var fake = new FakeApiClient([], [SampleProject()]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<NewWorkItem>();
+        var cut = Render<NewWorkItem>();
 
         Assert.Contains("claude", cut.Markup);
         Assert.Contains("copilot", cut.Markup);
@@ -162,7 +162,7 @@ public sealed class NewWorkItemFormTests : TestContext
         var fake = new FakeApiClient([], [SampleProject()]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<NewWorkItem>();
+        var cut = Render<NewWorkItem>();
 
         // pushUpstream checkbox should be present and checked by default
         var checkbox = cut.Find("input#pushUpstream");

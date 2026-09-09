@@ -483,22 +483,22 @@ internal sealed class CaptureSmtpClient : SmtpClient
         return Task.CompletedTask;
     }
 
-    public override Task? AuthenticateAsync(SaslMechanism mechanism, CancellationToken cancellationToken = default)
+    public override Task AuthenticateAsync(SaslMechanism mechanism, CancellationToken cancellationToken = default)
     {
         if (mechanism is SaslMechanismPlain plain)
-            _authCaptor?.Invoke(plain.Credentials.UserName, plain.Credentials.Password);
+            _authCaptor?.Invoke(plain.Credentials.UserName ?? string.Empty, plain.Credentials.Password ?? string.Empty);
         return Task.CompletedTask;
     }
 
-    public override Task<string?> SendAsync(MimeMessage message, CancellationToken cancellationToken = default, ITransferProgress? progress = null)
+    public override Task<string> SendAsync(MimeMessage message, CancellationToken cancellationToken = default, ITransferProgress? progress = null)
     {
         var toAddresses = message.To.Mailboxes.Select(mb => mb.Address).ToList();
         var fromAddress = message.From.Mailboxes.First().Address;
         var bodyText = message.Body is TextPart tp ? tp.Text : null;
         var headers = message.Headers.ToDictionary(h => h.Field, h => h.Value, StringComparer.Ordinal);
-        Snapshot = new CapturedSnapshot(message.Subject, toAddresses, fromAddress, bodyText, headers);
+        Snapshot = new CapturedSnapshot(message.Subject ?? string.Empty, toAddresses, fromAddress, bodyText, headers);
         _sendCaptor?.Invoke(message);
-        return Task.FromResult<string?>("ok");
+        return Task.FromResult("ok");
     }
 
     public override Task DisconnectAsync(bool quit, CancellationToken cancellationToken = default)

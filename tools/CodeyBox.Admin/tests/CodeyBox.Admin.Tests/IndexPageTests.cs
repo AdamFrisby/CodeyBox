@@ -11,7 +11,7 @@ namespace CodeyBox.Admin.Tests;
 /// Renders the Index component with a fake API client and asserts that the
 /// queue table reflects the returned items.
 /// </summary>
-public sealed class IndexPageTests : TestContext
+public sealed class IndexPageTests : BunitContext
 {
     private static WorkItemDto MakeItem(string id, string title, string state = "Queued") => new()
     {
@@ -38,7 +38,7 @@ public sealed class IndexPageTests : TestContext
         var fake = new FakeApiClient([MakeItem("aabbccdd-0000-0000-0000-000000000001", "Task A")]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<IndexPage>();
+        var cut = Render<IndexPage>();
         SelectAllTab(cut);
 
         Assert.Contains("Task A", cut.Markup);
@@ -52,7 +52,7 @@ public sealed class IndexPageTests : TestContext
         var fake = new FakeApiClient([item]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<IndexPage>();
+        var cut = Render<IndexPage>();
         SelectAllTab(cut);
 
         // Short ID is first 8 chars
@@ -65,7 +65,7 @@ public sealed class IndexPageTests : TestContext
         var fake = new FakeApiClient([]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<IndexPage>();
+        var cut = Render<IndexPage>();
 
         Assert.Contains("No work items", cut.Markup);
     }
@@ -82,7 +82,7 @@ public sealed class IndexPageTests : TestContext
         var fake = new FakeApiClient([.. items]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<IndexPage>();
+        var cut = Render<IndexPage>();
         SelectAllTab(cut);
 
         Assert.Contains("Alpha", cut.Markup);
@@ -96,7 +96,7 @@ public sealed class IndexPageTests : TestContext
         var fake = new FakeApiClient([MakeItem("aabbccdd-0000-0000-0000-000000000001", "Queued Task", "Queued")]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<IndexPage>();
+        var cut = Render<IndexPage>();
         SelectAllTab(cut);
 
         // Edit link present for queued items
@@ -112,7 +112,7 @@ public sealed class IndexPageTests : TestContext
         var fake = new FakeApiClient([MakeItem("aabbccdd-0000-0000-0000-000000000001", "Done Task", "Done")]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<IndexPage>();
+        var cut = Render<IndexPage>();
         SelectAllTab(cut);
 
         // Cancel button only shown for non-terminal items
@@ -125,7 +125,7 @@ public sealed class IndexPageTests : TestContext
         var fake = new FakeApiClient([MakeItem("aabbccdd-0000-0000-0000-000000000001", "Failed Task", "Failed")]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<IndexPage>();
+        var cut = Render<IndexPage>();
         SelectAllTab(cut);
 
         Assert.Contains("retry", cut.Markup);
@@ -140,7 +140,7 @@ public sealed class IndexPageTests : TestContext
         ]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<IndexPage>();
+        var cut = Render<IndexPage>();
         SelectAllTab(cut);
 
         Assert.Contains("Working", cut.Markup);
@@ -157,7 +157,7 @@ public sealed class IndexPageTests : TestContext
         ]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<IndexPage>();
+        var cut = Render<IndexPage>();
 
         Assert.Contains("Planning Task", cut.Markup);
         Assert.DoesNotContain("Review Task", cut.Markup);
@@ -184,7 +184,7 @@ public sealed class IndexPageTests : TestContext
         };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<IndexPage>();
+        var cut = Render<IndexPage>();
 
         Assert.Contains("QUEUE PAUSED", cut.Markup);
         Assert.Contains("maintenance window", cut.Markup);
@@ -199,7 +199,7 @@ public sealed class IndexPageTests : TestContext
         fake.QueueStatusOverride = new QueueStatusDto { State = "Running" };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<IndexPage>();
+        var cut = Render<IndexPage>();
 
         Assert.Contains("queue-banner-running", cut.Markup);
         Assert.Contains("Pause queue", cut.Markup);
@@ -213,7 +213,7 @@ public sealed class IndexPageTests : TestContext
         fake.QueueStatusOverride = new QueueStatusDto { State = "Running" };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<IndexPage>();
+        var cut = Render<IndexPage>();
         cut.Find(".btn-sm").Click();
 
         Assert.Contains("modal-overlay", cut.Markup);
@@ -227,7 +227,7 @@ public sealed class IndexPageTests : TestContext
         fake.QueueStatusOverride = new QueueStatusDto { State = "Running" };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<IndexPage>();
+        var cut = Render<IndexPage>();
         cut.Find(".btn-sm").Click(); // open modal
 
         // Click Pause without entering a reason.
@@ -244,7 +244,7 @@ public sealed class IndexPageTests : TestContext
         fake.QueueStatusOverride = new QueueStatusDto { State = "Running" };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<IndexPage>();
+        var cut = Render<IndexPage>();
 
         // Open pause modal
         cut.Find(".btn-sm").Click();
@@ -274,7 +274,7 @@ public sealed class IndexPageTests : TestContext
         };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<IndexPage>();
+        var cut = Render<IndexPage>();
         Assert.Contains("QUEUE PAUSED", cut.Markup);
 
         cut.Find(".btn-resume").Click();
@@ -301,7 +301,7 @@ public sealed class IndexPageTests : TestContext
         };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<IndexPage>();
+        var cut = Render<IndexPage>();
 
         Assert.Contains("budget-bar", cut.Markup);
         Assert.Contains("3/10/h", cut.Markup);
@@ -321,7 +321,7 @@ public sealed class IndexPageTests : TestContext
         };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<IndexPage>();
+        var cut = Render<IndexPage>();
 
         Assert.Contains("budget-warn", cut.Markup);
     }
@@ -340,7 +340,7 @@ public sealed class IndexPageTests : TestContext
         };
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<IndexPage>();
+        var cut = Render<IndexPage>();
 
         Assert.Contains("budget-full", cut.Markup);
     }
@@ -352,7 +352,7 @@ public sealed class IndexPageTests : TestContext
             [MakeItem("aabbccdd-0000-0000-0000-000000000001", "Done Task", "Done")]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<IndexPage>();
+        var cut = Render<IndexPage>();
 
         Assert.DoesNotContain("budget-bar-wrap", cut.Markup);
     }

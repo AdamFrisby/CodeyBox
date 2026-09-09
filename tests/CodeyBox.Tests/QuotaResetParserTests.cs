@@ -32,6 +32,29 @@ public sealed class QuotaResetParserTests
         Assert.Null(QuotaResetParser.TryParseResetAt([source]));
     }
 
+    [Theory]
+    [InlineData("Retry-After: 120", 120)]
+    [InlineData("429 Error from provider: rate_limit_exceeded. retry-after: 45", 45)]
+    [InlineData("RETRY-AFTER:  600  ", 600)]
+    public void TryParseRetryAfterHeader_DeltaSeconds_ReturnExpectedOffset(string source, int seconds)
+    {
+        var resetAt = QuotaResetParser.TryParseRetryAfterHeader([source]);
+
+        Assert.NotNull(resetAt);
+        var diff = resetAt!.Value - DateTimeOffset.UtcNow;
+        Assert.InRange(diff.TotalSeconds, seconds - 2, seconds + 2);
+    }
+
+    [Theory]
+    [InlineData("Please retry after a brief wait.")]
+    [InlineData("Retry-After: 0")]
+    [InlineData("Retry-After: soon")]
+    [InlineData("no header here")]
+    public void TryParseRetryAfterHeader_WithoutDeltaSeconds_ReturnNull(string source)
+    {
+        Assert.Null(QuotaResetParser.TryParseRetryAfterHeader([source]));
+    }
+
     private static double ExpectedSeconds(int hours, int minutes, int seconds) =>
         hours * 3600d + minutes * 60d + seconds;
 }

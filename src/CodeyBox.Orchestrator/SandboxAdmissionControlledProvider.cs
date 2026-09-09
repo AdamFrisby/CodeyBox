@@ -161,6 +161,7 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
         _inner is IResourceMetricsCapturingProvider capturing && capturing.CapturesResourceMetrics;
 
     public string Name => _inner.Name;
+    public SandboxIsolationLevel IsolationLevel => _inner.IsolationLevel;
     public SandboxAgentOutputTransportKind AgentOutputTransportKind => _inner.AgentOutputTransportKind;
     public SandboxBatchLaunchMode BatchLaunchMode => _inner.BatchLaunchMode;
 

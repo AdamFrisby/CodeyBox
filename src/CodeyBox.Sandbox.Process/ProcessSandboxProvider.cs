@@ -535,7 +535,7 @@ internal sealed class ProcessSandbox : IPreemptibleSandbox, IPreserveOnDisposeSa
     private string TranslateEnvironmentValue(string key, string value)
     {
         if (!string.Equals(key, "PATH", StringComparison.Ordinal))
-            return value;
+            return TranslatePath(value);
 
         var entries = value.Split(':');
         for (var i = 0; i < entries.Length; i++)

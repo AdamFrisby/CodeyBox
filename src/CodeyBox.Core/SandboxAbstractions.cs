@@ -99,6 +99,13 @@ public interface IManagedSandboxLifecycle
 public interface ISandboxProvider : IManagedSandboxLifecycle
 {
     /// <summary>
+    /// Strongest isolation boundary this provider guarantees. New providers deliberately default to
+    /// <see cref="SandboxIsolationLevel.None"/> so an unknown implementation cannot silently satisfy a
+    /// production trust policy.
+    /// </summary>
+    SandboxIsolationLevel IsolationLevel => SandboxIsolationLevel.None;
+
+    /// <summary>
     /// Agent-output data plane this provider can offer for long-running CLI
     /// invocations. Providers that do not override this keep stdout/stderr on
     /// the normal <see cref="ISandbox.ExecAsync"/> pipe.
@@ -118,6 +125,19 @@ public interface ISandboxProvider : IManagedSandboxLifecycle
     /// regardless of state.
     /// </summary>
     Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default);
+}
+
+public enum SandboxIsolationLevel
+{
+    None,
+    SharedKernel,
+    DedicatedKernel
+}
+
+public enum WorkloadTrust
+{
+    Trusted,
+    Untrusted
 }
 
 /// <summary>
@@ -1324,7 +1344,16 @@ public sealed record SandboxResourceLimits
         // clones comfortably above such baselines with room for build output;
         // qcow2/ZFS clones stay sparse, so the ceiling is only paid when used.
         DiskBytes = 16L * 1024 * 1024 * 1024,
-        WallClock = TimeSpan.FromMinutes(60),
+        // Backstop only — NOT a stall detector. IncusSandbox clamps its own 6h ExecTimeout down to
+        // this value, so this is the real ceiling on a single agent invocation. At 60 minutes it was
+        // shorter than one audit iteration's own budget (Defaults.Audit.PerIterationTimeoutMinutes
+        // defaults to 90), so a legitimately long agent session was killed mid-work and surfaced as
+        // "Incus CLI operation [exec] exceeded its 3600-second deadline" — observed against agy runs
+        // that were demonstrably progressing (48 recorded audit-progress rows, auditors completing).
+        // Hangs are caught by WorkerProgressWatchdog, which measures absence of PROGRESS; a wall clock
+        // cannot distinguish a stalled run from a slow one, so it is set to match ExecTimeout instead
+        // of second-guessing it.
+        WallClock = TimeSpan.FromHours(6),
     };
 }
 

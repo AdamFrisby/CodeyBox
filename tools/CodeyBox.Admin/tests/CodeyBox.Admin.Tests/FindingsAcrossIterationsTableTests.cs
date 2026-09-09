@@ -10,7 +10,7 @@ namespace CodeyBox.Admin.Tests;
 /// Verifies the "Findings across iterations" matrix table in the AuditReports page.
 /// Key scenario: finding f-007 persists across iterations 3–7 then resolves in 8.
 /// </summary>
-public sealed class FindingsAcrossIterationsTableTests : TestContext
+public sealed class FindingsAcrossIterationsTableTests : BunitContext
 {
     private static AuditReportsDto MakeReports(string id, params AuditReportIterationDto[] iterations) =>
         new() { WorkItemId = id, Iterations = [.. iterations] };
@@ -67,7 +67,7 @@ public sealed class FindingsAcrossIterationsTableTests : TestContext
             MakeIteration(8, MakeAuditor("Lint"))); // resolved — no findings
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<AuditReportsPage>(p => p.Add(x => x.Id, id));
+        var cut = Render<AuditReportsPage>(p => p.Add(x => x.Id, id));
 
         // Matrix should be shown and include finding title
         Assert.Contains("audit-matrix", cut.Markup);
@@ -94,7 +94,7 @@ public sealed class FindingsAcrossIterationsTableTests : TestContext
             MakeIteration(3, MakeAuditor("Lint", finding)));
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<AuditReportsPage>(p => p.Add(x => x.Id, id));
+        var cut = Render<AuditReportsPage>(p => p.Add(x => x.Id, id));
 
         // Only present cells (✓) — no absent CSS class in matrix cells
         Assert.Contains("✓", cut.Markup);
@@ -112,7 +112,7 @@ public sealed class FindingsAcrossIterationsTableTests : TestContext
             MakeIteration(2, MakeAuditor("Lint"))); // resolved
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<AuditReportsPage>(p => p.Add(x => x.Id, id));
+        var cut = Render<AuditReportsPage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("✓", cut.Markup);
         Assert.Contains("·", cut.Markup);
@@ -128,7 +128,7 @@ public sealed class FindingsAcrossIterationsTableTests : TestContext
             MakeIteration(3, MakeAuditor("Lint", finding)));
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<AuditReportsPage>(p => p.Add(x => x.Id, id));
+        var cut = Render<AuditReportsPage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("Hard-coded secret in TestSupport.cs", cut.Markup);
     }
@@ -144,7 +144,7 @@ public sealed class FindingsAcrossIterationsTableTests : TestContext
             MakeIteration(1, MakeAuditor("Lint", finding1, finding2)));
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<AuditReportsPage>(p => p.Add(x => x.Id, id));
+        var cut = Render<AuditReportsPage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("Issue Alpha", cut.Markup);
         Assert.Contains("Issue Beta", cut.Markup);

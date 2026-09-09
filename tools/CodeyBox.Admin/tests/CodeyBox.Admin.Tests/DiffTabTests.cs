@@ -7,7 +7,7 @@ using WorkItemDiffPage = CodeyBox.Admin.Web.Components.Pages.WorkItemDiff;
 
 namespace CodeyBox.Admin.Tests;
 
-public sealed class DiffTabTests : TestContext
+public sealed class DiffTabTests : BunitContext
 {
     private const string ItemId = "aabbccdd-0000-0000-0000-000000000001";
 
@@ -46,7 +46,7 @@ public sealed class DiffTabTests : TestContext
         fake.DiffOverride[ItemId] = MakeDiff(filesChanged: 3, linesAdded: 42, linesRemoved: 7);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDiffPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemDiffPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("+42", cut.Markup);
         Assert.Contains("-7", cut.Markup);
@@ -60,7 +60,7 @@ public sealed class DiffTabTests : TestContext
         fake.DiffOverride[ItemId] = MakeDiff();
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDiffPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemDiffPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("foo.cs", cut.Markup);
         Assert.Contains("diff-file-list", cut.Markup);
@@ -73,7 +73,7 @@ public sealed class DiffTabTests : TestContext
         fake.DiffOverride[ItemId] = MakeDiff();
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDiffPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemDiffPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains($"/workitems/{ItemId}/diff", cut.Markup);
     }
@@ -85,7 +85,7 @@ public sealed class DiffTabTests : TestContext
         fake.DiffOverride[ItemId] = MakeDiff(truncated: true);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDiffPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemDiffPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("truncated", cut.Markup, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("diff-truncated-banner", cut.Markup);
@@ -98,7 +98,7 @@ public sealed class DiffTabTests : TestContext
         // No DiffOverride → returns null → no diff available.
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDiffPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemDiffPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("diff-empty", cut.Markup);
         Assert.DoesNotContain("diff-toolbar", cut.Markup);
@@ -111,7 +111,7 @@ public sealed class DiffTabTests : TestContext
         fake.DiffOverride[ItemId] = MakeDiff();
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDiffPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemDiffPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains($"/work-items/{ItemId}", cut.Markup);
     }
@@ -123,7 +123,7 @@ public sealed class DiffTabTests : TestContext
         fake.DiffOverride[ItemId] = MakeDiff();
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDiffPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemDiffPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("diff-add", cut.Markup);
         Assert.Contains("diff-del", cut.Markup);
@@ -137,7 +137,7 @@ public sealed class DiffTabTests : TestContext
         fake.DiffOverride[ItemId] = MakeDiff(filesChanged: 1);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemDiffPage>(p => p.Add(x => x.Id, ItemId));
+        var cut = Render<WorkItemDiffPage>(p => p.Add(x => x.Id, ItemId));
 
         Assert.Contains("1 file", cut.Markup);
         Assert.DoesNotContain("1 files", cut.Markup);

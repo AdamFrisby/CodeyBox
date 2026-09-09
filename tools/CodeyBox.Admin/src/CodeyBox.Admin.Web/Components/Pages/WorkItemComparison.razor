@@ -223,7 +223,7 @@ else
         }
         catch (Exception ex)
         {
-            Logger.LogError(ex, "Failed to load comparison for work item {Id}", Id);
+            Logger.LogError(ex, "Failed to load comparison for work item {Id}", Id.Replace("\r", "").Replace("\n", ""));
             _error = "Failed to load comparison data. Check server logs for details.";
         }
     }

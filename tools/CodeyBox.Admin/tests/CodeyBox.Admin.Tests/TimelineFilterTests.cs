@@ -8,7 +8,7 @@ using WorkItemTimelinePage = CodeyBox.Admin.Web.Components.Pages.WorkItemTimelin
 
 namespace CodeyBox.Admin.Tests;
 
-public sealed class TimelineFilterTests : TestContext
+public sealed class TimelineFilterTests : BunitContext
 {
     private static TimelineEntryDto MakeEntry(string kind, string summary, object? details = null) => new()
     {
@@ -39,7 +39,7 @@ public sealed class TimelineFilterTests : TestContext
         Services.GetRequiredService<NavigationManager>()
             .NavigateTo($"http://localhost/work-items/{id}/timeline?kind=state_transition");
 
-        var cut = RenderComponent<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
+        var cut = Render<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("→ Done", cut.Markup);
         Assert.DoesNotContain("claude started", cut.Markup);
@@ -61,7 +61,7 @@ public sealed class TimelineFilterTests : TestContext
         fake.TimelineOverride = timeline;
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
+        var cut = Render<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("→ Done", cut.Markup);
         Assert.Contains("claude started", cut.Markup);
@@ -83,7 +83,7 @@ public sealed class TimelineFilterTests : TestContext
         fake.TimelineOverride = timeline;
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
+        var cut = Render<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
 
         // Both entries visible initially.
         Assert.Contains("→ Done", cut.Markup);
@@ -116,7 +116,7 @@ public sealed class TimelineFilterTests : TestContext
         Services.GetRequiredService<NavigationManager>()
             .NavigateTo($"http://localhost/work-items/{id}/timeline?kind=state_transition");
 
-        var cut = RenderComponent<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
+        var cut = Render<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
 
         Assert.DoesNotContain("claude started", cut.Markup);
 
@@ -148,7 +148,7 @@ public sealed class TimelineFilterTests : TestContext
         Services.GetRequiredService<NavigationManager>()
             .NavigateTo($"http://localhost/work-items/{id}/timeline?iteration=1");
 
-        var cut = RenderComponent<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
+        var cut = Render<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("iter 1", cut.Markup);
         Assert.DoesNotContain("iter 2", cut.Markup);

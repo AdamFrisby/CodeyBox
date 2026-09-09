@@ -19,6 +19,7 @@ namespace CodeyBox.Tests;
 public sealed class QuotaAutoRetryTests : IDisposable
 {
     private static readonly TimeSpan DispatchObservationTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan SweepObservationTimeout = TimeSpan.FromSeconds(30);
     private readonly string _workspace;
     private readonly FakeTimeProvider _time;
 
@@ -3066,7 +3067,7 @@ public sealed class QuotaAutoRetryTests : IDisposable
 
         quotaSignal.Fire();
 
-        var retried = await WaitForAttemptsAsync(store, parked.Id, expectedAttempts: 1, TimeSpan.FromSeconds(5));
+        var retried = await WaitForAttemptsAsync(store, parked.Id, expectedAttempts: 1, SweepObservationTimeout);
         Assert.Equal(WorkItemState.Queued, retried.State);
         Assert.True(router.ResolveCalls >= 2);
     }

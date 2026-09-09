@@ -110,6 +110,8 @@ internal sealed class SandboxProviderApiFactory : WebApplicationFactory<Program>
     private readonly IWebhookDispatcher? _webhooks;
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(), $"codeybox-uat-sandbox-api-{Guid.NewGuid():N}.db");
+    private readonly string _githubAppStorePath = Path.Combine(
+        Path.GetTempPath(), $"codeybox-github-apps-uat-{Guid.NewGuid():N}");
 
     public SandboxProviderApiFactory(
         string environment = "Development",
@@ -141,6 +143,7 @@ internal sealed class SandboxProviderApiFactory : WebApplicationFactory<Program>
                 ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
                 ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
                 ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                ["CodeyBox:GitHubAppStorePath"] = _githubAppStorePath,
                 ["CodeyBox:Changelog:Enabled"] = "false",
             };
 
@@ -199,7 +202,10 @@ internal sealed class SandboxProviderApiFactory : WebApplicationFactory<Program>
     {
         base.Dispose(disposing);
         if (disposing)
+        {
             try { File.Delete(_dbPath); } catch { }
+            try { Directory.Delete(_githubAppStorePath, recursive: true); } catch { }
+        }
     }
 }
 

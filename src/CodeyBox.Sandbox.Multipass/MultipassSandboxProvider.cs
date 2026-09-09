@@ -41,7 +41,7 @@ namespace CodeyBox.Sandbox.Multipass;
 /// any in-guest enforcement is voluntary and a compromised agent with
 /// sudo could flush it, so we don't pretend it's a boundary.
 /// See <c>scripts/setup-host-networks.sh</c> and
-/// <c>docs/host-firewall.md</c>.</para>
+/// <c>docs/operating/host-firewall.md</c>.</para>
 ///
 /// <para><b>Image:</b> defaults to Multipass's current LTS Ubuntu image.
 /// The agent CLI binaries (claude, codex, etc.) need to be installed in
@@ -237,6 +237,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     }
 
     public string Name => ProviderId;
+    public SandboxIsolationLevel IsolationLevel => SandboxIsolationLevel.DedicatedKernel;
     // HTTP ingest and detached launch are spec-dependent: the concrete sandbox
     // advertises them only when its network profile resolves to a host bridge.
     public SandboxAgentOutputTransportKind AgentOutputTransportKind => SandboxAgentOutputTransportKind.ExecPipe;

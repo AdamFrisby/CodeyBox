@@ -30,7 +30,7 @@ jobs:
   matrix:
     name: agent × suspend duration smoke
     # GitHub-hosted ubuntu-latest does not ship multipass/KVM; register a
-    # self-hosted runner with the `multipass` label (see docs/agent-suspend-resilience.md).
+    # self-hosted runner with the `multipass` label (see docs/operating/sandbox-reliability.md).
     runs-on: [self-hosted, multipass]
     timeout-minutes: 360
     env:

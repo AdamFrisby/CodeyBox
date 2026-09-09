@@ -56,7 +56,7 @@ public static class AgentClassesConfigBuilder
                 if (m.QualityScore is null)
                     throw new InvalidOperationException(
                         $"AgentClass '{classOpts.Id}': member '{m.Agent}' is missing QualityScore. " +
-                        $"Add QualityScore=N (0–200); see docs/agent-classes.md for recommended values.");
+                        $"Add QualityScore=N (0–200); see docs/concepts/agent-classes.md for recommended values.");
                 var score = m.QualityScore.Value;
                 if (score < 0 || score > 200)
                     throw new InvalidOperationException(
@@ -123,7 +123,7 @@ public static class AgentClassesConfigBuilder
                         (string.IsNullOrEmpty(m.ModelId) ? "" : $" model '{m.ModelId}'") +
                         ". Give same-kind subscriptions distinct InstanceId values " +
                         "(legacy shadowing duplicates are rejected since #226 multi-subscription pooling). " +
-                        "See docs/agent-classes.md \"Migrating pre-pooling configs\".");
+                        "See docs/concepts/agent-classes.md \"Migrating pre-pooling configs\".");
                 members.Add(member);
             }
 

@@ -75,6 +75,7 @@ internal sealed class ReloadableSandboxProvider :
     }
 
     public string Name => SelectedProvider.Provider.Name;
+    public SandboxIsolationLevel IsolationLevel => SelectedProvider.Provider.IsolationLevel;
 
     public SandboxAgentOutputTransportKind AgentOutputTransportKind =>
         SelectedProvider.Provider.AgentOutputTransportKind;

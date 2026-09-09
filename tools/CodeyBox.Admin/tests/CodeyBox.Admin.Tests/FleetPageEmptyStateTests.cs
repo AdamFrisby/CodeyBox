@@ -9,7 +9,7 @@ namespace CodeyBox.Admin.Tests;
 /// <summary>
 /// Tests for the Fleet page empty state when no projects are configured.
 /// </summary>
-public sealed class FleetPageEmptyStateTests : TestContext
+public sealed class FleetPageEmptyStateTests : BunitContext
 {
     [Fact]
     public void Fleet_NoProjects_ShowsEmptyStateMessage()
@@ -18,7 +18,7 @@ public sealed class FleetPageEmptyStateTests : TestContext
         fake.FleetSummaryOverride = [];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
 
         Assert.Contains("No projects configured", cut.Markup);
     }
@@ -30,7 +30,7 @@ public sealed class FleetPageEmptyStateTests : TestContext
         fake.FleetSummaryOverride = [];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
 
         Assert.DoesNotContain("queue-table", cut.Markup);
     }
@@ -52,7 +52,7 @@ public sealed class FleetPageEmptyStateTests : TestContext
         ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
 
         Assert.Contains("queue-table", cut.Markup);
         Assert.Contains("Solo Project", cut.Markup);

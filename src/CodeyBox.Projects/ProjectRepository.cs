@@ -513,7 +513,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
     /// upstream to merge back into, every work item against a shared local seed
     /// forks from the same starting point and produces an independent rewrite
     /// — the operator has no way to compose results across work items. See
-    /// <c>docs/projects.md</c> for the full failure mode write-up.
+    /// <c>docs/concepts/projects.md</c> for the full failure mode write-up.
     ///
     /// Bypass: set <c>Upstream.AcknowledgeSandboxIsolation=true</c> for genuine
     /// sandbox/experiment projects, or configure a real upstream
@@ -533,7 +533,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             $"RepositoryUrl ('{repositoryUrl}'). This produces work items that all " +
             "fork from the same seed with no upstream to merge back into, so every " +
             "Done item is an independent rewrite rather than iterative progress " +
-            "(see docs/projects.md). Fix this by either: " +
+            "(see docs/concepts/projects.md). Fix this by either: " +
             "(1) configuring a real upstream (Upstream.Kind='github' or " +
             "'git-generic') so the orchestrator can push merged work back to a " +
             "shared remote, or " +

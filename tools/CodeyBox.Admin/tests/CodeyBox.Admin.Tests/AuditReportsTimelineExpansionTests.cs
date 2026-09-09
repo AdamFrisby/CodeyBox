@@ -11,7 +11,7 @@ namespace CodeyBox.Admin.Tests;
 /// Verifies the timeline page's per-auditor findings expansion: each auditor_run entry
 /// shows the findings loaded from the audit-reports API, and the raw-output button appears.
 /// </summary>
-public sealed class AuditReportsTimelineExpansionTests : TestContext
+public sealed class AuditReportsTimelineExpansionTests : BunitContext
 {
     private static TimelineEntryDto MakeAuditorEntry(string name, int iteration, string summary = "auditor ran") =>
         new()
@@ -79,7 +79,7 @@ public sealed class AuditReportsTimelineExpansionTests : TestContext
         fake.AuditReportsOverride = MakeAuditReports(id, 1, "Lint", finding);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
+        var cut = Render<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("Missing null check", cut.Markup);
     }
@@ -93,7 +93,7 @@ public sealed class AuditReportsTimelineExpansionTests : TestContext
         fake.AuditReportsOverride = MakeAuditReports(id, 1, "Lint"); // no findings
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
+        var cut = Render<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("No findings", cut.Markup, StringComparison.OrdinalIgnoreCase);
     }
@@ -107,7 +107,7 @@ public sealed class AuditReportsTimelineExpansionTests : TestContext
         fake.AuditReportsOverride = MakeAuditReports(id, 1, "Lint");
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
+        var cut = Render<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("audit-raw-btn", cut.Markup);
     }
@@ -123,7 +123,7 @@ public sealed class AuditReportsTimelineExpansionTests : TestContext
             MakeFinding("f-2", "Issue B", "Warning"));
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
+        var cut = Render<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("(2)", cut.Markup);
     }
@@ -137,7 +137,7 @@ public sealed class AuditReportsTimelineExpansionTests : TestContext
         // AuditReportsOverride is null — simulates API returning null
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
+        var cut = Render<WorkItemTimelinePage>(p => p.Add(x => x.Id, id));
 
         Assert.Contains("Findings not available", cut.Markup, StringComparison.OrdinalIgnoreCase);
     }

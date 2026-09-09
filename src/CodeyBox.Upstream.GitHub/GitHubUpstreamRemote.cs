@@ -351,6 +351,28 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         return await resp.Content.ReadFromJsonAsync<GitHubPrDetailMergeable>(ct);
     }
 
+    public async Task<UpstreamPullRequestState?> GetPullRequestAsync(
+        int number,
+        CancellationToken ct = default)
+    {
+        if (number <= 0)
+            throw new ArgumentOutOfRangeException(nameof(number), "Pull request number must be positive.");
+
+        var detail = await FetchPullRequestDetailAsync(number, ct);
+        if (detail is null) return null;
+
+        var status = detail.Merged
+            ? PullRequestStatus.Merged
+            : string.Equals(detail.State, "closed", StringComparison.OrdinalIgnoreCase)
+                ? PullRequestStatus.Closed
+                : PullRequestStatus.Open;
+        return new UpstreamPullRequestState(
+            detail.Number,
+            detail.HtmlUrl ?? $"https://github.com/{_opts.Owner}/{_opts.Repository}/pull/{detail.Number}",
+            status,
+            detail.Merged ? detail.MergeCommitSha : null);
+    }
+
     /// <summary>
     /// Fetches the current head of <paramref name="baseBranch"/> from this
     /// upstream GitHub repo into the host bare repo, overwriting the local
@@ -1357,4 +1379,7 @@ internal sealed record GitHubPrDetailMergeable(
     [property: JsonPropertyName("number")] int Number,
     [property: JsonPropertyName("html_url")] string? HtmlUrl,
     [property: JsonPropertyName("mergeable")] bool? Mergeable,
-    [property: JsonPropertyName("mergeable_state")] string? MergeableState);
+    [property: JsonPropertyName("mergeable_state")] string? MergeableState,
+    [property: JsonPropertyName("state")] string? State = null,
+    [property: JsonPropertyName("merged")] bool Merged = false,
+    [property: JsonPropertyName("merge_commit_sha")] string? MergeCommitSha = null);

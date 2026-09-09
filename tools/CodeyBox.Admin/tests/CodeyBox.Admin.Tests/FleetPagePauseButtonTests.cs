@@ -11,7 +11,7 @@ namespace CodeyBox.Admin.Tests;
 /// budget-alerts work item lands, per-project pause falls back to the global
 /// pause queue; the fallback banner is always shown.
 /// </summary>
-public sealed class FleetPagePauseButtonTests : TestContext
+public sealed class FleetPagePauseButtonTests : BunitContext
 {
     [Fact]
     public void Fleet_PauseButton_Present_WhenProjectNotPaused()
@@ -23,7 +23,7 @@ public sealed class FleetPagePauseButtonTests : TestContext
         ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
 
         Assert.Contains("Pause queue (global)", cut.Markup);
     }
@@ -38,7 +38,7 @@ public sealed class FleetPagePauseButtonTests : TestContext
         ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
         cut.Find(".btn-fleet-pause").Click();
 
         Assert.Equal("my-project", fake.FleetSummaryPauseProjectIdCaptured);
@@ -55,7 +55,7 @@ public sealed class FleetPagePauseButtonTests : TestContext
         ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
 
         Assert.Contains("Resume queue (global)", cut.Markup);
         Assert.DoesNotContain("Pause queue (global)", cut.Markup);
@@ -71,7 +71,7 @@ public sealed class FleetPagePauseButtonTests : TestContext
         ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
 
         Assert.Contains("Queue", cut.Markup);
         Assert.Contains("global queue pause", cut.Markup);
@@ -83,7 +83,7 @@ public sealed class FleetPagePauseButtonTests : TestContext
         var fake = new FakeApiClient([]);
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
         cut.FindAll("input")[0].Change("claude");
         cut.FindAll("input")[1].Change("reserve quota");
         cut.FindAll("input")[2].Change("6");
@@ -116,7 +116,7 @@ public sealed class FleetPagePauseButtonTests : TestContext
         ];
         Services.AddSingleton<ICodeyBoxApiClient>(fake);
 
-        var cut = RenderComponent<FleetPage>();
+        var cut = Render<FleetPage>();
         cut.Find(".btn-agent-resume").Click();
 
         Assert.Equal("gemini", fake.AgentResumeKindCaptured);

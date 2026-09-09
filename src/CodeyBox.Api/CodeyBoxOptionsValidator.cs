@@ -96,6 +96,22 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             }
         }
 
+        if (options.SqliteMaintenance is null)
+        {
+            failures.Add("CodeyBox:SqliteMaintenance must not be null");
+        }
+        else
+        {
+            try
+            {
+                options.SqliteMaintenance.Validate();
+            }
+            catch (InvalidOperationException ex)
+            {
+                failures.Add(ex.Message);
+            }
+        }
+
         var e2e = options.E2eExecution;
         if (e2e is not null)
         {
@@ -291,6 +307,10 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
         if (options.PipelineTuning.EmptyReworkEscalationRetries < 0)
         {
             failures.Add("CodeyBox:PipelineTuning:EmptyReworkEscalationRetries must be non-negative");
+        }
+        if (options.PipelineTuning.DefaultRateLimitPause <= TimeSpan.Zero)
+        {
+            failures.Add("CodeyBox:PipelineTuning:DefaultRateLimitPause must be a positive TimeSpan");
         }
 
         if (options.PipelineTuning.CSharpTestPassAuditorIdleTimeout is { } cSharpTestIdle && cSharpTestIdle < TimeSpan.Zero)

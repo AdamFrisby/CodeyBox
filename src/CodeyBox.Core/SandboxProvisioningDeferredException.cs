@@ -5,8 +5,13 @@ namespace CodeyBox.Core;
 /// transient retry budget. The work item should be moved back to a durable
 /// pre-phase state and re-enqueued after <see cref="RecheckIn"/> rather than
 /// marked as an agent failure.
+///
+/// <para>Base type for every deferrable sandbox-provisioning failure, including
+/// <see cref="SandboxDiskDeferredException"/>. Catch sites must filter on this
+/// base type (not on a single leaf) so a new deferral kind cannot silently fall
+/// into a terminal-failure arm.</para>
 /// </summary>
-public sealed class SandboxProvisioningDeferredException : Exception
+public class SandboxProvisioningDeferredException : Exception
 {
     public SandboxProvisioningDeferredException(
         string provider,
@@ -18,7 +23,32 @@ public sealed class SandboxProvisioningDeferredException : Exception
         string? retainedSandboxLifecycleProviderId = null,
         string? retainedSandboxHostId = null,
         Exception? innerException = null)
-        : base(BuildMessage(provider, operation, errorClass, detail), innerException)
+        : this(
+            BuildMessage(provider, operation, errorClass, detail),
+            provider,
+            operation,
+            errorClass,
+            detail,
+            recheckIn,
+            retainedSandboxName,
+            retainedSandboxLifecycleProviderId,
+            retainedSandboxHostId,
+            innerException)
+    {
+    }
+
+    protected SandboxProvisioningDeferredException(
+        string message,
+        string provider,
+        string operation,
+        string errorClass,
+        string detail,
+        TimeSpan recheckIn,
+        string? retainedSandboxName = null,
+        string? retainedSandboxLifecycleProviderId = null,
+        string? retainedSandboxHostId = null,
+        Exception? innerException = null)
+        : base(message, innerException)
     {
         Provider = provider;
         Operation = operation;

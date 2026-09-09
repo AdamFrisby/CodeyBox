@@ -55,6 +55,7 @@ public sealed class SpritesSandboxProvider : ISandboxProvider, IActiveSandboxPro
     }
 
     public string Name => "sprites";
+    public SandboxIsolationLevel IsolationLevel => SandboxIsolationLevel.DedicatedKernel;
 
     public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
     {

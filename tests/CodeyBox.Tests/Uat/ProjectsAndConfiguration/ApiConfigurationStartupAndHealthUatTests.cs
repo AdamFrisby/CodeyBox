@@ -156,6 +156,8 @@ public sealed class SandboxStartupConfigurationUatTests
             {
                 ["CodeyBox:SandboxProvider"] = "process",
                 ["CodeyBox:DangerouslyAllowProcessSandbox"] = "true",
+                ["CodeyBox:WorkloadTrust"] = "Trusted",
+                ["CodeyBox:AcknowledgeSharedKernelRisk"] = "true",
             },
             projects: new InMemoryProjectRepository());
 

@@ -133,9 +133,25 @@ public sealed record WorkItem
 
     /// <summary>
     /// Number of times this work item has been automatically retried after
-    /// a quota failure.
+    /// a quota failure, scoped to <see cref="QuotaRetryScope"/>. The budget
+    /// is per quota bucket (agent/route/model): when the scheduler re-routes
+    /// the item to a different bucket than the one that accrued the attempts,
+    /// the counter resets so exhaustion of one agent cannot consume another's
+    /// budget. An operator retry resets this to zero.
     /// </summary>
     public int QuotaRetryAttempts { get; init; }
+
+    /// <summary>
+    /// Opaque key identifying the quota bucket (agent/route/model) that
+    /// <see cref="QuotaRetryAttempts"/> was accrued against. Stamped by the
+    /// quota retry scheduler when it dispatches a quota auto-retry and
+    /// deliberately preserved across non-quota states (including the Queued
+    /// retry target) so the next park→evaluate cycle can tell whether the
+    /// item re-routed to a different bucket. Null for rows that have never
+    /// been through a scoped retry; an operator retry clears it alongside
+    /// the counter.
+    /// </summary>
+    public string? QuotaRetryScope { get; init; }
 
     /// <summary>
     /// Pipeline entry point the quota retry scheduler should use when the quota

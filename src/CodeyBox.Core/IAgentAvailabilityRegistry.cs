@@ -47,6 +47,16 @@ public interface IAgentAvailabilityRegistry
     AvailabilityTransition RecordNoChangesOutcome(AgentKind kind, WorkItemId itemId);
 
     /// <summary>
+    /// Removes a previously recorded "produced no changes" outcome for
+    /// <paramref name="itemId"/> — used when a no-change pass turns out to be
+    /// a correct no-op (the audit recorded zero blocking findings, so there
+    /// was nothing to fix) rather than a silent failure. The default keeps
+    /// registries that do not track per-item outcomes unchanged.
+    /// </summary>
+    /// <returns>True when an outcome was removed.</returns>
+    bool RefundNoChangesOutcome(AgentKind kind, WorkItemId itemId) => false;
+
+    /// <summary>
     /// Signals that <paramref name="kind"/> just produced real changes on a
     /// work item — clears the no-changes streak counter so an isolated
     /// no-change before this success is forgotten. Does NOT lift an existing

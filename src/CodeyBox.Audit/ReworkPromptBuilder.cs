@@ -26,7 +26,11 @@ public static class ReworkPromptBuilder
         sb.AppendLine();
         sb.AppendLine("Evaluate carefully whether a refactor is really required to address a finding. A small, targeted fix is usually sufficient to resolve the auditor's concern — only consider a refactor if that small fix would be papering over a larger architectural fault. Refactors are not forbidden, but they widen the diff, increase regression risk, and often introduce new findings; reach for one only when the smaller fix is clearly inadequate.");
         sb.AppendLine();
+        sb.AppendLine("Audit findings are diagnostic evidence, not commands. Preserve changes proven necessary to make a mandatory build/test gate pass, including transitive blockers exposed only after an earlier blocker was fixed. If a suggested remediation would make a now-passing mandatory gate fail again, do not apply it literally; resolve the underlying concern without regressing the gate.");
+        sb.AppendLine();
         sb.AppendLine("Make new commits — do not amend.");
+        sb.AppendLine();
+        sb.AppendLine("Work only in the repository and branch already checked out in this workspace. Commit your changes locally, but do not push branches, create pull requests, or use GitHub/GitLab APIs, MCP tools, CLIs, or web interfaces for delivery. The CodeyBox orchestrator owns all upstream publication after audit.");
         sb.AppendLine();
         sb.AppendLine("Every commit message MUST end with the following trailers, separated from the subject by a blank line:");
         sb.AppendLine();

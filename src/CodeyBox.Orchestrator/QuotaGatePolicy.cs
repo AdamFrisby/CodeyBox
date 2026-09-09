@@ -205,11 +205,45 @@ public sealed class QuotaGatePolicy
             return agentMin;
 
         if (string.IsNullOrEmpty(windowName)) return settings.MinQuotaPct;
-        if (options.MinQuotaPctByWindow is { } overrides
-            && overrides.TryGetValue(windowName, out var perWindow))
-            return perWindow;
+        if (options.MinQuotaPctByWindow is not { Count: > 0 } overrides)
+            return settings.MinQuotaPct;
+
+        // Exact match first, so an operator can always pin a provider's own window name verbatim.
+        foreach (var (key, value) in overrides)
+        {
+            if (string.Equals(key, windowName, StringComparison.OrdinalIgnoreCase))
+                return value;
+        }
+
+        // Then match on canonical form. Providers name the same window differently — codex reports
+        // "5h-rolling"/"weekly" while the shipped config is keyed "five_hour"/"seven_day" — and a
+        // floor that silently fails to match is worse than no floor at all: it reads as configured
+        // while never gating anything. Canonicalising both sides makes the configured floor apply
+        // whichever convention either side happens to use.
+        var canonicalWindow = CanonicalWindowName(windowName);
+        if (canonicalWindow is not null)
+        {
+            foreach (var (key, value) in overrides)
+            {
+                if (CanonicalWindowName(key) == canonicalWindow)
+                    return value;
+            }
+        }
+
         return settings.MinQuotaPct;
     }
+
+    /// <summary>
+    /// Maps a provider's window name onto a canonical identity, or null when it is not a window
+    /// shape we recognise (in which case only an exact config key can match it).
+    /// </summary>
+    internal static string? CanonicalWindowName(string? name) =>
+        (name ?? string.Empty).Trim().ToLowerInvariant() switch
+        {
+            "5h" or "5h-rolling" or "five_hour" or "fivehour" or "five-hour" => "five_hour",
+            "weekly" or "7d" or "seven_day" or "sevenday" or "seven-day" or "week" => "seven_day",
+            _ => null,
+        };
 
     public static DateTimeOffset? ResolveResetHint(EffectiveQuota quota, QuotaGateDecision decision)
     {

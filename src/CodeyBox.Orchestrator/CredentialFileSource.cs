@@ -429,3 +429,12 @@ public sealed class OpencodeCredentialFileSource : CredentialFileSource
     public OpencodeCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null, bool watch = true)
         : base(filePath, log, watch) { }
 }
+
+/// <summary>
+/// Marker for the Antigravity (agy CLI) OAuth credentials file source.
+/// </summary>
+public sealed class AntigravityCredentialFileSource : CredentialFileSource
+{
+    public AntigravityCredentialFileSource(string filePath, ILogger<CredentialFileSource>? log = null, bool watch = true)
+        : base(filePath, log, watch) { }
+}
