@@ -9,10 +9,13 @@ namespace CodeyBox.Agents.Antigravity;
 
 /// <summary>
 /// Drives the Google Antigravity CLI (binary <c>agy</c>) in non-interactive
-/// mode. The CLI is shape-compatible with Claude Code: a one-shot
-/// <c>--print</c> mode that accepts <c>--model</c>, a permission-skip flag
-/// for sandboxed runs, and a native <c>--continue</c> / <c>--conversation</c>
-/// resume path. The agent is expected to be installed in the sandbox image;
+/// mode via its stream-json transport: one NDJSON frame in on stdin, NDJSON
+/// frames out. It accepts <c>--model</c>, a permission-skip flag for sandboxed
+/// runs, and a native <c>--continue</c> / <c>--conversation</c> resume path.
+/// Note it is NOT shape-compatible with Claude Code despite the resemblance —
+/// its stream frames are keyed <c>event</c> rather than <c>type</c>, and its
+/// <c>--print</c> flag is unusable here (see
+/// <see cref="BuildAgyStreamJsonPrefix"/>). The agent is expected to be installed in the sandbox image;
 /// the host injects subscription OAuth via tmpfs/env per
 /// <see cref="AntigravityConstants.OAuthCredsEnvVar"/>.
 ///
@@ -41,7 +44,8 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
     private const int MaxLogTailBytes = 256 * 1024;
 
     private const string StructuredStreamOutputFormatFlag = "--output-format";
-    private const string StructuredStreamOutputFormatValue = "stream-json";
+    private const string StructuredStreamInputFormatFlag = "--input-format";
+    private const string StructuredStreamFormatValue = "stream-json";
     private const int StructuredStreamProbeJsonMaxDepth = 64;
     private const int StructuredStreamVersionMaxChars = 256;
     private const int StructuredStreamBinaryMaxChars = 256;
@@ -58,6 +62,10 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
     // signature is fixed by the base class) without a new IAgentRunner
     // parameter. Set for the duration of a single run and cleared in finally.
     private readonly AsyncLocal<string?> _currentLogPath = new();
+
+    // Threads the run's absolute working directory into BuildAgyInvocation for --add-dir, the same way
+    // and for the same reason as _currentLogPath: the base class fixes BuildInvocation's signature.
+    private readonly AsyncLocal<string?> _currentWorkingDirectory = new();
     private readonly object _structuredStreamSupportCacheLock = new();
     private readonly Dictionary<string, bool> _structuredStreamSupportByVersion = new(StringComparer.Ordinal);
     private readonly Queue<string> _structuredStreamSupportCacheOrder = new();
@@ -85,9 +93,10 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
     public TimeSpan PrintTimeout { get; init; } = TimeSpan.FromMinutes(20);
 
     /// <summary>
-    /// Verifies structured-stream support with a real one-shot print-mode
-    /// invocation. Some agy builds can mention <c>--output-format stream-json</c>
-    /// in help text without accepting the flag in <c>--print</c>; only a
+    /// Verifies structured-stream support with a real non-interactive
+    /// invocation of the same shape a run uses. Some agy builds can mention
+    /// <c>--output-format stream-json</c> in help text without accepting the
+    /// format flags; only a
     /// successful NDJSON probe enables structured capture. Ambiguous failures
     /// fall back to plaintext capture. This method executes agy in the supplied
     /// sandbox and may materialise Antigravity CLI auth/session state before the
@@ -129,9 +138,13 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
                 return false;
             }
 
+            // Both format flags must exist: stream-json INPUT is what selects non-interactive mode
+            // without the unusable --print, and it requires stream-json output. A build offering only
+            // the output flag cannot run this runner's invocation at all.
             var helpOutput = CombinedOutput(help);
             if (!helpOutput.Contains(StructuredStreamOutputFormatFlag, StringComparison.Ordinal)
-                || !helpOutput.Contains(StructuredStreamOutputFormatValue, StringComparison.Ordinal))
+                || !helpOutput.Contains(StructuredStreamInputFormatFlag, StringComparison.Ordinal)
+                || !helpOutput.Contains(StructuredStreamFormatValue, StringComparison.Ordinal))
             {
                 CacheStructuredStreamSupport(cacheKey, supported: false);
                 return false;
@@ -144,7 +157,7 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
             {
                 Argv = BuildStructuredStreamProbeArgv(),
                 WorkingDirectory = "/tmp",
-                Stdin = StructuredStreamProbePrompt,
+                Stdin = BuildStreamJsonPromptFrame(StructuredStreamProbePrompt),
                 MaxStdoutBytes = StructuredStreamProbeMaxStdoutBytes,
                 MaxStderrBytes = StructuredStreamProbeMaxStderrBytes,
             }, ct).ConfigureAwait(false);
@@ -196,6 +209,7 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
 
         var result = await RunWithLogCaptureAsync(
             sandbox,
+            workingDirectory,
             effectiveCaptureStructuredStream,
             stdoutChunkCallback,
             ct,
@@ -213,7 +227,7 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         if (!captureStructuredStream || structuredStreamSupported)
             return result;
 
-        var warning = $"Warning: Antigravity CLI at '{Binary}' could not verify {StructuredStreamOutputFormatFlag} {StructuredStreamOutputFormatValue} support in --print mode; structured stream capture was disabled.";
+        var warning = $"Warning: Antigravity CLI at '{Binary}' could not verify {StructuredStreamInputFormatFlag}/{StructuredStreamOutputFormatFlag} {StructuredStreamFormatValue} support; structured stream capture was disabled.";
         var stderr = string.IsNullOrEmpty(result.Stderr) ? warning : $"{warning}\n{result.Stderr}";
         return result with { Stderr = stderr };
     }
@@ -230,13 +244,28 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         Action<string>? stdoutChunkCallback = null)
         => RunWithLogCaptureAsync(
             sandbox,
-            // Resume turns deliberately do not request the structured stream
-            // (see CliAgentRunnerBase.RunResumedAsync), so the folded glog uses
-            // the same plaintext line shape.
-            captureStructuredStream: false,
+            workingDirectory,
+            // Resume turns are structured too. They used to opt out (the base's
+            // RunResumedAsync only enables structured capture for session-id-bearing
+            // runners), which was right while --output-format was optional. It no
+            // longer is: stream-json input requires stream-json output, so a resume
+            // emits NDJSON whether or not anyone asked. Folding that as plaintext
+            // would file raw NDJSON into the capture, so the core is called directly
+            // with the flag set rather than going through base.RunResumedAsync.
+            captureStructuredStream: true,
             stdoutChunkCallback,
             ct,
-            () => base.RunResumedAsync(sandbox, workingDirectory, prompt, credential, resume, modelId, reasoningMode, ct, stdoutChunkCallback));
+            () => RunResumedCoreAsync(
+                sandbox,
+                workingDirectory,
+                prompt,
+                credential,
+                resume,
+                modelId,
+                reasoningMode,
+                ct,
+                stdoutChunkCallback,
+                captureStructuredStream: true));
 
     /// <summary>
     /// Shared lifecycle for both run overrides: pick the per-run agy glog path,
@@ -249,6 +278,7 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
     /// </summary>
     private async Task<AgentResult> RunWithLogCaptureAsync(
         ISandbox sandbox,
+        string workingDirectory,
         bool captureStructuredStream,
         Action<string>? stdoutChunkCallback,
         CancellationToken ct,
@@ -256,6 +286,7 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
     {
         var logFile = ComputeAgyLogPath();
         _currentLogPath.Value = logFile;
+        _currentWorkingDirectory.Value = workingDirectory;
         try
         {
             await EnsureLogDirectoryAsync(sandbox, logFile, ct).ConfigureAwait(false);
@@ -266,6 +297,7 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         finally
         {
             _currentLogPath.Value = null;
+            _currentWorkingDirectory.Value = null;
         }
     }
 
@@ -541,10 +573,11 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         bool useContinue,
         bool captureStructuredStream)
     {
-        // agy --print --dangerously-skip-permissions [...]: one-shot prompt
-        // that auto-approves tool calls. The sandbox boundary is the real
-        // permission boundary — same shape we use for Claude.
-        var argv = BuildAgyPrintModePrefix();
+        // agy --input-format stream-json --output-format stream-json
+        // --dangerously-skip-permissions --add-dir <cwd>: one non-interactive turn that
+        // auto-approves tool calls. The sandbox boundary is the real permission boundary —
+        // same posture as Claude. See BuildAgyStreamJsonPrefix for why --print is unusable.
+        var argv = BuildAgyStreamJsonPrefix();
 
         if (_currentLogPath.Value is { } logPath)
         {
@@ -579,15 +612,12 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
             argv.Add(modelId);
         }
 
-        // captureStructuredStream is set only after SupportsStructuredStreamAsync
-        // has verified that print-mode accepts this flag and emits parseable
-        // NDJSON. When false, agy emits its human-readable footer and the
-        // plaintext-fallback summariser takes over.
-        if (captureStructuredStream)
-        {
-            argv.Add(StructuredStreamOutputFormatFlag);
-            argv.Add(StructuredStreamOutputFormatValue);
-        }
+        // The output format is no longer conditional: stream-json input REQUIRES stream-json output,
+        // and stream-json input is the only non-interactive mode that keeps the prompt on stdin. The
+        // flag is emitted by BuildAgyStreamJsonPrefix for every run; captureStructuredStream now only
+        // selects how this runner FOLDS that output (structured vs plaintext summary), not whether agy
+        // produces it.
+        _ = captureStructuredStream;
 
         // Reasoning level is encoded in the model id for Antigravity (each
         // gateway model carries its thinking level — gemini-3.5-flash-high,
@@ -599,12 +629,15 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
         // Linux's MAX_ARG_STRLEN is 128 KiB per single argv element; rework
         // prompts that include many audit findings can exceed that and surface
         // as exit 126 from the sandbox wrapper's exec. Mirrors GeminiAgentRunner.
-        return new AgentInvocation(argv, Stdin: prompt);
+        // stream-json mode takes one NDJSON frame per turn, so the raw prompt is wrapped.
+        return new AgentInvocation(argv, Stdin: BuildStreamJsonPromptFrame(prompt));
     }
 
     private IReadOnlyList<string> BuildStructuredStreamProbeArgv()
     {
-        var argv = BuildAgyPrintModePrefix();
+        // Same shape as a real run (the format flags are already in the prefix) so the probe cannot
+        // certify an invocation the runner does not actually use.
+        var argv = BuildAgyStreamJsonPrefix();
         if (PrintTimeout > TimeSpan.Zero)
         {
             var probeTimeoutSeconds = Math.Clamp(
@@ -615,13 +648,73 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
             argv.Add($"{probeTimeoutSeconds}s");
         }
 
-        argv.Add(StructuredStreamOutputFormatFlag);
-        argv.Add(StructuredStreamOutputFormatValue);
         return argv;
     }
 
-    private List<string> BuildAgyPrintModePrefix() =>
-        [Binary, "--print", "--dangerously-skip-permissions"];
+    /// <summary>
+    /// The non-interactive prefix: stream-json in and out, permissions skipped.
+    ///
+    /// <para><b>Why not <c>--print</c>.</b> In agy 1.1.x <c>--print</c> is a STRING flag, so a bare
+    /// <c>--print</c> consumes the next argv element as its prompt. The previous shape here
+    /// (<c>[agy, --print, --dangerously-skip-permissions]</c>) therefore ran with the literal prompt
+    /// "--dangerously-skip-permissions", discarded the real prompt on stdin, and left permissions
+    /// un-skipped. Verified against agy 1.1.24, which reports:
+    /// <c>Error: --print took "--dangerously-skip-permissions" as its prompt, so the intended prompt
+    /// was left as an argument and ignored.</c> — and then <b>exits 0</b>, so the run looked
+    /// successful while doing nothing, surfacing downstream as "produced no changes".</para>
+    ///
+    /// <para>Putting the prompt back on argv (<c>--print=&lt;prompt&gt;</c>) is not an option: rework
+    /// prompts carrying audit findings exceed Linux's 128 KiB MAX_ARG_STRLEN, which is why this runner
+    /// feeds stdin in the first place. <c>--input-format stream-json</c> selects non-interactive mode on
+    /// its own, keeps the prompt on stdin, and is the only shape that does both. It requires
+    /// <c>--output-format stream-json</c>, so structured output is mandatory rather than optional here.</para>
+    /// </summary>
+    private List<string> BuildAgyStreamJsonPrefix()
+    {
+        var argv = new List<string>
+        {
+            Binary,
+            StructuredStreamInputFormatFlag,
+            StructuredStreamFormatValue,
+            StructuredStreamOutputFormatFlag,
+            StructuredStreamFormatValue,
+            "--dangerously-skip-permissions",
+        };
+
+        // Without an explicit workspace, a clean guest silently drops file writes: agy reports SUCCESS
+        // while the working tree is untouched. The path MUST be absolute — verified against 1.1.24, a
+        // relative "--add-dir ." also reported SUCCESS and wrote the file nowhere at all (not the cwd,
+        // not the scratch dir). Omitted when unknown so the flag is never passed a relative path.
+        if (_currentWorkingDirectory.Value is { Length: > 0 } workingDirectory
+            && workingDirectory.StartsWith('/'))
+        {
+            argv.Add("--add-dir");
+            argv.Add(workingDirectory);
+        }
+
+        return argv;
+    }
+
+    /// <summary>
+    /// Wraps a prompt in the single NDJSON frame agy's stream-json input format expects, terminated by
+    /// the newline that makes the CLI run the turn.
+    /// </summary>
+    /// <remarks>
+    /// The envelope key is <c>event</c>, not <c>type</c>: agy's stream-json resembles Claude Code's and
+    /// is not it, and a Claude-shaped line is rejected with
+    /// <c>stream input message is missing the "event" field</c>. Serialized rather than interpolated so
+    /// a prompt containing quotes, newlines or control characters cannot break the frame.
+    /// </remarks>
+    internal static string BuildStreamJsonPromptFrame(string prompt) =>
+        JsonSerializer.Serialize(new
+        {
+            @event = "user",
+            message = new
+            {
+                role = "user",
+                content = new[] { new { type = "text", text = prompt } },
+            },
+        }) + "\n";
 
     private async Task<bool> TryMaterialiseAuthForProbeAsync(ISandbox sandbox, CancellationToken ct)
     {

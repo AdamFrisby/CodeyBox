@@ -48,6 +48,16 @@ body {
     text-decoration: underline;
 }
 
+.admin-nav-user {
+    margin-left: auto;
+    color: #c8d6ff;
+    font-size: 0.85rem;
+    max-width: 22rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 .admin-main {
     padding: 1.5rem;
     flex: 1;

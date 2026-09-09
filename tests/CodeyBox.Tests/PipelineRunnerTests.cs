@@ -171,6 +171,16 @@ public sealed class PipelineRunnerTests
     }
 
     [Fact]
+    public void BuildInitialWorkPrompt_ReservesUpstreamDeliveryForOrchestrator()
+    {
+        var prompt = PipelineRunner.BuildInitialWorkPrompt("implement feature X");
+
+        Assert.Contains("Commit your changes locally", prompt, StringComparison.Ordinal);
+        Assert.Contains("do not push branches, create pull requests", prompt, StringComparison.Ordinal);
+        Assert.Contains("orchestrator owns all upstream publication after audit", prompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void BuildInitialWorkPrompt_PreservesUserPrompt()
     {
         const string userPrompt = "implement feature X with unit tests";

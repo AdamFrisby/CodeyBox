@@ -793,6 +793,7 @@ public sealed class IncusMountAndCloudInitTests
             baseline with { BaselineCpus = baseline.BaselineCpus + 1 },
             baseline with { BaselineMemoryBytes = baseline.BaselineMemoryBytes + 4096 },
             baseline with { BaselineDiskBytes = baseline.BaselineDiskBytes + 4096 },
+            baseline with { SecureBoot = false },
             baseline with { NetworkProfiles = new Dictionary<string, string> { ["internet"] = "cb-other" } },
             baseline with { ExtraRuncmd = ["echo changed"] },
             baseline with { ExtraCloudInit = "packages: [jq]" },

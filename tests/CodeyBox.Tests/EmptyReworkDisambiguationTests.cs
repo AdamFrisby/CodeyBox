@@ -260,7 +260,9 @@ public sealed class EmptyReworkDisambiguationTests : IDisposable
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
         Assert.NotEqual(WorkItemState.Failed, final.State);
-        Assert.Contains("quota failure", final.LastError ?? string.Empty,
+        Assert.Contains("rate-limited by provider", final.LastError ?? string.Empty,
+            StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("reported quota failure", final.LastError ?? string.Empty,
             StringComparison.OrdinalIgnoreCase);
         Assert.Equal(1, auditor.Calls);
         Assert.DoesNotContain(tp.Agent.WorkPrompts, p =>

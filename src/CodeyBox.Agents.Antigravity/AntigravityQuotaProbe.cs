@@ -65,10 +65,37 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
 
     /// <summary>
     /// Authorization/tier read. 200 ⇒ credential valid + subscription active.
-    /// The only gateway RPC that answers for our credential without spending
-    /// quota; the <c>:retrieveUserQuota*</c> meters return 403.
+    /// Used as the fallback liveness signal when the quota meter below cannot be
+    /// read; it costs no quota.
     /// </summary>
     internal const string LoadCodeAssistEndpoint = GatewayBase + ":loadCodeAssist";
+
+    /// <summary>
+    /// The real quota meter: per-model-family weekly and 5-hour remaining fractions with reset times.
+    /// This is the RPC the CLI's <c>/usage</c> command renders.
+    /// </summary>
+    internal const string QuotaSummaryEndpoint = GatewayBase + ":retrieveUserQuotaSummary";
+
+    /// <summary>
+    /// Request body for <see cref="QuotaSummaryEndpoint"/>. The <c>project</c> field is required —
+    /// an empty object is rejected — and <c>aicode-consumers</c> is the value a consumer
+    /// (Sign-in-with-Google, non-enterprise) credential is metered under.
+    /// </summary>
+    internal const string QuotaSummaryBody = "{\"project\":\"aicode-consumers\"}";
+
+    /// <summary>
+    /// Default <c>User-Agent</c> for the quota meter.
+    ///
+    /// <para><b>This value is load-bearing, not cosmetic.</b> The gateway gates
+    /// <see cref="QuotaSummaryEndpoint"/> on client identity: the same credential and body answer
+    /// <c>403 SUBSCRIPTION_REQUIRED</c> under any other agent string (verified against a generic
+    /// agent, a browser-shaped one, and curl's default) and <c>200</c> only when the request presents
+    /// itself as the Antigravity CLI. Keep it matching the <c>agy</c> build actually installed —
+    /// a version string that does not correspond to a real client is worse than none. Operators
+    /// override via <c>CodeyBox:Antigravity:QuotaUserAgent</c> when the CLI is upgraded.</para>
+    /// </summary>
+    internal const string DefaultQuotaUserAgent =
+        "antigravity/cli/1.1.26 (aidev_client; os_type=linux; arch=amd64; cl=976013059; auth_method=consumer)";
 
     /// <summary>
     /// Request body for <see cref="LoadCodeAssistEndpoint"/>. <c>pluginType</c>
@@ -98,18 +125,25 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
 
     public AgentKind Kind => AgentKind.Antigravity;
 
+    /// <summary>User-Agent presented to the quota meter. See <see cref="DefaultQuotaUserAgent"/>.</summary>
+    private readonly string _quotaUserAgent;
+
     public AntigravityQuotaProbe(
         IHttpClientFactory httpClientFactory,
         Func<AgentMembership, AgentQuotaCredentials> credentialsProvider,
         TimeSpan cacheTtl,
         ILogger<AntigravityQuotaProbe> log,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        string? quotaUserAgent = null)
     {
         _httpClientFactory = httpClientFactory;
         _credentialsProvider = credentialsProvider;
         _cacheTtl = cacheTtl;
         _log = log;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _quotaUserAgent = string.IsNullOrWhiteSpace(quotaUserAgent)
+            ? DefaultQuotaUserAgent
+            : quotaUserAgent;
     }
 
     public async Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct)
@@ -142,7 +176,11 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
             if (_cache.TryGetValue(cacheKey, out var entry) && entry.ExpiresAt > now)
                 return entry.Snapshot;
 
-            snapshot = await ProbeAuthorizationAsync(token, modelKey, ct).ConfigureAwait(false);
+            // Prefer the real meter (per-window remaining fractions + resets). The authorization read
+            // is the fallback: it costs no quota and still distinguishes a live credential from a dead
+            // one, but it can only report liveness, so a real reading always wins when available.
+            snapshot = await ProbeQuotaSummaryAsync(token, modelKey, ct).ConfigureAwait(false)
+                ?? await ProbeAuthorizationAsync(token, modelKey, ct).ConfigureAwait(false);
             _cache[cacheKey] = new CacheEntry(snapshot, now + _cacheTtl);
         }
         finally
@@ -235,6 +273,83 @@ public sealed class AntigravityQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheIn
     ///   router's QuotaUnknownPolicy decides.</description></item>
     /// </list>
     /// </summary>
+    /// <summary>
+    /// Reads the real quota meter. Returns null when the meter is unavailable for this credential, so
+    /// the caller can fall back to the authorization/liveness read rather than reporting a hard unknown.
+    /// </summary>
+    internal async Task<AgentQuotaSnapshot?> ProbeQuotaSummaryAsync(
+        string token, string modelId, CancellationToken ct)
+    {
+        try
+        {
+            var client = _httpClientFactory.CreateClient("agent-quota");
+            using var request = new HttpRequestMessage(HttpMethod.Post, QuotaSummaryEndpoint);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            // Set explicitly rather than via the shared client so the agent string cannot drift with
+            // unrelated HttpClient configuration — the gateway gates this RPC on it.
+            request.Headers.TryAddWithoutValidation("User-Agent", _quotaUserAgent);
+            request.Content = new StringContent(QuotaSummaryBody, Encoding.UTF8, "application/json");
+
+            using var response = await client.SendAsync(request, ct).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                _log.LogDebug(
+                    "Antigravity quota summary returned {StatusCode}; falling back to authorization probe",
+                    (int)response.StatusCode);
+                return null;
+            }
+
+            var body = await ReadCappedAsync(response.Content, ct).ConfigureAwait(false);
+            var groups = AntigravityQuotaSummaryParser.Parse(body);
+            var buckets = AntigravityQuotaSummaryParser.BucketsForModel(groups, modelId);
+            if (buckets.Count == 0)
+                return null;
+
+            var windows = buckets
+                .Select(b => new WindowQuota
+                {
+                    Name = b.Window,
+                    AvailablePct = b.AvailablePct,
+                    ResetAt = b.ResetAt,
+                    UsedPercent = Math.Clamp(100.0 - b.AvailablePct, 0.0, 100.0),
+                })
+                .ToArray();
+
+            // The binding window is the scarcest one; surface its reset so a park waits the right span.
+            var binding = windows.MinBy(w => w.AvailablePct)!;
+            var perModel = new Dictionary<string, ModelQuota>(StringComparer.OrdinalIgnoreCase);
+            if (!string.IsNullOrEmpty(modelId))
+            {
+                perModel[modelId] = new ModelQuota
+                {
+                    AvailablePct = binding.AvailablePct,
+                    ResetAt = binding.ResetAt,
+                    Window = binding.Name,
+                    Windows = windows,
+                };
+            }
+
+            return new AgentQuotaSnapshot
+            {
+                AvailablePct = binding.AvailablePct,
+                ResetAt = binding.ResetAt,
+                Notes = $"quota summary: {string.Join(
+                    ", ", windows.Select(w => $"{w.Name}={w.AvailablePct:0.#}%"))}",
+                Windows = windows,
+                PerModel = perModel,
+            };
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Antigravity quota summary probe failed; falling back to authorization probe");
+            return null;
+        }
+    }
+
     internal async Task<AgentQuotaSnapshot> ProbeAuthorizationAsync(string token, string modelId, CancellationToken ct)
     {
         try

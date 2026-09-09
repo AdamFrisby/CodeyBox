@@ -21,6 +21,9 @@ internal sealed class ProjectsAndConfigurationApiFactory : WebApplicationFactory
     private readonly string _dbPath = Path.Combine(
         Path.GetTempPath(),
         $"codeybox-projects-config-uat-{Guid.NewGuid():N}.db");
+    private readonly string _githubAppStorePath = Path.Combine(
+        Path.GetTempPath(),
+        $"codeybox-github-apps-uat-{Guid.NewGuid():N}");
 
     public ProjectsAndConfigurationApiFactory(
         string environment = "Development",
@@ -55,6 +58,7 @@ internal sealed class ProjectsAndConfigurationApiFactory : WebApplicationFactory
                 ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
                 ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
                 ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
+                ["CodeyBox:GitHubAppStorePath"] = _githubAppStorePath,
                 ["CodeyBox:Changelog:Enabled"] = "false",
             };
 
@@ -87,6 +91,7 @@ internal sealed class ProjectsAndConfigurationApiFactory : WebApplicationFactory
             WorkItemStore.Dispose();
             ReleaseStore.Dispose();
             try { File.Delete(_dbPath); } catch { }
+            try { Directory.Delete(_githubAppStorePath, recursive: true); } catch { }
         }
         base.Dispose(disposing);
     }

@@ -62,6 +62,15 @@ public sealed class AntigravityQuotaFailureDetector : IAgentQuotaFailureDetector
         ("ResourceExhausted", QuotaFailureKind.RateLimitExceeded),
         ("rate limit exceeded", QuotaFailureKind.RateLimitExceeded),
         ("quota exceeded", QuotaFailureKind.RateLimitExceeded),
+        // agy's PER-MODEL rolling limit, which is a third dimension the /usage meter does not
+        // surface: it refuses with this while the account's 5h reads 100% and the weekly is
+        // half-full. Observed verbatim: "Individual quota reached. Please upgrade your subscription
+        // to increase your limits. Resets in 1h8m20s." Note it says "quota reached", NOT "quota
+        // exceeded", so none of the rows above matched — the run fell through to a generic terminal
+        // failure and the item hard-FAILED instead of parking, even though the message carries its
+        // own reset which QuotaResetParser already knows how to read. RateLimitExceeded rather than
+        // LimitReached because this is a short rolling window (~1h), not a weekly lockout.
+        ("individual quota reached", QuotaFailureKind.RateLimitExceeded),
         ("too many requests", QuotaFailureKind.RateLimitExceeded),
         ("API Error: 401", QuotaFailureKind.Unauthorized),
         ("API Error: 403", QuotaFailureKind.Unauthorized),

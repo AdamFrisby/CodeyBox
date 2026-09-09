@@ -28,6 +28,10 @@
     <ProjectReference Include="..\CodeyBox.Notifications\CodeyBox.Notifications.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="CodeyBox.Tests" />
+  </ItemGroup>
+
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
@@ -37,7 +41,7 @@
   <!--
     Bundled per-(agent, model) pricing defaults. Copied next to the binary so
     AgentPricingDefaults can resolve it via IHostEnvironment.ContentRootPath
-    in both `dotnet run` and published deployments. See docs/agent-pricing.md.
+    in both `dotnet run` and published deployments. See docs/operating/costs.md.
     Uses Update (not Include) because the .NET Web SDK auto-discovers
     Content items at the project root.
   -->
@@ -75,6 +79,7 @@
     <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.17.0" />
     <PackageReference Include="OpenTelemetry.Instrumentation.Http" Version="1.17.0" />
     <PackageReference Include="OpenTelemetry.Instrumentation.Runtime" Version="1.17.0" />
+    <PackageReference Include="Tmds.DBus" Version="0.95.1" />
   </ItemGroup>
 
 </Project>

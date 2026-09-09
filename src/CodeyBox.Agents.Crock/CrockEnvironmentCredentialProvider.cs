@@ -68,7 +68,7 @@ public sealed class CrockEnvironmentCredentialProvider : ICredentialProvider
 {
     /// <summary>
     /// Host env var carrying the raw CrockCode config JSON. Documented in
-    /// <c>docs/agents.md</c>; the host populates this from
+    /// <c>docs/concepts/agents.md</c>; the host populates this from
     /// <c>~/.crockcode/config.json</c> (or wherever the operator's secret
     /// management stages it), and the runner materialises it back inside the
     /// VM at <c>~/.crockcode/config.json</c> with mode 0600.

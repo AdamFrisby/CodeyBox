@@ -210,7 +210,7 @@ public sealed class AgentRunnerStructuredStreamFlagTests
         var sandbox = new CapturingSandbox
         {
             VersionOutput = "agy version structured-supported",
-            HelpOutput = "Usage: agy --output-format stream-json",
+            HelpOutput = "Usage: agy --input-format stream-json --output-format stream-json",
             StructuredProbeOutput = "{\"type\":\"result\",\"result\":\"ok\"}\n",
         };
         var runner = new AntigravityAgentRunner { Binary = "/opt/agy" };
@@ -236,7 +236,7 @@ public sealed class AgentRunnerStructuredStreamFlagTests
         var sandbox = new CapturingSandbox
         {
             VersionOutput = "agy version structured-broken",
-            HelpOutput = "Usage: agy --output-format stream-json",
+            HelpOutput = "Usage: agy --input-format stream-json --output-format stream-json",
             StructuredProbeOutput = """
                 Available subcommands:
                   install   Configure environment paths and shell settings
@@ -259,7 +259,7 @@ public sealed class AgentRunnerStructuredStreamFlagTests
         var firstSandbox = new CapturingSandbox
         {
             VersionOutput = "agy version cached-supported",
-            HelpOutput = "Usage: agy --output-format stream-json",
+            HelpOutput = "Usage: agy --input-format stream-json --output-format stream-json",
             StructuredProbeOutput = "{\"type\":\"result\",\"result\":\"ok\"}\n",
         };
 
@@ -278,7 +278,7 @@ public sealed class AgentRunnerStructuredStreamFlagTests
         var thirdSandbox = new CapturingSandbox
         {
             VersionOutput = "agy version cached-unsupported",
-            HelpOutput = "Usage: agy --output-format stream-json",
+            HelpOutput = "Usage: agy --input-format stream-json --output-format stream-json",
             StructuredProbeOutput = """
                 Available subcommands:
                   install   Configure environment paths and shell settings
@@ -342,7 +342,7 @@ public sealed class AgentRunnerStructuredStreamFlagTests
         var firstSandbox = new CapturingSandbox
         {
             VersionOutput = "agy version output-limit",
-            HelpOutput = "Usage: agy --output-format stream-json",
+            HelpOutput = "Usage: agy --input-format stream-json --output-format stream-json",
             StructuredProbeOutput = "{\"type\":\"result\",\"result\":\"ok\"}\n",
             StructuredProbeStdoutLimitExceeded = true,
         };
@@ -352,7 +352,7 @@ public sealed class AgentRunnerStructuredStreamFlagTests
         var secondSandbox = new CapturingSandbox
         {
             VersionOutput = "agy version output-limit",
-            HelpOutput = "Usage: agy --output-format stream-json",
+            HelpOutput = "Usage: agy --input-format stream-json --output-format stream-json",
             StructuredProbeOutput = "{\"type\":\"result\",\"result\":\"ok\"}\n",
         };
 
@@ -367,7 +367,7 @@ public sealed class AgentRunnerStructuredStreamFlagTests
         var sandbox = new CapturingSandbox
         {
             VersionOutput = "agy version " + new string('x', 300),
-            HelpOutput = "Usage: agy --output-format stream-json",
+            HelpOutput = "Usage: agy --input-format stream-json --output-format stream-json",
             StructuredProbeOutput = "{\"type\":\"result\",\"result\":\"ok\"}\n",
         };
 

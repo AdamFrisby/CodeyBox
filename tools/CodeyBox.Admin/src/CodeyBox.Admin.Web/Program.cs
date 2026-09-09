@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.Authentication.Google;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.IdentityModel.Tokens;
 using CodeyBox.Admin.Web.Services;
 using CodeyBox.Admin.Web;
 
@@ -14,14 +15,23 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddRazorComponents()
     .AddInteractiveServerComponents();
+builder.Services.AddCascadingAuthenticationState();
+builder.Services.AddHttpContextAccessor();
 
 var apiBaseUrl = builder.Configuration.GetValue<string>("CodeyBoxAdmin:ApiBaseUrl")
     ?? "http://localhost:5050";
 var requireAuth = builder.Configuration.GetValue<bool>("CodeyBoxAdmin:RequireAuth", false);
+var cloudflareAccessRequested = builder.Configuration.GetValue<bool>("CodeyBoxAdmin:Authentication:CloudflareAccess:Enabled");
 var cloudflareTeamDomain = builder.Configuration["CodeyBoxAdmin:Authentication:CloudflareAccess:TeamDomain"]?.TrimEnd('/');
 var cloudflareAudience = builder.Configuration["CodeyBoxAdmin:Authentication:CloudflareAccess:Audience"];
-var cloudflareEnabled = !string.IsNullOrWhiteSpace(cloudflareTeamDomain)
+var cloudflareConfigured = !string.IsNullOrWhiteSpace(cloudflareTeamDomain)
     && !string.IsNullOrWhiteSpace(cloudflareAudience);
+if (cloudflareAccessRequested && !cloudflareConfigured)
+{
+    throw new InvalidOperationException(
+        "Cloudflare Access requires both TeamDomain and Audience when enabled.");
+}
+var cloudflareEnabled = cloudflareAccessRequested && cloudflareConfigured;
 var googleClientId = builder.Configuration["CodeyBoxAdmin:Authentication:Google:ClientId"];
 var googleClientSecret = builder.Configuration["CodeyBoxAdmin:Authentication:Google:ClientSecret"];
 var googleEnabled = !string.IsNullOrWhiteSpace(googleClientId)
@@ -78,6 +88,11 @@ if (cloudflareEnabled)
         options.Authority = $"https://{cloudflareTeamDomain}";
         options.Audience = cloudflareAudience;
         options.RequireHttpsMetadata = true;
+        options.MapInboundClaims = false;
+        options.TokenValidationParameters.RequireSignedTokens = true;
+        options.TokenValidationParameters.RequireExpirationTime = true;
+        options.TokenValidationParameters.ClockSkew = TimeSpan.FromSeconds(30);
+        options.TokenValidationParameters.ValidAlgorithms = [SecurityAlgorithms.RsaSha256];
         options.Events = new JwtBearerEvents
         {
             OnMessageReceived = context =>
@@ -149,7 +164,9 @@ var app = builder.Build();
 if (!app.Environment.IsDevelopment())
     app.UseExceptionHandler("/error");
 
-app.MapStaticAssets();
+// Static framework, stylesheet, and script assets are required to render the
+// anonymous login page. Protect the interactive dashboard route instead.
+app.MapStaticAssets().AllowAnonymous();
 app.UseAntiforgery();
 
 // Auth middleware must run before Blazor components so the user principal is available.
@@ -253,7 +270,9 @@ var moveEndpoint = app.MapPost("/admin/move/{id}/{direction}",
         }
         catch (Exception ex)
         {
-            moveLogger.LogWarning(ex, "No-JS reorder for item {ItemId} direction={Direction} failed", id, direction);
+            moveLogger.LogWarning(ex, "No-JS reorder for item {ItemId} direction={Direction} failed",
+                id.Replace("\r", "").Replace("\n", ""),
+                direction.Replace("\r", "").Replace("\n", ""));
         }
         return Results.Redirect("/");
     });

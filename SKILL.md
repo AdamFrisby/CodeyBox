@@ -15,13 +15,13 @@ unresolved policy choices. Do not silently omit optional components or choose
 production defaults on the user's behalf.
 
 Ask explicitly: **"Do you want the CodeyBox Admin UI installed?"** Do not infer
-the answer from an API-only deployment. If yes, confirm its hostname and
-authentication before selecting the ingress topology.
+the answer from an API-only deployment. If yes, confirm its authentication and
+any exception to the default co-hosted ingress topology.
 
 Confirm:
 
 - sandbox provider and storage pool;
-- whether to deploy Admin, and its hostname and authentication;
+- whether to deploy Admin, its authentication, and any requested ingress exception;
 - whether provider baselines should be disabled, baked lazily, or prewarmed;
 - required network profiles and which phases may access the internet;
 - repository credentials, upstream PR delivery, and auto-merge policy;
@@ -29,6 +29,23 @@ Confirm:
 
 Record non-secret choices in version-controlled configuration. Keep tokens and
 generated credentials in protected environment files or a secret store.
+
+### Co-host the Admin dashboard by default
+
+Use one public CodeyBox origin by default: serve Admin at the origin root and
+proxy the orchestrator API at `/api/` through the same TLS terminator or
+tunnel. Keep the API listener loopback-only, and update every caller
+(including JobTrack) to use the `/api` base URL. This provides one canonical
+operator URL and one edge-authentication policy.
+
+Do not create a separate public Admin hostname unless the user explicitly
+requests independent ingress or authentication. A separately packaged Admin
+process may still run locally; “co-hosted” describes the public origin and
+reverse-proxy boundary, not a requirement for a shared executable.
+
+Before cutover, identify every API consumer, preserve WebSocket forwarding,
+remove the separate public ingress, and validate unauthenticated Admin,
+authenticated Admin, API, and caller access through the canonical origin.
 
 ### Choose the sandbox provider explicitly
 
@@ -46,7 +63,7 @@ generated credentials in protected environment files or a secret store.
 
 Provider baselines are independent. Ask which network-profile baselines to
 prewarm; do not assume Incus inherits Multipass provisioning. Read
-`docs/sandbox-providers.md` and `docs/host-firewall.md`.
+`docs/concepts/sandboxes.md` and `docs/operating/host-firewall.md`.
 
 ## Define installation completeness
 
@@ -59,8 +76,12 @@ Inventory and explicitly deploy or omit:
 - startup supervision and restart behavior;
 - operator-visible queued, running, parked, and failed work.
 
+The normal public layout is `https://codeybox.example/` for Admin and
+`https://codeybox.example/api/` for the orchestrator API. A distinct public
+Admin hostname is an explicit exception, not the default.
+
 An operator must be able to tell what is running, what needs attention, why it
-failed, and how to recover it. Read `docs/security.md`, `docs/operations.md`,
+failed, and how to recover it. Read `docs/concepts/security.md`, `docs/operating/running.md`,
 and the Admin documentation before finalizing the inventory.
 
 ## Build and configure
@@ -96,7 +117,7 @@ Put project configuration in JSON and point `CODEYBOX_EXTRA_CONFIG` at it:
 ```
 
 Use credential-free repository URLs and protected environment variables for
-secrets. See `docs/projects.md` and `docs/configuration.md`.
+secrets. See `docs/concepts/projects.md` and `docs/reference/configuration.md`.
 
 For development:
 
@@ -198,4 +219,4 @@ reconciliation, dashboard visibility, and failure recovery separately.
   policy, and retry the bounded upstream phase.
 
 Judge health by advancing state and timestamps, not only completed-item count.
-See `docs/operations.md` and `docs/recovery.md`.
+See `docs/operating/running.md` and `docs/operating/recovery.md`.
