@@ -372,16 +372,28 @@ public sealed class StuckWorkItemRecoveryTests : IDisposable
 public sealed class WorkerPoolLogRateTests : IDisposable
 {
     private readonly TestSink _sink = new();
+    private readonly Serilog.ILogger _scopedLogger;
+    private readonly IDisposable _auditScope;
 
     public WorkerPoolLogRateTests()
     {
-        Log.Logger = new LoggerConfiguration()
+        // Route this flow's audit events to the test sink via a scoped logger
+        // rather than by replacing the process-global Log.Logger: other test
+        // collections (notably WebApplicationFactory boots) re-create the
+        // global logger concurrently, which both steals our events and leaks
+        // foreign events (e.g. host-terminated Fatal) into our sink.
+        _scopedLogger = new LoggerConfiguration()
             .MinimumLevel.Information()
             .WriteTo.Sink(_sink)
             .CreateLogger();
+        _auditScope = AuditLog.PushScopedLogger(_scopedLogger);
     }
 
-    public void Dispose() => Log.CloseAndFlush();
+    public void Dispose()
+    {
+        _auditScope.Dispose();
+        (_scopedLogger as IDisposable)?.Dispose();
+    }
 
     [Fact]
     public void PerPickupLifecycleLogging_StaysBelowInformation()
