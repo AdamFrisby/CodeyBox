@@ -202,6 +202,12 @@ public sealed class WorkerProgressWatchdogOptions
     /// <summary>
     /// Validates the configured values. Throws
     /// <see cref="InvalidOperationException"/> on misconfiguration.
+    /// Includes the timeout ordering check
+    /// (<see cref="ValidateTimeoutOrdering(TimeSpan, TimeSpan, TimeSpan?)"/>):
+    /// the per-turn progress budget must fit inside the item-stale window,
+    /// which must itself fire before the sandbox wall-clock backstop, so a
+    /// future edit cannot silently invert the detection order and either park
+    /// healthy long turns or let wedged items outlive their sandbox.
     /// </summary>
     public void Validate()
     {
@@ -269,6 +275,58 @@ public sealed class WorkerProgressWatchdogOptions
                 throw new InvalidOperationException(
                     $"CodeyBox:WorkerProgressWatchdog:PerAgent:{key}:ItemStaleTimeout ({itCheck.TotalSeconds}s) must be >= ItemStaleCheckInterval ({ItemStaleCheckInterval.TotalSeconds}s).");
         }
+
+        // Detection order runs last so field-level range errors keep their
+        // specific messages: per-turn progress budget < item-stale window <
+        // sandbox wall-clock backstop.
+        ValidateTimeoutOrdering(
+            ProgressTimeout,
+            ItemStaleTimeout,
+            SandboxResourceLimits.Default.WallClock,
+            "CodeyBox:WorkerProgressWatchdog");
+        foreach (var (key, per) in PerAgent)
+        {
+            if (per?.ProgressTimeout is { } entryProgress
+                && per?.ItemStaleTimeout is { } entryStale)
+            {
+                ValidateTimeoutOrdering(
+                    entryProgress,
+                    entryStale,
+                    wallClock: null,
+                    $"CodeyBox:WorkerProgressWatchdog:PerAgent:{key}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Enforces the detection order a future config edit must preserve: a
+    /// single agent turn (the per-turn progress budget) must fit inside the
+    /// item-stale window, which must itself fire before the sandbox
+    /// wall-clock backstop destroys the VM. Inverted otherwise: an
+    /// item-stale window at or below the per-turn budget parks healthy long
+    /// turns that never stamp <c>UpdatedAt</c> mid-turn, and a window at or
+    /// above the wall clock lets wedged items outlive their sandbox.
+    /// Disabled legs (<see cref="TimeSpan.Zero"/> timeouts, null wall clock)
+    /// are skipped so "disable this detector" sentinels keep working.
+    /// </summary>
+    public static void ValidateTimeoutOrdering(
+        TimeSpan perTurnBudget,
+        TimeSpan itemStaleTimeout,
+        TimeSpan? wallClock,
+        string configPrefix = "CodeyBox:WorkerProgressWatchdog")
+    {
+        if (itemStaleTimeout <= TimeSpan.Zero)
+            return;
+
+        if (perTurnBudget > TimeSpan.Zero && itemStaleTimeout <= perTurnBudget)
+            throw new InvalidOperationException(
+                $"{configPrefix}:ItemStaleTimeout ({itemStaleTimeout}) must be > per-turn progress budget ({perTurnBudget}) " +
+                "so a healthy long agent turn is not parked as stale before the per-worker progress path trips.");
+
+        if (wallClock is { } wall && wall > TimeSpan.Zero && itemStaleTimeout >= wall)
+            throw new InvalidOperationException(
+                $"{configPrefix}:ItemStaleTimeout ({itemStaleTimeout}) must be < sandbox wall clock ({wall}) " +
+                "so stale recovery fires before the wall-clock backstop destroys the sandbox.");
     }
 }
 

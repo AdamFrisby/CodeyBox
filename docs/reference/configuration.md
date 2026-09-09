@@ -490,7 +490,7 @@ CPU signal, and active sandbox ownership signal are all stale for
 | `ActiveSandboxProgressSignalEnabled` | `true` | Count provider-tracked active sandbox ownership as progress. This covers VM-backed providers whose guest CPU is not visible from host `/proc`; providers should omit sandboxes no longer actively owned by a work item. |
 | `PostAgentTransitionTimeout` | `00:10:00` | Bound the post-agent commit, push, and state-transition step. The item-stale watchdog also uses this bound while waiting for a recovery-cancelled local owner of a claimed durable checkpoint to quiesce. |
 | `MaxRecoveryAttempts` | `10` | Bounded automatic recoveries before transitioning the item to `AbandonedAfterRecoveryAttempts`; `0` means unlimited. |
-| `ItemStaleTimeout` | `01:15:00` | Window in which an active item's `UpdatedAt` must advance before the item-centric watchdog considers it wedged. Set `00:00:00` to disable this detector. |
+| `ItemStaleTimeout` | `01:15:00` | Window in which an active item's `UpdatedAt` must advance before the item-centric watchdog considers it wedged. A frozen `UpdatedAt` alone is not enough: an agent still appending stream output (or newly observed sandbox activity for its bound worker) is alive, not stale, and is skipped without consuming the recovery budget. Set `00:00:00` to disable this detector. Must stay above the per-turn progress budget (`ProgressTimeout`, and any per-agent `ProgressTimeout` override) and below the sandbox wall clock; misordering fails startup validation. |
 | `ItemStaleCheckInterval` | `00:05:00` | Item-centric stale sweep cadence. Sampled at startup; restart to change. |
 | `ItemStaleMaxRecoveryAttempts` | `3` | Bounded item-stale recoveries before parking at `NeedsOperatorInput`; `0` means unlimited. |
 
