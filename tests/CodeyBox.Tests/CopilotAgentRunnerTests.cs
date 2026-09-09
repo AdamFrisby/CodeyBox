@@ -167,4 +167,115 @@ public sealed class CopilotAgentRunnerTests
         Assert.Contains(CopilotAgentRunner.ProviderApiKeyEnvironmentVariable, declared);
         Assert.Contains(CopilotAgentRunner.ProviderBearerTokenEnvironmentVariable, declared);
     }
+
+    private static IReadOnlyDictionary<string, string> RunEnv(CopilotAgentRunner runner)
+    {
+        var sandbox = new CapturingSandbox();
+        runner.RunAsync(sandbox, "/work", "do the thing", credential: null)
+            .GetAwaiter().GetResult();
+        return sandbox.CapturedExec!.ExtraEnvironment!;
+    }
+
+    private static string HeaderLine(IReadOnlyDictionary<string, string> env, string name)
+    {
+        var lines = env["COPILOT_PROVIDER_HEADERS"].Split('\n');
+        var line = Assert.Single(lines, l => l.StartsWith(name + ":", StringComparison.Ordinal));
+        return line[(name.Length + 1)..].Trim();
+    }
+
+    [Fact]
+    public void ProviderHeaders_SessionPlaceholder_DiffersPerInvocation_WhileStaticHeaderIsIdentical()
+    {
+        // Two real invocations: the per-invocation header must vary (no shared session collapsing
+        // concurrent sandboxes onto one provider session) while the static header is byte-identical.
+        var runner = new CopilotAgentRunner
+        {
+            Options = Byok(p => p.Headers =
+            [
+                "X-Tenant: acme",
+                "x-opencode-session: {{codeybox.session_id}}",
+            ]),
+        };
+
+        var first = RunEnv(runner);
+        var second = RunEnv(runner);
+
+        Assert.Equal("acme", HeaderLine(first, "X-Tenant"));
+        Assert.Equal(HeaderLine(first, "X-Tenant"), HeaderLine(second, "X-Tenant"));
+        var firstSession = HeaderLine(first, "x-opencode-session");
+        var secondSession = HeaderLine(second, "x-opencode-session");
+        Assert.NotEqual(secondSession, firstSession);
+        Assert.True(Guid.TryParseExact(firstSession, "D", out _), $"not a UUID: {firstSession}");
+        Assert.True(Guid.TryParseExact(secondSession, "D", out _), $"not a UUID: {secondSession}");
+        // The diagnostic variable correlates each run with the session id it used.
+        Assert.Equal(firstSession, first[CopilotAgentRunner.ProviderSessionIdEnvironmentVariable]);
+        Assert.Equal(secondSession, second[CopilotAgentRunner.ProviderSessionIdEnvironmentVariable]);
+    }
+
+    [Fact]
+    public void ProviderHeaders_GeneratedValue_ReachesAgentEnvironment_InExpectedHeaderFormat()
+    {
+        // What the agent process receives must be a well-formed "Name: Value" line in the
+        // newline-separated format Copilot parses — not the raw placeholder.
+        var runner = new CopilotAgentRunner
+        {
+            Options = Byok(p => p.Headers = ["x-opencode-session: {{codeybox.session_id}}"]),
+        };
+
+        var env = RunEnv(runner);
+
+        var raw = env["COPILOT_PROVIDER_HEADERS"];
+        Assert.DoesNotContain(CopilotAgentRunner.ProviderSessionIdPlaceholder, raw);
+        Assert.Matches(@"^x-opencode-session: [0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", raw);
+    }
+
+    [Fact]
+    public void ProviderHeaders_StaticOnly_IsByteIdenticalAcrossInvocations_AndEmitsNoSessionId()
+    {
+        // Regression: other BYOK providers with only static headers see zero behaviour change —
+        // identical bytes across invocations and no diagnostic variable.
+        var runner = new CopilotAgentRunner
+        {
+            Options = Byok(p => p.Headers = ["X-Tenant: acme", "X-Other: 1"]),
+        };
+
+        var first = RunEnv(runner);
+        var second = RunEnv(runner);
+
+        Assert.Equal("X-Tenant: acme\nX-Other: 1", first["COPILOT_PROVIDER_HEADERS"]);
+        Assert.Equal(first["COPILOT_PROVIDER_HEADERS"], second["COPILOT_PROVIDER_HEADERS"]);
+        Assert.False(first.ContainsKey(CopilotAgentRunner.ProviderSessionIdEnvironmentVariable));
+        Assert.False(second.ContainsKey(CopilotAgentRunner.ProviderSessionIdEnvironmentVariable));
+    }
+
+    [Fact]
+    public void BuildProviderEnvironment_ResolvesEveryOccurrenceOncePerCall_WithInjectedGenerator()
+    {
+        // One generator call per invocation, shared by every occurrence so the whole invocation
+        // correlates to a single provider session.
+        var options = Byok(p => p.Headers =
+        [
+            "x-opencode-session: {{codeybox.session_id}}",
+            "x-trace: {{codeybox.session_id}}",
+        ]);
+        var calls = 0;
+        var env = CopilotAgentRunner.BuildProviderEnvironment(options, () => { calls++; return "fixed-id"; });
+
+        Assert.Equal(1, calls);
+        Assert.Equal("x-opencode-session: fixed-id\nx-trace: fixed-id", env["COPILOT_PROVIDER_HEADERS"]);
+        Assert.Equal("fixed-id", env[CopilotAgentRunner.ProviderSessionIdEnvironmentVariable]);
+    }
+
+    [Fact]
+    public void BuildProviderEnvironment_NeverInvokesGenerator_WithoutPlaceholder()
+    {
+        // Static headers must not touch the generator at all.
+        var options = Byok(p => p.Headers = ["X-Tenant: acme"]);
+        var env = CopilotAgentRunner.BuildProviderEnvironment(
+            options,
+            () => throw new InvalidOperationException("generator must not be invoked"));
+
+        Assert.Equal("X-Tenant: acme", env["COPILOT_PROVIDER_HEADERS"]);
+        Assert.False(env.ContainsKey(CopilotAgentRunner.ProviderSessionIdEnvironmentVariable));
+    }
 }

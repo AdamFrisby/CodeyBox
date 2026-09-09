@@ -35,6 +35,21 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase
     /// <see cref="ProviderApiKeyEnvironmentVariable"/>, so supplying both is ambiguous — set one.</summary>
     public const string ProviderBearerTokenEnvironmentVariable = "COPILOT_PROVIDER_BEARER_TOKEN";
 
+    /// <summary>Placeholder an operator may embed in a configured provider header value to request a
+    /// fresh session identifier per agent invocation, e.g.
+    /// <c>x-opencode-session: {{codeybox.session_id}}</c>. Matched with exact ordinal comparison;
+    /// anything else passes through byte-identical, so purely static headers are unaffected. Keeping
+    /// this a placeholder inside the existing string list (rather than a new schema member) means the
+    /// static form keeps working unchanged and stays hot-reloadable with no config migration.</summary>
+    public const string ProviderSessionIdPlaceholder = "{{codeybox.session_id}}";
+
+    /// <summary>Non-secret sandbox environment variable carrying the session identifier generated for
+    /// the current invocation, emitted only when <see cref="ProviderSessionIdPlaceholder"/> was
+    /// present. It lets a failing run be correlated with the session id it used; the id is random, so
+    /// unlike <c>COPILOT_PROVIDER_HEADERS</c> (which may carry secrets) this variable is safe to log.
+    /// Never log <c>COPILOT_PROVIDER_HEADERS</c> itself.</summary>
+    public const string ProviderSessionIdEnvironmentVariable = "CODEYBOX_COPILOT_SESSION_ID";
+
     /// <summary>Excluded tools applied when BYOK is on and the operator has expressed no preference.
     /// See <see cref="CopilotOptions.ExcludedTools"/> for why.</summary>
     public static readonly IReadOnlyList<string> DefaultByokExcludedTools = ["apply_patch"];
@@ -43,6 +58,16 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase
 
     /// <summary>Operator configuration. Defaults to subscription mode with no BYOK provider.</summary>
     public CopilotOptions Options { get; init; } = new();
+
+    /// <summary>Generates the session identifier substituted for
+    /// <see cref="ProviderSessionIdPlaceholder"/>. Defaults to a fresh random UUID per call and is an
+    /// instance member so tests can inject a deterministic generator; the runner invokes it at most
+    /// once per invocation, and only when a configured header actually contains the placeholder.
+    /// Injected randomness, not ambient <c>Guid.NewGuid</c> reads inside the pure mapping core.</summary>
+    public Func<string> SessionIdGenerator { get; init; } = NewProviderSessionId;
+
+    /// <summary>Generates one fresh session identifier in the UUID form providers expect.</summary>
+    public static string NewProviderSessionId() => Guid.NewGuid().ToString("D");
 
     /// <summary>
     /// Every environment variable the Copilot CLI reads a credential from. GH_TOKEN/GITHUB_TOKEN drive
@@ -64,7 +89,9 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase
     /// Renders BYOK settings to the environment variables Copilot reads. Empty when no base URL is
     /// configured: BYOK is inactive until <c>COPILOT_PROVIDER_BASE_URL</c> is set, and emitting the rest
     /// without it would be noise the CLI ignores. Pure, so the mapping is unit-testable without
-    /// launching anything.
+    /// launching anything. Header values containing
+    /// <see cref="ProviderSessionIdPlaceholder"/> are resolved with a freshly generated identifier;
+    /// pass an explicit generator to the overload for deterministic tests.
     /// </summary>
     /// <remarks>
     /// The credential (API key / bearer token) is deliberately absent: it reaches the CLI through the
@@ -72,6 +99,27 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase
     /// passes through this method's output.
     /// </remarks>
     public static IReadOnlyDictionary<string, string> BuildProviderEnvironment(CopilotOptions options)
+        => BuildProviderEnvironment(options, NewProviderSessionId);
+
+    /// <summary>
+    /// Renders BYOK settings with per-invocation header resolution. Any configured header value
+    /// containing <see cref="ProviderSessionIdPlaceholder"/> gets the placeholder replaced with a
+    /// single freshly generated identifier (one generator call per invocation, shared by every
+    /// occurrence so the whole invocation correlates to one provider session), and the identifier is
+    /// additionally exported as <see cref="ProviderSessionIdEnvironmentVariable"/> for diagnosis.
+    /// Headers without the placeholder are emitted byte-identical to the static form, and the
+    /// generator is never invoked when no header needs it.
+    /// </summary>
+    /// <remarks>
+    /// The credential (API key / bearer token) is deliberately absent: it reaches the CLI through the
+    /// credential provider's environment injection, so it is never assembled from config here and never
+    /// passes through this method's output. Likewise, never log the rendered
+    /// <c>COPILOT_PROVIDER_HEADERS</c> value — it may carry secrets — while the exported session id
+    /// is random and safe to log.
+    /// </remarks>
+    public static IReadOnlyDictionary<string, string> BuildProviderEnvironment(
+        CopilotOptions options,
+        Func<string>? sessionIdGenerator)
     {
         var env = new Dictionary<string, string>(StringComparer.Ordinal);
         var provider = options.Provider;
@@ -93,7 +141,21 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase
             .Select(h => h.Trim())
             .ToArray();
         if (headers.Length > 0)
+        {
+            string? sessionId = null;
+            if (headers.Any(h => h.Contains(ProviderSessionIdPlaceholder, StringComparison.Ordinal)))
+            {
+                sessionId = (sessionIdGenerator ?? NewProviderSessionId)();
+                ValidateSessionId(sessionId);
+                var resolved = sessionId;
+                headers = headers
+                    .Select(h => h.Replace(ProviderSessionIdPlaceholder, resolved, StringComparison.Ordinal))
+                    .ToArray();
+            }
             env["COPILOT_PROVIDER_HEADERS"] = string.Join('\n', headers);
+            if (sessionId is not null)
+                env[ProviderSessionIdEnvironmentVariable] = sessionId;
+        }
 
         // Copilot requires a provider for offline mode, so the flag is honoured only alongside one.
         if (options.Offline)
@@ -109,6 +171,21 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase
 
         static string? Format(int? value) =>
             value?.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// Guards the generated session id at the sink: it is spliced into newline-separated header
+    /// lines, so a value carrying newlines, carriage returns or NUL would corrupt the framing
+    /// Copilot parses (or smuggle an extra header). Random UUIDs always pass; a misbehaving
+    /// injected generator fails loudly instead of emitting corrupt headers.
+    /// </summary>
+    private static void ValidateSessionId(string? sessionId)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId)
+            || sessionId.Any(ch => ch is '\n' or '\r' or '\0'))
+            throw new ArgumentException(
+                "Provider session id generator must return a non-blank value without newline or NUL characters.",
+                nameof(sessionId));
     }
 
     /// <summary>
@@ -183,7 +260,7 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase
         _ = reasoningMode;
         _ = captureStructuredStream;
 
-        var env = BuildProviderEnvironment(Options);
+        var env = BuildProviderEnvironment(Options, SessionIdGenerator);
         return new AgentInvocation(argv, ExtraEnvironment: env.Count == 0 ? null : env);
     }
 }
