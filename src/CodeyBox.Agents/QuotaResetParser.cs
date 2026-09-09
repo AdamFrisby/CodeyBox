@@ -28,6 +28,10 @@ public static class QuotaResetParser
         @"(?:reset(?:s|ting)?(?:\s+will\s+reset)?\s+after|reset(?:s|ting)?\s+in|retry\s+after|try\s+again\s+after|available\s+(?:in|after))\s+(?:(\d+)\s*h(?![a-zA-Z]))?\s*(?:(\d+)\s*m(?![a-zA-Z]))?\s*(?:(\d+)\s*s(?![a-zA-Z]))?",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+    private static readonly Regex RetryAfterHeaderRegex = new(
+        @"retry-after\s*:\s*(\d{1,6})",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
     /// <summary>
     /// Returns the first parseable reset time from <paramref name="sources"/>,
     /// computed as <paramref name="utcNow"/> (defaulting to the current UTC
@@ -64,6 +68,39 @@ public static class QuotaResetParser
                 if (h > 0 || m > 0 || s > 0)
                     return now.Add(new TimeSpan(h, m, s));
             }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Returns the reset instant implied by an HTTP <c>Retry-After</c> header
+    /// echo (delta-seconds) inside CLI-captured text, e.g.
+    /// <c>Retry-After: 120</c>, computed as <paramref name="utcNow"/>
+    /// (defaulting to the current UTC instant) + the echoed delay. Returns
+    /// null when no source carries the echo.
+    ///
+    /// <para>Agent CLIs do not expose response headers structurally, so the
+    /// textual echo is the only Retry-After signal available at
+    /// classification time. Word-form prose ("retry after a brief wait")
+    /// carries no duration and yields null — the caller then falls back to
+    /// its bounded rate-limit default. The match is capped at six digits and
+    /// callers clamp the resulting instant to their maximum parsed reset
+    /// window, so a hostile or mistaken value cannot park an item arbitrarily
+    /// far in the future.</para>
+    /// </summary>
+    public static DateTimeOffset? TryParseRetryAfterHeader(
+        IEnumerable<string?> sources,
+        DateTimeOffset? utcNow = null)
+    {
+        var now = utcNow ?? DateTimeOffset.UtcNow;
+        foreach (var source in sources)
+        {
+            if (string.IsNullOrEmpty(source)) continue;
+            var match = RetryAfterHeaderRegex.Match(source);
+            if (!match.Success || !int.TryParse(match.Groups[1].Value, out var seconds) || seconds <= 0)
+                continue;
+            return now.AddSeconds(seconds);
         }
 
         return null;

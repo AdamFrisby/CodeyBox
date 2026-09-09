@@ -22,6 +22,32 @@ public interface IAuditProgressStore
         CancellationToken ct = default);
 
     /// <summary>
+    /// Every audit-progress row for a work item across all work-attempt partitions, each
+    /// carrying its surrogate id and partition metadata. Ordered newest attempt/iteration
+    /// first. Read path for the audit-progress API/UI (write path keys by the natural
+    /// composite (work item, attempt, iteration) instead). Implementations that do not back a
+    /// queryable store throw <see cref="NotSupportedException"/>.
+    /// </summary>
+    Task<IReadOnlyList<StoredAuditProgress>> GetAllAuditProgressForWorkItemAsync(
+        WorkItemId workItemId,
+        CancellationToken ct = default)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not provide addressable audit-progress reads.");
+
+    /// <summary>
+    /// One audit-progress row addressed by its surrogate <paramref name="id"/>. The
+    /// <paramref name="workItemId"/> participates in the lookup so a row is returned only when
+    /// it belongs to that work item (ownership is re-verified, not trusted). Null if not found.
+    /// Implementations that do not back a queryable store throw <see cref="NotSupportedException"/>.
+    /// </summary>
+    Task<StoredAuditProgress?> GetAuditProgressByIdAsync(
+        WorkItemId workItemId,
+        string id,
+        CancellationToken ct = default)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not provide addressable audit-progress reads.");
+
+    /// <summary>
     /// Deletes every persisted audit-progress row for a work item's work-attempt
     /// partition. Used when a resume discards a prior (passing / escaped) audit
     /// verdict and forces a fresh audit that restarts iteration numbering at 1:
@@ -35,6 +61,20 @@ public interface IAuditProgressStore
         DateTimeOffset? workAttemptStartedAt,
         CancellationToken ct = default);
 }
+
+/// <summary>
+/// A persisted audit-progress row together with its single-column surrogate key and
+/// work-attempt partition metadata. Used by read/display paths that address one row directly;
+/// the workflow write path keys by the natural composite (work item, attempt, iteration).
+/// <see cref="WorkAttemptKey"/> is the stored partition key: an empty string for the
+/// unpartitioned (null work-attempt) case, otherwise a round-trip ("O") timestamp.
+/// </summary>
+public sealed record StoredAuditProgress(
+    string Id,
+    WorkItemId WorkItemId,
+    string WorkAttemptKey,
+    DateTimeOffset RecordedAt,
+    AuditProgressRecord Progress);
 
 public sealed record AuditProgressRecord(
     int Iteration,

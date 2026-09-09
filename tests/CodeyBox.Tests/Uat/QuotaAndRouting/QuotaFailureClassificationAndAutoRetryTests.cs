@@ -1,7 +1,9 @@
 using CodeyBox.Agents;
 using CodeyBox.Agents.Claude;
 using CodeyBox.Agents.Codex;
+using CodeyBox.Agents.Copilot;
 using CodeyBox.Agents.Gemini;
+using CodeyBox.Agents.Opencode;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
@@ -33,6 +35,9 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
     [InlineData(nameof(AgentKind.Codex), "You hit your usage limit. Try again after 5m.", QuotaFailureKind.LimitReached)]
     [InlineData(nameof(AgentKind.Claude), "rate_limit_exceeded reset after 1h", QuotaFailureKind.RateLimitExceeded)]
     [InlineData(nameof(AgentKind.Gemini), "RESOURCE_EXHAUSTED reset after 20m", QuotaFailureKind.RateLimitExceeded)]
+    [InlineData(nameof(AgentKind.Copilot), "Failed to get response from the AI model; retried 5 times (total retry wait time: 91.99 seconds). Last error: 429 Error from provider (Console Go): Upstream request failed: [rate_limit_exceeded] Rate limit exceeded. Please retry after a brief wait.", QuotaFailureKind.RateLimitExceeded)]
+    [InlineData(nameof(AgentKind.Opencode), "429 Error from provider (Console Go): Upstream request failed: [rate_limit_exceeded] Rate limit exceeded.", QuotaFailureKind.RateLimitExceeded)]
+    [InlineData(nameof(AgentKind.Opencode), "Error: HTTP 402 from upstream", QuotaFailureKind.LimitReached)]
     public void DetectorClassifiesQuotaTextFromAgentOutput(string agentName, string stderr, QuotaFailureKind expected)
     {
         var detection = BuildClassifier().Detect(ResolveAgent(agentName), stderr, stdout: null);
@@ -113,6 +118,8 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
             new ClaudeQuotaFailureDetector(),
             new CodexQuotaFailureDetector(),
             new GeminiQuotaFailureDetector(),
+            new CopilotQuotaFailureDetector(),
+            new OpencodeQuotaFailureDetector(),
         ]);
 
     private static AgentKind ResolveAgent(string name) => name switch
@@ -120,6 +127,8 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
         nameof(AgentKind.Claude) => AgentKind.Claude,
         nameof(AgentKind.Codex) => AgentKind.Codex,
         nameof(AgentKind.Gemini) => AgentKind.Gemini,
+        nameof(AgentKind.Copilot) => AgentKind.Copilot,
+        nameof(AgentKind.Opencode) => AgentKind.Opencode,
         _ => throw new ArgumentOutOfRangeException(nameof(name)),
     };
 
@@ -208,6 +217,183 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
         Assert.Equal("quota", parked.FailureKind);
         Assert.Equal(expectedResetRounded, parked.QuotaResetAt);
         Assert.NotNull(parked.NextQuotaRetryAt);
+    }
+
+    [Fact]
+    public async Task PipelineParksCopilotRateLimitedItemForRetry()
+    {
+        // Regression for the September 2026 BYOK incident: Copilot relayed a
+        // Console Go 429 ("429 Error from provider … [rate_limit_exceeded]
+        // Rate limit exceeded. Please retry after a brief wait.") after its
+        // own ~92s retry budget, and the item terminated as failureKind
+        // "other" instead of parking for quota retry. The run must now park
+        // as WaitingForQuotaReset with a "rate-limited by provider" reason —
+        // visibly distinct from an exhausted account cap — and resume on the
+        // rate-limit backoff.
+        //
+        // DefaultRateLimitPause is set to 7 minutes (deliberately off the
+        // 5-minute DefaultQuotaFailurePause) so the assertion below proves
+        // the rate-limit knob — not the hard-quota pause — drives the wait.
+        const string stderr =
+            "Failed to get response from the AI model; retried 5 times (total retry wait time: 91.99 seconds). "
+            + "Last error: 429 Error from provider (Console Go): Upstream request failed: "
+            + "[rate_limit_exceeded] Rate limit exceeded. Please retry after a brief wait.";
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var context = BuildPipelineContext(
+            projectRepositoryUrl: seed,
+            agent: new QuotaFailingAgent(stderr: stderr, kind: AgentKind.Copilot),
+            pipelineTuning: new PipelineTuningSnapshot(new PipelineTuningOptions
+            {
+                DefaultRateLimitPause = TimeSpan.FromMinutes(7),
+            }));
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "copilot BYOK 429 UAT",
+            Prompt = "do work",
+            Agent = AgentKind.Copilot,
+            BaseBranch = "main",
+            WorkBranch = "feature/copilot-rate-limit",
+            PushUpstream = false,
+        };
+        await context.Store.CreateAsync(item);
+
+        await context.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var parked = await context.Store.GetAsync(item.Id);
+        Assert.NotNull(parked);
+        Assert.NotEqual(WorkItemState.Failed, parked!.State);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked.State);
+        Assert.Equal("quota", parked.FailureKind);
+        Assert.Contains("rate-limited by provider", parked.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("reported quota failure", parked.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.NotNull(parked.QuotaResetAt);
+        Assert.NotNull(parked.NextQuotaRetryAt);
+        // The park itself resumes on the rate-limit knob (7m, off the 5m
+        // hard-quota pause); the retry scheduler then arms the targeted
+        // timer one ClockDriftSafetyMargin (2m) later.
+        var resetWait = parked.QuotaResetAt!.Value - DateTimeOffset.UtcNow;
+        Assert.InRange(resetWait.TotalMinutes, 6, 8);
+        var retryWait = parked.NextQuotaRetryAt!.Value - DateTimeOffset.UtcNow;
+        Assert.InRange(retryWait.TotalMinutes, 8, 10);
+    }
+
+    [Fact]
+    public async Task PipelineHonoursRetryAfterOnCopilotRateLimit()
+    {
+        // When the provider refusal carries a Retry-After echo, the park must
+        // resume on the provider's own delay rather than the bounded default.
+        const string stderr =
+            "429 Error from provider (Console Go): Upstream request failed: "
+            + "[rate_limit_exceeded] Rate limit exceeded. Retry-After: 150";
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var context = BuildPipelineContext(
+            projectRepositoryUrl: seed,
+            agent: new QuotaFailingAgent(stderr: stderr, kind: AgentKind.Copilot),
+            pipelineTuning: new PipelineTuningSnapshot(new PipelineTuningOptions
+            {
+                DefaultRateLimitPause = TimeSpan.FromMinutes(7),
+            }));
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "copilot BYOK Retry-After UAT",
+            Prompt = "do work",
+            Agent = AgentKind.Copilot,
+            BaseBranch = "main",
+            WorkBranch = "feature/copilot-retry-after",
+            PushUpstream = false,
+        };
+        await context.Store.CreateAsync(item);
+
+        await context.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var parked = await context.Store.GetAsync(item.Id);
+        Assert.NotNull(parked);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, parked!.State);
+        Assert.NotNull(parked.QuotaResetAt);
+        Assert.NotNull(parked.NextQuotaRetryAt);
+        // The park resumes on the provider's own delay (150s); the retry
+        // scheduler arms the targeted timer one ClockDriftSafetyMargin (2m)
+        // after that.
+        var resetWait = parked.QuotaResetAt!.Value - DateTimeOffset.UtcNow;
+        Assert.InRange(resetWait.TotalSeconds, 120, 180);
+        var retryWait = parked.NextQuotaRetryAt!.Value - DateTimeOffset.UtcNow;
+        Assert.InRange(retryWait.TotalSeconds, 240, 300);
+    }
+
+    [Fact]
+    public async Task PipelineFailsGenuineCopilotFailureAsOther()
+    {
+        // Guard against the classifier swallowing real failures: a Copilot
+        // failure with no 429 anchor and no rate-limit token must still
+        // terminate the item as failureKind "other" — never park it for a
+        // quota window that would not clear it.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var context = BuildPipelineContext(
+            projectRepositoryUrl: seed,
+            agent: new QuotaFailingAgent(
+                stderr: "Error: model 'unknown-xyz' is not served by the provider endpoint",
+                kind: AgentKind.Copilot));
+        var item = new WorkItem
+        {
+            Id = WorkItemId.New(),
+            ProjectId = new ProjectId("test-project"),
+            Title = "copilot genuine failure UAT",
+            Prompt = "do work",
+            Agent = AgentKind.Copilot,
+            BaseBranch = "main",
+            WorkBranch = "feature/copilot-genuine-failure",
+            PushUpstream = false,
+        };
+        await context.Store.CreateAsync(item);
+
+        await context.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var failed = await context.Store.GetAsync(item.Id);
+        Assert.NotNull(failed);
+        Assert.Equal(WorkItemState.Failed, failed!.State);
+        Assert.Equal("other", failed.FailureKind);
+    }
+
+    [Fact]
+    public async Task AutoRetryEnabled_PeriodicSweepRetriesParkedQuotaItem()
+    {
+        // The second half of the park-and-resume contract: an item the
+        // pipeline parked as WaitingForQuotaReset (rather than Failed) with
+        // an overdue retry instant becomes runnable again on the next
+        // periodic sweep once quota is usable — it must not sit parked, and
+        // must not have taken the terminal failure path.
+        using var context = BuildRetryContext();
+        var item = FailedQuotaItem() with
+        {
+            State = WorkItemState.WaitingForQuotaReset,
+            QuotaRetryFrom = "work",
+            QuotaResetAt = _time.GetUtcNow().AddMinutes(-5),
+            NextQuotaRetryAt = _time.GetUtcNow().AddMinutes(-5),
+        };
+        await context.Store.CreateAsync(item);
+
+        await InvokePrivateAsync(context.Scheduler, "RunPeriodicSweepAsync", CancellationToken.None);
+
+        var retried = await context.Store.GetAsync(item.Id);
+        Assert.NotEqual(WorkItemState.Failed, retried!.State);
+        Assert.Equal(WorkItemState.Queued, retried.State);
+        Assert.Equal(1, retried.QuotaRetryAttempts);
+        Assert.Contains(context.Webhooks.Events, e => e.Event == "work_item.auto_retry");
+    }
+
+    [Theory]
+    [InlineData(QuotaFailureKind.RateLimitExceeded, "Agent copilot reported quota failure: agent exited 1", "Agent copilot rate-limited by provider (transient rate limit; retrying after backoff): agent exited 1")]
+    [InlineData(QuotaFailureKind.LimitReached, "Agent copilot reported quota failure: agent exited 1", "Agent copilot reported quota failure: agent exited 1")]
+    [InlineData(QuotaFailureKind.Unauthorized, "Agent copilot reported quota failure: agent exited 1", "Agent copilot reported quota failure: agent exited 1")]
+    [InlineData(QuotaFailureKind.RateLimitExceeded, "unrelated message without the marker", "unrelated message without the marker")]
+    public void QuotaFailureMessage_DistinguishesRateLimitFromExhaustion(
+        QuotaFailureKind kind, string exhaustedMessage, string expected)
+    {
+        Assert.Equal(expected, PipelineRunner.QuotaFailureMessage(kind, exhaustedMessage));
     }
 
     /// <summary>
@@ -500,7 +686,10 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
         return new RetryContext(store, scheduler, webhooks);
     }
 
-    private PipelineContext BuildPipelineContext(string projectRepositoryUrl, IAgentRunner agent)
+    private PipelineContext BuildPipelineContext(
+        string projectRepositoryUrl,
+        IAgentRunner agent,
+        PipelineTuningSnapshot? pipelineTuning = null)
     {
         var gitRoot = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]);
         var dbPath = Path.Combine(_workspace, "state-" + Guid.NewGuid().ToString("N")[..8] + ".db");
@@ -534,7 +723,8 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
             quotaClassifier: BuildClassifier(),
             requiredBuildVerifier: TestRequiredBuildVerifier.NotApplicable,
             terminalTransitions: terminalTransitions,
-            terminalRevisionBuilder: terminalTransitions);
+            terminalRevisionBuilder: terminalTransitions,
+            pipelineTuning: pipelineTuning);
 
         return new PipelineContext(pipeline, store);
     }
@@ -586,13 +776,14 @@ public sealed class QuotaFailureClassificationAndAutoRetryTests : IDisposable
         private readonly string? _stdout;
         private readonly string? _stderr;
 
-        public QuotaFailingAgent(string? stderr = null, string? stdout = null)
+        public QuotaFailingAgent(string? stderr = null, string? stdout = null, AgentKind? kind = null)
         {
             _stderr = stderr;
             _stdout = stdout;
+            Kind = kind ?? AgentKind.Claude;
         }
 
-        public AgentKind Kind => AgentKind.Claude;
+        public AgentKind Kind { get; }
 
         public Task<AgentResult> RunAsync(
             ISandbox sandbox,

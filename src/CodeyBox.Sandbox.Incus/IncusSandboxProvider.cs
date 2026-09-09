@@ -1537,14 +1537,14 @@ public sealed class IncusSandboxProvider :
             _timeProvider,
             token => VerifyDeviceTopologyAsync(options, name, bridge, mounts, token),
             ct).ConfigureAwait(false);
+        if (runCloudInit)
+            await WaitForCloudInitAsync(options, name, ct).ConfigureAwait(false);
         await IncusGuestLifecycle.PrepareRuntimeDirectoryAsync(
             _cli,
             options,
             name,
             ct).ConfigureAwait(false);
         await PrepareDotnetCliHomeAsync(options, name, ct).ConfigureAwait(false);
-        if (runCloudInit)
-            await WaitForCloudInitAsync(options, name, ct).ConfigureAwait(false);
         await IncusGuestLifecycle.VerifyExecWrapperAsync(
             _cli,
             options,
@@ -2622,13 +2622,14 @@ public sealed class IncusSandboxProvider :
         CancellationToken ct)
     {
         IncusInputValidation.ValidateInstanceName(name, nameof(name));
-        return (await ListInstancesAsync(options, ct).ConfigureAwait(false))
+        return (await ListInstancesAsync(options, ct, name).ConfigureAwait(false))
             .SingleOrDefault(instance => string.Equals(instance.Name, name, StringComparison.Ordinal));
     }
 
     private async Task<IReadOnlyList<IncusInstanceInfo>> ListInstancesAsync(
         IncusSandboxOptions options,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? requiredInstanceName = null)
     {
         var result = await _cli.RunCheckedAsync(
             "instance list",
@@ -2638,7 +2639,7 @@ public sealed class IncusSandboxProvider :
             options.OperationTimeout,
             ct,
             heavyOperation: false).ConfigureAwait(false);
-        return ParseInstances(result.Stdout);
+        return ParseInstances(result.Stdout, requiredInstanceName);
     }
 
     private async Task<bool> SnapshotExistsAsync(
@@ -2903,7 +2904,9 @@ public sealed class IncusSandboxProvider :
         return null;
     }
 
-    private static IReadOnlyList<IncusInstanceInfo> ParseInstances(string json)
+    internal static IReadOnlyList<IncusInstanceInfo> ParseInstances(
+        string json,
+        string? requiredInstanceName = null)
     {
         using var document = JsonDocument.Parse(json);
         if (document.RootElement.ValueKind != JsonValueKind.Array)
@@ -2933,21 +2936,41 @@ public sealed class IncusSandboxProvider :
                 ? statusElement.GetString() ?? string.Empty
                 : string.Empty;
             var type = typeElement.GetString()!;
-            result.Add(new IncusInstanceInfo(name, status, type, ParseConfig(element)));
+            var isStrict = requiredInstanceName is not null && string.Equals(name, requiredInstanceName, StringComparison.Ordinal);
+            result.Add(new IncusInstanceInfo(name, status, type, ParseConfig(element, isStrict)));
         }
         return result;
     }
 
-    private static Dictionary<string, string> ParseConfig(JsonElement element)
+    /// <summary>
+    /// Reads an inventory entry's config map. A missing or non-object <c>config</c> yields an EMPTY
+    /// map rather than throwing, unless the entry is the specifically requested instance.
+    /// </summary>
+    /// <remarks>
+    /// Incus lists instances that are mid-create or mid-delete without a materialised config. Throwing
+    /// on those aborted the ENTIRE inventory parse, which is disproportionate in both directions:
+    /// ownership is positive-only (<see cref="IsOwned"/> requires <c>managed=true</c> plus a matching
+    /// kind), so a config-less entry could never have been ours anyway — while the exception failed
+    /// whatever work item happened to trigger the listing, including mid-audit, and broke the reaper
+    /// sweeps. An empty map preserves the safety property exactly (we still act only on entries we
+    /// positively identify as ours) and a transient entry that is genuinely ours is picked up by the
+    /// next sweep once its config materialises.
+    /// When querying for a specific named instance, however, missing config remains strict and throws.
+    /// </remarks>
+    private static Dictionary<string, string> ParseConfig(JsonElement element, bool isStrict = false)
     {
         var result = new Dictionary<string, string>(StringComparer.Ordinal);
         if (!element.TryGetProperty("config", out var config) || config.ValueKind != JsonValueKind.Object)
-            throw new JsonException("Incus inventory entries must contain a JSON object property named 'config'.");
+        {
+            if (isStrict)
+                throw new JsonException("Incus inventory entries must contain a JSON object property named 'config'.");
+            return result;
+        }
         foreach (var property in config.EnumerateObject())
         {
             if (property.Value.ValueKind != JsonValueKind.String)
-                throw new JsonException("Incus inventory config values must be strings.");
-            result[property.Name] = property.Value.GetString() ?? string.Empty;
+                throw new JsonException($"Incus inventory entry config values must be JSON strings; property '{property.Name}' was {property.Value.ValueKind}.");
+            result[property.Name] = property.Value.GetString()!;
         }
         return result;
     }
@@ -2966,7 +2989,7 @@ public sealed class IncusSandboxProvider :
             ? value
             : null;
 
-    private sealed record IncusInstanceInfo(
+    internal sealed record IncusInstanceInfo(
         string Name,
         string Status,
         string Type,

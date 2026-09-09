@@ -249,7 +249,7 @@ internal sealed record ApiClientPrincipal(
 
 internal sealed record InitiatorResolution(WorkInitiator? Value, IResult? Error);
 
-internal sealed class ApiClientOptions
+public sealed class ApiClientOptions
 {
     public string Name { get; set; } = string.Empty;
     public string TokenEnvVar { get; set; } = string.Empty;

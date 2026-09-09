@@ -156,7 +156,7 @@ public sealed class ConcreteAgentRunnerUatTests
     }
 
     [Fact]
-    public async Task CopilotRunner_UsesPromptShapeAndIgnoresUnsupportedModelAndReasoningKnobs()
+    public async Task CopilotRunner_UsesPromptShape_PassesModel_AndHasNoSeparateReasoningKnob()
     {
         var sandbox = new RecordingSandbox();
 
@@ -165,12 +165,16 @@ public sealed class ConcreteAgentRunnerUatTests
             "/work",
             "answer",
             credential: null,
-            modelId: "ignored-model",
+            modelId: "gpt-5.6-sol",
             reasoningMode: "high");
 
         var argv = Assert.Single(sandbox.Execs).Argv;
-        Assert.Equal(["copilot", "-p", "answer"], argv);
-        Assert.DoesNotContain("--model", argv);
+        Assert.Equal(
+            ["copilot", "-p", "answer", "--allow-all-tools", "--allow-all-paths", "--model", "gpt-5.6-sol"],
+            argv);
+
+        // Copilot derives reasoning_effort from the model id rather than taking it as a flag, so the
+        // reasoning knob is expressed by model selection and there is nothing separate to pass.
         Assert.DoesNotContain("--reasoning", argv);
         Assert.DoesNotContain("--effort", argv);
     }

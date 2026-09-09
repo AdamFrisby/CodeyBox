@@ -1231,6 +1231,29 @@ public sealed class CodeyBoxOptionsValidatorTests
         Assert.Contains("CodeyBox:PipelineTuning:EmptyReworkEscalationRetries must be non-negative", result.FailureMessage);
     }
 
+    [Fact]
+    public void Validate_RejectsNonPositiveDefaultRateLimitPause()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.PipelineTuning.DefaultRateLimitPause = TimeSpan.Zero;
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.True(result.Failed);
+        Assert.Contains("CodeyBox:PipelineTuning:DefaultRateLimitPause must be a positive TimeSpan", result.FailureMessage);
+    }
+
+    [Fact]
+    public void Validate_AcceptsPositiveDefaultRateLimitPause()
+    {
+        var options = ValidCodeyBoxOptions();
+        options.PipelineTuning.DefaultRateLimitPause = TimeSpan.FromMinutes(3);
+
+        var result = new CodeyBoxOptionsValidator().Validate(null, options);
+
+        Assert.False(result.Failed, result.FailureMessage);
+    }
+
     [Theory]
     [InlineData("MaxPromptChars")]
     [InlineData("MaxOutputBufferChars")]

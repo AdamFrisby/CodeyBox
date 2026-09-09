@@ -279,6 +279,22 @@ builder.Services.AddSingleton(sp => new SqliteDatabaseWriteGateFactory(
     () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SqliteWriteGate,
     sp.GetRequiredService<ILoggerFactory>(),
     TimeProvider.System));
+// A BackgroundService fault stops the host via StopHost, which the host
+// reports as a graceful shutdown (exit code 0) — indistinguishable from an
+// intentional stop, so Restart=on-failure supervisors never restart after an
+// orchestrator crash (e.g. a sustained SQLite write-gate outage escalated by
+// the dispatch loop). Stated explicitly here (rather than relying on the
+// framework default) because the exit-code contract below depends on it:
+// faults are recorded on the tracker and mapped to a non-zero exit.
+builder.Services.Configure<HostOptions>(static o =>
+    o.BackgroundServiceExceptionBehavior = BackgroundServiceExceptionBehavior.StopHost);
+builder.Services.AddSingleton<BackgroundServiceFailureTracker>();
+builder.Services.AddHostedService(sp => new SqliteDatabaseMaintenanceService(
+    sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.StateDatabasePath,
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.SqliteMaintenance,
+    sp.GetRequiredService<SqliteDatabaseWriteGateFactory>(),
+    sp.GetRequiredService<ILogger<SqliteDatabaseMaintenanceService>>(),
+    TimeProvider.System));
 builder.Services.Configure<BuildScriptAuditorOptions>(builder.Configuration.GetSection("CodeyBox:BuildScriptAudit"));
 // Regression-test-selection mode (Audit:TestSelection:Mode). Bound through
 // AddOptions so IOptionsMonitor<TestSelectionOptions> hot-reloads the mode
@@ -291,6 +307,7 @@ builder.Services.AddOptions<TestSelectionOptions>()
         static opts => TestSelectionModeParser.TryParse(opts.Mode, out _),
         $"{TestSelectionOptions.SectionName}:Mode must be one of: all");
 builder.Services.Configure<NotificationsOptions>(builder.Configuration.GetSection("CodeyBox:Notifications"));
+builder.Services.Configure<AuditProgressApiOptions>(builder.Configuration.GetSection("CodeyBox:AuditProgressApi"));
 // E2eExecutionOptions binds as a standalone section so the pool / dispatcher can
 // take IOptionsMonitor<E2eExecutionOptions> directly without dragging the whole
 // CodeyBoxOptions graph. The same section is also a property on CodeyBoxOptions
@@ -395,7 +412,7 @@ ApiKeyAuth.Configure(builder);
 
 // --- Sandbox provider --------------------------------------------------------
 // Selected by CodeyBox:SandboxProvider in config. Each option has a different
-// security/setup trade-off — see docs/sandbox-providers.md.
+// security/setup trade-off — see docs/concepts/sandboxes.md.
 //
 //   process     — UNSAFE. No isolation. Dev only; refuses to load outside
 //                 Development env unless DangerouslyAllowProcessSandbox=true.
@@ -472,7 +489,7 @@ static ISandboxProvider SelectSandboxProvider(IServiceProvider sp)
             throw new InvalidOperationException(
                 "CodeyBox:SandboxProvider must be set in non-Development environments. " +
                 "Choose one of: incus, multipass, multipass-remote, sprites, bubblewrap, process " +
-                "(see docs/sandbox-providers.md for trade-offs).");
+                "(see docs/concepts/sandboxes.md for trade-offs).");
         }
     }
 
@@ -1065,7 +1082,13 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new ClaudeAgentRunner(
     sp.GetRequiredService<ClaudeThinkingBlockSanitizerConfig>(),
     sp.GetRequiredService<CodeyBox.Core.AgentNetworkToleranceSnapshot>(),
     sp.GetRequiredService<IQuotaFailureClassifier>()));
-builder.Services.AddSingleton<IAgentRunner, CopilotAgentRunner>();
+// Copilot: subscription mode by default; setting CodeyBox:Copilot:Provider:BaseUrl switches inference
+// to an OpenAI-compatible endpoint (BYOK). The credential for that endpoint arrives through the
+// credential chain as COPILOT_PROVIDER_API_KEY, never from this configuration section.
+builder.Services.AddSingleton<IAgentRunner>(sp => new CopilotAgentRunner
+{
+    Options = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Copilot,
+});
 builder.Services.AddSingleton<IAgentRunner>(sp => new CodexAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>(),
     sp.GetRequiredService<CodeyBox.Core.AgentNetworkToleranceSnapshot>(),
@@ -1074,19 +1097,19 @@ builder.Services.AddSingleton<IAgentRunner>(sp => new GeminiAgentRunner(
     sp.GetRequiredService<AgentDefaultsSnapshot>()));
 builder.Services.AddSingleton<IAgentRunner, CursorAgentRunner>();
 builder.Services.AddSingleton<IAgentRunner, OpencodeAgentRunner>();
-builder.Services.AddSingleton<IAgentRunner>(_ => new AntigravityAgentRunner
+builder.Services.AddSingleton<IAgentRunner>(sp => new AntigravityAgentRunner
 {
     // agy's built-in --print-timeout default (5m) aborts a one-shot session with
     // "timed out waiting for response" and zero changes the first time a single
     // gemini turn on a large work item exceeds it. Override with a generous,
     // operator-tunable budget. CodeyBox:Antigravity:PrintTimeoutMinutes (default 20).
     PrintTimeout = TimeSpan.FromMinutes(
-        builder.Configuration.GetValue<int?>("CodeyBox:Antigravity:PrintTimeoutMinutes") ?? 20),
+        sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.Antigravity.PrintTimeoutMinutes),
 });
 // Crock: registered, but DISABLED in shipped agent-class config. Operators opt
 // in by adding `crock` to an AgentClass member list AND setting
 // CodeyBox:Crock:HostDaemonSocketPath to the on-host `crock daemon` Unix
-// socket. See the CrockCode section of docs/agents.md and CrockSandboxOptions
+// socket. See the CrockCode section of docs/concepts/agents.md and CrockSandboxOptions
 // for the tunnel-model rationale and operator setup.
 builder.Services.AddSingleton<IAgentRunner>(sp => new CrockAgentRunner
 {
@@ -1227,7 +1250,7 @@ IReadOnlyList<LoadedPlugin>? preDiscoveredPlugins = null;
 // 2. Plugin ICredentialProvider implementations — inserted in discovery order
 //    (between OAuth-file and env-var). Vault-issued short-lived credentials
 //    are preferred over env-var fallbacks. Per-project ordering is expressed
-//    via Project.CredentialProviderPriority; see docs/credential-plugins.md.
+//    via Project.CredentialProviderPriority; see docs/extending/credential-plugins.md.
 // 3. CodexOAuthFileCredentialProvider and EnvironmentCredentialProvider —
 //    fallback providers. Codex host auth is deliberately after plugins so a
 //    project-selected credential plugin can isolate Codex credentials from the
@@ -1326,6 +1349,15 @@ if (opencodeAuthFilePath.StartsWith("~/", StringComparison.Ordinal))
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         opencodeAuthFilePath[2..]);
 
+var antigravityOAuthFilePath =
+    Environment.GetEnvironmentVariable("CODEYBOX_ANTIGRAVITY_OAUTH_FILE")
+    ?? builder.Configuration["CodeyBox:Antigravity:OAuthTokenFile"]
+    ?? Path.Combine(geminiHome, "antigravity-cli", "antigravity-oauth-token");
+if (antigravityOAuthFilePath.StartsWith("~/", StringComparison.Ordinal))
+    antigravityOAuthFilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        antigravityOAuthFilePath[2..]);
+
 // Optional override for where the sandbox-side credential file gets written.
 // Operators who confirm a different `opencode auth login` destination set
 // CODEYBOX_OPENCODE_AUTH_DEST on the host; the runner uses this value as the
@@ -1357,6 +1389,10 @@ builder.Services.AddSingleton(sp => new CursorCredentialFileSource(
     watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
 builder.Services.AddSingleton(sp => new OpencodeCredentialFileSource(
     opencodeAuthFilePath,
+    sp.GetService<ILogger<CredentialFileSource>>(),
+    watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
+builder.Services.AddSingleton(sp => new AntigravityCredentialFileSource(
+    antigravityOAuthFilePath,
     sp.GetService<ILogger<CredentialFileSource>>(),
     watch: CredentialFileWatcherSettings.IsEnabled(sp.GetRequiredService<IConfiguration>())));
 
@@ -1444,6 +1480,17 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
     builtInLast.Add(new EnvironmentCredentialProvider(new[]
     {
         new AgentCredentialMapping(AgentKind.Copilot, "CODEYBOX_COPILOT_TOKEN", "GH_TOKEN"),
+        // BYOK: the key for the operator-configured OpenAI-compatible endpoint. Kept in the credential
+        // chain rather than CodeyBox:Copilot so the secret never lands in a config file. Absent in
+        // subscription mode, and absent for local servers that need no key.
+        new AgentCredentialMapping(
+            AgentKind.Copilot,
+            "CODEYBOX_COPILOT_PROVIDER_API_KEY",
+            CopilotAgentRunner.ProviderApiKeyEnvironmentVariable),
+        new AgentCredentialMapping(
+            AgentKind.Copilot,
+            "CODEYBOX_COPILOT_PROVIDER_BEARER_TOKEN",
+            CopilotAgentRunner.ProviderBearerTokenEnvironmentVariable),
         new AgentCredentialMapping(AgentKind.Codex, "CODEYBOX_CODEX_API_KEY", "OPENAI_API_KEY"),
         new AgentCredentialMapping(AgentKind.Gemini, "CODEYBOX_GEMINI_API_KEY", "GEMINI_API_KEY"),
         // Cursor: the CLI uses subscription auth via ~/.cursor/credentials.json
@@ -1460,7 +1507,7 @@ builder.Services.AddSingleton<ChainedCredentialProvider>(sp =>
         // Note: no OPENCODE_API_KEY mapping. The opencode subscription IS the
         // credential path; auth flows exclusively through the auth.json file
         // materialised by OpencodeOAuthFileCredentialProvider. See the brief
-        // for the relevant 'Don't do' rule and docs/agents.md for setup.
+        // for the relevant 'Don't do' rule and docs/concepts/agents.md for setup.
         // Note: Antigravity is NOT in this verbatim mapping. The agy CLI's
         // OAuth token bundle is shipped to the sandbox by the dedicated
         // AntigravityEnvironmentCredentialProvider registered separately below.
@@ -1611,6 +1658,11 @@ builder.Services.AddSingleton<IGeminiQuotaTokenSource>(sp =>
             ?? config["CodeyBox:GeminiOauthClientSecret"],
         cliTokenRefresher: GeminiOauthCredentialFileRefresher.TryCreateCliRefreshHandler());
 });
+builder.Services.AddSingleton<IAntigravityQuotaTokenSource>(sp => new AntigravityOauthCredentialFileRefresher(
+    sp.GetRequiredService<AntigravityCredentialFileSource>(),
+    sp.GetRequiredService<IHttpClientFactory>(),
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<AntigravityOauthCredentialFileRefresher>(),
+    cliRunner: AntigravityOauthCredentialFileRefresher.TryCreateCliRefreshHandler()));
 
 // Every quota probe is wrapped so a transient blip serves the most recent real
 // reading (bounded by ProbeMaxStalenessSeconds + the reading's own reset) rather
@@ -1780,23 +1832,61 @@ builder.Services.AddSingleton<IAgentQuotaProbe>(sp =>
 {
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     var source = sp.GetRequiredService<GeminiOAuthCredentialFileSource>();
+    var antigravitySource = sp.GetRequiredService<AntigravityCredentialFileSource>();
+    var tokenSource = sp.GetRequiredService<IAntigravityQuotaTokenSource>();
     var probe = new AntigravityQuotaProbe(
         sp.GetRequiredService<IHttpClientFactory>(),
         member => AgentInstanceCredentialResolver.ResolveQuotaCredentials(
             member,
             () => new AgentQuotaCredentials(
-                CredentialFileTokenExtractor.ExtractGeminiAccessToken(source.GetRaw())
-                    ?? CredentialFileTokenExtractor.ExtractGeminiAccessToken(
+                tokenSource.GetAccessTokenAsync(CancellationToken.None).ConfigureAwait(false).GetAwaiter().GetResult()
+                    ?? ReadAntigravityTokenFile(antigravitySource.FilePath)
+                    ?? ReadAntigravityTokenFile(
+                        sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>()
+                            .CurrentValue.Antigravity.OAuthTokenFile)
+                    ?? CredentialFileTokenExtractor.ExtractGeminiAccessToken(source.GetRaw())
+                    // The agy bundle nests its token ({"token":{"access_token":…}}), so the gemini
+                    // extractor — which only reads a flat top-level access_token — always returned
+                    // null here. The probe then reported "no token configured", the router treated
+                    // that as UNKNOWN, and agy dispatched with no quota gate at all.
+                    ?? CredentialFileTokenExtractor.ExtractAntigravityAccessToken(
                         Environment.GetEnvironmentVariable(AntigravityConstants.OAuthCredsEnvVar))
                     ?? Environment.GetEnvironmentVariable("CODEYBOX_ANTIGRAVITY_OAUTH_TOKEN")
                     ?? Environment.GetEnvironmentVariable("CODEYBOX_GEMINI_OAUTH_TOKEN")))
             ?? new AgentQuotaCredentials(null),
         sp.GetRequiredService<QuotaRouterOptions>().QuotaCacheTtl,
-        loggerFactory.CreateLogger<AntigravityQuotaProbe>());
+        loggerFactory.CreateLogger<AntigravityQuotaProbe>(),
+        timeProvider: null,
+        quotaUserAgent: sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>()
+            .CurrentValue.Antigravity.QuotaUserAgent);
     var wrapped = WrapLastKnownGood(probe, sp);
     source.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
+    antigravitySource.TokenUpdated += ((IAgentQuotaCacheInvalidator)wrapped).InvalidateCredentialState;
     return wrapped;
 });
+
+// Reads the agy OAuth bundle from disk for the quota probe. Bounded and failure-tolerant: an
+// absent, unreadable, oversized or malformed file simply yields null so the caller falls through to
+// its other credential sources rather than throwing inside a probe.
+static string? ReadAntigravityTokenFile(string? path)
+{
+    const int MaxTokenFileBytes = 64 * 1024;
+    if (string.IsNullOrWhiteSpace(path))
+        return null;
+
+    try
+    {
+        var info = new FileInfo(path);
+        if (!info.Exists || info.Length > MaxTokenFileBytes)
+            return null;
+
+        return CredentialFileTokenExtractor.ExtractAntigravityAccessToken(File.ReadAllText(path));
+    }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
+    {
+        return null;
+    }
+}
 
 // --- Agent class router ------------------------------------------------------
 builder.Services.AddSingleton<AgentClassRouter>(sp =>
@@ -2263,11 +2353,19 @@ builder.Services.AddSingleton<IProjectRepository>(sp => new ProjectRepository(
 builder.Services.AddSingleton<IUpstreamRemoteFactory, UpstreamRemoteFactory>();
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<GitHubAppConnectState>();
-builder.Services.AddSingleton(new GitHubAppStore(
-    Environment.GetEnvironmentVariable("CODEYBOX_GITHUB_APP_STORE")
-        ?? (builder.Environment.IsProduction()
-            ? "/var/lib/codeybox/github-apps"
-            : Path.Combine(Path.GetTempPath(), $"codeybox-github-apps-{Environment.ProcessId}"))));
+// Read the store path from the final service-provider configuration. Test hosts
+// add their configuration sources after this registration code has run; reading
+// builder.Configuration here would ignore their isolated writable store path.
+builder.Services.AddSingleton(sp =>
+{
+    var configuration = sp.GetRequiredService<IConfiguration>();
+    return new GitHubAppStore(
+        configuration["CodeyBox:GitHubAppStorePath"]
+            ?? Environment.GetEnvironmentVariable("CODEYBOX_GITHUB_APP_STORE")
+            ?? (builder.Environment.IsProduction()
+                ? "/var/lib/codeybox/github-apps"
+                : Path.Combine(Path.GetTempPath(), $"codeybox-github-apps-{Environment.ProcessId}")));
+});
 builder.Services.AddSingleton(_ =>
 {
     var options = builder.Configuration.GetSection("CodeyBox:Presets").Get<PresetCatalogOptions>()
@@ -2608,7 +2706,7 @@ builder.Services.AddSingleton<IChangelogGenerator>(sp =>
             throw new InvalidOperationException(
                 "CodeyBox:Changelog:GitHubWebhookSecretEnvVar must be configured in non-Development environments. " +
                 "Set it to the name of the environment variable holding the HMAC-SHA256 webhook secret " +
-                "(see docs/changelog-automation.md).");
+                "(see docs/operating/releases.md).");
         }
     }
 }
@@ -2990,7 +3088,7 @@ builder.Services.AddSingleton<IReadOnlyDictionary<AgentKind, IAgentCostExtractor
 // Bundled per-(agent, model) pricing defaults shipped with CodeyBox so new
 // installs get cost reporting without the operator hand-populating every
 // entry from provider docs. Operator config under CodeyBox:AgentPricing
-// always wins per (agentKind, modelId). See docs/agent-pricing.md.
+// always wins per (agentKind, modelId). See docs/operating/costs.md.
 builder.Services.AddSingleton<AgentPricingDefaultsSnapshot>(sp =>
 {
     var env = sp.GetRequiredService<IHostEnvironment>();
@@ -3032,9 +3130,18 @@ builder.Services.AddSingleton<AgentStreamsOptions>(sp =>
     return opts;
 });
 builder.Services.AddSingleton<IAgentStreamStore>(sp =>
-    new AgentStreamStore(
-        sp.GetRequiredService<AgentStreamsOptions>(),
-        sp.GetRequiredService<ILogger<AgentStreamStore>>()));
+{
+    // Resolve the AgentStreamsOptions singleton once to run ValidateAtStartup
+    // (directory writability probe + startup log), then read numeric knobs
+    // (RetainedDays, MaxTotalSizeMb, MaxFileSizeMb) live from IOptionsMonitor so
+    // retention/size caps hot-reload without a restart. Path is pinned by the
+    // hot-reload guard, so reading it live is equivalent to the snapshot.
+    _ = sp.GetRequiredService<AgentStreamsOptions>();
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    return new AgentStreamStore(
+        () => monitor.CurrentValue.AgentStreams,
+        sp.GetRequiredService<ILogger<AgentStreamStore>>());
+});
 builder.Services.AddSingleton(sp =>
 {
     var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value.AgentStreamAnalysis;
@@ -3095,6 +3202,7 @@ builder.Services.AddSingleton<IAgentQuotaFailureDetector>(sp =>
 });
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, OpencodeQuotaFailureDetector>();
 builder.Services.AddSingleton<IAgentQuotaFailureDetector, AntigravityQuotaFailureDetector>();
+builder.Services.AddSingleton<IAgentQuotaFailureDetector, CopilotQuotaFailureDetector>();
 builder.Services.AddSingleton<IQuotaFailureClassifier>(sp =>
     new CompositeQuotaFailureClassifier(sp.GetServices<IAgentQuotaFailureDetector>()));
 builder.Services.AddSingleton<IAgentAuthFailureClassifier>(sp =>
@@ -3478,7 +3586,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     dispatchAvailability: sp.GetRequiredService<IAgentDispatchAvailability>(),
     knobRegistry: sp.GetRequiredService<IKnobRegistry>(),
     quotaRetryDispatchPromoter: sp.GetRequiredService<IQuotaRetryDispatchPromoter>(),
-    quotaRetryAdmissionRouter: sp.GetRequiredService<IQuotaRetryAdmissionRouter>()));
+    quotaRetryAdmissionRouter: sp.GetRequiredService<IQuotaRetryAdmissionRouter>(),
+    failureTracker: sp.GetRequiredService<BackgroundServiceFailureTracker>()));
 builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<IRefactorProjectGateStatusProvider>(
@@ -3639,7 +3748,7 @@ builder.Services.AddSingleton<IHostSmokeProbeRunner>(sp => sp.GetRequiredService
 // against this extension point is the statistics plugin's quota sampler — but
 // the host is sampler-agnostic; further plugins (throughput, audit pass rate,
 // cost-over-time) can register additional IMetricSampler implementations.
-// See docs/plugins.md (IMetricSampler) and docs/statistics-plugin.md.
+// See docs/extending/plugins.md (IMetricSampler) and docs/extending/statistics-plugin.md.
 builder.Services.AddHostedService<MetricSamplerHost>();
 builder.Services.AddHostedService(sp => new AuditAgentStartupValidationService(
     sp.GetRequiredService<IProjectRepository>(),
@@ -3799,7 +3908,7 @@ builder.Services.AddHostedService(sp =>
 // Discovers assemblies from CodeyBox:Plugins, registers plugin types under
 // their Core interfaces before the container is frozen, then runs
 // IPluginInitializer.InitializeAsync at startup via PluginInitializationService.
-// See docs/plugins.md for author guidance, allowlist config, and threat model.
+// See docs/extending/plugins.md for author guidance, allowlist config, and threat model.
 preDiscoveredPlugins = builder.Services.AddCodeyBoxPlugins(builder.Configuration);
 
 var app = builder.Build();
@@ -3876,6 +3985,7 @@ WorkItemDiffEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
 GitHubAppConnectEndpoints.Map(app);
 AuditReportEndpoints.Map(app);
+AuditProgressEndpoints.Map(app);
 AgentStreamEndpoints.Map(app);
 SseEndpoints.Map(app);
 ChangelogEndpoints.Map(app);
@@ -4334,6 +4444,19 @@ app.MapGet("/healthz", (ISandboxProvider sandboxes) =>
 try
 {
     app.Run();
+
+    // StopHost maps a BackgroundService fault to a graceful host shutdown,
+    // which would otherwise exit 0 exactly like an intentional stop. A
+    // recorded fault means the orchestrator died (e.g. sustained SQLite
+    // write-gate outage); exit non-zero so supervisors detect and restart.
+    var failureTracker = app.Services.GetService<BackgroundServiceFailureTracker>();
+    if (failureTracker?.Fault is not null)
+    {
+        Log.Error(
+            failureTracker.Fault,
+            "Host stopped after a background service fault; exiting non-zero");
+        Environment.ExitCode = BackgroundServiceFailureTracker.ResolveExitCode(backgroundServiceFaulted: true);
+    }
 }
 catch (Exception ex)
 {
@@ -4374,7 +4497,7 @@ namespace CodeyBox.Api
     ///
     /// The configured storage pool must already exist and use the ZFS or Btrfs
     /// driver; ZFS is strongly recommended for VM workloads.
-    /// See <c>docs/sandbox-providers.md</c> for the host setup and security
+    /// See <c>docs/concepts/sandboxes.md</c> for the host setup and security
     /// requirements.
     /// </summary>
     public sealed class IncusSandboxConfig
@@ -4401,6 +4524,9 @@ namespace CodeyBox.Api
 
         /// <summary>Use lazily baked baselines and COW <c>incus copy</c> clones for sandbox creation.</summary>
         public bool UseBaselineImages { get; set; } = Defaults.UseBaselineImages;
+
+        /// <summary>Enable UEFI Secure Boot for newly initialized Incus VMs.</summary>
+        public bool SecureBoot { get; set; } = Defaults.SecureBoot;
 
         /// <summary>
         /// Shell commands run once while baking a baseline or during a full
@@ -4906,7 +5032,7 @@ namespace CodeyBox.Api
 
     /// <summary>
     /// Top-level options bag bound from the <c>CodeyBox</c> configuration
-    /// section. See <c>docs/configuration.md</c> for the full hot-reload
+    /// section. See <c>docs/reference/configuration.md</c> for the full hot-reload
     /// contract per field. Summary of the rule of thumb consumers should
     /// follow when adding new fields:
     /// <list type="bullet">
@@ -4951,6 +5077,7 @@ namespace CodeyBox.Api
     /// </summary>
     public sealed class CodeyBoxOptions
     {
+        public List<ApiClientOptions> ApiClients { get; set; } = [];
         public string? PublicBaseUrl { get; set; }
         public string GitRootDirectory { get; set; } = "/var/lib/codeybox/repos";
         public int GitCommandMaxOutputBytes { get; set; } = LocalGitHostOptions.DefaultGitCommandMaxOutputBytes;
@@ -4958,6 +5085,7 @@ namespace CodeyBox.Api
         public string SharedUpstreamMirrorDirectory { get; set; } = "_upstream-mirror";
         public string StateDatabasePath { get; set; } = "/var/lib/codeybox/state.db";
         public SqliteWriteGateOptions SqliteWriteGate { get; set; } = new();
+        public SqliteMaintenanceOptions SqliteMaintenance { get; set; } = new();
         public string TemplateDirectory { get; set; } = "templates";
         public const int DefaultMaxTemplateChecks = 256;
         public const int MaximumMaxTemplateChecks = 1000;
@@ -5083,6 +5211,20 @@ namespace CodeyBox.Api
         /// Hot-reloadable through <c>IOptionsMonitor</c>.
         /// </summary>
         public CrockSandboxOptions Crock { get; set; } = new();
+
+        /// <summary>
+        /// GitHub Copilot CLI runner configuration. Subscription mode by default; setting
+        /// <c>Provider.BaseUrl</c> switches inference to an OpenAI-compatible endpoint (BYOK).
+        /// The BYOK credential is deliberately not here — it arrives through the credential chain
+        /// as <c>CODEYBOX_COPILOT_PROVIDER_API_KEY</c> so the secret never sits in config.
+        /// </summary>
+        public CopilotOptions Copilot { get; set; } = new();
+
+        /// <summary>
+        /// Google Antigravity (<c>agy</c>) runner and quota-probe settings. Bound from
+        /// <c>CodeyBox:Antigravity</c>.
+        /// </summary>
+        public AntigravitySectionOptions Antigravity { get; set; } = new();
 
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
@@ -5344,7 +5486,7 @@ namespace CodeyBox.Api
 
         /// <summary>
         /// Agent class definitions for quota-aware routing. Each class lists one or
-        /// more agent members in preference order. See docs/agent-classes.md.
+        /// more agent members in preference order. See docs/concepts/agent-classes.md.
         /// </summary>
         public List<AgentClassOptions> AgentClasses { get; set; } = [];
 
@@ -5362,7 +5504,7 @@ namespace CodeyBox.Api
         /// Operator-extensible per-agent quota stderr patterns. Keys are agent
         /// kind values (e.g. <c>cursor</c>); each entry adds a substring + kind
         /// to the per-provider detector's built-in defaults. See
-        /// docs/quota-gate.md for the schema and supported agent kinds.
+        /// docs/operating/quota.md for the schema and supported agent kinds.
         /// </summary>
         public Dictionary<string, List<QuotaFailurePatternOptions>> QuotaFailurePatterns { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
@@ -5378,7 +5520,7 @@ namespace CodeyBox.Api
         /// <summary>
         /// Time-of-day score modifiers. Applied as small effective-score adjustments
         /// to act as tiebreakers between near-equivalent models during peak cost windows.
-        /// See docs/configuration.md for the schedule schema.
+        /// See docs/reference/configuration.md for the schedule schema.
         /// </summary>
         public AgentScoreModifiersOptions AgentScoreModifiers { get; set; } = new();
 
@@ -5392,10 +5534,10 @@ namespace CodeyBox.Api
         /// </summary>
         public TransitionHealthConfig TransitionHealth { get; set; } = new();
 
-        /// <summary>Agent token pricing for cost estimation. See docs/cost-reporting.md.</summary>
+        /// <summary>Agent token pricing for cost estimation. See docs/operating/costs.md.</summary>
         public AgentPricingOptions AgentPricing { get; set; } = new();
 
-        /// <summary>Monthly cost-budget alert sweep configuration. See docs/budget-alerts.md.</summary>
+        /// <summary>Monthly cost-budget alert sweep configuration. See docs/operating/budgets.md.</summary>
         public BudgetAlertOptions BudgetAlerts { get; set; } = new();
 
         /// <summary>Automatic retry for quota-failed items.</summary>
@@ -5427,10 +5569,10 @@ namespace CodeyBox.Api
         /// </summary>
         public AutoRequeueOnAgentRestoreConfig AutoRequeueOnAgentRestore { get; set; } = new();
 
-        /// <summary>OpenTelemetry export configuration. See docs/observability.md.</summary>
+        /// <summary>OpenTelemetry export configuration. See docs/operating/observability.md.</summary>
         public OtelOptions Otel { get; set; } = new();
 
-        /// <summary>Changelog automation configuration. See docs/changelog-automation.md.</summary>
+        /// <summary>Changelog automation configuration. See docs/operating/releases.md.</summary>
         public ChangelogOptions Changelog { get; set; } = new();
 
         /// <summary>
@@ -5444,7 +5586,7 @@ namespace CodeyBox.Api
         /// <summary>
         /// Sandbox leak reaper configuration. The reaper periodically scans for
         /// <c>codeybox-*</c> Multipass VMs that outlived their work item and logs
-        /// (or optionally auto-disposes) them. See docs/sandbox-leaks.md.
+        /// (or optionally auto-disposes) them. See docs/operating/sandbox-reliability.md.
         /// </summary>
         public SandboxLeakOptions SandboxLeak { get; set; } = new();
 
@@ -6343,7 +6485,7 @@ namespace CodeyBox.Api
         public string? SandboxEnvironmentVariable { get; set; }
         /// <summary>
         /// Operator-curated capability score (0–200). Required; no silent default.
-        /// See docs/agent-classes.md for recommended seed values.
+        /// See docs/concepts/agent-classes.md for recommended seed values.
         /// </summary>
         public int? QualityScore { get; set; }
         /// <summary>
@@ -6355,7 +6497,7 @@ namespace CodeyBox.Api
         /// Clearance/capability tags this member is trusted to handle, e.g.
         /// <c>["sensitive", "architectural"]</c>. Default empty — members with
         /// no tags can only run work items that require no tags. See
-        /// docs/agent-classes.md for the recommended tag vocabulary.
+        /// docs/concepts/agent-classes.md for the recommended tag vocabulary.
         /// </summary>
         public List<string> Capabilities { get; set; } = [];
         /// <summary>
@@ -6685,7 +6827,7 @@ namespace CodeyBox.Api
     /// <summary>
     /// Rolling file log configuration. Paths are resolved relative to the
     /// API process's working directory when they are not absolute.
-    /// See <c>docs/audit-logging.md</c> for details.
+    /// See <c>docs/operating/logging.md</c> for details.
     /// </summary>
     public sealed class AuditLogOptions
     {

@@ -177,6 +177,31 @@ public sealed class ProcessSandboxProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task ExecAsync_TranslatesSandboxAbsolutePathValuesInOtherEnvironmentVariables()
+    {
+        var provider = new ProcessSandboxProvider(new RecordingLogger<ProcessSandboxProvider>());
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = "ignored",
+            WorkingDirectory = "/work",
+        });
+
+        var result = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["sh", "-c",
+                "mkdir -p \"$HOME\" \"$DOTNET_CLI_HOME\" && "
+                + "test -d \"$HOME\" && test -d \"$DOTNET_CLI_HOME\""],
+            ExtraEnvironment = new Dictionary<string, string>
+            {
+                ["HOME"] = "/work/home",
+                ["DOTNET_CLI_HOME"] = "/work/dotnet-home",
+            },
+        });
+
+        Assert.True(result.Success, result.Stderr);
+    }
+
+    [Fact]
     public async Task ExecAsync_StdinBrokenPipe_ReturnsProcessExitResult()
     {
         const int stdinBytes = 1024 * 1024;

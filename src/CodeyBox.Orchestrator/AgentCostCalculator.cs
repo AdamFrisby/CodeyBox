@@ -83,7 +83,7 @@ public sealed class AgentPricingOptions
 /// only requires that provider's cost extractor to expose its own <c>DefaultPricing</c>.
 ///
 /// For subscription plans, <c>estimatedUsd</c> is the equivalent pay-per-API value, not a
-/// real charge. See docs/cost-reporting.md §"Subscription equivalent USD".
+/// real charge. See docs/operating/costs.md §"Subscription equivalent USD".
 /// </summary>
 public sealed class AgentCostCalculator
 {
