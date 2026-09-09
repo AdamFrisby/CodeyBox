@@ -37,7 +37,7 @@ namespace CodeyBox.Orchestrator;
 public sealed class LastKnownGoodQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalidator, IAgentQuotaRecoveryStateInvalidator
 {
     private readonly IAgentQuotaProbe _inner;
-    private readonly Func<LastKnownGoodQuotaOptions> _optionsProvider;
+    private readonly Func<AgentMembership, CancellationToken, ValueTask<LastKnownGoodQuotaOptions>> _optionsProvider;
     private readonly ILogger? _log;
     private readonly TimeProvider _time;
 
@@ -51,9 +51,22 @@ public sealed class LastKnownGoodQuotaProbe : IAgentQuotaProbe, IAgentQuotaCache
         Func<LastKnownGoodQuotaOptions> optionsProvider,
         ILogger? log = null,
         TimeProvider? timeProvider = null)
+        : this(
+            inner,
+            AdaptOptionsProvider(optionsProvider),
+            log,
+            timeProvider)
     {
-        _inner = inner;
-        _optionsProvider = optionsProvider;
+    }
+
+    public LastKnownGoodQuotaProbe(
+        IAgentQuotaProbe inner,
+        Func<AgentMembership, CancellationToken, ValueTask<LastKnownGoodQuotaOptions>> optionsProvider,
+        ILogger? log = null,
+        TimeProvider? timeProvider = null)
+    {
+        _inner = inner ?? throw new ArgumentNullException(nameof(inner));
+        _optionsProvider = optionsProvider ?? throw new ArgumentNullException(nameof(optionsProvider));
         _log = log;
         _time = timeProvider ?? TimeProvider.System;
     }
@@ -81,6 +94,9 @@ public sealed class LastKnownGoodQuotaProbe : IAgentQuotaProbe, IAgentQuotaCache
         }
 
         var now = _time.GetUtcNow();
+        LastKnownGoodQuotaOptions? options = null;
+        if (!snapshot.IsKnown && snapshot.Unknown == QuotaUnknownReason.Transient)
+            options = await _optionsProvider(member, ct).ConfigureAwait(false);
 
         lock (_lock)
         {
@@ -106,7 +122,7 @@ public sealed class LastKnownGoodQuotaProbe : IAgentQuotaProbe, IAgentQuotaCache
                 var age = now - r.CapturedAt;
                 var resetPassed = r.Snapshot.ResetAt is { } reset && reset <= now;
 
-                if (!resetPassed && age <= _optionsProvider().MaxStaleness)
+                if (!resetPassed && age <= options!.MaxStaleness)
                 {
                     var ageSeconds = (long)Math.Round(age.TotalSeconds);
                     _log?.LogDebug(
@@ -178,6 +194,13 @@ public sealed class LastKnownGoodQuotaProbe : IAgentQuotaProbe, IAgentQuotaCache
 
     private static (string RouteKey, string ModelKey) KeyFor(AgentMembership member) =>
         (member.RouteKey, string.IsNullOrWhiteSpace(member.ModelId) ? "" : member.ModelId!);
+
+    private static Func<AgentMembership, CancellationToken, ValueTask<LastKnownGoodQuotaOptions>>
+        AdaptOptionsProvider(Func<LastKnownGoodQuotaOptions> optionsProvider)
+    {
+        ArgumentNullException.ThrowIfNull(optionsProvider);
+        return (member, ct) => ValueTask.FromResult(optionsProvider());
+    }
 }
 
 /// <summary>

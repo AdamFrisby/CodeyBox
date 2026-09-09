@@ -3,6 +3,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
+using CodeyBox.Agents;
 using CodeyBox.Core;
 
 namespace CodeyBox.Agents.Gemini;
@@ -323,7 +324,7 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalid
             using var response = await client.SendAsync(request, ct);
             if (response.StatusCode == HttpStatusCode.TooManyRequests)
             {
-                var reset = TryParseRetryAfter(response, DateTimeOffset.UtcNow);
+                var reset = HttpQuotaRetryPolicy.TryGetRetryAfterReset(response.Headers, DateTimeOffset.UtcNow);
                 return new ProbeOneResult(response.StatusCode, reset);
             }
             return new ProbeOneResult(response.StatusCode, null);
@@ -340,18 +341,6 @@ public sealed class GeminiQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalid
     }
 
     internal record struct ProbeOneResult(HttpStatusCode? Status, DateTimeOffset? ResetAt);
-
-    private static DateTimeOffset? TryParseRetryAfter(HttpResponseMessage response, DateTimeOffset now)
-    {
-        // Prefer the Retry-After header (delta-seconds or HTTP-date).
-        var ra = response.Headers.RetryAfter;
-        if (ra is not null)
-        {
-            if (ra.Delta is { } delta) return now + delta;
-            if (ra.Date is { } when) return when;
-        }
-        return null;
-    }
 
     private static async Task<string?> ReadCappedAsync(HttpContent content, CancellationToken ct)
     {

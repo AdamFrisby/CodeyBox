@@ -14,6 +14,8 @@ namespace CodeyBox.Agents.Claude;
 /// </summary>
 public sealed record ClaudeQuotaProbeResilienceOptions
 {
+    public static TimeSpan DefaultMaxRetryDelay { get; } = TimeSpan.FromMinutes(5);
+
     /// <summary>
     /// Additional attempts after the initial fetch fails transiently
     /// (network error / timeout / 5xx). Total attempts = 1 + MaxRetries.
@@ -26,6 +28,12 @@ public sealed record ClaudeQuotaProbeResilienceOptions
     /// attempt (RetryInitialDelay, 2x, 4x ...). Default 250 ms.
     /// </summary>
     public TimeSpan RetryInitialDelay { get; init; } = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>
+    /// Ceiling for any between-retry sleep, including provider
+    /// <c>Retry-After</c> values. Default 5 minutes.
+    /// </summary>
+    public TimeSpan MaxRetryDelay { get; init; } = DefaultMaxRetryDelay;
 
     /// <summary>
     /// Number of consecutive end-to-end probe failures (each end-to-end probe

@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
+using CodeyBox.Agents;
 using CodeyBox.Core;
 
 namespace CodeyBox.Agents.Claude;
@@ -309,8 +310,13 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalid
         {
             if (attempt > 0)
             {
-                var backoff = TimeSpan.FromTicks(
-                    opts.RetryInitialDelay.Ticks * (long)Math.Pow(2, attempt - 1));
+                var exponential = ComputeExponentialBackoff(opts.RetryInitialDelay, attempt - 1);
+                var backoff = HttpQuotaRetryPolicy.ComputeRetryDelay(
+                    exponential,
+                    last.RetryAfterDelay,
+                    opts.MaxRetryDelay > TimeSpan.Zero
+                        ? opts.MaxRetryDelay
+                        : ClaudeQuotaProbeResilienceOptions.DefaultMaxRetryDelay);
                 await Task.Delay(backoff, _timeProvider, ct);
             }
 
@@ -365,7 +371,11 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalid
                 }
 
                 return IsTransientStatus(response.StatusCode)
-                    ? ProbeAttemptResult.Transient(reason)
+                    ? ProbeAttemptResult.Transient(
+                        reason,
+                        HttpQuotaRetryPolicy.TryGetRetryAfterDelay(
+                            response.Headers,
+                            _timeProvider.GetUtcNow()))
                     : ProbeAttemptResult.Permanent(Unknown(QuotaUnknownReason.Permanent, reason), reason);
             }
 
@@ -394,15 +404,23 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalid
             || status == HttpStatusCode.TooManyRequests;
     }
 
+    private static TimeSpan ComputeExponentialBackoff(TimeSpan initialDelay, int completedRetries)
+    {
+        if (initialDelay <= TimeSpan.Zero)
+            return TimeSpan.Zero;
+
+        var multiplier = Math.Pow(2, completedRetries);
+        var ticks = initialDelay.Ticks * multiplier;
+        return ticks >= TimeSpan.MaxValue.Ticks
+            ? TimeSpan.MaxValue
+            : TimeSpan.FromTicks((long)ticks);
+    }
+
     /// <summary>
     /// Fallback cooldown when a 429 carries no usable <c>Retry-After</c>. Long enough to actually
     /// relieve the endpoint, short enough that a transient limit does not blind the router for long.
     /// </summary>
     internal static readonly TimeSpan DefaultRateLimitCooldown = TimeSpan.FromMinutes(15);
-
-    /// <summary>Upper bound on a provider-supplied <c>Retry-After</c>, so a hostile or mistaken value
-    /// cannot suppress quota reads indefinitely.</summary>
-    internal static readonly TimeSpan MaxRateLimitCooldown = TimeSpan.FromHours(1);
 
     private readonly object _rateLimitLock = new();
     private DateTimeOffset? _rateLimitedUntil;
@@ -437,19 +455,14 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalid
 
     /// <summary>
     /// When to resume probing after a 429: the provider's <c>Retry-After</c> when it supplies a usable
-    /// one (delta-seconds or HTTP-date), else <see cref="DefaultRateLimitCooldown"/>. Clamped to
-    /// <see cref="MaxRateLimitCooldown"/>.
+    /// one (delta-seconds or HTTP-date), else <see cref="DefaultRateLimitCooldown"/>. A provider
+    /// value is not shortened: probing before that time can prolong its rate limit.
     /// </summary>
     private DateTimeOffset ResolveRateLimitCooldownUntil(HttpResponseMessage response)
     {
         var now = _timeProvider.GetUtcNow();
-        var retryAfter = response.Headers.RetryAfter;
-        TimeSpan? hinted = retryAfter?.Delta;
-        if (hinted is null && retryAfter?.Date is { } date)
-            hinted = date - now;
-
-        var cooldown = hinted is { } h && h > TimeSpan.Zero ? h : DefaultRateLimitCooldown;
-        if (cooldown > MaxRateLimitCooldown) cooldown = MaxRateLimitCooldown;
+        var cooldown = HttpQuotaRetryPolicy.TryGetRetryAfterDelay(response.Headers, now)
+            ?? DefaultRateLimitCooldown;
         return now + cooldown;
     }
 
@@ -458,13 +471,14 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalid
     private readonly record struct ProbeAttemptResult(
         ProbeOutcome Outcome,
         AgentQuotaSnapshot? Snapshot,
-        string? Reason)
+        string? Reason,
+        TimeSpan? RetryAfterDelay = null)
     {
         public static ProbeAttemptResult Success(AgentQuotaSnapshot snapshot)
             => new(ProbeOutcome.Success, snapshot, null);
 
-        public static ProbeAttemptResult Transient(string reason)
-            => new(ProbeOutcome.TransientFailure, null, reason);
+        public static ProbeAttemptResult Transient(string reason, TimeSpan? retryAfterDelay = null)
+            => new(ProbeOutcome.TransientFailure, null, reason, retryAfterDelay);
 
         public static ProbeAttemptResult Permanent(AgentQuotaSnapshot snapshot, string reason)
             => new(ProbeOutcome.PermanentFailure, snapshot, reason);
