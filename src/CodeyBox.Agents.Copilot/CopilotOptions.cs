@@ -72,7 +72,17 @@ public sealed class CopilotProviderOptions
     public string? AzureApiVersion { get; set; }
 
     /// <summary>Extra HTTP headers sent only to the provider endpoint, as <c>Name: Value</c> entries.
-    /// Joined with newlines, which is the separator Copilot parses.</summary>
+    /// Joined with newlines, which is the separator Copilot parses.
+    ///
+    /// <para>A value may embed <c>{{codeybox.session_id}}</c> (see
+    /// <see cref="CopilotAgentRunner.ProviderSessionIdPlaceholder"/>) to request a per-invocation
+    /// session identifier, e.g. <c>x-opencode-session: {{codeybox.session_id}}</c>: every agent
+    /// invocation substitutes a fresh UUID for every occurrence, so concurrent sandboxes never share
+    /// one provider session. The resolved id is additionally exported as
+    /// <c>CODEYBOX_COPILOT_SESSION_ID</c> so a failing run can be correlated with the session it
+    /// used — that variable is random and safe to log, while the rendered headers themselves may
+    /// carry secrets and must never be logged. Values without the placeholder are emitted
+    /// byte-identical.</para></summary>
     public IList<string> Headers { get; set; } = [];
 
     /// <summary>Prompt-token ceiling advertised to Copilot. Null leaves Copilot's own default.</summary>

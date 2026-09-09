@@ -59,7 +59,7 @@ argv flags — so CodeyBox renders it from `CodeyBox:Copilot`:
 | `COPILOT_PROVIDER_API_KEY` / `..._BEARER_TOKEN` | Bearer wins inside Copilot — set one |
 | `COPILOT_PROVIDER_WIRE_API` | `completions` or `responses` |
 | `COPILOT_PROVIDER_TRANSPORT` | `http` or `websockets` (websockets only with `responses`) |
-| `COPILOT_PROVIDER_HEADERS` | newline-separated `Name: Value` |
+| `COPILOT_PROVIDER_HEADERS` | newline-separated `Name: Value` — embed `{{codeybox.session_id}}` in a value for a fresh UUID per invocation (also exported as `CODEYBOX_COPILOT_SESSION_ID` for diagnosis; never log the headers themselves) |
 | `COPILOT_OFFLINE` | no GitHub auth/telemetry/web tools/GitHub MCP/auto-update. **Requires a provider**, so CodeyBox emits it only alongside one. |
 
 The credential is **not** a config value: it arrives through the credential chain as
