@@ -1511,10 +1511,12 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             environmentOverrides: MergeEnvironment(poisonedEnvironment, FakeSudoPathEnvironment()));
         await WaitForProcessGroupGoneAsync(processGroupMarker, DetachedLaunchWatchdog);
         // The launcher exits as soon as the supervisor publishes its marker and
-        // process-group absence is only an indirect liveness signal, so observe
-        // the detached child's own completion sentinel (written after its other
-        // outputs) before reading them. Without this the reads below race a
-        // still-starting child under parallel load and flake with FileNotFound.
+        // process-group absence is only an indirect liveness signal: the
+        // process-group poll can observe group death before the child's
+        // just-written files are visible to open() under parallel load, so wait
+        // for the detached child's own completion sentinel (written last, after
+        // the other outputs asserted below) before reading them. Without this
+        // the reads below race a still-starting child and flake with FileNotFound.
         await WaitForFileAsync(doneFile, DetachedLaunchWatchdog);
 
         Assert.Equal(0, exit);
@@ -1593,6 +1595,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             releasePipe.WriteByte((byte)'\n');
             await releasePipe.FlushAsync();
             await WaitForProcessGroupGoneAsync(processGroupMarker, DetachedLaunchWatchdog);
+            // Group death can be observed before the child's files are visible
+            // to open() under parallel load; wait for the command's own signal.
+            await WaitForFileAsync(doneFile, DetachedLaunchWatchdog);
             Assert.True(File.Exists(doneFile));
         }
         finally
@@ -1836,6 +1841,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             Assert.Equal(1, Volatile.Read(ref targetRequests));
             Assert.Equal(0, Volatile.Read(ref proxyRequests));
             await WaitForProcessGroupGoneAsync(processGroupMarker, DetachedLaunchWatchdog);
+            // Group death can be observed before the child's files are visible
+            // to open() under parallel load; wait for the command's own signal.
+            await WaitForFileAsync(doneFile, DetachedLaunchWatchdog);
             Assert.True(File.Exists(doneFile));
         }
         finally
@@ -1934,6 +1942,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         // second invocation so its supervisor-dir prep and marker re-check never
         // race the trailing sidecar writes.
         await WaitForProcessGroupGoneAsync(processGroupMarker, DetachedLaunchWatchdog);
+        // Group death can be observed before the child's files are visible to
+        // open() under parallel load; wait for the command's own write.
+        await WaitForFileAsync(countFile, DetachedLaunchWatchdog);
         Assert.Equal("run", await File.ReadAllTextAsync(countFile));
         var second = await RunLocalProcessAsync(
             "/bin/bash",
@@ -2001,6 +2012,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         Assert.Equal("", stderr);
         await WaitForProcessGroupGoneAsync(processGroupMarker, DetachedLaunchWatchdog);
         AssertExitCode(session, 0);
+        // Group death can be observed before the child's files are visible to
+        // open() under parallel load; wait for the command's own write.
+        await WaitForFileAsync(capturedPromptFile, DetachedLaunchWatchdog);
         Assert.Equal("agent prompt\n", await File.ReadAllTextAsync(capturedPromptFile));
         Assert.False(File.Exists(exitTokenFile));
     }
@@ -2176,6 +2190,9 @@ public sealed class MultipassSandboxProviderTests : IDisposable
         await WaitForProcessGroupGoneAsync(processGroupMarker, DetachedLaunchWatchdog);
         AssertExitCode(session, 88);
         Assert.True(File.Exists(stdinFile));
+        // Group death can be observed before the sidecar files are visible to
+        // open() under parallel load; wait for the sidecar before reading it.
+        await WaitForFileAsync(processGroupMarker + ".stderr", DetachedLaunchWatchdog);
         Assert.Contains(
             "codeybox-detached: failed to read stdin sidecar (exit 23)",
             await File.ReadAllTextAsync(processGroupMarker + ".stderr"),
@@ -8635,6 +8652,10 @@ public sealed class MultipassSandboxProviderTests : IDisposable
             environmentOverrides: FakeSudoPathEnvironment());
         await WaitForProcessGroupGoneAsync(processGroupMarker, DetachedLaunchWatchdog);
         AssertExitCode(session, 2);
+        // Group death can be observed before the child's files are visible to
+        // open() under parallel load; wait for them before asserting.
+        await WaitForFileAsync(sentinel, DetachedLaunchWatchdog);
+        await WaitForFileAsync(exitFile, DetachedLaunchWatchdog);
 
         Assert.Equal(0, exit);
         Assert.Equal("", stdout);
