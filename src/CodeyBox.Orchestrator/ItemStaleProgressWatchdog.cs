@@ -15,14 +15,14 @@ namespace CodeyBox.Orchestrator;
 /// Walks <see cref="IWorkItemStore.ListByStateAsync"/> for every active
 /// in-flight state (see <see cref="WorkItemRecoveryPolicy.IsItemStaleWatchedState"/>)
 /// and compares <c>UpdatedAt</c> to
-/// <see cref="WorkerProgressWatchdogOptions.ItemStaleTimeout"/>. When the
-/// item has been frozen past the threshold the bound worker (if any) is
-/// aborted, the pool slot released, and the item requeued PRESERVING its
-/// work branch (re-pickup re-rebases onto current upstream main). The
-/// per-worker watchdog cannot see this case — it iterates worker rows, so
-/// an orphaned item with no live worker (post-restart) is invisible to it,
-/// and a worker stuck in a transport reconnect loop (CPU active, item
-/// frozen) looks healthy through its activity-source progress signal.
+/// <see cref="WorkerProgressWatchdogOptions.ItemStaleTimeout"/>. An item past
+/// the <c>UpdatedAt</c> cutoff is still classified as stale only when its
+/// agent shows no other liveness either: no recent append to its captured
+/// agent-stream files (the direct "still producing output" signal) and no
+/// newly-observed sandbox activity for its bound worker. A long turn that
+/// never stamps <c>UpdatedAt</c> mid-turn but keeps appending stream output
+/// is alive and must not be parked. A run producing no output for the
+/// configured interval is still stale and is recovered.
 /// </para>
 ///
 /// <para>
@@ -30,6 +30,16 @@ namespace CodeyBox.Orchestrator;
 /// normally while this item's slot is held by a dead-or-wedged worker.
 /// The per-worker watchdog defers to this one for any item it has not
 /// already recovered, so the two never double-recover.
+/// </para>
+///
+/// <para>
+/// Liveness inputs are deliberately narrower than the per-worker watchdog's.
+/// Heartbeat and host CPU activity are ignored here on purpose: the
+/// reconnect-loop wedge this detector was built for keeps heartbeating and
+/// burning CPU while the item is frozen, so either signal would mask it.
+/// Sandbox activity counts only as a same-sweep observation (a newly reported
+/// sandbox state), never as stable ownership — a wedge holding its VM open
+/// must still trip once its output goes quiet.
 /// </para>
 ///
 /// <para>
@@ -52,6 +62,8 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
     private readonly TimeProvider _time;
     private readonly IStartupInitialRecoveryBarrier? _startupRecoveryBarrier;
     private readonly CancellationRegistry? _cancellations;
+    private readonly IAgentStreamStore? _streams;
+    private readonly IWorkerProgressActivitySource? _activitySource;
     private IWorkerPoolRecoverySlotReleaser? _slotReleaser;
 
     // In-process record of items already recovered, keyed on the UpdatedAt
@@ -77,7 +89,9 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
         IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null,
         CancellationRegistry? cancellations = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        IAgentStreamStore? streams = null,
+        IWorkerProgressActivitySource? activitySource = null)
     {
         _store = store;
         _queue = queue;
@@ -89,6 +103,8 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
         _startupRecoveryBarrier = startupRecoveryBarrier;
         _cancellations = cancellations;
         _time = timeProvider ?? TimeProvider.System;
+        _streams = streams;
+        _activitySource = activitySource;
     }
 
     public ItemStaleProgressWatchdog(
@@ -101,8 +117,10 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
         IWorkerPoolRecoverySlotReleaser? slotReleaser = null,
         IStartupInitialRecoveryBarrier? startupRecoveryBarrier = null,
         CancellationRegistry? cancellations = null,
-        TimeProvider? timeProvider = null)
-        : this(store, queue, registry, () => opts, log, webhooks, slotReleaser, startupRecoveryBarrier, cancellations, timeProvider) { }
+        TimeProvider? timeProvider = null,
+        IAgentStreamStore? streams = null,
+        IWorkerProgressActivitySource? activitySource = null)
+        : this(store, queue, registry, () => opts, log, webhooks, slotReleaser, startupRecoveryBarrier, cancellations, timeProvider, streams, activitySource) { }
 
     /// <summary>
     /// Mirrors the per-worker watchdog's late-attach pattern: the DI graph
@@ -169,8 +187,13 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
 
     /// <summary>
     /// Single sweep. Walks every <see cref="WorkItemRecoveryPolicy.IsItemStaleWatchedState"/>
-    /// state, recovers any item whose <c>UpdatedAt</c> has not advanced
-    /// inside <see cref="WorkerProgressWatchdogOptions.ItemStaleTimeout"/>.
+    /// state and recovers items whose <c>UpdatedAt</c> has not advanced
+    /// inside <see cref="WorkerProgressWatchdogOptions.ItemStaleTimeout"/>
+    /// AND whose agent shows no other liveness (no recent agent-stream
+    /// append, no newly-observed sandbox activity for the bound worker).
+    /// An item past the <c>UpdatedAt</c> cutoff whose agent is still
+    /// producing output is alive, not stale: the sweep skips it without
+    /// touching <c>RecoveryAttempts</c>.
     /// Idempotent: an item already recovered in this process is skipped so
     /// the re-pickup window cannot double-recover before the new pickup
     /// stamps <c>UpdatedAt</c>.
@@ -211,11 +234,29 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
                     if (item.UpdatedAt > cutoff)
                         continue;
 
+                    // UpdatedAt is frozen past the threshold, but that alone
+                    // does not prove the agent is hung: a long turn may never
+                    // stamp UpdatedAt mid-turn while still appending stream
+                    // output. Classify as stale only when the agent shows no
+                    // other liveness either. Skipping here leaves
+                    // RecoveryAttempts untouched — a live run must not consume
+                    // the recovery budget.
+                    var liveness = await ObserveLivenessAsync(item, opts, cutoff, ct);
+                    if (liveness.IsAlive)
+                    {
+                        _log.LogDebug(
+                            "Item-stale sweep: work item {ItemId} UpdatedAt frozen for {SinceUpdated}s but agent is alive ({AliveReason}); not stale",
+                            item.Id, (long)(now - item.UpdatedAt).TotalSeconds, liveness.AliveReason);
+                        continue;
+                    }
+
                     var sinceUpdated = (long)(now - item.UpdatedAt).TotalSeconds;
                     await RecoverItemAsync(
                         item,
                         reason:
-                            $"item-stale: state {item.State}, UpdatedAt frozen for {sinceUpdated}s (threshold {(long)effectiveTimeout.TotalSeconds}s)",
+                            $"item-stale: state {item.State}, UpdatedAt frozen for {sinceUpdated}s (threshold {(long)effectiveTimeout.TotalSeconds}s); " +
+                            $"lastStreamWrite={liveness.StreamEvidence}; sandbox={liveness.SandboxEvidence}; " +
+                            $"lastTransition={item.State}@{item.UpdatedAt:O}",
                         trigger: "watchdog",
                         ct);
                 }
@@ -432,8 +473,8 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
             trigger);
 
         _log.LogWarning(
-            "Item-stale ({Trigger}) recovered work item {ItemId} (worker {WorkerId}) from {FromState} → {ToState} (attempt {Attempt}/{Max}); branchPreserved={BranchPreserved}",
-            trigger, item.Id, workerId ?? "<no-live-worker>", fromState, toState, attempts, opts.ItemStaleMaxRecoveryAttempts, branchPreserved);
+            "Item-stale ({Trigger}) recovered work item {ItemId} (worker {WorkerId}) from {FromState} → {ToState} (attempt {Attempt}/{Max}); branchPreserved={BranchPreserved}; {Reason}",
+            trigger, item.Id, workerId ?? "<no-live-worker>", fromState, toState, attempts, opts.ItemStaleMaxRecoveryAttempts, branchPreserved, reason);
 
         var restoredDependents = 0;
         if (toState != WorkItemState.NeedsOperatorInput && toState is not WorkItemState.Failed)
@@ -454,6 +495,7 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
                         fromState = fromState.ToString(),
                         toState = toState.ToString(),
                         reason = "item-stale updatedAt",
+                        detail = reason,
                         trigger,
                         recoveryAttempt = attempts,
                         maxRecoveryAttempts = opts.ItemStaleMaxRecoveryAttempts,
@@ -480,6 +522,153 @@ public sealed class ItemStaleProgressWatchdog : BackgroundService
             Attempt: attempts,
             BranchPreserved: branchPreserved,
             Error: null);
+    }
+
+    /// <summary>
+    /// Liveness evidence consulted before classifying an <c>UpdatedAt</c>-frozen
+    /// item as stale. Recorded into the stale-park reason
+    /// (<c>LastError</c>, audit log, webhook) so the next operator can tell a
+    /// real hang from a long turn without reconstructing it from file
+    /// timestamps.
+    /// </summary>
+    private sealed record ItemLiveness(
+        bool IsAlive,
+        string? AliveReason,
+        string StreamEvidence,
+        string SandboxEvidence);
+
+    /// <summary>
+    /// Checks whether an <c>UpdatedAt</c>-frozen item's agent is still alive.
+    /// Stream recency is the primary signal: an agent appending captured
+    /// output is producing output and must not be parked. Sandbox activity is
+    /// the secondary signal, observed through
+    /// <see cref="IWorkerProgressActivitySource"/> for the bound worker with
+    /// the process-CPU leg disabled — a reconnect-loop wedge burns CPU while
+    /// frozen, so CPU liveness would defeat this detector; only a newly
+    /// reported sandbox state counts, never stable ownership. Orphaned items
+    /// (no bound worker row) rely on stream evidence alone.
+    /// </summary>
+    private async Task<ItemLiveness> ObserveLivenessAsync(
+        WorkItem item,
+        WorkerProgressWatchdogOptions opts,
+        DateTimeOffset cutoff,
+        CancellationToken ct)
+    {
+        var lastStreamAt = await GetLastStreamActivityAsync(item.Id, ct);
+        string streamEvidence = lastStreamAt is null
+            ? (_streams is null ? "streams-unavailable" : "none")
+            : $"{lastStreamAt:O} ({(long)(_time.GetUtcNow() - lastStreamAt.Value).TotalSeconds}s ago)";
+        if (lastStreamAt is not null && lastStreamAt > cutoff)
+        {
+            return new ItemLiveness(
+                IsAlive: true,
+                AliveReason: $"stream-write {lastStreamAt:O}",
+                StreamEvidence: streamEvidence,
+                SandboxEvidence: "not-consulted");
+        }
+
+        var (sandboxAlive, sandboxEvidence) = await ObserveSandboxLivenessAsync(item, opts, ct);
+        if (sandboxAlive)
+        {
+            return new ItemLiveness(
+                IsAlive: true,
+                AliveReason: sandboxEvidence,
+                StreamEvidence: streamEvidence,
+                SandboxEvidence: sandboxEvidence);
+        }
+
+        return new ItemLiveness(
+            IsAlive: false,
+            AliveReason: null,
+            StreamEvidence: streamEvidence,
+            SandboxEvidence: sandboxEvidence);
+    }
+
+    private async Task<(bool Alive, string Evidence)> ObserveSandboxLivenessAsync(
+        WorkItem item,
+        WorkerProgressWatchdogOptions opts,
+        CancellationToken ct)
+    {
+        if (_activitySource is null)
+            return (false, "activity-source-unavailable");
+        if (!opts.ActiveSandboxProgressSignalEnabled)
+            return (false, "sandbox-signal-disabled");
+
+        var worker = await FindBoundWorkerAsync(item.Id, ct);
+        if (worker is null)
+            return (false, "no-bound-worker");
+
+        // CPU leg off: this detector exists for wedges that stay CPU-active
+        // while the item is frozen. See ObserveLivenessAsync.
+        var probe = new WorkerProgressActivityProbe(
+            ProcessCpuProgressSignalEnabled: false,
+            ActiveSandboxProgressSignalEnabled: true);
+        WorkerProgressActivity? activity;
+        try
+        {
+            activity = await _activitySource.ObserveAsync(worker, item.Id, probe, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Item-stale sweep: failed to read sandbox activity for {ItemId}; treating as no activity", item.Id);
+            return (false, "sandbox-probe-failed");
+        }
+
+        return activity is not null
+            ? (true, activity.Reason)
+            : (false, "no-sandbox-activity");
+    }
+
+    private async Task<WorkerRegistration?> FindBoundWorkerAsync(WorkItemId itemId, CancellationToken ct)
+    {
+        IReadOnlyList<WorkerRegistration> workers;
+        try
+        {
+            workers = await _registry.ListAsync(ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Item-stale sweep: failed to list workers while probing sandbox liveness for {ItemId}", itemId);
+            return null;
+        }
+
+        var idStr = itemId.ToString();
+        foreach (var worker in workers)
+        {
+            if (string.IsNullOrEmpty(worker.CurrentWorkItemId)) continue;
+            if (string.Equals(worker.CurrentWorkItemId, idStr, StringComparison.OrdinalIgnoreCase))
+                return worker;
+        }
+
+        return null;
+    }
+
+    private async Task<DateTimeOffset?> GetLastStreamActivityAsync(WorkItemId itemId, CancellationToken ct)
+    {
+        if (_streams is null) return null;
+        try
+        {
+            var files = await _streams.ListAsync(itemId, limit: AgentStreamStore.MaxListLimit, includeLineCount: false, ct);
+            if (files.Count == 0) return null;
+            // LastActivityAt (last append), not CapturedAt (creation), is the
+            // liveness signal: a long turn advances it on every stream append
+            // while UpdatedAt legitimately stays frozen mid-turn.
+            DateTimeOffset newest = files[0].LastActivityAt;
+            for (var i = 1; i < files.Count; i++)
+            {
+                if (files[i].LastActivityAt > newest)
+                    newest = files[i].LastActivityAt;
+            }
+            return newest;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Item-stale sweep: failed to read stream activity for {ItemId}; treating as no-stream", itemId);
+            return null;
+        }
     }
 
     private readonly record struct ClaimOwnerFenceResult(

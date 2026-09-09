@@ -3085,11 +3085,11 @@ builder.Services.AddSingleton<WorkerProgressWatchdog>(sp =>
 
 // --- Per-item stale-updatedAt watchdog --------------------------------------
 // Item-centric counterpart to WorkerProgressWatchdog: walks items by state
-// (not by the worker registry) and uses only item.UpdatedAt as the progress
-// signal, ignoring worker heartbeat / CPU / sandbox activity. Catches the
-// reconnect-loop wedge (worker still alive, CPU active, item frozen) and the
-// orphan-after-restart wedge (item Working but no live worker) that the
-// per-worker watchdog cannot see. Also powers POST /workitems/{id}/recover.
+// (not by the worker registry) and treats an item as wedged when its
+// UpdatedAt is frozen past ItemStaleTimeout AND its agent shows no other
+// liveness (no recent agent-stream append, no newly-observed sandbox
+// activity). Heartbeat / CPU activity alone never counts — that is the
+// reconnect-loop wedge this detector owns. Also powers POST /workitems/{id}/recover.
 builder.Services.AddSingleton<ItemStaleProgressWatchdog>(sp =>
 {
     var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
@@ -3105,7 +3105,12 @@ builder.Services.AddSingleton<ItemStaleProgressWatchdog>(sp =>
         // Recovery cancels the running pipeline's CT so its finally blocks
         // tear down the active sandbox / VM. Without this the wedged worker
         // can keep running on a row that has been requeued to a fresh slot.
-        cancellations: sp.GetRequiredService<CancellationRegistry>());
+        cancellations: sp.GetRequiredService<CancellationRegistry>(),
+        // Liveness inputs for the stale-vs-alive decision: a frozen UpdatedAt
+        // with a still-appending stream is a long turn, not a hang. Both are
+        // optional — without them the detector falls back to UpdatedAt-only.
+        streams: sp.GetService<IAgentStreamStore>(),
+        activitySource: sp.GetService<IWorkerProgressActivitySource>());
 });
 
 // --- Worker pool health watchdog --------------------------------------------
