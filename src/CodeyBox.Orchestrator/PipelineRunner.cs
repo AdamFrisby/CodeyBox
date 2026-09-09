@@ -1972,7 +1972,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 stdout: result.Stdout);
             throw new TerminalQuotaError(
                 detection.Kind,
-                $"Agent {runner.Kind} reported quota failure during planning: {result.Summary}",
+                QuotaFailureMessage(
+                    detection.Kind,
+                    $"Agent {runner.Kind} reported quota failure during planning: {result.Summary}"),
                 detection.ResetAt);
         }
 
@@ -3345,7 +3347,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 phase: PhaseForQuotaPark(current.State),
                 quotaResetAt: ex.ResetAt,
                 project: project,
-                iteration: null);
+                iteration: null,
+                quotaKind: ex.Kind);
         }
         catch (AgentSessionResumeExhaustedException ex)
         {
@@ -5724,7 +5727,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
                     var quotaKind = detection?.Kind ?? QuotaFailureKind.RateLimitExceeded;
                     throw new TerminalQuotaError(quotaKind,
-                        $"Agent {runner.Kind} reported quota failure: {agentResult.Summary}",
+                        QuotaFailureMessage(
+                            quotaKind,
+                            $"Agent {runner.Kind} reported quota failure: {agentResult.Summary}"),
                         detection?.ResetAt);
                 }
 
@@ -9949,7 +9954,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
             bypassExitedSummaryGuard: true);
 
         throw new TerminalQuotaError(noChangeQuota.Kind,
-            $"Agent {agent} reported quota failure on clean-exit/no-diff rework from {evidenceSource}: {RedactAndTruncateAgentDetail(stderr ?? stdout ?? string.Empty)}",
+            QuotaFailureMessage(
+                noChangeQuota.Kind,
+                $"Agent {agent} reported quota failure on clean-exit/no-diff rework from {evidenceSource}: {RedactAndTruncateAgentDetail(stderr ?? stdout ?? string.Empty)}"),
             noChangeQuota.ResetAt);
     }
 
@@ -14238,7 +14245,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
             {
                 throw new TerminalQuotaError(
                     quotaDetection.Kind,
-                    $"Audit agent {run.Runner.Kind} reported quota failure while running {run.Auditor.Name}: {run.Result.AgentSummary ?? "agent failed"}",
+                    QuotaFailureMessage(
+                        quotaDetection.Kind,
+                        $"Audit agent {run.Runner.Kind} reported quota failure while running {run.Auditor.Name}: {run.Result.AgentSummary ?? "agent failed"}"),
                     quotaDetection.ResetAt);
             }
         }
@@ -14278,7 +14287,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     bypassExitedSummaryGuard: true);
                 throw new TerminalQuotaError(
                     terminalQuota!.Kind,
-                    $"Audit agent {run.Runner.Kind} reported quota failure on clean exit while running {run.Auditor.Name}: {RedactAndTruncateAgentDetail(run.Result.AgentTerminalDiagnostic)}",
+                    QuotaFailureMessage(
+                        terminalQuota.Kind,
+                        $"Audit agent {run.Runner.Kind} reported quota failure on clean exit while running {run.Auditor.Name}: {RedactAndTruncateAgentDetail(run.Result.AgentTerminalDiagnostic)}"),
                     terminalQuota.ResetAt);
             }
         }
@@ -15914,7 +15925,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
 
             return new TerminalQuotaError(
                 detection.Kind,
-                $"Agent {runner.Kind} reported quota failure after exhausting session resume: {last.Summary}",
+                QuotaFailureMessage(
+                    detection.Kind,
+                    $"Agent {runner.Kind} reported quota failure after exhausting session resume: {last.Summary}"),
                 detection.ResetAt);
         }
 
@@ -16596,6 +16609,33 @@ public sealed partial class PipelineRunner : IPipelineRunner
     }
 
     /// <summary>
+    /// Renders the recorded failure reason for a quota-shaped terminal error,
+    /// distinguishing a transient provider rate refusal from a spent account
+    /// cap. Operators respond differently to the two — a 429 clears on its
+    /// own backoff, an exhausted cap needs capacity or a new window — so the
+    /// <c>LastError</c> parked on the work item must not conflate them.
+    ///
+    /// <para>Only the <see cref="QuotaFailureKind.RateLimitExceeded"/> wording
+    /// changes; every other kind returns <paramref name="exhaustedMessage"/>
+    /// byte-identical. The rate-limit rewrite targets the single
+    /// <c>"reported quota failure"</c> marker: messages that do not carry it
+    /// are returned unchanged rather than guessed at.</para>
+    /// </summary>
+    internal static string QuotaFailureMessage(QuotaFailureKind kind, string exhaustedMessage)
+    {
+        if (kind != QuotaFailureKind.RateLimitExceeded)
+            return exhaustedMessage;
+        const string marker = "reported quota failure";
+        var index = exhaustedMessage.IndexOf(marker, StringComparison.Ordinal);
+        if (index < 0)
+            return exhaustedMessage;
+        return string.Concat(
+            exhaustedMessage.AsSpan(0, index),
+            "rate-limited by provider (transient rate limit; retrying after backoff)",
+            exhaustedMessage.AsSpan(index + marker.Length));
+    }
+
+    /// <summary>
     /// R8-core: deterministic in-VM path to the tee'd agent log file for a
     /// single agent invocation. Persisted on the work item so the suspend-on-
     /// shutdown handler can read it back without coordinating with this
@@ -17140,7 +17180,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
                         ct,
                         projectId: item.ProjectId,
                         stdout: classificationResult.Stdout);
-                    throw new TerminalQuotaError(detection.Kind, $"Merge agent {chosenMergeRunner.Kind} reported quota failure: {classificationResult.Summary}", detection.ResetAt);
+                    throw new TerminalQuotaError(
+                        detection.Kind,
+                        QuotaFailureMessage(
+                            detection.Kind,
+                            $"Merge agent {chosenMergeRunner.Kind} reported quota failure: {classificationResult.Summary}"),
+                        detection.ResetAt);
                 }
 
                 ThrowIfTransientAgentFailure(chosenMergeRunner, classificationResult, "merge");
@@ -20565,7 +20610,8 @@ Original merge-phase failure (JSON string, for context only):
         Project? project,
         DateTimeOffset? detectedResetAt,
         string phase,
-        CancellationToken ct)
+        CancellationToken ct,
+        QuotaFailureKind? quotaKind = null)
     {
         var resetAt = ClampQuotaReset(detectedResetAt, _pipelineTuning.Current.MaxParsedQuotaResetWindow);
         if (resetAt is not null)
@@ -20597,7 +20643,13 @@ Original merge-phase failure (JSON string, for context only):
             }
         }
 
-        return DateTimeOffset.UtcNow.Add(_pipelineTuning.Current.DefaultQuotaFailurePause);
+        // A transient provider rate limit clears far sooner than a spent
+        // account cap, so it resumes on its own (shorter, separately tunable)
+        // backoff rather than the hard-quota pause.
+        var fallbackPause = quotaKind == QuotaFailureKind.RateLimitExceeded
+            ? _pipelineTuning.Current.DefaultRateLimitPause
+            : _pipelineTuning.Current.DefaultQuotaFailurePause;
+        return DateTimeOffset.UtcNow.Add(fallbackPause);
     }
 
     private async Task TransitionWaitingForQuotaResetAsync(
@@ -20759,11 +20811,12 @@ Original merge-phase failure (JSON string, for context only):
         string phase,
         DateTimeOffset? quotaResetAt,
         Project? project,
-        int? iteration)
+        int? iteration,
+        QuotaFailureKind? quotaKind = null)
     {
         var ct = CancellationToken.None;
         var current = await _store.GetAsync(item.Id, ct) ?? item;
-        var effectiveResetAt = await ResolveQuotaResetAtForFailedTransitionAsync(current, project, quotaResetAt, phase, ct);
+        var effectiveResetAt = await ResolveQuotaResetAtForFailedTransitionAsync(current, project, quotaResetAt, phase, ct, quotaKind);
         var agentTurnRetryFrom = RetryFromForAgentTurnCheckpoint(current);
         var next = WorkItemRecoveryPolicy.ReleaseAgentTurnDispatchClaim(
             current.With(

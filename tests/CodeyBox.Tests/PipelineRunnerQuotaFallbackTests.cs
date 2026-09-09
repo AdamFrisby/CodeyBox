@@ -575,7 +575,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
         var fallback = Assert.Single(history, h => h.Phase == "rework" && h.ToAgent == AgentKind.Claude);
         Assert.Equal(AgentKind.Codex, fallback.FromAgent);
-        Assert.Contains("quota failure", fallback.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("rate-limited by provider", fallback.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("reported quota failure", fallback.Reason, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -612,7 +613,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var history = await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None);
         var fallback = Assert.Single(history, h => h.Phase == "rework" && h.ToAgent == AgentKind.Claude);
         Assert.Equal(AgentKind.Codex, fallback.FromAgent);
-        Assert.Contains("quota failure", fallback.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("rate-limited by provider", fallback.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("reported quota failure", fallback.Reason, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -1557,7 +1559,8 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
         var swap = history.Single(h => h.Phase == "work" && h.ToAgent == AgentKind.Claude);
         Assert.Equal(AgentKind.Codex, swap.FromAgent);
         Assert.Equal(AgentKind.Claude, swap.ToAgent);
-        Assert.Contains("quota", swap.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("rate-limited by provider", swap.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("reported quota failure", swap.Reason, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

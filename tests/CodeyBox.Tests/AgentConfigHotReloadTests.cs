@@ -1914,6 +1914,7 @@ public sealed class AgentConfigHotReloadTests
             PipelineTuning = new PipelineTuningOptions
             {
                 DefaultQuotaFailurePause = TimeSpan.FromMinutes(5),
+                DefaultRateLimitPause = TimeSpan.FromMinutes(5),
                 QuotaExhaustionFallbackTtl = TimeSpan.FromHours(1),
                 MaxParsedQuotaResetWindow = TimeSpan.FromHours(24),
                 MergeSandboxStagingRestoreAttempts = 2,
@@ -1925,6 +1926,7 @@ public sealed class AgentConfigHotReloadTests
             new PipelineTuningOptions
             {
                 DefaultQuotaFailurePause = initial.PipelineTuning.DefaultQuotaFailurePause,
+                DefaultRateLimitPause = initial.PipelineTuning.DefaultRateLimitPause,
                 QuotaExhaustionFallbackTtl = initial.PipelineTuning.QuotaExhaustionFallbackTtl,
                 MaxParsedQuotaResetWindow = initial.PipelineTuning.MaxParsedQuotaResetWindow,
                 MergeSandboxStagingRestoreAttempts = initial.PipelineTuning.MergeSandboxStagingRestoreAttempts,
@@ -1948,6 +1950,7 @@ public sealed class AgentConfigHotReloadTests
         await coordinator.StartAsync(CancellationToken.None);
 
         Assert.Equal(TimeSpan.FromMinutes(5), snapshot.Current.DefaultQuotaFailurePause);
+        Assert.Equal(TimeSpan.FromMinutes(5), snapshot.Current.DefaultRateLimitPause);
         Assert.Equal(2, snapshot.Current.MergeSandboxStagingRestoreAttempts);
         Assert.Equal(2, snapshot.Current.MaxPlanReviewIterations);
 
@@ -1957,11 +1960,13 @@ public sealed class AgentConfigHotReloadTests
             PipelineTuning = new PipelineTuningOptions
             {
                 DefaultQuotaFailurePause = TimeSpan.FromMinutes(1),
+                DefaultRateLimitPause = TimeSpan.FromMinutes(2),
                 MergeSandboxStagingRestoreAttempts = 3,
                 MaxPlanReviewIterations = 4,
             },
         });
         Assert.Equal(TimeSpan.FromMinutes(1), snapshot.Current.DefaultQuotaFailurePause);
+        Assert.Equal(TimeSpan.FromMinutes(2), snapshot.Current.DefaultRateLimitPause);
         Assert.Equal(3, snapshot.Current.MergeSandboxStagingRestoreAttempts);
         Assert.Equal(4, snapshot.Current.MaxPlanReviewIterations);
 
@@ -1971,6 +1976,7 @@ public sealed class AgentConfigHotReloadTests
             PipelineTuning = new PipelineTuningOptions
             {
                 DefaultQuotaFailurePause = TimeSpan.FromMinutes(1),
+                DefaultRateLimitPause = TimeSpan.FromMinutes(2),
                 MergeSandboxStagingRestoreAttempts = 3,
                 MaxPlanReviewIterations = 4,
             },
