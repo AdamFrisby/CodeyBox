@@ -225,11 +225,11 @@ public sealed class ClaudeQuotaProbeResilienceTests
     }
 
     [Fact]
-    public async Task Transient429_WithRetryAfter_WaitsAtLeastServerDelayBeforeRetry()
+    public async Task Transient503_WithRetryAfter_WaitsAtLeastServerDelayBeforeRetry()
     {
         var time = new CapturingDelayTimeProvider(DateTimeOffset.UtcNow);
         var handler = new RetryAfterSequenceHandler(
-            new RetryAfterResponse(HttpStatusCode.TooManyRequests, "", TimeSpan.FromSeconds(12)),
+            new RetryAfterResponse(HttpStatusCode.ServiceUnavailable, "", TimeSpan.FromSeconds(12)),
             new RetryAfterResponse(HttpStatusCode.OK, Rollup(40), null));
         var probe = BuildProbe(
             handler,
@@ -258,7 +258,7 @@ public sealed class ClaudeQuotaProbeResilienceTests
         yield return new object?[]
         {
             "http-date",
-            HttpStatusCode.TooManyRequests,
+            HttpStatusCode.ServiceUnavailable,
             (TimeSpan?)null,
             now.AddSeconds(17),
             TimeSpan.FromMilliseconds(250),
@@ -278,7 +278,7 @@ public sealed class ClaudeQuotaProbeResilienceTests
         yield return new object?[]
         {
             "exponential wins",
-            HttpStatusCode.TooManyRequests,
+            HttpStatusCode.ServiceUnavailable,
             TimeSpan.FromSeconds(5),
             (DateTimeOffset?)null,
             TimeSpan.FromSeconds(20),
@@ -288,7 +288,7 @@ public sealed class ClaudeQuotaProbeResilienceTests
         yield return new object?[]
         {
             "server delay is honoured",
-            HttpStatusCode.TooManyRequests,
+            HttpStatusCode.ServiceUnavailable,
             TimeSpan.FromMinutes(10),
             (DateTimeOffset?)null,
             TimeSpan.FromMilliseconds(250),

@@ -123,6 +123,22 @@ public sealed class ClaudeQuotaProbeRateLimitTests
     }
 
     [Fact]
+    public async Task RetryAfterHeader_IsNeverShortenedByTheCooldownPolicy()
+    {
+        var handler = new CountingHandler(HttpStatusCode.TooManyRequests, TimeSpan.FromHours(2));
+        var clock = new MutableClock(DateTimeOffset.UtcNow);
+        var probe = Probe(handler, clock);
+
+        await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
+        var afterFirst = handler.Requests;
+
+        clock.Advance(TimeSpan.FromMinutes(90));
+        await probe.GetAvailabilityAsync(Member(), CancellationToken.None);
+
+        Assert.Equal(afterFirst, handler.Requests);
+    }
+
+    [Fact]
     public async Task TransientServerErrors_StillRetry()
     {
         // Only 429 means "stop asking" — a 500 is worth retrying, and that behaviour must survive.

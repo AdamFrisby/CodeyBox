@@ -341,7 +341,10 @@ public sealed class QuotaRouterProgramWiringTests
             var expired = await probe.GetAvailabilityAsync(ClaudeMember, CancellationToken.None);
             Assert.False(expired.IsKnown);
             Assert.Equal(QuotaUnknownReason.Transient, expired.Unknown);
-            Assert.Equal(3, handler.CallCount);
+            // The second 429 starts Claude's provider cooldown. The paused
+            // wrapper still expires and returns an unknown reading after the
+            // hot reload, but it must not hit a provider that asked us to wait.
+            Assert.Equal(2, handler.CallCount);
         }
         finally
         {
@@ -388,9 +391,9 @@ public sealed class QuotaRouterProgramWiringTests
     {
         var time = new CapturingDelayTimeProvider(DateTimeOffset.UtcNow);
         var handler = new RetryAfterSequenceHandler(
-            new RetryAfterResponse(HttpStatusCode.TooManyRequests, "", TimeSpan.FromSeconds(10)),
+            new RetryAfterResponse(HttpStatusCode.ServiceUnavailable, "", TimeSpan.FromSeconds(10)),
             new RetryAfterResponse(HttpStatusCode.OK, ClaudeRollup(40), null),
-            new RetryAfterResponse(HttpStatusCode.TooManyRequests, "", TimeSpan.FromSeconds(10)),
+            new RetryAfterResponse(HttpStatusCode.ServiceUnavailable, "", TimeSpan.FromSeconds(10)),
             new RetryAfterResponse(HttpStatusCode.OK, ClaudeRollup(30), null));
         var monitor = new MutableOptionsMonitor<CodeyBoxOptions>(ClaudeRetryOptions(maxRetryDelaySeconds: 1));
         using var factory = new ClaudeRetryCapWiringFactory(handler, time, monitor);
@@ -402,6 +405,7 @@ public sealed class QuotaRouterProgramWiringTests
         Assert.Equal(TimeSpan.FromSeconds(10), Assert.Single(time.Delays));
 
         monitor.Set(ClaudeRetryOptions(maxRetryDelaySeconds: 3));
+        ((IAgentQuotaCacheInvalidator)probe).InvalidateResponseCache();
 
         var second = await probe.GetAvailabilityAsync(ClaudeMember, CancellationToken.None);
         Assert.Equal(70, second.AvailablePct, precision: 5);
@@ -587,7 +591,7 @@ public sealed class QuotaRouterProgramWiringTests
                     ["CodeyBox:AuditLog:Path"] = Path.Combine(tmp, $"test-log-{Guid.NewGuid():N}-.json"),
                     ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(tmp, $"test-audit-{Guid.NewGuid():N}-.json"),
                     ["CodeyBox:AgentStreams:Path"] = Path.Combine(tmp, $"test-agent-streams-{Guid.NewGuid():N}"),
-                    ["CodeyBox:QuotaRouter:QuotaCacheTtlSeconds"] = "0",
+                    ["CodeyBox:QuotaRouter:QuotaCacheTtlSeconds"] = "5",
                 });
             });
             builder.ConfigureTestServices(services =>

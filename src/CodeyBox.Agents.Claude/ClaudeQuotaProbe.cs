@@ -422,10 +422,6 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalid
     /// </summary>
     internal static readonly TimeSpan DefaultRateLimitCooldown = TimeSpan.FromMinutes(15);
 
-    /// <summary>Upper bound on a provider-supplied <c>Retry-After</c>, so a hostile or mistaken value
-    /// cannot suppress quota reads indefinitely.</summary>
-    internal static readonly TimeSpan MaxRateLimitCooldown = TimeSpan.FromHours(1);
-
     private readonly object _rateLimitLock = new();
     private DateTimeOffset? _rateLimitedUntil;
 
@@ -459,19 +455,14 @@ public sealed class ClaudeQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalid
 
     /// <summary>
     /// When to resume probing after a 429: the provider's <c>Retry-After</c> when it supplies a usable
-    /// one (delta-seconds or HTTP-date), else <see cref="DefaultRateLimitCooldown"/>. Clamped to
-    /// <see cref="MaxRateLimitCooldown"/>.
+    /// one (delta-seconds or HTTP-date), else <see cref="DefaultRateLimitCooldown"/>. A provider
+    /// value is not shortened: probing before that time can prolong its rate limit.
     /// </summary>
     private DateTimeOffset ResolveRateLimitCooldownUntil(HttpResponseMessage response)
     {
         var now = _timeProvider.GetUtcNow();
-        var retryAfter = response.Headers.RetryAfter;
-        TimeSpan? hinted = retryAfter?.Delta;
-        if (hinted is null && retryAfter?.Date is { } date)
-            hinted = date - now;
-
-        var cooldown = hinted is { } h && h > TimeSpan.Zero ? h : DefaultRateLimitCooldown;
-        if (cooldown > MaxRateLimitCooldown) cooldown = MaxRateLimitCooldown;
+        var cooldown = HttpQuotaRetryPolicy.TryGetRetryAfterDelay(response.Headers, now)
+            ?? DefaultRateLimitCooldown;
         return now + cooldown;
     }
 
