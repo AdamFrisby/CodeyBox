@@ -4064,6 +4064,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
         {
             throw;
         }
+        catch (SandboxDiskDeferredException)
+        {
+            throw;
+        }
         catch (SandboxProvisioningDeferredException)
         {
             throw;
@@ -6130,7 +6134,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
             && ex is not OperationCanceledException
             && ex is not AgentTurnCheckpointConvertedException
             && ex is not AgentTurnResumeClaimConflictException
-            && ex is not AgentInfrastructureFailureException)
+            && ex is not AgentInfrastructureFailureException
+            && ex is not SandboxProvisioningDeferredException)
         {
             throw new AgentInfrastructureFailureException(
                 runner.Kind,
@@ -7719,6 +7724,10 @@ public sealed partial class PipelineRunner : IPipelineRunner
             await Transition(item, WorkItemState.Done, ct, project);
         }
         catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (SandboxDiskDeferredException)
         {
             throw;
         }

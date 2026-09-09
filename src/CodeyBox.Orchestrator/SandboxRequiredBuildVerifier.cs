@@ -437,6 +437,16 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         {
             throw;
         }
+        catch (SandboxDiskDeferredException)
+        {
+            // Disk-guard preflight refused the verification sandbox. Re-throw
+            // so the orchestrator defers and re-queues instead of flattening
+            // this into Unavailable (which terminal-fails the item). Kept
+            // explicit even though the disk deferral derives from the
+            // provisioning deferral below, so this boundary documents the
+            // incident it guards against.
+            throw;
+        }
         catch (SandboxProvisioningDeferredException)
         {
             throw;

@@ -1270,6 +1270,121 @@ public sealed class RequiredBuildGateTests : IDisposable
     }
 
     [Fact]
+    public async Task SandboxRequiredBuildVerifier_SandboxCreateAsyncDiskDeferred_Rethrows()
+    {
+        // Regression test for the incident where a transient Incus-pool disk
+        // preflight during required-build verification was flattened into
+        // RequiredBuildVerificationResult.Unavailable (terminal
+        // failure_kind=infrastructure, recovery_attempts=0) instead of
+        // deferring. The verifier must re-throw the disk deferral so the
+        // orchestrator returns the item to a runnable state and re-picks it
+        // up after RecheckIn. Uses the Incus storage-pool mount from the
+        // incident — a distinct resource from the host-filesystem paths in
+        // DiskGuard.HostPaths that crosses the threshold independently.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var deferred = new SandboxDiskDeferredException(
+            mountPath: "incus-pool:codeybox-zfs",
+            freeBytes: 8_522_469_888,
+            thresholdBytes: 10_737_418_240,
+            recheckIn: TimeSpan.FromSeconds(42));
+        var verifier = new SandboxRequiredBuildVerifier(
+            new SandboxFactoryProvisioningDeferredProvider(deferred),
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" });
+
+        var item = NewItem("feature/sandbox-create-disk-deferred") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "ok.txt", "ok\n", "branch exists");
+
+        var thrown = await Assert.ThrowsAsync<SandboxDiskDeferredException>(() =>
+            verifier.VerifyAsync(new RequiredBuildVerificationRequest
+            {
+                WorkItemId = item.Id,
+                ProjectId = item.ProjectId,
+                SandboxPolicy = new RequiredBuildSandboxPolicy(),
+                RepositoryId = repoId,
+                BaseBranch = item.BaseBranch,
+                WorkBranch = item.WorkBranch!,
+                Phase = "audit",
+            }, CancellationToken.None));
+
+        Assert.Same(deferred, thrown);
+        Assert.Equal("incus-pool:codeybox-zfs", thrown.MountPath);
+        Assert.Equal(8_522_469_888, thrown.FreeBytes);
+        Assert.Equal(10_737_418_240, thrown.ThresholdBytes);
+        // The re-pickup interval must survive the verification boundary: the
+        // orchestrator schedules the deferred requeue from this value.
+        Assert.Equal(TimeSpan.FromSeconds(42), thrown.RecheckIn);
+        Assert.Equal(TimeSpan.FromSeconds(42), ((SandboxProvisioningDeferredException)thrown).RecheckIn);
+        // Type-level guarantee: existing provisioning-deferral filters catch
+        // the disk deferral, so no future call site can silently reacquire
+        // the flatten-to-Unavailable bug.
+        Assert.IsAssignableFrom<SandboxProvisioningDeferredException>(thrown);
+    }
+
+    [Fact]
+    public void SandboxDiskDeferredException_CarriesProvisioningDeferralContract()
+    {
+        var ex = new SandboxDiskDeferredException(
+            mountPath: "incus-pool:codeybox-zfs",
+            freeBytes: 512L * 1024 * 1024,
+            thresholdBytes: 10L * 1024 * 1024 * 1024,
+            recheckIn: TimeSpan.FromMinutes(5));
+
+        var asProvisioning = Assert.IsAssignableFrom<SandboxProvisioningDeferredException>(ex);
+        Assert.Equal(TimeSpan.FromMinutes(5), asProvisioning.RecheckIn);
+        Assert.StartsWith("disk preflight:", ex.Message, StringComparison.Ordinal);
+        Assert.Equal("disk-guard", asProvisioning.Provider);
+        Assert.Equal("create", asProvisioning.Operation);
+        Assert.Equal("disk-space", asProvisioning.ErrorClass);
+        Assert.Contains("incus-pool:codeybox-zfs", asProvisioning.Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task SandboxRequiredBuildVerifier_NonDeferrableCreateFailure_StillReturnsUnavailable()
+    {
+        // The new disk-deferral rethrow must not mask real faults: a
+        // non-deferrable sandbox-creation failure still surfaces as
+        // Unavailable (never a pass, never a rethrow), so the item keeps the
+        // historical terminal infrastructure-failure handling.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        await AddDotnetSolutionMarkerAsync(seed);
+        var gitHost = new LocalGitHost(
+            new LocalGitHostOptions { RootDirectory = Path.Combine(_workspace, "repos-" + Guid.NewGuid().ToString("N")[..8]) },
+            NullLogger<LocalGitHost>.Instance);
+        var verifier = new SandboxRequiredBuildVerifier(
+            new SandboxFactoryFailingSandboxProvider("sandbox provisioning denied by quota"),
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" });
+
+        var item = NewItem("feature/sandbox-create-genuine-failure") with { State = WorkItemState.WorkComplete };
+        var repoId = await gitHost.EnsureRepositoryAsync(item.Id, seed, item.BaseBranch);
+        var barePath = gitHost.GetRepoPath(repoId);
+        await CommitToBareBranchAsync(barePath, item.WorkBranch!, "ok.txt", "ok\n", "branch exists");
+
+        var result = await verifier.VerifyAsync(new RequiredBuildVerificationRequest
+        {
+            WorkItemId = item.Id,
+            ProjectId = item.ProjectId,
+            SandboxPolicy = new RequiredBuildSandboxPolicy(),
+            RepositoryId = repoId,
+            BaseBranch = item.BaseBranch,
+            WorkBranch = item.WorkBranch!,
+            Phase = "audit",
+        }, CancellationToken.None);
+
+        Assert.Equal(RequiredBuildVerificationStatus.Unavailable, result.Status);
+        Assert.Contains("sandbox provisioning denied by quota", result.Reason);
+        Assert.NotEqual(RequiredBuildVerificationStatus.Passed, result.Status);
+        Assert.NotEqual(RequiredBuildVerificationStatus.Failed, result.Status);
+    }
+
+    [Fact]
     public async Task RequiredBuildGate_FailingBuild_PersistsAuditReportWithErrorFindingViaOrchestrator()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
