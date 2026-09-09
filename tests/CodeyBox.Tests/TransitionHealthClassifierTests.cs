@@ -6,7 +6,7 @@ namespace CodeyBox.Tests;
 /// <summary>
 /// Verifies that <see cref="TransitionHealthClassifier"/> labels each
 /// persisted-signal row according to the documented taxonomy in
-/// <c>docs/transition-health.md</c>:
+/// <c>docs/operating/pipeline-metrics.md</c>:
 ///
 /// <list type="bullet">
 /// <item>An audit→rework caused by a genuine blocking finding is LEGITIMATE

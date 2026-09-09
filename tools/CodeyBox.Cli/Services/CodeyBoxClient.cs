@@ -329,6 +329,39 @@ internal sealed class CodeyBoxClient
         return await resp.Content.ReadAsStringAsync(ct);
     }
 
+    internal async Task<string> GetWorkItemQuestionsAsync(string id, CancellationToken ct = default)
+    {
+        return await GetRawAsync($"/workitems/{Uri.EscapeDataString(id)}/questions", ct);
+    }
+
+    internal async Task<string> AnswerQuestionAsync(
+        string id, string questionId, string answer, CancellationToken ct = default)
+    {
+        var resp = await SendAsync(
+            token => _http.PostAsJsonAsync(
+                $"/workitems/{Uri.EscapeDataString(id)}/answer",
+                new AnswerQuestionRequest(questionId, answer),
+                CliJsonContext.Default.AnswerQuestionRequest,
+                token),
+            ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
+        return await resp.Content.ReadAsStringAsync(ct);
+    }
+
+    internal async Task<string> DismissQuestionAsync(
+        string id, string questionId, string reason, CancellationToken ct = default)
+    {
+        var resp = await SendAsync(
+            token => _http.PostAsJsonAsync(
+                $"/workitems/{Uri.EscapeDataString(id)}/dismiss-question",
+                new DismissQuestionRequest(questionId, reason),
+                CliJsonContext.Default.DismissQuestionRequest,
+                token),
+            ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
+        return await resp.Content.ReadAsStringAsync(ct);
+    }
+
     private async Task<string> GetRawAsync(string path, CancellationToken ct)
     {
         var resp = await SendAsync(token => _http.GetAsync(path, token), ct);

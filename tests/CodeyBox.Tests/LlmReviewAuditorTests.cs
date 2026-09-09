@@ -467,6 +467,44 @@ public sealed class LlmReviewAuditorTests
         Assert.Contains("custom frame", observed, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task ReworkAudit_PresentsPriorBlockingFindingsAsEffectiveScope()
+    {
+        var runner = new PromptCapturingRunner();
+        var auditor = new LlmReviewAuditor(new LlmReviewAuditorOptions
+        {
+            Name = "completeness:llm-review",
+            Agent = runner,
+            ReviewFocus = "- verify completeness",
+            FrameTemplate = "{{reviewFocus}}\n{{originalPrompt}}\n{{resultFile}}",
+        });
+        var ctx = new AuditContext(
+            WorkItemId.New(),
+            WorkBranch: "codeybox/test",
+            BaseBranch: "main",
+            Iteration: 2,
+            OriginalPrompt: "Create marker.md. Do not change any other files.",
+            AuditRunner: runner,
+            PriorBlockingFindings:
+            [
+                new AuditFinding(
+                    "project:build",
+                    AuditSeverity.Error,
+                    "lock file is stale",
+                    "Regenerate the workspace lock file.",
+                    "package-lock.json")
+            ]);
+
+        await auditor.RunAsync(new ResultFileSandbox(), "/work", ctx);
+
+        Assert.Contains("ORCHESTRATOR_REWORK_SCOPE (trusted policy)", runner.ObservedPrompt, StringComparison.Ordinal);
+        Assert.Contains("directly necessary to resolve the prior blocking findings", runner.ObservedPrompt, StringComparison.Ordinal);
+        Assert.Contains("transitive blockers that became visible only after an earlier blocker was fixed", runner.ObservedPrompt, StringComparison.Ordinal);
+        Assert.Contains("a now-passing mandatory gate is authoritative evidence", runner.ObservedPrompt, StringComparison.Ordinal);
+        Assert.Contains("lock file is stale", runner.ObservedPrompt, StringComparison.Ordinal);
+        Assert.Contains("package-lock.json", runner.ObservedPrompt, StringComparison.Ordinal);
+    }
+
     private static async Task<string> RenderPromptWithFrameAsync(string frameTemplate, string auditorName)
     {
         var runner = new PromptCapturingRunner();

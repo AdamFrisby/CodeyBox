@@ -55,6 +55,63 @@ public sealed class OpencodeQuotaFailureDetectorTests
         Assert.Contains(pattern, stderr, StringComparison.OrdinalIgnoreCase);
     }
 
+    // --- RateLimitExceeded patterns (transient provider 429) ------------------
+    // The same BYOK throughput limit that Copilot relays as "429 Error from
+    // provider (Console Go)" can surface through the opencode CLI when the
+    // backing endpoint refuses the request. These must park on the
+    // rate-limit backoff — never null (which the orchestrator records as
+    // failureKind "other" and hard-fails).
+
+    public static IEnumerable<object[]> RateLimitExceededSamples()
+    {
+        yield return new object[] { "429 Error from provider (Console Go): Upstream request failed: [rate_limit_exceeded] Rate limit exceeded. Please retry after a brief wait.", "429 Error" };
+        yield return new object[] { "Error: rate_limit_exceeded from upstream", "rate_limit_exceeded" };
+        yield return new object[] { "Provider responded: Rate Limit Exceeded, retry later", "Rate Limit Exceeded" };
+        yield return new object[] { "Error: HTTP 429 from model endpoint", "HTTP 429" };
+        yield return new object[] { "request failed with status 429, backing off", "status 429" };
+        yield return new object[] { "API Error: 429 — slow down", "API Error: 429" };
+        yield return new object[] { "429 Too Many Requests: quota window", "429 Too Many Requests" };
+    }
+
+    [Theory]
+    [MemberData(nameof(RateLimitExceededSamples))]
+    public void Detect_RateLimitPatterns_AllClassifyAsRateLimitExceeded(string stderr, string pattern)
+    {
+        var detection = _detector.Detect(stderr: stderr, stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.Contains(pattern, stderr, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Detect_RetryAfterHeaderEcho_IsHonouredAsResetAt()
+    {
+        const string stderr =
+            "429 Error from provider (Console Go): [rate_limit_exceeded] Rate limit exceeded. Retry-After: 90";
+
+        var detection = _detector.Detect(stderr: stderr, stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.NotNull(detection.ResetAt);
+        var diff = detection.ResetAt!.Value - DateTimeOffset.UtcNow;
+        Assert.InRange(diff.TotalSeconds, 90 - ResetAtAssertSkew.TotalSeconds, 90 + ResetAtAssertSkew.TotalSeconds);
+    }
+
+    [Theory]
+    [InlineData("Server returned 429 in a stack trace under review (no provider error)")]
+    [InlineData("The function retried 429 times before succeeding")]
+    [InlineData("processed 429 files successfully")]
+    public void Detect_Bare429WithoutAnchor_DoesNotFalsePositive(string code)
+    {
+        // None of these carry a 429 anchor ("HTTP 429", "status 429",
+        // "API Error: 429", "429 Too Many Requests", "429 Error") or a
+        // rate-limit token — they are arbitrary mentions of the number 429
+        // in code/prose. Detector must not flag.
+        Assert.Null(_detector.Detect(stderr: code, stdout: null));
+    }
+
     // --- Unauthorized patterns ------------------------------------------------
 
     [Theory]

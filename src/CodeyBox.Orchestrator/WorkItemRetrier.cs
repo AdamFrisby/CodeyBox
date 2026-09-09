@@ -331,15 +331,28 @@ public sealed class WorkItemRetrier
         // retries do not bump quota/transient counters. On any retry we clear
         // NextTerminalRetryAt so a stale backoff schedule does not gate the
         // next sweep. A manual retry also clears TerminalRetryAttempts:
-        // operator-forgiveness lets the cap reset.
-        var resetsTerminalRetries = trigger == "manual";
+        // operator-forgiveness lets the cap reset. An operator retry
+        // (trigger "manual", i.e. POST /workitems/{id}/retry) additionally
+        // restores a usable quota budget: QuotaRetryAttempts resets to zero
+        // so a retried item cannot immediately re-fail on an inherited cap.
+        // Other triggers preserve the inherited quota count: only the
+        // operator path forgives it. QuotaRetryScope follows the same rule
+        // explicitly: the scheduler stamps the current bucket on every
+        // auto-retry and the scope must survive the Queued transition
+        // (WorkItem.With preserves it) so the next park→evaluate cycle can
+        // detect a re-route; only an operator retry clears it back to
+        // unstamped.
+        var isOperatorRetry = trigger == "manual";
         var resumed = item.With(resumeState, error: null) with
         {
             RecoveryAttempts = 0,
             RecoveryAttemptSourceState = null,
             QuotaRetryAttempts = accounting == RetryAccounting.QuotaAutoRetry
                 ? item.QuotaRetryAttempts + 1
-                : item.QuotaRetryAttempts,
+                : isOperatorRetry
+                    ? 0
+                    : item.QuotaRetryAttempts,
+            QuotaRetryScope = isOperatorRetry ? null : item.QuotaRetryScope,
             TransientRetryAttempts = accounting == RetryAccounting.TransientAutoRetry
                 ? item.TransientRetryAttempts + 1
                 : 0,
@@ -349,7 +362,7 @@ public sealed class WorkItemRetrier
             TransientRetryFrom = accounting == RetryAccounting.TransientAutoRetry
                 ? item.TransientRetryFrom
                 : null,
-            TerminalRetryAttempts = resetsTerminalRetries ? 0 : item.TerminalRetryAttempts,
+            TerminalRetryAttempts = isOperatorRetry ? 0 : item.TerminalRetryAttempts,
             NextTerminalRetryAt = null,
             StartedAt = null
         };

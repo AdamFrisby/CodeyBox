@@ -26,6 +26,13 @@
                 <span class="nav-badge">@_openReleasesCount</span>
             }
         </NavLink>
+        <AuthorizeView>
+            <Authorized Context="authenticationState">
+                <span class="admin-nav-user" title="@UserLabel(authenticationState.User)">
+                    Signed in as @UserLabel(authenticationState.User)
+                </span>
+            </Authorized>
+        </AuthorizeView>
     </nav>
     <main class="admin-main">
         @Body
@@ -52,4 +59,10 @@
         try { _openReleasesCount = await ApiClient.GetOpenReleasesCountAsync(); }
         catch (Exception ex) { Logger.LogWarning(ex, "Failed to fetch open releases count for nav badge"); }
     }
+
+    private static string UserLabel(System.Security.Claims.ClaimsPrincipal user) =>
+        user.FindFirst(System.Security.Claims.ClaimTypes.Email)?.Value
+        ?? user.FindFirst("email")?.Value
+        ?? user.Identity?.Name
+        ?? "authenticated user";
 }
