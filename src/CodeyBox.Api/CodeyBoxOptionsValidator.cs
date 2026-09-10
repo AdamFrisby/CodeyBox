@@ -112,6 +112,25 @@ public sealed class CodeyBoxOptionsValidator : IValidateOptions<CodeyBoxOptions>
             }
         }
 
+        if (options.WorkerPool is null)
+        {
+            failures.Add("CodeyBox:WorkerPool must not be null");
+        }
+        else if (options.SqliteMaintenance is not null && options.SqliteWriteGate is not null)
+        {
+            try
+            {
+                OrchestratorOptionsFactory.ValidateMaintenanceHoldAgainstDispatchWindow(
+                    options.SqliteMaintenance,
+                    options.SqliteWriteGate,
+                    options.WorkerPool);
+            }
+            catch (InvalidOperationException ex)
+            {
+                failures.Add(ex.Message);
+            }
+        }
+
         var e2e = options.E2eExecution;
         if (e2e is not null)
         {

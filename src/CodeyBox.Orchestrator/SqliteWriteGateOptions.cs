@@ -21,6 +21,11 @@ public sealed class SqliteWriteGateOptions
     public TimeSpan AcquisitionTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>Elapsed hold time that emits a holder diagnostic. Must be positive and no greater than 00:05:00.</summary>
+    /// <remarks>
+    /// Applies to ordinary holders. Planned maintenance holds announce their
+    /// own expected budget at acquisition and are diagnosed against that
+    /// budget instead, so an in-policy VACUUM is not reported as a fault.
+    /// </remarks>
     public TimeSpan MaxHoldDuration { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>Maximum callers allowed to queue behind a held write gate. Must be between 1 and 4096.</summary>

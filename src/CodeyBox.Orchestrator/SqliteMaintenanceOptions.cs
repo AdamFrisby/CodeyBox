@@ -26,9 +26,21 @@ public sealed class SqliteMaintenanceOptions
 
     /// <summary>
     /// Command timeout for the VACUUM itself; rewriting a gigabyte-scale
-    /// file takes minutes. Must be positive. Default 30 minutes.
+    /// file takes minutes. Must be positive. Default 45 seconds.
     /// </summary>
-    public TimeSpan VacuumTimeout { get; set; } = TimeSpan.FromMinutes(30);
+    /// <remarks>
+    /// This timeout is also the maintenance gate-hold budget (plus a small
+    /// inspection allowance): while a VACUUM holds the write gate, dispatch
+    /// pickup waits are absorbed as expected maintenance backoff instead of
+    /// counting toward stuck-holder escalation, but only while the hold stays
+    /// inside this budget. Keep this value at or below
+    /// <c>SqliteWriteGate:AcquisitionTimeout</c> x
+    /// <c>WorkerPool:MaxConsecutiveDispatchGateTimeoutsBeforeEscalation</c> —
+    /// a larger value fails startup validation. Raising it for a larger
+    /// database requires widening that escalation window to match, which is
+    /// an explicit decision to tolerate a longer dispatch stall.
+    /// </remarks>
+    public TimeSpan VacuumTimeout { get; set; } = TimeSpan.FromSeconds(45);
 
     public void Validate()
     {

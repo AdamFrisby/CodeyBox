@@ -3591,6 +3591,10 @@ builder.Services.AddSingleton<OrchestratorOptions>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
     var startupLog = sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.Orchestrator");
+    OrchestratorOptionsFactory.ValidateMaintenanceHoldAgainstDispatchWindow(
+        cbOpts.SqliteMaintenance,
+        cbOpts.SqliteWriteGate,
+        cbOpts.WorkerPool);
     return OrchestratorOptionsFactory.Build(
         cbOpts.Concurrency,
         cbOpts.WorkerPool,
