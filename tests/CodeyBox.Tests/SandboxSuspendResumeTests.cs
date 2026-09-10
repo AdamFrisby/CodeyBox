@@ -27,19 +27,23 @@ namespace CodeyBox.Tests;
 [Collection("Background service timing")]
 public sealed class SandboxSuspendResumeTests : IDisposable
 {
-    private readonly string _dbPath =
-        Path.Combine(Path.GetTempPath(), $"codeybox-suspend-{Guid.NewGuid():N}.db");
+    private readonly TestScratchDirectory _scratch = TestScratchDirectory.Create("codeybox-suspend-");
+    private readonly string _dbPath;
     private readonly SqliteWorkItemStore _store;
 
     public SandboxSuspendResumeTests()
     {
+        _dbPath = _scratch.DbPath();
         _store = new SqliteWorkItemStore(_dbPath);
     }
 
     public void Dispose()
     {
+        // The store's connection must be disposed BEFORE the scratch
+        // directory is removed: an open WAL handle keeps -wal/-shm alive
+        // and the recursive delete would fail and leak.
         _store.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        _scratch.Dispose();
     }
 
     private static WorkItem MakeItem(WorkItemState state = WorkItemState.Working) => new()
