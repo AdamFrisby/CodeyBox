@@ -2,7 +2,7 @@ using System.Text;
 using Microsoft.Extensions.Logging;
 using Tmds.DBus;
 
-namespace CodeyBox.Api;
+namespace CodeyBox.Agents.Antigravity;
 
 [DBusInterface("org.freedesktop.Secret.Service")]
 public interface ISecretService : IDBusObject
