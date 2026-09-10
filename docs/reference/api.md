@@ -1266,6 +1266,26 @@ Clear a per-project queue pause. No-op if the project is not paused.
 * Returns `200 OK` with `{ "projectId", "paused": false, "pausedAt": null, "pausedReason": null }`.
 * Returns `404 Not Found` if the project does not exist.
 
+### `POST /queue/drain`
+
+Pause-and-wait drain for graceful restarts. Pauses the global queue when it
+is still running, then blocks until no workers are running or `timeoutSeconds`
+elapses — unlike `POST /queue/pause`, which returns immediately with in-flight
+work still running. The queue stays paused afterwards; resume it (or restart,
+then resume) when ready.
+
+```json
+{ "reason": "deploy restart", "timeoutSeconds": 300 }
+```
+
+* `reason` — required, ≤ 500 chars, no control characters.
+* `timeoutSeconds` — required, 1–3600.
+* Returns `200 OK` with `{ "state", "drained", "currentlyRunning", "pausedAt", "pausedReason" }`.
+  `drained: true` means every worker reached a safe boundary; `false` means
+  the deadline elapsed first (drain again, or restart and let recovery
+  re-queue the interrupted items).
+* Returns `400 Bad Request` if reason or timeout is missing or invalid.
+
 ### `GET /agents/paused`
 
 List agent kinds and pooled instances currently paused for new dispatch.

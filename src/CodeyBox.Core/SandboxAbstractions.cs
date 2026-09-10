@@ -910,8 +910,8 @@ public interface ISuspendingSandboxProvider
     /// preempt-checkpoint git ref on origin so the orchestrator's standard
     /// recovery flow (see <c>DeadWorkerReaper.RecoverWorkItemAsync</c>) can
     /// re-enqueue the work item with a non-null
-    /// <see cref="WorkItem.PreemptCheckpoint"/> instead of marking it Failed
-    /// for "Working without a preempt checkpoint".
+    /// <see cref="WorkItem.PreemptCheckpoint"/> for a clean resume (rather
+    /// than the checkpoint-less requeue).
     ///
     /// <para>Operation, executed inside the resumed VM:</para>
     /// <list type="number">

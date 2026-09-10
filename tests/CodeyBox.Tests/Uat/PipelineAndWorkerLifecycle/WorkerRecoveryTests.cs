@@ -45,7 +45,7 @@ public sealed class WorkerRecoveryTests : IDisposable
     }
 
     [Fact]
-    public void RestartRecovery_WorkingWithoutCheckpointFailsButCheckpointedWorkIsRequeued()
+    public void RestartRecovery_WorkingWithoutCheckpointRequeuesButCheckpointedWorkIsRequeued()
     {
         using var store = NewStore();
         var queue = new InMemoryTaskQueue();
@@ -57,11 +57,12 @@ public sealed class WorkerRecoveryTests : IDisposable
             PreemptCheckpoint = "refs/codeybox/preempt/test",
         };
 
-        var failed = service.TryBuildRecoveredStateForTest(plainWorking);
+        var requeued = service.TryBuildRecoveredStateForTest(plainWorking);
         var resumable = service.TryBuildRecoveredStateForTest(checkpointed);
 
-        Assert.Equal(WorkItemState.Failed, failed!.State);
-        Assert.Contains("without a preempt checkpoint", failed.LastError);
+        Assert.Equal(WorkItemState.Queued, requeued!.State);
+        Assert.Equal(plainWorking.RecoveryAttempts, requeued.RecoveryAttempts);
+        Assert.Contains("without a preempt checkpoint", requeued.LastError);
         Assert.Equal(WorkItemState.Working, resumable!.State);
         Assert.Equal(1, resumable.RecoveryAttempts);
         Assert.Null(resumable.StartedAt);
@@ -100,9 +101,9 @@ public sealed class WorkerRecoveryTests : IDisposable
 
         await service.ReplayPendingForTestAsync(CancellationToken.None);
 
-        Assert.Equal(1, queue.Count);
+        Assert.Equal(2, queue.Count);
         Assert.Equal(WorkItemState.AuditPassed, (await store.GetAsync(runnable.Id))!.State);
-        Assert.Equal(WorkItemState.Failed, (await store.GetAsync(dependency.Id))!.State);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(dependency.Id))!.State);
         Assert.Equal(WorkItemState.Queued, (await store.GetAsync(gated.Id))!.State);
     }
 

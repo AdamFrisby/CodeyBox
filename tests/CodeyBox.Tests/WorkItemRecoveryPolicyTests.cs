@@ -293,7 +293,6 @@ public sealed class WorkItemRecoveryPolicyTests
     }
 
     [Theory]
-    [InlineData(WorkItemState.Working, WorkItemState.Queued, true)]
     [InlineData(WorkItemState.Planning, WorkItemState.Queued, true)]
     [InlineData(WorkItemState.PlanReview, WorkItemState.PlanReview, true)]
     [InlineData(WorkItemState.PlanApproved, WorkItemState.PlanApproved, true)]
@@ -320,6 +319,28 @@ public sealed class WorkItemRecoveryPolicyTests
         Assert.Equal(to, recovered!.State);
         Assert.Equal(clearsStartedAt ? null : startedAt, recovered.StartedAt);
         Assert.Equal(1, recovered.RecoveryAttempts);
+    }
+
+    [Fact]
+    public void GracefulShutdownRecovery_WorkingWithoutCheckpoint_RequeuesWithoutConsumingBudget()
+    {
+        // A checkpoint-less Working item interrupted by shutdown carries no
+        // evidence of item fault: the fallback requeue must not consume the
+        // recovery budget and must never abandon, even at the cap.
+        var recovered = WorkItemRecoveryPolicy.BuildGracefulShutdownRecoveryState(
+            MakeItem(WorkItemState.Working) with
+            {
+                StartedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+                RecoveryAttempts = 3,
+            },
+            DateTimeOffset.UtcNow,
+            maxRecoveryAttempts: 3);
+
+        Assert.NotNull(recovered);
+        Assert.Equal(WorkItemState.Queued, recovered!.State);
+        Assert.Equal(3, recovered.RecoveryAttempts);
+        Assert.Null(recovered.StartedAt);
+        Assert.Contains("re-queued for a fresh run", recovered.LastError);
     }
 
     [Fact]

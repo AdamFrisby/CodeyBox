@@ -2470,13 +2470,6 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                         "Work item {Id} has been abandoned after {Max} recovery attempts; operator intervention required",
                         item.Id, _opts.MaxRecoveryAttempts);
                 }
-                else if (recovered.State == WorkItemState.Failed)
-                {
-                    await _store.UpdateAsync(recovered, ct);
-                    _log.LogWarning(
-                        "Work item {Id} was left Working without a preempt checkpoint; marked Failed as a crash case",
-                        item.Id);
-                }
                 else if (recovered.State == WorkItemState.Done)
                 {
                     await _store.UpdateAsync(recovered, ct);
@@ -2621,17 +2614,28 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
 
         if (item.State == WorkItemState.Working)
         {
-            return WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
-            {
-                State = WorkItemState.Failed,
-                LastError = "worker died while work phase was running without a preempt checkpoint",
-                StartedAt = null,
-                PreemptedAt = null,
-                PreemptCheckpoint = null,
-                AgentTurnResumeCheckpoint = null,
-                AgentTurnRecoveryLease = null,
-                UpdatedAt = _time.GetUtcNow(),
-            }, WorkItemRecoveryPolicy.NextRecoveryAttempt(item), item.State);
+            // A checkpoint-less Working item orphaned by a restart is an
+            // infrastructure loss, not a work-item failure: requeue preserving
+            // the work branch without consuming the recovery budget (a restart
+            // must not push the item toward Failed or erode the attempts that
+            // guard genuinely wedged items). Rerunnable CheckAndAct /
+            // AgentControl loops are handled by their dedicated branches above
+            // and never reach here.
+            return WorkItemRecoveryPolicy.BuildInfrastructureRequeueWithoutCheckpoint(
+                item,
+                "worker died while work phase was running without a preempt checkpoint",
+                _time.GetUtcNow())
+                ?? WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
+                {
+                    State = WorkItemState.Failed,
+                    LastError = "worker died while work phase was running without a preempt checkpoint",
+                    StartedAt = null,
+                    PreemptedAt = null,
+                    PreemptCheckpoint = null,
+                    AgentTurnResumeCheckpoint = null,
+                    AgentTurnRecoveryLease = null,
+                    UpdatedAt = _time.GetUtcNow(),
+                }, WorkItemRecoveryPolicy.NextRecoveryAttempt(item), item.State);
         }
 
         // Scheduler/operator parked states are resting points on startup:

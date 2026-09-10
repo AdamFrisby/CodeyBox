@@ -46,7 +46,13 @@ Each active worker fires an `UPDATE worker_registry SET last_heartbeat_at = $now
    quiescing.
 4. For each claimed row whose `current_work_item_id IS NOT NULL`:
    - Look up the work item.
-   - If it is in a recoverable worker-owned state (see table below), increment `RecoveryAttempts` and transition it.
+   - If it is a checkpoint-less `Working` item, requeue it preserving the
+     work branch **without incrementing `RecoveryAttempts`**: losing the
+     worker with no durable evidence is infrastructure, not item failure, so
+     a restart never erodes the item's recovery budget and never transitions
+     it to `Failed` or `AbandonedAfterRecoveryAttempts`.
+   - Otherwise, if it is in a recoverable worker-owned state (see table below),
+     increment `RecoveryAttempts` and transition it.
    - If it is in a durable phase-boundary state, re-dispatch it without changing state, still consuming a recovery attempt.
    - If `RecoveryAttempts` exceeds `MaxRecoveryAttempts` (default **10**): transition to `AbandonedAfterRecoveryAttempts` with `LastError = "exceeded MaxRecoveryAttempts"`.
    - Fire a `work_item.recovered` webhook event for recovery handoffs, including same-state phase-boundary redispatches.
@@ -70,7 +76,7 @@ The mechanics, the retained-VM fallback for Incus, and the attempt caps are in
 
 | State when worker died | Recovered to | Why |
 |---|---|---|
-| `Working` | `Working` with a typed Git or retained-sandbox recovery boundary; otherwise `Failed` | Valid recovery evidence preserves the interrupted turn for bounded resume. Without it there is no durable mid-turn evidence, so explicit retry is required. |
+| `Working` | `Queued` preserving the work branch (`PreserveWorkBranchOnQueuedPickup`), or `Working` with the preempt checkpoint when one exists | No durable mid-turn evidence means the worker loss is purely infrastructure: requeue for a fresh run **without consuming `RecoveryAttempts`** and never `Failed`. A preempt checkpoint resumes the exact interrupted turn. |
 | `Planning` | `Queued` | Planning edits are discarded; rerun the planning-only turn from a clean sandbox |
 | `PlanReview` | `PlanReview` | A plan artifact already exists; rerun the auditor-backed plan-review loop, including plan rework if reviewers still block |
 | `PlanApproved` | `PlanApproved` | Re-dispatch implementation from the approved-plan boundary and count the recovery handoff |
@@ -204,4 +210,7 @@ To rehearse the window: `kill -SIGTERM` the API, wait for the port to free,
 leave it down for 30 s, start it again, and check that work-item count is
 unchanged, that your poller's next tick succeeds, and that GitHub's "Recent
 deliveries" panel shows a successful retry. The new process logs its recovery
-banner as the reaper resets in-flight items to their safe restart point.
+banner as the reaper returns in-flight items to a runnable state. To avoid
+interrupting running work at all, drain first with `POST /queue/drain` (see
+[`running.md`](running.md#restarting-the-orchestrator-safely)) — pausing with
+`POST /queue/pause` alone does not wait for in-flight items.

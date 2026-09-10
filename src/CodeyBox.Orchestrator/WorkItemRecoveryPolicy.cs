@@ -229,32 +229,48 @@ public static class WorkItemRecoveryPolicy
             UpdatedAt = DateTimeOffset.UtcNow,
         }, recoveryAttempts, item.State);
 
-    public static bool TryBuildWorkingWithoutPreemptFailure(
+    /// <summary>
+    /// Requeues a regular work-phase item whose worker died without leaving a
+    /// preempt checkpoint. Losing the worker is an infrastructure event, not a
+    /// work-item failure: there is no durable evidence the item itself is at
+    /// fault, so the item returns to <see cref="WorkItemState.Queued"/>
+    /// preserving its work branch (the next pickup re-rebases existing commits
+    /// onto current upstream main) WITHOUT consuming
+    /// <see cref="WorkItem.RecoveryAttempts"/> and never transitions to
+    /// <see cref="WorkItemState.Failed"/> or
+    /// <see cref="WorkItemState.AbandonedAfterRecoveryAttempts"/>.
+    /// Returns null when the item is not a regular checkpoint-less
+    /// <see cref="WorkItemState.Working"/> row (rerunnable CheckAndAct /
+    /// AgentControl loops and checkpointed turns keep their own recovery
+    /// builders so their bounded-resume caps still apply).
+    /// </summary>
+    public static WorkItem? BuildInfrastructureRequeueWithoutCheckpoint(
         WorkItem item,
-        string lastError,
-        out WorkItem failed)
+        string reason,
+        DateTimeOffset now)
     {
-        if (IsRerunnableCheckAndActWithoutPreempt(item)
-            || IsRerunnableAgentControlWithoutPreempt(item)
-            || item.State != WorkItemState.Working
-            || item.HasAgentTurnRecoveryBoundary)
+        if (item.State != WorkItemState.Working
+            || item.HasAgentTurnRecoveryBoundary
+            || IsRerunnableCheckAndActWithoutPreempt(item)
+            || IsRerunnableAgentControlWithoutPreempt(item))
         {
-            failed = item;
-            return false;
+            return null;
         }
 
-        failed = WithRecoveryAttempt(item with
+        var preserve = !string.IsNullOrWhiteSpace(item.WorkBranch);
+        return ClearPlanFieldsIfQueued(item with
         {
-            State = WorkItemState.Failed,
-            LastError = lastError,
+            State = WorkItemState.Queued,
+            LastError = reason,
             StartedAt = null,
+            WorkBranch = item.WorkBranch,
+            PreserveWorkBranchOnQueuedPickup = preserve,
             PreemptedAt = null,
             PreemptCheckpoint = null,
             AgentTurnResumeCheckpoint = null,
             AgentTurnRecoveryLease = null,
-            UpdatedAt = DateTimeOffset.UtcNow,
-        }, item.RecoveryAttempts + 1, item.State);
-        return true;
+            UpdatedAt = now,
+        });
     }
 
     public static WorkItem? BuildGracefulShutdownRecoveryState(
@@ -283,6 +299,25 @@ public static class WorkItemRecoveryPolicy
 
         if (target is null)
             return null;
+
+        // A checkpoint-less Working item interrupted by shutdown carries no
+        // evidence of item fault — same infrastructure rationale as
+        // BuildInfrastructureRequeueWithoutCheckpoint — so the fallback
+        // requeue preserves the work branch without consuming the recovery
+        // budget and never abandons. Checkpointed turns and other states keep
+        // the bounded accounting below.
+        if (item.State == WorkItemState.Working && !item.HasAgentTurnRecoveryBoundary)
+        {
+            var infrastructureRequeue = BuildInfrastructureRequeueWithoutCheckpoint(
+                item,
+                $"{recoveryReason} while item was {item.State}; re-queued for a fresh run",
+                now);
+            if (infrastructureRequeue is not null)
+                return infrastructureRequeue;
+            // Rerunnable CheckAndAct / AgentControl loops fall through to the
+            // bounded accounting below so their control-loop rerun semantics
+            // stay consistent across detection paths.
+        }
 
         var attempts = NextRecoveryAttempt(item);
         if (ExceedsRecoveryAttempts(attempts, maxRecoveryAttempts))

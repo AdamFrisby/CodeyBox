@@ -747,12 +747,13 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
-    public async Task StartupResume_ResumeFailure_StillClearsBookkeeping()
+    public async Task StartupResume_ResumeFailure_RequeuesAndClearsBookkeeping()
     {
         // If multipassd is unavailable or the VM was operator-deleted, we
-        // can't bring it back. The item flows through the standard stranded-
-        // item recovery path; the bookkeeping must be cleared so the orphaned
-        // VM (if any) can be reaped on the leak reaper's normal schedule.
+        // can't bring it back. The item is re-queued for a fresh run — losing
+        // the sandbox is infrastructure, not item failure — and the
+        // bookkeeping is cleared so the orphaned VM (if any) can be reaped on
+        // the leak reaper's normal schedule.
         var item = MakeItem();
         await _store.CreateAsync(item with { SuspendedVmName = "vm-gone", SuspendedAt = DateTimeOffset.UtcNow });
 
@@ -767,9 +768,11 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await svc.ResumeAllForTestAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Equal(WorkItemState.Queued, after!.State);
         Assert.Null(after!.SuspendedVmName);
         Assert.Null(after.SuspendedAt);
+        Assert.Equal(0, after.RecoveryAttempts);
+        Assert.Contains("re-queued for a fresh run", after.LastError);
         Assert.Contains(log.Entries, entry =>
             entry.Level == LogLevel.Warning
             && entry.Properties.TryGetValue("VmName", out var vmName)
@@ -779,7 +782,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
-    public async Task StartupResume_ResumeTimeout_MarksWorkingItemFailedAndClearsBookkeeping()
+    public async Task StartupResume_ResumeTimeout_RequeuesWorkingItemAndClearsBookkeeping()
     {
         var configuredTimeout = TimeSpan.FromMilliseconds(50);
         var item = MakeItem(WorkItemState.Working);
@@ -808,10 +811,10 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await AdvancePastResumeTimeoutAsync(fakeTime, resume, configuredTimeout);
 
         var after = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Equal(WorkItemState.Queued, after!.State);
         Assert.Null(after.SuspendedVmName);
         Assert.Null(after.SuspendedAt);
-        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Equal(0, after.RecoveryAttempts);
         Assert.Contains("timed out", after.LastError);
         Assert.Contains($"timed out after {configuredTimeout}", after.LastError);
         Assert.Contains(log.Entries, entry =>
@@ -859,10 +862,10 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await AdvancePastResumeTimeoutAsync(fakeTime, resume, configuredTimeout);
 
         var after = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Equal(WorkItemState.Queued, after!.State);
         Assert.Null(after.SuspendedVmName);
         Assert.Null(after.SuspendedAt);
-        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Equal(0, after.RecoveryAttempts);
         Assert.Contains("timed out", after.LastError);
         Assert.Contains($"timed out after {configuredTimeout}", after.LastError);
         Assert.Contains(log.Entries, entry =>
@@ -930,7 +933,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
-    public async Task StartupResume_ProviderCancellation_MarksWorkingItemFailedAndClearsBookkeeping()
+    public async Task StartupResume_ProviderCancellation_RequeuesWorkingItemAndClearsBookkeeping()
     {
         var item = MakeItem(WorkItemState.Working);
         await _store.CreateAsync(item with
@@ -945,10 +948,10 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await svc.ResumeAllForTestAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Equal(WorkItemState.Queued, after!.State);
         Assert.Null(after.SuspendedVmName);
         Assert.Null(after.SuspendedAt);
-        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Equal(0, after.RecoveryAttempts);
         Assert.Contains("provider cancelled resume", after.LastError);
     }
 
@@ -1078,7 +1081,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await svc.StartAsync(CancellationToken.None);
 
         var after = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Equal(WorkItemState.Queued, after!.State);
         Assert.Null(after.SuspendedVmName);
         Assert.Single(provider.ResumedNames);
         Assert.Contains($"timed out after {configuredTimeout}", after.LastError);
@@ -1122,7 +1125,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         }
 
         var after = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Equal(WorkItemState.Queued, after!.State);
         Assert.Null(after.SuspendedVmName);
         Assert.Contains("timed out", after.LastError);
         Assert.Contains($"timed out after {configuredTimeout}", after.LastError);
@@ -1169,7 +1172,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
     }
 
     [Fact]
-    public async Task StartupResume_CancellationObservingTimeout_MarksFailedInsteadOfHostCancellation()
+    public async Task StartupResume_CancellationObservingTimeout_RequeuesInsteadOfHostCancellation()
     {
         var item = MakeItem(WorkItemState.Working);
         await _store.CreateAsync(item with
@@ -1203,7 +1206,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await WaitUntilAsync(() => provider.ResumeCancellationObserved);
 
         var after = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Equal(WorkItemState.Queued, after!.State);
         Assert.Null(after.SuspendedVmName);
         Assert.True(provider.ResumeCancellationObserved);
         Assert.Contains("timed out", after.LastError);
@@ -1270,7 +1273,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await resumeTask.WaitAsync(TimeSpan.FromSeconds(5));
 
         var timedOut = await _store.GetAsync(hung.Id);
-        Assert.Equal(WorkItemState.Failed, timedOut!.State);
+        Assert.Equal(WorkItemState.Queued, timedOut!.State);
         Assert.Contains("timed out", timedOut.LastError);
 
         var adoption = Assert.Single(provider.AdoptionCalls);
@@ -1447,7 +1450,7 @@ public sealed class SandboxSuspendResumeTests : IDisposable
         await barrier.RecoveryInputReady;
 
         var after = await _store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, after!.State);
+        Assert.Equal(WorkItemState.Queued, after!.State);
         Assert.Null(after.SuspendedVmName);
         Assert.Contains("timed out", after.LastError);
 

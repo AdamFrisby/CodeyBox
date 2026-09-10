@@ -40,7 +40,7 @@ public sealed class RestartRecoveryUatTests : IDisposable
     }
 
     [Fact]
-    public void WorkingCrashWithoutCheckpointFailsButPreemptCheckpointCanResume()
+    public void WorkingCrashWithoutCheckpointRequeuesButPreemptCheckpointCanResume()
     {
         using var store = new SqliteWorkItemStore(_workspace.NewDatabasePath());
         var queue = new InMemoryTaskQueue();
@@ -53,14 +53,13 @@ public sealed class RestartRecoveryUatTests : IDisposable
             PreemptCheckpoint = "refs/heads/codeybox/preempt/uat",
         };
 
-        var failed = service.TryBuildRecoveredStateForTest(crashedWork);
+        var requeued = service.TryBuildRecoveredStateForTest(crashedWork);
         var resumable = service.TryBuildRecoveredStateForTest(preemptedWork);
 
-        Assert.Equal(WorkItemState.Failed, failed!.State);
-        Assert.Equal(1, failed.RecoveryAttempts);
-        Assert.Null(failed.StartedAt);
-        Assert.Null(failed.PreemptCheckpoint);
-        Assert.Contains("without a preempt checkpoint", failed.LastError);
+        Assert.Equal(WorkItemState.Queued, requeued!.State);
+        Assert.Equal(0, requeued.RecoveryAttempts);
+        Assert.Null(requeued.StartedAt);
+        Assert.Contains("without a preempt checkpoint", requeued.LastError);
         Assert.Equal(WorkItemState.Working, resumable!.State);
         Assert.Equal(1, resumable.RecoveryAttempts);
         Assert.Null(resumable.StartedAt);
@@ -109,8 +108,9 @@ public sealed class RestartRecoveryUatTests : IDisposable
 
         await service.ReplayPendingForTestAsync(CancellationToken.None);
 
-        Assert.Equal(3, queue.Count);
-        Assert.Equal(WorkItemState.Failed, (await store.GetAsync(inFlightParent.Id))!.State);
+        Assert.Equal(4, queue.Count);
+        Assert.Equal(WorkItemState.Queued, (await store.GetAsync(inFlightParent.Id))!.State);
+        Assert.Equal(0, (await store.GetAsync(inFlightParent.Id))!.RecoveryAttempts);
         Assert.Equal(WorkItemState.Queued, (await store.GetAsync(blockedQueued.Id))!.State);
         Assert.Equal(WorkItemState.WorkComplete, (await store.GetAsync(interruptedAudit.Id))!.State);
         Assert.Equal(1, (await store.GetAsync(interruptedAudit.Id))!.RecoveryAttempts);

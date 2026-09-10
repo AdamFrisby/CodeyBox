@@ -51,6 +51,7 @@ internal static class WorkItemEndpoints
         app.MapGet("/queue/status", GetQueueStatusAsync);
         app.MapPost("/queue/pause", PauseQueueAsync);
         app.MapPost("/queue/resume", ResumeQueueAsync);
+        app.MapPost("/queue/drain", DrainQueueAsync);
     }
 
     private static async Task<IResult> GetWorkerStatusAsync(
@@ -2144,6 +2145,57 @@ internal static class WorkItemEndpoints
         });
     }
 
+    /// <summary>
+    /// Pause-and-wait drain for graceful restarts. Pauses the queue when it is
+    /// still running, then blocks until no workers are running or
+    /// <c>timeoutSeconds</c> elapses. Unlike <c>POST /queue/pause</c> — which
+    /// returns immediately and leaves in-flight work running — drain lets an
+    /// operator restart without interrupting running work: when
+    /// <c>drained</c> is true every worker has reached a safe boundary. The
+    /// queue stays paused afterwards; resume it (or restart, then resume)
+    /// when ready.
+    /// </summary>
+    private static async Task<IResult> DrainQueueAsync(
+        DrainQueueRequest body,
+        IQueueController queueController,
+        OrchestratorService orchestrator,
+        IWebhookDispatcher webhooks,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(body.Reason))
+            return Results.BadRequest(new { error = "reason is required" });
+        if (body.Reason.Any(char.IsControl))
+            return Results.BadRequest(new { error = "reason must not contain control characters" });
+        if (body.Reason.Length > 500)
+            return Results.BadRequest(new { error = "reason must be <= 500 chars" });
+        if (body.TimeoutSeconds is not { } timeoutSeconds || timeoutSeconds < 1 || timeoutSeconds > 3600)
+            return Results.BadRequest(new { error = "timeoutSeconds is required and must be between 1 and 3600" });
+
+        if (queueController.State == QueueState.Running)
+        {
+            await queueController.PauseAsync(body.Reason, ct);
+            _ = webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "queue.paused",
+                Details = new { pausedAt = queueController.PausedAt, reason = queueController.PausedReason, pausedBy = "api" },
+            }, CancellationToken.None);
+        }
+
+        var drained = await QueueDrain.WaitForQuiescenceAsync(
+            async innerCt => (await orchestrator.GetStatusAsync(innerCt)).CurrentlyRunning,
+            TimeSpan.FromSeconds(timeoutSeconds),
+            ct);
+        var status = await orchestrator.GetStatusAsync(ct);
+        return Results.Ok(new
+        {
+            state = queueController.State.ToString(),
+            drained,
+            currentlyRunning = status.CurrentlyRunning,
+            pausedAt = queueController.PausedAt,
+            pausedReason = queueController.PausedReason,
+        });
+    }
+
     // ── Budget usage ──────────────────────────────────────────────────────────
 
     private static async Task<IResult> GetBudgetUsageAsync(
@@ -3063,6 +3115,8 @@ public sealed record WorkItemIterationDto(int Iteration, int PromptRevision, Dat
 public sealed record ReorderWorkItemsRequest(string[]? Ids = null);
 
 public sealed record PauseQueueRequest(string Reason = "");
+
+public sealed record DrainQueueRequest(string Reason = "", int? TimeoutSeconds = null);
 
 public sealed record WorkItemTimelineResponse(string WorkItemId, IReadOnlyList<TimelineEntry> Entries);
 

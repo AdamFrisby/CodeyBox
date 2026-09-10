@@ -198,9 +198,14 @@ public sealed class DeadWorkerReaperTests : IDisposable
     }
 
     [Fact]
-    public async Task Reaper_WorkingWithoutPreempt_MarksFailed()
+    public async Task Reaper_WorkingWithoutPreempt_RequeuesRunnableWithoutConsumingBudget()
     {
-        var item = MakeItem(WorkItemState.Working);
+        // Losing the worker is an infrastructure event, not a work-item
+        // failure: the item returns to a runnable state (Queued, branch
+        // preserved) instead of Failed, and the restart does not consume the
+        // recovery budget that guards genuinely wedged items.
+        const string workBranch = "codeybox/dead-worker-orphan";
+        var item = MakeItem(WorkItemState.Working) with { WorkBranch = workBranch };
         await _store.CreateAsync(item);
         await PlantDeadWorkerAsync(Guid.NewGuid().ToString(), item.Id.ToString());
 
@@ -208,10 +213,32 @@ public sealed class DeadWorkerReaperTests : IDisposable
 
         var after = await _store.GetAsync(item.Id);
         Assert.NotNull(after);
-        Assert.Equal(WorkItemState.Failed, after.State);
-        Assert.Equal(1, after.RecoveryAttempts);
+        Assert.Equal(WorkItemState.Queued, after.State);
+        Assert.Equal(0, after.RecoveryAttempts);
+        Assert.Equal(workBranch, after.WorkBranch);
+        Assert.True(after.PreserveWorkBranchOnQueuedPickup);
+        Assert.Null(after.StartedAt);
         Assert.Contains("without a preempt checkpoint", after.LastError);
-        Assert.Equal(0, _queue.Count);
+        Assert.Equal(1, _queue.Count);
+    }
+
+    [Fact]
+    public async Task Reaper_WorkingWithoutPreempt_AtRecoveryCap_StillRequeues()
+    {
+        // An infrastructure-caused worker death must not push the item toward
+        // AbandonedAfterRecoveryAttempts, even when a previous genuine
+        // recovery already consumed the budget.
+        var item = MakeItem(WorkItemState.Working) with { RecoveryAttempts = 2 };
+        await _store.CreateAsync(item);
+        await PlantDeadWorkerAsync(Guid.NewGuid().ToString(), item.Id.ToString());
+
+        await _reaper.RunOnceAsync(CancellationToken.None);
+
+        var after = await _store.GetAsync(item.Id);
+        Assert.NotNull(after);
+        Assert.Equal(WorkItemState.Queued, after.State);
+        Assert.Equal(2, after.RecoveryAttempts);
+        Assert.Equal(1, _queue.Count);
     }
 
     [Fact]

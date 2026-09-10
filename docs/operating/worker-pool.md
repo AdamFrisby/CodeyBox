@@ -354,12 +354,34 @@ forget they left it paused.
 Pausing is **not** the same as cancelling. Items blocked by the pause gate
 remain Queued and are picked up automatically on resume.
 
+### Draining before a restart
+
+Pause alone does **not** wait: it returns immediately while in-flight workers
+keep running, so restarting right after pausing still interrupts running work
+(which recovery then re-queues). `POST /queue/drain` closes that gap — it
+pauses new pickup and then blocks until no workers are running or the deadline
+elapses:
+
+| | `POST /queue/pause` | `POST /queue/drain` |
+|---|---|---|
+| New item pickup | Blocked | Blocked (pauses first if still running) |
+| In-flight workers | Unaffected, keeps running | Waits until none are running |
+| Returns | Immediately | When quiescent or `timeoutSeconds` elapses |
+| Queue state after | Paused | Paused (resume it, or restart, when ready) |
+
+Safe-restart sequence: drain → restart → resume. When `drained` is `true`,
+every worker has reached a safe boundary and the restart disturbs nothing.
+When it is `false`, some workers were still running at the deadline — drain
+again or restart anyway and let recovery re-queue the interrupted items.
+
 ### API
 
 ```
 GET  /queue/status          → { state, pausedAt, pausedReason, refactorGates }
 POST /queue/pause           body: { "reason": "..." }  → { state, pausedAt }
 POST /queue/resume          → { state }
+POST /queue/drain           body: { "reason": "...", "timeoutSeconds": 300 }
+                            → { state, drained, currentlyRunning, pausedAt, pausedReason }
 ```
 
 Operators must supply a non-empty reason when pausing. The reason is stored

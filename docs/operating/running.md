@@ -59,11 +59,38 @@ by default). Put a reverse proxy in front of it for TLS and auth.
 ## Restarting the orchestrator safely
 
 Items in flight during a shutdown are **not** cancelled. They stay in their
-mid-flight state and the reaper resets each one to a safe restart point on the
-next startup, incrementing `recoveryAttempts`. After
-`CodeyBox:DeadWorker:MaxRecoveryAttempts` recoveries (default 10) without
-reaching a terminal state, an item lands in `AbandonedAfterRecoveryAttempts` and
-waits for `POST /workitems/{id}/retry`.
+mid-flight state and the reaper returns each one to a runnable state on the
+next startup. Losing the worker is treated as infrastructure, not item
+failure: a `Working` item interrupted without a preempt checkpoint is
+re-queued preserving its work branch **without** consuming its recovery
+budget, so routine restarts never push it toward `Failed` or
+`AbandonedAfterRecoveryAttempts`. Other mid-flight states still count their
+recovery handoff against `CodeyBox:DeadWorker:MaxRecoveryAttempts`
+(default 10); after that many recoveries without reaching a terminal state,
+an item lands in `AbandonedAfterRecoveryAttempts` and waits for
+`POST /workitems/{id}/retry`.
+
+For a clean restart with nothing interrupted, drain first — pausing alone is
+not enough, because pause only blocks *new* pickup while in-flight work keeps
+running:
+
+```bash
+# 1. Pause new pickup AND wait for running workers to finish (up to 300 s).
+curl -X POST localhost:5000/queue/drain \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"deploy restart","timeoutSeconds":300}'
+# → {"state":"Paused","drained":true,"currentlyRunning":0,...}
+
+# 2. Restart the process.
+
+# 3. Resume pickup.
+curl -X POST localhost:5000/queue/resume -H 'Content-Type: application/json' -d '{}'
+```
+
+If `drained` comes back `false`, some workers were still running when the
+deadline elapsed: wait and drain again, or restart anyway and let recovery
+re-queue the interrupted items. `POST /queue/pause` gives no such guarantee —
+it returns immediately with in-flight work still running.
 
 Per-state resume points, the reaper's fencing rules, and the caller-facing
 downtime window are in [`recovery.md`](recovery.md).
