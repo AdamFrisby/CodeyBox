@@ -279,14 +279,12 @@ public sealed class WorkerPoolHotReloadTests
         public OrchestratorService Orchestrator { get; private init; } = null!;
         public InMemoryTaskQueue Queue { get; private init; } = null!;
         private SqliteWorkItemStore? _store;
-        private string? _dbPath;
+        private TestScratchDirectory? _scratch;
 
         public static OrchFixture Build(int initialMaxConcurrent)
         {
-            var dbPath = Path.Combine(
-                Path.GetTempPath(),
-                $"cb-wp-hotreload-{Guid.NewGuid():N}.db");
-            var store = new SqliteWorkItemStore(dbPath);
+            var scratch = TestScratchDirectory.Create("cb-wp-hotreload-");
+            var store = new SqliteWorkItemStore(scratch.DbPath());
             var queue = new InMemoryTaskQueue();
             var orch = new OrchestratorService(
                 queue,
@@ -296,13 +294,15 @@ public sealed class WorkerPoolHotReloadTests
                 new OrchestratorOptions { MaxConcurrentWorkers = initialMaxConcurrent },
                 NullLogger<OrchestratorService>.Instance,
                 agentConcurrency: new AgentConcurrencyOptions());
-            return new OrchFixture { Orchestrator = orch, Queue = queue, _store = store, _dbPath = dbPath };
+            return new OrchFixture { Orchestrator = orch, Queue = queue, _store = store, _scratch = scratch };
         }
 
         public void Dispose()
         {
+            // Disposed before the scratch directory: an open WAL handle
+            // keeps -wal/-shm alive and the recursive delete would fail.
             _store?.Dispose();
-            if (_dbPath is not null) { try { File.Delete(_dbPath); } catch { } }
+            _scratch?.Dispose();
         }
     }
 
@@ -312,20 +312,20 @@ public sealed class WorkerPoolHotReloadTests
         public ManualMonitor<CodeyBoxOptions> Monitor { get; }
         private readonly AgentConfigHotReload _coordinator;
         private readonly SqliteWorkItemStore _store;
-        private readonly string _dbPath;
+        private readonly TestScratchDirectory _scratch;
 
         private CoordinatorFixture(
             AgentConfigHotReload coordinator,
             ManualMonitor<CodeyBoxOptions> monitor,
             OrchestratorService orchestrator,
             SqliteWorkItemStore store,
-            string dbPath)
+            TestScratchDirectory scratch)
         {
             _coordinator = coordinator;
             Monitor = monitor;
             Orchestrator = orchestrator;
             _store = store;
-            _dbPath = dbPath;
+            _scratch = scratch;
         }
 
         public static async Task<CoordinatorFixture> StartAsync(CodeyBoxOptions initial)
@@ -336,10 +336,8 @@ public sealed class WorkerPoolHotReloadTests
                 Array.Empty<IAgentQuotaProbe>(),
                 new QuotaRouterOptions { MinQuotaPct = 5.0 },
                 NullLogger<AgentClassRouter>.Instance);
-            var dbPath = Path.Combine(
-                Path.GetTempPath(),
-                $"cb-wp-coord-{Guid.NewGuid():N}.db");
-            var store = new SqliteWorkItemStore(dbPath);
+            var scratch = TestScratchDirectory.Create("cb-wp-coord-");
+            var store = new SqliteWorkItemStore(scratch.DbPath());
             var initialMax = initial.WorkerPool.MaxConcurrentWorkers
                 ?? initial.Concurrency
                 ?? 1;
@@ -359,14 +357,16 @@ public sealed class WorkerPoolHotReloadTests
                 monitor, orch, router, burn,
                 NullLogger<AgentConfigHotReload>.Instance);
             await coordinator.StartAsync(CancellationToken.None);
-            return new CoordinatorFixture(coordinator, monitor, orch, store, dbPath);
+            return new CoordinatorFixture(coordinator, monitor, orch, store, scratch);
         }
 
         public async ValueTask DisposeAsync()
         {
             await _coordinator.StopAsync(CancellationToken.None);
+            // Disposed before the scratch directory: an open WAL handle
+            // keeps -wal/-shm alive and the recursive delete would fail.
             _store.Dispose();
-            try { File.Delete(_dbPath); } catch { }
+            _scratch.Dispose();
         }
     }
 
