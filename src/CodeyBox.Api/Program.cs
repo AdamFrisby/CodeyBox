@@ -1657,7 +1657,9 @@ builder.Services.AddSingleton<IAgentInvolvementStore>(sp =>
 // it. Without this, an expired token would 401, the snapshot would become
 // AvailablePct=-1, and the router's default UnknownPolicy=UseObservedFailures
 // would fall open onto an agent that immediately 429s. See
-// OauthCredentialFileRefresher.cs for the per-provider refresh contracts.
+// CodeyBox.Agents/OauthCredentialFileRefresher.cs for the provider-neutral
+// refresh contracts; each concrete refresher lives in its own
+// CodeyBox.Agents.* project.
 builder.Services.AddSingleton<IClaudeQuotaTokenSource>(sp => new ClaudeOauthCredentialFileRefresher(
     sp.GetRequiredService<ClaudeCredentialFileSource>(),
     sp.GetRequiredService<IHttpClientFactory>(),
@@ -1679,11 +1681,26 @@ builder.Services.AddSingleton<IGeminiQuotaTokenSource>(sp =>
             ?? config["CodeyBox:GeminiOauthClientSecret"],
         cliTokenRefresher: GeminiOauthCredentialFileRefresher.TryCreateCliRefreshHandler());
 });
-builder.Services.AddSingleton<IAntigravityQuotaTokenSource>(sp => new AntigravityOauthCredentialFileRefresher(
-    sp.GetRequiredService<AntigravityCredentialFileSource>(),
-    sp.GetRequiredService<IHttpClientFactory>(),
-    sp.GetRequiredService<ILoggerFactory>().CreateLogger<AntigravityOauthCredentialFileRefresher>(),
-    cliRunner: AntigravityOauthCredentialFileRefresher.TryCreateCliRefreshHandler()));
+builder.Services.AddSingleton<IAntigravityQuotaTokenSource>(sp =>
+{
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    // Platform-guarded keyring access: the Secret Service reader only exists
+    // on Linux. Anywhere else the refresher keeps the last on-disk token and
+    // the startup warning below says so explicitly instead of degrading
+    // silently. Runs once (singleton) and is forced at startup — see the
+    // eager resolution after app.Build().
+    var keyringReader = SecretServiceKeyringReader.TryCreate(
+        log: loggerFactory.CreateLogger<SecretServiceKeyringReader>());
+    AntigravityKeyringStartup.LogKeyringStatus(
+        loggerFactory.CreateLogger("CodeyBox.Antigravity"),
+        keyringReader);
+    return new AntigravityOauthCredentialFileRefresher(
+        sp.GetRequiredService<AntigravityCredentialFileSource>(),
+        sp.GetRequiredService<IHttpClientFactory>(),
+        loggerFactory.CreateLogger<AntigravityOauthCredentialFileRefresher>(),
+        cliRunner: AntigravityOauthCredentialFileRefresher.TryCreateCliRefreshHandler(),
+        keyringReader: keyringReader is null ? null : AntigravityKeyring.ToRefreshDelegate(keyringReader));
+});
 
 // Every quota probe is wrapped so paused members use a longer polling cadence,
 // then transient blips serve the most recent real reading (bounded by the
@@ -3994,6 +4011,12 @@ var app = builder.Build();
 // Force the immutable-options baseline and retaining monitor cache to exist
 // before the host starts observing file-change reloads.
 _ = app.Services.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue;
+
+// Compose the Antigravity quota token source eagerly so the keyring-availability
+// warning in its factory is emitted once at startup rather than on the first
+// probe pickup. Singleton wiring guarantees the factory (and the warning) run
+// exactly once.
+_ = app.Services.GetRequiredService<IAntigravityQuotaTokenSource>();
 
 // Convert WorkItemStoreDiskFullException into a clean 503 instead of letting
 // the raw exception escape the HTTP layer. Once SQLite refuses to accept

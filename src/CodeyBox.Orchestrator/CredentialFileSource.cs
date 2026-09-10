@@ -1,4 +1,5 @@
 using System.Text.Json;
+using CodeyBox.Agents;
 using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Orchestrator;
@@ -30,7 +31,7 @@ namespace CodeyBox.Orchestrator;
 /// reload mechanism and <see cref="TokenUpdated"/> fires from the caller's
 /// thread.</para>
 /// </summary>
-public class CredentialFileSource : IDisposable
+public class CredentialFileSource : IDisposable, ICredentialFileReader
 {
     private const int MaxReadAttempts = 4; // 1 initial + 3 retries
     private const int RetryDelayMs = 100;
