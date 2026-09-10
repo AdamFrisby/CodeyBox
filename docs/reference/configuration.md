@@ -62,6 +62,18 @@ Hot-reloadable today:
   handling, observed-failure windows, cap-retry cadence, and cold-start
   fit-in-window. `QuotaCacheTtlSeconds` is still sampled by quota probe
   constructors at startup.
+- `WorkerPool.MaxConcurrentWorkers`, `WorkerPool.MaxConcurrentSandboxes`,
+  `WorkerPool.MinSpawnInterval` — re-applied via `AgentConfigHotReload` to the
+  live dispatcher concurrency gate, the sandbox admission gate, and the
+  spawn-pacing floor. Raising a cap admits queued waiters immediately;
+  lowering a cap never aborts in-flight work — new admissions stay blocked
+  until holders drain. Each change is logged
+  (`Hot-reloaded WorkerPool:<Field>: <old> → <new>`) so the effective value is
+  visible to operators. The remaining `WorkerPool.*` fields
+  (`DispatchGateAcquisitionBackoff`,
+  `MaxConsecutiveDispatchGateTimeoutsBeforeEscalation`, `NoProgressBackoffBase`,
+  `NoProgressBackoffMax`, `MaxNoProgressRedispatches`) are startup-captured;
+  see the not-hot-reloadable list below.
 - `DeadWorker.MaxRecoveryAttempts` and `DeadWorker.DeadWorkerThreshold` —
   re-read on every reaper sweep.
 - `PipelineTuning.AgentSessionResumeMaxAttempts` and
@@ -183,8 +195,14 @@ Not hot-reloadable (consumer captures the value at construction; restart require
   `PhaseAbsoluteTimeoutMultiplier` — bound into
   startup services and consumed by `PipelineRunner` / `ReleaseService` /
   shutdown-service constructors.
-- `WorkerPool.*`, `Concurrency`, `AutoRetryOnQuotaFailure.*` — sized into
+- `Concurrency`, `AutoRetryOnQuotaFailure.*` — sized into
   `OrchestratorOptions` and the worker-pool plumbing at startup.
+- `WorkerPool.DispatchGateAcquisitionBackoff`,
+  `WorkerPool.MaxConsecutiveDispatchGateTimeoutsBeforeEscalation`,
+  `WorkerPool.NoProgressBackoffBase`, `WorkerPool.NoProgressBackoffMax`,
+  `WorkerPool.MaxNoProgressRedispatches` — captured into the orchestrator's
+  startup options snapshot; no live reload bridge re-binds them yet, so edits
+  require a restart.
 - `QuotaRouter.QuotaCacheTtlSeconds` — captured by the per-provider quota probes
   at construction (probe caches are sized once). Other router gate fields are
   hot-reloaded.

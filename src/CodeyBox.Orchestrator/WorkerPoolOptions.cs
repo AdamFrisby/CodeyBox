@@ -19,14 +19,17 @@ public sealed class WorkerPoolOptions
     /// When unset, defaults to <c>2 * MaxConcurrentWorkers</c> so every worker
     /// can hold its phase sandbox while acquiring the next phase's sandbox
     /// (work -&gt; audit, audit -&gt; merge handoffs) without deadlocking the pool.
-    /// Values below <c>2 * MaxConcurrentWorkers</c> are rejected at startup.
-    /// Captured at startup; restart CodeyBox to resize the live admission gate.
+    /// Values below <c>2 * MaxConcurrentWorkers</c> are rejected at startup
+    /// and on hot-reload. Hot-reloadable: raising the value admits queued
+    /// creations immediately, lowering it blocks new admissions above the new
+    /// target while in-flight sandboxes drain naturally (never aborted).
     /// </summary>
     public int? MaxConcurrentSandboxes { get; set; }
 
     /// <summary>
     /// Minimum wall-clock interval between two consecutive worker spawns.
     /// Spreads out quota usage and sandbox-launch load. Default 0 (no pacing).
+    /// Hot-reloadable: the new floor applies to the next spawn.
     /// </summary>
     public TimeSpan MinSpawnInterval { get; set; } = TimeSpan.Zero;
 

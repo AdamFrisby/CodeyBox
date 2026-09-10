@@ -190,6 +190,13 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     private long _lastSpawnAtTicks = 0;
     private readonly object _spawnTimeLock = new();
 
+    // Live spawn-pacing floor (CodeyBox:WorkerPool:MinSpawnInterval), seeded
+    // from OrchestratorOptions at startup and resizable via
+    // ApplyMinSpawnIntervalReload. Stored as ticks so the dispatch loop reads
+    // it with a single volatile load; the record on _opts stays the startup
+    // snapshot for diagnostics.
+    private long _minSpawnIntervalTicks;
+
     // Worker index counter — monotonically increasing, used for log identity.
     private int _nextWorkerId = 0;
 
@@ -341,6 +348,7 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
         AgentConcurrencyOptions.ValidateAndThrow(_concurrencySnapshot.Current);
         _failureTracker = failureTracker;
         _concurrencyGate = new ResizableConcurrencyGate(opts.MaxConcurrentWorkers);
+        _minSpawnIntervalTicks = opts.MinSpawnInterval.Ticks;
         LogResolvedAgentCaps(_concurrencySnapshot.Current, reason: "startup");
     }
 
@@ -470,9 +478,10 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
     /// </list>
     /// <para>
     /// Idempotent: a reload with the same value is a no-op (no log, no
-    /// resize). <see cref="WorkerPoolOptions.MaxConcurrentSandboxes"/> and
-    /// <see cref="WorkerPoolOptions.MinSpawnInterval"/> remain startup-bound
-    /// — only the worker-pool size is hot-reloaded here.
+    /// resize). The sibling WorkerPool knobs ride alongside through
+    /// <see cref="SandboxAdmissionControlledProvider.ApplyMaxConcurrentSandboxesReload"/>
+    /// and <see cref="ApplyMinSpawnIntervalReload"/>; see
+    /// <see cref="WorkerPoolHotReloadPolicy"/> for the full hot-reloadable set.
     /// </para>
     /// </summary>
     /// <exception cref="ArgumentOutOfRangeException">
@@ -513,6 +522,56 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
             for (var i = 0; i < delta; i++)
                 _ = _queue.EnqueueDispatchWakeAsync(CancellationToken.None);
         }
+    }
+
+    /// <summary>
+    /// Live spawn-pacing floor (<c>CodeyBox:WorkerPool:MinSpawnInterval</c>).
+    /// Seeded from <see cref="OrchestratorOptions.MinSpawnInterval"/> at
+    /// startup; the dispatch loop reads this value on every spawn so
+    /// <see cref="ApplyMinSpawnIntervalReload"/> takes effect without restart.
+    /// </summary>
+    public TimeSpan MinSpawnInterval => new(Volatile.Read(ref _minSpawnIntervalTicks));
+
+    /// <summary>
+    /// Hot-reloads the spawn-pacing floor
+    /// (<c>CodeyBox:WorkerPool:MinSpawnInterval</c>). The dispatch loop
+    /// snapshots <see cref="MinSpawnInterval"/> per spawn, so the new floor
+    /// applies to the next spawn; a spawn already waiting keeps the bound it
+    /// started with. Rejects negatives and values &gt;= 1 hour with the same
+    /// semantics as the cold-start validation in
+    /// <see cref="OrchestratorOptionsFactory.Build(int?, WorkerPoolOptions, ILogger)"/>;
+    /// the coordinator catches and leaves the prior value in effect.
+    /// <para>
+    /// Idempotent: a reload with the same value is a no-op (no log).
+    /// </para>
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Thrown when <paramref name="newMinSpawnInterval"/> is negative or
+    /// &gt;= 1 hour.
+    /// </exception>
+    public void ApplyMinSpawnIntervalReload(TimeSpan newMinSpawnInterval)
+    {
+        if (newMinSpawnInterval < TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(
+                nameof(newMinSpawnInterval),
+                newMinSpawnInterval,
+                "CodeyBox:WorkerPool:MinSpawnInterval must be >= 0");
+        if (newMinSpawnInterval >= TimeSpan.FromHours(1))
+            throw new ArgumentOutOfRangeException(
+                nameof(newMinSpawnInterval),
+                newMinSpawnInterval,
+                "CodeyBox:WorkerPool:MinSpawnInterval must be < 1 hour (values >= 1h are almost certainly a configuration error)");
+
+        var newTicks = newMinSpawnInterval.Ticks;
+        var oldTicks = Volatile.Read(ref _minSpawnIntervalTicks);
+        if (oldTicks == newTicks)
+            return;
+        Volatile.Write(ref _minSpawnIntervalTicks, newTicks);
+
+        _log.LogInformation(
+            "Hot-reloaded WorkerPool:MinSpawnInterval: {OldValue} → {NewValue}",
+            new TimeSpan(oldTicks),
+            newMinSpawnInterval);
     }
 
     /// <summary>
@@ -1441,19 +1500,22 @@ public sealed class OrchestratorService : BackgroundService, IAgentRunningCounte
                 }
 
                 // Spawn pacing: enforce MinSpawnInterval between successive spawns.
-                if (_opts.MinSpawnInterval > TimeSpan.Zero)
+                // Snapshotted once per spawn so a hot-reload mid-wait does not
+                // move the goalposts for the wait already in progress.
+                var minSpawnInterval = MinSpawnInterval;
+                if (minSpawnInterval > TimeSpan.Zero)
                 {
                     long lastTicks;
                     lock (_spawnTimeLock) { lastTicks = _lastSpawnAtTicks; }
                     if (lastTicks != 0)
                     {
                         var lastSpawnAt = new DateTimeOffset(lastTicks, TimeSpan.Zero);
-                        var nextEligible = lastSpawnAt + _opts.MinSpawnInterval;
+                        var nextEligible = lastSpawnAt + minSpawnInterval;
                         var wait = nextEligible - DateTimeOffset.UtcNow;
                         if (wait <= TimeSpan.Zero && _queueController is not null)
                         {
-                            wait = _opts.MinSpawnInterval < SpawnPacingPauseObservationWindow
-                                ? _opts.MinSpawnInterval
+                            wait = minSpawnInterval < SpawnPacingPauseObservationWindow
+                                ? minSpawnInterval
                                 : SpawnPacingPauseObservationWindow;
                         }
                         if (wait > TimeSpan.Zero)

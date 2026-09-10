@@ -88,6 +88,77 @@ public sealed class SandboxAdmissionControlledProviderTests
     }
 
     [Fact]
+    public async Task Resize_Grow_AdmitsQueuedCreationsWithoutRestart()
+    {
+        var inner = new CountingSandboxProvider();
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 1, NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<SandboxAdmissionControlledProvider>(provider);
+        using var timeout = new CancellationTokenSource(TestDeadline);
+
+        await using var first = await provider.CreateAsync(Spec(), timeout.Token);
+        var queued = provider.CreateAsync(Spec(), timeout.Token);
+        await Task.Delay(50, timeout.Token);
+        Assert.False(queued.IsCompleted);
+        Assert.Equal(1, inner.Created);
+
+        admission.ApplyMaxConcurrentSandboxesReload(2);
+
+        await using var second = await queued.WaitAsync(timeout.Token);
+        Assert.Equal(2, admission.MaxConcurrentSandboxes);
+        Assert.Equal(2, admission.CurrentAdmittedSandboxes);
+        Assert.Equal(2, inner.Created);
+        Assert.Equal(2, inner.Active);
+    }
+
+    [Fact]
+    public async Task Resize_Shrink_BlocksNewAdmissionsWhileHoldersDrain()
+    {
+        var inner = new CountingSandboxProvider();
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 2, NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<SandboxAdmissionControlledProvider>(provider);
+        using var timeout = new CancellationTokenSource(TestDeadline);
+
+        await using var first = await provider.CreateAsync(Spec(), timeout.Token);
+        await using var second = await provider.CreateAsync(Spec(), timeout.Token);
+
+        admission.ApplyMaxConcurrentSandboxesReload(1);
+
+        // In-flight holders keep their slots; nothing is aborted.
+        Assert.Equal(1, admission.MaxConcurrentSandboxes);
+        Assert.Equal(2, admission.CurrentAdmittedSandboxes);
+        Assert.Equal(2, inner.Active);
+
+        // Draining one holder does not admit a newcomer while still at/above
+        // the new target.
+        await first.DisposeAsync();
+        var queued = provider.CreateAsync(Spec(), timeout.Token);
+        await Task.Delay(50, timeout.Token);
+        Assert.False(queued.IsCompleted);
+        Assert.Equal(2, inner.Created);
+
+        // Once holders drop below the target, queued creations flow again.
+        await second.DisposeAsync();
+        await using var third = await queued.WaitAsync(timeout.Token);
+        Assert.Equal(1, admission.CurrentAdmittedSandboxes);
+        Assert.Equal(3, inner.Created);
+    }
+
+    [Fact]
+    public void Resize_SameValue_IsNoop_AndNonPositive_Rejected()
+    {
+        var inner = new CountingSandboxProvider();
+        var provider = SandboxAdmissionControlledProvider.Wrap(inner, maxConcurrentSandboxes: 2, NullLogger.Instance);
+        var admission = Assert.IsAssignableFrom<SandboxAdmissionControlledProvider>(provider);
+
+        admission.ApplyMaxConcurrentSandboxesReload(2);
+        Assert.Equal(2, admission.MaxConcurrentSandboxes);
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => admission.ApplyMaxConcurrentSandboxesReload(0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => admission.ApplyMaxConcurrentSandboxesReload(-3));
+        Assert.Equal(2, admission.MaxConcurrentSandboxes);
+    }
+
+    [Fact]
     public async Task QueuedCreateCancellation_DoesNotConsumeAdmissionToken()
     {
         var inner = new CountingSandboxProvider();
