@@ -136,6 +136,37 @@ public sealed class AgentConfigHotReloadAuditLogTests : IDisposable
 
     // ── Helpers ─────────────────────────────────────────────────────────────
 
+    [Fact]
+    public async Task ChangedCircuitBreakerBlock_RepublishesSnapshotAndEmitsAudit()
+    {
+        var initial = BuildOptions(
+            claudeCap: 1,
+            classMembers: [new() { Agent = "claude", Billing = "Subscription", QualityScore = 100 }],
+            burnDefault: 4.0);
+        initial.AgentCircuitBreaker = new AgentCircuitBreakerOptions { Enabled = true, FailureThreshold = 3 };
+        var snapshot = new AgentCircuitBreakerSnapshot(initial.AgentCircuitBreaker);
+
+        using var coordinator = await StartCoordinatorAsync(initial, snapshot);
+
+        var next = BuildOptions(
+            claudeCap: 1,
+            classMembers: [new() { Agent = "claude", Billing = "Subscription", QualityScore = 100 }],
+            burnDefault: 4.0);
+        next.AgentCircuitBreaker = new AgentCircuitBreakerOptions { Enabled = true, FailureThreshold = 9 };
+        coordinator.Monitor.Fire(next);
+
+        // The swappable holder now reads through the new tuning...
+        Assert.Equal(9, snapshot.Current.FailureThreshold);
+        // ...and exactly one config_reloaded entry names the breaker block.
+        var breakerReloads = _sink.Events
+            .Where(e => e.Properties.TryGetValue("EventName", out var ev)
+                && ev is ScalarValue { Value: "config_reloaded" }
+                && e.Properties.TryGetValue("Block", out var b)
+                && b is ScalarValue { Value: "AgentCircuitBreaker" })
+            .ToList();
+        Assert.Single(breakerReloads);
+    }
+
     private static CodeyBoxOptions BuildOptions(
         int claudeCap,
         List<AgentMembershipOptions> classMembers,
@@ -162,7 +193,8 @@ public sealed class AgentConfigHotReloadAuditLogTests : IDisposable
         ],
         };
 
-    private static async Task<CoordinatorContext> StartCoordinatorAsync(CodeyBoxOptions initial)
+    private static async Task<CoordinatorContext> StartCoordinatorAsync(
+        CodeyBoxOptions initial, AgentCircuitBreakerSnapshot? circuitBreaker = null)
     {
         var monitor = new ManualOptionsMonitor<CodeyBoxOptions>(initial);
         var router = new AgentClassRouter(
@@ -185,7 +217,8 @@ public sealed class AgentConfigHotReloadAuditLogTests : IDisposable
             NullLogger<AgentBurnEstimator>.Instance);
         var coordinator = new AgentConfigHotReload(
             monitor, orch, router, burnEstimator,
-            NullLogger<AgentConfigHotReload>.Instance);
+            NullLogger<AgentConfigHotReload>.Instance,
+            circuitBreaker: circuitBreaker);
         await coordinator.StartAsync(CancellationToken.None);
         return new CoordinatorContext(coordinator, monitor, store, dbPath);
     }

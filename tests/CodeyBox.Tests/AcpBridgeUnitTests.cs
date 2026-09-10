@@ -1801,6 +1801,144 @@ public sealed class AcpBridgeUnitTests
         Assert.Equal(17, await forcedExit.Task.WaitAsync(TimeSpan.FromSeconds(5)));
     }
 
+    public static IEnumerable<object[]> ShutdownDisposalFaults() => new[]
+    {
+        // A disposed ConsoleStream reports CanRead=false → the in-flight read
+        // surfaces as NotSupportedException ("Stream does not support reading").
+        new object[] { new NotSupportedException("Stream does not support reading.") },
+        // A stream disposed mid-read commonly reports IOException.
+        new object[] { new IOException("The read operation failed.") },
+        // StreamReader's own reentrancy/closed guards can throw
+        // InvalidOperationException when the underlying stream vanishes mid-read.
+        new object[] { new InvalidOperationException("The stream is currently in use by a previous operation.") },
+    };
+
+    [Theory]
+    [MemberData(nameof(ShutdownDisposalFaults))]
+    public async Task Bridge_Shutdown_DisposesStdinMidRead_SwallowsAnyStreamFault(Exception faultOnRead)
+    {
+        // Regression: Shutdown() disposes _stdinStream from a signal/timer
+        // thread to unblock the parked stdin ReadLineAsync. Disposing the stream
+        // out from under an in-flight read is racy and surfaces as any of several
+        // fault types — NotSupportedException (disposed ConsoleStream reports
+        // CanRead=false), IOException, or InvalidOperationException from
+        // StreamReader's reentrancy/closed guards. Before the fix these escaped
+        // ReadStdinAsync as an unhandled exception, aborting the whole process
+        // with SIGABRT (exit 134) instead of the clean Shutdown(0) exit the POSIX
+        // signal path intends. The read loop now swallows ANY fault once shutdown
+        // is underway, so every one of these must yield the clean exit. This
+        // stream reproduces the exact disposal→read race deterministically, with
+        // no wall-clock and no real signal.
+        var stdin = new ShutdownDisposedStdinStream(faultOnRead);
+        await using var bridge = new Bridge(stdin);
+
+        var runTask = bridge.RunAsync();
+
+        // Wait until the bridge's stdin read is genuinely parked inside the
+        // stream before disposing it — that is the race the fix guards.
+        await stdin.ReadParked.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Drive Shutdown from this thread (the read loop runs on another),
+        // mirroring the POSIX-signal handler that disposes stdin under a live
+        // read. Shutdown disposes _stdinStream, faulting the parked read.
+        var shutdown = typeof(Bridge).GetMethod("Shutdown",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+        shutdown.Invoke(bridge, new object[] { 0 });
+
+        // The bridge must return its clean exit code, not fault: the parked
+        // read's fault is swallowed because ShutdownStarted, whatever its type.
+        var exit = await runTask.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(0, exit);
+    }
+
+    /// <summary>
+    /// A stdin stream whose parked read faults with a caller-chosen exception
+    /// once disposed — the observable behaviour of a real <c>ConsoleStream</c>
+    /// that <see cref="Bridge"/>.Shutdown disposes out from under an in-flight
+    /// <c>ReadLineAsync</c>. Disposing a stream mid-read is racy and can surface
+    /// as several fault types (<see cref="NotSupportedException"/>,
+    /// <see cref="IOException"/>, <see cref="InvalidOperationException"/>), so the
+    /// fault is parameterised to prove ReadStdinAsync unwinds cleanly for any of
+    /// them during shutdown. <see cref="ReadParked"/> completes once the read is
+    /// actually parked so the test can dispose at the precise racing moment.
+    /// </summary>
+    private sealed class ShutdownDisposedStdinStream : Stream
+    {
+        private readonly TaskCompletionSource _readParked =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _disposed =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly Exception _faultOnRead;
+        private volatile bool _canRead = true;
+
+        internal ShutdownDisposedStdinStream(Exception faultOnRead) =>
+            _faultOnRead = faultOnRead;
+
+        internal Task ReadParked => _readParked.Task;
+
+        public override bool CanRead => _canRead;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            _readParked.TrySetResult();
+            await _disposed.Task.ConfigureAwait(false);
+            throw _faultOnRead;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            _canRead = false;
+            _disposed.TrySetResult();
+            base.Dispose(disposing);
+        }
+
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) =>
+            throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) =>
+            throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) =>
+            throw new NotSupportedException();
+    }
+
+    [Fact]
+    public async Task Bridge_RunAsync_InProcessSeam_DoesNotInstallProcessWideSignalHandlers()
+    {
+        // Regression: an in-process bridge (the _stdinOverride test seam that
+        // BridgeRunHandle / the MemoryStream fixtures use) shares the test
+        // runner's process. RunAsync used to register PROCESS-WIDE
+        // SIGTERM/SIGINT/SIGHUP handlers unconditionally, so every in-process
+        // bridge instance hijacked the test host's signal disposition for the
+        // duration of the test. Those handlers set ctx.Cancel=true, which
+        // SWALLOWS a SIGTERM the harness may send the host to stop it — turning
+        // a clean stop into an escalated SIGKILL that MSBuild reports as a
+        // "child node exited prematurely" abnormal termination. The seam must
+        // leave the host's global signal disposition untouched; the real
+        // signal-shutdown contract is verified by the standalone-subprocess
+        // fixtures below. Before the fix _shutdownSignalRegistrations had length
+        // 3 here; after, it is empty.
+        await using var ctx = new BridgeRunHandle();
+
+        // bridge_started is emitted immediately AFTER the (now-skipped) signal
+        // registration block, so once we observe it the decision has been made.
+        await ctx.WaitForEnvelopeAsync("bridge_started");
+
+        var registrationsField = typeof(Bridge).GetField(
+            "_shutdownSignalRegistrations", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var registrations = (Array)registrationsField.GetValue(ctx.Bridge)!;
+        Assert.Empty(registrations);
+    }
+
     [Fact]
     public async Task Bridge_Shutdown_ConcurrentCauses_ClaudeExitEmittedExactlyOnceAndLockfileGone()
     {

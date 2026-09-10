@@ -75,6 +75,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly IncrementalRebaseSnapshot? _incrementalRebase;
     private readonly PipelineTuningSnapshot? _pipelineTuning;
     private readonly BudgetDeferralRecheckSnapshot? _budgetDeferralRecheck;
+    private readonly AgentCircuitBreakerSnapshot? _circuitBreaker;
     private readonly QuotaRouterOptions? _quotaRouterOptions;
     private readonly IInVmSmokeCoveragePolicy? _coverage;
     private readonly SmokeOptionsSnapshot? _smokeOptions;
@@ -101,6 +102,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private string _lastQuotaRouter = "";
     private string _lastPipelineTuning = "";
     private string _lastBudgetDeferralRecheck = "";
+    private string _lastCircuitBreaker = "";
     private string _lastSmoke = "";
     private string _lastTestFailureAttribution = "";
     private string _lastTransitionHealth = "";
@@ -125,6 +127,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         IncrementalRebaseSnapshot? incrementalRebase = null,
         PipelineTuningSnapshot? pipelineTuning = null,
         BudgetDeferralRecheckSnapshot? budgetDeferralRecheck = null,
+        AgentCircuitBreakerSnapshot? circuitBreaker = null,
         QuotaRouterOptions? quotaRouterOptions = null,
         IInVmSmokeCoveragePolicy? coverage = null,
         SmokeOptionsSnapshot? smokeOptions = null,
@@ -154,6 +157,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _incrementalRebase = incrementalRebase;
         _pipelineTuning = pipelineTuning;
         _budgetDeferralRecheck = budgetDeferralRecheck;
+        _circuitBreaker = circuitBreaker;
         _quotaRouterOptions = quotaRouterOptions;
         _coverage = coverage;
         _smokeOptions = smokeOptions;
@@ -184,6 +188,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _lastQuotaRouter = SerializeQuotaRouter(initial.QuotaRouter);
         _lastPipelineTuning = SerializePipelineTuning(initial.PipelineTuning);
         _lastBudgetDeferralRecheck = SerializeBudgetDeferralRecheck(initial.BudgetDeferralRecheck);
+        _lastCircuitBreaker = SerializeCircuitBreaker(initial.AgentCircuitBreaker);
         _lastSmoke = SerializeSmoke(initial.Smoke);
         _lastTestFailureAttribution = SerializeTestFailureAttribution(initial.TestFailureAttribution);
         _lastTransitionHealth = SerializeTransitionHealth(initial.TransitionHealth);
@@ -234,6 +239,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             ApplyQuotaRouterIfChanged(opts);
             ApplyPipelineTuningIfChanged(opts);
             ApplyBudgetDeferralRecheckIfChanged(opts);
+            ApplyCircuitBreakerIfChanged(opts);
         }
     }
 
@@ -1105,6 +1111,53 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 prev);
         }
     }
+
+    private void ApplyCircuitBreakerIfChanged(CodeyBoxOptions opts)
+    {
+        if (_circuitBreaker is null) return;
+
+        var next = SerializeCircuitBreaker(opts.AgentCircuitBreaker);
+        if (string.Equals(_lastCircuitBreaker, next, StringComparison.Ordinal))
+            return;
+
+        var prev = _lastCircuitBreaker;
+        try
+        {
+            _circuitBreaker.Replace(opts.AgentCircuitBreaker);
+            _lastCircuitBreaker = next;
+            AuditLog.ConfigReloaded("AgentCircuitBreaker", prev, next);
+            _log.LogInformation("Hot-reloaded AgentCircuitBreaker: {OldValue} → {NewValue}", prev, next);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex,
+                "Hot-reload of AgentCircuitBreaker rejected; keeping prior view ({Prev}). " +
+                "Fix the configuration error and re-save to retry.",
+                prev);
+        }
+    }
+
+    private static string SerializeCircuitBreaker(AgentCircuitBreakerOptions opts) =>
+        JsonSerializer.Serialize(
+            new
+            {
+                opts.Enabled,
+                opts.FailureThreshold,
+                WindowSeconds = opts.Window.TotalSeconds,
+                CooldownSeconds = opts.Cooldown.TotalSeconds,
+                opts.HalfOpenTrials,
+                PerAgent = opts.PerAgent
+                    .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                    .Select(kv => new
+                    {
+                        Agent = kv.Key,
+                        kv.Value.FailureThreshold,
+                        WindowSeconds = kv.Value.Window?.TotalSeconds,
+                        CooldownSeconds = kv.Value.Cooldown?.TotalSeconds,
+                        kv.Value.HalfOpenTrials,
+                    }),
+            },
+            JsonOpts);
 
     private static string SerializePipelineTuning(PipelineTuningOptions opts) =>
         JsonSerializer.Serialize(
