@@ -7,13 +7,13 @@ namespace CodeyBox.Tests;
 /// (SQLite databases, sandbox workspaces, seed repos).
 ///
 /// Replaces the old pattern of dropping uniquely-named files directly into
-/// <see cref="Path.GetTempPath"/> and deleting only the well-known file on
+/// the shared temp directory and deleting only the well-known file on
 /// teardown — which leaked SQLite <c>-wal</c>/<c>-shm</c> companions (a WAL
 /// pair outlives a carelessly-closed connection) and left whole directories
 /// behind whenever a test failed before its cleanup line ran.
 ///
 /// Ownership rule: dispose every connection or handle rooted in
-/// <see cref="Path"/> (e.g. <c>SqliteWorkItemStore.Dispose</c>) BEFORE
+/// <see cref="DirectoryPath"/> (e.g. <c>SqliteWorkItemStore.Dispose</c>) BEFORE
 /// disposing the scratch directory, otherwise the recursive delete retries
 /// against an open handle and the leak recurs. xUnit calls
 /// <see cref="IDisposable.Dispose"/> even when the test body throws, so
@@ -23,8 +23,9 @@ internal sealed class TestScratchDirectory : IDisposable
 {
     /// <summary>
     /// Environment variable overriding the scratch root. Must be an absolute
-    /// path when set. Unset (the norm) falls back to the standard temp-path
-    /// API so the suite never hardcodes a machine-specific location.
+    /// path when set. Unset (the norm) falls back to a per-user subdirectory
+    /// of the standard temp-path API so the suite never hardcodes a
+    /// machine-specific location and never sweeps the shared temp root.
     /// </summary>
     internal const string ScratchRootVariable = "CODEYBOX_TEST_SCRATCH_ROOT";
 
@@ -48,6 +49,8 @@ internal sealed class TestScratchDirectory : IDisposable
     /// </summary>
     internal static readonly string[] ManagedPrefixes = ["codeybox-", "cb-"];
 
+    private static readonly string[] SqliteCompanionSuffixes = ["-wal", "-shm", "-journal"];
+
     private const int DeleteAttempts = 5;
     private const int DeleteRetryDelayMilliseconds = 50;
 
@@ -55,11 +58,11 @@ internal sealed class TestScratchDirectory : IDisposable
 
     private TestScratchDirectory(string path)
     {
-        Path = path;
+        DirectoryPath = path;
     }
 
     /// <summary>Absolute path of the scratch directory.</summary>
-    internal string Path { get; }
+    internal string DirectoryPath { get; }
 
     /// <summary>
     /// Creates a uniquely-named scratch directory under the configured root
@@ -92,25 +95,58 @@ internal sealed class TestScratchDirectory : IDisposable
     internal string DbPath(string fileName = "store.db")
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(fileName);
-        return System.IO.Path.Combine(Path, fileName);
+        if (System.IO.Path.IsPathRooted(fileName))
+            throw new ArgumentException("Database file name must be a bare file name, not a rooted path.", nameof(fileName));
+        if (fileName.IndexOfAny(new[] { System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar }) >= 0)
+            throw new ArgumentException("Database file name must not contain directory separators.", nameof(fileName));
+        if (!string.Equals(fileName, System.IO.Path.GetFileName(fileName), StringComparison.Ordinal))
+            throw new ArgumentException("Database file name must be a bare file name.", nameof(fileName));
+
+        var combined = System.IO.Path.GetFullPath(System.IO.Path.Combine(DirectoryPath, fileName));
+        var containedPrefix = DirectoryPath.EndsWith(System.IO.Path.DirectorySeparatorChar)
+            ? DirectoryPath
+            : DirectoryPath + System.IO.Path.DirectorySeparatorChar;
+        if (!combined.StartsWith(containedPrefix, StringComparison.Ordinal))
+            throw new ArgumentException("Database file name escapes the scratch directory.", nameof(fileName));
+        return combined;
     }
 
     /// <summary>
     /// Removes stale files and directories from previous runs. Only entries
-    /// under <paramref name="root"/> whose names carry a managed prefix and
-    /// whose last write is older than <paramref name="maxAge"/> are removed.
-    /// Best-effort: failures are swallowed so a wedged leftover can never
-    /// fail test setup.
+    /// directly under <paramref name="root"/> whose names carry a managed
+    /// prefix and whose last write is older than <paramref name="maxAge"/>
+    /// are removed. Symbolic links and other reparse points are never
+    /// followed: the link itself is removed without recursion. Best-effort:
+    /// IO failures are swallowed so a wedged leftover can never fail test
+    /// setup, but programming errors still throw.
     /// </summary>
     internal static void SweepStale(string root, TimeSpan maxAge)
     {
+        string canonicalRoot;
+        try
+        {
+            canonicalRoot = System.IO.Path.GetFullPath(root);
+        }
+        catch (IOException)
+        {
+            return;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return;
+        }
+
         var cutoff = DateTimeOffset.UtcNow - maxAge;
         IEnumerable<string> entries;
         try
         {
-            entries = Directory.EnumerateFileSystemEntries(root);
+            entries = Directory.EnumerateFileSystemEntries(canonicalRoot);
         }
-        catch (Exception)
+        catch (IOException)
+        {
+            return;
+        }
+        catch (UnauthorizedAccessException)
         {
             return;
         }
@@ -122,24 +158,75 @@ internal sealed class TestScratchDirectory : IDisposable
                 var name = System.IO.Path.GetFileName(entry);
                 if (!ManagedPrefixes.Any(p => name.StartsWith(p, StringComparison.Ordinal)))
                     continue;
+
+                // Canonicalize-then-contain: never touch anything that does
+                // not resolve directly beneath the sweep root.
+                string fullEntry;
+                try
+                {
+                    fullEntry = System.IO.Path.GetFullPath(entry);
+                }
+                catch (IOException)
+                {
+                    continue;
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    continue;
+                }
+
+                var containedPrefix = canonicalRoot.EndsWith(System.IO.Path.DirectorySeparatorChar)
+                    ? canonicalRoot
+                    : canonicalRoot + System.IO.Path.DirectorySeparatorChar;
+                if (!fullEntry.StartsWith(containedPrefix, StringComparison.Ordinal))
+                    continue;
+
+                // No-follow: a symlinked entry is removed as a link, never
+                // recursed into, so a planted link cannot redirect the
+                // recursive delete at an arbitrary host path.
+                if (IsSymbolicLink(entry))
+                {
+                    DeleteLinkNoFollow(entry);
+                    continue;
+                }
+
                 if (Directory.Exists(entry))
                 {
                     if (Directory.GetLastWriteTimeUtc(entry) > cutoff.UtcDateTime)
                         continue;
+                    // Re-check immediately before the sink: the entry could
+                    // have been swapped for a link between the first check
+                    // and the delete (TOCTOU). Never recurse into a link.
+                    if (IsSymbolicLink(entry))
+                    {
+                        DeleteLinkNoFollow(entry);
+                        continue;
+                    }
+
                     Directory.Delete(entry, recursive: true);
                 }
                 else
                 {
                     if (File.GetLastWriteTimeUtc(entry) > cutoff.UtcDateTime)
                         continue;
+                    if (IsSymbolicLink(entry))
+                    {
+                        DeleteLinkNoFollow(entry);
+                        continue;
+                    }
+
                     File.Delete(entry);
                     if (name.EndsWith(".db", StringComparison.Ordinal))
                         DeleteSqliteCompanions(entry);
                 }
             }
-            catch (Exception)
+            catch (IOException)
             {
                 // Stale-sweep is self-healing hygiene, never a test gate.
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Locked or privileged leftover; a later run retries it.
             }
         }
     }
@@ -156,7 +243,11 @@ internal sealed class TestScratchDirectory : IDisposable
         {
             SqliteConnection.ClearAllPools();
         }
-        catch (Exception)
+        catch (IOException)
+        {
+            // Pool clearing is opportunistic; fall through to the delete.
+        }
+        catch (UnauthorizedAccessException)
         {
             // Pool clearing is opportunistic; fall through to the delete.
         }
@@ -172,13 +263,17 @@ internal sealed class TestScratchDirectory : IDisposable
     {
         ClearSqlitePools();
 
-        foreach (var suffix in new[] { "-wal", "-shm", "-journal" })
+        foreach (var suffix in SqliteCompanionSuffixes)
         {
             try
             {
                 File.Delete(dbPath + suffix);
             }
-            catch (Exception)
+            catch (IOException)
+            {
+                // Best-effort companion cleanup.
+            }
+            catch (UnauthorizedAccessException)
             {
                 // Best-effort companion cleanup.
             }
@@ -187,14 +282,47 @@ internal sealed class TestScratchDirectory : IDisposable
 
     /// <summary>
     /// Resolves the scratch root: <see cref="ScratchRootVariable"/> when set
-    /// to an absolute path, else the standard temp-path API.
+    /// to an absolute path (canonicalized), else a per-user subdirectory of
+    /// the standard temp-path API so the stale sweep never operates directly
+    /// on the shared temp root.
     /// </summary>
     internal static string ResolveRoot()
     {
         var configured = Environment.GetEnvironmentVariable(ScratchRootVariable);
         if (!string.IsNullOrWhiteSpace(configured) && System.IO.Path.IsPathRooted(configured))
-            return configured;
-        return System.IO.Path.GetTempPath();
+        {
+            try
+            {
+                return System.IO.Path.GetFullPath(configured);
+            }
+            catch (IOException)
+            {
+                // Fall through to the default root.
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Fall through to the default root.
+            }
+            catch (ArgumentException)
+            {
+                // Malformed override; fall through to the default root.
+            }
+            catch (NotSupportedException)
+            {
+                // Malformed override; fall through to the default root.
+            }
+        }
+
+        return DefaultRoot();
+    }
+
+    internal static string DefaultRoot()
+    {
+        var user = Environment.UserName ?? string.Empty;
+        var safe = new string(user.Select(c => char.IsLetterOrDigit(c) ? c : '-').ToArray()).Trim('-');
+        if (string.IsNullOrEmpty(safe))
+            safe = "shared";
+        return System.IO.Path.GetFullPath(System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"codeybox-tests-{safe}"));
     }
 
     internal static TimeSpan ResolveStaleMaxAge()
@@ -210,17 +338,93 @@ internal sealed class TestScratchDirectory : IDisposable
         return TimeSpan.FromHours(DefaultStaleMaxAgeHours);
     }
 
+    private static bool IsSymbolicLink(string path)
+    {
+        try
+        {
+            if (new FileInfo(path).LinkTarget is not null)
+                return true;
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+
+        try
+        {
+            if (new DirectoryInfo(path).LinkTarget is not null)
+                return true;
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+
+        try
+        {
+            return (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static void DeleteLinkNoFollow(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+
+        // A directory symlink may survive File.Delete on some runtimes;
+        // remove the link itself, never recursively.
+        try
+        {
+            if (Directory.Exists(path) && IsSymbolicLink(path))
+                Directory.Delete(path, recursive: false);
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
 
+        // Never recurse into a link planted at our own path: remove the link
+        // itself instead of following it.
+        if (IsSymbolicLink(DirectoryPath))
+        {
+            DeleteLinkNoFollow(DirectoryPath);
+            return;
+        }
+
         for (var attempt = 0; attempt < DeleteAttempts; attempt++)
         {
             try
             {
-                if (Directory.Exists(Path))
-                    Directory.Delete(Path, recursive: true);
+                if (Directory.Exists(DirectoryPath))
+                    Directory.Delete(DirectoryPath, recursive: true);
                 return;
             }
             catch (IOException) when (attempt < DeleteAttempts - 1)
