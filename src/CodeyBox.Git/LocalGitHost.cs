@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -687,6 +688,49 @@ public sealed class LocalGitHost : IGitHost
             stat.ExitCode == 0 ? stat.Stdout : string.Empty,
             diff.ExitCode == 0 ? diff.Stdout : string.Empty
         );
+    }
+
+    public async Task<IReadOnlyList<string>> GetCommitMessagesAsync(
+        string repositoryId, string baseBranch, string workBranch,
+        CancellationToken ct = default)
+    {
+        const int maxMessages = 20;
+        const int maxMessageBytes = 2048;
+
+        try
+        {
+            Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
+            Validation.ValidateBranchName(workBranch, nameof(workBranch));
+        }
+        catch (ArgumentException)
+        {
+            return [];
+        }
+
+        var path = GetRepoPath(repositoryId);
+        if (!Directory.Exists(path))
+            return [];
+
+        // Two-dot range lists commits reachable from work but not base.
+        // %B is the raw subject+body; %x1e terminates each message with an
+        // ASCII record separator so multi-line bodies survive the split.
+        // --reverse emits oldest first, matching the documented contract.
+        // `--` guards against branch names parsing as paths.
+        var rc = await RunGitAsync(path, ct, "log", "--format=%B%x1e", "--reverse", "-n", maxMessages.ToString(CultureInfo.InvariantCulture), $"{baseBranch}..{workBranch}", "--");
+        if (rc.ExitCode != 0)
+            return [];
+
+        var messages = new List<string>();
+        foreach (var raw in rc.Stdout.Split('\x1e'))
+        {
+            var message = raw.Trim();
+            if (string.IsNullOrEmpty(message))
+                continue;
+            messages.Add(RawOutputRedactor.TruncateToBytes(message, maxMessageBytes));
+            if (messages.Count >= maxMessages)
+                break;
+        }
+        return messages;
     }
 
     public string GetRepoPath(string repositoryId) => Path.Combine(_opts.RootDirectory, repositoryId + ".git");

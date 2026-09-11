@@ -2,6 +2,7 @@ using CodeyBox.Core;
 using CodeyBox.Upstream;
 using CodeyBox.Upstream.GitHub;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CodeyBox.Projects;
 
@@ -35,6 +36,8 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
     private readonly IReadOnlyList<IUpstreamRemote> _pluginRemotes;
     private readonly ILogger<UpstreamRemoteFactory>? _factoryLog;
     private readonly GitHubAppStore? _githubApps;
+    private readonly ICompletionClient? _completionClient;
+    private readonly ILogger<CompletionPullRequestDescriptionGenerator>? _completionLog;
 
     public UpstreamRemoteFactory(
         IGitHost gitHost,
@@ -47,7 +50,9 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
         IEnumerable<IUpstreamRemote>? pluginRemotes = null,
         ILogger<UpstreamRemoteFactory>? factoryLog = null,
         ITimingStore? timings = null,
-        GitHubAppStore? githubApps = null)
+        GitHubAppStore? githubApps = null,
+        ICompletionClient? completionClient = null,
+        ILogger<CompletionPullRequestDescriptionGenerator>? completionLog = null)
     {
         _gitHost = gitHost;
         _httpClientFactory = httpClientFactory;
@@ -59,6 +64,8 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
         _timings = timings;
         _factoryLog = factoryLog;
         _githubApps = githubApps;
+        _completionClient = completionClient;
+        _completionLog = completionLog;
 
         var remotes = new List<IUpstreamRemote>();
         foreach (var remote in pluginRemotes ?? [])
@@ -214,19 +221,62 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
         new()
         {
             Enabled = pd.Enabled,
+            Strategy = pd.Strategy,
             GeneratorAgent = pd.GeneratorAgent,
             GeneratorModelId = pd.GeneratorModelId,
             MaxDiffBytes = pd.MaxDiffBytes,
             Timeout = pd.Timeout,
             SandboxImageReference = pd.SandboxImageReference,
             AgentAllowedHosts = pd.AgentAllowedHosts,
+            CompletionEndpoint = pd.CompletionEndpoint,
+            CompletionModel = pd.CompletionModel,
+            CompletionWireApi = pd.CompletionWireApi,
+            CompletionApiKey = pd.CompletionApiKey,
+            CompletionApiKeyEnvVars = pd.CompletionApiKeyEnvVars,
+            CompletionMaxOutputTokens = pd.CompletionMaxOutputTokens,
+            CompletionAnthropicVersion = pd.CompletionAnthropicVersion,
         };
 
-    private LlmPullRequestDescriptionGenerator? BuildDescriptionGenerator(ProjectPrDescription pd)
+    /// <summary>
+    /// Builds the description generator for the selected strategy. Availability
+    /// is evaluated against the selected strategy's own requirement — a
+    /// configured completion endpoint for the completion strategy, a
+    /// <c>SandboxImageReference</c> for the agentic strategy — so selecting one
+    /// strategy is never disabled by the other's missing configuration. The
+    /// completion strategy additionally requires a completion client.
+    /// </summary>
+    private IPullRequestDescriptionGenerator? BuildDescriptionGenerator(ProjectPrDescription pd)
     {
-        if (!pd.Enabled || string.IsNullOrEmpty(pd.SandboxImageReference))
+        if (!pd.Enabled)
             return null;
-        return new LlmPullRequestDescriptionGenerator(
-            _sandboxes, _agents, _credentials, MapPrDescriptionOptions(pd), _generatorLog);
+
+        if (pd.Strategy == PrDescriptionStrategy.Agentic)
+        {
+            if (string.IsNullOrEmpty(pd.SandboxImageReference))
+            {
+                _factoryLog?.LogDebug(
+                    "PR description generator disabled: agentic strategy selected but SandboxImageReference is empty");
+                return null;
+            }
+            return new LlmPullRequestDescriptionGenerator(
+                _sandboxes, _agents, _credentials, MapPrDescriptionOptions(pd), _generatorLog);
+        }
+
+        if (string.IsNullOrEmpty(pd.CompletionEndpoint))
+        {
+            _factoryLog?.LogDebug(
+                "PR description generator disabled: completion strategy selected but CompletionEndpoint is empty");
+            return null;
+        }
+        if (_completionClient is null)
+        {
+            _factoryLog?.LogDebug(
+                "PR description generator disabled: completion strategy selected but no completion client is registered");
+            return null;
+        }
+        return new CompletionPullRequestDescriptionGenerator(
+            _completionClient,
+            MapPrDescriptionOptions(pd),
+            _completionLog ?? NullLogger<CompletionPullRequestDescriptionGenerator>.Instance);
     }
 }

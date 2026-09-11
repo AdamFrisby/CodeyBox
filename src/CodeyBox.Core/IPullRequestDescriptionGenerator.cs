@@ -11,6 +11,28 @@ public interface IPullRequestDescriptionGenerator
     Task<string> GenerateAsync(PullRequestDescriptionRequest request, CancellationToken ct);
 }
 
+/// <summary>
+/// Selects which <see cref="IPullRequestDescriptionGenerator"/> implementation
+/// produces pull request descriptions for a project. Bound from configuration
+/// (e.g. <c>Upstream.PrDescription.Strategy</c>) so operators can switch
+/// strategies without a restart; project configuration is reloaded through
+/// <c>IOptionsMonitor</c>. Default: <see cref="Completion"/>.
+/// </summary>
+public enum PrDescriptionStrategy
+{
+    /// <summary>
+    /// Tool-less completion call via <see cref="ICompletionClient"/> against a
+    /// configured completion endpoint. Creates no sandbox and runs no agent.
+    /// </summary>
+    Completion = 0,
+
+    /// <summary>
+    /// Runs the configured agent CLI inside a provisioned sandbox over the
+    /// diff. Requires <c>SandboxImageReference</c>.
+    /// </summary>
+    Agentic = 1,
+}
+
 /// <summary>Input to <see cref="IPullRequestDescriptionGenerator.GenerateAsync"/>.</summary>
 public sealed record PullRequestDescriptionRequest
 {
@@ -35,4 +57,13 @@ public sealed record PullRequestDescriptionRequest
 
     /// <summary>Last 2 KB of agent stdout — the agent's concluding reasoning.</summary>
     public string? AgentReasoningTail { get; init; }
+
+    /// <summary>
+    /// Full commit messages the agent produced on the work branch (subjects
+    /// plus bodies, oldest first). Each entry is pre-truncated to at most
+    /// 2 KB and the list holds at most 20 entries; strategies include them
+    /// in the generation prompt so the model sees the agent's own summary
+    /// of each change alongside the raw diff.
+    /// </summary>
+    public IReadOnlyList<string> CommitMessages { get; init; } = [];
 }

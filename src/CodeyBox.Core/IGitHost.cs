@@ -346,6 +346,23 @@ public interface IGitHost
         CancellationToken ct = default);
 
     /// <summary>
+    /// Returns the full commit messages (<c>git log --format=%B</c>) reachable
+    /// from <paramref name="workBranch"/> but not from <paramref name="baseBranch"/>
+    /// in the host bare repo, oldest first. Used to give PR description
+    /// generators the agent's own per-commit summaries. At most 20 messages are
+    /// returned and each is truncated to 2 KB. Returns an empty list when the
+    /// messages cannot be read (e.g. repo not found, branch does not exist).
+    /// Never throws.
+    ///
+    /// Default returns an empty list so test fakes that don't implement the
+    /// check behave as before.
+    /// </summary>
+    Task<IReadOnlyList<string>> GetCommitMessagesAsync(
+        string repositoryId, string baseBranch, string workBranch,
+        CancellationToken ct = default)
+        => Task.FromResult<IReadOnlyList<string>>([]);
+
+    /// <summary>
     /// Computes git's canonical host-side merge tree for two commits in the
     /// host bare repo. A non-zero git exit from content conflicts is returned
     /// as <see cref="GitMergeTreeResult.HasConflicts"/> rather than thrown.

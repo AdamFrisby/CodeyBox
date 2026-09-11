@@ -18491,6 +18491,19 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 }
             }
 
+            // Best-effort: read the agent's own commit messages for LLM-generated
+            // PR descriptions. Failures here are non-fatal — the field defaults
+            // to an empty list and the generator falls back to the diff alone.
+            IReadOnlyList<string> commitMessages = [];
+            try
+            {
+                commitMessages = await _gitHost.GetCommitMessagesAsync(repoId, baseBranch, workBranch, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                _log.LogDebug("Could not read commit messages for PR description: {Message}", ex.Message);
+            }
+
             var request = new UpstreamCompletionRequest
             {
                 RepositoryId = repoId,
@@ -18505,6 +18518,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 FullDiff = fullDiff,
                 WorkItemPrompt = item.Prompt,
                 AddressedFindings = addressedFindings,
+                CommitMessages = commitMessages,
                 AgentStdout = agentStdout,
                 PromptRevision = item.PromptRevision,
                 Initiator = item.Initiator,
