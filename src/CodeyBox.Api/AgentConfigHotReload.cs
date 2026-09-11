@@ -17,10 +17,15 @@ namespace CodeyBox.Api;
 /// <para>
 /// Several blocks are hot-reloadable here:
 /// <list type="bullet">
-/// <item><c>CodeyBox:WorkerPool:MaxConcurrentWorkers</c> →
-///   <see cref="OrchestratorService.ApplyWorkerPoolReload"/>. The other
-///   <c>WorkerPool</c> fields (<c>MaxConcurrentSandboxes</c>, <c>MinSpawnInterval</c>)
-///   are captured at startup and not re-bound here.</item>
+/// <item><c>CodeyBox:WorkerPool</c> hot-reloadable trio
+///   (<c>MaxConcurrentWorkers</c> →
+///   <see cref="OrchestratorService.ApplyWorkerPoolReload"/>,
+///   <c>MaxConcurrentSandboxes</c> →
+///   <see cref="SandboxAdmissionControlledProvider.ApplyMaxConcurrentSandboxesReload"/>,
+///   <c>MinSpawnInterval</c> →
+///   <see cref="OrchestratorService.ApplyMinSpawnIntervalReload"/>).
+///   The remaining <c>WorkerPool</c> fields are captured at startup — see
+///   <see cref="WorkerPoolHotReloadPolicy"/> for the exact split.</item>
 /// <item><c>CodeyBox:AgentConcurrency</c> → <see cref="OrchestratorService.ApplyAgentConcurrencyReload"/>.</item>
 /// <item><c>CodeyBox:AgentClasses</c> + <c>CodeyBox:AgentScoreModifiers</c> →
 ///   <see cref="AgentClassRouter.ApplyConfigReload"/>. Both are bundled because
@@ -84,6 +89,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     private readonly IAgentPauseController? _pauses;
     private readonly IAgentRegistry? _agents;
     private readonly ISandboxHostPoolSnapshot? _hostPoolSnapshot;
+    private readonly SandboxAdmissionControlledProvider? _sandboxAdmission;
     private readonly ILogger<AgentConfigHotReload> _log;
     private readonly Lock _gate = new();
     private IDisposable? _subscription;
@@ -135,7 +141,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         IAgentPauseController? pauses = null,
         IAgentRegistry? agents = null,
         TransitionHealthOptionsSnapshot? transitionHealth = null,
-        ISandboxHostPoolSnapshot? hostPoolSnapshot = null)
+        ISandboxHostPoolSnapshot? hostPoolSnapshot = null,
+        SandboxAdmissionControlledProvider? sandboxAdmission = null)
     {
         if (costCalculator is not null && pricingState is null)
         {
@@ -166,6 +173,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         _pauses = pauses;
         _agents = agents;
         _hostPoolSnapshot = hostPoolSnapshot;
+        _sandboxAdmission = sandboxAdmission;
         _log = log;
     }
 
@@ -512,8 +520,19 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         var prev = _lastWorkerPool;
         try
         {
-            var resolved = ResolveEffectiveMaxConcurrentWorkers(opts.WorkerPool, opts.Concurrency);
-            _orchestrator.ApplyWorkerPoolReload(resolved);
+            var resolvedWorkers = ResolveEffectiveMaxConcurrentWorkers(opts.WorkerPool, opts.Concurrency);
+            var resolvedSandboxes = ResolveEffectiveMaxConcurrentSandboxes(opts.WorkerPool, resolvedWorkers);
+            var resolvedInterval = opts.WorkerPool.MinSpawnInterval;
+            // Validate the whole trio before touching any live gate so a
+            // rejected candidate keeps every prior value in effect instead of
+            // committing workers while rejecting sandboxes or pacing.
+            OrchestratorOptionsFactory.ValidateWorkerPoolReload(
+                resolvedWorkers,
+                resolvedSandboxes,
+                resolvedInterval);
+            _orchestrator.ApplyWorkerPoolReload(resolvedWorkers);
+            _sandboxAdmission?.ApplyMaxConcurrentSandboxesReload(resolvedSandboxes);
+            _orchestrator.ApplyMinSpawnIntervalReload(resolvedInterval);
             _lastWorkerPool = next;
             AuditLog.ConfigReloaded("WorkerPool", prev, next);
         }
@@ -791,17 +810,18 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
     }
 
     /// <summary>
-    /// Hot-reload fingerprint for the worker-pool block. Only includes the
-    /// hot-reloadable fields — <c>MaxConcurrentSandboxes</c> and
-    /// <c>MinSpawnInterval</c> are captured at startup and are explicitly out
-    /// of scope here, so an unrelated edit to them does not trigger a
-    /// no-op resize call.
+    /// Hot-reload fingerprint for the worker-pool block. Covers exactly the
+    /// <see cref="WorkerPoolHotReloadPolicy.HotReloadableFields"/> set — an
+    /// edit to any other <c>WorkerPool</c> field does not trigger a reload
+    /// (those fields are startup-captured and require a restart).
     /// </summary>
     private static string SerializeWorkerPool(WorkerPoolOptions opts, int? legacyConcurrency) =>
         JsonSerializer.Serialize(
             new
             {
                 opts.MaxConcurrentWorkers,
+                opts.MaxConcurrentSandboxes,
+                opts.MinSpawnInterval,
                 LegacyConcurrency = legacyConcurrency,
             },
             JsonOpts);

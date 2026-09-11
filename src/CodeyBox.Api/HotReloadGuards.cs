@@ -76,7 +76,6 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
             Check("CodeyBox:GitRootDirectory", _snapshot.GitRootDirectory, NormalizePath(options.GitRootDirectory), failures);
             Check("CodeyBox:GitCommandMaxOutputBytes", _snapshot.GitCommandMaxOutputBytes, options.GitCommandMaxOutputBytes, failures);
             Check("CodeyBox:AgentStreams:Path", _snapshot.AgentStreamsPath, NormalizePath(options.AgentStreams.Path), failures);
-            Check("CodeyBox:WorkerPool:MaxConcurrentSandboxes", _snapshot.MaxConcurrentSandboxes, options.WorkerPool.MaxConcurrentSandboxes, failures);
             Check("CodeyBox:EnableSharedUpstreamMirror", _snapshot.EnableSharedUpstreamMirror, options.EnableSharedUpstreamMirror, failures);
             Check("CodeyBox:SharedUpstreamMirrorDirectory", _snapshot.SharedUpstreamMirrorDirectory, NormalizePath(options.SharedUpstreamMirrorDirectory), failures);
             if (IsReloadableSandboxProvider(_snapshot.SandboxProvider)
@@ -110,7 +109,6 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
             NormalizePath(options.GitRootDirectory),
             options.GitCommandMaxOutputBytes,
             NormalizePath(options.AgentStreams.Path),
-            options.WorkerPool.MaxConcurrentSandboxes,
             options.EnableSharedUpstreamMirror,
             NormalizePath(options.SharedUpstreamMirrorDirectory),
             captureIncusIdentity
@@ -186,7 +184,6 @@ public sealed class ImmutableCodeyBoxOptionsValidator : IValidateOptions<CodeyBo
         string GitRootDirectory,
         int GitCommandMaxOutputBytes,
         string AgentStreamsPath,
-        int? MaxConcurrentSandboxes,
         bool EnableSharedUpstreamMirror,
         string SharedUpstreamMirrorDirectory,
         string IncusProjectName,

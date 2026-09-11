@@ -272,6 +272,192 @@ public sealed class WorkerPoolHotReloadTests
         Assert.Equal(7, ctx.Orchestrator.GetConcurrencyState().GlobalMaxConcurrent);
     }
 
+    // ── MinSpawnInterval hot-reload (direct path) ──────────────────────────
+
+    [Fact]
+    public void ApplyMinSpawnIntervalReload_AppliesLiveValue()
+    {
+        using var fixture = OrchFixture.Build(initialMaxConcurrent: 2);
+        Assert.Equal(TimeSpan.Zero, fixture.Orchestrator.MinSpawnInterval);
+
+        fixture.Orchestrator.ApplyMinSpawnIntervalReload(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(TimeSpan.FromSeconds(30), fixture.Orchestrator.MinSpawnInterval);
+    }
+
+    [Fact]
+    public void ApplyMinSpawnIntervalReload_SeededFromStartupOptions()
+    {
+        using var fixture = OrchFixture.Build(
+            initialMaxConcurrent: 2,
+            initialMinSpawnInterval: TimeSpan.FromSeconds(5));
+        Assert.Equal(TimeSpan.FromSeconds(5), fixture.Orchestrator.MinSpawnInterval);
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(-1000)]
+    public void ApplyMinSpawnIntervalReload_Negative_Rejected_PriorValueRetained(int millis)
+    {
+        using var fixture = OrchFixture.Build(initialMaxConcurrent: 2);
+        fixture.Orchestrator.ApplyMinSpawnIntervalReload(TimeSpan.FromSeconds(10));
+
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            fixture.Orchestrator.ApplyMinSpawnIntervalReload(TimeSpan.FromMilliseconds(millis)));
+
+        Assert.Equal(TimeSpan.FromSeconds(10), fixture.Orchestrator.MinSpawnInterval);
+    }
+
+    [Fact]
+    public void ApplyMinSpawnIntervalReload_AtLeastOneHour_Rejected_PriorValueRetained()
+    {
+        using var fixture = OrchFixture.Build(initialMaxConcurrent: 2);
+        fixture.Orchestrator.ApplyMinSpawnIntervalReload(TimeSpan.FromSeconds(10));
+
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            fixture.Orchestrator.ApplyMinSpawnIntervalReload(TimeSpan.FromHours(1)));
+
+        Assert.Equal(TimeSpan.FromSeconds(10), fixture.Orchestrator.MinSpawnInterval);
+    }
+
+    [Fact]
+    public void ApplyMinSpawnIntervalReload_SameValue_IsIdempotent()
+    {
+        using var fixture = OrchFixture.Build(
+            initialMaxConcurrent: 2,
+            initialMinSpawnInterval: TimeSpan.FromSeconds(7));
+        fixture.Orchestrator.ApplyMinSpawnIntervalReload(TimeSpan.FromSeconds(7));
+        Assert.Equal(TimeSpan.FromSeconds(7), fixture.Orchestrator.MinSpawnInterval);
+    }
+
+    // ── WorkerPool trio via coordinator (sandbox + pacing) ─────────────────
+
+    [Fact]
+    public async Task Coordinator_OnChange_RebindsSandboxAndPacingTrio()
+    {
+        var initial = new CodeyBoxOptions
+        {
+            WorkerPool = new WorkerPoolOptions
+            {
+                MaxConcurrentWorkers = 2,
+                MaxConcurrentSandboxes = 4,
+                MinSpawnInterval = TimeSpan.Zero,
+            },
+        };
+        var admission = (SandboxAdmissionControlledProvider)SandboxAdmissionControlledProvider.Wrap(
+            new StubSandboxProvider(),
+            maxConcurrentSandboxes: 4,
+            NullLogger.Instance);
+        await using var ctx = await CoordinatorFixture.StartAsync(initial, admission);
+        Assert.Equal(4, admission.MaxConcurrentSandboxes);
+
+        ctx.Monitor.Fire(new CodeyBoxOptions
+        {
+            WorkerPool = new WorkerPoolOptions
+            {
+                MaxConcurrentWorkers = 5,
+                MaxConcurrentSandboxes = 10,
+                MinSpawnInterval = TimeSpan.FromSeconds(30),
+            },
+        });
+
+        Assert.Equal(5, ctx.Orchestrator.GetConcurrencyState().GlobalMaxConcurrent);
+        Assert.Equal(10, admission.MaxConcurrentSandboxes);
+        Assert.Equal(TimeSpan.FromSeconds(30), ctx.Orchestrator.MinSpawnInterval);
+    }
+
+    [Fact]
+    public async Task Coordinator_OnChange_InvalidSandboxes_KeepsAllPriorsAtomic()
+    {
+        // Pre-validation must run before any live gate is touched: a candidate
+        // with valid workers but an invalid sandbox cap must leave the worker
+        // cap at its prior value too (no partial commit across knobs).
+        var initial = new CodeyBoxOptions
+        {
+            WorkerPool = new WorkerPoolOptions
+            {
+                MaxConcurrentWorkers = 2,
+                MaxConcurrentSandboxes = 2,
+            },
+        };
+        var admission = (SandboxAdmissionControlledProvider)SandboxAdmissionControlledProvider.Wrap(
+            new StubSandboxProvider(),
+            maxConcurrentSandboxes: 2,
+            NullLogger.Instance);
+        await using var ctx = await CoordinatorFixture.StartAsync(initial, admission);
+
+        ctx.Monitor.Fire(new CodeyBoxOptions
+        {
+            WorkerPool = new WorkerPoolOptions
+            {
+                MaxConcurrentWorkers = 5,
+                MaxConcurrentSandboxes = 0,
+            },
+        });
+
+        Assert.Equal(2, ctx.Orchestrator.GetConcurrencyState().GlobalMaxConcurrent);
+        Assert.Equal(2, admission.MaxConcurrentSandboxes);
+    }
+
+    [Fact]
+    public async Task Coordinator_OnChange_RestartOnlyField_DoesNotTriggerReload()
+    {
+        // Fields in WorkerPoolHotReloadPolicy.RestartRequiredFields are absent
+        // from the reload fingerprint: editing one alone must not resize any
+        // live gate.
+        var initial = new CodeyBoxOptions
+        {
+            WorkerPool = new WorkerPoolOptions
+            {
+                MaxConcurrentWorkers = 2,
+                MaxConcurrentSandboxes = 3,
+                NoProgressBackoffBase = TimeSpan.FromMilliseconds(500),
+            },
+        };
+        var admission = (SandboxAdmissionControlledProvider)SandboxAdmissionControlledProvider.Wrap(
+            new StubSandboxProvider(),
+            maxConcurrentSandboxes: 3,
+            NullLogger.Instance);
+        await using var ctx = await CoordinatorFixture.StartAsync(initial, admission);
+
+        var candidate = new CodeyBoxOptions
+        {
+            WorkerPool = new WorkerPoolOptions
+            {
+                MaxConcurrentWorkers = 2,
+                MaxConcurrentSandboxes = 3,
+                NoProgressBackoffBase = TimeSpan.FromSeconds(5),
+            },
+        };
+        ctx.Monitor.Fire(candidate);
+
+        Assert.Equal(2, ctx.Orchestrator.GetConcurrencyState().GlobalMaxConcurrent);
+        Assert.Equal(3, admission.MaxConcurrentSandboxes);
+        Assert.Equal(TimeSpan.Zero, ctx.Orchestrator.MinSpawnInterval);
+    }
+
+    [Fact]
+    public void WorkerPoolHotReloadPolicy_PartitionsAllWorkerPoolOptions()
+    {
+        // The documented hot-reloadable set and the restart-required set must
+        // exactly partition every WorkerPoolOptions property: a new option
+        // added without classifying it here fails this test.
+        var props = typeof(WorkerPoolOptions)
+            .GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)
+            .Select(static p => p.Name)
+            .OrderBy(static name => name, StringComparer.Ordinal)
+            .ToArray();
+        var union = WorkerPoolHotReloadPolicy.HotReloadableFields
+            .Concat(WorkerPoolHotReloadPolicy.RestartRequiredFields)
+            .OrderBy(static name => name, StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.Equal(props, union);
+        Assert.Empty(WorkerPoolHotReloadPolicy.HotReloadableFields.Intersect(WorkerPoolHotReloadPolicy.RestartRequiredFields));
+        Assert.Contains("MaxConcurrentSandboxes", WorkerPoolHotReloadPolicy.HotReloadableFields);
+        Assert.Contains("MinSpawnInterval", WorkerPoolHotReloadPolicy.HotReloadableFields);
+    }
+
     // ─── fixtures ────────────────────────────────────────────────────────────
 
     private sealed class OrchFixture : IDisposable
@@ -281,7 +467,7 @@ public sealed class WorkerPoolHotReloadTests
         private SqliteWorkItemStore? _store;
         private TestScratchDirectory? _scratch;
 
-        public static OrchFixture Build(int initialMaxConcurrent)
+        public static OrchFixture Build(int initialMaxConcurrent, TimeSpan? initialMinSpawnInterval = null)
         {
             var scratch = TestScratchDirectory.Create("cb-wp-hotreload-");
             var store = new SqliteWorkItemStore(scratch.DbPath());
@@ -291,7 +477,11 @@ public sealed class WorkerPoolHotReloadTests
                 store,
                 new NoopPipeline(),
                 new CancellationRegistry(CancellationToken.None),
-                new OrchestratorOptions { MaxConcurrentWorkers = initialMaxConcurrent },
+                new OrchestratorOptions
+                {
+                    MaxConcurrentWorkers = initialMaxConcurrent,
+                    MinSpawnInterval = initialMinSpawnInterval ?? TimeSpan.Zero,
+                },
                 NullLogger<OrchestratorService>.Instance,
                 agentConcurrency: new AgentConcurrencyOptions());
             return new OrchFixture { Orchestrator = orch, Queue = queue, _store = store, _scratch = scratch };
@@ -328,7 +518,9 @@ public sealed class WorkerPoolHotReloadTests
             _scratch = scratch;
         }
 
-        public static async Task<CoordinatorFixture> StartAsync(CodeyBoxOptions initial)
+        public static async Task<CoordinatorFixture> StartAsync(
+            CodeyBoxOptions initial,
+            SandboxAdmissionControlledProvider? admission = null)
         {
             var monitor = new ManualMonitor<CodeyBoxOptions>(initial);
             var router = new AgentClassRouter(
@@ -346,7 +538,11 @@ public sealed class WorkerPoolHotReloadTests
                 store,
                 new NoopPipeline(),
                 new CancellationRegistry(CancellationToken.None),
-                new OrchestratorOptions { MaxConcurrentWorkers = initialMax },
+                new OrchestratorOptions
+                {
+                    MaxConcurrentWorkers = initialMax,
+                    MinSpawnInterval = initial.WorkerPool.MinSpawnInterval,
+                },
                 NullLogger<OrchestratorService>.Instance,
                 agentConcurrency: initial.AgentConcurrency);
             var burn = new AgentBurnEstimator(
@@ -355,7 +551,8 @@ public sealed class WorkerPoolHotReloadTests
                 NullLogger<AgentBurnEstimator>.Instance);
             var coordinator = new AgentConfigHotReload(
                 monitor, orch, router, burn,
-                NullLogger<AgentConfigHotReload>.Instance);
+                NullLogger<AgentConfigHotReload>.Instance,
+                sandboxAdmission: admission);
             await coordinator.StartAsync(CancellationToken.None);
             return new CoordinatorFixture(coordinator, monitor, orch, store, scratch);
         }
@@ -407,6 +604,30 @@ public sealed class WorkerPoolHotReloadTests
     {
         public Task RunAsync(WorkItem item, CancellationToken phaseCt, CancellationToken hostCt) =>
             Task.CompletedTask;
+    }
+
+    private sealed class StubSandboxProvider : ISandboxProvider
+    {
+        public string Name => "stub";
+
+        public Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default) =>
+            Task.FromResult<ISandbox>(new StubSandbox());
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<ManagedSandboxInfo>>([]);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) =>
+            Task.CompletedTask;
+    }
+
+    private sealed class StubSandbox : ISandbox
+    {
+        public string Id => "stub-1";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default) =>
+            Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private sealed class InertCosts : IWorkItemCostStore, IRecentCostsByAgentQueryable

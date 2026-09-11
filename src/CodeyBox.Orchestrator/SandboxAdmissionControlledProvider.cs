@@ -158,6 +158,42 @@ public class SandboxAdmissionControlledProvider : ISandboxProvider, ISandboxAdmi
 
     public int MaxConcurrentSandboxes => _gate.MaxConcurrent;
 
+    /// <summary>
+    /// Hot-reloads the sandbox admission ceiling
+    /// (<c>CodeyBox:WorkerPool:MaxConcurrentSandboxes</c>) without restarting
+    /// the host. Mirrors <see cref="OrchestratorService.ApplyWorkerPoolReload"/>:
+    /// grow admits queued creations immediately; shrink never aborts
+    /// in-flight sandboxes — new admissions stay blocked above the new target
+    /// until holders dispose and the count converges down.
+    /// <para>
+    /// Idempotent: a reload with the same value is a no-op (no log, no
+    /// resize). All capability-subclass wrappers created by
+    /// <see cref="Wrap"/> share the same gate instance, so resizing through
+    /// any of them resizes the single process-wide budget.
+    /// </para>
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Thrown when <paramref name="newMaxConcurrentSandboxes"/> is &lt; 1.
+    /// </exception>
+    public void ApplyMaxConcurrentSandboxesReload(int newMaxConcurrentSandboxes)
+    {
+        if (newMaxConcurrentSandboxes < 1)
+            throw new ArgumentOutOfRangeException(
+                nameof(newMaxConcurrentSandboxes),
+                newMaxConcurrentSandboxes,
+                "CodeyBox:WorkerPool:MaxConcurrentSandboxes must be >= 1");
+
+        var result = _gate.Resize(newMaxConcurrentSandboxes);
+        if (result.OldTarget == result.NewTarget)
+            return;
+
+        _log.LogInformation(
+            "Hot-reloaded WorkerPool:MaxConcurrentSandboxes: {OldValue} → {NewValue} (admitted={Admitted})",
+            result.OldTarget,
+            result.NewTarget,
+            result.InFlight);
+    }
+
     // Forward the wrapped provider's resource-metrics capture capability so
     // WorkSandboxContext (which only ever sees this decorator) can gate its
     // per-phase VM isolation on the live toggle.
@@ -1017,6 +1053,7 @@ internal sealed class SandboxAdmissionGate
     private readonly Queue<Waiter> _waiters = new();
     private readonly ILogger? _log;
     private readonly Func<TimeSpan>? _waitWarningThresholdProvider;
+    private int _target;
     private int _available;
 
     public SandboxAdmissionGate(
@@ -1026,20 +1063,27 @@ internal sealed class SandboxAdmissionGate
     {
         if (maxConcurrent < 1)
             throw new ArgumentOutOfRangeException(nameof(maxConcurrent), "Max concurrent sandboxes must be >= 1");
-        MaxConcurrent = maxConcurrent;
+        _target = maxConcurrent;
         _available = maxConcurrent;
         _log = log;
         _waitWarningThresholdProvider = waitWarningThresholdProvider;
     }
 
-    public int MaxConcurrent { get; }
+    public int MaxConcurrent
+    {
+        get
+        {
+            lock (_sync)
+                return _target;
+        }
+    }
 
     public int CurrentAdmitted
     {
         get
         {
             lock (_sync)
-                return MaxConcurrent - _available;
+                return _target - _available;
         }
     }
 
@@ -1116,8 +1160,19 @@ internal sealed class SandboxAdmissionGate
             {
                 if (_waiters.Count == 0)
                 {
-                    if (_available >= MaxConcurrent)
+                    if (_available >= _target)
                         throw new InvalidOperationException("Sandbox admission token released more than once");
+                    _available++;
+                    return;
+                }
+
+                // A shrink may have pushed the target below the live count
+                // (_available < 0). The released permit is then consumed to
+                // converge toward the new target instead of being handed to
+                // the next waiter, so in-flight holders drain naturally and
+                // new admissions stay blocked until below the target.
+                if (_available < 0)
+                {
                     _available++;
                     return;
                 }
@@ -1127,6 +1182,61 @@ internal sealed class SandboxAdmissionGate
 
             if (waiter.TryGrant())
                 return;
+        }
+    }
+
+    /// <summary>
+    /// Changes the admission target without restarting the host. Mirrors the
+    /// <see cref="ResizableConcurrencyGate.Resize"/> contract: growing admits
+    /// queued waiters immediately (in FIFO order); shrinking never interrupts
+    /// in-flight holders — the gate simply refuses new admissions above the
+    /// new target until holders release and the count converges down.
+    /// </summary>
+    /// <returns>The old target, new target, and current admitted count
+    /// observed inside the resize lock.</returns>
+    internal ResizeResult Resize(int newMaxConcurrent)
+    {
+        if (newMaxConcurrent < 1)
+            throw new ArgumentOutOfRangeException(
+                nameof(newMaxConcurrent),
+                newMaxConcurrent,
+                "Max concurrent sandboxes must be >= 1.");
+        int oldTarget;
+        int admitted;
+        lock (_sync)
+        {
+            oldTarget = _target;
+            if (oldTarget == newMaxConcurrent)
+                return new ResizeResult(oldTarget, newMaxConcurrent, _target - _available);
+            _target = newMaxConcurrent;
+            _available += newMaxConcurrent - oldTarget;
+            admitted = _target - _available;
+        }
+        // Grow path only: admit queued waiters against the new headroom.
+        // Shrink is a no-op for in-flight holders (Release converges them).
+        DrainWaiters();
+        return new ResizeResult(oldTarget, newMaxConcurrent, admitted);
+    }
+
+    private void DrainWaiters()
+    {
+        while (true)
+        {
+            Waiter? waiter;
+            lock (_sync)
+            {
+                if (_available <= 0 || _waiters.Count == 0)
+                    return;
+                waiter = _waiters.Dequeue();
+            }
+
+            if (waiter.TryGrant())
+            {
+                lock (_sync)
+                {
+                    _available--;
+                }
+            }
         }
     }
 
