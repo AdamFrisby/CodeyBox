@@ -210,6 +210,12 @@ public sealed record AuditMaxIterationsEscalationDetails
     public required IReadOnlyList<AuditProgressIterationDetails> History { get; init; }
     public required IReadOnlyList<AuditFindingPayload> RemainingBlockingFindings { get; init; }
     public required string ResumeHint { get; init; }
+    /// <summary>Status of the driving audit verdict (e.g. "complete"). A stale
+    /// verdict is distinguishable from a current one by this status together
+    /// with <see cref="VerdictRecordedAt"/>.</summary>
+    public string? VerdictStatus { get; init; }
+    /// <summary>When the driving audit verdict was recorded. Null when unknown.</summary>
+    public DateTimeOffset? VerdictRecordedAt { get; init; }
 }
 
 /// <summary>One audit iteration inside <see cref="AuditMaxIterationsEscalationDetails"/>.</summary>
@@ -218,6 +224,10 @@ public sealed record AuditProgressIterationDetails
     public required int Iteration { get; init; }
     public required int BlockingFindings { get; init; }
     public required int NonBlockingFindings { get; init; }
+    /// <summary>Status of this iteration's verdict (e.g. "complete").</summary>
+    public string? Status { get; init; }
+    /// <summary>When this iteration's verdict was recorded. Null when unknown.</summary>
+    public DateTimeOffset? RecordedAt { get; init; }
     public required IReadOnlyList<AuditFindingPayload> BlockingFindingsDetails { get; init; }
     public required IReadOnlyList<AuditFindingPayload> Findings { get; init; }
 }

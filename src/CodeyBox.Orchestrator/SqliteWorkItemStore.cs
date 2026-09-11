@@ -3811,7 +3811,7 @@ public sealed class SqliteWorkItemStore :
         cmd.CommandText = """
             SELECT iteration, max_iterations, blocking_findings, non_blocking_findings,
                    blocking_finding_ids_json, blocking_findings_json, findings_json, work_branch_tip,
-                   status, scheduled_auditors_json, completed_auditors_json
+                   status, scheduled_auditors_json, completed_auditors_json, recorded_at
             FROM work_item_audit_progress
             WHERE work_item_id = $wi AND work_attempt_started_at = $attempt
             ORDER BY iteration ASC;
@@ -3834,7 +3834,8 @@ public sealed class SqliteWorkItemStore :
                 WorkBranchTip: reader.IsDBNull(7) ? null : reader.GetString(7),
                 Status: reader.GetString(8),
                 ScheduledAuditors: DeserializeStringList(reader.GetString(9)),
-                CompletedAuditors: DeserializeStringList(reader.GetString(10))));
+                CompletedAuditors: DeserializeStringList(reader.GetString(10)),
+                RecordedAt: DateTimeOffset.Parse(reader.GetString(11), System.Globalization.CultureInfo.InvariantCulture)));
         }
         return results;
     }
@@ -3865,7 +3866,8 @@ public sealed class SqliteWorkItemStore :
                 WorkBranchTip: reader.IsDBNull(11) ? null : reader.GetString(11),
                 Status: reader.GetString(12),
                 ScheduledAuditors: DeserializeStringList(reader.GetString(13)),
-                CompletedAuditors: DeserializeStringList(reader.GetString(14))));
+                CompletedAuditors: DeserializeStringList(reader.GetString(14)),
+                RecordedAt: DateTimeOffset.Parse(reader.GetString(3), System.Globalization.CultureInfo.InvariantCulture)));
 
     /// <summary>
     /// All audit-progress rows for a work item across every work-attempt partition,
